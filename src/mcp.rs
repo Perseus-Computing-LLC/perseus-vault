@@ -189,302 +189,1062 @@ fn handle_request(
     }
 }
 
-/// Build the tools/list response with all 15 tools.
+/// Build the tools/list response with all 23 tools including outputSchema and annotations.
 fn list_tools(id: Option<Value>) -> JsonRpcResponse {
+    // Tools are defined inline as serde_json::Value for maximum flexibility.
+    // The json!() macro would require the exact structure at compile time,
+    // but since we have 23 tools with nested outputSchema, we parse from a string.
+    let tools_json: serde_json::Value = serde_json::from_str(
+        r###"[
+  {
+    "name": "mimir_remember",
+    "description": "Store or update an entity by (category, key). Idempotent \u2014 call as often as you want, same key returns an update. Use this for saving facts, decisions, architecture notes, and conventions.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "category": {
+          "type": "string",
+          "description": "Entity category: 'decision', 'architecture', 'convention', 'insight', or custom"
+        },
+        "key": {
+          "type": "string",
+          "description": "Unique key within the category, e.g. 'use-postgres-16' or 'deployment-strategy'"
+        },
+        "body_json": {
+          "type": "string",
+          "description": "JSON object with the entity body \u2014 store content, summary, and any custom fields here"
+        },
+        "status": {
+          "type": "string",
+          "default": "active",
+          "description": "Entity status: 'active', 'draft', 'deprecated'"
+        },
+        "type": {
+          "type": "string",
+          "default": "insight",
+          "description": "Entity type: 'insight', 'architecture', 'decision', 'reference', 'convention'"
+        },
+        "tags": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Tags for categorization and cross-referencing"
+        },
+        "importance": {
+          "type": "number",
+          "default": 0.5,
+          "description": "Initial importance 0.0\u20131.0 \u2014 sets the starting decay score"
+        },
+        "topic_path": {
+          "type": "string",
+          "default": "",
+          "description": "Hierarchical topic path, e.g. 'architecture/database/postgres'"
+        }
+      },
+      "required": [
+        "category",
+        "key",
+        "body_json"
+      ]
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Entity ID, e.g. 'mem-a1b2c3d4e5f6'"
+        },
+        "action": {
+          "type": "string",
+          "description": "'created' for new entities, 'updated' for existing ones"
+        },
+        "category": {
+          "type": "string",
+          "description": "Entity category"
+        },
+        "key": {
+          "type": "string",
+          "description": "Entity key"
+        }
+      }
+    },
+    "annotations": {
+      "destructiveHint": true
+    }
+  },
+  {
+    "name": "mimir_recall",
+    "description": "Search entities with FTS5 keyword search. Words are OR'd together. Returns entities sorted by relevance with expanded content/summary fields at top level. Use this to find previously stored facts, decisions, or architecture notes.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string",
+          "description": "Search query \u2014 words are OR'd together for broad recall"
+        },
+        "category": {
+          "type": "string",
+          "description": "Filter by category, e.g. 'decision' or 'architecture'"
+        },
+        "type": {
+          "type": "string",
+          "description": "Filter by entity type, e.g. 'insight' or 'reference'"
+        },
+        "limit": {
+          "type": "integer",
+          "default": 10,
+          "description": "Maximum number of results to return"
+        },
+        "min_decay": {
+          "type": "number",
+          "default": 0.0,
+          "description": "Minimum decay score threshold 0.0\u20131.0 \u2014 higher values return fresher results"
+        },
+        "topic_path": {
+          "type": "string",
+          "description": "Filter by topic path prefix, e.g. 'architecture/'"
+        },
+        "include_archived": {
+          "type": "boolean",
+          "default": false,
+          "description": "Include archived (soft-deleted) entities in results"
+        }
+      },
+      "required": [
+        "query"
+      ]
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "items": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          },
+          "description": "Matching entities with expanded body_json fields at top level"
+        },
+        "total": {
+          "type": "integer",
+          "description": "Number of results returned"
+        }
+      }
+    },
+    "annotations": {
+      "readOnlyHint": true
+    }
+  },
+  {
+    "name": "mimir_forget",
+    "description": "Soft-delete an entity by setting archived=1. The entity is hidden from queries but recoverable. Use this to clean up stale or incorrect facts without permanent data loss.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "category": {
+          "type": "string",
+          "description": "Entity category to archive"
+        },
+        "key": {
+          "type": "string",
+          "description": "Entity key to archive"
+        },
+        "reason": {
+          "type": "string",
+          "default": "",
+          "description": "Reason for archiving, logged for audit trail"
+        }
+      },
+      "required": [
+        "category",
+        "key"
+      ]
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "found": {
+          "type": "boolean",
+          "description": "Whether the entity was found and archived"
+        },
+        "category": {
+          "type": "string",
+          "description": "Entity category"
+        },
+        "key": {
+          "type": "string",
+          "description": "Entity key"
+        }
+      }
+    },
+    "annotations": {
+      "destructiveHint": true
+    }
+  },
+  {
+    "name": "mimir_link",
+    "description": "Create a relationship link from one entity to another. Builds a knowledge graph that mimir_traverse can walk. Use 'depends_on', 'implements', 'extends', 'references', or custom relationships.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "from_category": {
+          "type": "string",
+          "description": "Source entity category"
+        },
+        "from_key": {
+          "type": "string",
+          "description": "Source entity key"
+        },
+        "to_id": {
+          "type": "string",
+          "description": "Target entity ID (from mimir_remember return value)"
+        },
+        "relationship": {
+          "type": "string",
+          "default": "related",
+          "description": "Relationship type: 'depends_on', 'implements', 'extends', 'references', or custom"
+        }
+      },
+      "required": [
+        "from_category",
+        "from_key",
+        "to_id"
+      ]
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "success": {
+          "type": "boolean"
+        },
+        "from": {
+          "type": "string",
+          "description": "Source as 'category/key'"
+        },
+        "to": {
+          "type": "string",
+          "description": "Target entity ID"
+        },
+        "relationship": {
+          "type": "string",
+          "description": "Relationship type set"
+        }
+      }
+    },
+    "annotations": {
+      "destructiveHint": true
+    }
+  },
+  {
+    "name": "mimir_unlink",
+    "description": "Remove a relationship link from one entity to another. Use this to correct outdated or incorrect links in the knowledge graph.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "from_category": {
+          "type": "string",
+          "description": "Source entity category"
+        },
+        "from_key": {
+          "type": "string",
+          "description": "Source entity key"
+        },
+        "to_id": {
+          "type": "string",
+          "description": "Target entity ID to unlink"
+        }
+      },
+      "required": [
+        "from_category",
+        "from_key",
+        "to_id"
+      ]
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "success": {
+          "type": "boolean"
+        },
+        "from": {
+          "type": "string",
+          "description": "Source as 'category/key'"
+        },
+        "to": {
+          "type": "string",
+          "description": "Target entity ID"
+        }
+      }
+    },
+    "annotations": {
+      "destructiveHint": true
+    }
+  },
+  {
+    "name": "mimir_journal",
+    "description": "Append a structured decision/observation log entry. Uses evaluated/acted/forward pattern: what was considered, what was done, and what happens next. Essential for audit trails and timeline reconstruction.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "event_type": {
+          "type": "string",
+          "default": "decision",
+          "description": "Event type: 'decision', 'observation', 'action', 'error'"
+        },
+        "evaluated": {
+          "type": "object",
+          "description": "What was evaluated: options considered, context, constraints"
+        },
+        "acted": {
+          "type": "object",
+          "description": "What action was taken and why"
+        },
+        "forward": {
+          "type": "object",
+          "description": "What the plan is going forward"
+        },
+        "category": {
+          "type": "string",
+          "description": "Related entity category for linking"
+        },
+        "key": {
+          "type": "string",
+          "description": "Related entity key for linking"
+        },
+        "entity_id": {
+          "type": "string",
+          "description": "Related entity ID for linking"
+        }
+      },
+      "required": []
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Journal event ID"
+        },
+        "event_type": {
+          "type": "string",
+          "description": "Event type recorded"
+        },
+        "created_at_unix_ms": {
+          "type": "integer",
+          "description": "Creation timestamp in unix milliseconds"
+        }
+      }
+    },
+    "annotations": {
+      "destructiveHint": true
+    }
+  },
+  {
+    "name": "mimir_timeline",
+    "description": "Query journal events by time range with optional filters for event type, category, or entity. Use this to reconstruct the decision history and understand what happened when.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "from_ms": {
+          "type": "integer",
+          "description": "Start time boundary in unix milliseconds"
+        },
+        "to_ms": {
+          "type": "integer",
+          "description": "End time boundary in unix milliseconds"
+        },
+        "event_type": {
+          "type": "string",
+          "description": "Filter by event type: 'decision', 'observation', 'action', 'error'"
+        },
+        "category": {
+          "type": "string",
+          "description": "Filter by related entity category"
+        },
+        "entity_id": {
+          "type": "string",
+          "description": "Filter by related entity ID"
+        },
+        "limit": {
+          "type": "integer",
+          "default": 50,
+          "description": "Maximum number of events to return"
+        }
+      },
+      "required": []
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "items": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          },
+          "description": "Journal events matching the query"
+        },
+        "total": {
+          "type": "integer",
+          "description": "Number of events returned"
+        }
+      }
+    },
+    "annotations": {
+      "readOnlyHint": true
+    }
+  },
+  {
+    "name": "mimir_state_set",
+    "description": "Set a key-value state entry with optional TTL for auto-expiration. Use this for session state, temporary flags, or configuration values that should expire after a set time.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "key": {
+          "type": "string",
+          "description": "State key \u2014 unique identifier for this state entry"
+        },
+        "value_json": {
+          "type": "string",
+          "description": "JSON value to store"
+        },
+        "ttl_seconds": {
+          "type": "integer",
+          "description": "Time-to-live in seconds. Entry auto-expires and returns null after this duration. Omit for permanent state."
+        }
+      },
+      "required": [
+        "key",
+        "value_json"
+      ]
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "key": {
+          "type": "string",
+          "description": "State key set"
+        },
+        "ttl_seconds": {
+          "type": "integer",
+          "description": "TTL that was set, if any"
+        },
+        "expires_at_unix_ms": {
+          "type": "integer",
+          "description": "Expiration timestamp in unix milliseconds, if TTL was set"
+        }
+      }
+    },
+    "annotations": {
+      "destructiveHint": true
+    }
+  },
+  {
+    "name": "mimir_state_get",
+    "description": "Get a state value by key. Returns null if the key has expired or doesn't exist. Use this instead of mimir_recall for transient session state that doesn't need FTS5 search.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "key": {
+          "type": "string",
+          "description": "State key to retrieve"
+        }
+      },
+      "required": [
+        "key"
+      ]
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "found": {
+          "type": "boolean",
+          "description": "Whether the key exists and hasn't expired"
+        },
+        "key": {
+          "type": "string",
+          "description": "State key requested"
+        },
+        "value": {
+          "type": "string",
+          "description": "JSON value if found"
+        },
+        "expires_at_unix_ms": {
+          "type": "integer",
+          "description": "Expiration timestamp if TTL was set"
+        },
+        "created_at_unix_ms": {
+          "type": "integer",
+          "description": "Creation timestamp"
+        }
+      }
+    },
+    "annotations": {
+      "readOnlyHint": true
+    }
+  },
+  {
+    "name": "mimir_state_delete",
+    "description": "Delete a state entry by key. Permanent removal \u2014 unlike mimir_forget which is a soft-delete. Use this to clean up expired or unused state entries.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "key": {
+          "type": "string",
+          "description": "State key to permanently delete"
+        }
+      },
+      "required": [
+        "key"
+      ]
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "found": {
+          "type": "boolean",
+          "description": "Whether the key existed and was deleted"
+        },
+        "key": {
+          "type": "string",
+          "description": "Key that was deleted"
+        }
+      }
+    },
+    "annotations": {
+      "destructiveHint": true
+    }
+  },
+  {
+    "name": "mimir_state_list",
+    "description": "List all state keys, optionally filtered by a key prefix. Use this to discover what state entries exist without knowing exact keys ahead of time.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "prefix": {
+          "type": "string",
+          "default": "",
+          "description": "Only return keys that start with this prefix"
+        }
+      },
+      "required": []
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "keys": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Matching state keys"
+        },
+        "total": {
+          "type": "integer",
+          "description": "Number of keys returned"
+        }
+      }
+    },
+    "annotations": {
+      "readOnlyHint": true
+    }
+  },
+  {
+    "name": "mimir_health",
+    "description": "Check whether the Mimir server and its SQLite database are healthy. Returns a simple healthy/unhealthy status. Use this for health checks and monitoring, not for detailed stats (use mimir_stats).",
+    "inputSchema": {
+      "type": "object",
+      "properties": {}
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "status": {
+          "type": "string",
+          "enum": [
+            "healthy",
+            "unhealthy"
+          ],
+          "description": "Server health status"
+        }
+      }
+    },
+    "annotations": {
+      "readOnlyHint": true
+    }
+  },
+  {
+    "name": "mimir_stats",
+    "description": "Return comprehensive database statistics: entity counts by category, type, and decay layer; journal event count; state entry count; database file size; and date range of stored data.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {}
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "total_entities": {
+          "type": "integer",
+          "description": "Total entities in the database"
+        },
+        "by_category": {
+          "type": "object",
+          "description": "Entity counts grouped by category"
+        },
+        "by_type": {
+          "type": "object",
+          "description": "Entity counts grouped by type"
+        },
+        "by_layer": {
+          "type": "object",
+          "description": "Entity counts grouped by decay layer (buffer/working/core)"
+        },
+        "total_journal_events": {
+          "type": "integer",
+          "description": "Total journal events recorded"
+        },
+        "total_state_entries": {
+          "type": "integer",
+          "description": "Total state entries (including expired)"
+        },
+        "db_file_size_bytes": {
+          "type": "integer",
+          "description": "Database file size on disk in bytes"
+        },
+        "oldest_unix_ms": {
+          "type": "integer",
+          "description": "Oldest entity creation timestamp"
+        },
+        "newest_unix_ms": {
+          "type": "integer",
+          "description": "Newest entity creation timestamp"
+        }
+      }
+    },
+    "annotations": {
+      "readOnlyHint": true
+    }
+  },
+  {
+    "name": "mimir_compact",
+    "description": "Archive entities whose decay score has fallen below a threshold. Supports dry-run mode to preview without making changes. Run periodically or threshold-triggered to keep the database focused on active, high-value memories.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "min_decay": {
+          "type": "number",
+          "default": 0.1,
+          "description": "Decay threshold \u2014 entities with decay score below this are archived"
+        },
+        "dry_run": {
+          "type": "boolean",
+          "default": false,
+          "description": "If true, report what would be archived without making changes"
+        }
+      },
+      "required": []
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "entities_archived": {
+          "type": "integer",
+          "description": "Number of entities actually archived (0 in dry-run mode)"
+        },
+        "entities_examined": {
+          "type": "integer",
+          "description": "Number of entities checked"
+        },
+        "dry_run": {
+          "type": "boolean",
+          "description": "Whether this was a dry run"
+        },
+        "completed_at_unix_ms": {
+          "type": "integer",
+          "description": "Completion timestamp"
+        }
+      }
+    },
+    "annotations": {
+      "destructiveHint": true
+    }
+  },
+  {
+    "name": "mimir_migrate",
+    "description": "Migrate a v0.1.x Mimir database to the current v0.5.0 schema. Reads the old database, converts memories to the entity model, and merges into the current database. Use this once per legacy database during upgrade.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "from_path": {
+          "type": "string",
+          "description": "Absolute path to the v0.1.x SQLite database file to migrate"
+        }
+      },
+      "required": [
+        "from_path"
+      ]
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "total_old_memories": {
+          "type": "integer",
+          "description": "Number of memories found in the old database"
+        },
+        "entities_created": {
+          "type": "integer",
+          "description": "New entities created from old memories"
+        },
+        "entities_updated": {
+          "type": "integer",
+          "description": "Existing entities updated during merge"
+        },
+        "errors": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Any errors encountered during migration"
+        },
+        "completed_at_unix_ms": {
+          "type": "integer",
+          "description": "Completion timestamp"
+        }
+      }
+    },
+    "annotations": {
+      "destructiveHint": true
+    }
+  },
+  {
+    "name": "mimir_context",
+    "description": "Return a pre-formatted markdown context block of the most important entities for session injection. The downstream system (Perseus) uses this to pre-load AI agent context with relevant memories before work begins.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "categories": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Categories to include. Empty array = all categories."
+        },
+        "limit": {
+          "type": "integer",
+          "default": 10,
+          "description": "Maximum number of entities to include in the context block"
+        }
+      },
+      "required": []
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "rendered": {
+          "type": "string",
+          "description": "Markdown-formatted context block with entity details"
+        }
+      }
+    },
+    "annotations": {
+      "readOnlyHint": true
+    }
+  },
+  {
+    "name": "mimir_traverse",
+    "description": "Walk the entity link graph starting from a given entity up to a configurable depth. Returns a chain of linked entities \u2014 useful for exploring dependencies, decision trees, and relationship graphs built via mimir_link.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "category": {
+          "type": "string",
+          "description": "Starting entity category"
+        },
+        "key": {
+          "type": "string",
+          "description": "Starting entity key"
+        },
+        "max_depth": {
+          "type": "integer",
+          "default": 3,
+          "description": "Maximum traversal depth from the starting entity"
+        }
+      },
+      "required": [
+        "category",
+        "key"
+      ]
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "chain": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          },
+          "description": "Linked entities in traversal order"
+        }
+      }
+    },
+    "annotations": {
+      "readOnlyHint": true
+    }
+  },
+  {
+    "name": "mimir_score",
+    "description": "Assign a quality score (0.0\u20131.0) to an entity. Verified entities with high scores resist decay and rank higher in recall results. Use this to mark entities as accurate, verified, or deprecated.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "category": {
+          "type": "string",
+          "description": "Entity category to score"
+        },
+        "key": {
+          "type": "string",
+          "description": "Entity key to score"
+        },
+        "score": {
+          "type": "number",
+          "description": "Quality score 0.0\u20131.0. 1.0 = verified, 0.5 = neutral, 0.0 = low quality"
+        }
+      },
+      "required": [
+        "category",
+        "key",
+        "score"
+      ]
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "found": {
+          "type": "boolean",
+          "description": "Whether the entity was found"
+        },
+        "category": {
+          "type": "string",
+          "description": "Entity category"
+        },
+        "key": {
+          "type": "string",
+          "description": "Entity key"
+        },
+        "score": {
+          "type": "number",
+          "description": "Quality score assigned"
+        }
+      }
+    },
+    "annotations": {
+      "destructiveHint": true
+    }
+  },
+  {
+    "name": "mimir_conflicts",
+    "description": "Detect conflicting entities in the same category \u2014 pairs with low trigram similarity in their body_json. Flags potential contradictions, duplicate-but-divergent entries, and stale-overwritten facts that need human review.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "category": {
+          "type": "string",
+          "default": "general",
+          "description": "Category to scan for conflicts"
+        },
+        "threshold": {
+          "type": "number",
+          "default": 0.4,
+          "description": "Similarity threshold \u2014 pairs below this are flagged as conflicts"
+        },
+        "limit": {
+          "type": "integer",
+          "default": 10,
+          "description": "Maximum number of conflicts to return"
+        }
+      },
+      "required": [
+        "category"
+      ]
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "conflicts": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          },
+          "description": "Conflict pairs with similarity scores"
+        }
+      }
+    },
+    "annotations": {
+      "readOnlyHint": true
+    }
+  },
+  {
+    "name": "mimir_vault_export",
+    "description": "Export all non-archived entities to .md files with YAML frontmatter in a vault directory. Files are human-readable, git-trackable, and Obsidian-compatible. Use this for backup, transfer between workspaces, or offline review.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "vault_dir": {
+          "type": "string",
+          "default": "~/.mimir/vault",
+          "description": "Directory path to write .md files. Created if it doesn't exist. Use ~ for home directory."
+        }
+      },
+      "required": []
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "files_created": {
+          "type": "integer",
+          "description": "Number of new .md files created"
+        },
+        "files_updated": {
+          "type": "integer",
+          "description": "Number of existing .md files updated"
+        },
+        "errors": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Any errors encountered during export"
+        },
+        "vault_dir": {
+          "type": "string",
+          "description": "Absolute path to the vault directory"
+        },
+        "completed_at_unix_ms": {
+          "type": "integer",
+          "description": "Completion timestamp"
+        }
+      }
+    },
+    "annotations": {
+      "destructiveHint": true
+    }
+  },
+  {
+    "name": "mimir_vault_import",
+    "description": "Import .md files from a vault directory into the database. Reads YAML frontmatter for metadata and markdown body for content. Idempotent \u2014 re-running on the same vault won't duplicate entities. Pair with mimir_vault_export for transfer.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "vault_dir": {
+          "type": "string",
+          "default": "~/.mimir/vault",
+          "description": "Directory path to read .md files from. Use ~ for home directory."
+        }
+      },
+      "required": []
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "files_created": {
+          "type": "integer",
+          "description": "Number of new entities created from files"
+        },
+        "files_updated": {
+          "type": "integer",
+          "description": "Number of existing entities updated"
+        },
+        "errors": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Any errors encountered during import"
+        },
+        "vault_dir": {
+          "type": "string",
+          "description": "Absolute path of the vault directory read"
+        },
+        "completed_at_unix_ms": {
+          "type": "integer",
+          "description": "Completion timestamp"
+        }
+      }
+    },
+    "annotations": {
+      "destructiveHint": true
+    }
+  },
+  {
+    "name": "mimir_decay",
+    "description": "Recalculate Ebbinghaus decay scores for all entities based on time since last access. Auto-archives entities that have fully decayed (score < 0.05). Run periodically to keep memory fresh \u2014 decayed entities surface less often in recall results.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {}
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "entities_checked": {
+          "type": "integer",
+          "description": "Total entities evaluated"
+        },
+        "entities_updated": {
+          "type": "integer",
+          "description": "Entities whose decay score changed"
+        },
+        "auto_archived": {
+          "type": "integer",
+          "description": "Entities auto-archived because decay fell below 0.05"
+        },
+        "completed_at_unix_ms": {
+          "type": "integer",
+          "description": "Completion timestamp"
+        }
+      }
+    },
+    "annotations": {
+      "destructiveHint": true
+    }
+  },
+  {
+    "name": "mimir_workspace_list",
+    "description": "List all distinct entity categories present in the database. Use this to discover what knowledge domains exist before querying with mimir_recall or mimir_context.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {}
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "categories": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "All distinct categories in the database"
+        },
+        "total": {
+          "type": "integer",
+          "description": "Number of categories"
+        }
+      }
+    },
+    "annotations": {
+      "readOnlyHint": true
+    }
+  }
+]"###
+    ).expect("tools JSON must be valid");
+    
     JsonRpcResponse {
         jsonrpc: "2.0".to_string(),
         id,
         result: Some(json!({
-            "tools": [
-                {
-                    "name": "mimir_remember",
-                    "description": "Store or update an entity. Idempotent by (category, key) — call as many times as you want.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "category": {"type": "string", "description": "Entity category (e.g. 'decision', 'architecture', 'project')"},
-                            "key": {"type": "string", "description": "Unique key within the category (e.g. 'use-postgres-16')"},
-                            "body_json": {"type": "string", "description": "JSON object with entity body — flexible schema"},
-                            "status": {"type": "string", "default": "active", "description": "Entity status"},
-                            "type": {"type": "string", "default": "insight", "description": "Entity type: insight, architecture, decision, reference"},
-                            "tags": {"type": "array", "items": {"type": "string"}, "description": "Tags for categorization"},
-                            "importance": {"type": "number", "default": 0.5, "description": "0.0–1.0 importance (used as initial decay score)"},
-                            "topic_path": {"type": "string", "default": "", "description": "Hierarchical topic path (e.g. 'architecture/database')"}
-                        },
-                        "required": ["category", "key", "body_json"]
-                    }
-                },
-                {
-                    "name": "mimir_recall",
-                    "description": "Search entities with keyword search (FTS5) plus optional category/type/topic filters.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "query": {"type": "string", "description": "Search query — words are OR'd together"},
-                            "category": {"type": "string", "description": "Filter by category (e.g. 'decision')"},
-                            "type": {"type": "string", "description": "Filter by entity type (e.g. 'architecture')"},
-                            "limit": {"type": "integer", "default": 10, "description": "Maximum results"},
-                            "min_decay": {"type": "number", "default": 0.0, "description": "Minimum decay score threshold (0.0–1.0)"},
-                            "topic_path": {"type": "string", "description": "Filter by topic path prefix"},
-                            "include_archived": {"type": "boolean", "default": false, "description": "Include archived (soft-deleted) entities"}
-                        },
-                        "required": ["query"]
-                    }
-                },
-                {
-                    "name": "mimir_forget",
-                    "description": "Soft-delete an entity (sets archived=1). Recoverable.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "category": {"type": "string", "description": "Entity category"},
-                            "key": {"type": "string", "description": "Entity key"},
-                            "reason": {"type": "string", "default": "", "description": "Reason for archiving"}
-                        },
-                        "required": ["category", "key"]
-                    }
-                },
-                {
-                    "name": "mimir_link",
-                    "description": "Create a relationship link from one entity to another.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "from_category": {"type": "string", "description": "Source entity category"},
-                            "from_key": {"type": "string", "description": "Source entity key"},
-                            "to_id": {"type": "string", "description": "Target entity ID"},
-                            "relationship": {"type": "string", "default": "related", "description": "Relationship type (e.g. 'depends_on', 'implements')"}
-                        },
-                        "required": ["from_category", "from_key", "to_id"]
-                    }
-                },
-                {
-                    "name": "mimir_unlink",
-                    "description": "Remove a link from one entity to another.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "from_category": {"type": "string", "description": "Source entity category"},
-                            "from_key": {"type": "string", "description": "Source entity key"},
-                            "to_id": {"type": "string", "description": "Target entity ID to unlink"}
-                        },
-                        "required": ["from_category", "from_key", "to_id"]
-                    }
-                },
-                {
-                    "name": "mimir_journal",
-                    "description": "Append a journal event — structured decision/observation log with evaluated/acted/forward fields.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "event_type": {"type": "string", "default": "decision", "description": "Event type: decision, observation, action, error"},
-                            "evaluated": {"type": "object", "description": "What was evaluated (options, context)"},
-                            "acted": {"type": "object", "description": "What action was taken and why"},
-                            "forward": {"type": "object", "description": "What the plan is going forward"},
-                            "category": {"type": "string", "description": "Related entity category"},
-                            "key": {"type": "string", "description": "Related entity key"},
-                            "entity_id": {"type": "string", "description": "Related entity ID"}
-                        },
-                        "required": []
-                    }
-                },
-                {
-                    "name": "mimir_timeline",
-                    "description": "Query journal events by time range and optional filters.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "from_ms": {"type": "integer", "description": "Start time (unix ms)"},
-                            "to_ms": {"type": "integer", "description": "End time (unix ms)"},
-                            "event_type": {"type": "string", "description": "Filter by event type"},
-                            "category": {"type": "string", "description": "Filter by related category"},
-                            "entity_id": {"type": "string", "description": "Filter by related entity ID"},
-                            "limit": {"type": "integer", "default": 50, "description": "Maximum results"}
-                        },
-                        "required": []
-                    }
-                },
-                {
-                    "name": "mimir_state_set",
-                    "description": "Set a key-value state entry with optional TTL (auto-expires).",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "key": {"type": "string", "description": "State key"},
-                            "value_json": {"type": "string", "description": "JSON value"},
-                            "ttl_seconds": {"type": "integer", "description": "Time-to-live in seconds (optional)"}
-                        },
-                        "required": ["key", "value_json"]
-                    }
-                },
-                {
-                    "name": "mimir_state_get",
-                    "description": "Get a state value by key. Returns null if expired or missing.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "key": {"type": "string", "description": "State key to retrieve"}
-                        },
-                        "required": ["key"]
-                    }
-                },
-                {
-                    "name": "mimir_state_delete",
-                    "description": "Delete a state entry by key.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "key": {"type": "string", "description": "State key to delete"}
-                        },
-                        "required": ["key"]
-                    }
-                },
-                {
-                    "name": "mimir_state_list",
-                    "description": "List state keys, optionally filtered by prefix.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "prefix": {"type": "string", "default": "", "description": "Key prefix filter"}
-                        },
-                        "required": []
-                    }
-                },
-                {
-                    "name": "mimir_health",
-                    "description": "Check server and database health.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {}
-                    }
-                },
-                {
-                    "name": "mimir_stats",
-                    "description": "Database statistics: entity counts by category/type/layer, journal count, state count, DB file size.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {}
-                    }
-                },
-                {
-                    "name": "mimir_compact",
-                    "description": "Archive entities below a decay threshold. Supports dry-run mode.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "min_decay": {"type": "number", "default": 0.1, "description": "Decay threshold — entities below this are archived"},
-                            "dry_run": {"type": "boolean", "default": false, "description": "If true, report what would happen without making changes"}
-                        },
-                        "required": []
-                    }
-                },
-                {
-                    "name": "mimir_migrate",
-                    "description": "Migrate a v0.1.x Mimir database to v0.2.0 schema.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "from_path": {"type": "string", "description": "Path to the v0.1.x database file"}
-                        },
-                        "required": ["from_path"]
-                    }
-                },
-                {
-                    "name": "mimir_context",
-                    "description": "Return a pre-formatted markdown context block of top entities for session injection.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "categories": {"type": "array", "items": {"type": "string"}, "description": "Categories to include (empty = all)"},
-                            "limit": {"type": "integer", "default": 10, "description": "Maximum entities"}
-                        },
-                        "required": []
-                    }
-                },
-                {
-                    "name": "mimir_traverse",
-                    "description": "Traverse entity links starting from a given entity. Follows the relationship graph up to max_depth.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "category": {"type": "string", "description": "Starting entity category"},
-                            "key": {"type": "string", "description": "Starting entity key"},
-                            "max_depth": {"type": "integer", "default": 3, "description": "Maximum traversal depth"}
-                        },
-                        "required": ["category", "key"]
-                    }
-                },
-                {
-                    "name": "mimir_score",
-                    "description": "Score an entity's quality (0.0–1.0). High scores mark entities as verified and boost decay.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "category": {"type": "string", "description": "Entity category"},
-                            "key": {"type": "string", "description": "Entity key"},
-                            "score": {"type": "number", "description": "Quality score 0.0–1.0"}
-                        },
-                        "required": ["category", "key", "score"]
-                    }
-                },
-                {
-                    "name": "mimir_conflicts",
-                    "description": "Detect conflicting entities — entities in the same category with very different body_json (low trigram similarity).",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "category": {"type": "string", "default": "general", "description": "Category to scan for conflicts"},
-                            "threshold": {"type": "number", "default": 0.4, "description": "Similarity below this = potential conflict"},
-                            "limit": {"type": "integer", "default": 10, "description": "Maximum conflicts to return"}
-                        },
-                        "required": ["category"]
-                    }
-                },
-                {
-                    "name": "mimir_vault_export",
-                    "description": "Export all non-archived entities to .md files with YAML frontmatter in a vault directory. Human-readable, git-trackable, Obsidian-compatible.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "vault_dir": {"type": "string", "default": "~/.mimir/vault", "description": "Directory to write .md files"}
-                        },
-                        "required": []
-                    }
-                },
-                {
-                    "name": "mimir_vault_import",
-                    "description": "Import .md files from a vault directory into the database. Reads YAML frontmatter + body.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "vault_dir": {"type": "string", "default": "~/.mimir/vault", "description": "Directory to read .md files from"}
-                        },
-                        "required": []
-                    }
-                },
-                {
-                    "name": "mimir_decay",
-                    "description": "Recalculate Ebbinghaus decay scores for all entities and auto-archive fully decayed ones (decay < 0.05).",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {}
-                    }
-                },
-                {
-                    "name": "mimir_workspace_list",
-                    "description": "List all distinct entity categories in the database.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {}
-                    }
-                }
-            ]
+            "tools": tools_json
         })),
         error: None,
     }
 }
-
-/// Route a tools/call request to the appropriate handler.
 fn call_tool(
     name: &str,
     db: &Database,
