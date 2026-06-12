@@ -200,6 +200,19 @@ Categories are user-defined. Common patterns:
 
 ---
 
+## Confidence Decay (Ebbinghaus Model)
+
+Mimir implements a simplified version of the Ebbinghaus forgetting curve to manage memory salience over time. Every entity has a `decay_score` from 1.0 (max confidence) down to 0.0.
+
+-   **Decay:** The `mimir_decay` tool recalculates scores based on the time since an entity was last accessed. Older, unused memories fade.
+-   **Reinforcement:** Calling `mimir_recall` and accessing an entity boosts its score and resets the decay clock.
+-   **Archival:** Entities that fall below a certain threshold (e.g., 0.1) can be automatically archived by `mimir_compact` or `mimir_decay`, moving them out of the active set.
+-   **Pinning:** You can manually assign a high score to an entity using `mimir_score` to "pin" it and prevent it from decaying.
+
+This system ensures that the agent's working memory stays relevant, surfacing frequently used information while gracefully archiving stale context.
+
+---
+
 ## Key Properties
 
 - **Zero runtime deps** — static binary with bundled SQLite, no network needed
