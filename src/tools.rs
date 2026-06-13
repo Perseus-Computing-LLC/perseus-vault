@@ -197,7 +197,7 @@ pub fn handle_remember(db: &Database, args: Value) -> Result<String, String> {
     }
 
     let raw_id = Uuid::new_v4().to_string().replace('-', "");
-    let id = format!("mem-{}", &raw_id[..12]);
+    let id = format!("mem-{}", &raw_id[..12.min(raw_id.len())]);
     let now = now_ms();
 
     let entity = Entity {
@@ -429,7 +429,7 @@ pub fn handle_journal(db: &Database, args: Value) -> Result<String, String> {
     }
 
     let raw_id = Uuid::new_v4().to_string().replace('-', "");
-    let id = format!("jrn-{}", &raw_id[..12]);
+    let id = format!("jrn-{}", &raw_id[..12.min(raw_id.len())]);
 
     let event = JournalEvent {
         id,
