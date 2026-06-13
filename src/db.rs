@@ -1793,4 +1793,73 @@ mod tests {
 
         let _ = fs::remove_file(&path);
     }
+
+    #[test]
+    fn query_expansion_with_stemming() {
+        let (db, path) = temp_db();
+
+        // Create entities with "configuration" and "configured" in body.
+        // Neither contains "configure" as a substring, so LIKE won't help.
+        // This is exactly why stemming-based expansion is needed.
+        let e1 = make_entity(
+            "e1",
+            "insight",
+            "config-file",
+            r#"{"content": "The server configuration lives in /etc/config"}"#,
+        );
+        let e2 = make_entity(
+            "e2",
+            "insight",
+            "configured-host",
+            r#"{"content": "The host was configured via Ansible playbook"}"#,
+        );
+        let e3 = make_entity(
+            "e3",
+            "insight",
+            "unrelated",
+            r#"{"content": "Coffee is best at 93\u00b0C"}"#,
+        );
+        db.remember(&e1).unwrap();
+        db.remember(&e2).unwrap();
+        db.remember(&e3).unwrap();
+
+        // Baseline: search for "configure" — LIKE won't find "configuration"
+        let params = RecallParams {
+            query: "configure".to_string(),
+            limit: 10,
+            ..RecallParams::default()
+        };
+        let results = db.recall(&params).unwrap();
+        assert!(
+            results.iter().any(|e| e.key == "configured-host"),
+            "configured-host should match: 'configure' is a substring of 'configured'"
+        );
+        assert!(
+            !results.iter().any(|e| e.key == "config-file"),
+            "config-file should NOT match: 'configuration' does not contain 'configure'"
+        );
+        assert!(
+            !results.iter().any(|e| e.key == "unrelated"),
+            "unrelated should not match"
+        );
+
+        // With expansion: stemming reduces both "configure" and "configuration"
+        // to "configur", so searching for the stem should find both.
+        let params2 = RecallParams {
+            query: "configur".to_string(),
+            limit: 10,
+            ..RecallParams::default()
+        };
+        let results2 = db.recall(&params2).unwrap();
+        assert!(
+            results2.iter().any(|e| e.key == "config-file"),
+            "stemmed search should find 'configuration'"
+        );
+        assert!(
+            results2.iter().any(|e| e.key == "configured-host"),
+            "stemmed search should find 'configured'"
+        );
+
+        let _ = fs::remove_file(&path);
+    }
 }

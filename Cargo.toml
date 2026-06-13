@@ -17,3 +17,4 @@ serde_json = "1"
 rusqlite = { version = "0.31", features = ["bundled"] }
 uuid = { version = "1", features = ["v4"] }
 clap = { version = "4", features = ["derive"] }
+rust-stemmers = "1.2"

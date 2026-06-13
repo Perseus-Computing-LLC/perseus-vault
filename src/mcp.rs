@@ -309,6 +309,22 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
           "type": "boolean",
           "default": false,
           "description": "Include archived (soft-deleted) entities in results"
+        },
+        "expansion": {
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "default": false,
+              "description": "Enable stemming-based query expansion"
+            },
+            "n_variants": {
+              "type": "integer",
+              "default": 1,
+              "description": "Number of stemmed token variants to generate"
+            }
+          },
+          "description": "Configuration for FTS5 query expansion using Porter stemming"
         }
       },
       "required": [
@@ -328,6 +344,10 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
         "total": {
           "type": "integer",
           "description": "Number of results returned"
+        },
+        "variants": {
+          "type": "integer",
+          "description": "Number of query variants used when expansion is enabled"
         }
       }
     },

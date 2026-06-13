@@ -53,6 +53,8 @@ pub struct RecallArgs {
     pub topic_path: Option<String>,
     #[serde(default)]
     pub include_archived: bool,
+    #[serde(default)]
+    pub expansion: crate::models::QueryExpansionConfig,
 }
 
 fn default_limit() -> i64 {
@@ -231,6 +233,11 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
     let a: RecallArgs =
         serde_json::from_value(args).map_err(|e| format!("Invalid recall arguments: {}", e))?;
 
+    // If query expansion is enabled, generate stemming variants and merge results
+    if a.expansion.enabled && !a.query.is_empty() {
+        return handle_recall_with_expansion(db, &a);
+    }
+
     let params = RecallParams {
         query: a.query,
         category: a.category,
@@ -252,6 +259,80 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
     let result = json!({
         "items": items_expanded,
         "total": items_expanded.len(),
+    });
+    Ok(result.to_string())
+}
+
+/// Run recall with stemming-based query expansion, merging results from
+/// the original query and up to `n_variants` stemmed alternatives.
+fn handle_recall_with_expansion(db: &Database, a: &RecallArgs) -> Result<String, String> {
+    use rust_stemmers::{Algorithm, Stemmer};
+    use std::collections::HashMap;
+
+    let stemmer = Stemmer::create(Algorithm::English);
+    let tokens: Vec<&str> = a.query.split_whitespace().filter(|w| !w.is_empty()).collect();
+    if tokens.is_empty() {
+        return Err("Query expansion requires at least one token".to_string());
+    }
+
+    // Build variants: original query + stemmed alternatives
+    let mut variants: Vec<String> = vec![a.query.clone()];
+    for (i, &token) in tokens.iter().enumerate() {
+        if variants.len() >= a.expansion.n_variants + 1 {
+            break;
+        }
+        let stemmed = stemmer.stem(token).to_string();
+        if stemmed != token {
+            let mut alt_tokens: Vec<&str> = tokens.clone();
+            alt_tokens[i] = &stemmed;
+            variants.push(alt_tokens.join(" "));
+        }
+    }
+
+    // Collect results from all variants, keeping the highest-score version of each entity
+    let mut best: HashMap<String, (crate::models::Entity, f64)> = HashMap::new();
+
+    for variant in &variants {
+        let params = RecallParams {
+            query: variant.clone(),
+            category: a.category.clone(),
+            entity_type: a.entity_type.clone(),
+            limit: a.limit.max(50), // fetch more per variant to have good merge pool
+            min_decay: a.min_decay,
+            topic_path: a.topic_path.clone(),
+            include_archived: a.include_archived,
+            skip_side_effects: false,
+        };
+
+        if let Ok(entities) = db.recall(&params) {
+            for entity in entities {
+                let score = entity.decay_score;
+                best.entry(entity.id.clone())
+                    .and_modify(|(existing, existing_score)| {
+                        if score > *existing_score {
+                            *existing = entity.clone();
+                            *existing_score = score;
+                        }
+                    })
+                    .or_insert((entity, score));
+            }
+        }
+    }
+
+    // Sort by score descending, then truncate to limit
+    let mut merged: Vec<_> = best.into_values().collect();
+    merged.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    merged.truncate(a.limit as usize);
+
+    let items_expanded: Vec<serde_json::Value> = merged
+        .iter()
+        .map(|(entity, _)| entity.to_json_expanded())
+        .collect();
+
+    let result = json!({
+        "items": items_expanded,
+        "total": items_expanded.len(),
+        "variants": variants.len(),
     });
     Ok(result.to_string())
 }

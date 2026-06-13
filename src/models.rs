@@ -137,6 +137,19 @@ pub struct RecallParams {
     pub skip_side_effects: bool,
 }
 
+/// Configuration for FTS5 query expansion using stemming variants.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct QueryExpansionConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_n_variants")]
+    pub n_variants: usize,
+}
+
+fn default_n_variants() -> usize {
+    1
+}
+
 impl Default for RecallParams {
     fn default() -> Self {
         Self {
