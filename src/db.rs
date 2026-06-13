@@ -11,39 +11,8 @@ use crate::models::{
 use crate::schema;
 
 /// Format a unix timestamp in milliseconds as an ISO 8601 UTC string.
-/// Produces a human-readable date like "2026-06-12T10:58:00Z".
 fn chrono_like(ms: i64) -> String {
-    let secs = ms / 1000;
-    // M-5: emit actual ISO 8601 UTC instead of raw epoch seconds.
-    // Avoids chrono dependency by hand-rolling a minimal formatter.
-    // Only safe for timestamps from 1970 to ~3000 (no leap-second handling).
-    if secs <= 0 {
-        return format!("{}", secs); // Unix epoch 0 or negative — return as-is
-    }
-    let days_since_epoch = secs / 86400;
-    let secs_of_day = secs % 86400;
-    // Convert days since 1970-01-01 to year/month/day
-    let mut y = 1970i64;
-    let mut d = days_since_epoch;
-    loop {
-        let days_in_year = if (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0) { 366 } else { 365 };
-        if d < days_in_year { break; }
-        d -= days_in_year;
-        y += 1;
-    }
-    let leap = (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0);
-    let month_days = [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-    let mut m = 0usize;
-    while m < 12 && d >= month_days[m] {
-        d -= month_days[m];
-        m += 1;
-    }
-    let month = m + 1;
-    let day = d + 1;
-    let h = secs_of_day / 3600;
-    let min = (secs_of_day % 3600) / 60;
-    let s = secs_of_day % 60;
-    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, month, day, h, min, s)
+    crate::util::format_iso8601(ms / 1000)
 }
 
 pub fn now_ms() -> i64 {
@@ -58,7 +27,7 @@ pub struct Database {
     db_path: String,
     encryption: Option<EncryptionManager>,
     llm_config: LlmConfig,
-    pub connectors: Vec<Box<dyn Connector>>,
+    connectors: Vec<Box<dyn Connector>>,
 }
 
 /// Configuration for the LLM integration (Ollama API).
@@ -117,6 +86,11 @@ impl Database {
     /// Returns true if encryption is enabled.
     pub fn encryption_enabled(&self) -> bool {
         self.encryption.is_some()
+    }
+
+    /// Replace the connector list (used at startup to load configured connectors).
+    pub fn set_connectors(&mut self, connectors: Vec<Box<dyn Connector>>) {
+        self.connectors = connectors;
     }
 
     /// Configure LLM integration for the mimir_ask tool.
@@ -234,7 +208,10 @@ impl Database {
                     }
                     for doc in docs {
                         let entity = Entity {
-                            id: format!("ingest-{}", uuid::Uuid::new_v4().to_string().replace('-', "")[..12].to_string()),
+                            id: {
+                                let raw = uuid::Uuid::new_v4().to_string().replace('-', "");
+                                format!("ingest-{}", &raw[..12.min(raw.len())])
+                            },
                             category: doc.category,
                             key: doc.key,
                             body_json: doc.body_json,
@@ -297,12 +274,16 @@ impl Database {
         query_vec: &[f32],
         limit: usize,
     ) -> Result<Vec<(Entity, f64)>, Box<dyn std::error::Error>> {
+        let max_scan = 50_000; // safety ceiling — databases beyond this should use HNSW
         let mut stmt = self.conn.prepare(
-            "SELECT id, category, key, body_json, status, type, tags,
+            &format!(
+                "SELECT id, category, key, body_json, status, type, tags,
                     decay_score, retrieval_count, layer, topic_path,
                     archived, archive_reason, links, verified, source,
                     created_at_unix_ms, last_accessed_unix_ms, embedding
-             FROM entities WHERE archived = 0 AND embedding IS NOT NULL",
+             FROM entities WHERE archived = 0 AND embedding IS NOT NULL LIMIT {}",
+                max_scan
+            ),
         )?;
 
         let enc = self.encryption.as_ref();
@@ -371,6 +352,14 @@ impl Database {
     /// Recalculate decay scores for all non-archived entities.
     /// Called periodically or via mimir_decay tool.
     pub fn decay_tick(&self) -> Result<DecayReport, Box<dyn std::error::Error>> {
+        self.decay_tick_with_limit(None)
+    }
+
+    /// Like decay_tick but with an optional max entities to process per call.
+    fn decay_tick_with_limit(
+        &self,
+        max_entities: Option<i64>,
+    ) -> Result<DecayReport, Box<dyn std::error::Error>> {
         let now = now_ms();
         let total: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM entities WHERE archived = 0",
@@ -378,10 +367,16 @@ impl Database {
             |r| r.get(0),
         )?;
 
-        // Update decay_score for all non-archived entities
-        let mut stmt = self
-            .conn
-            .prepare("SELECT id, last_accessed_unix_ms FROM entities WHERE archived = 0")?;
+        // Update decay_score for non-archived entities, optionally capped
+        let sql = if let Some(max) = max_entities {
+            format!(
+                "SELECT id, last_accessed_unix_ms FROM entities WHERE archived = 0 LIMIT {}",
+                max
+            )
+        } else {
+            "SELECT id, last_accessed_unix_ms FROM entities WHERE archived = 0".to_string()
+        };
+        let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
 
         let mut updated = 0i64;
@@ -471,7 +466,7 @@ impl Database {
         threshold: f64,
     ) -> Result<Option<String>, Box<dyn std::error::Error>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, body_json FROM entities WHERE category = ?1 AND archived = 0 LIMIT 100",
+            "SELECT id, body_json FROM entities WHERE category = ?1 AND archived = 0",
         )?;
         let rows = stmt.query_map(params![category], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
@@ -692,18 +687,10 @@ impl Database {
                 .collect();
 
             if !words.is_empty() {
-                // FTS5 query: escape special chars and quote each term
+                // FTS5 query: wrap each term in double-quotes to treat special chars literally
                 let escape_fts = |s: &str| -> String {
-                    s.chars()
-                        .map(|c| match c {
-                            '"' | '\'' | '+' | '-' | '*' | '^' | '(' | ')' | '[' | ']' | '{'
-                            | '}' | '~' | '!' | '@' | '#' | '$' | '%' | '&' | '/' | ':' | '<'
-                            | '>' | '=' | '|' | '?' | ',' | '.' | '`' | ';' | '\\' => ' '.into(),
-                            _ => c.to_string(),
-                        })
-                        .collect::<String>()
-                        .trim()
-                        .to_string()
+                    // Double any double-quotes within the term (FTS5 escaping)
+                    s.replace('"', "\"\"")
                 };
                 let fts_query = words
                     .iter()
@@ -712,7 +699,7 @@ impl Database {
                         if escaped.is_empty() {
                             "\"\"".to_string()
                         } else {
-                            format!("\"{}\"", escaped.replace('"', "\"\""))
+                            format!("\"{}\"", escaped)
                         }
                     })
                     .collect::<Vec<_>>()
@@ -1808,7 +1795,7 @@ last_accessed: {}
             let entity = Entity {
                 id: if id.is_empty() {
                     let raw = uuid::Uuid::new_v4().to_string().replace('-', "");
-                    format!("mem-{}", &raw[..12])
+                    format!("mem-{}", &raw[..12.min(raw.len())])
                 } else {
                     id
                 },
