@@ -222,6 +222,8 @@ impl Database {
                             tags: doc.tags,
                             decay_score: 1.0,
                             retrieval_count: 0,
+                            always_on: false,
+                            certainty: 0.5,
                             layer: "buffer".to_string(),
                             topic_path: String::new(),
                             archived: false,
@@ -968,7 +970,7 @@ impl Database {
 
         let mut items = Vec::new();
         for row in rows {
-            let entity = row?;
+            let mut entity = row?;
             // Update retrieval count, recency, decay boost, and layer
             if !params.skip_side_effects {
                 let new_count = entity.retrieval_count + 1;
@@ -987,12 +989,11 @@ impl Database {
                 let cap = cap as usize;
                 if entity.body_json.len() > cap {
                     let extra = entity.body_json.len() - cap;
-                    let truncated = &entity.body_json[..cap];
+                    let truncated = entity.body_json[..cap].to_string();
                     let footer = format!(
                         "\n--truncated ({} more chars)-- full body: get_entity(\"{}\"). If large, delegate_to_subagent to read/extract it without polluting this context.",
                         extra, entity.id
                     );
-                    let mut entity = entity;
                     entity.body_json = format!("{}{}", truncated, footer);
                     items.push(entity);
                     continue;
@@ -2103,6 +2104,8 @@ last_accessed: {}
                 links: vec![],
                 verified: false,
                 source: "vault-import".to_string(),
+                always_on: false,
+                certainty: 0.5,
                 created_at_unix_ms: now_ms(),
                 last_accessed_unix_ms: now_ms(),
                 embedding: None,
@@ -2540,6 +2543,8 @@ mod tests {
             links: vec![],
             verified: false,
             source: "test".to_string(),
+            always_on: false,
+            certainty: 0.5,
             created_at_unix_ms: now_ms(),
             last_accessed_unix_ms: now_ms(),
             embedding: None,

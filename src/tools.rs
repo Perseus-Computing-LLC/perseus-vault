@@ -85,7 +85,6 @@ pub struct RecallArgs {
 fn default_halving() -> f64 {
     1.0
 }
-}
 
 fn default_limit() -> i64 {
     10
