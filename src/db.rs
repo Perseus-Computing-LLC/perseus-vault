@@ -27,6 +27,7 @@ pub struct Database {
     db_path: String,
     encryption: Option<EncryptionManager>,
     llm_config: LlmConfig,
+    embedding_config: crate::embedding::EmbeddingConfig,
     connectors: Vec<Box<dyn Connector>>,
 }
 
@@ -66,6 +67,7 @@ impl Database {
             db_path: path.to_string(),
             encryption: None,
             llm_config: LlmConfig::default(),
+            embedding_config: crate::embedding::EmbeddingConfig::default(),
             connectors: Vec::new(),
         })
     }

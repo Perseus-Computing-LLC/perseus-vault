@@ -1,5 +1,6 @@
 mod connectors;
 mod db;
+mod embedding;
 mod encryption;
 mod mcp;
 mod models;
@@ -45,6 +46,10 @@ struct Cli {
     #[arg(long)]
     llm_endpoint: Option<String>,
 
+    /// Path to ONNX embedding model (enables local embeddings, no Ollama required)
+    #[arg(long)]
+    embedding_model: Option<String>,
+
     /// Ollama model name (default: llama3)
     #[arg(long, default_value_t = String::from("llama3"))]
     llm_model: String,
@@ -89,6 +94,10 @@ enum Commands {
         /// Ollama API endpoint for the mimir_ask RAG tool
         #[arg(long)]
         llm_endpoint: Option<String>,
+
+        /// Path to ONNX embedding model (enables local embeddings, no Ollama required)
+        #[arg(long)]
+        embedding_model: Option<String>,
 
         /// Ollama model name (default: llama3)
         #[arg(long, default_value_t = String::from("llama3"))]

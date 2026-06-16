@@ -29,3 +29,12 @@ notify = "6"
 serde_yaml = "0.9"
 async-stream = "0.3"
 futures = "0.3"
+
+# Optional: bundled embedding model (all-MiniLM-L6-v2 via ONNX Runtime)
+ort = { version = "2.0.0-rc.12", optional = true, features = ["download-binaries"] }
+tokenizers = { version = "0.23", optional = true }
+ndarray = { version = "0.16", optional = true }
+
+[features]
+default = []
+bundled-embeddings = ["ort", "tokenizers", "ndarray"]
