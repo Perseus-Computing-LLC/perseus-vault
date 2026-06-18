@@ -238,7 +238,7 @@ fn main() {
                 }
             }
         }
-        Some(Commands::Serve { ref db, ref encryption_key, ref web, ref port, ref web_bind, ref llm_endpoint, ref llm_api_key, ref embedding_endpoint, ref llm_model, ref embedding_model: _, ref connectors_config, ref transport, .. }) => {
+        Some(Commands::Serve { ref db, ref encryption_key, ref web, ref port, ref web_bind, ref llm_endpoint, ref llm_api_key, ref embedding_endpoint, ref llm_model, embedding_model: _, ref connectors_config, ref transport, .. }) => {
             let db_path = db.clone();
             let mut database = match db::Database::open(&db_path) {
                 Ok(db) => db,
