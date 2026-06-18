@@ -52,15 +52,22 @@ impl EncryptionManager {
         B64.encode(key)
     }
 
-    /// Encrypt plaintext and return base64-encoded ciphertext (nonce prepended).
-    pub fn encrypt(&self, plaintext: &str) -> Result<String, String> {
+    /// Encrypt plaintext with AAD (additional authenticated data) and return
+    /// base64-encoded ciphertext (nonce prepended).
+    /// AAD binds the ciphertext to the provided context (e.g. category + key) so
+    /// that swapping encrypted payloads between entities is detected on decryption.
+    pub fn encrypt(&self, plaintext: &str, aad: &[u8]) -> Result<String, String> {
         let mut nonce_bytes = [0u8; 12];
         OsRng.fill_bytes(&mut nonce_bytes);
         let nonce = Nonce::from_slice(&nonce_bytes);
 
+        let payload = aes_gcm::aead::Payload {
+            msg: plaintext.as_bytes(),
+            aad: if aad.is_empty() { b"" } else { aad },
+        };
         let ciphertext = self
             .cipher
-            .encrypt(nonce, plaintext.as_bytes())
+            .encrypt(nonce, payload)
             .map_err(|e| format!("Encryption failed: {}", e))?;
 
         // Prepend nonce for decryption
@@ -70,7 +77,8 @@ impl EncryptionManager {
     }
 
     /// Decrypt a base64-encoded ciphertext (nonce prepended) back to plaintext.
-    pub fn decrypt(&self, encoded: &str) -> Result<String, String> {
+    /// aad must match what was passed to encrypt — otherwise decryption fails.
+    pub fn decrypt(&self, encoded: &str, aad: &[u8]) -> Result<String, String> {
         let combined = B64
             .decode(encoded)
             .map_err(|e| format!("Invalid base64 ciphertext: {}", e))?;
@@ -82,9 +90,13 @@ impl EncryptionManager {
         let (nonce_bytes, ciphertext) = combined.split_at(12);
         let nonce = Nonce::from_slice(nonce_bytes);
 
+        let payload = aes_gcm::aead::Payload {
+            msg: ciphertext,
+            aad: if aad.is_empty() { b"" } else { aad },
+        };
         let plaintext = self
             .cipher
-            .decrypt(nonce, ciphertext)
+            .decrypt(nonce, payload)
             .map_err(|e| format!("Decryption failed: incorrect key or corrupted data ({})", e))?;
 
         String::from_utf8(plaintext).map_err(|e| format!("Decrypted data is not valid UTF-8: {}", e))

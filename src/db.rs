@@ -63,7 +63,7 @@ impl Database {
         let conn = Connection::open(path)?;
 
         // Enable WAL for better concurrent read performance
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=1000; PRAGMA foreign_keys=ON;")?;
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=1000; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;")?;
 
         // Initialize schema if this is a new database
         schema::initialize_schema(&conn)?;
@@ -702,9 +702,10 @@ impl Database {
         let archived_int = if entity.archived { 1 } else { 0 };
         let verified_int = if entity.verified { 1 } else { 0 };
 
-        // Encrypt body_json if encryption is enabled
+        // Encrypt body_json with category+key as AAD to bind ciphertext to entity identity
         let body_encrypted = if let Some(ref enc) = self.encryption {
-            enc.encrypt(&entity.body_json)
+            let aad = format!("{}:{}", entity.category, entity.key);
+            enc.encrypt(&entity.body_json, aad.as_bytes())
                 .map_err(|e| format!("Encryption error in remember: {}", e))?
         } else {
             entity.body_json.clone()
@@ -866,9 +867,9 @@ impl Database {
 
                 // Hybrid: run FTS5 sparse search too, then fuse via RRF
                 let sparse = self.fts5_search(params)?;
-                let dense_ids: Vec<(String, f64)> = dense_results
-                    .iter()
-                    .map(|(e, score)| (e.id.clone(), *score))
+                let dense_scored: Vec<(Entity, f64)> = dense_results
+                    .into_iter()
+                    .map(|(e, score)| (e, score))
                     .collect();
                 let sparse_scored: Vec<(Entity, f64)> = sparse
                     .into_iter()
@@ -877,7 +878,7 @@ impl Database {
                         (e, score)
                     })
                     .collect();
-                let fused = crate::db::reciprocal_rank_fusion(&dense_ids, &sparse_scored, 60.0, params.limit as usize);
+                let fused = crate::db::reciprocal_rank_fusion(&dense_scored, &sparse_scored, 60.0, params.limit as usize);
                 return Ok(fused.into_iter().map(|(e, _)| e).collect());
             }
             // Fall through to FTS5 if no embedding vector provided
@@ -2369,7 +2370,9 @@ last_accessed: {}
             });
         }
 
-        // 1. Promote: buffer layer entities with retrieval_count >= threshold → working
+        // Wrap all mutations in a transaction so partial writes are not left
+        // behind if any step fails (cohere runs multiple statements on self.conn).
+        self.conn.execute("BEGIN IMMEDIATE", [])?;
         let promote_threshold = if params.promote_threshold > 0 {
             params.promote_threshold
         } else {
@@ -2446,6 +2449,8 @@ last_accessed: {}
             )?;
         }
 
+        self.conn.execute("COMMIT", [])?;
+
         Ok(crate::models::CohereReport {
             promoted,
             decayed,
@@ -2484,7 +2489,7 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f64 {
 /// Reciprocal Rank Fusion: combine dense and sparse result sets.
 /// k controls the rank penalty (higher k = less penalty for lower ranks).
 pub fn reciprocal_rank_fusion(
-    dense_results: &[(String, f64)],
+    dense_results: &[(crate::models::Entity, f64)],
     sparse_results: &[(crate::models::Entity, f64)],
     k: f64,
     limit: usize,
@@ -2494,9 +2499,10 @@ pub fn reciprocal_rank_fusion(
     let mut scores: HashMap<String, f64> = HashMap::new();
     let mut entities: HashMap<String, crate::models::Entity> = HashMap::new();
 
-    for (rank, (id, _)) in dense_results.iter().enumerate() {
+    for (rank, (entity, _)) in dense_results.iter().enumerate() {
         let rrf = 1.0 / (k + (rank + 1) as f64);
-        *scores.entry(id.clone()).or_insert(0.0) += rrf;
+        *scores.entry(entity.id.clone()).or_insert(0.0) += rrf;
+        entities.entry(entity.id.clone()).or_insert_with(|| entity.clone());
     }
 
     for (rank, (entity, _)) in sparse_results.iter().enumerate() {
@@ -2541,7 +2547,10 @@ fn entity_from_row(
     let raw_body_json: String = row.get(3)?;
 
     let body_json = if let Some(enc) = encryption {
-        enc.decrypt(&raw_body_json)
+        let cat: String = row.get(1)?;
+        let k: String = row.get(2)?;
+        let aad = format!("{}:{}", cat, k);
+        enc.decrypt(&raw_body_json, aad.as_bytes())
             .unwrap_or_else(|_| raw_body_json) // Fall back to raw if decryption fails (unencrypted DB)
     } else {
         raw_body_json

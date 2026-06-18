@@ -238,7 +238,7 @@ fn main() {
                 }
             }
         }
-        Some(Commands::Serve { ref db, ref encryption_key, ref web, ref port, ref web_bind, ref llm_endpoint, ref llm_api_key, ref embedding_endpoint, ref llm_model, ref embedding_model: _, ref connectors_config, ref transport, .. }) => {
+        Some(Commands::Serve { ref db, ref encryption_key, ref web, ref port, ref web_bind, ref llm_endpoint, ref llm_api_key, ref embedding_endpoint, ref llm_model, embedding_model: _, ref connectors_config, ref transport, .. }) => {
             let db_path = db.clone();
             let mut database = match db::Database::open(&db_path) {
                 Ok(db) => db,
@@ -346,8 +346,20 @@ fn main() {
                 }
                 let rt = tokio::runtime::Runtime::new().unwrap();
                 rt.block_on(async {
-                    let listener = tokio::net::TcpListener::bind(&transport_addr).await.unwrap();
-                    axum::serve(listener, transport_router).await.unwrap();
+                    let listener = match tokio::net::TcpListener::bind(&transport_addr).await {
+                        Ok(l) => l,
+                        Err(e) => {
+                            eprintln!("mimir: fatal: MCP transport bind failed on {}: {}", transport_addr, e);
+                            std::process::exit(1);
+                        }
+                    };
+                    match axum::serve(listener, transport_router).await {
+                        Ok(_) => {},
+                        Err(e) => {
+                            eprintln!("mimir: fatal: MCP transport server error: {}", e);
+                            std::process::exit(1);
+                        }
+                    }
                 });
             } else {
                 mcp::run_server(database);
@@ -457,8 +469,20 @@ fn main() {
                 }
                 let rt = tokio::runtime::Runtime::new().unwrap();
                 rt.block_on(async {
-                    let listener = tokio::net::TcpListener::bind(&transport_addr).await.unwrap();
-                    axum::serve(listener, transport_router).await.unwrap();
+                    let listener = match tokio::net::TcpListener::bind(&transport_addr).await {
+                        Ok(l) => l,
+                        Err(e) => {
+                            eprintln!("mimir: fatal: MCP transport bind failed on {}: {}", transport_addr, e);
+                            std::process::exit(1);
+                        }
+                    };
+                    match axum::serve(listener, transport_router).await {
+                        Ok(_) => {},
+                        Err(e) => {
+                            eprintln!("mimir: fatal: MCP transport server error: {}", e);
+                            std::process::exit(1);
+                        }
+                    }
                 });
             } else {
                 mcp::run_server(database);
