@@ -47,26 +47,39 @@ chmod +x mimir && mv mimir ~/.local/bin/
 
 ## Install
 
-```bash
-# Python client
-pip install mimir
+Mimir is a standalone Rust binary — no Python client needed. Download the latest release:
 
-# Or download the standalone binary (no Python needed)
-curl -L https://github.com/Perseus-Computing-LLC/mimir/releases/latest/download/mimir-linux-x86_64 -o mimir
+```bash
+# Linux x86_64
+curl -fsSL https://github.com/Perseus-Computing-LLC/mimir/releases/latest/download/mimir-x86_64-unknown-linux-gnu -o mimir
 chmod +x mimir
-./mimir --db ./memory.db
+sudo mv mimir /usr/local/bin/
+
+# macOS (Apple Silicon)
+curl -fsSL https://github.com/Perseus-Computing-LLC/mimir/releases/latest/download/mimir-aarch64-apple-darwin -o mimir
+chmod +x mimir
+sudo mv mimir /usr/local/bin/
+
+# Or build from source
+cargo build --release
+./target/release/mimir --db ./memory.db
 ```
 
 ## Quickstart
 
-```python
-from mimir import MimirClient
+```bash
+# Start the server
+./mimir serve --db memory.db
 
-client = MimirClient("./memory.db")
-client.remember("Hello world — my first persistent memory!", category="demo")
-results = client.recall("first memory")
-print(results[0].content)
-# "Hello world — my first persistent memory!"
+# Remember a fact via the HTTP API
+curl -s -X POST http://localhost:8787/mcp \
+  -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"mimir_remember","arguments":{"category":"demo","key":"hello","body_json":"{\"text\":\"Hello world — my first persistent memory!\"}"}}}'
+
+# Recall it
+curl -s -X POST http://localhost:8787/mcp \
+  -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"mimir_recall","arguments":{"query":"first memory"}}}'
 ```
 
 ## Why Mimir vs Alternatives

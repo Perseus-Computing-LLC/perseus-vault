@@ -2,7 +2,7 @@
 Mimir Quickstart — 60 seconds to persistent agent memory
 
 pip install mimir
-wget https://github.com/tcconnally/mimir/releases/latest/download/mimir-linux-x86_64
+wget https://github.com/Perseus-Computing-LLC/mimir/releases/latest/download/mimir-linux-x86_64
 chmod +x mimir-linux-x86_64
 """
 from mimir import MimirClient

@@ -4,7 +4,7 @@
 #  Persistent memory engine for AI agents — MCP JSON-RPC stdio server
 #
 #  Usage:
-#    curl -sSL https://raw.githubusercontent.com/tcconnally/mimir/main/scripts/bootstrap.sh | bash
+#    curl -sSL https://raw.githubusercontent.com/Perseus-Computing-LLC/mimir/main/scripts/bootstrap.sh | bash
 #
 #  What this does:
 #    1. Installs system dependencies (Rust toolchain via rustup, build tools)
@@ -33,7 +33,7 @@ info() { printf "${CYAN}→${NC} %s\n" "$*"; }
 header() { printf "\n${BOLD}══ %s ══${NC}\n" "$*"; }
 
 FORCE="${FORCE:-0}"
-MIMIR_REPO="https://github.com/tcconnally/mimir.git"
+MIMIR_REPO="https://github.com/Perseus-Computing-LLC/mimir.git"
 MIMIR_DIR="${MIMIR_DIR:-$HOME/.mimir}"
 MIMIR_BIN_DIR="${MIMIR_BIN_DIR:-$HOME/.local/bin}"
 MIMIR_DATA_DIR="${MIMIR_DATA_DIR:-$HOME/.mimir/data}"
@@ -44,7 +44,7 @@ echo ""
 echo "============================================"
 echo "  Mimir One-Shot Bootstrap"
 echo "  Persistent memory engine for AI agents"
-echo "  github.com/tcconnally/mimir"
+echo "  github.com/Perseus-Computing-LLC/mimir"
 echo "============================================"
 
 # ── Step 1: System dependencies ─────────────────────────────────────────────
@@ -278,5 +278,5 @@ echo ""
 echo "  Standalone MCP server:"
 echo "    mimir --db $MIMIR_DB_PATH"
 echo ""
-echo "  Docs: https://github.com/tcconnally/mimir"
+echo "  Docs: https://github.com/Perseus-Computing-LLC/mimir"
 echo "============================================"
