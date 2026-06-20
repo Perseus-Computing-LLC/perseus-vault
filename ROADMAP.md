@@ -122,7 +122,7 @@ were skipped — v1.0.0 includes everything planned through v0.5 plus more).
 
 ## v1.1.0 — Distribution & Ecosystem (current)
 
-**Target:** "Mimir everywhere."
+**Target window:** Q3 2026 (Jul–Sep) · **Theme:** "Mimir everywhere."
 
 ### Integration guides (in progress)
 - Claude Code integration guide
@@ -151,7 +151,7 @@ were skipped — v1.0.0 includes everything planned through v0.5 plus more).
 
 ## v1.2.0 — Multi-Agent & Federation
 
-**Target:** "One memory engine, many agents, many workspaces."
+**Target window:** Q4 2026 (Oct–Dec) · **Theme:** "One memory engine, many agents, many workspaces."
 
 - Workspace scoping with `workspace_hash`
 - Agent identity tracking on stored memories
@@ -163,7 +163,7 @@ were skipped — v1.0.0 includes everything planned through v0.5 plus more).
 
 ## v1.3.0 — Offline Embeddings
 
-**Target:** "Truly zero-dependency semantic search."
+**Target window:** Q1 2027 (Jan–Mar) · **Theme:** "Truly zero-dependency semantic search."
 
 - Bundle all-MiniLM-L6-v2 via `ort` (ONNX Runtime) or `candle`
 - Remove Ollama dependency for hybrid search
@@ -174,7 +174,7 @@ were skipped — v1.0.0 includes everything planned through v0.5 plus more).
 
 ## v2.0 — Platform
 
-**Target:** "Mimir as infrastructure."
+**Target window:** Q2 2027 (Apr–Jun) · **Theme:** "Mimir as infrastructure."
 
 - gRPC transport alongside MCP
 - Clustering with leader election
