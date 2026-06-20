@@ -2,12 +2,12 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.Perseus-Computing-LLC/mimir",
   "title": "Mimir — Persistent Memory Engine for AI Agents",
-  "description": "Lightweight Rust MCP server providing persistent memory for AI agents. SQLite + FTS5 keyword search, Ebbinghaus decay, knowledge graph with entity linking, journal audit trails, state management with TTL, vault import/export, and conflict detection. Zero network calls, no API keys, no embeddings model required. 30 tools over stdio JSON-RPC 2.0. Runs alongside your workspace — your agent remembers across sessions.",
-  "version": "0.5.0",
+  "description": "Lightweight Rust MCP server providing persistent memory for AI agents. SQLite + FTS5 keyword search, Ebbinghaus decay, knowledge graph with entity linking, journal audit trails, state management with TTL, vault import/export, and conflict detection. Zero network calls, no API keys, no embeddings model required. 30 tools over stdio JSON-RPC 2.0, with optional SSE/HTTP transport and Bearer-token auth. Runs alongside your workspace — your agent remembers across sessions.",
+  "version": "1.0.1",
   "packages": [{
     "registryType": "crates.io",
     "identifier": "mimir",
-    "version": "0.5.0",
+    "version": "1.0.1",
     "packageArguments": [
       {"type": "positional", "value": "--db"},
       {"type": "positional", "value": "~/.mimir/data/mimir.db"}
