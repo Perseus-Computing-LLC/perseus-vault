@@ -644,6 +644,8 @@ impl Database {
     }
 
     /// Like decay_tick but with an optional max entities to process per call.
+    /// Processes entities in batches of 1000, each in its own transaction,
+    /// to avoid holding a single large transaction at 100K+ scale.
     fn decay_tick_with_limit(
         &self,
         max_entities: Option<i64>,
@@ -669,36 +671,52 @@ impl Database {
 
         let mut updated = 0i64;
         let mut auto_archived = 0i64;
+        let mut batch: Vec<(String, i64)> = Vec::with_capacity(1000);
         let now_val = now;
 
-        // M-2: wrap in RAII transaction so error paths roll back automatically
-        let tx = self.conn.unchecked_transaction()?;
+        // Helper: flush the current batch in a transaction.
+        let flush_batch = |batch: &mut Vec<(String, i64)>,
+                            updated: &mut i64,
+                            auto_archived: &mut i64|
+         -> Result<(), Box<dyn std::error::Error>> {
+            if batch.is_empty() {
+                return Ok(());
+            }
+            let tx = self.conn.unchecked_transaction()?;
+            for (id, last_access) in batch.drain(..) {
+                let new_decay = Self::compute_decay(last_access, now_val);
+                tx.execute(
+                    "UPDATE entities SET decay_score = ?1 WHERE id = ?2",
+                    params![new_decay, &id],
+                )?;
+                *updated += 1;
+                // Auto-archive entities that have fully decayed (decay < 0.05)
+                if new_decay < 0.05 {
+                    tx.execute(
+                        "UPDATE entities SET archived = 1, archive_reason = 'decay threshold' WHERE id = ?1 AND archived = 0",
+                        params![&id],
+                    )?;
+                    *auto_archived += 1;
+                    // Clean FTS5 index for auto-archived entity
+                    let _ = tx.execute(
+                        "DELETE FROM entities_fts WHERE rowid = (SELECT rowid FROM entities WHERE id = ?1)",
+                        params![&id],
+                    );
+                }
+            }
+            tx.commit()?;
+            Ok(())
+        };
 
         for row in rows {
             let (id, last_access) = row?;
-            let new_decay = Self::compute_decay(last_access, now_val);
-            tx.execute(
-                "UPDATE entities SET decay_score = ?1 WHERE id = ?2",
-                params![new_decay, id],
-            )?;
-            updated += 1;
-
-            // Auto-archive entities that have fully decayed (decay < 0.05)
-            if new_decay < 0.05 {
-                tx.execute(
-                    "UPDATE entities SET archived = 1, archive_reason = 'decay threshold' WHERE id = ?1 AND archived = 0",
-                    params![id],
-                )?;
-                auto_archived += 1;
-                // Clean FTS5 index for auto-archived entity
-                let _ = tx.execute(
-                    "DELETE FROM entities_fts WHERE rowid = (SELECT rowid FROM entities WHERE id = ?1)",
-                    params![id],
-                );
+            batch.push((id, last_access));
+            if batch.len() >= 1000 {
+                flush_batch(&mut batch, &mut updated, &mut auto_archived)?;
             }
         }
-
-        tx.commit()?;
+        // Flush final partial batch
+        flush_batch(&mut batch, &mut updated, &mut auto_archived)?;
 
         Ok(DecayReport {
             entities_checked: total,
@@ -3219,4 +3237,216 @@ mod tests {
             "overlapping entity was dropped from hybrid results"
         );
     }
+
+    #[test]
+    #[ignore] // Requires ~10s to create entities; run manually with --ignored
+    fn stress_100k_entities_recall_and_decay() {
+        // Roadmap target: FTS5 recall < 5s, decay tick < 30s at 100K entities.
+        use std::time::Instant;
+
+        let (db, _path) = temp_db();
+
+        // Insert entities in transactions of 5000 for reasonable speed.
+        let n = 100_000;
+        let start_insert = Instant::now();
+        let mut count = 0;
+        for chunk in (0..n).collect::<Vec<_>>().chunks(5000) {
+            let tx = db.conn.unchecked_transaction().unwrap();
+            for i in chunk {
+                let i = *i;
+                let key = format!("entity-{:06}", i);
+                let body = format!(
+                    r#"{{"content":"Entity number {} with some searchable text {} {} {}"}}"#,
+                    i,
+                    if i % 3 == 0 { "alpha" } else { "" },
+                    if i % 5 == 0 { "beta" } else { "" },
+                    if i % 7 == 0 { "gamma" } else { "" }
+                );
+                tx.execute(
+                    "INSERT INTO entities (id, category, key, body_json, type, status, retrieval_count, last_accessed_unix_ms, created_at_unix_ms, decay_score, layer)
+                     VALUES (?1, 'benchmark', ?2, ?3, 'insight', 'active', 0, 0, 0, 0.5, 'working')",
+                    params![format!("ent-{:06}", i), key, body],
+                ).unwrap();
+                // Keep FTS5 in sync
+                tx.execute(
+                    "INSERT INTO entities_fts(rowid, body_json) VALUES (last_insert_rowid(), ?1)",
+                    params![body],
+                ).unwrap();
+            }
+            tx.commit().unwrap();
+            count += chunk.len();
+        }
+        let insert_elapsed = start_insert.elapsed();
+        eprintln!(
+            "Inserted {} entities in {:.2}s ({:.0} entities/s)",
+            count,
+            insert_elapsed.as_secs_f64(),
+            count as f64 / insert_elapsed.as_secs_f64()
+        );
+
+        // ── RECALL benchmark ──
+        let start_recall = Instant::now();
+        let results = db.fts5_search(
+            &crate::models::RecallParams {
+                query: "alpha".to_string(),
+                category: None,
+                entity_type: None,
+                limit: 10,
+                offset: 0,
+                min_decay: 0.0,
+                topic_path: None,
+                include_archived: false,
+                skip_side_effects: true,
+                mode: crate::models::SearchMode::Fts5,
+                embedding: None,
+                preview_cap: None,
+                always_on: None,
+                content_weight: 0.0,
+                diversity_halving: 1.0,
+                diversity_per_query_share: 0.0,
+            },
+        )
+        .unwrap();
+        let recall_elapsed = start_recall.elapsed();
+        eprintln!(
+            "FTS5 recall returned {} results in {:.3}s",
+            results.len(),
+            recall_elapsed.as_secs_f64()
+        );
+        assert!(
+            !results.is_empty(),
+            "expected at least one result for 'alpha' query"
+        );
+        assert!(
+            recall_elapsed.as_secs_f64() < 5.0,
+            "FTS5 recall took {:.3}s — roadmap target is < 5s",
+            recall_elapsed.as_secs_f64()
+        );
+
+        // ── DECAY benchmark ──
+        let start_decay = Instant::now();
+        let report = db
+            .decay_tick_with_limit(Some(n as i64))
+            .expect("decay_tick should succeed at 100K scale");
+        let decay_elapsed = start_decay.elapsed();
+        eprintln!(
+            "Decay tick: updated {} / auto-archived {} / total {} in {:.3}s",
+            report.entities_updated, report.auto_archived, report.entities_checked, decay_elapsed.as_secs_f64()
+        );
+        assert_eq!(report.entities_checked, n as i64);
+        assert!(
+            decay_elapsed.as_secs_f64() < 30.0,
+            "decay tick took {:.3}s — roadmap target is < 30s",
+            decay_elapsed.as_secs_f64()
+        );
+
+        eprintln!("STRESS TEST PASSED at {} entities", n);
+    }
+
+
+    #[test]
+    fn concurrent_reader_writer_no_locks() {
+        // Roadmap: verify no "database is locked" errors with concurrent r/w.
+        use std::sync::Arc;
+        use std::sync::Barrier;
+        use std::thread;
+
+        let (db, db_path) = temp_db();
+
+        // Pre-populate 1000 entities so the reader has something to search.
+        {
+            let tx = db.conn.unchecked_transaction().unwrap();
+            for i in 0..1000u32 {
+                let body = format!(r#"{{"content":"entity {}"}}"#, i);
+                tx.execute(
+                    "INSERT INTO entities (id, category, key, body_json, type, status, retrieval_count, last_accessed_unix_ms, created_at_unix_ms, decay_score, layer)
+                     VALUES (?1, 'stress', ?2, ?3, 'insight', 'active', 0, 0, 0, 0.5, 'working')",
+                    params![format!("ent-pre-{:04}", i), format!("key-{}", i), body],
+                ).unwrap();
+                tx.execute(
+                    "INSERT INTO entities_fts(rowid, body_json) VALUES (last_insert_rowid(), ?1)",
+                    params![body],
+                ).unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        drop(db); // close the temp_db connection so the second connection can open fresh
+
+        // Barrier: both threads start together after setup.
+        let barrier = Arc::new(Barrier::new(2));
+        let reader_failures = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let writer_failures = Arc::new(std::sync::atomic::AtomicU32::new(0));
+
+        let writer_path = db_path.clone();
+        let writer_barrier = Arc::clone(&barrier);
+        let wf = Arc::clone(&writer_failures);
+        let writer = thread::spawn(move || {
+            let wdb = crate::db::Database::open(&writer_path).expect("writer db open");
+            writer_barrier.wait();
+            for i in 0..500 {
+                let body = format!(r#"{{"content":"writer entity {}"}}"#, i);
+                if let Err(e) = (|| -> Result<(), Box<dyn std::error::Error>> {
+                    let tx = wdb.conn.unchecked_transaction()?;
+                    tx.execute(
+                        "INSERT INTO entities (id, category, key, body_json, type, status, retrieval_count, last_accessed_unix_ms, created_at_unix_ms, decay_score, layer)
+                         VALUES (?1, 'stress', ?2, ?3, 'insight', 'active', 0, 0, 0, 0.5, 'working')",
+                        params![format!("ent-wr-{:04}", i), format!("wkey-{}", i), body],
+                    )?;
+                    tx.execute(
+                        "INSERT INTO entities_fts(rowid, body_json) VALUES (last_insert_rowid(), ?1)",
+                        params![body],
+                    )?;
+                    tx.commit()?;
+                    Ok(())
+                })() {
+                    eprintln!("writer error at {}: {}", i, e);
+                    wf.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        });
+
+        let reader_path = db_path.clone();
+        let reader_barrier = Arc::clone(&barrier);
+        let rf = Arc::clone(&reader_failures);
+        let reader = thread::spawn(move || {
+            let rdb = crate::db::Database::open(&reader_path).expect("reader db open");
+            reader_barrier.wait();
+            for _ in 0..100 {
+                match rdb.fts5_search(&crate::models::RecallParams {
+                    query: "entity".to_string(),
+                    category: Some("stress".to_string()),
+                    entity_type: None,
+                    limit: 10i64,
+                    offset: 0i64,
+                    min_decay: 0.0f64,
+                    topic_path: None,
+                    include_archived: false,
+                    skip_side_effects: true,
+                    mode: crate::models::SearchMode::Fts5,
+                    embedding: None,
+                    preview_cap: None,
+                    always_on: None,
+                    content_weight: 0.0f64,
+                    diversity_halving: 1.0f64,
+                    diversity_per_query_share: 0.0f64,
+                }) {
+                    Ok(_) => {},
+                    Err(e) => {
+                        eprintln!("reader error: {}", e);
+                        rf.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            }
+        });
+
+        writer.join().expect("writer thread panicked");
+        reader.join().expect("reader thread panicked");
+
+        let writer_errs = writer_failures.load(std::sync::atomic::Ordering::Relaxed);
+        let reader_errs = reader_failures.load(std::sync::atomic::Ordering::Relaxed);
+        eprintln!("Concurrent test: writer errors={}, reader errors={}", writer_errs, reader_errs);
+        assert_eq!(writer_errs, 0, "writer should have zero errors with concurrent reader");
+        assert_eq!(reader_errs, 0, "reader should have zero 'database is locked' errors");
+    }
+
 }
