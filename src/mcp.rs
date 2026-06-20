@@ -247,6 +247,11 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
           "type": "string",
           "default": "",
           "description": "Hierarchical topic path, e.g. 'architecture/database/postgres'"
+        },
+        "workspace_hash": {
+          "type": "string",
+          "default": "",
+          "description": "Workspace scope identifier (v1.2.0). Empty = global. Entities with a workspace_hash are invisible to recall queries scoped to a different workspace."
         }
       },
       "required": [
@@ -361,6 +366,10 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
           "maximum": 1,
           "default": 1,
           "description": "Per-keyword diversity quota factor (1.0=disabled). Each distinct matched keyword gets ceil(N x halving^n) slots — first keyword N, second N/2, etc."
+        },
+        "workspace_hash": {
+          "type": "string",
+          "description": "Workspace scope filter (v1.2.0). When set, only entities with a matching workspace_hash are returned. Omit for no workspace filtering."
         }
       },
       "required": [
