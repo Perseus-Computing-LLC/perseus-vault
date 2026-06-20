@@ -296,6 +296,28 @@ connectors:
 
 ---
 
+## Government & Federal Procurement
+
+Mimir is built for government deployment from the ground up.
+
+| Capability | Status |
+|---|---|
+| **License** | MIT — no copyleft, no GPL/AGPL |
+| **SBOM** | [Published](./docs/SBOM.md) — NTIA minimum elements |
+| **Air-gapped** | Fully offline — no telemetry, no API calls, no network by default |
+| **Encryption at rest** | AES-256-GCM, transparent, opt-in |
+| **Audit trail** | Immutable journal with chain-of-custody (in development) |
+| **Supply chain** | SLSA attestation in progress |
+
+**For federal buyers:** See [docs/federal-buyers.md](./docs/federal-buyers.md) for
+procurement information, compliance status, and deployment models (air-gapped,
+on-premises, classified environments).
+
+Perseus Computing LLC is a US-owned small business. SAM.gov registration in progress.
+NAICS: 541715, 541511, 541512.
+
+---
+
 ## License
 
 MIT — see [LICENSE](./LICENSE).
