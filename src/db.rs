@@ -252,6 +252,7 @@ impl Database {
                             links: vec![],
                             verified: false,
                             source: format!("connector:{}", name),
+                            workspace_hash: String::new(),
                             created_at_unix_ms: now,
                             last_accessed_unix_ms: now,
                             embedding: None,
@@ -569,7 +570,8 @@ impl Database {
             "SELECT id, category, key, body_json, status, type, tags,
                     decay_score, retrieval_count, layer, topic_path,
                     archived, archive_reason, links, verified, source,
-                    created_at_unix_ms, last_accessed_unix_ms, embedding
+                    created_at_unix_ms, last_accessed_unix_ms, embedding,
+                    always_on, certainty, workspace_hash
              FROM entities WHERE archived = 0 AND embedding IS NOT NULL LIMIT {}",
             max_scan
         ))?;
@@ -852,9 +854,9 @@ impl Database {
                     decay_score = ?5, layer = ?6, topic_path = ?7,
                     archived = ?8, archive_reason = ?9, links = ?10,
                     verified = ?11, source = ?12, last_accessed_unix_ms = ?13,
-                    always_on = ?14, certainty = ?15,
+                    always_on = ?14, certainty = ?15, workspace_hash = ?16,
                     retrieval_count = retrieval_count + 1
-                 WHERE id = ?16",
+                 WHERE id = ?17",
                 params![
                     body_encrypted,
                     entity.status,
@@ -871,6 +873,7 @@ impl Database {
                     now,
                     entity.always_on as i32,
                     entity.certainty,
+                    entity.workspace_hash,
                     id,
                 ],
             )?;
@@ -910,11 +913,12 @@ impl Database {
                  (id, category, key, body_json, status, type, tags,
                   decay_score, retrieval_count, layer, topic_path,
                   archived, archive_reason, links, verified, source,
-                  always_on, certainty, created_at_unix_ms, last_accessed_unix_ms)
+                  always_on, certainty, created_at_unix_ms, last_accessed_unix_ms,
+                  workspace_hash)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7,
                          ?8, ?9, ?10, ?11,
                          ?12, ?13, ?14, ?15, ?16,
-                         ?17, ?18, ?19, ?20)",
+                         ?17, ?18, ?19, ?20, ?21)",
                 params![
                     id,
                     entity.category,
@@ -936,6 +940,7 @@ impl Database {
                     entity.certainty,
                     entity.created_at_unix_ms,
                     entity.last_accessed_unix_ms,
+                    entity.workspace_hash,
                 ],
             )?;
 
@@ -1092,6 +1097,13 @@ impl Database {
             param_values.push(Box::new(ao as i32));
         }
 
+        // Filter by workspace_hash (v1.2.0 scoping). When set, only entities
+        // in the matching workspace are visible.
+        if let Some(ref ws) = params.workspace_hash {
+            conditions.push(format!("workspace_hash = ?{}", param_values.len() + 1));
+            param_values.push(Box::new(ws.clone()));
+        }
+
         // Exclude archived unless explicitly requested
         if !params.include_archived {
             conditions.push("archived = 0".to_string());
@@ -1102,7 +1114,8 @@ impl Database {
             "SELECT id, category, key, body_json, status, type, tags,
                     decay_score, retrieval_count, layer, topic_path,
                     archived, archive_reason, links, verified, source,
-                    created_at_unix_ms, last_accessed_unix_ms
+                    created_at_unix_ms, last_accessed_unix_ms, embedding,
+                    always_on, certainty, workspace_hash
              FROM entities",
         );
 
@@ -1270,7 +1283,8 @@ impl Database {
             "SELECT id, category, key, body_json, status, type, tags,
                     decay_score, retrieval_count, layer, topic_path,
                     archived, archive_reason, links, verified, source,
-                    created_at_unix_ms, last_accessed_unix_ms
+                    created_at_unix_ms, last_accessed_unix_ms, embedding,
+                    always_on, certainty, workspace_hash
              FROM entities WHERE category = ?1 AND key = ?2 LIMIT 1",
         )?;
 
@@ -1762,7 +1776,8 @@ impl Database {
             "SELECT id, category, key, body_json, status, type, tags,
                     decay_score, retrieval_count, layer, topic_path,
                     archived, archive_reason, links, verified, source,
-                    created_at_unix_ms, last_accessed_unix_ms
+                    created_at_unix_ms, last_accessed_unix_ms, embedding,
+                    always_on, certainty, workspace_hash
              FROM entities WHERE id = ?1",
         )?;
         let mut rows = stmt.query_map(params![id], |row| {
@@ -1795,7 +1810,8 @@ impl Database {
             "SELECT id, category, key, body_json, status, type, tags,
                     decay_score, retrieval_count, layer, topic_path,
                     archived, archive_reason, links, verified, source,
-                    created_at_unix_ms, last_accessed_unix_ms
+                    created_at_unix_ms, last_accessed_unix_ms, embedding,
+                    always_on, certainty, workspace_hash
              FROM entities WHERE archived = 0",
         );
         let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
@@ -2309,6 +2325,7 @@ last_accessed: {}
                 source: "vault-import".to_string(),
                 always_on: false,
                 certainty: 0.5,
+                workspace_hash: String::new(),
                 created_at_unix_ms: now_ms(),
                 last_accessed_unix_ms: now_ms(),
                 embedding: None,
@@ -2460,7 +2477,8 @@ last_accessed: {}
             "SELECT id, category, key, body_json, status, type, tags,
                     decay_score, retrieval_count, layer, topic_path,
                     archived, archive_reason, links, verified, source,
-                    created_at_unix_ms, last_accessed_unix_ms
+                    created_at_unix_ms, last_accessed_unix_ms, embedding,
+                    always_on, certainty, workspace_hash
              FROM entities
              WHERE archived = 0 AND ({})
              ORDER BY decay_score DESC, retrieval_count DESC
@@ -2726,6 +2744,7 @@ fn entity_from_row(
         source: row.get(15)?,
         always_on: row.get::<_, i32>(19).unwrap_or(0) != 0,
         certainty: row.get::<_, f64>(20).unwrap_or(0.5),
+        workspace_hash: row.get::<_, Option<String>>(21).unwrap_or(None).unwrap_or_default(),
         created_at_unix_ms: row.get(16)?,
         last_accessed_unix_ms: row.get(17)?,
         embedding: None,
@@ -2765,6 +2784,7 @@ mod tests {
             source: "test".to_string(),
             always_on: false,
             certainty: 0.5,
+            workspace_hash: String::new(),
             created_at_unix_ms: now_ms(),
             last_accessed_unix_ms: now_ms(),
             embedding: None,
@@ -3304,6 +3324,7 @@ mod tests {
                 content_weight: 0.0,
                 diversity_halving: 1.0,
                 diversity_per_query_share: 0.0,
+                workspace_hash: None,
             },
         )
         .unwrap();
@@ -3429,6 +3450,7 @@ mod tests {
                     content_weight: 0.0f64,
                     diversity_halving: 1.0f64,
                     diversity_per_query_share: 0.0f64,
+                    workspace_hash: None,
                 }) {
                     Ok(_) => {},
                     Err(e) => {
@@ -3447,6 +3469,94 @@ mod tests {
         eprintln!("Concurrent test: writer errors={}, reader errors={}", writer_errs, reader_errs);
         assert_eq!(writer_errs, 0, "writer should have zero errors with concurrent reader");
         assert_eq!(reader_errs, 0, "reader should have zero 'database is locked' errors");
+    }
+
+
+    #[test]
+    fn workspace_scoping_isolates_entities() {
+        // Roadmap Phase 2 Week 1-3: Agent A's memories invisible to Agent B.
+        let (db, _path) = temp_db();
+
+        // Entity in workspace "alpha"
+        let mut ent_a = make_entity("ws-a", "shared", "secret", r#"{"content":"alpha apple apricot avocado data one"}"#);
+        ent_a.workspace_hash = "alpha".to_string();
+        db.remember(&ent_a).unwrap();
+
+        // Entity in workspace "beta"
+        let mut ent_b = make_entity("ws-b", "shared", "secret-beta", r#"{"content":"beta banana blueberry cherry data two"}"#);
+        ent_b.workspace_hash = "beta".to_string();
+        db.remember(&ent_b).unwrap();
+
+        // Global entity (no workspace)
+        let ent_g = make_entity("ws-g", "shared", "global-key", r#"{"content":"gamma grape guava melon data three"}"#);
+        db.remember(&ent_g).unwrap();
+
+        let base = |ws: Option<String>| crate::models::RecallParams {
+            query: "data".to_string(),
+            category: None,
+            entity_type: None,
+            limit: 50,
+            offset: 0,
+            min_decay: 0.0,
+            topic_path: None,
+            include_archived: false,
+            skip_side_effects: true,
+            mode: crate::models::SearchMode::Fts5,
+            embedding: None,
+            preview_cap: None,
+            always_on: None,
+            content_weight: 0.0,
+            diversity_halving: 1.0,
+            diversity_per_query_share: 0.0,
+            workspace_hash: ws,
+        };
+
+        // Scope to "alpha" — should only see ent_a
+        let alpha = db.recall(&base(Some("alpha".to_string()))).unwrap();
+        let alpha_keys: Vec<&str> = alpha.iter().map(|e| e.key.as_str()).collect();
+        assert!(alpha_keys.contains(&"secret"), "alpha scope should see its own entity");
+        assert!(!alpha_keys.contains(&"secret-beta"), "alpha scope must NOT see beta entity");
+        assert!(!alpha_keys.contains(&"global-key"), "alpha scope must NOT see global entity (scoped query)");
+
+        // Scope to "beta" — should only see ent_b
+        let beta = db.recall(&base(Some("beta".to_string()))).unwrap();
+        let beta_keys: Vec<&str> = beta.iter().map(|e| e.key.as_str()).collect();
+
+        assert!(beta_keys.contains(&"secret-beta"), "beta scope should see its own entity");
+        assert!(!beta_keys.contains(&"secret"), "beta scope must NOT see alpha entity");
+
+        // No scope — sees everything
+        let all = db.recall(&base(None)).unwrap();
+        let all_keys: Vec<&str> = all.iter().map(|e| e.key.as_str()).collect();
+        assert!(all_keys.contains(&"secret"), "unscoped recall sees alpha");
+        assert!(all_keys.contains(&"secret-beta"), "unscoped recall sees beta");
+        assert!(all_keys.contains(&"global-key"), "unscoped recall sees global");
+    }
+
+    #[test]
+    fn workspace_hash_roundtrips_through_recall() {
+        // workspace_hash must survive the store→recall roundtrip (was a latent
+        // bug: always_on/certainty were silently dropped by short SELECT lists).
+        let (db, _path) = temp_db();
+        let mut ent = make_entity("rt-1", "rt", "key1", r#"{"content":"roundtrip"}"#);
+        ent.workspace_hash = "myworkspace".to_string();
+        ent.always_on = true;
+        ent.certainty = 0.9;
+        db.remember(&ent).unwrap();
+
+        let params = crate::models::RecallParams {
+            query: "roundtrip".to_string(),
+            category: None, entity_type: None, limit: 10, offset: 0, min_decay: 0.0,
+            topic_path: None, include_archived: false, skip_side_effects: true,
+            mode: crate::models::SearchMode::Fts5, embedding: None, preview_cap: None,
+            always_on: None, content_weight: 0.0, diversity_halving: 1.0,
+            diversity_per_query_share: 0.0, workspace_hash: None,
+        };
+        let results = db.recall(&params).unwrap();
+        let found = results.iter().find(|e| e.key == "key1").expect("entity recalled");
+        assert_eq!(found.workspace_hash, "myworkspace", "workspace_hash must roundtrip");
+        assert!(found.always_on, "always_on must roundtrip (regression: short SELECT dropped it)");
+        assert_eq!(found.certainty, 0.9, "certainty must roundtrip");
     }
 
 }

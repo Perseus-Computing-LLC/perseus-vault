@@ -27,7 +27,8 @@ CREATE TABLE IF NOT EXISTS entities (
     last_accessed_unix_ms INTEGER NOT NULL,
     embedding BLOB,
     always_on INTEGER DEFAULT 0,
-    certainty REAL DEFAULT 0.5
+    certainty REAL DEFAULT 0.5,
+    workspace_hash TEXT DEFAULT ''
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_entities_category_key ON entities(category, key);
@@ -83,6 +84,14 @@ pub fn initialize_schema(conn: &Connection) -> Result<(), Box<dyn std::error::Er
         .is_ok();
     if !has_certainty {
         conn.execute_batch("ALTER TABLE entities ADD COLUMN certainty REAL DEFAULT 0.5;")?;
+    }
+
+    // Add workspace_hash column (v1.2.0 migration — multi-workspace scoping)
+    let has_workspace_hash: bool = conn
+        .prepare("SELECT workspace_hash FROM entities LIMIT 1")
+        .is_ok();
+    if !has_workspace_hash {
+        conn.execute_batch("ALTER TABLE entities ADD COLUMN workspace_hash TEXT DEFAULT '';")?;
     }
 
     Ok(())

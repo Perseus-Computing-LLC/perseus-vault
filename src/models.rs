@@ -38,6 +38,10 @@ pub struct Entity {
     /// low-certainty entities on the same topic are a conflict signal.
     #[serde(default = "default_certainty")]
     pub certainty: f64,
+    /// Workspace scope identifier (v1.2.0). Empty = global/unscoped.
+    /// Entities are invisible across workspaces when a scope is set.
+    #[serde(default)]
+    pub workspace_hash: String,
     pub created_at_unix_ms: i64,
     pub last_accessed_unix_ms: i64,
     #[serde(skip)]
@@ -165,6 +169,9 @@ pub struct RecallParams {
     /// Per-query reservation share for multi-query diversity (0.0 = disabled).
     #[allow(dead_code)]
     pub diversity_per_query_share: f64,
+    /// Workspace scope filter (v1.2.0). When Some, only entities with a
+    /// matching workspace_hash are returned. None = no workspace filtering.
+    pub workspace_hash: Option<String>,
 }
 
 /// Search mode for recall: FTS5 keyword, dense vector, or hybrid fusion.
@@ -223,6 +230,7 @@ impl Default for RecallParams {
             content_weight: 0.0,
             diversity_halving: 1.0,
             diversity_per_query_share: 0.0,
+            workspace_hash: None,
         }
     }
 }

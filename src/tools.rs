@@ -32,6 +32,8 @@ pub struct RememberArgs {
     pub always_on: bool,
     #[serde(default = "default_certainty")]
     pub certainty: f64,
+    #[serde(default)]
+    pub workspace_hash: String,
 }
 
 fn default_certainty() -> f64 {
@@ -80,6 +82,8 @@ pub struct RecallArgs {
     pub content_weight: f64,
     #[serde(default = "default_halving")]
     pub diversity_halving: f64,
+    #[serde(default)]
+    pub workspace_hash: Option<String>,
 }
 
 fn default_halving() -> f64 {
@@ -265,6 +269,7 @@ pub fn handle_remember(db: &Database, args: Value) -> Result<String, String> {
         source: "agent".to_string(),
         always_on: a.always_on,
         certainty: a.certainty,
+        workspace_hash: a.workspace_hash.clone(),
         created_at_unix_ms: now,
         last_accessed_unix_ms: now,
         embedding: None,
@@ -315,6 +320,7 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
         content_weight: a.content_weight,
         diversity_halving: a.diversity_halving,
         diversity_per_query_share: 0.0,
+        workspace_hash: a.workspace_hash.clone(),
     };
 
     let entities = db
@@ -382,6 +388,7 @@ fn handle_recall_with_expansion(db: &Database, a: &RecallArgs) -> Result<String,
             content_weight: a.content_weight,
             diversity_halving: a.diversity_halving,
             diversity_per_query_share: 0.0,
+            workspace_hash: a.workspace_hash.clone(),
         };
 
         if let Ok(entities) = db.recall(&params) {
