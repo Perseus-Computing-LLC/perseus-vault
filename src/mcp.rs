@@ -277,7 +277,7 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
       }
     },
     "annotations": {
-      "destructiveHint": false
+      "destructiveHint": true
     }
   },
   {
