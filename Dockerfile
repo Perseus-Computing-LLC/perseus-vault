@@ -11,4 +11,4 @@ FROM alpine:3.21
 RUN apk add --no-cache sqlite-libs
 COPY --from=builder /app/target/release/mimir /usr/local/bin/mimir
 ENTRYPOINT ["/usr/local/bin/mimir"]
-CMD ["--db", "/data/mimir.db"]
+CMD ["serve", "--db", "/data/mimir.db"]
