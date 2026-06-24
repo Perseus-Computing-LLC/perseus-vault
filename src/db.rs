@@ -1333,6 +1333,34 @@ impl Database {
             });
         }
 
+        // Provenance trust signal (additive boost, never penalizes).
+        // The agent should not just read — it should know what to trust. A
+        // verified source outranks an unverified AI draft on the same topic.
+        // Verified entities get the full boost; unverified entities get it
+        // scaled by their certainty (source="agent" drafts default to 0.5),
+        // so reliable sources float above speculative ones.
+        //
+        // Unlike the content-witness boost above, we sort by a local
+        // trust-adjusted key rather than mutating decay_score: decay_score is
+        // already capped at 1.0, so adding to it would saturate for fresh
+        // entities and fail to reorder — exactly when trust must reorder. We
+        // also avoid returning a >1.0 or inflated decay_score to the caller.
+        if params.trust_weight > 0.0 {
+            let trust_score = |e: &Entity| -> f64 {
+                let trust = if e.verified {
+                    1.0
+                } else {
+                    e.certainty.clamp(0.0, 1.0)
+                };
+                e.decay_score + params.trust_weight * trust
+            };
+            items.sort_by(|a, b| {
+                trust_score(b)
+                    .partial_cmp(&trust_score(a))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
+
         // #105: Two-level diversity quota (BrainDB-inspired)
         // Per-keyword halving: each distinct keyword gets ceil(max_results x halving^n) slots
         if params.diversity_halving < 1.0 && params.diversity_halving > 0.0 && !items.is_empty() {
@@ -3561,6 +3589,61 @@ mod tests {
     }
 
     #[test]
+    fn trust_weight_ranks_verified_above_drafts() {
+        let (db, path) = temp_db();
+
+        // Two entities matching the same query. The draft is inserted first and
+        // would otherwise tie on decay/recency; trust_weight must float the
+        // verified source to the top.
+        let mut draft = make_entity(
+            "draft-1",
+            "decision",
+            "db-choice-draft",
+            r#"{"note": "maybe use sqlite for the database"}"#,
+        );
+        draft.verified = false;
+        draft.source = "agent".to_string();
+        draft.certainty = 0.5;
+
+        let mut verified = make_entity(
+            "verified-1",
+            "decision",
+            "db-choice-final",
+            r#"{"note": "decided: use sqlite for the database"}"#,
+        );
+        verified.verified = true;
+        verified.source = "user".to_string();
+        verified.certainty = 0.9;
+
+        db.remember(&draft).unwrap();
+        db.remember(&verified).unwrap();
+
+        // Baseline: without trust_weight, no provenance ordering is guaranteed.
+        // With trust_weight, the verified source must rank first.
+        let params = RecallParams {
+            query: "sqlite database".to_string(),
+            trust_weight: 0.5,
+            limit: 10,
+            skip_side_effects: true,
+            ..RecallParams::default()
+        };
+        let results = db.recall(&params).unwrap();
+        assert_eq!(results.len(), 2, "both entities should match the query");
+        assert_eq!(
+            results[0].id, "verified-1",
+            "verified source must outrank the unverified draft when trust_weight > 0"
+        );
+
+        // decay_score must not be mutated/inflated by the trust boost.
+        assert!(
+            results.iter().all(|e| e.decay_score <= 1.0),
+            "trust ranking must not push decay_score above 1.0"
+        );
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
     fn forget_and_archive() {
         let (db, path) = temp_db();
 
@@ -4021,6 +4104,7 @@ mod tests {
                 preview_cap: None,
                 always_on: None,
                 content_weight: 0.0,
+                trust_weight: 0.0,
                 diversity_halving: 1.0,
                 diversity_per_query_share: 0.0,
                 workspace_hash: None,
@@ -4149,6 +4233,7 @@ mod tests {
                     preview_cap: None,
                     always_on: None,
                     content_weight: 0.0f64,
+                    trust_weight: 0.0f64,
                     diversity_halving: 1.0f64,
                     diversity_per_query_share: 0.0f64,
                     workspace_hash: None,
@@ -4209,6 +4294,7 @@ mod tests {
             preview_cap: None,
             always_on: None,
             content_weight: 0.0,
+            trust_weight: 0.0,
             diversity_halving: 1.0,
             diversity_per_query_share: 0.0,
             workspace_hash: ws,
@@ -4254,7 +4340,7 @@ mod tests {
             category: None, entity_type: None, limit: 10, offset: 0, min_decay: 0.0,
             topic_path: None, include_archived: false, skip_side_effects: true,
             mode: crate::models::SearchMode::Fts5, embedding: None, preview_cap: None,
-            always_on: None, content_weight: 0.0, diversity_halving: 1.0,
+            always_on: None, content_weight: 0.0, trust_weight: 0.0, diversity_halving: 1.0,
             diversity_per_query_share: 0.0, workspace_hash: None,
             agent_id: None,
             visibility: None,

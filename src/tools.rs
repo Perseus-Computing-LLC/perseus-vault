@@ -88,6 +88,8 @@ pub struct RecallArgs {
     pub always_on: Option<bool>,
     #[serde(default)]
     pub content_weight: f64,
+    #[serde(default = "crate::models::default_trust_weight")]
+    pub trust_weight: f64,
     #[serde(default = "default_halving")]
     pub diversity_halving: f64,
     #[serde(default)]
@@ -332,6 +334,7 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
         preview_cap: a.preview_cap,
         always_on: a.always_on,
         content_weight: a.content_weight,
+        trust_weight: a.trust_weight,
         diversity_halving: a.diversity_halving,
         diversity_per_query_share: 0.0,
         workspace_hash: a.workspace_hash.clone(),
@@ -402,6 +405,7 @@ fn handle_recall_with_expansion(db: &Database, a: &RecallArgs) -> Result<String,
             preview_cap: a.preview_cap,
             always_on: a.always_on,
             content_weight: a.content_weight,
+            trust_weight: a.trust_weight,
             diversity_halving: a.diversity_halving,
             diversity_per_query_share: 0.0,
             workspace_hash: a.workspace_hash.clone(),

@@ -99,6 +99,13 @@ fn default_certainty() -> f64 {
     0.5
 }
 
+/// Default recall trust weight. Non-zero so verified sources are preferred
+/// over unverified AI drafts everywhere by default; kept low so it acts as a
+/// tie-breaker rather than overriding relevance/recency.
+pub fn default_trust_weight() -> f64 {
+    0.15
+}
+
 fn default_visibility() -> String {
     "workspace".to_string()
 }
@@ -176,6 +183,11 @@ pub struct RecallParams {
     /// Additive boost weight for content witness signal (0.0 = disabled).
     /// Computes substring-match score against body_json, damped by body length.
     pub content_weight: f64,
+    /// Additive boost weight for provenance/trust signal (0.0 = disabled).
+    /// Verified sources are boosted fully; unverified entities are boosted in
+    /// proportion to their certainty, so trusted sources outrank AI drafts on
+    /// the same topic. Never penalizes.
+    pub trust_weight: f64,
     /// Per-keyword halving quota for result diversity (1.0 = disabled).
     /// Each distinct matched keyword gets ceil(max_results × halving^n) slots.
     pub diversity_halving: f64,
@@ -247,6 +259,7 @@ impl Default for RecallParams {
             preview_cap: None,
             always_on: None,
             content_weight: 0.0,
+            trust_weight: default_trust_weight(),
             diversity_halving: 1.0,
             diversity_per_query_share: 0.0,
             workspace_hash: None,

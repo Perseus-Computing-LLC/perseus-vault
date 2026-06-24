@@ -365,6 +365,13 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
           "default": 0,
           "description": "Additive boost for content witness — rewards entities whose body text literally contains query terms. Damped by body length. Never penalizes."
         },
+        "trust_weight": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "default": 0.15,
+          "description": "Additive boost for provenance/trust (default 0.15, on by default) — verified sources rank above unverified AI drafts on the same topic. Verified entities get the full boost; unverified ones are scaled by certainty. Set 0 to disable. Never penalizes."
+        },
         "diversity_halving": {
           "type": "number",
           "minimum": 0,
