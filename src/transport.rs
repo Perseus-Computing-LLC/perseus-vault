@@ -153,16 +153,27 @@ async fn handle_message(
     };
 
     let state = get_state()?;
-    let mut mcp_state = state
-        .mcp_state
-        .lock()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let db = state
-        .db
-        .lock()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    let response = mcp::handle_request(&req, &mut mcp_state, &db);
+    // #210: the handler holds the DB mutex and can make synchronous LLM
+    // round-trips (mimir_ask / mimir_synthesize), so run it on the blocking
+    // thread pool. Running it directly here would occupy a Tokio async worker for
+    // the full handler/LLM latency and stall the runtime that drives SSE streams
+    // and connection accept. The std Mutexes are taken inside the blocking task
+    // and never held across an await. (stdio transport is unaffected.)
+    let response = tokio::task::spawn_blocking(
+        move || -> Result<Option<mcp::JsonRpcResponse>, StatusCode> {
+            let mut mcp_state = state
+                .mcp_state
+                .lock()
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            let db = state
+                .db
+                .lock()
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            Ok(mcp::handle_request(&req, &mut mcp_state, &db))
+        },
+    )
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)??;
 
     match response {
         Some(resp) => {
