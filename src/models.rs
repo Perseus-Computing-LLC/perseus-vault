@@ -202,6 +202,10 @@ pub struct RecallParams {
     pub agent_id: Option<String>,
     /// Visibility filter (v1.2.0). When Some, only entities with matching
     /// visibility are returned. None = no visibility filter.
+    // Reserved: the recall query does not yet apply this filter and the MCP
+    // RecallArgs has no visibility field, so it is always None in practice.
+    // Kept so the filter can be wired without a signature change.
+    #[allow(dead_code)]
     pub visibility: Option<String>,
 }
 

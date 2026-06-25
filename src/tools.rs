@@ -399,7 +399,10 @@ fn handle_recall_with_expansion(db: &Database, a: &RecallArgs) -> Result<String,
             min_decay: a.min_decay,
             topic_path: a.topic_path.clone(),
             include_archived: a.include_archived,
-            skip_side_effects: false,
+            // #207: suppress per-variant side-effects; a single recall must bump
+            // each returned entity once, not once per matching variant. We apply
+            // the batched side-effect below on the final merged result set.
+            skip_side_effects: true,
             mode: SearchMode::Fts5,
             embedding: None,
             preview_cap: a.preview_cap,
@@ -432,6 +435,11 @@ fn handle_recall_with_expansion(db: &Database, a: &RecallArgs) -> Result<String,
     let mut merged: Vec<_> = best.into_values().collect();
     merged.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     merged.truncate(a.limit as usize);
+
+    // #207: apply recall side-effects once, to the entities actually returned,
+    // in one batched write — rather than once per variant inside the loop above.
+    let hit_ids: Vec<String> = merged.iter().map(|(e, _)| e.id.clone()).collect();
+    let _ = db.apply_recall_side_effects(&hit_ids);
 
     let items_expanded: Vec<serde_json::Value> = merged
         .iter()

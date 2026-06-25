@@ -775,6 +775,50 @@ impl Database {
         }
     }
 
+    /// Apply recall side-effects (retrieval-count bump, recency, decay boost,
+    /// layer promotion) to a set of entities in a single batched UPDATE.
+    ///
+    /// This is the SQL mirror of the per-entity `boost_decay` / `compute_layer`
+    /// logic, hoisted out of the recall row loop so the hottest read path issues
+    /// one write instead of one-per-row (#207). The `layer` CASE uses the
+    /// incremented count so it matches `compute_layer(retrieval_count + 1)`.
+    ///
+    /// A single `execute` is atomic, so no explicit transaction is needed. The id
+    /// count is bounded by the recall LIMIT clamp (≤1000), well under SQLite's
+    /// bound-variable ceiling.
+    pub fn apply_recall_side_effects(
+        &self,
+        ids: &[String],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let placeholders = vec!["?"; ids.len()].join(",");
+        let sql = format!(
+            "UPDATE entities SET \
+                retrieval_count = retrieval_count + 1, \
+                last_accessed_unix_ms = ?, \
+                decay_score = MIN(1.0, decay_score + {boost}), \
+                layer = CASE \
+                    WHEN retrieval_count + 1 >= {core} THEN 'core' \
+                    WHEN retrieval_count + 1 >= {working} THEN 'working' \
+                    ELSE 'buffer' END \
+             WHERE id IN ({placeholders})",
+            boost = Self::DECAY_BOOST,
+            core = Self::CORE_THRESHOLD,
+            working = Self::WORKING_THRESHOLD,
+        );
+
+        let now = now_ms();
+        let mut param_values: Vec<&dyn rusqlite::types::ToSql> = Vec::with_capacity(ids.len() + 1);
+        param_values.push(&now);
+        for id in ids {
+            param_values.push(id);
+        }
+        self.conn.execute(&sql, param_values.as_slice())?;
+        Ok(())
+    }
+
     /// Recalculate decay scores for all non-archived entities.
     /// Called periodically or via mimir_decay tool.
     pub fn decay_tick(&self) -> Result<DecayReport, Box<dyn std::error::Error>> {
@@ -1309,19 +1353,14 @@ impl Database {
         let rows = stmt.query_map(param_refs.as_slice(), |row| entity_from_row(row, enc))?;
 
         let mut items = Vec::new();
+        // #207: collect matched ids and apply retrieval-count/recency/decay/layer
+        // side-effects in one batched UPDATE after the loop, instead of one
+        // write per returned row on this read-mostly hot path.
+        let mut hit_ids: Vec<String> = Vec::new();
         for row in rows {
             let mut entity = row?;
-            // Update retrieval count, recency, decay boost, and layer
             if !params.skip_side_effects {
-                let new_count = entity.retrieval_count + 1;
-                let boosted_decay = Self::boost_decay(entity.decay_score);
-                let new_layer = Self::compute_layer(new_count);
-                let _ = self.conn.execute(
-                    "UPDATE entities SET retrieval_count = ?1,
-                     last_accessed_unix_ms = ?2, decay_score = ?3, layer = ?4
-                     WHERE id = ?5",
-                    params![new_count, now_ms(), boosted_decay, new_layer, entity.id],
-                );
+                hit_ids.push(entity.id.clone());
             }
 
             // #103: Apply preview cap with drill-down footer (BrainDB-inspired)
@@ -1340,6 +1379,13 @@ impl Database {
                 }
             }
             items.push(entity);
+        }
+
+        // #207: one batched side-effect write for all matched rows. Errors are
+        // ignored here exactly as the previous per-row write was — a failed bump
+        // must never fail the read.
+        if !hit_ids.is_empty() {
+            let _ = self.apply_recall_side_effects(&hit_ids);
         }
 
         // #106: Content witness signal (additive boost, never penalizes)
@@ -3399,6 +3445,9 @@ fn sha256_genesis(event_id: &str, created_at_ms: i64) -> String {
 /// Verify the audit chain by checking that each hash was correctly computed
 /// from the previous entry. Returns the number of entries verified, or an error
 /// describing the first invalid entry.
+// Retained as a callable integrity check (audit chain is written by the journal
+// path) but not yet wired to a CLI/MCP command, so it has no in-crate caller.
+#[allow(dead_code)]
 pub fn verify_audit_chain(db: &Database) -> Result<i64, String> {
     let mut stmt = db.conn.prepare(
         "SELECT id, audit_hash, created_at_unix_ms FROM journal WHERE audit_hash != '' ORDER BY created_at_unix_ms ASC",
@@ -4078,6 +4127,112 @@ mod tests {
             results2.iter().any(|e| e.key == "configured-host"),
             "stemmed search should find 'configured'"
         );
+
+        let _ = fs::remove_file(&path);
+    }
+
+    // #207: recall must apply retrieval-count/recency/decay/layer side-effects to
+    // every returned row, in one batched write, and bump each row exactly once.
+    #[test]
+    fn recall_batches_side_effects_and_bumps_once() {
+        let (db, path) = temp_db();
+
+        // Insert rows with controlled counts/decay so we can pin the CASE
+        // boundaries of compute_layer (buffer < 5 ≤ working < 20 ≤ core) and the
+        // decay cap. Side-effect-free raw inserts mirror the stress test.
+        let rows = [
+            // (id, retrieval_count, decay_score, archived)
+            ("se-buffer", 0i64, 0.5f64, 0i64),  // → count 1  → buffer, decay 0.75
+            ("se-working", 4, 0.5, 0),          // → count 5  → working, decay 0.75
+            ("se-core", 19, 0.9, 0),            // → count 20 → core, decay 1.0 (capped)
+            ("se-archived", 7, 0.5, 1),         // filtered out → never bumped
+        ];
+        for (id, count, decay, archived) in rows {
+            db.conn
+                .execute(
+                    "INSERT INTO entities (id, category, key, body_json, type, status,
+                        retrieval_count, last_accessed_unix_ms, created_at_unix_ms,
+                        decay_score, layer, archived)
+                     VALUES (?1, 'insight', ?1, '{\"content\":\"x\"}', 'insight', 'active',
+                        ?2, 0, 0, ?3, 'buffer', ?4)",
+                    params![id, count, decay, archived],
+                )
+                .unwrap();
+        }
+
+        // Live recall (side effects ON, the MCP default).
+        let live = db.recall(&RecallParams::default()).unwrap();
+        // Returned entities must reflect PRE-bump state (the loop never mutates
+        // the in-memory entity; only the DB is updated).
+        let live_working = live.iter().find(|e| e.id == "se-working").unwrap();
+        assert_eq!(
+            live_working.retrieval_count, 4,
+            "returned entity must show pre-bump count"
+        );
+        assert!(
+            !live.iter().any(|e| e.id == "se-archived"),
+            "archived entity must not be returned"
+        );
+
+        // Re-read without side effects to observe the persisted batched bump.
+        let after = db
+            .recall(&RecallParams {
+                include_archived: true,
+                skip_side_effects: true,
+                limit: 50,
+                ..RecallParams::default()
+            })
+            .unwrap();
+        let get = |id: &str| after.iter().find(|e| e.id == id).unwrap();
+
+        // Count bumped by exactly 1 — one batched write, not N, and not per-variant.
+        assert_eq!(get("se-buffer").retrieval_count, 1);
+        assert_eq!(get("se-working").retrieval_count, 5);
+        assert_eq!(get("se-core").retrieval_count, 20);
+        // Archived row was filtered from recall → untouched.
+        assert_eq!(get("se-archived").retrieval_count, 7);
+
+        // Layer recomputed on the new count, matching compute_layer exactly.
+        assert_eq!(get("se-buffer").layer, "buffer");
+        assert_eq!(get("se-working").layer, "working");
+        assert_eq!(get("se-core").layer, "core");
+
+        // Decay boosted by DECAY_BOOST (0.25), capped at 1.0.
+        assert!((get("se-buffer").decay_score - 0.75).abs() < 1e-9);
+        assert!((get("se-working").decay_score - 0.75).abs() < 1e-9);
+        assert!((get("se-core").decay_score - 1.0).abs() < 1e-9);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    // #207: duplicate ids in one batch bump only once (the property the
+    // query-expansion path relies on after merging variant results).
+    #[test]
+    fn apply_recall_side_effects_dedupes_ids() {
+        let (db, path) = temp_db();
+        db.conn
+            .execute(
+                "INSERT INTO entities (id, category, key, body_json, type, status,
+                    retrieval_count, last_accessed_unix_ms, created_at_unix_ms,
+                    decay_score, layer)
+                 VALUES ('dup-1', 'insight', 'dup', '{\"content\":\"x\"}', 'insight',
+                    'active', 0, 0, 0, 0.5, 'buffer')",
+                params![],
+            )
+            .unwrap();
+
+        db.apply_recall_side_effects(&["dup-1".to_string(), "dup-1".to_string()])
+            .unwrap();
+
+        let n: i64 = db
+            .conn
+            .query_row(
+                "SELECT retrieval_count FROM entities WHERE id = 'dup-1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1, "duplicate ids in IN (...) must bump only once");
 
         let _ = fs::remove_file(&path);
     }

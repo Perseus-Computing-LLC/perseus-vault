@@ -282,6 +282,9 @@ pub mod grpc {
     use crate::db::Database;
 
     /// Stub module — gRPC is compiled out.
+    // No in-crate caller in the default (non-grpc) build; kept so callers behind
+    // `--features grpc` get a clear error instead of a missing symbol.
+    #[allow(dead_code)]
     pub async fn serve(
         _db: Arc<Mutex<Database>>,
         _addr: std::net::SocketAddr,
