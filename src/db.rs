@@ -866,6 +866,31 @@ impl Database {
 
     // ─── Entities ────────────────────────────────────────────────
 
+    /// Character-trigram set of a string (fast, language-agnostic).
+    fn trigrams(s: &str) -> std::collections::HashSet<[char; 3]> {
+        let chars: Vec<char> = s.chars().collect();
+        if chars.len() < 3 {
+            return std::collections::HashSet::new();
+        }
+        chars.windows(3).map(|w| [w[0], w[1], w[2]]).collect()
+    }
+
+    /// Jaccard overlap of two precomputed trigram sets (0.0–1.0).
+    fn trigram_overlap(
+        ta: &std::collections::HashSet<[char; 3]>,
+        tb: &std::collections::HashSet<[char; 3]>,
+    ) -> f64 {
+        if ta.is_empty() || tb.is_empty() {
+            return 0.0;
+        }
+        let intersection = ta.intersection(tb).count();
+        let union = ta.len() + tb.len() - intersection;
+        if union == 0 {
+            return 0.0;
+        }
+        intersection as f64 / union as f64
+    }
+
     /// Compute trigram overlap similarity between two strings (0.0–1.0).
     /// Uses character trigrams for fast, language-agnostic comparison.
     fn trigram_similarity(a: &str, b: &str) -> f64 {
@@ -875,30 +900,7 @@ impl Database {
         if a == b {
             return 1.0;
         }
-
-        fn trigrams(s: &str) -> std::collections::HashSet<[char; 3]> {
-            let chars: Vec<char> = s.chars().collect();
-            if chars.len() < 3 {
-                return std::collections::HashSet::new();
-            }
-            chars.windows(3).map(|w| [w[0], w[1], w[2]]).collect()
-        }
-
-        let ta = trigrams(a);
-        let tb = trigrams(b);
-
-        if ta.is_empty() || tb.is_empty() {
-            return 0.0;
-        }
-
-        let intersection = ta.intersection(&tb).count();
-        let union = ta.len() + tb.len() - intersection;
-
-        if union == 0 {
-            return 0.0;
-        }
-
-        intersection as f64 / union as f64
+        Self::trigram_overlap(&Self::trigrams(a), &Self::trigrams(b))
     }
 
     /// Check for near-duplicate entities in the same category.
@@ -909,6 +911,15 @@ impl Database {
         body_json: &str,
         threshold: f64,
     ) -> Result<Option<String>, Box<dyn std::error::Error>> {
+        // Precompute the new body's trigram set ONCE rather than rebuilding it
+        // for every candidate inside trigram_similarity (it was reconstructed on
+        // each comparison — #209). The exact-match / empty cases below preserve
+        // trigram_similarity's prior semantics exactly.
+        if body_json.is_empty() {
+            return Ok(None);
+        }
+        let target = Self::trigrams(body_json);
+
         let mut stmt = self
             .conn
             .prepare("SELECT id, body_json FROM entities WHERE category = ?1 AND archived = 0")?;
@@ -918,7 +929,13 @@ impl Database {
 
         for row in rows {
             let (id, existing_body) = row?;
-            let sim = Self::trigram_similarity(body_json, &existing_body);
+            let sim = if existing_body.is_empty() {
+                0.0
+            } else if existing_body == body_json {
+                1.0
+            } else {
+                Self::trigram_overlap(&target, &Self::trigrams(&existing_body))
+            };
             if sim >= threshold {
                 return Ok(Some(id));
             }
@@ -2877,49 +2894,78 @@ last_accessed: {}
             return Ok(Vec::new());
         }
 
-        // Build LIKE clauses for each significant word in the context
-        // matching against body_json which should contain "recall_when" array entries
-        let mut like_parts = Vec::new();
-        let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-
-        for (i, word) in words.iter().enumerate() {
-            let param_idx = i + 1;
-            like_parts.push(format!("body_json LIKE ?{}", param_idx));
-            params_vec.push(Box::new(format!(
-                "%recall_when%{}%",
-                word.replace('\'', "''")
-            )));
+        // Prefilter candidates with an FTS5 prefix-OR query, then confirm each
+        // against the entity's recall_when triggers in Rust. This replaces a
+        // leading-wildcard `body_json LIKE '%recall_when%word%'` full table scan
+        // (#209). entities_fts holds the plaintext body even when encryption is
+        // on, so this also works on encrypted DBs — where the old LIKE ran
+        // against ciphertext and silently matched nothing.
+        let lc_words: Vec<String> = words.iter().map(|w| w.to_lowercase()).collect();
+        let fts_query = lc_words
+            .iter()
+            .map(|w| w.chars().filter(|c| c.is_alphanumeric()).collect::<String>())
+            .filter(|w| !w.is_empty())
+            .map(|w| format!("{}*", w))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        if fts_query.is_empty() {
+            return Ok(Vec::new());
         }
 
-        let sql = format!(
-            "SELECT id, category, key, body_json, status, type, tags,
+        let safe_limit = limit.clamp(0, 100);
+        // Scan a multiple of the requested limit since some FTS candidates won't
+        // pass the recall_when confirmation; bounded so this stays cheap.
+        let scan_cap = (safe_limit * 5).clamp(50, 500);
+
+        let sql = "SELECT id, category, key, body_json, status, type, tags,
                     decay_score, retrieval_count, layer, topic_path,
                     archived, archive_reason, links, verified, source,
                     created_at_unix_ms, last_accessed_unix_ms, embedding,
                     always_on, certainty, workspace_hash, agent_id, visibility
              FROM entities
-             WHERE archived = 0 AND ({})
+             WHERE archived = 0
+               AND rowid IN (SELECT rowid FROM entities_fts WHERE entities_fts MATCH ?1)
              ORDER BY decay_score DESC, retrieval_count DESC
-             LIMIT ?{}",
-            like_parts.join(" OR "),
-            params_vec.len() + 1
-        );
+             LIMIT ?2";
 
-        let safe_limit = limit.clamp(0, 100);
-        params_vec.push(Box::new(safe_limit));
-
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            params_vec.iter().map(|p| p.as_ref()).collect();
-
-        let mut stmt = self.conn.prepare(&sql)?;
+        let mut stmt = self.conn.prepare(sql)?;
         let enc = self.encryption.as_ref();
-        let rows = stmt.query_map(param_refs.as_slice(), |row| entity_from_row(row, enc))?;
+        let rows =
+            stmt.query_map(params![fts_query, scan_cap], |row| entity_from_row(row, enc))?;
 
         let mut items = Vec::new();
         for row in rows {
-            items.push(row?);
+            let entity = row?;
+            if Self::matches_recall_when(&entity.body_json, &lc_words) {
+                items.push(entity);
+                if items.len() as i64 >= safe_limit {
+                    break;
+                }
+            }
         }
         Ok(items)
+    }
+
+    /// True if any of `lc_words` (already lowercased) is a substring of any
+    /// string in the body's `recall_when` array. Used to confirm FTS candidates.
+    fn matches_recall_when(body_json: &str, lc_words: &[String]) -> bool {
+        let parsed: serde_json::Value = match serde_json::from_str(body_json) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        let triggers = match parsed.get("recall_when").and_then(|v| v.as_array()) {
+            Some(t) => t,
+            None => return false,
+        };
+        for trig in triggers {
+            if let Some(s) = trig.as_str() {
+                let s_lc = s.to_lowercase();
+                if lc_words.iter().any(|w| s_lc.contains(w.as_str())) {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// Coherence daemon: auto-groom the memory with promote, decay, link, archive.
@@ -2979,37 +3025,54 @@ last_accessed: {}
         )?;
         decayed = decayed_count;
 
-        // 3. Link: auto-link entities with shared tags within same category
-        // Find entities with overlapping tags who aren't already linked
-        let mut stmt = self.conn.prepare(
-            "SELECT e1.id, e1.category, e1.key, e1.tags, e2.id as e2_id
-             FROM entities e1
-             JOIN entities e2 ON e1.category = e2.category AND e1.id < e2.id
-             WHERE e1.archived = 0 AND e2.archived = 0
-             AND e1.tags != '[]' AND e2.tags != '[]'
-             LIMIT ?1",
-        )?;
-
+        // 3. Link: auto-link entities sharing a category. The JOIN already
+        // proves both rows exist and carries e1.id + e1.links, so we build the
+        // new link lists in memory and flush one UPDATE per source entity —
+        // instead of calling link() (≈4 queries each) per pair inside this write
+        // transaction (#209). Accumulating per e1 also keeps multiple links to
+        // the same source correct (the old code re-read links fresh each call).
         let max_links = params.max_links.clamp(0, 100) as i64;
-        let rows = stmt.query_map(params![max_links], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-            ))
-        })?;
-
-        for row in rows {
-            let (_e1_id, cat, key, _tags1_str, e2_id) = row?;
-
-            // Create a simple "related" link from e1 to e2
-            if let Err(e) = self.link(&cat, &key, &e2_id, "auto-related") {
-                eprintln!("mimir: cohere link error: {}", e);
-                continue;
+        let mut pending: std::collections::HashMap<String, Vec<MemoryLink>> =
+            std::collections::HashMap::new();
+        {
+            let mut stmt = self.conn.prepare(
+                "SELECT e1.id, e1.links, e2.id as e2_id
+                 FROM entities e1
+                 JOIN entities e2 ON e1.category = e2.category AND e1.id < e2.id
+                 WHERE e1.archived = 0 AND e2.archived = 0
+                 AND e1.tags != '[]' AND e2.tags != '[]'
+                 LIMIT ?1",
+            )?;
+            let rows = stmt.query_map(params![max_links], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?;
+            for row in rows {
+                let (e1_id, e1_links_json, e2_id) = row?;
+                let entry = pending
+                    .entry(e1_id)
+                    .or_insert_with(|| serde_json::from_str(&e1_links_json).unwrap_or_default());
+                if !entry.iter().any(|l| l.target_id == e2_id) {
+                    entry.push(MemoryLink {
+                        target_id: e2_id,
+                        relationship: "auto-related".to_string(),
+                        weight: 0.5,
+                    });
+                }
+                linked += 1;
             }
-            linked += 1;
+        }
+
+        let link_ts = now_ms();
+        for (id, links) in &pending {
+            let new_links = serde_json::to_string(links)?;
+            self.conn.execute(
+                "UPDATE entities SET links = ?1, last_accessed_unix_ms = ?2 WHERE id = ?3",
+                params![new_links, link_ts, id],
+            )?;
         }
 
         // 4. Archive: entities below decay threshold
@@ -3787,6 +3850,75 @@ mod tests {
         db.unlink("decision", "use-pg", "e2").unwrap();
         let entity2 = db.get_entity("decision", "use-pg").unwrap().unwrap();
         assert_eq!(entity2.links.len(), 0);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn recall_when_matches_triggers_via_fts() {
+        let (db, path) = temp_db();
+
+        let e1 = make_entity(
+            "rw1",
+            "skill",
+            "deploy",
+            r#"{"recall_when": ["deploying to production", "kubernetes rollout"], "note": "steps"}"#,
+        );
+        // Has the word "about" but no recall_when field — must be filtered out
+        // even though it becomes an FTS candidate.
+        let e2 = make_entity("rw2", "skill", "other", r#"{"note": "thinking about cats"}"#);
+        // Has recall_when but unrelated triggers.
+        let e3 = make_entity("rw3", "skill", "billing", r#"{"recall_when": ["invoice generation"]}"#);
+        db.remember(&e1).unwrap();
+        db.remember(&e2).unwrap();
+        db.remember(&e3).unwrap();
+
+        let hits = db.recall_when("about to start deploying the service", 10).unwrap();
+        let ids: Vec<String> = hits.iter().map(|h| h.id.clone()).collect();
+        assert!(ids.contains(&"rw1".to_string()), "should match deploy trigger, got {ids:?}");
+        assert!(!ids.contains(&"rw2".to_string()), "no recall_when field -> excluded by confirmation");
+        assert!(!ids.contains(&"rw3".to_string()), "unrelated triggers -> excluded");
+
+        // No overlapping triggers at all -> rw1 not returned.
+        let none = db.recall_when("completely unrelated banana topic", 10).unwrap();
+        assert!(none.iter().all(|h| h.id != "rw1"), "no spurious match");
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn cohere_auto_links_batched_same_source() {
+        let (db, path) = temp_db();
+
+        // All same category with non-empty tags; ids order ca < cb < cc, so the
+        // self-join yields pairs (ca,cb), (ca,cc), (cb,cc). ca appears in two
+        // pairs — the batched accumulation must keep BOTH links on ca.
+        let mut a = make_entity("ca", "project", "alpha", r#"{"n":1}"#);
+        a.tags = vec!["x".to_string()];
+        let mut b = make_entity("cb", "project", "beta", r#"{"n":2}"#);
+        b.tags = vec!["x".to_string()];
+        let mut c = make_entity("cc", "project", "gamma", r#"{"n":3}"#);
+        c.tags = vec!["y".to_string()];
+        db.remember(&a).unwrap();
+        db.remember(&b).unwrap();
+        db.remember(&c).unwrap();
+
+        let params = crate::models::CohereParams {
+            dry_run: false,
+            max_links: 100,
+            promote_threshold: 0,
+            archive_threshold: 0.0,
+        };
+        let report = db.cohere(&params).unwrap();
+        assert!(report.linked >= 1, "should link, got {}", report.linked);
+
+        let ca = db.get_entity("project", "alpha").unwrap().unwrap();
+        let targets: Vec<String> = ca.links.iter().map(|l| l.target_id.clone()).collect();
+        assert!(targets.contains(&"cb".to_string()), "ca->cb, got {targets:?}");
+        assert!(
+            targets.contains(&"cc".to_string()),
+            "ca->cc must survive batched same-source accumulation, got {targets:?}"
+        );
 
         let _ = fs::remove_file(&path);
     }
