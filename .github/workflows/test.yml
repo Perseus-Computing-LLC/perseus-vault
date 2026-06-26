@@ -37,3 +37,18 @@ jobs:
 
       - name: Run tests
         run: cargo test --verbose
+
+  # Verify the optional ONNX embedding path (the `bundled-embeddings` feature)
+  # compiles AND links, guarding against `ort`-crate API drift like #212. Linux
+  # only: on Windows MSVC, esaxx-rs (static CRT, pulled via tokenizers) and ort's
+  # dynamic-CRT prebuilt binaries cannot be linked into the same executable.
+  bundled-embeddings:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build with bundled-embeddings
+        run: cargo build --features bundled-embeddings --verbose

@@ -190,7 +190,8 @@ fn generate_with_ort(
         .expect("model_path must have a parent directory");
     let tokenizer_path = model_dir.join("tokenizer.json");
 
-    let session = Session::builder()?.commit_from_file(&config.model_path)?;
+    // rc.12: Session::run takes &mut self.
+    let mut session = Session::builder()?.commit_from_file(&config.model_path)?;
 
     let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
         .map_err(|e| format!("failed to load tokenizer: {}", e))?;
@@ -206,33 +207,37 @@ fn generate_with_ort(
         .map(|&m| m as i64)
         .collect();
 
-    let shape = [token_ids.len()];
-    // Use ndarray for tensor creation (ort 2.x uses ndarray)
-    let input_array = ndarray::Array1::from_vec(token_ids.clone());
-    let mask_array = ndarray::Array1::from_vec(attention_mask.clone());
+    // Use ndarray for tensor creation (ort 2.x uses ndarray). Bind the
+    // batch-axis arrays to locals so they outlive the borrowing TensorRefs
+    // through session.run (rc.12: from_array_view borrows the array). (#212)
+    let input_2d = ndarray::Array1::from_vec(token_ids.clone()).insert_axis(ndarray::Axis(0));
+    let mask_2d = ndarray::Array1::from_vec(attention_mask.clone()).insert_axis(ndarray::Axis(0));
 
-    let input_tensor =
-        ort::value::TensorRef::from_array_view(&input_array.insert_axis(ndarray::Axis(0)))?;
-    let mask_tensor =
-        ort::value::TensorRef::from_array_view(&mask_array.insert_axis(ndarray::Axis(0)))?;
+    let input_tensor = ort::value::TensorRef::from_array_view(&input_2d)?;
+    let mask_tensor = ort::value::TensorRef::from_array_view(&mask_2d)?;
 
+    // ort 2.0.0-rc.12: `inputs!` yields the inputs directly (no longer a Result),
+    // so there is no inner `?`. (#212)
     let outputs = session.run(ort::inputs![
         "input_ids" => input_tensor,
         "attention_mask" => mask_tensor,
-    ]?)?;
+    ])?;
 
-    // Extract last_hidden_state and mean pool
-    let hidden: &ort::value::TensorRef<f32> = outputs["last_hidden_state"].extract_tensor()?;
-    let view = hidden.view();
-    let seq_len = view.shape()[1];
-    let dim = view.shape()[2];
+    // Extract last_hidden_state and mean pool. rc.12 replaced `extract_tensor`
+    // (which no longer exists on a dynamic Value) with `try_extract_tensor`,
+    // returning (&Shape, &[T]) — a flat row-major slice. The tensor is
+    // [batch=1, seq_len, dim], so element [0, t, d] is at offset t*dim + d. (#212)
+    let (shape, data) = outputs["last_hidden_state"].try_extract_tensor::<f32>()?;
+    let seq_len = shape[1] as usize;
+    let dim = shape[2] as usize;
 
     let mut pooled = vec![0.0f32; dim];
     let mut active = 0usize;
     for t in 0..seq_len {
         if t < attention_mask.len() && attention_mask[t] == 1 {
+            let row = t * dim;
             for d in 0..dim {
-                pooled[d] += view[[0, t, d]];
+                pooled[d] += data[row + d];
             }
             active += 1;
         }

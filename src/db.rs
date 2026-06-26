@@ -3478,6 +3478,10 @@ pub fn verify_audit_chain(db: &Database) -> Result<i64, String> {
     Ok(count)
 }
 
+// Only the non-bundled-embeddings build uses this scalar fallback; the feature
+// build scores with the vectorized ndarray path above, so gate it to match its
+// sole caller and avoid a dead-code warning under the feature. (#212)
+#[cfg(not(feature = "bundled-embeddings"))]
 fn cosine_similarity(a: &[f32], b: &[f32]) -> f64 {
     if a.len() != b.len() || a.is_empty() {
         return 0.0;

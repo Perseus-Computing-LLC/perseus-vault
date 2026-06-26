@@ -33,7 +33,7 @@ futures = "0.3"
 # Optional: bundled embedding model (all-MiniLM-L6-v2 via ONNX Runtime)
 ort = { version = "2.0.0-rc.12", optional = true, features = ["download-binaries"] }
 tokenizers = { version = "0.23", optional = true }
-ndarray = { version = "0.16", optional = true }
+ndarray = { version = "0.17", optional = true }  # MUST match the ndarray version ort rc.12 depends on, else our arrays are a different crate-version type and TensorArrayData (from_array_view) won't accept them (#212)
 tonic = { version = "0.13", optional = true, features = ["transport"] }
 prost = { version = "0.14", optional = true }
 prost-types = { version = "0.14", optional = true }
