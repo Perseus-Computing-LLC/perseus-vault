@@ -659,80 +659,105 @@ impl Database {
         limit: usize,
     ) -> Result<Vec<(Entity, f64)>, Box<dyn std::error::Error>> {
         let max_scan = 50_000; // safety ceiling — databases beyond this should use HNSW
+        let dim = query_vec.len();
+
+        // Phase 1 (#209): lightweight scan — read only id + embedding for scoring.
+        // The old query hydrated EVERY candidate (decrypt body, parse tags/links)
+        // up to max_scan just to score and then keep top-k. Defer full hydration
+        // to the surviving top-k in phase 3.
         let mut stmt = self.conn.prepare(&format!(
-            "SELECT id, category, key, body_json, status, type, tags,
-                    decay_score, retrieval_count, layer, topic_path,
-                    archived, archive_reason, links, verified, source,
-                    created_at_unix_ms, last_accessed_unix_ms, embedding,
-                    always_on, certainty, workspace_hash, agent_id, visibility
-             FROM entities WHERE archived = 0 AND embedding IS NOT NULL LIMIT {}",
+            "SELECT id, embedding FROM entities \
+             WHERE archived = 0 AND embedding IS NOT NULL LIMIT {}",
             max_scan
         ))?;
-
-        let enc = self.encryption.as_ref();
         let rows = stmt.query_map([], |row| {
-            let entity = entity_from_row(row, enc)?;
-            let emb_blob: Vec<u8> = row.get(18)?;
+            let id: String = row.get(0)?;
+            let emb_blob: Vec<u8> = row.get(1)?;
             let emb: Vec<f32> = emb_blob
                 .chunks_exact(4)
                 .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
                 .collect();
-            Ok((entity, emb))
+            Ok((id, emb))
         })?;
+        let candidates: Vec<(String, Vec<f32>)> = rows
+            .filter_map(|r| r.ok())
+            .filter(|(_, emb)| emb.len() == dim)
+            .collect();
 
+        // Phase 2: score by cosine similarity, keep the top `limit` ids.
+        let mut scored_ids: Vec<(String, f64)>;
         #[cfg(feature = "bundled-embeddings")]
         {
-            // Batched cosine similarity using SIMD-accelerated ndarray ops
-            let mut entities: Vec<Entity> = Vec::new();
-            let mut all_embs: Vec<f32> = Vec::new();
-            let dim = query_vec.len();
-            for row in rows {
-                let (entity, emb) = row?;
-                if emb.len() == dim {
-                    all_embs.extend_from_slice(&emb);
-                    entities.push(entity);
+            // Batched cosine similarity using SIMD-accelerated ndarray ops.
+            scored_ids = Vec::with_capacity(candidates.len());
+            if !candidates.is_empty() {
+                let n = candidates.len();
+                let mut all_embs: Vec<f32> = Vec::with_capacity(n * dim);
+                for (_, emb) in &candidates {
+                    all_embs.extend_from_slice(emb);
                 }
-            }
-
-            let mut scored: Vec<(Entity, f64)> = Vec::new();
-            if !entities.is_empty() {
-                let n = entities.len();
                 let q = ndarray::Array1::from_vec(query_vec.to_vec());
                 let embs = ndarray::Array2::from_shape_vec((n, dim), all_embs)
                     .unwrap_or_else(|_| ndarray::Array2::zeros((n, dim)));
                 let q_norm = q.iter().map(|v| v * v).sum::<f32>().sqrt();
                 let emb_norms = embs.mapv(|v| v * v).sum_axis(ndarray::Axis(1)).mapv(f32::sqrt);
                 let dots = embs.dot(&q);
-                // Consume `entities` in order instead of `remove(0)` per element,
-                // which was O(n^2) — each remove shifts the whole vec down. (#209)
-                scored = entities
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, entity)| {
-                        let denom = q_norm * emb_norms[i];
-                        let sim = if denom > 0.0 { dots[i] as f64 / denom as f64 } else { 0.0 };
-                        (entity, sim)
-                    })
-                    .collect();
+                for (i, (id, _)) in candidates.into_iter().enumerate() {
+                    let denom = q_norm * emb_norms[i];
+                    let sim = if denom > 0.0 { dots[i] as f64 / denom as f64 } else { 0.0 };
+                    scored_ids.push((id, sim));
+                }
             }
-            scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            scored.truncate(limit);
-            return Ok(scored);
         }
-
         #[cfg(not(feature = "bundled-embeddings"))]
         {
-            // Row-by-row fallback (no ndarray available)
-            let mut scored: Vec<(Entity, f64)> = Vec::new();
-            for row in rows {
-                let (entity, emb) = row?;
-                let sim = cosine_similarity(query_vec, &emb);
-                scored.push((entity, sim));
-            }
-            scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            scored.truncate(limit);
-            return Ok(scored);
+            // Row-by-row fallback (no ndarray available).
+            scored_ids = candidates
+                .into_iter()
+                .map(|(id, emb)| {
+                    let sim = cosine_similarity(query_vec, &emb);
+                    (id, sim)
+                })
+                .collect();
         }
+        scored_ids.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored_ids.truncate(limit);
+        if scored_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Phase 3 (#209): hydrate only the surviving top-k rows, then return them
+        // in score order. This is the single place that pays the decrypt/parse
+        // cost — for `limit` rows instead of up to `max_scan`.
+        let placeholders = vec!["?"; scored_ids.len()].join(",");
+        let hydrate_sql = format!(
+            "SELECT id, category, key, body_json, status, type, tags,
+                    decay_score, retrieval_count, layer, topic_path,
+                    archived, archive_reason, links, verified, source,
+                    created_at_unix_ms, last_accessed_unix_ms, embedding,
+                    always_on, certainty, workspace_hash, agent_id, visibility
+             FROM entities WHERE id IN ({})",
+            placeholders
+        );
+        let enc = self.encryption.as_ref();
+        let mut hstmt = self.conn.prepare(&hydrate_sql)?;
+        let id_refs: Vec<&dyn rusqlite::types::ToSql> = scored_ids
+            .iter()
+            .map(|(id, _)| id as &dyn rusqlite::types::ToSql)
+            .collect();
+        let hydrated = hstmt.query_map(id_refs.as_slice(), |row| entity_from_row(row, enc))?;
+        let mut by_id: std::collections::HashMap<String, Entity> = std::collections::HashMap::new();
+        for e in hydrated {
+            let e = e?;
+            by_id.insert(e.id.clone(), e);
+        }
+        // Emit in the score order computed above; skip any id that vanished
+        // between the scan and the hydrate (deleted concurrently).
+        let result: Vec<(Entity, f64)> = scored_ids
+            .into_iter()
+            .filter_map(|(id, sim)| by_id.remove(&id).map(|e| (e, sim)))
+            .collect();
+        Ok(result)
     }
 
     // ─── Decay & Layer Progression ──────────────────────────────────
@@ -4205,6 +4230,47 @@ mod tests {
         assert!((get("se-buffer").decay_score - 0.75).abs() < 1e-9);
         assert!((get("se-working").decay_score - 0.75).abs() < 1e-9);
         assert!((get("se-core").decay_score - 1.0).abs() < 1e-9);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    // #209: dense_search must score a lightweight id+embedding scan, then hydrate
+    // only the top-k, returned in score order (archived rows excluded). Runs on
+    // the default (scalar) build; the feature build shares the scan + hydrate and
+    // differs only in the scoring math.
+    #[test]
+    fn dense_search_returns_top_k_hydrated_in_score_order() {
+        let (db, path) = temp_db();
+        let blob = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|f| f.to_le_bytes()).collect() };
+        let insert = |id: &str, key: &str, emb: &[f32], archived: i64| {
+            db.conn
+                .execute(
+                    "INSERT INTO entities (id, category, key, body_json, type, status,
+                        retrieval_count, last_accessed_unix_ms, created_at_unix_ms,
+                        decay_score, layer, embedding, archived)
+                     VALUES (?1, 'insight', ?2, ?3, 'insight', 'active', 0, 0, 0, 1.0, 'working', ?4, ?5)",
+                    params![id, key, format!("{{\"k\":\"{}\"}}", key), blob(emb), archived],
+                )
+                .unwrap();
+        };
+        insert("d-best", "best", &[1.0, 0.0, 0.0], 0);
+        insert("d-mid", "mid", &[0.7, 0.7, 0.0], 0);
+        insert("d-far", "far", &[0.0, 1.0, 0.0], 0);
+        insert("d-arch", "arch", &[1.0, 0.0, 0.0], 1); // archived → must be excluded
+
+        let results = db.dense_search(&[1.0, 0.0, 0.0], 2).unwrap();
+
+        // Top-2 by cosine: best (1.0) then mid (~0.707); far (0) truncated, archived filtered.
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].0.key, "best");
+        assert_eq!(results[1].0.key, "mid");
+        assert!(results[0].1 > results[1].1, "must be in descending score order");
+        // Full entity hydrated (body present), not just id/embedding.
+        assert!(results[0].0.body_json.contains("best"));
+        assert!(
+            !results.iter().any(|(e, _)| e.key == "arch"),
+            "archived entity must not be returned"
+        );
 
         let _ = fs::remove_file(&path);
     }
