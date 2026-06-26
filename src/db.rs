@@ -1021,6 +1021,7 @@ impl Database {
         category: &str,
         body_json: &str,
         threshold: f64,
+        fts_prefilter: bool,
     ) -> Result<Option<String>, Box<dyn std::error::Error>> {
         // Precompute the new body's trigram set ONCE rather than rebuilding it
         // for every candidate inside trigram_similarity (it was reconstructed on
@@ -1032,12 +1033,56 @@ impl Database {
         let target = Self::trigrams(body_json);
 
         let conn = self.conn()?;
-        let mut stmt = conn
-            .prepare("SELECT id, body_json FROM entities WHERE category = ?1 AND archived = 0")?;
-        let rows = stmt.query_map(params![category], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-        })?;
 
+        // Opt-in FTS candidate prefilter (#228), gated by the caller. The exact
+        // cost of dedup on bulk import is the exhaustive trigram comparison
+        // against every non-archived row in the category (O(M*N) over an import of
+        // M rows). When enabled, only same-category rows that share at least one
+        // FTS token with the new body are compared, which collapses that cost for
+        // categories with diverse bodies. This is a HEURISTIC, not lossless: a
+        // near-duplicate that shares no FTS token with the new body (e.g. one
+        // differing only in punctuation the tokenizer drops) can slip through and
+        // be stored as a separate entity. The default full scan stays exact.
+        // entities_fts holds the plaintext body even under encryption, so the
+        // prefilter works on encrypted DBs too.
+        let mut match_query = String::new();
+        if fts_prefilter {
+            // OR the body's distinct tokens into a single MATCH expression. Cap
+            // the term count so a very large body can't build a pathological FTS
+            // query; the cap only narrows candidates further (still a prefilter).
+            let mut seen = std::collections::HashSet::new();
+            let terms: Vec<String> = body_json
+                .split_whitespace()
+                .filter(|w| seen.insert(*w))
+                .take(64)
+                .map(|w| format!("\"{}\"", w.replace('"', "\"\"")))
+                .collect();
+            if !terms.is_empty() {
+                match_query = terms.join(" OR ");
+            }
+        }
+
+        // A non-capturing row mapper, shared so both query branches have the same
+        // closure type and can be assigned to one `rows` binding.
+        let map_row = |r: &rusqlite::Row<'_>| -> rusqlite::Result<(String, String)> {
+            Ok((r.get(0)?, r.get(1)?))
+        };
+        let mut stmt = if match_query.is_empty() {
+            conn.prepare("SELECT id, body_json FROM entities WHERE category = ?1 AND archived = 0")?
+        } else {
+            conn.prepare(
+                "SELECT id, body_json FROM entities \
+                 WHERE category = ?1 AND archived = 0 \
+                   AND rowid IN (SELECT rowid FROM entities_fts WHERE entities_fts MATCH ?2)",
+            )?
+        };
+        let rows = if match_query.is_empty() {
+            stmt.query_map(params![category], map_row)?
+        } else {
+            stmt.query_map(params![category, match_query], map_row)?
+        };
+
+        let target_len = target.len() as f64;
         for row in rows {
             let (id, existing_body) = row?;
             let sim = if existing_body.is_empty() {
@@ -1045,6 +1090,18 @@ impl Database {
             } else if existing_body == body_json {
                 1.0
             } else {
+                // Lossless length prefilter (#228). A candidate body of N chars
+                // yields at most N-2 trigrams, and Jaccard similarity is bounded
+                // by min(a,b)/max(a,b) <= (N-2)/a. If that ceiling is below the
+                // threshold the candidate can never qualify, so skip building its
+                // trigram set (the costly part). This prunes only candidates whose
+                // best possible score is sub-threshold, so it never changes which
+                // entities are deduped — exact matches share the target's length
+                // and so always clear the filter.
+                let cand_max_trigrams = existing_body.chars().count().saturating_sub(2);
+                if (cand_max_trigrams as f64) < threshold * target_len {
+                    continue;
+                }
                 Self::trigram_overlap(&target, &Self::trigrams(&existing_body))
             };
             if sim >= threshold {
@@ -1153,9 +1210,18 @@ impl Database {
         } else {
             // Check for near-duplicates before inserting
             let dup_threshold = 0.7; // 70% trigram similarity
-            if let Ok(Some(dup_id)) =
-                self.find_near_duplicate(&entity.category, &entity.body_json, dup_threshold)
-            {
+            // MIMIR_DEDUP_FTS_PREFILTER (default off) trades exact dedup for an
+            // FTS candidate prefilter that collapses the O(M*N) bulk-import cost.
+            // See find_near_duplicate for the lossiness tradeoff. (#228)
+            let fts_prefilter = std::env::var("MIMIR_DEDUP_FTS_PREFILTER")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            if let Ok(Some(dup_id)) = self.find_near_duplicate(
+                &entity.category,
+                &entity.body_json,
+                dup_threshold,
+                fts_prefilter,
+            ) {
                 // Near-duplicate found — bump its importance instead of creating new
                 let _ = conn.execute(
                     "UPDATE entities SET decay_score = MIN(1.0, decay_score + 0.15),
@@ -3799,6 +3865,130 @@ mod tests {
         assert_eq!(
             found2.unwrap().body_json,
             r#"{"decision": "Use PostgreSQL 16"}"#
+        );
+
+        let _ = fs::remove_file(&path);
+    }
+
+    // #228: the lossless length prefilter must never change which entities are
+    // treated as near-duplicates. We assert find_near_duplicate (prefilter on)
+    // agrees with an exhaustive trigram scan (the un-prefiltered reference) for a
+    // spread of probe bodies, including ones that exercise the short-candidate
+    // prune path.
+    #[test]
+    fn find_near_duplicate_length_prefilter_matches_exhaustive_scan() {
+        let (db, path) = temp_db();
+        let threshold = 0.7;
+
+        // Same-category corpus with deliberately varied body lengths.
+        let bodies = [
+            ("c1", r#"{"note":"the quick brown fox jumps over the lazy dog"}"#),
+            ("c2", r#"{"note":"the quick brown fox jumps over the lazy cat"}"#),
+            ("c3", r#"{"x":"tiny"}"#),
+            ("c4", r#"{"note":"completely unrelated content about databases"}"#),
+            ("c5", r#"{"note":"the quick brown fox jumps over the lazy dog!!"}"#),
+        ];
+        for (key, body) in bodies {
+            db.remember(&make_entity(key, "insight", key, body)).unwrap();
+        }
+
+        // Some corpus bodies are near-duplicates of each other and so dedup on
+        // insert; read back what actually landed rather than assuming all five.
+        let stored: Vec<String> = {
+            let conn = db.conn().unwrap();
+            let mut stmt = conn
+                .prepare("SELECT body_json FROM entities WHERE category = 'insight' AND archived = 0")
+                .unwrap();
+            stmt.query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+
+        // Exhaustive reference: any stored same-category body whose trigram
+        // similarity to the probe meets the threshold. This is exactly what
+        // find_near_duplicate computes without the length prefilter.
+        let reference_has_dup = |probe: &str| -> bool {
+            stored
+                .iter()
+                .any(|b| Database::trigram_similarity(b, probe) >= threshold)
+        };
+
+        let probes = [
+            r#"{"note":"the quick brown fox jumps over the lazy dog"}"#, // exact match
+            r#"{"note":"the quick brown fox jumps over the lazy dog."}"#, // near match
+            r#"{"x":"tiny"}"#,                                            // exact short match
+            r#"{"y":"no"}"#,                                              // short, no match
+            r#"{"note":"a totally different sentence with no overlap xyz"}"#, // long, no match
+        ];
+        for probe in probes {
+            let got = db
+                .find_near_duplicate("insight", probe, threshold, false)
+                .unwrap()
+                .is_some();
+            assert_eq!(
+                got,
+                reference_has_dup(probe),
+                "length prefilter changed dedup outcome for probe: {}",
+                probe
+            );
+        }
+
+        let _ = fs::remove_file(&path);
+    }
+
+    // #228: the opt-in FTS prefilter finds near-duplicates that share an FTS
+    // token (the common case) but, by design, can miss a near-duplicate that
+    // shares none. Both halves are asserted so the documented tradeoff is pinned.
+    #[test]
+    fn find_near_duplicate_fts_prefilter_tradeoff() {
+        let (db, path) = temp_db();
+        let threshold = 0.7;
+
+        // Token-sharing near-duplicate: caught by the FTS prefilter.
+        db.remember(&make_entity(
+            "f1",
+            "insight",
+            "f1",
+            r#"{"content":"hello world foo bar"}"#,
+        ))
+        .unwrap();
+        let token_sharing_probe = r#"{"content":"hello world foo baz"}"#;
+        assert!(
+            Database::trigram_similarity(
+                r#"{"content":"hello world foo bar"}"#,
+                token_sharing_probe
+            ) >= threshold,
+            "probe must be a genuine near-duplicate"
+        );
+        assert!(
+            db.find_near_duplicate("insight", token_sharing_probe, threshold, true)
+                .unwrap()
+                .is_some(),
+            "FTS prefilter should find a token-sharing near-duplicate"
+        );
+
+        // No-shared-token near-duplicate: the whole body is a single token, so a
+        // one-character difference yields disjoint FTS tokens despite >=0.7
+        // trigram overlap. The exact scan finds it; the FTS prefilter cannot.
+        db.remember(&make_entity("f2", "insight", "f2", "abcabcabcabc"))
+            .unwrap();
+        let no_shared_token_probe = "abcabcabcabd";
+        assert!(
+            Database::trigram_similarity("abcabcabcabc", no_shared_token_probe) >= threshold,
+            "probe must be a genuine near-duplicate"
+        );
+        assert!(
+            db.find_near_duplicate("insight", no_shared_token_probe, threshold, false)
+                .unwrap()
+                .is_some(),
+            "exact scan should find the no-shared-token near-duplicate"
+        );
+        assert!(
+            db.find_near_duplicate("insight", no_shared_token_probe, threshold, true)
+                .unwrap()
+                .is_none(),
+            "FTS prefilter is expected to miss a near-duplicate sharing no token"
         );
 
         let _ = fs::remove_file(&path);
