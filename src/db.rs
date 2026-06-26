@@ -1294,42 +1294,45 @@ impl Database {
                 .collect();
 
             if !words.is_empty() {
-                // FTS5 query: wrap each term in double-quotes to treat special chars literally
-                let escape_fts = |s: &str| -> String {
-                    // Double any double-quotes within the term (FTS5 escaping)
-                    s.replace('"', "\"\"")
-                };
-                let fts_query = words
-                    .iter()
-                    .map(|w| {
-                        let escaped = escape_fts(w);
-                        if escaped.is_empty() {
-                            "\"\"".to_string()
-                        } else {
-                            format!("\"{}\"", escaped)
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" OR ");
-                param_values.push(Box::new(fts_query));
+                // FTS5 escaping: double any double-quotes within the term.
+                let escape_fts = |s: &str| -> String { s.replace('"', "\"\"") };
 
-                // LIKE fallback: match each word as substring
-                let mut like_clauses = Vec::new();
-                for _ in &words {
-                    let idx = param_values.len() + 1;
-                    like_clauses.push(format!("body_json LIKE ?{}", idx));
-                }
-                for word in &words {
-                    param_values.push(Box::new(format!("%{}%", word.replace('\'', "''"))));
-                }
-
-                // When include_archived, skip FTS5 — archived entities have no FTS5 entries
                 if params.include_archived {
+                    // Archived entities are not in the FTS5 index, so this
+                    // opt-in path still scans body_json with a LIKE substring
+                    // match. It is the only path that can reach archived rows.
+                    let mut like_clauses = Vec::new();
+                    for word in &words {
+                        let idx = param_values.len() + 1;
+                        like_clauses.push(format!("body_json LIKE ?{}", idx));
+                        param_values.push(Box::new(format!("%{}%", word.replace('\'', "''"))));
+                    }
                     conditions.push(like_clauses.join(" OR "));
                 } else {
+                    // Prefix-match each term against the FTS5 index. The trailing
+                    // `*` makes "auth" still find "authentication" while keeping
+                    // the lookup on the index; the previous `OR body_json LIKE
+                    // '%term%'` forced a full body_json scan on every recall,
+                    // defeating FTS5. (Pure-infix matches like "oauth" for the
+                    // query "auth" are no longer returned; prefix matching covers
+                    // the common case without scanning the table.)
+                    let fts_query = words
+                        .iter()
+                        .map(|w| {
+                            let escaped = escape_fts(w);
+                            if escaped.is_empty() {
+                                "\"\"".to_string()
+                            } else {
+                                format!("\"{}\"*", escaped)
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" OR ");
+                    let idx = param_values.len() + 1;
+                    param_values.push(Box::new(fts_query));
                     conditions.push(format!(
-                        "((rowid IN (SELECT rowid FROM entities_fts WHERE entities_fts MATCH ?1)) OR {})",
-                        like_clauses.join(" OR ")
+                        "rowid IN (SELECT rowid FROM entities_fts WHERE entities_fts MATCH ?{})",
+                        idx
                     ));
                 }
             }
@@ -3824,6 +3827,49 @@ mod tests {
         let params2 = RecallParams::default();
         let results2 = db.recall(&params2).unwrap();
         assert_eq!(results2.len(), 2);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    // #227: keyword recall matches via the FTS5 index (with prefix matching)
+    // rather than an unconditional body_json LIKE scan. A prefix query must
+    // still find longer tokens, and an exact token must still match.
+    #[test]
+    fn recall_keyword_prefix_matches_via_fts() {
+        let (db, path) = temp_db();
+        db.remember(&make_entity(
+            "e1",
+            "insight",
+            "auth-note",
+            r#"{"content": "authentication flow uses tokens"}"#,
+        ))
+        .unwrap();
+
+        // Prefix: "auth" must still find the "authentication" token.
+        let prefix = db
+            .recall(&RecallParams {
+                query: "auth".to_string(),
+                limit: 10,
+                ..RecallParams::default()
+            })
+            .unwrap();
+        assert!(
+            prefix.iter().any(|e| e.id == "e1"),
+            "prefix query 'auth' should match 'authentication' via FTS5"
+        );
+
+        // Exact token still matches.
+        let exact = db
+            .recall(&RecallParams {
+                query: "tokens".to_string(),
+                limit: 10,
+                ..RecallParams::default()
+            })
+            .unwrap();
+        assert!(
+            exact.iter().any(|e| e.id == "e1"),
+            "exact token 'tokens' should match"
+        );
 
         let _ = fs::remove_file(&path);
     }
