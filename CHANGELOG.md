@@ -5,6 +5,36 @@ All notable changes to Mimir are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [2.4.0] - 2026-06-27
+
+Bi-temporal facts: Mimir now keeps a fact's prior versions when it changes and
+can answer "what did we believe at time T?" — pure SQLite, local, no cloud.
+
+### Added
+- **Bi-temporal fact history (#249, #250, #251).** When `remember()` overwrites
+  an existing `(category, key)` with new content, the prior version is now
+  snapshotted into a new `entity_history` table instead of being lost. Each
+  entity gains two time axes — **valid time** (`valid_from`/`valid_to`) and
+  **transaction time** (`recorded_at`/`invalidated_at`) — plus
+  `supersedes`/`superseded_by` links. The live `entities` table stays
+  one-row-per-key (its `UNIQUE(category, key)`, recall, and dedup paths are
+  untouched), so default recall remains live-only by construction. An identical
+  re-assertion creates no version (idempotent, compared on plaintext).
+- **`mimir_as_of` tool + `Database::as_of(category, key, as_of_unix_ms)`.**
+  Bi-temporal time-travel: returns the version of a fact that was live at a past
+  instant (or `found=false` if it had not been recorded yet). Brings the MCP
+  tool count to **43**.
+
+### Changed
+- `recorded_at_unix_ms` is now set to `created_at_unix_ms` on insert; the
+  `user_version` 1→2 migration backfills it for existing rows and adds the
+  bi-temporal columns + the `idx_entities_invalidated` live-fact index.
+
+### Documentation
+- Reconciled the README tool count (badge / comparison table / section header)
+  from a stale **40** to the actual **43**, adding the missing `mimir_extract`,
+  `mimir_ingest_file` (both shipped in 2.3.0) and `mimir_as_of` rows.
+
 ## [2.3.0] - 2026-06-27
 
 Local, offline knowledge tooling — structured extraction and multimodal document
