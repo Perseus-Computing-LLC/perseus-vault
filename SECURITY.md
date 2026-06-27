@@ -47,21 +47,33 @@ Mimir is a **local-first MCP server** that stores AI agent memory. It processes:
 
 ### Encryption
 
-Mimir supports **AES-256-GCM encryption at rest** for entity bodies.
+Mimir supports **opt-in AES-256-GCM encryption at rest** for entity bodies. It
+is **off by default**. See the full [Encryption Specification](./docs/ENCRYPTION.md)
+and [Threat Model](./docs/THREAT-MODEL.md) for precise guarantees and limits.
 
 | Property | Detail |
 |---|---|
-| Algorithm | AES-256-GCM |
-| Key derivation | From user-provided passphrase |
-| Encryption scope | Entity `body_json` field |
-| Encrypted at rest | ✅ All stored entities |
-| Encrypted in transit | ⚠️ MCP stdio transport (local only; HTTP transport uses TLS when configured) |
-| Key management | User responsibility — keys never leave the deployment boundary |
+| Algorithm | AES-256-GCM (96-bit random nonce per message; 128-bit tag) |
+| Key | Raw 256-bit key from a base64 **key file** — **no passphrase / KDF** |
+| AAD | `category:key` binds ciphertext to entity identity (anti-swap) |
+| Encryption scope | The `entities.body_json` field **only** |
+| Encrypted at rest | ⚠️ Body only. **The FTS5 index and all metadata are plaintext** — see caveat below |
+| Encrypted in transit | ⚠️ MCP stdio is local-only; secure the optional HTTP/SSE transport with TLS yourself |
+| Key management | Operator responsibility — keys never leave the machine; no escrow, no recovery |
 
 **Enable encryption:**
 ```bash
-mimir --encryption-key "your-strong-passphrase"
+mimir keygen                                  # writes ~/.mimir/secret.key (0o600 on Unix)
+mimir --encryption-key ~/.mimir/secret.key    # start with encryption on
 ```
+
+> ⚠️ **Body encryption does not make the database file opaque.** For keyword
+> search to work, the FTS5 index (`entities_fts`) stores the body in **plaintext**,
+> and metadata columns (category, key, tags, workspace, timestamps) are plaintext
+> by design. To keep content unreadable from the file itself, **also** enable
+> OS-level disk encryption (LUKS / FileVault / BitLocker). On Windows, Mimir does
+> not restrict the key file's ACL — do it yourself. Details in
+> [docs/ENCRYPTION.md](./docs/ENCRYPTION.md).
 
 ### Attack surface
 
