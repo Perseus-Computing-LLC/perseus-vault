@@ -8,47 +8,74 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # build.rs copies the bundled embedding model from here instead of hitting
+  # HuggingFace, so the (cached) model is fetched at most once per runner.
+  MIMIR_BUNDLED_MODEL_DIR: ${{ github.workspace }}/.model-cache
 
 jobs:
+  # Default build = bundled-embeddings (#237): this exercises the headline
+  # zero-config dense-search path, including real inference in the embedding test.
   test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
-
+      - name: Cache embedding model
+        uses: actions/cache@v4
+        with:
+          path: .model-cache
+          key: minilm-l6-v2-qint8-v1
+      - name: Fetch embedding model (if not cached)
+        shell: bash
+        run: |
+          mkdir -p .model-cache
+          base=https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main
+          [ -s .model-cache/model_qint8_avx512_vnni.onnx ] || curl -fL "$base/onnx/model_qint8_avx512_vnni.onnx" -o .model-cache/model_qint8_avx512_vnni.onnx
+          [ -s .model-cache/tokenizer.json ] || curl -fL "$base/tokenizer.json" -o .model-cache/tokenizer.json
+          # build.rs looks for these exact names:
+          cp .model-cache/model_qint8_avx512_vnni.onnx .model-cache/model_quantized.onnx
       - name: Build
         run: cargo build --verbose
-
       - name: Run tests
         run: cargo test --verbose
 
+  # All-platform first-class (#237): the bundled default must also build, LINK,
+  # and run on Windows MSVC. The esaxx-rs/ort static-vs-dynamic-CRT link clash was
+  # resolved by dropping tokenizers' esaxx_fast feature (#222), so this now works.
   test-windows:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
-
+      - name: Cache embedding model
+        uses: actions/cache@v4
+        with:
+          path: .model-cache
+          key: minilm-l6-v2-qint8-v1
+      - name: Fetch embedding model (if not cached)
+        shell: bash
+        run: |
+          mkdir -p .model-cache
+          base=https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main
+          [ -s .model-cache/model_qint8_avx512_vnni.onnx ] || curl -fL "$base/onnx/model_qint8_avx512_vnni.onnx" -o .model-cache/model_qint8_avx512_vnni.onnx
+          [ -s .model-cache/tokenizer.json ] || curl -fL "$base/tokenizer.json" -o .model-cache/tokenizer.json
+          cp .model-cache/model_qint8_avx512_vnni.onnx .model-cache/model_quantized.onnx
       - name: Build
         run: cargo build --verbose
-
       - name: Run tests
         run: cargo test --verbose
 
-  # Verify the optional ONNX embedding path (the `bundled-embeddings` feature)
-  # compiles AND links, guarding against `ort`-crate API drift like #212. Linux
-  # only: on Windows MSVC, esaxx-rs (static CRT, pulled via tokenizers) and ort's
-  # dynamic-CRT prebuilt binaries cannot be linked into the same executable.
-  bundled-embeddings:
+  # Guard the lean escape hatch: the binary must still build without the embedding
+  # stack for size-sensitive / unsupported-platform users.
+  lite-build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
-
-      - name: Build with bundled-embeddings
-        run: cargo build --features bundled-embeddings --verbose
+      - name: Build (no default features)
+        run: cargo build --no-default-features --verbose
+      - name: Test (no default features)
+        run: cargo test --no-default-features --verbose

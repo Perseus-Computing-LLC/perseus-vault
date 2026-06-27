@@ -237,6 +237,10 @@ mimir keygen --key-file ~/.mimir/secret.key
 ## Features
 
 ### Hybrid Search
+- **Offline dense search out of the box** — a quantized all-MiniLM-L6-v2 model is
+  compiled into the binary, so semantic recall works with **zero config and zero
+  network** (no Ollama, no API key, no model download). Build a lean binary
+  without it via `cargo build --no-default-features`.
 - **FTS5 keyword search** with LIKE fallback and Porter stemming expansion
 - **Dense vector search** via cosine similarity on stored embeddings
 - **Reciprocal Rank Fusion (RRF)** — combine keyword + vector results

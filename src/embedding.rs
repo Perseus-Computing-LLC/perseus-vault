@@ -11,15 +11,28 @@
 
 use std::path::PathBuf;
 
+// #237: the quantized model + tokenizer are fetched by build.rs into OUT_DIR and
+// compiled into the binary, so dense/hybrid search works fully offline with no
+// first-run download. Only present when the (default-on) feature is enabled.
+#[cfg(feature = "bundled-embeddings")]
+static BUNDLED_MODEL: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/model_quantized.onnx"));
+#[cfg(feature = "bundled-embeddings")]
+static BUNDLED_TOKENIZER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tokenizer.json"));
+
 /// Configuration for the local embedding backend.
 #[derive(Clone)]
 pub struct EmbeddingConfig {
     /// Whether local embeddings are enabled.
     #[allow(dead_code)]
     pub enabled: bool,
-    /// Path to the ONNX model file.
+    /// Path to the ONNX model file (used only when `bundled` is false).
     #[allow(dead_code)]
     pub model_path: PathBuf,
+    /// Use the model compiled into the binary (#237) rather than a file on disk.
+    /// True for the zero-config default; false when `--embedding-model` points at
+    /// a custom ONNX file.
+    #[allow(dead_code)]
+    pub bundled: bool,
 }
 
 impl EmbeddingConfig {
@@ -28,6 +41,7 @@ impl EmbeddingConfig {
         EmbeddingConfig {
             enabled: true,
             model_path: path,
+            bundled: false,
         }
     }
 
@@ -47,7 +61,12 @@ impl EmbeddingConfig {
 impl Default for EmbeddingConfig {
     fn default() -> Self {
         EmbeddingConfig {
-            enabled: false,
+            // #237: with the bundled model compiled in (default feature), local
+            // dense embeddings are available with zero config — so enable them by
+            // default. Without the feature (lite build) they stay off, falling
+            // back to a remote endpoint if one is configured.
+            enabled: cfg!(feature = "bundled-embeddings"),
+            bundled: cfg!(feature = "bundled-embeddings"),
             model_path: Self::default_path(),
         }
     }
@@ -148,7 +167,10 @@ pub fn generate_embedding(
     config: &EmbeddingConfig,
     text: &str,
 ) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
-    ensure_model(config).map_err(|e| format!("model setup failed: {}", e))?;
+    // Bundled model is compiled into the binary — no download/setup needed.
+    if !config.bundled {
+        ensure_model(config).map_err(|e| format!("model setup failed: {}", e))?;
+    }
 
     // Try native ort backend first
     #[cfg(feature = "bundled-embeddings")]
@@ -204,23 +226,40 @@ fn cached_ort_model(
     let mut map = cache
         .lock()
         .map_err(|_| "embedding model cache mutex poisoned")?;
-    if let Some(model) = map.get(&config.model_path) {
+    // Key the bundled model by a sentinel so it shares one cached session
+    // regardless of the (unused) default model_path.
+    let key = if config.bundled {
+        PathBuf::from("<bundled:all-MiniLM-L6-v2>")
+    } else {
+        config.model_path.clone()
+    };
+    if let Some(model) = map.get(&key) {
         return Ok(Arc::clone(model));
     }
 
-    let model_dir = config
-        .model_path
-        .parent()
-        .ok_or("model_path must have a parent directory")?;
-    let tokenizer_path = model_dir.join("tokenizer.json");
-    let session = Session::builder()?.commit_from_file(&config.model_path)?;
-    let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
-        .map_err(|e| format!("failed to load tokenizer: {}", e))?;
+    let (session, tokenizer) = if config.bundled {
+        // #237: load the compiled-in model + tokenizer straight from memory — no
+        // file on disk, no network.
+        let session = Session::builder()?.commit_from_memory(BUNDLED_MODEL)?;
+        let tokenizer = tokenizers::Tokenizer::from_bytes(BUNDLED_TOKENIZER)
+            .map_err(|e| format!("failed to load bundled tokenizer: {}", e))?;
+        (session, tokenizer)
+    } else {
+        let model_dir = config
+            .model_path
+            .parent()
+            .ok_or("model_path must have a parent directory")?;
+        let tokenizer_path = model_dir.join("tokenizer.json");
+        let session = Session::builder()?.commit_from_file(&config.model_path)?;
+        let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
+            .map_err(|e| format!("failed to load tokenizer: {}", e))?;
+        (session, tokenizer)
+    };
     let model = Arc::new(OrtModel {
         session: Mutex::new(session),
         tokenizer,
     });
-    map.insert(config.model_path.clone(), Arc::clone(&model));
+    map.insert(key, Arc::clone(&model));
     Ok(model)
 }
 
@@ -245,14 +284,22 @@ fn generate_with_ort(
         .map(|&m| m as i64)
         .collect();
 
+    // BERT models (incl. all-MiniLM-L6-v2) take three inputs; token_type_ids is
+    // all-zeros for a single sequence. The quantized export *requires* it (the
+    // graph has a token_type_embeddings Gather), so omitting it fails at runtime —
+    // pass it explicitly. (#237)
+    let type_ids: Vec<i64> = vec![0i64; token_ids.len()];
+
     // Use ndarray for tensor creation (ort 2.x uses ndarray). Bind the
     // batch-axis arrays to locals so they outlive the borrowing TensorRefs
     // through session.run (rc.12: from_array_view borrows the array). (#212)
     let input_2d = ndarray::Array1::from_vec(token_ids.clone()).insert_axis(ndarray::Axis(0));
     let mask_2d = ndarray::Array1::from_vec(attention_mask.clone()).insert_axis(ndarray::Axis(0));
+    let types_2d = ndarray::Array1::from_vec(type_ids).insert_axis(ndarray::Axis(0));
 
     let input_tensor = ort::value::TensorRef::from_array_view(&input_2d)?;
     let mask_tensor = ort::value::TensorRef::from_array_view(&mask_2d)?;
+    let types_tensor = ort::value::TensorRef::from_array_view(&types_2d)?;
 
     // ort 2.0.0-rc.12: `inputs!` yields the inputs directly (no longer a Result),
     // so there is no inner `?`. Lock the cached session for the run; the guard is
@@ -264,6 +311,7 @@ fn generate_with_ort(
     let outputs = session.run(ort::inputs![
         "input_ids" => input_tensor,
         "attention_mask" => mask_tensor,
+        "token_type_ids" => types_tensor,
     ])?;
 
     // Extract last_hidden_state and mean pool. rc.12 replaced `extract_tensor`
@@ -392,4 +440,41 @@ except Exception as e:
         .collect();
 
     Ok(embedding)
+}
+
+// ─── End-to-end test for the bundled model (#237) ────────────────────────
+// Runs only in a bundled-embeddings build: it loads the compiled-in quantized
+// model from memory and runs real inference, validating the in-memory load path
+// and the model's (input_ids, attention_mask) -> last_hidden_state signature —
+// which a plain `cargo build` would not exercise.
+#[cfg(all(test, feature = "bundled-embeddings"))]
+mod bundled_tests {
+    use super::*;
+
+    fn cosine(a: &[f32], b: &[f32]) -> f32 {
+        a.iter().zip(b).map(|(x, y)| x * y).sum()
+    }
+
+    #[test]
+    fn bundled_model_embeds_and_is_semantic() {
+        let cfg = EmbeddingConfig::default();
+        assert!(cfg.enabled && cfg.bundled, "bundled config should be on by default");
+
+        let v = generate_embedding(&cfg, "hello world").expect("bundled embedding works");
+        assert_eq!(v.len(), 384, "all-MiniLM-L6-v2 is 384-dim");
+
+        // Output is L2-normalized → unit norm.
+        let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-3, "expected unit vector, norm={norm}");
+
+        // Semantically related texts rank above an unrelated one (sanity that the
+        // quantized model produces meaningful embeddings, not noise).
+        let a = generate_embedding(&cfg, "cats and dogs").unwrap();
+        let b = generate_embedding(&cfg, "kittens and puppies").unwrap();
+        let c = generate_embedding(&cfg, "quarterly financial report").unwrap();
+        assert!(
+            cosine(&a, &b) > cosine(&a, &c),
+            "related texts should be more similar than unrelated ones"
+        );
+    }
 }

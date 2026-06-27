@@ -51,7 +51,11 @@ prost-types = { version = "0.14", optional = true }
 tokio-stream = { version = "0.1", optional = true }
 
 [features]
-default = []
+# bundled-embeddings is ON by default (#237): zero-config, zero-network dense /
+# hybrid semantic search out of the box. The quantized all-MiniLM-L6-v2 model is
+# fetched once by build.rs and compiled into the binary (no first-run download).
+# Build a lean binary without it via `cargo build --no-default-features`.
+default = ["bundled-embeddings"]
 bundled-embeddings = ["ort", "tokenizers", "ndarray"]
 grpc = ["tonic", "prost", "prost-types", "tonic-build"]
 
@@ -60,3 +64,6 @@ tower = { version = "0.5", features = ["util"] }
 
 [build-dependencies]
 tonic-build = { version = "0.13", optional = true }
+# Used by build.rs to fetch the quantized embedding model into OUT_DIR at build
+# time (only when the bundled-embeddings feature is active). Cached across builds.
+ureq = "2"

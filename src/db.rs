@@ -450,8 +450,11 @@ impl Database {
             }
         }
 
-        // 1. Local ONNX — if config is enabled and model file exists
-        if self.embedding_config.enabled && self.embedding_config.model_path.exists() {
+        // 1. Local ONNX — if enabled and either the model is compiled in (#237)
+        //    or a model file exists on disk.
+        if self.embedding_config.enabled
+            && (self.embedding_config.bundled || self.embedding_config.model_path.exists())
+        {
             match crate::embedding::generate_embedding(&self.embedding_config, text) {
                 Ok(vec) => {
                     // Cache successful embedding
@@ -4598,7 +4601,12 @@ mod tests {
     // results — the silent fallback was what masked the missing embedding.
     #[test]
     fn dense_recall_without_backend_errors_instead_of_silent_fts5() {
-        let (db, path) = temp_db();
+        let (mut db, path) = temp_db();
+        // Explicitly disable the embedding backend. With bundled-embeddings now on
+        // by default (#237) the default Db *has* a backend, so to exercise the
+        // "no backend" path (#226) we turn it off here — keeping this test valid in
+        // both the default and --no-default-features builds.
+        db.embedding_config.enabled = false;
         // Seed a row a keyword search WOULD match, so the pre-fix silent FTS5
         // fallback would have wrongly returned it as an Ok result.
         db.conn()
