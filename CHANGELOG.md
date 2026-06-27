@@ -5,6 +5,12 @@ All notable changes to Mimir are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [2.2.0] - 2026-06-27
+
+Local-first semantic memory, now true out of the box and on every platform, plus
+the first time-aware retrieval control. The headline since `2.1.0`: dense/hybrid
+search works with zero config and zero network by default.
+
 ### Added
 - **Time-aware / recency-boosted hybrid recall (#235).** `mimir_recall` accepts an
   optional `recency_half_life_secs` for `mode: "hybrid"`. When set, each fused
@@ -28,7 +34,10 @@ All notable changes to Mimir are documented here. This project adheres to
   embedding failed at runtime. Now passed explicitly.
 
 ### CI
-- The default build (now bundled-embeddings) is built **and tested** on Linux and
-  **Windows MSVC** — including an end-to-end test that runs real inference through
-  the compiled-in model — confirming the single-binary semantic-search claim on
-  every platform. Added a `lite-build` job guarding `--no-default-features`.
+- The default build (now bundled-embeddings) is built **and tested** on **Linux,
+  Windows MSVC, and macOS** (#239) — including an end-to-end test that runs real
+  inference through the compiled-in model — confirming the single-binary
+  semantic-search claim on every platform a developer runs. Added a `lite-build`
+  job guarding `--no-default-features`.
+
+[2.2.0]: https://github.com/Perseus-Computing-LLC/mimir/compare/v2.1.0...v2.2.0

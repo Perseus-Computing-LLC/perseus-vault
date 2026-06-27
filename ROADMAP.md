@@ -14,10 +14,10 @@ Zero runtime dependencies. Structured entity model with journal events and state
 
 ---
 
-## Status — 2026-06-24
+## Status — 2026-06-27
 
-- **Latest release:** `v2.0.1`
-- **`main`:** `2.1.0` (unreleased) — adds trust-aware recall ranking and top-level `--db`
+- **Latest release:** `v2.1.0` (Performance & Reliability)
+- **`main`:** `2.2.0` (unreleased) — bundles offline embeddings by default, adds time-aware recall, and finishes all-platform CI
 - **MCP tools:** **40**, spanning entities, search/RAG, journal, state, graph, lifecycle, multi-agent/federation, and vault
 - **In one line:** everything originally planned from v0.1 through the v2.0 "Platform" milestone has shipped. This document is being corrected to reflect that, and the forward section is deliberately short and honest.
 
@@ -61,25 +61,36 @@ Zero runtime dependencies. Structured entity model with journal events and state
 - **Additional tools since the docs last counted:** `autocohere`, `bench`, `correct`, `supersede`,
   `synthesize`, `share`, `purge`, `maintenance`, `recall_when`, `get_entity` — **40 tools total**
 
-### Unreleased on `main` (`2.1.0`)
+### v2.1.0 — Performance & Reliability ✅ (2026-06-26)
 - **Trust-aware recall:** `mimir_recall` ranks verified sources above unverified drafts
   (uses `verified`/`source`/`certainty`; on by default at a low weight). Consistent with `mimir_conflicts`.
 - **CLI:** top-level `--db` accepted when running the server directly (`mimir --db <path>`),
   matching the documented MCP host config.
+- **Performance & reliability:** HTTP/SSE connection pool (concurrent reads under WAL),
+  cached ONNX session/tokenizer, `dense_search` top-k hydration, recall-ranking index and
+  batched side-effects; `bundled-embeddings` made to link on Windows MSVC.
+
+### Unreleased on `main` (`2.2.0`)
+- **Offline embeddings bundled by default (#237/#238):** the quantized all-MiniLM-L6-v2 model
+  is compiled into the binary and the embedding backend is on by default — dense/hybrid search
+  works with zero config and zero network. Lean build via `--no-default-features`.
+- **Time-aware / recency-boosted recall (#235):** optional `recency_half_life_secs` weight on
+  the hybrid RRF fusion step, default off, fully local.
+- **All-platform CI (#239):** the bundled default is built and tested (with real inference) on
+  Linux, Windows MSVC, and macOS.
 
 ---
 
-## Now — Foundation
+## Now — Foundation ✅ (done as of `2.2.0`)
 
 **Theme: "what we ship matches what we say."** Stabilize the base before adding capability.
 
-- **Single source of version truth:** `Cargo.toml`, the README badge, git tags, and this doc agree.
-  (`Cargo.toml` had drifted *behind* the latest release tag.)
-- **Doc accuracy:** correct the tool count (40), audit README capability claims against code,
-  and collapse the duplicate `docs/ROADMAP.md`.
-- **Cross-platform CI:** Windows in the matrix; resolve the gnu/mingw build gap so all three
-  platforms are first-class (today the gnu toolchain can't build locally without mingw).
-- **Release discipline:** start a `CHANGELOG.md`, commit to semver, and cut a clean `2.1.0`.
+- ✅ **Single source of version truth:** `Cargo.toml`, the README badge, git tags, and this doc agree.
+- ✅ **Doc accuracy:** tool count corrected (40), README claims audited against code.
+- ✅ **Cross-platform CI:** Linux, Windows MSVC, and macOS all first-class in the matrix (#239).
+- ✅ **Release discipline:** `CHANGELOG.md` adopted, semver, clean releases (`2.1.0`, `2.2.0`).
+- ✅ **Bundled-by-default offline embeddings (#237/#238):** model compiled into the binary —
+  zero-network semantic search out of the box.
 
 ## Next — Remaining platform hardening
 
@@ -87,8 +98,8 @@ The genuinely-unshipped pieces of the "Mimir as infrastructure" goal:
 
 - **Clustering / HA:** leader election and read replicas for high-availability deployments
   (the one part of the v2.0 platform theme not yet built).
-- **Bundled-by-default offline embeddings:** ship the model in the binary rather than the current
-  opt-in `ort` download — truly zero-network semantic search out of the box.
+- **Local knowledge extraction (#234):** optional, pluggable, local extractor over stored
+  memories — no cloud key, default off, to preserve the air-gapped path.
 - **Scale:** 100K+ entity stress tests with documented recall latency budgets.
 - **Federation maturation:** sync health/observability (lag, conflict rate, entity drift) for `mimir_federate`.
 
