@@ -999,6 +999,81 @@ pub fn handle_ingest(db: &Database, args: Value) -> Result<String, String> {
     }
 }
 
+#[derive(Debug, Deserialize)]
+pub struct IngestFileArgs {
+    /// Path to the document file to ingest.
+    pub path: String,
+    #[serde(default)]
+    pub category: Option<String>,
+    #[serde(default)]
+    pub key: Option<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+}
+
+/// Ingest a document file into memory by extracting its text **locally** (#236).
+/// Plaintext/markdown work in any build; DOCX/PDF need `--features multimodal`.
+/// The extracted text is stored as a normal entity (category default "document",
+/// key default = file name) so it is recallable like any other memory.
+pub fn handle_ingest_file(db: &Database, args: Value) -> Result<String, String> {
+    let a: IngestFileArgs = serde_json::from_value(args)
+        .map_err(|e| format!("Invalid ingest_file arguments: {}", e))?;
+    let path = std::path::Path::new(&a.path);
+
+    let text = crate::multimodal::extract_text(path)?;
+    let char_count = text.chars().count();
+
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("document")
+        .to_string();
+    let category = a.category.unwrap_or_else(|| "document".to_string());
+    let key = a.key.unwrap_or(file_name);
+
+    let body = json!({ "content": text, "source_path": a.path }).to_string();
+    let now = now_ms();
+    let raw_id = Uuid::new_v4().to_string().replace('-', "");
+    let id = format!("mem-{}", &raw_id[..12.min(raw_id.len())]);
+    let entity = Entity {
+        id,
+        category,
+        key,
+        body_json: body,
+        status: "active".to_string(),
+        entity_type: "document".to_string(),
+        tags: a.tags,
+        decay_score: 1.0,
+        retrieval_count: 0,
+        layer: "buffer".to_string(),
+        topic_path: String::new(),
+        archived: false,
+        archive_reason: String::new(),
+        links: vec![],
+        verified: false,
+        source: "ingest_file".to_string(),
+        always_on: false,
+        certainty: 0.5,
+        workspace_hash: String::new(),
+        agent_id: String::new(),
+        visibility: "workspace".to_string(),
+        created_at_unix_ms: now,
+        last_accessed_unix_ms: now,
+        embedding: None,
+    };
+    let (eid, action) = db
+        .remember(&entity)
+        .map_err(|e| format!("Remember failed: {}", e))?;
+    Ok(json!({
+        "id": eid,
+        "action": action,
+        "category": entity.category,
+        "key": entity.key,
+        "chars": char_count,
+    })
+    .to_string())
+}
+
 pub fn handle_embed(db: &Database, args: Value) -> Result<String, String> {
     let params: EmbedParams =
         serde_json::from_value(args).map_err(|e| format!("Invalid embed arguments: {}", e))?;

@@ -4995,6 +4995,38 @@ mod tests {
     }
 
     #[test]
+    fn handle_ingest_file_stores_and_recalls_plaintext_document() {
+        // #236: mimir_ingest_file extracts a document's text locally and stores it
+        // as a normal, recallable entity. Plaintext works without the multimodal
+        // feature.
+        let (db, _path) = temp_db();
+        let p = std::env::temp_dir().join(format!("mimir-ingest-{}.md", uuid::Uuid::new_v4()));
+        std::fs::write(&p, "# Notes\n\nThe widget API uses cursor pagination.").unwrap();
+
+        let out = crate::tools::handle_ingest_file(
+            &db,
+            serde_json::json!({ "path": p.to_string_lossy(), "category": "docs" }),
+        )
+        .expect("ingest_file should succeed");
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["category"], "docs");
+        assert!(v["chars"].as_i64().unwrap() > 0);
+
+        let found = db
+            .recall(&crate::models::RecallParams {
+                query: "cursor pagination".to_string(),
+                limit: 5,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(
+            found.iter().any(|e| e.body_json.contains("cursor pagination")),
+            "ingested document must be recallable"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
     #[ignore] // Requires ~10s to create entities; run manually with --ignored
     fn stress_100k_entities_recall_and_decay() {
         // Roadmap target: FTS5 recall < 5s, decay tick < 30s at 100K entities.

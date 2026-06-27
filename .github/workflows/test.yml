@@ -107,3 +107,18 @@ jobs:
         run: cargo build --no-default-features --verbose
       - name: Test (no default features)
         run: cargo test --no-default-features --verbose
+
+  # Guard the optional multimodal document-extraction feature (#236): it pulls
+  # zip + pdf-extract, so make sure it still builds and its tests pass. Built
+  # without default features to isolate the multimodal deps from the embedding
+  # stack and keep the job fast.
+  multimodal-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Build (multimodal, no embeddings)
+        run: cargo build --no-default-features --features multimodal --verbose
+      - name: Test (multimodal, no embeddings)
+        run: cargo test --no-default-features --features multimodal multimodal --verbose

@@ -6,6 +6,12 @@ All notable changes to Mimir are documented here. This project adheres to
 ## [Unreleased]
 
 ### Added
+- **Local multimodal document ingestion (#236).** New `mimir_ingest_file` tool
+  extracts a document's text **locally** (no cloud, no network) and stores it as a
+  recallable entity. Plaintext / markdown / structured-text work in any build;
+  **DOCX and PDF** are supported when built with the new optional
+  `--features multimodal` (pulls `zip` + `pdf-extract`), keeping the lean default
+  binary dependency-free. Brings the MCP tool count to **42**.
 - **Local knowledge extraction (#234).** New `mimir_extract` tool turns raw text
   (or a stored entity) into structured items — facts, preferences, temporal
   events, episodes — via a fully **local, deterministic, rule-based** extractor:

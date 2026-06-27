@@ -50,6 +50,13 @@ prost = { version = "0.14", optional = true }
 prost-types = { version = "0.14", optional = true }
 tokio-stream = { version = "0.1", optional = true }
 
+# Optional: local multimodal document text extraction (#236). DOCX via `zip` +
+# in-tree XML text stripping; PDF via `pdf-extract`. Kept OUT of the default
+# build so the lean single-binary / zero-dependency story is unchanged; enable
+# with `--features multimodal`. All extraction is local (no cloud, no network).
+zip = { version = "2", optional = true, default-features = false, features = ["deflate"] }
+pdf-extract = { version = "0.7", optional = true }
+
 [features]
 # bundled-embeddings is ON by default (#237): zero-config, zero-network dense /
 # hybrid semantic search out of the box. The quantized all-MiniLM-L6-v2 model is
@@ -58,6 +65,8 @@ tokio-stream = { version = "0.1", optional = true }
 default = ["bundled-embeddings"]
 bundled-embeddings = ["ort", "tokenizers", "ndarray"]
 grpc = ["tonic", "prost", "prost-types", "tonic-build"]
+# Local document text extraction for mimir_ingest_file (DOCX/PDF). Opt-in.
+multimodal = ["zip", "pdf-extract"]
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

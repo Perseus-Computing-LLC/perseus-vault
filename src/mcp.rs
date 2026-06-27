@@ -203,7 +203,7 @@ pub fn handle_request(
     }
 }
 
-/// Build the tools/list response with all 41 tools including outputSchema and annotations.
+/// Build the tools/list response with all 42 tools including outputSchema and annotations.
 fn list_tools(id: Option<Value>) -> JsonRpcResponse {
     // The tool registry is a compile-time constant. Parse it exactly once per
     // process and reuse the cached Value instead of re-parsing ~1.8k lines of
@@ -591,6 +591,33 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
           "items": {"type": "string"},
           "description": "Error messages from connectors that failed"
         }
+      }
+    },
+    "annotations": {
+      "destructiveHint": true
+    }
+  },
+  {
+    "name": "mimir_ingest_file",
+    "description": "Ingest a document file into memory by extracting its text LOCALLY (no cloud, no network). Plaintext/markdown/structured-text work in any build; DOCX and PDF require a binary built with --features multimodal (otherwise a clear error is returned). The extracted text is stored as a normal entity (recallable via mimir_recall). category defaults to 'document', key defaults to the file name.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "path": { "type": "string", "description": "Path to the document file to ingest" },
+        "category": { "type": "string", "description": "Entity category (default 'document')" },
+        "key": { "type": "string", "description": "Entity key (default: the file name)" },
+        "tags": { "type": "array", "items": { "type": "string" }, "description": "Optional tags" }
+      },
+      "required": ["path"]
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Stored entity id" },
+        "action": { "type": "string", "description": "created or updated" },
+        "category": { "type": "string" },
+        "key": { "type": "string" },
+        "chars": { "type": "integer", "description": "Characters of text extracted" }
       }
     },
     "annotations": {
@@ -2101,6 +2128,8 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
         "mimir_forget" => tools::handle_forget(db, args).map_err(|e| e.to_string()),
 
         "mimir_ingest" => tools::handle_ingest(db, args).map_err(|e| e.to_string()),
+
+        "mimir_ingest_file" => tools::handle_ingest_file(db, args).map_err(|e| e.to_string()),
 
         "mimir_embed" => tools::handle_embed(db, args).map_err(|e| e.to_string()),
 

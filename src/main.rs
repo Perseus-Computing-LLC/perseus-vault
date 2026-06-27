@@ -5,6 +5,7 @@ mod encryption;
 mod extraction;
 mod mcp;
 mod models;
+mod multimodal;
 mod schema;
 mod tools;
 mod transport;
