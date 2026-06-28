@@ -5,6 +5,27 @@ All notable changes to Mimir are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [2.5.0] - 2026-06-27
+
+Bi-temporal facts, completed: conflicting facts can now be actively resolved
+(not just detected), with the loser superseded into history rather than deleted.
+
+### Added
+- **Opt-in conflict invalidation (#253).** `mimir_conflicts` gains `resolve=true`:
+  the lower-certainty side of a clear conflict is invalidated — superseded into
+  `entity_history` and removed from the live table, so it drops out of recall but
+  stays reversible and time-travelable via `mimir_as_of`. Conservative by design:
+  `dry_run` defaults to **true** (an accidental `resolve` previews, never mutates),
+  and pairs whose certainties are within `certainty_margin` (default 0.2) are
+  skipped as ambiguous. Detection (`resolve=false`) is unchanged and remains the
+  default. New `Database::invalidate_entity` / `Database::resolve_conflicts`.
+
+### Tested
+- **History-resurrection invariant guard (#257).** Locks in that superseded
+  versions and conflict-invalidated losers (both in `entity_history`) are never
+  resurfaced by `decay_tick` or `recall` — the architecture already guarantees
+  this; the guard fails loudly if a future change breaks it.
+
 ## [2.4.0] - 2026-06-27
 
 Bi-temporal facts: Mimir now keeps a fact's prior versions when it changes and

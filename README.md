@@ -174,7 +174,7 @@ Any MCP-compatible framework works with Mimir directly. See
 | Tool | Description |
 |---|---|
 | `mimir_score` | Assign quality score (0.0-1.0). |
-| `mimir_conflicts` | Detect near-duplicate entities via trigram similarity. |
+| `mimir_conflicts` | Detect conflicting entities via trigram similarity; opt-in `resolve=true` invalidates the lower-certainty side into history (reversible, dry-run by default). |
 | `mimir_correct` | Structured correction capture for learning from errors. |
 | `mimir_supersede` | Mark a new fact as superseding an old one (sets the old entity to `deprecated`). |
 
