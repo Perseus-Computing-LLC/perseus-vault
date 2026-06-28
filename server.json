@@ -2,7 +2,7 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.Perseus-Computing-LLC/mimir",
   "title": "Mimir, persistent memory engine for AI agents",
-  "description": "MCP-native, local-first persistent memory for AI agents. A single Rust binary: SQLite with FTS5 plus hybrid vector search, AES-256-GCM encryption at rest, bi-temporal fact history, Ebbinghaus decay, journal audit trail, and conflict detection. Zero network calls, no API keys. 43 MCP tools over stdio. Distributed via GHCR and GitHub releases.",
+  "description": "Local-first MCP memory server: SQLite, FTS5 and vector search, AES-256-GCM. 43 tools, no cloud.",
   "version": "2.7.0",
   "packages": [{
     "registryType": "oci",
