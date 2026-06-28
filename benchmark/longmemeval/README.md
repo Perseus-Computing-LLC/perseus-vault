@@ -90,6 +90,46 @@ Reproduce: `python benchmark/longmemeval/run.py --data longmemeval_s_cleaned.jso
 (signature `f82bee43...`; deterministic run-to-run).
 <!-- RESULTS-END -->
 
+## Stage 2: QA accuracy (answer generation + LongMemEval's official judge)
+
+`qa.py` is the second stage. It feeds context to a named LLM, writes answers in
+LongMemEval's hypothesis format, and is graded by **LongMemEval's own judge** (we do
+not invent one). It runs every system through the **same** model at temperature 0.
+
+Systems: `fullcontext` (all ~48 sessions), `mimir` (top-k hybrid-retrieved sessions),
+`oracle` (gold sessions only, upper bound).
+
+**Token efficiency (offline, no key needed, `--dry-run`).** On 50 `_s` instances,
+k=5 retrieval:
+
+| system | avg sessions/q | relative context | 
+|---|--:|--:|
+| fullcontext | 48.7 | 8.0x (baseline) |
+| **mimir (k=5)** | **5.0** | **1.0x (8.0x less)** |
+| oracle | 1.0 | ~34x less |
+
+**Mimir feeds the LLM ~8x fewer tokens than dumping the whole history** — and from the
+retrieval result above, hybrid recall@5 is 97%, so those 5 sessions contain the evidence
+almost every time. (Token counts use tiktoken when present, else a ~4-chars/token
+estimate; the *ratio* is tokenizer-independent. This is the honest, reproducible version
+of the deprecated doc's "82x fewer tokens" claim.)
+
+**Accuracy (needs a named LLM + judge).** Not run here (kept honest — no number without
+named models). To produce it:
+
+```bash
+export OPENAI_API_KEY=...        # OPENAI_BASE_URL optional (OpenAI / OpenRouter / local)
+python benchmark/longmemeval/qa.py --data longmemeval_s_cleaned.json \
+  --systems fullcontext mimir --model <named-model> --k 5
+# then grade each hypotheses file with LongMemEval's OFFICIAL judge:
+#   cd <LongMemEval>/src/evaluation
+#   python3 evaluate_qa.py <judge-model> hypotheses-<system>-<model>.jsonl ../../data/longmemeval_oracle.json
+#   python3 print_qa_metrics.py <judge-model> hypotheses-<system>-<model>.jsonl.log ../../data/longmemeval_oracle.json
+```
+
+Run every system's hypotheses through the **same** judge model, and report the LLM and
+judge by name beside the number.
+
 ## Honesty notes (read before quoting a number)
 
 - This is a **retrieval** number, not end-to-end QA accuracy. Do not compare it to
