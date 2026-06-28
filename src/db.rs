@@ -1550,8 +1550,20 @@ impl Database {
             sql.push_str(&conditions.join(" AND "));
         }
 
-        // Rank by retrieval count + recency
-        sql.push_str(" ORDER BY retrieval_count DESC, last_accessed_unix_ms DESC");
+        // Rank by retrieval count + recency, with a stable total-order tie-break.
+        //
+        // #254 (determinism): retrieval_count and last_accessed_unix_ms both
+        // MUTATE on every non-side-effect-skipping recall, so without a stable
+        // final key two entities that tie on both columns could swap order
+        // run-to-run. Appending `id ASC` makes the ordering a total order that
+        // depends only on stored identity once the leading keys tie. Combined
+        // with `skip_side_effects = true` (which suppresses the retrieval-count
+        // and last-accessed bumps), recall over a frozen DB is byte-identical
+        // across runs — the property Perseus's @memory reproducibility claim
+        // relies on.
+        sql.push_str(
+            " ORDER BY retrieval_count DESC, last_accessed_unix_ms DESC, id ASC",
+        );
 
         let safe_limit = params.limit.clamp(0, 1000);
         sql.push_str(&format!(" LIMIT ?{}", param_values.len() + 1));
@@ -2334,6 +2346,73 @@ impl Database {
         let path = std::path::Path::new(&self.db_path);
         let metadata = std::fs::metadata(path)?;
         Ok(metadata.len())
+    }
+
+    /// Cheap, deterministic content digest of the non-archived entity set (#256).
+    ///
+    /// Returns a `StateDigest` that Perseus (or any caller) can use as a cache
+    /// key for resolved `@memory` outputs: the digest is stable while the
+    /// relevant DB state is unchanged, and changes iff that state changes —
+    /// covering inserts, deletes, and in-place edits (including same-length
+    /// edits, which a length-only signal would miss).
+    ///
+    /// Implementation notes:
+    /// - Scope is non-archived entities only, because recall reads that set.
+    ///   Archiving a row therefore changes the digest (it leaves the recall
+    ///   scope), and so does un-archiving.
+    /// - The content hash is an order-independent FNV-1a over each row's
+    ///   `id` and `body_json`. Each row is folded into its own FNV-1a value and
+    ///   the per-row values are XOR-combined, so the digest does not depend on
+    ///   row return order (no ORDER BY needed — cheaper, and robust to SQLite
+    ///   scan-order changes). `id` is included so that two rows swapping bodies
+    ///   still changes the digest.
+    /// - `count` is carried alongside the hash so that the pathological case of
+    ///   XOR cancellation (extremely unlikely, but possible in principle) cannot
+    ///   produce a collision between materially different states.
+    ///
+    /// Cost is a single sequential scan of `(id, body_json)` with no embedding,
+    /// no network, and no per-row allocation beyond the column reads — cheap
+    /// relative to any recall that embeds a query.
+    pub fn state_digest(&self) -> Result<crate::models::StateDigest, Box<dyn std::error::Error>> {
+        let conn = self.conn()?;
+        let mut stmt =
+            conn.prepare("SELECT id, body_json FROM entities WHERE archived = 0")?;
+        let mut rows = stmt.query([])?;
+
+        const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+        const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+        fn fnv1a(seed: u64, bytes: &[u8]) -> u64 {
+            let mut h = seed;
+            for b in bytes {
+                h ^= *b as u64;
+                h = h.wrapping_mul(FNV_PRIME);
+            }
+            h
+        }
+
+        let mut combined: u64 = 0;
+        let mut count: u64 = 0;
+        while let Some(row) = rows.next()? {
+            let id: String = row.get(0)?;
+            let body: String = row.get(1)?;
+            // Per-row FNV-1a over id + NUL separator + body, XOR-folded so the
+            // result is independent of row scan order.
+            let mut h = fnv1a(FNV_OFFSET, id.as_bytes());
+            h = fnv1a(h, b"\x00");
+            h = fnv1a(h, body.as_bytes());
+            combined ^= h;
+            count += 1;
+        }
+
+        // Mix the count into the final hash so XOR cancellation cannot collide
+        // states with different cardinalities.
+        let digest = fnv1a(combined, &count.to_le_bytes());
+
+        Ok(crate::models::StateDigest {
+            digest: format!("{:016x}", digest),
+            entity_count: count,
+        })
     }
 
     /// Migrate from v0.1.x database.
@@ -4832,6 +4911,129 @@ mod tests {
         let params2 = RecallParams::default();
         let results2 = db.recall(&params2).unwrap();
         assert_eq!(results2.len(), 2);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    // #254 (determinism): recall ordering must be a stable total order so that
+    // @memory resolution over a frozen DB is byte-identical run-to-run. Entities
+    // that tie on (retrieval_count, last_accessed_unix_ms) must fall back to a
+    // deterministic `id ASC` tie-break, and skip_side_effects must suppress the
+    // access-state mutations that would otherwise perturb the sort keys.
+    #[test]
+    fn recall_is_deterministic_on_frozen_db_with_ties() {
+        let (db, path) = temp_db();
+
+        // Five entities sharing the same category and an identical fixed
+        // last_accessed timestamp + retrieval_count, so the only distinguishing
+        // sort key is the id tie-break. Insert in shuffled id order to prove the
+        // ORDER BY — not insertion order — determines the result.
+        let fixed_ts = 1_700_000_000_000_i64;
+        for raw_id in ["e3", "e1", "e5", "e2", "e4"] {
+            let mut e = make_entity(raw_id, "decision", raw_id, r#"{"d": "x"}"#);
+            e.retrieval_count = 0;
+            e.last_accessed_unix_ms = fixed_ts;
+            db.remember(&e).unwrap();
+        }
+
+        let params = RecallParams {
+            category: Some("decision".to_string()),
+            limit: 10,
+            // Frozen DB: do not mutate retrieval_count / last_accessed on read.
+            skip_side_effects: true,
+            ..RecallParams::default()
+        };
+
+        // First recall establishes the order.
+        let first: Vec<String> = db
+            .recall(&params)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.id)
+            .collect();
+
+        // Ties resolve by id ASC.
+        assert_eq!(
+            first,
+            vec![
+                "e1".to_string(),
+                "e2".to_string(),
+                "e3".to_string(),
+                "e4".to_string(),
+                "e5".to_string()
+            ],
+            "tie-break must order equal-rank entities by id ASC"
+        );
+
+        // Repeated recalls over the unchanged DB are byte-identical.
+        for _ in 0..5 {
+            let again: Vec<String> = db
+                .recall(&params)
+                .unwrap()
+                .into_iter()
+                .map(|e| e.id)
+                .collect();
+            assert_eq!(again, first, "recall over a frozen DB must be deterministic");
+        }
+
+        let _ = fs::remove_file(&path);
+    }
+
+    // #256: state_digest must be stable while DB state is unchanged and must
+    // change iff relevant state changes — covering inserts, in-place edits
+    // (including same-length edits), deletes (archive), and not depend on
+    // scan/return order.
+    #[test]
+    fn state_digest_changes_iff_state_changes() {
+        let (db, path) = temp_db();
+
+        db.remember(&make_entity("e1", "decision", "k1", r#"{"d":"alpha"}"#))
+            .unwrap();
+        db.remember(&make_entity("e2", "decision", "k2", r#"{"d":"beta"}"#))
+            .unwrap();
+
+        let d0 = db.state_digest().unwrap();
+        assert_eq!(d0.entity_count, 2);
+
+        // Stability: recall side-effects (retrieval_count / last_accessed bumps)
+        // must NOT change the content digest.
+        let _ = db
+            .recall(&RecallParams {
+                category: Some("decision".to_string()),
+                limit: 10,
+                ..RecallParams::default()
+            })
+            .unwrap();
+        let d_after_recall = db.state_digest().unwrap();
+        assert_eq!(
+            d0.digest, d_after_recall.digest,
+            "recall access-state bumps must not change the content digest"
+        );
+
+        // In-place edit, SAME body length ("alpha" -> "gamma"): a length-only
+        // signal would miss this; the content digest must catch it.
+        db.remember(&make_entity("e1", "decision", "k1", r#"{"d":"gamma"}"#))
+            .unwrap();
+        let d1 = db.state_digest().unwrap();
+        assert_ne!(d0.digest, d1.digest, "same-length edit must change digest");
+        assert_eq!(d1.entity_count, 2);
+
+        // Insert changes digest and count.
+        db.remember(&make_entity("e3", "decision", "k3", r#"{"d":"delta"}"#))
+            .unwrap();
+        let d2 = db.state_digest().unwrap();
+        assert_ne!(d1.digest, d2.digest);
+        assert_eq!(d2.entity_count, 3);
+
+        // Archive (leaves recall scope) changes digest and count.
+        db.forget("decision", "k3", "test").unwrap();
+        let d3 = db.state_digest().unwrap();
+        assert_ne!(d2.digest, d3.digest, "archiving must change digest");
+        assert_eq!(d3.entity_count, 2);
+
+        // Determinism: recomputing on unchanged state yields the same digest.
+        let d3b = db.state_digest().unwrap();
+        assert_eq!(d3.digest, d3b.digest);
 
         let _ = fs::remove_file(&path);
     }

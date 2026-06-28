@@ -298,6 +298,15 @@ enum Commands {
         db: String,
     },
 
+    /// Print a cheap, deterministic content digest of the recall-visible
+    /// entity set as JSON (#256). Use as a cache key for resolved @memory
+    /// outputs: stable while DB state is unchanged, changes iff it changes.
+    StateDigest {
+        /// SQLite database path
+        #[arg(long, default_value_t = default_db_path())]
+        db: String,
+    },
+
     /// Export all non-archived entities to .md files in a vault directory
     VaultExport {
         /// SQLite database path
@@ -511,6 +520,16 @@ fn main() {
                 Ok(stats) => print_json(&stats),
                 Err(e) => {
                     eprintln!("mimir: stats failed: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        Some(Commands::StateDigest { db: ref db_path }) => {
+            let database = open_db_or_exit(db_path);
+            match database.state_digest() {
+                Ok(d) => print_json(&d),
+                Err(e) => {
+                    eprintln!("mimir: state-digest failed: {}", e);
                     std::process::exit(1);
                 }
             }

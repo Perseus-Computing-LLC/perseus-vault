@@ -391,6 +391,17 @@ pub struct CohereReport {
     pub completed_at_unix_ms: i64,
 }
 
+/// Cheap, deterministic content digest of the recall-visible entity set (#256).
+/// Used as a cache key for resolved `@memory` outputs: stable while DB state is
+/// unchanged, changes iff that state changes.
+#[derive(Debug, Clone, Serialize)]
+pub struct StateDigest {
+    /// 16-hex-char FNV-1a digest over (id, body_json) of non-archived entities.
+    pub digest: String,
+    /// Number of non-archived entities folded into the digest.
+    pub entity_count: u64,
+}
+
 /// Full database statistics.
 #[derive(Debug, Clone, Serialize)]
 pub struct Stats {
