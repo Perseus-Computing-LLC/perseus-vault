@@ -4574,6 +4574,80 @@ mod tests {
     }
 
     #[test]
+    fn decay_and_recall_never_resurrect_superseded_or_invalidated_history() {
+        // Invariant guard (D5): superseded versions (D2) and conflict-invalidated
+        // losers (D4) live in entity_history, which decay_tick and recall never
+        // touch — so a history-only fact must never resurface. This locks in the
+        // architecture so a future change that scanned entity_history in those
+        // paths would fail here.
+        let (db, path) = temp_db();
+
+        // (a) D2 supersession: v1's unique token survives only in history.
+        let v1 = make_entity("e-d5a", "facts", "k", r#"{"note":"zylophone marker alpha unique"}"#);
+        db.remember(&v1).unwrap();
+        let v2 = make_entity("ignored", "facts", "k", r#"{"note":"completely replaced content beta"}"#);
+        db.remember(&v2).unwrap();
+        assert_eq!(db.history_versions("facts", "k").unwrap().len(), 1);
+
+        // (b) D4 invalidation: a low-certainty conflicting belief moved to history.
+        let mut keep = make_entity(
+            "keep-id",
+            "beliefs",
+            "keep",
+            r#"{"note":"the moon orbits the earth roughly monthly"}"#,
+        );
+        keep.certainty = 0.9;
+        db.remember(&keep).unwrap();
+        let mut drop_e = make_entity(
+            "drop-id",
+            "beliefs",
+            "drop",
+            r#"{"note":"qwertyx distinct sushi friday marker token"}"#,
+        );
+        drop_e.certainty = 0.1;
+        db.remember(&drop_e).unwrap();
+        let r = db.resolve_conflicts("beliefs", 0.4, 10, 0, 0.2, false).unwrap();
+        assert_eq!(r["resolved"], serde_json::json!(1));
+
+        // Decay must run cleanly (it scans only live entities).
+        db.decay_tick().unwrap();
+
+        // Recall (keyword) for tokens that now live ONLY in history returns nothing.
+        for token in ["zylophone", "qwertyx"] {
+            let params = RecallParams {
+                query: token.to_string(),
+                limit: 20,
+                ..RecallParams::default()
+            };
+            let hits = db.recall(&params).unwrap();
+            assert!(
+                hits.iter().all(|e| !e.body_json.contains(token)),
+                "history-only content ({token}) must never resurface in recall"
+            );
+        }
+
+        // The history rows survived decay intact.
+        let conn = db.conn().unwrap();
+        let hist_alpha: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM entity_history WHERE body_json LIKE '%zylophone%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(hist_alpha, 1, "superseded version must remain in history");
+        let hist_drop: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM entity_history WHERE body_json LIKE '%qwertyx%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(hist_drop, 1, "invalidated loser must remain in history");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
     fn remember_creates_and_updates_entity() {
         let (db, path) = temp_db();
 
