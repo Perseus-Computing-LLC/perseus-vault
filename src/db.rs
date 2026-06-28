@@ -791,13 +791,18 @@ impl Database {
         }
         #[cfg(not(feature = "bundled-embeddings"))]
         {
-            // Row-by-row fallback (no ndarray available).
+            // Row-by-row fallback (no ndarray available). Precompute the query
+            // norm ONCE — the per-candidate scoring then needs only the dot
+            // product and the candidate's own norm (the old shared helper
+            // recomputed the query norm on every candidate).
+            let q_norm = query_vec
+                .iter()
+                .map(|&v| (v as f64) * (v as f64))
+                .sum::<f64>()
+                .sqrt();
             scored_ids = candidates
                 .into_iter()
-                .map(|(id, emb)| {
-                    let sim = cosine_similarity(query_vec, &emb);
-                    (id, sim)
-                })
+                .map(|(id, emb)| (id, cosine_with_query_norm(query_vec, q_norm, &emb)))
                 .collect();
         }
         scored_ids.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -2925,6 +2930,13 @@ impl Database {
         Ok(affected > 0)
     }
 
+    /// How many of the most-recently-accessed entities in a category a single
+    /// conflict scan considers (paged by `offset`). The detector is O(window²)
+    /// — every candidate is trigram-compared with every other — so this bounds
+    /// the work per call; raise it or page via `offset` to reach older entities.
+    /// (Cross-window pairs are not compared; widen the window if that matters.)
+    const CONFLICT_SCAN_WINDOW: i64 = 500;
+
     /// Detect conflicting entities — entities in the same category with very different body_json.
     /// Returns pairs of entities with low trigram similarity (potential conflicts).
     /// #107: Also factors in certainty — low-certainty entities on the same topic
@@ -2938,10 +2950,11 @@ impl Database {
         offset: i64,
     ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
         let conn = self.conn()?;
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare(&format!(
             "SELECT id, key, body_json, certainty FROM entities WHERE category = ?1 AND archived = 0
-             ORDER BY last_accessed_unix_ms DESC LIMIT 200 OFFSET ?2"
-        )?;
+             ORDER BY last_accessed_unix_ms DESC LIMIT {} OFFSET ?2",
+            Self::CONFLICT_SCAN_WINDOW
+        ))?;
         let rows = stmt.query_map(params![category, offset], |r| {
             Ok((
                 r.get::<_, String>(0)?,
@@ -3059,10 +3072,11 @@ impl Database {
     ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
         let entities: Vec<(String, String, String, f64)> = {
             let conn = self.conn()?;
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare(&format!(
                 "SELECT id, key, body_json, certainty FROM entities WHERE category = ?1 AND archived = 0
-                 ORDER BY last_accessed_unix_ms DESC LIMIT 200 OFFSET ?2",
-            )?;
+                 ORDER BY last_accessed_unix_ms DESC LIMIT {} OFFSET ?2",
+                Self::CONFLICT_SCAN_WINDOW
+            ))?;
             let rows = stmt.query_map(params![category, offset], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
@@ -4217,22 +4231,23 @@ pub fn verify_audit_chain(db: &Database) -> Result<i64, String> {
 // Only the non-bundled-embeddings build uses this scalar fallback; the feature
 // build scores with the vectorized ndarray path above, so gate it to match its
 // sole caller and avoid a dead-code warning under the feature. (#212)
+//
+// Takes the query norm precomputed by the caller (it is constant across all
+// candidates in a dense_search, so recomputing it per candidate was wasted work).
 #[cfg(not(feature = "bundled-embeddings"))]
-fn cosine_similarity(a: &[f32], b: &[f32]) -> f64 {
-    if a.len() != b.len() || a.is_empty() {
+fn cosine_with_query_norm(query: &[f32], q_norm: f64, b: &[f32]) -> f64 {
+    if query.len() != b.len() || b.is_empty() || q_norm <= 0.0 {
         return 0.0;
     }
     let mut dot = 0.0f64;
-    let mut norm_a = 0.0f64;
     let mut norm_b = 0.0f64;
-    for i in 0..a.len() {
-        let va = a[i] as f64;
+    for i in 0..b.len() {
+        let va = query[i] as f64;
         let vb = b[i] as f64;
         dot += va * vb;
-        norm_a += va * va;
         norm_b += vb * vb;
     }
-    let denom = (norm_a * norm_b).sqrt();
+    let denom = q_norm * norm_b.sqrt();
     if denom < 1e-12 {
         0.0
     } else {

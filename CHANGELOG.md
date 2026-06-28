@@ -17,6 +17,18 @@ All notable changes to Mimir are documented here. This project adheres to
   test that pins the cross-arm consensus hit). The `mimir-recall-mini` headline
   metrics are unchanged (24 docs saturate at `limit=10`), but the benchmark
   signature updates as the fused tail re-orders.
+- **Conflict scan window is now an explicit, wider constant.** `detect_conflicts`
+  / `resolve_conflicts` hard-coded a `LIMIT 200` candidate window (the O(window²)
+  pairwise scan only ever looked at the 200 most-recently-accessed entities per
+  call). Replaced the magic number with a documented `CONFLICT_SCAN_WINDOW` (500),
+  widening coverage; still paged by `offset`.
+
+### Performance
+- **Scalar `dense_search` fallback precomputes the query norm once.** The
+  non-`bundled-embeddings` (lean-build) cosine path recomputed the query vector's
+  norm for every candidate; it is constant across a search, so it is now computed
+  once and only the dot product + candidate norm are per-row. No effect on the
+  default (vectorized ndarray) build.
 
 ### Fixed
 - **`mimir_reindex` no longer breaks keyword search on encrypted databases.**
