@@ -177,6 +177,30 @@ impl Database {
         self.encryption.is_some()
     }
 
+    /// #271: whether a dense-embedding backend is active. With the default
+    /// `bundled-embeddings` feature the in-process ONNX model is compiled in and
+    /// this is `true` with zero config; a lite build (`--no-default-features`)
+    /// returns `false` unless a remote endpoint is wired separately.
+    pub fn embedding_enabled(&self) -> bool {
+        self.embedding_config.enabled
+    }
+
+    /// #271: count of non-archived entities that carry a stored dense embedding.
+    /// Used by recall to decide whether hybrid (dense+keyword) should be the
+    /// default mode. Returns 0 on any error so recall degrades to keyword search.
+    pub fn embedding_coverage(&self) -> i64 {
+        let conn = match self.conn() {
+            Ok(c) => c,
+            Err(_) => return 0,
+        };
+        conn.query_row(
+            "SELECT COUNT(*) FROM entities WHERE embedding IS NOT NULL AND archived = 0",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0)
+    }
+
     /// Replace the connector list (used at startup to load configured connectors).
     pub fn set_connectors(&mut self, connectors: Vec<Box<dyn Connector>>) {
         self.connectors = connectors;
@@ -1188,6 +1212,10 @@ impl Database {
 
         let action;
         let id;
+        // #271: whether this write should (re)compute a dense embedding. A new
+        // entity always embeds; an update only re-embeds when its content
+        // actually changed, so identical re-writes don't recompute.
+        let should_embed;
 
         if let Some(ex_id) = existing_id {
             // Update existing entity — compute decay + boost (it's being remembered)
@@ -1312,6 +1340,7 @@ impl Database {
             tx.commit()?;
 
             action = "updated".to_string();
+            should_embed = content_changed;
         } else {
             // Check for near-duplicates before inserting
             let dup_threshold = 0.7; // 70% trigram similarity
@@ -1391,6 +1420,27 @@ impl Database {
             tx.commit()?;
 
             action = "created".to_string();
+            should_embed = true;
+        }
+
+        // #271: synchronous auto-embed on write. Single-entity embedding is
+        // deterministic and LRU-cached, so this is cheap and safe — unlike the
+        // batch path, whose nondeterminism caused the prior regression. We embed
+        // the PLAINTEXT body_json (not the possibly-encrypted column value).
+        // Failures are non-fatal: a missing embedding only means this row won't
+        // surface in dense/hybrid search until it is embedded later. Gated on the
+        // content-changed signal so identical re-asserts skip the recompute.
+        if should_embed && self.embedding_config.enabled {
+            match self.generate_embedding_with_fallback(&entity.body_json) {
+                Ok(vec) => {
+                    if let Err(e) = self.store_embedding(&id, &vec) {
+                        eprintln!("mimir: auto-embed store failed for {}: {}", id, e);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("mimir: auto-embed generation failed for {}: {}", id, e)
+                }
+            }
         }
 
         Ok((id, action))
@@ -6800,4 +6850,185 @@ mod tests {
         assert_eq!(found.agent_id, "security-bot");
     }
 
+    // ─── #271: auto-embed on write + hybrid-default recall ──────────────────
+    // These exercise the bundled in-process ONNX embedder, so they only run in
+    // the default `bundled-embeddings` build (lite-build has no backend and
+    // would have nothing to embed).
+
+    #[cfg(feature = "bundled-embeddings")]
+    fn raw_embedding(db: &Database, id: &str) -> Option<Vec<u8>> {
+        db.conn()
+            .unwrap()
+            .query_row(
+                "SELECT embedding FROM entities WHERE id = ?1",
+                params![id],
+                |r| r.get::<_, Option<Vec<u8>>>(0),
+            )
+            .unwrap()
+    }
+
+    #[cfg(feature = "bundled-embeddings")]
+    #[test]
+    fn remember_auto_embeds_on_write() {
+        let (db, path) = temp_db();
+        assert!(db.embedding_enabled(), "bundled embeddings should be on");
+        let e = make_entity(
+            "ae-1",
+            "insight",
+            "ae-1",
+            "{\"content\":\"the cat sat on the warm sunny windowsill\"}",
+        );
+        let (id, _action) = db.remember(&e).unwrap();
+        let emb = raw_embedding(&db, &id);
+        assert!(
+            emb.is_some() && !emb.unwrap().is_empty(),
+            "a newly remembered entity must have a non-null embedding"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[cfg(feature = "bundled-embeddings")]
+    #[test]
+    fn embedding_coverage_counts_embedded_rows() {
+        let (db, path) = temp_db();
+        assert_eq!(db.embedding_coverage(), 0, "empty db has zero coverage");
+        db.remember(&make_entity(
+            "cov-1",
+            "insight",
+            "cov-1",
+            "{\"content\":\"quarterly revenue and tax accounting report\"}",
+        ))
+        .unwrap();
+        db.remember(&make_entity(
+            "cov-2",
+            "insight",
+            "cov-2",
+            "{\"content\":\"a golden retriever puppy playing in the park\"}",
+        ))
+        .unwrap();
+        assert_eq!(
+            db.embedding_coverage(),
+            2,
+            "both auto-embedded entities must be counted"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[cfg(feature = "bundled-embeddings")]
+    #[test]
+    fn reremember_identical_body_keeps_same_vector_no_recompute() {
+        let (db, path) = temp_db();
+        let e = make_entity(
+            "re-1",
+            "insight",
+            "re-1",
+            "{\"content\":\"distributed consensus via raft leader election\"}",
+        );
+        let (id, _) = db.remember(&e).unwrap();
+        // Overwrite the auto-embedding with a sentinel vector. If an identical
+        // re-write recomputes, the sentinel is clobbered; if the content-changed
+        // gate works, the sentinel survives untouched.
+        let sentinel: Vec<u8> = vec![0xAB; 16];
+        db.conn()
+            .unwrap()
+            .execute(
+                "UPDATE entities SET embedding = ?1 WHERE id = ?2",
+                params![sentinel.clone(), id],
+            )
+            .unwrap();
+
+        // Re-remember the SAME body — must NOT recompute the embedding.
+        db.remember(&e).unwrap();
+        assert_eq!(
+            raw_embedding(&db, &id),
+            Some(sentinel.clone()),
+            "identical re-write must not recompute the embedding"
+        );
+
+        // Now change the body — must recompute (sentinel replaced by a real vec).
+        let changed = make_entity(
+            "re-1",
+            "insight",
+            "re-1",
+            "{\"content\":\"a totally different topic about baking sourdough bread\"}",
+        );
+        db.remember(&changed).unwrap();
+        let after = raw_embedding(&db, &id).unwrap();
+        assert_ne!(after, sentinel, "a content change must recompute the embedding");
+        assert!(!after.is_empty());
+        let _ = fs::remove_file(&path);
+    }
+
+    #[cfg(feature = "bundled-embeddings")]
+    #[test]
+    fn recall_no_mode_with_coverage_uses_hybrid() {
+        let (db, path) = temp_db();
+        db.remember(&make_entity(
+            "h-cat",
+            "insight",
+            "h-cat",
+            "{\"content\":\"the fluffy cat napped on the warm windowsill all afternoon\"}",
+        ))
+        .unwrap();
+        db.remember(&make_entity(
+            "h-fin",
+            "insight",
+            "h-fin",
+            "{\"content\":\"quarterly financial revenue and corporate tax accounting report\"}",
+        ))
+        .unwrap();
+        assert!(db.embedding_coverage() > 0);
+
+        // No `mode` field at all → handle_recall must auto-select hybrid.
+        let args = serde_json::json!({ "query": "feline pet animal resting", "limit": 5 });
+        let out = crate::tools::handle_recall(&db, args).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let items = v["items"].as_array().unwrap();
+        assert!(!items.is_empty(), "hybrid recall must return results");
+        // The semantically-related cat entity must rank ahead of the finance one.
+        let keys: Vec<&str> = items.iter().filter_map(|i| i["key"].as_str()).collect();
+        let cat_pos = keys.iter().position(|k| *k == "h-cat");
+        let fin_pos = keys.iter().position(|k| *k == "h-fin");
+        assert!(cat_pos.is_some(), "cat entity should appear in hybrid results");
+        if let (Some(c), Some(f)) = (cat_pos, fin_pos) {
+            assert!(c < f, "semantically related entity should outrank the unrelated one in hybrid order");
+        }
+        let _ = fs::remove_file(&path);
+    }
+
+    #[cfg(feature = "bundled-embeddings")]
+    #[test]
+    fn semantic_search_returns_dense_ranked_order() {
+        let (db, path) = temp_db();
+        db.remember(&make_entity(
+            "s-dog",
+            "insight",
+            "s-dog",
+            "{\"content\":\"a golden retriever puppy fetching a ball in the green park\"}",
+        ))
+        .unwrap();
+        db.remember(&make_entity(
+            "s-tax",
+            "insight",
+            "s-tax",
+            "{\"content\":\"corporate quarterly tax filing and accounting compliance deadlines\"}",
+        ))
+        .unwrap();
+
+        let args = serde_json::json!({ "query": "canine pet animal playing outdoors", "limit": 5 });
+        let out = crate::tools::handle_semantic_search(&db, args).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let items = v["items"].as_array().unwrap();
+        assert!(!items.is_empty(), "semantic search must return results");
+        let keys: Vec<&str> = items.iter().filter_map(|i| i["key"].as_str()).collect();
+        assert_eq!(
+            keys.first().copied(),
+            Some("s-dog"),
+            "dense-ranked order must put the semantically nearest entity first; got {:?}",
+            keys
+        );
+        let _ = fs::remove_file(&path);
+    }
+
 }
+

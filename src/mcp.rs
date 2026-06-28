@@ -203,7 +203,7 @@ pub fn handle_request(
     }
 }
 
-/// Build the tools/list response with all 43 tools including outputSchema and annotations.
+/// Build the tools/list response with all 44 tools including outputSchema and annotations.
 fn list_tools(id: Option<Value>) -> JsonRpcResponse {
     // The tool registry is a compile-time constant. Parse it exactly once per
     // process and reuse the cached Value instead of re-parsing ~1.8k lines of
@@ -423,6 +423,58 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
         "variants": {
           "type": "integer",
           "description": "Number of query variants used when expansion is enabled"
+        }
+      }
+    },
+    "annotations": {
+      "readOnlyHint": true
+    }
+  },
+  {
+    "name": "mimir_semantic_search",
+    "description": "Dense-only semantic search: find entities by meaning, ranked purely by embedding similarity (no keyword fallback). On by default via the bundled in-process ONNX model \u2014 zero config, zero network. A one-tool shortcut for 'find things like this'. For fused keyword+vector results use mimir_recall.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string",
+          "description": "Natural-language text to semantically match against stored memories"
+        },
+        "limit": {
+          "type": "integer",
+          "default": 10,
+          "description": "Maximum number of results to return"
+        },
+        "category": {
+          "type": "string",
+          "description": "Filter by category, e.g. 'decision' or 'architecture'"
+        },
+        "workspace_hash": {
+          "type": "string",
+          "description": "Workspace scope filter. When set, only entities with a matching workspace_hash are returned."
+        },
+        "agent_id": {
+          "type": "string",
+          "description": "Agent identity filter. When set, only entities with a matching agent_id are returned."
+        }
+      },
+      "required": [
+        "query"
+      ]
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "items": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          },
+          "description": "Matching entities ranked by dense embedding similarity, with expanded body_json fields at top level"
+        },
+        "total": {
+          "type": "integer",
+          "description": "Number of results returned"
         }
       }
     },
@@ -2176,6 +2228,10 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
         "mimir_remember" => tools::handle_remember(db, args).map_err(|e| e.to_string()),
 
         "mimir_recall" => tools::handle_recall(db, args).map_err(|e| e.to_string()),
+
+        "mimir_semantic_search" => {
+            tools::handle_semantic_search(db, args).map_err(|e| e.to_string())
+        }
 
         "mimir_ask" => tools::handle_ask(db, args).map_err(|e| e.to_string()),
 

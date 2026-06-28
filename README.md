@@ -10,7 +10,7 @@
 [![LangGraph](https://img.shields.io/badge/integrations-LangGraph-blue)](integrations/langgraph/)
 [![CrewAI](https://img.shields.io/badge/integrations-CrewAI-orange)](integrations/crewai/)
 [![AutoGen](https://img.shields.io/badge/integrations-AutoGen-purple)](integrations/autogen/)
-[![MCP Tools](https://img.shields.io/badge/MCP%20tools-43-brightgreen)]()
+[![MCP Tools](https://img.shields.io/badge/MCP%20tools-44-brightgreen)]()
 
 Mimir is a single Rust binary that gives AI agents durable memory across sessions.
 **One binary. One file. No Docker. No Postgres. No cloud.** Just persistent memory
@@ -66,7 +66,7 @@ local-first, zero-dependency, AND agent-first.
 |---|---|---|---|---|
 | **Deployment** | Single binary (~8MB) | Cloud + self-host | Docker/Postgres | Docker/Postgres |
 | **Dependencies** | None (SQLite embedded) | Python + vector DB | Postgres + Python | Postgres + Go |
-| **MCP-Native** | ✅ 43 tools | ❌ Not MCP-native | ❌ Not MCP-native | ❌ Not MCP-native |
+| **MCP-Native** | ✅ 44 tools | ❌ Not MCP-native | ❌ Not MCP-native | ❌ Not MCP-native |
 | **Offline/Local** | ✅ Fully local | Cloud-dependent | Docker needed | Docker needed |
 | **Encryption** | AES-256-GCM ✅ | ❌ | ❌ | ❌ |
 | **Hybrid Search** | BM25 + Dense + RRF | Vector only | Vector only | Vector + Graph |
@@ -74,7 +74,7 @@ local-first, zero-dependency, AND agent-first.
 | **Entity Graph** | Link + Traverse | ❌ | ❌ | ✅ |
 | **Journal Audit Trail** | ✅ Immutable | ❌ | ❌ | ❌ |
 | **State Management** | ✅ Key-value + TTL | ❌ | ❌ | ❌ |
-| **MCP Tools** | 43 | 5 | 8 | 0 |
+| **MCP Tools** | 44 | 5 | 8 | 0 |
 | **GitHub Stars** | ~20 | ~55K | ~15K | ~3K |
 | **License** | MIT | Apache 2.0 | Apache 2.0 | Apache 2.0 |
 
@@ -116,7 +116,7 @@ Each adapter:
 Any MCP-compatible framework works with Mimir directly. See
 [Awesome Mimir](awesome-mimir.md) for the full list.
 
-## 43 MCP Tools
+## 44 MCP Tools
 
 ### Entity CRUD
 | Tool | Description |
@@ -132,7 +132,8 @@ Any MCP-compatible framework works with Mimir directly. See
 | Tool | Description |
 |---|---|
 | `mimir_ask` | RAG: recall context, query LLM, return grounded answer with sources. |
-| `mimir_embed` | Generate dense vectors via Ollama or OpenAI-compatible endpoint. |
+| `mimir_embed` | Generate dense vectors via the bundled model, Ollama, or OpenAI-compatible endpoint. |
+| `mimir_semantic_search` | Dense-only semantic search shortcut — find entities by meaning, ranked purely by embedding similarity (no keyword fallback). |
 | `mimir_context` | Pre-formatted markdown block for session injection. |
 | `mimir_ingest` | Trigger connector syncs (GitHub, file watcher). |
 | `mimir_ingest_file` | Locally extract a document's text (plaintext/markdown always; DOCX/PDF with the `multimodal` feature) and store it as a recallable entity. |
@@ -239,11 +240,32 @@ mimir keygen --key-file ~/.mimir/secret.key
 
 ## Features
 
-### Hybrid Search
-- **Offline dense search out of the box** — a quantized all-MiniLM-L6-v2 model is
-  compiled into the binary, so semantic recall works with **zero config and zero
-  network** (no Ollama, no API key, no model download). Build a lean binary
-  without it via `cargo build --no-default-features`.
+### Semantic Search (on by default)
+- **Bundled, in-process embeddings** — a quantized all-MiniLM-L6-v2 model
+  (384-dim) is compiled into the binary, so dense/semantic search works with
+  **zero config and zero network**: no Ollama, no API key, no model download.
+  This is the default build (`bundled-embeddings` feature).
+- **Auto-embed on write (#271)** — `mimir_remember` embeds each new (or
+  content-changed) entity **synchronously** as it is written, using the bundled
+  model. Single-entity embedding is deterministic and LRU-cached, so it is cheap
+  and adds no background tasks. Embedding failures are non-fatal (logged to
+  stderr); the write always succeeds.
+- **Hybrid is the default recall mode (#271)** — `mimir_recall(query=...)` with
+  no `mode` flag automatically selects **hybrid** (dense + keyword fused via RRF)
+  whenever embeddings exist, and transparently falls back to **fts5** keyword
+  search when none do. No manual `mimir_embed` step, no flags to remember.
+- **`mimir_semantic_search(query, limit)`** — a one-tool shortcut for pure
+  dense, meaning-based search (no keyword fallback) when you just want "find
+  things like this".
+- **Optional alternate embedder** — to use **Ollama** or any OpenAI-compatible
+  `/v1/embeddings` endpoint instead of the bundled model, set `--llm-endpoint`
+  (and `--embedding-endpoint` / `--llm-api-key` as needed). This is entirely
+  optional; the bundled model is used by default.
+- Build a lean binary without bundled embeddings via
+  `cargo build --no-default-features` — recall then defaults to keyword search
+  unless a remote embedder is configured.
+
+### Hybrid Search internals
 - **FTS5 keyword search** with LIKE fallback and Porter stemming expansion
 - **Dense vector search** via cosine similarity on stored embeddings
 - **Reciprocal Rank Fusion (RRF)** — combine keyword + vector results

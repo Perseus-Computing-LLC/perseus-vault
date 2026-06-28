@@ -331,9 +331,22 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
     let a: RecallArgs =
         serde_json::from_value(args).map_err(|e| format!("Invalid recall arguments: {}", e))?;
 
+    // #271: an unset `mode` ("" — the serde default) auto-selects the best
+    // available strategy. When the embedding backend is on AND at least one
+    // entity is embedded, default to Hybrid (deterministic dense + keyword RRF);
+    // otherwise fall back to keyword FTS5 exactly as before. An explicit mode
+    // always wins.
     let mode = match a.mode.as_str() {
         "dense" => SearchMode::Dense,
         "hybrid" => SearchMode::Hybrid,
+        "fts5" => SearchMode::Fts5,
+        "" => {
+            if db.embedding_enabled() && db.embedding_coverage() > 0 {
+                SearchMode::Hybrid
+            } else {
+                SearchMode::Fts5
+            }
+        }
         _ => SearchMode::Fts5,
     };
 
@@ -369,6 +382,54 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
     let entities = db
         .recall(&params)
         .map_err(|e| format!("Recall failed: {}", e))?;
+
+    let items_expanded: Vec<serde_json::Value> =
+        entities.iter().map(|e| e.to_json_expanded()).collect();
+
+    let result = json!({
+        "items": items_expanded,
+        "total": items_expanded.len(),
+    });
+    Ok(result.to_string())
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SemanticSearchArgs {
+    pub query: String,
+    #[serde(default = "default_limit")]
+    pub limit: i64,
+    #[serde(default)]
+    pub category: Option<String>,
+    #[serde(default)]
+    pub workspace_hash: Option<String>,
+    #[serde(default)]
+    pub agent_id: Option<String>,
+}
+
+/// #271: `mimir_semantic_search` — dense-only semantic search shortcut. Unlike
+/// `mimir_recall` (which fuses keyword + dense in hybrid mode), this runs the
+/// pure dense vector arm with NO FTS5 fallback: results are ranked solely by
+/// embedding cosine similarity. Requires an embedding backend (on by default via
+/// the bundled in-process ONNX model). Errors clearly when no backend is
+/// available rather than silently degrading to keyword search.
+pub fn handle_semantic_search(db: &Database, args: Value) -> Result<String, String> {
+    let a: SemanticSearchArgs = serde_json::from_value(args)
+        .map_err(|e| format!("Invalid semantic_search arguments: {}", e))?;
+
+    let params = RecallParams {
+        query: a.query,
+        category: a.category,
+        limit: a.limit,
+        skip_side_effects: false,
+        mode: SearchMode::Dense,
+        workspace_hash: a.workspace_hash,
+        agent_id: a.agent_id,
+        ..RecallParams::default()
+    };
+
+    let entities = db
+        .recall(&params)
+        .map_err(|e| format!("Semantic search failed: {}", e))?;
 
     let items_expanded: Vec<serde_json::Value> =
         entities.iter().map(|e| e.to_json_expanded()).collect();
