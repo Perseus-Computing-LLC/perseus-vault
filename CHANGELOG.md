@@ -5,6 +5,12 @@ All notable changes to Mimir are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [2.6.0] - 2026-06-28
+
+Round-3 hardening & efficiency: a data-loss fix on encrypted databases, an
+ingest DoS guard, a lean-build injection fix, and recall-quality + perf
+improvements.
+
 ### Changed
 - **Hybrid recall over-fetches each arm before RRF fusion.** The dense and BM25
   keyword arms were each pre-truncated to `limit` *before* being fused, so a hit
