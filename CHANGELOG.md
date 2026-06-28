@@ -5,6 +5,14 @@ All notable changes to Mimir are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Security
+- **Bounded file size for `mimir_ingest_file` (#236 hardening).** Document ingestion
+  read the entire file into memory with no size limit, then copied the text into a
+  JSON body and the FTS index — a single huge or maliciously-sized file could OOM
+  the server (denial of service). Ingestion now rejects files larger than a
+  configurable cap (`MIMIR_MAX_INGEST_BYTES`, default 50 MiB) **before** reading,
+  for plaintext, DOCX and PDF alike. Regression test added.
+
 ## [2.5.0] - 2026-06-27
 
 Bi-temporal facts, completed: conflicting facts can now be actively resolved
