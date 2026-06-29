@@ -735,9 +735,21 @@ impl Database {
             let mut count = 0usize;
             for (rowid, category, key, raw_body) in rows {
                 let aad = format!("{}:{}", category, key);
-                // Fall back to raw on decrypt failure (e.g. a row written before
-                // encryption was enabled), mirroring entity_from_row.
-                let plain = enc.decrypt(&raw_body, aad.as_bytes()).unwrap_or(raw_body);
+                // Index decrypted text, or a legacy plaintext row. On an
+                // authentication failure (wrong key / tampered), index an empty
+                // body rather than the ciphertext: putting ciphertext into the
+                // plaintext FTS index would both leak it and corrupt search.
+                let plain = match enc.decrypt_body(&raw_body, aad.as_bytes()) {
+                    crate::encryption::BodyDecrypt::Plaintext(s)
+                    | crate::encryption::BodyDecrypt::LegacyPlaintext(s) => s,
+                    crate::encryption::BodyDecrypt::AuthFailed(e) => {
+                        eprintln!(
+                            "mimir: reindex skipping body text for {}:{} — decryption {}.",
+                            category, key, e
+                        );
+                        "{}".to_string()
+                    }
+                };
                 insert.execute(params![rowid, plain])?;
                 count += 1;
             }
@@ -1252,8 +1264,16 @@ impl Database {
                 .unwrap_or_default();
             let old_plain_body = if let Some(ref enc) = self.encryption {
                 let aad = format!("{}:{}", entity.category, entity.key);
-                enc.decrypt(&old_raw_body, aad.as_bytes())
-                    .unwrap_or_else(|_| old_raw_body.clone())
+                match enc.decrypt_body(&old_raw_body, aad.as_bytes()) {
+                    crate::encryption::BodyDecrypt::Plaintext(s)
+                    | crate::encryption::BodyDecrypt::LegacyPlaintext(s) => s,
+                    // Can't authenticate the prior body: do NOT compare against
+                    // ciphertext. Use a sentinel so content_changed is true and we
+                    // conservatively snapshot history.
+                    crate::encryption::BodyDecrypt::AuthFailed(_) => {
+                        "\u{0}__mimir_undecryptable__".to_string()
+                    }
+                }
             } else {
                 old_raw_body.clone()
             };
@@ -4543,8 +4563,24 @@ fn entity_from_row(
         let cat: String = row.get(1)?;
         let k: String = row.get(2)?;
         let aad = format!("{}:{}", cat, k);
-        enc.decrypt(&raw_body_json, aad.as_bytes())
-            .unwrap_or(raw_body_json) // Fall back to raw if decryption fails (unencrypted DB)
+        match enc.decrypt_body(&raw_body_json, aad.as_bytes()) {
+            // Decrypted ciphertext, or a legacy plaintext row in a mixed DB.
+            crate::encryption::BodyDecrypt::Plaintext(s)
+            | crate::encryption::BodyDecrypt::LegacyPlaintext(s) => s,
+            // Authentic-looking ciphertext that failed GCM auth (wrong key or
+            // tampered). Never return the raw ciphertext — that would silently
+            // defeat the AES-256-GCM/AAD integrity guarantee. Surface a sentinel
+            // and warn instead.
+            crate::encryption::BodyDecrypt::AuthFailed(e) => {
+                eprintln!(
+                    "mimir: refusing to return body for {}:{} — decryption {}. \
+                     Wrong key or tampered ciphertext.",
+                    cat, k, e
+                );
+                "{\"error\":\"mimir: body decryption failed (wrong key or tampered ciphertext)\"}"
+                    .to_string()
+            }
+        }
     } else {
         raw_body_json
     };

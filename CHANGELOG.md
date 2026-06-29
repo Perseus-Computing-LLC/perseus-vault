@@ -5,6 +5,22 @@ All notable changes to Mimir are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Security
+- **Decryption failures no longer silently return ciphertext.** On an encrypted DB,
+  the read path (`entity_from_row`), FTS reindex, and the history content-change
+  check used `decrypt(...).unwrap_or(raw)`, so any authentication failure — wrong
+  key, or AAD-mismatched / tampered ciphertext (exactly what AES-256-GCM + AAD exist
+  to detect) — was swallowed and the raw ciphertext was returned/indexed as if it
+  were the plaintext body. That nullified the integrity guarantee: an attacker who
+  could write to the DB file could tamper with a body and have it surface
+  undetected. New `EncryptionManager::decrypt_body` classifies the input as
+  decrypted plaintext, a legacy plaintext row (a real JSON body is never valid
+  base64, so mixed DBs still work), or an authentication failure — and read paths
+  now refuse to return the bytes on failure (a clear error sentinel + stderr warning
+  for recall; an empty FTS entry so ciphertext is never indexed). Regression tests
+  cover roundtrip, legacy-plaintext passthrough, and tamper / wrong-AAD / wrong-key
+  rejection.
+
 ## [2.7.0] - 2026-06-28
 
 ### Distribution
