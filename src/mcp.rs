@@ -214,7 +214,7 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
         r###"[
   {
     "name": "mimir_remember",
-    "description": "Store or update an entity by (category, key). Idempotent \u2014 call as often as you want, same key returns an update. Optional always_on=true injects entity into every mimir_context. Optional certainty (0.0-1.0) is used by mimir_conflicts for typed-entity conflict detection. Use this for saving facts, decisions, architecture notes, and conventions. When encryption is enabled, body_json is encrypted at rest with AES-256-GCM.",
+    "description": "Store or update an entity by (category, key). Idempotent — call as often as you want, same key returns an update. Optional always_on=true injects entity into every mimir_context. Optional certainty (0.0-1.0) is used by mimir_conflicts for typed-entity conflict detection. Use this for saving facts, decisions, architecture notes, and conventions. When encryption is enabled, body_json is encrypted at rest with AES-256-GCM.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -228,7 +228,7 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
         },
         "body_json": {
           "type": "string",
-          "description": "JSON object with the entity body \u2014 store content, summary, and any custom fields here"
+          "description": "JSON object with the entity body — store content, summary, and any custom fields here"
         },
         "status": {
           "type": "string",
@@ -250,7 +250,7 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
         "importance": {
           "type": "number",
           "default": 0.5,
-          "description": "Initial importance 0.0\u20131.0 \u2014 sets the starting decay score"
+          "description": "Initial importance 0.0–1.0 — sets the starting decay score"
         },
         "topic_path": {
           "type": "string",
@@ -297,7 +297,8 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
     },
     "annotations": {
       "destructiveHint": true
-    }
+    },
+    "title": "Remember Entity"
   },
   {
     "name": "mimir_recall",
@@ -307,7 +308,7 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
       "properties": {
         "query": {
           "type": "string",
-          "description": "Search query \u2014 words are OR'd together for broad recall"
+          "description": "Search query — words are OR'd together for broad recall"
         },
         "category": {
           "type": "string",
@@ -330,7 +331,7 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
         "min_decay": {
           "type": "number",
           "default": 0.0,
-          "description": "Minimum decay score threshold 0.0\u20131.0 \u2014 higher values return fresher results"
+          "description": "Minimum decay score threshold 0.0–1.0 — higher values return fresher results"
         },
         "topic_path": {
           "type": "string",
@@ -340,7 +341,11 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
           "type": "string",
           "default": "fts5",
           "description": "Search mode: 'fts5' (keyword), 'dense' (vector), or 'hybrid' (fused via RRF)",
-          "enum": ["fts5", "dense", "hybrid"]
+          "enum": [
+            "fts5",
+            "dense",
+            "hybrid"
+          ]
         },
         "include_archived": {
           "type": "boolean",
@@ -432,7 +437,8 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
     },
     "annotations": {
       "readOnlyHint": true
-    }
+    },
+    "title": "Recall Entities"
   },
   {
     "name": "mimir_recall_layer",
@@ -473,7 +479,7 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
   },
   {
     "name": "mimir_semantic_search",
-    "description": "Dense-only semantic search: find entities by meaning, ranked purely by embedding similarity (no keyword fallback). On by default via the bundled in-process ONNX model \u2014 zero config, zero network. A one-tool shortcut for 'find things like this'. For fused keyword+vector results use mimir_recall.",
+    "description": "Dense-only semantic search: find entities by meaning, ranked purely by embedding similarity (no keyword fallback). On by default via the bundled in-process ONNX model — zero config, zero network. A one-tool shortcut for 'find things like this'. For fused keyword+vector results use mimir_recall.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -521,7 +527,8 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
     },
     "annotations": {
       "readOnlyHint": true
-    }
+    },
+    "title": "Semantic Search Entities"
   },
   {
     "name": "mimir_ask",
@@ -555,10 +562,18 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
           "items": {
             "type": "object",
             "properties": {
-              "key": { "type": "string" },
-              "category": { "type": "string" },
-              "score": { "type": "number" },
-              "snippet": { "type": "string" }
+              "key": {
+                "type": "string"
+              },
+              "category": {
+                "type": "string"
+              },
+              "score": {
+                "type": "number"
+              },
+              "snippet": {
+                "type": "string"
+              }
             }
           },
           "description": "Cited source entities used in the answer"
@@ -568,7 +583,8 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
     "annotations": {
       "readOnlyHint": true,
       "destructiveHint": false
-    }
+    },
+    "title": "Ask Question from Memories"
   },
   {
     "name": "mimir_get_entity",
@@ -588,22 +604,46 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
     "outputSchema": {
       "type": "object",
       "properties": {
-        "id": { "type": "string" },
-        "category": { "type": "string" },
-        "key": { "type": "string" },
-        "body_json": { "type": "string", "description": "Full entity body content" },
-        "status": { "type": "string" },
-        "entity_type": { "type": "string" },
-        "decay_score": { "type": "number" },
-        "retrieval_count": { "type": "integer" },
-        "layer": { "type": "string" },
-        "always_on": { "type": "boolean" },
-        "certainty": { "type": "number" }
+        "id": {
+          "type": "string"
+        },
+        "category": {
+          "type": "string"
+        },
+        "key": {
+          "type": "string"
+        },
+        "body_json": {
+          "type": "string",
+          "description": "Full entity body content"
+        },
+        "status": {
+          "type": "string"
+        },
+        "entity_type": {
+          "type": "string"
+        },
+        "decay_score": {
+          "type": "number"
+        },
+        "retrieval_count": {
+          "type": "integer"
+        },
+        "layer": {
+          "type": "string"
+        },
+        "always_on": {
+          "type": "boolean"
+        },
+        "certainty": {
+          "type": "number"
+        }
       }
     },
     "annotations": {
       "readOnlyHint": true
-    }
+    },
+    "title": "Get Entity by ID"
   },
   {
     "name": "mimir_as_of",
@@ -611,9 +651,18 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
     "inputSchema": {
       "type": "object",
       "properties": {
-        "category": { "type": "string", "description": "Entity category" },
-        "key": { "type": "string", "description": "Entity key within the category" },
-        "as_of_unix_ms": { "type": "integer", "description": "Transaction-time instant (unix ms) to travel to" }
+        "category": {
+          "type": "string",
+          "description": "Entity category"
+        },
+        "key": {
+          "type": "string",
+          "description": "Entity key within the category"
+        },
+        "as_of_unix_ms": {
+          "type": "integer",
+          "description": "Transaction-time instant (unix ms) to travel to"
+        }
       },
       "required": [
         "category",
@@ -624,19 +673,38 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
     "outputSchema": {
       "type": "object",
       "properties": {
-        "found": { "type": "boolean", "description": "False if the fact had not been recorded by as_of_unix_ms" },
-        "id": { "type": "string" },
-        "category": { "type": "string" },
-        "key": { "type": "string" },
-        "body_json": { "type": "string", "description": "The fact's content as it was at as_of_unix_ms" },
-        "status": { "type": "string" },
-        "entity_type": { "type": "string" },
-        "as_of_unix_ms": { "type": "integer" }
+        "found": {
+          "type": "boolean",
+          "description": "False if the fact had not been recorded by as_of_unix_ms"
+        },
+        "id": {
+          "type": "string"
+        },
+        "category": {
+          "type": "string"
+        },
+        "key": {
+          "type": "string"
+        },
+        "body_json": {
+          "type": "string",
+          "description": "The fact's content as it was at as_of_unix_ms"
+        },
+        "status": {
+          "type": "string"
+        },
+        "entity_type": {
+          "type": "string"
+        },
+        "as_of_unix_ms": {
+          "type": "integer"
+        }
       }
     },
     "annotations": {
       "readOnlyHint": true
-    }
+    },
+    "title": "Time-Travel Entity Lookup"
   },
   {
     "name": "mimir_forget",
@@ -682,7 +750,8 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
     },
     "annotations": {
       "destructiveHint": true
-    }
+    },
+    "title": "Forget Entity (Soft-Delete)"
   },
   {
     "name": "mimir_ingest",
@@ -714,14 +783,17 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
         },
         "errors": {
           "type": "array",
-          "items": {"type": "string"},
+          "items": {
+            "type": "string"
+          },
           "description": "Error messages from connectors that failed"
         }
       }
     },
     "annotations": {
       "destructiveHint": true
-    }
+    },
+    "title": "Ingest External Data"
   },
   {
     "name": "mimir_ingest_file",
@@ -729,26 +801,57 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
     "inputSchema": {
       "type": "object",
       "properties": {
-        "path": { "type": "string", "description": "Path to the document file to ingest" },
-        "category": { "type": "string", "description": "Entity category (default 'document')" },
-        "key": { "type": "string", "description": "Entity key (default: the file name)" },
-        "tags": { "type": "array", "items": { "type": "string" }, "description": "Optional tags" }
+        "path": {
+          "type": "string",
+          "description": "Path to the document file to ingest"
+        },
+        "category": {
+          "type": "string",
+          "description": "Entity category (default 'document')"
+        },
+        "key": {
+          "type": "string",
+          "description": "Entity key (default: the file name)"
+        },
+        "tags": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Optional tags"
+        }
       },
-      "required": ["path"]
+      "required": [
+        "path"
+      ]
     },
     "outputSchema": {
       "type": "object",
       "properties": {
-        "id": { "type": "string", "description": "Stored entity id" },
-        "action": { "type": "string", "description": "created or updated" },
-        "category": { "type": "string" },
-        "key": { "type": "string" },
-        "chars": { "type": "integer", "description": "Characters of text extracted" }
+        "id": {
+          "type": "string",
+          "description": "Stored entity id"
+        },
+        "action": {
+          "type": "string",
+          "description": "created or updated"
+        },
+        "category": {
+          "type": "string"
+        },
+        "key": {
+          "type": "string"
+        },
+        "chars": {
+          "type": "integer",
+          "description": "Characters of text extracted"
+        }
       }
     },
     "annotations": {
       "destructiveHint": true
-    }
+    },
+    "title": "Ingest Document File"
   },
   {
     "name": "mimir_embed",
@@ -756,21 +859,46 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
     "inputSchema": {
       "type": "object",
       "properties": {
-        "text": { "type": "string", "description": "Text to embed (omit to use entity body_json)" },
-        "category": { "type": "string", "description": "Entity category for single mode" },
-        "key": { "type": "string", "description": "Entity key for single mode" },
-        "batch_category": { "type": "string", "description": "Embed all entities in this category lacking embeddings" },
-        "batch_limit": { "type": "integer", "default": 100, "description": "Max entities in batch mode" }
+        "text": {
+          "type": "string",
+          "description": "Text to embed (omit to use entity body_json)"
+        },
+        "category": {
+          "type": "string",
+          "description": "Entity category for single mode"
+        },
+        "key": {
+          "type": "string",
+          "description": "Entity key for single mode"
+        },
+        "batch_category": {
+          "type": "string",
+          "description": "Embed all entities in this category lacking embeddings"
+        },
+        "batch_limit": {
+          "type": "integer",
+          "default": 100,
+          "description": "Max entities in batch mode"
+        }
       }
     },
     "outputSchema": {
       "type": "object",
       "properties": {
-        "embedded": { "type": "integer", "description": "Number of entities embedded" },
-        "dimensions": { "type": "integer", "description": "Vector dimensions" }
+        "embedded": {
+          "type": "integer",
+          "description": "Number of entities embedded"
+        },
+        "dimensions": {
+          "type": "integer",
+          "description": "Vector dimensions"
+        }
       }
     },
-    "annotations": { "destructiveHint": true }
+    "annotations": {
+      "destructiveHint": true
+    },
+    "title": "Generate Entity Embeddings"
   },
   {
     "name": "mimir_prune",
@@ -778,23 +906,51 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
     "inputSchema": {
       "type": "object",
       "properties": {
-        "category": { "type": "string", "description": "Archive entities in this category" },
-        "min_decay": { "type": "number", "description": "Archive entities with decay_score below this threshold" },
-        "older_than_days": { "type": "integer", "description": "Archive entities older than this many days" },
-        "limit": { "type": "integer", "default": 100, "description": "Max entities to prune (0 = unlimited)" },
-        "dry_run": { "type": "boolean", "default": false, "description": "Preview without archiving" }
+        "category": {
+          "type": "string",
+          "description": "Archive entities in this category"
+        },
+        "min_decay": {
+          "type": "number",
+          "description": "Archive entities with decay_score below this threshold"
+        },
+        "older_than_days": {
+          "type": "integer",
+          "description": "Archive entities older than this many days"
+        },
+        "limit": {
+          "type": "integer",
+          "default": 100,
+          "description": "Max entities to prune (0 = unlimited)"
+        },
+        "dry_run": {
+          "type": "boolean",
+          "default": false,
+          "description": "Preview without archiving"
+        }
       }
     },
     "outputSchema": {
       "type": "object",
       "properties": {
-        "archived": { "type": "integer" },
-        "examined": { "type": "integer" },
-        "dry_run": { "type": "boolean" },
-        "reason": { "type": "string" }
+        "archived": {
+          "type": "integer"
+        },
+        "examined": {
+          "type": "integer"
+        },
+        "dry_run": {
+          "type": "boolean"
+        },
+        "reason": {
+          "type": "string"
+        }
       }
     },
-    "annotations": { "destructiveHint": true }
+    "annotations": {
+      "destructiveHint": true
+    },
+    "title": "Prune Stale Entities"
   },
   {
     "name": "mimir_link",
@@ -848,7 +1004,8 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
     },
     "annotations": {
       "destructiveHint": true
-    }
+    },
+    "title": "Link Entities"
   },
   {
     "name": "mimir_unlink",
@@ -893,7 +1050,8 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
     },
     "annotations": {
       "destructiveHint": true
-    }
+    },
+    "title": "Unlink Entities"
   },
   {
     "name": "mimir_journal",
@@ -957,7 +1115,8 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
     },
     "annotations": {
       "destructiveHint": true
-    }
+    },
+    "title": "Append Journal Entry"
   },
   {
     "name": "mimir_timeline",
@@ -1016,7 +1175,8 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
     },
     "annotations": {
       "readOnlyHint": true
-    }
+    },
+    "title": "Query Journal Timeline"
   },
   {
     "name": "mimir_state_set",
@@ -1026,7 +1186,7 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
       "properties": {
         "key": {
           "type": "string",
-          "description": "State key \u2014 unique identifier for this state entry"
+          "description": "State key — unique identifier for this state entry"
         },
         "value_json": {
           "type": "string",
@@ -1061,7 +1221,8 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
     },
     "annotations": {
       "destructiveHint": true
-    }
+    },
+    "title": "Set State Entry"
   },
   {
     "name": "mimir_state_get",
@@ -1105,11 +1266,12 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
     },
     "annotations": {
       "readOnlyHint": true
-    }
+    },
+    "title": "Get State Entry"
   },
   {
     "name": "mimir_state_delete",
-    "description": "Delete a state entry by key. Permanent removal \u2014 unlike mimir_forget which is a soft-delete. Use this to clean up expired or unused state entries.",
+    "description": "Delete a state entry by key. Permanent removal — unlike mimir_forget which is a soft-delete. Use this to clean up expired or unused state entries.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -1137,7 +1299,8 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
     },
     "annotations": {
       "destructiveHint": true
-    }
+    },
+    "title": "Delete State Entry"
   },
   {
     "name": "mimir_state_list",
@@ -1171,7 +1334,8 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
     },
     "annotations": {
       "readOnlyHint": true
-    }
+    },
+    "title": "List State Entries"
   },
   {
     "name": "mimir_health",
@@ -1195,7 +1359,8 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
     },
     "annotations": {
       "readOnlyHint": true
-    }
+    },
+    "title": "Check Health"
   },
   {
     "name": "mimir_stats",
@@ -1247,7 +1412,8 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
     },
     "annotations": {
       "readOnlyHint": true
-    }
+    },
+    "title": "Get Database Statistics"
   },
   {
     "name": "mimir_compact",
@@ -1258,7 +1424,7 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
         "min_decay": {
           "type": "number",
           "default": 0.1,
-          "description": "Decay threshold \u2014 entities with decay score below this are archived"
+          "description": "Decay threshold — entities with decay score below this are archived"
         },
         "dry_run": {
           "type": "boolean",
@@ -1291,11 +1457,12 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
     },
     "annotations": {
       "destructiveHint": true
-    }
+    },
+    "title": "Compact Low-Decay Entities"
   },
   {
     "name": "mimir_purge",
-    "description": "Permanently delete all archived entities and run VACUUM to reclaim disk space. This is the only operation that actually removes entities \u2014 prune/forget only soft-archive. Archived entities are DELETED and NOT RECOVERABLE. Supports dry_run=true to preview first.",
+    "description": "Permanently delete all archived entities and run VACUUM to reclaim disk space. This is the only operation that actually removes entities — prune/forget only soft-archive. Archived entities are DELETED and NOT RECOVERABLE. Supports dry_run=true to preview first.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -1330,7 +1497,8 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
     },
     "annotations": {
       "destructiveHint": true
-    }
+    },
+    "title": "Purge Archived Entities"
   },
   {
     "name": "mimir_migrate",
@@ -1377,7 +1545,8 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
     },
     "annotations": {
       "destructiveHint": true
-    }
+    },
+    "title": "Migrate Legacy Database"
   },
   {
     "name": "mimir_context",
@@ -1415,7 +1584,8 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
     },
     "annotations": {
       "readOnlyHint": true
-    }
+    },
+    "title": "Get Context Block"
   },
   {
     "name": "mimir_extract",
@@ -1423,28 +1593,58 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
     "inputSchema": {
       "type": "object",
       "properties": {
-        "text": { "type": "string", "description": "Raw text to extract from. If omitted, category + key of a stored entity are used." },
-        "category": { "type": "string", "description": "Category of a stored entity to extract from (requires key)." },
-        "key": { "type": "string", "description": "Key of a stored entity to extract from (requires category)." },
-        "strategy": { "type": "string", "default": "rule_based", "enum": ["rule_based", "none"], "description": "Extractor strategy: 'rule_based' (local heuristics) or 'none' (no-op)." }
+        "text": {
+          "type": "string",
+          "description": "Raw text to extract from. If omitted, category + key of a stored entity are used."
+        },
+        "category": {
+          "type": "string",
+          "description": "Category of a stored entity to extract from (requires key)."
+        },
+        "key": {
+          "type": "string",
+          "description": "Key of a stored entity to extract from (requires category)."
+        },
+        "strategy": {
+          "type": "string",
+          "default": "rule_based",
+          "enum": [
+            "rule_based",
+            "none"
+          ],
+          "description": "Extractor strategy: 'rule_based' (local heuristics) or 'none' (no-op)."
+        }
       },
       "required": []
     },
     "outputSchema": {
       "type": "object",
       "properties": {
-        "items": { "type": "array", "items": { "type": "object" }, "description": "Extracted items, each an object with `kind` and `text`." },
-        "total": { "type": "integer", "description": "Number of items extracted" },
-        "strategy": { "type": "string", "description": "Extractor strategy used" }
+        "items": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          },
+          "description": "Extracted items, each an object with `kind` and `text`."
+        },
+        "total": {
+          "type": "integer",
+          "description": "Number of items extracted"
+        },
+        "strategy": {
+          "type": "string",
+          "description": "Extractor strategy used"
+        }
       }
     },
     "annotations": {
       "readOnlyHint": true
-    }
+    },
+    "title": "Extract Structured Knowledge"
   },
   {
     "name": "mimir_traverse",
-    "description": "Walk the entity link graph starting from a given entity up to a configurable depth. Returns a chain of linked entities \u2014 useful for exploring dependencies, decision trees, and relationship graphs built via mimir_link.",
+    "description": "Walk the entity link graph starting from a given entity up to a configurable depth. Returns a chain of linked entities — useful for exploring dependencies, decision trees, and relationship graphs built via mimir_link.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -1487,15 +1687,19 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
           "description": "Linked entities traversed from root"
         }
       },
-      "required": ["entity", "traversed"]
+      "required": [
+        "entity",
+        "traversed"
+      ]
     },
     "annotations": {
       "readOnlyHint": true
-    }
+    },
+    "title": "Traverse Entity Graph"
   },
   {
     "name": "mimir_score",
-    "description": "Assign a quality score (0.0\u20131.0) to an entity. Verified entities with high scores resist decay and rank higher in recall results. Use this to mark entities as accurate, verified, or deprecated.",
+    "description": "Assign a quality score (0.0–1.0) to an entity. Verified entities with high scores resist decay and rank higher in recall results. Use this to mark entities as accurate, verified, or deprecated.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -1509,7 +1713,7 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
         },
         "score": {
           "type": "number",
-          "description": "Quality score 0.0\u20131.0. 1.0 = verified, 0.5 = neutral, 0.0 = low quality"
+          "description": "Quality score 0.0–1.0. 1.0 = verified, 0.5 = neutral, 0.0 = low quality"
         }
       },
       "required": [
@@ -1541,11 +1745,12 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
     },
     "annotations": {
       "destructiveHint": true
-    }
+    },
+    "title": "Score Entity Quality"
   },
   {
     "name": "mimir_conflicts",
-    "description": "Detect conflicting entities in the same category \u2014 pairs with low trigram similarity in their body_json. Flags potential contradictions, duplicate-but-divergent entries, and stale-overwritten facts. Read-only by default. Opt in with resolve=true to actively invalidate the lower-certainty side of clear conflicts (superseding it into history, reversible + time-travelable via mimir_as_of); that path defaults to dry_run=true so you preview first, and never resolves pairs whose certainties are within certainty_margin.",
+    "description": "Detect conflicting entities in the same category — pairs with low trigram similarity in their body_json. Flags potential contradictions, duplicate-but-divergent entries, and stale-overwritten facts. Read-only by default. Opt in with resolve=true to actively invalidate the lower-certainty side of clear conflicts (superseding it into history, reversible + time-travelable via mimir_as_of); that path defaults to dry_run=true so you preview first, and never resolves pairs whose certainties are within certainty_margin.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -1557,7 +1762,7 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
         "threshold": {
           "type": "number",
           "default": 0.4,
-          "description": "Similarity threshold \u2014 pairs below this are flagged as conflicts"
+          "description": "Similarity threshold — pairs below this are flagged as conflicts"
         },
         "limit": {
           "type": "integer",
@@ -1610,7 +1815,8 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
     },
     "annotations": {
       "readOnlyHint": false
-    }
+    },
+    "title": "Detect Conflicting Entities"
   },
   {
     "name": "mimir_vault_export",
@@ -1656,11 +1862,12 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
     },
     "annotations": {
       "destructiveHint": true
-    }
+    },
+    "title": "Export Vault to Files"
   },
   {
     "name": "mimir_vault_import",
-    "description": "Import .md files from a vault directory into the database. Reads YAML frontmatter for metadata and markdown body for content. Idempotent \u2014 re-running on the same vault won't duplicate entities. Pair with mimir_vault_export for transfer.",
+    "description": "Import .md files from a vault directory into the database. Reads YAML frontmatter for metadata and markdown body for content. Idempotent — re-running on the same vault won't duplicate entities. Pair with mimir_vault_export for transfer.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -1702,11 +1909,12 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
     },
     "annotations": {
       "destructiveHint": true
-    }
+    },
+    "title": "Import Vault from Files"
   },
   {
     "name": "mimir_decay",
-    "description": "Recalculate Ebbinghaus decay scores for all entities based on time since last access. Auto-archives entities that have fully decayed (score < 0.05). Run periodically to keep memory fresh \u2014 decayed entities surface less often in recall results.",
+    "description": "Recalculate Ebbinghaus decay scores for all entities based on time since last access. Auto-archives entities that have fully decayed (score < 0.05). Run periodically to keep memory fresh — decayed entities surface less often in recall results.",
     "inputSchema": {
       "type": "object",
       "properties": {}
@@ -1734,7 +1942,8 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
     },
     "annotations": {
       "destructiveHint": true
-    }
+    },
+    "title": "Recalculate Decay Scores"
   },
   {
     "name": "mimir_reindex",
@@ -1754,7 +1963,8 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
     },
     "annotations": {
       "destructiveHint": true
-    }
+    },
+    "title": "Rebuild Search Index"
   },
   {
     "name": "mimir_workspace_list",
@@ -1781,11 +1991,12 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
     },
     "annotations": {
       "readOnlyHint": true
-    }
+    },
+    "title": "List Workspace Categories"
   },
   {
     "name": "mimir_recall_when",
-    "description": "Search entities whose recall_when triggers match a given context. Use this for proactive just-in-time memory injection \u2014 before writing code, before plans, at session start. Pass the current task description as context and get back memories that declared they should be recalled in similar situations.",
+    "description": "Search entities whose recall_when triggers match a given context. Use this for proactive just-in-time memory injection — before writing code, before plans, at session start. Pass the current task description as context and get back memories that declared they should be recalled in similar situations.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -1799,19 +2010,31 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
           "default": 10
         }
       },
-      "required": ["context"]
+      "required": [
+        "context"
+      ]
     },
     "outputSchema": {
       "type": "object",
       "properties": {
-        "items": {"type": "array", "items": {"type": "object"}},
-        "total": {"type": "integer"},
-        "context": {"type": "string"}
+        "items": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        },
+        "total": {
+          "type": "integer"
+        },
+        "context": {
+          "type": "string"
+        }
       }
     },
     "annotations": {
       "readOnlyHint": true
-    }
+    },
+    "title": "Proactive Recall by Context"
   },
   {
     "name": "mimir_cohere",
@@ -1844,18 +2067,38 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
     "outputSchema": {
       "type": "object",
       "properties": {
-        "promoted": {"type": "integer", "description": "Number of entities promoted from buffer to working"},
-        "decayed": {"type": "integer", "description": "Number of entities whose decay score was reduced"},
-        "linked": {"type": "integer", "description": "Number of auto-links created"},
-        "archived": {"type": "integer", "description": "Number of entities archived due to low decay"},
-        "entities_examined": {"type": "integer", "description": "Total non-archived entities examined"},
-        "dry_run": {"type": "boolean"},
-        "completed_at_unix_ms": {"type": "integer"}
+        "promoted": {
+          "type": "integer",
+          "description": "Number of entities promoted from buffer to working"
+        },
+        "decayed": {
+          "type": "integer",
+          "description": "Number of entities whose decay score was reduced"
+        },
+        "linked": {
+          "type": "integer",
+          "description": "Number of auto-links created"
+        },
+        "archived": {
+          "type": "integer",
+          "description": "Number of entities archived due to low decay"
+        },
+        "entities_examined": {
+          "type": "integer",
+          "description": "Total non-archived entities examined"
+        },
+        "dry_run": {
+          "type": "boolean"
+        },
+        "completed_at_unix_ms": {
+          "type": "integer"
+        }
       }
     },
     "annotations": {
       "destructiveHint": true
-    }
+    },
+    "title": "Run Coherence Grooming"
   },
   {
     "name": "mimir_share",
@@ -1876,7 +2119,11 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
           "description": "Target workspace hash to copy the entity into"
         }
       },
-      "required": ["category", "key", "to_workspace"]
+      "required": [
+        "category",
+        "key",
+        "to_workspace"
+      ]
     },
     "outputSchema": {
       "type": "object",
@@ -1901,7 +2148,8 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
     },
     "annotations": {
       "destructiveHint": true
-    }
+    },
+    "title": "Share Entity to Workspace"
   },
   {
     "name": "mimir_federate",
@@ -1923,7 +2171,10 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
           "description": "Temporary vault directory for the intermediate .md export files"
         }
       },
-      "required": ["from_workspace", "to_workspace"]
+      "required": [
+        "from_workspace",
+        "to_workspace"
+      ]
     },
     "outputSchema": {
       "type": "object",
@@ -1942,19 +2193,21 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
         },
         "import_errors": {
           "type": "array",
-          "items": {"type": "string"},
+          "items": {
+            "type": "string"
+          },
           "description": "Any errors encountered during import"
         }
       }
     },
     "annotations": {
       "destructiveHint": true
-    }
-  }
-,
+    },
+    "title": "Federate Entities Between Workspaces"
+  },
   {
     "name": "mimir_correct",
-    "description": "Capture a user correction to the agent. Stores what went wrong, what the user said, and the lesson learned \u2014 as both a 'correction' entity and a journal entry. Use this every time the user corrects your approach. Enables the self-improving feedback loop: the agent learns from mistakes across sessions.",
+    "description": "Capture a user correction to the agent. Stores what went wrong, what the user said, and the lesson learned — as both a 'correction' entity and a journal entry. Use this every time the user corrects your approach. Enables the self-improving feedback loop: the agent learns from mistakes across sessions.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -1977,7 +2230,9 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
         },
         "tags": {
           "type": "array",
-          "items": {"type": "string"},
+          "items": {
+            "type": "string"
+          },
           "description": "Tags for categorization"
         },
         "category": {
@@ -1991,21 +2246,38 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
           "description": "Visibility: 'private', 'workspace', or 'public'"
         }
       },
-      "required": ["wrong_approach", "user_correction", "task_context"]
+      "required": [
+        "wrong_approach",
+        "user_correction",
+        "task_context"
+      ]
     },
     "outputSchema": {
       "type": "object",
       "properties": {
-        "entity_id": {"type": "string", "description": "Created correction entity ID"},
-        "journal_id": {"type": "string", "description": "Created journal entry ID"},
-        "category": {"type": "string"},
-        "key": {"type": "string"},
-        "created_at_unix_ms": {"type": "integer"}
+        "entity_id": {
+          "type": "string",
+          "description": "Created correction entity ID"
+        },
+        "journal_id": {
+          "type": "string",
+          "description": "Created journal entry ID"
+        },
+        "category": {
+          "type": "string"
+        },
+        "key": {
+          "type": "string"
+        },
+        "created_at_unix_ms": {
+          "type": "integer"
+        }
       }
     },
     "annotations": {
       "destructiveHint": true
-    }
+    },
+    "title": "Capture Agent Correction"
   },
   {
     "name": "mimir_synthesize",
@@ -2024,7 +2296,9 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
         },
         "tags": {
           "type": "array",
-          "items": {"type": "string"},
+          "items": {
+            "type": "string"
+          },
           "description": "Tags applied to all synthesized entities"
         },
         "visibility": {
@@ -2033,7 +2307,9 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
           "description": "Visibility for synthesized entities"
         }
       },
-      "required": ["session_content"]
+      "required": [
+        "session_content"
+      ]
     },
     "outputSchema": {
       "type": "object",
@@ -2043,27 +2319,45 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
           "items": {
             "type": "object",
             "properties": {
-              "lesson_type": {"type": "string"},
-              "summary": {"type": "string"},
-              "evidence": {"type": "string"},
-              "confidence": {"type": "number"}
+              "lesson_type": {
+                "type": "string"
+              },
+              "summary": {
+                "type": "string"
+              },
+              "evidence": {
+                "type": "string"
+              },
+              "confidence": {
+                "type": "number"
+              }
             }
           },
           "description": "Extracted lessons with type, summary, evidence, and confidence"
         },
-        "entities_created": {"type": "integer", "description": "Number of lesson entities created"},
-        "journal_id": {"type": "string"},
-        "dry_run": {"type": "boolean"},
-        "completed_at_unix_ms": {"type": "integer"}
+        "entities_created": {
+          "type": "integer",
+          "description": "Number of lesson entities created"
+        },
+        "journal_id": {
+          "type": "string"
+        },
+        "dry_run": {
+          "type": "boolean"
+        },
+        "completed_at_unix_ms": {
+          "type": "integer"
+        }
       }
     },
     "annotations": {
       "destructiveHint": true
-    }
+    },
+    "title": "Synthesize Session Lessons"
   },
   {
     "name": "mimir_bench",
-    "description": "Record a performance benchmark data point. Tracks task metrics (turns taken, tokens used, success) alongside whether memory recall was used \u2014 enabling measurement of Mimir's impact on agent performance. Aggregate with mimir_recall to analyze trends.",
+    "description": "Record a performance benchmark data point. Tracks task metrics (turns taken, tokens used, success) alongside whether memory recall was used — enabling measurement of Mimir's impact on agent performance. Aggregate with mimir_recall to analyze trends.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -2100,22 +2394,35 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
         },
         "tags": {
           "type": "array",
-          "items": {"type": "string"},
+          "items": {
+            "type": "string"
+          },
           "description": "Tags for categorization"
         }
       },
-      "required": ["task_description", "turns_taken", "tokens_used", "memory_recall_used"]
+      "required": [
+        "task_description",
+        "turns_taken",
+        "tokens_used",
+        "memory_recall_used"
+      ]
     },
     "outputSchema": {
       "type": "object",
       "properties": {
-        "entity_id": {"type": "string", "description": "Created benchmark entity ID"},
-        "created_at_unix_ms": {"type": "integer"}
+        "entity_id": {
+          "type": "string",
+          "description": "Created benchmark entity ID"
+        },
+        "created_at_unix_ms": {
+          "type": "integer"
+        }
       }
     },
     "annotations": {
       "destructiveHint": true
-    }
+    },
+    "title": "Record Benchmark"
   },
   {
     "name": "mimir_autocohere",
@@ -2133,18 +2440,39 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
     "outputSchema": {
       "type": "object",
       "properties": {
-        "promoted_entities": {"type": "integer", "description": "Entities promoted during cohere"},
-        "links_created": {"type": "integer", "description": "Auto-links created during cohere"},
-        "archived_entities": {"type": "integer", "description": "Entities archived (cohere + compact)"},
-        "decay_updates": {"type": "integer", "description": "Entities whose decay score was updated"},
-        "compact_archived_count": {"type": "integer", "description": "Entities archived during compact step"},
-        "db_size_delta_bytes": {"type": "integer", "description": "Change in SQLite file size in bytes"},
-        "dry_run": {"type": "boolean"}
+        "promoted_entities": {
+          "type": "integer",
+          "description": "Entities promoted during cohere"
+        },
+        "links_created": {
+          "type": "integer",
+          "description": "Auto-links created during cohere"
+        },
+        "archived_entities": {
+          "type": "integer",
+          "description": "Entities archived (cohere + compact)"
+        },
+        "decay_updates": {
+          "type": "integer",
+          "description": "Entities whose decay score was updated"
+        },
+        "compact_archived_count": {
+          "type": "integer",
+          "description": "Entities archived during compact step"
+        },
+        "db_size_delta_bytes": {
+          "type": "integer",
+          "description": "Change in SQLite file size in bytes"
+        },
+        "dry_run": {
+          "type": "boolean"
+        }
       }
     },
     "annotations": {
       "destructiveHint": true
-    }
+    },
+    "title": "Atomic Coherence Pass"
   },
   {
     "name": "mimir_supersede",
@@ -2179,24 +2507,49 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
           "default": "supersedes"
         }
       },
-      "required": ["from_category", "from_key", "to_category", "to_key"]
+      "required": [
+        "from_category",
+        "from_key",
+        "to_category",
+        "to_key"
+      ]
     },
     "outputSchema": {
       "type": "object",
       "properties": {
-        "from_entity_id": {"type": "string", "description": "ID of the old (superseded) entity"},
-        "from_entity_category": {"type": "string"},
-        "from_entity_key": {"type": "string"},
-        "to_entity_id": {"type": "string", "description": "ID of the new (superseding) entity"},
-        "to_entity_category": {"type": "string"},
-        "to_entity_key": {"type": "string"},
-        "relationship": {"type": "string"},
-        "status_updated": {"type": "string", "description": "New status of the old entity (always 'deprecated')"}
+        "from_entity_id": {
+          "type": "string",
+          "description": "ID of the old (superseded) entity"
+        },
+        "from_entity_category": {
+          "type": "string"
+        },
+        "from_entity_key": {
+          "type": "string"
+        },
+        "to_entity_id": {
+          "type": "string",
+          "description": "ID of the new (superseding) entity"
+        },
+        "to_entity_category": {
+          "type": "string"
+        },
+        "to_entity_key": {
+          "type": "string"
+        },
+        "relationship": {
+          "type": "string"
+        },
+        "status_updated": {
+          "type": "string",
+          "description": "New status of the old entity (always 'deprecated')"
+        }
       }
     },
     "annotations": {
       "destructiveHint": true
-    }
+    },
+    "title": "Supersede Entity"
   },
   {
     "name": "mimir_maintenance",
@@ -2239,19 +2592,44 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
     "outputSchema": {
       "type": "object",
       "properties": {
-        "dedup_archived": {"type": "integer", "description": "Number of duplicate entities archived"},
-        "orphan_journal_entries_found": {"type": "integer", "description": "Orphan journal entries detected"},
-        "orphan_links_found": {"type": "integer", "description": "Orphan links detected"},
-        "vacuum_reclaimed_bytes": {"type": "integer", "description": "Disk space reclaimed by VACUUM"},
-        "reindex_rows_affected": {"type": "integer", "description": "Rows reindexed into FTS5"},
-        "dry_run": {"type": "boolean"},
-        "errors": {"type": "array", "items": {"type": "string"}, "description": "Errors encountered during maintenance"}
+        "dedup_archived": {
+          "type": "integer",
+          "description": "Number of duplicate entities archived"
+        },
+        "orphan_journal_entries_found": {
+          "type": "integer",
+          "description": "Orphan journal entries detected"
+        },
+        "orphan_links_found": {
+          "type": "integer",
+          "description": "Orphan links detected"
+        },
+        "vacuum_reclaimed_bytes": {
+          "type": "integer",
+          "description": "Disk space reclaimed by VACUUM"
+        },
+        "reindex_rows_affected": {
+          "type": "integer",
+          "description": "Rows reindexed into FTS5"
+        },
+        "dry_run": {
+          "type": "boolean"
+        },
+        "errors": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Errors encountered during maintenance"
+        }
       }
     },
     "annotations": {
       "destructiveHint": true
-    }
-  }]"###
+    },
+    "title": "Run Database Maintenance"
+  }
+]"###
         ).expect("tools JSON must be valid")
     });
 
