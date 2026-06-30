@@ -55,6 +55,23 @@ echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"mimir_reme
 echo '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"mimir_recall","arguments":{"query":"Hello"}}}' | mimir serve --db memory.db
 ```
 
+## Works With Every MCP Client
+
+Mimir is a standard MCP **stdio** server — the same `mimir serve` command works
+everywhere. Run `mimir doctor` to validate your install and print this matrix locally.
+
+| Client | Status | Config | 
+|---|---|---|
+| Claude Desktop | ✅ | `claude_desktop_config.json` |
+| Claude Code / Hermes | ✅ | `.mcp.json` / `config.yaml` |
+| Cursor | ✅ | `.cursor/mcp.json` |
+| Windsurf | ✅ | `mcp_config.json` |
+| VS Code + Continue.dev | ✅ | `config.json` |
+| Zed | ✅ | `settings.json` |
+| Codex CLI | ✅ | `~/.codex/config.toml` |
+
+Copy-paste config snippets for each: **[docs/clients/](docs/clients/)**.
+
 ## Why Mimir
 
 Mimir is the **only** memory engine that is simultaneously MCP-native,

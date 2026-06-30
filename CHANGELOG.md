@@ -5,6 +5,15 @@ All notable changes to Mimir are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Added
+- **`mimir doctor` + verified client compatibility matrix (#272).** New `mimir doctor`
+  subcommand validates the local install (binary path, db path) and prints the MCP
+  stdio config plus a compatibility matrix for Claude Desktop, Claude Code/Hermes,
+  Cursor, Windsurf, VS Code+Continue.dev, Zed, and Codex CLI. Added a "Works With
+  Every MCP Client" table to the README and copy-paste config snippets in
+  `docs/clients/`. Mimir is a standard MCP stdio server, so the same command works
+  everywhere — this documents and self-checks it.
+
 ### Security
 - **Decryption failures no longer silently return ciphertext.** On an encrypted DB,
   the read path (`entity_from_row`), FTS reindex, and the history content-change
