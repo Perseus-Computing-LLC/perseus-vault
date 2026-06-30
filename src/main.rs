@@ -365,6 +365,54 @@ enum Commands {
     },
 }
 
+impl Commands {
+    /// Mutable handle to this subcommand's defaulted `--db String` field, if it
+    /// has one. `Migrate`/`Keygen` have no database; `ObsidianSync` uses an
+    /// `Option<String>` and is handled separately (#313).
+    fn db_field_mut(&mut self) -> Option<&mut String> {
+        match self {
+            Commands::Write { db, .. }
+            | Commands::Serve { db, .. }
+            | Commands::Forget { db, .. }
+            | Commands::Prune { db, .. }
+            | Commands::Decay { db, .. }
+            | Commands::Reindex { db, .. }
+            | Commands::Stats { db, .. }
+            | Commands::StateDigest { db, .. }
+            | Commands::VaultExport { db, .. }
+            | Commands::VaultImport { db, .. }
+            | Commands::Purge { db, .. }
+            | Commands::Doctor { db, .. } => Some(db),
+            Commands::ObsidianSync { .. } | Commands::Migrate { .. } | Commands::Keygen { .. } => {
+                None
+            }
+        }
+    }
+}
+
+/// #313: honor the documented top-level `--db` even when a subcommand follows
+/// (`mimir --db PATH serve`). Each subcommand carries its own `--db` defaulted to
+/// `default_db_path()`; when the user did not pass a subcommand-level `--db` (it
+/// still equals the default), the top-level flag fills it in so it is no longer
+/// silently ignored. An explicit subcommand-level `--db` always wins.
+fn apply_top_level_db(cli: &mut Cli) {
+    let Some(top_db) = cli.db.clone() else {
+        return;
+    };
+    let Some(cmd) = cli.command.as_mut() else {
+        return;
+    };
+    if let Commands::ObsidianSync { db, .. } = cmd {
+        if db.is_none() {
+            *db = Some(top_db);
+        }
+    } else if let Some(db) = cmd.db_field_mut() {
+        if *db == default_db_path() {
+            *db = top_db;
+        }
+    }
+}
+
 fn default_db_path() -> String {
     std::env::var("MIMIR_DB_PATH").unwrap_or_else(|_| {
         let home = std::env::var("HOME")
@@ -475,7 +523,8 @@ fn run_doctor(db_path: &str) {
 }
 
 fn main() {
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
+    apply_top_level_db(&mut cli); // #313: `mimir --db PATH serve` must honor --db
 
     match cli.command {
         Some(Commands::Keygen { key_file }) => {
@@ -1281,6 +1330,41 @@ mod tests {
         match cli.command {
             Some(Commands::Serve { db, .. }) => assert_eq!(db, "/tmp/mimir-serve.db"),
             _ => panic!("expected serve subcommand"),
+        }
+    }
+
+    #[test]
+    fn top_level_db_propagates_to_serve_subcommand() {
+        // #313: `mimir --db PATH serve` must NOT silently fall back to the
+        // subcommand's default db — the documented top-level flag fills it in.
+        let mut cli = Cli::parse_from(["mimir", "--db", "/tmp/top.db", "serve"]);
+        apply_top_level_db(&mut cli);
+        match cli.command {
+            Some(Commands::Serve { db, .. }) => assert_eq!(db, "/tmp/top.db"),
+            _ => panic!("expected serve subcommand"),
+        }
+    }
+
+    #[test]
+    fn explicit_subcommand_db_wins_over_top_level() {
+        // #313: an explicit subcommand-level `--db` always beats the top-level one.
+        let mut cli =
+            Cli::parse_from(["mimir", "--db", "/tmp/top.db", "serve", "--db", "/tmp/sub.db"]);
+        apply_top_level_db(&mut cli);
+        match cli.command {
+            Some(Commands::Serve { db, .. }) => assert_eq!(db, "/tmp/sub.db"),
+            _ => panic!("expected serve subcommand"),
+        }
+    }
+
+    #[test]
+    fn top_level_db_propagates_to_obsidian_sync() {
+        // #313: ObsidianSync uses an Option<String> db; the top-level flag fills it.
+        let mut cli = Cli::parse_from(["mimir", "--db", "/tmp/top.db", "obsidian-sync", "/tmp/v"]);
+        apply_top_level_db(&mut cli);
+        match cli.command {
+            Some(Commands::ObsidianSync { db, .. }) => assert_eq!(db.as_deref(), Some("/tmp/top.db")),
+            _ => panic!("expected obsidian-sync subcommand"),
         }
     }
 
