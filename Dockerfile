@@ -14,12 +14,18 @@ WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY src/ ./src/
 COPY build.rs ./
-RUN cargo build --release --no-default-features && strip target/release/mimir
+RUN cargo build --release --no-default-features && strip target/release/mneme
 
 FROM alpine:3.21
 # Ownership proof for the MCP Registry (must equal server.json "name").
+# NOTE: left as "mimir" deliberately — the MCP Registry name is a separately
+# re-verified identity (see server.json), not part of this code-level rename.
 LABEL io.modelcontextprotocol.server.name="io.github.Perseus-Computing-LLC/mimir"
 RUN apk add --no-cache sqlite-libs
-COPY --from=builder /app/target/release/mimir /usr/local/bin/mimir
-ENTRYPOINT ["/usr/local/bin/mimir"]
-CMD ["serve", "--db", "/data/mimir.db"]
+COPY --from=builder /app/target/release/mneme /usr/local/bin/mneme
+# Mneme rename (transition release): keep a "mimir" symlink so existing
+# `docker run`/compose configs that override CMD with a `mimir ...` command
+# keep working unchanged.
+RUN ln -s /usr/local/bin/mneme /usr/local/bin/mimir
+ENTRYPOINT ["/usr/local/bin/mneme"]
+CMD ["serve", "--db", "/data/mneme.db"]

@@ -21,7 +21,7 @@ jobs:
           out=$(printf '%s\n' \
             '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"smoke","version":"0"}}}' \
             '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
-            | ./target/debug/mimir --db /tmp/smoke.db)
+            | ./target/debug/mneme --db /tmp/smoke.db)
           echo "$out"
           echo "$out" | grep -q '"protocolVersion"' || { echo "initialize failed"; exit 1; }
           echo "$out" | grep -q 'mimir_remember' || { echo "tools/list missing mimir_remember"; exit 1; }
