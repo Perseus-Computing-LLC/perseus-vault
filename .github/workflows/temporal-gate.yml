@@ -1,0 +1,53 @@
+name: Bi-temporal gate
+
+# Guards Mimir's bi-temporal contract: time-travel (mimir_as_of) returns the
+# version that was live at a past instant, supersede moves the prior version to
+# history, and current recall is live-only (a superseded version must never
+# resurface). A single failing check means time-travel or supersede regressed,
+# so this gate requires 100%. Fast, offline, no network or API key.
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - "src/**"
+      - "benchmark/temporal/**"
+      - ".github/workflows/temporal-gate.yml"
+  pull_request:
+    branches: [main, master]
+    paths:
+      - "src/**"
+      - "benchmark/temporal/**"
+      - ".github/workflows/temporal-gate.yml"
+
+env:
+  CARGO_TERM_COLOR: always
+  MIMIR_BUNDLED_MODEL_DIR: ${{ github.workspace }}/.model-cache
+
+jobs:
+  temporal-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Cache embedding model
+        uses: actions/cache@v4
+        with:
+          path: .model-cache
+          key: minilm-l6-v2-qint8-v1
+      - name: Fetch embedding model (if not cached)
+        shell: bash
+        run: |
+          mkdir -p .model-cache
+          base=https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main
+          [ -s .model-cache/model_qint8_avx512_vnni.onnx ] || curl -fL "$base/onnx/model_qint8_avx512_vnni.onnx" -o .model-cache/model_qint8_avx512_vnni.onnx
+          [ -s .model-cache/tokenizer.json ] || curl -fL "$base/tokenizer.json" -o .model-cache/tokenizer.json
+          cp .model-cache/model_qint8_avx512_vnni.onnx .model-cache/model_quantized.onnx
+      - name: Build (release, bundled embeddings)
+        run: cargo build --release
+      - name: Bi-temporal gate
+        run: python benchmark/temporal/gate.py
