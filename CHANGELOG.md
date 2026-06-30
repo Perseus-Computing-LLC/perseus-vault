@@ -13,6 +13,10 @@ All notable changes to Mimir are documented here. This project adheres to
   Every MCP Client" table to the README and copy-paste config snippets in
   `docs/clients/`. Mimir is a standard MCP stdio server, so the same command works
   everywhere — this documents and self-checks it.
+- **`include_confidence` on `mimir_recall` (#287).** Opt-in (default false): each result
+  gains a normalized `confidence` (0.0–1.0) rolled up from rank, trust (verified/certainty),
+  and decay — a single number for callers/UIs instead of eyeballing raw signals. Purely
+  presentation-layer; ranking math and existing snapshots are unchanged.
 
 ### Security
 - **Decryption failures no longer silently return ciphertext.** On an encrypted DB,
