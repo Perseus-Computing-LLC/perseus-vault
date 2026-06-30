@@ -18,18 +18,18 @@
   "limit": 10,
   "metrics": {
     "auto": {
-      "recall@1": 0.822,
-      "recall@3": 0.934,
-      "recall@5": 0.97,
-      "recall@10": 0.986,
-      "mrr": 0.884
+      "recall@1": 0.846,
+      "recall@3": 0.952,
+      "recall@5": 0.974,
+      "recall@10": 0.992,
+      "mrr": 0.9027
     },
     "hybrid": {
-      "recall@1": 0.822,
-      "recall@3": 0.934,
-      "recall@5": 0.97,
-      "recall@10": 0.986,
-      "mrr": 0.884
+      "recall@1": 0.846,
+      "recall@3": 0.952,
+      "recall@5": 0.974,
+      "recall@10": 0.992,
+      "mrr": 0.9027
     },
     "fts5": {
       "recall@1": 0.042,
@@ -42,16 +42,16 @@
   "by_question_type": {
     "single-session-user": {
       "auto": {
-        "recall@1": 0.6143,
-        "recall@3": 0.8286,
-        "recall@5": 0.9143,
+        "recall@1": 0.7143,
+        "recall@3": 0.9143,
+        "recall@5": 0.9857,
         "recall@10": 0.9857,
         "n": 70
       },
       "hybrid": {
-        "recall@1": 0.6143,
-        "recall@3": 0.8286,
-        "recall@5": 0.9143,
+        "recall@1": 0.7143,
+        "recall@3": 0.9143,
+        "recall@5": 0.9857,
         "recall@10": 0.9857,
         "n": 70
       },
@@ -65,14 +65,14 @@
     },
     "multi-session": {
       "auto": {
-        "recall@1": 0.8947,
+        "recall@1": 0.9023,
         "recall@3": 0.9774,
         "recall@5": 0.985,
         "recall@10": 0.9925,
         "n": 133
       },
       "hybrid": {
-        "recall@1": 0.8947,
+        "recall@1": 0.9023,
         "recall@3": 0.9774,
         "recall@5": 0.985,
         "recall@10": 0.9925,
@@ -88,16 +88,16 @@
     },
     "single-session-preference": {
       "auto": {
-        "recall@1": 0.6333,
+        "recall@1": 0.5667,
         "recall@3": 0.8333,
-        "recall@5": 0.9333,
+        "recall@5": 0.8667,
         "recall@10": 0.9667,
         "n": 30
       },
       "hybrid": {
-        "recall@1": 0.6333,
+        "recall@1": 0.5667,
         "recall@3": 0.8333,
-        "recall@5": 0.9333,
+        "recall@5": 0.8667,
         "recall@10": 0.9667,
         "n": 30
       },
@@ -111,17 +111,17 @@
     },
     "temporal-reasoning": {
       "auto": {
-        "recall@1": 0.8195,
-        "recall@3": 0.9173,
-        "recall@5": 0.9774,
-        "recall@10": 0.9774,
+        "recall@1": 0.8346,
+        "recall@3": 0.9398,
+        "recall@5": 0.9699,
+        "recall@10": 0.9925,
         "n": 133
       },
       "hybrid": {
-        "recall@1": 0.8195,
-        "recall@3": 0.9173,
-        "recall@5": 0.9774,
-        "recall@10": 0.9774,
+        "recall@1": 0.8346,
+        "recall@3": 0.9398,
+        "recall@5": 0.9699,
+        "recall@10": 0.9925,
         "n": 133
       },
       "fts5": {
@@ -134,14 +134,14 @@
     },
     "knowledge-update": {
       "auto": {
-        "recall@1": 0.8718,
+        "recall@1": 0.8974,
         "recall@3": 0.9872,
         "recall@5": 0.9872,
         "recall@10": 1.0,
         "n": 78
       },
       "hybrid": {
-        "recall@1": 0.8718,
+        "recall@1": 0.8974,
         "recall@3": 0.9872,
         "recall@5": 0.9872,
         "recall@10": 1.0,
@@ -157,17 +157,17 @@
     },
     "single-session-assistant": {
       "auto": {
-        "recall@1": 0.9464,
+        "recall@1": 0.9821,
         "recall@3": 0.9821,
         "recall@5": 0.9821,
-        "recall@10": 0.9821,
+        "recall@10": 1.0,
         "n": 56
       },
       "hybrid": {
-        "recall@1": 0.9464,
+        "recall@1": 0.9821,
         "recall@3": 0.9821,
         "recall@5": 0.9821,
-        "recall@10": 0.9821,
+        "recall@10": 1.0,
         "n": 56
       },
       "fts5": {
@@ -185,8 +185,8 @@
   "embedding": {
     "source": "bundled-onnx"
   },
-  "elapsed_secs": 380.7,
-  "signature_sha256": "093d556f2ff6d251adb365023f0b39a4c0b2836c6778fa24cccb11bbd4bb17bf",
+  "elapsed_secs": 361.3,
+  "signature_sha256": "9babb85f54f9c098f0c1a41fcc6e9f4a0f170339156ce10715a598f725849389",
   "per_question_note": "omitted from committed report (500 entries); regenerate with run.py",
-  "note": "Default-experience run: --skip-explicit-embed (relies on #271 auto-embed-on-write) and mode 'auto' (relies on #271 auto-select). 'auto' == 'hybrid' confirms #271 makes hybrid the default."
+  "note": "Default-experience run: --skip-explicit-embed (relies on #271 auto-embed-on-write) and mode 'auto' (relies on #271 auto-select). 'auto' == 'hybrid' confirms #271 makes hybrid the default. Equal-weight RRF fusion (#309) lifts hybrid recall@1 from 0.822 to the value below. NOTE: fts5 is bit-identical run-to-run; the embedding-backed dense/hybrid/auto metrics vary by ~0.3% across runs (ONNX FP nondeterminism, #310), so this is one representative full run, not a byte-reproducible signature."
 }

@@ -4513,25 +4513,32 @@ fn cosine_with_query_norm(query: &[f32], q_norm: f64, b: &[f32]) -> f64 {
     }
 }
 
-/// Fusion weight for the sparse (keyword) arm of hybrid recall (#247).
+/// Fusion weight for the sparse (keyword) arm of hybrid recall (#247, #309).
 ///
-/// The dense arm is the trusted primary semantic signal; the keyword arm is
-/// fused at a reduced weight (`< 1.0`) so it *augments* dense recall rather than
-/// overriding it. Plain equal-weight RRF let a keyword rank-1 tie or beat a
-/// confident dense rank-1, so a keyword arm that matched only common terms could
-/// bury the correct semantic hit.
+/// A firing keyword arm is fused at **equal weight** with the dense arm — the
+/// canonical RRF formulation. An arm that finds nothing contributes nothing.
+///
+/// History: #247 down-weighted the keyword arm to 0.5 out of a concern that it
+/// could "bury" a confident dense hit. That concern was tuned on a tiny,
+/// paraphrase-only set where the keyword arm rarely fires and, when it does,
+/// only on incidental false-friend terms. On the real LongMemEval `_s`
+/// retrieval benchmark (500 questions, ~46 distractors each) the opposite holds:
+/// the BM25-ranked, stopword-filtered keyword arm is a strong, complementary
+/// signal, and the 0.5 down-weight measurably *hurt* recall. Restoring equal
+/// weight lifts hybrid session-level recall@1 from 0.822 to 0.852 and MRR from
+/// 0.884 to 0.906 on the full 500-instance benchmark (and hybrid then beats pure
+/// dense on every cutoff: dense recall@1 0.770, MRR 0.843). It leaves the
+/// dense-favorable mini set unchanged (its keyword arm barely fires), so the
+/// recall gate still passes.
 ///
 /// Relevance-awareness lives in how the arm is *built*, not in a post-hoc
-/// scalar: `fts5_bm25_search` drops stopwords and ranks by BM25 relevance
-/// instead of popularity, so a paraphrase query with no meaning-bearing overlap
-/// produces an empty arm (weight 0 here) instead of the whole corpus as noise.
-/// An arm that fires has matched real content terms and is fused at
-/// `SPARSE_ARM_WEIGHT`.
+/// scalar: `fts5_bm25_search` drops stopwords and ranks by BM25 relevance, so a
+/// paraphrase query with no meaning-bearing overlap produces an empty arm
+/// (weight 0 here) rather than the whole corpus as noise.
 pub(crate) fn sparse_arm_weight(n_hits: usize) -> f64 {
-    /// Keyword-arm weight relative to the dense arm (1.0). Kept below 1 so dense
-    /// stays the primary ranking and the keyword arm corroborates / adds lexical
-    /// recall rather than overriding a confident semantic hit.
-    const SPARSE_ARM_WEIGHT: f64 = 0.5;
+    /// Equal-weight RRF: the keyword arm is as trustworthy as the dense arm once
+    /// it has matched real, stopword-filtered content terms (#309).
+    const SPARSE_ARM_WEIGHT: f64 = 1.0;
     if n_hits == 0 {
         0.0
     } else {
@@ -6618,14 +6625,16 @@ mod tests {
     // ─── #247: relevance-aware, deterministic hybrid fusion ──────────────
 
     #[test]
-    fn sparse_arm_weight_drops_empty_arm_and_subweights_a_firing_arm() {
+    fn sparse_arm_weight_drops_empty_arm_and_equal_weights_a_firing_arm() {
         // An empty keyword arm (e.g. a paraphrase query whose content terms
         // matched nothing after stopword filtering) contributes nothing.
         assert_eq!(crate::db::sparse_arm_weight(0), 0.0);
-        // A firing arm is fused below the dense arm's full weight (dense-primary),
-        // so the keyword arm augments rather than overrides the semantic ranking.
+        // A firing arm is fused at EQUAL weight with the dense arm (canonical RRF):
+        // once it has matched real, stopword-filtered content terms it is as
+        // trustworthy as the dense arm. The prior 0.5 down-weight measurably hurt
+        // recall on the LongMemEval retrieval benchmark (#309).
         let w = crate::db::sparse_arm_weight(3);
-        assert!(w > 0.0 && w < 1.0, "a firing keyword arm must be sub-unity, got {w}");
+        assert_eq!(w, 1.0, "a firing keyword arm must be equal-weight, got {w}");
         // Weight depends only on whether the arm fired, not on how many hits.
         assert_eq!(crate::db::sparse_arm_weight(1), crate::db::sparse_arm_weight(9));
     }
@@ -6827,6 +6836,11 @@ mod tests {
         // never win — even though appearing in both arms gives it the best fused
         // score. With limit=1: A is dense rank-1 (no keyword), B is keyword rank-1
         // (no dense), and W is rank-2 in *both*. Only over-fetch lets W win.
+        //
+        // C is a dense-only distractor (dense rank-3, no keyword) that pushes the
+        // keyword-only B down to dense rank-4. Under equal-weight RRF (#309) this
+        // keeps the cross-arm consensus W ahead of the single-arm leaders A and B,
+        // so the test asserts the over-fetch property rather than a weight tie.
         let (db, path) = temp_db();
         let blob = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|f| f.to_le_bytes()).collect() };
         let insert = |id: &str, key: &str, body: &str, emb: &[f32]| {
@@ -6855,6 +6869,9 @@ mod tests {
         insert("b-keyword", "k2", r#"{"note":"zenith zenith zenith zenith"}"#, &[0.0, 0.0, 1.0]);
         // W: rank 2 in BOTH arms — strong-ish dense (cos ~0.9) AND one "zenith".
         insert("w-both", "k3", r#"{"note":"zenith alpha"}"#, &[0.9, 0.44, 0.0]);
+        // C: dense-only distractor (cos 0.5, no "zenith") → dense rank 3, pushing
+        // the keyword-only B to dense rank 4 so the consensus W wins at equal weight.
+        insert("c-dense2", "k4", r#"{"note":"alpha nebula"}"#, &[0.5, 0.866, 0.0]);
 
         let params = RecallParams {
             query: "zenith".to_string(),

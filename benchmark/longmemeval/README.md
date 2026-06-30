@@ -38,9 +38,11 @@ curl -L https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned/resolve/m
 python benchmark/longmemeval/run.py --data longmemeval_s_cleaned.json
 ```
 
-Output: a signed `report.json` plus a console table. The run is offline and the
-metrics are deterministic run-to-run (fts5 and dense always were; hybrid RRF is
-byte-stable per #247).
+Output: a signed `report.json` plus a console table. The run is offline. `fts5`
+is bit-identical run-to-run and the RRF fusion step is deterministic (#247); the
+embedding-backed `dense`/`hybrid`/`auto` metrics vary by ~0.3% across runs
+because the ONNX backend's float math is not bit-reproducible (#310). Treat the
+hybrid headline as a representative number ±~0.3%, not a byte-exact signature.
 
 ## Method
 
@@ -72,31 +74,36 @@ vectors.
 | path | recall@1 | recall@3 | recall@5 | recall@10 | MRR |
 |------|---------:|---------:|---------:|----------:|----:|
 | keyword only (fts5) | 4.2% | 13.0% | 23.6% | 42.0% | 0.126 |
-| **default (auto, post-#271)** | **82.2%** | **93.4%** | **97.0%** | **98.6%** | **0.884** |
-| hybrid (explicit) | 82.2% | 93.4% | 97.0% | 98.6% | 0.884 |
+| **default (auto, post-#271 + #309)** | **84.6%** | **95.2%** | **97.4%** | **99.2%** | **0.903** |
+| hybrid (explicit) | 84.6% | 95.2% | 97.4% | 99.2% | 0.903 |
 
 **The headline:** before #271 a bare remember+recall fell back to keyword search, which
 finds the right session only **4%** of the time at rank 1 (LongMemEval paraphrases its
 questions). #271 makes auto-embed-on-write + hybrid the default, so the same bare calls
-now hit **82% recall@1 / 97% recall@5** with no API key, no cloud, no LLM, and no manual
-step. `auto` == `hybrid` to the digit, confirming the default now equals the ceiling.
-(Standalone dense, measured separately with explicit embed, is 77.0% / 93.8%.)
+now hit **~85% recall@1 / 97% recall@5** with no API key, no cloud, no LLM, and no manual
+step. `auto` == `hybrid` to the digit, confirming the default equals the ceiling.
+(Standalone dense, measured separately, is 77.0% / 93.8% — so fusing the keyword arm
+adds ~8 points of recall@1 over dense alone.) **#309** raised the keyword arm to equal
+weight in the RRF fusion (it had been under-weighted at 0.5), lifting the default from
+82.2% / 0.884 MRR to the numbers above. The headline carries ~0.3% run-to-run noise (#310).
 
 By question type (default/auto recall@1 / recall@5):
 
 | question type | n | recall@1 | recall@5 |
 |---|--:|--:|--:|
-| single-session-assistant | 56 | 94.6% | 98.2% |
-| multi-session | 133 | 89.5% | 98.5% |
-| knowledge-update | 78 | 87.2% | 98.7% |
-| temporal-reasoning | 133 | 82.0% | 97.7% |
-| single-session-preference | 30 | 63.3% | 93.3% |
-| single-session-user | 70 | 61.4% | 91.4% |
+| single-session-assistant | 56 | 98.2% | 98.2% |
+| multi-session | 133 | 90.2% | 98.5% |
+| knowledge-update | 78 | 89.7% | 98.7% |
+| temporal-reasoning | 133 | 83.5% | 97.0% |
+| single-session-user | 70 | 71.4% | 98.6% |
+| single-session-preference | 30 | 56.7% | 86.7% |
 
-Reproduce the default experience:
+Equal-weight fusion (#309) improved 5 of the 6 types vs the old 0.5 weight; the small
+`single-session-preference` set (n=30) traded down (63.3→56.7 recall@1) as the net
+across all 500 rose. Reproduce the default experience:
 `python benchmark/longmemeval/run.py --data longmemeval_s_cleaned.json --skip-explicit-embed --modes auto fts5`
-(signature `093d556f...`; deterministic run-to-run). Drop the flags to also measure the
-explicit dense/hybrid modes.
+(one representative signature `9babb85...`; `fts5` is exact, the hybrid number moves
+~0.3% run-to-run per #310). Drop the flags to also measure the explicit dense/hybrid modes.
 <!-- RESULTS-END -->
 
 ## Stage 2: QA accuracy (answer generation + LongMemEval's official judge)
