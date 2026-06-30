@@ -2871,4 +2871,58 @@ mod tests {
 
         let _ = fs::remove_file(db_path);
     }
+
+    #[test]
+    fn recall_layer_filter_scopes_by_canonical_and_alias() {
+        let db_path =
+            std::env::temp_dir().join(format!("mimir-layerfilter-{}.db", uuid::Uuid::new_v4()));
+        let db = Database::open(db_path.to_str().expect("temp db path")).expect("open temp db");
+
+        tools::handle_remember(
+            &db,
+            json!({"category":"demo","key":"a","body_json":"{\"content\":\"alpha core fact\"}","layer":"core"}),
+        )
+        .expect("remember a");
+        tools::handle_remember(
+            &db,
+            json!({"category":"demo","key":"b","body_json":"{\"content\":\"alpha working fact\"}","layer":"working"}),
+        )
+        .expect("remember b");
+
+        let keys = |resp: &str| -> Vec<String> {
+            let v: Value = serde_json::from_str(resp).unwrap();
+            v["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|i| i["key"].as_str().unwrap().to_string())
+                .collect()
+        };
+
+        // Canonical "core" -> only entity a.
+        let core =
+            tools::handle_recall(&db, json!({"query":"alpha","layer":"core"})).expect("recall");
+        let ck = keys(&core);
+        assert!(
+            ck.contains(&"a".to_string()) && !ck.contains(&"b".to_string()),
+            "core filter returned {:?}",
+            ck
+        );
+
+        // Alias "semantic" -> "working" -> only entity b.
+        let sem =
+            tools::handle_recall(&db, json!({"query":"alpha","layer":"semantic"})).expect("recall");
+        let sk = keys(&sem);
+        assert!(
+            sk.contains(&"b".to_string()) && !sk.contains(&"a".to_string()),
+            "semantic->working filter returned {:?}",
+            sk
+        );
+
+        // No layer filter -> both.
+        let all = tools::handle_recall(&db, json!({"query":"alpha"})).expect("recall");
+        assert_eq!(keys(&all).len(), 2, "no filter should return both");
+
+        let _ = fs::remove_file(db_path);
+    }
 }
