@@ -27,6 +27,14 @@ REPO = HERE.parent.parent
 # Conservative invariants. The default (auto) path must clearly beat keyword-only.
 MIN_AUTO_RECALL_AT_5 = 0.80      # default path must find the answer in top 5 most of the time
 MIN_AUTO_OVER_FTS5_AT_5 = 0.20   # and must beat FTS5 by a wide, semantic margin
+MIN_AUTO_MRR = 0.80              # and must rank the answer HIGH, not just somewhere in top 5
+# The default path is hybrid (dense + keyword RRF). RRF can dilute a strong dense
+# ranking when the keyword arm is weak, so the default may sit slightly below
+# pure dense — but it must never collapse far below it. This guards the fusion
+# quality of the default path against a regression that silently degrades it
+# toward the weak keyword arm (see the fusion-dilution follow-up issue).
+MAX_AUTO_BELOW_DENSE_AT_5 = 0.15   # default recall@5 must stay within this of pure dense
+MAX_AUTO_BELOW_DENSE_MRR = 0.15    # and within this of pure dense on MRR
 
 
 def find_binary(explicit):
@@ -94,6 +102,17 @@ def recall_at(ranked, relevant, k):
     return 1.0 if set(relevant) & set(ranked[:k]) else 0.0
 
 
+def reciprocal_rank(ranked, relevant):
+    """1/rank of the first relevant hit (0 if none). Rewards ranking the answer
+    high, not merely surfacing it somewhere in the top-k — which is exactly the
+    quality RRF fusion can erode when the keyword arm is noisy."""
+    rel = set(relevant)
+    for i, key in enumerate(ranked):
+        if key in rel:
+            return 1.0 / (i + 1)
+    return 0.0
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--bin", default=None)
@@ -117,24 +136,35 @@ def main():
         for mem in memories:
             m.call("mimir_remember", {"category": mem["category"], "key": mem["key"],
                                       "body_json": json.dumps({"note": mem["note"]}), "type": "fact"})
-        auto5 = fts5 = 0.0
+        auto5 = fts5 = dense5 = 0.0
+        auto_mrr = dense_mrr = 0.0
         for q in queries:
             # default path: no mode -> server auto-selects (#271)
             ra = m.call("mimir_recall", {"query": q["q"], "limit": 5, "trust_weight": 0, "min_decay": 0})
             rf = m.call("mimir_recall", {"query": q["q"], "mode": "fts5", "limit": 5,
                                          "trust_weight": 0, "min_decay": 0})
+            rd = m.call("mimir_recall", {"query": q["q"], "mode": "dense", "limit": 5,
+                                         "trust_weight": 0, "min_decay": 0})
             auto = [it.get("key") for it in (ra.get("items", []) if isinstance(ra, dict) else [])]
             keyw = [it.get("key") for it in (rf.get("items", []) if isinstance(rf, dict) else [])]
+            dens = [it.get("key") for it in (rd.get("items", []) if isinstance(rd, dict) else [])]
             auto5 += recall_at(auto, q["relevant"], 5)
             fts5 += recall_at(keyw, q["relevant"], 5)
+            dense5 += recall_at(dens, q["relevant"], 5)
+            auto_mrr += reciprocal_rank(auto, q["relevant"])
+            dense_mrr += reciprocal_rank(dens, q["relevant"])
     finally:
         m.close()
 
     n = len(queries)
     auto5 /= n
     fts5 /= n
-    print(f"default(auto) recall@5 = {auto5:.3f}   fts5 recall@5 = {fts5:.3f}   "
-          f"(n={n}, {len(memories)} memories, no manual embed)")
+    dense5 /= n
+    auto_mrr /= n
+    dense_mrr /= n
+    print(f"default(auto) recall@5 = {auto5:.3f}  MRR = {auto_mrr:.3f}   "
+          f"dense recall@5 = {dense5:.3f}  MRR = {dense_mrr:.3f}   "
+          f"fts5 recall@5 = {fts5:.3f}   (n={n}, {len(memories)} memories, no manual embed)")
 
     ok = True
     if auto5 < MIN_AUTO_RECALL_AT_5:
@@ -145,8 +175,24 @@ def main():
         print(f"FAIL: default beats fts5 by only {auto5-fts5:.3f} < {MIN_AUTO_OVER_FTS5_AT_5} "
               f"(default path is not using semantic search)")
         ok = False
+    if auto_mrr < MIN_AUTO_MRR:
+        print(f"FAIL: default MRR {auto_mrr:.3f} < {MIN_AUTO_MRR} "
+              f"(default path surfaces the answer but ranks it poorly)")
+        ok = False
+    # Fusion-quality guard: the default (hybrid) path may sit slightly below pure
+    # dense, but a regression that collapses fusion toward the weak keyword arm
+    # must fail loudly rather than ship green.
+    if dense5 - auto5 > MAX_AUTO_BELOW_DENSE_AT_5:
+        print(f"FAIL: default recall@5 {auto5:.3f} trails pure dense {dense5:.3f} by "
+              f">{MAX_AUTO_BELOW_DENSE_AT_5} (hybrid fusion is diluting the dense ranking)")
+        ok = False
+    if dense_mrr - auto_mrr > MAX_AUTO_BELOW_DENSE_MRR:
+        print(f"FAIL: default MRR {auto_mrr:.3f} trails pure dense {dense_mrr:.3f} by "
+              f">{MAX_AUTO_BELOW_DENSE_MRR} (hybrid fusion is diluting the dense ranking)")
+        ok = False
     if ok:
-        print("PASS: the default path uses semantic search and clearly beats keyword-only.")
+        print("PASS: the default path uses semantic search, ranks answers high, "
+              "and fusion does not dilute the dense ranking.")
     return 0 if ok else 1
 
 
