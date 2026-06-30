@@ -240,7 +240,16 @@ fn cached_ort_model(
     let (session, tokenizer) = if config.bundled {
         // #237: load the compiled-in model + tokenizer straight from memory — no
         // file on disk, no network.
-        let session = Session::builder()?.commit_from_memory(BUNDLED_MODEL)?;
+        // #310: pin a single intra-op thread + deterministic compute so the
+        // embedding is bit-reproducible run-to-run. Multi-threaded ORT reduces
+        // in nondeterministic order, producing tiny FP differences that flip
+        // near-tied cosine ranks (≈0.3% of LongMemEval at scale). The model is
+        // tiny (MiniLM-L6, short inputs) and results are LRU-cached, so the
+        // single-thread cost is negligible.
+        let session = Session::builder()?
+            .with_intra_threads(1)?
+            .with_deterministic_compute(true)?
+            .commit_from_memory(BUNDLED_MODEL)?;
         let tokenizer = tokenizers::Tokenizer::from_bytes(BUNDLED_TOKENIZER)
             .map_err(|e| format!("failed to load bundled tokenizer: {}", e))?;
         (session, tokenizer)
@@ -250,7 +259,10 @@ fn cached_ort_model(
             .parent()
             .ok_or("model_path must have a parent directory")?;
         let tokenizer_path = model_dir.join("tokenizer.json");
-        let session = Session::builder()?.commit_from_file(&config.model_path)?;
+        let session = Session::builder()?
+            .with_intra_threads(1)?
+            .with_deterministic_compute(true)?
+            .commit_from_file(&config.model_path)?;
         let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
             .map_err(|e| format!("failed to load tokenizer: {}", e))?;
         (session, tokenizer)

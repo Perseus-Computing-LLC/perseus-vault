@@ -38,11 +38,12 @@ curl -L https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned/resolve/m
 python benchmark/longmemeval/run.py --data longmemeval_s_cleaned.json
 ```
 
-Output: a signed `report.json` plus a console table. The run is offline. `fts5`
-is bit-identical run-to-run and the RRF fusion step is deterministic (#247); the
-embedding-backed `dense`/`hybrid`/`auto` metrics vary by ~0.3% across runs
-because the ONNX backend's float math is not bit-reproducible (#310). Treat the
-hybrid headline as a representative number ±~0.3%, not a byte-exact signature.
+Output: a signed `report.json` plus a console table. The run is offline and the
+metrics are **deterministic run-to-run** across every mode: `fts5` and the RRF
+fusion step always were (#247), and the embedding-backed `dense`/`hybrid`/`auto`
+modes are now too — the bundled ONNX backend is pinned to single-threaded,
+deterministic inference (#310), so the same input yields a byte-identical
+embedding (and therefore a byte-identical signature) on every run.
 
 ## Method
 
@@ -85,7 +86,8 @@ step. `auto` == `hybrid` to the digit, confirming the default equals the ceiling
 (Standalone dense, measured separately, is 77.0% / 93.8% — so fusing the keyword arm
 adds ~8 points of recall@1 over dense alone.) **#309** raised the keyword arm to equal
 weight in the RRF fusion (it had been under-weighted at 0.5), lifting the default from
-82.2% / 0.884 MRR to the numbers above. The headline carries ~0.3% run-to-run noise (#310).
+82.2% / 0.884 MRR to the numbers above. These numbers are now reproducible run-to-run
+across all modes (deterministic embeddings, #310).
 
 By question type (default/auto recall@1 / recall@5):
 
@@ -102,8 +104,8 @@ Equal-weight fusion (#309) improved 5 of the 6 types vs the old 0.5 weight; the 
 `single-session-preference` set (n=30) traded down (63.3→56.7 recall@1) as the net
 across all 500 rose. Reproduce the default experience:
 `python benchmark/longmemeval/run.py --data longmemeval_s_cleaned.json --skip-explicit-embed --modes auto fts5`
-(one representative signature `9babb85...`; `fts5` is exact, the hybrid number moves
-~0.3% run-to-run per #310). Drop the flags to also measure the explicit dense/hybrid modes.
+(signature `9babb85...`, byte-identical run-to-run now that embeddings are deterministic,
+#310). Drop the flags to also measure the explicit dense/hybrid modes.
 <!-- RESULTS-END -->
 
 ## Stage 2: QA accuracy (answer generation + LongMemEval's official judge)
