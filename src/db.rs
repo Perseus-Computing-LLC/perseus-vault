@@ -917,6 +917,12 @@ impl Database {
     /// forgetting curve. Well above the 0.05 archive threshold.
     const VERIFIED_DECAY_FLOOR: f64 = 0.2;
 
+    /// Minimum trigram similarity for `cohere` to auto-link two same-category
+    /// entities (#300). Below this the pair is not meaningfully related, so
+    /// linking it would just add graph noise. Same dependency-free measure used
+    /// for dedup / conflict detection.
+    const AUTO_LINK_SIM_THRESHOLD: f64 = 0.3;
+
     /// Compute Ebbinghaus decay score based on time since last access.
     /// decay = e^(-elapsed_ms / half_life_ms)
     /// Returns value in [0.0, 1.0] where 1.0 = just accessed.
@@ -4084,27 +4090,44 @@ last_accessed: {}
         // instead of calling link() (≈4 queries each) per pair inside this write
         // transaction (#209). Accumulating per e1 also keeps multiple links to
         // the same source correct (the old code re-read links fresh each call).
+        // #300: auto-link same-category pairs, but gate on real content
+        // similarity so we create *meaningful* edges instead of stamping a
+        // blanket "auto-related" on every same-category pair (which made
+        // `mimir_traverse` noise). Over-fetch a bounded candidate pool, score
+        // each pair by trigram similarity (the dependency-free measure already
+        // used for dedup/conflict detection), and link only pairs at or above
+        // AUTO_LINK_SIM_THRESHOLD — weighting the edge by the actual similarity —
+        // until max_links is reached. Empty-tag free-form entities (e.g.
+        // conversation) stay unlinked by design, matching their exclusion from
+        // the recall surface (#298/#302).
         let max_links = params.max_links.clamp(0, 100) as i64;
+        let candidate_budget = max_links.saturating_mul(50).clamp(0, 5000);
         let mut pending: std::collections::HashMap<String, Vec<MemoryLink>> =
             std::collections::HashMap::new();
         {
             let mut stmt = conn.prepare(
-                "SELECT e1.id, e1.links, e2.id as e2_id
+                "SELECT e1.id, e1.links, e2.id as e2_id, e1.body_json, e2.body_json
                  FROM entities e1
                  JOIN entities e2 ON e1.category = e2.category AND e1.id < e2.id
                  WHERE e1.archived = 0 AND e2.archived = 0
                  AND e1.tags != '[]' AND e2.tags != '[]'
                  LIMIT ?1",
             )?;
-            let rows = stmt.query_map(params![max_links], |row| {
+            let rows = stmt.query_map(params![candidate_budget], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
                 ))
             })?;
-            for row in rows {
-                let (e1_id, e1_links_json, e2_id) = row?;
+            'link: for row in rows {
+                let (e1_id, e1_links_json, e2_id, body1, body2) = row?;
+                let sim = Self::trigram_similarity(&body1, &body2);
+                if sim < Self::AUTO_LINK_SIM_THRESHOLD {
+                    continue;
+                }
                 let entry = pending
                     .entry(e1_id)
                     .or_insert_with(|| serde_json::from_str(&e1_links_json).unwrap_or_default());
@@ -4112,10 +4135,13 @@ last_accessed: {}
                     entry.push(MemoryLink {
                         target_id: e2_id,
                         relationship: "auto-related".to_string(),
-                        weight: 0.5,
+                        weight: sim,
                     });
+                    linked += 1;
+                    if linked >= max_links {
+                        break 'link;
+                    }
                 }
-                linked += 1;
             }
         }
 
@@ -5971,6 +5997,52 @@ mod tests {
             targets.contains(&"cc".to_string()),
             "ca->cc must survive batched same-source accumulation, got {targets:?}"
         );
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn cohere_links_only_similar_pairs() {
+        // #300: auto-link must gate on content similarity, not link every
+        // same-category pair. A similar pair links; an unrelated same-category
+        // entity must not. Insert directly (bypassing remember()'s 0.7 dedup) so
+        // a clearly-similar pair can coexist alongside an unrelated entity.
+        let (db, path) = temp_db();
+        let ins = |id: &str, key: &str, body: &str| {
+            db.conn().unwrap().execute(
+                "INSERT INTO entities (id, category, key, body_json, status, type, tags, \
+                 decay_score, retrieval_count, layer, topic_path, archived, archive_reason, \
+                 links, verified, source, created_at_unix_ms, last_accessed_unix_ms) \
+                 VALUES (?1, 'project', ?2, ?3, 'active', 'insight', '[\"x\"]', 1.0, 0, \
+                 'working', '', 0, '', '[]', 0, 'agent', 0, 0)",
+                params![id, key, body],
+            ).unwrap();
+        };
+        ins("la", "alpha", r#"{"note":"the payment service database migration plan for the Q3 rollout"}"#);
+        ins("lb", "beta", r#"{"note":"the payment service database migration plan for the Q4 rollout"}"#);
+        ins("lc", "gamma", r#"{"note":"quarterly all-hands meeting notes and the cafeteria lunch menu"}"#);
+
+        let params = crate::models::CohereParams {
+            dry_run: false,
+            max_links: 100,
+            promote_threshold: 0,
+            archive_threshold: 0.0,
+        };
+        db.cohere(&params).unwrap();
+
+        let la = db.get_entity("project", "alpha").unwrap().unwrap();
+        let la_targets: Vec<String> = la.links.iter().map(|l| l.target_id.clone()).collect();
+        assert!(
+            la_targets.contains(&"lb".to_string()),
+            "similar pair alpha->beta must link, got {la_targets:?}"
+        );
+        assert!(
+            !la_targets.contains(&"lc".to_string()),
+            "dissimilar gamma must NOT be linked to alpha, got {la_targets:?}"
+        );
+        // gamma is unrelated to everything → no links at all.
+        let lc = db.get_entity("project", "gamma").unwrap().unwrap();
+        assert!(lc.links.is_empty(), "unrelated gamma must have no links, got {:?}", lc.links);
 
         let _ = fs::remove_file(&path);
     }
