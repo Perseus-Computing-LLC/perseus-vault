@@ -1,6 +1,6 @@
-# Mimir CrewAI Integration
+# Mneme CrewAI Integration
 
-Persistent memory for CrewAI agents via Mimir.
+Persistent memory for CrewAI agents via Mneme.
 
 ## Install
 
@@ -35,7 +35,7 @@ researcher = Agent(
 task = Task(
     description=(
         "Research the competitor's pricing strategy. "
-        "Use Mimir Memory to recall any previous findings on this topic, "
+        "Use Mneme Memory to recall any previous findings on this topic, "
         "then remember your new conclusions."
     ),
     agent=researcher,
@@ -57,7 +57,7 @@ result = crew.kickoff()
 
 ## How It Works
 
-The `MimirMemoryTool` wraps Mimir's MCP tools as a CrewAI tool:
+The `MimirMemoryTool` wraps Mneme's MCP tools as a CrewAI tool:
 
 - `remember` → `mimir_remember`
 - `recall` → `mimir_recall`
@@ -69,6 +69,6 @@ a shared knowledge base over time.
 
 ## Requirements
 
-- Mimir v1.0.0+ (`curl -sSL https://raw.githubusercontent.com/Perseus-Computing-LLC/mimir/main/scripts/bootstrap.sh | bash`)
+- Mneme v1.0.0+ (`curl -sSL https://raw.githubusercontent.com/Perseus-Computing-LLC/mimir/main/scripts/bootstrap.sh | bash`)
 - CrewAI >= 0.30.0
 - Python 3.10+

@@ -10,11 +10,11 @@
 
 ## MCP Host Integration
 
-Mimir works with any MCP-compatible host. See the [README](README.md#mcp-configuration)
+Mneme works with any MCP-compatible host. See the [README](README.md#mcp-configuration)
 for Claude Desktop, Cursor, OpenClaw, and Hermes Agent configuration examples.
 
 ## Perseus Integration
 
-If you're using Mimir as the memory backend for Perseus, see the
+If you're using Mneme as the memory backend for Perseus, see the
 [Perseus docs](https://github.com/Perseus-Computing-LLC/perseus) for the full
 `.perseus/config.yaml` setup.

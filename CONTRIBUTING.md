@@ -1,6 +1,6 @@
-# Contributing to Mimir
+# Contributing to Mneme
 
-Thanks for wanting to help! Mimir is a Rust MCP server for persistent AI agent
+Thanks for wanting to help! Mneme is a Rust MCP server for persistent AI agent
 memory. Contributions of all kinds are welcome — code, docs, bug reports, feature
 ideas.
 

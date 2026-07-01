@@ -1,8 +1,8 @@
-# Mimir vs Mem0: Local-First vs Cloud-Only Memory
+# Mneme vs Mem0: Local-First vs Cloud-Only Memory
 
 ## Quick Summary
 
-| | Mimir | Mem0 |
+| | Mneme | Mem0 |
 |---|---|---|
 | **Stars** | ~20 | ~55K |
 | **Language** | Rust | Python |
@@ -16,7 +16,7 @@
 | **License** | MIT | Apache 2.0 |
 | **Embeddings** | Optional (Ollama or OpenAI-compatible) | Required (OpenAI default) |
 
-## When to Use Mimir
+## When to Use Mneme
 
 - You want a **single binary** with no infrastructure
 - You need **fully offline** operation (air-gapped, classified environments)
@@ -36,7 +36,7 @@
 
 ## Architecture Differences
 
-### Mimir: Single Binary, No Dependencies
+### Mneme: Single Binary, No Dependencies
 
 ```
 Agent ──MCP stdio── mimir (Rust binary)
@@ -46,7 +46,7 @@ Agent ──MCP stdio── mimir (Rust binary)
                       └── Web dashboard (optional)
 ```
 
-Mimir is a self-contained Rust binary. The SQLite database is a single file.
+Mneme is a self-contained Rust binary. The SQLite database is a single file.
 Install is one `curl | sh`. Nothing else to configure.
 
 ### Mem0: Python + External Services
@@ -63,9 +63,9 @@ The "self-hosted" path still needs PostgreSQL, Qdrant, or Neo4j running.
 
 ## Memory Models
 
-### Mimir: Structured Entities
+### Mneme: Structured Entities
 
-Entities in Mimir have explicit structure:
+Entities in Mneme have explicit structure:
 - **Category + Key**: Namespaced, idempotent storage
 - **Type**: Declared entity type (fact, decision, preference, etc.)
 - **Decay**: Ebbinghaus decay with retrieval boosts
@@ -88,9 +88,9 @@ that works well for straightforward RAG use cases.
 
 ## MCP Tools: 36 vs 5
 
-Mimir exposes 36 MCP tools covering the full memory lifecycle:
+Mneme exposes 36 MCP tools covering the full memory lifecycle:
 
-| Category | Mimir Tools |
+| Category | Mneme Tools |
 |---|---|
 | CRUD | remember, recall, recall_when, get_entity, forget |
 | Graph | link, unlink, traverse |
@@ -108,7 +108,7 @@ Mem0 exposes ~5 tools: add, search, get, get_all, delete.
 
 ## MCP-Native Advantage
 
-Mimir is MCP-native — the binary IS an MCP server. Connect via stdio, SSE, or HTTP:
+Mneme is MCP-native — the binary IS an MCP server. Connect via stdio, SSE, or HTTP:
 
 ```json
 {
@@ -126,7 +126,7 @@ afterthought, not the native interface.
 
 ## Honest Assessment
 
-**Mimir's strengths:**
+**Mneme's strengths:**
 - Zero-dependency deployment (one binary, one file)
 - MCP-native architecture
 - Structured memory model with lifecycle management
@@ -134,13 +134,13 @@ afterthought, not the native interface.
 - Fully offline operation
 - MIT license
 
-**Mimir's weaknesses vs Mem0:**
+**Mneme's weaknesses vs Mem0:**
 - Much smaller community (20 stars vs 55K)
 - Requires Rust toolchain to build from source
 - No managed cloud offering
 - Fewer tutorials and integration examples
 - Binary distribution is less familiar to Python developers
 
-**If you're choosing today:** Pick Mimir if you value simplicity, privacy, and
+**If you're choosing today:** Pick Mneme if you value simplicity, privacy, and
 MCP-native design. Pick Mem0 if you need cloud-managed memory or already have
 a Python/PostgreSQL stack.

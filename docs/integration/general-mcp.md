@@ -1,11 +1,11 @@
 # General MCP Integration Guide
 
-Mimir is an MCP stdio server. It works with **any** MCP-compatible client.
+Mneme is an MCP stdio server. It works with **any** MCP-compatible client.
 
 ## Bootstrap (60 seconds)
 
 ```bash
-# Install Mimir
+# Install Mneme
 curl -sSL https://raw.githubusercontent.com/Perseus-Computing-LLC/mimir/main/scripts/bootstrap.sh | bash
 
 # Create data directory
@@ -97,7 +97,7 @@ mcp_servers:
 
 ## Encryption
 
-Mimir supports AES-256-GCM encryption at rest for `body_json`. Opt-in:
+Mneme supports AES-256-GCM encryption at rest for `body_json`. Opt-in:
 
 ```bash
 # Generate key
@@ -113,7 +113,7 @@ mimir keygen --key-file ~/.mimir/secret.key
 docker run -v ~/.mimir/data:/data ghcr.io/Perseus-Computing-LLC/mimir:latest --db /data/mimir.db
 ```
 
-## What Mimir Is Not
+## What Mneme Is Not
 
 - ❌ Not a vector database — it's a persistent memory engine
 - ❌ Not a cloud service — everything runs locally
@@ -122,4 +122,4 @@ docker run -v ~/.mimir/data:/data ghcr.io/Perseus-Computing-LLC/mimir:latest --d
 
 ## Design Philosophy
 
-> Mimir is memory for machines. It remembers what your agents learn so they don't start cold every session. Everything is stored locally, searchable via FTS5 + hybrid search, and exportable as plain Markdown files. No API keys, no cloud dependencies, no vendor lock-in.
+> Mneme is memory for machines. It remembers what your agents learn so they don't start cold every session. Everything is stored locally, searchable via FTS5 + hybrid search, and exportable as plain Markdown files. No API keys, no cloud dependencies, no vendor lock-in.
