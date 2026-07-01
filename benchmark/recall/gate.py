@@ -39,12 +39,16 @@ MAX_AUTO_BELOW_DENSE_MRR = 0.15    # and within this of pure dense on MRR
 
 def find_binary(explicit):
     cands = [explicit, os.environ.get("MIMIR_BIN")]
-    exe = "mneme.exe" if os.name == "nt" else "mneme"
-    cands += [str(REPO / "target" / "release" / exe), str(REPO / "target" / "debug" / exe)]
+    # Perseus Vault rename: the release binary is now "perseus-vault"; fall
+    # back through the prior names ("mneme", then "mimir") so this script
+    # still finds an already-built binary from an older checkout/cache.
+    for name in ("perseus-vault", "mneme", "mimir"):
+        exe = f"{name}.exe" if os.name == "nt" else name
+        cands += [str(REPO / "target" / "release" / exe), str(REPO / "target" / "debug" / exe)]
     for c in cands:
         if c and Path(c).exists():
             return str(Path(c).resolve())
-    sys.exit("error: mimir binary not found (build it or pass --bin / set MIMIR_BIN).")
+    sys.exit("error: perseus-vault binary not found (build it or pass --bin / set MIMIR_BIN).")
 
 
 class Mimir:
