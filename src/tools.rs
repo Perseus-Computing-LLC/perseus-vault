@@ -1214,6 +1214,20 @@ pub fn handle_conflicts(db: &Database, args: Value) -> String {
     }
 }
 
+pub fn handle_consolidate(db: &Database, args: Value) -> String {
+    let params: crate::models::ConsolidateParams = match serde_json::from_value(args) {
+        Ok(p) => p,
+        Err(e) => {
+            return json!({"error": format!("Invalid consolidate arguments: {}", e)}).to_string()
+        }
+    };
+    match db.consolidate(&params) {
+        Ok(report) => serde_json::to_string(&report)
+            .unwrap_or_else(|e| json!({"error": format!("{}", e)}).to_string()),
+        Err(e) => json!({"error": format!("Consolidation failed: {}", e)}).to_string(),
+    }
+}
+
 pub fn handle_decay(db: &Database, _args: Value) -> String {
     match db.decay_tick() {
         Ok(report) => serde_json::to_string(&report).unwrap_or_else(|e| {

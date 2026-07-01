@@ -1875,6 +1875,76 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
     "title": "Detect Conflicting Entities"
   },
   {
+    "name": "mimir_consolidate",
+    "description": "Merge overlapping/duplicative entities in the same category into durable, evidence-tracked 'observations' — the mirror image of mimir_conflicts, which flags dissimilar (contradictory) pairs. Groups entities whose pairwise trigram similarity meets similarity_threshold, then creates one new entity per group (category='observation') whose body carries a summary (the highest-certainty source's content), the full list of source entity ids as evidence, and a proof_count. Source entities are NOT deleted or archived — they remain independently accessible, and the new observation links back to each of them (relationship='evidence_for') for full audit. Read-only preview with dry_run=true.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "category": {
+          "type": "string",
+          "description": "Category to scan for overlapping/duplicative entities to consolidate"
+        },
+        "similarity_threshold": {
+          "type": "number",
+          "default": 0.6,
+          "description": "Trigram similarity threshold at or above which two entities are considered overlapping enough to merge"
+        },
+        "limit": {
+          "type": "integer",
+          "default": 50,
+          "description": "Maximum number of observations to create"
+        },
+        "offset": {
+          "type": "integer",
+          "default": 0,
+          "description": "Number of entities to skip for pagination"
+        },
+        "dry_run": {
+          "type": "boolean",
+          "default": false,
+          "description": "Preview which observations would be created without writing anything"
+        }
+      },
+      "required": [
+        "category"
+      ]
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "category": {
+          "type": "string"
+        },
+        "entities_examined": {
+          "type": "integer",
+          "description": "Number of entities scanned in this category"
+        },
+        "observations_created": {
+          "type": "integer",
+          "description": "Number of new observation entities created (or would be, in dry-run)"
+        },
+        "source_entities_merged": {
+          "type": "integer",
+          "description": "Total count of source entities folded into the created observations"
+        },
+        "dry_run": {
+          "type": "boolean"
+        },
+        "observations": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          },
+          "description": "The observations created (or previewed), each with entity_id, key, summary, source_ids, proof_count, certainty"
+        }
+      }
+    },
+    "annotations": {
+      "readOnlyHint": false
+    },
+    "title": "Consolidate Overlapping Facts into Observations"
+  },
+  {
     "name": "mimir_vault_export",
     "description": "Export all non-archived entities to .md files with YAML frontmatter in a vault directory. Files are human-readable, git-trackable, and Obsidian-compatible. Use this for backup, transfer between workspaces, or offline review.",
     "inputSchema": {
@@ -2781,6 +2851,7 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
         "mimir_traverse" => Ok(tools::handle_traverse(db, args)),
         "mimir_score" => Ok(tools::handle_score(db, args)),
         "mimir_conflicts" => Ok(tools::handle_conflicts(db, args)),
+        "mimir_consolidate" => Ok(tools::handle_consolidate(db, args)),
         "mimir_vault_export" => Ok(tools::handle_vault_export(db, args)),
         "mimir_vault_import" => Ok(tools::handle_vault_import(db, args)),
         "mimir_decay" => Ok(tools::handle_decay(db, args)),

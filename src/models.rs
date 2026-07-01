@@ -616,3 +616,57 @@ pub struct BenchResult {
     pub created_at_unix_ms: i64,
 }
 
+/// Parameters for the mimir_consolidate tool (#steal-2, competitive research:
+/// Hindsight's Observation layer). Merges overlapping/duplicative facts within
+/// a category into a smaller number of durable, evidence-tracked observations.
+#[derive(Debug, Deserialize)]
+pub struct ConsolidateParams {
+    pub category: String,
+    /// Trigram similarity threshold ABOVE which two entities are considered
+    /// "overlapping" and eligible to merge (opposite sense from
+    /// detect_conflicts, which flags dissimilarity as a conflict).
+    #[serde(default = "default_consolidate_threshold")]
+    pub similarity_threshold: f64,
+    #[serde(default = "default_consolidate_limit")]
+    pub limit: i64,
+    #[serde(default)]
+    pub offset: i64,
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+fn default_consolidate_threshold() -> f64 {
+    0.6
+}
+
+fn default_consolidate_limit() -> i64 {
+    50
+}
+
+/// One evidence-tracked observation formed by merging 2+ overlapping entities.
+#[derive(Debug, Serialize, Clone)]
+pub struct Observation {
+    /// The new observation entity's id (category="observation").
+    pub entity_id: String,
+    pub key: String,
+    /// Concatenated/deduplicated summary text of the merged sources.
+    pub summary: String,
+    /// IDs of the source entities this observation was built from (evidence).
+    pub source_ids: Vec<String>,
+    /// How many source entities support this observation.
+    pub proof_count: i64,
+    /// Average certainty across merged sources.
+    pub certainty: f64,
+}
+
+/// Result from mimir_consolidate.
+#[derive(Debug, Serialize)]
+pub struct ConsolidateReport {
+    pub category: String,
+    pub entities_examined: i64,
+    pub observations_created: i64,
+    pub source_entities_merged: i64,
+    pub dry_run: bool,
+    pub observations: Vec<Observation>,
+}
+

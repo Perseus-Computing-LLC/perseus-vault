@@ -3315,8 +3315,190 @@ impl Database {
         }))
     }
 
-    /// Invalidate a live entity by moving it into entity_history
-    /// (invalidated_at = now, superseded_by = `winner_id`) and removing it from
+    /// Merge overlapping/duplicative entities within a category into durable,
+    /// evidence-tracked "observations" (#steal-2, competitive research:
+    /// Hindsight's Observation layer). Where `detect_conflicts` flags pairs
+    /// that are DISSIMILAR (contradictory), `consolidate` flags pairs that are
+    /// SIMILAR (redundant/overlapping) and merges them into a single higher-
+    /// confidence entity, rather than leaving N near-duplicate facts to pile up.
+    ///
+    /// Algorithm: within the scan window, greedily group entities whose
+    /// pairwise trigram similarity is >= `similarity_threshold` into clusters
+    /// (union-style: if A~B and B~C, all three merge, even if A~C alone would
+    /// be just under threshold). Clusters of size 1 (nothing to merge) are
+    /// left untouched — only real groups of 2+ produce a new observation.
+    /// Singletons are NOT archived or altered.
+    ///
+    /// Each observation stores: a summary (the highest-certainty source's body,
+    /// since that source is presumed most reliable), the full list of source
+    /// entity ids as evidence (`source_ids`), a `proof_count` (how many
+    /// sources back it), and the average certainty across sources. The source
+    /// entities are NOT deleted — they remain accessible via their own
+    /// category/key and via the observation's `source_ids` for audit — this
+    /// mirrors Hindsight's "continuous refinement, history preserved" design
+    /// rather than a destructive merge.
+    ///
+    /// `dry_run` reports what would be created without writing anything.
+    pub fn consolidate(
+        &self,
+        params: &crate::models::ConsolidateParams,
+    ) -> Result<crate::models::ConsolidateReport, Box<dyn std::error::Error>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT id, key, body_json, certainty FROM entities WHERE category = ?1 AND archived = 0
+             ORDER BY last_accessed_unix_ms DESC LIMIT {} OFFSET ?2",
+            Self::CONFLICT_SCAN_WINDOW
+        ))?;
+        let rows = stmt.query_map(params![params.category, params.offset], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, f64>(3).unwrap_or(0.5),
+            ))
+        })?;
+        let entities: Vec<(String, String, String, f64)> = rows.filter_map(|r| r.ok()).collect();
+        drop(stmt);
+
+        // Union-find over entity indices, joining any pair whose trigram
+        // similarity meets the threshold.
+        let n = entities.len();
+        let mut parent: Vec<usize> = (0..n).collect();
+        fn find(parent: &mut [usize], x: usize) -> usize {
+            if parent[x] != x {
+                parent[x] = find(parent, parent[x]);
+            }
+            parent[x]
+        }
+        fn union(parent: &mut [usize], a: usize, b: usize) {
+            let ra = find(parent, a);
+            let rb = find(parent, b);
+            if ra != rb {
+                parent[ra] = rb;
+            }
+        }
+
+        for i in 0..n {
+            for j in (i + 1)..n {
+                let sim = Self::trigram_similarity(&entities[i].2, &entities[j].2);
+                if sim >= params.similarity_threshold {
+                    union(&mut parent, i, j);
+                }
+            }
+        }
+
+        // Group indices by their root parent.
+        let mut clusters: std::collections::HashMap<usize, Vec<usize>> = std::collections::HashMap::new();
+        for i in 0..n {
+            let root = find(&mut parent, i);
+            clusters.entry(root).or_default().push(i);
+        }
+
+        let mut observations = Vec::new();
+        let mut source_entities_merged: i64 = 0;
+        let now = now_ms();
+
+        // Deterministic order: sort clusters by their lowest member index so
+        // repeated runs over an unchanged DB produce the same observation order.
+        let mut cluster_list: Vec<Vec<usize>> = clusters.into_values().collect();
+        cluster_list.sort_by_key(|c| *c.iter().min().unwrap_or(&0));
+
+        for cluster in cluster_list {
+            if cluster.len() < 2 || observations.len() as i64 >= params.limit {
+                continue;
+            }
+
+            let members: Vec<&(String, String, String, f64)> =
+                cluster.iter().map(|&i| &entities[i]).collect();
+            // The highest-certainty member's body becomes the summary (most
+            // reliable source), ties broken by entity id for determinism.
+            let best = members
+                .iter()
+                .max_by(|a, b| {
+                    a.3.partial_cmp(&b.3)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| b.0.cmp(&a.0))
+                })
+                .expect("cluster has at least 2 members");
+
+            let source_ids: Vec<String> = members.iter().map(|m| m.0.clone()).collect();
+            let avg_certainty =
+                members.iter().map(|m| m.3).sum::<f64>() / members.len() as f64;
+            let proof_count = members.len() as i64;
+
+            let raw_id = uuid::Uuid::new_v4().to_string().replace('-', "");
+            let entity_id = format!("obs-{}", &raw_id[..12.min(raw_id.len())]);
+            let key = format!("{}-{}", params.category, &raw_id[..8.min(raw_id.len())]);
+
+            let body = serde_json::json!({
+                "summary": serde_json::from_str::<serde_json::Value>(&best.2).unwrap_or(serde_json::json!(best.2)),
+                "source_ids": source_ids,
+                "proof_count": proof_count,
+                "merged_from_category": params.category,
+            });
+
+            let observation = crate::models::Observation {
+                entity_id: entity_id.clone(),
+                key: key.clone(),
+                summary: best.2.clone(),
+                source_ids: source_ids.clone(),
+                proof_count,
+                certainty: avg_certainty,
+            };
+
+            if !params.dry_run {
+                let entity = crate::models::Entity {
+                    id: entity_id.clone(),
+                    category: "observation".to_string(),
+                    key: key.clone(),
+                    body_json: body.to_string(),
+                    status: "active".to_string(),
+                    entity_type: "insight".to_string(),
+                    tags: vec!["consolidated".to_string()],
+                    decay_score: avg_certainty.max(0.5),
+                    retrieval_count: 0,
+                    layer: "working".to_string(),
+                    topic_path: String::new(),
+                    archived: false,
+                    archive_reason: String::new(),
+                    links: source_ids
+                        .iter()
+                        .map(|sid| crate::models::MemoryLink {
+                            target_id: sid.clone(),
+                            relationship: "evidence_for".to_string(),
+                            weight: 1.0,
+                        })
+                        .collect(),
+                    verified: false,
+                    source: "mimir_consolidate".to_string(),
+                    always_on: false,
+                    certainty: avg_certainty,
+                    workspace_hash: String::new(),
+                    agent_id: String::new(),
+                    visibility: "workspace".to_string(),
+                    embedding: None,
+                    created_at_unix_ms: now,
+                    last_accessed_unix_ms: now,
+                };
+                self.remember(&entity)?;
+            }
+
+            source_entities_merged += proof_count;
+            observations.push(observation);
+        }
+
+        Ok(crate::models::ConsolidateReport {
+            category: params.category.clone(),
+            entities_examined: n as i64,
+            observations_created: observations.len() as i64,
+            source_entities_merged,
+            dry_run: params.dry_run,
+            observations,
+        })
+    }
+
+    /// Opt-in active conflict resolution. Finds conflicting pairs in a category
+
     /// the live `entities` table, so it no longer appears in recall but remains
     /// time-travelable via `as_of`. Reversible (the snapshot is kept) and
     /// auditable. Returns false if `loser_id` is not a live, unarchived entity.
@@ -6958,6 +7140,188 @@ mod tests {
         assert_eq!(crate::db::graph_arm_weight(0), 0.0);
         assert_eq!(crate::db::graph_arm_weight(1), crate::db::graph_arm_weight(9));
         assert!(crate::db::graph_arm_weight(1) > 0.0);
+    }
+
+    #[test]
+    fn consolidate_merges_overlapping_entities_into_observation() {
+        let (db, path) = temp_db();
+
+        // Insert directly via SQL (bypassing remember()'s own near-duplicate
+        // dedup, which would otherwise collapse these two intentionally-
+        // similar fixtures before consolidate() ever runs) with a certainty
+        // column set explicitly.
+        let ins = |id: &str, key: &str, body: &str, certainty: f64| {
+            db.conn()
+                .unwrap()
+                .execute(
+                    "INSERT INTO entities (id, category, key, body_json, status, type, tags, \
+                     decay_score, retrieval_count, layer, topic_path, archived, archive_reason, \
+                     links, verified, source, certainty, created_at_unix_ms, last_accessed_unix_ms) \
+                     VALUES (?1, 'facts', ?2, ?3, 'active', 'insight', '[]', 1.0, 0, \
+                     'working', '', 0, '', '[]', 0, 'agent', ?4, 0, 0)",
+                    params![id, key, body, certainty],
+                )
+                .unwrap();
+        };
+
+        // Two near-duplicate facts about the same thing, worded slightly
+        // differently but with high trigram overlap.
+        ins(
+            "src-1",
+            "db-choice",
+            r#"{"note":"the team adopted postgres sixteen as the primary datastore"}"#,
+            0.6,
+        );
+        ins(
+            "src-2",
+            "db-choice-v2",
+            r#"{"note":"the team adopted postgres sixteen as the primary data store"}"#,
+            0.9,
+        );
+
+        // A clearly unrelated singleton in the same category — must NOT be
+        // pulled into any observation.
+        ins(
+            "src-3",
+            "unrelated",
+            r#"{"note":"quarterly all hands meeting notes and agenda items"}"#,
+            0.5,
+        );
+
+        let params = crate::models::ConsolidateParams {
+            category: "facts".to_string(),
+            similarity_threshold: 0.6,
+            limit: 50,
+            offset: 0,
+            dry_run: false,
+        };
+        let report = db.consolidate(&params).unwrap();
+
+        assert_eq!(report.entities_examined, 3);
+        assert_eq!(
+            report.observations_created, 1,
+            "the two overlapping facts should merge into exactly one observation"
+        );
+        assert_eq!(report.source_entities_merged, 2);
+
+        let obs = &report.observations[0];
+        assert_eq!(obs.proof_count, 2);
+        assert!(
+            obs.source_ids.contains(&"src-1".to_string())
+                && obs.source_ids.contains(&"src-2".to_string()),
+            "observation must cite both source entities as evidence, got {:?}",
+            obs.source_ids
+        );
+        // Summary comes from the higher-certainty source (src-2, certainty 0.9).
+        assert!(
+            obs.summary.contains("data store") || obs.summary.contains("datastore"),
+            "summary should be one of the source bodies, got: {}",
+            obs.summary
+        );
+        assert!(
+            (obs.certainty - 0.75).abs() < 1e-9,
+            "certainty should average the two sources (0.6+0.9)/2=0.75, got {}",
+            obs.certainty
+        );
+
+        // The new observation entity is actually persisted, linked to both
+        // sources, and the sources themselves are untouched (not archived).
+        let stored = db.get_entity("observation", &obs.key).unwrap();
+        assert!(stored.is_some(), "observation entity must be persisted");
+        let stored = stored.unwrap();
+        assert_eq!(stored.links.len(), 2);
+        assert!(stored
+            .links
+            .iter()
+            .all(|l| l.relationship == "evidence_for"));
+
+        let src1_still_live = db.get_entity("facts", "db-choice").unwrap();
+        assert!(
+            src1_still_live.is_some() && !src1_still_live.unwrap().archived,
+            "source entities must remain live, not archived, after consolidation"
+        );
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn consolidate_dry_run_reports_without_writing() {
+        let (db, path) = temp_db();
+        let ins = |id: &str, key: &str, body: &str, certainty: f64| {
+            db.conn()
+                .unwrap()
+                .execute(
+                    "INSERT INTO entities (id, category, key, body_json, status, type, tags, \
+                     decay_score, retrieval_count, layer, topic_path, archived, archive_reason, \
+                     links, verified, source, certainty, created_at_unix_ms, last_accessed_unix_ms) \
+                     VALUES (?1, 'notes', ?2, ?3, 'active', 'insight', '[]', 1.0, 0, \
+                     'working', '', 0, '', '[]', 0, 'agent', ?4, 0, 0)",
+                    params![id, key, body, certainty],
+                )
+                .unwrap();
+        };
+        ins(
+            "dr-1",
+            "topic-a",
+            r#"{"note":"deploy the service to production on friday"}"#,
+            0.5,
+        );
+        ins(
+            "dr-2",
+            "topic-a-dup",
+            r#"{"note":"deploy the service to production on friday!"}"#,
+            0.5,
+        );
+
+        let params = crate::models::ConsolidateParams {
+            category: "notes".to_string(),
+            similarity_threshold: 0.6,
+            limit: 50,
+            offset: 0,
+            dry_run: true,
+        };
+        let report = db.consolidate(&params).unwrap();
+        assert_eq!(report.observations_created, 1);
+        assert!(report.dry_run);
+
+        // Nothing was actually written: no "observation" category entity exists.
+        let conn = db.conn().unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM entities WHERE category = 'observation'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0, "dry_run must not persist any observation entity");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn consolidate_leaves_singletons_untouched() {
+        let (db, path) = temp_db();
+        db.remember(&make_entity(
+            "solo-1",
+            "misc",
+            "alone",
+            r#"{"note":"a completely unique statement about nothing shared"}"#,
+        ))
+        .unwrap();
+
+        let params = crate::models::ConsolidateParams {
+            category: "misc".to_string(),
+            similarity_threshold: 0.6,
+            limit: 50,
+            offset: 0,
+            dry_run: false,
+        };
+        let report = db.consolidate(&params).unwrap();
+        assert_eq!(
+            report.observations_created, 0,
+            "a category with only one entity must produce zero observations"
+        );
+        assert_eq!(report.source_entities_merged, 0);
+        let _ = fs::remove_file(&path);
     }
 
     #[test]
