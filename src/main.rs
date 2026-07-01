@@ -395,6 +395,32 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
     },
+
+    /// PMB-inspired pre-turn auto-injection ("Prepare"). Runs `recall_when`
+    /// (proactive trigger match) plus `context` (top always-on + recent
+    /// entities) against the given task description and prints a
+    /// `<memory-prep>` block ready to splice into a system prompt — no LLM
+    /// call, pure local queries. Intended as a Hermes pre-turn hook so
+    /// relevant memories are pushed into context before the model sees the
+    /// prompt, instead of relying on the agent remembering to call
+    /// `recall_when` itself.
+    Prepare {
+        /// SQLite database path
+        #[arg(long, default_value_t = default_db_path())]
+        db: String,
+        /// Task/message description to match recall_when triggers against
+        #[arg(long, default_value_t = String::new())]
+        task: String,
+        /// Max entities from recall_when
+        #[arg(long, default_value_t = 10)]
+        recall_when_limit: i64,
+        /// Max entities from the always-on/context pull
+        #[arg(long, default_value_t = 10)]
+        context_limit: i64,
+        /// Emit raw JSON instead of the <memory-prep> markdown block
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 impl Commands {
@@ -416,7 +442,8 @@ impl Commands {
             | Commands::VaultImport { db, .. }
             | Commands::Purge { db, .. }
             | Commands::Doctor { db, .. }
-            | Commands::Connect { db, .. } => Some(db),
+            | Commands::Connect { db, .. }
+            | Commands::Prepare { db, .. } => Some(db),
             Commands::ObsidianSync { .. } | Commands::Migrate { .. } | Commands::Keygen { .. } => {
                 None
             }
@@ -575,6 +602,8 @@ fn run_doctor(db_path: &str) {
     println!("\nPer-client copy-paste snippets: docs/clients/");
     println!("Tip: run `perseus-vault connect --client <name>` to auto-wire a client's config");
     println!("     (supported: claude-desktop, claude-code, hermes, cursor, windsurf, vscode, zed, codex)");
+    println!("Tip: run `perseus-vault prepare --task \"<what you're about to do>\"` for a pre-turn");
+    println!("     memory-prep block (recall_when triggers + always-on context), zero LLM calls.");
     println!("All checks passed: Perseus Vault speaks MCP stdio, so any MCP client works.");
 }
 
@@ -800,6 +829,100 @@ fn run_connect(client: &str, db_path: &str, dry_run: bool) {
     }
 }
 
+/// Local truncation helper (mirrors `db::truncate_str`, which is private to
+/// that module) — avoids widening an internal helper's visibility just for
+/// this one CLI-only render path.
+fn truncate_for_prepare(s: &str, max_len: usize) -> String {
+    if s.chars().count() <= max_len {
+        s.to_string()
+    } else {
+        let truncated: String = s.chars().take(max_len).collect();
+        format!("{}...", truncated)
+    }
+}
+
+/// PMB-inspired `perseus-vault prepare` — pre-turn auto-injection ("Prepare").
+/// Runs the two read-only, zero-LLM-call queries that together approximate
+/// "what should be in context before this turn starts": `recall_when`
+/// (proactive trigger match against the task description) and `context`
+/// (top always-on + recent entities). Prints a single `<memory-prep>` block
+/// so a Hermes pre-turn hook can splice the result straight into the system
+/// prompt, instead of relying on the agent remembering to call
+/// `mimir_recall_when` itself mid-conversation. Cost: two local SQLite
+/// queries, no network, no model calls — designed to run on every turn.
+fn run_prepare(
+    db: &db::Database,
+    task: &str,
+    recall_when_limit: i64,
+    context_limit: i64,
+    json_output: bool,
+) {
+    let recall_when_hits = if task.trim().is_empty() {
+        Vec::new()
+    } else {
+        match db.recall_when(task, recall_when_limit) {
+            Ok(hits) => hits,
+            Err(e) => {
+                eprintln!("mimir: prepare: recall_when failed: {}", e);
+                Vec::new()
+            }
+        }
+    };
+
+    let context_md = match db.context(&[], context_limit) {
+        Ok(md) => md,
+        Err(e) => {
+            eprintln!("mimir: prepare: context failed: {}", e);
+            String::new()
+        }
+    };
+
+    if json_output {
+        let result = serde_json::json!({
+            "task": task,
+            "recall_when": recall_when_hits.iter().map(|e| e.to_json_expanded()).collect::<Vec<_>>(),
+            "recall_when_count": recall_when_hits.len(),
+            "context_markdown": context_md,
+        });
+        println!("{}", serde_json::to_string_pretty(&result).unwrap_or_default());
+        return;
+    }
+
+    println!("{}", render_prepare_block(&recall_when_hits, &context_md));
+}
+
+/// Pure rendering step for `perseus-vault prepare`'s non-JSON output — split
+/// out from `run_prepare` so the markdown assembly (recall_when section
+/// present iff there are trigger matches, always-on/context section
+/// appended, graceful empty-vault message) is unit-testable without a live
+/// `Database`.
+fn render_prepare_block(recall_when_hits: &[crate::models::Entity], context_md: &str) -> String {
+    let mut out = String::from("<memory-prep>\n");
+    if !recall_when_hits.is_empty() {
+        out.push_str("## Proactive Recall (triggered by current task)\n\n");
+        for e in recall_when_hits {
+            out.push_str(&format!(
+                "- [{}] **{}** — {}\n",
+                e.category,
+                e.key,
+                truncate_for_prepare(&e.body_json, 160),
+            ));
+        }
+        out.push('\n');
+    }
+    if !context_md.trim().is_empty() {
+        out.push_str(context_md);
+        if !context_md.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+    if recall_when_hits.is_empty() && context_md.trim().is_empty() {
+        out.push_str("_(no memory to prepare — empty or freshly initialized vault)_\n");
+    }
+    out.push_str("</memory-prep>");
+    out
+}
+
 fn main() {
     let mut cli = Cli::parse();
     apply_top_level_db(&mut cli); // #313: `mimir --db PATH serve` must honor --db
@@ -956,6 +1079,16 @@ fn main() {
             dry_run,
         }) => {
             run_connect(client, db_path, dry_run);
+        }
+        Some(Commands::Prepare {
+            db: ref db_path,
+            ref task,
+            recall_when_limit,
+            context_limit,
+            json,
+        }) => {
+            let database = open_db_or_exit(db_path);
+            run_prepare(&database, task, recall_when_limit, context_limit, json);
         }
         Some(Commands::StateDigest { db: ref db_path }) => {
             let database = open_db_or_exit(db_path);
@@ -1683,6 +1816,114 @@ mod tests {
             Some(Commands::Connect { dry_run, .. }) => assert!(dry_run),
             _ => panic!("expected connect subcommand"),
         }
+    }
+
+    #[test]
+    fn parses_prepare_with_task_and_limits() {
+        let cli = Cli::parse_from([
+            "mimir",
+            "prepare",
+            "--db",
+            "/tmp/prep.db",
+            "--task",
+            "deploying the service",
+            "--recall-when-limit",
+            "5",
+            "--context-limit",
+            "3",
+        ]);
+        match cli.command {
+            Some(Commands::Prepare {
+                db,
+                task,
+                recall_when_limit,
+                context_limit,
+                json,
+            }) => {
+                assert_eq!(db, "/tmp/prep.db");
+                assert_eq!(task, "deploying the service");
+                assert_eq!(recall_when_limit, 5);
+                assert_eq!(context_limit, 3);
+                assert!(!json);
+            }
+            _ => panic!("expected prepare subcommand"),
+        }
+    }
+
+    #[test]
+    fn parses_prepare_defaults_and_json_flag() {
+        let cli = Cli::parse_from(["mimir", "prepare", "--json"]);
+        match cli.command {
+            Some(Commands::Prepare {
+                task,
+                recall_when_limit,
+                context_limit,
+                json,
+                ..
+            }) => {
+                assert_eq!(task, "");
+                assert_eq!(recall_when_limit, 10);
+                assert_eq!(context_limit, 10);
+                assert!(json);
+            }
+            _ => panic!("expected prepare subcommand"),
+        }
+    }
+
+    #[test]
+    fn prepare_block_includes_recall_when_section_only_when_hits_present() {
+        let make_entity = |cat: &str, key: &str, body: &str| -> crate::models::Entity {
+            serde_json::from_value(serde_json::json!({
+                "id": format!("prep-{}", key),
+                "category": cat,
+                "key": key,
+                "body_json": body,
+                "created_at_unix_ms": 0,
+                "last_accessed_unix_ms": 0,
+            }))
+            .unwrap()
+        };
+
+        let hits = vec![make_entity(
+            "convention",
+            "deploy-rule",
+            r#"{"recall_when": ["deploying"], "summary": "run tests first"}"#,
+        )];
+        let with_hits = render_prepare_block(&hits, "## Mneme Context\n\nsome context\n");
+        assert!(
+            with_hits.contains("Proactive Recall"),
+            "matching task must include the recall_when section:\n{}",
+            with_hits
+        );
+        assert!(with_hits.contains("deploy-rule"));
+        assert!(with_hits.contains("some context"));
+
+        let no_hits = render_prepare_block(&[], "## Mneme Context\n\nsome context\n");
+        assert!(
+            !no_hits.contains("Proactive Recall"),
+            "no trigger matches must NOT include the recall_when section:\n{}",
+            no_hits
+        );
+        assert!(no_hits.contains("some context"));
+    }
+
+    #[test]
+    fn prepare_block_shows_placeholder_when_both_sources_empty() {
+        let out = render_prepare_block(&[], "");
+        assert!(
+            out.contains("empty or freshly initialized vault"),
+            "empty vault must show the placeholder message:\n{}",
+            out
+        );
+        assert!(out.starts_with("<memory-prep>"));
+        assert!(out.ends_with("</memory-prep>"));
+    }
+
+    #[test]
+    fn prepare_block_wraps_output_in_memory_prep_tags() {
+        let out = render_prepare_block(&[], "## Mneme Context\n\nsome context\n");
+        assert!(out.starts_with("<memory-prep>"));
+        assert!(out.ends_with("</memory-prep>"));
     }
 
     #[test]

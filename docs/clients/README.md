@@ -11,6 +11,14 @@ Run `mimir doctor` to validate your install and print this matrix locally.
 Run `mimir connect --client <name>` to auto-wire a client's config file
 (merges a `mimir` MCP stanza into it, backing up the original first — no
 manual JSON/YAML/TOML editing required).
+Run `mimir prepare --task "<what you're about to do>"` for a pre-turn
+memory-prep block — combines `recall_when` (proactive trigger matches
+against the task text) and `context` (always-on + recent entities) into a
+single `<memory-prep>...</memory-prep>` block, zero LLM calls, ~10-50ms.
+Wire it into a Hermes/agent pre-turn hook so relevant memories are pushed
+into context before the model sees the prompt, instead of depending on the
+agent remembering to call `mimir_recall_when` itself. `--json` emits
+structured output for programmatic hooks.
 
 | Client | Status | Config file | Notes |
 |---|---|---|---|
