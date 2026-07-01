@@ -1,12 +1,12 @@
-# Integrating Mimir with Claude Code
+# Integrating Mneme with Claude Code
 
 Claude Code is Anthropic's CLI coding agent. It supports custom MCP servers
-via configuration, allowing Mimir to serve as persistent long-term memory
+via configuration, allowing Mneme to serve as persistent long-term memory
 across coding sessions.
 
 ## Quick Start
 
-### 1. Install Mimir
+### 1. Install Mneme
 
 ```bash
 # One-shot bootstrap (recommended)
@@ -65,10 +65,10 @@ claude
 
 Ask:
 
-> List your available tools. Do you have access to Mimir tools?
+> List your available tools. Do you have access to Mneme tools?
 
 You should see `mimir_remember`, `mimir_recall`, `mimir_context`, and other
-Mimir tools in the tool list.
+Mneme tools in the tool list.
 
 ## Usage Patterns
 
@@ -100,7 +100,7 @@ Claude Code will call `mimir_journal` to append a structured event.
 
 ## Troubleshooting
 
-### Mimir tools don't appear
+### Mneme tools don't appear
 
 1. **Absolute paths:** Ensure the `--db` argument uses a full absolute path.
    `/home/user/.mimir/data/mimir.db` not `~/.mimir/data/mimir.db`.
@@ -121,9 +121,9 @@ chmod 755 ~/.mimir/data
 chmod 644 ~/.mimir/data/mimir.db
 ```
 
-### Mimir exits immediately
+### Mneme exits immediately
 
-Run Mimir manually to check for startup errors:
+Run Mneme manually to check for startup errors:
 
 ```bash
 mimir --db ~/.mimir/data/mimir.db
@@ -137,7 +137,7 @@ mimir --db ~/.mimir/data/mimir.db
 ### Multiple Claude Code instances
 
 SQLite WAL mode supports concurrent readers. If you see "database is locked",
-another process has an exclusive lock. Kill orphaned Mimir processes:
+another process has an exclusive lock. Kill orphaned Mneme processes:
 
 ```bash
 ps aux | grep '[m]imir'
@@ -163,7 +163,7 @@ This keeps project memories isolated.
 
 ### Web dashboard
 
-Mimir includes an optional web dashboard for browsing entities:
+Mneme includes an optional web dashboard for browsing entities:
 
 ```bash
 mimir --db ~/.mimir/data/mimir.db --web --port 8767

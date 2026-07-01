@@ -1,4 +1,4 @@
-# Mimir SBOM (Software Bill of Materials)
+# Mneme SBOM (Software Bill of Materials)
 ## For Federal Procurement Compliance
 
 **Package:** mimir v2.0.0

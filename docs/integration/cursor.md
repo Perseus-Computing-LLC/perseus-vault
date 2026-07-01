@@ -1,12 +1,12 @@
-# Integrating Mimir with Cursor
+# Integrating Mneme with Cursor
 
 Cursor is the AI-first code editor built on VS Code. It supports MCP servers
-natively, allowing Mimir to provide persistent memory across coding sessions
+natively, allowing Mneme to provide persistent memory across coding sessions
 and projects.
 
 ## Quick Start
 
-### 1. Install Mimir
+### 1. Install Mneme
 
 ```bash
 # One-shot bootstrap (recommended)
@@ -67,7 +67,7 @@ Create or edit `~/.cursor/mcp.json`:
 2. Look for the Mimir entry — it should show a green **"Connected"** indicator
 3. Open a Chat or Composer session and ask:
 
-> Use Mimir to check if you have any stored context for this project.
+> Use Mneme to check if you have any stored context for this project.
 
 ## Usage Patterns
 
@@ -91,11 +91,11 @@ Cursor's agent can chain: recall → code generation, all in one prompt.
 
 ### Cross-session continuity
 
-Cursor remembers context within a session. Mimir adds cross-session memory:
+Cursor remembers context within a session. Mneme adds cross-session memory:
 
 > Before I start coding today, recall what we were working on last time.
 
-Mimir returns the context block from `mimir_context`, which includes recent
+Mneme returns the context block from `mimir_context`, which includes recent
 entities, decisions, and architecture notes.
 
 ### Project-specific memory
@@ -117,7 +117,7 @@ This keeps project memories isolated. Add `.mimir/mimir.db` to `.gitignore`.
 
 ## Troubleshooting
 
-### Mimir shows "Disconnected" or fails to connect
+### Mneme shows "Disconnected" or fails to connect
 
 1. **Absolute paths:** Check that `--db` uses a full path, not `~`.
 2. **Binary location:** Run `which mimir`. If not found, use the full path
@@ -127,7 +127,7 @@ This keeps project memories isolated. Add `.mimir/mimir.db` to `.gitignore`.
 
 ### MCP status indicator stays gray/yellow
 
-1. Run Mimir manually to check for startup errors:
+1. Run Mneme manually to check for startup errors:
    ```bash
    mimir --db ~/.mimir/data/mimir.db
    ```
@@ -140,16 +140,16 @@ This keeps project memories isolated. Add `.mimir/mimir.db` to `.gitignore`.
 
 If you see "database is locked" errors:
 
-1. Check for orphaned Mimir processes:
+1. Check for orphaned Mneme processes:
    ```bash
    ps aux | grep '[m]imir'
    ```
 2. Kill orphans: `kill <PID>`
 3. Restart Cursor
 
-### Mimir tools not appearing in agent
+### Mneme tools not appearing in agent
 
-Cursor's agent discovers tools on session start. After connecting Mimir:
+Cursor's agent discovers tools on session start. After connecting Mneme:
 
 1. Start a new Chat or Composer session
 2. Ask: "List all available tools"
@@ -183,7 +183,7 @@ Then configure Cursor to use the encrypted database:
 
 ### Web dashboard for browsing
 
-Mimir includes a web dashboard. Run it alongside Cursor:
+Mneme includes a web dashboard. Run it alongside Cursor:
 
 ```bash
 mimir --db ~/.mimir/data/mimir.db --web --port 8767
@@ -194,14 +194,14 @@ and explore the entity link graph.
 
 ### Hybrid search (semantic + keyword)
 
-If you have Ollama running, Mimir can generate embeddings for hybrid search:
+If you have Ollama running, Mneme can generate embeddings for hybrid search:
 
 ```bash
 # Ensure Ollama is running with an embedding-capable model
 ollama pull nomic-embed-text
 ```
 
-Then in your Mimir config, configure the LLM endpoint and model:
+Then in your Mneme config, configure the LLM endpoint and model:
 
 ```json
 {
@@ -220,7 +220,7 @@ Then in your Mimir config, configure the LLM endpoint and model:
 
 > **Note:** `--llm-model` sets the model for BOTH embeddings and `mimir_ask`
 > (RAG). If you use `mimir_ask`, choose a model that supports both chat and
-> embeddings, or run a separate Mimir instance for each.
+> embeddings, or run a separate Mneme instance for each.
 
 With embeddings enabled, `mimir_recall` with `mode: "hybrid"` combines
 keyword matching with semantic similarity for better recall.

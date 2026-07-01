@@ -1,6 +1,6 @@
-# Mimir Integrations
+# Mneme Integrations
 
-Ready-to-use adapters that connect Mimir to popular AI agent frameworks.
+Ready-to-use adapters that connect Mneme to popular AI agent frameworks.
 
 ## Available Integrations
 
@@ -26,13 +26,13 @@ integrations/<framework>/
 ```
 
 The adapter pattern:
-1. **MCP subprocess call** — Uses Mimir's stdio MCP transport
-2. **Framework interface mapping** — Maps the framework's memory API to Mimir tools
+1. **MCP subprocess call** — Uses Mneme's stdio MCP transport
+2. **Framework interface mapping** — Maps the framework's memory API to Mneme tools
 3. **Drop-in compatibility** — Works as a replacement for the framework's default memory
 
 ## Requirements
 
-All integrations require Mimir v1.0.0+ installed:
+All integrations require Mneme v1.0.0+ installed:
 
 ```bash
 curl -sSL https://raw.githubusercontent.com/Perseus-Computing-LLC/mneme/main/scripts/bootstrap.sh | bash

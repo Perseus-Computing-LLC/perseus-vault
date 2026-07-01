@@ -1,8 +1,8 @@
-# Mimir vs Zep: Binary vs Infrastructure
+# Mneme vs Zep: Binary vs Infrastructure
 
 ## Quick Summary
 
-| | Mimir | Zep |
+| | Mneme | Zep |
 |---|---|---|
 | **Stars** | ~20 | ~3K |
 | **Language** | Rust | Go + Python |
@@ -18,13 +18,13 @@
 
 ## Architecture
 
-### Mimir: One Binary
+### Mneme: One Binary
 
 ```
 Agent ──MCP── mimir ── SQLite (single file)
 ```
 
-Mimir is a single Rust binary. The database is one file. Install, run, done.
+Mneme is a single Rust binary. The database is one file. Install, run, done.
 
 ### Zep: Microservices
 
@@ -40,7 +40,7 @@ needs PostgreSQL.
 
 ## MCP-Native vs REST
 
-Mimir is built on MCP from the ground up. The binary IS an MCP server:
+Mneme is built on MCP from the ground up. The binary IS an MCP server:
 
 ```json
 {
@@ -58,9 +58,9 @@ server. This adds complexity and another point of failure.
 
 ## Memory Models
 
-### Mimir: Entity-First
+### Mneme: Entity-First
 
-Mimir's memory model is built around structured entities:
+Mneme's memory model is built around structured entities:
 - Idempotent by `(category, key)`
 - Lifecycle: buffer → working → core → archived
 - Graph relationships between entities
@@ -76,15 +76,15 @@ Zep is built around conversation history:
 - User/session-based organization
 - Graph-based knowledge representation
 
-Zep excels at conversation-heavy use cases. Mimir excels at structured
+Zep excels at conversation-heavy use cases. Mneme excels at structured
 knowledge management across any agent workflow.
 
 ## MCP Tools: 36 vs 0
 
-This is the biggest gap. Mimir has 36 MCP tools. Zep has zero — it's not
+This is the biggest gap. Mneme has 36 MCP tools. Zep has zero — it's not
 an MCP server at all. To use Zep with MCP hosts, you need to write a bridge.
 
-Mimir's tools cover:
+Mneme's tools cover:
 - CRUD operations on entities
 - Hybrid search (keyword + vector)
 - Graph traversal and linking
@@ -97,7 +97,7 @@ Mimir's tools cover:
 - RAG and embedding generation
 - Performance benchmarking
 
-## When to Use Mimir
+## When to Use Mneme
 
 - You want **zero infrastructure** memory
 - You're building with MCP hosts (Claude Desktop, Cursor, Hermes)
@@ -116,7 +116,7 @@ Mimir's tools cover:
 
 ## Honest Assessment
 
-**Mimir's strengths vs Zep:**
+**Mneme's strengths vs Zep:**
 - Zero infrastructure (single binary vs Docker + PostgreSQL)
 - MCP-native (no wrapper needed)
 - 36 tools vs 0 MCP tools
@@ -124,13 +124,13 @@ Mimir's tools cover:
 - Full entity lifecycle
 - Single-file database (easy backup/restore)
 
-**Mimir's weaknesses vs Zep:**
+**Mneme's weaknesses vs Zep:**
 - Zep has stronger conversation-history features (summarization, entity extraction)
 - Zep's graph-based knowledge representation is more sophisticated
 - Zep has a managed cloud offering (Zep Cloud)
 - Larger existing user base
 - REST API is more familiar to web developers
 
-**If you're choosing today:** Mimir wins on simplicity (one binary, no Docker)
+**If you're choosing today:** Mneme wins on simplicity (one binary, no Docker)
 and MCP integration. Zep wins if you need advanced conversation processing and
 already have PostgreSQL infrastructure.

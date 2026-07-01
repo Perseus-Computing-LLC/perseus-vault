@@ -1,7 +1,7 @@
-# Mimir for AutoGen
+# Mneme for AutoGen
 
 Persistent long-term memory for [AutoGen](https://github.com/microsoft/autogen)
-(AG2 / `autogen-core` v0.4+) agents, backed by [Mimir](https://github.com/Perseus-Computing-LLC/mneme).
+(AG2 / `autogen-core` v0.4+) agents, backed by [Mneme](https://github.com/Perseus-Computing-LLC/mneme).
 
 `MimirMemory` implements the `autogen_core.memory.Memory` protocol, so it drops
 straight into an `AssistantAgent(memory=[...])`. Stored knowledge is injected
@@ -11,7 +11,7 @@ survives across sessions, processes, and crews.
 ## Install
 
 ```bash
-# Install Mimir (the binary)
+# Install Mneme (the binary)
 curl -sSL https://raw.githubusercontent.com/Perseus-Computing-LLC/mneme/main/scripts/bootstrap.sh | bash
 
 # Install the adapter
@@ -53,9 +53,9 @@ async def main():
 asyncio.run(main())
 ```
 
-## How it maps to Mimir
+## How it maps to Mneme
 
-| AutoGen `Memory` method | Mimir tool | Behavior |
+| AutoGen `Memory` method | Mneme tool | Behavior |
 |---|---|---|
 | `add(MemoryContent)` | `mimir_remember` | Content → `body_json`; `metadata.category`/`metadata.key` route the entity |
 | `query(text)` | `mimir_recall` | FTS5 keyword search → list of `MemoryContent` |

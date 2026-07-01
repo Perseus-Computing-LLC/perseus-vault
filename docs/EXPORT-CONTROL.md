@@ -1,4 +1,4 @@
-# Export Control Self-Classification — Perseus & Mimir
+# Export Control Self-Classification — Perseus & Mneme
 
 **Prepared by:** Perseus Computing LLC
 **Date:** 2026-06-20
@@ -9,7 +9,7 @@
 
 ## Executive Summary
 
-Both Perseus (perseus-ctx) and Mimir are **MIT-licensed, publicly available open source software**.
+Both Perseus (perseus-ctx) and Mneme are **MIT-licensed, publicly available open source software**.
 Under the Export Administration Regulations (EAR) 15 CFR §§ 730-774 and the International
 Traffic in Arms Regulations (ITAR) 22 CFR §§ 120-130, both products are self-classified as
 **EAR99** — not subject to export licensing requirements.
@@ -26,7 +26,7 @@ This document provides the analysis and rationale for federal procurement and SB
 - **Distribution:** PyPI (public package registry)
 - **Source:** https://github.com/Perseus-Computing-LLC/perseus (public, MIT license)
 
-### Mimir (v2.0.0)
+### Mneme (v2.0.0)
 - **Type:** Rust binary — persistent memory MCP server for AI agents
 - **Function:** Stores, searches, and retrieves structured entities via JSON-RPC 2.0 over stdio. Includes AES-256-GCM encryption (standard commercial algorithm). Optional embedding via public ONNX models. No cryptographic key management — keys are user-provided.
 - **Distribution:** GitHub Releases (public binary downloads)
@@ -39,7 +39,7 @@ This document provides the analysis and rationale for federal procurement and SB
 ### Jurisdiction: EAR99
 
 Per 15 CFR § 734.3(b), items subject to the EAR include all items in the United States
-unless specifically excluded. The following analysis determines whether Perseus or Mimir
+unless specifically excluded. The following analysis determines whether Perseus or Mneme
 fall under a more restrictive ECCN (Export Control Classification Number).
 
 ### ECCN Review
@@ -56,7 +56,7 @@ fall under a more restrictive ECCN (Export Control Classification Number).
 
 ### Cryptography Analysis (ECCN 5D002)
 
-Mimir includes AES-256-GCM encryption via the `aes-gcm` Rust crate (v0.10). Under
+Mneme includes AES-256-GCM encryption via the `aes-gcm` Rust crate (v0.10). Under
 EAR Category 5 Part 2, cryptographic software may require classification under 5D002.
 
 **However**, per 15 CFR § 740.13(b)(1) and Supplement No. 8 to Part 742, "publicly
@@ -66,7 +66,7 @@ available" encryption source code is **not subject to the EAR** when it is:
 2. Available for free distribution (MIT license — ✅)
 3. Not restricted to specific countries or persons (public repo — ✅)
 
-Both Perseus and Mimir source code are publicly available on GitHub under MIT license.
+Both Perseus and Mneme source code are publicly available on GitHub under MIT license.
 The AES-256-GCM implementation is via a standard, publicly available open-source crate.
 No proprietary or classified encryption algorithms are used.
 
@@ -85,7 +85,7 @@ countries, 10% for embargoed destinations).
 ### USML Review
 
 Per 22 CFR § 121.1 (United States Munitions List), ITAR controls apply to defense
-articles and services. Neither Perseus nor Mimir:
+articles and services. Neither Perseus nor Mneme:
 
 - Are specifically designed, developed, configured, adapted, or modified for a
   military application (Category I-XXI)
@@ -120,7 +120,7 @@ open source software, standard EAR99 treatment applies.
 | Product | ECCN | ITAR | License Required | Encryption Registration |
 |---|---|---|---|---|
 | Perseus (perseus-ctx) | EAR99 | Not applicable | No | No |
-| Mimir | EAR99 | Not applicable | No | No (public availability exclusion) |
+| Mneme | EAR99 | Not applicable | No | No (public availability exclusion) |
 
 ---
 
