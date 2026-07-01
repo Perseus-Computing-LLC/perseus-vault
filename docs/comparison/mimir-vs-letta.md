@@ -1,8 +1,8 @@
-# Mimir vs Letta: Memory Engine vs Agent Runtime
+# Mneme vs Letta: Memory Engine vs Agent Runtime
 
 ## Quick Summary
 
-| | Mimir | Letta |
+| | Mneme | Letta |
 |---|---|---|
 | **Stars** | ~20 | ~15K |
 | **What it is** | Pure memory engine | Full agent runtime with memory |
@@ -18,11 +18,11 @@
 
 ## Architecture: Composable vs Monolithic
 
-Mimir is a **pure memory engine** — it does one thing (persistent memory) and
+Mneme is a **pure memory engine** — it does one thing (persistent memory) and
 composes with any agent framework via MCP stdio. Letta is an **agent runtime**
 that includes memory as one component.
 
-### Mimir: Memory as a Service
+### Mneme: Memory as a Service
 
 ```
 CrewAI ──────────┐
@@ -32,8 +32,8 @@ Claude Desktop ──┤                    └── SQLite
 Cursor ──────────┘
 ```
 
-Mimir plugs into any MCP host. Your agents can use CrewAI, LangGraph, AutoGen,
-or any framework — Mimir is just the memory layer.
+Mneme plugs into any MCP host. Your agents can use CrewAI, LangGraph, AutoGen,
+or any framework — Mneme is just the memory layer.
 
 ### Letta: Everything in One Box
 
@@ -49,7 +49,7 @@ Letta agents run inside Letta's runtime. The memory is coupled to the agent
 framework. You can't use Letta's memory with a CrewAI agent or a Claude Desktop
 session.
 
-## When to Use Mimir
+## When to Use Mneme
 
 - You want memory that **works with any agent framework**
 - You're building agents with CrewAI, LangGraph, AutoGen, or raw MCP
@@ -68,9 +68,9 @@ session.
 
 ## Memory Models
 
-### Mimir: Lifecycle-Aware Entities
+### Mneme: Lifecycle-Aware Entities
 
-Mimir entities have a full lifecycle:
+Mneme entities have a full lifecycle:
 - **Ebbinghaus decay** — memories naturally fade unless retrieved
 - **Layer promotion** — buffer → working → core based on access patterns
 - **Automatic archival** — stale entities archive, recoverable
@@ -91,8 +91,8 @@ a standalone memory service.
 
 ## MCP Tools: 36 vs 8
 
-Mimir's 36 MCP tools cover the entire memory surface. Letta exposes ~8 tools
-focused on agent state management. Mimir's additional tools enable:
+Mneme's 36 MCP tools cover the entire memory surface. Letta exposes ~8 tools
+focused on agent state management. Mneme's additional tools enable:
 
 - **mimir_correct** — structured learning from errors
 - **mimir_synthesize** — LLM session synthesis
@@ -103,7 +103,7 @@ focused on agent state management. Mimir's additional tools enable:
 
 ## Honest Assessment
 
-**Mimir's strengths vs Letta:**
+**Mneme's strengths vs Letta:**
 - Composable with any framework (not locked into one agent runtime)
 - Single binary, no PostgreSQL dependency
 - 36 MCP tools vs 8
@@ -111,13 +111,13 @@ focused on agent state management. Mimir's additional tools enable:
 - Full entity lifecycle management
 - MIT license
 
-**Mimir's weaknesses vs Letta:**
+**Mneme's weaknesses vs Letta:**
 - Letta has a more mature agent platform with advanced features
 - Letta's memory block model is well-tested in production
 - Letta provides managed cloud hosting (Letta Cloud)
 - Larger community and more documentation
 - Sandboxed code execution is Letta-native
 
-**If you're choosing today:** Mimir is the better choice if you want memory
+**If you're choosing today:** Mneme is the better choice if you want memory
 that works with any agent framework. Letta is better if you want a complete
 managed agent platform and are willing to commit to Letta's ecosystem.

@@ -1,6 +1,6 @@
-# Mimir LangGraph Integration
+# Mneme LangGraph Integration
 
-Drop-in persistent long-term memory for LangGraph agents via Mimir.
+Drop-in persistent long-term memory for LangGraph agents via Mneme.
 
 ## Install
 
@@ -16,7 +16,7 @@ pip install -e integrations/langgraph/
 ```python
 from mimir_langgraph import MimirStore
 
-# Create a Mimir-backed store
+# Create a Mneme-backed store
 store = MimirStore(
     binary="mimir",  # or /usr/local/bin/mimir
     db_path="~/.mimir/data/mimir.db",
@@ -68,9 +68,9 @@ from previous interactions using `store.search()`.
 
 ## How It Works
 
-LangGraph's BaseStore interface maps cleanly onto Mimir's entity model:
+LangGraph's BaseStore interface maps cleanly onto Mneme's entity model:
 
-| LangGraph | Mimir |
+| LangGraph | Mneme |
 |---|---|
 | `namespace: tuple[str, ...]` | `category: str` (joined with `/`) |
 | `key: str` | `key: str` |
@@ -81,6 +81,6 @@ LangGraph's BaseStore interface maps cleanly onto Mimir's entity model:
 
 ## Requirements
 
-- Mimir v1.0.0+ installed (`curl -sSL https://raw.githubusercontent.com/Perseus-Computing-LLC/mneme/main/scripts/bootstrap.sh | bash`)
+- Mneme v1.0.0+ installed (`curl -sSL https://raw.githubusercontent.com/Perseus-Computing-LLC/mneme/main/scripts/bootstrap.sh | bash`)
 - LangGraph >= 0.2.0
 - Python 3.10+

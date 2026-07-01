@@ -1,7 +1,7 @@
-# Awesome Mimir
+# Awesome Mneme
 
-> Curated list of Mimir integrations, tools, and resources.
-> Mimir is an MCP-native, local-first persistent memory engine for AI agents.
+> Curated list of Mneme integrations, tools, and resources.
+> Mneme is an MCP-native, local-first persistent memory engine for AI agents.
 
 ## Contents
 
@@ -15,14 +15,14 @@
 
 ## Official Resources
 
-- [Mimir GitHub Repo](https://github.com/Perseus-Computing-LLC/mneme) — The Mimir source
+- [Mneme GitHub Repo](https://github.com/Perseus-Computing-LLC/mneme) — The Mneme source
 - [Roadmap](https://github.com/Perseus-Computing-LLC/mneme/blob/main/ROADMAP.md)
 - [Contributing Guide](https://github.com/Perseus-Computing-LLC/mneme/blob/main/CONTRIBUTING.md)
 - [Security Policy](https://github.com/Perseus-Computing-LLC/mneme/blob/main/SECURITY.md)
 
 ## Framework Integrations
 
-Mimir adapters for popular AI agent frameworks:
+Mneme adapters for popular AI agent frameworks:
 
 ### LangGraph (LangChain)
 - [mimir-langgraph](https://github.com/Perseus-Computing-LLC/mneme/tree/main/integrations/langgraph) — `MimirStore` implementing `BaseStore`
@@ -40,7 +40,7 @@ Mimir adapters for popular AI agent frameworks:
 - `pip install -e integrations/autogen/`
 
 ### Other Frameworks
-Mimir is MCP-native — any framework with MCP support can use Mimir directly:
+Mneme is MCP-native — any framework with MCP support can use Mneme directly:
 - [OpenAI Agents SDK](https://github.com/openai/openai-agents-python) — via MCP stdio
 - [Google ADK](https://github.com/google/adk-python) — via MCP stdio
 - [Agno](https://github.com/agno-agi/agno) — via MCP stdio
@@ -48,7 +48,7 @@ Mimir is MCP-native — any framework with MCP support can use Mimir directly:
 
 ## MCP Hosts
 
-Mimir works with any MCP host. Configuration is one line:
+Mneme works with any MCP host. Configuration is one line:
 
 ```json
 {
@@ -71,7 +71,7 @@ Tested and confirmed working with:
 
 ## Tools & Plugins
 
-### Mimir Itself (36 MCP Tools)
+### Mneme Itself (36 MCP Tools)
 
 | Category | Tools |
 |---|---|
@@ -88,8 +88,8 @@ Tested and confirmed working with:
 
 ### Plugin Ecosystem
 
-- [hermes-mimir-plugin](https://github.com/Perseus-Computing-LLC/hermes-mimir-plugin) — Native Mimir integration for Hermes Agent
-- [Perseus Mimir Connector](https://github.com/Perseus-Computing-LLC/perseus) — Perseus live context injection from Mimir
+- [hermes-mimir-plugin](https://github.com/Perseus-Computing-LLC/hermes-mimir-plugin) — Native Mneme integration for Hermes Agent
+- [Perseus Mneme Connector](https://github.com/Perseus-Computing-LLC/perseus) — Perseus live context injection from Mneme
 
 ## Community Projects
 
@@ -97,19 +97,19 @@ Tested and confirmed working with:
 
 ## Articles & Tutorials
 
-*Add articles, blog posts, and tutorials about Mimir.*
+*Add articles, blog posts, and tutorials about Mneme.*
 
 ## Comparisons
 
-- [Mimir vs Mem0](https://github.com/Perseus-Computing-LLC/mneme/blob/main/docs/comparison/mimir-vs-mem0.md) — Local-first vs cloud-only
-- [Mimir vs Letta](https://github.com/Perseus-Computing-LLC/mneme/blob/main/docs/comparison/mimir-vs-letta.md) — Memory engine vs agent runtime
-- [Mimir vs Zep](https://github.com/Perseus-Computing-LLC/mneme/blob/main/docs/comparison/mimir-vs-zep.md) — Single binary vs infrastructure
+- [Mneme vs Mem0](https://github.com/Perseus-Computing-LLC/mneme/blob/main/docs/comparison/mimir-vs-mem0.md) — Local-first vs cloud-only
+- [Mneme vs Letta](https://github.com/Perseus-Computing-LLC/mneme/blob/main/docs/comparison/mimir-vs-letta.md) — Memory engine vs agent runtime
+- [Mneme vs Zep](https://github.com/Perseus-Computing-LLC/mneme/blob/main/docs/comparison/mimir-vs-zep.md) — Single binary vs infrastructure
 
 ## Key Differentiators
 
-Why Mimir stands out:
+Why Mneme stands out:
 
-| Feature | Mimir | Mem0 | Letta | Zep |
+| Feature | Mneme | Mem0 | Letta | Zep |
 |---|---|---|---|---|
 | **MCP-Native** | ✅ 36 tools | ❌ | ❌ | ❌ |
 | **Local-First** | ✅ Single binary | ❌ Cloud-dependent | ❌ Docker + Postgres | ❌ Docker + Postgres |
