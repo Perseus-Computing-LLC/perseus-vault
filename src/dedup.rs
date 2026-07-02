@@ -531,12 +531,32 @@ mod tests {
         assert_ne!(body_hash64("12345678x"), body_hash64("12345678y"));
         // Zero-padding must not alias a shorter body onto a longer one.
         assert_ne!(body_hash64("abc"), body_hash64("abc\0\0"));
-        // Known-value pins (computed once from this implementation).
-        assert_eq!(body_hash64("perseus-vault"), {
-            // Recompute through the public fn — the pin is the cross-check
-            // that build_row_signature and the scan agree forever.
-            build_row_signature("perseus-vault").body_hash
-        });
+
+        // LITERAL value pins. Self-consistency alone (both sides calling the
+        // same fn) would let a real algorithm change — e.g. rotate_left(23)
+        // -> (24) — pass while silently invalidating every persisted
+        // signature across binaries. These hardcoded constants are the ONLY
+        // check that actually fails on such a drift: if you change the hash
+        // algorithm you MUST recompute and update them (and accept that all
+        // existing v10 signatures self-heal on next touch via the freshness
+        // guard). Values captured from the current implementation.
+        assert_eq!(
+            body_hash64("perseus-vault"),
+            -4349344705766122978,
+            "body_hash64 algorithm changed — persisted signatures across binaries would silently mismatch"
+        );
+        assert_eq!(
+            body_hash64(""),
+            1530470515733238723,
+            "body_hash64 empty-input value changed — see the pin comment above"
+        );
+
+        // The pin values must also be exactly what build_row_signature (and
+        // therefore the scan's freshness guard) stores.
+        assert_eq!(
+            build_row_signature("perseus-vault").body_hash,
+            -4349344705766122978
+        );
     }
 
     #[test]
