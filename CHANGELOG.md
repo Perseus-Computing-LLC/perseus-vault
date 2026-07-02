@@ -113,6 +113,25 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
   `mimir_history`/`mimir_as_of` and the journal append-only forever.
   `PurgeReport` gains `history_rows_deleted` / `journal_rows_redacted`
   (dry_run previews both with the same predicates).
+- `remember()`'s near-duplicate scan no longer rebuilds every candidate's
+  trigram set per insert (#392) — the O(M·N) cost that made a single write
+  stall ~1.6s at 50k same-category entities (0.6 inserts/s). Each row's
+  packed trigram set is now stored once at write time (schema v10:
+  `dedup_signatures` + `dedup_signature_blobs`, derived from the stored —
+  i.e. possibly encrypted — `body_json` column value) and the scan computes
+  its verdict from the stored signature behind two provably lossless prunes
+  (exact set-size ceiling, 256-bucket histogram intersection ceiling).
+  Dedup semantics are EXACT: the new path returns the identical
+  match-or-not and matched id as the exhaustive trigram-Jaccard scan
+  (randomized property-tested against the old implementation, including
+  threshold-boundary, tiny-body, unicode and encrypted stores). Existing
+  rows need no migration pass: unsigned rows take the old rebuild path and
+  are backfilled lazily in bounded batches (512/scan). Measured (release,
+  1KB uniform-length bodies — the length prefilter's worst case; medians
+  over 15 probes): single-insert dedup scan @50k 1628.5ms → 69.3ms
+  (23.5x); bulk import of 5,000 (fresh store, dedup ON) 123.6s (pre, per
+  #392) → 11.8s total (~10x). The opt-in `MIMIR_DEDUP_FTS_PREFILTER` path
+  is unchanged and composes with the stored signatures.
 - `follow()`'s row resolution no longer collapses real DB errors into
   "not found" (#396, the #394 principle): only `QueryReturnedNoRows` maps to
   the clean `found: false` report; a locked file or corruption error now

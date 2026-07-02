@@ -1,6 +1,7 @@
 mod communities;
 mod connectors;
 mod db;
+mod dedup;
 mod embedding;
 mod encryption;
 mod extraction;

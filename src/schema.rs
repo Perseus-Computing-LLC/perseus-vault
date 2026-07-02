@@ -150,7 +150,7 @@ CREATE INDEX IF NOT EXISTS idx_entity_history_catkey ON entity_history(category,
 /// the column-add migrations below have been applied. Bump this whenever you add
 /// a new ALTER-probe migration in `initialize_schema`, or existing databases
 /// (already at the previous level) will skip it.
-const SCHEMA_VERSION: i64 = 9;
+const SCHEMA_VERSION: i64 = 10;
 
 /// Initialize the v0.2.0 schema on a fresh database.
 pub fn initialize_schema(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
@@ -360,6 +360,46 @@ fn apply_migrations(conn: &Connection) -> Result<(), Box<dyn std::error::Error>>
          WHERE valid_from_unix_ms IS NULL;",
     )?;
     // ── end v9 ──────────────────────────────────────────────────────────
+
+    // ── v10 (#392): stored near-duplicate signatures ─────────────────────
+    // Self-contained block (renumber-safe). One row per entity holding the
+    // packed character-trigram set of the STORED body_json column value (see
+    // src/dedup.rs), so find_near_duplicate can compute its exact Jaccard
+    // verdict without rebuilding the trigram set per candidate per insert —
+    // the O(M·N) cost behind the 1.6s-per-write stall at 50k rows.
+    //
+    // Backfill is LAZY: rows written before this migration simply have no
+    // signature; the dedup scan takes the old rebuild-from-body path for
+    // them (identical verdicts, old cost) and writes the signature back in
+    // bounded batches, so a large store converges without a potentially
+    // multi-minute eager migration. body_len records the stored body's byte
+    // length as a freshness guard. ON DELETE CASCADE keeps the side table in
+    // step with every entity-delete path (the pool opens connections with
+    // foreign_keys=ON); a surviving orphan is inert — the scan joins FROM
+    // entities, so it can never resurrect a deleted row.
+    // Two tables, split by access pattern. The scan LEFT JOINs
+    // dedup_signatures (small fixed-size rows: freshness guard, set size,
+    // 256-byte prune histogram) for EVERY candidate, so its per-row page
+    // footprint must stay tiny — a writer committing between scans
+    // invalidates other pooled connections' page caches, making the scan's
+    // hot page count the real cost on write-heavy workloads. The multi-KB
+    // exact trigram set lives in dedup_signature_blobs and is fetched by a
+    // separate point query ONLY for the rare candidate that survives both
+    // lossless prunes. WITHOUT ROWID: the entity_id probes hit one clustered
+    // b-tree instead of autoindex-then-rowid double lookups.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS dedup_signatures (
+            entity_id TEXT PRIMARY KEY REFERENCES entities(id) ON DELETE CASCADE,
+            body_len INTEGER NOT NULL,
+            tg_count INTEGER NOT NULL,
+            histo BLOB
+         ) WITHOUT ROWID;
+         CREATE TABLE IF NOT EXISTS dedup_signature_blobs (
+            entity_id TEXT PRIMARY KEY REFERENCES entities(id) ON DELETE CASCADE,
+            sig BLOB NOT NULL
+         ) WITHOUT ROWID;",
+    )?;
+    // ── end v10 ─────────────────────────────────────────────────────────
 
     // Stamp the migration level so subsequent opens skip the probe block above.
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -1195,6 +1235,60 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM entities WHERE id='v8-keep'", [], |r| r.get(0))
             .unwrap();
         assert_eq!(kept, 1, "migration must not drop data");
+    }
+
+    #[test]
+    fn migrates_legacy_db_to_v10_with_dedup_signatures() {
+        // v10 (#392): a v9-era DB must gain the dedup_signatures side table on
+        // reopen, land on the current SCHEMA_VERSION, and keep its data. No
+        // eager backfill: pre-existing entities simply have no signature row
+        // (the dedup scan rebuilds and writes back lazily).
+        let (conn, _path) = temp_db();
+        initialize_schema(&conn).expect("fresh init");
+        conn.execute(
+            "INSERT INTO entities (id, category, key, body_json, created_at_unix_ms, last_accessed_unix_ms)
+             VALUES ('v10-keep', 'note', 'k', '{}', 0, 0)",
+            [],
+        )
+        .unwrap();
+        // Rewind to the v9 state: side tables gone, version 9.
+        conn.execute_batch(
+            "DROP TABLE IF EXISTS dedup_signatures;
+             DROP TABLE IF EXISTS dedup_signature_blobs;
+             PRAGMA user_version = 9;",
+        )
+        .unwrap();
+        assert!(
+            conn.prepare("SELECT entity_id FROM dedup_signatures LIMIT 1").is_err(),
+            "precondition: v9 DB lacks the dedup_signatures table"
+        );
+
+        initialize_schema(&conn).expect("v9 -> v10 migration");
+
+        assert!(
+            conn.prepare(
+                "SELECT entity_id, body_len, tg_count, histo FROM dedup_signatures LIMIT 1"
+            )
+            .is_ok(),
+            "dedup_signatures with all v10 columns must exist"
+        );
+        assert!(
+            conn.prepare("SELECT entity_id, sig FROM dedup_signature_blobs LIMIT 1").is_ok(),
+            "dedup_signature_blobs must exist"
+        );
+        let v: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+        let kept: i64 = conn
+            .query_row("SELECT COUNT(*) FROM entities WHERE id='v10-keep'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(kept, 1, "migration must not drop data");
+        // Lazy backfill: the migration itself writes NO signatures.
+        let sigs: i64 = conn
+            .query_row("SELECT COUNT(*) FROM dedup_signatures", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(sigs, 0, "v10 must not eagerly backfill signatures");
     }
 
     #[test]
