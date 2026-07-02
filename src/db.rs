@@ -89,9 +89,6 @@ struct EmbedJob {
 /// to the worker).
 struct EmbedWorker {
     tx: std::sync::mpsc::SyncSender<EmbedJob>,
-    /// Set by Drop: the worker skips remaining queued jobs and exits after the
-    /// in-flight one finishes.
-    shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Count of enqueued-but-not-finished jobs; the condvar wakes
     /// `embed_queue_flush` waiters when it reaches zero.
     pending: std::sync::Arc<(std::sync::Mutex<u64>, std::sync::Condvar)>,
@@ -775,8 +772,11 @@ impl Database {
     /// write ~6.7ms (62x). Non-blocking: if the bounded queue is full the job
     /// is DROPPED (drop-new) with a rate-limited warning; auto-embedding is
     /// best-effort by contract, and unbounded queue growth is not acceptable.
-    /// A dropped row stays out of dense search until its next content change
-    /// or an explicit `mimir_embed` batch pass (`WHERE embedding IS NULL`).
+    /// The caller's write transaction already cleared the row's embedding on
+    /// content change, so a dropped (or still-lagging) job means the row is
+    /// ABSENT from dense search — never served with the previous body's stale
+    /// vector — until its next content change or an explicit `mimir_embed`
+    /// batch pass (`WHERE embedding IS NULL`).
     fn enqueue_auto_embed(&self, id: &str, plaintext: &str) {
         let worker = self.embed_worker.get_or_init(|| {
             Self::spawn_embed_worker(
@@ -805,15 +805,20 @@ impl Database {
             // flush waiters don't hang on a job that will never run.
             let (lock, cvar) = &*worker.pending;
             if let Ok(mut n) = lock.lock() {
+                debug_assert!(*n > 0, "embed pending counter underflow on enqueue rollback");
                 *n = n.saturating_sub(1);
                 if *n == 0 {
                     cvar.notify_all();
                 }
             }
+            // The dropped row's embedding is NULL — the write transaction
+            // cleared it on content change — so it is out of dense search
+            // (keyword still finds it) and recoverable by mimir_embed batch
+            // mode's `WHERE embedding IS NULL` scan.
             rate_limited_log(
                 "embed-queue-overflow",
-                "mimir: auto-embed queue full — dropping newest job(s); rows stay \
-                 unembedded until their next change or a mimir_embed batch pass",
+                "mimir: auto-embed queue full — dropping newest job(s); affected rows \
+                 have no embedding until their next change or a mimir_embed batch pass",
             );
         }
     }
@@ -829,22 +834,22 @@ impl Database {
         llm_config: LlmConfig,
         queue_cap: usize,
     ) -> EmbedWorker {
-        use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::{Arc, Condvar, Mutex};
 
         let (tx, rx) = std::sync::mpsc::sync_channel::<EmbedJob>(queue_cap);
         let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
-        let shutdown = Arc::new(AtomicBool::new(false));
         let pending = Arc::new((Mutex::new(0u64), Condvar::new()));
 
-        let w_shutdown = Arc::clone(&shutdown);
         let w_pending = Arc::clone(&pending);
         let handle = std::thread::Builder::new()
             .name("mimir-embed-worker".to_string())
             .spawn(move || {
-                // recv() keeps yielding buffered jobs after the sender drops, so
-                // a shutdown drains the remainder through the skip branch below
-                // (fast) before recv() finally errors and the loop exits.
+                // recv() keeps yielding buffered jobs after the sender drops
+                // (Drop disconnects it), so shutdown DRAINS the remaining
+                // queued jobs — a CLI one-shot's writes still get embedded,
+                // matching the pre-#393 synchronous behavior — before recv()
+                // finally errors and the loop exits. Drop bounds its wait; a
+                // drain that outlives it continues on the detached thread.
                 while let Ok(first) = rx.recv() {
                     let mut batch = vec![first];
                     while batch.len() < EMBED_BATCH_MAX {
@@ -854,49 +859,48 @@ impl Database {
                         }
                     }
                     for job in batch {
-                        if !w_shutdown.load(Ordering::SeqCst) {
-                            match Self::generate_embedding_backend(
-                                &embedding_config,
-                                &llm_config,
-                                &job.plaintext,
-                            ) {
-                                Ok(vec) => match pool.get() {
-                                    Ok(conn) => {
-                                        if let Err(e) = Self::store_embedding_guarded_with_conn(
-                                            &conn,
-                                            &job.id,
-                                            &job.plaintext,
-                                            &vec,
-                                        ) {
-                                            rate_limited_log(
-                                                "embed-store",
-                                                &format!(
-                                                    "mimir: auto-embed store failed for {}: {}",
-                                                    job.id, e
-                                                ),
-                                            );
-                                        }
+                        match Self::generate_embedding_backend(
+                            &embedding_config,
+                            &llm_config,
+                            &job.plaintext,
+                        ) {
+                            Ok(vec) => match pool.get() {
+                                Ok(conn) => {
+                                    if let Err(e) = Self::store_embedding_guarded_with_conn(
+                                        &conn,
+                                        &job.id,
+                                        &job.plaintext,
+                                        &vec,
+                                    ) {
+                                        rate_limited_log(
+                                            "embed-store",
+                                            &format!(
+                                                "mimir: auto-embed store failed for {}: {}",
+                                                job.id, e
+                                            ),
+                                        );
                                     }
-                                    Err(e) => rate_limited_log(
-                                        "embed-pool",
-                                        &format!(
-                                            "mimir: auto-embed skipped {} — no pooled connection: {}",
-                                            job.id, e
-                                        ),
-                                    ),
-                                },
+                                }
                                 Err(e) => rate_limited_log(
-                                    "embed-generate",
+                                    "embed-pool",
                                     &format!(
-                                        "mimir: auto-embed generation failed for {}: {}",
+                                        "mimir: auto-embed skipped {} — no pooled connection: {}",
                                         job.id, e
                                     ),
                                 ),
-                            }
+                            },
+                            Err(e) => rate_limited_log(
+                                "embed-generate",
+                                &format!(
+                                    "mimir: auto-embed generation failed for {}: {}",
+                                    job.id, e
+                                ),
+                            ),
                         }
-                        // Finished (or shutdown-skipped): wake flush waiters.
+                        // Finished: wake flush waiters.
                         let (lock, cvar) = &*w_pending;
                         if let Ok(mut n) = lock.lock() {
+                            debug_assert!(*n > 0, "embed pending counter underflow in worker");
                             *n = n.saturating_sub(1);
                             if *n == 0 {
                                 cvar.notify_all();
@@ -910,7 +914,6 @@ impl Database {
 
         EmbedWorker {
             tx,
-            shutdown,
             pending,
             done_rx: std::sync::Mutex::new(done_rx),
             handle,
@@ -2406,10 +2409,24 @@ impl Database {
             // caller didn't say otherwise (#363): new content is a new claim
             // about the world starting at transaction time — inheriting the old
             // version's valid_from would silently backdate it.
+            //
+            // #393 (PR #415 review): a content change also CLEARS the stored
+            // embedding in this same transaction. The vector was computed from
+            // the OLD body; with the auto-embed deferred, keeping it would
+            // serve a wrong vector to dense search for the whole lag window —
+            // permanently, if the re-embed job is dropped on queue overflow,
+            // because a non-NULL embedding is invisible to `mimir_embed` batch
+            // repair (`WHERE embedding IS NULL`). Absent beats stale: the row
+            // drops out of dense search (keyword still finds it) until the
+            // worker's guarded store lands, and every dropped job is genuinely
+            // NULL-scan-recoverable. Cleared regardless of whether an embedding
+            // backend is enabled — a vector for a body the row no longer has is
+            // wrong in any configuration.
             if content_changed {
                 tx.execute(
                     "UPDATE entities SET recorded_at_unix_ms = ?1, supersedes = ?2,
-                        valid_from_unix_ms = ?4, valid_to_unix_ms = ?5 WHERE id = ?3",
+                        valid_from_unix_ms = ?4, valid_to_unix_ms = ?5,
+                        embedding = NULL, emb_sig = NULL WHERE id = ?3",
                     params![now, history_id, id, valid_from.unwrap_or(now), valid_to],
                 )?;
             } else if let Some(old_eff_from) = audit_reassert_from {
@@ -2572,7 +2589,10 @@ impl Database {
         // doesn't surface in dense/hybrid search until embedded). The worker
         // embeds the PLAINTEXT body_json and re-verifies it against the row
         // before storing (stale guard), so a queued vector can never overwrite
-        // a newer body's embedding. The #219 session cache is intentionally not
+        // a newer body's embedding — and the update path's transaction already
+        // CLEARED the old vector on content change, so the lag window (or a
+        // dropped job) serves no embedding rather than the previous body's
+        // stale one. The #219 session cache is intentionally not
         // consulted here: new/changed bodies are unique by definition, so the
         // write path only ever paid up to 256 full-body string compares for a
         // guaranteed miss. Gated on the content-changed signal so identical
@@ -7539,21 +7559,21 @@ If no clear lessons found, return: {{"lessons": []}}"#,
 }
 
 /// #393: graceful shutdown of the background auto-embed worker so tests and
-/// the CLI exit cleanly. Signals shutdown, disconnects the queue, and waits a
-/// bounded 5s for the worker's completion signal before joining: the in-flight
-/// embed finishes, remaining QUEUED jobs are skipped/dropped (fine by the
-/// best-effort contract — those rows stay unembedded until their next change
-/// or a `mimir_embed` batch pass). If the worker is wedged in a slow remote
-/// embed call past the wait, the thread is detached rather than blocking
-/// Drop — it exits on its own once the call times out.
+/// the CLI exit cleanly. Disconnects the queue and waits a bounded 5s for the
+/// worker's completion signal before joining. The worker DRAINS the remaining
+/// queued jobs after the disconnect (a CLI one-shot's writes still get their
+/// embeddings, matching the pre-#393 synchronous behavior; typical backlog is
+/// a handful of ~7ms local embeds). If the drain outlives the 5s grace —
+/// e.g. wedged in a slow remote embed call — the thread is detached rather
+/// than blocking Drop: it keeps draining best-effort and exits on its own
+/// when the queue empties or the process does. Rows whose jobs never ran have
+/// a NULL embedding (cleared at write time on content change), so they are
+/// recoverable via `mimir_embed` batch mode or their next change.
 impl Drop for Database {
     fn drop(&mut self) {
         if let Some(worker) = self.embed_worker.take() {
-            worker
-                .shutdown
-                .store(true, std::sync::atomic::Ordering::SeqCst);
-            // Disconnect the channel so the worker's recv() terminates once
-            // the (now skip-drained) buffer is empty.
+            // Disconnect the channel: the worker drains what is buffered,
+            // then its recv() errors and it exits.
             drop(worker.tx);
             let finished = worker
                 .done_rx
@@ -14527,14 +14547,21 @@ mod tests {
     /// `{"embeddings": [[<request content-length>, 1.0, 2.0]]}` — the vector
     /// encodes the request body length, so embeds of different texts are
     /// distinguishable in assertions (see `expected_fake_vec_first`).
-    fn spawn_fake_embed_server(delay: std::time::Duration) -> u16 {
+    /// The returned counter increments as each connection is ACCEPTED, letting
+    /// tests observe "the worker is now in flight on job N" without sleeps.
+    fn spawn_fake_embed_server(
+        delay: std::time::Duration,
+    ) -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
         use std::io::{Read, Write};
         let listener =
             std::net::TcpListener::bind("127.0.0.1:0").expect("bind fake embed server");
         let port = listener.local_addr().unwrap().port();
+        let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let accepted_srv = std::sync::Arc::clone(&accepted);
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(mut s) = stream else { break };
+                accepted_srv.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 std::thread::spawn(move || {
                     let mut buf: Vec<u8> = Vec::new();
                     let mut tmp = [0u8; 4096];
@@ -14574,7 +14601,7 @@ mod tests {
                 });
             }
         });
-        port
+        (port, accepted)
     }
 
     /// The first component of the vector the fake server answers for `text` —
@@ -14591,7 +14618,7 @@ mod tests {
     fn db_with_fake_embed_endpoint(
         delay: std::time::Duration,
         queue_cap: Option<usize>,
-    ) -> (Database, String) {
+    ) -> (Database, String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
         let (mut db, path) = temp_db();
         if let Some(cap) = queue_cap {
             db.set_embed_queue_cap(cap);
@@ -14600,7 +14627,7 @@ mod tests {
             .join(format!("mimir-no-model-{}", uuid::Uuid::new_v4()))
             .join("model.onnx");
         db.set_embedding_model(missing.to_str().unwrap());
-        let port = spawn_fake_embed_server(delay);
+        let (port, accepted) = spawn_fake_embed_server(delay);
         db.set_llm(
             true,
             &format!("http://127.0.0.1:{port}/api/generate"),
@@ -14608,7 +14635,24 @@ mod tests {
             None,
             Some(&format!("http://127.0.0.1:{port}/api/embed")),
         );
-        (db, path)
+        (db, path, accepted)
+    }
+
+    /// Spin until the fake server has accepted `n` connections — i.e. the
+    /// worker is in flight on the n-th embed (its ureq call is inside the
+    /// server's delay window, so the queue slot it occupied is free again).
+    fn wait_for_accepts(
+        accepted: &std::sync::atomic::AtomicUsize,
+        n: usize,
+    ) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while accepted.load(std::sync::atomic::Ordering::SeqCst) < n {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fake embed server never saw request #{n}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
     }
 
     /// #393 regression: a content-changing write must return without waiting
@@ -14617,7 +14661,7 @@ mod tests {
     /// stored when it returned.
     #[test]
     fn write_path_does_not_block_on_slow_embed_backend() {
-        let (db, path) =
+        let (db, path, _) =
             db_with_fake_embed_endpoint(std::time::Duration::from_millis(500), None);
         let body = "{\"content\":\"write must return before the 500ms embed completes\"}";
         let t = std::time::Instant::now();
@@ -14713,7 +14757,7 @@ mod tests {
     /// write and then overwritten by job B; both satisfy the invariant.)
     #[test]
     fn stale_deferred_embed_never_overwrites_newer_body() {
-        let (db, path) =
+        let (db, path, _) =
             db_with_fake_embed_endpoint(std::time::Duration::from_millis(400), None);
         let body_a = "{\"content\":\"version A of this fact\"}";
         let body_b =
@@ -14746,7 +14790,7 @@ mod tests {
     /// leave waiters hanging).
     #[test]
     fn embed_queue_overflow_drops_newest_and_flush_still_drains() {
-        let (db, path) =
+        let (db, path, _) =
             db_with_fake_embed_endpoint(std::time::Duration::from_millis(400), Some(1));
         for i in 0..4 {
             db.remember_skip_dedup(&make_entity(
@@ -14780,6 +14824,86 @@ mod tests {
         assert!(
             missing >= 1,
             "cap=1 with 4 rapid writes must drop at least one job (drop-new); got {embedded} embedded / {missing} missing"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    /// #393 (PR #415 review): a content-changing UPDATE whose embed job is
+    /// dropped by overflow must NOT keep serving the PREVIOUS body's vector.
+    /// The write transaction clears the stored embedding on content change, so
+    /// embed lag/drop means ABSENT (row drops out of dense search; keyword
+    /// still finds it), never STALE — and the cleared row is genuinely
+    /// repairable by `mimir_embed` batch mode (`WHERE embedding IS NULL`).
+    /// Pre-fix this failed both ways: the old body's vector survived the
+    /// dropped job, and batch mode reported embedded: 0 (nothing was NULL).
+    #[test]
+    fn overflow_dropped_update_clears_stale_vector_and_batch_repairs_it() {
+        let (db, path, accepted) =
+            db_with_fake_embed_endpoint(std::time::Duration::from_millis(400), Some(1));
+        let body_a = "{\"content\":\"first version of the target fact\"}";
+        let body_b =
+            "{\"content\":\"second, entirely rewritten version of the target fact body\"}";
+
+        // Baseline: create the target and let its embed land.
+        let (id, _) = db
+            .remember(&make_entity("ovu-x", "insight", "ovu-x", body_a))
+            .unwrap();
+        assert!(db.embed_queue_flush(std::time::Duration::from_secs(30)));
+        let before = raw_embedding(&db, &id).expect("baseline vector for body A");
+        assert_eq!(
+            f32::from_le_bytes(before[0..4].try_into().unwrap()),
+            expected_fake_vec_first("fake-embed", body_a)
+        );
+
+        // Occupy the worker: filler 1's job goes in flight (observed via the
+        // server's accept counter — request #2 after the baseline's #1), then
+        // filler 2's job takes the single queue slot.
+        db.remember_skip_dedup(&make_entity(
+            "ovu-f1",
+            "insight",
+            "ovu-f1",
+            "{\"content\":\"filler one keeps the worker busy in flight\"}",
+        ))
+        .unwrap();
+        wait_for_accepts(&accepted, 2);
+        db.remember_skip_dedup(&make_entity(
+            "ovu-f2",
+            "insight",
+            "ovu-f2",
+            "{\"content\":\"filler two occupies the only queue slot\"}",
+        ))
+        .unwrap();
+
+        // This content-changing UPDATE's embed job is dropped (drop-new).
+        db.remember(&make_entity("ovu-x", "insight", "ovu-x", body_b))
+            .unwrap();
+        assert!(db.embed_queue_flush(std::time::Duration::from_secs(30)));
+
+        // The previous body's vector must be GONE, not silently served.
+        assert!(
+            raw_embedding(&db, &id).is_none(),
+            "a dropped update job must leave the embedding ABSENT (NULL), not body A's stale vector"
+        );
+
+        // NULL makes the row repairable by the documented recovery path.
+        let report = db
+            .embed_entity(&EmbedParams {
+                text: None,
+                category: None,
+                key: None,
+                batch_category: Some("insight".to_string()),
+                batch_limit: 100,
+            })
+            .unwrap();
+        assert!(
+            report["embedded"].as_i64().unwrap_or(0) >= 1,
+            "batch mode must repair the cleared row, got {report}"
+        );
+        let after = raw_embedding(&db, &id).expect("repaired vector");
+        assert_eq!(
+            f32::from_le_bytes(after[0..4].try_into().unwrap()),
+            expected_fake_vec_first("fake-embed", body_b),
+            "the repair must embed the CURRENT body"
         );
         let _ = fs::remove_file(&path);
     }
