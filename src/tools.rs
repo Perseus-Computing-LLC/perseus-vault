@@ -2265,11 +2265,14 @@ pub fn handle_supersede(db: &Database, args: Value) -> Result<String, String> {
         .set_valid_to(&from_entity.id, requested)
         .map_err(|e| format!("Failed to close 'from' entity's valid period: {}", e))?;
 
-    // 3. Set the OLD entity's status to "deprecated". Unaudited by design
-    // (see update_entity_status); on the supersede path the audit trail was
-    // just written by the close above. Not atomic with the close — a failure
-    // here leaves the period closed but the status active, the same
-    // non-atomicity between steps this handler has always had.
+    // 3. Set the OLD entity's status to "deprecated". Audited (#377): an
+    // actual flip writes its own history snapshot, so even when the close
+    // above was a no-op (superseding an already-expired fact — set_valid_to
+    // never extends an existing close and snapshots nothing), the
+    // pre-supersede status stays reconstructable at earlier tx instants.
+    // Not atomic with the close — a failure here leaves the period closed
+    // but the status active, the same non-atomicity between steps this
+    // handler has always had.
     db.update_entity_status(&from_entity.id, "deprecated", &a.reason)
         .map_err(|e| format!("Failed to deprecate 'from' entity: {}", e))?;
 
@@ -3343,7 +3346,11 @@ mod tests {
 
         sleep(Duration::from_millis(5));
         let tx_open = now_ms();
-        sleep(Duration::from_millis(5));
+        // Strictly later clock tick — see the granularity note in
+        // supersede_snapshot_preserves_the_pre_supersede_status.
+        while now_ms() <= tx_open {
+            sleep(Duration::from_millis(1));
+        }
 
         let r = handle_supersede(
             &db,
@@ -3356,8 +3363,8 @@ mod tests {
 
         assert_eq!(
             db.history_versions("facts", "sup-old").unwrap().len(),
-            1,
-            "supersede's close must inherit the audit snapshot"
+            2,
+            "supersede must write the close snapshot plus the audited status-flip snapshot (#377)"
         );
         // Pre-supersede knowledge still believes the old fact open at an
         // instant the close later excluded.
@@ -3418,7 +3425,13 @@ mod tests {
 
         sleep(Duration::from_millis(5));
         let tx_mid = now_ms(); // pre-supersede transaction instant
-        sleep(Duration::from_millis(5));
+        // The supersede must land on a strictly later clock tick than tx_mid,
+        // or its snapshots' recorded_at collides with tx_mid and the
+        // reconstruction below matches the wrong version (Windows now_ms
+        // granularity can exceed a small sleep).
+        while now_ms() <= tx_mid {
+            sleep(Duration::from_millis(1));
+        }
 
         let r = handle_supersede(
             &db,
@@ -3429,8 +3442,9 @@ mod tests {
         let v: Value = serde_json::from_str(&r).unwrap();
         let closed_at = v["from_valid_to_unix_ms"].as_i64().expect("close instant");
 
-        // Exactly one snapshot of the OLD fact; the successor untouched.
-        assert_eq!(db.history_versions("facts", "anachron").unwrap().len(), 1);
+        // Two snapshots of the OLD fact (the audited close, then the audited
+        // status flip — #377); the successor untouched.
+        assert_eq!(db.history_versions("facts", "anachron").unwrap().len(), 2);
         assert!(db.history_versions("facts", "anachron-new").unwrap().is_empty());
 
         // Pre-supersede reconstruction: ACTIVE and open.
@@ -3449,17 +3463,155 @@ mod tests {
         );
         assert_eq!(v["valid_to_unix_ms"], Value::Null, "{r}");
 
-        // Post-supersede (current knowledge): DEPRECATED and closed.
+        // Post-supersede (current knowledge): DEPRECATED and closed. Queried
+        // at a future tx instant — the audited writes bump recorded_at
+        // strictly past the previous one (#373), which can land 1ms ahead of
+        // the wall clock, so `now_ms()` in the same tick could miss the live
+        // row and match the intermediate close snapshot instead.
         let r = handle_bitemporal(
             &db,
             json!({"category": "facts", "key": "anachron",
-                   "tx_at_unix_ms": now_ms(), "valid_at_unix_ms": closed_at - 1}),
+                   "tx_at_unix_ms": now_ms() + 60_000, "valid_at_unix_ms": closed_at - 1}),
         )
         .expect("bitemporal post-supersede cell");
         let v: Value = serde_json::from_str(&r).unwrap();
         assert_eq!(v["found"], json!(true), "{r}");
         assert_eq!(v["status"], json!("deprecated"), "{r}");
         assert_eq!(v["valid_to_unix_ms"], json!(closed_at), "{r}");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn supersede_of_expired_fact_still_audits_the_status_flip() {
+        // #377: superseding a fact whose valid period is ALREADY closed takes
+        // set_valid_to's no-op early-return — no close snapshot. The status
+        // flip used to be unaudited on top of that, baking 'deprecated' under
+        // the ORIGINAL recorded_at, so reconstruction at pre-supersede tx
+        // instants showed the expired fact as already deprecated. The audited
+        // flip now writes the only snapshot on this path.
+        use std::thread::sleep;
+        use std::time::Duration;
+        let (db, path) = temp_db();
+
+        let expiry = now_ms() + 20;
+        handle_remember(
+            &db,
+            json!({"category": "facts", "key": "expired-old",
+                   "body_json": "{\"note\":\"expired but still active\"}",
+                   "valid_to_unix_ms": expiry}),
+        )
+        .expect("expired fact");
+        handle_remember(
+            &db,
+            json!({"category": "facts", "key": "expired-new",
+                   "body_json": "{\"note\":\"replacement\"}"}),
+        )
+        .expect("successor");
+
+        // Let the fact expire naturally; its status is still 'active'.
+        sleep(Duration::from_millis(30));
+        assert!(now_ms() > expiry, "fact must be past its valid_to");
+        assert_eq!(
+            db.get_entity("facts", "expired-old").unwrap().unwrap().status,
+            "active"
+        );
+        assert!(db.history_versions("facts", "expired-old").unwrap().is_empty());
+
+        let tx_mid = now_ms(); // pre-supersede transaction instant
+        // Strictly later clock tick — see the granularity note in
+        // supersede_snapshot_preserves_the_pre_supersede_status.
+        while now_ms() <= tx_mid {
+            sleep(Duration::from_millis(1));
+        }
+
+        handle_supersede(
+            &db,
+            json!({"from_category": "facts", "from_key": "expired-old",
+                   "to_category": "facts", "to_key": "expired-new"}),
+        )
+        .expect("supersede expired fact");
+
+        // The close was a no-op (the period had already ended), so the flip's
+        // snapshot is the ONLY history row.
+        assert_eq!(
+            db.history_versions("facts", "expired-old").unwrap().len(),
+            1,
+            "the audited status flip must snapshot when the close no-ops"
+        );
+
+        // Pre-supersede reconstruction at an in-period instant: ACTIVE, with
+        // the original expiry intact.
+        let r = handle_bitemporal(
+            &db,
+            json!({"category": "facts", "key": "expired-old",
+                   "tx_at_unix_ms": tx_mid, "valid_at_unix_ms": expiry - 1}),
+        )
+        .expect("bitemporal pre-supersede cell");
+        let v: Value = serde_json::from_str(&r).unwrap();
+        assert_eq!(v["found"], json!(true), "{r}");
+        assert_eq!(
+            v["status"],
+            json!("active"),
+            "pre-supersede reconstruction of an expired fact must not show the later deprecation: {r}"
+        );
+        assert_eq!(v["valid_to_unix_ms"], json!(expiry), "{r}");
+
+        // Current knowledge: deprecated, expiry unchanged (never extended).
+        // Future tx instant for the same recorded_at-skew reason as in
+        // supersede_snapshot_preserves_the_pre_supersede_status.
+        let r = handle_bitemporal(
+            &db,
+            json!({"category": "facts", "key": "expired-old",
+                   "tx_at_unix_ms": now_ms() + 60_000, "valid_at_unix_ms": expiry - 1}),
+        )
+        .expect("bitemporal post-supersede cell");
+        let v: Value = serde_json::from_str(&r).unwrap();
+        assert_eq!(v["found"], json!(true), "{r}");
+        assert_eq!(v["status"], json!("deprecated"), "{r}");
+        assert_eq!(v["valid_to_unix_ms"], json!(expiry), "{r}");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn same_status_reason_overwrite_stays_unversioned() {
+        // #377 decision: a status no-change call (e.g. re-superseding an
+        // already-deprecated fact) refreshes archive_reason in place without
+        // a snapshot — a reason overwrite is operational metadata, not a
+        // knowledge change.
+        let (db, path) = temp_db();
+
+        handle_remember(
+            &db,
+            json!({"category": "facts", "key": "rs-old", "body_json": "{\"note\":\"old\"}"}),
+        )
+        .expect("old");
+        handle_remember(
+            &db,
+            json!({"category": "facts", "key": "rs-new", "body_json": "{\"note\":\"new\"}"}),
+        )
+        .expect("new");
+        handle_supersede(
+            &db,
+            json!({"from_category": "facts", "from_key": "rs-old",
+                   "to_category": "facts", "to_key": "rs-new"}),
+        )
+        .expect("first supersede");
+        let snapshots = db.history_versions("facts", "rs-old").unwrap().len();
+
+        let old_id = db.get_entity("facts", "rs-old").unwrap().unwrap().id;
+        db.update_entity_status(&old_id, "deprecated", "second reason")
+            .expect("same-status reason overwrite");
+
+        assert_eq!(
+            db.history_versions("facts", "rs-old").unwrap().len(),
+            snapshots,
+            "a same-status reason overwrite must not write a snapshot"
+        );
+        let e = db.get_entity("facts", "rs-old").unwrap().unwrap();
+        assert_eq!(e.status, "deprecated");
+        assert_eq!(e.archive_reason, "second reason");
 
         let _ = std::fs::remove_file(&path);
     }

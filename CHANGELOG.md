@@ -46,6 +46,18 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
   count 53 → 55.
 
 ### Fixed
+- Audited status flips (#377): `update_entity_status` now snapshots the
+  pre-change version to `entity_history` and advances the live row's
+  transaction time whenever the status actually changes — closing the
+  expired-fact supersede corner, where the valid period was already closed,
+  `set_valid_to`'s close was a no-op that wrote no snapshot, and the
+  `deprecated` flip was baked in under the original transaction time (so
+  `mimir_bitemporal` at pre-supersede instants showed the expired fact as
+  already deprecated). A same-status call (e.g. re-superseding an
+  already-deprecated fact) still refreshes `archive_reason` in place,
+  unversioned by design — a reason overwrite is operational metadata, not a
+  knowledge change. A normal supersede now writes two snapshots: the audited
+  close, then the audited flip.
 - Supersede snapshot status fidelity (#375): `mimir_supersede` now closes the
   old fact's valid period BEFORE flipping its status to `deprecated`, so the
   #373 audit snapshot captures the true pre-supersede state — previously the
