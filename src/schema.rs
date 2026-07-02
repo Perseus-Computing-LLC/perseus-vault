@@ -53,7 +53,10 @@ CREATE TABLE IF NOT EXISTS entities (
     efficacy_status TEXT DEFAULT 'unverified'  -- 'unverified' | 'useful' | 'dead'
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS idx_entities_category_key ON entities(category, key);
+-- Identity index: (category, key, workspace_hash) — #339. Created in
+-- initialize_schema's gated block, NOT here: on a legacy DB this ungated DDL
+-- runs before the ALTER that adds workspace_hash, so an index referencing the
+-- column here would fail the whole batch.
 
 -- Recall ranking index: lets the browse path (WHERE archived=0 [+ residual
 -- filters] ORDER BY retrieval_count DESC, last_accessed_unix_ms DESC LIMIT k)
@@ -89,9 +92,9 @@ CREATE TABLE IF NOT EXISTS state (
 );
 
 -- Superseded fact versions (v2.4.0 — bi-temporal facts). When a remember()
--- overwrites an existing (category,key) with new content, the prior row is
--- snapshotted here with invalidated_at set, so live reads stay one-row-per-key
--- (entities + its UNIQUE(category,key) are untouched) while history is kept for
+-- overwrites an existing (category,key,workspace_hash) with new content, the prior
+-- row is snapshotted here with invalidated_at set, so live reads stay one-row-per-key
+-- (entities + its UNIQUE(category,key,workspace_hash) are untouched) while history is kept for
 -- as-of / time-travel queries. A version was live during
 -- [recorded_at_unix_ms, invalidated_at_unix_ms). superseded_by points at the
 -- live entity id that replaced it. body_json carries the same encryption as
@@ -137,7 +140,7 @@ CREATE INDEX IF NOT EXISTS idx_entity_history_catkey ON entity_history(category,
 /// the column-add migrations below have been applied. Bump this whenever you add
 /// a new ALTER-probe migration in `initialize_schema`, or existing databases
 /// (already at the previous level) will skip it.
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 /// Initialize the v0.2.0 schema on a fresh database.
 pub fn initialize_schema(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
@@ -260,6 +263,20 @@ pub fn initialize_schema(conn: &Connection) -> Result<(), Box<dyn std::error::Er
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_entities_invalidated \
          ON entities(invalidated_at_unix_ms);",
+    )?;
+
+    // v4 (#339): identity becomes (category, key, workspace_hash). A plain
+    // (category, key) uniqueness made cross-workspace key collisions
+    // unstorable, which is what forced mimir_share's "copy into workspace" to
+    // clobber the source row. Created here (after the workspace_hash ALTER,
+    // like idx_entities_invalidated) rather than in the ungated DDL. Safe on
+    // a populated DB — the old constraint was strictly tighter, so no
+    // existing rows can collide. Create-then-drop, so uniqueness is never
+    // unenforced.
+    conn.execute_batch(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_entities_category_key_ws \
+         ON entities(category, key, workspace_hash); \
+         DROP INDEX IF EXISTS idx_entities_category_key;",
     )?;
 
     // Stamp the migration level so subsequent opens skip the probe block above.
@@ -602,6 +619,65 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(v, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn migrates_unique_index_to_workspace_scoped_identity() {
+        // v4 (#339): a v3-era DB with the two-column unique index and existing
+        // rows must come out with the three-column index, the old index
+        // dropped, and cross-workspace key collisions storable.
+        let (conn, _path) = temp_db();
+        initialize_schema(&conn).expect("fresh init");
+        // Rewind to the v3 state: old index back, new index gone, version 3.
+        conn.execute_batch(
+            "DROP INDEX IF EXISTS idx_entities_category_key_ws;
+             CREATE UNIQUE INDEX idx_entities_category_key ON entities(category, key);
+             PRAGMA user_version = 3;",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO entities (id, category, key, body_json, workspace_hash, created_at_unix_ms, last_accessed_unix_ms)
+             VALUES ('mig-a', 'note', 'k', '{}', 'ws-alpha', 0, 0)",
+            [],
+        )
+        .unwrap();
+
+        initialize_schema(&conn).expect("v3 -> v4 migration");
+
+        let old_idx: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_entities_category_key'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(old_idx, 0, "old two-column unique index must be dropped");
+        let new_idx: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_entities_category_key_ws'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(new_idx, 1, "workspace-scoped unique index must exist");
+
+        // Same (category, key) in a different workspace now inserts…
+        conn.execute(
+            "INSERT INTO entities (id, category, key, body_json, workspace_hash, created_at_unix_ms, last_accessed_unix_ms)
+             VALUES ('mig-b', 'note', 'k', '{}', 'ws-beta', 0, 0)",
+            [],
+        )
+        .expect("cross-workspace key collision must be storable after v4");
+        // …while a true duplicate in the SAME workspace is still rejected.
+        assert!(
+            conn.execute(
+                "INSERT INTO entities (id, category, key, body_json, workspace_hash, created_at_unix_ms, last_accessed_unix_ms)
+                 VALUES ('mig-c', 'note', 'k', '{}', 'ws-alpha', 0, 0)",
+                [],
+            )
+            .is_err(),
+            "same-workspace duplicate must still violate uniqueness"
+        );
     }
 
     #[test]

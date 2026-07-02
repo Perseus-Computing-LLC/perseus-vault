@@ -1495,10 +1495,16 @@ impl Database {
             entity.body_json.clone()
         };
 
+        // Identity is (category, key, workspace_hash) — #339. Matching on
+        // (category, key) alone made a cross-workspace write with a colliding
+        // key take the UPDATE path and overwrite the other workspace's row in
+        // place: mimir_share's "clone into target workspace" was actually a
+        // destructive MOVE of the source entity. Single-workspace vaults
+        // (workspace_hash = "" everywhere) are unaffected.
         let existing_id: Option<String> = conn
             .query_row(
-                "SELECT id FROM entities WHERE category = ?1 AND key = ?2",
-                params![entity.category, entity.key],
+                "SELECT id FROM entities WHERE category = ?1 AND key = ?2 AND workspace_hash = ?3",
+                params![entity.category, entity.key, entity.workspace_hash],
                 |r| r.get(0),
             )
             .ok();
@@ -2420,8 +2426,14 @@ impl Database {
                     created_at_unix_ms, last_accessed_unix_ms, NULL as embedding,
                     always_on, certainty, workspace_hash, agent_id, visibility,
                     follow_count, miss_count, follow_rate, efficacy_status
-             FROM entities WHERE category = ?1 AND key = ?2 LIMIT 1",
+             FROM entities WHERE category = ?1 AND key = ?2
+             ORDER BY workspace_hash ASC, id ASC LIMIT 1",
         )?;
+        // With workspace-scoped identity (#339) the same (category, key) can
+        // legitimately exist in several workspaces. Callers without a
+        // workspace in hand get a DETERMINISTIC pick: the global ('') row
+        // first, then the lexicographically-first workspace — not whichever
+        // row SQLite happened to visit.
 
         let mut rows = stmt.query_map(params![category, key], |row| {
             entity_from_row(row, self.encryption.as_ref())
@@ -2450,10 +2462,13 @@ impl Database {
              WHERE category = ?3 AND key = ?4 AND archived = 0",
             params![reason, now_ms(), category, key],
         )?;
-        // Clean FTS5 index for archived entity
+        // Clean FTS5 index for archived entity/entities. IN, not `=`: forget
+        // archives every row matching (category, key) — which since #339 can
+        // be one per workspace — so the FTS cleanup must cover all of them,
+        // not just the single rowid the old scalar subquery returned.
         if affected > 0 {
             let _ = tx.execute(
-                "DELETE FROM entities_fts WHERE rowid = (SELECT rowid FROM entities WHERE category = ?1 AND key = ?2)",
+                "DELETE FROM entities_fts WHERE rowid IN (SELECT rowid FROM entities WHERE category = ?1 AND key = ?2 AND archived = 1)",
                 params![category, key],
             );
         }
@@ -6962,6 +6977,52 @@ mod tests {
         let (id_c, act_c) = db.remember(&c).unwrap();
         assert!(act_c.contains("deduped"), "same-workspace dedup preserved: {act_c}");
         assert_eq!(id_c, "dws-a");
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn remember_identity_is_workspace_scoped_so_share_copies_instead_of_moving() {
+        // #339: identity was (category, key), so handle_share's clone into a
+        // target workspace matched the SOURCE row and updated it in place —
+        // a destructive move (source workspace lost the entity, fresh id
+        // discarded, stats clobbered). Identity is now
+        // (category, key, workspace_hash).
+        let (db, path) = temp_db();
+
+        let mut a = make_entity("id-a", "note", "shared-key", r#"{"n":1}"#);
+        a.workspace_hash = "ws-alpha".to_string();
+        db.remember(&a).unwrap();
+
+        // Simulate handle_share's clone into another workspace: same
+        // (category, key), different workspace, fresh id.
+        let mut clone = a.clone();
+        clone.workspace_hash = "ws-beta".to_string();
+        clone.id = "mem-fresh".to_string();
+        let (id, action) = db.remember(&clone).unwrap();
+        assert_eq!(action, "created", "cross-workspace clone must INSERT, not update the source");
+        assert_eq!(id, "mem-fresh");
+
+        // Source untouched in its home workspace; copy exists in the target.
+        let src = db.get_entity_by_id_public("id-a").unwrap().unwrap();
+        assert_eq!(src.workspace_hash, "ws-alpha", "source must not move");
+        let cp = db.get_entity_by_id_public("mem-fresh").unwrap().unwrap();
+        assert_eq!(cp.workspace_hash, "ws-beta");
+
+        // Same-workspace re-remember still takes the idempotent update path.
+        let (id2, action2) = db.remember(&a).unwrap();
+        assert_eq!(id2, "id-a");
+        assert_eq!(action2, "updated");
+
+        // get_entity without a workspace in hand picks deterministically
+        // (lexicographically-first workspace when no global '' row exists).
+        let picked = db.get_entity("note", "shared-key").unwrap().unwrap();
+        assert_eq!(picked.workspace_hash, "ws-alpha");
+
+        // forget archives every workspace's copy and cleans FTS for all.
+        assert!(db.forget("note", "shared-key", "test cleanup").unwrap());
+        assert!(db.get_entity_by_id_public("id-a").unwrap().unwrap().archived);
+        assert!(db.get_entity_by_id_public("mem-fresh").unwrap().unwrap().archived);
 
         let _ = fs::remove_file(&path);
     }
