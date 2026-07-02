@@ -46,6 +46,16 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
   count 53 → 55.
 
 ### Fixed
+- Audited-writer TOCTOU (#379): the three audited temporal writers (the #371
+  re-assert path in remember, the #373 `set_valid_to` close, the #377 status
+  flip) read their preconditions on the bare pooled connection before opening
+  a transaction, so two concurrent writers on the same id could both pass
+  their checks against the same stale read and interleave — double snapshots,
+  zero/inverted history windows, and a live `recorded_at` moving backwards
+  (reliably reproducible under a 3-thread hammer). All three now take an
+  IMMEDIATE writer lock BEFORE the precondition read via a shared
+  `audited_write_tx` helper; concurrent writers serialize on the connection's
+  `busy_timeout` instead of corrupting, and rejected writes roll back cleanly.
 - Audited status flips (#377): `update_entity_status` now snapshots the
   pre-change version to `entity_history` and advances the live row's
   transaction time whenever the status actually changes — closing the

@@ -1668,15 +1668,22 @@ impl Database {
         if let Some(ex_id) = existing_id {
             // Update existing entity — compute decay + boost (it's being remembered)
             id = ex_id;
+            // #379: this branch is an audited read-decide-write (the #371
+            // re-assert audit below) — take the writer lock BEFORE the reads
+            // so a concurrent set_valid_to/status flip/re-assert can't
+            // invalidate them mid-flight. See audited_write_tx. The inversion
+            // guards' early Err returns drop the tx (rollback): a rejected
+            // write still mutates nothing.
+            let tx = Self::audited_write_tx(&conn)?;
             let now = now_ms();
-            let old_decay: f64 = conn
+            let old_decay: f64 = tx
                 .query_row(
                     "SELECT decay_score FROM entities WHERE id = ?1",
                     params![id],
                     |r| r.get(0),
                 )
                 .unwrap_or(1.0);
-            let old_count: i64 = conn
+            let old_count: i64 = tx
                 .query_row(
                     "SELECT retrieval_count FROM entities WHERE id = ?1",
                     params![id],
@@ -1691,7 +1698,7 @@ impl Database {
             // before overwriting, so history is kept for as-of queries. An
             // identical re-assertion is NOT a new version (no spurious history).
             // Compare on plaintext — GCM ciphertext differs every call.
-            let old_raw_body: String = conn
+            let old_raw_body: String = tx
                 .query_row(
                     "SELECT body_json FROM entities WHERE id = ?1",
                     params![id],
@@ -1737,7 +1744,7 @@ impl Database {
             let audit_reassert_from: Option<i64> = if !content_changed
                 && (valid_from.is_some() || valid_to.is_some())
             {
-                let (stored_eff_from, stored_to): (i64, Option<i64>) = conn.query_row(
+                let (stored_eff_from, stored_to): (i64, Option<i64>) = tx.query_row(
                     "SELECT COALESCE(valid_from_unix_ms, recorded_at_unix_ms, created_at_unix_ms), \
                             valid_to_unix_ms \
                      FROM entities WHERE id = ?1",
@@ -1765,7 +1772,7 @@ impl Database {
             // `invalidated_at_unix_ms > ?` can never match for any timestamp
             // -- permanently unreachable despite mimir_history still listing it.
             let now = if content_changed || audit_period_change {
-                let old_recorded_or_created: i64 = conn
+                let old_recorded_or_created: i64 = tx
                     .query_row(
                         "SELECT COALESCE(recorded_at_unix_ms, created_at_unix_ms) FROM entities WHERE id = ?1",
                         params![id],
@@ -1790,13 +1797,13 @@ impl Database {
             // period that valid_at can never match while still shadowing older
             // versions in bitemporal_at — the exact "unanswerable fact" state
             // set_valid_to already refuses for the identical defaulted-from
-            // case. Checked BEFORE the transaction so a rejected write mutates
-            // nothing.
+            // case. Checked before any write lands, so a rejected write
+            // mutates nothing (the Err return drops the tx — rollback).
             if let Some(vt) = valid_to {
                 let eff_from: i64 = match valid_from {
                     Some(vf) => vf,
                     None if content_changed => now,
-                    None => conn.query_row(
+                    None => tx.query_row(
                         "SELECT COALESCE(valid_from_unix_ms, recorded_at_unix_ms, created_at_unix_ms) \
                          FROM entities WHERE id = ?1",
                         params![id],
@@ -1820,7 +1827,7 @@ impl Database {
                 // UPDATE re-sets valid_to to the caller's value (NULL here,
                 // i.e. [vf, ∞)), which cannot invert.
                 if !content_changed {
-                    let stored_to: Option<i64> = conn.query_row(
+                    let stored_to: Option<i64> = tx.query_row(
                         "SELECT valid_to_unix_ms FROM entities WHERE id = ?1",
                         params![id],
                         |r| r.get(0),
@@ -1837,8 +1844,9 @@ impl Database {
                 }
             }
 
-            // M-1: wrap entity UPDATE + FTS UPDATE in a transaction
-            let tx = conn.unchecked_transaction()?;
+            // M-1: entity UPDATE + FTS UPDATE ride the same audited-writer
+            // transaction opened at the top of this branch (#379), so a
+            // failure in one can't leave the other orphaned.
 
             // Snapshot the OLD row BEFORE the UPDATE overwrites it. invalidated_at
             // = now (transaction time it was retired); superseded_by = the live id
@@ -3610,7 +3618,9 @@ impl Database {
         reason: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let conn = self.conn()?;
-        let (cur_status, eff_from, old_rec): (Option<String>, i64, i64) = conn.query_row(
+        // #379: writer lock BEFORE the precondition read — see audited_write_tx.
+        let tx = Self::audited_write_tx(&conn)?;
+        let (cur_status, eff_from, old_rec): (Option<String>, i64, i64) = tx.query_row(
             "SELECT status, \
                     COALESCE(valid_from_unix_ms, recorded_at_unix_ms, created_at_unix_ms), \
                     COALESCE(recorded_at_unix_ms, created_at_unix_ms) \
@@ -3619,10 +3629,11 @@ impl Database {
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?;
         if cur_status.as_deref() == Some(status) {
-            conn.execute(
+            tx.execute(
                 "UPDATE entities SET archive_reason = ?1, last_accessed_unix_ms = ?2 WHERE id = ?3",
                 params![reason, now_ms(), id],
             )?;
+            tx.commit()?;
             return Ok(());
         }
         // Audited flip — same shape as set_valid_to's close (#373): snapshot
@@ -3636,7 +3647,6 @@ impl Database {
             "hist-{}",
             uuid::Uuid::new_v4().to_string().replace('-', "")[..16].to_string()
         );
-        let tx = conn.unchecked_transaction()?;
         Self::snapshot_live_row_to_history(&tx, &history_id, now, id)?;
         tx.execute(
             "UPDATE entities SET status = ?1, archive_reason = ?2, last_accessed_unix_ms = ?3,
@@ -3647,6 +3657,27 @@ impl Database {
         )?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// Begin an IMMEDIATE transaction for an audited temporal writer (#379).
+    ///
+    /// The audited writers (the #371 re-assert path in remember, the #373
+    /// set_valid_to close, the #377 status flip) are read-decide-write: they
+    /// read a precondition (stored body/period/status, old recorded_at),
+    /// decide whether and how to snapshot, then write. Reading on the bare
+    /// pooled connection — or inside a DEFERRED transaction — lets two
+    /// concurrent writers on the same id both pass their checks against the
+    /// same stale read and interleave: double snapshots, zero/inverted
+    /// history windows, and a live recorded_at that moves backwards.
+    /// IMMEDIATE takes the writer lock up front, so the precondition read
+    /// happens under the same lock as the write; concurrent writers
+    /// serialize on the connection's busy_timeout instead of corrupting.
+    /// Every exit path must either commit or let the transaction drop
+    /// (rollback) — a rejected write mutates nothing.
+    fn audited_write_tx(
+        conn: &rusqlite::Connection,
+    ) -> rusqlite::Result<rusqlite::Transaction<'_>> {
+        rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
     }
 
     /// Snapshot the current live row of `id` into `entity_history`, retired at
@@ -3710,7 +3741,10 @@ impl Database {
     /// stored close that was kept).
     pub fn set_valid_to(&self, id: &str, valid_to: i64) -> Result<i64, Box<dyn std::error::Error>> {
         let conn = self.conn()?;
-        let (eff_from, cur_to, old_rec): (i64, Option<i64>, i64) = conn.query_row(
+        // #379: writer lock BEFORE the precondition read — see audited_write_tx.
+        // The refusal/no-op returns below drop the tx (rollback): nothing written.
+        let tx = Self::audited_write_tx(&conn)?;
+        let (eff_from, cur_to, old_rec): (i64, Option<i64>, i64) = tx.query_row(
             "SELECT COALESCE(valid_from_unix_ms, recorded_at_unix_ms, created_at_unix_ms), \
                     valid_to_unix_ms, \
                     COALESCE(recorded_at_unix_ms, created_at_unix_ms) \
@@ -3745,7 +3779,6 @@ impl Database {
             "hist-{}",
             uuid::Uuid::new_v4().to_string().replace('-', "")[..16].to_string()
         );
-        let tx = conn.unchecked_transaction()?;
         Self::snapshot_live_row_to_history(&tx, &history_id, now, id)?;
         tx.execute(
             "UPDATE entities SET valid_to_unix_ms = ?1, recorded_at_unix_ms = ?2,
@@ -7658,6 +7691,112 @@ mod tests {
         assert!(live_body.contains("green"), "live row has the new content");
         assert!(supersedes.starts_with("hist-"), "live row links to its snapshot");
         assert_eq!(invalidated, None, "live row must not be invalidated");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn concurrent_audited_writers_serialize_without_corrupting_history() {
+        // #379: the audited writers are read-decide-write. Before the
+        // IMMEDIATE writer lock (audited_write_tx), concurrent writers on the
+        // same id could both pass their precondition checks against the same
+        // stale read and interleave — double snapshots, zero/inverted history
+        // windows, a live recorded_at moving backwards. Hammer one id from
+        // several threads across two writer kinds and then assert the
+        // partition invariants that as_of/bitemporal reconstruction depends
+        // on: every window strictly positive, windows contiguous, and the
+        // last snapshot handing off exactly at the live row's recorded_at.
+        use std::sync::Arc;
+        use std::thread;
+
+        let (db, path) = temp_db();
+        let e = make_entity("e-379", "facts", "race-key", r#"{"note":"v0"}"#);
+        db.remember(&e).unwrap();
+        let id: String = {
+            let conn = db.conn().unwrap();
+            conn.query_row(
+                "SELECT id FROM entities WHERE category='facts' AND key='race-key'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+
+        let db = Arc::new(db);
+        let mut handles = Vec::new();
+        // Two threads of status flips (#377 writer), phase-shifted so most
+        // calls are actual changes.
+        for t in 0..2usize {
+            let db = Arc::clone(&db);
+            let id = id.clone();
+            handles.push(thread::spawn(move || {
+                for i in 0..20 {
+                    let s = if (t + i) % 2 == 0 { "deprecated" } else { "active" };
+                    db.update_entity_status(&id, s, "race").expect("status flip");
+                }
+            }));
+        }
+        // One thread of content-changing re-asserts (the remember writer).
+        {
+            let db = Arc::clone(&db);
+            handles.push(thread::spawn(move || {
+                for i in 0..20 {
+                    let e = make_entity(
+                        "ignored",
+                        "facts",
+                        "race-key",
+                        &format!(r#"{{"note":"v{}"}}"#, i + 1),
+                    );
+                    db.remember(&e).expect("re-assert");
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let conn = db.conn().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT recorded_at_unix_ms, invalidated_at_unix_ms FROM entity_history \
+                 WHERE id = ?1 ORDER BY recorded_at_unix_ms ASC",
+            )
+            .unwrap();
+        let windows: Vec<(i64, i64)> = stmt
+            .query_map(params![id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        let live_rec: i64 = conn
+            .query_row(
+                "SELECT COALESCE(recorded_at_unix_ms, created_at_unix_ms) FROM entities WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        assert!(
+            windows.len() >= 20,
+            "the actual-change writes must have snapshotted (got {})",
+            windows.len()
+        );
+        for (rec, inv) in &windows {
+            assert!(
+                rec < inv,
+                "zero/inverted history window [{rec}, {inv}) — writers interleaved"
+            );
+        }
+        for w in windows.windows(2) {
+            assert_eq!(
+                w[0].1, w[1].0,
+                "history windows must partition transaction time contiguously"
+            );
+        }
+        assert_eq!(
+            windows.last().unwrap().1,
+            live_rec,
+            "the last snapshot must hand off exactly at the live row's recorded_at"
+        );
+
         let _ = fs::remove_file(&path);
     }
 
