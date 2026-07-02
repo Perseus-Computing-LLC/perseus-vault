@@ -149,6 +149,38 @@ The legacy unconditional top-N dump remains available as an explicit opt-in
 (`mode: "always_inject"` on `mimir_context`, `--legacy-context` on
 `prepare`) and is unclamped unless a budget is passed. The gRPC `context`
 RPC keeps the legacy semantics for wire compatibility.
+## Dreaming (LLM consolidation, episodic → semantic)
+
+Consolidation compresses *duplicates*; `mimir_dream` goes one step further and
+**reasons** over clusters of merely *related* memories. It batches the coldest
+entities per category (cold-first by default — consolidate fading memories
+before decay claims them), sends each trigram-neighborhood cluster to the
+configured LLM ("given these N memories, what stable pattern / preference /
+fact do they collectively imply?"), and writes the answer back as a durable
+**semantic insight** (category `insight`, `working` layer — the canonical
+storage layer for the `semantic` biomimetic alias). Properties:
+
+- **Full provenance** — every insight links `evidence_for` to each source
+  entity, and its body carries `derived: true`, `derivation: "dream"`, and the
+  source ids, so it is auditable and reversible.
+- **Never fabricates** — insights need at least two cited sources; clusters
+  that support no durable generalization are a no-op. LLM output is parsed
+  strictly (unknown types, empty summaries, out-of-range evidence indices are
+  dropped, never repaired into a write).
+- **Idempotent** — insights are keyed by a hash of their evidence set, so
+  re-dreaming an unchanged cluster dedupes instead of duplicating.
+- **Contradiction-aware** — disagreeing sources become a flagged
+  `contradiction` insight (sources always stay live), never a silent merge.
+- **Bounded** — `max_entities` caps the scan, `max_clusters` caps LLM calls.
+- **Same archive safety rules** — opt-in `archive_sources` retires dreamed
+  sources (`archive_reason` names the insight), but **verified or
+  importance-floored sources are never archived**.
+
+Dreaming requires `--llm-endpoint` (fully local via Ollama). Without one it
+returns a clean error — or, with `fallback_consolidate: true`, degrades to the
+mechanical `mimir_consolidate` cold-first pass. `dry_run: true` previews the
+candidate insights and their evidence sets without writing anything (not even
+a journal entry).
 
 ## Semantic recall and reinforcement
 

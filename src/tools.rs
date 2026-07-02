@@ -1451,6 +1451,79 @@ pub fn handle_consolidate(db: &Database, args: Value) -> String {
     }
 }
 
+// ─── mimir_dream handler ─────────────────────────────────────────
+
+/// Wire args for mimir_dream: DreamParams plus the handler-level
+/// `fallback_consolidate` switch (LLM-less environments can opt into the
+/// mechanical consolidate pass instead of an error).
+#[derive(Debug, Deserialize)]
+pub struct DreamArgs {
+    #[serde(flatten)]
+    pub params: crate::models::DreamParams,
+    /// When the LLM endpoint is not configured: instead of a clean error,
+    /// fall back to the non-LLM mimir_consolidate (cold_first) over the same
+    /// categories. Off by default — dreaming and mechanical merging produce
+    /// different artifacts, so the substitution must be explicit.
+    #[serde(default)]
+    pub fallback_consolidate: bool,
+}
+
+pub fn handle_dream(db: &Database, args: Value) -> Result<String, String> {
+    let a: DreamArgs =
+        serde_json::from_value(args).map_err(|e| format!("Invalid dream arguments: {}", e))?;
+
+    if !db.llm_enabled() && a.fallback_consolidate {
+        // Graceful no-LLM fallback: run the mechanical consolidation pass
+        // (cold_first, same archive-safety rules) per category and report it
+        // AS a fallback so callers can tell nothing was LLM-reasoned.
+        let categories: Vec<String> = match a.params.category {
+            Some(ref c) => vec![c.clone()],
+            None => db
+                .workspace_list_categories()
+                .map_err(|e| format!("Dream fallback (categories) failed: {}", e))?
+                .into_iter()
+                .filter(|c| {
+                    c != "insight" && c != "observation" && c != "synthesis" && c != "memories"
+                })
+                .collect(),
+        };
+        let mut observations_created = 0i64;
+        let mut sources_archived = 0i64;
+        let mut entities_examined = 0i64;
+        for cat in &categories {
+            let report = db
+                .consolidate(&crate::models::ConsolidateParams {
+                    category: cat.clone(),
+                    similarity_threshold: 0.6,
+                    limit: a.params.max_clusters,
+                    offset: 0,
+                    dry_run: a.params.dry_run,
+                    cold_first: true,
+                    archive_sources: a.params.archive_sources,
+                })
+                .map_err(|e| format!("Dream fallback (consolidate {}) failed: {}", cat, e))?;
+            observations_created += report.observations_created;
+            sources_archived += report.sources_archived;
+            entities_examined += report.entities_examined;
+        }
+        return Ok(json!({
+            "fallback": "consolidate",
+            "note": "LLM endpoint not configured — ran the non-LLM mimir_consolidate (cold_first) pass instead. Set --llm-endpoint for real dreaming.",
+            "categories_scanned": categories,
+            "entities_examined": entities_examined,
+            "observations_created": observations_created,
+            "sources_archived": sources_archived,
+            "dry_run": a.params.dry_run,
+        })
+        .to_string());
+    }
+
+    let report = db
+        .dream(&a.params)
+        .map_err(|e| format!("Dream failed: {}", e))?;
+    serde_json::to_string(&report).map_err(|e| format!("Serialization failed: {}", e))
+}
+
 pub fn handle_decay(db: &Database, _args: Value) -> String {
     match db.decay_tick() {
         Ok(report) => serde_json::to_string(&report).unwrap_or_else(|e| {

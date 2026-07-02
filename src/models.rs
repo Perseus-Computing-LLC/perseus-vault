@@ -771,6 +771,115 @@ fn default_consolidate_limit() -> i64 {
     50
 }
 
+/// Parameters for the mimir_dream tool (#364) — sleep-time LLM consolidation
+/// of episodic memories into higher-order semantic insights. Where
+/// `consolidate` mechanically merges near-duplicates, `dream` REASONS over a
+/// cluster of related memories via the configured LLM and writes back what
+/// they collectively imply (a durable pattern / preference / fact), fully
+/// provenance-linked to its sources.
+#[derive(Debug, Deserialize)]
+pub struct DreamParams {
+    /// Category to dream over. When omitted, all categories are scanned
+    /// (except derived/output categories: observation, insight, synthesis,
+    /// memories) until the entity budget is exhausted.
+    #[serde(default)]
+    pub category: Option<String>,
+    /// Optional topic_path prefix filter applied to the scan.
+    #[serde(default)]
+    pub topic_path: Option<String>,
+    /// Trigram similarity threshold for grouping RELATED (not duplicate)
+    /// memories into one cluster. Deliberately lower than consolidate's 0.6:
+    /// dreaming wants thematic neighborhoods, not near-copies.
+    #[serde(default = "default_dream_threshold")]
+    pub similarity_threshold: f64,
+    /// Budget cap: maximum entities scanned per run (across categories).
+    #[serde(default = "default_dream_max_entities")]
+    pub max_entities: i64,
+    /// Budget cap: maximum clusters sent to the LLM per run (= max LLM calls).
+    #[serde(default = "default_dream_max_clusters")]
+    pub max_clusters: i64,
+    /// Minimum memories a cluster needs before it is worth dreaming over.
+    #[serde(default = "default_dream_min_cluster")]
+    pub min_cluster_size: i64,
+    /// Report candidate insights without writing anything.
+    #[serde(default)]
+    pub dry_run: bool,
+    /// Scan the COLDEST entities first (default true) — consolidate fading
+    /// memories into durable semantic insights before decay claims them.
+    #[serde(default = "default_dream_cold_first")]
+    pub cold_first: bool,
+    /// Archive source entities once an insight citing them is written.
+    /// Verified or importance-floored sources are never archived (same
+    /// exemption policy as decay and consolidate). Default false.
+    #[serde(default)]
+    pub archive_sources: bool,
+}
+
+fn default_dream_threshold() -> f64 {
+    0.3
+}
+
+fn default_dream_max_entities() -> i64 {
+    100
+}
+
+fn default_dream_max_clusters() -> i64 {
+    5
+}
+
+fn default_dream_min_cluster() -> i64 {
+    2
+}
+
+fn default_dream_cold_first() -> bool {
+    true
+}
+
+/// One semantic insight distilled by a dream pass, provenance-linked to the
+/// episodic sources that support it.
+#[derive(Debug, Serialize, Clone)]
+pub struct DreamInsight {
+    /// The new insight entity's id (category="insight"), or the EXISTING
+    /// entity's id when `deduped` is true.
+    pub entity_id: String,
+    /// Deterministic key derived from the evidence-set hash — re-running over
+    /// an unchanged cluster maps to the same key, so no duplicates spawn.
+    pub key: String,
+    pub summary: String,
+    /// "pattern" | "preference" | "fact" | "habit" | "contradiction".
+    pub insight_type: String,
+    /// Final certainty: LLM confidence blended with evidence coverage.
+    pub confidence: f64,
+    /// IDs of the source entities that support this insight (evidence).
+    pub source_ids: Vec<String>,
+    /// The source category this insight was dreamed from.
+    pub category: String,
+    /// True when the sources contradict each other — surfaced as a flagged
+    /// insight, never a silent merge.
+    pub contradiction: bool,
+    /// True when an insight with the identical evidence set already existed
+    /// (idempotent re-run) — nothing was written.
+    pub deduped: bool,
+}
+
+/// Result from mimir_dream.
+#[derive(Debug, Serialize)]
+pub struct DreamReport {
+    pub categories_scanned: Vec<String>,
+    pub entities_examined: i64,
+    /// Clusters actually sent to the LLM this run.
+    pub clusters_dreamed: i64,
+    pub insights_written: i64,
+    /// Insights skipped because the identical evidence set was already dreamed.
+    pub insights_deduped: i64,
+    pub contradictions_flagged: i64,
+    /// Sources archived because archive_sources was set (verified or
+    /// importance-floored sources are exempt).
+    pub sources_archived: i64,
+    pub dry_run: bool,
+    pub insights: Vec<DreamInsight>,
+}
+
 /// One evidence-tracked observation formed by merging 2+ overlapping entities.
 #[derive(Debug, Serialize, Clone)]
 pub struct Observation {
