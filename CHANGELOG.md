@@ -33,6 +33,21 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
   (20 hits) recall 5.1ms → 0.08ms (~64x); dense-match queries pay a small
   fixed probe cost (common term ~33k hits: +~0.5ms, the intrinsic FTS5
   prefix-doclist materialization — they were and remain O(corpus)).
+- Web dashboard and gRPC no longer wrap the pooled `Database` in a global
+  `std::Mutex` (#402): both surfaces now share the SAME `Arc<Database>` as the
+  MCP transport (one process, one connection pool — the dashboard previously
+  opened a second 16-conn pool on the same file) and run every DB call on the
+  blocking thread pool via `tokio::task::spawn_blocking`, mirroring
+  transport.rs (#210/#217). Dashboard requests and gRPC RPCs now execute in
+  parallel instead of single-lane, and no longer stall async runtime workers.
+- `GET /api/graph` is paginated (#402): `limit` (default 500, max 5000) and
+  `offset` query params; response adds `total_nodes` / `returned_nodes` /
+  `truncated` so clients can tell a page from the whole graph (previously it
+  full-scanned and returned every node+edge unpaginated — tens of MB of JSON
+  at 100k entities, per dashboard render). The dashboard's graph tab shows a
+  truncation note when capped. Edges dangling outside the returned node set
+  are dropped (previously the unscoped path emitted edges to archived/deleted
+  targets that the renderer couldn't resolve).
 
 ## [2.14.0] - 2026-07-02
 

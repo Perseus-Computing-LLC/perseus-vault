@@ -4468,20 +4468,43 @@ impl Database {
     /// scope are dropped rather than pointing at a node the caller never
     /// receives (the dashboard's graph tab leaked cross-workspace
     /// nodes/edges before this).
+    ///
+    /// Paginated (#402): `limit`/`offset` page over the node set in a
+    /// deterministic order (newest first, id as tiebreaker), and the returned
+    /// `total_nodes` is the full COUNT(*) under the same filter so callers can
+    /// report truncation. `limit <= 0` means "no limit" (SQLite `LIMIT -1`) —
+    /// network-facing callers must pass an explicit cap. Previously this
+    /// full-scanned and returned every node and edge unpaginated: tens of MB
+    /// of JSON at 100k entities, per dashboard render.
     pub fn get_entity_graph(
         &self,
         workspace_hash: Option<&str>,
-    ) -> Result<(Vec<GraphNode>, Vec<GraphEdge>), Box<dyn std::error::Error>> {
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<GraphNode>, Vec<GraphEdge>, i64), Box<dyn std::error::Error>> {
         let conn = self.conn()?;
-        let (sql, scoped) = match workspace_hash.filter(|ws| !ws.is_empty()) {
-            Some(_) => (
-                "SELECT id, category, key, links FROM entities WHERE archived = 0 AND workspace_hash = ?1",
-                true,
-            ),
-            None => (
-                "SELECT id, category, key, links FROM entities WHERE archived = 0",
-                false,
-            ),
+        let limit = if limit <= 0 { -1 } else { limit };
+        let offset = offset.max(0);
+        let scoped = workspace_hash.filter(|ws| !ws.is_empty()).is_some();
+        let (count_sql, sql) = if scoped {
+            (
+                "SELECT COUNT(*) FROM entities WHERE archived = 0 AND workspace_hash = ?1",
+                "SELECT id, category, key, links FROM entities
+                 WHERE archived = 0 AND workspace_hash = ?1
+                 ORDER BY created_at_unix_ms DESC, id ASC LIMIT ?2 OFFSET ?3",
+            )
+        } else {
+            (
+                "SELECT COUNT(*) FROM entities WHERE archived = 0",
+                "SELECT id, category, key, links FROM entities
+                 WHERE archived = 0
+                 ORDER BY created_at_unix_ms DESC, id ASC LIMIT ?1 OFFSET ?2",
+            )
+        };
+        let total_nodes: i64 = if scoped {
+            conn.query_row(count_sql, params![workspace_hash.unwrap()], |r| r.get(0))?
+        } else {
+            conn.query_row(count_sql, [], |r| r.get(0))?
         };
         let mut stmt = conn.prepare(sql)?;
         let map_row = |row: &rusqlite::Row| {
@@ -4493,10 +4516,10 @@ impl Database {
             Ok((id, category, key, links))
         };
         let rows: Vec<(String, String, String, Vec<MemoryLink>)> = if scoped {
-            stmt.query_map(params![workspace_hash.unwrap()], map_row)?
+            stmt.query_map(params![workspace_hash.unwrap(), limit, offset], map_row)?
                 .collect::<rusqlite::Result<Vec<_>>>()?
         } else {
-            stmt.query_map([], map_row)?
+            stmt.query_map(params![limit, offset], map_row)?
                 .collect::<rusqlite::Result<Vec<_>>>()?
         };
 
@@ -4520,14 +4543,14 @@ impl Database {
                 });
             }
         }
-        if scoped {
-            // Drop edges pointing outside the scoped node set: the target
-            // entity is in a different workspace, so the caller never
-            // receives that node and a dangling edge would be meaningless
-            // (or, worse, leak the existence/id of a cross-workspace entity).
-            edges.retain(|e| seen_ids.contains(&e.to));
-        }
-        Ok((nodes, edges))
+        // Drop edges pointing outside the returned node set. For workspace
+        // scoping that avoids dangling references and cross-workspace
+        // existence leaks (as before); with pagination it also keeps each
+        // page self-contained — an edge to a node the caller never received
+        // is unrenderable. (Side effect vs pre-#402: the unscoped path no
+        // longer emits dangling edges to archived/deleted targets either.)
+        edges.retain(|e| seen_ids.contains(&e.to));
+        Ok((nodes, edges, total_nodes))
     }
 
     /// Score an entity's quality (0.0–1.0). Agents rate memories as useful/wrong.

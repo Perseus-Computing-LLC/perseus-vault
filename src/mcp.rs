@@ -49,7 +49,11 @@ impl MCPState {
 }
 
 /// Run the MCP server loop: read JSON-RPC from stdin, write responses to stdout.
-pub fn run_server(db: Database) {
+///
+/// Takes `Arc<Database>` (#402) so main.rs can hand the SAME pooled Database
+/// to the web dashboard / gRPC surfaces instead of each opening a second
+/// `Database` (a second 16-conn pool) on the same file.
+pub fn run_server(db: std::sync::Arc<Database>) {
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
     let reader = BufReader::new(stdin.lock());

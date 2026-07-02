@@ -11,23 +11,32 @@
 pub mod grpc {
     tonic::include_proto!("mneme.v1");
 
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
     use tonic::{Request, Response, Status};
 
     use crate::db::Database;
     use crate::models;
 
+    // #402: no Mutex — `Database` is Sync (internally r2d2-pooled, see the
+    // #210 comment in transport.rs), and this is the SAME `Arc<Database>` the
+    // other surfaces use: one process, one pool. Concurrent RPCs each check
+    // out their own pooled connection instead of serializing on a global lock.
     pub struct MnemeGrpcServer {
-        db: Arc<Mutex<Database>>,
+        db: Arc<Database>,
     }
 
     impl MnemeGrpcServer {
-        pub fn new(db: Arc<Mutex<Database>>) -> Self {
+        pub fn new(db: Arc<Database>) -> Self {
             Self { db }
         }
     }
 
-    // Helper to run DB operations inside the mutex.
+    // Helper to run DB operations on the blocking thread pool.
+    //
+    // #402: DB work is synchronous rusqlite, so it must not run inline in an
+    // async fn — that stalls a tonic/tokio runtime worker for the duration of
+    // the query. Mirror the MCP HTTP transport (#217): `spawn_blocking` keeps
+    // the async workers free, and with no mutex the closures run in parallel.
     //
     // Error hygiene (#354): this module is a documented external wire contract,
     // so internal error text (rusqlite constraint/column names, file paths)
@@ -36,12 +45,22 @@ pub mod grpc {
     // return a generic INTERNAL to the client. Handlers that raise a *typed*
     // Status inside the closure (e.g. get_entity's not_found) get it passed
     // through unchanged instead of being flattened into INTERNAL.
-    fn with_db<T>(
+    // (sanitize_error runs INSIDE the blocking closure: `Box<dyn Error>` is
+    // not Send, so it must be mapped to a `Status` before crossing back.)
+    async fn with_db<T>(
         server: &MnemeGrpcServer,
-        f: impl FnOnce(&Database) -> Result<T, Box<dyn std::error::Error>>,
-    ) -> Result<T, Status> {
-        let db = server.db.lock().map_err(|_| Status::internal("lock poisoned"))?;
-        f(&db).map_err(sanitize_error)
+        f: impl FnOnce(&Database) -> Result<T, Box<dyn std::error::Error>> + Send + 'static,
+    ) -> Result<T, Status>
+    where
+        T: Send + 'static,
+    {
+        let db = Arc::clone(&server.db);
+        tokio::task::spawn_blocking(move || f(&db).map_err(sanitize_error))
+            .await
+            .map_err(|e| {
+                eprintln!("mimir grpc: blocking task join error: {e}");
+                Status::internal("internal error")
+            })?
     }
 
     /// Map a handler error to the client-facing Status: intentional `Status`
@@ -61,7 +80,7 @@ pub mod grpc {
         // ── CRUD ──
         async fn remember(&self, req: Request<RememberRequest>) -> Result<Response<RememberResponse>, Status> {
             let r = req.into_inner();
-            with_db(self, |db| {
+            with_db(self, move |db| {
                 // Same id convention as the MCP surface (handle_remember):
                 // db.remember does NOT generate ids — an empty id here would be
                 // inserted verbatim, producing an entity unreachable by id.
@@ -100,11 +119,12 @@ pub mod grpc {
                 let (id, action) = db.remember(&entity)?;
                 Ok(Response::new(RememberResponse { id, action, category: entity.category, key: entity.key }))
             })
+            .await
         }
 
         async fn recall(&self, req: Request<RecallRequest>) -> Result<Response<RecallResponse>, Status> {
             let r = req.into_inner();
-            with_db(self, |db| {
+            with_db(self, move |db| {
                 let params = models::RecallParams {
                     query: r.query,
                     category: r.category,
@@ -136,24 +156,27 @@ pub mod grpc {
                 let total = items.len() as i64;
                 Ok(Response::new(RecallResponse { items, total }))
             })
+            .await
         }
 
         async fn get_entity(&self, req: Request<GetEntityRequest>) -> Result<Response<EntityMessage>, Status> {
             let r = req.into_inner();
-            with_db(self, |db| {
+            with_db(self, move |db| {
                 let entity = db.get_entity_by_id_public(&r.id)
                     .map_err(|_| Status::not_found("entity not found"))?
                     .ok_or_else(|| Status::not_found("entity not found"))?;
                 Ok(Response::new(entity_to_proto(&entity)))
             })
+            .await
         }
 
         async fn forget(&self, req: Request<ForgetRequest>) -> Result<Response<ForgetResponse>, Status> {
             let r = req.into_inner();
-            with_db(self, |db| {
+            with_db(self, move |db| {
                 db.forget(&r.category, &r.key, &r.reason)?;
                 Ok(Response::new(ForgetResponse { ok: true }))
             })
+            .await
         }
 
         // ── Graph ──
@@ -170,7 +193,7 @@ pub mod grpc {
         // ── Journal ──
         async fn journal(&self, req: Request<JournalRequest>) -> Result<Response<JournalEvent>, Status> {
             let r = req.into_inner();
-            with_db(self, |db| {
+            with_db(self, move |db| {
                 let event = models::JournalEvent {
                     id: format!("jrn-{}", uuid::Uuid::new_v4().to_string().replace('-', "").chars().take(12).collect::<String>()),
                     event_type: r.event_type,
@@ -186,6 +209,7 @@ pub mod grpc {
                 db.journal(&event)?;
                 Ok(Response::new(journal_event_to_proto(&event)))
             })
+            .await
         }
 
         async fn timeline(&self, _req: Request<TimelineRequest>) -> Result<Response<TimelineResponse>, Status> {
@@ -195,7 +219,7 @@ pub mod grpc {
         // ── State ──
         async fn state_set(&self, req: Request<StateSetRequest>) -> Result<Response<StateSetResponse>, Status> {
             let r = req.into_inner();
-            with_db(self, |db| {
+            with_db(self, move |db| {
                 let now = crate::db::now_ms();
                 let entry = models::StateEntry {
                     key: r.key,
@@ -207,6 +231,7 @@ pub mod grpc {
                 db.state_set(&entry)?;
                 Ok(Response::new(StateSetResponse { ok: true }))
             })
+            .await
         }
         async fn state_get(&self, _req: Request<StateGetRequest>) -> Result<Response<StateEntry>, Status> {
             Err(Status::unimplemented("state_get"))
@@ -220,12 +245,13 @@ pub mod grpc {
 
         // ── Ops ──
         async fn health(&self, _req: Request<HealthRequest>) -> Result<Response<HealthResponse>, Status> {
-            with_db(self, |db| {
+            with_db(self, move |db| {
                 Ok(Response::new(HealthResponse { healthy: db.health_check() }))
             })
+            .await
         }
         async fn stats(&self, _req: Request<StatsRequest>) -> Result<Response<StatsResponse>, Status> {
-            with_db(self, |db| {
+            with_db(self, move |db| {
                 let s = db.stats()?;
                 Ok(Response::new(StatsResponse {
                     total_entities: s.total_entities,
@@ -234,19 +260,22 @@ pub mod grpc {
                     db_size_bytes: s.db_file_size_bytes as i64,
                 }))
             })
+            .await
         }
         async fn context(&self, req: Request<ContextRequest>) -> Result<Response<ContextResponse>, Status> {
             let r = req.into_inner();
-            with_db(self, |db| {
+            with_db(self, move |db| {
                 let ctx = db.context(&r.categories, r.limit, r.workspace_hash.as_deref())?;
                 Ok(Response::new(ContextResponse { context: ctx }))
             })
+            .await
         }
         async fn workspace_list(&self, _req: Request<WorkspaceListRequest>) -> Result<Response<WorkspaceListResponse>, Status> {
-            with_db(self, |db| {
+            with_db(self, move |db| {
                 let cats = db.workspace_list_categories()?;
                 Ok(Response::new(WorkspaceListResponse { categories: cats }))
             })
+            .await
         }
 
         // ── AI ──
@@ -310,7 +339,7 @@ pub mod grpc {
     /// Start the gRPC server on the given address. Runs in the current thread
     /// and blocks until shutdown. For background usage, spawn via std::thread::spawn.
     pub async fn serve(
-        db: Arc<Mutex<Database>>,
+        db: Arc<Database>,
         addr: std::net::SocketAddr,
     ) -> Result<(), Box<dyn std::error::Error>> {
         use tonic::transport::Server;
@@ -333,7 +362,7 @@ pub mod grpc {
                 .join(format!("mimir-test-grpc-{}.db", uuid::Uuid::new_v4()));
             let path_str = path.to_str().unwrap().to_string();
             let db = Database::open(&path_str).expect("open test db");
-            (MnemeGrpcServer::new(Arc::new(Mutex::new(db))), path_str)
+            (MnemeGrpcServer::new(Arc::new(db)), path_str)
         }
 
         fn remember_req(key: &str) -> RememberRequest {
@@ -457,6 +486,38 @@ pub mod grpc {
             let _ = std::fs::remove_file(&path);
         }
 
+        /// Deterministic overlap proof (#402): two in-flight `with_db`
+        /// closures rendezvous on a 2-party barrier INSIDE their DB closure —
+        /// only possible if both run simultaneously. Under the old
+        /// `Arc<Mutex<Database>>` (closure executed synchronously while
+        /// holding the global lock) this rendezvous would deadlock; the
+        /// timeout turns that into a failure.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn rpc_db_closures_overlap_instead_of_serializing() {
+            let (server, path) = test_server();
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let (b1, b2) = (barrier.clone(), barrier.clone());
+            let fut = async {
+                let a = with_db(&server, move |db| {
+                    let healthy = db.health_check();
+                    b1.wait();
+                    Ok(healthy)
+                });
+                let b = with_db(&server, move |db| {
+                    let healthy = db.health_check();
+                    b2.wait();
+                    Ok(healthy)
+                });
+                tokio::join!(a, b)
+            };
+            let (ra, rb) = tokio::time::timeout(std::time::Duration::from_secs(10), fut)
+                .await
+                .expect("concurrent RPC DB closures must overlap, not serialize");
+            assert!(ra.unwrap());
+            assert!(rb.unwrap());
+            let _ = std::fs::remove_file(&path);
+        }
+
         #[tokio::test]
         async fn health_and_stats_respond() {
             let (server, path) = test_server();
@@ -480,15 +541,16 @@ pub mod grpc {
 // Non-grpc fallback
 #[cfg(not(feature = "grpc"))]
 pub mod grpc {
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
     use crate::db::Database;
 
     /// Stub module — gRPC is compiled out.
     // No in-crate caller in the default (non-grpc) build; kept so callers behind
     // `--features grpc` get a clear error instead of a missing symbol.
+    // (#402: signature tracks the real serve() — shared Arc<Database>, no Mutex.)
     #[allow(dead_code)]
     pub async fn serve(
-        _db: Arc<Mutex<Database>>,
+        _db: Arc<Database>,
         _addr: std::net::SocketAddr,
     ) -> Result<(), Box<dyn std::error::Error>> {
         Err("gRPC transport not compiled in. Rebuild with: cargo build --features grpc".into())
@@ -505,7 +567,7 @@ pub mod grpc {
             let path_str = path.to_str().unwrap().to_string();
             let db = Database::open(&path_str).expect("open test db");
             let err = serve(
-                Arc::new(Mutex::new(db)),
+                Arc::new(db),
                 "127.0.0.1:0".parse().unwrap(),
             )
             .await

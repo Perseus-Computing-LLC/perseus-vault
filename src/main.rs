@@ -1475,26 +1475,19 @@ fn main() {
                 }
             }
 
+            // One Database (one connection pool) per process (#402): every
+            // surface — web dashboard, MCP transport, stdio server — shares
+            // this Arc. Database is Sync (internally r2d2-pooled), so no Mutex.
+            let database = std::sync::Arc::new(database);
+
             // Start web dashboard in background if requested
             if effective_web {
                 let web_port = *port;
                 let web_bind_addr = web_bind.clone();
-                let web_key = encryption_key.clone();
-                let mut web_db = match db::Database::open(&db_path) {
-                    Ok(db) => db,
-                    Err(e) => {
-                        eprintln!("mimir: failed to open web database: {}", e);
-                        std::process::exit(1);
-                    }
-                };
-                // Propagate encryption key to web dashboard DB
-                if let Some(ref key_file) = web_key {
-                    if let Err(e) = web_db.set_encryption(key_file) {
-                        eprintln!("mimir: web dashboard encryption setup failed: {}", e);
-                        std::process::exit(1);
-                    }
-                }
-                let web_db = std::sync::Arc::new(std::sync::Mutex::new(web_db));
+                // #402: share the already-configured Database (encryption/LLM/
+                // connectors applied above) instead of opening a SECOND
+                // Database — and second 16-conn pool — on the same file.
+                let web_db = std::sync::Arc::clone(&database);
                 let router = crate::web::build_router(web_db, web_auth_token.clone());
                 let addr = format!("{}:{}", web_bind_addr, web_port);
                 eprintln!("mimir: web dashboard starting on http://{}", addr);
@@ -1530,8 +1523,7 @@ fn main() {
             };
 
             if let Some(mode) = tmode {
-                let transport_db = std::sync::Arc::new(database);
-                crate::transport::init_transport_state(transport_db);
+                crate::transport::init_transport_state(std::sync::Arc::clone(&database));
                 let transport_router =
                     crate::transport::build_transport_router(mode, mcp_token.clone());
                 let transport_addr = format!("{}:{}", web_bind, *port);
@@ -1624,24 +1616,14 @@ fn main() {
                 }
             }
 
+            // One Database (one connection pool) per process (#402) — see the
+            // matching comment in the `serve` arm above.
+            let database = std::sync::Arc::new(database);
+
             if cli.web {
                 let web_port = cli.port;
                 let web_bind_addr = cli.web_bind.clone();
-                let web_key = cli.encryption_key.clone();
-                let mut web_db = match db::Database::open(&db_path) {
-                    Ok(db) => db,
-                    Err(e) => {
-                        eprintln!("mimir: failed to open web database: {}", e);
-                        std::process::exit(1);
-                    }
-                };
-                if let Some(ref key_file) = web_key {
-                    if let Err(e) = web_db.set_encryption(key_file) {
-                        eprintln!("mimir: web dashboard encryption setup failed: {}", e);
-                        std::process::exit(1);
-                    }
-                }
-                let web_db = std::sync::Arc::new(std::sync::Mutex::new(web_db));
+                let web_db = std::sync::Arc::clone(&database);
                 let router = crate::web::build_router(web_db, cli.web_auth_token.clone());
                 let addr = format!("{}:{}", web_bind_addr, web_port);
                 eprintln!("mimir: web dashboard starting on http://{}", addr);
@@ -1677,8 +1659,7 @@ fn main() {
             };
 
             if let Some(mode) = transport_mode {
-                let transport_db = std::sync::Arc::new(database);
-                crate::transport::init_transport_state(transport_db);
+                crate::transport::init_transport_state(std::sync::Arc::clone(&database));
                 let transport_router =
                     crate::transport::build_transport_router(mode, cli.mcp_token.clone());
                 let transport_addr = format!("{}:{}", cli.web_bind, cli.port);

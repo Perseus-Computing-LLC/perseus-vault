@@ -158,6 +158,7 @@
     </table>
   </div>
   <div class="tab-content" id="tab-graph">
+    <div id="graph-truncation-note" class="hidden" style="padding:6px 2px;font-size:12px;color:var(--text-dim);"></div>
     <div id="graph-container"></div>
   </div>
   <div class="tab-content" id="tab-timeline">
@@ -255,6 +256,17 @@ async function loadTimeline() {
 let graphNetwork = null;
 async function loadGraph() {
   const data = await api('/api/graph');
+  // #402: /api/graph is capped (default 500 nodes); surface truncation
+  // instead of silently rendering a partial graph.
+  const note = document.getElementById('graph-truncation-note');
+  if (note) {
+    if (data.truncated) {
+      note.textContent = `Showing ${data.returned_nodes} of ${data.total_nodes} nodes (largest graphs are capped for rendering performance).`;
+      note.classList.remove('hidden');
+    } else {
+      note.classList.add('hidden');
+    }
+  }
   const nodes = new vis.DataSet((data.nodes || []).map(n => ({
     id: n.id, label: n.label || n.key || n.id, title: n.category,
     color: { background: '#58a6ff', border: '#1f6feb' }
