@@ -5122,12 +5122,22 @@ Return a JSON object with an "insights" array. Each insight has:
         winner_id: &str,
     ) -> Result<bool, Box<dyn std::error::Error>> {
         let conn = self.conn()?;
-        let now = now_ms();
         let history_id = format!(
             "hist-{}",
             uuid::Uuid::new_v4().to_string().replace('-', "")[..16].to_string()
         );
-        let tx = conn.unchecked_transaction()?;
+        // #381: this is the fourth entity_history writer and must follow the
+        // same discipline as the audited three (#379): take the IMMEDIATE
+        // writer lock up front, and stamp invalidated_at strictly after the
+        // version's own recorded_at. The audited writers set the live
+        // recorded_at to max(now, old+1), which can land 1ms AHEAD of the
+        // wall clock — a raw now_ms() here could then write an INVERTED
+        // window (invalidated_at < recorded_at); and a same-millisecond
+        // create+invalidate would write a zero-width one that as_of's strict
+        // `invalidated_at > T` can never reconstruct. MAX(?2, recorded_at+1)
+        // inside the snapshot SELECT keeps the window strictly positive
+        // against whatever recorded_at is current under the lock.
+        let tx = Self::audited_write_tx(&conn)?;
         let moved = tx.execute(
             "INSERT INTO entity_history
              (history_id, id, category, key, body_json, status, type, tags, decay_score,
@@ -5138,10 +5148,11 @@ Return a JSON object with an "insights" array. Each insight has:
              SELECT ?1, id, category, key, body_json, status, type, tags, decay_score,
               retrieval_count, layer, topic_path, archived, archive_reason, links, verified,
               source, always_on, certainty, workspace_hash, agent_id, visibility,
-              valid_from_unix_ms, valid_to_unix_ms, recorded_at_unix_ms, ?2,
+              valid_from_unix_ms, valid_to_unix_ms, recorded_at_unix_ms,
+              MAX(?2, COALESCE(recorded_at_unix_ms, created_at_unix_ms) + 1),
               supersedes, ?3, created_at_unix_ms, last_accessed_unix_ms
              FROM entities WHERE id = ?4 AND archived = 0",
-            params![history_id, now, winner_id, loser_id],
+            params![history_id, now_ms(), winner_id, loser_id],
         )?;
         if moved == 0 {
             // Not a live entity — nothing snapshotted; drop the tx (rollback).
@@ -7711,6 +7722,15 @@ mod tests {
         let (db, path) = temp_db();
         let e = make_entity("e-379", "facts", "race-key", r#"{"note":"v0"}"#);
         db.remember(&e).unwrap();
+        // Winner for the post-join #381 invalidation, created up front so the
+        // invalidate can land as close to the last audited write as possible.
+        db.remember(&make_entity(
+            "w-379",
+            "facts",
+            "race-winner",
+            r#"{"note":"w"}"#,
+        ))
+        .unwrap();
         let id: String = {
             let conn = db.conn().unwrap();
             conn.query_row(
@@ -7754,6 +7774,12 @@ mod tests {
             h.join().unwrap();
         }
 
+        // #381: the invalidation writer joins the same discipline. Retire the
+        // hammered id immediately after the last audited write — whose
+        // recorded_at may legitimately lead the wall clock by up to 1ms per
+        // bump — and require the full partition to still reconstruct.
+        assert!(db.invalidate_entity(&id, "w-379").expect("invalidate"));
+
         let conn = db.conn().unwrap();
         let mut stmt = conn
             .prepare(
@@ -7766,17 +7792,18 @@ mod tests {
             .unwrap()
             .map(|r| r.unwrap())
             .collect();
-        let live_rec: i64 = conn
+        let live_left: i64 = conn
             .query_row(
-                "SELECT COALESCE(recorded_at_unix_ms, created_at_unix_ms) FROM entities WHERE id = ?1",
+                "SELECT COUNT(*) FROM entities WHERE id = ?1",
                 params![id],
                 |r| r.get(0),
             )
             .unwrap();
+        assert_eq!(live_left, 0, "invalidate_entity must retire the live row");
 
         assert!(
-            windows.len() >= 20,
-            "the actual-change writes must have snapshotted (got {})",
+            windows.len() >= 21,
+            "the actual-change writes + the final invalidation must have snapshotted (got {})",
             windows.len()
         );
         for (rec, inv) in &windows {
@@ -7791,12 +7818,93 @@ mod tests {
                 "history windows must partition transaction time contiguously"
             );
         }
-        assert_eq!(
-            windows.last().unwrap().1,
-            live_rec,
-            "the last snapshot must hand off exactly at the live row's recorded_at"
-        );
 
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn invalidate_entity_window_stays_positive_when_recorded_at_leads_the_clock() {
+        // #381 failure mode (a): an audited writer stamps the live row's
+        // recorded_at at max(now, old+1), which can land AHEAD of the wall
+        // clock (#373's zero-width guarantee). A raw now_ms() in
+        // invalidate_entity then writes an INVERTED window
+        // (invalidated_at < recorded_at). Simulate the leading recorded_at
+        // deterministically (60s ahead) instead of betting on a
+        // same-millisecond race.
+        let (db, path) = temp_db();
+        db.remember(&make_entity("e-381", "facts", "k381", r#"{"n":"v1"}"#))
+            .unwrap();
+        db.remember(&make_entity("w-381", "facts", "winner381", r#"{"n":"w"}"#))
+            .unwrap();
+        let ahead = now_ms() + 60_000;
+        {
+            let conn = db.conn().unwrap();
+            conn.execute(
+                "UPDATE entities SET recorded_at_unix_ms = ?1 WHERE id = 'e-381'",
+                params![ahead],
+            )
+            .unwrap();
+        }
+        assert!(db.invalidate_entity("e-381", "w-381").unwrap());
+
+        let conn = db.conn().unwrap();
+        let (rec, inv): (i64, i64) = conn
+            .query_row(
+                "SELECT recorded_at_unix_ms, invalidated_at_unix_ms FROM entity_history \
+                 WHERE id = 'e-381'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert!(
+            rec < inv,
+            "inverted/zero-width invalidation window [{rec}, {inv})"
+        );
+        assert_eq!(
+            inv,
+            rec + 1,
+            "the bump must be minimal: max(now, recorded_at + 1) with a leading recorded_at"
+        );
+        drop(conn);
+        // The retired version must be reachable by reconstruction at its own
+        // recorded_at instant (as_of matches recorded_at <= T < invalidated_at).
+        let back = db.as_of("facts", "k381", rec).unwrap();
+        let back = back.expect("invalidated version unreachable by as_of at its recorded_at");
+        assert!(back.body_json.contains("v1"));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn invalidate_entity_same_millisecond_create_stays_reconstructable() {
+        // #381 failure mode (b): create + invalidate inside one millisecond
+        // (the common case under Windows' ~16ms clock granularity) must not
+        // produce a zero-width window that mimir_history lists but as_of can
+        // never match.
+        let (db, path) = temp_db();
+        // Winner first, so create → invalidate on the loser is back-to-back
+        // and lands inside one clock tick as often as possible.
+        db.remember(&make_entity("w-381b", "facts", "winner381b", r#"{"n":"w"}"#))
+            .unwrap();
+        db.remember(&make_entity("e-381b", "facts", "k381b", r#"{"n":"v1"}"#))
+            .unwrap();
+        assert!(db.invalidate_entity("e-381b", "w-381b").unwrap());
+
+        let conn = db.conn().unwrap();
+        let (rec, inv): (i64, i64) = conn
+            .query_row(
+                "SELECT recorded_at_unix_ms, invalidated_at_unix_ms FROM entity_history \
+                 WHERE id = 'e-381b'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert!(rec < inv, "zero-width invalidation window [{rec}, {inv})");
+        drop(conn);
+        let back = db.as_of("facts", "k381b", rec).unwrap();
+        assert!(
+            back.is_some(),
+            "same-millisecond invalidated version must stay reachable via as_of"
+        );
         let _ = fs::remove_file(&path);
     }
 
