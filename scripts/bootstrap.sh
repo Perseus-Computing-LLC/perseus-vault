@@ -166,6 +166,20 @@ mkdir -p "$MIMIR_BIN_DIR"
 cp "$BINARY" "$MIMIR_BIN_DIR/mimir"
 chmod +x "$MIMIR_BIN_DIR/mimir"
 
+# macOS Apple silicon: a freshly built (unsigned) binary is SIGKILLed on first
+# run — `mimir --version` prints "Killed: 9" with no other output (#422). Apply
+# an ad-hoc code signature so it launches. Guarded by Darwin + arm64 so it is a
+# no-op on Intel macOS and other platforms.
+if [ "$(uname -s)" = "Darwin" ] && [ "$(uname -m)" = "arm64" ] && command -v codesign >/dev/null 2>&1; then
+    info "Ad-hoc code-signing binary (macOS Apple silicon, #422)..."
+    if codesign --force --sign - "$MIMIR_BIN_DIR/mimir" 2>/dev/null; then
+        ok "Ad-hoc code-signed"
+    else
+        warn "Could not code-sign. If 'mimir' is Killed: 9, run:"
+        warn "  codesign --force --sign - $MIMIR_BIN_DIR/mimir"
+    fi
+fi
+
 # Ensure ~/.local/bin is on PATH
 case ":$PATH:" in
     *":$MIMIR_BIN_DIR:"*) ;;

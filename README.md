@@ -28,15 +28,20 @@ That's it. Perseus Vault is installed to `~/.local/bin/perseus-vault`. Start it:
 perseus-vault serve --db ~/.mimir/data/perseus-vault.db
 ```
 
-> **macOS note.** On Apple Silicon, an unsigned binary is killed on launch
-> (`Killed: 9`, no output) by the OS binary policy — even with no quarantine
-> attribute. The installer ad-hoc code-signs Perseus Vault for you. If you build or copy
-> the binary yourself (`cargo build --release && cp target/release/perseus-vault
-> ~/.cargo/bin/`), sign it once after each rebuild:
+> **macOS note (Apple Silicon).** A freshly built or copied binary is
+> SIGKILLed on first run (`Killed: 9`, no other output) by the OS binary
+> policy — even with no quarantine attribute. The one-line installer and the
+> `bootstrap.sh` build-from-source installer ad-hoc code-sign Perseus Vault for
+> you. If you build the binary yourself, sign it once **after each rebuild**:
 >
 > ```bash
-> codesign --sign - "$(command -v perseus-vault)"
+> cargo build --release
+> cp target/release/perseus-vault ~/.local/bin/perseus-vault
+> codesign --force --sign - ~/.local/bin/perseus-vault   # required on Apple Silicon; fixes "Killed: 9"
 > ```
+>
+> `--force` re-signs an already-signed binary (needed after every rebuild); the
+> step is harmless on Intel macOS and unnecessary on Linux/Windows.
 
 Connect any MCP host (Claude Desktop, Cursor, Hermes Agent, Perseus, etc.):
 
@@ -277,6 +282,31 @@ perseus-vault keygen --key-file ~/.mimir/secret.key
 | `--llm-api-key` | API key for LLM endpoints (OpenAI, Azure, etc.) |
 | `--embedding-endpoint` | OpenAI-compatible embedding endpoint |
 | `--connectors-config` | Path to connectors.yaml |
+
+### Database location
+
+The **canonical** database path is:
+
+```
+~/.mimir/data/perseus-vault.db
+```
+
+Always pass `--db` (or set `$MIMIR_DB_PATH`) in scripts, MCP host configs, and
+cron/harvest jobs so every invocation targets the same file. When neither is
+set, Perseus Vault resolves the default in this order and uses the **first that
+already exists** (so upgraders and legacy single-user installs are picked up
+instead of silently starting empty):
+
+1. `~/.mimir/data/perseus-vault.db` — canonical (current name)
+2. `~/.mimir/data/mneme.db` — pre-rename
+3. `~/.mimir/data/mimir.db` — pre-rename
+4. `~/mimir.db` — legacy single-user install location
+
+If none exist, it creates `~/.mimir/data/perseus-vault.db`. If **more than one**
+of these exists and you did not pass `--db`/`$MIMIR_DB_PATH`, Perseus Vault
+prints a stderr warning naming the chosen file and the others it ignored, so an
+ambiguous multi-database state is visible rather than silent. Setting `--db` or
+`$MIMIR_DB_PATH` explicitly always wins and suppresses the warning.
 
 ## Your AI Memory in Obsidian
 

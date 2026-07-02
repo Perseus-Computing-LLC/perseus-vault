@@ -492,45 +492,132 @@ fn apply_top_level_db(cli: &mut Cli) {
     }
 }
 
+/// Outcome of resolving the default database path when no `--db`/`$MIMIR_DB_PATH`
+/// was given: the chosen path plus any *other* existing candidate databases that
+/// were passed over. When `other_candidates` is non-empty the caller should warn
+/// so an ambiguous multi-DB state is visible rather than silent (#421).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DbResolution {
+    chosen: String,
+    other_candidates: Vec<String>,
+}
+
+/// Pure, testable core of default DB-path resolution (#421).
+///
+/// Given the home directory and an existence check, decides which database the
+/// server should open when the user did not pass `--db` or set `$MIMIR_DB_PATH`.
+///
+/// Precedence (first existing wins):
+///   1. `~/.mimir/data/perseus-vault.db`  (canonical, current name)
+///   2. `~/.mimir/data/mneme.db`          (pre-rename)
+///   3. `~/.mimir/data/mimir.db`          (pre-rename)
+///   4. `~/mimir.db`                       (legacy single-user install location)
+/// If none exist, fall back to creating (1), the canonical path.
+///
+/// Crucially `~/mimir.db` is chosen *before* falling through to create a fresh
+/// canonical DB, so an existing single-user install is picked up instead of
+/// silently starting empty. `other_candidates` reports every *other* database
+/// that also exists so the caller can warn about the ambiguity.
+fn resolve_default_db(home: &str, exists: &dyn Fn(&str) -> bool) -> DbResolution {
+    let dir = format!("{}/.mimir/data", home);
+    let vault_path = format!("{}/perseus-vault.db", dir);
+    let mneme_path = format!("{}/mneme.db", dir);
+    let mimir_path = format!("{}/mimir.db", dir);
+    let home_legacy_path = format!("{}/mimir.db", home);
+
+    // Ordered candidate list; the first that exists is chosen.
+    let candidates = [
+        vault_path.clone(),
+        mneme_path,
+        mimir_path,
+        home_legacy_path,
+    ];
+
+    let existing: Vec<String> = candidates
+        .iter()
+        .filter(|p| exists(p))
+        .cloned()
+        .collect();
+
+    // Chosen: first existing candidate in precedence order, else the canonical
+    // path (which will be created fresh).
+    let chosen = existing.first().cloned().unwrap_or(vault_path);
+    let other_candidates = existing
+        .into_iter()
+        .filter(|p| *p != chosen)
+        .collect();
+
+    DbResolution {
+        chosen,
+        other_candidates,
+    }
+}
+
 /// Resolve the default database path.
 ///
 /// Perseus Vault rename: fresh installs default to `perseus-vault.db`. If a
-/// pre-rename `mneme.db` or `mimir.db` already exists at the same directory
-/// (and no `perseus-vault.db` does), we keep using it so upgraders don't
-/// silently start over with an empty database — same fallback shape as the
-/// legacy `~/mimir.db` -> `~/.mimir/data/`
-/// move handled by `check_legacy_db` below.
+/// pre-rename `mneme.db`/`mimir.db`, or a legacy single-user `~/mimir.db`,
+/// already exists we keep using it so upgraders don't silently start over with
+/// an empty database (#421).
+///
+/// This is intentionally side-effect free apart from creating the data dir: it
+/// is used both as clap's `default_value_t` (evaluated eagerly, even when the
+/// user passes `--db`) and in equality comparisons by `apply_top_level_db`, so
+/// it must NOT print warnings. The multi-candidate split-brain warning is
+/// emitted separately by `check_legacy_db`, which runs only at real startup and
+/// only when the default path was actually used.
 fn default_db_path() -> String {
-    std::env::var("MIMIR_DB_PATH").unwrap_or_else(|_| {
-        let home = std::env::var("HOME")
-            .or_else(|_| std::env::var("USERPROFILE"))
-            .unwrap_or_else(|_| {
-                eprintln!("perseus-vault: could not determine home directory. Set MIMIR_DB_PATH or HOME/USERPROFILE.");
-                std::process::exit(1);
-            });
-        let dir = format!("{}/.mimir/data", home);
-        let _ = std::fs::create_dir_all(&dir);
-        let vault_path = format!("{}/perseus-vault.db", dir);
-        let mneme_path = format!("{}/mneme.db", dir);
-        let mimir_path = format!("{}/mimir.db", dir);
-        if std::path::Path::new(&vault_path).exists() {
-            vault_path
-        } else if std::path::Path::new(&mneme_path).exists() {
-            mneme_path
-        } else if std::path::Path::new(&mimir_path).exists() {
-            mimir_path
-        } else {
-            vault_path
-        }
-    })
+    if let Ok(explicit) = std::env::var("MIMIR_DB_PATH") {
+        return explicit;
+    }
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_else(|_| {
+            eprintln!("perseus-vault: could not determine home directory. Set MIMIR_DB_PATH or HOME/USERPROFILE.");
+            std::process::exit(1);
+        });
+    let dir = format!("{}/.mimir/data", home);
+    let _ = std::fs::create_dir_all(&dir);
+
+    resolve_default_db(&home, &|p| std::path::Path::new(p).exists()).chosen
 }
 
 /// Check for a legacy database at ~/mimir.db and warn if the default path
 /// would create a new empty database instead.
+///
+/// Also emits the #421 split-brain warning: when the path being used is the
+/// resolved *default* (no `--db`, no `$MIMIR_DB_PATH`) and more than one
+/// candidate database exists on disk, name the chosen one and the others so the
+/// ambiguity is visible rather than silent. When `--db`/`$MIMIR_DB_PATH` is set
+/// explicitly, behavior is unchanged and no warning fires.
 fn check_legacy_db(db_path: &str) {
     let home = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
         .unwrap_or_else(|_| "/root".to_string());
+
+    // Was this path chosen implicitly (the resolved default) rather than via
+    // --db / $MIMIR_DB_PATH? Only then do we own the resolution and warn.
+    let env_set = std::env::var("MIMIR_DB_PATH").is_ok();
+    let is_default = !env_set && db_path == default_db_path();
+
+    // #421: multiple candidate DBs but the user didn't pick one — surface the
+    // split-brain instead of silently reading/creating one of them.
+    if is_default {
+        let resolution = resolve_default_db(&home, &|p| std::path::Path::new(p).exists());
+        if !resolution.other_candidates.is_empty() {
+            eprintln!(
+                "perseus-vault: ⚠  multiple candidate databases found; using {}",
+                resolution.chosen
+            );
+            for other in &resolution.other_candidates {
+                eprintln!("perseus-vault:    also present (ignored): {}", other);
+            }
+            eprintln!(
+                "perseus-vault:    pass --db <path> or set MIMIR_DB_PATH to choose explicitly and silence this warning."
+            );
+        }
+    }
+
     let legacy = std::path::PathBuf::from(format!("{}/mimir.db", home));
     let target = std::path::PathBuf::from(db_path);
     if legacy.exists() && !target.exists() {
@@ -1815,6 +1902,82 @@ mod tests {
     fn parses_direct_server_without_subcommand() {
         let cli = Cli::parse_from(["mimir"]);
         assert!(cli.command.is_none());
+    }
+
+    // ---- #421: default DB-path resolution (split-brain) ----
+
+    /// Helper: existence checker over a fixed set of present paths.
+    fn present(set: &[String]) -> impl Fn(&str) -> bool + '_ {
+        move |p: &str| set.iter().any(|e| e == p)
+    }
+
+    #[test]
+    fn resolve_default_db_picks_home_legacy_over_creating_fresh() {
+        // #421 core: only ~/mimir.db exists. It must be selected instead of
+        // creating a fresh ~/.mimir/data/perseus-vault.db (the silent
+        // split-brain the issue reports).
+        let home = "/home/tester";
+        let home_legacy = format!("{}/mimir.db", home);
+        let existing = vec![home_legacy.clone()];
+        let r = resolve_default_db(home, &present(&existing));
+        assert_eq!(r.chosen, home_legacy, "should adopt existing ~/mimir.db");
+        assert!(r.other_candidates.is_empty());
+    }
+
+    #[test]
+    fn resolve_default_db_prefers_canonical_when_present() {
+        // Canonical perseus-vault.db wins over legacy names in precedence order.
+        let home = "/home/tester";
+        let vault = format!("{}/.mimir/data/perseus-vault.db", home);
+        let home_legacy = format!("{}/mimir.db", home);
+        let existing = vec![vault.clone(), home_legacy.clone()];
+        let r = resolve_default_db(home, &present(&existing));
+        assert_eq!(r.chosen, vault);
+        assert_eq!(r.other_candidates, vec![home_legacy]);
+    }
+
+    #[test]
+    fn resolve_default_db_falls_back_to_canonical_when_none_exist() {
+        // Fresh install: nothing exists -> create canonical path, no warning.
+        let home = "/home/tester";
+        let vault = format!("{}/.mimir/data/perseus-vault.db", home);
+        let r = resolve_default_db(home, &present(&[]));
+        assert_eq!(r.chosen, vault);
+        assert!(r.other_candidates.is_empty());
+    }
+
+    #[test]
+    fn resolve_default_db_reports_multiple_candidates() {
+        // Multiple candidate DBs -> chosen is highest-precedence, others named
+        // so the caller can warn about the ambiguity.
+        let home = "/home/tester";
+        let mneme = format!("{}/.mimir/data/mneme.db", home);
+        let mimir = format!("{}/.mimir/data/mimir.db", home);
+        let home_legacy = format!("{}/mimir.db", home);
+        let existing = vec![mneme.clone(), mimir.clone(), home_legacy.clone()];
+        let r = resolve_default_db(home, &present(&existing));
+        // perseus-vault.db absent -> mneme.db is highest precedence.
+        assert_eq!(r.chosen, mneme);
+        assert_eq!(r.other_candidates, vec![mimir, home_legacy]);
+    }
+
+    #[test]
+    fn resolve_default_db_precedence_order_is_stable() {
+        // The full documented order: vault > mneme > mimir(dir) > ~/mimir.db.
+        let home = "/home/tester";
+        let vault = format!("{}/.mimir/data/perseus-vault.db", home);
+        let mneme = format!("{}/.mimir/data/mneme.db", home);
+        let mimir = format!("{}/.mimir/data/mimir.db", home);
+        let home_legacy = format!("{}/mimir.db", home);
+        let all = vec![
+            vault.clone(),
+            mneme.clone(),
+            mimir.clone(),
+            home_legacy.clone(),
+        ];
+        let r = resolve_default_db(home, &present(&all));
+        assert_eq!(r.chosen, vault);
+        assert_eq!(r.other_candidates, vec![mneme, mimir, home_legacy]);
     }
 
     #[test]

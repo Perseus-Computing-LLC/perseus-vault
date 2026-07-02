@@ -100,6 +100,28 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
   behavior is unchanged.
 
 ### Fixed
+- Default DB-path resolution surfaces the split-brain instead of hiding it
+  (#421): the legacy single-user location `~/mimir.db` is now **added to the
+  fallback chain** (adopted when it is the *only* existing DB, instead of
+  creating a fresh empty `~/.mimir/data/perseus-vault.db`). Full precedence
+  (first existing wins): `~/.mimir/data/perseus-vault.db` >
+  `~/.mimir/data/mneme.db` > `~/.mimir/data/mimir.db` > `~/mimir.db`; if none
+  exist the canonical `perseus-vault.db` is created. Note this is
+  precedence-only, not emptiness-aware: in the issue's reported scenario where
+  a live `~/mimir.db` **and** a stale-empty `~/.mimir/data/mimir.db` both
+  exist, the higher-precedence dir DB still wins — `~/mimir.db` is **surfaced
+  via the warning, not auto-adopted**. When more than one candidate DB exists
+  and no `--db`/`$MIMIR_DB_PATH` was given, a stderr warning names the chosen
+  file and the ignored candidate(s) so the ambiguity is visible; passing
+  `--db`/`$MIMIR_DB_PATH` explicitly is the deterministic remedy and suppresses
+  the warning. Resolution was refactored into a pure, unit-tested
+  `resolve_default_db(home, exists)` function. (Emptiness-aware precedence is a
+  filed follow-up.)
+- macOS Apple silicon build-from-source binaries no longer fail with an
+  unexplained `Killed: 9` on first run (#422): the `bootstrap.sh` build-and-
+  install path now ad-hoc code-signs the binary (`codesign --force --sign -`)
+  guarded by a `uname` Darwin/arm64 check, and the README build-from-source
+  note documents the required signing step after every rebuild.
 - `mimir_purge` now honors its own "actually remove" contract (#398): purging
   an archived entity also DELETEs every superseded version of it from
   `entity_history` (matched by id and by category/key/workspace, so versions
