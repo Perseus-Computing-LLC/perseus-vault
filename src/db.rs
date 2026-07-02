@@ -4488,7 +4488,7 @@ last_accessed: {}
         }
 
         // Format as markdown
-        let mut ctx = String::from("## Mneme Context\n\n");
+        let mut ctx = String::from("## Perseus Vault Context\n\n");
 
         // Always-on entities first, visually distinct
         if !always_on_entities.is_empty() {
