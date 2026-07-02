@@ -65,6 +65,38 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
   semantics, and per-transaction drop-safety (#388); the run stays correct
   under interleaved writers, and the new non-atomicity boundaries are
   documented at the split site.
+- `mimir_autocohere`'s cohere step actually creates auto-links now (#412).
+  `CohereParams`' derived `Default` gave `max_links = 0`, and autocohere
+  builds its params with `..Default::default()` — so the link-candidate
+  query ran with `LIMIT 0` and the graph-building half of scheduled
+  maintenance had silently been a no-op since it shipped. A manual
+  `Default` impl now carries the same `max_links = 20` budget the
+  `mimir_cohere` argument path gets from its serde default;
+  `promote_threshold`/`archive_threshold` keep their fall-through-to-
+  constants sentinels, and explicit `mimir_cohere` args are unaffected.
+- `GET /api/entities`, `GET /api/search`, and `GET /api/journal` clamp
+  `limit` to [1, 5000] (#413), exactly like #402's `/api/graph` clamp: an
+  explicit `?limit=1000000` previously passed straight into SQL and dumped
+  the whole table (14.7MB/1.5s at 20k rows) — and since #402 moved the
+  dashboard onto the shared connection pool, a handful of such requests
+  could pin every pooled connection and brown out MCP traffic. Defaults are
+  unchanged (50 each); non-numeric/overflowing `limit`/`offset` values are
+  rejected with 400; the responses now echo the effective `limit` (and
+  `offset` for `/api/entities`).
+
+### Changed
+- **Empty-string `workspace_hash` is now STRICT everywhere (#408).**
+  `list_entities`/`count_entities` (the dashboard entity list and
+  its `total`) and `get_entity_graph` treated `Some("")` as *unscoped* —
+  no filter, every workspace's rows — while `recall`/`recall_when`/`follow`
+  treat `""` with strict equality (only the global `''` rows). The same
+  argument value meant two different scopes depending on the surface. All
+  three now apply strict equality for any `Some`, including `Some("")`;
+  `None`/omitting the param remains the unscoped view. On the web API this
+  means `?workspace=` (present but empty) now returns only global-`''`
+  rows instead of everything — omit the parameter entirely for the
+  unscoped view. The bundled dashboard never sends the parameter, so its
+  behavior is unchanged.
 
 ## [2.14.0] - 2026-07-02
 

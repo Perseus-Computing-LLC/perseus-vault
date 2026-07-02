@@ -123,7 +123,9 @@ struct EntityListParams {
     layer: Option<String>,
     /// Scope the entity list to a single workspace. Without this, a
     /// federated (multi-workspace) vault's dashboard showed every
-    /// workspace's memory in one unfiltered list.
+    /// workspace's memory in one unfiltered list. `?workspace=` (present
+    /// but empty) scopes strictly to the global `''` workspace (#408);
+    /// omit the param entirely for the unscoped view.
     #[serde(default)]
     workspace: Option<String>,
 }
@@ -172,9 +174,12 @@ struct GraphParams {
 
 /// Default node cap for `/api/graph` (#402).
 const DEFAULT_GRAPH_LIMIT: i64 = 500;
-/// Hard ceiling for an explicit `?limit=` (#402): honors large explicit
-/// requests without reopening the unbounded-dump hole.
-const MAX_GRAPH_LIMIT: i64 = 5000;
+/// Hard ceiling for an explicit `?limit=` on every list-shaped endpoint
+/// (#402 for /api/graph; #413 extended the same clamp to /api/entities,
+/// /api/search, and /api/journal): honors large explicit requests without
+/// reopening the unbounded-dump hole — one `?limit=1000000` request could
+/// return ~15MB and pin a shared-pool connection for seconds.
+const MAX_API_LIMIT: i64 = 5000;
 
 fn default_graph_limit() -> i64 {
     DEFAULT_GRAPH_LIMIT
@@ -201,11 +206,17 @@ async fn list_entities(
     State(state): State<WebState>,
     Query(params): Query<EntityListParams>,
 ) -> Result<Json<Value>, StatusCode> {
+    // #413: same param hygiene /api/graph got in #402 — default (50) stays,
+    // explicit limits are clamped to [1, MAX_API_LIMIT] so a single request
+    // can't dump the whole table through a shared-pool connection.
+    // (Non-numeric / overflowing `?limit=` is already a 400 via Query<i64>.)
+    let limit = params.limit.clamp(1, MAX_API_LIMIT);
+    let offset = params.offset.max(0);
     let (items, total) = blocking_db(state.db.clone(), move |db| {
         let entities = db
             .list_entities(
-                params.offset,
-                params.limit,
+                offset,
+                limit,
                 params.category.as_deref(),
                 params.layer.as_deref(),
                 params.workspace.as_deref(),
@@ -233,7 +244,9 @@ async fn list_entities(
     })
     .await?;
 
-    Ok(Json(json!({ "items": items, "total": total })))
+    // `limit`/`offset` echo the clamped effective values (#413), mirroring
+    // /api/graph — so callers (and tests) can see what was actually applied.
+    Ok(Json(json!({ "items": items, "total": total, "limit": limit, "offset": offset })))
 }
 
 async fn entity_detail(
@@ -255,11 +268,14 @@ async fn search(
     State(state): State<WebState>,
     Query(params): Query<SearchParams>,
 ) -> Result<Json<Value>, StatusCode> {
+    // #413: same clamp as /api/entities — /api/search had the identical
+    // unbounded-`?limit=` shape.
+    let limit = params.limit.clamp(1, MAX_API_LIMIT);
     let items = blocking_db(state.db.clone(), move |db| {
         let recall_params = crate::models::RecallParams {
             query: params.q.clone(),
             category: params.category.clone(),
-            limit: params.limit,
+            limit,
             // recall() already supports workspace_hash scoping (v1.2.0) —
             // the dashboard just wasn't passing it through, so search leaked
             // cross-workspace results the same way list_entities did.
@@ -278,7 +294,7 @@ async fn search(
     // ranking, and adding one would double the recall cost for a value the
     // UI doesn't currently use for pagination. Documented so it doesn't get
     // silently assumed to mean the same thing as list_entities' `total`.
-    Ok(Json(json!({ "items": items, "total": items.len() })))
+    Ok(Json(json!({ "items": items, "total": items.len(), "limit": limit })))
 }
 
 async fn stats(State(state): State<WebState>) -> Result<Json<Value>, StatusCode> {
@@ -295,13 +311,17 @@ async fn journal(
     State(state): State<WebState>,
     Query(params): Query<JournalParams>,
 ) -> Result<Json<Value>, StatusCode> {
+    // #413: /api/journal had the same unbounded-`?limit=` hole as
+    // /api/entities and /api/search — `get_recent_journal` passes the value
+    // straight into SQL `LIMIT`. Clamp it identically.
+    let limit = params.limit.clamp(1, MAX_API_LIMIT);
     let events = blocking_db(state.db.clone(), move |db| {
-        db.get_recent_journal(params.limit)
+        db.get_recent_journal(limit)
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
     })
     .await?;
 
-    Ok(Json(json!({ "items": events, "total": events.len() })))
+    Ok(Json(json!({ "items": events, "total": events.len(), "limit": limit })))
 }
 
 async fn graph(
@@ -309,7 +329,7 @@ async fn graph(
     Query(params): Query<GraphParams>,
 ) -> Result<Json<Value>, StatusCode> {
     // #402: capped by default, clamped ceiling for explicit requests.
-    let limit = params.limit.clamp(1, MAX_GRAPH_LIMIT);
+    let limit = params.limit.clamp(1, MAX_API_LIMIT);
     let offset = params.offset.max(0);
     let (nodes, edges, total_nodes) = blocking_db(state.db.clone(), move |db| {
         db.get_entity_graph(params.workspace.as_deref(), limit, offset)
@@ -791,6 +811,218 @@ mod tests {
         assert_eq!(v["nodes"].as_array().unwrap().len(), 3);
         assert_eq!(v["total_nodes"], 3);
         assert_eq!(v["truncated"], false);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ── limit clamps (#413) ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn entities_limit_is_clamped_not_unbounded() {
+        // #413: /api/entities accepted any `?limit=` and passed it straight
+        // into SQL — `?limit=1000000` dumped the whole table (14.7MB/1.5s at
+        // 20k rows) through a shared-pool connection.
+        let (db_arc, path) = temp_db();
+        {
+            let db = &db_arc;
+            for i in 0..3 {
+                db.remember(&make_entity(
+                    &format!("lim-{i}"),
+                    "insight",
+                    &format!("lim-key-{i}"),
+                    &format!(r#"{{"note":"lim {i} {}"}}"#, uuid::Uuid::new_v4()),
+                    "",
+                ))
+                .unwrap();
+            }
+        }
+        let router = build_router(db_arc, None);
+
+        // An absurd explicit limit is clamped to the ceiling, not honored.
+        let resp = router
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/api/entities?limit=999999")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        assert_eq!(
+            v["limit"], MAX_API_LIMIT,
+            "effective limit must be clamped to the {MAX_API_LIMIT} ceiling, got {}",
+            v["limit"]
+        );
+        assert_eq!(v["items"].as_array().unwrap().len(), 3);
+
+        // limit=0 clamps up to 1 — previously it hit SQL as `LIMIT 0` and
+        // returned nothing.
+        let resp = router
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/api/entities?limit=0")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let v = body_json(resp).await;
+        assert_eq!(
+            v["items"].as_array().unwrap().len(),
+            1,
+            "limit=0 must clamp to 1 row, not pass LIMIT 0 through to SQL"
+        );
+
+        // Negative offset is floored to 0, same as /api/graph.
+        let resp = router
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/api/entities?offset=-5")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let v = body_json(resp).await;
+        assert_eq!(v["offset"], 0);
+        assert_eq!(v["items"].as_array().unwrap().len(), 3);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn non_numeric_or_overflowing_limit_is_400() {
+        // #413 param hygiene, matching /api/graph: garbage `?limit=` values
+        // are a client error, not a silent default or a 500.
+        let (db, path) = temp_db();
+        let router = build_router(db, None);
+        for uri in [
+            "/api/entities?limit=abc",
+            "/api/entities?limit=99999999999999999999999",
+            "/api/search?q=x&limit=abc",
+            "/api/journal?limit=abc",
+            "/api/graph?limit=abc",
+        ] {
+            let resp = router
+                .clone()
+                .oneshot(HttpRequest::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_REQUEST,
+                "{uri} must be rejected with 400"
+            );
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn search_and_journal_limits_are_clamped() {
+        // #413: /api/search and /api/journal had the identical unbounded
+        // `?limit=` shape as /api/entities.
+        let (db_arc, path) = temp_db();
+        {
+            let db = &db_arc;
+            db.remember(&make_entity(
+                "sj-1",
+                "insight",
+                "sj-key-1",
+                r#"{"note":"quasar clamp marker"}"#,
+                "",
+            ))
+            .unwrap();
+        }
+        let router = build_router(db_arc, None);
+        for uri in ["/api/search?q=quasar&limit=999999", "/api/journal?limit=999999"] {
+            let resp = router
+                .clone()
+                .oneshot(HttpRequest::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+            let v = body_json(resp).await;
+            assert_eq!(
+                v["limit"], MAX_API_LIMIT,
+                "{uri}: effective limit must be clamped, got {}",
+                v["limit"]
+            );
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ── strict empty-workspace scoping (#408) ─────────────────────────
+
+    #[tokio::test]
+    async fn empty_workspace_param_scopes_to_global_rows_only() {
+        // #408: `?workspace=` (present but empty) used to silently mean
+        // UNSCOPED on /api/entities and /api/graph while recall treated ""
+        // as strict-global. Now every surface is strict: Some("") = only the
+        // global '' rows; omit the param for the unscoped view.
+        let (db_arc, path) = temp_db();
+        {
+            let db = &db_arc;
+            db.remember(&make_entity("ws-g", "insight", "k-global", "{}", ""))
+                .unwrap();
+            db.remember(&make_entity("ws-a", "insight", "k-alpha", "{}", "alpha"))
+                .unwrap();
+        }
+        let router = build_router(db_arc, None);
+
+        let resp = router
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/api/entities?workspace=")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let v = body_json(resp).await;
+        let items = v["items"].as_array().unwrap();
+        assert_eq!(
+            items.len(),
+            1,
+            "?workspace= must scope to global-'' rows only, got {items:?}"
+        );
+        assert_eq!(items[0]["key"], "k-global");
+        assert_eq!(v["total"], 1, "count_entities must use the same strict scope");
+
+        let resp = router
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/api/graph?workspace=")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let v = body_json(resp).await;
+        assert_eq!(
+            v["nodes"].as_array().unwrap().len(),
+            1,
+            "graph ?workspace= must scope to global-'' nodes only"
+        );
+        assert_eq!(v["total_nodes"], 1);
+
+        // Omitting the param is still the unscoped view (unchanged).
+        let resp = router
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/api/entities")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let v = body_json(resp).await;
+        assert_eq!(v["total"], 2);
         let _ = std::fs::remove_file(&path);
     }
 

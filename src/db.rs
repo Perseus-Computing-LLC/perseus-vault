@@ -4338,10 +4338,12 @@ impl Database {
     }
 
     /// List entities with pagination and optional filters.
-    /// `workspace_hash`: when `Some(non-empty)`, only entities with a matching
+    /// `workspace_hash`: when `Some`, only entities with a matching
     /// workspace_hash are returned — same exact-match scoping `recall()` and
     /// `context()` use (#338/#343). Without it, the web dashboard's entity
-    /// list leaked every workspace's memory into one view.
+    /// list leaked every workspace's memory into one view. `Some("")` is
+    /// strict too — it targets only the global `''` rows, matching
+    /// `recall`/`recall_when`/`follow` (#408); pass `None` for unscoped.
     pub fn list_entities(
         &self,
         offset: i64,
@@ -4374,11 +4376,12 @@ impl Database {
                 params.push(Box::new(l.to_string()));
             }
         }
+        // #408: strict equality for ANY Some — including Some("") = only the
+        // global '' rows — matching recall/recall_when/follow. Only None
+        // means unscoped. (Some("") used to silently mean unscoped here.)
         if let Some(ws) = workspace_hash {
-            if !ws.is_empty() {
-                sql.push_str(&format!(" AND workspace_hash = ?{}", params.len() + 1));
-                params.push(Box::new(ws.to_string()));
-            }
+            sql.push_str(&format!(" AND workspace_hash = ?{}", params.len() + 1));
+            params.push(Box::new(ws.to_string()));
         }
 
         sql.push_str(" ORDER BY last_accessed_unix_ms DESC");
@@ -4428,11 +4431,10 @@ impl Database {
                 params.push(Box::new(l.to_string()));
             }
         }
+        // #408: same strict Some("") = global-only semantics as list_entities.
         if let Some(ws) = workspace_hash {
-            if !ws.is_empty() {
-                sql.push_str(&format!(" AND workspace_hash = ?{}", params.len() + 1));
-                params.push(Box::new(ws.to_string()));
-            }
+            sql.push_str(&format!(" AND workspace_hash = ?{}", params.len() + 1));
+            params.push(Box::new(ws.to_string()));
         }
 
         let param_refs: Vec<&dyn rusqlite::types::ToSql> =
@@ -4482,11 +4484,13 @@ impl Database {
     }
 
     /// Build an entity link graph: nodes + edges for visualization.
-    /// `workspace_hash`: when `Some(non-empty)`, only entities (nodes) whose
+    /// `workspace_hash`: when `Some`, only entities (nodes) whose
     /// workspace_hash matches are included; edges to a target outside that
     /// scope are dropped rather than pointing at a node the caller never
     /// receives (the dashboard's graph tab leaked cross-workspace
-    /// nodes/edges before this).
+    /// nodes/edges before this). `Some("")` scopes strictly to the global
+    /// `''` rows, matching recall/recall_when/follow (#408); only `None`
+    /// means unscoped.
     ///
     /// Paginated (#402): `limit`/`offset` page over the node set in a
     /// deterministic order (newest first, id as tiebreaker), and the returned
@@ -4504,7 +4508,8 @@ impl Database {
         let conn = self.conn()?;
         let limit = if limit <= 0 { -1 } else { limit };
         let offset = offset.max(0);
-        let scoped = workspace_hash.filter(|ws| !ws.is_empty()).is_some();
+        // #408: any Some — including Some("") — is a strict scope.
+        let scoped = workspace_hash.is_some();
         let (count_sql, sql) = if scoped {
             (
                 "SELECT COUNT(*) FROM entities WHERE archived = 0 AND workspace_hash = ?1",
@@ -14442,6 +14447,68 @@ mod tests {
         };
         assert_eq!(count_of("f-396-d0"), 1, "global '' row is the unscoped pick");
         assert_eq!(count_of("f-396-d1"), 0, "workspace row untouched by unscoped follow");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn list_and_count_entities_empty_workspace_hash_is_strict_global_scope() {
+        // #408: list_entities/count_entities treated Some("") as UNSCOPED
+        // (no filter) while recall/recall_when/follow treat "" with strict
+        // equality — the same argument value meant two different scopes
+        // depending on the tool. Some("") must target only the global ''
+        // rows; only None means unscoped.
+        let (db, path) = temp_db();
+        let g = make_entity("ws408-g", "insight", "g-key", r#"{"n":"global"}"#);
+        db.remember_skip_dedup(&g).unwrap(); // workspace_hash = '' (global)
+        let mut a = make_entity("ws408-a", "insight", "a-key", r#"{"n":"alpha"}"#);
+        a.workspace_hash = "aaaa".to_string();
+        db.remember_skip_dedup(&a).unwrap();
+
+        let rows = db.list_entities(0, 100, None, None, Some("")).unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "Some(\"\") must return only global-'' rows, got {:?}",
+            rows.iter().map(|e| e.id.clone()).collect::<Vec<_>>()
+        );
+        assert_eq!(rows[0].id, "ws408-g");
+        assert_eq!(
+            db.count_entities(None, None, Some("")).unwrap(),
+            1,
+            "count_entities must apply the same strict scope"
+        );
+
+        // None stays unscoped (unchanged).
+        assert_eq!(db.list_entities(0, 100, None, None, None).unwrap().len(), 2);
+        assert_eq!(db.count_entities(None, None, None).unwrap(), 2);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn entity_graph_empty_workspace_hash_is_strict_global_scope() {
+        // #408: same alignment for get_entity_graph — Some("") used to mean
+        // "every workspace's nodes", diverging from recall's strict '' scope.
+        let (db, path) = temp_db();
+        let g = make_entity("gr408-g", "insight", "g-node", r#"{"n":"global"}"#);
+        db.remember_skip_dedup(&g).unwrap(); // workspace_hash = '' (global)
+        let mut a = make_entity("gr408-a", "insight", "a-node", r#"{"n":"alpha"}"#);
+        a.workspace_hash = "aaaa".to_string();
+        db.remember_skip_dedup(&a).unwrap();
+
+        let (nodes, _edges, total) = db.get_entity_graph(Some(""), 100, 0).unwrap();
+        assert_eq!(
+            nodes.len(),
+            1,
+            "Some(\"\") must scope the graph to global-'' nodes only, got {:?}",
+            nodes.iter().map(|n| n.id.clone()).collect::<Vec<_>>()
+        );
+        assert_eq!(nodes[0].id, "gr408-g");
+        assert_eq!(total, 1, "total_nodes must use the same strict scope");
+
+        // None stays unscoped (unchanged).
+        let (nodes, _edges, total) = db.get_entity_graph(None, 100, 0).unwrap();
+        assert_eq!(nodes.len(), 2);
+        assert_eq!(total, 2);
         let _ = fs::remove_file(&path);
     }
 

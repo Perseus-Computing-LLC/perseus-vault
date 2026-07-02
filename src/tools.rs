@@ -2809,6 +2809,47 @@ mod tests {
         (db, path_str)
     }
 
+    // ─── Autocohere link budget (#412) ───────────────────────────
+
+    #[test]
+    fn autocohere_creates_links_on_linkable_corpus() {
+        // #412: `CohereParams`' derived `Default` gave `max_links = 0`, and
+        // handle_autocohere builds its params with `..Default::default()` —
+        // so the cohere step's candidate SELECT ran with `LIMIT 0` and the
+        // "run everything" maintenance pass had NEVER created a single
+        // auto-link. Pin the arg-less autocohere path to a real link budget.
+        let (db, path) = temp_db();
+        let now = now_ms();
+        let mk = |id: &str, key: &str, note: &str| {
+            let mut e: Entity = serde_json::from_value(json!({
+                "id": id,
+                "category": "project",
+                "key": key,
+                "body_json": format!(r#"{{"note":"{note}"}}"#),
+                "created_at_unix_ms": now,
+                "last_accessed_unix_ms": now,
+            }))
+            .unwrap();
+            // Auto-link requires non-empty tags on both sides.
+            e.tags = vec!["x".to_string()];
+            // Skip remember()'s similarity dedup — the corpus is
+            // intentionally near-duplicate so trigram similarity clears
+            // the auto-link threshold.
+            db.remember_skip_dedup(&e).unwrap();
+        };
+        mk("ac-a", "alpha", "the payment service database migration plan for the Q3 rollout");
+        mk("ac-b", "beta", "the payment service database migration plan for the Q4 rollout");
+
+        let resp = handle_autocohere(&db, json!({ "dry_run": false })).expect("autocohere");
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        assert!(
+            v["links_created"].as_i64().unwrap() > 0,
+            "autocohere must auto-link a clearly-linkable corpus (max_links \
+             default must not be 0): {resp}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
     // ─── History pagination (#403) ───────────────────────────────
 
     #[test]

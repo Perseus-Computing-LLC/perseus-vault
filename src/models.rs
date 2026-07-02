@@ -470,7 +470,7 @@ pub struct PurgeReport {
 }
 
 /// Parameters for the coherence daemon pass.
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct CohereParams {
     #[serde(default)]
     pub dry_run: bool,
@@ -480,6 +480,23 @@ pub struct CohereParams {
     pub promote_threshold: i64,
     #[serde(default = "default_archive_threshold")]
     pub archive_threshold: f64,
+}
+
+// Manual Default so `..Default::default()` construction (autocohere) gets the
+// SAME link budget as the MCP arg path's serde default. The derived Default
+// gave max_links = 0 → candidate_budget 0 → `LIMIT 0` — autocohere's cohere
+// step never created a single link (#412). promote_threshold = 0 and
+// archive_threshold = 0.0 stay as-is: cohere treats those sentinels as
+// "fall through to WORKING_THRESHOLD / ARCHIVE_DECAY_THRESHOLD".
+impl Default for CohereParams {
+    fn default() -> Self {
+        Self {
+            dry_run: false,
+            max_links: default_max_links(),
+            promote_threshold: 0,
+            archive_threshold: 0.0,
+        }
+    }
 }
 
 fn default_max_links() -> usize {
