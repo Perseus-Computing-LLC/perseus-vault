@@ -22,20 +22,40 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
   with a rate-limited warning) and return immediately; the worker drains up
   to 32 jobs per wake, embeds, and stores each vector through a stale guard
   (an atomic conditional UPDATE against the entity's current FTS plaintext),
-  so a queued embed can never overwrite a newer body's vector. Deferral is
-  within the existing contract — auto-embed already ran post-commit with
-  non-fatal failures; a row simply doesn't surface in dense/hybrid search
-  until embedded (now milliseconds later; dropped-on-overflow rows are
-  recoverable via `mimir_embed` batch mode or their next change). Explicit
-  `mimir_embed` stays synchronous. The write path also no longer consults
-  the #219 embedding session cache (new/changed bodies can never hit it —
-  each write paid up to 256 full-body string compares for nothing), and the
+  so a queued embed can never overwrite a newer body's vector. A
+  content-changing UPDATE also clears the row's stored embedding inside the
+  write transaction, so embed lag — or a dropped job — means the row is
+  ABSENT from dense search (keyword search still finds it), never served
+  with the previous body's stale vector, and every unembedded row is
+  genuinely recoverable via `mimir_embed` batch mode
+  (`WHERE embedding IS NULL`) or its next change. Deferral is within the
+  existing contract — auto-embed already ran post-commit with non-fatal
+  failures; a row simply doesn't surface in dense/hybrid search until
+  embedded (now milliseconds later). Explicit `mimir_embed` stays
+  synchronous. The write path also no longer consults the #219 embedding
+  session cache (new/changed bodies can never hit it — each write paid up
+  to 256 full-body string compares for nothing), and the
   misconfigured-backend log (enabled, model missing, no endpoint — formerly
   one eprintln per write) is rate-limited to once per minute. `Drop` for
-  `Database` signals the worker and waits up to 5s: the in-flight embed
-  finishes, remaining queued jobs are dropped. Measured (debug profile,
-  1KB bodies, bundled ONNX, n=40, median-of-5-runs): write median
-  7,714µs → ~159µs (~48×).
+  `Database` disconnects the queue and waits up to 5s while the worker
+  DRAINS the remaining jobs (CLI one-shot writes still get embedded, as
+  they did synchronously pre-#393); a drain that outlives the grace
+  continues on the detached thread, and any never-embedded row is NULL —
+  batch-recoverable, never stale. Measured (debug profile, 1KB bodies,
+  bundled ONNX, n=40, median-of-5-runs): write median 7,714µs → ~159µs
+  (~48×).
+- **Empty-string `workspace_hash` is now STRICT everywhere (#408).**
+  `list_entities`/`count_entities` (the dashboard entity list and
+  its `total`) and `get_entity_graph` treated `Some("")` as *unscoped* —
+  no filter, every workspace's rows — while `recall`/`recall_when`/`follow`
+  treat `""` with strict equality (only the global `''` rows). The same
+  argument value meant two different scopes depending on the surface. All
+  three now apply strict equality for any `Some`, including `Some("")`;
+  `None`/omitting the param remains the unscoped view. On the web API this
+  means `?workspace=` (present but empty) now returns only global-`''`
+  rows instead of everything — omit the parameter entirely for the
+  unscoped view. The bundled dashboard never sends the parameter, so its
+  behavior is unchanged.
 
 ### Fixed
 - `follow()`'s row resolution no longer collapses real DB errors into
@@ -106,20 +126,6 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
   unchanged (50 each); non-numeric/overflowing `limit`/`offset` values are
   rejected with 400; the responses now echo the effective `limit` (and
   `offset` for `/api/entities`).
-
-### Changed
-- **Empty-string `workspace_hash` is now STRICT everywhere (#408).**
-  `list_entities`/`count_entities` (the dashboard entity list and
-  its `total`) and `get_entity_graph` treated `Some("")` as *unscoped* —
-  no filter, every workspace's rows — while `recall`/`recall_when`/`follow`
-  treat `""` with strict equality (only the global `''` rows). The same
-  argument value meant two different scopes depending on the surface. All
-  three now apply strict equality for any `Some`, including `Some("")`;
-  `None`/omitting the param remains the unscoped view. On the web API this
-  means `?workspace=` (present but empty) now returns only global-`''`
-  rows instead of everything — omit the parameter entirely for the
-  unscoped view. The bundled dashboard never sends the parameter, so its
-  behavior is unchanged.
 
 ## [2.14.0] - 2026-07-02
 
