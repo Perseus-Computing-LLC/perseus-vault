@@ -525,6 +525,22 @@ mod tests {
             ok_writes, issued_writes,
             "every issued write should have returned success"
         );
+        // #404: optional wall-clock budget, enforced only when the caller pins
+        // one (the concurrency-gate CI workflow sets 60s). Before the #397 fix
+        // this configuration at 2x pool oversubscription browned out to ~32s
+        // walls with 30s max latency; the budget catches a regression whose
+        // symptom is stalling rather than erroring. Checked LAST so the more
+        // specific error/durability asserts above name the failure first.
+        if let Some(budget_secs) = std::env::var("MIMIR_LOADTEST_MAX_WALL_SECS")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+        {
+            assert!(
+                elapsed.as_secs_f64() < budget_secs,
+                "wall time {:.2}s exceeded the {budget_secs}s budget",
+                elapsed.as_secs_f64()
+            );
+        }
         // (Reaching here at all proves no deadlock — all client threads joined.)
     }
 }

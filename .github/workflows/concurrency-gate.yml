@@ -1,0 +1,60 @@
+name: Concurrency gate
+
+# Guards the #397 fix (nested pooled-connection draws) at 2x pool
+# oversubscription: 32 concurrent clients against a 16-connection pool, driven
+# through the REAL HTTP transport. Before the fix this exact configuration
+# browned out (174 req/s, 30s max latency, failed writes) and 4x hard-wedged;
+# after it, the run must complete with zero errors, every write persisted, and
+# the wall well inside the 60s budget. The four named hammer tests then pin
+# the per-subsystem concurrency invariants (audited-writer history, link/edge
+# durability, follow increments, pool starvation) so a failure names the
+# subsystem that regressed. Lean build (--no-default-features): the pool
+# behavior under test is independent of the embedding stack, and the lean
+# build keeps the gate fast. (#404)
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/concurrency-gate.yml"
+  pull_request:
+    branches: [main, master]
+    paths:
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/concurrency-gate.yml"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  concurrency-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Build (lean, release)
+        run: cargo build --release --no-default-features --tests
+      - name: Pool load test at 2x oversubscription (32 clients / pool 16)
+        env:
+          MIMIR_LOADTEST_CLIENTS: "32"
+          MIMIR_LOADTEST_WRITES: "25"
+          MIMIR_LOADTEST_READS: "75"
+          MIMIR_POOL_MAX_SIZE: "16"
+          MIMIR_BUSY_TIMEOUT_MS: "5000"
+          MIMIR_LOADTEST_MAX_WALL_SECS: "60"
+        run: |
+          cargo test --release --no-default-features \
+            pool_load_test_http_transport -- --ignored --nocapture
+      - name: Concurrency hammer tests
+        run: |
+          cargo test --release --no-default-features -- \
+            concurrent_audited_writers_serialize_without_corrupting_history \
+            concurrent_links_and_remembers_do_not_lose_edges \
+            concurrent_follows_do_not_lose_increments \
+            many_concurrent_linkers_do_not_starve_the_pool
