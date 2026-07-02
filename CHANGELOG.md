@@ -24,6 +24,12 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
   entities across clusters instead of only the nearest one). Communities are
   persisted in a new `communities` table (schema v8); `mimir_stats` now
   reports `total_communities` and `graph_modularity`.
+- `mimir_dream` — sleep-time LLM consolidation of episodic → semantic memory:
+  clusters related cold memories per category, reflects over each cluster via
+  the configured `--llm-endpoint`, and writes back provenance-linked semantic
+  insights (`evidence_for` to every source, `derivation: "dream"`, idempotent
+  by evidence-set hash, contradiction-aware, bounded budgets, dry-run;
+  verified/importance-floored sources never archived). 53rd MCP tool (#364)
 
 ### Fixed
 - Context injection relevance gating (#356): `context`/`prepare` no longer

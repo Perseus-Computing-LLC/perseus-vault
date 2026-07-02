@@ -2123,6 +2123,113 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
     "title": "Consolidate Overlapping Facts into Observations"
   },
   {
+    "name": "mimir_dream",
+    "description": "Sleep-time LLM consolidation: batch clusters of related cold/episodic memories, reflect over each cluster via the configured LLM endpoint, and write back durable higher-order SEMANTIC insights (category='insight', semantic layer) — 'given these N memories, what stable pattern/preference/fact do they collectively imply?'. Each written insight carries evidence_for links to every source entity (full provenance), a certainty blended from LLM confidence and evidence coverage, and derivation='dream' so it is auditable and reversible. Idempotent: insights are keyed by an evidence-set hash, so re-dreaming an unchanged cluster never spawns duplicates. Contradictory sources surface as a flagged 'contradiction' insight, never a silent merge. Never fabricates: clusters that support no durable generalization are a no-op. Requires --llm-endpoint (fully local via Ollama); returns a clean error without it unless fallback_consolidate=true, which runs the non-LLM mimir_consolidate pass instead. Bounded by max_entities/max_clusters budgets. Preview with dry_run=true.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "category": {
+          "type": "string",
+          "description": "Category to dream over. Omit to scan all categories (derived categories — insight, observation, synthesis, memories — are always skipped) until the entity budget is exhausted."
+        },
+        "topic_path": {
+          "type": "string",
+          "description": "Optional topic_path prefix filter applied to the scan."
+        },
+        "similarity_threshold": {
+          "type": "number",
+          "default": 0.3,
+          "description": "Trigram similarity threshold for grouping RELATED memories into one cluster. Lower than consolidate's 0.6 on purpose: dreaming wants thematic neighborhoods, not near-duplicates."
+        },
+        "max_entities": {
+          "type": "integer",
+          "default": 100,
+          "description": "Budget cap: maximum entities scanned per run (across categories)."
+        },
+        "max_clusters": {
+          "type": "integer",
+          "default": 5,
+          "description": "Budget cap: maximum clusters sent to the LLM per run (= max LLM calls)."
+        },
+        "min_cluster_size": {
+          "type": "integer",
+          "default": 2,
+          "description": "Minimum memories a cluster needs before it is worth dreaming over."
+        },
+        "dry_run": {
+          "type": "boolean",
+          "default": false,
+          "description": "Report candidate insights and their evidence sets without writing anything."
+        },
+        "cold_first": {
+          "type": "boolean",
+          "default": true,
+          "description": "Scan the COLDEST entities first (longest since last access) — consolidate fading memories into durable semantic insights before decay claims them."
+        },
+        "archive_sources": {
+          "type": "boolean",
+          "default": false,
+          "description": "Archive source entities once an insight citing them is written (archive_reason names the insight; reversible). Verified or importance-floored sources are never archived; contradiction sources always stay live."
+        },
+        "fallback_consolidate": {
+          "type": "boolean",
+          "default": false,
+          "description": "When no --llm-endpoint is configured, run the mechanical (non-LLM) mimir_consolidate cold_first pass instead of returning an error."
+        }
+      },
+      "required": []
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "categories_scanned": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "entities_examined": {
+          "type": "integer",
+          "description": "Number of entities scanned across all categories this run"
+        },
+        "clusters_dreamed": {
+          "type": "integer",
+          "description": "Clusters actually sent to the LLM this run"
+        },
+        "insights_written": {
+          "type": "integer",
+          "description": "Semantic insights written (or that would be, in dry-run)"
+        },
+        "insights_deduped": {
+          "type": "integer",
+          "description": "Insights skipped because the identical evidence set was already dreamed"
+        },
+        "contradictions_flagged": {
+          "type": "integer",
+          "description": "Insights flagged as contradictions among their sources"
+        },
+        "sources_archived": {
+          "type": "integer",
+          "description": "Sources archived because archive_sources was set (verified/importance-floored sources are exempt)"
+        },
+        "dry_run": {
+          "type": "boolean"
+        },
+        "insights": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          },
+          "description": "The insights written (or previewed), each with entity_id, key, summary, insight_type, confidence, source_ids, category, contradiction, deduped"
+        }
+      }
+    },
+    "annotations": {
+      "readOnlyHint": false
+    },
+    "title": "Dream: LLM Consolidation of Episodic Memory into Semantic Insights"
+  },
+  {
     "name": "mimir_vault_export",
     "description": "Export all non-archived entities to .md files with YAML frontmatter in a vault directory. Files are human-readable, git-trackable, and Obsidian-compatible. Use this for backup, transfer between workspaces, or offline review.",
     "inputSchema": {
@@ -3208,6 +3315,7 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
         "mimir_follow" => tools::handle_follow(db, args).map_err(|e| e.to_string()),
         "mimir_conflicts" => Ok(tools::handle_conflicts(db, args)),
         "mimir_consolidate" => Ok(tools::handle_consolidate(db, args)),
+        "mimir_dream" => tools::handle_dream(db, args),
         "mimir_vault_export" => Ok(tools::handle_vault_export(db, args)),
         "mimir_vault_import" => Ok(tools::handle_vault_import(db, args)),
         "mimir_decay" => Ok(tools::handle_decay(db, args)),
@@ -3267,6 +3375,49 @@ fn error_response(id: Option<Value>, code: i64, message: &str) -> JsonRpcRespons
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn dream_is_registered_with_aliases_and_errors_cleanly_without_llm() {
+        // tools/list must expose mimir_dream and its rename-transition aliases.
+        let listed = list_tools(Some(json!(1)));
+        let tools_json = serde_json::to_string(&listed.result).unwrap();
+        for name in ["\"mimir_dream\"", "\"mneme_dream\"", "\"perseus_vault_dream\""] {
+            assert!(tools_json.contains(name), "tools/list missing {name}");
+        }
+
+        let db_path = std::env::temp_dir()
+            .join(format!("mimir-dream-{}.db", uuid::Uuid::new_v4()));
+        let db = Database::open(db_path.to_str().expect("temp db path")).expect("open temp db");
+
+        // No --llm-endpoint configured: the tool must answer with a clean MCP
+        // tool error (isError, spec §3.3) — never a crash or protocol error —
+        // and the message must name the flag and the non-LLM alternative.
+        let r = call_tool("mimir_dream", &db, json!({"category": "episodes"}), None);
+        let v: Value = serde_json::from_str(&r).unwrap();
+        assert_eq!(v["isError"], json!(true), "got: {r}");
+        let msg = v["content"][0]["text"].as_str().unwrap();
+        assert!(msg.contains("--llm-endpoint"), "got: {msg}");
+        assert!(msg.contains("mimir_consolidate"), "got: {msg}");
+
+        // Alias prefixes normalize into the same handler.
+        let r = call_tool("perseus_vault_dream", &db, json!({}), None);
+        let v: Value = serde_json::from_str(&r).unwrap();
+        assert_eq!(v["isError"], json!(true));
+
+        // Opt-in graceful degradation: fallback_consolidate runs the non-LLM
+        // consolidate pass instead of erroring, and says so.
+        let r = call_tool(
+            "mimir_dream",
+            &db,
+            json!({"fallback_consolidate": true, "dry_run": true}),
+            None,
+        );
+        let v: Value = serde_json::from_str(&r).unwrap();
+        assert_eq!(v["fallback"], json!("consolidate"), "got: {r}");
+        assert_eq!(v["dry_run"], json!(true));
+
+        let _ = fs::remove_file(&db_path);
+    }
 
     #[test]
     fn memories_adapter_full_lifecycle_roundtrip() {
