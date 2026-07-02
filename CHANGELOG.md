@@ -134,11 +134,11 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
   verdicts (rollback-safe; dropping the two side tables is also always a
   safe reset). The lazy write-back re-verifies the row's current body
   under the write lock before landing, so a backfill can never overwrite
-  the fresher signature a concurrent update just committed. Measured (release,
-  1KB uniform-length bodies — the length prefilter's worst case; medians
-  over 15 probes): single-insert dedup scan @50k 1628.5ms → 69.3ms
-  (23.5x); bulk import of 5,000 (fresh store, dedup ON) 123.6s (pre, per
-  #392) → 11.8s total (~10x). The opt-in `MIMIR_DEDUP_FTS_PREFILTER` path
+  the fresher signature a concurrent update just committed. Measured
+  (release, 1KB uniform-length bodies — the length prefilter's worst
+  case; medians over 15 probes, same run for both paths): single-insert
+  dedup scan @50k 1363.3ms → 89.4ms (15.3x); bulk import of 5,000
+  (fresh store, dedup ON) 123.6s (pre, per #392) → 15.1s total (~8x). The opt-in `MIMIR_DEDUP_FTS_PREFILTER` path
   is unchanged and composes with the stored signatures.
 - `follow()`'s row resolution no longer collapses real DB errors into
   "not found" (#396, the #394 principle): only `QueryReturnedNoRows` maps to
