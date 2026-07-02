@@ -6072,24 +6072,29 @@ Return a JSON object with an "insights" array. Each insight has:
             "event_type != 'redacted' AND (entity_id = ?1 OR (category = ?2 AND key = ?3 AND key != ''))";
 
         if dry_run {
-            let mut hist = 0i64;
-            let mut jrn = 0i64;
+            // Dedupe by row id: two doomed entities sharing (category, key)
+            // across workspaces match the SAME journal rows — the real run
+            // redacts them once (the second UPDATE's `!= 'redacted'` guard
+            // skips them), so the preview must count them once too.
+            let mut hist: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut jrn: std::collections::HashSet<String> = std::collections::HashSet::new();
             for (id, cat, key, ws) in &doomed {
-                hist += conn.query_row(
-                    &format!("SELECT COUNT(*) FROM entity_history WHERE {HIST_MATCH}"),
-                    params![id, cat, key, ws],
-                    |r| r.get::<_, i64>(0),
+                let mut stmt = conn.prepare(
+                    &format!("SELECT history_id FROM entity_history WHERE {HIST_MATCH}"),
                 )?;
-                jrn += conn.query_row(
-                    &format!("SELECT COUNT(*) FROM journal WHERE {JRN_MATCH}"),
-                    params![id, cat, key],
-                    |r| r.get::<_, i64>(0),
-                )?;
+                for row in stmt.query_map(params![id, cat, key, ws], |r| r.get::<_, String>(0))? {
+                    hist.insert(row?);
+                }
+                let mut stmt =
+                    conn.prepare(&format!("SELECT id FROM journal WHERE {JRN_MATCH}"))?;
+                for row in stmt.query_map(params![id, cat, key], |r| r.get::<_, String>(0))? {
+                    jrn.insert(row?);
+                }
             }
             return Ok(PurgeReport {
                 entities_deleted: count,
-                history_rows_deleted: hist,
-                journal_rows_redacted: jrn,
+                history_rows_deleted: hist.len() as i64,
+                journal_rows_redacted: jrn.len() as i64,
                 bytes_freed: 0,
                 dry_run: true,
                 completed_at_unix_ms: now_ms(),
@@ -15826,6 +15831,48 @@ mod tests {
             "as_of must not resurrect an erased fact"
         );
 
+        let _ = fs::remove_file(&path);
+    }
+
+    /// #398: two archived rows sharing (category, key) across workspaces
+    /// match the SAME journal rows — the dry_run preview must dedupe them
+    /// exactly like the real run's `!= 'redacted'` guard does.
+    #[test]
+    fn purge_dry_run_dedupes_journal_rows_shared_across_workspaces() {
+        let (db, path) = temp_db();
+        let mut e1 = make_entity("e-ws-a", "facts", "shared", r#"{"n":"a"}"#);
+        e1.workspace_hash = "wsA".to_string();
+        db.remember(&e1).unwrap();
+        let mut e2 = make_entity("e-ws-b", "facts", "shared", r#"{"n":"b"}"#);
+        e2.workspace_hash = "wsB".to_string();
+        db.remember(&e2).unwrap();
+
+        // One journal row referencing the key only (no entity_id): both
+        // doomed entities match it via the category/key predicate.
+        db.journal(&crate::models::JournalEvent {
+            id: "jrn-ws-shared".to_string(),
+            event_type: "decision".to_string(),
+            evaluated_json: r#"{"k":"shared"}"#.to_string(),
+            acted_json: "{}".to_string(),
+            forward_json: "{}".to_string(),
+            category: "facts".to_string(),
+            key: "shared".to_string(),
+            entity_id: String::new(),
+            agent_id: "test".to_string(),
+            created_at_unix_ms: now_ms(),
+        })
+        .unwrap();
+
+        assert!(db.forget("facts", "shared", "test").unwrap()); // archives both
+        let dry = db.purge(true).unwrap();
+        assert_eq!(dry.entities_deleted, 2);
+        assert_eq!(
+            dry.journal_rows_redacted, 1,
+            "the shared journal row must be counted once, not once per entity"
+        );
+        let actual = db.purge(false).unwrap();
+        assert_eq!(dry.journal_rows_redacted, actual.journal_rows_redacted);
+        assert_eq!(dry.history_rows_deleted, actual.history_rows_deleted);
         let _ = fs::remove_file(&path);
     }
 
