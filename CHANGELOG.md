@@ -35,6 +35,19 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
 - `mimir_stats` reports history growth (#398): `total_history_rows`,
   `history_bytes` (stored body bytes), and `top_history_keys` (top-10 keys by
   version count with bytes) — the hot state-like keys to cap first.
+- `perf-gate` CI workflow (#404, completing the issue — the concurrency half
+  shipped as `concurrency-gate`): a release-build gate that seeds temp DBs
+  via the fastest direct-SQL path and pins the 2026-07-02 capacity-deep-dive
+  baselines with 3-5× CI-variance headroom — rare-term FTS recall, browse and
+  get_entity p50 @100k, as_of p50 @50k history versions of one key,
+  decay_tick wall @100k plus the #399 regression signature (second
+  consecutive tick rewrites < 1% of rows, WAL growth < 2× DB size), cohere
+  wall @100k plus the post-#400 longest single writer-lock hold < 1s
+  (measured with the #400 BEGIN IMMEDIATE probe), and on-disk history bytes
+  per superseded version at a ~1KB body. Medians of 5 for latency metrics;
+  every metric prints a `PERF-GATE |` table row to the job log so a
+  regression is diagnosable from the run. Budgets and corpus sizes are pinned
+  as env vars in the workflow.
 - `mimir_follow` accepts an optional `workspace_hash` (#396, the #338
   pattern): when set, the efficacy stamp resolves its target row with strict
   workspace equality — the same semantics as a workspace-scoped recall — so a

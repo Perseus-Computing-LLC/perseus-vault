@@ -9158,10 +9158,51 @@ mod tests {
         let _ = fs::remove_file(&path);
     }
 
-    /// #400 lock-window measurement — not a CI gate. Seeds a large store and
-    /// measures the LONGEST SINGLE writer-lock hold during cohere (the
-    /// issue's metric: one pre-fix hold spanning the whole pass is what
-    /// crosses busy_timeout in the field). Run explicitly:
+    /// Writer-lock HOLD probe (#400, reused by the #404 perf gate):
+    /// busy_timeout=0 makes each BEGIN IMMEDIATE attempt fail instantly while
+    /// another writer transaction is open, so polling every 1ms and tracking
+    /// the longest CONTINUOUS busy span measures the longest single
+    /// writer-lock hold (±1ms poll resolution). cohere's chunked pass yields
+    /// 2ms between chunk transactions, so consecutive chunk holds register as
+    /// separate spans — exactly the window a fine-grained waiter can actually
+    /// use. Set `done` and join to collect the longest hold observed.
+    fn spawn_lock_hold_probe(
+        probe_path: String,
+        probe_done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> std::thread::JoinHandle<std::time::Duration> {
+        use std::sync::atomic::Ordering;
+        use std::time::{Duration, Instant};
+        std::thread::spawn(move || -> Duration {
+            let conn = rusqlite::Connection::open(&probe_path).unwrap();
+            conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=0;")
+                .unwrap();
+            let mut max_hold = Duration::ZERO;
+            let mut busy_since: Option<Instant> = None;
+            while !probe_done.load(Ordering::Relaxed) {
+                match conn.execute_batch("BEGIN IMMEDIATE; COMMIT;") {
+                    Ok(()) => {
+                        if let Some(s) = busy_since.take() {
+                            max_hold = max_hold.max(s.elapsed());
+                        }
+                    }
+                    Err(_) => {
+                        busy_since.get_or_insert_with(Instant::now);
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            if let Some(s) = busy_since {
+                max_hold = max_hold.max(s.elapsed());
+            }
+            max_hold
+        })
+    }
+
+    /// #400 lock-window measurement — not a CI gate (the CI gate is
+    /// `perf_gate_cohere_at_100k`, #404). Seeds a large store and measures the
+    /// LONGEST SINGLE writer-lock hold during cohere (the issue's metric: one
+    /// pre-fix hold spanning the whole pass is what crosses busy_timeout in
+    /// the field). Run explicitly:
     ///
     /// ```text
     /// MIMIR_COHERE_MEASURE_ROWS=100000 \
@@ -9188,40 +9229,7 @@ mod tests {
         eprintln!("seeded {rows} rows in {:.2}s", seed_start.elapsed().as_secs_f64());
 
         let done = Arc::new(AtomicBool::new(false));
-        let probe_path = path.clone();
-        let probe_done = Arc::clone(&done);
-        let probe = std::thread::spawn(move || -> Duration {
-            // Writer-lock HOLD probe: busy_timeout=0 makes each BEGIN
-            // IMMEDIATE attempt fail instantly while another writer
-            // transaction is open, so polling every 1ms and tracking the
-            // longest CONTINUOUS busy span measures the longest single
-            // writer-lock hold (±1ms poll resolution). cohere's chunked pass
-            // yields 2ms between chunk transactions, so consecutive chunk
-            // holds register as separate spans — exactly the window a
-            // fine-grained waiter can actually use.
-            let conn = rusqlite::Connection::open(&probe_path).unwrap();
-            conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=0;")
-                .unwrap();
-            let mut max_hold = Duration::ZERO;
-            let mut busy_since: Option<Instant> = None;
-            while !probe_done.load(Ordering::Relaxed) {
-                match conn.execute_batch("BEGIN IMMEDIATE; COMMIT;") {
-                    Ok(()) => {
-                        if let Some(s) = busy_since.take() {
-                            max_hold = max_hold.max(s.elapsed());
-                        }
-                    }
-                    Err(_) => {
-                        busy_since.get_or_insert_with(Instant::now);
-                    }
-                }
-                std::thread::sleep(Duration::from_millis(1));
-            }
-            if let Some(s) = busy_since {
-                max_hold = max_hold.max(s.elapsed());
-            }
-            max_hold
-        });
+        let probe = spawn_lock_hold_probe(path.clone(), Arc::clone(&done));
 
         let params = crate::models::CohereParams {
             dry_run: false,
@@ -9254,6 +9262,445 @@ mod tests {
             "longest single writer-lock hold during cohere was {:.3}s — issue #400 targets <1s",
             max_hold.as_secs_f64()
         );
+    }
+
+    // ───────────────── #404: perf gate (CI) ─────────────────
+    //
+    // Release-build performance gate pinning the 2026-07-02 capacity
+    // deep-dive baselines (#404). Each perf_gate_* test seeds its own temp DB
+    // via the fastest direct-SQL path (no dedup/embed side effects — the
+    // SQLite costs under test are independent of the embedding stack, so the
+    // gate runs on the lean build), measures medians of 5 for latency
+    // metrics, prints one `PERF-GATE |` table row per metric, and asserts the
+    // issue's budgets. The budgets already carry 3-5x headroom over the
+    // measured baselines for CI variance; .github/workflows/perf-gate.yml
+    // pins them via env so the numbers are visible next to the workflow.
+    // Failures are collected per test so the FULL table still prints when one
+    // metric regresses.
+    //
+    // Run locally (release; on Windows use the MSVC toolchain):
+    //
+    // ```text
+    // cargo test --release --no-default-features perf_gate_ -- \
+    //   --ignored --nocapture --test-threads=1
+    // ```
+
+    fn gate_env_f64(name: &str, default: f64) -> f64 {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
+    }
+
+    fn gate_env_usize(name: &str, default: usize) -> usize {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
+    }
+
+    /// Median-of-5 wall time in ms for `op`, after one untimed warmup run
+    /// (cache/page warmup — the budgets pin steady-state latency, not first
+    /// touch).
+    fn gate_median_of_5_ms(mut op: impl FnMut()) -> f64 {
+        op();
+        let mut samples: Vec<f64> = (0..5)
+            .map(|_| {
+                let t = std::time::Instant::now();
+                op();
+                t.elapsed().as_secs_f64() * 1000.0
+            })
+            .collect();
+        samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        samples[2]
+    }
+
+    /// Print one metrics-table row and record a failure (instead of asserting
+    /// inline) so every row of the table reaches the job log even when an
+    /// early metric regresses.
+    fn gate_check(failures: &mut Vec<String>, metric: &str, value: f64, budget: f64, unit: &str) {
+        let verdict = if value < budget { "ok" } else { "FAIL" };
+        eprintln!(
+            "PERF-GATE | {metric:<46} | {value:>12.3} {unit:<7} | budget < {budget:>10.3} {unit:<7} | {verdict}"
+        );
+        if value >= budget {
+            failures.push(format!(
+                "{metric}: {value:.3} {unit} exceeded budget {budget:.3} {unit}"
+            ));
+        }
+    }
+
+    fn gate_assert_ok(failures: Vec<String>) {
+        assert!(
+            failures.is_empty(),
+            "perf gate budgets exceeded (#404):\n  {}",
+            failures.join("\n  ")
+        );
+    }
+
+    /// #404 perf-gate corpus: `n` rows via the fastest insert path (batched
+    /// direct-SQL transactions, FTS kept in sync, no dedup/embed side
+    /// effects — same seeding approach as `bench_401_fts_recall_selectivity`).
+    /// "raretoken" hits n/5000 rows (20 @100k), "alpha" ~n/3; keys are
+    /// `entity-NNNNNN`. `last_accessed_ms` is caller-set: the decay gate
+    /// needs "just accessed" rows so the recomputed score is ~1.0.
+    fn seed_perf_corpus(db: &Database, n: usize, last_accessed_ms: i64) {
+        for chunk in (0..n).collect::<Vec<_>>().chunks(5000) {
+            let conn = db.conn().unwrap();
+            let tx = conn.unchecked_transaction().unwrap();
+            for i in chunk {
+                let i = *i;
+                let body = format!(
+                    r#"{{"content":"entity-{:06} number {} with some searchable text {} {} {}"}}"#,
+                    i,
+                    i,
+                    if i % 3 == 0 { "alpha" } else { "" },
+                    if i % 5 == 0 { "beta" } else { "" },
+                    if i % 5000 == 0 { "raretoken" } else { "" },
+                );
+                tx.execute(
+                    "INSERT INTO entities (id, category, key, body_json, type, status, retrieval_count,
+                                           last_accessed_unix_ms, created_at_unix_ms, decay_score, layer)
+                     VALUES (?1, 'benchmark', ?2, ?3, 'insight', 'active', ?4, ?5, ?5, 0.5, 'working')",
+                    params![
+                        format!("ent-{:06}", i),
+                        format!("entity-{:06}", i),
+                        body,
+                        (i % 100) as i64,
+                        last_accessed_ms
+                    ],
+                )
+                .unwrap();
+                tx.execute(
+                    "INSERT INTO entities_fts(rowid, body_json) VALUES (last_insert_rowid(), ?1)",
+                    params![body],
+                )
+                .unwrap();
+            }
+            tx.commit().unwrap();
+        }
+    }
+
+    /// #404: read-path latencies at 100k entities. Baselines (2026-07-02
+    /// deep-dive, re-validated post-#401): rare-term FTS recall 6.4ms
+    /// (~0.08ms after #401), browse 35µs, get_entity 41µs.
+    #[test]
+    #[ignore = "perf gate (#404): run in release via perf-gate.yml or locally with --ignored"]
+    fn perf_gate_reads_at_100k() {
+        use std::time::Instant;
+        let n = gate_env_usize("MIMIR_PERF_ROWS", 100_000);
+        let (db, path) = temp_db();
+        let seed_start = Instant::now();
+        seed_perf_corpus(&db, n, now_ms());
+        eprintln!("perf_gate_reads: seeded {n} rows in {:.2}s", seed_start.elapsed().as_secs_f64());
+
+        let recall_p50 = |query: &str| {
+            gate_median_of_5_ms(|| {
+                let r = db
+                    .recall(&crate::models::RecallParams {
+                        query: query.to_string(),
+                        limit: 10,
+                        skip_side_effects: true,
+                        ..Default::default()
+                    })
+                    .unwrap();
+                assert!(!r.is_empty(), "recall({query:?}) returned no rows");
+            })
+        };
+
+        let mut failures = Vec::new();
+        gate_check(
+            &mut failures,
+            "recall FTS rare-term @100k p50",
+            recall_p50("raretoken"),
+            gate_env_f64("MIMIR_PERF_BUDGET_RECALL_RARE_MS", 30.0),
+            "ms",
+        );
+        gate_check(
+            &mut failures,
+            "recall browse (empty query) @100k p50",
+            recall_p50(""),
+            gate_env_f64("MIMIR_PERF_BUDGET_BROWSE_MS", 5.0),
+            "ms",
+        );
+        gate_check(
+            &mut failures,
+            "get_entity @100k p50",
+            gate_median_of_5_ms(|| {
+                let key = format!("entity-{:06}", n / 2);
+                assert!(
+                    db.get_entity("benchmark", &key).unwrap().is_some(),
+                    "seeded entity {key} must resolve"
+                );
+            }),
+            gate_env_f64("MIMIR_PERF_BUDGET_GET_ENTITY_MS", 1.0),
+            "ms",
+        );
+        let _ = fs::remove_file(&path);
+        gate_assert_ok(failures);
+    }
+
+    /// #404: as_of point lookup against 50k history versions of ONE key —
+    /// the idx_entity_history_catkey seek must keep time-travel O(log n),
+    /// not O(versions). Baseline: 17µs.
+    #[test]
+    #[ignore = "perf gate (#404): run in release via perf-gate.yml or locally with --ignored"]
+    fn perf_gate_as_of_at_50k_history() {
+        use std::time::Instant;
+        let n = gate_env_usize("MIMIR_PERF_HISTORY_ROWS", 50_000);
+        let (db, path) = temp_db();
+
+        // One live row + n history versions, version i live during
+        // [2i, 2i+2) — contiguous half-open intervals, exactly what
+        // remember-supersession produces.
+        let seed_start = Instant::now();
+        {
+            let conn = db.conn().unwrap();
+            conn.execute(
+                "INSERT INTO entities (id, category, key, body_json, type, status, retrieval_count,
+                                       last_accessed_unix_ms, created_at_unix_ms, recorded_at_unix_ms,
+                                       decay_score, layer)
+                 VALUES ('asof-live', 'bench', 'asof-key', '{\"content\":\"live version\"}', 'insight',
+                         'active', 0, ?1, ?1, ?1, 0.5, 'working')",
+                params![2 * n as i64],
+            )
+            .unwrap();
+            for chunk in (0..n).collect::<Vec<_>>().chunks(5000) {
+                let tx = conn.unchecked_transaction().unwrap();
+                for i in chunk {
+                    let i = *i as i64;
+                    tx.execute(
+                        "INSERT INTO entity_history (history_id, id, category, key, body_json,
+                                                     recorded_at_unix_ms, invalidated_at_unix_ms,
+                                                     superseded_by, created_at_unix_ms, last_accessed_unix_ms)
+                         VALUES (?1, 'asof-live', 'bench', 'asof-key', ?2, ?3, ?4, 'asof-live', ?3, ?3)",
+                        params![
+                            format!("hist-{i:06}"),
+                            format!("{{\"content\":\"superseded version {i:06}\"}}"),
+                            2 * i,
+                            2 * i + 2
+                        ],
+                    )
+                    .unwrap();
+                }
+                tx.commit().unwrap();
+            }
+        }
+        eprintln!(
+            "perf_gate_as_of: seeded {n} history rows in {:.2}s",
+            seed_start.elapsed().as_secs_f64()
+        );
+
+        // Probe an instant in the middle of the version chain.
+        let t_mid = n as i64; // inside version n/2's [2i, 2i+2) interval
+        let mut failures = Vec::new();
+        gate_check(
+            &mut failures,
+            "as_of @50k history rows (one key) p50",
+            gate_median_of_5_ms(|| {
+                let hit = db.as_of("bench", "asof-key", t_mid).unwrap();
+                assert!(hit.is_some(), "as_of must resolve a mid-chain version");
+            }),
+            gate_env_f64("MIMIR_PERF_BUDGET_AS_OF_MS", 1.0),
+            "ms",
+        );
+        let _ = fs::remove_file(&path);
+        gate_assert_ok(failures);
+    }
+
+    /// #404: decay_tick at 100k. Tick 1 rewrites the whole seeded corpus
+    /// (decay 0.5 -> ~1.0, the conservative full-write case; baseline wall
+    /// 2.2-3.1s). Tick 2 immediately after must be a ~no-op (#399/#405
+    /// epsilon skip): < 1% of rows physically rewritten and WAL growth
+    /// < 2x DB size — the #399 regression signature (412MB WAL per tick on a
+    /// 45MB DB) that wall time alone won't catch.
+    #[test]
+    #[ignore = "perf gate (#404): run in release via perf-gate.yml or locally with --ignored"]
+    fn perf_gate_decay_tick_at_100k() {
+        use std::time::Instant;
+        let n = gate_env_usize("MIMIR_PERF_ROWS", 100_000);
+        let (db, path) = temp_db();
+        let seed_start = Instant::now();
+        seed_perf_corpus(&db, n, now_ms());
+        eprintln!("perf_gate_decay: seeded {n} rows in {:.2}s", seed_start.elapsed().as_secs_f64());
+
+        let mut failures = Vec::new();
+
+        let t1 = Instant::now();
+        let rep1 = db.decay_tick().expect("first decay tick");
+        let wall1 = t1.elapsed().as_secs_f64();
+        assert_eq!(rep1.entities_checked, n as i64);
+        gate_check(
+            &mut failures,
+            "decay_tick @100k wall (full rewrite)",
+            wall1,
+            gate_env_f64("MIMIR_PERF_BUDGET_DECAY_WALL_S", 10.0),
+            "s",
+        );
+
+        // Reset the WAL so tick 2's growth is measured from ~zero, and pin
+        // the checkpointed DB size the ratio is judged against.
+        {
+            let conn = db.conn().unwrap();
+            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+        }
+        let db_size = fs::metadata(&path).expect("db file").len();
+
+        let t2 = Instant::now();
+        let rep2 = db.decay_tick().expect("second decay tick");
+        let wall2 = t2.elapsed().as_secs_f64();
+        let wal_size = fs::metadata(format!("{path}-wal")).map(|m| m.len()).unwrap_or(0);
+        eprintln!(
+            "perf_gate_decay: tick1 updated {} rows in {wall1:.3}s; tick2 updated {} rows in {wall2:.3}s; \
+             db={db_size}B wal={wal_size}B",
+            rep1.entities_updated, rep2.entities_updated
+        );
+        gate_check(
+            &mut failures,
+            "decay_tick second-consecutive updated rows",
+            rep2.entities_updated as f64 * 100.0 / n as f64,
+            gate_env_f64("MIMIR_PERF_BUDGET_DECAY_SECOND_TICK_PCT", 1.0),
+            "%",
+        );
+        gate_check(
+            &mut failures,
+            "decay_tick second-tick WAL growth / DB size",
+            wal_size as f64 / db_size as f64,
+            gate_env_f64("MIMIR_PERF_BUDGET_DECAY_WAL_RATIO", 2.0),
+            "x",
+        );
+        let _ = fs::remove_file(&path);
+        gate_assert_ok(failures);
+    }
+
+    /// #404: cohere at 100k — wall budget plus the post-#400 bound on the
+    /// LONGEST single writer-lock hold (measured with the same BEGIN
+    /// IMMEDIATE probe as `cohere_lock_window_measurement`). Pre-#400 the
+    /// decay pass held ONE lock linear in store size (~4.4s @100k).
+    #[test]
+    #[ignore = "perf gate (#404): run in release via perf-gate.yml or locally with --ignored"]
+    fn perf_gate_cohere_at_100k() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use std::time::Instant;
+
+        let n = gate_env_usize("MIMIR_PERF_ROWS", 100_000);
+        let (db, path) = temp_db();
+        let seed_start = Instant::now();
+        {
+            let conn = db.conn().unwrap();
+            seed_bulk_entities(&conn, n, "perfgate");
+        }
+        eprintln!("perf_gate_cohere: seeded {n} rows in {:.2}s", seed_start.elapsed().as_secs_f64());
+
+        let done = Arc::new(AtomicBool::new(false));
+        let probe = spawn_lock_hold_probe(path.clone(), Arc::clone(&done));
+
+        let params = crate::models::CohereParams {
+            dry_run: false,
+            max_links: 20,
+            promote_threshold: 0,
+            archive_threshold: 0.0,
+        };
+        let t = Instant::now();
+        let report = db.cohere(&params).expect("cohere must succeed at 100k");
+        let wall = t.elapsed().as_secs_f64();
+        done.store(true, Ordering::Relaxed);
+        let max_hold = probe.join().expect("probe thread panicked");
+        eprintln!(
+            "perf_gate_cohere: promoted={} decayed={} linked={} archived={}",
+            report.promoted, report.decayed, report.linked, report.archived
+        );
+
+        let mut failures = Vec::new();
+        gate_check(
+            &mut failures,
+            "cohere @100k wall",
+            wall,
+            gate_env_f64("MIMIR_PERF_BUDGET_COHERE_WALL_S", 5.0),
+            "s",
+        );
+        gate_check(
+            &mut failures,
+            "cohere @100k longest writer-lock hold",
+            max_hold.as_secs_f64() * 1000.0,
+            gate_env_f64("MIMIR_PERF_BUDGET_COHERE_HOLD_MS", 1000.0),
+            "ms",
+        );
+        let _ = fs::remove_file(&path);
+        gate_assert_ok(failures);
+    }
+
+    /// #404: on-disk history cost per superseded version at a ~1KB body.
+    /// Baseline 1,448 bytes/row. Preferred measure is dbstat (exact pages
+    /// owned by entity_history); if this SQLite build lacks the DBSTAT vtab
+    /// the fallback is the checkpointed whole-file delta per version — a
+    /// strictly more conservative number (it also counts the entities/FTS
+    /// churn of the same writes).
+    #[test]
+    #[ignore = "perf gate (#404): run in release via perf-gate.yml or locally with --ignored"]
+    fn perf_gate_history_bytes_per_row() {
+        let versions = gate_env_usize("MIMIR_PERF_HISTORY_VERSIONS", 200);
+        let (db, path) = temp_db();
+
+        // ~1KB body, unique per version so every remember() supersedes.
+        let filler = "h".repeat(940);
+        let body = |i: usize| format!(r#"{{"content":"history bytes probe version {i:06} {filler}"}}"#);
+
+        db.remember(&make_entity("hb-0", "bench", "hb-key", &body(0))).unwrap();
+
+        let table_bytes = |name: &str| -> Option<u64> {
+            let conn = db.conn().unwrap();
+            conn.query_row(
+                "SELECT COALESCE(SUM(pgsize), 0) FROM dbstat WHERE name = ?1",
+                params![name],
+                |r| r.get::<_, i64>(0),
+            )
+            .ok()
+            .map(|v| v as u64)
+        };
+        let checkpointed_file_size = || -> u64 {
+            let conn = db.conn().unwrap();
+            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+            fs::metadata(&path).expect("db file").len()
+        };
+
+        let hist_before = table_bytes("entity_history");
+        let file_before = checkpointed_file_size();
+
+        for i in 1..=versions {
+            db.remember(&make_entity("hb-0", "bench", "hb-key", &body(i))).unwrap();
+        }
+
+        let rows: i64 = {
+            let conn = db.conn().unwrap();
+            conn.query_row("SELECT COUNT(*) FROM entity_history", [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(rows, versions as i64, "every superseding write must snapshot one version");
+
+        let (bytes_per_row, method) = match (hist_before, table_bytes("entity_history")) {
+            (Some(before), Some(after)) => (((after - before) as f64) / rows as f64, "dbstat"),
+            _ => {
+                let file_after = checkpointed_file_size();
+                (
+                    ((file_after.saturating_sub(file_before)) as f64) / rows as f64,
+                    "file-delta",
+                )
+            }
+        };
+        eprintln!("perf_gate_history: {rows} versions at ~1KB body, measured via {method}");
+
+        let mut failures = Vec::new();
+        gate_check(
+            &mut failures,
+            "history bytes/row @1KB body",
+            bytes_per_row,
+            gate_env_f64("MIMIR_PERF_BUDGET_HISTORY_BYTES_PER_ROW", 2048.0),
+            "B",
+        );
+        let _ = fs::remove_file(&path);
+        gate_assert_ok(failures);
     }
 
     #[test]

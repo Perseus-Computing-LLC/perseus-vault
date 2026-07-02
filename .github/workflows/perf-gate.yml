@@ -1,0 +1,66 @@
+name: Perf gate
+
+# Pins the 2026-07-02 capacity-deep-dive baselines (#404): release build,
+# seeded temp DBs (fast direct-SQL seeding, no dedup/embed side effects),
+# medians of 5 for latency metrics. The budgets below already carry 3-5x
+# headroom over the ORIGINAL measured numbers for CI variance — and most now
+# have far more after the fixes that landed since the issue was written
+# (#401 rare-term recall, #400 bounded cohere lock holds, #399/#405 decay
+# no-op skip, #393/#415/#418 async auto-embed). The decay job also asserts
+# the #399 regression SIGNATURE (second-consecutive-tick rewritten rows < 1%
+# and WAL growth < 2x DB size), which wall time alone won't catch. Each test
+# prints a `PERF-GATE |` metrics table to the job log so a regression is
+# diagnosable from the run, not just red. Lean build (--no-default-features):
+# the SQLite paths under test are independent of the embedding stack, and the
+# lean build keeps the gate fast. (#404)
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/perf-gate.yml"
+  pull_request:
+    branches: [main, master]
+    paths:
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/perf-gate.yml"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  perf-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Build (lean, release)
+        run: cargo build --release --no-default-features --tests
+      - name: Perf gate (100k corpus, medians of 5)
+        env:
+          # Corpus sizes (issue #404 scales)
+          MIMIR_PERF_ROWS: "100000"
+          MIMIR_PERF_HISTORY_ROWS: "50000"
+          MIMIR_PERF_HISTORY_VERSIONS: "200"
+          # Budgets (issue #404; measured baselines in parentheses)
+          MIMIR_PERF_BUDGET_RECALL_RARE_MS: "30" # rare-term FTS p50 (6.4ms; ~0.08ms post-#401)
+          MIMIR_PERF_BUDGET_BROWSE_MS: "5" # browse p50 (35µs)
+          MIMIR_PERF_BUDGET_GET_ENTITY_MS: "1" # get_entity p50 (41µs)
+          MIMIR_PERF_BUDGET_AS_OF_MS: "1" # as_of p50 @50k history rows (17µs)
+          MIMIR_PERF_BUDGET_DECAY_WALL_S: "10" # decay_tick wall (2.2-3.1s)
+          MIMIR_PERF_BUDGET_DECAY_SECOND_TICK_PCT: "1" # #399 signature: 2nd tick rewrites ~0 rows
+          MIMIR_PERF_BUDGET_DECAY_WAL_RATIO: "2" # #399 signature: WAL < 2x DB (was ~9x)
+          MIMIR_PERF_BUDGET_COHERE_WALL_S: "5" # cohere wall
+          MIMIR_PERF_BUDGET_COHERE_HOLD_MS: "1000" # post-#400 longest writer-lock hold
+          MIMIR_PERF_BUDGET_HISTORY_BYTES_PER_ROW: "2048" # @1KB body (1,448)
+        # --test-threads=1: the latency medians must not contend with another
+        # 100k seed/tick running in parallel.
+        run: |
+          cargo test --release --no-default-features perf_gate_ -- \
+            --ignored --nocapture --test-threads=1
