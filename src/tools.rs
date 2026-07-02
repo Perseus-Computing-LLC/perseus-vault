@@ -2864,7 +2864,19 @@ mod tests {
         assert!(body.contains("v1"), "rejected write must not update the entity: {body}");
 
         // (c) Existing entity, identical body (COALESCE re-assert path):
-        // valid_to is validated against the STORED valid_from.
+        // valid_to is validated against the STORED valid_from — and the
+        // rejected write must leave the STORED PERIOD untouched.
+        let stored_period = |db: &Database| -> (Value, Value) {
+            let r = handle_valid_at(
+                &db,
+                json!({"category": "facts", "key": "one-sided", "valid_at_unix_ms": now_ms()}),
+            )
+            .expect("valid_at");
+            let v: Value = serde_json::from_str(&r).unwrap();
+            assert_eq!(v["found"], json!(true), "{r}");
+            (v["valid_from_unix_ms"].clone(), v["valid_to_unix_ms"].clone())
+        };
+        let before = stored_period(&db);
         let err = handle_remember(
             &db,
             json!({"category": "facts", "key": "one-sided", "body_json": "{\"note\":\"v1\"}",
@@ -2872,6 +2884,96 @@ mod tests {
         )
         .expect_err("one-sided past valid_to on an identical re-assert must be rejected");
         assert!(err.contains("valid_to_unix_ms"), "got: {err}");
+        assert_eq!(
+            stored_period(&db),
+            before,
+            "rejected re-assert must not change the stored valid period"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn reassert_rejects_one_sided_valid_from_at_or_after_stored_valid_to() {
+        // #363 review (round 3): the mirror-image hole. On an identical-body
+        // re-assert the UPDATE takes the caller's valid_from via COALESCE
+        // while KEEPING the stored valid_to — so a one-sided valid_from
+        // at/after the stored close would store [vf, stored_to): inverted,
+        // unanswerable at every instant.
+        let (db, path) = temp_db();
+        let now = now_ms();
+        let vf = now - 100_000;
+        let vt = now - 50_000;
+        let body = "{\"note\":\"bounded\"}";
+
+        handle_remember(
+            &db,
+            json!({"category": "facts", "key": "mirror", "body_json": body,
+                   "valid_from_unix_ms": vf, "valid_to_unix_ms": vt}),
+        )
+        .expect("bounded fact");
+
+        let stored_period = |db: &Database| -> (Value, Value) {
+            let r = handle_valid_at(
+                &db,
+                json!({"category": "facts", "key": "mirror", "valid_at_unix_ms": vt - 1_000}),
+            )
+            .expect("valid_at");
+            let v: Value = serde_json::from_str(&r).unwrap();
+            assert_eq!(v["found"], json!(true), "{r}");
+            (v["valid_from_unix_ms"].clone(), v["valid_to_unix_ms"].clone())
+        };
+        assert_eq!(stored_period(&db), (json!(vf), json!(vt)));
+
+        // (a) valid_from strictly after the stored close: inverted, rejected.
+        let err = handle_remember(
+            &db,
+            json!({"category": "facts", "key": "mirror", "body_json": body,
+                   "valid_from_unix_ms": vt + 10_000}),
+        )
+        .expect_err("one-sided valid_from after the stored valid_to must be rejected");
+        assert!(err.contains("valid_from_unix_ms"), "got: {err}");
+
+        // (b) valid_from exactly AT the stored close: empty period, rejected.
+        let err = handle_remember(
+            &db,
+            json!({"category": "facts", "key": "mirror", "body_json": body,
+                   "valid_from_unix_ms": vt}),
+        )
+        .expect_err("one-sided valid_from at the stored valid_to must be rejected");
+        assert!(err.contains("valid_from_unix_ms"), "got: {err}");
+
+        // Rejected writes left the stored period untouched.
+        assert_eq!(
+            stored_period(&db),
+            (json!(vf), json!(vt)),
+            "rejected re-asserts must not change the stored valid period"
+        );
+
+        // (c) Legitimate one-sided valid_from strictly BEFORE the stored
+        // close: accepted, and it moves the open while keeping the close.
+        let new_vf = vf - 10_000;
+        handle_remember(
+            &db,
+            json!({"category": "facts", "key": "mirror", "body_json": body,
+                   "valid_from_unix_ms": new_vf}),
+        )
+        .expect("one-sided valid_from before the stored valid_to must be accepted");
+        assert_eq!(stored_period(&db), (json!(new_vf), json!(vt)));
+
+        // (d) No stored valid_to (unbounded fact): any one-sided valid_from
+        // yields [vf, infinity) — accepted.
+        handle_remember(
+            &db,
+            json!({"category": "facts", "key": "unbounded", "body_json": body}),
+        )
+        .expect("unbounded fact");
+        handle_remember(
+            &db,
+            json!({"category": "facts", "key": "unbounded", "body_json": body,
+                   "valid_from_unix_ms": now + 60_000}),
+        )
+        .expect("one-sided valid_from on an unbounded fact must be accepted");
 
         let _ = std::fs::remove_file(&path);
     }

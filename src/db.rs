@@ -1769,6 +1769,31 @@ impl Database {
                     )
                     .into());
                 }
+            } else if let Some(vf) = valid_from {
+                // #363 review (round 3): the mirror-image hole. On a
+                // content-UNCHANGED re-assert the UPDATE below takes the
+                // caller's valid_from (COALESCE ?20) while KEEPING the stored
+                // valid_to, so a one-sided valid_from at/after the stored
+                // close would store [vf, stored_to) — inverted. Only this
+                // branch can inherit a bound: on a content change the stamp
+                // UPDATE re-sets valid_to to the caller's value (NULL here,
+                // i.e. [vf, ∞)), which cannot invert.
+                if !content_changed {
+                    let stored_to: Option<i64> = conn.query_row(
+                        "SELECT valid_to_unix_ms FROM entities WHERE id = ?1",
+                        params![id],
+                        |r| r.get(0),
+                    )?;
+                    if let Some(et) = stored_to {
+                        if vf >= et {
+                            return Err(format!(
+                                "valid_from_unix_ms ({vf}) must be less than the fact's effective \
+                                 valid_to ({et}) — refusing to invert the valid period"
+                            )
+                            .into());
+                        }
+                    }
+                }
             }
 
             // M-1: wrap entity UPDATE + FTS UPDATE in a transaction
