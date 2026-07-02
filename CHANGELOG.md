@@ -48,6 +48,23 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
   truncation note when capped. Edges dangling outside the returned node set
   are dropped (previously the unscoped path emitted edges to archived/deleted
   targets that the renderer couldn't resolve).
+- `mimir_cohere` no longer holds one writer lock for the whole grooming pass
+  (#400). The single BEGIN IMMEDIATE previously spanned promotion, a
+  full-table decay UPDATE, link building, and archive — a lock window linear
+  in store size (~4.4s @100k entities) that crossed the default 5000ms
+  `busy_timeout` just past ~130k entities, so concurrent `remember`s failed
+  SQLITE_BUSY during every maintenance run. cohere now runs three bounded
+  windows: promotion, a decay pass chunked at 1000 rows per drop-safe
+  transaction (with a 2ms inter-chunk yield so waiting writers can actually
+  acquire the lock), and link+archive. Longest single hold measured @200k
+  entities (release, ~450B rows): 0.68s → 0.09s; the write work under any
+  one lock is now bounded by the chunk size, and the remaining linear
+  component (the promote/archive full-table read scans) is ~7.5x shallower
+  than before. Preserves the #399/#405 no-op write skip (floored
+  rows are not rewritten), cohere's documented ×0.95 standalone decay
+  semantics, and per-transaction drop-safety (#388); the run stays correct
+  under interleaved writers, and the new non-atomicity boundaries are
+  documented at the split site.
 
 ## [2.14.0] - 2026-07-02
 

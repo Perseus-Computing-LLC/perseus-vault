@@ -257,6 +257,14 @@ impl Database {
         // the pool to their workload and so the concurrent-client load test can
         // sweep them (#223). Defaults preserve the prior hard-coded values
         // (max_size=16, busy_timeout=5000ms).
+        //
+        // Store-size note (#400): maintenance lock holds are bounded — cohere
+        // chunks its decay pass (COHERE_DECAY_CHUNK_ROWS per transaction) and
+        // decay_tick batches at 1000 rows — so the default 5000ms no longer
+        // needs to scale with entity count. If very large stores (many 100k
+        // entities) still see SQLITE_BUSY during maintenance under heavy
+        // sustained write load, raise MIMIR_BUSY_TIMEOUT_MS rather than
+        // shrinking the store.
         let max_size: u32 = std::env::var("MIMIR_POOL_MAX_SIZE")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -1293,6 +1301,17 @@ impl Database {
     /// that consumes decay (ARCHIVE_DECAY_THRESHOLD = 0.05), so ranking,
     /// layering, and archival behavior are unaffected.
     const DECAY_WRITE_EPSILON: f64 = 1e-4;
+
+    /// #400: rows per transaction for cohere's chunked decay pass. cohere
+    /// previously applied its multiplicative decay as ONE full-table UPDATE
+    /// inside the same IMMEDIATE transaction as promotion/link/archive, so a
+    /// single writer-lock hold grew linearly with store size (~4.4s @100k
+    /// entities) and crossed the default 5000ms busy_timeout just past ~130k
+    /// — every concurrent `remember` failed SQLITE_BUSY during maintenance.
+    /// Chunking bounds each hold to one batch regardless of table size.
+    /// Matches decay_tick's batch size (decay_tick_with_limit), which has run
+    /// at 1000 rows/transaction since its own chunking fix.
+    const COHERE_DECAY_CHUNK_ROWS: i64 = 1000;
 
     /// Minimum trigram similarity for `cohere` to auto-link two same-category
     /// entities (#300). Below this the pair is not meaningfully related, so
@@ -6617,6 +6636,99 @@ last_accessed: {}
         false
     }
 
+    /// cohere's decay pass, chunked (#400): apply the gentle multiplicative
+    /// ×0.95 decay (floored at VERIFIED_DECAY_FLOOR for verified facts and at
+    /// `importance` for scored ones, #298 / v2.13.0) in batches of
+    /// COHERE_DECAY_CHUNK_ROWS rowids, each in its own drop-safe IMMEDIATE
+    /// transaction, so no single writer-lock hold scales with table size.
+    /// Keyset-paginates on rowid: rows touched by an earlier chunk are never
+    /// revisited, so each eligible row decays exactly once per pass.
+    ///
+    /// Preserves the #399/#405 no-op write skip: a row whose decay expression
+    /// lands within DECAY_WRITE_EPSILON of the stored value (verified rows
+    /// already sitting at the floor, importance-floored rows) is not
+    /// rewritten — SQLite re-dirties a row's page into the WAL even when SET
+    /// assigns the existing value. Genuinely decaying rows are never skipped:
+    /// the eligibility filter requires decay_score > 0.01, so an unfloored
+    /// row changes by at least 0.05 × 0.01 = 5e-4 > DECAY_WRITE_EPSILON.
+    ///
+    /// NOTE: distinct from decay_tick's Ebbinghaus recompute-from-recency —
+    /// this is cohere's documented relative "×0.95 per call" groom. The two
+    /// deliberately coexist (see #298's floor rationale); only the chunking
+    /// STRUCTURE is aligned with decay_tick_with_limit here.
+    ///
+    /// Returns (eligible_rows, chunk_transactions).
+    fn cohere_decay_chunked(
+        conn: &rusqlite::Connection,
+    ) -> Result<(i64, i64), Box<dyn std::error::Error>> {
+        let eligible: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM entities WHERE archived = 0 AND decay_score > 0.01",
+            [],
+            |r| r.get(0),
+        )?;
+        if eligible == 0 {
+            return Ok((0, 0));
+        }
+        // COALESCE: `importance` is a v5 migration column (REAL DEFAULT 0.0);
+        // a NULL from an out-of-band write must floor at 0.0, not poison the
+        // MAX into writing a NULL decay_score.
+        let decay_expr = format!(
+            "MAX(decay_score * 0.95, \
+                 CASE WHEN verified = 1 THEN {floor} ELSE 0.0 END, \
+                 COALESCE(importance, 0.0))",
+            floor = Self::VERIFIED_DECAY_FLOOR
+        );
+        let mut chunks: i64 = 0;
+        let mut last_rowid: i64 = i64::MIN;
+        loop {
+            let tx = Self::audited_write_tx(conn)?;
+            // Upper rowid bound of the next chunk of ELIGIBLE rows past the
+            // cursor. Reading it inside the same IMMEDIATE tx as the UPDATE
+            // keeps the chunk's read-decide-write under one writer lock.
+            let (max_rowid, batch_len): (Option<i64>, i64) = tx.query_row(
+                "SELECT MAX(rowid), COUNT(*) FROM ( \
+                     SELECT rowid FROM entities \
+                     WHERE archived = 0 AND decay_score > 0.01 AND rowid > ?1 \
+                     ORDER BY rowid LIMIT ?2)",
+                params![last_rowid, Self::COHERE_DECAY_CHUNK_ROWS],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            let Some(max_rowid) = max_rowid else {
+                // No eligible rows past the cursor (eligible count was an
+                // exact multiple of the chunk size). Nothing was written in
+                // this tx; dropping it rolls the empty transaction back.
+                break;
+            };
+            tx.execute(
+                &format!(
+                    "UPDATE entities SET decay_score = {expr} \
+                     WHERE archived = 0 AND decay_score > 0.01 \
+                       AND rowid > ?1 AND rowid <= ?2 \
+                       AND ABS({expr} - decay_score) >= {eps}",
+                    expr = decay_expr,
+                    eps = Self::DECAY_WRITE_EPSILON,
+                ),
+                params![last_rowid, max_rowid],
+            )?;
+            tx.commit()?;
+            chunks += 1;
+            last_rowid = max_rowid;
+            if batch_len < Self::COHERE_DECAY_CHUNK_ROWS {
+                break;
+            }
+            // Yield between chunks: commit→BEGIN back-to-back leaves only a
+            // microsecond gap, and SQLite's busy handler retries on a
+            // growing sleep schedule (up to 100ms per retry), so a waiting
+            // writer could starve across MANY individually-bounded chunks
+            // and still burn most of its busy_timeout. A real 2ms window per
+            // chunk gives every waiter a per-cycle chance to acquire, making
+            // starvation probabilistically negligible at the default 5000ms
+            // timeout. Costs 2ms of wall per 1000 rows (~0.2s @100k).
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        Ok((eligible, chunks))
+    }
+
     /// Coherence daemon: auto-groom the memory with promote, decay, link, archive.
     #[allow(unused_assignments)]
     pub fn cohere(
@@ -6649,14 +6761,33 @@ last_accessed: {}
             });
         }
 
-        // Wrap all mutations in a transaction so partial writes are not left
-        // behind if any step fails. A drop-safe Transaction, NOT a raw
-        // "BEGIN IMMEDIATE" execute: any `?` error between a raw BEGIN and
-        // its COMMIT returned this pooled connection with the transaction
-        // still open, so the next checkout of that connection failed with
-        // "cannot start a transaction within a transaction" — one failed
-        // cohere run poisoned that pool slot permanently (#388).
-        let tx = Self::audited_write_tx(&conn)?;
+        // #400: cohere is deliberately NOT one atomic transaction. The
+        // previous single BEGIN IMMEDIATE (promotion + full-table decay
+        // UPDATE + link scan + archive) held the writer lock for a window
+        // linear in store size (~4.4s @100k entities), which crosses the
+        // default 5000ms busy_timeout just past ~130k — concurrent writers
+        // failed SQLITE_BUSY on every maintenance run. The decay pass needs
+        // no atomicity with promotion or link building (each step re-reads
+        // its own inputs and is independently consistent), so cohere now
+        // runs three bounded lock windows:
+        //   1. promotion (one UPDATE whose write set is the promotable rows),
+        //   2. the decay pass, chunked at COHERE_DECAY_CHUNK_ROWS rows per
+        //      transaction so no single hold scales with table size,
+        //   3. link building + archive (bounded by candidate_budget; the
+        //      links read-modify-write stays inside one IMMEDIATE tx, so the
+        //      #388 clobber analysis still holds).
+        // NON-ATOMICITY BOUNDARY: an error (or crash) between these windows
+        // can leave a run partially applied — e.g. promoted and decayed but
+        // not linked/archived. Every step is idempotent and leaves the store
+        // consistent on its own; the next cohere/autocohere run completes the
+        // remaining grooming. Writers interleaving between windows are
+        // tolerated the same way autocohere already tolerates them between
+        // its cohere/decay_tick/compact steps. Each individual transaction
+        // is still a drop-safe Transaction, NOT a raw "BEGIN IMMEDIATE"
+        // execute: any `?` error between a raw BEGIN and its COMMIT returned
+        // this pooled connection with the transaction still open, poisoning
+        // that pool slot permanently (#388).
+        //
         // Default promotion threshold matches the recall path's
         // WORKING_THRESHOLD so buffer→working promotion happens at the same
         // retrieval count everywhere. Previously cohere promoted at a literal
@@ -6668,33 +6799,27 @@ last_accessed: {}
         } else {
             Self::WORKING_THRESHOLD
         };
-        promoted = tx.execute(
-            "UPDATE entities SET layer = 'working' WHERE layer = 'buffer' AND retrieval_count >= ?1",
-            params![promote_threshold],
-        )? as i64;
+        {
+            let tx = Self::audited_write_tx(&conn)?;
+            promoted = tx.execute(
+                "UPDATE entities SET layer = 'working' WHERE layer = 'buffer' AND retrieval_count >= ?1",
+                params![promote_threshold],
+            )? as i64;
+            tx.commit()?;
+        }
 
         // 2. Decay: apply a gentle multiplicative decay to non-archived
         // entities, but floor verified/curated facts at VERIFIED_DECAY_FLOOR
         // so repeated standalone cohere calls can't walk them below the
         // archive threshold (#298). Without the floor, ~59 cohere calls
         // (0.95^59 ≈ 0.048) archived every unboosted entity, verified included.
-        let decayed_count: i64 = tx.query_row(
-            "SELECT COUNT(*) FROM entities WHERE archived = 0 AND decay_score > 0.01",
-            [],
-            |r| r.get(0),
-        )?;
-        tx.execute(
-            &format!(
-                "UPDATE entities SET decay_score = \
-                 MAX(decay_score * 0.95, \
-                     CASE WHEN verified = 1 THEN {floor} ELSE 0.0 END, \
-                     importance) \
-                 WHERE archived = 0 AND decay_score > 0.01",
-                floor = Self::VERIFIED_DECAY_FLOOR
-            ),
-            [],
-        )?;
-        decayed = decayed_count;
+        // #400: chunked — see cohere_decay_chunked. `decayed` keeps its
+        // existing meaning: rows ELIGIBLE for decay (archived = 0,
+        // decay_score > 0.01), not rows physically rewritten.
+        let (decay_eligible, _decay_chunks) = Self::cohere_decay_chunked(&conn)?;
+        decayed = decay_eligible;
+
+        let tx = Self::audited_write_tx(&conn)?;
 
         // 3. Link: auto-link entities sharing a category. The JOIN already
         // proves both rows exist and carries e1.id + e1.links, so we build the
@@ -8049,6 +8174,332 @@ mod tests {
         assert_eq!(db.get_entity("note", "four").unwrap().unwrap().layer, "buffer");
         assert_eq!(db.get_entity("note", "five").unwrap().unwrap().layer, "working");
         let _ = fs::remove_file(&path);
+    }
+
+    /// Seed `n` active entities directly (bypassing remember's dedup and side
+    /// effects) for the #400 cohere lock-window tests. decay 0.5 (eligible
+    /// for cohere's ×0.95 pass), non-empty tags so the link scan sees
+    /// candidates, unique ~420-byte bodies so row size matches the issue's
+    /// measured store (45MB @100k ≈ 450B/row) — the decay UPDATE's WAL cost
+    /// scales with row size, so toy bodies understate the lock window.
+    fn seed_bulk_entities(conn: &rusqlite::Connection, n: usize, prefix: &str) {
+        let filler = "x".repeat(360);
+        let tx = conn.unchecked_transaction().unwrap();
+        for i in 0..n {
+            tx.execute(
+                "INSERT INTO entities (id, category, key, body_json, status, type, tags, \
+                 decay_score, retrieval_count, layer, topic_path, archived, archive_reason, \
+                 links, verified, source, created_at_unix_ms, last_accessed_unix_ms) \
+                 VALUES (?1, 'bulk', ?2, ?3, 'active', 'insight', '[\"bench\"]', 0.5, 0, \
+                 'working', '', 0, '', '[]', 0, 'agent', 0, 0)",
+                params![
+                    format!("{prefix}-{i:06}"),
+                    format!("{prefix}-key-{i:06}"),
+                    format!(
+                        "{{\"content\":\"bulk probe row number {i} for lock window\",\"filler\":\"{filler}\"}}"
+                    ),
+                ],
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+    }
+
+    /// #400 regression: cohere's decay pass must run in bounded per-chunk
+    /// transactions instead of one full-table UPDATE whose writer-lock hold
+    /// grows linearly with store size. 2,500 eligible rows at the 1000-row
+    /// chunk size must take exactly 3 chunk transactions, and every row must
+    /// still receive exactly one ×0.95 decay (no row skipped, none decayed
+    /// twice across chunk boundaries).
+    #[test]
+    fn cohere_decay_pass_is_chunked_and_decays_every_row_once() {
+        let (db, path) = temp_db();
+        let conn = db.conn().unwrap();
+        seed_bulk_entities(&conn, 2500, "chunk");
+
+        let (eligible, chunks) = Database::cohere_decay_chunked(&conn).unwrap();
+        assert_eq!(eligible, 2500);
+        assert_eq!(
+            chunks, 3,
+            "2500 eligible rows / {} rows per chunk must run 3 chunk transactions",
+            Database::COHERE_DECAY_CHUNK_ROWS
+        );
+
+        let (min, max): (f64, f64) = conn
+            .query_row(
+                "SELECT MIN(decay_score), MAX(decay_score) FROM entities WHERE category = 'bulk'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert!(
+            (min - 0.475).abs() < 1e-9 && (max - 0.475).abs() < 1e-9,
+            "every row must decay 0.5 -> 0.475 exactly once, got min={min} max={max}"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    /// #400 must not regress the #399/#405 no-op write skip: rows whose decay
+    /// expression lands within DECAY_WRITE_EPSILON of the stored value — a
+    /// verified row already at VERIFIED_DECAY_FLOOR, an importance-floored
+    /// row — are not physically rewritten by the chunked pass, while
+    /// genuinely decaying rows still are.
+    #[test]
+    fn cohere_chunked_decay_skips_noop_floored_rows() {
+        let (db, path) = temp_db();
+        let conn = db.conn().unwrap();
+        seed_bulk_entities(&conn, 5, "noop");
+        // Verified row parked exactly at the floor: MAX(0.95·floor, floor, 0)
+        // == floor, so the recompute is a no-op.
+        conn.execute(
+            "INSERT INTO entities (id, category, key, body_json, status, type, tags, \
+             decay_score, retrieval_count, layer, topic_path, archived, archive_reason, \
+             links, verified, source, created_at_unix_ms, last_accessed_unix_ms) \
+             VALUES ('noop-verified', 'bulk', 'noop-verified-key', '{}', 'active', 'insight', '[]', \
+             ?1, 0, 'working', '', 0, '', '[]', 1, 'agent', 0, 0)",
+            params![Database::VERIFIED_DECAY_FLOOR],
+        )
+        .unwrap();
+        // Importance-floored row: MAX(0.95·0.9, 0, 0.9) == 0.9, also a no-op.
+        conn.execute(
+            "INSERT INTO entities (id, category, key, body_json, status, type, tags, \
+             decay_score, retrieval_count, layer, topic_path, archived, archive_reason, \
+             links, verified, source, importance, created_at_unix_ms, last_accessed_unix_ms) \
+             VALUES ('noop-scored', 'bulk', 'noop-scored-key', '{}', 'active', 'insight', '[]', \
+             0.9, 0, 'working', '', 0, '', '[]', 0, 'agent', 0.9, 0, 0)",
+            [],
+        )
+        .unwrap();
+
+        let before: i64 = conn
+            .query_row("SELECT total_changes()", [], |r| r.get(0))
+            .unwrap();
+        let (eligible, _) = Database::cohere_decay_chunked(&conn).unwrap();
+        let after: i64 = conn
+            .query_row("SELECT total_changes()", [], |r| r.get(0))
+            .unwrap();
+
+        assert_eq!(eligible, 7, "all seven rows are eligible (decay > 0.01)");
+        assert_eq!(
+            after - before,
+            5,
+            "only the 5 genuinely decaying rows may be written; the two floored rows are no-op skips"
+        );
+        let floor_val: f64 = conn
+            .query_row(
+                "SELECT decay_score FROM entities WHERE id = 'noop-verified'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let scored_val: f64 = conn
+            .query_row(
+                "SELECT decay_score FROM entities WHERE id = 'noop-scored'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!((floor_val - Database::VERIFIED_DECAY_FLOOR).abs() < 1e-9);
+        assert!((scored_val - 0.9).abs() < 1e-9);
+        let _ = fs::remove_file(&path);
+    }
+
+    /// #400 regression: a concurrent writer whose total wait budget is below
+    /// the old single-transaction cohere window must succeed WHILE cohere
+    /// grooms a large store. Pre-fix, cohere held ONE writer lock for the
+    /// whole pass — linear in store size, measured 598ms @150k rows on a
+    /// fast dev box (debug; the issue's deep-dive box measured 4.45s @100k)
+    /// — so no writer with a ~250ms budget could EVER acquire inside it.
+    /// Post-fix the longest hold is one 1000-row decay chunk or the
+    /// candidate_budget-bounded link/archive tx (~60ms worst at this scale,
+    /// debug, same box), and the 2ms inter-chunk yield guarantees an
+    /// acquisition window after each chunk. Both sides scale with machine
+    /// speed, so the ~10x pre/post hold ratio — not absolute timing — is
+    /// what the 250ms budget sits inside.
+    ///
+    /// The writer polls with a fine-grained 1ms busy handler rather than
+    /// PRAGMA busy_timeout: SQLite's default busy handler sleeps up to 100ms
+    /// between retries, which measures retry-schedule luck against the 2ms
+    /// windows instead of the property under test (no single hold may exceed
+    /// the wait budget). Field writers keep the default 5000ms timeout,
+    /// which the bounded holds now clear at any store size.
+    #[test]
+    fn concurrent_writer_not_starved_during_cohere() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::sync::Arc;
+
+        // ~250ms total wait budget at 1ms retry granularity (fn pointer —
+        // rusqlite's busy_handler takes stateless fns; the attempt count is
+        // the state).
+        fn fine_grained_budget(attempts: i32) -> bool {
+            if attempts >= 250 {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            true
+        }
+
+        let (db, path) = temp_db();
+        {
+            let conn = db.conn().unwrap();
+            seed_bulk_entities(&conn, 150_000, "starve");
+        }
+
+        let done = Arc::new(AtomicBool::new(false));
+        let busy_failures = Arc::new(AtomicU64::new(0));
+        let attempts = Arc::new(AtomicU64::new(0));
+
+        let writer_path = path.clone();
+        let writer_done = Arc::clone(&done);
+        let writer_busy = Arc::clone(&busy_failures);
+        let writer_attempts = Arc::clone(&attempts);
+        let writer = std::thread::spawn(move || {
+            // Separate raw connection with a ~250ms fine-grained wait budget
+            // — below the pre-fix whole-pass lock window at this scale,
+            // several times above any post-fix bounded hold (see the test
+            // doc comment for the measured basis).
+            let conn = rusqlite::Connection::open(&writer_path).unwrap();
+            conn.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
+            conn.busy_handler(Some(fine_grained_budget)).unwrap();
+            let mut i = 0u64;
+            while !writer_done.load(Ordering::Relaxed) {
+                writer_attempts.fetch_add(1, Ordering::Relaxed);
+                let res = conn.execute(
+                    "INSERT INTO entities (id, category, key, body_json, status, type, tags, \
+                     decay_score, retrieval_count, layer, topic_path, archived, archive_reason, \
+                     links, verified, source, created_at_unix_ms, last_accessed_unix_ms) \
+                     VALUES (?1, 'starve-writer', ?2, '{}', 'active', 'insight', '[]', 1.0, 0, \
+                     'buffer', '', 0, '', '[]', 0, 'agent', 0, 0)",
+                    params![format!("sw-{i:06}"), format!("sw-key-{i:06}")],
+                );
+                if res.is_err() {
+                    writer_busy.fetch_add(1, Ordering::Relaxed);
+                }
+                i += 1;
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        });
+
+        let params = crate::models::CohereParams {
+            dry_run: false,
+            max_links: 20,
+            promote_threshold: 0,
+            archive_threshold: 0.0,
+        };
+        db.cohere(&params).expect("cohere must succeed under a concurrent writer");
+        done.store(true, Ordering::Relaxed);
+        writer.join().expect("writer thread panicked");
+
+        let n_attempts = attempts.load(Ordering::Relaxed);
+        let n_busy = busy_failures.load(Ordering::Relaxed);
+        assert!(
+            n_attempts > 0,
+            "writer must have attempted at least one insert during cohere"
+        );
+        assert_eq!(
+            n_busy, 0,
+            "concurrent writer hit SQLITE_BUSY {n_busy}/{n_attempts} times during cohere — \
+             a single lock hold exceeded its ~250ms wait budget (#400)"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    /// #400 lock-window measurement — not a CI gate. Seeds a large store and
+    /// measures the LONGEST SINGLE writer-lock hold during cohere (the
+    /// issue's metric: one pre-fix hold spanning the whole pass is what
+    /// crosses busy_timeout in the field). Run explicitly:
+    ///
+    /// ```text
+    /// MIMIR_COHERE_MEASURE_ROWS=100000 \
+    ///   cargo test --release cohere_lock_window_measurement -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "lock-window measurement: run explicitly with --release --ignored --nocapture"]
+    fn cohere_lock_window_measurement() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        let rows: usize = std::env::var("MIMIR_COHERE_MEASURE_ROWS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(100_000);
+
+        let (db, path) = temp_db();
+        let seed_start = Instant::now();
+        {
+            let conn = db.conn().unwrap();
+            seed_bulk_entities(&conn, rows, "measure");
+        }
+        eprintln!("seeded {rows} rows in {:.2}s", seed_start.elapsed().as_secs_f64());
+
+        let done = Arc::new(AtomicBool::new(false));
+        let probe_path = path.clone();
+        let probe_done = Arc::clone(&done);
+        let probe = std::thread::spawn(move || -> Duration {
+            // Writer-lock HOLD probe: busy_timeout=0 makes each BEGIN
+            // IMMEDIATE attempt fail instantly while another writer
+            // transaction is open, so polling every 1ms and tracking the
+            // longest CONTINUOUS busy span measures the longest single
+            // writer-lock hold (±1ms poll resolution). cohere's chunked pass
+            // yields 2ms between chunk transactions, so consecutive chunk
+            // holds register as separate spans — exactly the window a
+            // fine-grained waiter can actually use.
+            let conn = rusqlite::Connection::open(&probe_path).unwrap();
+            conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=0;")
+                .unwrap();
+            let mut max_hold = Duration::ZERO;
+            let mut busy_since: Option<Instant> = None;
+            while !probe_done.load(Ordering::Relaxed) {
+                match conn.execute_batch("BEGIN IMMEDIATE; COMMIT;") {
+                    Ok(()) => {
+                        if let Some(s) = busy_since.take() {
+                            max_hold = max_hold.max(s.elapsed());
+                        }
+                    }
+                    Err(_) => {
+                        busy_since.get_or_insert_with(Instant::now);
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            if let Some(s) = busy_since {
+                max_hold = max_hold.max(s.elapsed());
+            }
+            max_hold
+        });
+
+        let params = crate::models::CohereParams {
+            dry_run: false,
+            max_links: 20,
+            promote_threshold: 0,
+            archive_threshold: 0.0,
+        };
+        let cohere_start = Instant::now();
+        let report = db.cohere(&params).expect("cohere");
+        let cohere_wall = cohere_start.elapsed();
+        done.store(true, Ordering::Relaxed);
+        let max_hold = probe.join().expect("probe thread panicked");
+
+        eprintln!(
+            "\n#400 cohere lock-window measurement\n\
+             rows={rows} cohere wall={:.3}s\n\
+             longest single writer-lock hold observed={:.3}s\n\
+             report: promoted={} decayed={} linked={} archived={}",
+            cohere_wall.as_secs_f64(),
+            max_hold.as_secs_f64(),
+            report.promoted,
+            report.decayed,
+            report.linked,
+            report.archived,
+        );
+
+        let _ = fs::remove_file(&path);
+        assert!(
+            max_hold < Duration::from_millis(1000),
+            "longest single writer-lock hold during cohere was {:.3}s — issue #400 targets <1s",
+            max_hold.as_secs_f64()
+        );
     }
 
     #[test]
