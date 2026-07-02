@@ -156,7 +156,7 @@ Any MCP-compatible framework works with Perseus Vault directly. See
 | `mimir_as_of` | Transaction-time time-travel: the version of a fact (category + key) that was *believed* at a past instant. |
 | `mimir_valid_at` | Valid-time lookup: the version that was *actually true in the world* at an instant, per current knowledge (SQL:2011 APPLICATION_TIME). |
 | `mimir_bitemporal` | Full 2-axis bi-temporal query: "as of transaction time T, what did we believe was true at valid time V" — the exact rectangle cell. |
-| `mimir_history` | List every superseded version of a fact (category + key), newest first — the full version trail (companion to `mimir_as_of`). |
+| `mimir_history` | List superseded versions of a fact (category + key), newest first — paginated (`limit` default 20, plus `offset`); `total` reports the full trail size (companion to `mimir_as_of`). |
 | `mimir_forget` | Soft-delete (archived=1). |
 
 ### Search & RAG

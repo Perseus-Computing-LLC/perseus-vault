@@ -1052,9 +1052,23 @@ pub fn handle_history(db: &Database, args: Value) -> Result<String, String> {
         .get("key")
         .and_then(|v| v.as_str())
         .ok_or_else(|| "Missing 'key' parameter".to_string())?;
+    // #403: page the version trail. A hot key with 10k versions previously
+    // returned every full decrypted body (~10-15MB) into agent context.
+    // Default 20 newest; `total` reports the full trail size so agents know
+    // to page with `offset`.
+    let limit = args
+        .get("limit")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(20)
+        .clamp(0, 1000);
+    let offset = args
+        .get("offset")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0)
+        .max(0);
 
-    let versions = db
-        .history_versions(category, key)
+    let (versions, total) = db
+        .history_versions_page(category, key, limit, offset)
         .map_err(|e| format!("history failed: {}", e))?;
 
     let items: Vec<serde_json::Value> = versions.iter().map(|e| e.to_json_expanded()).collect();
@@ -1062,7 +1076,11 @@ pub fn handle_history(db: &Database, args: Value) -> Result<String, String> {
         "category": category,
         "key": key,
         "versions": items,
-        "total": items.len(),
+        // Full trail size (not the returned-page size) — see `returned`.
+        "total": total,
+        "returned": items.len(),
+        "limit": limit,
+        "offset": offset,
     });
     Ok(result.to_string())
 }
@@ -2784,6 +2802,69 @@ mod tests {
         let path_str = path.to_str().unwrap().to_string();
         let db = Database::open(&path_str).expect("open test db");
         (db, path_str)
+    }
+
+    // ─── History pagination (#403) ───────────────────────────────
+
+    #[test]
+    fn history_tool_pages_newest_first_with_full_total() {
+        let (db, path) = temp_db();
+
+        // 51 writes to one key -> 50 superseded versions (v0..v49) in history;
+        // v50 stays live. Each content change snapshots the prior version.
+        for i in 0..51 {
+            handle_remember(
+                &db,
+                json!({"category": "facts", "key": "hot",
+                       "body_json": format!("{{\"content\":\"version-v{i}-body\"}}")}),
+            )
+            .expect("remember");
+        }
+        // The unpaged DB API still returns the full trail (back-compat).
+        assert_eq!(db.history_versions("facts", "hot").unwrap().len(), 50);
+
+        // Default: the 20 NEWEST versions, with total = full trail size.
+        let resp = handle_history(&db, json!({"category":"facts","key":"hot"})).expect("history");
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v["total"].as_i64().unwrap(), 50, "total is the FULL trail: {resp}");
+        assert_eq!(v["returned"].as_i64().unwrap(), 20);
+        assert_eq!(v["versions"].as_array().unwrap().len(), 20);
+        assert!(
+            v["versions"][0].to_string().contains("version-v49-body"),
+            "newest superseded version first: {}",
+            v["versions"][0]
+        );
+        assert!(
+            v["versions"][19].to_string().contains("version-v30-body"),
+            "20th newest is v30: {}",
+            v["versions"][19]
+        );
+
+        // Explicit limit + offset page deeper into the trail.
+        let resp = handle_history(
+            &db,
+            json!({"category":"facts","key":"hot","limit":5,"offset":10}),
+        )
+        .expect("history page");
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v["total"].as_i64().unwrap(), 50);
+        assert_eq!(v["returned"].as_i64().unwrap(), 5);
+        assert!(v["versions"][0].to_string().contains("version-v39-body"));
+        assert!(v["versions"][4].to_string().contains("version-v35-body"));
+
+        // A page past the end returns the remainder, total unchanged.
+        let resp = handle_history(
+            &db,
+            json!({"category":"facts","key":"hot","limit":20,"offset":48}),
+        )
+        .expect("history tail");
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v["total"].as_i64().unwrap(), 50);
+        assert_eq!(v["returned"].as_i64().unwrap(), 2);
+        assert!(v["versions"][0].to_string().contains("version-v1-body"));
+        assert!(v["versions"][1].to_string().contains("version-v0-body"));
+
+        let _ = std::fs::remove_file(&path);
     }
 
     // ─── Bi-temporal valid-time tools (#363) ─────────────────────

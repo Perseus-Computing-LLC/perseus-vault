@@ -266,6 +266,15 @@ impl Database {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(5000);
+        // #397: how long a request waits for a pooled connection before giving
+        // up. r2d2's default is 30s, which under pool exhaustion turned into a
+        // 30-second brownout per request; operators can now tune it (e.g. fail
+        // fast at 2s and let the client retry). Default preserves r2d2's 30s.
+        let pool_timeout_ms: u64 = std::env::var("MIMIR_POOL_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(30_000);
         let manager = SqliteConnectionManager::file(path).with_init(move |c| {
             c.execute_batch(&format!(
                 "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=1000; \
@@ -274,7 +283,10 @@ impl Database {
                  PRAGMA mmap_size=268435456; PRAGMA temp_store=MEMORY;",
             ))
         });
-        let pool = r2d2::Pool::builder().max_size(max_size).build(manager)?;
+        let pool = r2d2::Pool::builder()
+            .max_size(max_size)
+            .connection_timeout(std::time::Duration::from_millis(pool_timeout_ms))
+            .build(manager)?;
 
         // Initialize schema once if this is a new database.
         let setup_conn = pool.get()?;
@@ -615,6 +627,12 @@ impl Database {
 
     /// Store a dense vector embedding for an entity (and its sign-bit
     /// signature — see `embedding_signature` / the dense_search prefilter).
+    ///
+    /// Draws its own pooled connection — for callers that do NOT already hold
+    /// one. Callers holding a live connection must use
+    /// `store_embedding_with_conn` instead: drawing a second pooled connection
+    /// while one is held deadlock-collapses the pool at >= pool-size
+    /// concurrency (#397).
     #[allow(dead_code)]
     pub fn store_embedding(
         &self,
@@ -622,6 +640,17 @@ impl Database {
         embedding: &[f32],
     ) -> Result<(), Box<dyn std::error::Error>> {
         let conn = self.conn()?;
+        Self::store_embedding_with_conn(&conn, id, embedding)
+    }
+
+    /// #397: `store_embedding` on the CALLER's already-held connection, so hot
+    /// paths (remember's auto-embed, embed_entity) use exactly one pooled
+    /// connection per request.
+    fn store_embedding_with_conn(
+        conn: &rusqlite::Connection,
+        id: &str,
+        embedding: &[f32],
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let blob: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
         let sig = embedding_signature(embedding);
         conn.execute(
@@ -636,9 +665,13 @@ impl Database {
         &self,
         params: &EmbedParams,
     ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-        let conn = self.conn()?;
         // Batch mode: embed all entities in a category that lack embeddings
         if let Some(ref cat) = params.batch_category {
+            // #397: the connection is scoped to THIS branch. Drawing it for the
+            // whole function meant the single-entity path below held it across
+            // its own self-drawing get_entity/store_embedding calls — a nested
+            // pool draw that deadlocks at >= pool-size concurrent embeds.
+            let conn = self.conn()?;
             let mut stmt = conn.prepare(
                 "SELECT id, body_json FROM entities WHERE category = ?1 AND archived = 0 AND embedding IS NULL LIMIT ?2",
             )?;
@@ -652,7 +685,9 @@ impl Database {
                 let (id, body) = row?;
                 match self.generate_embedding_with_fallback(&body) {
                     Ok(vec) => {
-                        self.store_embedding(&id, &vec)?;
+                        // #397: reuse the connection held since the top of
+                        // embed_entity — no nested pool draw.
+                        Self::store_embedding_with_conn(&conn, &id, &vec)?;
                         embedded += 1;
                     }
                     Err(e) => errors.push(format!("{}: {}", id, e)),
@@ -665,7 +700,10 @@ impl Database {
             }));
         }
 
-        // Single entity mode: require category + key
+        // Single entity mode: require category + key. get_entity and
+        // store_embedding each draw (and return) their own pooled connection
+        // SEQUENTIALLY — at no point are two held at once, so this path is
+        // safe at full pool saturation (#397).
         let category = params.category.as_ref().ok_or("category is required")?;
         let key = params.key.as_ref().ok_or("key is required")?;
         let entity = self
@@ -1241,6 +1279,21 @@ impl Database {
     /// (VERIFIED_DECAY_FLOOR) and are never auto-archived.
     pub(crate) const ARCHIVE_DECAY_THRESHOLD: f64 = 0.05;
 
+    /// #399: decay_tick skips a row's UPDATE when the recomputed decay_score
+    /// is within this epsilon of the stored value (and no archive transition
+    /// applies), so a steady-state tick writes ~0 rows instead of rewriting
+    /// the whole table (412MB of WAL per tick on a 45MB DB @100k, measured).
+    ///
+    /// The recompute is time-dependent — decay drifts by ~decay/half_life per
+    /// ms (~1.7e-9/ms at decay 1.0 with the 7-day half-life) — so a literal
+    /// float-equality epsilon (1e-9) would never skip anything: consecutive
+    /// ticks always differ by the wall time between them. 1e-4 absorbs up to
+    /// ~60s of drift between ticks while bounding the staleness of a stored
+    /// score to 1e-4 — three orders of magnitude below the smallest threshold
+    /// that consumes decay (ARCHIVE_DECAY_THRESHOLD = 0.05), so ranking,
+    /// layering, and archival behavior are unaffected.
+    const DECAY_WRITE_EPSILON: f64 = 1e-4;
+
     /// Minimum trigram similarity for `cohere` to auto-link two same-category
     /// entities (#300). Below this the pair is not meaningfully related, so
     /// linking it would just add graph noise. Same dependency-free measure used
@@ -1286,11 +1339,30 @@ impl Database {
     /// A single `execute` is atomic, so no explicit transaction is needed. The id
     /// count is bounded by the recall LIMIT clamp (≤1000), well under SQLite's
     /// bound-variable ceiling.
+    ///
+    /// Draws its own pooled connection — for callers that do NOT already hold
+    /// one (the tools layer, reinforce_if_requested). Callers holding a live
+    /// connection must use `apply_recall_side_effects_with_conn`: drawing a
+    /// second pooled connection while one is held deadlock-collapses the pool
+    /// at >= pool-size concurrency (#397).
     pub fn apply_recall_side_effects(
         &self,
         ids: &[String],
     ) -> Result<(), Box<dyn std::error::Error>> {
+        if ids.is_empty() {
+            return Ok(());
+        }
         let conn = self.conn()?;
+        Self::apply_recall_side_effects_with_conn(&conn, ids)
+    }
+
+    /// #397: `apply_recall_side_effects` on the CALLER's already-held
+    /// connection, so the default recall path (fts5_search) uses exactly one
+    /// pooled connection per request.
+    fn apply_recall_side_effects_with_conn(
+        conn: &rusqlite::Connection,
+        ids: &[String],
+    ) -> Result<(), Box<dyn std::error::Error>> {
         if ids.is_empty() {
             return Ok(());
         }
@@ -1344,11 +1416,11 @@ impl Database {
         // Update decay_score for non-archived entities, optionally capped
         let sql = if let Some(max) = max_entities {
             format!(
-                "SELECT id, last_accessed_unix_ms, verified, efficacy_status, follow_rate, importance FROM entities WHERE archived = 0 LIMIT {}",
+                "SELECT id, last_accessed_unix_ms, verified, efficacy_status, follow_rate, importance, decay_score FROM entities WHERE archived = 0 LIMIT {}",
                 max
             )
         } else {
-            "SELECT id, last_accessed_unix_ms, verified, efficacy_status, follow_rate, importance FROM entities WHERE archived = 0".to_string()
+            "SELECT id, last_accessed_unix_ms, verified, efficacy_status, follow_rate, importance, decay_score FROM entities WHERE archived = 0".to_string()
         };
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map([], |r| {
@@ -1361,16 +1433,17 @@ impl Database {
                     .unwrap_or_else(|| "unverified".to_string()),
                 r.get::<_, Option<f64>>(4).unwrap_or(None).unwrap_or(0.0),
                 r.get::<_, Option<f64>>(5).unwrap_or(None).unwrap_or(0.0),
+                r.get::<_, f64>(6).unwrap_or(0.0),
             ))
         })?;
 
         let mut updated = 0i64;
         let mut auto_archived = 0i64;
-        let mut batch: Vec<(String, i64, bool, String, f64, f64)> = Vec::with_capacity(1000);
+        let mut batch: Vec<(String, i64, bool, String, f64, f64, f64)> = Vec::with_capacity(1000);
         let now_val = now;
 
         // Helper: flush the current batch in a transaction.
-        let flush_batch = |batch: &mut Vec<(String, i64, bool, String, f64, f64)>,
+        let flush_batch = |batch: &mut Vec<(String, i64, bool, String, f64, f64, f64)>,
                             updated: &mut i64,
                             auto_archived: &mut i64|
          -> Result<(), Box<dyn std::error::Error>> {
@@ -1378,7 +1451,7 @@ impl Database {
                 return Ok(());
             }
             let tx = conn.unchecked_transaction()?;
-            for (id, last_access, verified, efficacy_status, follow_rate, importance) in
+            for (id, last_access, verified, efficacy_status, follow_rate, importance, stored_decay) in
                 batch.drain(..)
             {
                 let mut new_decay = Self::compute_decay(last_access, now_val);
@@ -1407,11 +1480,30 @@ impl Database {
                 // efficacy composite. Previously a manual score was erased by
                 // this very recompute on the next tick.
                 new_decay = new_decay.max(importance.clamp(0.0, 1.0));
-                tx.execute(
-                    "UPDATE entities SET decay_score = ?1 WHERE id = ?2",
-                    params![new_decay, &id],
-                )?;
-                *updated += 1;
+                // #399: skip the write when the recompute landed within epsilon
+                // of the stored score and no archive transition applies — the
+                // UPDATE would re-dirty the row's page for a value change no
+                // consumer can observe. `updated` therefore counts rows
+                // actually WRITTEN, not rows evaluated (`entities_checked`
+                // still reports the full evaluated count).
+                //
+                // The write is also forced when new/stored straddle a layer
+                // demotion boundary (0.2 / 0.5 — must mirror the layer CASE
+                // below): the demotion UPDATE reads the STORED score, so
+                // skipping a straddling write would delay that row's demotion
+                // until the drift exceeded epsilon.
+                let straddles_layer_boundary = (new_decay < 0.2) != (stored_decay < 0.2)
+                    || (new_decay < 0.5) != (stored_decay < 0.5);
+                let no_op = (new_decay - stored_decay).abs() < Self::DECAY_WRITE_EPSILON
+                    && new_decay >= Self::ARCHIVE_DECAY_THRESHOLD
+                    && !straddles_layer_boundary;
+                if !no_op {
+                    tx.execute(
+                        "UPDATE entities SET decay_score = ?1 WHERE id = ?2",
+                        params![new_decay, &id],
+                    )?;
+                    *updated += 1;
+                }
                 // Auto-archive entities that have fully decayed.
                 // Verified entities are floored above this and never reach it.
                 if new_decay < Self::ARCHIVE_DECAY_THRESHOLD {
@@ -1432,8 +1524,9 @@ impl Database {
         };
 
         for row in rows {
-            let (id, last_access, verified, efficacy_status, follow_rate, importance) = row?;
-            batch.push((id, last_access, verified, efficacy_status, follow_rate, importance));
+            let (id, last_access, verified, efficacy_status, follow_rate, importance, stored_decay) =
+                row?;
+            batch.push((id, last_access, verified, efficacy_status, follow_rate, importance, stored_decay));
             if batch.len() >= 1000 {
                 flush_batch(&mut batch, &mut updated, &mut auto_archived)?;
             }
@@ -1450,13 +1543,18 @@ impl Database {
         // recall-count driven — and exempts verified/always-on entities
         // (curated / pinned). Runs once over the freshly-recomputed decay
         // scores; pairs with the verified decay floor above.
+        // #399: the WHERE mirrors the CASE's transition conditions so only rows
+        // whose layer actually CHANGES are written — SQLite rewrites a row (and
+        // its page, into the WAL) even when SET assigns the existing value, so
+        // the previous broad WHERE re-dirtied every non-buffer row every tick.
         conn.execute(
             "UPDATE entities SET layer = CASE \
                 WHEN decay_score < 0.2 THEN 'buffer' \
                 WHEN decay_score < 0.5 AND layer = 'core' THEN 'working' \
                 ELSE layer END \
              WHERE archived = 0 AND verified = 0 AND always_on = 0 \
-               AND layer != 'buffer'",
+               AND layer != 'buffer' \
+               AND (decay_score < 0.2 OR (decay_score < 0.5 AND layer = 'core'))",
             [],
         )?;
 
@@ -1513,8 +1611,35 @@ impl Database {
     /// swallowed as a "duplicate" — the content never existed in B (and B's
     /// write bumped A's retrieval stats instead).
     /// Returns Some(existing_entity_id) if similarity > threshold.
+    ///
+    /// Draws its own pooled connection — for callers that do NOT already hold
+    /// one (tests, ad-hoc checks). Callers holding a live connection must use
+    /// `find_near_duplicate_with_conn`: drawing a second pooled connection
+    /// while one is held deadlock-collapses the pool at >= pool-size
+    /// concurrency (#397).
     fn find_near_duplicate(
         &self,
+        category: &str,
+        workspace_hash: &str,
+        body_json: &str,
+        threshold: f64,
+        fts_prefilter: bool,
+    ) -> Result<Option<String>, Box<dyn std::error::Error>> {
+        let conn = self.conn()?;
+        Self::find_near_duplicate_with_conn(
+            &conn,
+            category,
+            workspace_hash,
+            body_json,
+            threshold,
+            fts_prefilter,
+        )
+    }
+
+    /// #397: `find_near_duplicate` on the CALLER's already-held connection, so
+    /// remember's create path uses exactly one pooled connection per request.
+    fn find_near_duplicate_with_conn(
+        conn: &rusqlite::Connection,
         category: &str,
         workspace_hash: &str,
         body_json: &str,
@@ -1529,8 +1654,6 @@ impl Database {
             return Ok(None);
         }
         let target = Self::trigrams(body_json);
-
-        let conn = self.conn()?;
 
         // Opt-in FTS candidate prefilter (#228), gated by the caller. The exact
         // cost of dedup on bulk import is the exhaustive trigram comparison
@@ -2031,7 +2154,11 @@ impl Database {
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false);
             if !skip_dedup {
-                if let Ok(Some(dup_id)) = self.find_near_duplicate(
+                // #397: run the dedup scan on the connection this remember()
+                // already holds — a nested self.conn() here held TWO pooled
+                // connections per create and collapsed the pool under load.
+                if let Ok(Some(dup_id)) = Self::find_near_duplicate_with_conn(
+                    &conn,
                     &entity.category,
                     &entity.workspace_hash,
                     &entity.body_json,
@@ -2121,7 +2248,9 @@ impl Database {
         if should_embed && self.embedding_config.enabled {
             match self.generate_embedding_with_fallback(&entity.body_json) {
                 Ok(vec) => {
-                    if let Err(e) = self.store_embedding(&id, &vec) {
+                    // #397: store on the connection this remember() already
+                    // holds — no nested pool draw on the write hot path.
+                    if let Err(e) = Self::store_embedding_with_conn(&conn, &id, &vec) {
                         eprintln!("mimir: auto-embed store failed for {}: {}", id, e);
                     }
                 }
@@ -2514,9 +2643,11 @@ impl Database {
 
         // #207: one batched side-effect write for all matched rows. Errors are
         // ignored here exactly as the previous per-row write was — a failed bump
-        // must never fail the read.
+        // must never fail the read. #397: applied on the connection this search
+        // already holds — a nested self.conn() here held TWO pooled connections
+        // per recall and collapsed the pool under load.
         if !hit_ids.is_empty() {
-            let _ = self.apply_recall_side_effects(&hit_ids);
+            let _ = Self::apply_recall_side_effects_with_conn(&conn, &hit_ids);
         }
 
         // #106: Content witness signal (additive boost, never penalizes)
@@ -3027,7 +3158,29 @@ impl Database {
         category: &str,
         key: &str,
     ) -> Result<Vec<crate::models::Entity>, Box<dyn std::error::Error>> {
+        // LIMIT -1 is SQLite's "no limit".
+        Ok(self.history_versions_page(category, key, -1, 0)?.0)
+    }
+
+    /// #403: paginated version trail — newest first, `limit` rows starting at
+    /// `offset`, plus the TOTAL number of superseded versions for the key so
+    /// callers know there is more. A hot key can accumulate tens of thousands
+    /// of versions; returning every full decrypted body in one tool response
+    /// (~10-15MB at 10k versions) is what this bounds. `limit = -1` returns
+    /// everything (SQLite semantics), which `history_versions` uses.
+    pub fn history_versions_page(
+        &self,
+        category: &str,
+        key: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<crate::models::Entity>, i64), Box<dyn std::error::Error>> {
         let conn = self.conn()?;
+        let total: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM entity_history WHERE category = ?1 AND key = ?2",
+            params![category, key],
+            |r| r.get(0),
+        )?;
         // Column order matches entity_from_row (incl. NULL embedding at index 18).
         let mut stmt = conn.prepare(
             "SELECT id, category, key, body_json, status, type, tags, decay_score,
@@ -3037,15 +3190,18 @@ impl Database {
                     visibility
              FROM entity_history
              WHERE category = ?1 AND key = ?2
-             ORDER BY invalidated_at_unix_ms DESC, recorded_at_unix_ms DESC",
+             ORDER BY invalidated_at_unix_ms DESC, recorded_at_unix_ms DESC
+             LIMIT ?3 OFFSET ?4",
         )?;
         let enc = self.encryption.as_ref();
-        let rows = stmt.query_map(params![category, key], |r| entity_from_row(r, enc))?;
+        let rows = stmt.query_map(params![category, key, limit, offset.max(0)], |r| {
+            entity_from_row(r, enc)
+        })?;
         let mut out = Vec::new();
         for r in rows {
             out.push(r?);
         }
-        Ok(out)
+        Ok((out, total))
     }
 
     /// The version of (category, key) that was the live fact at transaction time
@@ -7427,6 +7583,139 @@ mod tests {
         let (db, path) = temp_db();
         assert!(db.health_check());
         let _ = fs::remove_file(&path);
+    }
+
+    /// #399: decay_tick must not rewrite rows whose recomputed decay matches
+    /// what is already stored. First tick over a stale store persists the
+    /// recomputed scores; an immediately-following second tick recomputes
+    /// values within DECAY_WRITE_EPSILON of what the first tick stored and
+    /// must write zero rows (previously it rewrote the entire table every
+    /// tick — 412MB of WAL per tick on a 45MB DB @100k).
+    #[test]
+    fn second_consecutive_decay_tick_writes_zero_rows() {
+        let (db, path) = temp_db();
+        let now = now_ms();
+        for i in 0..10 {
+            let mut e = make_entity(
+                &format!("decay-noop-{i}"),
+                "insight",
+                &format!("decay-noop-key-{i}"),
+                &format!("{{\"content\":\"decay steady-state probe {i}\"}}"),
+            );
+            // Stored decay 1.0 but last touched 2 days ago: the first tick's
+            // recompute (~0.75) differs from 1.0 and must be written; the
+            // second tick then recomputes within epsilon of the stored value.
+            e.last_accessed_unix_ms = now - 2 * 24 * 60 * 60 * 1000;
+            // skip_dedup: the probe bodies are >70% trigram-similar to each
+            // other and would otherwise collapse into one entity.
+            db.remember_skip_dedup(&e).expect("seed");
+        }
+
+        let first = db.decay_tick().expect("first tick");
+        assert_eq!(first.entities_checked, 10);
+        assert_eq!(
+            first.entities_updated, 10,
+            "first tick over a stale store must persist every recomputed score"
+        );
+        assert_eq!(first.auto_archived, 0);
+
+        let second = db.decay_tick().expect("second tick");
+        assert_eq!(
+            second.entities_checked, 10,
+            "every non-archived row is still EVALUATED"
+        );
+        assert_eq!(
+            second.entities_updated, 0,
+            "steady-state tick must WRITE zero rows (#399)"
+        );
+        assert_eq!(second.auto_archived, 0);
+
+        // The stored scores really did land on the first tick (not skipped):
+        // all ten decayed well below their seeded 1.0.
+        let conn = db.conn().expect("conn");
+        let max_decay: f64 = conn
+            .query_row(
+                "SELECT MAX(decay_score) FROM entities WHERE category = 'insight'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("max decay");
+        assert!(
+            max_decay < 0.9,
+            "first tick must have persisted the recomputed (~0.75) scores, got {max_decay}"
+        );
+
+        let _ = fs::remove_file(&path);
+    }
+
+    /// #397 (review follow-up): single-entity embed_entity must never hold one
+    /// pooled connection while get_entity/store_embedding draw another. With a
+    /// ONE-connection pool and a short checkout timeout, any nested draw
+    /// deadlocks-then-times-out — exactly the reviewer's repro (pool=1,
+    /// MIMIR_POOL_TIMEOUT_MS=700 -> single-mode embed timed out in ~714ms).
+    /// The pool is built directly (not via env) so parallel tests are
+    /// unaffected. A missing embedding backend (lean builds) is an acceptable
+    /// error; a pool checkout timeout is the regression.
+    #[test]
+    fn single_mode_embed_entity_does_not_nest_pool_draws() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("mimir-test-pool1-{}.db", uuid::Uuid::new_v4()));
+        let path_str = path.to_str().unwrap().to_string();
+        let manager = SqliteConnectionManager::file(&path_str).with_init(|c| {
+            c.execute_batch(
+                "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;",
+            )
+        });
+        let pool = r2d2::Pool::builder()
+            .max_size(1)
+            .connection_timeout(std::time::Duration::from_millis(700))
+            .build(manager)
+            .expect("pool");
+        let setup = pool.get().expect("setup conn");
+        schema::initialize_schema(&setup).expect("schema");
+        drop(setup);
+        let db = Database {
+            pool,
+            db_path: path_str.clone(),
+            encryption: None,
+            llm_config: LlmConfig::default(),
+            embedding_config: crate::embedding::EmbeddingConfig::default(),
+            embedding_cache: std::sync::Mutex::new(EmbeddingCache::new(256)),
+            connectors: Vec::new(),
+        };
+
+        db.remember_skip_dedup(&make_entity(
+            "pool1-e",
+            "insight",
+            "pool1-key",
+            "{\"content\":\"embed me over a one-connection pool\"}",
+        ))
+        .expect("seed entity");
+
+        let started = std::time::Instant::now();
+        let res = db.embed_entity(&EmbedParams {
+            text: None,
+            category: Some("insight".to_string()),
+            key: Some("pool1-key".to_string()),
+            batch_category: None,
+            batch_limit: 100,
+        });
+        match res {
+            Ok(v) => assert_eq!(v["embedded"], 1, "single-mode embed should succeed: {v}"),
+            Err(e) => {
+                let msg = e.to_string().to_lowercase();
+                assert!(
+                    !msg.contains("timed out") && !msg.contains("timeout"),
+                    "single-mode embed_entity nested a pool draw (checkout timed out \
+                     after {:?}): {msg}",
+                    started.elapsed()
+                );
+            }
+        }
+        // The pool must still be usable afterwards (nothing leaked a checkout).
+        assert!(db.health_check(), "pool wedged after single-mode embed");
+
+        let _ = fs::remove_file(&path_str);
     }
 
     #[test]

@@ -719,7 +719,7 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
   },
   {
     "name": "mimir_history",
-    "description": "List every superseded (historical) version of a fact (category + key), newest first. Each entry was the live fact for an interval before it was overwritten. The companion to mimir_as_of: as_of returns the single version live at one instant; history returns the full version trail. Returns an empty list if the fact has never been overwritten (its only version is the current live one in recall).",
+    "description": "List superseded (historical) versions of a fact (category + key), newest first. Each entry was the live fact for an interval before it was overwritten. The companion to mimir_as_of: as_of returns the single version live at one instant; history returns the version trail. Paginated: returns the `limit` newest versions (default 20) starting at `offset`; `total` in the response is the FULL trail size, so total > returned means there are more pages. Returns an empty list if the fact has never been overwritten (its only version is the current live one in recall).",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -730,6 +730,16 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
         "key": {
           "type": "string",
           "description": "Entity key within the category"
+        },
+        "limit": {
+          "type": "integer",
+          "default": 20,
+          "description": "Maximum versions to return (newest first), 0-1000. Defaults to 20. 0 is count-only: returns no version bodies while `total` still reports the full trail size."
+        },
+        "offset": {
+          "type": "integer",
+          "default": 0,
+          "description": "Number of newest versions to skip, for paging through a long trail."
         }
       },
       "required": [
@@ -2527,7 +2537,7 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
         },
         "entities_updated": {
           "type": "integer",
-          "description": "Entities whose decay score changed"
+          "description": "Entities whose stored decay score was actually rewritten (rows whose recomputed score changed). A steady-state tick reports ~0: unchanged rows are evaluated but not written."
         },
         "auto_archived": {
           "type": "integer",
