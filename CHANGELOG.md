@@ -19,6 +19,20 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
   "not found" (#396, the #394 principle): only `QueryReturnedNoRows` maps to
   the clean `found: false` report; a locked file or corruption error now
   propagates.
+- Selective FTS recall cost now tracks the number of HITS, not corpus size
+  (#401). Queries whose FTS match set fits under a cap (512 rows)
+  materialize the matched rowids first and run the ranking ORDER BY over
+  just those rows via INTEGER PRIMARY KEY lookups (`NOT INDEXED` pins the
+  plan), instead of scanning `idx_entities_recall` while probing an
+  up-to-100k-rowid FTS IN-list. Larger match sets keep the legacy
+  rank-index-driven plan, which is efficient exactly when matches are
+  dense. Result semantics are byte-identical (same filters, ranking order,
+  LIMIT/OFFSET — equivalence-tested against the legacy plan); a query
+  whose FTS terms match nothing now short-circuits without touching the
+  entities table. Measured @100k (release, p50/50 iters): rare-term
+  (20 hits) recall 5.1ms → 0.08ms (~64x); dense-match queries pay a small
+  fixed probe cost (common term ~33k hits: +~0.5ms, the intrinsic FTS5
+  prefix-doclist materialization — they were and remain O(corpus)).
 
 ## [2.14.0] - 2026-07-02
 

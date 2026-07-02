@@ -2419,14 +2419,48 @@ impl Database {
         Ok(())
     }
 
+    /// #401: ceiling on the FTS match-set size for the FTS-driven ("selective")
+    /// recall plan. At or below this, the matched rowids are materialized up
+    /// front and the ranking ORDER BY runs over just those rows via INTEGER
+    /// PRIMARY KEY lookups plus a small temp-B-tree sort — cost tracks the
+    /// number of HITS, not corpus size. Above it, the legacy rank-index-driven
+    /// plan takes over: a dense match set means the idx_entities_recall scan
+    /// finds `limit` matching rows after a short prefix of the index, which is
+    /// exactly where that plan is cheap.
+    ///
+    /// Correctness never depends on this value: the selective plan is only
+    /// chosen when the ENTIRE match set fit under the cap, so any LIMIT/OFFSET
+    /// pages the same ordered set either way. The trade-off is purely probe
+    /// overhead vs coverage: every query pays the probe (~0.25µs per rowid
+    /// read, measured @100k release), so a large cap taxes non-selective
+    /// queries — 2048 cost the common-term case ~0.5ms (+16%), 512 keeps it
+    /// ~0.1ms (noise) while still covering match sets far beyond typical
+    /// recall limits (default 10, clamp 1000). Queries matching 513+ rows
+    /// keep today's plan and today's cost — no regression, just no speedup.
+    const FTS_DRIVEN_MAX_MATCHES: usize = 512;
+
     /// Core FTS5 + LIKE keyword search (extracted for reuse by recall and hybrid).
     fn fts5_search(
         &self,
         params: &RecallParams,
     ) -> Result<Vec<Entity>, Box<dyn std::error::Error>> {
-        let conn = self.conn()?;
+        self.fts5_search_with_fts_drive_max(params, Self::FTS_DRIVEN_MAX_MATCHES)
+    }
+
+    /// Builds the recall SQL + bind params for `fts5_search`. Returns
+    /// `Ok(None)` when the query has FTS terms but the FTS index matched
+    /// nothing — no row can satisfy the AND-ed match condition, so the caller
+    /// skips the main query entirely (#401).
+    fn build_fts5_search_sql(
+        conn: &rusqlite::Connection,
+        params: &RecallParams,
+        fts_drive_max: usize,
+    ) -> Result<Option<(String, Vec<Box<dyn rusqlite::types::ToSql>>)>, Box<dyn std::error::Error>>
+    {
         let mut conditions: Vec<String> = Vec::new();
         let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        // #401: set when the FTS-driven (selective) plan was chosen below.
+        let mut fts_selective = false;
 
         // Keyword search: FTS5 OR match + LIKE fallback
         if !params.query.is_empty() {
@@ -2471,12 +2505,47 @@ impl Database {
                         })
                         .collect::<Vec<_>>()
                         .join(" OR ");
-                    let idx = param_values.len() + 1;
-                    param_values.push(Box::new(fts_query));
-                    conditions.push(format!(
-                        "rowid IN (SELECT rowid FROM entities_fts WHERE entities_fts MATCH ?{})",
-                        idx
-                    ));
+
+                    // #401: probe the FTS index FIRST. FTS5 can enumerate the
+                    // matched rowids cheaply, while the ranking index has no
+                    // idea which rows match — so when the match set is small
+                    // (selective query), drive the plan from the matches:
+                    // rank-sorting a few hundred rows costs microseconds,
+                    // whereas the legacy plan walks the ranking index probing
+                    // the match set and costs O(corpus) regardless of hit
+                    // count. When the match set is large the probe bails out
+                    // (it reads at most fts_drive_max + 1 rowids) and the
+                    // legacy plan — efficient exactly when matches are dense —
+                    // is kept.
+                    match Self::fts_matched_rowids(conn, &fts_query, fts_drive_max)? {
+                        Some(rowids) if rowids.is_empty() => {
+                            // The FTS terms match nothing: the AND-ed match
+                            // condition can never hold.
+                            return Ok(None);
+                        }
+                        Some(rowids) => {
+                            // Selective: inline the matched rowids (i64s — no
+                            // injection surface) and steer the plan onto
+                            // INTEGER PRIMARY KEY lookups via NOT INDEXED
+                            // below.
+                            fts_selective = true;
+                            let list = rowids
+                                .iter()
+                                .map(|r| r.to_string())
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            conditions.push(format!("rowid IN ({list})"));
+                        }
+                        None => {
+                            // Large match set: legacy rank-index-driven plan.
+                            let idx = param_values.len() + 1;
+                            param_values.push(Box::new(fts_query));
+                            conditions.push(format!(
+                                "rowid IN (SELECT rowid FROM entities_fts WHERE entities_fts MATCH ?{})",
+                                idx
+                            ));
+                        }
+                    }
                 }
             }
         }
@@ -2575,6 +2644,15 @@ impl Database {
              FROM entities",
         );
 
+        // #401: NOT INDEXED steers the selective arm onto INTEGER PRIMARY KEY
+        // rowid lookups (explicitly still permitted under NOT INDEXED) — the
+        // planner otherwise keeps choosing the idx_entities_recall scan to
+        // avoid the ORDER BY sort, which is exactly the O(corpus) plan this
+        // arm exists to bypass. Verified by the EXPLAIN QUERY PLAN test.
+        if fts_selective {
+            sql.push_str(" NOT INDEXED");
+        }
+
         if !conditions.is_empty() {
             sql.push_str(" WHERE ");
             sql.push_str(&conditions.join(" AND "));
@@ -2604,6 +2682,55 @@ impl Database {
             sql.push_str(&format!(" OFFSET ?{}", param_values.len() + 1));
             param_values.push(Box::new(safe_offset));
         }
+
+        Ok(Some((sql, param_values)))
+    }
+
+    /// #401: materialize the FTS match set when it is small. Returns
+    /// `Ok(Some(rowids))` when the query matches at most `max` rows, and
+    /// `Ok(None)` when the match set exceeds `max` — or when `max` is 0, which
+    /// disables the probe entirely. Reads at most `max + 1` rowids, so a
+    /// corpus-common term bails out after a bounded, cheap scan.
+    fn fts_matched_rowids(
+        conn: &rusqlite::Connection,
+        fts_query: &str,
+        max: usize,
+    ) -> Result<Option<Vec<i64>>, rusqlite::Error> {
+        if max == 0 {
+            return Ok(None);
+        }
+        let mut stmt =
+            conn.prepare("SELECT rowid FROM entities_fts WHERE entities_fts MATCH ?1 LIMIT ?2")?;
+        let rows = stmt.query_map(params![fts_query, (max as i64) + 1], |r| {
+            r.get::<_, i64>(0)
+        })?;
+        let mut out: Vec<i64> = Vec::new();
+        for r in rows {
+            out.push(r?);
+            if out.len() > max {
+                return Ok(None);
+            }
+        }
+        Ok(Some(out))
+    }
+
+    /// `fts_drive_max` caps the FTS-driven plan's match-set size (#401); 0
+    /// disables the probe and forces the legacy rank-index-driven plan (the
+    /// equivalence tests use this to assert the two plans return identical
+    /// ordered results).
+    fn fts5_search_with_fts_drive_max(
+        &self,
+        params: &RecallParams,
+        fts_drive_max: usize,
+    ) -> Result<Vec<Entity>, Box<dyn std::error::Error>> {
+        let conn = self.conn()?;
+        let (sql, param_values) =
+            match Self::build_fts5_search_sql(&conn, params, fts_drive_max)? {
+                Some(built) => built,
+                // FTS terms present but nothing matched: result is empty by
+                // construction, with no side effects to apply (no hits).
+                None => return Ok(Vec::new()),
+            };
 
         let param_refs: Vec<&dyn rusqlite::types::ToSql> =
             param_values.iter().map(|p| p.as_ref()).collect();
@@ -12822,6 +12949,270 @@ mod tests {
         eprintln!("STRESS TEST PASSED at {} entities", n);
     }
 
+    // ───────────────── #401: FTS-driven selective recall plan ─────────────────
+
+    /// Direct-SQL seeder (no embedding, no dedup) that keeps entities_fts in
+    /// sync — the recall-plan tests need precise control over retrieval_count,
+    /// last_accessed, category and archived without paying per-row embeds.
+    /// Archived rows are seeded WITHOUT an FTS row, matching the production
+    /// invariant that archived entities are not in the FTS index.
+    fn seed_plain_entity(
+        db: &Database,
+        id: &str,
+        body: &str,
+        category: &str,
+        retrieval_count: i64,
+        last_accessed: i64,
+        archived: bool,
+    ) {
+        let conn = db.conn().unwrap();
+        conn.execute(
+            "INSERT INTO entities (id, category, key, body_json, type, status, retrieval_count,
+                                   last_accessed_unix_ms, created_at_unix_ms, decay_score, layer, archived)
+             VALUES (?1, ?2, ?3, ?4, 'insight', 'active', ?5, ?6, 0, 0.5, 'working', ?7)",
+            params![id, category, id, body, retrieval_count, last_accessed, archived as i64],
+        )
+        .unwrap();
+        if !archived {
+            conn.execute(
+                "INSERT INTO entities_fts(rowid, body_json) VALUES (last_insert_rowid(), ?1)",
+                params![body],
+            )
+            .unwrap();
+        }
+    }
+
+    fn explain_plan(
+        conn: &rusqlite::Connection,
+        sql: &str,
+        binds: &[Box<dyn rusqlite::types::ToSql>],
+    ) -> String {
+        let refs: Vec<&dyn rusqlite::types::ToSql> = binds.iter().map(|b| b.as_ref()).collect();
+        conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap()
+            .query_map(refs.as_slice(), |r| r.get::<_, String>(3))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect::<Vec<_>>()
+            .join(" | ")
+    }
+
+    /// #401 EQP evidence: a selective query must SEARCH entities by INTEGER
+    /// PRIMARY KEY over the materialized FTS match set, not scan the ranking
+    /// index probing an FTS IN-list (the O(corpus) plan the issue measured).
+    #[test]
+    fn selective_fts_recall_drives_from_rowids_not_rank_index() {
+        let (db, path) = temp_db();
+        for i in 0..30 {
+            seed_plain_entity(
+                &db,
+                &format!("eqp-{i:03}"),
+                &format!(r#"{{"content":"eqp zebra probe {i}"}}"#),
+                "facts",
+                i,
+                i,
+                false,
+            );
+        }
+        let params = crate::models::RecallParams {
+            query: "zebra".to_string(),
+            skip_side_effects: true,
+            ..Default::default()
+        };
+        let conn = db.conn().unwrap();
+
+        // Selective arm: 30 matches <= cap, so the FTS-driven plan is chosen.
+        let (sql, binds) = Database::build_fts5_search_sql(&conn, &params, 2048)
+            .unwrap()
+            .expect("zebra matches rows");
+        assert!(
+            sql.contains("NOT INDEXED"),
+            "selective arm should pin the rowid plan: {sql}"
+        );
+        let plan = explain_plan(&conn, &sql, &binds);
+        eprintln!("#401 selective plan: {plan}");
+        assert!(
+            plan.contains("USING INTEGER PRIMARY KEY (rowid=?)"),
+            "selective plan must SEARCH entities by rowid, got: {plan}"
+        );
+        assert!(
+            !plan.contains("idx_entities_recall"),
+            "selective plan must not scan the ranking index, got: {plan}"
+        );
+
+        // Probe disabled (cap 0): documents the legacy plan #401 fixed — the
+        // ranking-index scan probing an FTS LIST SUBQUERY.
+        let (sql0, binds0) = Database::build_fts5_search_sql(&conn, &params, 0)
+            .unwrap()
+            .expect("legacy arm always builds");
+        assert!(!sql0.contains("NOT INDEXED"));
+        let plan0 = explain_plan(&conn, &sql0, &binds0);
+        eprintln!("#401 legacy plan:    {plan0}");
+        assert!(
+            plan0.contains("idx_entities_recall"),
+            "legacy plan drives from the ranking index, got: {plan0}"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    /// #401 equivalence: the FTS-driven plan must return byte-identical ordered
+    /// results to the legacy rank-index-driven plan — same filters (archived,
+    /// excluded categories), same ranking order incl. the id ASC tie-break,
+    /// same LIMIT/OFFSET behavior.
+    #[test]
+    fn fts_driven_plan_matches_rank_driven_results_exactly() {
+        let (db, path) = temp_db();
+        // 40 matching rows with deliberate ranking-key ties so the id ASC
+        // tie-break is load-bearing, plus rows every filter must drop equally
+        // on both arms.
+        for i in 0..40i64 {
+            seed_plain_entity(
+                &db,
+                &format!("eq-{i:03}"),
+                &format!(r#"{{"content":"equivterm shared corpus row {i}"}}"#),
+                "facts",
+                i % 5,
+                i % 3,
+                false,
+            );
+        }
+        seed_plain_entity(&db, "eq-archived", r#"{"content":"equivterm archived"}"#, "facts", 99, 99, true);
+        seed_plain_entity(&db, "eq-conv", r#"{"content":"equivterm chatter"}"#, "conversation", 99, 99, false);
+        seed_plain_entity(&db, "eq-unrelated", r#"{"content":"nothing here"}"#, "facts", 99, 99, false);
+
+        let ids = |v: &[Entity]| v.iter().map(|e| e.id.clone()).collect::<Vec<_>>();
+        let params = crate::models::RecallParams {
+            query: "equivterm".to_string(),
+            limit: 25,
+            skip_side_effects: true,
+            ..Default::default()
+        };
+        let new = db
+            .fts5_search_with_fts_drive_max(&params, Database::FTS_DRIVEN_MAX_MATCHES)
+            .unwrap();
+        let legacy = db.fts5_search_with_fts_drive_max(&params, 0).unwrap();
+        assert_eq!(new.len(), 25, "limit must clamp identically");
+        assert_eq!(ids(&new), ids(&legacy), "selective plan changed result order");
+        assert!(
+            !ids(&new).iter().any(|i| i == "eq-archived" || i == "eq-conv" || i == "eq-unrelated"),
+            "filters must apply identically on the selective arm"
+        );
+
+        // Above-threshold through the same seam: cap 5 < 40 matches, so the
+        // probe overflows and the fallback arm runs.
+        let fallback = db.fts5_search_with_fts_drive_max(&params, 5).unwrap();
+        assert_eq!(ids(&fallback), ids(&legacy), "fallback arm changed result order");
+
+        // Multi-word OR + OFFSET paging parity.
+        let paged = crate::models::RecallParams {
+            query: "equivterm zzznope".to_string(),
+            limit: 10,
+            offset: 20,
+            skip_side_effects: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            ids(&db.fts5_search_with_fts_drive_max(&paged, 2048).unwrap()),
+            ids(&db.fts5_search_with_fts_drive_max(&paged, 0).unwrap()),
+            "OFFSET paging must page the same ordered set on both arms"
+        );
+
+        // Zero matches: the selective arm short-circuits; both must be empty.
+        let none = crate::models::RecallParams {
+            query: "zzznope".to_string(),
+            skip_side_effects: true,
+            ..Default::default()
+        };
+        assert!(db.fts5_search(&none).unwrap().is_empty());
+        assert!(db.fts5_search_with_fts_drive_max(&none, 0).unwrap().is_empty());
+        let _ = fs::remove_file(&path);
+    }
+
+    /// #401 perf evidence: FTS recall cost must track HITS, not corpus size.
+    /// Run manually in release:
+    ///   cargo +stable-x86_64-pc-windows-msvc test --release -- --ignored bench_401 --nocapture
+    #[test]
+    #[ignore] // seeds 100k rows; run manually with --ignored (release build)
+    fn bench_401_fts_recall_selectivity() {
+        use std::time::Instant;
+        let (db, path) = temp_db();
+        let n: usize = 100_000;
+        for chunk in (0..n).collect::<Vec<_>>().chunks(5000) {
+            let conn = db.conn().unwrap();
+            let tx = conn.unchecked_transaction().unwrap();
+            for i in chunk {
+                let i = *i;
+                // "entity" is a corpus-common prefix term (all rows); the
+                // zero-padded number is unique per row; "raretoken" hits
+                // exactly 20 rows spread across the corpus; "alpha" ~33k.
+                let body = format!(
+                    r#"{{"content":"entity-{:06} number {} with some searchable text {} {} {}"}}"#,
+                    i,
+                    i,
+                    if i % 3 == 0 { "alpha" } else { "" },
+                    if i % 5 == 0 { "beta" } else { "" },
+                    if i % 5000 == 0 { "raretoken" } else { "" },
+                );
+                tx.execute(
+                    "INSERT INTO entities (id, category, key, body_json, type, status, retrieval_count,
+                                           last_accessed_unix_ms, created_at_unix_ms, decay_score, layer)
+                     VALUES (?1, 'benchmark', ?2, ?3, 'insight', 'active', ?4, ?5, 0, 0.5, 'working')",
+                    params![format!("ent-{:06}", i), format!("entity-{:06}", i), body, (i % 100) as i64, (i % 1000) as i64],
+                )
+                .unwrap();
+                tx.execute(
+                    "INSERT INTO entities_fts(rowid, body_json) VALUES (last_insert_rowid(), ?1)",
+                    params![body],
+                )
+                .unwrap();
+            }
+            tx.commit().unwrap();
+        }
+
+        let p50 = |query: &str, cap: usize| -> (f64, Vec<String>) {
+            let params = crate::models::RecallParams {
+                query: query.to_string(),
+                limit: 10,
+                skip_side_effects: true,
+                ..Default::default()
+            };
+            let mut samples = Vec::with_capacity(50);
+            let mut ids = Vec::new();
+            for _ in 0..50 {
+                let t = Instant::now();
+                let r = db.fts5_search_with_fts_drive_max(&params, cap).unwrap();
+                samples.push(t.elapsed().as_secs_f64() * 1000.0);
+                ids = r.iter().map(|e| e.id.clone()).collect();
+            }
+            samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            (samples[samples.len() / 2], ids)
+        };
+
+        let mut rare_pair = (0.0f64, 0.0f64);
+        for (name, q) in [
+            ("rare term (20 hits)", "raretoken"),
+            ("rare numeric term (1 hit)", "001234"),
+            ("common term (~33k hits)", "alpha"),
+            ("multi-word w/ corpus-common prefix", "entity 001234"),
+        ] {
+            let (legacy, legacy_ids) = p50(q, 0);
+            let (new, new_ids) = p50(q, Database::FTS_DRIVEN_MAX_MATCHES);
+            assert_eq!(new_ids, legacy_ids, "{name}: plans disagreed on results");
+            eprintln!("{name:40} legacy p50 {legacy:8.3}ms -> new p50 {new:8.3}ms");
+            if q == "raretoken" {
+                rare_pair = (legacy, new);
+            }
+        }
+        // The headline claim: selective recall no longer costs O(corpus). The
+        // margin is enormous (ms -> tens of µs), so p50 < half is a safe bound.
+        assert!(
+            rare_pair.1 < rare_pair.0 / 2.0,
+            "rare-term recall should be far cheaper FTS-driven: legacy {:.3}ms vs new {:.3}ms",
+            rare_pair.0,
+            rare_pair.1
+        );
+        let _ = fs::remove_file(&path);
+    }
 
     #[test]
     fn concurrent_reader_writer_no_locks() {
