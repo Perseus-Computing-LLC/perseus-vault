@@ -1,6 +1,6 @@
 # Remote Transport: SSE & Streamable HTTP
 
-Mimir is an MCP **stdio** server by default. For remote access — Claude Desktop,
+Perseus Vault is an MCP **stdio** server by default. For remote access — Claude Desktop,
 the Anthropic MCP Connector API, or any HTTP MCP client — it also ships a full
 **SSE** and **Streamable HTTP** transport, with optional Bearer-token auth.
 
@@ -15,7 +15,7 @@ the Anthropic MCP Connector API, or any HTTP MCP client — it also ships a full
 ## Quick start
 
 ```bash
-mimir --db /path/to/mimir.db \
+perseus-vault --db /path/to/perseus-vault.db \
   --transport sse \
   --web-bind 0.0.0.0 \
   --port 8765
@@ -24,9 +24,9 @@ mimir --db /path/to/mimir.db \
 Output:
 
 ```
-mimir: MCP over sse transport on http://0.0.0.0:8765
-mimir: POST http://0.0.0.0:8765/message
-mimir: GET  http://0.0.0.0:8765/sse
+perseus-vault: MCP over sse transport on http://0.0.0.0:8765
+perseus-vault: POST http://0.0.0.0:8765/message
+perseus-vault: GET  http://0.0.0.0:8765/sse
 ```
 
 > ⚠️ `--web-bind 0.0.0.0` exposes the server on all interfaces. Only do this
@@ -41,7 +41,7 @@ token — get `401 Unauthorized` with a `WWW-Authenticate: Bearer` header. Has n
 effect on stdio transport.
 
 ```bash
-mimir --db /path/to/mimir.db \
+perseus-vault --db /path/to/perseus-vault.db \
   --transport http \
   --web-bind 0.0.0.0 \
   --port 8765 \
@@ -108,11 +108,11 @@ client.beta.messages.create(
     model="claude-opus-4-8",
     mcp_servers=[{
         "type": "url",
-        "url": "https://mimir-mcp.example.com/sse",
-        "name": "mimir",
+        "url": "https://perseus-vault-mcp.example.com/sse",
+        "name": "perseus-vault",
         "authorization_token": "YOUR_TOKEN",  # matches --mcp-token
     }],
-    tools=[{"type": "mcp_toolset", "mcp_server_name": "mimir"}],
+    tools=[{"type": "mcp_toolset", "mcp_server_name": "perseus-vault"}],
     betas=["mcp-client-2025-11-20"],
 )
 ```
@@ -122,8 +122,8 @@ client.beta.messages.create(
 ```bash
 docker run -p 8765:8765 \
   -v ~/.mimir/data:/data \
-  ghcr.io/perseus-computing-llc/mimir:latest \
-  --db /data/mimir.db \
+  ghcr.io/perseus-computing-llc/perseus-vault:latest \
+  --db /data/perseus-vault.db \
   --transport sse \
   --web-bind 0.0.0.0 \
   --port 8765 \

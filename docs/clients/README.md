@@ -1,23 +1,23 @@
-# Mimir — MCP Client Setup
+# Perseus Vault — MCP Client Setup
 
-Mimir is a standard **MCP stdio server**, so it works with every MCP-compatible
+Perseus Vault is a standard **MCP stdio server**, so it works with every MCP-compatible
 client. The command is always the same:
 
 ```
-mimir serve --db ~/.mimir/data/mimir.db
+perseus-vault serve
 ```
 
-Run `mimir doctor` to validate your install and print this matrix locally.
-Run `mimir connect --client <name>` to auto-wire a client's config file
-(merges a `mimir` MCP stanza into it, backing up the original first — no
+Run `perseus-vault doctor` to validate your install and print this matrix locally.
+Run `perseus-vault connect --client <name>` to auto-wire a client's config file
+(merges a `perseus-vault` MCP stanza into it, backing up the original first — no
 manual JSON/YAML/TOML editing required).
-Run `mimir prepare --task "<what you're about to do>"` for a pre-turn
+Run `perseus-vault prepare --task "<what you're about to do>"` for a pre-turn
 memory-prep block — combines `recall_when` (proactive trigger matches
 against the task text) and `context` (always-on + recent entities) into a
 single `<memory-prep>...</memory-prep>` block, zero LLM calls, ~10-50ms.
 Wire it into a Hermes/agent pre-turn hook so relevant memories are pushed
 into context before the model sees the prompt, instead of depending on the
-agent remembering to call `mimir_recall_when` itself. `--json` emits
+agent remembering to call `perseus_vault_recall_when` itself. `--json` emits
 structured output for programmatic hooks.
 
 | Client | Status | Config file | Notes |
@@ -36,49 +36,51 @@ structured output for programmatic hooks.
 
 ### Claude Desktop — `claude_desktop_config.json`
 ```json
-{ "mcpServers": { "mimir": { "command": "mimir", "args": ["serve", "--db", "~/.mimir/data/mimir.db"] } } }
+{ "mcpServers": { "perseus-vault": { "command": "perseus-vault", "args": ["serve"] } } }
 ```
 
 ### Claude Code — `.mcp.json` (project root)
 ```json
-{ "mcpServers": { "mimir": { "command": "mimir", "args": ["serve", "--db", "~/.mimir/data/mimir.db"] } } }
+{ "mcpServers": { "perseus-vault": { "command": "perseus-vault", "args": ["serve"] } } }
 ```
 
 ### Hermes — `~/.hermes/config.yaml`
 ```yaml
 mcp_servers:
-  mimir:
-    command: mimir
-    args: ["serve", "--db", "~/.mimir/data/mimir.db"]
+  perseus-vault:
+    command: perseus-vault
+    args: ["serve"]
 ```
 
 ### Cursor — `.cursor/mcp.json`
 ```json
-{ "mcpServers": { "mimir": { "command": "mimir", "args": ["serve", "--db", "~/.mimir/data/mimir.db"] } } }
+{ "mcpServers": { "perseus-vault": { "command": "perseus-vault", "args": ["serve"] } } }
 ```
 
 ### Windsurf — `mcp_config.json`
 ```json
-{ "mcpServers": { "mimir": { "command": "mimir", "args": ["serve", "--db", "~/.mimir/data/mimir.db"] } } }
+{ "mcpServers": { "perseus-vault": { "command": "perseus-vault", "args": ["serve"] } } }
 ```
 
 ### VS Code + Continue.dev — `config.json`
 ```json
-{ "mcpServers": { "mimir": { "command": "mimir", "args": ["serve", "--db", "~/.mimir/data/mimir.db"] } } }
+{ "mcpServers": { "perseus-vault": { "command": "perseus-vault", "args": ["serve"] } } }
 ```
 
 ### Zed — `settings.json`
 ```json
-{ "context_servers": { "mimir": { "command": { "path": "mimir", "args": ["serve", "--db", "~/.mimir/data/mimir.db"] } } } }
+{ "context_servers": { "perseus-vault": { "command": { "path": "perseus-vault", "args": ["serve"] } } } }
 ```
 
 ### Codex CLI — `~/.codex/config.toml`
 ```toml
-[mcp_servers.mimir]
-command = "mimir"
-args = ["serve", "--db", "~/.mimir/data/mimir.db"]
+[mcp_servers.perseus-vault]
+command = "perseus-vault"
+args = ["serve"]
 ```
 
-> Use an absolute `--db` path if your client runs Mimir from a different working
-> directory. Everything else is identical across clients because Mimir speaks
-> plain MCP stdio.
+> `perseus-vault serve` defaults its database to `~/.mimir/data/perseus-vault.db`
+> (with a legacy fallback chain). Pass an absolute `--db` path if your client
+> runs Perseus Vault from a different working directory or you want a specific
+> location. Everything else is identical across clients because Perseus Vault
+> speaks plain MCP stdio.

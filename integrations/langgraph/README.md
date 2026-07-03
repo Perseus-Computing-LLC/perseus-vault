@@ -18,8 +18,8 @@ from mimir_langgraph import MimirStore
 
 # Create a Perseus Vault-backed store
 store = MimirStore(
-    binary="mimir",  # or /usr/local/bin/mimir
-    db_path="~/.mimir/data/mimir.db",
+    binary="perseus-vault",  # or /usr/local/bin/perseus-vault
+    db_path="~/.mimir/data/perseus-vault.db",
 )
 
 # Use as a drop-in BaseStore replacement
@@ -59,8 +59,8 @@ from previous interactions using `store.search()`.
 
 | Parameter | Default | Description |
 |---|---|---|
-| `binary` | `"mimir"` | Path to the mimir binary |
-| `db_path` | `"~/.mimir/data/mimir.db"` | Path to the SQLite database |
+| `binary` | `"perseus-vault"` | Path to the perseus-vault binary |
+| `db_path` | `"~/.mimir/data/perseus-vault.db"` | Path to the SQLite database |
 | `timeout` | `30.0` | Tool call timeout in seconds |
 | `encryption_key` | `None` | Path to AES-256-GCM key file |
 | `ollama_url` | `None` | Ollama endpoint for hybrid search |

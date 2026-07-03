@@ -12,7 +12,7 @@ curl -sSL https://raw.githubusercontent.com/Perseus-Computing-LLC/perseus-vault/
 mkdir -p ~/.mimir/data
 
 # Verify it works
-/usr/local/bin/mimir --version
+/usr/local/bin/perseus-vault --version
 ```
 
 ## MCP Client Configuration
@@ -23,10 +23,10 @@ All MCP clients use the same pattern. The exact config format varies by client:
 
 ```yaml
 # Generic config
-command: /usr/local/bin/mimir
+command: /usr/local/bin/perseus-vault
 args:
   - "--db"
-  - "~/.mimir/data/mimir.db"
+  - "~/.mimir/data/perseus-vault.db"
 ```
 
 ### Client-specific formats
@@ -45,9 +45,9 @@ args:
 
 ```yaml
 mcp_servers:
-  mimir:
-    command: "/usr/local/bin/mimir"
-    args: ["--db", "/home/YOUR_USER/.mimir/data/mimir.db"]
+  perseus-vault:
+    command: "/usr/local/bin/perseus-vault"
+    args: ["--db", "/home/YOUR_USER/.mimir/data/perseus-vault.db"]
     timeout: 60
     connect_timeout: 30
 ```
@@ -57,9 +57,9 @@ mcp_servers:
 ```json
 {
   "mcpServers": {
-    "mimir": {
-      "command": "/usr/local/bin/mimir",
-      "args": ["--db", "~/.mimir/data/mimir.db"]
+    "perseus-vault": {
+      "command": "/usr/local/bin/perseus-vault",
+      "args": ["--db", "~/.mimir/data/perseus-vault.db"]
     }
   }
 }
@@ -71,16 +71,19 @@ mcp_servers:
 {
   "experimental": {
     "mcpServers": {
-      "mimir": {
-        "command": "/usr/local/bin/mimir",
-        "args": ["--db", "~/.mimir/data/mimir.db"]
+      "perseus-vault": {
+        "command": "/usr/local/bin/perseus-vault",
+        "args": ["--db", "~/.mimir/data/perseus-vault.db"]
       }
     }
   }
 }
 ```
 
-## All 30 Tools
+## Tools (55 total)
+
+A representative selection is shown below; run `perseus-vault --version` and your
+client's tool list to see all 55.
 
 | Category | Tools |
 |---|---|
@@ -101,10 +104,10 @@ Perseus Vault supports AES-256-GCM encryption at rest for `body_json`. Opt-in:
 
 ```bash
 # Generate key
-mimir keygen --key-file ~/.mimir/secret.key
+perseus-vault keygen --key-file ~/.mimir/secret.key
 
 # Use with any client (add --encryption-key to args)
-/usr/local/bin/mimir --db ~/.mimir/data/mimir.db --encryption-key ~/.mimir/secret.key
+/usr/local/bin/perseus-vault --db ~/.mimir/data/perseus-vault.db --encryption-key ~/.mimir/secret.key
 ```
 
 ## Docker
