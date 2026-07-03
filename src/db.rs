@@ -3889,24 +3889,14 @@ impl Database {
     /// Append a journal event.
     pub fn journal(&self, event: &JournalEvent) -> Result<(), Box<dyn std::error::Error>> {
         let conn = self.conn()?;
-        // Compute audit chain hash: SHA-256(prev_hash || event_id || created_at_ms)
-        let prev_hash: Option<String> = conn.query_row(
-            "SELECT audit_hash FROM journal ORDER BY created_at_unix_ms DESC LIMIT 1",
-            [],
-            |r| r.get::<_, Option<String>>(0),
-        ).unwrap_or(None);
-
-        let computed_hash = if let Some(ref prev) = prev_hash {
-            crate::db::sha256_chain(prev, &event.id, event.created_at_unix_ms)
-        } else {
-            crate::db::sha256_genesis(&event.id, event.created_at_unix_ms)
-        };
 
         // #417: stamp the workspace of the referenced entity so purge can scope
         // journal redaction per-workspace. Prefer an explicit value on the
         // event; otherwise derive it from the referenced entity (the live row,
         // or a superseded version in entity_history when the live id has since
         // changed). System events with no entity_id stay '' (workspace-agnostic).
+        // #433 M2: derived BEFORE the audit hash because it is now part of the
+        // hashed tuple.
         let workspace_hash = if !event.workspace_hash.is_empty() {
             event.workspace_hash.clone()
         } else if !event.entity_id.is_empty() {
@@ -3927,6 +3917,19 @@ impl Database {
             .unwrap_or_default()
         } else {
             String::new()
+        };
+
+        // Compute audit chain hash over (prev_hash, id, created_at, workspace).
+        let prev_hash: Option<String> = conn.query_row(
+            "SELECT audit_hash FROM journal ORDER BY created_at_unix_ms DESC LIMIT 1",
+            [],
+            |r| r.get::<_, Option<String>>(0),
+        ).unwrap_or(None);
+
+        let computed_hash = if let Some(ref prev) = prev_hash {
+            crate::db::sha256_chain(prev, &event.id, event.created_at_unix_ms, &workspace_hash)
+        } else {
+            crate::db::sha256_genesis(&event.id, event.created_at_unix_ms, &workspace_hash)
         };
 
         conn.execute(
@@ -6390,12 +6393,14 @@ Return a JSON object with an "insights" array. Each insight has:
     ///     historical bodies readable via mimir_history / mimir_as_of.
     ///   * `journal`: rows referencing a purged entity (by entity_id or by its
     ///     category/key) are REDACTED IN PLACE, not deleted. The audit chain
-    ///     hashes only (prev_hash, id, created_at_unix_ms) — see audit_hash —
-    ///     so scrubbing the payload columns (evaluated/acted/forward JSON,
-    ///     category, key, entity_id) and stamping event_type='redacted'
-    ///     preserves end-to-end chain verifiability (verify_audit_chain)
-    ///     while removing every purged body from the log. Deleting the rows
-    ///     instead would break every subsequent link of the chain.
+    ///     hashes (prev_hash, id, created_at_unix_ms, workspace_hash) — see
+    ///     audit_hash (#433 M2) — so scrubbing only the payload/identifying
+    ///     columns (evaluated/acted/forward JSON, category, key, entity_id) and
+    ///     stamping event_type='redacted', while PRESERVING the hashed tuple
+    ///     (id, created_at, workspace_hash), keeps end-to-end chain
+    ///     verifiability (verify_audit_chain) while removing every purged body
+    ///     from the log. Deleting the rows — or scrubbing a hashed field —
+    ///     would break every subsequent link of the chain.
     pub fn purge(&self, dry_run: bool) -> Result<PurgeReport, Box<dyn std::error::Error>> {
         let conn = self.conn()?;
         let before_size = match std::fs::metadata(&self.db_path) {
@@ -6500,9 +6505,15 @@ Return a JSON object with an "insights" array. Each insight has:
             )? as i64;
             journal_redacted += conn.execute(
                 &format!(
+                    // #433 M2: workspace_hash is now part of the audit-chain
+                    // hashed tuple, so it must be PRESERVED through redaction
+                    // (like id/created_at/audit_hash) or the chain would no
+                    // longer verify. It is a non-reversible digest of a path,
+                    // not stored content, so retaining it on the tombstone is
+                    // consistent with erasing the payload + identifying fields.
                     "UPDATE journal SET event_type = 'redacted', evaluated_json = '{{}}', \
                      acted_json = '{{}}', forward_json = '{{}}', category = '', key = '', \
-                     entity_id = '', workspace_hash = '' WHERE {JRN_MATCH}"
+                     entity_id = '' WHERE {JRN_MATCH}"
                 ),
                 params![id, cat, key, ws],
             )? as i64;
@@ -8312,21 +8323,64 @@ impl Drop for Database {
 /// Simple deterministic hash for audit chain (SHA-256 substitute).
 /// Uses Rust's stdlib SipHash — not cryptographic but fast and deterministic.
 /// For production audit logs, upgrade to a proper crypto crate.
-fn audit_hash(prev_hash: &str, event_id: &str, created_at_ms: i64) -> String {
+fn audit_hash(prev_hash: &str, event_id: &str, created_at_ms: i64, workspace_hash: &str) -> String {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     prev_hash.hash(&mut hasher);
     event_id.hash(&mut hasher);
     created_at_ms.hash(&mut hasher);
+    // #433 M2: bind the entry's workspace into the chain so a journal row can't
+    // be silently moved between workspaces without breaking verification. (Hash
+    // impls for &str are length-prefixed, so distinct fields never collide.)
+    workspace_hash.hash(&mut hasher);
     format!("{:016x}", hasher.finish())
 }
 
-fn sha256_chain(prev_hash: &str, event_id: &str, created_at_ms: i64) -> String {
-    audit_hash(prev_hash, event_id, created_at_ms)
+fn sha256_chain(prev_hash: &str, event_id: &str, created_at_ms: i64, workspace_hash: &str) -> String {
+    audit_hash(prev_hash, event_id, created_at_ms, workspace_hash)
 }
 
-fn sha256_genesis(event_id: &str, created_at_ms: i64) -> String {
-    audit_hash("genesis", event_id, created_at_ms)
+fn sha256_genesis(event_id: &str, created_at_ms: i64, workspace_hash: &str) -> String {
+    audit_hash("genesis", event_id, created_at_ms, workspace_hash)
+}
+
+/// #433 M2: recompute the whole audit chain under the workspace-bound hash
+/// formula. The v12 schema migration calls this to upgrade chains written by
+/// pre-v12 binaries (which hashed only `(prev, id, created_at)`) so they still
+/// verify. Rows are read in the SAME order [`verify_audit_chain`] uses; each
+/// `audit_hash` is recomputed from its (now workspace-bound) inputs and written
+/// back by `rowid`. Deterministic and idempotent — re-running yields identical
+/// hashes and is a no-op on an already-v12 chain.
+pub(crate) fn rehash_audit_chain(
+    conn: &rusqlite::Connection,
+) -> Result<i64, Box<dyn std::error::Error>> {
+    let mut stmt = conn.prepare(
+        "SELECT rowid, id, created_at_unix_ms, COALESCE(workspace_hash, '') \
+         FROM journal WHERE audit_hash != '' \
+         ORDER BY created_at_unix_ms ASC, rowid ASC",
+    )?;
+    let rows: Vec<(i64, String, i64, String)> = stmt
+        .query_map([], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })?
+        .collect::<Result<_, _>>()?;
+    drop(stmt);
+
+    let mut prev_hash: Option<String> = None;
+    let mut n = 0i64;
+    for (rowid, id, ts, ws) in rows {
+        let h = match prev_hash {
+            Some(ref prev) => sha256_chain(prev, &id, ts, &ws),
+            None => sha256_genesis(&id, ts, &ws),
+        };
+        conn.execute(
+            "UPDATE journal SET audit_hash = ?1 WHERE rowid = ?2",
+            params![h, rowid],
+        )?;
+        prev_hash = Some(h);
+        n += 1;
+    }
+    Ok(n)
 }
 
 /// #398: deterministic fold for history-tombstone digests — chained over each
@@ -8360,21 +8414,25 @@ fn history_retention_digest(
 pub fn verify_audit_chain(db: &Database) -> Result<i64, String> {
     let conn = db.conn().map_err(|e| format!("connection: {}", e))?;
     let mut stmt = conn.prepare(
-        "SELECT id, audit_hash, created_at_unix_ms FROM journal WHERE audit_hash != '' ORDER BY created_at_unix_ms ASC",
+        "SELECT id, audit_hash, created_at_unix_ms, COALESCE(workspace_hash, '') \
+         FROM journal WHERE audit_hash != '' \
+         ORDER BY created_at_unix_ms ASC, rowid ASC",
     ).map_err(|e| format!("prepare: {}", e))?;
 
     let rows = stmt.query_map([], |r| {
-        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?, r.get::<_, String>(3)?))
     }).map_err(|e| format!("query: {}", e))?;
 
     let mut count = 0i64;
     let mut prev_hash: Option<String> = None;
     for row in rows {
-        let (id, stored_hash, ts) = row.map_err(|e| format!("row: {}", e))?;
+        let (id, stored_hash, ts, ws) = row.map_err(|e| format!("row: {}", e))?;
+        // #433 M2: workspace_hash is part of the hashed tuple, so a moved entry
+        // (different workspace_hash) recomputes to a different expected hash.
         let expected = if let Some(ref prev) = prev_hash {
-            sha256_chain(prev, &id, ts)
+            sha256_chain(prev, &id, ts, &ws)
         } else {
-            sha256_genesis(&id, ts)
+            sha256_genesis(&id, ts, &ws)
         };
         if expected != stored_hash {
             return Err(format!(
@@ -18004,6 +18062,109 @@ mod tests {
         assert_eq!(top[0]["versions"], serde_json::json!(3));
         assert!(top[0]["bytes"].as_i64().unwrap() > 0);
         let _ = fs::remove_file(&path);
+    }
+
+    // ─── #433 M2: workspace-bound audit chain ────────────────────
+
+    #[test]
+    fn audit_chain_binds_workspace_and_detects_move() {
+        let (db, path) = temp_db();
+        let base = now_ms();
+        for (i, (id, ws)) in [("jrn-w1", "wsA"), ("jrn-w2", "wsB"), ("jrn-w3", "wsA")]
+            .iter()
+            .enumerate()
+        {
+            db.journal(&crate::models::JournalEvent {
+                id: id.to_string(),
+                event_type: "decision".to_string(),
+                evaluated_json: "{}".to_string(),
+                acted_json: "{}".to_string(),
+                forward_json: "{}".to_string(),
+                category: "facts".to_string(),
+                key: "k".to_string(),
+                entity_id: String::new(),
+                agent_id: "test".to_string(),
+                workspace_hash: ws.to_string(),
+                created_at_unix_ms: base + i as i64,
+            })
+            .unwrap();
+        }
+        assert_eq!(
+            verify_audit_chain(&db).expect("freshly written chain must verify"),
+            3
+        );
+
+        // Move an entry to a different workspace — the whole point of M2 is that
+        // this now breaks verification (pre-M2 it silently passed).
+        {
+            let conn = db.conn().unwrap();
+            conn.execute(
+                "UPDATE journal SET workspace_hash = 'wsEVIL' WHERE id = 'jrn-w2'",
+                [],
+            )
+            .unwrap();
+        }
+        assert!(
+            verify_audit_chain(&db).is_err(),
+            "moving a journal entry between workspaces must break the audit chain"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn v11_audit_chain_verifies_after_migration_to_v12() {
+        // Forge a chain hashed under the pre-M2 formula (no workspace_hash),
+        // then prove the v11->v12 migration rehashes it so it verifies under the
+        // new workspace-bound formula — the backward-compat guarantee.
+        fn old_hash(prev: &str, id: &str, ts: i64) -> String {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            prev.hash(&mut h);
+            id.hash(&mut h);
+            ts.hash(&mut h);
+            format!("{:016x}", h.finish())
+        }
+        let (db, path) = temp_db();
+        let base = now_ms();
+        let rows = [("jo-1", "wsA"), ("jo-2", "wsB"), ("jo-3", "wsA")];
+        {
+            let conn = db.conn().unwrap();
+            let mut prev = String::new();
+            for (i, (id, ws)) in rows.iter().enumerate() {
+                let ts = base + i as i64;
+                let h = if i == 0 {
+                    old_hash("genesis", id, ts)
+                } else {
+                    old_hash(&prev, id, ts)
+                };
+                prev = h.clone();
+                conn.execute(
+                    "INSERT INTO journal (id, event_type, evaluated_json, acted_json, \
+                     forward_json, category, key, entity_id, agent_id, audit_hash, \
+                     workspace_hash, created_at_unix_ms) \
+                     VALUES (?1,'decision','{}','{}','{}','facts','k','','test',?2,?3,?4)",
+                    params![id, h, ws, ts],
+                )
+                .unwrap();
+            }
+        }
+        // A v11 chain does NOT verify under the new formula…
+        assert!(
+            verify_audit_chain(&db).is_err(),
+            "pre-M2 chain must not verify under the workspace-bound formula"
+        );
+        // …until the v11->v12 migration rehashes it. Roll user_version back and
+        // re-run schema init to exercise the real migration path.
+        {
+            let conn = db.conn().unwrap();
+            conn.pragma_update(None, "user_version", 11i64).unwrap();
+            crate::schema::initialize_schema(&conn).expect("v11->v12 migration must succeed");
+        }
+        assert_eq!(
+            verify_audit_chain(&db).expect("chain must verify after v11->v12 migration"),
+            3
+        );
+        let _ = std::fs::remove_file(&path);
     }
 }
 
