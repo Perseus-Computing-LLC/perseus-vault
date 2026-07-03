@@ -161,7 +161,12 @@ pub struct JournalEvent {
     #[serde(default)]
     pub entity_id: String,
     pub agent_id: String,
-    /// Visibility: 'private', 'workspace', or 'public' (v1.2.0)
+    /// Workspace of the entity this event refers to, stamped at write time so
+    /// `purge` can scope journal redaction per-workspace (#417). Empty for
+    /// workspace-agnostic system events (dream/synthesis) and for legacy rows
+    /// written before the SCHEMA_VERSION 11 migration added the column.
+    #[serde(default)]
+    pub workspace_hash: String,
     pub created_at_unix_ms: i64,
 }
 

@@ -88,11 +88,17 @@ CREATE TABLE IF NOT EXISTS journal (
     entity_id TEXT DEFAULT '',
     agent_id TEXT DEFAULT '',
     audit_hash TEXT DEFAULT '',
+    -- #417: workspace of the referenced entity, stamped at write time so purge
+    -- can scope journal redaction per-workspace. '' = system event or legacy row.
+    workspace_hash TEXT NOT NULL DEFAULT '',
     created_at_unix_ms INTEGER NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_journal_created ON journal(created_at_unix_ms);
 CREATE INDEX IF NOT EXISTS idx_journal_entity ON journal(entity_id);
+-- NOTE: the (category, key, workspace_hash) index is created in apply_migrations,
+-- not here -- on a legacy DB this batch runs BEFORE the workspace_hash column is
+-- added, so referencing it here would fail with a no-such-column error (#417).
 
 CREATE TABLE IF NOT EXISTS state (
     key TEXT PRIMARY KEY,
@@ -150,7 +156,7 @@ CREATE INDEX IF NOT EXISTS idx_entity_history_catkey ON entity_history(category,
 /// the column-add migrations below have been applied. Bump this whenever you add
 /// a new ALTER-probe migration in `initialize_schema`, or existing databases
 /// (already at the previous level) will skip it.
-const SCHEMA_VERSION: i64 = 10;
+const SCHEMA_VERSION: i64 = 11;
 
 /// Initialize the v0.2.0 schema on a fresh database.
 pub fn initialize_schema(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
@@ -412,6 +418,23 @@ fn apply_migrations(conn: &Connection) -> Result<(), Box<dyn std::error::Error>>
          ) WITHOUT ROWID;",
     )?;
     // ── end v10 ─────────────────────────────────────────────────────────
+
+    // ── v11: per-workspace journal scoping (#417) ───────────────────────
+    // journal had no workspace column, so purge's (category, key) redaction
+    // over-redacted cross-workspace same-key rows. Add the column + its match
+    // index. Legacy rows keep '' (unknown) and stay conservatively matched by
+    // purge; new rows are stamped at write time in Database::journal.
+    // category/key have been in the journal table since v0.2.0 and are already
+    // assumed by purge's JRN_MATCH and the journal readers; ensure_column them
+    // here so the composite index below is robust even on ancient pre-v0.2.0
+    // journals (and minimal test fixtures) that predate those columns.
+    ensure_column(conn, "journal", "category", "TEXT DEFAULT ''")?;
+    ensure_column(conn, "journal", "key", "TEXT DEFAULT ''")?;
+    ensure_column(conn, "journal", "workspace_hash", "TEXT NOT NULL DEFAULT ''")?;
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_journal_catkeyws ON journal(category, key, workspace_hash);",
+    )?;
+    // ── end v11 ─────────────────────────────────────────────────────────
 
     // Stamp the migration level so subsequent opens skip the probe block above.
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -1301,6 +1324,67 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM dedup_signatures", [], |r| r.get(0))
             .unwrap();
         assert_eq!(sigs, 0, "v10 must not eagerly backfill signatures");
+    }
+
+    #[test]
+    fn migrates_legacy_db_to_v11_with_journal_workspace_hash() {
+        // v11 (#417): a v10-era journal table has no workspace_hash column. The
+        // gated migration must ALTER it in, create the (category,key,workspace)
+        // index, stamp SCHEMA_VERSION, and preserve existing rows (defaulting to
+        // an empty workspace_hash).
+        let (conn, _path) = temp_db();
+        // A pre-v11 journal table: all v10 columns, but no workspace_hash.
+        conn.execute_batch(
+            "CREATE TABLE journal (
+                id TEXT PRIMARY KEY,
+                event_type TEXT NOT NULL DEFAULT 'decision',
+                evaluated_json TEXT DEFAULT '{}',
+                acted_json TEXT DEFAULT '{}',
+                forward_json TEXT DEFAULT '{}',
+                category TEXT DEFAULT '',
+                key TEXT DEFAULT '',
+                entity_id TEXT DEFAULT '',
+                agent_id TEXT DEFAULT '',
+                audit_hash TEXT DEFAULT '',
+                created_at_unix_ms INTEGER NOT NULL
+             );
+             INSERT INTO journal (id, category, key, created_at_unix_ms)
+                 VALUES ('jrn-old', 'facts', 'k', 1);
+             PRAGMA user_version = 10;",
+        )
+        .unwrap();
+        assert!(
+            conn.prepare("SELECT workspace_hash FROM journal LIMIT 1").is_err(),
+            "precondition: v10 journal lacks workspace_hash"
+        );
+
+        initialize_schema(&conn).expect("v10 -> v11 migration");
+
+        // Column added, index created, version stamped.
+        assert!(
+            conn.prepare("SELECT workspace_hash FROM journal LIMIT 1").is_ok(),
+            "workspace_hash column must be added"
+        );
+        let has_idx: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_journal_catkeyws'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_idx, 1, "purge-match index must be created");
+        let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+        // Legacy row preserved, defaulting to empty workspace_hash.
+        let (kept, ws): (i64, String) = conn
+            .query_row(
+                "SELECT COUNT(*), COALESCE(MAX(workspace_hash), '') FROM journal WHERE id='jrn-old'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(kept, 1, "migration must not drop journal rows");
+        assert_eq!(ws, "", "legacy journal rows default to empty workspace_hash");
     }
 
     #[test]

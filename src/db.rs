@@ -3902,11 +3902,38 @@ impl Database {
             crate::db::sha256_genesis(&event.id, event.created_at_unix_ms)
         };
 
+        // #417: stamp the workspace of the referenced entity so purge can scope
+        // journal redaction per-workspace. Prefer an explicit value on the
+        // event; otherwise derive it from the referenced entity (the live row,
+        // or a superseded version in entity_history when the live id has since
+        // changed). System events with no entity_id stay '' (workspace-agnostic).
+        let workspace_hash = if !event.workspace_hash.is_empty() {
+            event.workspace_hash.clone()
+        } else if !event.entity_id.is_empty() {
+            conn.query_row(
+                "SELECT workspace_hash FROM entities WHERE id = ?1",
+                params![event.entity_id],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .or_else(|_| {
+                conn.query_row(
+                    "SELECT workspace_hash FROM entity_history WHERE id = ?1 LIMIT 1",
+                    params![event.entity_id],
+                    |r| r.get::<_, Option<String>>(0),
+                )
+            })
+            .ok()
+            .flatten()
+            .unwrap_or_default()
+        } else {
+            String::new()
+        };
+
         conn.execute(
             "INSERT INTO journal
              (id, event_type, evaluated_json, acted_json, forward_json,
-              category, key, entity_id, agent_id, audit_hash, created_at_unix_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+              category, key, entity_id, agent_id, audit_hash, workspace_hash, created_at_unix_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 event.id,
                 event.event_type,
@@ -3918,6 +3945,7 @@ impl Database {
                 event.entity_id,
                 event.agent_id,
                 computed_hash,
+                workspace_hash,
                 event.created_at_unix_ms,
             ],
         )?;
@@ -4268,6 +4296,8 @@ impl Database {
                 key: row.get(6)?,
                 entity_id: row.get(7)?,
                 agent_id: row.get::<_, Option<String>>(8).unwrap_or(None).unwrap_or_default(),
+                // Not selected by this listing query; purge-scoping metadata only.
+                workspace_hash: String::new(),
                 created_at_unix_ms: row.get(9)?,
             })
         })?;
@@ -5074,13 +5104,11 @@ impl Database {
 
     /// Get recent journal events.
     ///
-    /// NOTE: the `journal` table has no `workspace_hash` column, so
-    /// this cannot be scoped to a workspace the way `list_entities`/
-    /// `get_entity_graph`/`context`/`recall_when` now are. In a federated
-    /// vault, journal events from every workspace are visible here. Fixing
-    /// this properly needs a schema migration (new column + SCHEMA_VERSION
-    /// bump + JournalEvent struct + every journal() call site) — tracked as
-    /// a follow-up rather than folded into this pass.
+    /// NOTE: as of #417 the `journal` table has a `workspace_hash` column
+    /// (stamped at write time) that `purge` uses to scope redaction. This
+    /// listing query does not yet expose or filter by it — journal events from
+    /// every workspace are still visible here. Adding a workspace filter to the
+    /// read path is a separate, additive change.
     pub fn get_recent_journal(
         &self,
         limit: i64,
@@ -5102,6 +5130,8 @@ impl Database {
                 key: row.get::<_, String>(6).unwrap_or_default(),
                 entity_id: row.get::<_, String>(7).unwrap_or_default(),
                 agent_id: row.get::<_, Option<String>>(8).unwrap_or(None).unwrap_or_default(),
+                // Not selected by this listing query; purge-scoping metadata only.
+                workspace_hash: String::new(),
                 created_at_unix_ms: row.get(9)?,
             })
         })?;
@@ -6068,6 +6098,7 @@ impl Database {
                 key: "dream-run".to_string(),
                 entity_id: String::new(),
                 agent_id: String::new(),
+                workspace_hash: String::new(), // workspace-agnostic system event
                 created_at_unix_ms: now,
             };
             self.journal(&event)?;
@@ -6395,8 +6426,21 @@ Return a JSON object with an "insights" array. Each insight has:
         // so the preview counts exactly what the real run affects.
         const HIST_MATCH: &str =
             "id = ?1 OR (category = ?2 AND key = ?3 AND COALESCE(workspace_hash,'') = ?4)";
+        // #417: journal rows now carry the workspace of the entity they
+        // reference (stamped in `journal()`), so the (category, key) branch is
+        // scoped to the purged entity's workspace — purging workspace A no
+        // longer redacts workspace B's live same-key rows. Rows with an empty
+        // workspace_hash (`''`) are still matched: those are legacy rows
+        // (pre-SCHEMA_VERSION-11, workspace unknown) or genuine default-workspace
+        // rows, and could belong to the purged entity — matching them keeps
+        // erasure GDPR-complete (never under-redacts). The residual over-redaction
+        // is thus narrowed to default-workspace rows sharing an exact (category,
+        // key) with a purged *named*-workspace entity — strictly tighter than the
+        // pre-#417 cross-workspace behavior. The entity_id branch is exact and
+        // already workspace-safe.
         const JRN_MATCH: &str =
-            "event_type != 'redacted' AND (entity_id = ?1 OR (category = ?2 AND key = ?3 AND key != ''))";
+            "event_type != 'redacted' AND (entity_id = ?1 OR (category = ?2 AND key = ?3 AND key != '' \
+             AND (COALESCE(workspace_hash,'') = ?4 OR COALESCE(workspace_hash,'') = '')))";
 
         if dry_run {
             // Dedupe by row id: two doomed entities sharing (category, key)
@@ -6414,7 +6458,7 @@ Return a JSON object with an "insights" array. Each insight has:
                 }
                 let mut stmt =
                     conn.prepare(&format!("SELECT id FROM journal WHERE {JRN_MATCH}"))?;
-                for row in stmt.query_map(params![id, cat, key], |r| r.get::<_, String>(0))? {
+                for row in stmt.query_map(params![id, cat, key, ws], |r| r.get::<_, String>(0))? {
                     jrn.insert(row?);
                 }
             }
@@ -6458,9 +6502,9 @@ Return a JSON object with an "insights" array. Each insight has:
                 &format!(
                     "UPDATE journal SET event_type = 'redacted', evaluated_json = '{{}}', \
                      acted_json = '{{}}', forward_json = '{{}}', category = '', key = '', \
-                     entity_id = '' WHERE {JRN_MATCH}"
+                     entity_id = '', workspace_hash = '' WHERE {JRN_MATCH}"
                 ),
-                params![id, cat, key],
+                params![id, cat, key, ws],
             )? as i64;
         }
         tx.commit()?;
@@ -8011,10 +8055,12 @@ last_accessed: {}
             key: key.clone(),
             entity_id: id.clone(),
             agent_id: String::new(),
+            // Derived from the referenced entity by journal(); left empty here.
+            workspace_hash: String::new(),
             created_at_unix_ms: now,
         };
         self.journal(&event)?;
-        
+
         Ok(crate::models::CorrectResult {
             entity_id: id,
             journal_id,
@@ -8159,10 +8205,11 @@ If no clear lessons found, return: {{"lessons": []}}"#,
             key: format!("session-{}", params.session_id),
             entity_id: String::new(),
             agent_id: String::new(),
+            workspace_hash: String::new(), // workspace-agnostic system event
             created_at_unix_ms: now,
         };
         self.journal(&event)?;
-        
+
         Ok(crate::models::SynthesizeResult {
             lessons,
             entities_created,
@@ -13298,6 +13345,7 @@ mod tests {
             key: "use-pg".to_string(),
             entity_id: "e1".to_string(),
             agent_id: "agent-1".to_string(),
+            workspace_hash: String::new(),
             created_at_unix_ms: now_ms(),
         };
         db.journal(&event).unwrap();
@@ -16172,6 +16220,7 @@ mod tests {
             key: "t1".to_string(),
             entity_id: String::new(),
             agent_id: "security-bot".to_string(),
+            workspace_hash: String::new(),
             created_at_unix_ms: now_ms(),
         };
         db.journal(&event).unwrap();
@@ -17342,6 +17391,7 @@ mod tests {
             key: "pii".to_string(),
             entity_id: live_id.clone(),
             agent_id: "test".to_string(),
+            workspace_hash: String::new(),
             created_at_unix_ms: now_ms(),
         })
         .unwrap();
@@ -17357,6 +17407,7 @@ mod tests {
             key: "unrelated".to_string(),
             entity_id: String::new(),
             agent_id: "test".to_string(),
+            workspace_hash: String::new(),
             created_at_unix_ms: now_ms() + 1,
         })
         .unwrap();
@@ -17456,6 +17507,7 @@ mod tests {
             key: "shared".to_string(),
             entity_id: String::new(),
             agent_id: "test".to_string(),
+            workspace_hash: String::new(),
             created_at_unix_ms: now_ms(),
         })
         .unwrap();
@@ -17470,6 +17522,108 @@ mod tests {
         let actual = db.purge(false).unwrap();
         assert_eq!(dry.journal_rows_redacted, actual.journal_rows_redacted);
         assert_eq!(dry.history_rows_deleted, actual.history_rows_deleted);
+        let _ = fs::remove_file(&path);
+    }
+
+    /// #417: purging one workspace's entity must NOT redact another workspace's
+    /// LIVE same-key journal rows. Before the workspace_hash column the
+    /// (category, key) redaction match was workspace-blind and scrubbed
+    /// workspace B's audit payloads when workspace A was purged.
+    #[test]
+    fn purge_does_not_redact_other_workspace_live_journal_rows() {
+        let (db, path) = temp_db();
+
+        // Two LIVE entities: same (category, key), different workspaces. Identity
+        // is (category, key, workspace_hash) (#339), so neither supersedes the other.
+        let mut e_a = make_entity("e-a", "facts", "k", r#"{"n":"a"}"#);
+        e_a.workspace_hash = "wsA".to_string();
+        db.remember(&e_a).unwrap();
+        let mut e_b = make_entity("e-b", "facts", "k", r#"{"n":"b"}"#);
+        e_b.workspace_hash = "wsB".to_string();
+        db.remember(&e_b).unwrap();
+
+        // One journal row per entity, referenced by id. journal() derives and
+        // stamps each row's workspace from the referenced entity.
+        db.journal(&crate::models::JournalEvent {
+            id: "jrn-a".to_string(),
+            event_type: "decision".to_string(),
+            evaluated_json: r#"{"secret":"A-only"}"#.to_string(),
+            acted_json: "{}".to_string(),
+            forward_json: "{}".to_string(),
+            category: "facts".to_string(),
+            key: "k".to_string(),
+            entity_id: "e-a".to_string(),
+            agent_id: "test".to_string(),
+            workspace_hash: String::new(),
+            created_at_unix_ms: now_ms(),
+        })
+        .unwrap();
+        db.journal(&crate::models::JournalEvent {
+            id: "jrn-b".to_string(),
+            event_type: "decision".to_string(),
+            evaluated_json: r#"{"keep":"B-live"}"#.to_string(),
+            acted_json: "{}".to_string(),
+            forward_json: "{}".to_string(),
+            category: "facts".to_string(),
+            key: "k".to_string(),
+            entity_id: "e-b".to_string(),
+            agent_id: "test".to_string(),
+            workspace_hash: String::new(),
+            created_at_unix_ms: now_ms() + 1,
+        })
+        .unwrap();
+
+        // journal() must have stamped each row with its referenced entity's workspace.
+        {
+            let conn = db.conn().unwrap();
+            let ws_a: String = conn
+                .query_row("SELECT workspace_hash FROM journal WHERE id='jrn-a'", [], |r| r.get(0))
+                .unwrap();
+            let ws_b: String = conn
+                .query_row("SELECT workspace_hash FROM journal WHERE id='jrn-b'", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(ws_a, "wsA", "journal() must stamp the referenced entity's workspace");
+            assert_eq!(ws_b, "wsB");
+        }
+
+        // Archive ONLY workspace A's entity, then purge. (forget by (category,
+        // key) is workspace-blind, so archive e-a directly to isolate wsA.)
+        {
+            let conn = db.conn().unwrap();
+            conn.execute("UPDATE entities SET archived = 1 WHERE id = 'e-a'", [])
+                .unwrap();
+        }
+        let report = db.purge(false).unwrap();
+        assert_eq!(report.entities_deleted, 1);
+        assert_eq!(
+            report.journal_rows_redacted, 1,
+            "only workspace A's journal row should be redacted"
+        );
+
+        let conn = db.conn().unwrap();
+        // wsA's row is redacted...
+        let a_type: String = conn
+            .query_row("SELECT event_type FROM journal WHERE id='jrn-a'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(a_type, "redacted");
+        // ...but wsB's LIVE row is untouched — payload and identity intact.
+        let (b_type, b_eval, b_cat): (String, String, String) = conn
+            .query_row(
+                "SELECT event_type, evaluated_json, category FROM journal WHERE id='jrn-b'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            b_type, "decision",
+            "another workspace's live journal row must not be redacted (#417)"
+        );
+        assert!(b_eval.contains("B-live"), "another workspace's payload must survive");
+        assert_eq!(b_cat, "facts");
+
+        drop(conn);
+        verify_audit_chain(&db).expect("audit chain must survive workspace-scoped redaction");
+
         let _ = fs::remove_file(&path);
     }
 

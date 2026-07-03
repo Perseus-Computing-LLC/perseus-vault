@@ -100,6 +100,19 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
   behavior is unchanged.
 
 ### Fixed
+- Journal redaction is now workspace-scoped (#417, follow-up to #416): the
+  `journal` table gained a `workspace_hash` column (SCHEMA_VERSION 10 → 11),
+  stamped at write time in `Database::journal` from the referenced entity's
+  workspace. `purge`'s `(category, key)` redaction match is scoped to the
+  purged entity's workspace, so purging workspace A no longer redacts workspace
+  B's live same-key journal rows. Rows with an empty `workspace_hash` (legacy
+  pre-v11 rows, or genuine default-workspace rows) are still matched
+  conservatively so erasure never *under*-redacts (no GDPR regression); the
+  residual over-redaction is narrowed to default-workspace rows sharing an
+  exact `(category, key)` with a purged *named*-workspace entity. `docs/
+  retention.md` now also names the derivative artifacts `purge` does not
+  auto-erase (dream/consolidate outputs, community summaries, vault_export
+  files).
 - Default DB-path resolution surfaces the split-brain instead of hiding it
   (#421): the legacy single-user location `~/mimir.db` is now **added to the
   fallback chain** (adopted when it is the *only* existing DB, instead of

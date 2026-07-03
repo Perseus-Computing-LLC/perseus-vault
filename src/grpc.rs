@@ -204,6 +204,9 @@ pub mod grpc {
                     key: r.key,
                     entity_id: r.entity_id,
                     agent_id: r.agent_id,
+                    // #417: journal() derives the workspace from the referenced
+                    // entity; the gRPC JournalRequest carries no workspace field.
+                    workspace_hash: String::new(),
                     created_at_unix_ms: crate::db::now_ms(),
                 };
                 db.journal(&event)?;

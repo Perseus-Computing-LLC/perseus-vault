@@ -344,6 +344,11 @@ pub struct JournalArgs {
     pub entity_id: String,
     #[serde(default)]
     pub agent_id: String,
+    /// #417: optional explicit workspace of the referenced entity. Usually
+    /// omitted — `Database::journal` derives it from `entity_id` — but a caller
+    /// may set it (e.g. federated writes) to scope purge redaction precisely.
+    #[serde(default)]
+    pub workspace_hash: String,
 }
 
 fn default_event_type() -> String {
@@ -1199,6 +1204,7 @@ pub fn handle_journal(db: &Database, args: Value) -> Result<String, String> {
         key: a.key,
         entity_id: a.entity_id,
         agent_id: a.agent_id,
+        workspace_hash: a.workspace_hash,
         created_at_unix_ms: now_ms(),
     };
 

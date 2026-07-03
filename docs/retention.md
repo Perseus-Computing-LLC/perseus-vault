@@ -113,6 +113,30 @@ Deletion is explicit and two-step:
   because the audit hash chain covers row identity, so `verify_audit_chain`
   stays valid). `forget` then `purge` is the GDPR-style erasure path.
 
+  **Journal redaction is workspace-scoped (#417).** Journal rows carry the
+  `workspace_hash` of the entity they reference (stamped at write time), so
+  purging one workspace's entity no longer redacts another workspace's live
+  same-key journal rows. Rows with an empty `workspace_hash` — legacy rows
+  written before the schema v11 migration, or genuine default-workspace rows —
+  are still matched conservatively (erasure never *under*-redacts), so the only
+  residual over-redaction is a default-workspace row that shares an exact
+  `(category, key)` with a purged *named*-workspace entity.
+
+  **Derivative artifacts are NOT auto-erased by `purge`.** Purge scopes to the
+  archived source entities, their `entity_history`, and journal rows. Content
+  *derived* from a purged entity is out of scope and, if it may echo the erased
+  body, must be handled separately:
+  - **Dream/consolidate outputs** — `mimir_dream` and `mimir_consolidate` write
+    new entities (`derived: true`) whose bodies summarize their sources. These
+    are ordinary entities: to erase them, `forget` + `purge` them too (the
+    `derivation`/source metadata on each derived entity identifies candidates).
+  - **Community summaries** — LLM summaries over community clusters can quote
+    member bodies; regenerate or clear them after a purge if the purged entity
+    was a member.
+  - **`mimir_vault_export` files** — exported Markdown/JSON on disk is a point-in-
+    time copy outside the database and is never touched by `purge`; delete the
+    export artifacts out-of-band.
+
 ## Version history retention (#398)
 
 Every content overwrite of a `(category, key)` snapshots the prior version
