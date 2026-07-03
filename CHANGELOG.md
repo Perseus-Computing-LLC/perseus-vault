@@ -5,6 +5,41 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
 
 ## [Unreleased]
 
+## [2.16.0] - 2026-07-03
+
+### Security / Hardening
+- Audit chain now cryptographically binds the workspace (#433 M2, #438): the
+  journal hash folds in `workspace_hash` (stamped on every row since #417), so
+  a journal entry can no longer be moved between workspaces without breaking
+  `verify_audit_chain`. Ships a v11→v12 schema migration that re-hashes existing
+  chains under the new formula (deterministic, idempotent, crash-safe inside the
+  migration transaction) so pre-upgrade chains still verify, and purge redaction
+  now preserves `workspace_hash` as a hashed field (still scrubbing payload +
+  identifying columns).
+- Encryption key file is created with `0600` at inode creation on Unix (#433 M1,
+  #434), closing the brief world-readable window between write and chmod.
+- `remember` bounds input sizes (#433, #434): category ≤ 256 B, key ≤ 1024 B,
+  body ≤ 4 MiB — closes a DoS-via-huge-key vector on indexed/identity/FTS fields.
+- File-watcher connector rejects symlinked entries (#433, #434): directory scans
+  no longer follow a symlink out of the configured watch root.
+
+### Added
+- Prebuilt release binaries (#432, #435): tagged releases now publish
+  `perseus-vault-lite` (static musl, linux x86_64/aarch64, no default features)
+  and full `perseus-vault` (linux-gnu x86_64, macOS x86_64/arm64) with SHA-256
+  checksums — no more mandatory from-source build to install/upgrade.
+- `perseus-vault doctor` reports data freshness (#433 N4, #434): a "last write N
+  days ago" line (WARN past 14 days) so a stale vault (stopped harvest) is
+  visible instead of silently reported healthy.
+
+### Changed
+- Default on-disk paths moved to `~/.perseus-vault/` (#427, #437), precedence-only
+  — fresh installs use `~/.perseus-vault/data/perseus-vault.db`; existing
+  `~/.mimir/` installs keep working via the fallback chain (no data moved).
+  Adds `PERSEUS_VAULT_DB_PATH` (`MIMIR_DB_PATH` still honored); `secret.key`
+  default prefers an existing location so encrypted installs never lose their key.
+- MCP-registry server name aligned to `io.github.Perseus-Computing-LLC/perseus-vault` (#428, #436).
+
 ## [2.15.0] - 2026-07-03
 
 ### Fixed
