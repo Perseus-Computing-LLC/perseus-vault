@@ -156,7 +156,7 @@ CREATE INDEX IF NOT EXISTS idx_entity_history_catkey ON entity_history(category,
 /// the column-add migrations below have been applied. Bump this whenever you add
 /// a new ALTER-probe migration in `initialize_schema`, or existing databases
 /// (already at the previous level) will skip it.
-const SCHEMA_VERSION: i64 = 11;
+const SCHEMA_VERSION: i64 = 12;
 
 /// Initialize the v0.2.0 schema on a fresh database.
 pub fn initialize_schema(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
@@ -435,6 +435,16 @@ fn apply_migrations(conn: &Connection) -> Result<(), Box<dyn std::error::Error>>
         "CREATE INDEX IF NOT EXISTS idx_journal_catkeyws ON journal(category, key, workspace_hash);",
     )?;
     // ── end v11 ─────────────────────────────────────────────────────────
+
+    // ── v12 (#433 M2): bind workspace into the audit-chain hash ──────────
+    // Pre-v12 chains hashed only (prev_hash, id, created_at_unix_ms), so a
+    // journal entry could be moved between workspaces without breaking the
+    // chain. The hash now also folds in workspace_hash (stamped since v11).
+    // Recompute existing chains under the new formula so they still verify.
+    // Deterministic + idempotent; runs inside the migration transaction and is
+    // a no-op on a fresh DB (empty journal).
+    crate::db::rehash_audit_chain(conn)?;
+    // ── end v12 ──────────────────────────────────────────────────────────
 
     // Stamp the migration level so subsequent opens skip the probe block above.
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
