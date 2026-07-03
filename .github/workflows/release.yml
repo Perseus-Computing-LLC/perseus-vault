@@ -1,0 +1,93 @@
+name: Release binaries
+
+# #432: GitHub Releases shipped no binary assets, so every install/upgrade
+# required a full Rust source build (rustup + gcc + libssl-dev + g++ + a
+# multi-minute cargo build). This workflow builds prebuilt binaries on tag
+# push and uploads them as release assets, so the documented install/recovery
+# path becomes a one-line `curl -L <asset> | tar xz`.
+#
+# Two flavors are shipped per platform:
+#   * perseus-vault-lite — `--no-default-features`, statically linked (musl on
+#     Linux). No bundled ONNX embeddings, NO openssl/system-lib runtime deps
+#     (this is the same lean build the Dockerfile already produces). Smallest,
+#     most portable; ideal for the "deploy a one-file fix" case in the issue.
+#   * perseus-vault      — default features (bundled-embeddings). Zero-config
+#     dense/hybrid semantic search out of the box; dynamically linked (glibc /
+#     system libssl on Linux), so it targets the platform's stable runner.
+
+on:
+  push:
+    tags:
+      - "v*"
+  # Allow validating the build on demand without cutting a tag.
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/release.yml"
+
+permissions:
+  contents: write # upload assets onto the release for the pushed tag
+
+jobs:
+  # ── Lean, fully static binaries (no default features, no openssl) ──────────
+  lite:
+    name: lite ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v4
+      - name: Upload lite binary
+        uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: perseus-vault
+          # Distinguish the lean asset from the full one on the release page.
+          archive: perseus-vault-lite-$target
+          target: ${{ matrix.target }}
+          no-default-features: true
+          # cross handles the musl toolchain in a container; --no-default-features
+          # drops ort/tokenizers and the openssl-sys download path entirely.
+          tar: unix
+          checksum: sha256
+          # On a tag push this uploads to the release; on dispatch/PR it just
+          # builds (dry-run) to validate the pipeline.
+          dry-run: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ── Full binaries with bundled embeddings (default features) ───────────────
+  full:
+    name: full ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: x86_64-apple-darwin
+            os: macos-13
+          - target: aarch64-apple-darwin
+            os: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      # bundled-embeddings pulls ort's download path which links openssl-sys on
+      # Linux; provide the system dev libs the source build needs.
+      - name: Install Linux build deps
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
+      - name: Upload full binary
+        uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: perseus-vault
+          archive: perseus-vault-$target
+          target: ${{ matrix.target }}
+          tar: unix
+          checksum: sha256
+          dry-run: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
