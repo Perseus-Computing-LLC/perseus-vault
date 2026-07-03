@@ -1239,7 +1239,7 @@ fn main() {
                         .truncate(true)
                         .mode(0o600)
                         .open(&expanded)
-                        .and_then(|mut f| f.write_all(&key))
+                        .and_then(|mut f| f.write_all(key.as_bytes()))
                 }
                 #[cfg(not(unix))]
                 {
