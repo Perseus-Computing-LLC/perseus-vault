@@ -27,9 +27,10 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
 
-    /// SQLite database path (default: $MIMIR_DB_PATH or ~/.mimir/data/perseus-vault.db,
-    /// falling back to an existing ~/.mimir/data/mneme.db or ~/.mimir/data/mimir.db
-    /// from before the Perseus Vault rename). Used when running the server directly
+    /// SQLite database path (default: $PERSEUS_VAULT_DB_PATH / $MIMIR_DB_PATH or
+    /// ~/.perseus-vault/data/perseus-vault.db, falling back to an existing
+    /// ~/.mimir/data/{perseus-vault,mneme,mimir}.db from before the rename).
+    /// Used when running the server directly
     /// without the `serve` subcommand — matches the documented MCP host config:
     /// `perseus-vault --db /path/to/perseus-vault.db`.
     #[arg(long)]
@@ -238,7 +239,8 @@ enum Commands {
 
     /// Generate a new AES-256-GCM encryption key and write it to a file
     Keygen {
-        /// Path to write the key file (default: ~/.mimir/secret.key)
+        /// Path to write the key file (default: ~/.perseus-vault/secret.key, or
+        /// an existing ~/.mimir/secret.key from before the rename)
         #[arg(long, default_value_t = default_key_file())]
         key_file: String,
     },
@@ -356,7 +358,7 @@ enum Commands {
     ObsidianSync {
         /// Target Obsidian vault directory (created if needed)
         vault_path: String,
-        /// SQLite database path (defaults to $MIMIR_DB_PATH or ~/.mimir/data/perseus-vault.db)
+        /// SQLite database path (defaults to $PERSEUS_VAULT_DB_PATH / $MIMIR_DB_PATH or ~/.perseus-vault/data/perseus-vault.db)
         #[arg(long)]
         db: Option<String>,
         /// Continuously re-export whenever memory changes
@@ -509,11 +511,17 @@ struct DbResolution {
 /// pass `--db` or set `$MIMIR_DB_PATH`.
 ///
 /// Precedence (first existing wins):
-///   1. `~/.mimir/data/perseus-vault.db`  (canonical, current name)
-///   2. `~/.mimir/data/mneme.db`          (pre-rename)
-///   3. `~/.mimir/data/mimir.db`          (pre-rename)
-///   4. `~/mimir.db`                       (legacy single-user install location)
+///   1. `~/.perseus-vault/data/perseus-vault.db`  (canonical, current brand)
+///   2. `~/.mimir/data/perseus-vault.db`          (pre-dir-rename, #427)
+///   3. `~/.mimir/data/mneme.db`                  (pre-rename)
+///   4. `~/.mimir/data/mimir.db`                  (pre-rename)
+///   5. `~/mimir.db`                               (legacy single-user install location)
 /// If none exist, fall back to creating (1), the canonical path.
+///
+/// #427 is a *precedence-only* directory rename: fresh installs land in
+/// `~/.perseus-vault/`, while any existing `~/.mimir/` install keeps being
+/// adopted via the fallback chain — no data is moved. `~/.mimir/` stays in the
+/// chain indefinitely so upgraders are never orphaned.
 ///
 /// Crucially `~/mimir.db` is chosen *before* falling through to create a fresh
 /// canonical DB, so an existing single-user install is picked up instead of
@@ -535,15 +543,18 @@ fn resolve_default_db(
     exists: &dyn Fn(&str) -> bool,
     entity_count: &dyn Fn(&str) -> Option<i64>,
 ) -> DbResolution {
-    let dir = format!("{}/.mimir/data", home);
-    let vault_path = format!("{}/perseus-vault.db", dir);
-    let mneme_path = format!("{}/mneme.db", dir);
-    let mimir_path = format!("{}/mimir.db", dir);
+    let new_dir = format!("{}/.perseus-vault/data", home);
+    let legacy_dir = format!("{}/.mimir/data", home);
+    let vault_path = format!("{}/perseus-vault.db", new_dir); // #427 canonical
+    let legacy_vault_path = format!("{}/perseus-vault.db", legacy_dir);
+    let mneme_path = format!("{}/mneme.db", legacy_dir);
+    let mimir_path = format!("{}/mimir.db", legacy_dir);
     let home_legacy_path = format!("{}/mimir.db", home);
 
     // Ordered candidate list; the first that exists is chosen.
     let candidates = [
         vault_path.clone(),
+        legacy_vault_path,
         mneme_path,
         mimir_path,
         home_legacy_path,
@@ -619,16 +630,24 @@ fn probe_entity_count(path: &str) -> Option<i64> {
 /// emitted separately by `normalize_default_db`, which runs once at real
 /// startup and only when the default path was actually used.
 fn default_db_path() -> String {
+    // #427: PERSEUS_VAULT_DB_PATH is the current-brand override; MIMIR_DB_PATH
+    // stays honored for back-compat (checked second).
+    if let Ok(explicit) = std::env::var("PERSEUS_VAULT_DB_PATH") {
+        return explicit;
+    }
     if let Ok(explicit) = std::env::var("MIMIR_DB_PATH") {
         return explicit;
     }
     let home = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
         .unwrap_or_else(|_| {
-            eprintln!("perseus-vault: could not determine home directory. Set MIMIR_DB_PATH or HOME/USERPROFILE.");
+            eprintln!("perseus-vault: could not determine home directory. Set PERSEUS_VAULT_DB_PATH or HOME/USERPROFILE.");
             std::process::exit(1);
         });
-    let dir = format!("{}/.mimir/data", home);
+    // Create the current-brand canonical data dir for fresh installs. Existing
+    // ~/.mimir installs are still adopted by resolve_default_db via the fallback
+    // chain (this only ever creates an empty dir alongside them).
+    let dir = format!("{}/.perseus-vault/data", home);
     let _ = std::fs::create_dir_all(&dir);
 
     // Path-only here: clap evaluates this eagerly for *every* invocation (even
@@ -652,7 +671,10 @@ fn default_db_path() -> String {
 /// rather than only the handful of sites that used to call `check_legacy_db`.
 fn normalize_default_db(cli: &mut Cli) {
     // Explicit selection (env or top-level `--db`) is never second-guessed.
-    if std::env::var_os("MIMIR_DB_PATH").is_some() || cli.db.is_some() {
+    if std::env::var_os("PERSEUS_VAULT_DB_PATH").is_some()
+        || std::env::var_os("MIMIR_DB_PATH").is_some()
+        || cli.db.is_some()
+    {
         return;
     }
     let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) else {
@@ -698,7 +720,7 @@ fn normalize_default_db(cli: &mut Cli) {
             eprintln!("perseus-vault:    also present (ignored): {}", other);
         }
         eprintln!(
-            "perseus-vault:    pass --db <path> or set MIMIR_DB_PATH to choose explicitly and silence this warning."
+            "perseus-vault:    pass --db <path> or set PERSEUS_VAULT_DB_PATH to choose explicitly and silence this warning."
         );
     }
 
@@ -717,7 +739,18 @@ fn default_key_file() -> String {
     let home = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
         .unwrap_or_else(|_| "/root".to_string());
-    format!("{}/.mimir/secret.key", home)
+    // #427 precedence-only: prefer whichever secret.key already exists so an
+    // existing encrypted install NEVER loses its key (a wrong default would
+    // silently make the vault undecryptable). Fresh installs use the new dir.
+    let new_key = format!("{}/.perseus-vault/secret.key", home);
+    let legacy_key = format!("{}/.mimir/secret.key", home);
+    if std::path::Path::new(&new_key).exists() {
+        new_key
+    } else if std::path::Path::new(&legacy_key).exists() {
+        legacy_key
+    } else {
+        new_key
+    }
 }
 
 /// Open a database for a CLI maintenance command, or exit(1) with a message.
@@ -2028,11 +2061,38 @@ mod tests {
 
     #[test]
     fn resolve_default_db_falls_back_to_canonical_when_none_exist() {
-        // Fresh install: nothing exists -> create canonical path, no warning.
+        // Fresh install: nothing exists -> create the #427 canonical path under
+        // ~/.perseus-vault/, no warning.
         let home = "/home/tester";
-        let vault = format!("{}/.mimir/data/perseus-vault.db", home);
+        let vault = format!("{}/.perseus-vault/data/perseus-vault.db", home);
         let r = resolve_default_db(home, &present(&[]), &unknown);
         assert_eq!(r.chosen, vault);
+        assert!(r.other_candidates.is_empty());
+    }
+
+    #[test]
+    fn resolve_default_db_427_prefers_new_dir_when_present() {
+        // Both the new ~/.perseus-vault and a legacy ~/.mimir DB exist: the new
+        // canonical dir wins; the legacy one is reported as an also-present.
+        let home = "/home/tester";
+        let new_vault = format!("{}/.perseus-vault/data/perseus-vault.db", home);
+        let legacy_vault = format!("{}/.mimir/data/perseus-vault.db", home);
+        let existing = vec![new_vault.clone(), legacy_vault.clone()];
+        let r = resolve_default_db(home, &present(&existing), &unknown);
+        assert_eq!(r.chosen, new_vault);
+        assert_eq!(r.other_candidates, vec![legacy_vault]);
+    }
+
+    #[test]
+    fn resolve_default_db_427_adopts_legacy_mimir_dir_on_upgrade() {
+        // Upgrade path: only the legacy ~/.mimir DB exists (no ~/.perseus-vault
+        // yet). It must be adopted, NOT shadowed by a fresh empty new-dir DB —
+        // no data is moved.
+        let home = "/home/tester";
+        let legacy_vault = format!("{}/.mimir/data/perseus-vault.db", home);
+        let existing = vec![legacy_vault.clone()];
+        let r = resolve_default_db(home, &present(&existing), &unknown);
+        assert_eq!(r.chosen, legacy_vault);
         assert!(r.other_candidates.is_empty());
     }
 
