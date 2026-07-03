@@ -5,6 +5,8 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
 
 ## [Unreleased]
 
+## [2.15.0] - 2026-07-03
+
 ### Fixed
 - Default DB resolution now factors in emptiness (#424, follow-up to #421):
   when the database path is the implicit default (no `--db`, no

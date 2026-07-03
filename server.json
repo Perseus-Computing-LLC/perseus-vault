@@ -3,7 +3,7 @@
   "name": "io.github.Perseus-Computing-LLC/mimir",
   "title": "Perseus Vault (formerly Mimir/Mneme), persistent memory engine for AI agents",
   "description": "Local-first MCP memory server: SQLite, FTS5 and vector search, AES-256-GCM. 55 tools, no cloud.",
-  "version": "2.14.0",
+  "version": "2.15.0",
   "packages": [{
     "registryType": "oci",
     "identifier": "ghcr.io/perseus-computing-llc/perseus-vault:2.14.0",
