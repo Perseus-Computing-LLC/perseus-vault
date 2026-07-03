@@ -477,6 +477,34 @@ pub fn handle_remember(db: &Database, args: Value) -> Result<String, String> {
         return Err(format!("body_json is not valid JSON: {}", e));
     }
 
+    // #433 L: bound input sizes. category/key are indexed, hashed for identity
+    // (category, key, workspace_hash), and fed to FTS — an unbounded key is a
+    // DoS-via-huge-key vector. These caps sit far above any legitimate use.
+    const MAX_CATEGORY_LEN: usize = 256;
+    const MAX_KEY_LEN: usize = 1024;
+    const MAX_BODY_LEN: usize = 4 * 1024 * 1024; // 4 MiB
+    if a.category.len() > MAX_CATEGORY_LEN {
+        return Err(format!(
+            "category too long: {} bytes (max {})",
+            a.category.len(),
+            MAX_CATEGORY_LEN
+        ));
+    }
+    if a.key.len() > MAX_KEY_LEN {
+        return Err(format!(
+            "key too long: {} bytes (max {})",
+            a.key.len(),
+            MAX_KEY_LEN
+        ));
+    }
+    if a.body_json.len() > MAX_BODY_LEN {
+        return Err(format!(
+            "body_json too long: {} bytes (max {})",
+            a.body_json.len(),
+            MAX_BODY_LEN
+        ));
+    }
+
     // Merge recall_when into body_json if provided
     let body = if a.recall_when.is_empty() {
         a.body_json
@@ -4605,6 +4633,45 @@ mod tests {
             3,
             "no env knobs → maintenance must keep every version"
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ─── #433 L: input length bounds on remember ─────────────────
+
+    #[test]
+    fn remember_rejects_oversized_key() {
+        let (db, path) = temp_db();
+        let huge_key = "k".repeat(2000); // > MAX_KEY_LEN (1024)
+        let err = handle_remember(
+            &db,
+            json!({"category": "facts", "key": huge_key, "body_json": "{}"}),
+        )
+        .expect_err("oversized key must be rejected");
+        assert!(err.contains("key too long"), "unexpected error: {err}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn remember_rejects_oversized_category() {
+        let (db, path) = temp_db();
+        let huge_cat = "c".repeat(500); // > MAX_CATEGORY_LEN (256)
+        let err = handle_remember(
+            &db,
+            json!({"category": huge_cat, "key": "k", "body_json": "{}"}),
+        )
+        .expect_err("oversized category must be rejected");
+        assert!(err.contains("category too long"), "unexpected error: {err}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn remember_accepts_normal_sizes() {
+        let (db, path) = temp_db();
+        handle_remember(
+            &db,
+            json!({"category": "facts", "key": "normal-key", "body_json": "{\"a\":1}"}),
+        )
+        .expect("normally-sized remember must succeed");
         let _ = std::fs::remove_file(&path);
     }
 }

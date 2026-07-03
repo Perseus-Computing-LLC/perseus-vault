@@ -86,6 +86,18 @@ impl FileWatcher {
             let entry = entry.map_err(|e| format!("Dir entry error: {}", e))?;
             let path = entry.path();
 
+            // #433 L: reject symlinked entries. `is_dir()`/`is_file()` follow
+            // symlinks, so a symlink planted inside a watched directory could
+            // point outside the configured root (SECURITY.md claims watched
+            // paths are canonicalized). `entry.file_type()` reports the link
+            // itself without traversing it, so we can skip it before any
+            // recursion or read.
+            match entry.file_type() {
+                Ok(ft) if ft.is_symlink() => continue,
+                Ok(_) => {}
+                Err(_) => continue,
+            }
+
             if path.is_dir() {
                 // Skip hidden dirs and common non-content dirs
                 let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
@@ -157,5 +169,59 @@ impl Connector for FileWatcher {
 
     fn last_sync(&self) -> &AtomicI64 {
         &self.last_sync
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg_for(dir: &std::path::Path) -> FileWatcherConfig {
+        FileWatcherConfig {
+            enabled: true,
+            paths: vec![dir.to_string_lossy().to_string()],
+            extensions: vec![".md".to_string()],
+            debounce_ms: 0,
+        }
+    }
+
+    #[test]
+    fn scan_ingests_regular_files() {
+        let dir = std::env::temp_dir().join(format!("pv-fw-reg-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("note.md"), "hello").unwrap();
+        let fw = FileWatcher::new(cfg_for(&dir));
+        let docs = fw.fetch().expect("fetch");
+        assert_eq!(docs.len(), 1);
+        assert!(docs[0].body_json.contains("hello"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // #433 L: a symlink planted in a watched dir must be skipped, not followed
+    // out of the configured root.
+    #[cfg(unix)]
+    #[test]
+    fn scan_skips_symlinked_files() {
+        use std::os::unix::fs::symlink;
+        let root = std::env::temp_dir().join(format!("pv-fw-link-{}", uuid::Uuid::new_v4()));
+        let outside = std::env::temp_dir().join(format!("pv-fw-out-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        // Secret target lives OUTSIDE the watched root.
+        let secret = outside.join("secret.md");
+        std::fs::write(&secret, "TOP SECRET").unwrap();
+        // Symlink inside the watched root points at it.
+        symlink(&secret, root.join("link.md")).unwrap();
+        // A real file that must still be ingested.
+        std::fs::write(root.join("real.md"), "ok").unwrap();
+
+        let fw = FileWatcher::new(cfg_for(&root));
+        let docs = fw.fetch().expect("fetch");
+        assert_eq!(docs.len(), 1, "only the real file, not the symlink");
+        assert!(docs[0].body_json.contains("ok"));
+        assert!(!docs.iter().any(|d| d.body_json.contains("TOP SECRET")));
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
     }
 }
