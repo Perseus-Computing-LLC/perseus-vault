@@ -753,6 +753,32 @@ fn print_json<T: serde::Serialize>(value: &T) {
 /// #272: `perseus-vault doctor` — validate the local install + config and report
 /// which MCP clients Perseus Vault works with. ASCII-only output (cross-platform
 /// console safe).
+/// #433 N4: age in days since the most recent entity/journal write, or `None`
+/// when the DB is empty or unreadable. Uses a read-only connection and
+/// plaintext timestamp columns, so it needs no encryption key.
+fn latest_write_age_days(db_path: &str) -> Option<f64> {
+    let conn = rusqlite::Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .ok()?;
+    let max_of = |sql: &str| -> Option<i64> {
+        conn.query_row(sql, [], |r| r.get::<_, Option<i64>>(0))
+            .ok()
+            .flatten()
+    };
+    let ent =
+        max_of("SELECT MAX(COALESCE(recorded_at_unix_ms, created_at_unix_ms)) FROM entities");
+    let jrn = max_of("SELECT MAX(created_at_unix_ms) FROM journal");
+    let latest = [ent, jrn].into_iter().flatten().max()?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_millis() as i64;
+    let age_ms = (now - latest).max(0);
+    Some(age_ms as f64 / (1000.0 * 60.0 * 60.0 * 24.0))
+}
+
 fn run_doctor(db_path: &str) {
     println!("perseus-vault doctor — v{}", env!("CARGO_PKG_VERSION"));
     match std::env::current_exe() {
@@ -768,6 +794,22 @@ fn run_doctor(db_path: &str) {
         "not yet created (dir made on first run)"
     };
     println!("  database: {} ({})", db_path, db_status);
+
+    // #433 N4: freshness/liveness — surface a stale vault instead of silently
+    // reporting "healthy" while the harvest/writer has quietly stopped. Reads
+    // the most recent write timestamp from plaintext columns, so it needs no
+    // encryption key.
+    if dbp.exists() {
+        const STALE_AFTER_DAYS: f64 = 14.0;
+        match latest_write_age_days(db_path) {
+            Some(days) if days > STALE_AFTER_DAYS => println!(
+                "  freshness: [WARN] last write {:.1} days ago (> {:.0} days) — is the harvest/writer running?",
+                days, STALE_AFTER_DAYS
+            ),
+            Some(days) => println!("  freshness: last write {:.1} days ago", days),
+            None => println!("  freshness: (no writes recorded yet)"),
+        }
+    }
 
     println!("\nMCP stdio config (identical for every client below):");
     println!("  command: perseus-vault");
@@ -1181,9 +1223,34 @@ fn main() {
             }
 
             let key = crate::encryption::EncryptionManager::generate_key();
-            match std::fs::write(&expanded, &key) {
+            // #433 M1: create the key file with 0600 *at creation time* so the
+            // secret is never briefly world-readable in the window between the
+            // write and a follow-up chmod. On Unix, OpenOptions::mode applies
+            // the permission when the inode is created (umask can only remove
+            // bits, never widen past 0600).
+            let write_result: std::io::Result<()> = {
+                #[cfg(unix)]
+                {
+                    use std::io::Write;
+                    use std::os::unix::fs::OpenOptionsExt;
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .create(true)
+                        .truncate(true)
+                        .mode(0o600)
+                        .open(&expanded)
+                        .and_then(|mut f| f.write_all(&key))
+                }
+                #[cfg(not(unix))]
+                {
+                    std::fs::write(&expanded, &key)
+                }
+            };
+            match write_result {
                 Ok(_) => {
-                    // Set restrictive permissions (owner read-only)
+                    // Defense-in-depth: if the path already existed with looser
+                    // perms, create+truncate does not retighten it, so re-assert
+                    // 0600 explicitly.
                     #[cfg(unix)]
                     {
                         use std::os::unix::fs::PermissionsExt;
