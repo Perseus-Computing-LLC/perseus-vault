@@ -502,10 +502,11 @@ struct DbResolution {
     other_candidates: Vec<String>,
 }
 
-/// Pure, testable core of default DB-path resolution (#421).
+/// Pure, testable core of default DB-path resolution (#421, #424).
 ///
-/// Given the home directory and an existence check, decides which database the
-/// server should open when the user did not pass `--db` or set `$MIMIR_DB_PATH`.
+/// Given the home directory, an existence check, and a keyless entity-count
+/// probe, decides which database the server should open when the user did not
+/// pass `--db` or set `$MIMIR_DB_PATH`.
 ///
 /// Precedence (first existing wins):
 ///   1. `~/.mimir/data/perseus-vault.db`  (canonical, current name)
@@ -518,7 +519,22 @@ struct DbResolution {
 /// canonical DB, so an existing single-user install is picked up instead of
 /// silently starting empty. `other_candidates` reports every *other* database
 /// that also exists so the caller can warn about the ambiguity.
-fn resolve_default_db(home: &str, exists: &dyn Fn(&str) -> bool) -> DbResolution {
+///
+/// #424: purely path-based precedence let a stale, *empty* higher-precedence DB
+/// (e.g. a `~/.mimir/data/mimir.db` created by an earlier default-path run)
+/// shadow a live lower-precedence one (e.g. `~/mimir.db` with real data). So
+/// when — and only when — the highest-precedence existing candidate is
+/// *known-empty* (`entity_count` returns `Some(0)`), we prefer the
+/// highest-precedence candidate that is *known-non-empty*. Candidates whose
+/// count can't be read (locked/corrupt/not-yet-a-vault → `None`) are treated as
+/// unknown: we never demote *on* an unknown, and never promote *to* one, so an
+/// unreadable top candidate keeps its position (current order + warn). The
+/// probe is only consulted here in the rare multi-candidate case.
+fn resolve_default_db(
+    home: &str,
+    exists: &dyn Fn(&str) -> bool,
+    entity_count: &dyn Fn(&str) -> Option<i64>,
+) -> DbResolution {
     let dir = format!("{}/.mimir/data", home);
     let vault_path = format!("{}/perseus-vault.db", dir);
     let mneme_path = format!("{}/mneme.db", dir);
@@ -541,7 +557,22 @@ fn resolve_default_db(home: &str, exists: &dyn Fn(&str) -> bool) -> DbResolution
 
     // Chosen: first existing candidate in precedence order, else the canonical
     // path (which will be created fresh).
-    let chosen = existing.first().cloned().unwrap_or(vault_path);
+    let chosen = match existing.first() {
+        None => vault_path,
+        Some(first) => {
+            // #424: only reconsider precedence when the top candidate is
+            // *known* empty; prefer the highest-precedence known-non-empty DB.
+            if entity_count(first) == Some(0) {
+                existing
+                    .iter()
+                    .find(|p| entity_count(p).is_some_and(|c| c > 0))
+                    .cloned()
+                    .unwrap_or_else(|| first.clone())
+            } else {
+                first.clone()
+            }
+        }
+    };
     let other_candidates = existing
         .into_iter()
         .filter(|p| *p != chosen)
@@ -551,6 +582,26 @@ fn resolve_default_db(home: &str, exists: &dyn Fn(&str) -> bool) -> DbResolution
         chosen,
         other_candidates,
     }
+}
+
+/// #424: keyless probe of a candidate DB's entity count. Opens the file
+/// **read-only** so a candidate we don't end up adopting is never mutated (no
+/// schema init, no WAL/SHM churn — unlike [`db::Database::open`], which creates
+/// the schema). Returns `Some(count)` when the `entities` table can be read,
+/// and `None` when the DB can't be opened/read or has no such table (locked,
+/// corrupt, or not yet a vault) — callers treat `None` as "unknown".
+///
+/// A row `COUNT(*)` needs no encryption key: encryption is per-field, so the
+/// table structure and row count are plaintext even on an encrypted store.
+fn probe_entity_count(path: &str) -> Option<i64> {
+    use rusqlite::OpenFlags;
+    let conn = rusqlite::Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .ok()?;
+    conn.query_row("SELECT COUNT(*) FROM entities", [], |r| r.get::<_, i64>(0))
+        .ok()
 }
 
 /// Resolve the default database path.
@@ -563,9 +614,10 @@ fn resolve_default_db(home: &str, exists: &dyn Fn(&str) -> bool) -> DbResolution
 /// This is intentionally side-effect free apart from creating the data dir: it
 /// is used both as clap's `default_value_t` (evaluated eagerly, even when the
 /// user passes `--db`) and in equality comparisons by `apply_top_level_db`, so
-/// it must NOT print warnings. The multi-candidate split-brain warning is
-/// emitted separately by `check_legacy_db`, which runs only at real startup and
-/// only when the default path was actually used.
+/// it must NOT print warnings and stays path-only (no DB probing). The
+/// multi-candidate split-brain warning and the emptiness-aware refinement are
+/// emitted separately by `normalize_default_db`, which runs once at real
+/// startup and only when the default path was actually used.
 fn default_db_path() -> String {
     if let Ok(explicit) = std::env::var("MIMIR_DB_PATH") {
         return explicit;
@@ -579,55 +631,85 @@ fn default_db_path() -> String {
     let dir = format!("{}/.mimir/data", home);
     let _ = std::fs::create_dir_all(&dir);
 
-    resolve_default_db(&home, &|p| std::path::Path::new(p).exists()).chosen
+    // Path-only here: clap evaluates this eagerly for *every* invocation (even
+    // when `--db` is passed) and `apply_top_level_db` compares against it, so it
+    // must stay cheap and side-effect-free. The emptiness-aware refinement (the
+    // `entity_count` probe) is applied once at real startup by
+    // `normalize_default_db`, not here.
+    resolve_default_db(&home, &|p| std::path::Path::new(p).exists(), &|_| None).chosen
 }
 
-/// Check for a legacy database at ~/mimir.db and warn if the default path
-/// would create a new empty database instead.
+/// #421/#424: single owner of default-DB resolution + its warnings at real
+/// startup. When — and only when — the database path is the *implicit default*
+/// (no `--db` at either level, no `$MIMIR_DB_PATH`), this refines the path with
+/// the keyless emptiness probe (so a stale-empty higher-precedence DB no longer
+/// shadows a live lower-precedence one, #424), rewrites the subcommand's `--db`
+/// field to the resolved path, and surfaces any multi-candidate ambiguity on
+/// stderr. When the user selected a DB explicitly, this is a no-op.
 ///
-/// Also emits the #421 split-brain warning: when the path being used is the
-/// resolved *default* (no `--db`, no `$MIMIR_DB_PATH`) and more than one
-/// candidate database exists on disk, name the chosen one and the others so the
-/// ambiguity is visible rather than silent. When `--db`/`$MIMIR_DB_PATH` is set
-/// explicitly, behavior is unchanged and no warning fires.
-fn check_legacy_db(db_path: &str) {
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .unwrap_or_else(|_| "/root".to_string());
+/// Runs once in `main()` before the command match, so every command path —
+/// `serve` and the maintenance subcommands alike — opens the same resolved DB,
+/// rather than only the handful of sites that used to call `check_legacy_db`.
+fn normalize_default_db(cli: &mut Cli) {
+    // Explicit selection (env or top-level `--db`) is never second-guessed.
+    if std::env::var_os("MIMIR_DB_PATH").is_some() || cli.db.is_some() {
+        return;
+    }
+    let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) else {
+        return;
+    };
+    let default = default_db_path();
+    let Some(cmd) = cli.command.as_mut() else {
+        return;
+    };
 
-    // Was this path chosen implicitly (the resolved default) rather than via
-    // --db / $MIMIR_DB_PATH? Only then do we own the resolution and warn.
-    let env_set = std::env::var("MIMIR_DB_PATH").is_ok();
-    let is_default = !env_set && db_path == default_db_path();
-
-    // #421: multiple candidate DBs but the user didn't pick one — surface the
-    // split-brain instead of silently reading/creating one of them.
-    if is_default {
-        let resolution = resolve_default_db(&home, &|p| std::path::Path::new(p).exists());
-        if !resolution.other_candidates.is_empty() {
-            eprintln!(
-                "perseus-vault: ⚠  multiple candidate databases found; using {}",
-                resolution.chosen
-            );
-            for other in &resolution.other_candidates {
-                eprintln!("perseus-vault:    also present (ignored): {}", other);
-            }
-            eprintln!(
-                "perseus-vault:    pass --db <path> or set MIMIR_DB_PATH to choose explicitly and silence this warning."
-            );
-        }
+    // Is this the implicit default? Commands without a `--db` (Keygen/Migrate)
+    // are skipped; ObsidianSync carries an `Option<String>` handled separately.
+    let is_implicit = match cmd {
+        Commands::ObsidianSync { db, .. } => db.is_none(),
+        _ => cmd.db_field_mut().map(|db| *db == default).unwrap_or(false),
+    };
+    if !is_implicit {
+        return;
     }
 
-    let legacy = std::path::PathBuf::from(format!("{}/mimir.db", home));
-    let target = std::path::PathBuf::from(db_path);
-    if legacy.exists() && !target.exists() {
-        eprintln!("mimir: ⚠  Legacy database found at {}", legacy.display());
-        eprintln!("mimir:    The default database path is now {}", target.display());
-        eprintln!("mimir:    To use the legacy database, either:");
-        eprintln!("mimir:      - Set MIMIR_DB_PATH={}", legacy.display());
-        eprintln!("mimir:      - Pass --db {}", legacy.display());
-        eprintln!("mimir:      - Move it: mv {} {}", legacy.display(), target.display());
-        eprintln!("mimir:    Starting with a new empty database at {}.", target.display());
+    let resolution = resolve_default_db(
+        &home,
+        &|p| std::path::Path::new(p).exists(),
+        &probe_entity_count,
+    );
+
+    // Surface a split-brain (multiple candidate DBs, user picked none) instead
+    // of silently reading/creating one of them.
+    if !resolution.other_candidates.is_empty() {
+        eprintln!(
+            "perseus-vault: ⚠  multiple candidate databases found; using {}",
+            resolution.chosen
+        );
+        // #424: make the emptiness-aware override explicit — otherwise adopting
+        // a lower-precedence DB over the "expected" default looks surprising.
+        if resolution.chosen != default {
+            eprintln!(
+                "perseus-vault:    (preferred a non-empty database over the empty {})",
+                default
+            );
+        }
+        for other in &resolution.other_candidates {
+            eprintln!("perseus-vault:    also present (ignored): {}", other);
+        }
+        eprintln!(
+            "perseus-vault:    pass --db <path> or set MIMIR_DB_PATH to choose explicitly and silence this warning."
+        );
+    }
+
+    // Apply the resolved path back onto the subcommand's `--db` field.
+    match cmd {
+        Commands::ObsidianSync { db, .. } => *db = Some(resolution.chosen),
+        _ => {
+            if let Some(db) = cmd.db_field_mut() {
+                *db = resolution.chosen;
+            }
+        }
     }
 }
 
@@ -1073,6 +1155,7 @@ fn render_prepare_block(recall_when_hits: &[crate::models::Entity], context_md: 
 fn main() {
     let mut cli = Cli::parse();
     apply_top_level_db(&mut cli); // #313: `mimir --db PATH serve` must honor --db
+    normalize_default_db(&mut cli); // #421/#424: resolve implicit default DB + warn
 
     match cli.command {
         Some(Commands::Keygen { key_file }) => {
@@ -1338,7 +1421,6 @@ fn main() {
             ref vault_dir,
             ref workspace_hash,
         }) => {
-            check_legacy_db(db_path);
             let database = open_db_or_exit(db_path);
             let dir = if vault_dir.starts_with("~/") {
                 let home = std::env::var("HOME")
@@ -1360,7 +1442,6 @@ fn main() {
             db: ref db_path,
             ref vault_dir,
         }) => {
-            check_legacy_db(db_path);
             let database = open_db_or_exit(db_path);
             let dir = if vault_dir.starts_with("~/") {
                 let home = std::env::var("HOME")
@@ -1384,7 +1465,6 @@ fn main() {
             watch,
         }) => {
             let db_path = db.clone().unwrap_or_else(default_db_path);
-            check_legacy_db(&db_path);
             let database = open_db_or_exit(&db_path);
             let dir = if vault_path.starts_with("~/") {
                 let home = std::env::var("HOME")
@@ -1445,7 +1525,6 @@ fn main() {
             db: ref db_path,
             dry_run,
         }) => {
-            check_legacy_db(db_path);
             let database = open_db_or_exit(db_path);
             match database.purge(dry_run) {
                 Ok(report) => print_json(&report),
@@ -1497,7 +1576,6 @@ fn main() {
             ..
         }) => {
             let db_path = db.clone();
-            check_legacy_db(&db_path);
             eprintln!("mimir: using database at {}", db_path);
 
             // Offline mode: disable network-dependent features
@@ -1659,7 +1737,6 @@ fn main() {
         }
         None => {
             let db_path = cli.db.clone().unwrap_or_else(default_db_path);
-            check_legacy_db(&db_path);
             eprintln!("mimir: using database at {}", db_path);
             let mut database = match db::Database::open(&db_path) {
                 Ok(db) => db,
@@ -1911,6 +1988,19 @@ mod tests {
         move |p: &str| set.iter().any(|e| e == p)
     }
 
+    /// Probe that reports every candidate as unknown (`None`) — reproduces the
+    /// pre-#424 purely path-based behavior, so the #421 precedence tests still
+    /// assert exactly what they did before the emptiness refinement.
+    fn unknown(_: &str) -> Option<i64> {
+        None
+    }
+
+    /// Probe backed by a fixed map of path -> entity count; paths not in the map
+    /// are unknown (`None`).
+    fn counts(map: &[(String, i64)]) -> impl Fn(&str) -> Option<i64> + '_ {
+        move |p: &str| map.iter().find(|(k, _)| k == p).map(|(_, c)| *c)
+    }
+
     #[test]
     fn resolve_default_db_picks_home_legacy_over_creating_fresh() {
         // #421 core: only ~/mimir.db exists. It must be selected instead of
@@ -1919,7 +2009,7 @@ mod tests {
         let home = "/home/tester";
         let home_legacy = format!("{}/mimir.db", home);
         let existing = vec![home_legacy.clone()];
-        let r = resolve_default_db(home, &present(&existing));
+        let r = resolve_default_db(home, &present(&existing), &unknown);
         assert_eq!(r.chosen, home_legacy, "should adopt existing ~/mimir.db");
         assert!(r.other_candidates.is_empty());
     }
@@ -1931,7 +2021,7 @@ mod tests {
         let vault = format!("{}/.mimir/data/perseus-vault.db", home);
         let home_legacy = format!("{}/mimir.db", home);
         let existing = vec![vault.clone(), home_legacy.clone()];
-        let r = resolve_default_db(home, &present(&existing));
+        let r = resolve_default_db(home, &present(&existing), &unknown);
         assert_eq!(r.chosen, vault);
         assert_eq!(r.other_candidates, vec![home_legacy]);
     }
@@ -1941,7 +2031,7 @@ mod tests {
         // Fresh install: nothing exists -> create canonical path, no warning.
         let home = "/home/tester";
         let vault = format!("{}/.mimir/data/perseus-vault.db", home);
-        let r = resolve_default_db(home, &present(&[]));
+        let r = resolve_default_db(home, &present(&[]), &unknown);
         assert_eq!(r.chosen, vault);
         assert!(r.other_candidates.is_empty());
     }
@@ -1955,7 +2045,7 @@ mod tests {
         let mimir = format!("{}/.mimir/data/mimir.db", home);
         let home_legacy = format!("{}/mimir.db", home);
         let existing = vec![mneme.clone(), mimir.clone(), home_legacy.clone()];
-        let r = resolve_default_db(home, &present(&existing));
+        let r = resolve_default_db(home, &present(&existing), &unknown);
         // perseus-vault.db absent -> mneme.db is highest precedence.
         assert_eq!(r.chosen, mneme);
         assert_eq!(r.other_candidates, vec![mimir, home_legacy]);
@@ -1975,9 +2065,103 @@ mod tests {
             mimir.clone(),
             home_legacy.clone(),
         ];
-        let r = resolve_default_db(home, &present(&all));
+        let r = resolve_default_db(home, &present(&all), &unknown);
         assert_eq!(r.chosen, vault);
         assert_eq!(r.other_candidates, vec![mneme, mimir, home_legacy]);
+    }
+
+    // ---- #424: factor emptiness into precedence ----
+
+    #[test]
+    fn resolve_default_db_prefers_nonempty_over_empty_higher_precedence() {
+        // The exact #424/#421 scenario: canonical/dir mimir.db is stale-empty,
+        // the live single-user ~/mimir.db has real data. The non-empty DB wins
+        // even though it's lower precedence.
+        let home = "/home/tester";
+        let mimir = format!("{}/.mimir/data/mimir.db", home);
+        let home_legacy = format!("{}/mimir.db", home);
+        let existing = vec![mimir.clone(), home_legacy.clone()];
+        let r = resolve_default_db(
+            home,
+            &present(&existing),
+            &counts(&[(mimir.clone(), 0), (home_legacy.clone(), 26)]),
+        );
+        assert_eq!(r.chosen, home_legacy, "live DB should be adopted over stale-empty");
+        assert_eq!(r.other_candidates, vec![mimir]);
+    }
+
+    #[test]
+    fn resolve_default_db_keeps_top_when_it_is_nonempty() {
+        // A non-empty highest-precedence DB is never demoted, even if a
+        // lower-precedence one also has data.
+        let home = "/home/tester";
+        let vault = format!("{}/.mimir/data/perseus-vault.db", home);
+        let home_legacy = format!("{}/mimir.db", home);
+        let existing = vec![vault.clone(), home_legacy.clone()];
+        let r = resolve_default_db(
+            home,
+            &present(&existing),
+            &counts(&[(vault.clone(), 5), (home_legacy.clone(), 26)]),
+        );
+        assert_eq!(r.chosen, vault);
+        assert_eq!(r.other_candidates, vec![home_legacy]);
+    }
+
+    #[test]
+    fn resolve_default_db_does_not_demote_on_unknown_top() {
+        // An unreadable (locked/corrupt) top candidate is unknown, not empty:
+        // keep it in place (current order + the caller warns) rather than
+        // silently switching to a lower-precedence DB.
+        let home = "/home/tester";
+        let vault = format!("{}/.mimir/data/perseus-vault.db", home);
+        let home_legacy = format!("{}/mimir.db", home);
+        let existing = vec![vault.clone(), home_legacy.clone()];
+        let r = resolve_default_db(
+            home,
+            &present(&existing),
+            // vault -> None (unknown); home_legacy -> 26
+            &counts(&[(home_legacy.clone(), 26)]),
+        );
+        assert_eq!(r.chosen, vault, "unknown top candidate is not demoted");
+        assert_eq!(r.other_candidates, vec![home_legacy]);
+    }
+
+    #[test]
+    fn resolve_default_db_keeps_top_when_all_empty() {
+        // Top is empty and no lower candidate is known-non-empty -> keep the
+        // highest-precedence one (no better option, don't thrash).
+        let home = "/home/tester";
+        let vault = format!("{}/.mimir/data/perseus-vault.db", home);
+        let home_legacy = format!("{}/mimir.db", home);
+        let existing = vec![vault.clone(), home_legacy.clone()];
+        let r = resolve_default_db(
+            home,
+            &present(&existing),
+            &counts(&[(vault.clone(), 0), (home_legacy.clone(), 0)]),
+        );
+        assert_eq!(r.chosen, vault);
+        assert_eq!(r.other_candidates, vec![home_legacy]);
+    }
+
+    #[test]
+    fn resolve_default_db_empty_top_skips_to_nonempty_past_unknown() {
+        // Top known-empty, second unknown, third known-non-empty -> the
+        // known-non-empty one wins (a known-good DB beats both an empty and an
+        // unknown one).
+        let home = "/home/tester";
+        let vault = format!("{}/.mimir/data/perseus-vault.db", home);
+        let mneme = format!("{}/.mimir/data/mneme.db", home);
+        let mimir = format!("{}/.mimir/data/mimir.db", home);
+        let existing = vec![vault.clone(), mneme.clone(), mimir.clone()];
+        let r = resolve_default_db(
+            home,
+            &present(&existing),
+            // vault empty, mneme unknown, mimir non-empty
+            &counts(&[(vault.clone(), 0), (mimir.clone(), 12)]),
+        );
+        assert_eq!(r.chosen, mimir);
+        // other_candidates preserves precedence order minus the chosen.
+        assert_eq!(r.other_candidates, vec![vault, mneme]);
     }
 
     #[test]
