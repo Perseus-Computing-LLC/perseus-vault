@@ -5,6 +5,27 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
 
 ## [Unreleased]
 
+### Fixed
+- Default DB resolution now factors in emptiness (#424, follow-up to #421):
+  when the database path is the implicit default (no `--db`, no
+  `$MIMIR_DB_PATH`) and the highest-precedence candidate DB is *known-empty*
+  (`SELECT COUNT(*) FROM entities == 0` — a keyless read, works under
+  encryption), a lower-precedence but *non-empty* candidate is preferred
+  instead. This fixes the reported case where a stale-empty
+  `~/.mimir/data/mimir.db` shadowed a live `~/mimir.db`. Candidates that can't
+  be read (locked/corrupt/not-yet-a-vault) are treated as unknown — never
+  demoted-on and never promoted-to — so behavior degrades gracefully to the
+  path-based order plus the existing split-brain warning. Resolution + its
+  warnings are now performed once in `main()` (`normalize_default_db`), so
+  `serve` and every maintenance subcommand open the same resolved DB
+  (previously only a handful of sites warned). `default_db_path()` (clap's
+  eager default) stays path-only and side-effect-free.
+- `scripts/bootstrap.sh` looked for a `target/release/mimir` binary that the
+  `perseus-vault`-named crate no longer produces (the build would report
+  success then fail to find the binary). It now builds/installs `perseus-vault`
+  with `mimir`/`mneme` compat symlinks, defaults to `perseus-vault.db`, and
+  uses the `serve` subcommand — matching `scripts/install.sh` (#424).
+
 ### Added
 - History retention mechanism (#398): entity_history can now be bounded via
   env knobs — `MIMIR_HISTORY_MAX_AGE_DAYS`, `MIMIR_HISTORY_MAX_VERSIONS_PER_KEY`
