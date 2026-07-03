@@ -67,8 +67,8 @@ asyncio.run(main())
 
 ```python
 MimirMemory(
-    binary="mimir",                       # or absolute path: /usr/local/bin/mimir
-    db_path="~/.mimir/data/mimir.db",
+    binary="perseus-vault",               # or absolute path: /usr/local/bin/perseus-vault
+    db_path="~/.mimir/data/perseus-vault.db",
     category="autogen",                   # default category for add()
     context_limit=10,                     # entities injected by update_context()
     encryption_key="~/.mimir/secret.key", # optional AES-256-GCM at rest

@@ -53,9 +53,9 @@ Perseus Vault works with any MCP host. Configuration is one line:
 ```json
 {
   "mcpServers": {
-    "mimir": {
-      "command": "mimir",
-      "args": ["serve", "--db", "~/.mimir/data/mimir.db"]
+    "perseus-vault": {
+      "command": "perseus-vault",
+      "args": ["serve", "--db", "~/.mimir/data/perseus-vault.db"]
     }
   }
 }
@@ -71,7 +71,7 @@ Tested and confirmed working with:
 
 ## Tools & Plugins
 
-### Perseus Vault Itself (36 MCP Tools)
+### Perseus Vault Itself (55 MCP Tools)
 
 | Category | Tools |
 |---|---|
@@ -111,7 +111,7 @@ Why Perseus Vault stands out:
 
 | Feature | Perseus Vault | Mem0 | Letta | Zep |
 |---|---|---|---|---|
-| **MCP-Native** | ✅ 36 tools | ❌ | ❌ | ❌ |
+| **MCP-Native** | ✅ 55 tools | ❌ | ❌ | ❌ |
 | **Local-First** | ✅ Single binary | ❌ Cloud-dependent | ❌ Docker + Postgres | ❌ Docker + Postgres |
 | **Zero Dependencies** | ✅ SQLite bundled | ❌ Python + vector DB | ❌ Python + Postgres | ❌ Go + Postgres |
 | **Encryption at Rest** | ✅ AES-256-GCM | ❌ | ❌ | ❌ |

@@ -85,9 +85,9 @@ Choose one:
 **Download binary (fastest):**
 ```bash
 # Linux x86_64
-curl -L https://github.com/Perseus-Computing-LLC/perseus-vault/releases/latest/download/mimir-linux-x86_64 -o mimir
-chmod +x mimir
-sudo mv mimir /usr/local/bin/
+curl -L https://github.com/Perseus-Computing-LLC/perseus-vault/releases/latest/download/perseus-vault-x86_64-unknown-linux-gnu -o perseus-vault
+chmod +x perseus-vault
+sudo mv perseus-vault /usr/local/bin/
 ```
 
 **Build from source (requires Rust):**
@@ -95,7 +95,7 @@ sudo mv mimir /usr/local/bin/
 git clone https://github.com/Perseus-Computing-LLC/perseus-vault.git
 cd perseus-vault
 cargo build --release
-sudo cp target/release/mimir /usr/local/bin/
+sudo cp target/release/perseus-vault /usr/local/bin/
 ```
 
 **Python client (optional, for scripts):**
@@ -111,7 +111,7 @@ Add to your OpenClaw MCP servers config:
 {
   "mcpServers": {
     "mimir": {
-      "command": "mimir",
+      "command": "perseus-vault",
       "args": ["--db", "~/.openclaw/mimir/mimir.db"],
       "env": {
         "MIMIR_ENCRYPTION_KEY": "${MIMIR_ENCRYPTION_KEY}"
@@ -126,7 +126,7 @@ For semantic search with embeddings, also set:
 {
   "mcpServers": {
     "mimir": {
-      "command": "mimir",
+      "command": "perseus-vault",
       "args": [
         "--db", "~/.openclaw/mimir/mimir.db",
         "--llm-endpoint", "http://localhost:11434"
@@ -156,10 +156,10 @@ Without an encryption key, Mimir stores data unencrypted (still local).
 mkdir -p ~/.openclaw/mimir
 
 # Start Mimir once to initialize
-mimir --db ~/.openclaw/mimir/mimir.db --health
+perseus-vault --db ~/.openclaw/mimir/mimir.db --health
 
 # Verify it's running
-mimir --db ~/.openclaw/mimir/mimir.db --stats
+perseus-vault --db ~/.openclaw/mimir/mimir.db --stats
 ```
 
 Then start a new OpenClaw session. Your agent now has access to all 23 Mimir memory tools.
@@ -168,7 +168,7 @@ Then start a new OpenClaw session. Your agent now has access to all 23 Mimir mem
 
 ```bash
 # Start the web dashboard on port 8789
-mimir --db ~/.openclaw/mimir/mimir.db --dashboard --port 8789
+perseus-vault --db ~/.openclaw/mimir/mimir.db --dashboard --port 8789
 # Open http://localhost:8789
 ```
 
@@ -203,13 +203,13 @@ Pair Mimir with these ClawHub skills for a complete memory stack:
 To run Mimir in CI or scheduled jobs:
 ```bash
 # Start Mimir in the background
-mimir --db /tmp/mimir_ci.db &
+perseus-vault --db /tmp/mimir_ci.db &
 
 # Run a coherence grooming pass nightly
-mimir --db ~/.openclaw/mimir/mimir.db --cohere
+perseus-vault --db ~/.openclaw/mimir/mimir.db --cohere
 
 # Export to vault for git backup
-mimir --db ~/.openclaw/mimir/mimir.db --vault-export ~/mimir-vault/
+perseus-vault --db ~/.openclaw/mimir/mimir.db --vault-export ~/mimir-vault/
 ```
 
 ## Links

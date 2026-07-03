@@ -25,6 +25,16 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
   success then fail to find the binary). It now builds/installs `perseus-vault`
   with `mimir`/`mneme` compat symlinks, defaults to `perseus-vault.db`, and
   uses the `serve` subcommand — matching `scripts/install.sh` (#424).
+- Onboarding/deploy surface completed the Mimir → Perseus Vault rename: client
+  setup docs (`docs/clients/README.md`, all 8 copy-paste snippets), MCP
+  packaging (`smithery.yaml`, `manifest.json` version `2.13.0` → `2.14.0`),
+  framework integration docs (langgraph/autogen + `docs/integration/*`),
+  transport docs, the clawhub skill, and `awesome-mimir.md` (tool count
+  `36` → `55`) now use the `perseus-vault` command and the canonical
+  `~/.mimir/data/perseus-vault.db` default path. Fresh operators copy-pasting
+  any client/integration snippet now get a working config that matches the
+  installed binary. The `~/.mimir/` support directory is intentionally
+  unchanged pending the migration-shim work in #427.
 
 ### Added
 - History retention mechanism (#398): entity_history can now be bounded via

@@ -18,8 +18,8 @@ cargo install --git https://github.com/Perseus-Computing-LLC/perseus-vault
 
 Verify:
 ```bash
-mimir --version
-# Expected: mimir 1.0.1
+perseus-vault --version
+# Expected: perseus-vault 2.14.0
 ```
 
 ### 2. Create a data directory
@@ -38,10 +38,10 @@ mkdir -p ~/.mimir/data
 4. Click **"+ Add New MCP Server"**
 5. Fill in:
    - **Type:** `command`
-   - **Name:** `Mimir`
+   - **Name:** `Perseus Vault`
    - **Command:**
      ```
-     mimir --db /home/YOUR_USER/.mimir/data/mimir.db
+     perseus-vault --db /home/YOUR_USER/.mimir/data/perseus-vault.db
      ```
      (Use absolute paths — `~` may not expand correctly)
 6. Click **Save**
@@ -53,9 +53,9 @@ Create or edit `~/.cursor/mcp.json`:
 ```json
 {
   "mcpServers": {
-    "mimir": {
-      "command": "mimir",
-      "args": ["--db", "/home/YOUR_USER/.mimir/data/mimir.db"]
+    "perseus-vault": {
+      "command": "perseus-vault",
+      "args": ["--db", "/home/YOUR_USER/.mimir/data/perseus-vault.db"]
     }
   }
 }
@@ -84,7 +84,7 @@ Cursor will call `mimir_recall`.
 
 ### In Composer / Agent mode
 
-> @Mimir Search for any stored decisions about the authentication module.
+> @Perseus Vault Search for any stored decisions about the authentication module.
 > Then implement the login page based on those decisions.
 
 Cursor's agent can chain: recall → code generation, all in one prompt.
@@ -105,23 +105,23 @@ Create a `.mimir/` directory in your project and configure Cursor to use it:
 ```json
 {
   "mcpServers": {
-    "mimir": {
-      "command": "mimir",
-      "args": ["--db", "/home/YOU/projects/my-app/.mimir/mimir.db"]
+    "perseus-vault": {
+      "command": "perseus-vault",
+      "args": ["--db", "/home/YOU/projects/my-app/.mimir/perseus-vault.db"]
     }
   }
 }
 ```
 
-This keeps project memories isolated. Add `.mimir/mimir.db` to `.gitignore`.
+This keeps project memories isolated. Add `.mimir/perseus-vault.db` to `.gitignore`.
 
 ## Troubleshooting
 
 ### Perseus Vault shows "Disconnected" or fails to connect
 
 1. **Absolute paths:** Check that `--db` uses a full path, not `~`.
-2. **Binary location:** Run `which mimir`. If not found, use the full path
-   in the command: `/usr/local/bin/mimir --db ...`
+2. **Binary location:** Run `which perseus-vault`. If not found, use the full path
+   in the command: `/usr/local/bin/perseus-vault --db ...`
 3. **Restart Cursor:** After config changes, use `Cmd+Shift+P` →
    "Developer: Reload Window" or quit and reopen Cursor.
 
@@ -129,7 +129,7 @@ This keeps project memories isolated. Add `.mimir/mimir.db` to `.gitignore`.
 
 1. Run Perseus Vault manually to check for startup errors:
    ```bash
-   mimir --db ~/.mimir/data/mimir.db
+   perseus-vault --db ~/.mimir/data/perseus-vault.db
    ```
    It should hang waiting for stdin. If it exits, there's a startup error.
 
@@ -142,7 +142,7 @@ If you see "database is locked" errors:
 
 1. Check for orphaned Perseus Vault processes:
    ```bash
-   ps aux | grep '[m]imir'
+   ps aux | grep '[p]erseus-vault'
    ```
 2. Kill orphans: `kill <PID>`
 3. Restart Cursor
@@ -162,7 +162,7 @@ If they don't appear, reload the window (`Cmd+Shift+P` → "Developer: Reload Wi
 ### Encryption at rest
 
 ```bash
-mimir keygen --key-file ~/.mimir/secret.key
+perseus-vault keygen --key-file ~/.mimir/secret.key
 ```
 
 Then configure Cursor to use the encrypted database:
@@ -170,10 +170,10 @@ Then configure Cursor to use the encrypted database:
 ```json
 {
   "mcpServers": {
-    "mimir": {
-      "command": "mimir",
+    "perseus-vault": {
+      "command": "perseus-vault",
       "args": [
-        "--db", "/home/YOU/.mimir/data/mimir.db",
+        "--db", "/home/YOU/.mimir/data/perseus-vault.db",
         "--encryption-key", "/home/YOU/.mimir/secret.key"
       ]
     }
@@ -186,7 +186,7 @@ Then configure Cursor to use the encrypted database:
 Perseus Vault includes a web dashboard. Run it alongside Cursor:
 
 ```bash
-mimir --db ~/.mimir/data/mimir.db --web --port 8767
+perseus-vault --db ~/.mimir/data/perseus-vault.db --web --port 8767
 ```
 
 Open `http://localhost:8767` to browse entities, search, view journal events,
@@ -206,10 +206,10 @@ Then in your Perseus Vault config, configure the LLM endpoint and model:
 ```json
 {
   "mcpServers": {
-    "mimir": {
-      "command": "mimir",
+    "perseus-vault": {
+      "command": "perseus-vault",
       "args": [
-        "--db", "/home/YOU/.mimir/data/mimir.db",
+        "--db", "/home/YOU/.mimir/data/perseus-vault.db",
         "--llm-endpoint", "http://localhost:11434/api/generate",
         "--llm-model", "nomic-embed-text"
       ]

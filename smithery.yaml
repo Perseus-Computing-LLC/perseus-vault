@@ -7,11 +7,11 @@ startCommand:
       dbPath:
         type: string
         description: Path to the SQLite database file
-        default: ~/.mimir/data/mimir.db
+        default: ~/.mimir/data/perseus-vault.db
   commandFunction: |-
     (config) => ({
-      command: 'mimir',
-      args: ['serve', '--db', config.dbPath || '~/.mimir/data/mimir.db']
+      command: 'perseus-vault',
+      args: ['serve', '--db', config.dbPath || '~/.mimir/data/perseus-vault.db']
     })
   exampleConfig:
-    dbPath: ~/.mimir/data/mimir.db
+    dbPath: ~/.mimir/data/perseus-vault.db

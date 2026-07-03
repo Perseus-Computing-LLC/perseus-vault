@@ -18,8 +18,8 @@ cargo install --git https://github.com/Perseus-Computing-LLC/perseus-vault
 
 Verify:
 ```bash
-mimir --version
-# Expected: mimir 1.0.1
+perseus-vault --version
+# Expected: perseus-vault 2.14.0
 ```
 
 ### 2. Create a data directory
@@ -40,15 +40,15 @@ Create `.mcp.json` in your project root:
 ```json
 {
   "mcpServers": {
-    "mimir": {
-      "command": "mimir",
-      "args": ["--db", "/home/YOUR_USER/.mimir/data/mimir.db"]
+    "perseus-vault": {
+      "command": "perseus-vault",
+      "args": ["--db", "/home/YOUR_USER/.mimir/data/perseus-vault.db"]
     }
   }
 }
 ```
 
-Replace `/home/YOUR_USER/.mimir/data/mimir.db` with the absolute path to your
+Replace `/home/YOUR_USER/.mimir/data/perseus-vault.db` with the absolute path to your
 database. Do NOT use `~` — tilde expansion may not work in the MCP spawn context.
 
 **Global** (applies to all projects):
@@ -103,12 +103,12 @@ Claude Code will call `mimir_journal` to append a structured event.
 ### Perseus Vault tools don't appear
 
 1. **Absolute paths:** Ensure the `--db` argument uses a full absolute path.
-   `/home/user/.mimir/data/mimir.db` not `~/.mimir/data/mimir.db`.
+   `/home/user/.mimir/data/perseus-vault.db` not `~/.mimir/data/perseus-vault.db`.
 
-2. **Binary on PATH:** Run `which mimir`. If not found, install it or use
-   the full path in the `command` field: `/usr/local/bin/mimir`.
+2. **Binary on PATH:** Run `which perseus-vault`. If not found, install it or use
+   the full path in the `command` field: `/usr/local/bin/perseus-vault`.
 
-3. **Database writable:** The directory containing `mimir.db` must be writable
+3. **Database writable:** The directory containing `perseus-vault.db` must be writable
    by the user running Claude Code.
 
 4. **Restart Claude Code:** MCP servers are discovered at startup. After
@@ -118,7 +118,7 @@ Claude Code will call `mimir_journal` to append a structured event.
 
 ```bash
 chmod 755 ~/.mimir/data
-chmod 644 ~/.mimir/data/mimir.db
+chmod 644 ~/.mimir/data/perseus-vault.db
 ```
 
 ### Perseus Vault exits immediately
@@ -126,12 +126,12 @@ chmod 644 ~/.mimir/data/mimir.db
 Run Perseus Vault manually to check for startup errors:
 
 ```bash
-mimir --db ~/.mimir/data/mimir.db
+perseus-vault --db ~/.mimir/data/perseus-vault.db
 # Should hang waiting for stdin (this is correct — MCP stdio server)
 
 # If it exits with an error, check:
-# - SQLite is available (ldd $(which mimir) | grep sqlite)
-# - Database file is not corrupted (mimir --db /tmp/test.db to try a fresh DB)
+# - SQLite is available (ldd $(which perseus-vault) | grep sqlite)
+# - Database file is not corrupted (perseus-vault --db /tmp/test.db to try a fresh DB)
 ```
 
 ### Multiple Claude Code instances
@@ -140,7 +140,7 @@ SQLite WAL mode supports concurrent readers. If you see "database is locked",
 another process has an exclusive lock. Kill orphaned Perseus Vault processes:
 
 ```bash
-ps aux | grep '[m]imir'
+ps aux | grep '[p]erseus-vault'
 kill <PID>
 ```
 
@@ -151,9 +151,9 @@ kill <PID>
 ```json
 {
   "mcpServers": {
-    "mimir": {
-      "command": "mimir",
-      "args": ["--db", "/home/YOU/projects/my-project/.mimir/mimir.db"]
+    "perseus-vault": {
+      "command": "perseus-vault",
+      "args": ["--db", "/home/YOU/projects/my-project/.mimir/perseus-vault.db"]
     }
   }
 }
@@ -166,7 +166,7 @@ This keeps project memories isolated.
 Perseus Vault includes an optional web dashboard for browsing entities:
 
 ```bash
-mimir --db ~/.mimir/data/mimir.db --web --port 8767
+perseus-vault --db ~/.mimir/data/perseus-vault.db --web --port 8767
 ```
 
 Open `http://localhost:8767` in a browser. The dashboard shows entity lists,
@@ -177,7 +177,7 @@ search, graph visualization, and journal events.
 Generate a key and use it:
 
 ```bash
-mimir keygen --key-file ~/.mimir/secret.key
+perseus-vault keygen --key-file ~/.mimir/secret.key
 ```
 
 Then in `.mcp.json`:
@@ -185,10 +185,10 @@ Then in `.mcp.json`:
 ```json
 {
   "mcpServers": {
-    "mimir": {
-      "command": "mimir",
+    "perseus-vault": {
+      "command": "perseus-vault",
       "args": [
-        "--db", "/home/YOU/.mimir/data/mimir.db",
+        "--db", "/home/YOU/.mimir/data/perseus-vault.db",
         "--encryption-key", "/home/YOU/.mimir/secret.key"
       ]
     }
