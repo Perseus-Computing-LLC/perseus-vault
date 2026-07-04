@@ -69,8 +69,11 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
-          - target: x86_64-apple-darwin
-            os: macos-13
+          # macOS Intel (x86_64-apple-darwin) is intentionally NOT built: the
+          # macos-13 runner class is chronically backlogged in the queue and
+          # repeatedly stalled the v2.17.0 release for ~1h. Apple Silicon
+          # (aarch64) covers modern Macs; Intel-Mac users can `cargo install`
+          # from source or run the lite musl build under Rosetta if needed.
           - target: aarch64-apple-darwin
             os: macos-14
     steps:
