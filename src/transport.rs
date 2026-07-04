@@ -380,6 +380,14 @@ mod tests {
         let writes_per = env_usize("MIMIR_LOADTEST_WRITES", 25);
         let reads_per = env_usize("MIMIR_LOADTEST_READS", 75);
 
+        // This test measures DB-pool concurrency + max throughput by flooding the
+        // transport as fast as possible — which is inherently defeated by the HTTP
+        // rate limiter (it would shed the flood with 429s and be counted as
+        // errors). Disable rate limiting for this run; it has its own unit tests
+        // in `httplimit`. (The bucket is per-router, so this only affects the
+        // router built below.)
+        std::env::set_var("MIMIR_HTTP_RATE_PER_SEC", "0");
+
         let path = std::env::temp_dir()
             .join(format!("mimir-loadtest-{}.db", uuid::Uuid::new_v4()));
         let path_str = path.to_str().unwrap().to_string();
