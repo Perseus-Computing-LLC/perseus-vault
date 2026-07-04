@@ -5,23 +5,7 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
 
 ## [Unreleased]
 
-### Performance
-- Empty-query browse recall no longer degrades on large stores. The browse path
-  orders by `retrieval_count DESC, last_accessed_unix_ms DESC, id ASC`, but
-  `idx_entities_recall` covered only the first two keys — so a large tie-group on
-  the leading keys (a cold or bulk-imported store with uniform `last_accessed`)
-  forced SQLite to sort the whole group by `id` to satisfy `LIMIT k`
-  (O(tie-group)). The index now includes the `id` tie-break, making browse a pure
-  k-row range scan. Measured p50 at 1,000,000 rows: **29.7 ms → 0.046 ms**
-  (~645×); FTS and point-lookup latencies were already flat and are unchanged.
-  Ships a v13 schema migration that rebuilds the index on existing databases.
-### Fixed
-- De-flaked `concurrent_writer_not_starved_during_cohere`: the #400 lock-hold
-  gate asserted *exactly zero* SQLITE_BUSY, which spuriously failed on loaded CI
-  runners when OS scheduler jitter delayed a single (correctly chunked) cohere
-  commit past the writer's ~250ms budget. Now asserts a low busy *rate* (<10%) —
-  the #400 regression it guards produces ~100%, jitter ~0.5%, so detection is
-  preserved with wide margin. No production-code change.
+## [2.17.0] - 2026-07-03
 
 ### Security / Hardening
 - Multimodal ingest is now bounded against decompression bombs. A `.docx` is a
@@ -71,6 +55,25 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
   runtime reminder that key-file ACLs are operator-owned.
 - Bumped `anyhow` 1.0.102 → 1.0.103 to clear RUSTSEC-2026-0190 (unsoundness in
   `Error::downcast_mut()`).
+
+### Performance
+- Empty-query browse recall no longer degrades on large stores. The browse path
+  orders by `retrieval_count DESC, last_accessed_unix_ms DESC, id ASC`, but
+  `idx_entities_recall` covered only the first two keys — so a large tie-group on
+  the leading keys (a cold or bulk-imported store with uniform `last_accessed`)
+  forced SQLite to sort the whole group by `id` to satisfy `LIMIT k`
+  (O(tie-group)). The index now includes the `id` tie-break, making browse a pure
+  k-row range scan. Measured p50 at 1,000,000 rows: **29.7 ms → 0.046 ms**
+  (~645×); FTS and point-lookup latencies were already flat and are unchanged.
+  Ships a v13 schema migration that rebuilds the index on existing databases.
+
+### Fixed
+- De-flaked `concurrent_writer_not_starved_during_cohere`: the #400 lock-hold
+  gate asserted *exactly zero* SQLITE_BUSY, which spuriously failed on loaded CI
+  runners when OS scheduler jitter delayed a single (correctly chunked) cohere
+  commit past the writer's ~250ms budget. Now asserts a low busy *rate* (<10%) —
+  the #400 regression it guards produces ~100%, jitter ~0.5%, so detection is
+  preserved with wide margin. No production-code change.
 
 ## [2.16.0] - 2026-07-03
 
