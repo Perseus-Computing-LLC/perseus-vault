@@ -18,7 +18,8 @@ the Anthropic MCP Connector API, or any HTTP MCP client — it also ships a full
 perseus-vault --db /path/to/perseus-vault.db \
   --transport sse \
   --web-bind 0.0.0.0 \
-  --port 8765
+  --port 8765 \
+  --mcp-token "$(openssl rand -hex 32)"
 ```
 
 Output:
@@ -29,9 +30,11 @@ perseus-vault: POST http://0.0.0.0:8765/message
 perseus-vault: GET  http://0.0.0.0:8765/sse
 ```
 
-> ⚠️ `--web-bind 0.0.0.0` exposes the server on all interfaces. Only do this
-> behind a reverse proxy/tunnel **and** with `--mcp-token` set (see below).
-> The default bind is `127.0.0.1` (loopback only).
+> ⚠️ Binding to a non-loopback address (`--web-bind 0.0.0.0`) **without** an auth
+> token is refused by default — the server exits with an error rather than come
+> up wide open. Set `--mcp-token` (as above), keep the default `127.0.0.1` bind,
+> or, only if the network is genuinely trusted (e.g. an auth-terminating reverse
+> proxy), set `MIMIR_ALLOW_INSECURE_BIND=1` to override.
 
 ## Authentication (`--mcp-token`)
 
@@ -64,7 +67,26 @@ curl -s -X POST http://localhost:8765/message \
 | Correct `Bearer <token>` | `200 OK` (request processed) |
 
 When `--mcp-token` is **not** set, auth is skipped entirely (backward
-compatible) — appropriate only for loopback (`127.0.0.1`) deployments.
+compatible) — appropriate only for loopback (`127.0.0.1`) deployments. Token
+comparison is constant-time, so a wrong token leaks no timing signal about the
+secret.
+
+## Hardening
+
+The HTTP surfaces (MCP transport + web dashboard) apply these protections by
+default; all are env-tunable:
+
+| Control | Default | Env knob |
+|---|---|---|
+| Secure-bind guard | refuse non-loopback bind with no token | `MIMIR_ALLOW_INSECURE_BIND=1` to override |
+| Request-body cap | 8 MiB | `MIMIR_MAX_HTTP_BODY_BYTES` |
+| Rate limit (global token bucket) | 50 req/s, burst 100 → `429` | `MIMIR_HTTP_RATE_PER_SEC` (0 disables), `MIMIR_HTTP_RATE_BURST` |
+| CORS | tightened methods/headers; origin mirrors request | `MIMIR_CORS_ALLOWED_ORIGINS` (comma-separated allowlist) |
+
+The rate limit is **global**, not per-client — the vault is a single-tenant,
+local-first service, so per-IP fairness is a fronting reverse proxy's job. TLS is
+likewise expected to be terminated by a proxy for the HTTP transport; the gRPC
+server can terminate TLS/mTLS itself (see [GRPC-SECURITY.md](./GRPC-SECURITY.md)).
 
 ## Verify the endpoint
 
