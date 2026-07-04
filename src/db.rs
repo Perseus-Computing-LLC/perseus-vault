@@ -7882,7 +7882,44 @@ last_accessed: {}
 
     /// Coherence daemon: auto-groom the memory with promote, decay, link, archive.
     #[allow(unused_assignments)]
+    /// Public entry point: run a cohere pass, retrying on transient write-lock
+    /// contention. cohere is a background maintenance op whose steps are each
+    /// idempotent (see `cohere_inner`), so a concurrent writer (e.g. an agent's
+    /// `remember` racing scheduled maintenance) that briefly holds the WAL write
+    /// lock past the pool's busy_timeout must not make the whole pass hard-fail.
+    /// On a transient SQLITE_BUSY / "database is locked" we re-run the pass (a
+    /// few bounded attempts with backoff); any non-busy error propagates
+    /// immediately. Non-contention runs take the fast path (one attempt).
     pub fn cohere(
+        &self,
+        params: &crate::models::CohereParams,
+    ) -> Result<crate::models::CohereReport, Box<dyn std::error::Error>> {
+        let mut attempt = 0;
+        loop {
+            match self.cohere_inner(params) {
+                Ok(report) => return Ok(report),
+                Err(e) if attempt < 3 && Self::err_is_busy(e.as_ref()) => {
+                    attempt += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(100 * attempt));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// True if a boxed error is a transient SQLite write-lock contention
+    /// (DatabaseBusy / DatabaseLocked) — the class of failure cohere retries.
+    fn err_is_busy(e: &(dyn std::error::Error + 'static)) -> bool {
+        if let Some(rusqlite::Error::SqliteFailure(err, _)) =
+            e.downcast_ref::<rusqlite::Error>()
+        {
+            return err.code == rusqlite::ErrorCode::DatabaseBusy
+                || err.code == rusqlite::ErrorCode::DatabaseLocked;
+        }
+        false
+    }
+
+    fn cohere_inner(
         &self,
         params: &crate::models::CohereParams,
     ) -> Result<crate::models::CohereReport, Box<dyn std::error::Error>> {
