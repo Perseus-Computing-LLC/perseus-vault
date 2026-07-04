@@ -5,6 +5,14 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
 
 ## [Unreleased]
 
+### Fixed
+- De-flaked `concurrent_writer_not_starved_during_cohere`: the #400 lock-hold
+  gate asserted *exactly zero* SQLITE_BUSY, which spuriously failed on loaded CI
+  runners when OS scheduler jitter delayed a single (correctly chunked) cohere
+  commit past the writer's ~250ms budget. Now asserts a low busy *rate* (<10%) —
+  the #400 regression it guards produces ~100%, jitter ~0.5%, so detection is
+  preserved with wide margin. No production-code change.
+
 ### Security / Hardening
 - Network transport & gRPC hardening (audit phases 1–3):
   - **Secure-bind guard**: binding an HTTP surface (MCP transport or web
