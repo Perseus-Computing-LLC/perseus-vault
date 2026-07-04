@@ -7,6 +7,11 @@
 //! lean default binary stays dependency-free. Without the feature, requesting a
 //! docx/pdf returns a clear "rebuild with --features multimodal" error rather
 //! than failing opaquely.
+//!
+//! Two size bounds guard against denial-of-service: `MIMIR_MAX_INGEST_BYTES`
+//! caps the on-disk file, and `MIMIR_MAX_DECOMPRESSED_BYTES` caps the bytes read
+//! out of a DOCX (a DEFLATE zip whose entries can decompress far past the on-disk
+//! cap — a zip bomb). See `extract_docx_limited`.
 
 use std::path::Path;
 
@@ -30,6 +35,25 @@ fn max_ingest_bytes() -> u64 {
         .and_then(|v| v.trim().parse::<u64>().ok())
         .filter(|&n| n > 0)
         .unwrap_or(DEFAULT_MAX_INGEST_BYTES)
+}
+
+/// Default cap on the DECOMPRESSED size of a container entry (currently a DOCX's
+/// `word/document.xml`), overridable with `MIMIR_MAX_DECOMPRESSED_BYTES`. This is
+/// a SEPARATE limit from `max_ingest_bytes`: a DOCX is a DEFLATE zip, so a small
+/// on-disk file (within the ingest cap) can decompress to many GB — a classic zip
+/// bomb. The on-disk cap cannot bound that; this one does, by capping the bytes
+/// read out of the archive. Generous headroom over any realistic document, a hard
+/// ceiling against a bomb.
+#[cfg(feature = "multimodal")]
+const DEFAULT_MAX_DECOMPRESSED_BYTES: u64 = 256 * 1024 * 1024; // 256 MiB
+
+#[cfg(feature = "multimodal")]
+fn max_decompressed_bytes() -> u64 {
+    std::env::var("MIMIR_MAX_DECOMPRESSED_BYTES")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_MAX_DECOMPRESSED_BYTES)
 }
 
 /// Reject a file whose on-disk size exceeds `max_bytes`, before it is read.
@@ -86,6 +110,23 @@ fn extract_text_limited(path: &Path, max_bytes: u64) -> Result<String, String> {
 
 #[cfg(feature = "multimodal")]
 fn extract_docx(path: &Path, max_bytes: u64) -> Result<String, String> {
+    extract_docx_limited(path, max_bytes, max_decompressed_bytes())
+}
+
+/// DOCX extraction with an explicit decompressed-size cap (test seam).
+///
+/// Zip-bomb defense: `word/document.xml` is DEFLATE-compressed, so a tiny on-disk
+/// entry (well within `max_bytes`) can decompress to many GB. We read at most
+/// `max_decompressed + 1` bytes and reject if the entry is larger, instead of
+/// letting `read_to_string` materialize an unbounded `String` (OOM). The entry's
+/// declared uncompressed `size()` is deliberately IGNORED — it is attacker-
+/// controlled metadata and can lie; the bound is enforced on the actual read.
+#[cfg(feature = "multimodal")]
+fn extract_docx_limited(
+    path: &Path,
+    max_bytes: u64,
+    max_decompressed: u64,
+) -> Result<String, String> {
     use std::io::Read;
     enforce_ingest_size(path, max_bytes)?;
     let file =
@@ -94,11 +135,23 @@ fn extract_docx(path: &Path, max_bytes: u64) -> Result<String, String> {
         zip::ZipArchive::new(file).map_err(|e| format!("{} is not a valid .docx (zip): {e}", path.display()))?;
     let mut xml = String::new();
     {
-        let mut doc = zip
+        let doc = zip
             .by_name("word/document.xml")
             .map_err(|_| format!("{}: .docx is missing word/document.xml", path.display()))?;
-        doc.read_to_string(&mut xml)
+        // Cap the decompressed read at max_decompressed + 1: if we manage to read
+        // that many bytes, the entry exceeds the limit and is rejected.
+        let mut limited = doc.take(max_decompressed.saturating_add(1));
+        limited
+            .read_to_string(&mut xml)
             .map_err(|e| format!("read word/document.xml: {e}"))?;
+        if xml.len() as u64 > max_decompressed {
+            return Err(format!(
+                "{}: word/document.xml decompresses beyond the {}-byte limit \
+                 (possible zip bomb; raise MIMIR_MAX_DECOMPRESSED_BYTES to override)",
+                path.display(),
+                max_decompressed
+            ));
+        }
     }
     Ok(docx_xml_to_text(&xml))
 }
@@ -110,6 +163,13 @@ fn extract_docx(_path: &Path, _max_bytes: u64) -> Result<String, String> {
 
 #[cfg(feature = "multimodal")]
 fn extract_pdf(path: &Path, max_bytes: u64) -> Result<String, String> {
+    // The on-disk cap is the only bound available here: `pdf_extract` owns the
+    // parse + FlateDecode decompression internally and exposes no streaming/limit
+    // API, so a decompression-amplifying PDF is bounded only by its compressed
+    // input size (max_bytes), not its decompressed size. Lower MIMIR_MAX_INGEST_BYTES
+    // for untrusted PDF sources; a hard decompressed bound would require sandboxing
+    // the parse (out of scope). DOCX, whose single entry we read ourselves, IS
+    // decompressed-bounded — see extract_docx_limited.
     enforce_ingest_size(path, max_bytes)?;
     pdf_extract::extract_text(path)
         .map_err(|e| format!("PDF text extraction failed for {}: {e}", path.display()))
@@ -288,6 +348,40 @@ mod tests {
         }
         let text = extract_text(&p).unwrap();
         assert!(text.contains("Hello from docx"), "got: {text:?}");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[cfg(feature = "multimodal")]
+    #[test]
+    fn docx_decompression_bomb_is_rejected() {
+        use zip::write::SimpleFileOptions;
+        let dir = std::env::temp_dir();
+        let p = dir.join(format!("mimir-mm-bomb-{}.docx", uuid::Uuid::new_v4()));
+        {
+            let file = std::fs::File::create(&p).unwrap();
+            let mut zw = zip::ZipWriter::new(file);
+            // Highly repetitive, DEFLATE-compressed: ~5 MiB decompressed but only
+            // a few KB on disk — passes any sane on-disk ingest cap while blowing
+            // a small decompressed cap. This is the zip-bomb shape.
+            zw.start_file(
+                "word/document.xml",
+                SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated),
+            )
+            .unwrap();
+            zw.write_all(&vec![b'A'; 5 * 1024 * 1024]).unwrap();
+            zw.finish().unwrap();
+        }
+
+        // On-disk size is tiny; a generous ingest cap (50 MiB) passes, but the
+        // entry decompresses past a 64 KiB decompressed cap -> rejected as a bomb.
+        let err = extract_docx_limited(&p, 50 * 1024 * 1024, 64 * 1024).unwrap_err();
+        assert!(err.contains("decompresses beyond"), "got: {err}");
+        assert!(err.contains("MIMIR_MAX_DECOMPRESSED_BYTES"), "got: {err}");
+
+        // A decompressed cap above the entry size extracts without error.
+        let ok = extract_docx_limited(&p, 50 * 1024 * 1024, 16 * 1024 * 1024);
+        assert!(ok.is_ok(), "generous decompressed cap should succeed: {ok:?}");
+
         let _ = std::fs::remove_file(&p);
     }
 }
