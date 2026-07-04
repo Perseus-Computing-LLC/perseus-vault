@@ -5,13 +5,30 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
 
 ## [Unreleased]
 
+## [2.17.1] - 2026-07-04
+
+### Fixed
+- **`install.sh` was broken for every prebuilt install.** It downloaded a bare
+  `perseus-vault-${TARGET}` asset name, but releases ship `.tar.gz` archives
+  (+ `.sha256`), so the download 404'd on every platform and fell through to the
+  build-from-source path. Now downloads the `.tar.gz`, extracts the binary, and
+  verifies the published checksum (hard-fail on mismatch). Also corrected the
+  platform→asset map: aarch64-linux ships only the `lite` musl build (the old
+  code requested a nonexistent `-gnu` asset). (#451)
+- **MCP Registry publish** (had failed on v2.16.0 and v2.17.0): the Docker
+  image's `io.modelcontextprotocol.server.name` OCI annotation was still
+  `io.github.Perseus-Computing-LLC/mimir` while `server.json` had moved to
+  `…/perseus-vault`, so the registry's ownership validation rejected the publish
+  with a 400. The label now matches `server.json`, so v2.17.1 publishes under the
+  `perseus-vault` namespace. (#452)
+
 ### Changed
 - Dropped prebuilt **macOS Intel (x86_64-apple-darwin)** release binaries. The
   `macos-13` runner class is chronically backlogged and repeatedly stalled the
   release pipeline for ~1h. Apple Silicon (`aarch64-apple-darwin`) covers modern
   Macs; Intel-Mac users can `cargo install --git …` from source (or run the lite
   musl build under Rosetta). `install.sh` degrades gracefully with a source-build
-  hint for that target.
+  hint for that target. (#447)
 
 ## [2.17.0] - 2026-07-03
 
