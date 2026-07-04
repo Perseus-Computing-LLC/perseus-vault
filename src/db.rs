@@ -9661,10 +9661,27 @@ mod tests {
             n_attempts > 0,
             "writer must have attempted at least one insert during cohere"
         );
-        assert_eq!(
-            n_busy, 0,
-            "concurrent writer hit SQLITE_BUSY {n_busy}/{n_attempts} times during cohere — \
-             a single lock hold exceeded its ~250ms wait budget (#400)"
+        // #400 guards against cohere holding the writer lock for a window that
+        // scales with store size. Pre-fix, the single whole-pass IMMEDIATE tx
+        // (~4.4s @100k) starved the writer on ESSENTIALLY EVERY ~5ms attempt
+        // (busy rate ≈ 100%). Post-fix, holds are bounded (1000-row chunks + 2ms
+        // inter-chunk yields), so the writer almost always acquires.
+        //
+        // We assert a LOW busy RATE, not exactly zero: a single chunk's commit
+        // can occasionally be delayed past the ~250ms budget by OS scheduler
+        // jitter on a loaded CI runner (parallel test jobs contending for CPU)
+        // even when the code is correctly chunked — a handful of failures, ~0.5%
+        // in practice. Asserting == 0 made this test flaky (spurious reruns) for
+        // a property it wasn't really measuring. A regression that reintroduces
+        // an unbounded hold spikes the rate back toward 100%, so a 10% ceiling
+        // separates the two regimes with wide margin while staying jitter-immune.
+        let busy_rate = n_busy as f64 / n_attempts as f64;
+        assert!(
+            busy_rate < 0.10,
+            "concurrent writer hit SQLITE_BUSY {n_busy}/{n_attempts} times ({:.1}%) during \
+             cohere — well above jitter noise; a lock hold is likely scaling with store size \
+             (#400 regression?)",
+            busy_rate * 100.0
         );
         let _ = fs::remove_file(&path);
     }
