@@ -24,6 +24,14 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
   preserved with wide margin. No production-code change.
 
 ### Security / Hardening
+- Multimodal ingest is now bounded against decompression bombs. A `.docx` is a
+  DEFLATE zip, so a tiny on-disk file (within `MIMIR_MAX_INGEST_BYTES`) could
+  decompress `word/document.xml` to many GB — the on-disk cap couldn't bound it,
+  and the read was unbounded (OOM). The decompressed read is now capped at
+  `MIMIR_MAX_DECOMPRESSED_BYTES` (default 256 MiB) and rejected past it. PDF
+  extraction is bounded by the on-disk cap only (`pdf_extract` owns decompression
+  with no limit API — documented; lower `MIMIR_MAX_INGEST_BYTES` for untrusted
+  PDFs).
 - Network transport & gRPC hardening (audit phases 1–3):
   - **Secure-bind guard**: binding an HTTP surface (MCP transport or web
     dashboard) to a non-loopback address with **no** auth token now refuses to
