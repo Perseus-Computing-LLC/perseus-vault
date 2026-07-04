@@ -17,10 +17,12 @@ COPY build.rs ./
 RUN cargo build --release --no-default-features && strip target/release/perseus-vault
 
 FROM alpine:3.21
-# Ownership proof for the MCP Registry (must equal server.json "name").
-# NOTE: left as "mimir" deliberately — the MCP Registry name is a separately
-# re-verified identity (see server.json), not part of this code-level rename.
-LABEL io.modelcontextprotocol.server.name="io.github.Perseus-Computing-LLC/mimir"
+# Ownership proof for the MCP Registry: MUST equal server.json "name". The
+# registry validates this OCI annotation against the published name; a mismatch
+# is a hard 400 ("OCI image ownership validation failed"). Migrated mimir →
+# perseus-vault to match the server.json rename so v2.17.0+ can publish under
+# the new namespace (the stale mimir label blocked the v2.16.0/v2.17.0 publishes).
+LABEL io.modelcontextprotocol.server.name="io.github.Perseus-Computing-LLC/perseus-vault"
 RUN apk add --no-cache sqlite-libs
 COPY --from=builder /app/target/release/perseus-vault /usr/local/bin/perseus-vault
 # Perseus Vault rename (transition release): keep "mneme" and "mimir" symlinks
