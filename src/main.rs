@@ -753,6 +753,40 @@ fn default_key_file() -> String {
     }
 }
 
+/// Best-effort tighten of a key file's ACLs on Windows, which has no umask/0600
+/// equivalent applied at creation (the `#[cfg(unix)]` 0600 path in `Keygen` does
+/// not exist there). Strips inherited ACEs and grants only the current user full
+/// control via `icacls`, so the encryption key is not readable by other local
+/// accounts. Returns false if the file could not be restricted (icacls missing,
+/// USERNAME unset, or a non-zero exit) so the caller can warn.
+#[cfg(windows)]
+fn tighten_windows_key_acls(path: &str) -> bool {
+    let Ok(user) = std::env::var("USERNAME") else {
+        return false;
+    };
+    std::process::Command::new("icacls")
+        .args([path, "/inheritance:r", "/grant:r", &format!("{user}:F")])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// On Windows the key file's ACLs are the operator's responsibility (see
+/// docs/ENCRYPTION.md). Emit a one-line runtime reminder when encryption is
+/// enabled so the exposure is visible at startup, not only in the docs. No-op on
+/// Unix, where `Keygen` creates the file 0600.
+#[allow(unused_variables)]
+fn warn_key_acls_on_windows(key_file: &str) {
+    #[cfg(windows)]
+    {
+        eprintln!(
+            "mimir: NOTE (Windows): key-file ACLs are not enforced by an OS umask. \
+             Ensure {key_file} is readable only by your account, e.g.: \
+             icacls \"{key_file}\" /inheritance:r /grant:r %USERNAME%:F"
+        );
+    }
+}
+
 /// Open a database for a CLI maintenance command, or exit(1) with a message.
 fn open_db_or_exit(db_path: &str) -> db::Database {
     match db::Database::open(db_path) {
@@ -1292,6 +1326,21 @@ fn main() {
                             std::fs::Permissions::from_mode(0o600),
                         );
                     }
+                    // Windows has no 0600-at-creation equivalent, so restrict the
+                    // key file's ACLs to the current user here. Warn loudly if that
+                    // fails — the secret would otherwise be readable by other local
+                    // accounts.
+                    #[cfg(windows)]
+                    {
+                        if !tighten_windows_key_acls(&expanded) {
+                            eprintln!(
+                                "mimir: WARNING: could not restrict ACLs on key file {}. \
+                                 Other local users may be able to read your encryption key. \
+                                 Restrict it manually: icacls \"{}\" /inheritance:r /grant:r %USERNAME%:F",
+                                expanded, expanded
+                            );
+                        }
+                    }
                     println!("Key written to {}", expanded);
                     println!("Use --encryption-key {} to enable encryption", expanded);
                 }
@@ -1703,6 +1752,7 @@ fn main() {
                     std::process::exit(1);
                 }
                 eprintln!("mimir: encryption enabled (key: {})", key_file);
+                warn_key_acls_on_windows(key_file);
             }
 
             // Configure LLM for mimir_ask if endpoint is provided
@@ -1851,6 +1901,7 @@ fn main() {
                     std::process::exit(1);
                 }
                 eprintln!("mimir: encryption enabled (key: {})", key_file);
+                warn_key_acls_on_windows(key_file);
             }
 
             if let Some(ref endpoint) = cli.llm_endpoint {

@@ -5,6 +5,21 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
 
 ## [Unreleased]
 
+### Security / Hardening
+- Build-time model fetch is now supply-chain pinned (`build.rs`): the bundled
+  `all-MiniLM-L6-v2` ONNX model + tokenizer are fetched from an **immutable commit
+  revision** (was the mutable `main` ref) and **SHA-256 verified** before being
+  baked into the binary via `include_bytes!`. A compromised or updated upstream
+  repo can no longer silently change the embedded model — a mismatch fails the
+  build. Operator-supplied files (`MIMIR_BUNDLED_MODEL_DIR`, air-gapped builds)
+  are verified against the same hashes.
+- Windows key-file ACLs: `keygen` now restricts the new key file to the current
+  user via `icacls` (Windows has no `0600`-at-creation equivalent), warning
+  loudly if that fails; enabling encryption on Windows also emits a one-line
+  runtime reminder that key-file ACLs are operator-owned.
+- Bumped `anyhow` 1.0.102 → 1.0.103 to clear RUSTSEC-2026-0190 (unsoundness in
+  `Error::downcast_mut()`).
+
 ## [2.16.0] - 2026-07-03
 
 ### Security / Hardening

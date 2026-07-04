@@ -85,3 +85,6 @@ tonic-build = { version = "0.13", optional = true }
 # Used by build.rs to fetch the quantized embedding model into OUT_DIR at build
 # time (only when the bundled-embeddings feature is active). Cached across builds.
 ureq = "2"
+# Verifies the SHA-256 of every fetched model asset before it is baked into the
+# binary via include_bytes! (supply-chain pinning in fetch_model_assets).
+sha2 = "0.10"
