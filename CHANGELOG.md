@@ -6,6 +6,16 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
 ## [Unreleased]
 
 ### Security / Hardening
+- Encryption canary (fail-fast wrong-key detection). `set_encryption` now
+  verifies the configured key against a dedicated canary row at startup and
+  **aborts loudly** ("the provided key is incorrect or the database is corrupt")
+  instead of letting a wrong/rotated key silently `AuthFailed` on every later
+  read. The canary is established on first encrypted setup (or when encryption is
+  enabled on a legacy-plaintext DB); a canary-less store with pre-existing
+  encrypted data is validated by scanning for authentic ciphertext, so a wrong
+  key can never "bless" itself by writing a canary under it. Stored in its own
+  `encryption_canary` table — invisible to recall/FTS/stats and caller-facing
+  state tools.
 - Build-time model fetch is now supply-chain pinned (`build.rs`): the bundled
   `all-MiniLM-L6-v2` ONNX model + tokenizer are fetched from an **immutable commit
   revision** (was the mutable `main` ref) and **SHA-256 verified** before being

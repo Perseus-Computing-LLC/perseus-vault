@@ -1,4 +1,5 @@
 use rusqlite::params;
+use rusqlite::OptionalExtension;
 use r2d2_sqlite::SqliteConnectionManager;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -414,9 +415,107 @@ impl Database {
 
     /// Enable encryption by loading the AES-256-GCM key from `key_file`.
     /// Returns an error if the key file cannot be read or is invalid.
+    ///
+    /// Fail-fast key check: the key is verified against the database's encryption
+    /// canary (establishing one if none exists yet) BEFORE it is accepted, so a
+    /// wrong or rotated key aborts startup with a clear message instead of
+    /// silently returning `AuthFailed` on every later read.
     pub fn set_encryption(&mut self, key_file: &str) -> Result<(), String> {
         let mgr = EncryptionManager::from_key_file(key_file)?;
+        self.verify_or_init_canary(&mgr)?;
         self.encryption = Some(mgr);
+        Ok(())
+    }
+
+    /// AAD for the encryption canary row — same length-prefixed scheme entities
+    /// use, so it can't collide with a real (category, key) pair.
+    fn canary_aad() -> String {
+        Self::build_aad("mimir_internal", "encryption_canary")
+    }
+
+    /// Known plaintext stored (encrypted) in the canary row. Version-tagged so a
+    /// future format change is distinguishable rather than ambiguous.
+    const CANARY_MARKER: &'static str = "{\"canary\":\"perseus-vault\",\"v\":1}";
+
+    /// Verify the loaded key against the database, or establish the canary if
+    /// none exists yet. Called from `set_encryption`.
+    ///
+    /// - Canary present → it must authenticate under the key, else fatal.
+    /// - Canary absent, but the DB holds ciphertext that FAILS auth under this
+    ///   key → fatal (wrong key). We refuse to write a canary in this case, which
+    ///   would otherwise permanently "bless" an incorrect key.
+    /// - Canary absent, DB empty / all-plaintext / authentic under this key →
+    ///   create the canary (fresh install, or encryption enabled on a legacy
+    ///   plaintext DB), making every subsequent open an O(1) fail-fast check.
+    fn verify_or_init_canary(&self, enc: &EncryptionManager) -> Result<(), String> {
+        let conn = self.conn().map_err(|e| e.to_string())?;
+        let aad = Self::canary_aad();
+
+        // 1. An existing canary is the authoritative key check.
+        let stored: Option<String> = conn
+            .query_row(
+                "SELECT ciphertext FROM encryption_canary WHERE id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        if let Some(ct) = stored {
+            return match enc.decrypt_body(&ct, aad.as_bytes()) {
+                crate::encryption::BodyDecrypt::Plaintext(_) => Ok(()),
+                // A canary we wrote is always ciphertext, so anything other than a
+                // clean decrypt means the key is wrong or the row is corrupt.
+                _ => Err("failed to decrypt encryption canary — the provided key \
+                          is incorrect or the database is corrupt"
+                    .to_string()),
+            };
+        }
+
+        // 2. No canary yet. Before trusting the key, make sure it doesn't FAIL
+        //    against existing encrypted data. Scanning for the first authentic
+        //    ciphertext row is enough: a wrong key produces AuthFailed there.
+        //    Bounded so opening a large all-plaintext DB stays cheap; a store
+        //    with real encrypted data has authentic ciphertext well within it.
+        {
+            let mut stmt = conn
+                .prepare("SELECT category, key, body_json FROM entities LIMIT 512")
+                .map_err(|e| e.to_string())?;
+            let mut rows = stmt
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
+                })
+                .map_err(|e| e.to_string())?;
+            while let Some(row) = rows.next() {
+                let (category, key, body) = row.map_err(|e| e.to_string())?;
+                match Self::decrypt_body_with_aad_fallback(enc, &body, &category, &key) {
+                    // Authentic ciphertext under this key — key confirmed good.
+                    crate::encryption::BodyDecrypt::Plaintext(_) => break,
+                    crate::encryption::BodyDecrypt::AuthFailed(_) => {
+                        return Err("existing encrypted data does not decrypt under \
+                                    the provided key — the key is incorrect or the \
+                                    database is corrupt"
+                            .to_string());
+                    }
+                    // Legacy plaintext row says nothing about the key; keep looking.
+                    crate::encryption::BodyDecrypt::LegacyPlaintext(_) => {}
+                }
+            }
+        }
+
+        // 3. Key confirmed (or DB has no encrypted data yet): establish the canary.
+        let ct = enc
+            .encrypt(Self::CANARY_MARKER, aad.as_bytes())
+            .map_err(|e| format!("could not create encryption canary: {}", e))?;
+        conn.execute(
+            "INSERT OR REPLACE INTO encryption_canary (id, ciphertext, created_at_unix_ms) \
+             VALUES (1, ?1, ?2)",
+            params![ct, now_ms()],
+        )
+        .map_err(|e| e.to_string())?;
         Ok(())
     }
 
@@ -12089,6 +12188,141 @@ mod tests {
         }
 
         let _ = std::fs::remove_file(&key_path);
+        let _ = fs::remove_file(&path);
+    }
+
+    // ---- Encryption canary: fail-fast wrong-key detection at startup ----
+
+    /// Write a freshly generated key to a temp file and return (path_string, b64).
+    fn temp_key_file() -> (String, String) {
+        use std::io::Write;
+        let key = EncryptionManager::generate_key();
+        let path = std::env::temp_dir()
+            .join(format!("mimir-canary-key-{}.key", uuid::Uuid::new_v4()));
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(key.as_bytes()).unwrap();
+        drop(f);
+        (path.to_str().unwrap().to_string(), key)
+    }
+
+    #[test]
+    fn canary_established_on_fresh_db_and_correct_key_reopens() {
+        let (mut db, path) = temp_db();
+        let (key_path, _b64) = temp_key_file();
+        db.set_encryption(&key_path).unwrap();
+
+        // set_encryption on a fresh DB must have written exactly one canary row.
+        let n: i64 = db
+            .conn()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM encryption_canary", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1, "canary row must be created on first encryption setup");
+        drop(db);
+
+        // Reopening with the SAME key authenticates against the canary.
+        let mut db2 = Database::open(&path).unwrap();
+        assert!(
+            db2.set_encryption(&key_path).is_ok(),
+            "correct key must pass the canary check"
+        );
+        let _ = std::fs::remove_file(&key_path);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn wrong_key_fails_canary_check_at_startup() {
+        let (mut db, path) = temp_db();
+        let (key_a, _) = temp_key_file();
+        db.set_encryption(&key_a).unwrap();
+        db.remember(&make_entity("c-1", "note", "c-1", r#"{"x":1}"#))
+            .unwrap();
+        drop(db);
+
+        // A DIFFERENT key must be rejected at set_encryption time (not silently
+        // accepted then AuthFailing on later reads).
+        let (key_b, _) = temp_key_file();
+        let mut db2 = Database::open(&path).unwrap();
+        let err = db2.set_encryption(&key_b).unwrap_err();
+        assert!(
+            err.contains("canary") || err.contains("decrypt"),
+            "wrong key must fail loudly, got: {err}"
+        );
+        let _ = std::fs::remove_file(&key_a);
+        let _ = std::fs::remove_file(&key_b);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn wrong_key_on_preexisting_encrypted_db_without_canary_fails() {
+        let (mut db, path) = temp_db();
+        let (key_a, _) = temp_key_file();
+        db.set_encryption(&key_a).unwrap();
+        db.remember(&make_entity("c-1", "note", "c-1", r#"{"secret":"y"}"#))
+            .unwrap();
+        // Simulate a store written BEFORE the canary existed: drop the row.
+        db.conn()
+            .unwrap()
+            .execute("DELETE FROM encryption_canary", [])
+            .unwrap();
+        drop(db);
+
+        // Wrong key must be caught via the existing-ciphertext scan, and must NOT
+        // bless itself by writing a canary.
+        let (key_b, _) = temp_key_file();
+        let mut db_wrong = Database::open(&path).unwrap();
+        assert!(
+            db_wrong.set_encryption(&key_b).is_err(),
+            "wrong key on canary-less encrypted DB must be rejected"
+        );
+        let blessed: i64 = db_wrong
+            .conn()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM encryption_canary", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(blessed, 0, "a rejected key must not write a canary");
+        drop(db_wrong);
+
+        // The correct key passes and back-fills the canary for next time.
+        let mut db_right = Database::open(&path).unwrap();
+        db_right.set_encryption(&key_a).unwrap();
+        let n: i64 = db_right
+            .conn()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM encryption_canary", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1, "correct key must back-fill the canary");
+        let _ = std::fs::remove_file(&key_a);
+        let _ = std::fs::remove_file(&key_b);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn enabling_encryption_on_plaintext_db_creates_canary() {
+        // Legacy plaintext rows say nothing about the key; enabling encryption on
+        // such a DB must succeed and establish a canary going forward.
+        let (db, path) = temp_db();
+        db.remember(&make_entity("p-1", "note", "p-1", r#"{"plain":true}"#))
+            .unwrap();
+        drop(db);
+
+        let (key_a, _) = temp_key_file();
+        let mut db2 = Database::open(&path).unwrap();
+        db2.set_encryption(&key_a).unwrap();
+        let n: i64 = db2
+            .conn()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM encryption_canary", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1, "canary created when encrypting a plaintext DB");
+        drop(db2);
+
+        // And a wrong key is now rejected on reopen.
+        let (key_b, _) = temp_key_file();
+        let mut db3 = Database::open(&path).unwrap();
+        assert!(db3.set_encryption(&key_b).is_err());
+        let _ = std::fs::remove_file(&key_a);
+        let _ = std::fs::remove_file(&key_b);
         let _ = fs::remove_file(&path);
     }
 

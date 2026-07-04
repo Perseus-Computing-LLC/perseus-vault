@@ -107,6 +107,18 @@ CREATE TABLE IF NOT EXISTS state (
     created_at_unix_ms INTEGER NOT NULL
 );
 
+-- Encryption canary (fail-fast wrong-key detection). A single row (id=1) holding
+-- a known marker encrypted under the configured key. On startup set_encryption
+-- decrypts it and aborts loudly if it fails, so a wrong/rotated key is caught
+-- before any read silently returns AuthFailed. Deliberately NOT in `entities` or
+-- `state`: it must stay invisible to recall/FTS/stats and to caller-facing state
+-- tools. Ungated IF NOT EXISTS so it back-fills onto older databases too.
+CREATE TABLE IF NOT EXISTS encryption_canary (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    ciphertext TEXT NOT NULL,
+    created_at_unix_ms INTEGER NOT NULL
+);
+
 -- Superseded fact versions (v2.4.0 — bi-temporal facts). When a remember()
 -- overwrites an existing (category,key,workspace_hash) with new content, the prior
 -- row is snapshotted here with invalidated_at set, so live reads stay one-row-per-key
