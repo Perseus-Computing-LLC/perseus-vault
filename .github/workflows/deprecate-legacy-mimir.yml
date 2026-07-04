@@ -1,0 +1,45 @@
+name: Deprecate legacy mimir registry entry (one-shot)
+
+# One-shot, manual. Marks the pre-rename MCP Registry listing
+# `io.github.Perseus-Computing-LLC/mimir` (last published v2.15.0) as
+# DEPRECATED, with a message pointing users at the current
+# `io.github.Perseus-Computing-LLC/perseus-vault` listing.
+#
+# Run this ONLY AFTER perseus-vault has published successfully (v2.17.1+ — see
+# mcp-registry.yml), so the deprecation notice points at a live replacement.
+#
+# Auth is GitHub OIDC — the same namespace-ownership proof mcp-registry.yml
+# uses; it covers the whole `io.github.Perseus-Computing-LLC/*` namespace, so it
+# authorizes editing the `mimir` name too. Deprecation is a status change on an
+# existing entry (not a publish), so it does NOT re-validate package/OCI
+# ownership — the old mimir image labels are irrelevant here.
+#
+# Safe to delete this workflow file once the deprecation has run.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  deprecate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install mcp-publisher
+        run: |
+          curl -fsSL "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_$(uname -s | tr '[:upper:]' '[:lower:]')_amd64.tar.gz" \
+            | tar -xz mcp-publisher
+
+      - name: Authenticate (GitHub OIDC)
+        run: ./mcp-publisher login github-oidc
+
+      - name: Mark io.github.Perseus-Computing-LLC/mimir deprecated (all versions)
+        run: |
+          ./mcp-publisher status \
+            --status deprecated \
+            --all-versions \
+            --yes \
+            --message "Renamed to io.github.Perseus-Computing-LLC/perseus-vault. Install: https://github.com/Perseus-Computing-LLC/perseus-vault" \
+            io.github.Perseus-Computing-LLC/mimir
