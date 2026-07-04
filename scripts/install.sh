@@ -2,11 +2,14 @@
 set -euo pipefail
 
 # Perseus Vault (formerly "Mneme"/"Mimir") one-line installer
-# Usage: curl -sSf https://get.mimir.perseus.observer | sh
-# Or:     curl -sSf https://raw.githubusercontent.com/Perseus-Computing-LLC/perseus-vault/main/scripts/install.sh | sh
+# Usage: curl -sSf https://raw.githubusercontent.com/Perseus-Computing-LLC/perseus-vault/main/scripts/install.sh | sh
 #
-# Prebuilt binaries: Linux (x86_64, aarch64), macOS Apple Silicon (aarch64), WSL.
-# Intel macOS (x86_64) and Windows: build from source (cargo install --git ...).
+# Prebuilt binaries (published as .tar.gz + .sha256):
+#   - macOS Apple Silicon (aarch64)      — full build
+#   - Linux x86_64 (glibc)               — full build
+#   - Linux aarch64 (musl)               — 'lite' build (no bundled embedding model)
+# Intel macOS (x86_64), Windows, and aarch64-linux-full: build from source
+#   (cargo install --git https://github.com/Perseus-Computing-LLC/perseus-vault).
 
 BOLD="\033[1m"
 GREEN="\033[32m"
@@ -26,85 +29,112 @@ echo ""
 OS="$(uname -s)"
 ARCH="$(uname -m)"
 
-case "$OS" in
-    Linux)  OS="unknown-linux-gnu" ;;
-    Darwin) OS="apple-darwin" ;;
-    *)
-        echo -e "${RED}Unsupported OS: $OS${RESET}"
-        echo "Prebuilt: Linux (x86_64, aarch64) and macOS Apple Silicon. Intel macOS and Windows: cargo install --git https://github.com/${REPO}"
-        exit 1
-        ;;
+no_prebuilt() {
+    echo -e "${RED}No prebuilt binary for $1.${RESET}"
+    echo ""
+    echo "Build from source with cargo (needs the Rust toolchain):"
+    echo "  cargo install --git https://github.com/${REPO}"
+    exit 1
+}
+
+# Map platform → the published asset base name. These match the release assets
+# produced by taiki-e/upload-rust-binary-action. NOTE: aarch64-linux ships only
+# the reduced 'lite' musl build; x86_64-linux and macOS-arm64 ship full builds.
+VARIANT="full"
+case "${OS}/${ARCH}" in
+    Darwin/arm64|Darwin/aarch64) ASSET_BASE="perseus-vault-aarch64-apple-darwin" ;;
+    Linux/x86_64|Linux/amd64)    ASSET_BASE="perseus-vault-x86_64-unknown-linux-gnu" ;;
+    Linux/aarch64|Linux/arm64)   ASSET_BASE="perseus-vault-lite-aarch64-unknown-linux-musl"; VARIANT="lite" ;;
+    Darwin/x86_64)               no_prebuilt "Intel macOS (x86_64)" ;;
+    *)                           no_prebuilt "${OS}/${ARCH}" ;;
 esac
 
-case "$ARCH" in
-    x86_64|amd64)  ARCH="x86_64" ;;
-    aarch64|arm64) ARCH="aarch64" ;;
-    *)
-        echo -e "${RED}Unsupported architecture: $ARCH${RESET}"
-        exit 1
-        ;;
-esac
+# Pre-rename asset names for older pinned versions (MIMIR_VERSION=<old tag>),
+# newest first. Best-effort: tried only if the current name 404s.
+SUFFIX="${ASSET_BASE#perseus-vault-}"
+LEGACY_BASES="mneme-${SUFFIX} mimir-${SUFFIX}"
 
-TARGET="${ARCH}-${OS}"
-# Perseus Vault rename (transition release): releases cut after this rename
-# publish a "perseus-vault-${TARGET}" asset. Older releases publish
-# "mneme-${TARGET}", and releases before that publish "mimir-${TARGET}".
-# Try the newest name first and fall back through the legacy names so this
-# script keeps working against every published release, not just future ones.
-ARCHIVE_NAME="perseus-vault-${TARGET}"
-LEGACY_ARCHIVE_NAME="mneme-${TARGET}"
-LEGACY2_ARCHIVE_NAME="mimir-${TARGET}"
+release_url() {  # release_url <filename> → full download URL
+    if [ "$VERSION" = "latest" ]; then
+        echo "https://github.com/${REPO}/releases/latest/download/$1"
+    else
+        echo "https://github.com/${REPO}/releases/download/${VERSION}/$1"
+    fi
+}
 
-# ── Download ─────────────────────────────────────────────────────────
-if [ "$VERSION" = "latest" ]; then
-    DOWNLOAD_URL="https://github.com/${REPO}/releases/latest/download/${ARCHIVE_NAME}"
-    LEGACY_DOWNLOAD_URL="https://github.com/${REPO}/releases/latest/download/${LEGACY_ARCHIVE_NAME}"
-    LEGACY2_DOWNLOAD_URL="https://github.com/${REPO}/releases/latest/download/${LEGACY2_ARCHIVE_NAME}"
-else
-    DOWNLOAD_URL="https://github.com/${REPO}/releases/download/${VERSION}/${ARCHIVE_NAME}"
-    LEGACY_DOWNLOAD_URL="https://github.com/${REPO}/releases/download/${VERSION}/${LEGACY_ARCHIVE_NAME}"
-    LEGACY2_DOWNLOAD_URL="https://github.com/${REPO}/releases/download/${VERSION}/${LEGACY2_ARCHIVE_NAME}"
-fi
+fetch() {  # fetch <url> <out> → 0 on success (HTTP 200), nonzero otherwise
+    if command -v curl >/dev/null 2>&1; then
+        curl -sSfL -o "$2" "$1"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -q -O "$2" "$1"
+    else
+        echo -e "${RED}Need curl or wget to download.${RESET}"; exit 1
+    fi
+}
 
-echo -e "→ Platform: ${BOLD}${TARGET}${RESET}"
+verify_sha() {  # verify_sha <shafile>  (cwd must contain the referenced archive)
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum -c "$1" >/dev/null 2>&1
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 -c "$1" >/dev/null 2>&1
+    else
+        echo -e "${YELLOW}⚠  No sha256sum/shasum found; skipping checksum verification.${RESET}"
+        return 0
+    fi
+}
+
+echo -e "→ Platform: ${BOLD}${OS}/${ARCH}${RESET}  (asset: ${ASSET_BASE}.tar.gz, ${VARIANT} build)"
 echo -e "→ Installing to: ${BOLD}${BIN_DIR}${RESET}"
 echo ""
 
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
+# ── Download + verify + extract ──────────────────────────────────────
+try_install() {  # try_install <asset_base> → 0 if downloaded/verified/extracted
+    local base="$1"
+    local tgz="${base}.tar.gz" sha="${base}.sha256"
+    if ! fetch "$(release_url "$tgz")" "$TMP_DIR/$tgz"; then
+        return 1
+    fi
+    echo -e "→ Downloaded ${BOLD}${tgz}${RESET}"
+    if fetch "$(release_url "$sha")" "$TMP_DIR/$sha"; then
+        if ( cd "$TMP_DIR" && verify_sha "$sha" ); then
+            echo "→ Checksum verified"
+        else
+            echo -e "${RED}✗ Checksum verification FAILED for ${tgz} — aborting.${RESET}"
+            exit 1
+        fi
+    else
+        echo -e "${YELLOW}⚠  No checksum published for ${tgz}; skipping verification.${RESET}"
+    fi
+    tar -xzf "$TMP_DIR/$tgz" -C "$TMP_DIR"
+    return 0
+}
+
 echo "→ Downloading perseus-vault..."
-if command -v curl >/dev/null 2>&1; then
-    HTTP_CODE=$(curl -sSfL -w "%{http_code}" -o "$TMP_DIR/perseus-vault" "$DOWNLOAD_URL")
-    if [ "$HTTP_CODE" != "200" ] && [ "$HTTP_CODE" != "302" ]; then
-        echo -e "${YELLOW}→ No '${ARCHIVE_NAME}' asset yet, trying pre-rename '${LEGACY_ARCHIVE_NAME}'...${RESET}"
-        HTTP_CODE=$(curl -sSfL -w "%{http_code}" -o "$TMP_DIR/perseus-vault" "$LEGACY_DOWNLOAD_URL")
-    fi
-    if [ "$HTTP_CODE" != "200" ] && [ "$HTTP_CODE" != "302" ]; then
-        echo -e "${YELLOW}→ No '${LEGACY_ARCHIVE_NAME}' asset either, trying pre-rename '${LEGACY2_ARCHIVE_NAME}'...${RESET}"
-        HTTP_CODE=$(curl -sSfL -w "%{http_code}" -o "$TMP_DIR/perseus-vault" "$LEGACY2_DOWNLOAD_URL")
-    fi
-    if [ "$HTTP_CODE" != "200" ] && [ "$HTTP_CODE" != "302" ]; then
-        echo -e "${RED}Download failed (HTTP $HTTP_CODE)${RESET}"
-        echo "No pre-built binary for ${TARGET}."
-        echo ""
-        echo "Build from source with cargo:"
-        echo "  cargo install --git https://github.com/${REPO}"
-        exit 1
-    fi
-elif command -v wget >/dev/null 2>&1; then
-    wget -q --show-progress -O "$TMP_DIR/perseus-vault" "$DOWNLOAD_URL" \
-        || wget -q --show-progress -O "$TMP_DIR/perseus-vault" "$LEGACY_DOWNLOAD_URL" \
-        || wget -q --show-progress -O "$TMP_DIR/perseus-vault" "$LEGACY2_DOWNLOAD_URL"
-else
-    echo -e "${RED}Need curl or wget to download perseus-vault.${RESET}"
+INSTALLED=1
+for base in "$ASSET_BASE" $LEGACY_BASES; do
+    if try_install "$base"; then INSTALLED=0; break; fi
+    echo -e "${YELLOW}→ '${base}.tar.gz' not available for ${VERSION}, trying next name...${RESET}"
+done
+[ "$INSTALLED" -eq 0 ] || no_prebuilt "${OS}/${ARCH} (version: ${VERSION})"
+
+# The archive contains a single 'perseus-vault' binary at its root.
+BIN_SRC="$(find "$TMP_DIR" -type f -name 'perseus-vault' 2>/dev/null | head -n1)"
+if [ -z "$BIN_SRC" ]; then
+    # Fallback: first regular file that isn't the archive/checksum.
+    BIN_SRC="$(find "$TMP_DIR" -type f ! -name '*.tar.gz' ! -name '*.sha256' 2>/dev/null | head -n1)"
+fi
+if [ -z "$BIN_SRC" ]; then
+    echo -e "${RED}Extraction succeeded but no binary was found in the archive.${RESET}"
     exit 1
 fi
 
 # ── Install ──────────────────────────────────────────────────────────
 mkdir -p "$BIN_DIR"
-chmod +x "$TMP_DIR/perseus-vault"
-mv "$TMP_DIR/perseus-vault" "$BIN_DIR/perseus-vault"
+chmod +x "$BIN_SRC"
+mv "$BIN_SRC" "$BIN_DIR/perseus-vault"
 # Perseus Vault rename: keep "mneme" and "mimir" symlinks so existing MCP host
 # configs/scripts that invoke either older command name keep working unchanged.
 ln -sf "$BIN_DIR/perseus-vault" "$BIN_DIR/mneme"
@@ -115,7 +145,7 @@ ln -sf "$BIN_DIR/perseus-vault" "$BIN_DIR/mimir"
 # even with no quarantine xattr — so `perseus-vault --version`/`doctor` would
 # produce no output. `codesign --sign -` applies an ad-hoc signature; harmless
 # on Intel.
-if [ "$OS" = "apple-darwin" ] && command -v codesign >/dev/null 2>&1; then
+if [ "$OS" = "Darwin" ] && command -v codesign >/dev/null 2>&1; then
     if codesign --force --sign - "$BIN_DIR/perseus-vault" 2>/dev/null; then
         echo "→ Ad-hoc code-signed for macOS"
     else
@@ -126,7 +156,7 @@ fi
 
 # Check if BIN_DIR is on PATH
 if ! echo "$PATH" | tr ':' '\n' | grep -qxF "$BIN_DIR"; then
-    case "$SHELL" in
+    case "${SHELL:-}" in
         */zsh) RC="$HOME/.zshrc" ;;
         */bash) RC="$HOME/.bashrc" ;;
         */fish) RC="$HOME/.config/fish/config.fish" ;;
@@ -139,6 +169,13 @@ if ! echo "$PATH" | tr ':' '\n' | grep -qxF "$BIN_DIR"; then
     echo -e "   ${BOLD}export PATH=\"\$HOME/.local/bin:\$PATH\"${RESET}"
     echo ""
     echo "   Or run:  echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> $RC"
+fi
+
+if [ "$VARIANT" = "lite" ]; then
+    echo ""
+    echo -e "${YELLOW}Note:${RESET} installed the 'lite' build (no bundled embedding model)."
+    echo "  Local embeddings need a model — point --embedding-model at an ONNX model,"
+    echo "  or configure an embedding endpoint. FTS5 keyword search works without one."
 fi
 
 # ── Verify ───────────────────────────────────────────────────────────
