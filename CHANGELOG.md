@@ -6,6 +6,22 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
 ## [Unreleased]
 
 ### Security / Hardening
+- Network transport & gRPC hardening (audit phases 1–3):
+  - **Secure-bind guard**: binding an HTTP surface (MCP transport or web
+    dashboard) to a non-loopback address with **no** auth token now refuses to
+    start instead of coming up wide open. Override with
+    `MIMIR_ALLOW_INSECURE_BIND=1` for a trusted network / auth-terminating proxy.
+  - **Constant-time token comparison** for Bearer auth on both HTTP surfaces
+    (was a byte-wise `==`, a timing side-channel on the secret).
+  - **Request-body cap** (`MIMIR_MAX_HTTP_BODY_BYTES`, default 8 MiB) and a
+    **global token-bucket rate limit** (`MIMIR_HTTP_RATE_PER_SEC` /
+    `MIMIR_HTTP_RATE_BURST`, default 50 req/s + burst 100 → `429`).
+  - **Tightened transport CORS** — explicit methods/headers instead of `Any`,
+    with an optional `MIMIR_CORS_ALLOWED_ORIGINS` allowlist.
+  - **gRPC security model**: `serve` now supports a Bearer-token auth interceptor
+    (`MIMIR_GRPC_AUTH_TOKEN`), TLS and mutual-TLS (`MIMIR_GRPC_TLS_CERT/KEY`,
+    `MIMIR_GRPC_TLS_CLIENT_CA`), a message-size cap (`MIMIR_GRPC_MAX_MSG_BYTES`),
+    and the same secure-bind guard. See [docs/GRPC-SECURITY.md](docs/GRPC-SECURITY.md).
 - Encryption canary (fail-fast wrong-key detection). `set_encryption` now
   verifies the configured key against a dedicated canary row at startup and
   **aborts loudly** ("the provided key is incorrect or the database is corrupt")

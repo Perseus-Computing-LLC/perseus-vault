@@ -48,7 +48,7 @@ pub fn build_router(db: Arc<Database>, auth_token: Option<String>) -> Router {
             .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
     };
 
-    Router::new()
+    let router = Router::new()
         .route("/", get(dashboard))
         .route("/api/entities", get(list_entities))
         .route("/api/entities/{id}", get(entity_detail))
@@ -58,7 +58,9 @@ pub fn build_router(db: Arc<Database>, auth_token: Option<String>) -> Router {
         .route("/api/graph", get(graph))
         .route_layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
         .layer(cors)
-        .with_state(state)
+        .with_state(state);
+    // DoS-resistance: explicit body-size cap + global rate limit (Phase 1/2).
+    crate::httplimit::apply_http_limits(router)
 }
 
 /// Middleware: require Bearer token if auth_token is set.
@@ -81,7 +83,7 @@ async fn auth_middleware(
 
     if let Some(auth) = auth_header {
         if let Some(token) = auth.strip_prefix("Bearer ") {
-            if token == expected {
+            if crate::util::constant_time_str_eq(token, expected) {
                 return Ok(next.run(request).await);
             }
         }

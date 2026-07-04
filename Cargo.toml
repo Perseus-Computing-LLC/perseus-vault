@@ -28,6 +28,10 @@ base64 = "0.22"
 axum = "0.7"
 tokio = { version = "1", features = ["full"] }
 tower-http = { version = "0.5", features = ["cors"] }
+# Constant-time equality for auth-token comparison (avoids a timing side-channel
+# on the Bearer secret). Already compiled transitively via aes-gcm; pinned here as
+# a direct dep so the network-transport auth path can use it explicitly.
+subtle = "2"
 ureq = "2"
 notify = "6"
 serde_yaml = "0.9"
@@ -50,7 +54,7 @@ ndarray = { version = "0.17", optional = true }  # MUST match the ndarray versio
 # `Message`, but tonic's codec requires ITS prost's `Message` — mixing 0.14
 # with tonic 0.13 fails every RPC with "trait bound `X: prost::message::Message`
 # is not satisfied". Caught by the grpc CI lane (#354).
-tonic = { version = "0.13", optional = true, features = ["transport"] }
+tonic = { version = "0.13", optional = true, features = ["transport", "tls-ring"] }
 prost = { version = "0.13", optional = true }
 prost-types = { version = "0.13", optional = true }
 tokio-stream = { version = "0.1", optional = true }

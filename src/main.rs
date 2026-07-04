@@ -5,6 +5,7 @@ mod dedup;
 mod embedding;
 mod encryption;
 mod extraction;
+mod httplimit;
 mod mcp;
 mod models;
 mod multimodal;
@@ -785,6 +786,30 @@ fn warn_key_acls_on_windows(key_file: &str) {
              icacls \"{key_file}\" /inheritance:r /grant:r %USERNAME%:F"
         );
     }
+}
+
+/// Refuse (by default) to expose an HTTP surface on a non-loopback address with
+/// NO auth token — the "bound to 0.0.0.0 and wide open" footgun. An operator who
+/// intentionally fronts the vault with a trusted network or a proxy that
+/// terminates auth can override with `MIMIR_ALLOW_INSECURE_BIND=1`.
+fn guard_bind(surface: &str, bind_host: &str, has_token: bool) {
+    if has_token || crate::util::host_is_loopback(bind_host) {
+        return;
+    }
+    if std::env::var("MIMIR_ALLOW_INSECURE_BIND").ok().as_deref() == Some("1") {
+        eprintln!(
+            "mimir: WARNING: {surface} is bound to non-loopback {bind_host} with NO auth token \
+             (MIMIR_ALLOW_INSECURE_BIND=1 set — proceeding). Anyone who can reach this port has \
+             full read/write access to the vault."
+        );
+        return;
+    }
+    eprintln!(
+        "mimir: fatal: refusing to expose {surface} on non-loopback address {bind_host} without an \
+         auth token. Set an auth token, bind to 127.0.0.1, or — if the network is trusted (e.g. an \
+         auth-terminating reverse proxy) — set MIMIR_ALLOW_INSECURE_BIND=1."
+    );
+    std::process::exit(1);
 }
 
 /// Open a database for a CLI maintenance command, or exit(1) with a message.
@@ -1804,6 +1829,7 @@ fn main() {
                 // connectors applied above) instead of opening a SECOND
                 // Database — and second 16-conn pool — on the same file.
                 let web_db = std::sync::Arc::clone(&database);
+                guard_bind("web dashboard", &web_bind_addr, web_auth_token.is_some());
                 let router = crate::web::build_router(web_db, web_auth_token.clone());
                 let addr = format!("{}:{}", web_bind_addr, web_port);
                 eprintln!("mimir: web dashboard starting on http://{}", addr);
@@ -1839,6 +1865,7 @@ fn main() {
             };
 
             if let Some(mode) = tmode {
+                guard_bind("MCP transport", web_bind, mcp_token.is_some());
                 crate::transport::init_transport_state(std::sync::Arc::clone(&database));
                 let transport_router =
                     crate::transport::build_transport_router(mode, mcp_token.clone());
@@ -1940,6 +1967,7 @@ fn main() {
                 let web_port = cli.port;
                 let web_bind_addr = cli.web_bind.clone();
                 let web_db = std::sync::Arc::clone(&database);
+                guard_bind("web dashboard", &web_bind_addr, cli.web_auth_token.is_some());
                 let router = crate::web::build_router(web_db, cli.web_auth_token.clone());
                 let addr = format!("{}:{}", web_bind_addr, web_port);
                 eprintln!("mimir: web dashboard starting on http://{}", addr);
@@ -1975,6 +2003,7 @@ fn main() {
             };
 
             if let Some(mode) = transport_mode {
+                guard_bind("MCP transport", &cli.web_bind, cli.mcp_token.is_some());
                 crate::transport::init_transport_state(std::sync::Arc::clone(&database));
                 let transport_router =
                     crate::transport::build_transport_router(mode, cli.mcp_token.clone());
