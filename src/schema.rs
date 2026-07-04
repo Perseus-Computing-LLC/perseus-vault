@@ -69,11 +69,16 @@ CREATE TABLE IF NOT EXISTS entities (
 -- column here would fail the whole batch.
 
 -- Recall ranking index: lets the browse path (WHERE archived=0 [+ residual
--- filters] ORDER BY retrieval_count DESC, last_accessed_unix_ms DESC LIMIT k)
--- seek the archived=0 partition and read rows already in rank order, avoiding a
--- full table scan + temp-b-tree sort. EXPLAIN-verified: ~224x on global browse,
--- ~66x on workspace-scoped browse at 30k rows. (#209)
-CREATE INDEX IF NOT EXISTS idx_entities_recall ON entities(archived, retrieval_count DESC, last_accessed_unix_ms DESC);
+-- filters] ORDER BY retrieval_count DESC, last_accessed_unix_ms DESC, id ASC
+-- LIMIT k) seek the archived=0 partition and read rows already in rank order,
+-- avoiding a full table scan + temp-b-tree sort. EXPLAIN-verified: ~224x on
+-- global browse, ~66x on workspace-scoped browse at 30k rows. (#209)
+-- The trailing `id ASC` covers recall's #254 determinism tie-break: without it,
+-- a large tie-group on (retrieval_count, last_accessed) — e.g. a cold or
+-- bulk-imported store with uniform last_accessed — forced SQLite to sort the
+-- whole group by id to satisfy LIMIT k (O(tie-group); ~30ms browse @1M). With it
+-- the index satisfies the FULL ordering, so browse stays a k-row range scan.
+CREATE INDEX IF NOT EXISTS idx_entities_recall ON entities(archived, retrieval_count DESC, last_accessed_unix_ms DESC, id ASC);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS entities_fts USING fts5(body_json, content_rowid='rowid');
 
@@ -168,7 +173,7 @@ CREATE INDEX IF NOT EXISTS idx_entity_history_catkey ON entity_history(category,
 /// the column-add migrations below have been applied. Bump this whenever you add
 /// a new ALTER-probe migration in `initialize_schema`, or existing databases
 /// (already at the previous level) will skip it.
-const SCHEMA_VERSION: i64 = 12;
+const SCHEMA_VERSION: i64 = 13;
 
 /// Initialize the v0.2.0 schema on a fresh database.
 pub fn initialize_schema(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
@@ -457,6 +462,24 @@ fn apply_migrations(conn: &Connection) -> Result<(), Box<dyn std::error::Error>>
     // a no-op on a fresh DB (empty journal).
     crate::db::rehash_audit_chain(conn)?;
     // ── end v12 ──────────────────────────────────────────────────────────
+
+    // ── v13: cover the browse ORDER BY tie-break in idx_entities_recall ──
+    // The empty-query browse path orders by
+    //   retrieval_count DESC, last_accessed_unix_ms DESC, id ASC
+    // but the pre-v13 index covered only the first two keys, so a large
+    // tie-group on (retrieval_count, last_accessed) — a cold or bulk-imported
+    // store where last_accessed is uniform — forced SQLite to sort the whole
+    // group by id to satisfy LIMIT k (O(tie-group); measured ~30ms browse p50
+    // at 1M rows). Adding id ASC as a trailing key lets the index satisfy the
+    // full ordering, so browse is a pure k-row range scan again. DROP+recreate
+    // because the old index lacks the column; safe on a populated DB (the index
+    // is derived, and recall/browse fall back to a scan for the brief window).
+    conn.execute_batch(
+        "DROP INDEX IF EXISTS idx_entities_recall; \
+         CREATE INDEX IF NOT EXISTS idx_entities_recall \
+           ON entities(archived, retrieval_count DESC, last_accessed_unix_ms DESC, id ASC);",
+    )?;
+    // ── end v13 ──────────────────────────────────────────────────────────
 
     // Stamp the migration level so subsequent opens skip the probe block above.
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -1212,11 +1235,17 @@ mod tests {
             )
             .unwrap();
         assert_eq!(exists, 1, "idx_entities_recall should be created");
-        // ...and the recall browse query must use it (no full scan / temp sort).
+        // ...and the recall browse query must use it with NO temp-b-tree sort.
+        // Uses the FULL 3-key ordering the recall path actually emits (db.rs:
+        // "ORDER BY retrieval_count DESC, last_accessed_unix_ms DESC, id ASC"),
+        // including the #254 determinism tie-break. This is the v13 guard: the
+        // pre-v13 index covered only the first two keys, so this exact query
+        // needed a TEMP B-TREE to order the tie-break — the O(tie-group) sort
+        // that made browse ~30ms at 1M rows.
         let plan: Vec<String> = conn
             .prepare(
                 "EXPLAIN QUERY PLAN SELECT id FROM entities WHERE archived = 0 \
-                 ORDER BY retrieval_count DESC, last_accessed_unix_ms DESC LIMIT 20",
+                 ORDER BY retrieval_count DESC, last_accessed_unix_ms DESC, id ASC LIMIT 20",
             )
             .unwrap()
             .query_map([], |r| r.get::<_, String>(3))
@@ -1230,7 +1259,7 @@ mod tests {
         );
         assert!(
             !joined.to_uppercase().contains("TEMP B-TREE"),
-            "recall query should not need a temp-b-tree sort, got: {joined}"
+            "recall browse (incl. id tie-break) should not need a temp-b-tree sort, got: {joined}"
         );
     }
 

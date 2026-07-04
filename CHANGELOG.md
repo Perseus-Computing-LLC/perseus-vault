@@ -5,6 +5,17 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
 
 ## [Unreleased]
 
+### Performance
+- Empty-query browse recall no longer degrades on large stores. The browse path
+  orders by `retrieval_count DESC, last_accessed_unix_ms DESC, id ASC`, but
+  `idx_entities_recall` covered only the first two keys — so a large tie-group on
+  the leading keys (a cold or bulk-imported store with uniform `last_accessed`)
+  forced SQLite to sort the whole group by `id` to satisfy `LIMIT k`
+  (O(tie-group)). The index now includes the `id` tie-break, making browse a pure
+  k-row range scan. Measured p50 at 1,000,000 rows: **29.7 ms → 0.046 ms**
+  (~645×); FTS and point-lookup latencies were already flat and are unchanged.
+  Ships a v13 schema migration that rebuilds the index on existing databases.
+
 ### Security / Hardening
 - Network transport & gRPC hardening (audit phases 1–3):
   - **Secure-bind guard**: binding an HTTP surface (MCP transport or web
