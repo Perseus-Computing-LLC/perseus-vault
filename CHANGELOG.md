@@ -5,6 +5,14 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
 
 ## [Unreleased]
 
+### Changed
+- Dropped prebuilt **macOS Intel (x86_64-apple-darwin)** release binaries. The
+  `macos-13` runner class is chronically backlogged and repeatedly stalled the
+  release pipeline for ~1h. Apple Silicon (`aarch64-apple-darwin`) covers modern
+  Macs; Intel-Mac users can `cargo install --git …` from source (or run the lite
+  musl build under Rosetta). `install.sh` degrades gracefully with a source-build
+  hint for that target.
+
 ## [2.17.0] - 2026-07-03
 
 ### Security / Hardening

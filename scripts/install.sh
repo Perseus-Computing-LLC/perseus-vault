@@ -5,7 +5,8 @@ set -euo pipefail
 # Usage: curl -sSf https://get.mimir.perseus.observer | sh
 # Or:     curl -sSf https://raw.githubusercontent.com/Perseus-Computing-LLC/perseus-vault/main/scripts/install.sh | sh
 #
-# Supports: Linux (x86_64, aarch64), macOS (x86_64, aarch64), WSL
+# Prebuilt binaries: Linux (x86_64, aarch64), macOS Apple Silicon (aarch64), WSL.
+# Intel macOS (x86_64) and Windows: build from source (cargo install --git ...).
 
 BOLD="\033[1m"
 GREEN="\033[32m"
@@ -30,7 +31,7 @@ case "$OS" in
     Darwin) OS="apple-darwin" ;;
     *)
         echo -e "${RED}Unsupported OS: $OS${RESET}"
-        echo "Perseus Vault supports Linux (x86_64, aarch64), macOS (x86_64, aarch64), and Windows (via cargo install)."
+        echo "Prebuilt: Linux (x86_64, aarch64) and macOS Apple Silicon. Intel macOS and Windows: cargo install --git https://github.com/${REPO}"
         exit 1
         ;;
 esac
