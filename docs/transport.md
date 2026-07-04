@@ -12,6 +12,35 @@ the Anthropic MCP Connector API, or any HTTP MCP client — it also ships a full
 | `--transport sse` | `GET /sse` + `POST /message` | Claude Desktop, MCP Connector API |
 | `--transport http` | `POST /message` only | Stateless Streamable HTTP |
 
+## stdio process lifecycle & the idle-watchdog
+
+Each MCP client spawns **one** `perseus-vault` stdio process per connection and
+runs all its tool calls over that persistent pipe — it does **not** spawn a
+process per tool call. A well-behaved client closes stdin when the session ends,
+the server sees EOF, and it exits, freeing its DB handle.
+
+Some long-lived clients (e.g. a Hermes worker that reconnects) can leak the
+write-end of the pipe without closing it, so the server would never see EOF and
+would block forever — accumulating one orphan per reconnect. The **idle-watchdog**
+(shipped in v2.16.0+) guards this: after `MIMIR_IDLE_TIMEOUT_SECS` of zero
+traffic the server exits on its own.
+
+- **Default: 600s (10 min).** An active client issues a `tools/call` (or at
+  least a `ping`) well within that window, so it is never affected; an orphan
+  self-terminates and frees its handle.
+- Override with `MIMIR_IDLE_TIMEOUT_SECS=<seconds>`; set `0` to disable.
+
+> ⚠️ **Do not run an external process-count reaper** (e.g. a cron that kills the
+> oldest `perseus-vault` processes when more than N exist). These subprocesses
+> are the normal stdio transport for **live** tool calls, so a count-based reap
+> races with active operations and kills them mid-call — clients then see
+> `Unknown tool` errors and silent dispatch failures ([#450]). The built-in
+> idle-watchdog already reclaims true orphans. If you must add external cleanup,
+> key it on **age + orphaned parent** (PPID reparented to init), never on raw
+> process count.
+
+[#450]: https://github.com/Perseus-Computing-LLC/perseus-vault/issues/450
+
 ## Quick start
 
 ```bash

@@ -5,6 +5,15 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
 
 ## [Unreleased]
 
+### Documentation
+- Documented the **stdio idle-watchdog** (`MIMIR_IDLE_TIMEOUT_SECS`, default
+  600s) in `docs/transport.md`, and explicitly warned against external
+  process-count reapers of `perseus-vault` stdio subprocesses: those are the
+  live transport for in-flight tool calls, so count-based reaping kills them
+  mid-operation (surfaces as `Unknown tool` errors). The built-in watchdog
+  already reclaims true orphans; external cleanup must key on age + orphaned
+  parent, never raw count. (#450)
+
 ## [2.17.1] - 2026-07-04
 
 ### Fixed
