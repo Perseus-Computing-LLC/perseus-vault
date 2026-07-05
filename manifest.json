@@ -1,7 +1,7 @@
 {
   "manifest_version": "0.3",
   "name": "perseus-vault",
-  "version": "2.17.0",
+  "version": "2.17.2",
   "display_name": "Perseus Vault — Persistent Memory for Claude (formerly Mimir/Mneme)",
   "description": "Persistent cross-session memory for Claude. 55 MCP tools: remember, recall, search, link entities, journal audit trail, state management, AES-256-GCM encryption. Local-first, single Rust binary, zero cloud dependencies.",
   "long_description": "Perseus Vault (formerly \"Mimir\", then \"Mneme\") gives Claude durable memory across sessions. It is a single Rust binary (~8MB) with an embedded SQLite database — no Docker, no Postgres, no cloud. Features include:\n\n- **55 MCP tools** for entity storage, hybrid search (FTS5 + dense vector), knowledge-graph traversal, journal audit trail, and state management\n- **AES-256-GCM encryption at rest** (optional, transparent)\n- **Fully local** — never phones home, no telemetry, air-gapped by default\n- **Agent-first design** — entity lifecycle with Ebbinghaus decay, auto-promotion, archiving\n- **Works with any MCP host** — Claude Desktop, Claude Code, Cursor, Hermes Agent, Perseus, and more\n\nInstall in one line: `curl -sSf https://raw.githubusercontent.com/Perseus-Computing-LLC/perseus-vault/main/scripts/install.sh | sh`",
@@ -14,16 +14,25 @@
   "homepage": "https://perseus.observer/perseus-vault/",
   "documentation": "https://github.com/Perseus-Computing-LLC/perseus-vault#readme",
   "license": "MIT",
+  "icon": "icon.png",
   "keywords": ["memory", "persistent-memory", "mcp", "local-first", "encryption", "sqlite", "fts5", "hybrid-search", "agent-memory"],
   "privacy_policies": [
     "https://github.com/Perseus-Computing-LLC/perseus-vault#privacy-policy"
   ],
   "server": {
     "type": "binary",
-    "entry_point": "perseus-vault",
+    "entry_point": "server/perseus-vault",
     "mcp_config": {
-      "command": "perseus-vault",
-      "args": ["serve", "--db", "~/.mimir/data/perseus-vault.db"]
+      "command": "${__dirname}/server/perseus-vault",
+      "args": ["serve"],
+      "platform_overrides": {
+        "win32": {
+          "command": "${__dirname}/server/perseus-vault.exe"
+        },
+        "linux": {
+          "command": "${__dirname}/server/perseus-vault-linux"
+        }
+      }
     }
   },
   "compatibility": {

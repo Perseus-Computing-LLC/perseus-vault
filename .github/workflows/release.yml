@@ -69,13 +69,18 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
-          # macOS Intel (x86_64-apple-darwin) is intentionally NOT built: the
-          # macos-13 runner class is chronically backlogged in the queue and
-          # repeatedly stalled the v2.17.0 release for ~1h. Apple Silicon
-          # (aarch64) covers modern Macs; Intel-Mac users can `cargo install`
-          # from source or run the lite musl build under Rosetta if needed.
           - target: aarch64-apple-darwin
             os: macos-14
+          # macOS Intel — the Anthropic MCP Directory listing declares darwin
+          # support, so Intel Macs get a prebuilt full binary too (previously
+          # skipped over macos-13 queue latency; accepted for complete coverage).
+          - target: x86_64-apple-darwin
+            os: macos-13
+          # Windows — bundled-embeddings links on MSVC (see Cargo.toml #222); no
+          # openssl in the dep tree (ureq/rustls + bundled sqlite), so no system
+          # libs are required.
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
     steps:
       - uses: actions/checkout@v4
       # bundled-embeddings pulls ort's download path which links openssl-sys on
