@@ -3044,7 +3044,9 @@ impl Database {
 
             if let Some(query_vec) = query_vec {
                 if params.mode == crate::models::SearchMode::Dense {
-                    let dense_results = self.dense_search(query_vec, params.limit as usize)?;
+                    // Clamp negative limits to 0 before the usize cast (a negative
+                    // i64 would wrap to a huge usize). Matches the Hybrid path below.
+                    let dense_results = self.dense_search(query_vec, params.limit.max(0) as usize)?;
                     let mut out: Vec<Entity> = dense_results.into_iter().map(|(e, _)| e).collect();
                     Self::retain_layer(&mut out, params);
                     self.reinforce_if_requested(params, &out)?;

@@ -5,6 +5,16 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
 
 ## [Unreleased]
 
+### Security — hardening (2026-07-05 review)
+- **`traverse` clamps caller-supplied `max_depth`/`max_nodes`** to sane ceilings
+  (64 / 100,000) so a single request can't be asked to walk an unbounded slice of
+  the link graph (LOW DoS hardening).
+- **Dense recall clamps a negative `limit`** with `.max(0)` before the `usize` cast
+  (a negative would wrap huge; downstream caps already neutralized it — hygiene).
+- **GitHub connector validates `repo` as strict `owner/name`** before interpolating
+  it into the api.github.com URL, preventing path/query injection from a malformed
+  operator-config value (LOW).
+
 ### Documentation
 - Documented the **stdio idle-watchdog** (`MIMIR_IDLE_TIMEOUT_SECS`, default
   600s) in `docs/transport.md`, and explicitly warned against external

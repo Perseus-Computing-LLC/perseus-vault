@@ -1563,7 +1563,11 @@ pub fn handle_traverse(db: &Database, args: Value) -> String {
             return json!({"error": format!("Invalid traverse arguments: {}", e)}).to_string()
         }
     };
-    match db.traverse_chain(&a.category, &a.key, a.max_depth, a.max_nodes) {
+    // DoS hardening: clamp caller-supplied bounds to sane ceilings so a single
+    // request can't be asked to walk an unbounded depth/breadth of the link graph.
+    let max_depth = a.max_depth.clamp(0, 64);
+    let max_nodes = a.max_nodes.clamp(0, 100_000);
+    match db.traverse_chain(&a.category, &a.key, max_depth, max_nodes) {
         Ok(chain) => serde_json::to_string(&chain)
             .unwrap_or_else(|e| json!({"error": format!("{}", e)}).to_string()),
         Err(e) => json!({"error": format!("Traverse failed: {}", e)}).to_string(),
