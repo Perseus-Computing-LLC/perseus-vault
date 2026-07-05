@@ -22,6 +22,8 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
   payload commitment — both tracked as the next step. See
   `docs/security-review-2026-07-05.md`.
 
+## [2.17.3] - 2026-07-05
+
 ### Security (2026-07-05 review)
 - **`install.sh` checksum verification now fails closed** (MED). A missing published
   `.sha256`, or a host without `sha256sum`/`shasum`, previously warned and installed
