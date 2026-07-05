@@ -96,10 +96,11 @@ struct Cli {
     #[arg(long)]
     mcp_token: Option<String>,
 
-    /// Token required for cross-workspace access (v1.2.0). When set, transport
-    /// routes accept this token as workspace authentication.
-    #[arg(long)]
-    workspace_token: Option<String>,
+    // 2026-07-05 security review: the `--workspace-token` flag was removed. It was
+    // documented as "cross-workspace access" auth but NO code ever read it (the
+    // Serve handler destructured it away), so it was a security control that looked
+    // active and wasn't. Transport auth is `--mcp-token`; workspace scoping is a
+    // routing control, not an enforced boundary (see docs/THREAT-MODEL.md).
 
     /// Enable offline / air-gapped mode. Disables the web dashboard, LLM endpoint,
     /// embedding endpoint, and external connectors. All core tools (remember, recall,
@@ -217,9 +218,9 @@ enum Commands {
         #[arg(long)]
         mcp_token: Option<String>,
 
-        /// Token required for cross-workspace access (v1.2.0)
-        #[arg(long)]
-        workspace_token: Option<String>,
+        // 2026-07-05 security review: `--workspace-token` removed — it was a
+        // documented auth flag that no code read (destructured away below). Use
+        // `--mcp-token` for transport auth.
 
         /// Enable offline / air-gapped mode. Disables web dashboard, LLM,
         /// embedding, and connectors. NIST SP 800-53 SC-7 / DoD IL5+ support.
