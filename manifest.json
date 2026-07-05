@@ -10,7 +10,10 @@
     "email": "privacy@perseus.observer",
     "url": "https://perseus.observer"
   },
-  "repository": "https://github.com/Perseus-Computing-LLC/perseus-vault",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Perseus-Computing-LLC/perseus-vault"
+  },
   "homepage": "https://perseus.observer/perseus-vault/",
   "documentation": "https://github.com/Perseus-Computing-LLC/perseus-vault#readme",
   "license": "MIT",
