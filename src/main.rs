@@ -259,6 +259,14 @@ enum Commands {
         encryption_key: String,
     },
 
+    /// Verify the journal audit chain (SHA-256 hash chain over event
+    /// existence/order/time/workspace). Exits non-zero if the chain is broken.
+    VerifyAuditChain {
+        /// SQLite database path
+        #[arg(long, default_value_t = default_db_path())]
+        db: String,
+    },
+
     /// Archive (soft-delete) a single entity by category + key
     Forget {
         /// SQLite database path
@@ -453,6 +461,7 @@ impl Commands {
             Commands::Write { db, .. }
             | Commands::Serve { db, .. }
             | Commands::RekeyAad { db, .. }
+            | Commands::VerifyAuditChain { db, .. }
             | Commands::Forget { db, .. }
             | Commands::Prune { db, .. }
             | Commands::Decay { db, .. }
@@ -1396,6 +1405,16 @@ fn main() {
                 }
                 Err(e) => {
                     eprintln!("mimir: rekey-aad failed: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        Some(Commands::VerifyAuditChain { db: ref db_path }) => {
+            let database = open_db_or_exit(db_path);
+            match crate::db::verify_audit_chain(&database) {
+                Ok(n) => println!("audit chain OK: {} entries verified", n),
+                Err(e) => {
+                    eprintln!("mimir: audit chain verification FAILED: {}", e);
                     std::process::exit(1);
                 }
             }

@@ -94,11 +94,20 @@ describe workspace scoping as "isolation" or the current chain as "tamper-proof.
 - **Now (supply/deploy, no engine risk):** #4 (install.sh hard-fail), #5 (non-root `USER`),
   #6 (add the `cargo audit` CI job the docs already promise), #8 (digest pins).
 - **Now (small code):** #3 (wire or remove `--workspace-token`), #10/#11 (clamps), #12 (encode `repo`).
-- **Soon (integrity — migration-sensitive, review carefully):** #1 + #2 — hash the full
-  entry payload under a real cryptographic primitive (and a keyed MAC when encryption is
-  on, so encrypted deployments get true tamper-evidence), verify-before-rehash in the
-  migration, wire `verify_audit_chain` to a CLI command. Then #7 (bind `workspace_hash`
-  into the AEAD AAD with a rekey migration).
+- **Partially addressed (this review's follow-up PR):** #1 — the chain is now a real
+  **SHA-256** (was 64-bit SipHash) and `verify_audit_chain` is **wired to a
+  `verify-audit-chain` CLI command** (was dead code); ships a v13→v14 rehash migration.
+  **Important correction:** the chain's *exclusion of the payload is deliberate*, not an
+  oversight — `purge`/redaction must be able to erase payload content (GDPR) while the
+  chain over event existence/order/time/workspace stays verifiable. So "cover the
+  payload" cannot be done naively; it requires a redaction-safe per-entry payload
+  *commitment*.
+- **Still open (migration-sensitive — the external-audit item):** the chain remains
+  **unkeyed**, so it is not tamper-evident against an attacker who can recompute it. True
+  tamper-evidence needs a **keyed MAC** (HMAC off the encryption key; note the
+  encryption-set-after-open ordering must be handled) plus the payload commitment above
+  for content-integrity. Then #7 (bind `workspace_hash` into the AEAD AAD with a rekey
+  migration).
 
 ## External audit
 The engine internals are strong and the threat model is refreshingly honest. Before any
