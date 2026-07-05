@@ -5,6 +5,8 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
 
 ## [Unreleased]
 
+## [2.17.4] - 2026-07-05
+
 ### Security — housekeeping (2026-07-05 review)
 - **Removed the dead `--workspace-token` flag.** It was documented as
   "cross-workspace access" authentication but **no code ever read it** (the `serve`
