@@ -5,6 +5,20 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
 
 ## [Unreleased]
 
+### Security (2026-07-05 review)
+- **`install.sh` checksum verification now fails closed** (MED). A missing published
+  `.sha256`, or a host without `sha256sum`/`shasum`, previously warned and installed
+  the binary **unverified**. Both now abort; set
+  `PERSEUS_VAULT_INSECURE_SKIP_CHECKSUM=1` to explicitly opt out.
+- **Docker image runs as a non-root `vault` user** (MED) instead of root; `/data` is
+  created and owned by that user so the default `serve` command works on a fresh volume.
+- **`cargo audit` now actually runs in CI** (MED) — a new `Security Audit` workflow
+  scans `Cargo.lock` against RustSec on every push/PR and weekly, making the existing
+  SECURITY.md claim true. (Vulnerabilities gate; two unmaintained-only advisories are
+  documented ignores.)
+- See `docs/security-review-2026-07-05.md` for the full ranked review (the audit-chain
+  integrity redesign — #1/#2 — is tracked as a separate follow-up).
+
 ### Documentation
 - Documented the **stdio idle-watchdog** (`MIMIR_IDLE_TIMEOUT_SECS`, default
   600s) in `docs/transport.md`, and explicitly warned against external

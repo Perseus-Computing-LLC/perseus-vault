@@ -30,5 +30,12 @@ COPY --from=builder /app/target/release/perseus-vault /usr/local/bin/perseus-vau
 # command name keep working unchanged.
 RUN ln -s /usr/local/bin/perseus-vault /usr/local/bin/mneme && \
     ln -s /usr/local/bin/perseus-vault /usr/local/bin/mimir
+# Run as a non-root user. The server parses untrusted memory content and writes
+# the SQLite DB at /data; there is no reason for it to hold root in-container.
+# /data is created and owned by the runtime user so the default CMD works with a
+# fresh volume mount.
+RUN addgroup -g 10001 vault && adduser -D -u 10001 -G vault vault && \
+    mkdir -p /data && chown -R vault:vault /data
+USER vault
 ENTRYPOINT ["/usr/local/bin/perseus-vault"]
 CMD ["serve", "--db", "/data/perseus-vault.db"]

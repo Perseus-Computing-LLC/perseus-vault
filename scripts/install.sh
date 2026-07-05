@@ -78,8 +78,16 @@ verify_sha() {  # verify_sha <shafile>  (cwd must contain the referenced archive
     elif command -v shasum >/dev/null 2>&1; then
         shasum -a 256 -c "$1" >/dev/null 2>&1
     else
-        echo -e "${YELLOW}⚠  No sha256sum/shasum found; skipping checksum verification.${RESET}"
-        return 0
+        # Security: fail closed. Previously this returned 0 (verification
+        # silently skipped) on any host without a hashing tool, installing an
+        # unverified binary. Require an explicit opt-out to proceed unverified.
+        if [ "${PERSEUS_VAULT_INSECURE_SKIP_CHECKSUM:-0}" = "1" ]; then
+            echo -e "${YELLOW}⚠  No sha256sum/shasum found; PERSEUS_VAULT_INSECURE_SKIP_CHECKSUM=1 set — proceeding UNVERIFIED.${RESET}"
+            return 0
+        fi
+        echo -e "${RED}✗ No sha256sum/shasum tool available to verify the download.${RESET}"
+        echo -e "${RED}  Install coreutils, or re-run with PERSEUS_VAULT_INSECURE_SKIP_CHECKSUM=1 to bypass (NOT recommended).${RESET}"
+        return 1
     fi
 }
 
@@ -106,7 +114,17 @@ try_install() {  # try_install <asset_base> → 0 if downloaded/verified/extract
             exit 1
         fi
     else
-        echo -e "${YELLOW}⚠  No checksum published for ${tgz}; skipping verification.${RESET}"
+        # Security: fail closed. A missing published checksum previously meant
+        # "install unverified"; an attacker who can tamper with the archive can
+        # equally suppress the .sha256 (same origin), so this downgrade defeated
+        # the check entirely. Abort unless the operator explicitly opts out.
+        if [ "${PERSEUS_VAULT_INSECURE_SKIP_CHECKSUM:-0}" = "1" ]; then
+            echo -e "${YELLOW}⚠  No checksum published for ${tgz}; PERSEUS_VAULT_INSECURE_SKIP_CHECKSUM=1 set — proceeding UNVERIFIED.${RESET}"
+        else
+            echo -e "${RED}✗ No checksum published for ${tgz} — refusing to install an unverified binary.${RESET}"
+            echo -e "${RED}  Re-run with PERSEUS_VAULT_INSECURE_SKIP_CHECKSUM=1 to bypass (NOT recommended).${RESET}"
+            exit 1
+        fi
     fi
     tar -xzf "$TMP_DIR/$tgz" -C "$TMP_DIR"
     return 0
