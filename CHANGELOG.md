@@ -19,6 +19,28 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
 - See `docs/security-review-2026-07-05.md` for the full ranked review (the audit-chain
   integrity redesign — #1/#2 — is tracked as a separate follow-up).
 
+## [2.17.2] - 2026-07-05
+
+### Fixed
+- **Anthropic MCP Directory bundle was not installable.** The submitted `.mcpb`
+  contained only `manifest.json` — the `binary` server it declared was never
+  placed inside the bundle, so it could not be installed or run for review. The
+  manifest also carried a stale `mimir serve --db ~/.mimir/...` command. Fixed:
+  `entry_point` now points at `server/perseus-vault` inside the bundle, the
+  command uses `${__dirname}/server/...` with `platform_overrides` for Windows
+  (`.exe`) and Linux, and the stale `--db` arg is dropped (the binary
+  self-resolves the cross-platform default DB path). (#456)
+
+### Added
+- **Real, self-contained `.mcpb` release artifact.** A new `mcpb.yml` workflow
+  builds per-platform lite binaries — macOS **universal** (arm64+x86_64) via
+  `lipo`, Windows MSVC (`crt-static`), Linux musl (static) — stages them under
+  `server/`, and validates + packs with the official `@anthropic-ai/mcpb` CLI,
+  attaching `perseus-vault.mcpb` to the release. (#456)
+- **Windows and macOS-Intel prebuilt release binaries.** `release.yml` now builds
+  `x86_64-pc-windows-msvc` and `x86_64-apple-darwin` in the full matrix, so every
+  platform the directory listing declares has a prebuilt binary. (#456)
+
 ### Documentation
 - Documented the **stdio idle-watchdog** (`MIMIR_IDLE_TIMEOUT_SECS`, default
   600s) in `docs/transport.md`, and explicitly warned against external
