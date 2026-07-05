@@ -1,3 +1,7 @@
+<div align="center">
+  <img src=".github/banner.png" alt="Perseus Vault — Persistent Memory. Encrypted, local-first, one portable file." width="100%">
+</div>
+
 # Perseus Vault
 
 <!-- mcp-name: io.github.Perseus-Computing-LLC/perseus-vault -->
