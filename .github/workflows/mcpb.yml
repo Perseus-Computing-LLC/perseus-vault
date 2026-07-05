@@ -1,0 +1,127 @@
+name: Build .mcpb bundle
+
+# Anthropic MCP Directory review flagged that our submitted .mcpb contained only
+# manifest.json — the binary server it declares was not inside the bundle, so it
+# could not be installed or run for review. This workflow builds a REAL, self-
+# contained bundle: per-platform lite (static, no-runtime-dep) binaries staged
+# under server/, packed with the official `@anthropic-ai/mcpb` CLI (which also
+# validates the manifest), and uploaded as the `perseus-vault.mcpb` release asset.
+#
+# On PR / workflow_dispatch it builds + validates + uploads a workflow artifact
+# (dry run). On a tag push it additionally attaches the .mcpb to the release.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/mcpb.yml"
+      - "manifest.json"
+      - "scripts/build-mcpb.sh"
+
+permissions:
+  contents: write # attach the .mcpb to the release on a tag push
+
+jobs:
+  # ── Per-platform lite binaries (static, --no-default-features) ──────────────
+  binaries:
+    name: bin ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: darwin
+            os: macos-14
+          - name: win32
+            os: windows-latest
+          - name: linux
+            os: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      # macOS: build BOTH arches and lipo them into one universal binary so a
+      # single darwin entry covers Apple Silicon and Intel Macs (the .mcpb format
+      # selects binaries by OS, not by arch, so we cannot ship two darwin files).
+      - name: Build macOS universal (lite)
+        if: matrix.name == 'darwin'
+        run: |
+          rustup target add x86_64-apple-darwin aarch64-apple-darwin
+          cargo build --release --locked --no-default-features --target x86_64-apple-darwin
+          cargo build --release --locked --no-default-features --target aarch64-apple-darwin
+          mkdir -p dist
+          lipo -create -output dist/perseus-vault \
+            target/x86_64-apple-darwin/release/perseus-vault \
+            target/aarch64-apple-darwin/release/perseus-vault
+          lipo -info dist/perseus-vault
+
+      # Windows: MSVC lite build. --no-default-features drops ort/tokenizers, so
+      # the esaxx /MT-vs-/MD link clash does not apply and crt-static yields a
+      # binary that runs without the VC++ redistributable installed.
+      - name: Build Windows (lite)
+        if: matrix.name == 'win32'
+        shell: bash
+        env:
+          RUSTFLAGS: "-C target-feature=+crt-static"
+        run: |
+          cargo build --release --locked --no-default-features
+          mkdir -p dist
+          cp target/release/perseus-vault.exe dist/perseus-vault.exe
+
+      # Linux: musl target => fully static, runs in any sandbox regardless of the
+      # host glibc / distro.
+      - name: Build Linux (lite, musl static)
+        if: matrix.name == 'linux'
+        run: |
+          sudo apt-get update && sudo apt-get install -y musl-tools
+          rustup target add x86_64-unknown-linux-musl
+          cargo build --release --locked --no-default-features --target x86_64-unknown-linux-musl
+          mkdir -p dist
+          cp target/x86_64-unknown-linux-musl/release/perseus-vault dist/perseus-vault-linux
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bin-${{ matrix.name }}
+          path: dist/*
+          if-no-files-found: error
+
+  # ── Assemble + validate + pack the bundle ──────────────────────────────────
+  bundle:
+    name: assemble .mcpb
+    needs: binaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Stage bundle
+        run: bash scripts/build-mcpb.sh
+
+      - name: Validate manifest
+        run: npx --yes @anthropic-ai/mcpb validate build-mcpb/manifest.json
+
+      - name: Pack .mcpb
+        run: |
+          mkdir -p dist
+          npx --yes @anthropic-ai/mcpb pack build-mcpb dist/perseus-vault.mcpb
+          echo "== bundle contents =="
+          unzip -l dist/perseus-vault.mcpb
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: perseus-vault-mcpb
+          path: dist/perseus-vault.mcpb
+          if-no-files-found: error
+
+      - name: Attach .mcpb to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/perseus-vault.mcpb
