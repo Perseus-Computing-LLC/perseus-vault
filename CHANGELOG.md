@@ -5,7 +5,17 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
 
 ## [Unreleased]
 
-### Security — hardening (2026-07-05 review)
+### Security (2026-07-05 review)
+- **`install.sh` checksum verification now fails closed** (MED). A missing published
+  `.sha256`, or a host without `sha256sum`/`shasum`, previously warned and installed
+  the binary **unverified**. Both now abort; set
+  `PERSEUS_VAULT_INSECURE_SKIP_CHECKSUM=1` to explicitly opt out.
+- **Docker image runs as a non-root `vault` user** (MED) instead of root; `/data` is
+  created and owned by that user so the default `serve` command works on a fresh volume.
+- **`cargo audit` now actually runs in CI** (MED) — a new `Security Audit` workflow
+  scans `Cargo.lock` against RustSec on every push/PR and weekly, making the existing
+  SECURITY.md claim true. (Vulnerabilities gate; two unmaintained-only advisories are
+  documented ignores.)
 - **`traverse` clamps caller-supplied `max_depth`/`max_nodes`** to sane ceilings
   (64 / 100,000) so a single request can't be asked to walk an unbounded slice of
   the link graph (LOW DoS hardening).
@@ -14,6 +24,8 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
 - **GitHub connector validates `repo` as strict `owner/name`** before interpolating
   it into the api.github.com URL, preventing path/query injection from a malformed
   operator-config value (LOW).
+- See `docs/security-review-2026-07-05.md` for the full ranked review (the audit-chain
+  integrity redesign — #1/#2 — is tracked as a separate follow-up).
 
 ## [2.17.2] - 2026-07-05
 
