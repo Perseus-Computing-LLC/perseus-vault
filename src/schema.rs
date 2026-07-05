@@ -173,7 +173,7 @@ CREATE INDEX IF NOT EXISTS idx_entity_history_catkey ON entity_history(category,
 /// the column-add migrations below have been applied. Bump this whenever you add
 /// a new ALTER-probe migration in `initialize_schema`, or existing databases
 /// (already at the previous level) will skip it.
-const SCHEMA_VERSION: i64 = 13;
+const SCHEMA_VERSION: i64 = 14;
 
 /// Initialize the v0.2.0 schema on a fresh database.
 pub fn initialize_schema(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
@@ -480,6 +480,19 @@ fn apply_migrations(conn: &Connection) -> Result<(), Box<dyn std::error::Error>>
            ON entities(archived, retrieval_count DESC, last_accessed_unix_ms DESC, id ASC);",
     )?;
     // ── end v13 ──────────────────────────────────────────────────────────
+
+    // ── v14 (2026-07-05 security review): cryptographic audit-chain hash ──
+    // Pre-v14 the journal chain used a 64-bit, non-cryptographic `DefaultHasher`
+    // (SipHash) — brute-forceable for targeted collisions. It is now a real
+    // SHA-256 over the same erasure-safe identifying tuple (prev, id,
+    // created_at, workspace_hash). Recompute existing chains under the new
+    // formula so they verify from here forward. Deterministic + idempotent;
+    // a no-op on a fresh DB (empty journal). (The chain still commits only to
+    // event existence/order/time/workspace — NOT payload content — so `purge`
+    // redaction stays compatible; keying the chain for true tamper-evidence is
+    // the tracked follow-up. See docs/security-review-2026-07-05.md.)
+    crate::db::rehash_audit_chain(conn)?;
+    // ── end v14 ──────────────────────────────────────────────────────────
 
     // Stamp the migration level so subsequent opens skip the probe block above.
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;

@@ -8455,23 +8455,51 @@ impl Drop for Database {
     }
 }
 
-/// Compute cosine similarity between two vectors.
-/// Compute SHA-256 chain hash for the next journal entry.
-/// chain = SHA-256(prev_hash || event_id || created_at_ms)
-/// Simple deterministic hash for audit chain (SHA-256 substitute).
-/// Uses Rust's stdlib SipHash — not cryptographic but fast and deterministic.
-/// For production audit logs, upgrade to a proper crypto crate.
+/// v14 (2026-07-05 security review): audit-chain link hash, now a real
+/// **SHA-256** over `(prev_hash, event_id, created_at_ms, workspace_hash)`.
+///
+/// Pre-v14 this was a 64-bit, non-cryptographic `DefaultHasher` (SipHash) — its
+/// own comment said "not cryptographic … upgrade to a proper crypto crate." A
+/// 64-bit digest is brute-forceable for targeted collisions; SHA-256 removes
+/// that weakness. Fields are length-prefixed so distinct field boundaries can
+/// never be ambiguously concatenated (e.g. `("ab","c")` vs `("a","bc")`).
+///
+/// DESIGN NOTE — what the chain does and does NOT attest to:
+/// It deliberately covers only the **immutable identifying fields** (id, time,
+/// workspace, and the previous link), NOT the event payload
+/// (`evaluated_json`/`acted_json`/`forward_json`/…). This is intentional so
+/// `purge`/redaction can erase payload content (GDPR / right-to-erasure) while
+/// the chain over event *existence, order, timing, and workspace* stays
+/// verifiable (see `redact_journal`). Consequently the chain does not detect
+/// tampering with an event's *content*.
+///
+/// The chain is also still **unkeyed**, so it detects accidental corruption and
+/// naive edits but is not tamper-*evident* against an attacker who can recompute
+/// it. True tamper-evidence needs a keyed MAC (HMAC/BLAKE3-keyed off the
+/// encryption key) — and, if content-integrity is also required, a per-entry
+/// payload *commitment* that survives redaction. Both are the tracked follow-up
+/// (see docs/security-review-2026-07-05.md); this change is the incremental,
+/// erasure-compatible hardening.
 fn audit_hash(prev_hash: &str, event_id: &str, created_at_ms: i64, workspace_hash: &str) -> String {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    prev_hash.hash(&mut hasher);
-    event_id.hash(&mut hasher);
-    created_at_ms.hash(&mut hasher);
+    use sha2::{Digest, Sha256};
+    fn feed(h: &mut Sha256, field: &[u8]) {
+        h.update((field.len() as u64).to_le_bytes());
+        h.update(field);
+    }
+    let mut hasher = Sha256::new();
+    feed(&mut hasher, prev_hash.as_bytes());
+    feed(&mut hasher, event_id.as_bytes());
+    feed(&mut hasher, &created_at_ms.to_le_bytes());
     // #433 M2: bind the entry's workspace into the chain so a journal row can't
-    // be silently moved between workspaces without breaking verification. (Hash
-    // impls for &str are length-prefixed, so distinct fields never collide.)
-    workspace_hash.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
+    // be silently moved between workspaces without breaking verification.
+    feed(&mut hasher, workspace_hash.as_bytes());
+    let digest = hasher.finalize();
+    let mut out = String::with_capacity(64);
+    for b in digest {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{:02x}", b);
+    }
+    out
 }
 
 fn sha256_chain(prev_hash: &str, event_id: &str, created_at_ms: i64, workspace_hash: &str) -> String {
@@ -8545,10 +8573,8 @@ fn history_retention_digest(
 
 /// Verify the audit chain by checking that each hash was correctly computed
 /// from the previous entry. Returns the number of entries verified, or an error
-/// describing the first invalid entry.
-// Retained as a callable integrity check (audit chain is written by the journal
-// path) but not yet wired to a CLI/MCP command, so it has no in-crate caller.
-#[allow(dead_code)]
+/// describing the first invalid entry. Wired to the `verify-audit-chain` CLI
+/// subcommand (2026-07-05 security review) so operators can actually run it.
 pub fn verify_audit_chain(db: &Database) -> Result<i64, String> {
     let conn = db.conn().map_err(|e| format!("connection: {}", e))?;
     let mut stmt = conn.prepare(
@@ -18480,6 +18506,22 @@ mod tests {
             3
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn audit_hash_is_sha256_hex_not_64bit_siphash() {
+        // v14 (2026-07-05 security review): the chain link is now a full SHA-256
+        // (64 lowercase hex chars), not the pre-v14 16-hex 64-bit DefaultHasher.
+        let h = audit_hash("genesis", "evt-1", 1_700_000_000_000, "wsA");
+        assert_eq!(h.len(), 64, "expected 64 hex chars (SHA-256), got {}", h.len());
+        assert!(h.chars().all(|c| c.is_ascii_hexdigit()), "must be hex: {}", h);
+        // Deterministic, and sensitive to every hashed field.
+        assert_eq!(h, audit_hash("genesis", "evt-1", 1_700_000_000_000, "wsA"));
+        assert_ne!(h, audit_hash("genesis", "evt-1", 1_700_000_000_000, "wsB"));
+        assert_ne!(h, audit_hash("genesis", "evt-2", 1_700_000_000_000, "wsA"));
+        assert_ne!(h, audit_hash("other", "evt-1", 1_700_000_000_000, "wsA"));
+        // Length-prefix framing: ("ab","c") must not collide with ("a","bc").
+        assert_ne!(audit_hash("ab", "c", 0, ""), audit_hash("a", "bc", 0, ""));
     }
 }
 

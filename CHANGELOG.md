@@ -5,6 +5,23 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
 
 ## [Unreleased]
 
+### Security — audit-chain hardening (2026-07-05 review, follow-up)
+- **The journal audit chain is now a real SHA-256 hash chain**, replacing the
+  64-bit non-cryptographic `DefaultHasher` (SipHash) whose own comment said "not
+  cryptographic … upgrade to a proper crypto crate." Fields are length-prefixed.
+  Ships a **v13→v14 migration** that rehashes existing chains under the new
+  formula (deterministic, idempotent, no-op on a fresh DB).
+- **`verify-audit-chain` CLI command** added — `verify_audit_chain` was
+  previously dead code with no caller, so nothing ever checked the chain.
+  `perseus-vault verify-audit-chain --db <path>` now verifies it and exits
+  non-zero on a broken chain.
+- The chain still commits only to event **existence / order / time / workspace**
+  (NOT payload content) so `purge` redaction stays compatible, and it remains
+  **unkeyed**. True tamper-evidence against a recomputing attacker needs a keyed
+  MAC (HMAC off the encryption key) plus, for content-integrity, a redaction-safe
+  payload commitment — both tracked as the next step. See
+  `docs/security-review-2026-07-05.md`.
+
 ## [2.17.3] - 2026-07-05
 
 ### Security (2026-07-05 review)
