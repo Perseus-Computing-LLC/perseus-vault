@@ -3051,6 +3051,48 @@ impl Database {
         }
     }
 
+    /// Post-filter enforcing the same metadata predicates as `fts5_search` for
+    /// the semantic (Dense/Hybrid) recall paths. `dense_search` ranks over the
+    /// raw embedding space with only `archived = 0`, and `graph_expand` follows
+    /// links regardless of metadata, so without this a Dense or Hybrid recall
+    /// silently ignores `category` (and `type`/`topic_path`/`workspace_hash`/
+    /// `agent_id`/`min_decay`/`always_on`) — returning cross-category hits even
+    /// when the caller scoped the query (#467). `layer` and `archived` are
+    /// already applied (retain_layer / dense_search) and are not repeated here.
+    fn retain_metadata_filters(entities: &mut Vec<Entity>, params: &RecallParams) {
+        match params.category.as_deref() {
+            Some(cat) if !cat.is_empty() => entities.retain(|e| e.category == cat),
+            // #298/#525: with no explicit category, hide the high-volume
+            // free-form categories (default: conversation), matching fts5_search.
+            _ => {
+                let excluded = excluded_recall_categories();
+                entities.retain(|e| !excluded.iter().any(|c| c == &e.category));
+            }
+        }
+        if let Some(ref t) = params.entity_type {
+            if !t.is_empty() {
+                entities.retain(|e| e.entity_type == *t);
+            }
+        }
+        if params.min_decay > 0.0 {
+            entities.retain(|e| e.decay_score >= params.min_decay);
+        }
+        if let Some(ref tp) = params.topic_path {
+            if !tp.is_empty() {
+                entities.retain(|e| e.topic_path.starts_with(tp.as_str()));
+            }
+        }
+        if let Some(ao) = params.always_on {
+            entities.retain(|e| e.always_on == ao);
+        }
+        if let Some(ref ws) = params.workspace_hash {
+            entities.retain(|e| e.workspace_hash == *ws);
+        }
+        if let Some(ref aid) = params.agent_id {
+            entities.retain(|e| e.agent_id == *aid);
+        }
+    }
+
     pub fn recall(&self, params: &RecallParams) -> Result<Vec<Entity>, Box<dyn std::error::Error>> {
         // Dense vector search path
         if params.mode == crate::models::SearchMode::Dense
@@ -3073,10 +3115,19 @@ impl Database {
             if let Some(query_vec) = query_vec {
                 if params.mode == crate::models::SearchMode::Dense {
                     // Clamp negative limits to 0 before the usize cast (a negative
-                    // i64 would wrap to a huge usize). Matches the Hybrid path below.
-                    let dense_results = self.dense_search(query_vec, params.limit.max(0) as usize)?;
+                    // i64 would wrap to a huge usize). Over-fetch a candidate pool,
+                    // apply the same metadata predicates the FTS SQL enforces
+                    // (dense_search only filters archived/embedding), then truncate
+                    // to `limit`. Without the post-filter a Dense recall silently
+                    // ignores category/type/topic_path/workspace/etc. (#467).
+                    let limit = params.limit.max(0) as usize;
+                    let candidate_k =
+                        limit.saturating_mul(5).clamp(1, 1000).max(limit.min(1000));
+                    let dense_results = self.dense_search(query_vec, candidate_k)?;
                     let mut out: Vec<Entity> = dense_results.into_iter().map(|(e, _)| e).collect();
                     Self::retain_layer(&mut out, params);
+                    Self::retain_metadata_filters(&mut out, params);
+                    out.truncate(limit);
                     self.reinforce_if_requested(params, &out)?;
                     return Ok(out);
                 }
@@ -3132,7 +3183,10 @@ impl Database {
                         &dense_scored,
                         &sparse_scored,
                         60.0,
-                        limit,
+                        // Over-fetch to the candidate pool; the metadata
+                        // post-filter below drops out-of-scope hits before the
+                        // final truncate to `limit` (#467).
+                        candidate_k,
                         sparse_weight,
                         params.recency_half_life_secs,
                         now_ms(),
@@ -3157,7 +3211,7 @@ impl Database {
                         &dense_sparse,
                         &graph_scored,
                         60.0,
-                        limit,
+                        candidate_k,
                         graph_weight,
                         params.recency_half_life_secs,
                         now_ms(),
@@ -3165,6 +3219,13 @@ impl Database {
                 };
                 let mut out: Vec<Entity> = fused.into_iter().map(|(e, _)| e).collect();
                 Self::retain_layer(&mut out, params);
+                // Apply the same metadata predicates as fts5_search: the dense
+                // and graph arms rank without them, so an unfiltered fuse leaks
+                // cross-category/type/workspace hits (#467). The arms were
+                // over-fetched to candidate_k, so truncating here still fills
+                // `limit` whenever enough in-scope hits exist.
+                Self::retain_metadata_filters(&mut out, params);
+                out.truncate(limit);
                 self.reinforce_if_requested(params, &out)?;
                 return Ok(out);
             }
@@ -12795,6 +12856,61 @@ mod tests {
         let params2 = RecallParams::default();
         let results2 = db.recall(&params2).unwrap();
         assert_eq!(results2.len(), 2);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    // #467: the semantic (Dense/Hybrid) recall paths must honor the `category`
+    // filter just like the FTS path. dense_search/graph_expand rank without the
+    // metadata predicates, so before retain_metadata_filters a category-scoped
+    // Dense or Hybrid recall leaked cross-category hits.
+    #[test]
+    fn dense_and_hybrid_recall_apply_category_filter() {
+        let (db, path) = temp_db();
+        let blob = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|f| f.to_le_bytes()).collect() };
+        let insert = |id: &str, category: &str, key: &str, emb: &[f32]| {
+            db.conn()
+                .unwrap()
+                .execute(
+                    "INSERT INTO entities (id, category, key, body_json, type, status,
+                        retrieval_count, last_accessed_unix_ms, created_at_unix_ms,
+                        decay_score, layer, embedding, archived)
+                     VALUES (?1, ?2, ?3, ?4, 'insight', 'active', 0, 0, 0, 1.0, 'working', ?5, 0)",
+                    params![id, category, key, format!("{{\"k\":\"{}\"}}", key), blob(emb)],
+                )
+                .unwrap();
+        };
+        // Two near-identical embeddings in different categories: a naive dense
+        // ranking would surface both, so the category filter is what matters.
+        insert("op-1", "opportunity", "grant", &[1.0, 0.0, 0.0]);
+        insert("infra-1", "infrastructure", "server", &[0.99, 0.01, 0.0]);
+
+        let q = vec![1.0f32, 0.0, 0.0];
+        for mode in [
+            crate::models::SearchMode::Dense,
+            crate::models::SearchMode::Hybrid,
+        ] {
+            let params = RecallParams {
+                query: "server grant".to_string(),
+                category: Some("opportunity".to_string()),
+                embedding: Some(q.clone()),
+                mode: mode.clone(),
+                limit: 10,
+                ..RecallParams::default()
+            };
+            let results = db.recall(&params).unwrap();
+            assert!(
+                !results.is_empty(),
+                "{:?}: category-scoped recall should still return the matching entity",
+                mode
+            );
+            assert!(
+                results.iter().all(|e| e.category == "opportunity"),
+                "{:?}: recall must not leak other categories, got {:?}",
+                mode,
+                results.iter().map(|e| e.category.clone()).collect::<Vec<_>>()
+            );
+        }
 
         let _ = fs::remove_file(&path);
     }
