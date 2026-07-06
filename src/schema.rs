@@ -128,10 +128,10 @@ CREATE TABLE IF NOT EXISTS encryption_canary (
     created_at_unix_ms INTEGER NOT NULL
 );
 
--- v15 (2026-07-05): records the audit chain's keying so `set_encryption` can skip
+-- v15 (2026-07-05): records the audit chain keying so set_encryption can skip
 -- the O(journal) rekey when the chain is already keyed under the current key.
--- `key_canary` = HMAC-SHA256(audit_key, fixed label); a match means "already keyed
--- under this key". See docs/audit-chain-keyed-mac-design.md §3.4.
+-- key_canary = HMAC-SHA256(audit_key, fixed label); a match means already-keyed
+-- under this key. See docs/audit-chain-keyed-mac-design.md section 3.4.
 CREATE TABLE IF NOT EXISTS audit_chain_state (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     scheme TEXT NOT NULL,
