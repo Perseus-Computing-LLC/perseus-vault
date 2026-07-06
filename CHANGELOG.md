@@ -21,6 +21,11 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
   rehashes). HMAC is unit-tested against RFC 4231. **Design + limits + reviewer questions:
   `docs/audit-chain-keyed-mac-design.md`.**
 
+## [2.17.5] - 2026-07-06
+
+### Fixed
+- **`recall`'s `category` filter (and `type`/`topic_path`/`workspace_hash`/`agent_id`/`min_decay`/`always_on`) was silently ignored in Dense and Hybrid modes** (#467). `fts5_search` applied these predicates in SQL, but `dense_search` ranked over the raw embedding space (`archived = 0` only) and `graph_expand` followed links regardless of metadata — so a category-scoped recall, including the common no-mode recall that auto-selects Hybrid when embeddings exist, returned cross-category hits. Added `retain_metadata_filters`, mirroring the `fts5_search` WHERE-clause semantics (including the #298/#525 default that hides `conversation` when no category is requested), applied to both semantic paths with over-fetch→filter→truncate so scoped queries still fill `limit`. (#468)
+
 ## [2.17.4] - 2026-07-05
 
 ### Security — housekeeping (2026-07-05 review)
