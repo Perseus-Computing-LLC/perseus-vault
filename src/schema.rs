@@ -461,10 +461,11 @@ fn apply_migrations(conn: &Connection) -> Result<(), Box<dyn std::error::Error>>
     // Pre-v12 chains hashed only (prev_hash, id, created_at_unix_ms), so a
     // journal entry could be moved between workspaces without breaking the
     // chain. The hash now also folds in workspace_hash (stamped since v11).
-    // Recompute existing chains under the new formula so they still verify.
-    // Deterministic + idempotent; runs inside the migration transaction and is
-    // a no-op on a fresh DB (empty journal).
-    crate::db::rehash_audit_chain(conn)?;
+    // (The chain rehash that was here is now performed once in the v15 block —
+    // the v15 formula supersedes v12's, and the migrate function runs every block
+    // top-to-bottom for any DB below SCHEMA_VERSION, so a single final rehash is
+    // sufficient. Doing it here as well would fail on legacy journals that don't
+    // yet have the payload columns the v15 rehash reads.)
     // ── end v12 ──────────────────────────────────────────────────────────
 
     // ── v13: cover the browse ORDER BY tie-break in idx_entities_recall ──
@@ -491,11 +492,8 @@ fn apply_migrations(conn: &Connection) -> Result<(), Box<dyn std::error::Error>>
     // SHA-256 over the same erasure-safe identifying tuple (prev, id,
     // created_at, workspace_hash). Recompute existing chains under the new
     // formula so they verify from here forward. Deterministic + idempotent;
-    // a no-op on a fresh DB (empty journal). (The chain still commits only to
-    // event existence/order/time/workspace — NOT payload content — so `purge`
-    // redaction stays compatible; keying the chain for true tamper-evidence is
-    // the tracked follow-up. See docs/security-review-2026-07-05.md.)
-    crate::db::rehash_audit_chain(conn)?;
+    // a no-op on a fresh DB (empty journal). (Rehash deferred to the v15 block —
+    // see the v12 note; the v15 formula supersedes this one.)
     // ── end v14 ──────────────────────────────────────────────────────────
 
     // ── v15 (2026-07-05 security review): payload commitment + keyed chain ──
@@ -505,6 +503,16 @@ fn apply_migrations(conn: &Connection) -> Result<(), Box<dyn std::error::Error>>
     // HMAC once the encryption key is loaded. Backfills commitments for existing
     // rows. Deterministic + idempotent; no-op on a fresh DB. See
     // docs/audit-chain-keyed-mac-design.md.
+    // Ensure every column the rehash reads exists — a very old (pre-bitemporal)
+    // journal may predate some of them; ensure_column is idempotent.
+    ensure_column(conn, "journal", "event_type", "TEXT DEFAULT 'decision'")?;
+    ensure_column(conn, "journal", "evaluated_json", "TEXT DEFAULT '{}'")?;
+    ensure_column(conn, "journal", "acted_json", "TEXT DEFAULT '{}'")?;
+    ensure_column(conn, "journal", "forward_json", "TEXT DEFAULT '{}'")?;
+    ensure_column(conn, "journal", "category", "TEXT DEFAULT ''")?;
+    ensure_column(conn, "journal", "key", "TEXT DEFAULT ''")?;
+    ensure_column(conn, "journal", "entity_id", "TEXT DEFAULT ''")?;
+    ensure_column(conn, "journal", "agent_id", "TEXT DEFAULT ''")?;
     ensure_column(conn, "journal", "payload_commitment", "TEXT DEFAULT ''")?;
     crate::db::rehash_audit_chain(conn)?;
     // ── end v15 ──────────────────────────────────────────────────────────
