@@ -425,14 +425,32 @@ impl Database {
         self.verify_or_init_canary(&mgr)?;
         self.encryption = Some(mgr);
         // Key is now available → (re)key the journal audit chain to HMAC so it is
-        // tamper-evident (docs/audit-chain-keyed-mac-design.md §3.3). Idempotent:
-        // re-running under the same key yields identical hashes. NOTE: this runs
-        // on every encrypted open; the design's canary-gated skip (§3.4) is a
-        // tracked optimization, not required for correctness.
+        // tamper-evident (docs/audit-chain-keyed-mac-design.md §3.3–3.4). The
+        // audit-key canary lets us skip the O(journal) rekey when the chain is
+        // already keyed under this key: rekey only happens once (first encrypted
+        // open after upgrade, or a key change), not on every open.
         if let Some(key) = self.audit_key() {
             let conn = self.conn().map_err(|e| e.to_string())?;
-            crate::db::rehash_audit_chain_keyed(&conn, Some(&key))
-                .map_err(|e| format!("audit-chain rekey failed: {}", e))?;
+            let canary = crate::db::audit_key_canary(&key);
+            let stored: Option<String> = conn
+                .query_row(
+                    "SELECT key_canary FROM audit_chain_state WHERE id = 1",
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(|e| e.to_string())?;
+            if stored.as_deref() != Some(canary.as_str()) {
+                // Not yet keyed under this key (first time, or key changed) → rekey.
+                crate::db::rehash_audit_chain_keyed(&conn, Some(&key))
+                    .map_err(|e| format!("audit-chain rekey failed: {}", e))?;
+                conn.execute(
+                    "INSERT OR REPLACE INTO audit_chain_state \
+                     (id, scheme, key_canary, updated_at_unix_ms) VALUES (1, ?1, ?2, ?3)",
+                    params!["hmac-sha256-v1", canary, now_ms()],
+                )
+                .map_err(|e| e.to_string())?;
+            }
         }
         Ok(())
     }
@@ -8616,6 +8634,14 @@ pub(crate) fn audit_chain_mac(
         Some(k) => digest_to_hex(hmac_sha256(k, &framed)),
         None => digest_to_hex(framed),
     }
+}
+
+/// Canary for the audit key: `HMAC-SHA256(audit_key, fixed-label)`. Stored in
+/// `audit_chain_state.key_canary`; a match on `set_encryption` means the chain is
+/// already keyed under this key, so the O(journal) rekey can be skipped
+/// (docs/audit-chain-keyed-mac-design.md §3.4). Reveals nothing about the key.
+pub(crate) fn audit_key_canary(audit_key: &[u8; 32]) -> String {
+    digest_to_hex(hmac_sha256(audit_key, b"perseus-vault/audit-canary/v1"))
 }
 
 /// #433 M2: recompute the whole audit chain under the workspace-bound hash
@@ -18692,6 +18718,15 @@ mod tests {
         assert_ne!(hk1, h, "keyed MAC must differ from unkeyed hash");
         assert_ne!(hk1, audit_chain_mac(Some(&k2), "genesis", "evt-1", 1_700_000_000_000, "wsA", c));
         assert_eq!(hk1.len(), 64);
+    }
+
+    #[test]
+    fn audit_key_canary_is_deterministic_and_key_sensitive() {
+        let c1 = audit_key_canary(&[1u8; 32]);
+        assert_eq!(c1.len(), 64);
+        assert!(c1.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(c1, audit_key_canary(&[1u8; 32]), "same key -> same canary (skip rekey)");
+        assert_ne!(c1, audit_key_canary(&[2u8; 32]), "different key -> different canary (rekey)");
     }
 
     #[test]
