@@ -1,7 +1,19 @@
 # Design: Audit-chain redesign (keyed, payload-binding, verifiable)
 
-Status: **DRAFT — pending owner decision + external cryptographic review**
+Status: **DECIDED (2026-07-06) — implementation GATED on external cryptographic review**
 Tracking: 2026-07-05 security audit deferred item.
+
+## Decisions (2026-07-06)
+
+- **Key management: Option A + floor.** Derive `K_audit` via HKDF from the
+  existing AES-256 master key (`info="perseus-vault/audit/v1"`); when no
+  encryption key is configured, fall back to the unkeyed SHA-256 chain (Option C)
+  and have `verify_audit_chain` / health **report the active mode** so a "keyed
+  audit" guarantee is never claimed for a keyless DB.
+- **Sequencing: design-only now.** This PR lands as design. **No audit-chain code
+  changes until external cryptographic review** of this design completes — then
+  implement the v13→v14 migration. No CMMC / "audit trail" claim is made in the
+  interim.
 
 ## Problem
 
