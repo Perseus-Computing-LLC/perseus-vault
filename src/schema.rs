@@ -96,6 +96,10 @@ CREATE TABLE IF NOT EXISTS journal (
     -- #417: workspace of the referenced entity, stamped at write time so purge
     -- can scope journal redaction per-workspace. '' = system event or legacy row.
     workspace_hash TEXT NOT NULL DEFAULT '',
+    -- v15 (2026-07-05): SHA-256 commitment over the payload, covered by the audit
+    -- chain so content tampering is detectable while the payload can still be
+    -- redacted (the commitment survives). See docs/audit-chain-keyed-mac-design.md.
+    payload_commitment TEXT DEFAULT '',
     created_at_unix_ms INTEGER NOT NULL
 );
 
@@ -173,7 +177,7 @@ CREATE INDEX IF NOT EXISTS idx_entity_history_catkey ON entity_history(category,
 /// the column-add migrations below have been applied. Bump this whenever you add
 /// a new ALTER-probe migration in `initialize_schema`, or existing databases
 /// (already at the previous level) will skip it.
-const SCHEMA_VERSION: i64 = 14;
+const SCHEMA_VERSION: i64 = 15;
 
 /// Initialize the v0.2.0 schema on a fresh database.
 pub fn initialize_schema(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
@@ -493,6 +497,17 @@ fn apply_migrations(conn: &Connection) -> Result<(), Box<dyn std::error::Error>>
     // the tracked follow-up. See docs/security-review-2026-07-05.md.)
     crate::db::rehash_audit_chain(conn)?;
     // ── end v14 ──────────────────────────────────────────────────────────
+
+    // ── v15 (2026-07-05 security review): payload commitment + keyed chain ──
+    // Add the per-entry payload_commitment column and recompute the chain over
+    // (prev, id, created_at, workspace, commitment). At migration time no key is
+    // available, so the rehash is UNKEYED; `set_encryption` later rekeys it to
+    // HMAC once the encryption key is loaded. Backfills commitments for existing
+    // rows. Deterministic + idempotent; no-op on a fresh DB. See
+    // docs/audit-chain-keyed-mac-design.md.
+    ensure_column(conn, "journal", "payload_commitment", "TEXT DEFAULT ''")?;
+    crate::db::rehash_audit_chain(conn)?;
+    // ── end v15 ──────────────────────────────────────────────────────────
 
     // Stamp the migration level so subsequent opens skip the probe block above.
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;

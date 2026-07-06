@@ -5,6 +5,20 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
 
 ## [Unreleased]
 
+### Security — keyed-MAC audit chain + payload commitment (DRAFT, under review)
+- **Keyed, content-committing audit chain** (v14→v15). The journal chain now (a)
+  stores a per-entry SHA-256 **payload commitment** covered by the chain, so content
+  tampering of a non-redacted entry is detected, while `purge` can still erase the
+  payload (the commitment survives); and (b) is a **keyed HMAC-SHA256** when encryption
+  is enabled — tamper-evident against an attacker who can recompute an unkeyed hash.
+  Unencrypted deployments keep the unkeyed SHA-256 chain. Keying happens at
+  `set_encryption` time (the key isn't available during open-time migration).
+  `verify-audit-chain` is scheme-aware and **fails closed** if a keyed chain is
+  verified without the key. Ships a v15 migration (adds `payload_commitment`, backfills,
+  rehashes). HMAC is unit-tested against RFC 4231. **Design + limits + reviewer questions:
+  `docs/audit-chain-keyed-mac-design.md`.** This is the external-review artifact for the
+  audit-chain integrity item; not for merge until reviewed.
+
 ## [2.17.4] - 2026-07-05
 
 ### Security — housekeeping (2026-07-05 review)

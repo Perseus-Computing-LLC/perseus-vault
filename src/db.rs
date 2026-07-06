@@ -424,6 +424,16 @@ impl Database {
         let mgr = EncryptionManager::from_key_file(key_file)?;
         self.verify_or_init_canary(&mgr)?;
         self.encryption = Some(mgr);
+        // Key is now available → (re)key the journal audit chain to HMAC so it is
+        // tamper-evident (docs/audit-chain-keyed-mac-design.md §3.3). Idempotent:
+        // re-running under the same key yields identical hashes. NOTE: this runs
+        // on every encrypted open; the design's canary-gated skip (§3.4) is a
+        // tracked optimization, not required for correctness.
+        if let Some(key) = self.audit_key() {
+            let conn = self.conn().map_err(|e| e.to_string())?;
+            crate::db::rehash_audit_chain_keyed(&conn, Some(&key))
+                .map_err(|e| format!("audit-chain rekey failed: {}", e))?;
+        }
         Ok(())
     }
 
@@ -4020,24 +4030,43 @@ impl Database {
             String::new()
         };
 
-        // Compute audit chain hash over (prev_hash, id, created_at, workspace).
+        // Audit chain: commit to the full payload, then MAC the link over
+        // (prev, id, created_at, workspace, commitment). Keyed (HMAC) when
+        // encryption is enabled, else unkeyed SHA-256. See
+        // docs/audit-chain-keyed-mac-design.md.
         let prev_hash: Option<String> = conn.query_row(
             "SELECT audit_hash FROM journal ORDER BY created_at_unix_ms DESC LIMIT 1",
             [],
             |r| r.get::<_, Option<String>>(0),
         ).unwrap_or(None);
+        let prev = prev_hash.as_deref().unwrap_or("genesis");
 
-        let computed_hash = if let Some(ref prev) = prev_hash {
-            crate::db::sha256_chain(prev, &event.id, event.created_at_unix_ms, &workspace_hash)
-        } else {
-            crate::db::sha256_genesis(&event.id, event.created_at_unix_ms, &workspace_hash)
-        };
+        let commitment = crate::db::audit_payload_commitment(
+            &event.event_type,
+            &event.evaluated_json,
+            &event.acted_json,
+            &event.forward_json,
+            &event.category,
+            &event.key,
+            &event.entity_id,
+            &event.agent_id,
+        );
+        let audit_key = self.audit_key();
+        let computed_hash = crate::db::audit_chain_mac(
+            audit_key.as_ref(),
+            prev,
+            &event.id,
+            event.created_at_unix_ms,
+            &workspace_hash,
+            &commitment,
+        );
 
         conn.execute(
             "INSERT INTO journal
              (id, event_type, evaluated_json, acted_json, forward_json,
-              category, key, entity_id, agent_id, audit_hash, workspace_hash, created_at_unix_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+              category, key, entity_id, agent_id, audit_hash, workspace_hash,
+              payload_commitment, created_at_unix_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 event.id,
                 event.event_type,
@@ -4050,10 +4079,17 @@ impl Database {
                 event.agent_id,
                 computed_hash,
                 workspace_hash,
+                commitment,
                 event.created_at_unix_ms,
             ],
         )?;
         Ok(())
+    }
+
+    /// The audit-chain HMAC key derived from the loaded encryption key, if any.
+    /// `None` → the chain is unkeyed (no secret available); see the design doc.
+    pub(crate) fn audit_key(&self) -> Option<[u8; 32]> {
+        self.encryption.as_ref().map(|e| *e.audit_key())
     }
 
     /// All superseded (historical) versions of a (category, key), newest first.
@@ -8480,34 +8516,106 @@ impl Drop for Database {
 /// payload *commitment* that survives redaction. Both are the tracked follow-up
 /// (see docs/security-review-2026-07-05.md); this change is the incremental,
 /// erasure-compatible hardening.
-fn audit_hash(prev_hash: &str, event_id: &str, created_at_ms: i64, workspace_hash: &str) -> String {
-    use sha2::{Digest, Sha256};
-    fn feed(h: &mut Sha256, field: &[u8]) {
-        h.update((field.len() as u64).to_le_bytes());
-        h.update(field);
-    }
-    let mut hasher = Sha256::new();
-    feed(&mut hasher, prev_hash.as_bytes());
-    feed(&mut hasher, event_id.as_bytes());
-    feed(&mut hasher, &created_at_ms.to_le_bytes());
-    // #433 M2: bind the entry's workspace into the chain so a journal row can't
-    // be silently moved between workspaces without breaking verification.
-    feed(&mut hasher, workspace_hash.as_bytes());
-    let digest = hasher.finalize();
+/// Length-prefixed field framing: `u64_le(len) || bytes`, so adjacent fields can
+/// never be ambiguously concatenated (`("ab","c")` != `("a","bc")`).
+fn audit_feed(h: &mut sha2::Sha256, field: &[u8]) {
+    use sha2::Digest;
+    h.update((field.len() as u64).to_le_bytes());
+    h.update(field);
+}
+
+fn digest_to_hex(bytes: impl AsRef<[u8]>) -> String {
+    use std::fmt::Write as _;
     let mut out = String::with_capacity(64);
-    for b in digest {
-        use std::fmt::Write as _;
+    for b in bytes.as_ref() {
         let _ = write!(out, "{:02x}", b);
     }
     out
 }
 
-fn sha256_chain(prev_hash: &str, event_id: &str, created_at_ms: i64, workspace_hash: &str) -> String {
-    audit_hash(prev_hash, event_id, created_at_ms, workspace_hash)
+/// HMAC-SHA256 (RFC 2104), hand-rolled over `sha2`. Unit-tested against the
+/// RFC 4231 vectors so CI proves correctness (the crate can't be built on the
+/// audit workstation). See docs/audit-chain-keyed-mac-design.md.
+pub(crate) fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    const B: usize = 64; // SHA-256 block size
+    let mut k = [0u8; B];
+    if key.len() > B {
+        k[..32].copy_from_slice(&Sha256::digest(key));
+    } else {
+        k[..key.len()].copy_from_slice(key);
+    }
+    let mut ipad = [0x36u8; B];
+    let mut opad = [0x5cu8; B];
+    for i in 0..B {
+        ipad[i] ^= k[i];
+        opad[i] ^= k[i];
+    }
+    let mut inner = Sha256::new();
+    inner.update(ipad);
+    inner.update(msg);
+    let inner_d = inner.finalize();
+    let mut outer = Sha256::new();
+    outer.update(opad);
+    outer.update(inner_d);
+    outer.finalize().into()
 }
 
-fn sha256_genesis(event_id: &str, created_at_ms: i64, workspace_hash: &str) -> String {
-    audit_hash("genesis", event_id, created_at_ms, workspace_hash)
+/// SHA-256 commitment over the full journal payload (length-prefixed). Stored per
+/// entry and covered by the chain, so content tampering is detectable — while the
+/// raw payload can still be redacted (the commitment survives).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn audit_payload_commitment(
+    event_type: &str,
+    evaluated_json: &str,
+    acted_json: &str,
+    forward_json: &str,
+    category: &str,
+    key: &str,
+    entity_id: &str,
+    agent_id: &str,
+) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    for f in [
+        event_type,
+        evaluated_json,
+        acted_json,
+        forward_json,
+        category,
+        key,
+        entity_id,
+        agent_id,
+    ] {
+        audit_feed(&mut h, f.as_bytes());
+    }
+    digest_to_hex(h.finalize())
+}
+
+/// Audit-chain link hash over (prev, id, created_at, workspace_hash, commitment).
+/// Keyed **HMAC-SHA256** when an audit key is present (tamper-evident vs a
+/// recomputing attacker), else unkeyed **SHA-256** (accidental-corruption /
+/// naive-edit detection only). `prev_hash` is "genesis" for the first entry.
+pub(crate) fn audit_chain_mac(
+    audit_key: Option<&[u8; 32]>,
+    prev_hash: &str,
+    event_id: &str,
+    created_at_ms: i64,
+    workspace_hash: &str,
+    payload_commitment: &str,
+) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    audit_feed(&mut h, prev_hash.as_bytes());
+    audit_feed(&mut h, event_id.as_bytes());
+    audit_feed(&mut h, &created_at_ms.to_le_bytes());
+    audit_feed(&mut h, workspace_hash.as_bytes());
+    audit_feed(&mut h, payload_commitment.as_bytes());
+    let framed = h.finalize(); // 32-byte digest of the framed fields
+    match audit_key {
+        Some(k) => digest_to_hex(hmac_sha256(k, &framed)),
+        None => digest_to_hex(framed),
+    }
 }
 
 /// #433 M2: recompute the whole audit chain under the workspace-bound hash
@@ -8517,36 +8625,65 @@ fn sha256_genesis(event_id: &str, created_at_ms: i64, workspace_hash: &str) -> S
 /// `audit_hash` is recomputed from its (now workspace-bound) inputs and written
 /// back by `rowid`. Deterministic and idempotent — re-running yields identical
 /// hashes and is a no-op on an already-v12 chain.
-pub(crate) fn rehash_audit_chain(
+/// Recompute the whole audit chain under the current (v15) formula: per-entry
+/// payload commitment + a chain MAC over (prev, id, created_at, workspace,
+/// commitment). Keyed with `audit_key` (HMAC) when provided, else unkeyed
+/// SHA-256. Called with `None` from the v15 migration (no key yet at open time)
+/// and with `Some(key)` from `set_encryption` to rekey. For a **redacted** row
+/// (event_type='redacted') the stored `payload_commitment` is preserved as-is
+/// (the payload is gone); otherwise the commitment is recomputed from the payload.
+/// Deterministic + idempotent. See docs/audit-chain-keyed-mac-design.md.
+pub(crate) fn rehash_audit_chain_keyed(
     conn: &rusqlite::Connection,
+    audit_key: Option<&[u8; 32]>,
 ) -> Result<i64, Box<dyn std::error::Error>> {
     let mut stmt = conn.prepare(
-        "SELECT rowid, id, created_at_unix_ms, COALESCE(workspace_hash, '') \
+        "SELECT rowid, id, created_at_unix_ms, COALESCE(workspace_hash, ''), \
+                COALESCE(event_type,''), COALESCE(evaluated_json,''), \
+                COALESCE(acted_json,''), COALESCE(forward_json,''), \
+                COALESCE(category,''), COALESCE(key,''), COALESCE(entity_id,''), \
+                COALESCE(agent_id,''), COALESCE(payload_commitment,'') \
          FROM journal WHERE audit_hash != '' \
          ORDER BY created_at_unix_ms ASC, rowid ASC",
     )?;
-    let rows: Vec<(i64, String, i64, String)> = stmt
-        .query_map([], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+    let rows: Vec<(i64, String, i64, String, String, String, String, String, String, String, String, String, String)> =
+        stmt.query_map([], |r| {
+            Ok((
+                r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?,
+                r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?, r.get(10)?, r.get(11)?, r.get(12)?,
+            ))
         })?
         .collect::<Result<_, _>>()?;
     drop(stmt);
 
-    let mut prev_hash: Option<String> = None;
+    let mut prev_hash = String::from("genesis");
     let mut n = 0i64;
-    for (rowid, id, ts, ws) in rows {
-        let h = match prev_hash {
-            Some(ref prev) => sha256_chain(prev, &id, ts, &ws),
-            None => sha256_genesis(&id, ts, &ws),
+    for (rowid, id, ts, ws, etype, ev, ac, fw, cat, key, eid, aid, stored_commit) in rows {
+        // A redacted row's payload is gone; keep its stored commitment. Otherwise
+        // (re)derive it from the payload so a v14 row without one gets backfilled.
+        let commitment = if etype == "redacted" && !stored_commit.is_empty() {
+            stored_commit
+        } else {
+            audit_payload_commitment(&etype, &ev, &ac, &fw, &cat, &key, &eid, &aid)
         };
+        let h = audit_chain_mac(audit_key, &prev_hash, &id, ts, &ws, &commitment);
         conn.execute(
-            "UPDATE journal SET audit_hash = ?1 WHERE rowid = ?2",
-            params![h, rowid],
+            "UPDATE journal SET audit_hash = ?1, payload_commitment = ?2 WHERE rowid = ?3",
+            params![h, commitment, rowid],
         )?;
-        prev_hash = Some(h);
+        prev_hash = h;
         n += 1;
     }
     Ok(n)
+}
+
+/// v14-compatibility shim: the schema migration path calls `rehash_audit_chain`.
+/// At migration time no key is available, so the chain is rehashed **unkeyed**;
+/// `set_encryption` later rekeys it via `rehash_audit_chain_keyed(Some(key))`.
+pub(crate) fn rehash_audit_chain(
+    conn: &rusqlite::Connection,
+) -> Result<i64, Box<dyn std::error::Error>> {
+    rehash_audit_chain_keyed(conn, None)
 }
 
 /// #398: deterministic fold for history-tombstone digests — chained over each
@@ -8577,34 +8714,62 @@ fn history_retention_digest(
 /// subcommand (2026-07-05 security review) so operators can actually run it.
 pub fn verify_audit_chain(db: &Database) -> Result<i64, String> {
     let conn = db.conn().map_err(|e| format!("connection: {}", e))?;
+    // v15: the chain MACs a per-entry payload commitment and is keyed with the
+    // audit key (HMAC) when encryption is enabled. Verifying a keyed chain
+    // requires the key — fail CLOSED (never a false pass) if it is absent.
+    let audit_key = db.audit_key();
     let mut stmt = conn.prepare(
-        "SELECT id, audit_hash, created_at_unix_ms, COALESCE(workspace_hash, '') \
+        "SELECT id, audit_hash, created_at_unix_ms, COALESCE(workspace_hash, ''), \
+                COALESCE(event_type,''), COALESCE(evaluated_json,''), \
+                COALESCE(acted_json,''), COALESCE(forward_json,''), \
+                COALESCE(category,''), COALESCE(key,''), COALESCE(entity_id,''), \
+                COALESCE(agent_id,''), COALESCE(payload_commitment,'') \
          FROM journal WHERE audit_hash != '' \
          ORDER BY created_at_unix_ms ASC, rowid ASC",
     ).map_err(|e| format!("prepare: {}", e))?;
 
     let rows = stmt.query_map([], |r| {
-        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?, r.get::<_, String>(3)?))
+        Ok((
+            r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?,
+            r.get::<_, String>(3)?, r.get::<_, String>(4)?, r.get::<_, String>(5)?,
+            r.get::<_, String>(6)?, r.get::<_, String>(7)?, r.get::<_, String>(8)?,
+            r.get::<_, String>(9)?, r.get::<_, String>(10)?, r.get::<_, String>(11)?,
+            r.get::<_, String>(12)?,
+        ))
     }).map_err(|e| format!("query: {}", e))?;
 
     let mut count = 0i64;
-    let mut prev_hash: Option<String> = None;
+    let mut prev_hash = String::from("genesis");
     for row in rows {
-        let (id, stored_hash, ts, ws) = row.map_err(|e| format!("row: {}", e))?;
-        // #433 M2: workspace_hash is part of the hashed tuple, so a moved entry
-        // (different workspace_hash) recomputes to a different expected hash.
-        let expected = if let Some(ref prev) = prev_hash {
-            sha256_chain(prev, &id, ts, &ws)
-        } else {
-            sha256_genesis(&id, ts, &ws)
-        };
+        let (id, stored_hash, ts, ws, etype, ev, ac, fw, cat, key, eid, aid, stored_commit) =
+            row.map_err(|e| format!("row: {}", e))?;
+        // For a live (non-redacted) entry, the stored commitment must match the
+        // payload — detects content tampering. A redacted entry's payload is gone,
+        // so its commitment is accepted as stored (still covered by the chain MAC).
+        if etype != "redacted" {
+            let expect_commit =
+                audit_payload_commitment(&etype, &ev, &ac, &fw, &cat, &key, &eid, &aid);
+            if expect_commit != stored_commit {
+                return Err(format!(
+                    "audit chain broken at journal entry '{}': payload does not match \
+                     its commitment (content was altered)",
+                    id
+                ));
+            }
+        }
+        let expected = audit_chain_mac(audit_key.as_ref(), &prev_hash, &id, ts, &ws, &stored_commit);
         if expected != stored_hash {
             return Err(format!(
-                "audit chain broken at journal entry '{}': expected {} but stored {}",
-                id, expected, stored_hash
+                "audit chain broken at journal entry '{}': link MAC mismatch{}",
+                id,
+                if audit_key.is_none() {
+                    " (chain may be keyed — verify with the encryption key)"
+                } else {
+                    ""
+                }
             ));
         }
-        prev_hash = Some(stored_hash);
+        prev_hash = stored_hash;
         count += 1;
     }
     Ok(count)
@@ -18509,19 +18674,47 @@ mod tests {
     }
 
     #[test]
-    fn audit_hash_is_sha256_hex_not_64bit_siphash() {
-        // v14 (2026-07-05 security review): the chain link is now a full SHA-256
-        // (64 lowercase hex chars), not the pre-v14 16-hex 64-bit DefaultHasher.
-        let h = audit_hash("genesis", "evt-1", 1_700_000_000_000, "wsA");
+    fn audit_chain_mac_is_sha256_hex_and_field_sensitive() {
+        // v15: unkeyed link is a full SHA-256 (64 hex), sensitive to every field.
+        let c = "commit";
+        let h = audit_chain_mac(None, "genesis", "evt-1", 1_700_000_000_000, "wsA", c);
         assert_eq!(h.len(), 64, "expected 64 hex chars (SHA-256), got {}", h.len());
         assert!(h.chars().all(|c| c.is_ascii_hexdigit()), "must be hex: {}", h);
-        // Deterministic, and sensitive to every hashed field.
-        assert_eq!(h, audit_hash("genesis", "evt-1", 1_700_000_000_000, "wsA"));
-        assert_ne!(h, audit_hash("genesis", "evt-1", 1_700_000_000_000, "wsB"));
-        assert_ne!(h, audit_hash("genesis", "evt-2", 1_700_000_000_000, "wsA"));
-        assert_ne!(h, audit_hash("other", "evt-1", 1_700_000_000_000, "wsA"));
-        // Length-prefix framing: ("ab","c") must not collide with ("a","bc").
-        assert_ne!(audit_hash("ab", "c", 0, ""), audit_hash("a", "bc", 0, ""));
+        assert_eq!(h, audit_chain_mac(None, "genesis", "evt-1", 1_700_000_000_000, "wsA", c));
+        assert_ne!(h, audit_chain_mac(None, "genesis", "evt-1", 1_700_000_000_000, "wsB", c));
+        assert_ne!(h, audit_chain_mac(None, "genesis", "evt-2", 1_700_000_000_000, "wsA", c));
+        assert_ne!(h, audit_chain_mac(None, "prev", "evt-1", 1_700_000_000_000, "wsA", c));
+        assert_ne!(h, audit_chain_mac(None, "genesis", "evt-1", 1_700_000_000_000, "wsA", "other"));
+        // Keyed (HMAC) differs from unkeyed, and is key-sensitive.
+        let k1 = [1u8; 32];
+        let k2 = [2u8; 32];
+        let hk1 = audit_chain_mac(Some(&k1), "genesis", "evt-1", 1_700_000_000_000, "wsA", c);
+        assert_ne!(hk1, h, "keyed MAC must differ from unkeyed hash");
+        assert_ne!(hk1, audit_chain_mac(Some(&k2), "genesis", "evt-1", 1_700_000_000_000, "wsA", c));
+        assert_eq!(hk1.len(), 64);
+    }
+
+    #[test]
+    fn hmac_sha256_matches_rfc4231_vector() {
+        // RFC 4231 Test Case 2: key="Jefe", data="what do ya want for nothing?".
+        let mac = hmac_sha256(b"Jefe", b"what do ya want for nothing?");
+        assert_eq!(
+            digest_to_hex(mac),
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
+    }
+
+    #[test]
+    fn audit_payload_commitment_detects_content_change_and_frames() {
+        let a = audit_payload_commitment("decision", "{\"x\":1}", "{}", "{}", "c", "k", "", "ag");
+        assert_eq!(a.len(), 64);
+        // Any payload field change moves the commitment.
+        assert_ne!(a, audit_payload_commitment("decision", "{\"x\":2}", "{}", "{}", "c", "k", "", "ag"));
+        // Length-prefix framing: field-boundary shifts don't collide.
+        assert_ne!(
+            audit_payload_commitment("a", "b", "", "", "", "", "", ""),
+            audit_payload_commitment("", "ab", "", "", "", "", "", ""),
+        );
     }
 }
 
