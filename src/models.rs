@@ -658,9 +658,21 @@ pub struct StateDigest {
 #[derive(Debug, Clone, Serialize)]
 pub struct Stats {
     pub total_entities: i64,
+    /// #493: entities with archived = 0 — the set every user-facing read
+    /// (list_entities, count_entities, recall) already operates on.
+    /// `total_entities` stays archived-inclusive for compatibility.
+    pub active_entities: i64,
+    /// #493: entities with archived = 1 (forgotten/decayed), so consumers
+    /// can show "N hidden" instead of a silently inflated total.
+    pub archived_entities: i64,
     pub by_category: serde_json::Value,
     pub by_type: serde_json::Value,
     pub by_layer: serde_json::Value,
+    /// #493: grouped counts restricted to active (archived = 0) rows; the
+    /// unsuffixed groups above remain archived-inclusive for compatibility.
+    pub by_category_active: serde_json::Value,
+    pub by_type_active: serde_json::Value,
+    pub by_layer_active: serde_json::Value,
     pub total_journal_events: i64,
     pub total_state_entries: i64,
     pub db_file_size_bytes: u64,

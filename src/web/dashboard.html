@@ -64,6 +64,7 @@
   }
   .stat-card .label { font-size: 12px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.5px; }
   .stat-card .value { font-size: 28px; font-weight: 700; margin-top: 4px; }
+  .stat-card .sub { font-size: 11px; color: var(--text-dim); margin-top: 2px; }
   .tabs {
     display: flex;
     gap: 2px;
@@ -140,7 +141,7 @@
 </header>
 <main>
   <div class="stats-row" id="stats-row">
-    <div class="stat-card"><div class="label">Entities</div><div class="value" id="stat-total">—</div></div>
+    <div class="stat-card"><div class="label">Entities</div><div class="value" id="stat-total">—</div><div class="sub" id="stat-archived"></div></div>
     <div class="stat-card"><div class="label">Journal</div><div class="value" id="stat-journal">—</div></div>
     <div class="stat-card"><div class="label">State</div><div class="value" id="stat-state">—</div></div>
     <div class="stat-card"><div class="label">DB Size</div><div class="value" id="stat-size">—</div></div>
@@ -182,7 +183,13 @@ async function api(url) {
 
 async function loadStats() {
   const s = await api('/api/stats');
-  document.getElementById('stat-total').textContent = s.total_entities || 0;
+  // #493: prefer the active-only count — archived (forgotten/decayed) rows
+  // are invisible to list/recall, so counting them inflates every number a
+  // user sees. Fall back to total_entities for servers without the field.
+  document.getElementById('stat-total').textContent =
+    (s.active_entities ?? s.total_entities) || 0;
+  document.getElementById('stat-archived').textContent =
+    s.archived_entities > 0 ? '+' + s.archived_entities + ' archived' : '';
   document.getElementById('stat-journal').textContent = s.total_journal_events || 0;
   document.getElementById('stat-state').textContent = s.total_state_entries || 0;
   const bytes = s.db_file_size_bytes || 0;

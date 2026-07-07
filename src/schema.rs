@@ -753,10 +753,23 @@ pub fn migrate_from_v0_1(
 /// Gather database statistics across all tables.
 pub fn gather_stats(conn: &Connection, db_path: &str) -> Result<Stats, Box<dyn std::error::Error>> {
     let total_entities: i64 = conn.query_row("SELECT COUNT(*) FROM entities", [], |r| r.get(0))?;
+    // #493: active/archived split. Every user-facing read path (list_entities,
+    // count_entities, recall) filters archived = 0, so stats must expose the
+    // same view; total_entities stays archived-inclusive for compatibility.
+    let active_entities: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM entities WHERE archived = 0",
+        [],
+        |r| r.get(0),
+    )?;
+    let archived_entities = total_entities - active_entities;
 
-    let by_category = query_grouped_counts(conn, "entities", "category")?;
-    let by_type = query_grouped_counts(conn, "entities", "type")?;
-    let by_layer = query_grouped_counts(conn, "entities", "layer")?;
+    let by_category = query_grouped_counts(conn, "entities", "category", "")?;
+    let by_type = query_grouped_counts(conn, "entities", "type", "")?;
+    let by_layer = query_grouped_counts(conn, "entities", "layer", "")?;
+    let by_category_active =
+        query_grouped_counts(conn, "entities", "category", "WHERE archived = 0")?;
+    let by_type_active = query_grouped_counts(conn, "entities", "type", "WHERE archived = 0")?;
+    let by_layer_active = query_grouped_counts(conn, "entities", "layer", "WHERE archived = 0")?;
 
     let total_journal: i64 = conn.query_row("SELECT COUNT(*) FROM journal", [], |r| r.get(0))?;
 
@@ -823,9 +836,14 @@ pub fn gather_stats(conn: &Connection, db_path: &str) -> Result<Stats, Box<dyn s
 
     Ok(Stats {
         total_entities,
+        active_entities,
+        archived_entities,
         by_category,
         by_type,
         by_layer,
+        by_category_active,
+        by_type_active,
+        by_layer_active,
         total_journal_events: total_journal,
         total_state_entries: total_state,
         db_file_size_bytes: db_size,
@@ -843,10 +861,11 @@ fn query_grouped_counts(
     conn: &Connection,
     table: &str,
     column: &str,
+    where_sql: &str,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     let sql = format!(
-        "SELECT {}, COUNT(*) FROM {} GROUP BY {} ORDER BY COUNT(*) DESC",
-        column, table, column
+        "SELECT {}, COUNT(*) FROM {} {} GROUP BY {} ORDER BY COUNT(*) DESC",
+        column, table, where_sql, column
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map([], |r| {
@@ -1650,6 +1669,44 @@ mod tests {
         let stats = gather_stats(&conn, &path).unwrap();
         assert_eq!(stats.total_entities, 1);
         assert!(stats.db_file_size_bytes > 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn gather_stats_splits_active_and_archived_counts() {
+        // #493: total_entities counted archived rows with no active-only
+        // counterpart, so every user-visible number was inflated relative to
+        // what list/count/recall (all archived = 0) actually return.
+        let (conn, path) = temp_db();
+        initialize_schema(&conn).expect("init schema");
+
+        let now = now_ms();
+        for (id, key, category, archived) in [
+            ("mem-1", "k1", "decision", 0),
+            ("mem-2", "k2", "decision", 0),
+            ("mem-3", "k3", "decision", 1),
+            ("mem-4", "k4", "insight", 1),
+        ] {
+            conn.execute(
+                "INSERT INTO entities (id, category, key, body_json, archived,
+                                       created_at_unix_ms, last_accessed_unix_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![id, category, key, "{}", archived, now, now],
+            )
+            .unwrap();
+        }
+
+        let stats = gather_stats(&conn, &path).unwrap();
+        // Compatibility: the unsuffixed fields stay archived-inclusive.
+        assert_eq!(stats.total_entities, 4);
+        assert_eq!(stats.by_category["decision"], 3);
+        assert_eq!(stats.by_category["insight"], 1);
+        // New additive fields expose the view recall/list actually serve.
+        assert_eq!(stats.active_entities, 2);
+        assert_eq!(stats.archived_entities, 2);
+        assert_eq!(stats.by_category_active["decision"], 2);
+        assert!(stats.by_category_active.get("insight").is_none());
+
         let _ = std::fs::remove_file(&path);
     }
 }
