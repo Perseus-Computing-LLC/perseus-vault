@@ -21,6 +21,11 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
   rehashes). HMAC is unit-tested against RFC 4231. **Design + limits + reviewer questions:
   `docs/audit-chain-keyed-mac-design.md`.**
 
+## [2.18.0] - 2026-07-07
+
+### Added
+- **Temporal RAG — point-in-time semantic recall** (#472). `recall` now accepts `as_of_unix_ms`, a transaction-time instant: semantic search reconstructs *what was believed at T* — each hit's body is the version that was live at that instant, and corrections recorded later do not leak into the T-view. Combine with `valid_at` for the full bi-temporal cell. Hits are stamped with `is_live_version` / `recorded_at_unix_ms` / `valid_from_unix_ms` / `valid_to_unix_ms`; absent `as_of`, output is unchanged. Additive post-ranking reconstruction (new `Database::as_of_version()` + `temporal_resolve()`) over the hardened bi-temporal engine (#470) — the ranking path is untouched. Transaction-time *ranked* recall is unclaimed territory among agent-memory systems; the compliance story is "reproduce the exact retrieval context the agent had at decision time." v1 note: candidate generation is over the live index, so a fact fully deleted since T won't surface; `valid_at` full reconstruction, `ask`/`global_recall` threading, and the temporal benchmark are follow-ups tracked on #472. Spec: `docs/specs/temporal-rag.md`. (#478)
+
 ## [2.17.5] - 2026-07-06
 
 ### Fixed
