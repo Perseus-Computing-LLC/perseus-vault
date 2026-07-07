@@ -5,7 +5,29 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
 
 ## [Unreleased]
 
+## [2.19.0] - 2026-07-07
+
 ### Added
+- **One-shot `maintain` CLI verb** (#490). `perseus-vault maintain [--dry-run] [--vacuum] [--db …]`
+  runs the full hands-off hygiene pass (decay tick → conflict re-scan → prune/compact →
+  reindex → optional VACUUM) as a single shell entry point, exiting non-zero on failure so
+  schedulers (cron / Task Scheduler / `perseus scheduler --job maintain`) can alert.
+- **Maintenance dry-run estimates** (#491). `maintain --dry-run` (and the `maintenance` tool's
+  dry-run) now report would-do estimates for vacuum (reclaimable bytes) and reindex, so a
+  report-only first week can show what the pass *would* have done instead of zeros.
+- **In-server maintenance loop** (#492). `serve --maintain-every <hours>` runs the same hygiene
+  pass on a background thread inside the long-lived MCP server — hands-off hygiene with no
+  external scheduler at all. Off unless the flag is passed.
+- **Active-only stats fields** (#493). `gather_stats` counted archived (forgotten/decayed) rows
+  in `total_entities` and every `by_*` group, inflating every number a user sees relative to
+  what `list`/`count`/`recall` (all `archived = 0`) actually return. `Stats` now also carries
+  `active_entities`, `archived_entities`, and `by_category_active`/`by_type_active`/`by_layer_active`;
+  the unsuffixed fields are unchanged for compatibility. The dashboard headline prefers the
+  active count and shows "+N archived" as a muted aside.
+- **"About you" dashboard tab** (#494). Plain-language, trust-annotated, read-only view of what
+  the vault holds — buckets mirror `perseus knows` (perseus#692): About you / Recently learned /
+  Project facts & decisions / Low confidence; ✔/~ verified markers; old conversation/session
+  flotsam collapses into a count line; curation is pointed at `perseus knows --correct/--forget`.
 - **Scope as a ranking multiplier in `recall`** (#485, Belief-Memory-inspired).
   New optional `scope_weight` (0.0–1.0, requires `workspace_hash`): the workspace
   predicate widens from a hard filter to "current workspace OR global (`''`)", with
