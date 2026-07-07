@@ -21,6 +21,11 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
   rehashes). HMAC is unit-tested against RFC 4231. **Design + limits + reviewer questions:
   `docs/audit-chain-keyed-mac-design.md`.**
 
+## [2.18.2] - 2026-07-07
+
+### CI / Release
+- **Hardened `release.yml` against the parallel upload race** (#483). Every recent release (v2.17.5 / v2.18.0 / v2.18.1) lost the full `x86_64-unknown-linux-gnu` asset because the matrix legs each *create-or-upload* to the release via `taiki-e/upload-rust-binary-action` and raced to create it — the loser failed with "release not found", requiring a manual cancel + `gh run rerun`. A new `create-release` job now creates the GitHub Release once up front and `lite`/`full` `needs` it, so every leg only *uploads* (no creation race). Added `timeout-minutes` to the full legs so a wedged runner can't hang the run. No binary/behavior change — the 2.18.2 binary is functionally identical to 2.18.1 (this release also validates the fixed pipeline).
+
 ## [2.18.1] - 2026-07-07
 
 ### Fixed
