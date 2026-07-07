@@ -29,6 +29,36 @@ where
     Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
 }
 
+/// Deserialize `Option<i64>` from a JSON number, a numeric string, or null/absent.
+/// MCP/LLM tool-call clients frequently emit integer arguments as strings (e.g.
+/// `"as_of_unix_ms": "1783400000000"`); without this the value is rejected with
+/// "invalid type: string, expected i64" and the temporal filters are unusable
+/// from those clients. Numbers still deserialize unchanged, so this only widens
+/// what is accepted (backward compatible). Empty/whitespace string = None.
+fn string_or_int_opt<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StrOrInt {
+        Int(i64),
+        Str(String),
+    }
+    Ok(match Option::<StrOrInt>::deserialize(deserializer)? {
+        None => None,
+        Some(StrOrInt::Int(n)) => Some(n),
+        Some(StrOrInt::Str(s)) => {
+            let t = s.trim();
+            if t.is_empty() {
+                None
+            } else {
+                Some(t.parse::<i64>().map_err(serde::de::Error::custom)?)
+            }
+        }
+    })
+}
+
 #[derive(Debug, Deserialize)]
 pub struct RememberArgs {
     pub category: String,
@@ -189,18 +219,19 @@ pub struct RecallArgs {
     /// "as we believed it" at this past instant. Each hit's body is the version
     /// that was live at as_of_unix_ms; corrections recorded later do not leak in.
     /// Combine with valid_at for the full bi-temporal cell. None = live view.
-    #[serde(default)]
+    /// Accepts a number or a numeric string (LLM clients often stringify ints).
+    #[serde(default, deserialize_with = "string_or_int_opt")]
     pub as_of_unix_ms: Option<i64>,
     /// #363: valid-time instant filter — only return facts whose application-
     /// time period [valid_from, valid_to) contains this world-instant.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "string_or_int_opt")]
     pub valid_at: Option<i64>,
     /// #363: valid-time period filter start (pair with valid_to_unix_ms and
     /// valid_op). Ignored when valid_at is set.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "string_or_int_opt")]
     pub valid_from_unix_ms: Option<i64>,
     /// #363: valid-time period filter end (half-open; omit = unbounded).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "string_or_int_opt")]
     pub valid_to_unix_ms: Option<i64>,
     /// #363: SQL:2011 period predicate for the period filter: "overlaps"
     /// (default — periods share an instant) or "contains" (the fact's period
@@ -4480,6 +4511,29 @@ mod tests {
                 result.err()
             );
         }
+    }
+
+    // #472: LLM/MCP clients frequently emit integer tool-call args as strings.
+    // The temporal filters must accept a numeric string as well as a number
+    // (and empty string / null → None), or Temporal RAG is uncallable from
+    // those clients ("invalid type: string, expected i64").
+    #[test]
+    fn recall_args_accept_stringified_temporal_ints() {
+        let v = json!({
+            "query": "test",
+            "as_of_unix_ms": "1783400000000",
+            "valid_at": "1700000000000",
+            "valid_from_unix_ms": 1600000000000i64,
+            "valid_to_unix_ms": ""
+        });
+        let a: RecallArgs = serde_json::from_value(v).expect("stringified temporal ints must parse");
+        assert_eq!(a.as_of_unix_ms, Some(1783400000000));
+        assert_eq!(a.valid_at, Some(1700000000000));
+        assert_eq!(a.valid_from_unix_ms, Some(1600000000000)); // bare number still works
+        assert_eq!(a.valid_to_unix_ms, None); // empty string → None
+        // Non-numeric string is a clear error, not silently dropped.
+        let bad = json!({ "query": "t", "as_of_unix_ms": "notanumber" });
+        assert!(serde_json::from_value::<RecallArgs>(bad).is_err());
     }
 
     #[test]
