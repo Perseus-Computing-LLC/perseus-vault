@@ -7,6 +7,20 @@ use rand::RngCore;
 /// Manages AES-256-GCM encryption for entity body_json.
 pub struct EncryptionManager {
     cipher: Aes256Gcm,
+    /// Subkey derived from the raw encryption key, used to key the journal audit
+    /// chain's HMAC (see docs/audit-chain-keyed-mac-design.md). Domain-separated
+    /// from the AEAD key so the two uses can never collide.
+    audit_key: [u8; 32],
+}
+
+/// Derive the audit-chain MAC subkey from the raw 32-byte encryption key.
+/// `SHA256("perseus-vault/audit-chain/v1\0" || key)` — domain-separated.
+fn derive_audit_key(key_bytes: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(b"perseus-vault/audit-chain/v1\0");
+    h.update(key_bytes);
+    h.finalize().into()
 }
 
 /// Result of attempting to decrypt a stored `body_json` in a possibly-mixed DB
@@ -55,8 +69,15 @@ impl EncryptionManager {
 
         let key = Key::<Aes256Gcm>::from_slice(&key_bytes);
         let cipher = Aes256Gcm::new(key);
+        let audit_key = derive_audit_key(&key_bytes);
 
-        Ok(Self { cipher })
+        Ok(Self { cipher, audit_key })
+    }
+
+    /// The audit-chain HMAC subkey derived from this manager's encryption key.
+    /// Used to key the journal chain (docs/audit-chain-keyed-mac-design.md).
+    pub fn audit_key(&self) -> &[u8; 32] {
+        &self.audit_key
     }
 
     /// Generate a new 256-bit key and return it as a base64 string.
@@ -131,6 +152,7 @@ mod tests {
         let key = Key::<Aes256Gcm>::from_slice(&[7u8; 32]);
         EncryptionManager {
             cipher: Aes256Gcm::new(key),
+            audit_key: derive_audit_key(&[7u8; 32]),
         }
     }
 
@@ -188,6 +210,7 @@ mod tests {
         let ct = m.encrypt("{\"a\":1}", b"cat:key").unwrap();
         let other = EncryptionManager {
             cipher: Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&[9u8; 32])),
+            audit_key: derive_audit_key(&[9u8; 32]),
         };
         match other.decrypt_body(&ct, b"cat:key") {
             BodyDecrypt::AuthFailed(_) => {}

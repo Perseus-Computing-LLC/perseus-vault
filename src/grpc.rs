@@ -339,18 +339,159 @@ pub mod grpc {
         }
     }
 
-    /// Start the gRPC server on the given address. Runs in the current thread
-    /// and blocks until shutdown. For background usage, spawn via std::thread::spawn.
+    /// Default cap on an inbound gRPC message (bytes). Bounds memory a single RPC
+    /// can force the server to buffer, mirroring the HTTP body cap.
+    const DEFAULT_MAX_MSG_BYTES: usize = 4 * 1024 * 1024;
+
+    /// Security configuration for the gRPC server. All fields default to "off"
+    /// so behavior is unchanged unless an operator opts in — but `serve` refuses
+    /// to expose an unauthenticated, non-TLS server on a non-loopback address
+    /// (see the checks below), matching the HTTP `guard_bind` policy.
+    #[derive(Default)]
+    pub struct GrpcSecurity {
+        /// Require `authorization: Bearer <token>` metadata on every RPC.
+        pub auth_token: Option<String>,
+        /// Server identity (PEM cert + key) enabling TLS.
+        pub tls: Option<GrpcTls>,
+        /// Max inbound message size in bytes.
+        pub max_message_bytes: usize,
+    }
+
+    /// TLS material for the gRPC server. `client_ca_pem` enables mutual TLS
+    /// (clients must present a cert chaining to that CA).
+    pub struct GrpcTls {
+        pub cert_pem: Vec<u8>,
+        pub key_pem: Vec<u8>,
+        pub client_ca_pem: Option<Vec<u8>>,
+    }
+
+    impl GrpcSecurity {
+        /// Build config from environment:
+        ///   * `MIMIR_GRPC_AUTH_TOKEN`   — Bearer token clients must present
+        ///   * `MIMIR_GRPC_TLS_CERT` / `MIMIR_GRPC_TLS_KEY` — PEM file paths (TLS)
+        ///   * `MIMIR_GRPC_TLS_CLIENT_CA` — PEM path; presence enables mTLS
+        ///   * `MIMIR_GRPC_MAX_MSG_BYTES` — inbound message cap (default 4 MiB)
+        pub fn from_env() -> Result<Self, Box<dyn std::error::Error>> {
+            let auth_token = std::env::var("MIMIR_GRPC_AUTH_TOKEN")
+                .ok()
+                .filter(|t| !t.is_empty());
+            let tls = match (
+                std::env::var("MIMIR_GRPC_TLS_CERT").ok(),
+                std::env::var("MIMIR_GRPC_TLS_KEY").ok(),
+            ) {
+                (Some(cert), Some(key)) => Some(GrpcTls {
+                    cert_pem: std::fs::read(&cert)
+                        .map_err(|e| format!("gRPC TLS cert {cert}: {e}"))?,
+                    key_pem: std::fs::read(&key)
+                        .map_err(|e| format!("gRPC TLS key {key}: {e}"))?,
+                    client_ca_pem: match std::env::var("MIMIR_GRPC_TLS_CLIENT_CA").ok() {
+                        Some(ca) => Some(
+                            std::fs::read(&ca)
+                                .map_err(|e| format!("gRPC TLS client CA {ca}: {e}"))?,
+                        ),
+                        None => None,
+                    },
+                }),
+                _ => None,
+            };
+            let max_message_bytes = std::env::var("MIMIR_GRPC_MAX_MSG_BYTES")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|&n| n > 0)
+                .unwrap_or(DEFAULT_MAX_MSG_BYTES);
+            Ok(Self {
+                auth_token,
+                tls,
+                max_message_bytes,
+            })
+        }
+    }
+
+    /// Interceptor enforcing a Bearer token on every RPC when one is configured.
+    /// No-op (all RPCs allowed) when `token` is `None`.
+    #[derive(Clone)]
+    pub struct AuthInterceptor {
+        token: Option<Arc<String>>,
+    }
+
+    impl tonic::service::Interceptor for AuthInterceptor {
+        fn call(&mut self, req: Request<()>) -> Result<Request<()>, Status> {
+            let expected = match &self.token {
+                Some(t) => t,
+                None => return Ok(req),
+            };
+            let provided = req
+                .metadata()
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.strip_prefix("Bearer "));
+            match provided {
+                Some(tok) if crate::util::constant_time_str_eq(tok, expected) => Ok(req),
+                _ => Err(Status::unauthenticated("valid Bearer token required")),
+            }
+        }
+    }
+
+    /// Start the gRPC server on the given address using security config from the
+    /// environment. Runs in the current thread and blocks until shutdown.
     pub async fn serve(
         db: Arc<Database>,
         addr: std::net::SocketAddr,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        use tonic::transport::Server;
+        let cfg = GrpcSecurity::from_env()?;
+        serve_with(db, addr, cfg).await
+    }
+
+    /// Start the gRPC server with an explicit security config.
+    pub async fn serve_with(
+        db: Arc<Database>,
+        addr: std::net::SocketAddr,
+        cfg: GrpcSecurity,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use tonic::service::interceptor::InterceptedService;
+        use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
+
+        // Secure-by-default bind guard (mirrors HTTP `guard_bind`): an exposed,
+        // unauthenticated, plaintext gRPC endpoint is a footgun. TLS with a
+        // client CA (mTLS) also counts as authenticated.
+        let authenticated = cfg.auth_token.is_some()
+            || cfg.tls.as_ref().map(|t| t.client_ca_pem.is_some()).unwrap_or(false);
+        if !addr.ip().is_loopback()
+            && !authenticated
+            && std::env::var("MIMIR_ALLOW_INSECURE_BIND").ok().as_deref() != Some("1")
+        {
+            return Err(format!(
+                "refusing to expose gRPC on non-loopback {addr} without auth or mTLS. Set \
+                 MIMIR_GRPC_AUTH_TOKEN, enable mTLS via MIMIR_GRPC_TLS_CLIENT_CA, bind to \
+                 loopback, or set MIMIR_ALLOW_INSECURE_BIND=1 for a trusted network."
+            )
+            .into());
+        }
+
+        let max_msg = if cfg.max_message_bytes > 0 {
+            cfg.max_message_bytes
+        } else {
+            DEFAULT_MAX_MSG_BYTES
+        };
         let svc = MnemeGrpcServer::new(db);
-        Server::builder()
-            .add_service(mneme_server::MnemeServer::new(svc))
-            .serve(addr)
-            .await?;
+        let inner = mneme_server::MnemeServer::new(svc)
+            .max_decoding_message_size(max_msg)
+            .max_encoding_message_size(max_msg);
+        let auth = AuthInterceptor {
+            token: cfg.auth_token.map(Arc::new),
+        };
+        let service = InterceptedService::new(inner, auth);
+
+        let mut builder = Server::builder();
+        if let Some(tls) = cfg.tls {
+            let mut tls_cfg =
+                ServerTlsConfig::new().identity(Identity::from_pem(tls.cert_pem, tls.key_pem));
+            if let Some(ca) = tls.client_ca_pem {
+                tls_cfg = tls_cfg.client_ca_root(Certificate::from_pem(ca));
+            }
+            builder = builder.tls_config(tls_cfg)?;
+        }
+        builder.add_service(service).serve(addr).await?;
         Ok(())
     }
 
@@ -359,6 +500,54 @@ pub mod grpc {
         use super::mneme_server::Mneme;
         use super::*;
         use crate::db::Database;
+        use tonic::service::Interceptor;
+
+        fn bearer_req(token: Option<&str>) -> Request<()> {
+            let mut req = Request::new(());
+            if let Some(t) = token {
+                req.metadata_mut()
+                    .insert("authorization", format!("Bearer {t}").parse().unwrap());
+            }
+            req
+        }
+
+        #[test]
+        fn auth_interceptor_allows_all_when_no_token_configured() {
+            let mut interceptor = AuthInterceptor { token: None };
+            assert!(interceptor.call(bearer_req(None)).is_ok());
+            assert!(interceptor.call(bearer_req(Some("anything"))).is_ok());
+        }
+
+        #[test]
+        fn auth_interceptor_enforces_bearer_token() {
+            let mut interceptor = AuthInterceptor {
+                token: Some(Arc::new("s3cret".to_string())),
+            };
+            // Correct token passes.
+            assert!(interceptor.call(bearer_req(Some("s3cret"))).is_ok());
+            // Wrong or missing token is unauthenticated.
+            let wrong = interceptor.call(bearer_req(Some("nope"))).unwrap_err();
+            assert_eq!(wrong.code(), tonic::Code::Unauthenticated);
+            let missing = interceptor.call(bearer_req(None)).unwrap_err();
+            assert_eq!(missing.code(), tonic::Code::Unauthenticated);
+        }
+
+        #[tokio::test]
+        async fn serve_refuses_insecure_non_loopback_bind() {
+            // Non-loopback + no auth + no mTLS must be refused (env override off).
+            std::env::remove_var("MIMIR_ALLOW_INSECURE_BIND");
+            let (_srv, path) = test_server();
+            let db = Database::open(&path).unwrap();
+            let addr: std::net::SocketAddr = "0.0.0.0:0".parse().unwrap();
+            let err = serve_with(Arc::new(db), addr, GrpcSecurity::default())
+                .await
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("refusing to expose gRPC"),
+                "expected insecure-bind refusal, got: {err}"
+            );
+            let _ = std::fs::remove_file(&path);
+        }
 
         fn test_server() -> (MnemeGrpcServer, String) {
             let path = std::env::temp_dir()

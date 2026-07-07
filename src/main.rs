@@ -5,6 +5,7 @@ mod dedup;
 mod embedding;
 mod encryption;
 mod extraction;
+mod httplimit;
 mod mcp;
 mod models;
 mod multimodal;
@@ -27,9 +28,10 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
 
-    /// SQLite database path (default: $MIMIR_DB_PATH or ~/.mimir/data/perseus-vault.db,
-    /// falling back to an existing ~/.mimir/data/mneme.db or ~/.mimir/data/mimir.db
-    /// from before the Perseus Vault rename). Used when running the server directly
+    /// SQLite database path (default: $PERSEUS_VAULT_DB_PATH / $MIMIR_DB_PATH or
+    /// ~/.perseus-vault/data/perseus-vault.db, falling back to an existing
+    /// ~/.mimir/data/{perseus-vault,mneme,mimir}.db from before the rename).
+    /// Used when running the server directly
     /// without the `serve` subcommand — matches the documented MCP host config:
     /// `perseus-vault --db /path/to/perseus-vault.db`.
     #[arg(long)]
@@ -94,10 +96,11 @@ struct Cli {
     #[arg(long)]
     mcp_token: Option<String>,
 
-    /// Token required for cross-workspace access (v1.2.0). When set, transport
-    /// routes accept this token as workspace authentication.
-    #[arg(long)]
-    workspace_token: Option<String>,
+    // 2026-07-05 security review: the `--workspace-token` flag was removed. It was
+    // documented as "cross-workspace access" auth but NO code ever read it (the
+    // Serve handler destructured it away), so it was a security control that looked
+    // active and wasn't. Transport auth is `--mcp-token`; workspace scoping is a
+    // routing control, not an enforced boundary (see docs/THREAT-MODEL.md).
 
     /// Enable offline / air-gapped mode. Disables the web dashboard, LLM endpoint,
     /// embedding endpoint, and external connectors. All core tools (remember, recall,
@@ -215,9 +218,9 @@ enum Commands {
         #[arg(long)]
         mcp_token: Option<String>,
 
-        /// Token required for cross-workspace access (v1.2.0)
-        #[arg(long)]
-        workspace_token: Option<String>,
+        // 2026-07-05 security review: `--workspace-token` removed — it was a
+        // documented auth flag that no code read (destructured away below). Use
+        // `--mcp-token` for transport auth.
 
         /// Enable offline / air-gapped mode. Disables web dashboard, LLM,
         /// embedding, and connectors. NIST SP 800-53 SC-7 / DoD IL5+ support.
@@ -238,7 +241,8 @@ enum Commands {
 
     /// Generate a new AES-256-GCM encryption key and write it to a file
     Keygen {
-        /// Path to write the key file (default: ~/.mimir/secret.key)
+        /// Path to write the key file (default: ~/.perseus-vault/secret.key, or
+        /// an existing ~/.mimir/secret.key from before the rename)
         #[arg(long, default_value_t = default_key_file())]
         key_file: String,
     },
@@ -254,6 +258,14 @@ enum Commands {
         /// Path to AES-256-GCM encryption key file (base64-encoded, 32 bytes)
         #[arg(long)]
         encryption_key: String,
+    },
+
+    /// Verify the journal audit chain (SHA-256 hash chain over event
+    /// existence/order/time/workspace). Exits non-zero if the chain is broken.
+    VerifyAuditChain {
+        /// SQLite database path
+        #[arg(long, default_value_t = default_db_path())]
+        db: String,
     },
 
     /// Archive (soft-delete) a single entity by category + key
@@ -356,7 +368,7 @@ enum Commands {
     ObsidianSync {
         /// Target Obsidian vault directory (created if needed)
         vault_path: String,
-        /// SQLite database path (defaults to $MIMIR_DB_PATH or ~/.mimir/data/perseus-vault.db)
+        /// SQLite database path (defaults to $PERSEUS_VAULT_DB_PATH / $MIMIR_DB_PATH or ~/.perseus-vault/data/perseus-vault.db)
         #[arg(long)]
         db: Option<String>,
         /// Continuously re-export whenever memory changes
@@ -450,6 +462,7 @@ impl Commands {
             Commands::Write { db, .. }
             | Commands::Serve { db, .. }
             | Commands::RekeyAad { db, .. }
+            | Commands::VerifyAuditChain { db, .. }
             | Commands::Forget { db, .. }
             | Commands::Prune { db, .. }
             | Commands::Decay { db, .. }
@@ -509,11 +522,17 @@ struct DbResolution {
 /// pass `--db` or set `$MIMIR_DB_PATH`.
 ///
 /// Precedence (first existing wins):
-///   1. `~/.mimir/data/perseus-vault.db`  (canonical, current name)
-///   2. `~/.mimir/data/mneme.db`          (pre-rename)
-///   3. `~/.mimir/data/mimir.db`          (pre-rename)
-///   4. `~/mimir.db`                       (legacy single-user install location)
+///   1. `~/.perseus-vault/data/perseus-vault.db`  (canonical, current brand)
+///   2. `~/.mimir/data/perseus-vault.db`          (pre-dir-rename, #427)
+///   3. `~/.mimir/data/mneme.db`                  (pre-rename)
+///   4. `~/.mimir/data/mimir.db`                  (pre-rename)
+///   5. `~/mimir.db`                               (legacy single-user install location)
 /// If none exist, fall back to creating (1), the canonical path.
+///
+/// #427 is a *precedence-only* directory rename: fresh installs land in
+/// `~/.perseus-vault/`, while any existing `~/.mimir/` install keeps being
+/// adopted via the fallback chain — no data is moved. `~/.mimir/` stays in the
+/// chain indefinitely so upgraders are never orphaned.
 ///
 /// Crucially `~/mimir.db` is chosen *before* falling through to create a fresh
 /// canonical DB, so an existing single-user install is picked up instead of
@@ -535,15 +554,18 @@ fn resolve_default_db(
     exists: &dyn Fn(&str) -> bool,
     entity_count: &dyn Fn(&str) -> Option<i64>,
 ) -> DbResolution {
-    let dir = format!("{}/.mimir/data", home);
-    let vault_path = format!("{}/perseus-vault.db", dir);
-    let mneme_path = format!("{}/mneme.db", dir);
-    let mimir_path = format!("{}/mimir.db", dir);
+    let new_dir = format!("{}/.perseus-vault/data", home);
+    let legacy_dir = format!("{}/.mimir/data", home);
+    let vault_path = format!("{}/perseus-vault.db", new_dir); // #427 canonical
+    let legacy_vault_path = format!("{}/perseus-vault.db", legacy_dir);
+    let mneme_path = format!("{}/mneme.db", legacy_dir);
+    let mimir_path = format!("{}/mimir.db", legacy_dir);
     let home_legacy_path = format!("{}/mimir.db", home);
 
     // Ordered candidate list; the first that exists is chosen.
     let candidates = [
         vault_path.clone(),
+        legacy_vault_path,
         mneme_path,
         mimir_path,
         home_legacy_path,
@@ -619,16 +641,24 @@ fn probe_entity_count(path: &str) -> Option<i64> {
 /// emitted separately by `normalize_default_db`, which runs once at real
 /// startup and only when the default path was actually used.
 fn default_db_path() -> String {
+    // #427: PERSEUS_VAULT_DB_PATH is the current-brand override; MIMIR_DB_PATH
+    // stays honored for back-compat (checked second).
+    if let Ok(explicit) = std::env::var("PERSEUS_VAULT_DB_PATH") {
+        return explicit;
+    }
     if let Ok(explicit) = std::env::var("MIMIR_DB_PATH") {
         return explicit;
     }
     let home = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
         .unwrap_or_else(|_| {
-            eprintln!("perseus-vault: could not determine home directory. Set MIMIR_DB_PATH or HOME/USERPROFILE.");
+            eprintln!("perseus-vault: could not determine home directory. Set PERSEUS_VAULT_DB_PATH or HOME/USERPROFILE.");
             std::process::exit(1);
         });
-    let dir = format!("{}/.mimir/data", home);
+    // Create the current-brand canonical data dir for fresh installs. Existing
+    // ~/.mimir installs are still adopted by resolve_default_db via the fallback
+    // chain (this only ever creates an empty dir alongside them).
+    let dir = format!("{}/.perseus-vault/data", home);
     let _ = std::fs::create_dir_all(&dir);
 
     // Path-only here: clap evaluates this eagerly for *every* invocation (even
@@ -652,7 +682,10 @@ fn default_db_path() -> String {
 /// rather than only the handful of sites that used to call `check_legacy_db`.
 fn normalize_default_db(cli: &mut Cli) {
     // Explicit selection (env or top-level `--db`) is never second-guessed.
-    if std::env::var_os("MIMIR_DB_PATH").is_some() || cli.db.is_some() {
+    if std::env::var_os("PERSEUS_VAULT_DB_PATH").is_some()
+        || std::env::var_os("MIMIR_DB_PATH").is_some()
+        || cli.db.is_some()
+    {
         return;
     }
     let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) else {
@@ -698,7 +731,7 @@ fn normalize_default_db(cli: &mut Cli) {
             eprintln!("perseus-vault:    also present (ignored): {}", other);
         }
         eprintln!(
-            "perseus-vault:    pass --db <path> or set MIMIR_DB_PATH to choose explicitly and silence this warning."
+            "perseus-vault:    pass --db <path> or set PERSEUS_VAULT_DB_PATH to choose explicitly and silence this warning."
         );
     }
 
@@ -717,7 +750,76 @@ fn default_key_file() -> String {
     let home = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
         .unwrap_or_else(|_| "/root".to_string());
-    format!("{}/.mimir/secret.key", home)
+    // #427 precedence-only: prefer whichever secret.key already exists so an
+    // existing encrypted install NEVER loses its key (a wrong default would
+    // silently make the vault undecryptable). Fresh installs use the new dir.
+    let new_key = format!("{}/.perseus-vault/secret.key", home);
+    let legacy_key = format!("{}/.mimir/secret.key", home);
+    if std::path::Path::new(&new_key).exists() {
+        new_key
+    } else if std::path::Path::new(&legacy_key).exists() {
+        legacy_key
+    } else {
+        new_key
+    }
+}
+
+/// Best-effort tighten of a key file's ACLs on Windows, which has no umask/0600
+/// equivalent applied at creation (the `#[cfg(unix)]` 0600 path in `Keygen` does
+/// not exist there). Strips inherited ACEs and grants only the current user full
+/// control via `icacls`, so the encryption key is not readable by other local
+/// accounts. Returns false if the file could not be restricted (icacls missing,
+/// USERNAME unset, or a non-zero exit) so the caller can warn.
+#[cfg(windows)]
+fn tighten_windows_key_acls(path: &str) -> bool {
+    let Ok(user) = std::env::var("USERNAME") else {
+        return false;
+    };
+    std::process::Command::new("icacls")
+        .args([path, "/inheritance:r", "/grant:r", &format!("{user}:F")])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// On Windows the key file's ACLs are the operator's responsibility (see
+/// docs/ENCRYPTION.md). Emit a one-line runtime reminder when encryption is
+/// enabled so the exposure is visible at startup, not only in the docs. No-op on
+/// Unix, where `Keygen` creates the file 0600.
+#[allow(unused_variables)]
+fn warn_key_acls_on_windows(key_file: &str) {
+    #[cfg(windows)]
+    {
+        eprintln!(
+            "mimir: NOTE (Windows): key-file ACLs are not enforced by an OS umask. \
+             Ensure {key_file} is readable only by your account, e.g.: \
+             icacls \"{key_file}\" /inheritance:r /grant:r %USERNAME%:F"
+        );
+    }
+}
+
+/// Refuse (by default) to expose an HTTP surface on a non-loopback address with
+/// NO auth token — the "bound to 0.0.0.0 and wide open" footgun. An operator who
+/// intentionally fronts the vault with a trusted network or a proxy that
+/// terminates auth can override with `MIMIR_ALLOW_INSECURE_BIND=1`.
+fn guard_bind(surface: &str, bind_host: &str, has_token: bool) {
+    if has_token || crate::util::host_is_loopback(bind_host) {
+        return;
+    }
+    if std::env::var("MIMIR_ALLOW_INSECURE_BIND").ok().as_deref() == Some("1") {
+        eprintln!(
+            "mimir: WARNING: {surface} is bound to non-loopback {bind_host} with NO auth token \
+             (MIMIR_ALLOW_INSECURE_BIND=1 set — proceeding). Anyone who can reach this port has \
+             full read/write access to the vault."
+        );
+        return;
+    }
+    eprintln!(
+        "mimir: fatal: refusing to expose {surface} on non-loopback address {bind_host} without an \
+         auth token. Set an auth token, bind to 127.0.0.1, or — if the network is trusted (e.g. an \
+         auth-terminating reverse proxy) — set MIMIR_ALLOW_INSECURE_BIND=1."
+    );
+    std::process::exit(1);
 }
 
 /// Open a database for a CLI maintenance command, or exit(1) with a message.
@@ -753,6 +855,32 @@ fn print_json<T: serde::Serialize>(value: &T) {
 /// #272: `perseus-vault doctor` — validate the local install + config and report
 /// which MCP clients Perseus Vault works with. ASCII-only output (cross-platform
 /// console safe).
+/// #433 N4: age in days since the most recent entity/journal write, or `None`
+/// when the DB is empty or unreadable. Uses a read-only connection and
+/// plaintext timestamp columns, so it needs no encryption key.
+fn latest_write_age_days(db_path: &str) -> Option<f64> {
+    let conn = rusqlite::Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .ok()?;
+    let max_of = |sql: &str| -> Option<i64> {
+        conn.query_row(sql, [], |r| r.get::<_, Option<i64>>(0))
+            .ok()
+            .flatten()
+    };
+    let ent =
+        max_of("SELECT MAX(COALESCE(recorded_at_unix_ms, created_at_unix_ms)) FROM entities");
+    let jrn = max_of("SELECT MAX(created_at_unix_ms) FROM journal");
+    let latest = [ent, jrn].into_iter().flatten().max()?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_millis() as i64;
+    let age_ms = (now - latest).max(0);
+    Some(age_ms as f64 / (1000.0 * 60.0 * 60.0 * 24.0))
+}
+
 fn run_doctor(db_path: &str) {
     println!("perseus-vault doctor — v{}", env!("CARGO_PKG_VERSION"));
     match std::env::current_exe() {
@@ -768,6 +896,22 @@ fn run_doctor(db_path: &str) {
         "not yet created (dir made on first run)"
     };
     println!("  database: {} ({})", db_path, db_status);
+
+    // #433 N4: freshness/liveness — surface a stale vault instead of silently
+    // reporting "healthy" while the harvest/writer has quietly stopped. Reads
+    // the most recent write timestamp from plaintext columns, so it needs no
+    // encryption key.
+    if dbp.exists() {
+        const STALE_AFTER_DAYS: f64 = 14.0;
+        match latest_write_age_days(db_path) {
+            Some(days) if days > STALE_AFTER_DAYS => println!(
+                "  freshness: [WARN] last write {:.1} days ago (> {:.0} days) — is the harvest/writer running?",
+                days, STALE_AFTER_DAYS
+            ),
+            Some(days) => println!("  freshness: last write {:.1} days ago", days),
+            None => println!("  freshness: (no writes recorded yet)"),
+        }
+    }
 
     println!("\nMCP stdio config (identical for every client below):");
     println!("  command: perseus-vault");
@@ -1181,9 +1325,34 @@ fn main() {
             }
 
             let key = crate::encryption::EncryptionManager::generate_key();
-            match std::fs::write(&expanded, &key) {
+            // #433 M1: create the key file with 0600 *at creation time* so the
+            // secret is never briefly world-readable in the window between the
+            // write and a follow-up chmod. On Unix, OpenOptions::mode applies
+            // the permission when the inode is created (umask can only remove
+            // bits, never widen past 0600).
+            let write_result: std::io::Result<()> = {
+                #[cfg(unix)]
+                {
+                    use std::io::Write;
+                    use std::os::unix::fs::OpenOptionsExt;
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .create(true)
+                        .truncate(true)
+                        .mode(0o600)
+                        .open(&expanded)
+                        .and_then(|mut f| f.write_all(key.as_bytes()))
+                }
+                #[cfg(not(unix))]
+                {
+                    std::fs::write(&expanded, &key)
+                }
+            };
+            match write_result {
                 Ok(_) => {
-                    // Set restrictive permissions (owner read-only)
+                    // Defense-in-depth: if the path already existed with looser
+                    // perms, create+truncate does not retighten it, so re-assert
+                    // 0600 explicitly.
                     #[cfg(unix)]
                     {
                         use std::os::unix::fs::PermissionsExt;
@@ -1191,6 +1360,21 @@ fn main() {
                             &expanded,
                             std::fs::Permissions::from_mode(0o600),
                         );
+                    }
+                    // Windows has no 0600-at-creation equivalent, so restrict the
+                    // key file's ACLs to the current user here. Warn loudly if that
+                    // fails — the secret would otherwise be readable by other local
+                    // accounts.
+                    #[cfg(windows)]
+                    {
+                        if !tighten_windows_key_acls(&expanded) {
+                            eprintln!(
+                                "mimir: WARNING: could not restrict ACLs on key file {}. \
+                                 Other local users may be able to read your encryption key. \
+                                 Restrict it manually: icacls \"{}\" /inheritance:r /grant:r %USERNAME%:F",
+                                expanded, expanded
+                            );
+                        }
                     }
                     println!("Key written to {}", expanded);
                     println!("Use --encryption-key {} to enable encryption", expanded);
@@ -1222,6 +1406,16 @@ fn main() {
                 }
                 Err(e) => {
                     eprintln!("mimir: rekey-aad failed: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        Some(Commands::VerifyAuditChain { db: ref db_path }) => {
+            let database = open_db_or_exit(db_path);
+            match crate::db::verify_audit_chain(&database) {
+                Ok(n) => println!("audit chain OK: {} entries verified", n),
+                Err(e) => {
+                    eprintln!("mimir: audit chain verification FAILED: {}", e);
                     std::process::exit(1);
                 }
             }
@@ -1603,6 +1797,7 @@ fn main() {
                     std::process::exit(1);
                 }
                 eprintln!("mimir: encryption enabled (key: {})", key_file);
+                warn_key_acls_on_windows(key_file);
             }
 
             // Configure LLM for mimir_ask if endpoint is provided
@@ -1654,6 +1849,7 @@ fn main() {
                 // connectors applied above) instead of opening a SECOND
                 // Database — and second 16-conn pool — on the same file.
                 let web_db = std::sync::Arc::clone(&database);
+                guard_bind("web dashboard", &web_bind_addr, web_auth_token.is_some());
                 let router = crate::web::build_router(web_db, web_auth_token.clone());
                 let addr = format!("{}:{}", web_bind_addr, web_port);
                 eprintln!("mimir: web dashboard starting on http://{}", addr);
@@ -1689,6 +1885,7 @@ fn main() {
             };
 
             if let Some(mode) = tmode {
+                guard_bind("MCP transport", web_bind, mcp_token.is_some());
                 crate::transport::init_transport_state(std::sync::Arc::clone(&database));
                 let transport_router =
                     crate::transport::build_transport_router(mode, mcp_token.clone());
@@ -1751,6 +1948,7 @@ fn main() {
                     std::process::exit(1);
                 }
                 eprintln!("mimir: encryption enabled (key: {})", key_file);
+                warn_key_acls_on_windows(key_file);
             }
 
             if let Some(ref endpoint) = cli.llm_endpoint {
@@ -1789,6 +1987,7 @@ fn main() {
                 let web_port = cli.port;
                 let web_bind_addr = cli.web_bind.clone();
                 let web_db = std::sync::Arc::clone(&database);
+                guard_bind("web dashboard", &web_bind_addr, cli.web_auth_token.is_some());
                 let router = crate::web::build_router(web_db, cli.web_auth_token.clone());
                 let addr = format!("{}:{}", web_bind_addr, web_port);
                 eprintln!("mimir: web dashboard starting on http://{}", addr);
@@ -1824,6 +2023,7 @@ fn main() {
             };
 
             if let Some(mode) = transport_mode {
+                guard_bind("MCP transport", &cli.web_bind, cli.mcp_token.is_some());
                 crate::transport::init_transport_state(std::sync::Arc::clone(&database));
                 let transport_router =
                     crate::transport::build_transport_router(mode, cli.mcp_token.clone());
@@ -2028,11 +2228,38 @@ mod tests {
 
     #[test]
     fn resolve_default_db_falls_back_to_canonical_when_none_exist() {
-        // Fresh install: nothing exists -> create canonical path, no warning.
+        // Fresh install: nothing exists -> create the #427 canonical path under
+        // ~/.perseus-vault/, no warning.
         let home = "/home/tester";
-        let vault = format!("{}/.mimir/data/perseus-vault.db", home);
+        let vault = format!("{}/.perseus-vault/data/perseus-vault.db", home);
         let r = resolve_default_db(home, &present(&[]), &unknown);
         assert_eq!(r.chosen, vault);
+        assert!(r.other_candidates.is_empty());
+    }
+
+    #[test]
+    fn resolve_default_db_427_prefers_new_dir_when_present() {
+        // Both the new ~/.perseus-vault and a legacy ~/.mimir DB exist: the new
+        // canonical dir wins; the legacy one is reported as an also-present.
+        let home = "/home/tester";
+        let new_vault = format!("{}/.perseus-vault/data/perseus-vault.db", home);
+        let legacy_vault = format!("{}/.mimir/data/perseus-vault.db", home);
+        let existing = vec![new_vault.clone(), legacy_vault.clone()];
+        let r = resolve_default_db(home, &present(&existing), &unknown);
+        assert_eq!(r.chosen, new_vault);
+        assert_eq!(r.other_candidates, vec![legacy_vault]);
+    }
+
+    #[test]
+    fn resolve_default_db_427_adopts_legacy_mimir_dir_on_upgrade() {
+        // Upgrade path: only the legacy ~/.mimir DB exists (no ~/.perseus-vault
+        // yet). It must be adopted, NOT shadowed by a fresh empty new-dir DB —
+        // no data is moved.
+        let home = "/home/tester";
+        let legacy_vault = format!("{}/.mimir/data/perseus-vault.db", home);
+        let existing = vec![legacy_vault.clone()];
+        let r = resolve_default_db(home, &present(&existing), &unknown);
+        assert_eq!(r.chosen, legacy_vault);
         assert!(r.other_candidates.is_empty());
     }
 

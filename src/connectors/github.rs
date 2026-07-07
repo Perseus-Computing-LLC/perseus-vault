@@ -73,6 +73,20 @@ impl Connector for GitHubConnector {
 
 impl GitHubConnector {
     fn fetch_repo_issues(&self, repo: &str, since: &str) -> Result<Vec<RawDocument>, String> {
+        // Validate `repo` (operator config) as a strict `owner/name` before
+        // interpolating it into the API URL, so a malformed value can't inject
+        // extra path segments or query parameters against api.github.com.
+        let parts: Vec<&str> = repo.split('/').collect();
+        let repo_ok = parts.len() == 2
+            && !parts[0].is_empty()
+            && !parts[1].is_empty()
+            && parts.iter().all(|p| {
+                p.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+            });
+        if !repo_ok {
+            return Err(format!("invalid GitHub repo (expected owner/name): {:?}", repo));
+        }
         let url = format!(
             "https://api.github.com/repos/{}/issues?state=all&since={}&per_page=100&sort=updated&direction=desc",
             repo, since

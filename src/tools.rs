@@ -477,6 +477,34 @@ pub fn handle_remember(db: &Database, args: Value) -> Result<String, String> {
         return Err(format!("body_json is not valid JSON: {}", e));
     }
 
+    // #433 L: bound input sizes. category/key are indexed, hashed for identity
+    // (category, key, workspace_hash), and fed to FTS — an unbounded key is a
+    // DoS-via-huge-key vector. These caps sit far above any legitimate use.
+    const MAX_CATEGORY_LEN: usize = 256;
+    const MAX_KEY_LEN: usize = 1024;
+    const MAX_BODY_LEN: usize = 4 * 1024 * 1024; // 4 MiB
+    if a.category.len() > MAX_CATEGORY_LEN {
+        return Err(format!(
+            "category too long: {} bytes (max {})",
+            a.category.len(),
+            MAX_CATEGORY_LEN
+        ));
+    }
+    if a.key.len() > MAX_KEY_LEN {
+        return Err(format!(
+            "key too long: {} bytes (max {})",
+            a.key.len(),
+            MAX_KEY_LEN
+        ));
+    }
+    if a.body_json.len() > MAX_BODY_LEN {
+        return Err(format!(
+            "body_json too long: {} bytes (max {})",
+            a.body_json.len(),
+            MAX_BODY_LEN
+        ));
+    }
+
     // Merge recall_when into body_json if provided
     let body = if a.recall_when.is_empty() {
         a.body_json
@@ -1535,7 +1563,11 @@ pub fn handle_traverse(db: &Database, args: Value) -> String {
             return json!({"error": format!("Invalid traverse arguments: {}", e)}).to_string()
         }
     };
-    match db.traverse_chain(&a.category, &a.key, a.max_depth, a.max_nodes) {
+    // DoS hardening: clamp caller-supplied bounds to sane ceilings so a single
+    // request can't be asked to walk an unbounded depth/breadth of the link graph.
+    let max_depth = a.max_depth.clamp(0, 64);
+    let max_nodes = a.max_nodes.clamp(0, 100_000);
+    match db.traverse_chain(&a.category, &a.key, max_depth, max_nodes) {
         Ok(chain) => serde_json::to_string(&chain)
             .unwrap_or_else(|e| json!({"error": format!("{}", e)}).to_string()),
         Err(e) => json!({"error": format!("Traverse failed: {}", e)}).to_string(),
@@ -4605,6 +4637,45 @@ mod tests {
             3,
             "no env knobs → maintenance must keep every version"
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ─── #433 L: input length bounds on remember ─────────────────
+
+    #[test]
+    fn remember_rejects_oversized_key() {
+        let (db, path) = temp_db();
+        let huge_key = "k".repeat(2000); // > MAX_KEY_LEN (1024)
+        let err = handle_remember(
+            &db,
+            json!({"category": "facts", "key": huge_key, "body_json": "{}"}),
+        )
+        .expect_err("oversized key must be rejected");
+        assert!(err.contains("key too long"), "unexpected error: {err}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn remember_rejects_oversized_category() {
+        let (db, path) = temp_db();
+        let huge_cat = "c".repeat(500); // > MAX_CATEGORY_LEN (256)
+        let err = handle_remember(
+            &db,
+            json!({"category": huge_cat, "key": "k", "body_json": "{}"}),
+        )
+        .expect_err("oversized category must be rejected");
+        assert!(err.contains("category too long"), "unexpected error: {err}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn remember_accepts_normal_sizes() {
+        let (db, path) = temp_db();
+        handle_remember(
+            &db,
+            json!({"category": "facts", "key": "normal-key", "body_json": "{\"a\":1}"}),
+        )
+        .expect("normally-sized remember must succeed");
         let _ = std::fs::remove_file(&path);
     }
 }

@@ -69,11 +69,16 @@ CREATE TABLE IF NOT EXISTS entities (
 -- column here would fail the whole batch.
 
 -- Recall ranking index: lets the browse path (WHERE archived=0 [+ residual
--- filters] ORDER BY retrieval_count DESC, last_accessed_unix_ms DESC LIMIT k)
--- seek the archived=0 partition and read rows already in rank order, avoiding a
--- full table scan + temp-b-tree sort. EXPLAIN-verified: ~224x on global browse,
--- ~66x on workspace-scoped browse at 30k rows. (#209)
-CREATE INDEX IF NOT EXISTS idx_entities_recall ON entities(archived, retrieval_count DESC, last_accessed_unix_ms DESC);
+-- filters] ORDER BY retrieval_count DESC, last_accessed_unix_ms DESC, id ASC
+-- LIMIT k) seek the archived=0 partition and read rows already in rank order,
+-- avoiding a full table scan + temp-b-tree sort. EXPLAIN-verified: ~224x on
+-- global browse, ~66x on workspace-scoped browse at 30k rows. (#209)
+-- The trailing `id ASC` covers recall's #254 determinism tie-break: without it,
+-- a large tie-group on (retrieval_count, last_accessed) — e.g. a cold or
+-- bulk-imported store with uniform last_accessed — forced SQLite to sort the
+-- whole group by id to satisfy LIMIT k (O(tie-group); ~30ms browse @1M). With it
+-- the index satisfies the FULL ordering, so browse stays a k-row range scan.
+CREATE INDEX IF NOT EXISTS idx_entities_recall ON entities(archived, retrieval_count DESC, last_accessed_unix_ms DESC, id ASC);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS entities_fts USING fts5(body_json, content_rowid='rowid');
 
@@ -91,6 +96,10 @@ CREATE TABLE IF NOT EXISTS journal (
     -- #417: workspace of the referenced entity, stamped at write time so purge
     -- can scope journal redaction per-workspace. '' = system event or legacy row.
     workspace_hash TEXT NOT NULL DEFAULT '',
+    -- v15 (2026-07-05): SHA-256 commitment over the payload, covered by the audit
+    -- chain so content tampering is detectable while the payload can still be
+    -- redacted (the commitment survives). See docs/audit-chain-keyed-mac-design.md.
+    payload_commitment TEXT DEFAULT '',
     created_at_unix_ms INTEGER NOT NULL
 );
 
@@ -105,6 +114,29 @@ CREATE TABLE IF NOT EXISTS state (
     value_json TEXT NOT NULL DEFAULT '{}',
     expires_at_unix_ms INTEGER,
     created_at_unix_ms INTEGER NOT NULL
+);
+
+-- Encryption canary (fail-fast wrong-key detection). A single row (id=1) holding
+-- a known marker encrypted under the configured key. On startup set_encryption
+-- decrypts it and aborts loudly if it fails, so a wrong/rotated key is caught
+-- before any read silently returns AuthFailed. Deliberately NOT in `entities` or
+-- `state`: it must stay invisible to recall/FTS/stats and to caller-facing state
+-- tools. Ungated IF NOT EXISTS so it back-fills onto older databases too.
+CREATE TABLE IF NOT EXISTS encryption_canary (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    ciphertext TEXT NOT NULL,
+    created_at_unix_ms INTEGER NOT NULL
+);
+
+-- v15 (2026-07-05): records the audit chain keying so set_encryption can skip
+-- the O(journal) rekey when the chain is already keyed under the current key.
+-- key_canary = HMAC-SHA256(audit_key, fixed label); a match means already-keyed
+-- under this key. See docs/audit-chain-keyed-mac-design.md section 3.4.
+CREATE TABLE IF NOT EXISTS audit_chain_state (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    scheme TEXT NOT NULL,
+    key_canary TEXT NOT NULL,
+    updated_at_unix_ms INTEGER NOT NULL
 );
 
 -- Superseded fact versions (v2.4.0 — bi-temporal facts). When a remember()
@@ -156,7 +188,7 @@ CREATE INDEX IF NOT EXISTS idx_entity_history_catkey ON entity_history(category,
 /// the column-add migrations below have been applied. Bump this whenever you add
 /// a new ALTER-probe migration in `initialize_schema`, or existing databases
 /// (already at the previous level) will skip it.
-const SCHEMA_VERSION: i64 = 11;
+const SCHEMA_VERSION: i64 = 15;
 
 /// Initialize the v0.2.0 schema on a fresh database.
 pub fn initialize_schema(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
@@ -435,6 +467,66 @@ fn apply_migrations(conn: &Connection) -> Result<(), Box<dyn std::error::Error>>
         "CREATE INDEX IF NOT EXISTS idx_journal_catkeyws ON journal(category, key, workspace_hash);",
     )?;
     // ── end v11 ─────────────────────────────────────────────────────────
+
+    // ── v12 (#433 M2): bind workspace into the audit-chain hash ──────────
+    // Pre-v12 chains hashed only (prev_hash, id, created_at_unix_ms), so a
+    // journal entry could be moved between workspaces without breaking the
+    // chain. The hash now also folds in workspace_hash (stamped since v11).
+    // (The chain rehash that was here is now performed once in the v15 block —
+    // the v15 formula supersedes v12's, and the migrate function runs every block
+    // top-to-bottom for any DB below SCHEMA_VERSION, so a single final rehash is
+    // sufficient. Doing it here as well would fail on legacy journals that don't
+    // yet have the payload columns the v15 rehash reads.)
+    // ── end v12 ──────────────────────────────────────────────────────────
+
+    // ── v13: cover the browse ORDER BY tie-break in idx_entities_recall ──
+    // The empty-query browse path orders by
+    //   retrieval_count DESC, last_accessed_unix_ms DESC, id ASC
+    // but the pre-v13 index covered only the first two keys, so a large
+    // tie-group on (retrieval_count, last_accessed) — a cold or bulk-imported
+    // store where last_accessed is uniform — forced SQLite to sort the whole
+    // group by id to satisfy LIMIT k (O(tie-group); measured ~30ms browse p50
+    // at 1M rows). Adding id ASC as a trailing key lets the index satisfy the
+    // full ordering, so browse is a pure k-row range scan again. DROP+recreate
+    // because the old index lacks the column; safe on a populated DB (the index
+    // is derived, and recall/browse fall back to a scan for the brief window).
+    conn.execute_batch(
+        "DROP INDEX IF EXISTS idx_entities_recall; \
+         CREATE INDEX IF NOT EXISTS idx_entities_recall \
+           ON entities(archived, retrieval_count DESC, last_accessed_unix_ms DESC, id ASC);",
+    )?;
+    // ── end v13 ──────────────────────────────────────────────────────────
+
+    // ── v14 (2026-07-05 security review): cryptographic audit-chain hash ──
+    // Pre-v14 the journal chain used a 64-bit, non-cryptographic `DefaultHasher`
+    // (SipHash) — brute-forceable for targeted collisions. It is now a real
+    // SHA-256 over the same erasure-safe identifying tuple (prev, id,
+    // created_at, workspace_hash). Recompute existing chains under the new
+    // formula so they verify from here forward. Deterministic + idempotent;
+    // a no-op on a fresh DB (empty journal). (Rehash deferred to the v15 block —
+    // see the v12 note; the v15 formula supersedes this one.)
+    // ── end v14 ──────────────────────────────────────────────────────────
+
+    // ── v15 (2026-07-05 security review): payload commitment + keyed chain ──
+    // Add the per-entry payload_commitment column and recompute the chain over
+    // (prev, id, created_at, workspace, commitment). At migration time no key is
+    // available, so the rehash is UNKEYED; `set_encryption` later rekeys it to
+    // HMAC once the encryption key is loaded. Backfills commitments for existing
+    // rows. Deterministic + idempotent; no-op on a fresh DB. See
+    // docs/audit-chain-keyed-mac-design.md.
+    // Ensure every column the rehash reads exists — a very old (pre-bitemporal)
+    // journal may predate some of them; ensure_column is idempotent.
+    ensure_column(conn, "journal", "event_type", "TEXT DEFAULT 'decision'")?;
+    ensure_column(conn, "journal", "evaluated_json", "TEXT DEFAULT '{}'")?;
+    ensure_column(conn, "journal", "acted_json", "TEXT DEFAULT '{}'")?;
+    ensure_column(conn, "journal", "forward_json", "TEXT DEFAULT '{}'")?;
+    ensure_column(conn, "journal", "category", "TEXT DEFAULT ''")?;
+    ensure_column(conn, "journal", "key", "TEXT DEFAULT ''")?;
+    ensure_column(conn, "journal", "entity_id", "TEXT DEFAULT ''")?;
+    ensure_column(conn, "journal", "agent_id", "TEXT DEFAULT ''")?;
+    ensure_column(conn, "journal", "payload_commitment", "TEXT DEFAULT ''")?;
+    crate::db::rehash_audit_chain(conn)?;
+    // ── end v15 ──────────────────────────────────────────────────────────
 
     // Stamp the migration level so subsequent opens skip the probe block above.
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -1190,11 +1282,17 @@ mod tests {
             )
             .unwrap();
         assert_eq!(exists, 1, "idx_entities_recall should be created");
-        // ...and the recall browse query must use it (no full scan / temp sort).
+        // ...and the recall browse query must use it with NO temp-b-tree sort.
+        // Uses the FULL 3-key ordering the recall path actually emits (db.rs:
+        // "ORDER BY retrieval_count DESC, last_accessed_unix_ms DESC, id ASC"),
+        // including the #254 determinism tie-break. This is the v13 guard: the
+        // pre-v13 index covered only the first two keys, so this exact query
+        // needed a TEMP B-TREE to order the tie-break — the O(tie-group) sort
+        // that made browse ~30ms at 1M rows.
         let plan: Vec<String> = conn
             .prepare(
                 "EXPLAIN QUERY PLAN SELECT id FROM entities WHERE archived = 0 \
-                 ORDER BY retrieval_count DESC, last_accessed_unix_ms DESC LIMIT 20",
+                 ORDER BY retrieval_count DESC, last_accessed_unix_ms DESC, id ASC LIMIT 20",
             )
             .unwrap()
             .query_map([], |r| r.get::<_, String>(3))
@@ -1208,7 +1306,7 @@ mod tests {
         );
         assert!(
             !joined.to_uppercase().contains("TEMP B-TREE"),
-            "recall query should not need a temp-b-tree sort, got: {joined}"
+            "recall browse (incl. id tie-break) should not need a temp-b-tree sort, got: {joined}"
         );
     }
 

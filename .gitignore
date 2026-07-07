@@ -1,5 +1,7 @@
 /target
 workdir/
+/build-mcpb/
+/dist/
 __pycache__/
 .model-cache/
 .claude/

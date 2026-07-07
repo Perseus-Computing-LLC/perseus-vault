@@ -7,7 +7,7 @@
 
 use axum::{
     extract::{Query, State},
-    http::{header, Request, StatusCode},
+    http::{header, Method, Request, StatusCode},
     middleware::{self, Next},
     response::{
         sse::{Event, Sse},
@@ -21,7 +21,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::sync::{Arc, OnceLock};
 use tokio::sync::broadcast;
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use crate::db::Database;
 use crate::mcp::{self, JsonRpcRequest, MCPState};
@@ -78,10 +78,15 @@ struct SseParams {
 /// `Authorization: Bearer <token>` header and returns 401 otherwise.
 /// When `None`, auth is skipped entirely (backward compatible).
 pub fn build_transport_router(mode: TransportMode, auth_token: Option<String>) -> Router {
+    // Tightened CORS: explicit methods + headers instead of the previous
+    // `Any/Any/Any`. Origin mirrors the request (auth is header-based Bearer, not
+    // cookie/ambient, so reflecting Origin does not enable a cross-site
+    // credential attack), but a `MIMIR_CORS_ALLOWED_ORIGINS` allowlist can lock
+    // it down further.
     let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
+        .allow_origin(cors_allow_origin())
+        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE]);
 
     let mut router = Router::new().route("/message", post(handle_message));
 
@@ -89,9 +94,26 @@ pub fn build_transport_router(mode: TransportMode, auth_token: Option<String>) -
         router = router.route("/sse", get(handle_sse));
     }
 
-    router
+    let router = router
         .route_layer(middleware::from_fn_with_state(auth_token, auth_middleware))
-        .layer(cors)
+        .layer(cors);
+    // DoS-resistance: explicit body-size cap + global rate limit (Phase 1/2).
+    crate::httplimit::apply_http_limits(router)
+}
+
+/// Resolve the CORS origin policy: an explicit comma-separated allowlist from
+/// `MIMIR_CORS_ALLOWED_ORIGINS` if set, otherwise mirror the request origin.
+fn cors_allow_origin() -> AllowOrigin {
+    match std::env::var("MIMIR_CORS_ALLOWED_ORIGINS") {
+        Ok(list) if !list.trim().is_empty() => {
+            let origins: Vec<header::HeaderValue> = list
+                .split(',')
+                .filter_map(|o| header::HeaderValue::from_str(o.trim()).ok())
+                .collect();
+            AllowOrigin::list(origins)
+        }
+        _ => AllowOrigin::mirror_request(),
+    }
 }
 
 /// Middleware: require a Bearer token if one is configured.
@@ -113,7 +135,7 @@ async fn auth_middleware(
 
     if let Some(auth) = auth_header {
         if let Some(token) = auth.strip_prefix("Bearer ") {
-            if token == expected {
+            if crate::util::constant_time_str_eq(token, &expected) {
                 return Ok(next.run(request).await);
             }
         }
@@ -357,6 +379,14 @@ mod tests {
         let clients = env_usize("MIMIR_LOADTEST_CLIENTS", 16);
         let writes_per = env_usize("MIMIR_LOADTEST_WRITES", 25);
         let reads_per = env_usize("MIMIR_LOADTEST_READS", 75);
+
+        // This test measures DB-pool concurrency + max throughput by flooding the
+        // transport as fast as possible — which is inherently defeated by the HTTP
+        // rate limiter (it would shed the flood with 429s and be counted as
+        // errors). Disable rate limiting for this run; it has its own unit tests
+        // in `httplimit`. (The bucket is per-router, so this only affects the
+        // router built below.)
+        std::env::set_var("MIMIR_HTTP_RATE_PER_SEC", "0");
 
         let path = std::env::temp_dir()
             .join(format!("mimir-loadtest-{}.db", uuid::Uuid::new_v4()));

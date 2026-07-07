@@ -5,6 +5,232 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
 
 ## [Unreleased]
 
+### Security — keyed-MAC audit chain + payload commitment (DRAFT, under review)
+- **Keyed, content-committing audit chain** (v14→v15). The journal chain now (a)
+  stores a per-entry SHA-256 **payload commitment** covered by the chain, so content
+  tampering of a non-redacted entry is detected, while `purge` can still erase the
+  payload (the commitment survives); and (b) is a **keyed HMAC-SHA256** when encryption
+  is enabled — tamper-evident against an attacker who can recompute an unkeyed hash.
+  Unencrypted deployments keep the unkeyed SHA-256 chain. Keying happens at
+  `set_encryption` time (the key isn't available during open-time migration) and is
+  **canary-gated** — an `audit_chain_state.key_canary` (an HMAC of a fixed label under
+  the audit key) lets the rekey run once (first encrypted open after upgrade, or a key
+  change) instead of on every open (§3.4).
+  `verify-audit-chain` is scheme-aware and **fails closed** if a keyed chain is
+  verified without the key. Ships a v15 migration (adds `payload_commitment`, backfills,
+  rehashes). HMAC is unit-tested against RFC 4231. **Design + limits + reviewer questions:
+  `docs/audit-chain-keyed-mac-design.md`.**
+
+## [2.17.5] - 2026-07-06
+
+### Fixed
+- **`recall`'s `category` filter (and `type`/`topic_path`/`workspace_hash`/`agent_id`/`min_decay`/`always_on`) was silently ignored in Dense and Hybrid modes** (#467). `fts5_search` applied these predicates in SQL, but `dense_search` ranked over the raw embedding space (`archived = 0` only) and `graph_expand` followed links regardless of metadata — so a category-scoped recall, including the common no-mode recall that auto-selects Hybrid when embeddings exist, returned cross-category hits. Added `retain_metadata_filters`, mirroring the `fts5_search` WHERE-clause semantics (including the #298/#525 default that hides `conversation` when no category is requested), applied to both semantic paths with over-fetch→filter→truncate so scoped queries still fill `limit`. (#468)
+
+### Security
+- Bump `crossbeam-epoch` 0.9.18 → 0.9.20 to clear **RUSTSEC-2026-0204** (invalid pointer dereference in the `fmt::Pointer` impl for `Atomic`/`Shared` null pointers; transitive dependency, lockfile-only).
+
+## [2.17.4] - 2026-07-05
+
+### Security — housekeeping (2026-07-05 review)
+- **Removed the dead `--workspace-token` flag.** It was documented as
+  "cross-workspace access" authentication but **no code ever read it** (the `serve`
+  handler destructured it away) — a control that looked active and wasn't. Transport
+  auth is `--mcp-token`; workspace scoping is a routing/relevance control, not an
+  enforced boundary (see `docs/THREAT-MODEL.md`). Passing `--workspace-token` now
+  errors instead of silently no-op'ing.
+
+## [2.17.3] - 2026-07-05
+
+### Security (2026-07-05 review)
+- **`install.sh` checksum verification now fails closed** (MED). A missing published
+  `.sha256`, or a host without `sha256sum`/`shasum`, previously warned and installed
+  the binary **unverified**. Both now abort; set
+  `PERSEUS_VAULT_INSECURE_SKIP_CHECKSUM=1` to explicitly opt out.
+- **Docker image runs as a non-root `vault` user** (MED) instead of root; `/data` is
+  created and owned by that user so the default `serve` command works on a fresh volume.
+- **`cargo audit` now actually runs in CI** (MED) — a new `Security Audit` workflow
+  scans `Cargo.lock` against RustSec on every push/PR and weekly, making the existing
+  SECURITY.md claim true. (Vulnerabilities gate; two unmaintained-only advisories are
+  documented ignores.)
+- **`traverse` clamps caller-supplied `max_depth`/`max_nodes`** to sane ceilings
+  (64 / 100,000) so a single request can't be asked to walk an unbounded slice of
+  the link graph (LOW DoS hardening).
+- **Dense recall clamps a negative `limit`** with `.max(0)` before the `usize` cast
+  (a negative would wrap huge; downstream caps already neutralized it — hygiene).
+- **GitHub connector validates `repo` as strict `owner/name`** before interpolating
+  it into the api.github.com URL, preventing path/query injection from a malformed
+  operator-config value (LOW).
+- **Cryptographic audit chain.** The journal chain is now a real **SHA-256** hash
+  chain (was a 64-bit non-cryptographic `DefaultHasher`/SipHash), length-prefixed,
+  with a **v13→v14 rehash migration** (deterministic, idempotent, no-op on a fresh
+  DB). New **`verify-audit-chain` CLI command** (`verify_audit_chain` was previously
+  dead code, so nothing ever checked the chain). The chain still commits only to
+  event existence/order/time/workspace (NOT payload — so `purge` erasure stays
+  compatible) and remains **unkeyed**: a keyed MAC (off the encryption key) plus a
+  redaction-safe payload commitment for full tamper-evidence is the tracked follow-up.
+- See `docs/security-review-2026-07-05.md` for the full ranked review.
+
+## [2.17.2] - 2026-07-05
+
+### Fixed
+- **Anthropic MCP Directory bundle was not installable.** The submitted `.mcpb`
+  contained only `manifest.json` — the `binary` server it declared was never
+  placed inside the bundle, so it could not be installed or run for review. The
+  manifest also carried a stale `mimir serve --db ~/.mimir/...` command. Fixed:
+  `entry_point` now points at `server/perseus-vault` inside the bundle, the
+  command uses `${__dirname}/server/...` with `platform_overrides` for Windows
+  (`.exe`) and Linux, and the stale `--db` arg is dropped (the binary
+  self-resolves the cross-platform default DB path). (#456)
+
+### Added
+- **Real, self-contained `.mcpb` release artifact.** A new `mcpb.yml` workflow
+  builds per-platform lite binaries — macOS **universal** (arm64+x86_64) via
+  `lipo`, Windows MSVC (`crt-static`), Linux musl (static) — stages them under
+  `server/`, and validates + packs with the official `@anthropic-ai/mcpb` CLI,
+  attaching `perseus-vault.mcpb` to the release. (#456)
+- **Windows and macOS-Intel prebuilt release binaries.** `release.yml` now builds
+  `x86_64-pc-windows-msvc` and `x86_64-apple-darwin` in the full matrix, so every
+  platform the directory listing declares has a prebuilt binary. (#456)
+
+### Documentation
+- Documented the **stdio idle-watchdog** (`MIMIR_IDLE_TIMEOUT_SECS`, default
+  600s) in `docs/transport.md`, and explicitly warned against external
+  process-count reapers of `perseus-vault` stdio subprocesses: those are the
+  live transport for in-flight tool calls, so count-based reaping kills them
+  mid-operation (surfaces as `Unknown tool` errors). The built-in watchdog
+  already reclaims true orphans; external cleanup must key on age + orphaned
+  parent, never raw count. (#450)
+
+## [2.17.1] - 2026-07-04
+
+### Fixed
+- **`install.sh` was broken for every prebuilt install.** It downloaded a bare
+  `perseus-vault-${TARGET}` asset name, but releases ship `.tar.gz` archives
+  (+ `.sha256`), so the download 404'd on every platform and fell through to the
+  build-from-source path. Now downloads the `.tar.gz`, extracts the binary, and
+  verifies the published checksum (hard-fail on mismatch). Also corrected the
+  platform→asset map: aarch64-linux ships only the `lite` musl build (the old
+  code requested a nonexistent `-gnu` asset). (#451)
+- **MCP Registry publish** (had failed on v2.16.0 and v2.17.0): the Docker
+  image's `io.modelcontextprotocol.server.name` OCI annotation was still
+  `io.github.Perseus-Computing-LLC/mimir` while `server.json` had moved to
+  `…/perseus-vault`, so the registry's ownership validation rejected the publish
+  with a 400. The label now matches `server.json`, so v2.17.1 publishes under the
+  `perseus-vault` namespace. (#452)
+
+### Changed
+- Dropped prebuilt **macOS Intel (x86_64-apple-darwin)** release binaries. The
+  `macos-13` runner class is chronically backlogged and repeatedly stalled the
+  release pipeline for ~1h. Apple Silicon (`aarch64-apple-darwin`) covers modern
+  Macs; Intel-Mac users can `cargo install --git …` from source (or run the lite
+  musl build under Rosetta). `install.sh` degrades gracefully with a source-build
+  hint for that target. (#447)
+
+## [2.17.0] - 2026-07-03
+
+### Security / Hardening
+- Multimodal ingest is now bounded against decompression bombs. A `.docx` is a
+  DEFLATE zip, so a tiny on-disk file (within `MIMIR_MAX_INGEST_BYTES`) could
+  decompress `word/document.xml` to many GB — the on-disk cap couldn't bound it,
+  and the read was unbounded (OOM). The decompressed read is now capped at
+  `MIMIR_MAX_DECOMPRESSED_BYTES` (default 256 MiB) and rejected past it. PDF
+  extraction is bounded by the on-disk cap only (`pdf_extract` owns decompression
+  with no limit API — documented; lower `MIMIR_MAX_INGEST_BYTES` for untrusted
+  PDFs).
+- Network transport & gRPC hardening (audit phases 1–3):
+  - **Secure-bind guard**: binding an HTTP surface (MCP transport or web
+    dashboard) to a non-loopback address with **no** auth token now refuses to
+    start instead of coming up wide open. Override with
+    `MIMIR_ALLOW_INSECURE_BIND=1` for a trusted network / auth-terminating proxy.
+  - **Constant-time token comparison** for Bearer auth on both HTTP surfaces
+    (was a byte-wise `==`, a timing side-channel on the secret).
+  - **Request-body cap** (`MIMIR_MAX_HTTP_BODY_BYTES`, default 8 MiB) and a
+    **global token-bucket rate limit** (`MIMIR_HTTP_RATE_PER_SEC` /
+    `MIMIR_HTTP_RATE_BURST`, default 50 req/s + burst 100 → `429`).
+  - **Tightened transport CORS** — explicit methods/headers instead of `Any`,
+    with an optional `MIMIR_CORS_ALLOWED_ORIGINS` allowlist.
+  - **gRPC security model**: `serve` now supports a Bearer-token auth interceptor
+    (`MIMIR_GRPC_AUTH_TOKEN`), TLS and mutual-TLS (`MIMIR_GRPC_TLS_CERT/KEY`,
+    `MIMIR_GRPC_TLS_CLIENT_CA`), a message-size cap (`MIMIR_GRPC_MAX_MSG_BYTES`),
+    and the same secure-bind guard. See [docs/GRPC-SECURITY.md](docs/GRPC-SECURITY.md).
+- Encryption canary (fail-fast wrong-key detection). `set_encryption` now
+  verifies the configured key against a dedicated canary row at startup and
+  **aborts loudly** ("the provided key is incorrect or the database is corrupt")
+  instead of letting a wrong/rotated key silently `AuthFailed` on every later
+  read. The canary is established on first encrypted setup (or when encryption is
+  enabled on a legacy-plaintext DB); a canary-less store with pre-existing
+  encrypted data is validated by scanning for authentic ciphertext, so a wrong
+  key can never "bless" itself by writing a canary under it. Stored in its own
+  `encryption_canary` table — invisible to recall/FTS/stats and caller-facing
+  state tools.
+- Build-time model fetch is now supply-chain pinned (`build.rs`): the bundled
+  `all-MiniLM-L6-v2` ONNX model + tokenizer are fetched from an **immutable commit
+  revision** (was the mutable `main` ref) and **SHA-256 verified** before being
+  baked into the binary via `include_bytes!`. A compromised or updated upstream
+  repo can no longer silently change the embedded model — a mismatch fails the
+  build. Operator-supplied files (`MIMIR_BUNDLED_MODEL_DIR`, air-gapped builds)
+  are verified against the same hashes.
+- Windows key-file ACLs: `keygen` now restricts the new key file to the current
+  user via `icacls` (Windows has no `0600`-at-creation equivalent), warning
+  loudly if that fails; enabling encryption on Windows also emits a one-line
+  runtime reminder that key-file ACLs are operator-owned.
+- Bumped `anyhow` 1.0.102 → 1.0.103 to clear RUSTSEC-2026-0190 (unsoundness in
+  `Error::downcast_mut()`).
+
+### Performance
+- Empty-query browse recall no longer degrades on large stores. The browse path
+  orders by `retrieval_count DESC, last_accessed_unix_ms DESC, id ASC`, but
+  `idx_entities_recall` covered only the first two keys — so a large tie-group on
+  the leading keys (a cold or bulk-imported store with uniform `last_accessed`)
+  forced SQLite to sort the whole group by `id` to satisfy `LIMIT k`
+  (O(tie-group)). The index now includes the `id` tie-break, making browse a pure
+  k-row range scan. Measured p50 at 1,000,000 rows: **29.7 ms → 0.046 ms**
+  (~645×); FTS and point-lookup latencies were already flat and are unchanged.
+  Ships a v13 schema migration that rebuilds the index on existing databases.
+
+### Fixed
+- De-flaked `concurrent_writer_not_starved_during_cohere`: the #400 lock-hold
+  gate asserted *exactly zero* SQLITE_BUSY, which spuriously failed on loaded CI
+  runners when OS scheduler jitter delayed a single (correctly chunked) cohere
+  commit past the writer's ~250ms budget. Now asserts a low busy *rate* (<10%) —
+  the #400 regression it guards produces ~100%, jitter ~0.5%, so detection is
+  preserved with wide margin. No production-code change.
+
+## [2.16.0] - 2026-07-03
+
+### Security / Hardening
+- Audit chain now cryptographically binds the workspace (#433 M2, #438): the
+  journal hash folds in `workspace_hash` (stamped on every row since #417), so
+  a journal entry can no longer be moved between workspaces without breaking
+  `verify_audit_chain`. Ships a v11→v12 schema migration that re-hashes existing
+  chains under the new formula (deterministic, idempotent, crash-safe inside the
+  migration transaction) so pre-upgrade chains still verify, and purge redaction
+  now preserves `workspace_hash` as a hashed field (still scrubbing payload +
+  identifying columns).
+- Encryption key file is created with `0600` at inode creation on Unix (#433 M1,
+  #434), closing the brief world-readable window between write and chmod.
+- `remember` bounds input sizes (#433, #434): category ≤ 256 B, key ≤ 1024 B,
+  body ≤ 4 MiB — closes a DoS-via-huge-key vector on indexed/identity/FTS fields.
+- File-watcher connector rejects symlinked entries (#433, #434): directory scans
+  no longer follow a symlink out of the configured watch root.
+
+### Added
+- Prebuilt release binaries (#432, #435): tagged releases now publish
+  `perseus-vault-lite` (static musl, linux x86_64/aarch64, no default features)
+  and full `perseus-vault` (linux-gnu x86_64, macOS x86_64/arm64) with SHA-256
+  checksums — no more mandatory from-source build to install/upgrade.
+- `perseus-vault doctor` reports data freshness (#433 N4, #434): a "last write N
+  days ago" line (WARN past 14 days) so a stale vault (stopped harvest) is
+  visible instead of silently reported healthy.
+
+### Changed
+- Default on-disk paths moved to `~/.perseus-vault/` (#427, #437), precedence-only
+  — fresh installs use `~/.perseus-vault/data/perseus-vault.db`; existing
+  `~/.mimir/` installs keep working via the fallback chain (no data moved).
+  Adds `PERSEUS_VAULT_DB_PATH` (`MIMIR_DB_PATH` still honored); `secret.key`
+  default prefers an existing location so encrypted installs never lose their key.
+- MCP-registry server name aligned to `io.github.Perseus-Computing-LLC/perseus-vault` (#428, #436).
+
 ## [2.15.0] - 2026-07-03
 
 ### Fixed

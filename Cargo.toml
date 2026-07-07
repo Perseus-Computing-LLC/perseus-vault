@@ -1,6 +1,6 @@
 [package]
 name = "perseus-vault"
-version = "2.15.0"
+version = "2.17.5"
 edition = "2021"
 description = "Persistent memory engine for AI agents — MCP JSON-RPC stdio server (formerly Mneme/Mimir)"
 repository = "https://github.com/Perseus-Computing-LLC/perseus-vault"
@@ -25,9 +25,16 @@ rust-stemmers = "1.2"
 aes-gcm = "0.10"
 rand = "0.8"
 base64 = "0.22"
+# Runtime dep (also a build-dependency below): the journal audit chain uses
+# SHA-256 for its tamper-evidence hash (2026-07-05 security review).
+sha2 = "0.10"
 axum = "0.7"
 tokio = { version = "1", features = ["full"] }
 tower-http = { version = "0.5", features = ["cors"] }
+# Constant-time equality for auth-token comparison (avoids a timing side-channel
+# on the Bearer secret). Already compiled transitively via aes-gcm; pinned here as
+# a direct dep so the network-transport auth path can use it explicitly.
+subtle = "2"
 ureq = "2"
 notify = "6"
 serde_yaml = "0.9"
@@ -50,7 +57,7 @@ ndarray = { version = "0.17", optional = true }  # MUST match the ndarray versio
 # `Message`, but tonic's codec requires ITS prost's `Message` — mixing 0.14
 # with tonic 0.13 fails every RPC with "trait bound `X: prost::message::Message`
 # is not satisfied". Caught by the grpc CI lane (#354).
-tonic = { version = "0.13", optional = true, features = ["transport"] }
+tonic = { version = "0.13", optional = true, features = ["transport", "tls-ring"] }
 prost = { version = "0.13", optional = true }
 prost-types = { version = "0.13", optional = true }
 tokio-stream = { version = "0.1", optional = true }
@@ -85,3 +92,6 @@ tonic-build = { version = "0.13", optional = true }
 # Used by build.rs to fetch the quantized embedding model into OUT_DIR at build
 # time (only when the bundled-embeddings feature is active). Cached across builds.
 ureq = "2"
+# Verifies the SHA-256 of every fetched model asset before it is baked into the
+# binary via include_bytes! (supply-chain pinning in fetch_model_assets).
+sha2 = "0.10"

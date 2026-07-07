@@ -30,16 +30,38 @@ fn fetch_model_assets(out_dir: &str) {
     // the fp32 model — so it keeps the (input_ids, attention_mask) -> last_hidden_state
     // signature the inference code already handles. The qint8 ops run on any CPU via
     // ONNX Runtime's CPU EP (the arch suffix is just the export's calibration preset).
-    const MODEL_URL: &str = "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/onnx/model_qint8_avx512_vnni.onnx";
-    const TOKENIZER_URL: &str = "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/tokenizer.json";
+    //
+    // Supply-chain pinning: the URL is anchored to an IMMUTABLE commit revision
+    // (not the mutable `main` ref), and every asset is SHA-256 verified before it
+    // is baked into the binary via include_bytes!. A compromised or merely updated
+    // upstream repo therefore cannot silently change the embedded model — a
+    // mismatch fails the build loudly. The hashes are the HuggingFace LFS oids for
+    // this revision (reproducible with `sha256sum` on the downloaded files).
+    const REV: &str = "1110a243fdf4706b3f48f1d95db1a4f5529b4d41";
+    let model_url = format!(
+        "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/{REV}/onnx/model_qint8_avx512_vnni.onnx"
+    );
+    let tokenizer_url = format!(
+        "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/{REV}/tokenizer.json"
+    );
+    const MODEL_SHA256: &str =
+        "4278337fd0ff3c68bfb6291042cad8ab363e1d9fbc43dcb499fe91c871902474";
+    const TOKENIZER_SHA256: &str =
+        "be50c3628f2bf5bb5e3a7f17b1f74611b2561a3a27eeab05e5aa30f411572037";
+
+    let model_dest = format!("{out_dir}/model_quantized.onnx");
+    let tokenizer_dest = format!("{out_dir}/tokenizer.json");
+
     // Allow an operator/CI to pre-place or override the model dir (offline builds,
-    // air-gapped CI) instead of downloading.
+    // air-gapped CI) instead of downloading. Overridden files are still checksum-
+    // verified below by ensure_asset, so an offline build can't be tricked into
+    // embedding a mismatched model either.
     if let Ok(dir) = std::env::var("MIMIR_BUNDLED_MODEL_DIR") {
         copy_if_present(&dir, "model_quantized.onnx", out_dir);
         copy_if_present(&dir, "tokenizer.json", out_dir);
     }
-    download_to(MODEL_URL, &format!("{out_dir}/model_quantized.onnx"), 10_000_000);
-    download_to(TOKENIZER_URL, &format!("{out_dir}/tokenizer.json"), 100_000);
+    ensure_asset(&model_url, &model_dest, MODEL_SHA256);
+    ensure_asset(&tokenizer_url, &tokenizer_dest, TOKENIZER_SHA256);
 }
 
 #[allow(dead_code)]
@@ -50,28 +72,45 @@ fn copy_if_present(src_dir: &str, name: &str, out_dir: &str) {
     }
 }
 
+/// Ensure `dest` exists and matches `expected_sha256`, downloading from `url` if
+/// needed. A cached (or operator-supplied) file whose hash matches is reused; any
+/// other case re-downloads and verifies. The SHA-256 check subsumes the old
+/// min-bytes truncation heuristic (a truncated download simply won't match).
 #[allow(dead_code)]
-fn download_to(url: &str, dest: &str, min_bytes: u64) {
-    // Skip if a valid (non-truncated) file is already cached in OUT_DIR.
-    if let Ok(meta) = std::fs::metadata(dest) {
-        if meta.len() >= min_bytes {
+fn ensure_asset(url: &str, dest: &str, expected_sha256: &str) {
+    if let Ok(bytes) = std::fs::read(dest) {
+        if sha256_hex(&bytes) == expected_sha256 {
             return;
         }
+        // Stale cache or mismatched override — fall through and re-fetch.
     }
     let resp = ureq::get(url)
         .timeout(std::time::Duration::from_secs(600))
         .call()
-        .unwrap_or_else(|e| panic!("build.rs: failed to download {url}: {e}\nFor an offline build, set MIMIR_BUNDLED_MODEL_DIR to a dir containing the model + tokenizer, or build with --no-default-features."));
+        .unwrap_or_else(|e| panic!("build.rs: failed to download {url}: {e}\nFor an offline build, set MIMIR_BUNDLED_MODEL_DIR to a dir containing the model + tokenizer (still checksum-verified), or build with --no-default-features."));
     let mut reader = resp.into_reader();
-    let tmp = format!("{dest}.tmp");
-    let mut file = std::fs::File::create(&tmp)
-        .unwrap_or_else(|e| panic!("build.rs: cannot create {tmp}: {e}"));
-    let n = std::io::copy(&mut reader, &mut file)
-        .unwrap_or_else(|e| panic!("build.rs: download write failed for {url}: {e}"));
-    assert!(
-        n >= min_bytes,
-        "build.rs: downloaded {url} is only {n} bytes (< {min_bytes}); likely truncated/blocked"
+    let mut buf = Vec::new();
+    std::io::copy(&mut reader, &mut buf)
+        .unwrap_or_else(|e| panic!("build.rs: download read failed for {url}: {e}"));
+    let got = sha256_hex(&buf);
+    assert_eq!(
+        got, expected_sha256,
+        "build.rs: SHA-256 mismatch for {url}\n  expected {expected_sha256}\n  got      {got}\nRefusing to embed an unverified asset."
     );
+    let tmp = format!("{dest}.tmp");
+    std::fs::write(&tmp, &buf).unwrap_or_else(|e| panic!("build.rs: cannot write {tmp}: {e}"));
     std::fs::rename(&tmp, dest)
         .unwrap_or_else(|e| panic!("build.rs: cannot finalize {dest}: {e}"));
+}
+
+#[allow(dead_code)]
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(bytes);
+    let mut s = String::with_capacity(64);
+    for b in digest {
+        use std::fmt::Write as _;
+        let _ = write!(s, "{b:02x}");
+    }
+    s
 }

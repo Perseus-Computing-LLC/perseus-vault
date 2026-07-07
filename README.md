@@ -1,3 +1,7 @@
+<div align="center">
+  <img src=".github/banner.png" alt="Perseus Vault — Persistent Memory. Encrypted, local-first, one portable file." width="100%">
+</div>
+
 # Perseus Vault
 
 <!-- mcp-name: io.github.Perseus-Computing-LLC/perseus-vault -->
@@ -6,7 +10,7 @@
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 [![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](https://rust-lang.org)
-[![Version](https://img.shields.io/badge/version-2.15.0-green.svg)](https://github.com/Perseus-Computing-LLC/perseus-vault/releases)
+[![Version](https://img.shields.io/badge/version-2.17.0-green.svg)](https://github.com/Perseus-Computing-LLC/perseus-vault/releases)
 [![LangGraph](https://img.shields.io/badge/integrations-LangGraph-blue)](integrations/langgraph/)
 [![CrewAI](https://img.shields.io/badge/integrations-CrewAI-orange)](integrations/crewai/)
 [![AutoGen](https://img.shields.io/badge/integrations-AutoGen-purple)](integrations/autogen/)
