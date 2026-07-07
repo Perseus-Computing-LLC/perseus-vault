@@ -5,3 +5,7 @@ workdir/
 __pycache__/
 .model-cache/
 .claude/
+
+# LongMemEval QA harness artifacts (dataset is a 277 MB public download; hypotheses are per-run)
+benchmark/longmemeval/longmemeval_*_cleaned.json
+benchmark/longmemeval/hypotheses-*.jsonl
