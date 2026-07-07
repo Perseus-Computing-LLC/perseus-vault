@@ -629,7 +629,14 @@ impl Database {
             skip_side_effects: true,
             ..Default::default()
         };
-        let entities = self.recall(&recall_params)?;
+        let mut entities = self.recall(&recall_params)?;
+        // #472 Temporal RAG: reconstruct the retrieved context at the requested
+        // past instant so the RAG answer is reproducible at a decision point.
+        self.resolve_temporal_versions(
+            &mut entities,
+            params.as_of_unix_ms,
+            params.valid_at_unix_ms,
+        )?;
 
         if entities.is_empty() {
             return Err("No matching memories found for this question.".into());
@@ -4433,6 +4440,37 @@ impl Database {
             .versions_recorded_by(category, key, tx_at)?
             .into_iter()
             .next())
+    }
+
+    /// #472 Temporal RAG: reconstruct a recalled entity set to its point-in-time
+    /// versions in place — transaction-time `as_of` and/or world-time `valid_at`.
+    /// Each body is swapped for the version live at that instant; entities with
+    /// no version there are dropped. No-op when both are None. Shared by
+    /// `mimir_ask` so RAG answers are reconstructable at a past instant, matching
+    /// `mimir_recall`'s temporal mode. (`global_recall` intentionally stays
+    /// current-view: its community summaries are recomputed artifacts, not
+    /// versioned facts, so a point-in-time reconstruction there is ill-defined.)
+    pub(crate) fn resolve_temporal_versions(
+        &self,
+        entities: &mut Vec<crate::models::Entity>,
+        as_of: Option<i64>,
+        valid_at: Option<i64>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if as_of.is_none() && valid_at.is_none() {
+            return Ok(());
+        }
+        let mut resolved = Vec::with_capacity(entities.len());
+        for e in std::mem::take(entities) {
+            let tv = match valid_at {
+                Some(v) => self.bitemporal_at(&e.category, &e.key, as_of.unwrap_or(i64::MAX), v)?,
+                None => self.as_of_version(&e.category, &e.key, as_of.unwrap())?,
+            };
+            if let Some(tv) = tv {
+                resolved.push(tv.entity);
+            }
+        }
+        *entities = resolved;
+        Ok(())
     }
 
     /// Effective valid periods for a set of live entities, keyed by id (#363).
@@ -11366,6 +11404,59 @@ mod tests {
             .as_of_version("facts", "capital2", t_created - 1)
             .unwrap()
             .is_none());
+
+        let _ = fs::remove_file(&path);
+    }
+
+    // #472: resolve_temporal_versions is the shared reconstruction used by
+    // mimir_ask (and mirrors mimir_recall's temporal mode). Given a recall hit
+    // set, it must swap each body for the version live at the instant and drop
+    // hits with no version there.
+    #[test]
+    fn resolve_temporal_versions_reconstructs_recalled_bodies() {
+        use std::thread::sleep;
+        use std::time::Duration;
+        let (db, path) = temp_db();
+
+        db.remember(&make_entity("e-rtv", "facts", "capital3", r#"{"note":"Bonn"}"#))
+            .unwrap();
+        sleep(Duration::from_millis(5));
+        db.remember(&make_entity("ignored3", "facts", "capital3", r#"{"note":"Berlin"}"#))
+            .unwrap();
+        let t_super: i64 = {
+            let conn = db.conn().unwrap();
+            conn.query_row(
+                "SELECT recorded_at_unix_ms FROM entities WHERE category='facts' AND key='capital3'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+
+        // A recall hit set = the live version; reconstructing before the
+        // supersede swaps in the historical body.
+        let mut hits = vec![make_entity("live", "facts", "capital3", r#"{"note":"Berlin"}"#)];
+        db.resolve_temporal_versions(&mut hits, Some(t_super - 1), None)
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].body_json.contains("Bonn"), "must reconstruct the historical body");
+
+        // At/after the supersede → the live body.
+        let mut hits2 = vec![make_entity("live", "facts", "capital3", r#"{"note":"Berlin"}"#)];
+        db.resolve_temporal_versions(&mut hits2, Some(t_super), None)
+            .unwrap();
+        assert!(hits2[0].body_json.contains("Berlin"));
+
+        // Instant before the fact existed → the hit is dropped.
+        let mut hits3 = vec![make_entity("live", "facts", "capital3", r#"{"note":"Berlin"}"#)];
+        db.resolve_temporal_versions(&mut hits3, Some(t_super - 1_000_000), None)
+            .unwrap();
+        assert!(hits3.is_empty(), "reconstruction before existence drops the hit");
+
+        // No temporal params → no-op (bodies untouched).
+        let mut hits4 = vec![make_entity("live", "facts", "capital3", r#"{"note":"Berlin"}"#)];
+        db.resolve_temporal_versions(&mut hits4, None, None).unwrap();
+        assert!(hits4[0].body_json.contains("Berlin"));
 
         let _ = fs::remove_file(&path);
     }

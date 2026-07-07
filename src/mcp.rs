@@ -536,7 +536,7 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
         },
         "valid_at": {
           "type": "integer",
-          "description": "Valid-time instant filter (#363, unix ms): only return facts whose application-time period [valid_from, valid_to) contains this world-instant — 'what was true at time T'. Applied after ranking, so it only narrows results."
+          "description": "Valid-time instant (#363/#472, unix ms): reconstruct recall to the world-version whose application-time period [valid_from, valid_to) contains this instant — 'what was true at time T', per current (or as_of) knowledge. Rebuilds the point-in-time body from history (not just a live-row narrow) and returns hits stamped with is_live_version / recorded_at_unix_ms / valid_from/to. Combine with as_of_unix_ms for the full bi-temporal cell."
         },
         "valid_from_unix_ms": {
           "type": "integer",
@@ -686,6 +686,14 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
           "type": "integer",
           "default": 5,
           "description": "Number of top entities to use as context (max 20)"
+        },
+        "as_of_unix_ms": {
+          "type": "integer",
+          "description": "#472 Temporal RAG: answer from the memory context AS IT WAS BELIEVED at this transaction-time instant (unix ms) — the retrieved bodies are reconstructed to the versions live at that instant, so a corrected-later fact does not leak into the past answer. Combine with valid_at_unix_ms for the full bi-temporal cell. Omit for the live view."
+        },
+        "valid_at_unix_ms": {
+          "type": "integer",
+          "description": "#472 Temporal RAG: answer from the context that was TRUE IN THE WORLD at this valid-time instant (unix ms), per current (or as_of) knowledge. Omit for the live view."
         }
       },
       "required": [
