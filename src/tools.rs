@@ -112,6 +112,20 @@ pub struct RememberArgs {
     /// When the fact stopped being true. Omit for "still true" (unbounded).
     #[serde(default)]
     pub valid_to_unix_ms: Option<i64>,
+    /// #487: the memories this write was built on. Each cited source gets an
+    /// automatic usefulness bump (`mark_useful`) — the honest "this memory
+    /// actually informed a later write" signal that feeds decay and ranking.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub derived_from: Vec<DerivedFromRef>,
+}
+
+/// #487: a `derived_from` citation — either an entity id (`"mem-..."`, as
+/// returned by recall/remember) or a `{category, key}` pair.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum DerivedFromRef {
+    Id(String),
+    Pair { category: String, key: String },
 }
 
 fn default_certainty() -> f64 {
@@ -596,6 +610,16 @@ pub fn handle_remember(db: &Database, args: Value) -> Result<String, String> {
             MAX_BODY_LEN
         ));
     }
+    // #487: bound the citation list like the other inputs — far above any
+    // legitimate "here's what I recalled before writing this" set.
+    const MAX_DERIVED_FROM: usize = 64;
+    if a.derived_from.len() > MAX_DERIVED_FROM {
+        return Err(format!(
+            "derived_from too long: {} citations (max {})",
+            a.derived_from.len(),
+            MAX_DERIVED_FROM
+        ));
+    }
 
     // Merge recall_when into body_json if provided
     let body = if a.recall_when.is_empty() {
@@ -672,12 +696,62 @@ pub fn handle_remember(db: &Database, args: Value) -> Result<String, String> {
         .remember_with_validity(&entity, a.valid_from_unix_ms, a.valid_to_unix_ms)
         .map_err(|e| format!("Remember failed: {}", e))?;
 
-    let result = json!({
+    // #487: auto-reinforce the cited sources. Runs AFTER the write succeeded
+    // — a rejected remember must not reinforce anything. Self-citations are
+    // skipped (a write cannot vouch for itself); citations that resolve to no
+    // live row are reported back, not fatal (the write already happened).
+    // Resolution uses the writer's workspace with follow()'s semantics
+    // (#391/#396): strict equality when scoped, deterministic global-first
+    // pick when not.
+    let derived_report = if a.derived_from.is_empty() {
+        None
+    } else {
+        let ws = if entity.workspace_hash.is_empty() {
+            None
+        } else {
+            Some(entity.workspace_hash.as_str())
+        };
+        let mut reinforced = 0i64;
+        let mut not_found: Vec<String> = Vec::new();
+        for src in &a.derived_from {
+            let (label, hit) = match src {
+                DerivedFromRef::Id(id) => {
+                    if *id == eid {
+                        continue;
+                    }
+                    let hit = db.mark_useful_by_id(id).map_err(|e| {
+                        format!("Remembered {} but derived_from reinforcement failed: {}", eid, e)
+                    })?;
+                    (id.clone(), hit)
+                }
+                DerivedFromRef::Pair { category, key } => {
+                    if *category == entity.category && *key == entity.key {
+                        continue;
+                    }
+                    let hit = db.mark_useful(category, key, ws).map_err(|e| {
+                        format!("Remembered {} but derived_from reinforcement failed: {}", eid, e)
+                    })?;
+                    (format!("{}/{}", category, key), hit)
+                }
+            };
+            if hit {
+                reinforced += 1;
+            } else {
+                not_found.push(label);
+            }
+        }
+        Some(json!({"reinforced": reinforced, "not_found": not_found}))
+    };
+
+    let mut result = json!({
         "id": eid,
         "action": action,
         "category": entity.category,
         "key": entity.key,
     });
+    if let Some(dr) = derived_report {
+        result["derived_from"] = dr;
+    }
     Ok(result.to_string())
 }
 
@@ -3066,6 +3140,165 @@ mod tests {
         let path_str = path.to_str().unwrap().to_string();
         let db = Database::open(&path_str).expect("open test db");
         (db, path_str)
+    }
+
+    // ─── derived_from auto-reinforcement (#487) ──────────────────
+
+    #[test]
+    fn remember_derived_from_reinforces_cited_sources() {
+        let (db, path) = temp_db();
+        // Two sources the later write will cite: one by (category, key), one
+        // by entity id. Bodies are deliberately dissimilar so remember()'s
+        // similarity dedup can't merge them.
+        let resp = handle_remember(
+            &db,
+            json!({"category": "insight", "key": "src-key",
+                   "body_json": "{\"content\":\"postgres 16 upgrade requires reindexing all GIN indexes\"}"}),
+        )
+        .expect("remember src-key");
+        let src: Value = serde_json::from_str(&resp).unwrap();
+        let src_id = src["id"].as_str().unwrap().to_string();
+        handle_remember(
+            &db,
+            json!({"category": "insight", "key": "src-key-2",
+                   "body_json": "{\"content\":\"the deploy pipeline caches docker layers per branch\"}"}),
+        )
+        .expect("remember src-key-2");
+
+        let resp = handle_remember(
+            &db,
+            json!({"category": "decision", "key": "derived-write",
+                   "body_json": "{\"content\":\"we will reindex during the maintenance window\"}",
+                   "derived_from": [src_id, {"category": "insight", "key": "src-key-2"}]}),
+        )
+        .expect("remember with derived_from");
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v["derived_from"]["reinforced"].as_i64(), Some(2), "{resp}");
+        assert_eq!(
+            v["derived_from"]["not_found"].as_array().unwrap().len(),
+            0,
+            "{resp}"
+        );
+
+        // Both cited sources: usefulness bumped, last_useful stamped, and
+        // last_accessed refreshed (a citation IS an access).
+        let conn = db.conn().unwrap();
+        for key in ["src-key", "src-key-2"] {
+            let (u, lu, la): (i64, i64, i64) = conn
+                .query_row(
+                    "SELECT usefulness_count, last_useful_unix_ms, last_accessed_unix_ms \
+                     FROM entities WHERE category = 'insight' AND key = ?1",
+                    rusqlite::params![key],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(u, 1, "usefulness_count for {key}");
+            assert!(lu > 0, "last_useful_unix_ms stamped for {key}");
+            assert_eq!(la, lu, "citation must refresh last_accessed for {key}");
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn remember_derived_from_reports_missing_and_skips_self() {
+        let (db, path) = temp_db();
+        let resp = handle_remember(
+            &db,
+            json!({"category": "insight", "key": "self-citer",
+                   "body_json": "{\"content\":\"a fact that tries to vouch for itself\"}",
+                   "derived_from": [
+                       {"category": "insight", "key": "self-citer"},
+                       {"category": "insight", "key": "does-not-exist"}
+                   ]}),
+        )
+        .expect("remember must succeed despite unresolved citations");
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v["derived_from"]["reinforced"].as_i64(), Some(0), "{resp}");
+        let nf = v["derived_from"]["not_found"].as_array().unwrap();
+        assert_eq!(nf.len(), 1, "self-citation must be skipped, not reported: {resp}");
+        assert_eq!(nf[0].as_str(), Some("insight/does-not-exist"));
+
+        // The self-citation must not have bumped the entity's own counter.
+        let u: i64 = db
+            .conn()
+            .unwrap()
+            .query_row(
+                "SELECT usefulness_count FROM entities WHERE category = 'insight' AND key = 'self-citer'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(u, 0, "a write cannot vouch for itself");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn remember_derived_from_rejects_oversized_citation_list() {
+        let (db, path) = temp_db();
+        let refs: Vec<Value> = (0..65).map(|i| json!(format!("mem-{i:012}"))).collect();
+        let err = handle_remember(
+            &db,
+            json!({"category": "insight", "key": "too-many",
+                   "body_json": "{\"content\":\"x\"}",
+                   "derived_from": refs}),
+        )
+        .expect_err("65 citations must be rejected");
+        assert!(err.contains("derived_from too long"), "{err}");
+        // Rejected up front: no entity was created.
+        let n: i64 = db
+            .conn()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM entities WHERE key = 'too-many'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 0, "rejected remember must not create an entity");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn remember_derived_from_is_workspace_strict() {
+        // Mirrors follow()'s #391/#396 semantics: a workspace-scoped write
+        // reinforces the row in ITS workspace, never the global '' row.
+        let (db, path) = temp_db();
+        handle_remember(
+            &db,
+            json!({"category": "insight", "key": "shared-key",
+                   "body_json": "{\"content\":\"the global variant of this fact\"}"}),
+        )
+        .expect("remember global row");
+        handle_remember(
+            &db,
+            json!({"category": "insight", "key": "shared-key", "workspace_hash": "ws-a",
+                   "body_json": "{\"content\":\"the ws-a variant of this fact entirely different\"}"}),
+        )
+        .expect("remember ws-a row");
+
+        let resp = handle_remember(
+            &db,
+            json!({"category": "decision", "key": "ws-derived", "workspace_hash": "ws-a",
+                   "body_json": "{\"content\":\"a ws-a decision built on the shared fact\"}",
+                   "derived_from": [{"category": "insight", "key": "shared-key"}]}),
+        )
+        .expect("remember with ws-scoped citation");
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v["derived_from"]["reinforced"].as_i64(), Some(1), "{resp}");
+
+        let conn = db.conn().unwrap();
+        let get = |ws: &str| -> i64 {
+            conn.query_row(
+                "SELECT usefulness_count FROM entities \
+                 WHERE category = 'insight' AND key = 'shared-key' AND workspace_hash = ?1",
+                rusqlite::params![ws],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(get("ws-a"), 1, "the ws-a row the agent saw gets the credit");
+        assert_eq!(get(""), 0, "the global row must NOT be stamped by a ws-scoped write");
+        let _ = std::fs::remove_file(&path);
     }
 
     // ─── Autocohere link budget (#412) ───────────────────────────
