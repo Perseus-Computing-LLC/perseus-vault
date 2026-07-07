@@ -145,6 +145,7 @@ pub mod grpc {
                     diversity_per_query_share: 0.0,
                     recency_half_life_secs: None,
                     workspace_hash: r.workspace_hash,
+                    scope_weight: None,
                     agent_id: r.agent_id,
                     visibility: r.visibility,
                     layer: None,
