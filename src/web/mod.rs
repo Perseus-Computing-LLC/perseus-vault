@@ -1164,4 +1164,28 @@ mod tests {
         }
         let _ = std::fs::remove_file(&path);
     }
+
+    // ── #494: "About you" dashboard tab ──────────────────────────────
+
+    #[test]
+    fn dashboard_ships_about_you_tab() {
+        // The tab, its loader, and its read-only curation pointer must all be
+        // present in the embedded SPA. Bucketing mirrors `perseus knows`
+        // (perseus #692) — the shared bucket names are load-bearing.
+        let html = super::dashboard_html::HTML;
+        assert!(html.contains("data-tab=\"about\""));
+        assert!(html.contains("async function loadAbout()"));
+        for bucket in [
+            "About you",
+            "Recently learned",
+            "Project facts & decisions",
+            "Low confidence — might be stale",
+        ] {
+            assert!(html.contains(bucket), "missing bucket: {}", bucket);
+        }
+        // Honest headline: active-only stats preferred, archived shown muted.
+        assert!(html.contains("stats.active_entities"));
+        // Read-only by design — points at the CLI for curation.
+        assert!(html.contains("perseus knows --forget"));
+    }
 }

@@ -127,6 +127,26 @@
     overflow-y: auto;
   }
   #loading { text-align: center; padding: 48px; color: var(--text-dim); }
+  /* #494: "About you" plain-language tab */
+  .about-headline { font-size: 18px; font-weight: 600; margin-bottom: 16px; }
+  .about-headline .muted { color: var(--text-dim); font-weight: 400; font-size: 14px; }
+  .about-bucket {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 14px 16px;
+    margin-bottom: 14px;
+  }
+  .about-bucket h3 { font-size: 14px; margin-bottom: 8px; }
+  .about-bucket h3 .count { color: var(--text-dim); font-weight: 400; }
+  .about-item { padding: 4px 0; font-size: 13px; display: flex; gap: 8px; align-items: baseline; }
+  .about-item .mark { width: 14px; flex: none; }
+  .about-item .mark.ok { color: var(--green); }
+  .about-item .mark.unv { color: var(--text-dim); }
+  .about-item .meta { color: var(--text-dim); font-size: 12px; white-space: nowrap; }
+  .about-more, .about-footer { color: var(--text-dim); font-size: 12px; padding: 4px 0; }
+  .about-footer { margin-top: 8px; }
+  .about-footer code { background: var(--bg); padding: 1px 5px; border-radius: 4px; }
   .hidden { display: none !important; }
   #loading.hidden { display: none; }
 </style>
@@ -148,10 +168,20 @@
   </div>
   <div class="tabs">
     <button class="active" data-tab="entities">Entities</button>
+    <button data-tab="about">About you</button>
     <button data-tab="graph">Graph</button>
     <button data-tab="timeline">Timeline</button>
   </div>
   <div id="loading">Loading...</div>
+  <div class="tab-content" id="tab-about">
+    <div id="about-headline" class="about-headline"></div>
+    <div id="about-buckets"></div>
+    <div class="about-footer">
+      ✔ verified · ~ unverified. This view is read-only — to fix or remove
+      something, run <code>perseus knows --correct &lt;id&gt; "the right value"</code>
+      or <code>perseus knows --forget &lt;id&gt;</code>.
+    </div>
+  </div>
   <div class="tab-content active" id="tab-entities">
     <table id="entities-table">
       <thead><tr><th>Key</th><th>Category</th><th>Layer</th><th>Score</th></tr></thead>
@@ -290,6 +320,103 @@ async function loadGraph() {
   });
 }
 
+// ── #494: "About you" — plain-language, read-only view ──────────────────────
+// Bucketing mirrors `perseus knows` (perseus #692) so both surfaces tell the
+// same story. Data comes from the active-only /api/entities listing; the
+// headline prefers the active-only stats fields (#493).
+const ABOUT_YOU_CATS = new Set(['user', 'identity', 'preference', 'preferences',
+                                'profile', 'personal', 'communication']);
+const CONVERSATIONAL_CATS = new Set(['conversation', 'session', 'checkpoint', 'general']);
+const ABOUT_BUCKETS = ['About you', 'Recently learned', 'Project facts & decisions',
+                       'Low confidence — might be stale'];
+const LOW_CONFIDENCE_DECAY = 0.3;
+const RECENT_MS = 7 * 86400 * 1000;
+
+function aboutBucket(e, now) {
+  if (ABOUT_YOU_CATS.has(e.category)) return 'About you';
+  if ((e.decay_score ?? 1) < LOW_CONFIDENCE_DECAY) return 'Low confidence — might be stale';
+  if (now - (e.created_at_unix_ms || 0) <= RECENT_MS) return 'Recently learned';
+  return 'Project facts & decisions';
+}
+
+function aboutAge(now, then) {
+  const days = Math.max(0, Math.floor((now - (then || 0)) / 86400000));
+  if (days === 0) return 'today';
+  if (days === 1) return 'yesterday';
+  if (days < 30) return days + 'd ago';
+  if (days < 365) return Math.floor(days / 30) + 'mo ago';
+  return Math.floor(days / 365) + 'y ago';
+}
+
+function aboutLabel(e) {
+  const text = (e.summary || e.title || e.text || e.content || e.note ||
+                e.description || e.key || e.category || '').toString();
+  return text.length > 110 ? text.slice(0, 107) + '…' : text;
+}
+
+async function loadAbout() {
+  const now = Date.now();
+  const [stats, data] = await Promise.all([
+    api('/api/stats').catch(() => ({})),
+    api('/api/entities?limit=500'),
+  ]);
+  const items = data.items || [];
+
+  const buckets = {};
+  ABOUT_BUCKETS.forEach(b => buckets[b] = []);
+  let olderConversational = 0;
+  items.forEach(e => {
+    const b = aboutBucket(e, now);
+    if (b === 'Project facts & decisions' && CONVERSATIONAL_CATS.has(e.category)) {
+      olderConversational++;
+      return;
+    }
+    buckets[b].push(e);
+  });
+
+  // Honest headline: active-only stats when the server has them (#493);
+  // otherwise the listing size — never the archived-inflated total_entities.
+  const head = document.getElementById('about-headline');
+  if (stats.active_entities != null) {
+    const archived = stats.archived_entities > 0
+      ? ` <span class="muted">(${stats.archived_entities} archived — hidden)</span>` : '';
+    head.innerHTML = `Perseus knows ${stats.active_entities} things${archived}`;
+  } else {
+    const more = items.length >= (data.limit || 500) ? '+' : '';
+    head.innerHTML = `Perseus knows ${items.length}${more} things` +
+      ` <span class="muted">(newest ${items.length} shown)</span>`;
+  }
+
+  const root = document.getElementById('about-buckets');
+  root.innerHTML = '';
+  const PER_BUCKET = 8;
+  ABOUT_BUCKETS.forEach(name => {
+    const list = buckets[name];
+    if (!list.length) return;
+    const div = document.createElement('div');
+    div.className = 'about-bucket';
+    const rows = list.slice(0, PER_BUCKET).map(e => {
+      const mark = e.verified ? '<span class="mark ok">✔</span>'
+                              : '<span class="mark unv">~</span>';
+      return `<div class="about-item">${mark}<span>${esc(aboutLabel(e))}</span>` +
+        `<span class="meta">${esc(e.category || 'uncategorized')} · ` +
+        `${aboutAge(now, e.created_at_unix_ms)}</span></div>`;
+    }).join('');
+    const more = list.length > PER_BUCKET
+      ? `<div class="about-more">… and ${list.length - PER_BUCKET} more</div>` : '';
+    div.innerHTML = `<h3>${esc(name)} <span class="count">(${list.length})</span></h3>` +
+      rows + more;
+    root.appendChild(div);
+  });
+  if (olderConversational) {
+    const div = document.createElement('div');
+    div.className = 'about-more';
+    div.textContent = `…plus ${olderConversational} older conversation/session ` +
+      'memories (auto-captured; not shown)';
+    root.appendChild(div);
+  }
+}
+
 // Tab switching
 document.querySelectorAll('.tabs button').forEach(btn => {
   btn.addEventListener('click', () => {
@@ -298,6 +425,7 @@ document.querySelectorAll('.tabs button').forEach(btn => {
     btn.classList.add('active');
     const tabId = 'tab-' + btn.dataset.tab;
     document.getElementById(tabId).classList.add('active');
+    if (btn.dataset.tab === 'about') loadAbout();
     if (btn.dataset.tab === 'graph') loadGraph();
     if (btn.dataset.tab === 'timeline') loadTimeline();
   });
