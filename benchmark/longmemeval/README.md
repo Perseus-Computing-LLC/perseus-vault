@@ -108,14 +108,20 @@ across all 500 rose. Reproduce the default experience:
 #310). Drop the flags to also measure the explicit dense/hybrid modes.
 <!-- RESULTS-END -->
 
-## Stage 2: QA accuracy (answer generation + LongMemEval's official judge)
+## Stage 2: QA accuracy (pinned answerer + pinned judge — the vs-Zep harness, #475)
 
-`qa.py` is the second stage. It feeds context to a named LLM, writes answers in
-LongMemEval's hypothesis format, and is graded by **LongMemEval's own judge** (we do
-not invent one). It runs every system through the **same** model at temperature 0.
+`qa.py` is the second stage and the head-to-head-vs-Zep harness. Per question it
+ingests the haystack into the real binary, hybrid-retrieves top-k sessions,
+answers with a **pinned, named** LLM (default `gpt-4o-2024-08-06`, temperature 0)
+and grades with a **pinned, named** judge (default `gpt-4o-2024-08-06`,
+temperature 0, strict yes/no prompt committed in `qa.py`). It writes a signed
+`qa_report.json` (models, split, per-category accuracy, commit, binary, verdict
+sha256) plus hypotheses files in LongMemEval's official format so their
+`evaluate_qa.py` can cross-check our judge. See [COMPARISON.md](COMPARISON.md)
+for the comparison rules and the scoreboard vs Zep's published 63.8%.
 
-Systems: `fullcontext` (all ~48 sessions), `mimir` (top-k hybrid-retrieved sessions),
-`oracle` (gold sessions only, upper bound).
+Systems: `fullcontext` (all ~48 sessions), `mimir` (top-k hybrid-retrieved sessions,
+the default), `oracle` (gold sessions only, upper bound).
 
 **Token efficiency (offline, no key needed, `--dry-run`).** On 50 `_s` instances,
 k=5 retrieval:
@@ -132,21 +138,27 @@ almost every time. (Token counts use tiktoken when present, else a ~4-chars/toke
 estimate; the *ratio* is tokenizer-independent. This is the honest, reproducible version
 of the deprecated doc's "82x fewer tokens" claim.)
 
-**Accuracy (needs a named LLM + judge).** Not run here (kept honest — no number without
-named models). To produce it:
+**Accuracy (needs a named LLM + judge; opt-in, NOT in any CI gate).** To produce it:
 
 ```bash
-export OPENAI_API_KEY=...        # OPENAI_BASE_URL optional (OpenAI / OpenRouter / local)
-python benchmark/longmemeval/qa.py --data longmemeval_s_cleaned.json \
-  --systems fullcontext mimir --model <named-model> --k 5
-# then grade each hypotheses file with LongMemEval's OFFICIAL judge:
-#   cd <LongMemEval>/src/evaluation
-#   python3 evaluate_qa.py <judge-model> hypotheses-<system>-<model>.jsonl ../../data/longmemeval_oracle.json
-#   python3 print_qa_metrics.py <judge-model> hypotheses-<system>-<model>.jsonl.log ../../data/longmemeval_oracle.json
+export OPENAI_API_KEY=...        # or put the key in ~/.openai_key; OPENAI_BASE_URL optional
+
+# Free plumbing check (no key, no network): stubbed answerer+judge, real ingest+retrieval
+python benchmark/longmemeval/qa.py --mock-llm --limit 5
+
+# Cheap paid smoke run
+python benchmark/longmemeval/qa.py --limit 10
+
+# Full 500-question head-to-head number (prints a cost estimate, requires --yes)
+python benchmark/longmemeval/qa.py --yes
 ```
 
-Run every system's hypotheses through the **same** judge model, and report the LLM and
-judge by name beside the number.
+Defaults: answerer `gpt-4o-2024-08-06`, judge `gpt-4o-2024-08-06`, split `_s`,
+hybrid k=10 — override with `--model` / `--judge` / `--split` / `--k` / `--limit`
+(all recorded in the report). Optionally cross-check with LongMemEval's official
+judge by feeding the emitted `hypotheses-<system>-<model>.jsonl` to their
+`src/evaluation/evaluate_qa.py`. Run every system through the **same** models,
+and report the LLM and judge by name beside the number (see COMPARISON.md).
 
 ## Honesty notes (read before quoting a number)
 
