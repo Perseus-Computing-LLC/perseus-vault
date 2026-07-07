@@ -197,7 +197,16 @@ CREATE INDEX IF NOT EXISTS idx_entity_history_catkey ON entity_history(category,
 /// the column-add migrations below have been applied. Bump this whenever you add
 /// a new ALTER-probe migration in `initialize_schema`, or existing databases
 /// (already at the previous level) will skip it.
-const SCHEMA_VERSION: i64 = 15;
+///
+/// v16 (#503): #487 added the usefulness columns (`usefulness_count`,
+/// `last_useful_unix_ms`) WITHOUT bumping this, so every store already at v15
+/// (anything upgraded through v2.18.x) skipped the ALTERs — decay_tick, and
+/// with it maintain / --maintain-every / autocohere, failed with "no such
+/// column: usefulness_count" (hit live on the first v2.19.0 production
+/// deploy). The whole migration function is idempotent (ensure_column probes;
+/// the v15 rehash is deterministic and the keyed-chain rekey is canary-gated),
+/// so the bump simply re-runs it once and picks up the missing columns.
+const SCHEMA_VERSION: i64 = 16;
 
 /// Initialize the v0.2.0 schema on a fresh database.
 pub fn initialize_schema(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
@@ -310,6 +319,9 @@ fn apply_migrations(conn: &Connection) -> Result<(), Box<dyn std::error::Error>>
     ensure_column(conn, "entities", "efficacy_status", "TEXT DEFAULT 'unverified'")?;
 
     // Add usefulness-tracking columns (#487 — derived_from reinforcement).
+    // v16 (#503): these shipped without a SCHEMA_VERSION bump, so v15 stores
+    // never ran them — the bump to 16 exists to deliver exactly these two
+    // ALTERs to already-migrated stores.
     ensure_column(conn, "entities", "usefulness_count", "INTEGER DEFAULT 0")?;
     ensure_column(conn, "entities", "last_useful_unix_ms", "INTEGER DEFAULT 0")?;
 

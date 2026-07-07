@@ -19940,6 +19940,57 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// #503: #487's usefulness columns shipped without a SCHEMA_VERSION bump,
+    /// so a store already stamped v15 (anything upgraded through v2.18.x)
+    /// never ran the ALTERs — decay_tick (and with it maintain /
+    /// --maintain-every / autocohere) died with "no such column:
+    /// usefulness_count" on the first v2.19.0 production deploy. Simulate that
+    /// exact store shape: drop the columns, stamp the pre-bump version, and
+    /// assert the real migration path (initialize_schema) delivers them.
+    #[test]
+    fn v16_migration_delivers_usefulness_columns_to_v15_stores() {
+        let (db, path) = temp_db();
+        db.remember(&make_entity("mem-503", "facts", "k503", "{\"text\": \"survives migration\"}"))
+            .unwrap();
+        {
+            let conn = db.conn().unwrap();
+            // ALTER ... DROP COLUMN chokes on the inline comments in the stored
+            // entities DDL ("incomplete input"), so rebuild the table without
+            // the two columns instead — the same shape a store born pre-#487
+            // actually has. Column list built dynamically so this test doesn't
+            // go stale when future columns land.
+            let keep: Vec<String> = {
+                let mut stmt = conn.prepare("PRAGMA table_info(entities)").unwrap();
+                stmt.query_map([], |r| r.get::<_, String>(1))
+                    .unwrap()
+                    .flatten()
+                    .filter(|c| c != "usefulness_count" && c != "last_useful_unix_ms")
+                    .collect()
+            };
+            conn.execute_batch(&format!(
+                "CREATE TABLE entities_pre487 AS SELECT {} FROM entities; \
+                 DROP TABLE entities; \
+                 ALTER TABLE entities_pre487 RENAME TO entities;",
+                keep.join(", ")
+            ))
+            .expect("simulate a pre-#487 store");
+            conn.pragma_update(None, "user_version", 15i64).unwrap();
+            // The greg failure mode: decay's SELECT names the column explicitly.
+            assert!(
+                conn.prepare("SELECT usefulness_count FROM entities LIMIT 1").is_err(),
+                "test setup must reproduce the missing column"
+            );
+            crate::schema::initialize_schema(&conn).expect("v15->v16 migration must succeed");
+            conn.prepare("SELECT usefulness_count, last_useful_unix_ms FROM entities LIMIT 1")
+                .expect("v16 must deliver the #487 columns");
+            let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+            assert!(v >= 16, "migration must stamp v16, got {}", v);
+        }
+        // The actual production symptom: the maintenance pass must run.
+        db.decay_tick().expect("decay_tick must work after the migration");
+        let _ = fs::remove_file(&path);
+    }
+
     #[test]
     fn audit_chain_mac_is_sha256_hex_and_field_sensitive() {
         // v15: unkeyed link is a full SHA-256 (64 hex), sensitive to every field.
