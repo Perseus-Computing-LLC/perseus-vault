@@ -316,7 +316,7 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
         r###"[
   {
     "name": "mimir_remember",
-    "description": "Store or update an entity by (category, key). Idempotent — call as often as you want, same key returns an update. Prefer recall_when triggers (retrieve when relevant) over always_on=true (inject unconditionally): the recall-first mimir_context hard-caps the always-on set and warns when it overflows, so reserve always_on for genuinely identity-critical facts. Optional certainty (0.0-1.0) is used by mimir_conflicts for typed-entity conflict detection. Use this for saving facts, decisions, architecture notes, and conventions. When encryption is enabled, body_json is encrypted at rest with AES-256-GCM.",
+    "description": "Store or update an entity by (category, key). Idempotent — call as often as you want, same key returns an update. Prefer recall_when triggers (retrieve when relevant) over always_on=true (inject unconditionally): the recall-first mimir_context hard-caps the always-on set and warns when it overflows, so reserve always_on for genuinely identity-critical facts. Optional certainty (0.0-1.0) is used by mimir_conflicts for typed-entity conflict detection. Pass derived_from (ids or {category,key} pairs of the memories you recalled) to auto-mark those sources useful — cited memories rank higher and decay slower. Use this for saving facts, decisions, architecture notes, and conventions. When encryption is enabled, body_json is encrypted at rest with AES-256-GCM.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -376,6 +376,27 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
         "valid_to_unix_ms": {
           "type": "integer",
           "description": "Application-time period end (#363, exclusive): when the fact STOPPED being true in the world. Omit for 'still true' (unbounded). Must be greater than valid_from_unix_ms."
+        },
+        "derived_from": {
+          "type": "array",
+          "items": {
+            "oneOf": [
+              {
+                "type": "string",
+                "description": "Entity id of a cited source, e.g. 'mem-a1b2c3d4e5f6' (as returned by recall/remember)"
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "category": { "type": "string" },
+                  "key": { "type": "string" }
+                },
+                "required": ["category", "key"],
+                "description": "A cited source addressed by (category, key)"
+              }
+            ]
+          },
+          "description": "#487: the memories this write was built on (max 64). Each cited source is automatically marked useful — usefulness_count bumped, last_useful/last_accessed refreshed — so memories that actually inform later writes rank higher in recall and decay slower. Cite the entities you recalled before composing this write. Unknown citations are reported in the result, not fatal; self-citations are ignored."
         }
       },
       "required": [
@@ -402,6 +423,10 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
         "key": {
           "type": "string",
           "description": "Entity key"
+        },
+        "derived_from": {
+          "type": "object",
+          "description": "Present when derived_from citations were passed: {reinforced: n, not_found: [labels]}"
         }
       }
     },

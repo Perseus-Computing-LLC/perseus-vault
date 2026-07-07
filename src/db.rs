@@ -1895,11 +1895,11 @@ impl Database {
         // Update decay_score for non-archived entities, optionally capped
         let sql = if let Some(max) = max_entities {
             format!(
-                "SELECT id, last_accessed_unix_ms, verified, efficacy_status, follow_rate, importance, decay_score FROM entities WHERE archived = 0 LIMIT {}",
+                "SELECT id, last_accessed_unix_ms, verified, efficacy_status, follow_rate, importance, decay_score, usefulness_count FROM entities WHERE archived = 0 LIMIT {}",
                 max
             )
         } else {
-            "SELECT id, last_accessed_unix_ms, verified, efficacy_status, follow_rate, importance, decay_score FROM entities WHERE archived = 0".to_string()
+            "SELECT id, last_accessed_unix_ms, verified, efficacy_status, follow_rate, importance, decay_score, usefulness_count FROM entities WHERE archived = 0".to_string()
         };
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map([], |r| {
@@ -1913,16 +1913,18 @@ impl Database {
                 r.get::<_, Option<f64>>(4).unwrap_or(None).unwrap_or(0.0),
                 r.get::<_, Option<f64>>(5).unwrap_or(None).unwrap_or(0.0),
                 r.get::<_, f64>(6).unwrap_or(0.0),
+                r.get::<_, Option<i64>>(7).unwrap_or(None).unwrap_or(0),
             ))
         })?;
 
         let mut updated = 0i64;
         let mut auto_archived = 0i64;
-        let mut batch: Vec<(String, i64, bool, String, f64, f64, f64)> = Vec::with_capacity(1000);
+        let mut batch: Vec<(String, i64, bool, String, f64, f64, f64, i64)> =
+            Vec::with_capacity(1000);
         let now_val = now;
 
         // Helper: flush the current batch in a transaction.
-        let flush_batch = |batch: &mut Vec<(String, i64, bool, String, f64, f64, f64)>,
+        let flush_batch = |batch: &mut Vec<(String, i64, bool, String, f64, f64, f64, i64)>,
                             updated: &mut i64,
                             auto_archived: &mut i64|
          -> Result<(), Box<dyn std::error::Error>> {
@@ -1930,7 +1932,7 @@ impl Database {
                 return Ok(());
             }
             let tx = conn.unchecked_transaction()?;
-            for (id, last_access, verified, efficacy_status, follow_rate, importance, stored_decay) in
+            for (id, last_access, verified, efficacy_status, follow_rate, importance, stored_decay, usefulness) in
                 batch.drain(..)
             {
                 let mut new_decay = Self::compute_decay(last_access, now_val);
@@ -1951,8 +1953,16 @@ impl Database {
                     "dead" => 0.05,
                     _ => 1.0,
                 };
+                // #487 (usefulness composite): memories repeatedly cited as
+                // derived_from sources by later writes earned their keep and
+                // decay slower. Log-damped and capped (see usefulness_weight)
+                // so citation counts amplify but never dominate — a heavily
+                // cited but long-untouched memory still decays, just later.
+                // Composes with the efficacy weight: both are honest-usage
+                // signals, one from follow-rate, one from citation.
                 if !verified {
-                    new_decay = (new_decay * efficacy_weight).clamp(0.0, 1.0);
+                    new_decay = (new_decay * efficacy_weight * usefulness_weight(usefulness))
+                        .clamp(0.0, 1.0);
                 }
                 // v2.13.0: explicit importance (mimir_score) is a persistent
                 // floor applied LAST — fidelity beats recency and beats the
@@ -2003,9 +2013,9 @@ impl Database {
         };
 
         for row in rows {
-            let (id, last_access, verified, efficacy_status, follow_rate, importance, stored_decay) =
+            let (id, last_access, verified, efficacy_status, follow_rate, importance, stored_decay, usefulness) =
                 row?;
-            batch.push((id, last_access, verified, efficacy_status, follow_rate, importance, stored_decay));
+            batch.push((id, last_access, verified, efficacy_status, follow_rate, importance, stored_decay, usefulness));
             if batch.len() >= 1000 {
                 flush_batch(&mut batch, &mut updated, &mut auto_archived)?;
             }
@@ -3224,6 +3234,12 @@ impl Database {
                         now_ms(),
                     )
                 };
+                // #487: usefulness term in the composite rank expression —
+                // Belief Memory's `(1.0 + usefulness())`. Applied over the
+                // fused candidate pool BEFORE the metadata filter + truncate,
+                // so a cited-and-reused memory ranked just past `limit` can
+                // still make the cut over a never-reused near-tie.
+                let fused = self.apply_usefulness_rank_boost(fused)?;
                 let mut out: Vec<Entity> = fused.into_iter().map(|(e, _)| e).collect();
                 Self::retain_layer(&mut out, params);
                 // Apply the same metadata predicates as fts5_search: the dense
@@ -3242,6 +3258,56 @@ impl Database {
         let mut results = self.fts5_search(params)?;
         Self::retain_layer(&mut results, params);
         Ok(results)
+    }
+
+    /// #487: multiply each fused score by the usefulness weight — memories
+    /// repeatedly cited as `derived_from` sources outrank equally-relevant
+    /// never-reused ones. One primary-key IN-lookup over the candidate pool
+    /// (≤ candidate_k rows), touching only rows with a non-zero count, so the
+    /// common all-zero case is a single index probe and an unchanged order.
+    /// Read-only: ranking only, no access-state writes — hybrid recall stays
+    /// idempotent (#247). The re-sort mirrors reciprocal_rank_fusion's
+    /// deterministic tie-break (score desc, id asc).
+    fn apply_usefulness_rank_boost(
+        &self,
+        mut fused: Vec<(Entity, f64)>,
+    ) -> Result<Vec<(Entity, f64)>, Box<dyn std::error::Error>> {
+        if fused.is_empty() {
+            return Ok(fused);
+        }
+        let conn = self.conn()?;
+        let placeholders = vec!["?"; fused.len()].join(",");
+        let sql = format!(
+            "SELECT id, usefulness_count FROM entities \
+             WHERE id IN ({placeholders}) AND usefulness_count > 0"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let id_params: Vec<&dyn rusqlite::ToSql> = fused
+            .iter()
+            .map(|(e, _)| &e.id as &dyn rusqlite::ToSql)
+            .collect();
+        let mut counts: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+        let rows = stmt.query_map(id_params.as_slice(), |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+        })?;
+        for row in rows {
+            let (id, c) = row?;
+            counts.insert(id, c);
+        }
+        if counts.is_empty() {
+            return Ok(fused);
+        }
+        for (entity, score) in fused.iter_mut() {
+            if let Some(&c) = counts.get(&entity.id) {
+                *score *= usefulness_weight(c);
+            }
+        }
+        fused.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.id.cmp(&b.0.id))
+        });
+        Ok(fused)
     }
 
     /// Opt-in reinforcement for the semantic (Dense/Hybrid) recall paths.
@@ -5682,6 +5748,69 @@ impl Database {
             follow_rate,
             efficacy_status,
         })
+    }
+
+    /// #487 (Belief-Memory-inspired derived_from reinforcement): record that
+    /// an entity was cited as a `derived_from` source by a later `remember` —
+    /// the automatic "this memory actually informed a subsequent write"
+    /// signal that `follow`/`score` only capture when an agent explicitly
+    /// calls them (which in practice is rare).
+    ///
+    /// Bumps `usefulness_count`, stamps `last_useful_unix_ms`, and refreshes
+    /// `last_accessed_unix_ms` — a citation IS an access (same precedent as
+    /// `score_entity`), so the existing recency ranking, decay recompute, and
+    /// FTS5 rank tie-break all pick the signal up with no read-path changes.
+    ///
+    /// Row resolution mirrors `follow()` (#391/#396): with a workspace_hash,
+    /// STRICT workspace equality — the agent reinforces the row it actually
+    /// saw, never the global `''` row or another workspace's; without one,
+    /// the deterministic pick (global `''` first, then lexicographically-
+    /// first workspace), live rows only. The increment is a single UPDATE
+    /// with a resolving subquery, so concurrent citations compose without
+    /// the read-decide-write hazard of the #377/#385 family.
+    pub fn mark_useful(
+        &self,
+        category: &str,
+        key: &str,
+        workspace_hash: Option<&str>,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        let conn = self.conn()?;
+        let now = now_ms();
+        let affected = match workspace_hash {
+            Some(ws) => conn.execute(
+                "UPDATE entities SET usefulness_count = usefulness_count + 1, \
+                 last_useful_unix_ms = ?1, last_accessed_unix_ms = ?1 \
+                 WHERE id = (SELECT id FROM entities \
+                     WHERE category = ?2 AND key = ?3 AND workspace_hash = ?4 \
+                     AND archived = 0 ORDER BY id ASC LIMIT 1)",
+                params![now, category, key, ws],
+            )?,
+            None => conn.execute(
+                "UPDATE entities SET usefulness_count = usefulness_count + 1, \
+                 last_useful_unix_ms = ?1, last_accessed_unix_ms = ?1 \
+                 WHERE id = (SELECT id FROM entities \
+                     WHERE category = ?2 AND key = ?3 AND archived = 0 \
+                     ORDER BY workspace_hash ASC, id ASC LIMIT 1)",
+                params![now, category, key],
+            )?,
+        };
+        Ok(affected > 0)
+    }
+
+    /// `mark_useful` addressed by entity id — recall results carry ids, so
+    /// `derived_from: ["mem-..."]` is the cheapest citation form. Live rows
+    /// only; an archived source is not reinforced (it was already judged
+    /// stale — citation should not resurrect it silently).
+    pub fn mark_useful_by_id(&self, id: &str) -> Result<bool, Box<dyn std::error::Error>> {
+        let conn = self.conn()?;
+        let now = now_ms();
+        let affected = conn.execute(
+            "UPDATE entities SET usefulness_count = usefulness_count + 1, \
+             last_useful_unix_ms = ?1, last_accessed_unix_ms = ?1 \
+             WHERE id = ?2 AND archived = 0",
+            params![now, id],
+        )?;
+        Ok(affected > 0)
     }
 
     /// How many of the most-recently-accessed entities in a category a single
@@ -8987,6 +9116,15 @@ fn cosine_with_query_norm(query: &[f32], q_norm: f64, b: &[f32]) -> f64 {
 /// scalar: `fts5_bm25_search` drops stopwords and ranks by BM25 relevance, so a
 /// paraphrase query with no meaning-bearing overlap produces an empty arm
 /// (weight 0 here) rather than the whole corpus as noise.
+/// #487: usefulness multiplier — Belief Memory's `(1.0 + usefulness())` rank
+/// term, shared by decay_tick's composite and the post-fusion hybrid rank
+/// boost so the two never drift. Log-damped (`ln(1+n)`) and capped so
+/// citation counts separate ties and near-ties but can never drown out
+/// relevance: 1 citation → ~1.07, 10 → ~1.24, cap 1.4 from ~55 citations.
+pub(crate) fn usefulness_weight(usefulness_count: i64) -> f64 {
+    1.0 + ((usefulness_count.max(0) as f64).ln_1p() * 0.1).min(0.4)
+}
+
 pub(crate) fn sparse_arm_weight(n_hits: usize) -> f64 {
     /// Equal-weight RRF: the keyword arm is as trustworthy as the dense arm once
     /// it has matched real, stopword-filtered content terms (#309).
@@ -16274,6 +16412,133 @@ mod tests {
         let ids2: Vec<&str> = second.iter().map(|e| e.id.as_str()).collect();
         assert_eq!(ids1, ids2, "repeated hybrid recall must be idempotent");
 
+        let _ = fs::remove_file(&path);
+    }
+
+    // ─── derived_from usefulness (#487) ──────────────────────────
+
+    #[test]
+    fn usefulness_weight_is_log_damped_and_capped() {
+        assert_eq!(usefulness_weight(0), 1.0, "no citations = no boost");
+        assert_eq!(usefulness_weight(-3), 1.0, "negative counts clamp to no boost");
+        assert!(usefulness_weight(1) > 1.0 && usefulness_weight(1) < 1.1);
+        assert!(usefulness_weight(10) > usefulness_weight(1), "monotonic");
+        assert!(
+            usefulness_weight(1_000_000) <= 1.4 + 1e-12,
+            "citation counts must never drown out relevance (cap 1.4)"
+        );
+    }
+
+    #[test]
+    fn derived_from_usefulness_slows_decay() {
+        // #487 acceptance: repeatedly-derived-from memories survive a decay
+        // pass longer than equally-stale never-reused ones.
+        let (db, path) = temp_db();
+        // Exactly one half-life stale: base decay ≈ e^-1 ≈ 0.368, comfortably
+        // above the auto-archive threshold so both rows stay live and the
+        // ordering assertion is about decay_score, not archival.
+        let old = now_ms() - 7 * 24 * 60 * 60 * 1000;
+        {
+            let conn = db.conn().unwrap();
+            let insert = |id: &str, key: &str, usefulness: i64| {
+                conn.execute(
+                    "INSERT INTO entities (id, category, key, body_json, type, status,
+                        retrieval_count, last_accessed_unix_ms, created_at_unix_ms,
+                        decay_score, layer, archived, usefulness_count)
+                     VALUES (?1, 'insight', ?2, '{}', 'insight', 'active', 0, ?3, ?3, 0.5, 'working', 0, ?4)",
+                    params![id, key, old, usefulness],
+                )
+                .unwrap();
+            };
+            insert("d-plain", "plain", 0);
+            insert("d-cited", "cited", 10);
+        }
+        db.decay_tick().unwrap();
+        let conn = db.conn().unwrap();
+        let get = |id: &str| -> f64 {
+            conn.query_row(
+                "SELECT decay_score FROM entities WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert!(
+            get("d-cited") > get("d-plain"),
+            "cited-and-reused memories must decay slower: cited={} plain={}",
+            get("d-cited"),
+            get("d-plain")
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn hybrid_rank_boosts_derived_from_usefulness() {
+        // #487 acceptance: a repeatedly-derived-from memory ranks above an
+        // EQUALLY-RELEVANT never-reused one. Identical bodies + identical
+        // embeddings make every arm tie, so without the usefulness term the
+        // deterministic id tie-break puts "e-aaa" first; the boost on
+        // "e-bbb" must flip that — and only ranking may change (the boost is
+        // read-only, preserving #247 idempotence).
+        let (db, path) = temp_db();
+        let blob = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|f| f.to_le_bytes()).collect() };
+        let insert = |id: &str, key: &str, usefulness: i64| {
+            let body = r#"{"note":"espresso machine maintenance checklist"}"#;
+            db.conn()
+                .unwrap()
+                .execute(
+                    "INSERT INTO entities (id, category, key, body_json, type, status,
+                        retrieval_count, last_accessed_unix_ms, created_at_unix_ms,
+                        decay_score, layer, embedding, archived, usefulness_count)
+                     VALUES (?1, 'insight', ?2, ?3, 'insight', 'active', 0, 0, 0, 1.0, 'working', ?4, 0, ?5)",
+                    params![id, key, body, blob(&[1.0, 0.0, 0.0]), usefulness],
+                )
+                .unwrap();
+            db.conn()
+                .unwrap()
+                .execute(
+                    "INSERT INTO entities_fts (rowid, body_json)
+                     VALUES ((SELECT rowid FROM entities WHERE id = ?1), ?2)",
+                    params![id, body],
+                )
+                .unwrap();
+        };
+        insert("e-aaa", "twin-a", 0);
+        insert("e-bbb", "twin-b", 5);
+
+        let recall_params = RecallParams {
+            query: "espresso".to_string(),
+            mode: crate::models::SearchMode::Hybrid,
+            embedding: Some(vec![1.0, 0.0, 0.0]),
+            limit: 10,
+            ..RecallParams::default()
+        };
+        let hits = db.recall(&recall_params).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(
+            hits[0].id, "e-bbb",
+            "the cited-and-reused twin must outrank its never-reused equal"
+        );
+
+        // Read-only: the boost queried but never wrote.
+        let (u, la): (i64, i64) = db
+            .conn()
+            .unwrap()
+            .query_row(
+                "SELECT usefulness_count, last_accessed_unix_ms FROM entities WHERE id = 'e-bbb'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(u, 5, "rank boost must not write usefulness_count");
+        assert_eq!(la, 0, "rank boost must not touch last_accessed_unix_ms");
+
+        // Deterministic and idempotent across repeated recalls.
+        let again = db.recall(&recall_params).unwrap();
+        assert_eq!(
+            hits.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
+            again.iter().map(|e| e.id.as_str()).collect::<Vec<_>>()
+        );
         let _ = fs::remove_file(&path);
     }
 

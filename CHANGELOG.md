@@ -5,6 +5,24 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
 
 ## [Unreleased]
 
+### Added
+- **Auto-reinforcement via `derived_from` on `remember`** (#487, Belief-Memory-inspired).
+  `remember` accepts an optional `derived_from` array (entity ids or `{category, key}`
+  pairs, max 64) citing the memories the write was built on. Each cited source is
+  automatically marked useful: `usefulness_count` bumped, `last_useful_unix_ms` stamped,
+  `last_accessed_unix_ms` refreshed (a citation IS an access). Unlike `follow`/`score`,
+  no explicit call is needed — the reinforcement rides the write the agent was already
+  making, capturing the honest "this memory actually informed a later write" signal.
+  Usefulness feeds the engine twice: `decay_tick` multiplies non-verified decay by a
+  log-damped, capped `usefulness_weight` (1 citation ≈ ×1.07, 10 ≈ ×1.24, cap ×1.4) so
+  cited-and-reused memories survive decay/compact longer, and hybrid recall applies the
+  same weight post-RRF (Belief Memory's `(1.0 + usefulness())` rank term) so they outrank
+  equally-relevant never-reused ones — read-only, preserving #247 idempotence. Row
+  resolution mirrors `follow()`'s workspace semantics (#391/#396): strict equality when
+  scoped, deterministic global-first pick when not. Self-citations are skipped; unknown
+  citations are reported in the result (`derived_from: {reinforced, not_found}`), never
+  fatal. Two new additive columns (`usefulness_count`, `last_useful_unix_ms`).
+
 ### Security — keyed-MAC audit chain + payload commitment (DRAFT, under review)
 - **Keyed, content-committing audit chain** (v14→v15). The journal chain now (a)
   stores a per-entry SHA-256 **payload commitment** covered by the chain, so content

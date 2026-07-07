@@ -60,7 +60,16 @@ CREATE TABLE IF NOT EXISTS entities (
     follow_count INTEGER DEFAULT 0,      -- times confirmed/detected as followed
     miss_count INTEGER DEFAULT 0,        -- times confirmed/detected as NOT followed
     follow_rate REAL DEFAULT 0.0,        -- follow_count / (follow_count + miss_count), 0.0 if no attempts
-    efficacy_status TEXT DEFAULT 'unverified'  -- 'unverified' | 'useful' | 'dead'
+    efficacy_status TEXT DEFAULT 'unverified',  -- 'unverified' | 'useful' | 'dead'
+
+    -- Usefulness tracking (#487 — Belief-Memory-inspired derived_from
+    -- reinforcement). Unlike retrieval_count (how often a memory was merely
+    -- recalled), usefulness_count only increments when a later remember()
+    -- explicitly cites this entity via derived_from — i.e. the memory
+    -- demonstrably informed a subsequent write. Feeds decay_tick (cited
+    -- memories decay slower) and the hybrid-recall rank boost.
+    usefulness_count INTEGER DEFAULT 0,  -- times cited as a derived_from source
+    last_useful_unix_ms INTEGER DEFAULT 0 -- when it was last cited (0 = never)
 );
 
 -- Identity index: (category, key, workspace_hash) — #339. Created in
@@ -299,6 +308,10 @@ fn apply_migrations(conn: &Connection) -> Result<(), Box<dyn std::error::Error>>
     ensure_column(conn, "entities", "miss_count", "INTEGER DEFAULT 0")?;
     ensure_column(conn, "entities", "follow_rate", "REAL DEFAULT 0.0")?;
     ensure_column(conn, "entities", "efficacy_status", "TEXT DEFAULT 'unverified'")?;
+
+    // Add usefulness-tracking columns (#487 — derived_from reinforcement).
+    ensure_column(conn, "entities", "usefulness_count", "INTEGER DEFAULT 0")?;
+    ensure_column(conn, "entities", "last_useful_unix_ms", "INTEGER DEFAULT 0")?;
 
     // Backfill transaction time for pre-existing rows: a fact's recorded_at is
     // when Mneme first stored it, i.e. its created_at. (No-op on a fresh DB.)
