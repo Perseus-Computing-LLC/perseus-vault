@@ -74,8 +74,9 @@ python benchmark/longmemeval/qa.py --yes
 Defaults are the pinned models above; `--model`, `--judge`, `--split`, `--k`,
 `--limit` override (every override is recorded in `qa_report.json`). This run is
 **opt-in and NOT part of any CI gate** — it costs real money (estimate printed
-upfront; roughly $10–15 for the full 500-question mimir-only run at 2026-07
-GPT-4o pricing, dominated by k=10 context tokens).
+upfront; roughly $28 for the full 500-question mimir-only run at k=10 and
+2026-07 GPT-4o pricing, ~$15 at k=5, ~$165 if you add the fullcontext and
+oracle baselines — dominated by answerer context tokens).
 
 ## Related numbers (do not conflate)
 
