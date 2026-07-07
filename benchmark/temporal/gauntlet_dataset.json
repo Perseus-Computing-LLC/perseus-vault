@@ -1,0 +1,79 @@
+{
+  "name": "perseus-vault-bitemporal-gauntlet",
+  "version": 1,
+  "description": "A rigorous bi-temporal reasoning gauntlet for Perseus Vault. Unlike the 4-scenario transaction-time mini-benchmark, the gauntlet exercises all THREE temporal axes against SQL:2011 semantics: (1) transaction time via as_of ('what did we believe at T'), (2) valid/application time via valid_at ('what was actually true in the world at T, as we understand it now'), and (3) full bi-temporal via bitemporal ('as of what we believed at tx_at, what was true at valid_at'). Scenarios cover the hard cases that flat and single-axis memory stores (Mem0, Cognee) and valid-time-only stores (Zep/Graphiti) get wrong: retroactive correction, proactive/future-dated facts, out-of-order arrival, and audit-grade point-in-time reconstruction. All timestamps are expressed as day-offsets from an anchor 'now' the harness resolves at runtime, so absolute times vary run-to-run but PASS/FAIL verdicts are stable.",
+  "scenarios": [
+    {
+      "id": "retroactive-correction",
+      "category": "hr",
+      "key": "alice-title",
+      "narrative": "We recorded on day 0 that Alice is a 'staff engineer'. On day 0 we ALSO learn (retroactively) that she was actually a 'senior engineer' from day -300 until she was promoted on day -60. Both facts are recorded now but describe different world-periods.",
+      "writes": [
+        {"body": {"title": "senior engineer"}, "valid_from_days": -300, "valid_to_days": -60, "recorded_offset_ms": 0},
+        {"body": {"title": "staff engineer"},  "valid_from_days": -60,  "valid_to_days": null, "recorded_offset_ms": 3000}
+      ],
+      "checks": [
+        {"axis": "valid_at", "at_days": -150, "expect_body_contains": "senior engineer", "why": "In the world at day -150 she was a senior engineer"},
+        {"axis": "valid_at", "at_days": -10,  "expect_body_contains": "staff engineer",  "why": "By day -10 she had been promoted"},
+        {"axis": "valid_at", "at_days": -320, "expect_found": false, "why": "Before day -300 no title fact was valid"}
+      ]
+    },
+    {
+      "id": "proactive-future-dated",
+      "category": "hr",
+      "key": "bob-salary",
+      "narrative": "On day 0 we record that Bob earns 120k now, and that a raise to 150k becomes effective on day +30 (a future-dated / proactive fact). A valid-time query for today must return 120k; a query for day +45 must return 150k even though that world-instant has not happened yet.",
+      "writes": [
+        {"body": {"salary": "120k"}, "valid_from_days": -400, "valid_to_days": 30, "recorded_offset_ms": 0},
+        {"body": {"salary": "150k"}, "valid_from_days": 30,  "valid_to_days": null, "recorded_offset_ms": 2000}
+      ],
+      "checks": [
+        {"axis": "valid_at", "at_days": 0,  "expect_body_contains": "120k", "why": "Today the raise has not taken effect"},
+        {"axis": "valid_at", "at_days": 45, "expect_body_contains": "150k", "why": "The future-dated raise is valid from day +30"}
+      ]
+    },
+    {
+      "id": "belief-vs-truth-divergence",
+      "category": "facts",
+      "key": "project-status",
+      "narrative": "On day 0 (t0) we believed a project was 'on-track'. On day 0 + a few seconds (t1) we learn it was actually 'at-risk' the whole time and correct the record with a retroactive valid_from in the past. Transaction time and valid time now DIVERGE: as_of(t0) still returns the old belief ('on-track'); valid_at(past) returns the corrected truth ('at-risk').",
+      "writes": [
+        {"body": {"status": "on-track"}, "valid_from_days": -20, "valid_to_days": null, "recorded_offset_ms": 0, "mark_tx": "t0"},
+        {"body": {"status": "at-risk"},  "valid_from_days": -20, "valid_to_days": null, "recorded_offset_ms": 4000, "mark_tx": "t1"}
+      ],
+      "checks": [
+        {"axis": "as_of", "tx_mark": "t0", "expect_body_contains": "on-track", "why": "At t0 we still BELIEVED on-track"},
+        {"axis": "valid_at", "at_days": -10, "expect_body_contains": "at-risk", "why": "As we understand it NOW, it was at-risk the whole time"},
+        {"axis": "bitemporal", "tx_mark": "t0", "valid_at_days": -10, "expect_body_contains": "on-track", "why": "As of what we believed at t0, the day -10 status was on-track"},
+        {"axis": "bitemporal", "tx_mark": "after", "valid_at_days": -10, "expect_body_contains": "at-risk", "why": "As of current knowledge, the day -10 status was at-risk"}
+      ]
+    },
+    {
+      "id": "out-of-order-arrival",
+      "category": "config",
+      "key": "primary-model",
+      "narrative": "Facts arrive out of chronological order. We first record the NEWER fact (opus-4-8, valid from day -5), then later record an OLDER fact we forgot to log (opus-4-7, valid day -90 to day -5). Valid-time queries must still stitch the timeline correctly regardless of recording order.",
+      "writes": [
+        {"body": {"model": "opus-4-8"}, "valid_from_days": -5,  "valid_to_days": null, "recorded_offset_ms": 0},
+        {"body": {"model": "opus-4-7"}, "valid_from_days": -90, "valid_to_days": -5,  "recorded_offset_ms": 2000}
+      ],
+      "checks": [
+        {"axis": "valid_at", "at_days": -40, "expect_body_contains": "opus-4-7", "why": "At day -40 the model was opus-4-7 even though logged second"},
+        {"axis": "valid_at", "at_days": -1,  "expect_body_contains": "opus-4-8", "why": "At day -1 the model was opus-4-8"}
+      ]
+    },
+    {
+      "id": "closed-period-no-longer-true",
+      "category": "prefs",
+      "key": "commute",
+      "narrative": "A fact with a CLOSED valid period that is not superseded by a successor. User biked from day -200 to day -30, then the fact ends (they stopped commuting entirely; no replacement fact). valid_at inside the window returns 'bike'; valid_at after the window returns found=false (the fact stopped being true and nothing replaced it).",
+      "writes": [
+        {"body": {"mode": "bike"}, "valid_from_days": -200, "valid_to_days": -30, "recorded_offset_ms": 0}
+      ],
+      "checks": [
+        {"axis": "valid_at", "at_days": -100, "expect_body_contains": "bike", "why": "Inside the closed window"},
+        {"axis": "valid_at", "at_days": -5,   "expect_found": false, "why": "After the window closed with no successor"}
+      ]
+    }
+  ]
+}

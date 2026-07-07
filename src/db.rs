@@ -4147,10 +4147,21 @@ impl Database {
         // Walk newest-recorded first, tracking the earliest effective
         // valid_from among versions already seen (i.e. recorded later): that is
         // the implicit close for every older version's open period.
+        //
+        // A later-recorded version may only *close* an older version's period
+        // if its valid_from lies at or after where the older period began. With
+        // out-of-order arrival (a later-recorded fact whose valid_from is
+        // EARLIER than an already-seen version's), `min_later_from` can fall
+        // before the current version's `eff_from`; applying it as an implicit
+        // close would collapse the period into an empty/backwards interval
+        // `[eff_from, m)` with `m < eff_from` and make the version unmatchable.
+        // Guard with `m > eff_from` so only genuine successors truncate a
+        // period; earlier-valid siblings recorded later never do.
         let mut min_later_from: Option<i64> = None;
         for v in versions {
             let eff_from = v.valid_from_unix_ms.unwrap_or(v.recorded_at_unix_ms);
-            let eff_to = match (v.valid_to_unix_ms, min_later_from) {
+            let implicit_close = min_later_from.filter(|&m| m > eff_from);
+            let eff_to = match (v.valid_to_unix_ms, implicit_close) {
                 (Some(t), Some(m)) => Some(t.min(m)),
                 (Some(t), None) => Some(t),
                 (None, m) => m,
@@ -10978,6 +10989,52 @@ mod tests {
         // Consistency: the two single-axis tools are the rectangle's edges.
         let via_valid = db.valid_at("facts", "border", t_seg).unwrap().unwrap();
         assert_eq!(via_valid.entity.body_json, q4.entity.body_json);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn out_of_order_arrival_open_period_still_matches() {
+        // Regression for the bi-temporal gauntlet's out-of-order-arrival case
+        // (benchmark/temporal/gauntlet.py). Facts arrive in REVERSE valid-time
+        // order: the newer, open-ended fact is recorded FIRST, then an older
+        // fact covering an earlier closed window is recorded second.
+        //
+        // The later-recorded fact has an EARLIER valid_from, so the implicit
+        // close heuristic must NOT clamp the open period down to a backwards
+        // interval. Before the `m > eff_from` guard, valid_at() inside the
+        // open period wrongly returned None.
+        let (db, path) = temp_db();
+
+        let base = now_ms();
+        let day = 86_400_000i64;
+
+        // Recorded FIRST: current model, valid from 5 days ago, open-ended.
+        let v_new = make_entity("e-ooo", "config", "primary-model", r#"{"model":"opus-4-8"}"#);
+        db.remember_with_validity(&v_new, Some(base - 5 * day), None)
+            .unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        // Recorded SECOND: the older model we forgot to log — an EARLIER,
+        // closed window [-90d, -5d). Same (category, key); recorded later.
+        let v_old = make_entity("ignored", "config", "primary-model", r#"{"model":"opus-4-7"}"#);
+        db.remember_with_validity(&v_old, Some(base - 90 * day), Some(base - 5 * day))
+            .unwrap();
+
+        // Inside the OLDER window → opus-4-7.
+        let at_old = db
+            .valid_at("config", "primary-model", base - 40 * day)
+            .unwrap()
+            .expect("day -40 must resolve to the older, later-recorded fact");
+        assert!(at_old.entity.body_json.contains("opus-4-7"), "day -40 = opus-4-7");
+
+        // Inside the NEWER open period → opus-4-8. This is the case the bug broke.
+        let at_new = db
+            .valid_at("config", "primary-model", base - 1 * day)
+            .unwrap()
+            .expect("day -1 must resolve to the open-period fact, not None");
+        assert!(at_new.entity.body_json.contains("opus-4-8"), "day -1 = opus-4-8");
 
         let _ = fs::remove_file(&path);
     }
