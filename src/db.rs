@@ -5422,6 +5422,31 @@ impl Database {
         Ok(())
     }
 
+    /// #491: bytes VACUUM could reclaim right now — freelist pages × page
+    /// size. Read-only; backs the maintenance dry-run so the preview names
+    /// the physical work instead of silently skipping it.
+    pub fn vacuum_reclaimable_bytes_estimate(&self) -> Result<i64, Box<dyn std::error::Error>> {
+        let conn = self.conn()?;
+        let freelist: i64 = conn.query_row("PRAGMA freelist_count", [], |r| r.get(0))?;
+        let page_size: i64 = conn.query_row("PRAGMA page_size", [], |r| r.get(0))?;
+        Ok(freelist * page_size)
+    }
+
+    /// #491: cheap FTS drift signal for the maintenance dry-run — active
+    /// entities minus FTS rows. Nonzero (either sign) means reindex_fts has
+    /// work to do; zero can still hide stale CONTENT, so it is an estimate,
+    /// not a proof of index health.
+    pub fn fts_drift_estimate(&self) -> Result<i64, Box<dyn std::error::Error>> {
+        let conn = self.conn()?;
+        let active: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM entities WHERE archived = 0",
+            [],
+            |r| r.get(0),
+        )?;
+        let fts: i64 = conn.query_row("SELECT COUNT(*) FROM entities_fts", [], |r| r.get(0))?;
+        Ok(active - fts)
+    }
+
     /// Get a single entity by ID (internal helper).
     fn get_entity_by_id(&self, id: &str) -> Result<Option<Entity>, Box<dyn std::error::Error>> {
         let conn = self.conn()?;

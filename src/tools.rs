@@ -2732,32 +2732,63 @@ pub fn handle_maintenance(db: &Database, args: Value) -> Result<String, String> 
         }
     }
 
-    // Vacuum
-    if (a.vacuum || a.all) && !a.dry_run {
-        match db.vacuum() {
-            Ok(_) => {
-                let after_vacuum_db_size = db
-                    .file_size_bytes()
-                    .map_err(|e| format!("Failed to get DB size after vacuum: {}", e))?;
-                report["vacuum_reclaimed_bytes"] = json!(current_db_size as i64 - after_vacuum_db_size as i64);
+    // Vacuum. #491: under dry_run the physical rewrite is skipped, but the
+    // report must SAY so and estimate the reclaimable space — a bare
+    // `vacuum_reclaimed_bytes: 0` is indistinguishable from "ran, nothing to
+    // reclaim", which made report-only rollouts silently understate the
+    // physical work a live run would do.
+    if a.vacuum || a.all {
+        if a.dry_run {
+            report["vacuum_skipped_dry_run"] = json!(true);
+            match db.vacuum_reclaimable_bytes_estimate() {
+                Ok(bytes) => {
+                    report["vacuum_would_reclaim_bytes_estimate"] = json!(bytes);
+                }
+                Err(e) => report["errors"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!(format!("Vacuum estimate failed: {}", e))),
             }
-            Err(e) => report["errors"]
-                .as_array_mut()
-                .unwrap()
-                .push(json!(format!("Vacuum failed: {}", e))),
+        } else {
+            match db.vacuum() {
+                Ok(_) => {
+                    let after_vacuum_db_size = db
+                        .file_size_bytes()
+                        .map_err(|e| format!("Failed to get DB size after vacuum: {}", e))?;
+                    report["vacuum_reclaimed_bytes"] = json!(current_db_size as i64 - after_vacuum_db_size as i64);
+                }
+                Err(e) => report["errors"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!(format!("Vacuum failed: {}", e))),
+            }
         }
     }
 
-    // Reindex
-    if (a.reindex || a.all) && !a.dry_run {
-        match db.reindex_fts() {
-            Ok(n) => {
-                report["reindex_rows_affected"] = json!(n);
+    // Reindex. #491: same dry-run honesty — mark the skip and report a cheap
+    // row-count drift estimate so the preview shows whether reindex has work.
+    if a.reindex || a.all {
+        if a.dry_run {
+            report["reindex_skipped_dry_run"] = json!(true);
+            match db.fts_drift_estimate() {
+                Ok(n) => {
+                    report["fts_rows_drift_estimate"] = json!(n);
+                }
+                Err(e) => report["errors"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!(format!("FTS drift estimate failed: {}", e))),
             }
-            Err(e) => report["errors"]
-                .as_array_mut()
-                .unwrap()
-                .push(json!(format!("Reindex failed: {}", e))),
+        } else {
+            match db.reindex_fts() {
+                Ok(n) => {
+                    report["reindex_rows_affected"] = json!(n);
+                }
+                Err(e) => report["errors"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!(format!("Reindex failed: {}", e))),
+            }
         }
     }
 
@@ -3552,6 +3583,45 @@ mod tests {
             Some(0),
             "{report}"
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ─── maintenance dry-run estimates (#491) ────────────────────
+
+    #[test]
+    fn maintenance_dry_run_reports_physical_estimates() {
+        let (db, path) = temp_db();
+        handle_remember(
+            &db,
+            json!({"category": "insight", "key": "est-a",
+                   "body_json": "{\"content\":\"fts drift probe entity\"}"}),
+        )
+        .expect("remember");
+        // Manufacture FTS drift: drop the entity's FTS row directly.
+        db.conn()
+            .unwrap()
+            .execute("DELETE FROM entities_fts", [])
+            .unwrap();
+
+        let resp =
+            handle_maintenance(&db, json!({"all": true, "dry_run": true})).expect("maintenance");
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        // Skips are NAMED, not silently zero...
+        assert_eq!(v["vacuum_skipped_dry_run"], json!(true), "{resp}");
+        assert_eq!(v["reindex_skipped_dry_run"], json!(true), "{resp}");
+        // ...and each carries a read-only estimate of the pending work.
+        assert!(
+            v["vacuum_would_reclaim_bytes_estimate"].as_i64().unwrap() >= 0,
+            "{resp}"
+        );
+        assert_eq!(v["fts_rows_drift_estimate"].as_i64(), Some(1), "{resp}");
+        // The physical steps themselves still did not run.
+        assert_eq!(v["vacuum_reclaimed_bytes"], json!(0), "{resp}");
+        assert_eq!(v["reindex_rows_affected"], json!(0), "{resp}");
+
+        // A live reindex then clears the drift the preview reported.
+        handle_maintenance(&db, json!({"reindex": true})).expect("live reindex");
+        assert_eq!(db.fts_drift_estimate().unwrap(), 0);
         let _ = std::fs::remove_file(&path);
     }
 
