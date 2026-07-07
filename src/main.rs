@@ -226,6 +226,13 @@ enum Commands {
         /// embedding, and connectors. NIST SP 800-53 SC-7 / DoD IL5+ support.
         #[arg(long, default_value_t = false, hide = true)]
         offline: bool,
+
+        /// #492: run the full hygiene pass (same as `maintain`, never with
+        /// vacuum) every N hours while the server lives. Off unless set —
+        /// this is the no-cron fallback (native Windows); prefer a scheduled
+        /// `perseus-vault maintain` where cron/launchd/systemd exists.
+        #[arg(long, value_name = "HOURS")]
+        maintain_every: Option<u64>,
     },
 
     /// Migrate a v0.1.x Mneme database to v0.2.0 schema
@@ -838,6 +845,13 @@ fn guard_bind(surface: &str, bind_host: &str, has_token: bool) {
          auth-terminating reverse proxy) — set MIMIR_ALLOW_INSECURE_BIND=1."
     );
     std::process::exit(1);
+}
+
+/// #492: interval for the in-server hygiene loop. Clamped to ≥ 1 hour — the
+/// pass is cheap at steady state (≈0 writes), but sub-hourly hygiene has no
+/// benefit and a 0 would busy-loop.
+fn maintain_loop_interval(hours: u64) -> std::time::Duration {
+    std::time::Duration::from_secs(hours.max(1) * 3600)
 }
 
 /// Open a database for a CLI maintenance command, or exit(1) with a message.
@@ -1799,6 +1813,7 @@ fn main() {
             ref web_auth_token,
             ref transport,
             ref mcp_token,
+            maintain_every,
             ..
         }) => {
             let db_path = db.clone();
@@ -1872,6 +1887,29 @@ fn main() {
             // surface — web dashboard, MCP transport, stdio server — shares
             // this Arc. Database is Sync (internally r2d2-pooled), so no Mutex.
             let database = std::sync::Arc::new(database);
+
+            // #492: optional in-server hygiene loop — the no-cron (native
+            // Windows) fallback. Runs the exact pass `maintain` runs, minus
+            // vacuum (the physical rewrite stays an explicit, scheduled
+            // decision). Sleeps FIRST so startup isn't taxed; reports go to
+            // stderr like every other server log line (stdout is MCP).
+            if let Some(hours) = maintain_every {
+                let every = maintain_loop_interval(hours);
+                let maint_db = std::sync::Arc::clone(&database);
+                eprintln!(
+                    "mimir: in-server maintenance loop enabled (every {}h)",
+                    every.as_secs() / 3600
+                );
+                std::thread::spawn(move || loop {
+                    std::thread::sleep(every);
+                    match tools::run_maintenance_pass(&maint_db, false, false) {
+                        Ok(report) => {
+                            eprintln!("mimir: maintenance pass complete: {}", report)
+                        }
+                        Err(e) => eprintln!("mimir: maintenance pass failed: {}", e),
+                    }
+                });
+            }
 
             // Start web dashboard in background if requested
             if effective_web {
@@ -2489,6 +2527,28 @@ mod tests {
             Some(Commands::Maintain { db, .. }) => assert_eq!(db, "/tmp/top-maintain.db"),
             _ => panic!("expected maintain subcommand"),
         }
+    }
+
+    #[test]
+    fn parses_serve_maintain_every_and_clamps_interval() {
+        // #492: off unless set — absence must equal today's behavior.
+        let cli = Cli::parse_from(["mimir", "serve"]);
+        match cli.command {
+            Some(Commands::Serve { maintain_every, .. }) => assert_eq!(maintain_every, None),
+            _ => panic!("expected serve subcommand"),
+        }
+
+        let cli = Cli::parse_from(["mimir", "serve", "--maintain-every", "6"]);
+        match cli.command {
+            Some(Commands::Serve { maintain_every, .. }) => {
+                assert_eq!(maintain_every, Some(6));
+            }
+            _ => panic!("expected serve subcommand"),
+        }
+
+        // A 0 would busy-loop; clamp to 1 hour.
+        assert_eq!(maintain_loop_interval(0).as_secs(), 3600);
+        assert_eq!(maintain_loop_interval(24).as_secs(), 24 * 3600);
     }
 
     #[test]
