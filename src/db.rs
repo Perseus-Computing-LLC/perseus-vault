@@ -4368,18 +4368,24 @@ impl Database {
         // the implicit close for every older version's open period.
         //
         // A later-recorded version may only *close* an older version's period
-        // if its valid_from lies at or after where the older period began. With
-        // out-of-order arrival (a later-recorded fact whose valid_from is
-        // EARLIER than an already-seen version's), `min_later_from` can fall
-        // before the current version's `eff_from`; applying it as an implicit
-        // close would collapse the period into an empty/backwards interval
-        // `[eff_from, m)` with `m < eff_from` and make the version unmatchable.
-        // Guard with `m > eff_from` so only genuine successors truncate a
-        // period; earlier-valid siblings recorded later never do.
+        // when its valid_from lies at or after where the older period began.
+        // With out-of-order arrival (a later-recorded fact whose valid_from is
+        // strictly EARLIER than an already-seen version's), `min_later_from`
+        // falls before the current version's `eff_from`; applying it as an
+        // implicit close would collapse the period into an empty/backwards
+        // interval `[eff_from, m)` with `m < eff_from` and make the version
+        // unmatchable. Guard with `m >= eff_from` so:
+        //   * genuine successors (m > eff_from)      truncate the period,
+        //   * supersede/close markers (m == eff_from) still close it — the
+        //     close mechanism records a marker whose valid_from equals the
+        //     older period's start, and that MUST zero-length-close it,
+        //   * earlier-valid siblings recorded later (m < eff_from) never do.
+        // (`>` alone regressed the supersede-close audit tests, which rely on
+        // the `m == eff_from` marker closing the old fact's valid period.)
         let mut min_later_from: Option<i64> = None;
         for v in versions {
             let eff_from = v.valid_from_unix_ms.unwrap_or(v.recorded_at_unix_ms);
-            let implicit_close = min_later_from.filter(|&m| m > eff_from);
+            let implicit_close = min_later_from.filter(|&m| m >= eff_from);
             let eff_to = match (v.valid_to_unix_ms, implicit_close) {
                 (Some(t), Some(m)) => Some(t.min(m)),
                 (Some(t), None) => Some(t),
