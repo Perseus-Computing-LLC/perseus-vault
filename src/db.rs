@@ -1874,15 +1874,26 @@ impl Database {
     /// Recalculate decay scores for all non-archived entities.
     /// Called periodically or via mimir_decay tool.
     pub fn decay_tick(&self) -> Result<DecayReport, Box<dyn std::error::Error>> {
-        self.decay_tick_with_limit(None)
+        self.decay_tick_with_limit(None, false)
+    }
+
+    /// #490: preview form of decay_tick — computes the same report (rows that
+    /// would be rewritten, entities that would auto-archive) without writing
+    /// anything. Backs the autocohere/maintain dry-run path, which previously
+    /// ran the LIVE tick and mutated the store mid-"preview".
+    pub fn decay_tick_preview(&self) -> Result<DecayReport, Box<dyn std::error::Error>> {
+        self.decay_tick_with_limit(None, true)
     }
 
     /// Like decay_tick but with an optional max entities to process per call.
     /// Processes entities in batches of 1000, each in its own transaction,
     /// to avoid holding a single large transaction at 100K+ scale.
+    /// With `dry_run` the full recompute runs and the report counts what
+    /// WOULD change, but no UPDATE (score, archive, FTS, demotion) executes.
     fn decay_tick_with_limit(
         &self,
         max_entities: Option<i64>,
+        dry_run: bool,
     ) -> Result<DecayReport, Box<dyn std::error::Error>> {
         let conn = self.conn()?;
         let now = now_ms();
@@ -1987,25 +1998,29 @@ impl Database {
                     && new_decay >= Self::ARCHIVE_DECAY_THRESHOLD
                     && !straddles_layer_boundary;
                 if !no_op {
-                    tx.execute(
-                        "UPDATE entities SET decay_score = ?1 WHERE id = ?2",
-                        params![new_decay, &id],
-                    )?;
+                    if !dry_run {
+                        tx.execute(
+                            "UPDATE entities SET decay_score = ?1 WHERE id = ?2",
+                            params![new_decay, &id],
+                        )?;
+                    }
                     *updated += 1;
                 }
                 // Auto-archive entities that have fully decayed.
                 // Verified entities are floored above this and never reach it.
                 if new_decay < Self::ARCHIVE_DECAY_THRESHOLD {
-                    tx.execute(
-                        "UPDATE entities SET archived = 1, archive_reason = 'decay threshold' WHERE id = ?1 AND archived = 0",
-                        params![&id],
-                    )?;
+                    if !dry_run {
+                        tx.execute(
+                            "UPDATE entities SET archived = 1, archive_reason = 'decay threshold' WHERE id = ?1 AND archived = 0",
+                            params![&id],
+                        )?;
+                        // Clean FTS5 index for auto-archived entity
+                        let _ = tx.execute(
+                            "DELETE FROM entities_fts WHERE rowid = (SELECT rowid FROM entities WHERE id = ?1)",
+                            params![&id],
+                        );
+                    }
                     *auto_archived += 1;
-                    // Clean FTS5 index for auto-archived entity
-                    let _ = tx.execute(
-                        "DELETE FROM entities_fts WHERE rowid = (SELECT rowid FROM entities WHERE id = ?1)",
-                        params![&id],
-                    );
                 }
             }
             tx.commit()?;
@@ -2036,16 +2051,18 @@ impl Database {
         // whose layer actually CHANGES are written — SQLite rewrites a row (and
         // its page, into the WAL) even when SET assigns the existing value, so
         // the previous broad WHERE re-dirtied every non-buffer row every tick.
-        conn.execute(
-            "UPDATE entities SET layer = CASE \
-                WHEN decay_score < 0.2 THEN 'buffer' \
-                WHEN decay_score < 0.5 AND layer = 'core' THEN 'working' \
-                ELSE layer END \
-             WHERE archived = 0 AND verified = 0 AND always_on = 0 \
-               AND layer != 'buffer' \
-               AND (decay_score < 0.2 OR (decay_score < 0.5 AND layer = 'core'))",
-            [],
-        )?;
+        if !dry_run {
+            conn.execute(
+                "UPDATE entities SET layer = CASE \
+                    WHEN decay_score < 0.2 THEN 'buffer' \
+                    WHEN decay_score < 0.5 AND layer = 'core' THEN 'working' \
+                    ELSE layer END \
+                 WHERE archived = 0 AND verified = 0 AND always_on = 0 \
+                   AND layer != 'buffer' \
+                   AND (decay_score < 0.2 OR (decay_score < 0.5 AND layer = 'core'))",
+                [],
+            )?;
+        }
 
         Ok(DecayReport {
             entities_checked: total,
@@ -17068,7 +17085,7 @@ mod tests {
         // ── DECAY benchmark ──
         let start_decay = Instant::now();
         let report = db
-            .decay_tick_with_limit(Some(n as i64))
+            .decay_tick_with_limit(Some(n as i64), false)
             .expect("decay_tick should succeed at 100K scale");
         let decay_elapsed = start_decay.elapsed();
         eprintln!(

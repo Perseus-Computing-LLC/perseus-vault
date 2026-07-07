@@ -2430,10 +2430,15 @@ pub fn handle_autocohere(db: &Database, args: Value) -> Result<String, String> {
     total_links += cohere_report.linked;
     total_archived_cohere += cohere_report.archived;
 
-    // 2. Then mimir_decay (recalculate Ebbinghaus decay)
-    let decay_report = db
-        .decay_tick()
-        .map_err(|e| format!("Autocohere step (decay) failed: {}", e))?;
+    // 2. Then mimir_decay (recalculate Ebbinghaus decay). #490: honor
+    // dry_run — this step previously ran the LIVE tick inside the "preview"
+    // pass, rewriting scores and auto-archiving mid-dry-run.
+    let decay_report = if a.dry_run {
+        db.decay_tick_preview()
+    } else {
+        db.decay_tick()
+    }
+    .map_err(|e| format!("Autocohere step (decay) failed: {}", e))?;
 
     // 3. Then mimir_compact (archive below threshold). Use the same archive
     // threshold as decay_tick/cohere so "run everything" forgets at the same
@@ -2494,6 +2499,10 @@ pub fn handle_autocohere(db: &Database, args: Value) -> Result<String, String> {
         "links_created": total_links,
         "archived_entities": total_archived_cohere + compact_report.entities_archived,
         "decay_updates": decay_report.entities_updated,
+        // #490: surface the decay step's own archive count — under dry_run
+        // the stored scores are untouched, so compact's preview can't see
+        // what decay WOULD have archived; this field is the only signal.
+        "decay_auto_archived": decay_report.auto_archived,
         "compact_archived_count": compact_report.entities_archived,
         "observations_created": observations_created,
         "consolidate_sources_archived": consolidate_sources_archived,
@@ -2772,6 +2781,49 @@ pub fn handle_maintenance(db: &Database, args: Value) -> Result<String, String> 
     }
 
     Ok(report.to_string())
+}
+
+/// #490: the full unattended hygiene pass — compose the shipped autocohere
+/// (cohere → decay → compact → consolidate → history retention) and
+/// maintenance (dedup, orphan detection, reindex) handlers into one
+/// conservative run. Shared by the `maintain` CLI verb and any scheduled
+/// caller so both run the exact same pass.
+///
+/// Safety contract: every effect is a reversible `archived=1` flip except
+/// VACUUM, which physically rewrites the file and therefore only runs when
+/// the caller explicitly asks (`vacuum: true`) — schedulers should throttle
+/// it to ~weekly rather than every pass. Hard delete (`purge`) is never part
+/// of this path. History retention stays a guaranteed no-op unless the
+/// `MIMIR_HISTORY_*` env knobs opt in; it runs inside the autocohere step,
+/// so it is deliberately NOT requested again from maintenance.
+pub fn run_maintenance_pass(db: &Database, dry_run: bool, vacuum: bool) -> Result<Value, String> {
+    let autocohere: Value = handle_autocohere(db, json!({ "dry_run": dry_run }))
+        .and_then(|s| {
+            serde_json::from_str(&s).map_err(|e| format!("autocohere report parse failed: {}", e))
+        })
+        .map_err(|e| format!("Maintenance pass (autocohere) failed: {}", e))?;
+
+    let maintenance: Value = handle_maintenance(
+        db,
+        json!({
+            "dedup": true,
+            "orphans": true,
+            "reindex": true,
+            "vacuum": vacuum,
+            "dry_run": dry_run,
+        }),
+    )
+    .and_then(|s| {
+        serde_json::from_str(&s).map_err(|e| format!("maintenance report parse failed: {}", e))
+    })
+    .map_err(|e| format!("Maintenance pass (maintenance) failed: {}", e))?;
+
+    Ok(json!({
+        "autocohere": autocohere,
+        "maintenance": maintenance,
+        "dry_run": dry_run,
+        "vacuum_requested": vacuum,
+    }))
 }
 
 // ─── mimir_correct handler ────────────────────────────────────────
@@ -3388,6 +3440,117 @@ mod tests {
             v["links_created"].as_i64().unwrap() > 0,
             "autocohere must auto-link a clearly-linkable corpus (max_links \
              default must not be 0): {resp}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ─── maintain pass (#490) ────────────────────────────────────
+
+    #[test]
+    fn maintain_pass_dry_run_mutates_nothing() {
+        let (db, path) = temp_db();
+        // Distinct bodies so neither remember-dedup nor consolidate can merge.
+        handle_remember(
+            &db,
+            json!({"category": "insight", "key": "mp-a",
+                   "body_json": "{\"content\":\"the ingest queue backs up when redis restarts\"}"}),
+        )
+        .expect("remember mp-a");
+        handle_remember(
+            &db,
+            json!({"category": "decision", "key": "mp-b",
+                   "body_json": "{\"content\":\"ship the billing cutover on a tuesday morning\"}"}),
+        )
+        .expect("remember mp-b");
+
+        // Make mp-b long-cold so the decay step WOULD auto-archive it: 60
+        // idle days ≈ decay 0.003 (7-day half-life), far under the 0.05
+        // archive threshold. importance = 0 so the persistent floor (#487)
+        // doesn't rescue it. The preview must REPORT it without archiving —
+        // decay_tick previously ran LIVE inside dry_run.
+        db.conn()
+            .unwrap()
+            .execute(
+                "UPDATE entities SET last_accessed_unix_ms = last_accessed_unix_ms \
+                 - 60 * 24 * 3600 * 1000, importance = 0.0 WHERE key = 'mp-b'",
+                [],
+            )
+            .unwrap();
+
+        let count_active = |db: &Database| -> i64 {
+            db.conn()
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM entities WHERE archived = 0",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        let before = count_active(&db);
+
+        let report = run_maintenance_pass(&db, true, false).expect("dry-run pass");
+        assert_eq!(report["dry_run"], json!(true), "{report}");
+        assert_eq!(report["vacuum_requested"], json!(false), "{report}");
+        assert!(report["autocohere"].is_object(), "{report}");
+        assert!(report["maintenance"].is_object(), "{report}");
+        // The preview names the would-be forgetting...
+        assert!(
+            report["autocohere"]["decay_auto_archived"].as_i64().unwrap() >= 1,
+            "preview must report the cold entity as would-archive: {report}"
+        );
+        // ...but must not change anything.
+        assert_eq!(count_active(&db), before, "dry_run archived something");
+
+        // The live pass then actually forgets it.
+        let report = run_maintenance_pass(&db, false, false).expect("live pass");
+        assert!(
+            report["autocohere"]["decay_auto_archived"].as_i64().unwrap() >= 1,
+            "{report}"
+        );
+        assert_eq!(count_active(&db), before - 1, "live pass must archive the cold entity");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn maintain_pass_live_runs_all_steps_and_vacuum_only_on_request() {
+        let (db, path) = temp_db();
+        handle_remember(
+            &db,
+            json!({"category": "insight", "key": "mp-live",
+                   "body_json": "{\"content\":\"grafana dashboards live in the ops folder\"}"}),
+        )
+        .expect("remember mp-live");
+
+        // Default pass: no vacuum requested — the physical rewrite is the
+        // scheduler's call, not every run's.
+        let report = run_maintenance_pass(&db, false, false).expect("live pass");
+        assert_eq!(report["dry_run"], json!(false), "{report}");
+        assert_eq!(report["maintenance"]["vacuum_reclaimed_bytes"], json!(0), "{report}");
+        assert_eq!(
+            report["maintenance"]["errors"].as_array().map(Vec::len),
+            Some(0),
+            "{report}"
+        );
+        // A fresh, hot entity must survive the conservative pass.
+        let alive: i64 = db
+            .conn()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM entities WHERE key = 'mp-live' AND archived = 0",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(alive, 1, "fresh entity must not be archived by maintain");
+
+        // Explicit vacuum request runs the physical step without error.
+        let report = run_maintenance_pass(&db, false, true).expect("vacuum pass");
+        assert_eq!(report["vacuum_requested"], json!(true), "{report}");
+        assert_eq!(
+            report["maintenance"]["errors"].as_array().map(Vec::len),
+            Some(0),
+            "{report}"
         );
         let _ = std::fs::remove_file(&path);
     }

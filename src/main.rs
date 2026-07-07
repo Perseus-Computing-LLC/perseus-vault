@@ -313,6 +313,23 @@ enum Commands {
         db: String,
     },
 
+    /// Run the full unattended hygiene pass once and exit: cohere → decay →
+    /// compact → consolidate, then dedup / orphan detection / FTS reindex.
+    /// Every effect is a reversible archive (never a hard delete); VACUUM
+    /// only runs with --vacuum. Designed for a scheduler (nightly maintain,
+    /// ~weekly maintain --vacuum) — see #490.
+    Maintain {
+        /// SQLite database path
+        #[arg(long, default_value_t = default_db_path())]
+        db: String,
+        /// Preview the combined report without changing anything
+        #[arg(long)]
+        dry_run: bool,
+        /// Also VACUUM the database file (physical rewrite — throttle to ~weekly)
+        #[arg(long)]
+        vacuum: bool,
+    },
+
     /// Rebuild the FTS5 search index from the entities table (repairs index drift)
     Reindex {
         /// SQLite database path
@@ -466,6 +483,7 @@ impl Commands {
             | Commands::Forget { db, .. }
             | Commands::Prune { db, .. }
             | Commands::Decay { db, .. }
+            | Commands::Maintain { db, .. }
             | Commands::Reindex { db, .. }
             | Commands::Stats { db, .. }
             | Commands::StateDigest { db, .. }
@@ -1474,6 +1492,20 @@ fn main() {
                 }
             }
         }
+        Some(Commands::Maintain {
+            db: ref db_path,
+            dry_run,
+            vacuum,
+        }) => {
+            let database = open_db_or_exit(db_path);
+            match tools::run_maintenance_pass(&database, dry_run, vacuum) {
+                Ok(report) => print_json(&report),
+                Err(e) => {
+                    eprintln!("perseus-vault: maintain failed: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
         Some(Commands::Reindex { db: ref db_path }) => {
             let database = open_db_or_exit(db_path);
             match database.reindex_fts() {
@@ -2418,6 +2450,44 @@ mod tests {
         match cli.command {
             Some(Commands::Serve { db, .. }) => assert_eq!(db, "/tmp/top.db"),
             _ => panic!("expected serve subcommand"),
+        }
+    }
+
+    #[test]
+    fn parses_maintain_with_flags_and_top_level_db() {
+        // #490: the scheduled hygiene entry point. Defaults conservative:
+        // no dry-run, no vacuum unless asked.
+        let cli = Cli::parse_from(["mimir", "maintain", "--db", "/tmp/maintain.db"]);
+        match cli.command {
+            Some(Commands::Maintain {
+                db,
+                dry_run,
+                vacuum,
+            }) => {
+                assert_eq!(db, "/tmp/maintain.db");
+                assert!(!dry_run);
+                assert!(!vacuum);
+            }
+            _ => panic!("expected maintain subcommand"),
+        }
+
+        let cli = Cli::parse_from(["mimir", "maintain", "--dry-run", "--vacuum"]);
+        match cli.command {
+            Some(Commands::Maintain {
+                dry_run, vacuum, ..
+            }) => {
+                assert!(dry_run);
+                assert!(vacuum);
+            }
+            _ => panic!("expected maintain subcommand"),
+        }
+
+        // Top-level --db must propagate like the other db-carrying verbs.
+        let mut cli = Cli::parse_from(["mimir", "--db", "/tmp/top-maintain.db", "maintain"]);
+        apply_top_level_db(&mut cli);
+        match cli.command {
+            Some(Commands::Maintain { db, .. }) => assert_eq!(db, "/tmp/top-maintain.db"),
+            _ => panic!("expected maintain subcommand"),
         }
     }
 
