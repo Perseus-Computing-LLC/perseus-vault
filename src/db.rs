@@ -4414,6 +4414,27 @@ impl Database {
         self.bitemporal_at(category, key, i64::MAX, valid_at)
     }
 
+    /// #472 Temporal RAG: the version of (category, key) believed at transaction
+    /// time `tx_at` — the newest-recorded version at or before that instant —
+    /// returned as a `TemporalVersion` so the recall resolver gets the
+    /// point-in-time body plus recorded/valid provenance. `None` if nothing had
+    /// been recorded by then. This is the transaction-time axis in the shape
+    /// Temporal RAG needs; `bitemporal_at` covers the combined two-axis case.
+    pub fn as_of_version(
+        &self,
+        category: &str,
+        key: &str,
+        tx_at: i64,
+    ) -> Result<Option<TemporalVersion>, Box<dyn std::error::Error>> {
+        // versions_recorded_by returns versions recorded by tx_at newest-first;
+        // the newest-recorded is the one live at tx_at (anything superseding it
+        // was recorded strictly later, i.e. after tx_at).
+        Ok(self
+            .versions_recorded_by(category, key, tx_at)?
+            .into_iter()
+            .next())
+    }
+
     /// Effective valid periods for a set of live entities, keyed by id (#363).
     /// Used by recall's valid-time filters. Returns (valid_from, valid_to)
     /// with valid_from already COALESCEd to the row's transaction time, and
@@ -11286,6 +11307,65 @@ mod tests {
             .unwrap()
             .expect("v2 is live from the supersede onward");
         assert!(now.body_json.contains("Berlin"), "as_of now must return the current version");
+
+        let _ = fs::remove_file(&path);
+    }
+
+    // #472 Temporal RAG: as_of_version is the recall resolver's transaction-time
+    // primitive — it must return the point-in-time BODY plus a liveness flag
+    // (invalidated_at present => historical, None => the live version).
+    #[test]
+    fn as_of_version_reconstructs_point_in_time_body_and_liveness() {
+        use std::thread::sleep;
+        use std::time::Duration;
+        let (db, path) = temp_db();
+
+        let v1 = make_entity("e-asofv", "facts", "capital2", r#"{"note":"Bonn"}"#);
+        db.remember(&v1).unwrap();
+        let t_created: i64 = {
+            let conn = db.conn().unwrap();
+            conn.query_row(
+                "SELECT created_at_unix_ms FROM entities WHERE id='e-asofv'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+
+        sleep(Duration::from_millis(5));
+        let v2 = make_entity("ignored2", "facts", "capital2", r#"{"note":"Berlin"}"#);
+        db.remember(&v2).unwrap();
+        let t_super: i64 = {
+            let conn = db.conn().unwrap();
+            conn.query_row(
+                "SELECT recorded_at_unix_ms FROM entities WHERE category='facts' AND key='capital2'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+
+        // Between the writes: reconstructed version is the OLD body, marked retired.
+        let mid = db
+            .as_of_version("facts", "capital2", t_super - 1)
+            .unwrap()
+            .expect("v1 live just before supersede");
+        assert!(mid.entity.body_json.contains("Bonn"), "must reconstruct the point-in-time body");
+        assert!(mid.invalidated_at_unix_ms.is_some(), "historical version must be marked retired");
+
+        // At/after the supersede: the live version, not retired.
+        let now = db
+            .as_of_version("facts", "capital2", t_super)
+            .unwrap()
+            .expect("v2 live from supersede onward");
+        assert!(now.entity.body_json.contains("Berlin"));
+        assert!(now.invalidated_at_unix_ms.is_none(), "live version must not be marked retired");
+
+        // Before it existed: nothing recorded yet.
+        assert!(db
+            .as_of_version("facts", "capital2", t_created - 1)
+            .unwrap()
+            .is_none());
 
         let _ = fs::remove_file(&path);
     }

@@ -185,6 +185,12 @@ pub struct RecallArgs {
     /// false — the semantic paths stay byte-deterministic (#247).
     #[serde(default, deserialize_with = "null_as_default")]
     pub reinforce: bool,
+    /// #472 Temporal RAG: transaction-time instant — reconstruct semantic recall
+    /// "as we believed it" at this past instant. Each hit's body is the version
+    /// that was live at as_of_unix_ms; corrections recorded later do not leak in.
+    /// Combine with valid_at for the full bi-temporal cell. None = live view.
+    #[serde(default)]
+    pub as_of_unix_ms: Option<i64>,
     /// #363: valid-time instant filter — only return facts whose application-
     /// time period [valid_from, valid_to) contains this world-instant.
     #[serde(default)]
@@ -239,6 +245,53 @@ fn valid_time_retain(
         )
     });
     Ok(())
+}
+
+/// #472 Temporal RAG: transaction-time (and optional valid-time) provenance for
+/// a reconstructed recall hit, stamped onto the output alongside the point-in-
+/// time body.
+struct TemporalHit {
+    is_live: bool,
+    recorded_at: i64,
+    valid_from: Option<i64>,
+    valid_to: Option<i64>,
+}
+
+/// #472: reconstruct each recall candidate to the version that was live at
+/// transaction time `as_of` (optionally gated to `valid_at` for the full
+/// bi-temporal cell), swapping in the point-in-time body and dropping
+/// candidates that had no version at that instant. Ranked order is preserved.
+/// Returns provenance aligned 1:1 with the surviving `entities`. Candidate
+/// generation is still over the live index, so a fact fully deleted since
+/// `as_of` (present only in history, unindexed) will not surface — the
+/// documented v1 limitation; the dominant "reproduce what I believed about a
+/// still-known fact" case is exact.
+fn temporal_resolve(
+    db: &Database,
+    as_of: i64,
+    valid_at: Option<i64>,
+    entities: &mut Vec<crate::models::Entity>,
+) -> Result<Vec<TemporalHit>, String> {
+    let mut hits = Vec::new();
+    let mut resolved = Vec::new();
+    for e in std::mem::take(entities) {
+        let tv = match valid_at {
+            Some(v) => db.bitemporal_at(&e.category, &e.key, as_of, v),
+            None => db.as_of_version(&e.category, &e.key, as_of),
+        }
+        .map_err(|err| format!("temporal recall resolution failed: {}", err))?;
+        if let Some(tv) = tv {
+            hits.push(TemporalHit {
+                is_live: tv.invalidated_at_unix_ms.is_none(),
+                recorded_at: tv.recorded_at_unix_ms,
+                valid_from: tv.valid_from_unix_ms,
+                valid_to: tv.valid_to_unix_ms,
+            });
+            resolved.push(tv.entity);
+        }
+    }
+    *entities = resolved;
+    Ok(hits)
 }
 
 /// #287: presentation-layer confidence rollup over signals Mneme already has.
@@ -625,14 +678,22 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
     };
 
     // If query expansion is enabled, generate stemming variants and merge results
-    if a.expansion.enabled && !a.query.is_empty() && mode == SearchMode::Fts5 {
+    // #472: as_of recall always takes the main path (temporal_resolve); the
+    // query-expansion path does not reconstruct point-in-time bodies.
+    if a.expansion.enabled
+        && !a.query.is_empty()
+        && mode == SearchMode::Fts5
+        && a.as_of_unix_ms.is_none()
+    {
         return handle_recall_with_expansion(db, &a);
     }
 
     // #363: captured before RecallParams moves fields out of `a`.
     let (valid_at, valid_from, valid_to) = (a.valid_at, a.valid_from_unix_ms, a.valid_to_unix_ms);
+    let as_of = a.as_of_unix_ms; // #472 Temporal RAG (transaction-time instant)
     let valid_op = a.valid_op.clone();
-    let temporal_filtering = valid_at.is_some() || valid_from.is_some() || valid_to.is_some();
+    let temporal_filtering =
+        valid_at.is_some() || valid_from.is_some() || valid_to.is_some() || as_of.is_some();
     let mode_for_side_effects = mode.clone();
     let reinforce_requested = a.reinforce;
 
@@ -673,8 +734,15 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
         .recall(&params)
         .map_err(|e| format!("Recall failed: {}", e))?;
 
-    // #363: valid-time filters (no-op unless requested).
-    valid_time_retain(db, valid_at, valid_from, valid_to, &valid_op, &mut entities)?;
+    // #472 Temporal RAG: with a transaction-time instant, reconstruct each hit's
+    // point-in-time body (optionally the full bi-temporal cell via valid_at)
+    // rather than the #363 live valid-time narrow. Absent as_of, unchanged.
+    let temporal_meta = if let Some(tx) = as_of {
+        Some(temporal_resolve(db, tx, valid_at, &mut entities)?)
+    } else {
+        valid_time_retain(db, valid_at, valid_from, valid_to, &valid_op, &mut entities)?;
+        None
+    };
 
     // #363 review: re-apply the deferred recall side-effects to the survivors,
     // under exactly the conditions the un-filtered path would have reinforced:
@@ -689,6 +757,19 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
 
     let mut items_expanded: Vec<serde_json::Value> =
         entities.iter().map(|e| e.to_json_expanded()).collect();
+
+    // #472: stamp point-in-time provenance onto each reconstructed hit.
+    if let Some(meta) = &temporal_meta {
+        for (item, h) in items_expanded.iter_mut().zip(meta.iter()) {
+            if let Some(obj) = item.as_object_mut() {
+                obj.insert("as_of_unix_ms".to_string(), json!(as_of));
+                obj.insert("is_live_version".to_string(), json!(h.is_live));
+                obj.insert("recorded_at_unix_ms".to_string(), json!(h.recorded_at));
+                obj.insert("valid_from_unix_ms".to_string(), json!(h.valid_from));
+                obj.insert("valid_to_unix_ms".to_string(), json!(h.valid_to));
+            }
+        }
+    }
 
     if a.include_confidence {
         apply_confidence(&mut items_expanded, &entities);

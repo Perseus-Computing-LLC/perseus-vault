@@ -530,6 +530,10 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
             "type": "string",
             "description": "Filter by memory layer (world, episodic, semantic)."
         },
+        "as_of_unix_ms": {
+          "type": "integer",
+          "description": "#472 Temporal RAG: transaction-time instant (unix ms). Reconstruct semantic recall AS BELIEVED at this past instant — each hit's body is the version that was live at as_of_unix_ms; corrections recorded later do not leak in. Combine with valid_at for the full bi-temporal cell. Hits are stamped with is_live_version / recorded_at_unix_ms / valid_from_unix_ms / valid_to_unix_ms. Omit for today's live view. (v1: candidate generation is over the live index, so a fact fully deleted since that instant will not surface.)"
+        },
         "valid_at": {
           "type": "integer",
           "description": "Valid-time instant filter (#363, unix ms): only return facts whose application-time period [valid_from, valid_to) contains this world-instant — 'what was true at time T'. Applied after ranking, so it only narrows results."
