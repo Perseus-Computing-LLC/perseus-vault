@@ -5,6 +5,24 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
 
 ## [Unreleased]
 
+## [2.19.1] - 2026-07-07
+
+### Fixed
+- **`maintain`/`decay_tick`/`autocohere` failed with "no such column: usefulness_count" on
+  upgraded stores** (#503). #487's usefulness columns were added to the migration block without
+  bumping `SCHEMA_VERSION`, so any store already stamped v15 (anything upgraded through v2.18.x)
+  skipped the ALTERs — fresh DBs were fine, and read paths kept working, so the failure stayed
+  silent until the first maintenance pass. Hit live on the first v2.19.0 production deploy.
+  `SCHEMA_VERSION` is now 16; the idempotent migration re-runs once and delivers the columns.
+
+### Added
+- **Cross-scope promotion** (#486, Belief-Memory-inspired; merged after 2.19.0 was cut). Opt-in
+  `cross_scope_promote` on `cohere`: a fact independently observed in >= `cross_scope_k`
+  (default 3) distinct workspaces is promoted to one global-scope entity carrying the most
+  informative member body, `promoted_from` links to every per-scope evidence row, and
+  provenance tags. Idempotent re-runs (the global scope's dedup absorbs them); undo = forget
+  the promoted entity. Off by default — absence of the args is byte-for-byte prior behavior.
+
 ## [2.19.0] - 2026-07-07
 
 ### Added
