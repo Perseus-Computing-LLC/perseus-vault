@@ -689,6 +689,16 @@ pub struct AskParams {
     pub query: String,
     #[serde(default = "default_ask_limit")]
     pub top_k: usize,
+    /// #472 Temporal RAG: reconstruct the retrieved context as it was believed
+    /// at this transaction-time instant (unix ms), so the RAG answer is
+    /// reproducible at a past decision point. None = live view. Accepts a number
+    /// or numeric string (LLM clients often stringify ints).
+    #[serde(default, deserialize_with = "crate::tools::string_or_int_opt")]
+    pub as_of_unix_ms: Option<i64>,
+    /// #472: reconstruct the retrieved context as it was true in the world at
+    /// this valid-time instant (unix ms). Combine with as_of for the full cell.
+    #[serde(default, deserialize_with = "crate::tools::string_or_int_opt")]
+    pub valid_at_unix_ms: Option<i64>,
 }
 
 fn default_ask_limit() -> usize {

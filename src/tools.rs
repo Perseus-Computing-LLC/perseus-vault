@@ -35,7 +35,7 @@ where
 /// "invalid type: string, expected i64" and the temporal filters are unusable
 /// from those clients. Numbers still deserialize unchanged, so this only widens
 /// what is accepted (backward compatible). Empty/whitespace string = None.
-fn string_or_int_opt<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
+pub(crate) fn string_or_int_opt<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -288,18 +288,22 @@ struct TemporalHit {
     valid_to: Option<i64>,
 }
 
-/// #472: reconstruct each recall candidate to the version that was live at
-/// transaction time `as_of` (optionally gated to `valid_at` for the full
-/// bi-temporal cell), swapping in the point-in-time body and dropping
-/// candidates that had no version at that instant. Ranked order is preserved.
-/// Returns provenance aligned 1:1 with the surviving `entities`. Candidate
-/// generation is still over the live index, so a fact fully deleted since
-/// `as_of` (present only in history, unindexed) will not surface — the
-/// documented v1 limitation; the dominant "reproduce what I believed about a
-/// still-known fact" case is exact.
+/// #472: reconstruct each recall candidate to its point-in-time version and swap
+/// in that body, dropping candidates that had no version at the requested
+/// instant. Ranked order is preserved; provenance is returned 1:1 with the
+/// survivors. The axes:
+///   * `valid_at` set → the world-version whose valid period contains T, per
+///     `as_of` knowledge (tx = `as_of` or, when only `valid_at` is given, now/∞)
+///     — this is the full bi-temporal cell, and `valid_at` ALONE now
+///     reconstructs the historical world-version rather than narrowing live rows.
+///   * `as_of` only → the version believed at transaction time `as_of`.
+/// At least one of `as_of` / `valid_at` must be Some (the caller guarantees it).
+/// Candidate generation is still over the live index, so a fact fully deleted
+/// since the instant (history-only, unindexed) will not surface — the documented
+/// v1 limitation; the dominant "reproduce a still-known fact at T" case is exact.
 fn temporal_resolve(
     db: &Database,
-    as_of: i64,
+    as_of: Option<i64>,
     valid_at: Option<i64>,
     entities: &mut Vec<crate::models::Entity>,
 ) -> Result<Vec<TemporalHit>, String> {
@@ -307,8 +311,12 @@ fn temporal_resolve(
     let mut resolved = Vec::new();
     for e in std::mem::take(entities) {
         let tv = match valid_at {
-            Some(v) => db.bitemporal_at(&e.category, &e.key, as_of, v),
-            None => db.as_of_version(&e.category, &e.key, as_of),
+            Some(v) => db.bitemporal_at(&e.category, &e.key, as_of.unwrap_or(i64::MAX), v),
+            None => db.as_of_version(
+                &e.category,
+                &e.key,
+                as_of.expect("temporal_resolve requires as_of or valid_at"),
+            ),
         }
         .map_err(|err| format!("temporal recall resolution failed: {}", err))?;
         if let Some(tv) = tv {
@@ -765,13 +773,15 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
         .recall(&params)
         .map_err(|e| format!("Recall failed: {}", e))?;
 
-    // #472 Temporal RAG: with a transaction-time instant, reconstruct each hit's
-    // point-in-time body (optionally the full bi-temporal cell via valid_at)
-    // rather than the #363 live valid-time narrow. Absent as_of, unchanged.
-    let temporal_meta = if let Some(tx) = as_of {
-        Some(temporal_resolve(db, tx, valid_at, &mut entities)?)
+    // #472 Temporal RAG: an as_of (transaction) and/or valid_at (world) instant
+    // reconstructs each hit's point-in-time body — valid_at alone now rebuilds
+    // the historical world-version, not just a live-row narrow; as_of adds the
+    // transaction axis; together = the full bi-temporal cell. The valid_from/
+    // valid_to PERIOD-range filter (when no valid_at instant) stays a live narrow.
+    let temporal_meta = if as_of.is_some() || valid_at.is_some() {
+        Some(temporal_resolve(db, as_of, valid_at, &mut entities)?)
     } else {
-        valid_time_retain(db, valid_at, valid_from, valid_to, &valid_op, &mut entities)?;
+        valid_time_retain(db, None, valid_from, valid_to, &valid_op, &mut entities)?;
         None
     };
 
