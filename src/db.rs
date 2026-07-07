@@ -8337,16 +8337,252 @@ last_accessed: {}
         params: &crate::models::CohereParams,
     ) -> Result<crate::models::CohereReport, Box<dyn std::error::Error>> {
         let mut attempt = 0;
-        loop {
+        let mut report = loop {
             match self.cohere_inner(params) {
-                Ok(report) => return Ok(report),
+                Ok(report) => break report,
                 Err(e) if attempt < 3 && Self::err_is_busy(e.as_ref()) => {
                     attempt += 1;
                     std::thread::sleep(std::time::Duration::from_millis(100 * attempt));
                 }
                 Err(e) => return Err(e),
             }
+        };
+        // #486: cross-scope promotion runs OUTSIDE cohere_inner, after its
+        // pooled connection is returned — the pass calls remember(), which
+        // draws its own connection, and holding two pooled connections at
+        // once is the #397 pool-collapse hazard.
+        if params.cross_scope_promote {
+            let k = if params.cross_scope_k >= 2 {
+                params.cross_scope_k
+            } else {
+                Self::CROSS_SCOPE_PROMOTE_K
+            };
+            let threshold = if params.cross_scope_similarity > 0.0 {
+                params.cross_scope_similarity.min(1.0)
+            } else {
+                Self::CROSS_SCOPE_SIM_THRESHOLD
+            };
+            let (clusters, promoted, skipped) =
+                self.promote_cross_scope(k, threshold, params.dry_run)?;
+            report.cross_scope_clusters = clusters;
+            report.cross_scope_promoted = promoted;
+            report.cross_scope_skipped_existing = skipped;
         }
+        Ok(report)
+    }
+
+    /// #486 defaults: promote once a fact recurs in 3 distinct workspaces
+    /// (below that, generalizing is premature), matched at the same trigram
+    /// similarity remember() uses to call two bodies "the same fact" (0.7).
+    const CROSS_SCOPE_PROMOTE_K: i64 = 3;
+    const CROSS_SCOPE_SIM_THRESHOLD: f64 = 0.7;
+    /// Bound the promotion scan so one pass over a huge store can't stall
+    /// maintenance; the store converges over successive passes (same posture
+    /// as DEDUP_SIG_BACKFILL_CAP).
+    const CROSS_SCOPE_SCAN_CAP: i64 = 5000;
+
+    /// #486: cross-scope promotion — promote recurring facts up the scope
+    /// ladder (Belief-Memory-inspired). A fact independently written in >= k
+    /// distinct workspaces is no longer a workspace fact: one global-scope
+    /// ('') entity is created carrying the most informative member body, with
+    /// `promoted_from` links back to every per-scope evidence row and
+    /// provenance tags (`promoted:cross-scope`, `scopes:N`).
+    ///
+    /// Deterministic and idempotent:
+    ///   - clustering is greedy trigram-Jaccard within a category over a
+    ///     bounded, creation-ordered scan (no LLM, no randomness);
+    ///   - the write goes through remember() with workspace_hash = '', so the
+    ///     global scope's own near-duplicate detection absorbs re-runs (the
+    ///     second pass reports `skipped_existing`, creates nothing);
+    ///   - undo = forget the promoted entity (a reversible archive); the
+    ///     evidence rows are never modified.
+    fn promote_cross_scope(
+        &self,
+        k: i64,
+        threshold: f64,
+        dry_run: bool,
+    ) -> Result<(i64, i64, i64), Box<dyn std::error::Error>> {
+        struct Row {
+            id: String,
+            category: String,
+            key: String,
+            body: String,
+            ws: String,
+            entity_type: String,
+        }
+        // Phase 1 — bounded scan (own pooled connection, dropped before any
+        // write). `conversation` is auto-captured session flotsam, excluded
+        // from the recall surface (#298/#302) — recurring session chatter is
+        // not a belief worth promoting.
+        let rows: Vec<Row> = {
+            let conn = self.conn()?;
+            let mut stmt = conn.prepare(
+                "SELECT id, category, key, body_json, workspace_hash, type \
+                 FROM entities \
+                 WHERE archived = 0 AND workspace_hash != '' AND category != 'conversation' \
+                 ORDER BY category ASC, created_at_unix_ms ASC, id ASC \
+                 LIMIT ?1",
+            )?;
+            let mapped = stmt.query_map(params![Self::CROSS_SCOPE_SCAN_CAP], |r| {
+                Ok(Row {
+                    id: r.get(0)?,
+                    category: r.get(1)?,
+                    key: r.get(2)?,
+                    body: r.get(3)?,
+                    ws: r.get(4)?,
+                    entity_type: r.get(5)?,
+                })
+            })?;
+            let mut rows = Vec::new();
+            for row in mapped {
+                let mut row = row?;
+                // Encrypted stores: cluster over plaintext. AuthFailed rows are
+                // skipped — clustering over ciphertext would be noise, and the
+                // raw value must not be used (see decrypt_body).
+                if let Some(ref enc) = self.encryption {
+                    let aad = Self::build_aad(&row.category, &row.key);
+                    match enc.decrypt_body(&row.body, aad.as_bytes()) {
+                        crate::encryption::BodyDecrypt::Plaintext(pt)
+                        | crate::encryption::BodyDecrypt::LegacyPlaintext(pt) => row.body = pt,
+                        crate::encryption::BodyDecrypt::AuthFailed(_) => continue,
+                    }
+                }
+                rows.push(row);
+            }
+            rows
+        };
+
+        // Phase 2 — greedy clustering per category: each row joins the first
+        // cluster whose REPRESENTATIVE (first member) it matches at the
+        // threshold, else starts a new cluster. Trigram sets are computed
+        // once per row (#209 lesson).
+        let mut clusters: Vec<Vec<usize>> = Vec::new();
+        {
+            let mut reps: Vec<(usize, std::collections::HashSet<[char; 3]>)> = Vec::new();
+            let mut tg: Vec<Option<std::collections::HashSet<[char; 3]>>> =
+                vec![None; rows.len()];
+            for i in 0..rows.len() {
+                if rows[i].body.is_empty() {
+                    continue;
+                }
+                if tg[i].is_none() {
+                    tg[i] = Some(Self::trigrams(&rows[i].body));
+                }
+                let mut joined = false;
+                for (ci, (rep_idx, rep_tg)) in reps.iter().enumerate() {
+                    if rows[*rep_idx].category != rows[i].category {
+                        continue;
+                    }
+                    let sim = if rows[*rep_idx].body == rows[i].body {
+                        1.0
+                    } else {
+                        Self::trigram_overlap(rep_tg, tg[i].as_ref().unwrap())
+                    };
+                    if sim >= threshold {
+                        clusters[ci].push(i);
+                        joined = true;
+                        break;
+                    }
+                }
+                if !joined {
+                    reps.push((i, tg[i].clone().unwrap()));
+                    clusters.push(vec![i]);
+                }
+            }
+        }
+
+        // Phase 3 — promote clusters spanning >= k distinct workspaces.
+        let mut found: i64 = 0;
+        let mut promoted: i64 = 0;
+        let mut skipped: i64 = 0;
+        for cluster in &clusters {
+            let scopes: std::collections::HashSet<&str> =
+                cluster.iter().map(|&i| rows[i].ws.as_str()).collect();
+            if (scopes.len() as i64) < k {
+                continue;
+            }
+            found += 1;
+            if dry_run {
+                continue;
+            }
+            // Representative: the most informative (longest) member body.
+            let rep = *cluster
+                .iter()
+                .max_by_key(|&&i| rows[i].body.len())
+                .expect("cluster is non-empty");
+            let rep_row = &rows[rep];
+            let now = now_ms();
+            // Stable identity: keyed by the evidence set, so the same cluster
+            // maps to the same (category, key) run after run.
+            let key = {
+                use sha2::{Digest, Sha256};
+                let mut h = Sha256::new();
+                let mut member_keys: Vec<&str> =
+                    cluster.iter().map(|&i| rows[i].key.as_str()).collect();
+                member_keys.sort_unstable();
+                h.update(rep_row.category.as_bytes());
+                for mk in member_keys {
+                    h.update(b"\x1f");
+                    h.update(mk.as_bytes());
+                }
+                format!("promoted-{:x}", h.finalize())[..21].to_string()
+            };
+            let links: Vec<MemoryLink> = cluster
+                .iter()
+                .map(|&i| MemoryLink {
+                    target_id: rows[i].id.clone(),
+                    relationship: "promoted_from".to_string(),
+                    weight: 1.0,
+                })
+                .collect();
+            let entity = crate::models::Entity {
+                id: format!(
+                    "mem-{}",
+                    &uuid::Uuid::new_v4().to_string().replace('-', "")[..12]
+                ),
+                category: rep_row.category.clone(),
+                key,
+                body_json: rep_row.body.clone(),
+                status: "active".to_string(),
+                entity_type: rep_row.entity_type.clone(),
+                tags: vec![
+                    "promoted:cross-scope".to_string(),
+                    format!("scopes:{}", scopes.len()),
+                ],
+                decay_score: 1.0,
+                retrieval_count: 0,
+                layer: "working".to_string(),
+                topic_path: String::new(),
+                archived: false,
+                archive_reason: String::new(),
+                links,
+                verified: false,
+                source: "cross_scope_promotion".to_string(),
+                always_on: false,
+                certainty: 1.0,
+                workspace_hash: String::new(),
+                agent_id: String::new(),
+                visibility: "workspace".to_string(),
+                follow_count: 0,
+                miss_count: 0,
+                follow_rate: 0.0,
+                efficacy_status: "unverified".to_string(),
+                embedding: None,
+                created_at_unix_ms: now,
+                last_accessed_unix_ms: now,
+            };
+            let (_id, action) = self.remember(&entity)?;
+            // Only a genuine create is a new promotion. "deduped" = the global
+            // scope already holds an equivalent fact; "updated" = this exact
+            // promoted key exists from a prior pass — both are re-run noise,
+            // not new beliefs.
+            if action == "created" {
+                promoted += 1;
+            } else {
+                skipped += 1;
+            }
+        }
+        Ok((found, promoted, skipped))
     }
 
     /// True if a boxed error is a transient SQLite write-lock contention
@@ -8388,6 +8624,9 @@ last_accessed: {}
                 entities_examined: examined,
                 dry_run: true,
                 completed_at_unix_ms: now,
+                cross_scope_clusters: 0,
+                cross_scope_promoted: 0,
+                cross_scope_skipped_existing: 0,
             });
         }
 
@@ -8579,6 +8818,9 @@ last_accessed: {}
             entities_examined: examined,
             dry_run: false,
             completed_at_unix_ms: now,
+            cross_scope_clusters: 0,
+            cross_scope_promoted: 0,
+            cross_scope_skipped_existing: 0,
         })
     }
     /// Structured correction capture — stores the wrong approach, user correction,
@@ -9801,6 +10043,136 @@ mod tests {
         let _ = fs::remove_file(&path);
     }
 
+    // ─── #486: cross-scope promotion ─────────────────────────────────────
+
+    fn ws_entity(id: &str, category: &str, key: &str, body: &str, ws: &str) -> Entity {
+        let mut e = make_entity(id, category, key, body);
+        e.workspace_hash = ws.to_string();
+        e
+    }
+
+    const PROMO_BODY: &str =
+        "{\"text\": \"deploys must run the schema migration before the app rollout every time\"}";
+
+    fn seed_recurring_fact(db: &Database, scopes: &[&str]) {
+        for (i, ws) in scopes.iter().enumerate() {
+            db.remember(&ws_entity(
+                &format!("mem-x486{}", i),
+                "convention",
+                &format!("deploy-order-{}", i),
+                PROMO_BODY,
+                ws,
+            ))
+            .expect("seed write");
+        }
+    }
+
+    fn promoted_rows(db: &Database) -> Vec<Entity> {
+        db.list_entities(0, 100, None, None, Some(""))
+            .expect("list global scope")
+            .into_iter()
+            .filter(|e| e.source == "cross_scope_promotion")
+            .collect()
+    }
+
+    #[test]
+    fn cross_scope_promotion_promotes_fact_seen_in_k_workspaces() {
+        let (db, path) = temp_db();
+        seed_recurring_fact(&db, &["ws-a", "ws-b", "ws-c"]);
+        // An unrelated single-scope fact must NOT be promoted.
+        db.remember(&ws_entity(
+            "mem-y486", "convention", "unrelated",
+            "{\"text\": \"completely different lore about kestrels and granite spires\"}",
+            "ws-a",
+        ))
+        .unwrap();
+
+        let report = db
+            .cohere(&crate::models::CohereParams {
+                cross_scope_promote: true,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(report.cross_scope_clusters, 1);
+        assert_eq!(report.cross_scope_promoted, 1);
+
+        let promoted = promoted_rows(&db);
+        assert_eq!(promoted.len(), 1, "exactly one broader-scope entity");
+        let p = &promoted[0];
+        assert_eq!(p.workspace_hash, "", "promoted entity lives at the global scope");
+        assert!(p.key.starts_with("promoted-"));
+        assert!(p.tags.iter().any(|t| t == "promoted:cross-scope"));
+        assert!(p.tags.iter().any(|t| t == "scopes:3"));
+        // Evidence provenance: links back to every per-scope original.
+        let evidence: Vec<_> = p
+            .links
+            .iter()
+            .filter(|l| l.relationship == "promoted_from")
+            .collect();
+        assert_eq!(evidence.len(), 3, "links to all 3 evidence rows");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn cross_scope_promotion_below_threshold_promotes_nothing() {
+        let (db, path) = temp_db();
+        seed_recurring_fact(&db, &["ws-a", "ws-b"]); // 2 scopes < default k=3
+        let report = db
+            .cohere(&crate::models::CohereParams {
+                cross_scope_promote: true,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(report.cross_scope_clusters, 0);
+        assert_eq!(report.cross_scope_promoted, 0);
+        assert!(promoted_rows(&db).is_empty(), "no premature generalization");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn cross_scope_promotion_is_idempotent_across_reruns() {
+        let (db, path) = temp_db();
+        seed_recurring_fact(&db, &["ws-a", "ws-b", "ws-c"]);
+        let params = crate::models::CohereParams {
+            cross_scope_promote: true,
+            ..Default::default()
+        };
+        let first = db.cohere(&params).unwrap();
+        assert_eq!(first.cross_scope_promoted, 1);
+        let second = db.cohere(&params).unwrap();
+        assert_eq!(second.cross_scope_promoted, 0, "re-run creates nothing new");
+        assert!(second.cross_scope_skipped_existing >= 1);
+        assert_eq!(promoted_rows(&db).len(), 1, "still exactly one promoted entity");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn cross_scope_promotion_dry_run_reports_without_writing() {
+        let (db, path) = temp_db();
+        seed_recurring_fact(&db, &["ws-a", "ws-b", "ws-c"]);
+        let report = db
+            .cohere(&crate::models::CohereParams {
+                cross_scope_promote: true,
+                dry_run: true,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(report.cross_scope_clusters, 1, "dry run still finds the cluster");
+        assert_eq!(report.cross_scope_promoted, 0);
+        assert!(promoted_rows(&db).is_empty(), "dry run writes nothing");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn cross_scope_promotion_off_by_default() {
+        let (db, path) = temp_db();
+        seed_recurring_fact(&db, &["ws-a", "ws-b", "ws-c"]);
+        let report = db.cohere(&crate::models::CohereParams::default()).unwrap();
+        assert_eq!(report.cross_scope_clusters, 0);
+        assert!(promoted_rows(&db).is_empty(), "absence of the flag = today's behavior");
+        let _ = fs::remove_file(&path);
+    }
+
     /// #399: decay_tick must not rewrite rows whose recomputed decay matches
     /// what is already stored. First tick over a stale store persists the
     /// recomputed scores; an immediately-following second tick recomputes
@@ -9983,6 +10355,7 @@ mod tests {
             max_links: 0,
             promote_threshold: 0,
             archive_threshold: 0.0,
+            ..Default::default()
         };
         for _ in 0..80 {
             db.cohere(&params).unwrap();
@@ -10034,6 +10407,7 @@ mod tests {
             max_links: 0,
             promote_threshold: 0,
             archive_threshold: 0.0,
+            ..Default::default()
         };
         for _ in 0..80 {
             db.cohere(&params).unwrap();
@@ -10085,6 +10459,7 @@ mod tests {
             max_links: 0,
             promote_threshold: 0, // use the default
             archive_threshold: 0.0,
+            ..Default::default()
         };
         db.cohere(&params).unwrap();
         assert_eq!(db.get_entity("note", "four").unwrap().unwrap().layer, "buffer");
@@ -10301,6 +10676,7 @@ mod tests {
             max_links: 20,
             promote_threshold: 0,
             archive_threshold: 0.0,
+            ..Default::default()
         };
         // cohere runs while the raw writer hammers an INSERT every ~5ms. Under
         // this synthetic max-contention — and especially on slow/loaded Windows
@@ -10440,6 +10816,7 @@ mod tests {
             max_links: 20,
             promote_threshold: 0,
             archive_threshold: 0.0,
+            ..Default::default()
         };
         let cohere_start = Instant::now();
         let report = db.cohere(&params).expect("cohere");
@@ -10805,6 +11182,7 @@ mod tests {
             max_links: 20,
             promote_threshold: 0,
             archive_threshold: 0.0,
+            ..Default::default()
         };
         let t = Instant::now();
         let report = db.cohere(&params).expect("cohere must succeed at 100k");
@@ -14468,6 +14846,7 @@ mod tests {
             max_links: 100,
             promote_threshold: 0,
             archive_threshold: 0.0,
+            ..Default::default()
         };
         let report = db.cohere(&params).unwrap();
         assert!(report.linked >= 1, "should link, got {}", report.linked);
@@ -14509,6 +14888,7 @@ mod tests {
             max_links: 100,
             promote_threshold: 0,
             archive_threshold: 0.0,
+            ..Default::default()
         };
         db.cohere(&params).unwrap();
 

@@ -2836,6 +2836,21 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
           "type": "number",
           "description": "Decay score below which entities are auto-archived (default 0.05)",
           "default": 0.05
+        },
+        "cross_scope_promote": {
+          "type": "boolean",
+          "description": "#486: also run cross-scope promotion — a fact independently observed in >= cross_scope_k distinct workspaces is promoted to one global-scope entity with promoted_from links back to the per-scope evidence. Off by default; re-runs are idempotent (the global scope's dedup absorbs them); undo by forgetting the promoted entity.",
+          "default": false
+        },
+        "cross_scope_k": {
+          "type": "integer",
+          "description": "Minimum distinct workspaces before a recurring fact is promoted (default 3, minimum 2)",
+          "default": 3
+        },
+        "cross_scope_similarity": {
+          "type": "number",
+          "description": "Trigram similarity treating two bodies as the same fact across scopes (default 0.7, matching write-time dedup)",
+          "default": 0.7
         }
       }
     },
@@ -2845,6 +2860,18 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
         "promoted": {
           "type": "integer",
           "description": "Number of entities promoted from buffer to working"
+        },
+        "cross_scope_clusters": {
+          "type": "integer",
+          "description": "#486: clusters found spanning >= cross_scope_k workspaces (0 unless cross_scope_promote)"
+        },
+        "cross_scope_promoted": {
+          "type": "integer",
+          "description": "#486: new global-scope entities created by cross-scope promotion"
+        },
+        "cross_scope_skipped_existing": {
+          "type": "integer",
+          "description": "#486: qualifying clusters already represented at the global scope (idempotent re-run)"
         },
         "decayed": {
           "type": "integer",

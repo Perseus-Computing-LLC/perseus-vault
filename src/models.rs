@@ -601,6 +601,21 @@ pub struct CohereParams {
     pub promote_threshold: i64,
     #[serde(default = "default_archive_threshold")]
     pub archive_threshold: f64,
+    /// #486: opt-in cross-scope promotion — promote a fact independently
+    /// observed in >= `cross_scope_k` distinct workspaces up to the global
+    /// ('') scope, linking back to the per-scope evidence. OFF by default:
+    /// absence of these args = pre-#486 behavior exactly.
+    #[serde(default)]
+    pub cross_scope_promote: bool,
+    /// Minimum distinct workspaces before a recurring fact is promoted
+    /// (0 sentinel → default 3; clamped to >= 2 — "seen twice" is not a
+    /// pattern worth generalizing).
+    #[serde(default)]
+    pub cross_scope_k: i64,
+    /// Trigram similarity for "same fact across scopes" (0.0 sentinel → the
+    /// remember() dedup threshold, 0.7).
+    #[serde(default)]
+    pub cross_scope_similarity: f64,
 }
 
 // Manual Default so `..Default::default()` construction (autocohere) gets the
@@ -616,6 +631,9 @@ impl Default for CohereParams {
             max_links: default_max_links(),
             promote_threshold: 0,
             archive_threshold: 0.0,
+            cross_scope_promote: false,
+            cross_scope_k: 0,
+            cross_scope_similarity: 0.0,
         }
     }
 }
@@ -641,6 +659,12 @@ pub struct CohereReport {
     pub entities_examined: i64,
     pub dry_run: bool,
     pub completed_at_unix_ms: i64,
+    /// #486: cross-scope promotion outcome (all 0 / absent-in-spirit unless
+    /// `cross_scope_promote` was requested). Additive fields — older readers
+    /// keep working.
+    pub cross_scope_clusters: i64,
+    pub cross_scope_promoted: i64,
+    pub cross_scope_skipped_existing: i64,
 }
 
 /// Cheap, deterministic content digest of the recall-visible entity set (#256).
