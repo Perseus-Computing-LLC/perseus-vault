@@ -206,7 +206,15 @@ CREATE INDEX IF NOT EXISTS idx_entity_history_catkey ON entity_history(category,
 /// deploy). The whole migration function is idempotent (ensure_column probes;
 /// the v15 rehash is deterministic and the keyed-chain rekey is canary-gated),
 /// so the bump simply re-runs it once and picks up the missing columns.
-const SCHEMA_VERSION: i64 = 16;
+///
+/// v17 (#476): dedup_signatures gains scope columns (category,
+/// workspace_hash) + the (category, workspace_hash, tg_count) band index, and
+/// every active entity's missing signature is backfilled once — the
+/// near-duplicate scan now drives off this small table instead of hydrating
+/// (and re-hashing) every same-category entity body per write, which was
+/// O(N·body_size) per insert and the cause of the #474-measured quadratic
+/// bulk-load curve (141/s @10K → 7/s @100K).
+const SCHEMA_VERSION: i64 = 17;
 
 /// Initialize the v0.2.0 schema on a fresh database.
 pub fn initialize_schema(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
@@ -461,13 +469,19 @@ fn apply_migrations(conn: &Connection) -> Result<(), Box<dyn std::error::Error>>
     // next dedup touch — so v10 stores stay ROLLBACK-SAFE: running an older
     // binary never poisons dedup verdicts, and dropping both side tables is
     // always a safe reset (they hold only derived, rebuildable data).
+    // category/workspace_hash (v17, #476): the scan is signature-driven and
+    // must filter scope WITHOUT joining entities (that join is what hydrated
+    // every multi-KB body per write). Fresh DBs get the full shape here;
+    // pre-v17 stores get the columns + backfill in the gated v17 block.
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS dedup_signatures (
             entity_id TEXT PRIMARY KEY REFERENCES entities(id) ON DELETE CASCADE,
             body_len INTEGER NOT NULL,
             body_hash INTEGER NOT NULL,
             tg_count INTEGER NOT NULL,
-            histo BLOB
+            histo BLOB,
+            category TEXT NOT NULL DEFAULT '',
+            workspace_hash TEXT NOT NULL DEFAULT ''
          ) WITHOUT ROWID;
          CREATE TABLE IF NOT EXISTS dedup_signature_blobs (
             entity_id TEXT PRIMARY KEY REFERENCES entities(id) ON DELETE CASCADE,
@@ -552,6 +566,76 @@ fn apply_migrations(conn: &Connection) -> Result<(), Box<dyn std::error::Error>>
     ensure_column(conn, "journal", "payload_commitment", "TEXT DEFAULT ''")?;
     crate::db::rehash_audit_chain(conn)?;
     // ── end v15 ──────────────────────────────────────────────────────────
+
+    // ── v17 (#476): signature-driven dedup scan ──────────────────────────
+    // The near-duplicate scan used to hydrate every same-category entity row
+    // (multi-KB bodies, overflow pages) AND recompute body_hash64 over each
+    // body per write — O(N·body_size) per insert, the measured cause of the
+    // quadratic bulk-load curve (#474: 141/s @10K → 7/s @100K). The scan now
+    // drives off dedup_signatures alone: small fixed-size rows, band-pruned
+    // by the lossless tg_count ratio bound, bodies touched only on a hit.
+    // Three pieces make that possible:
+    //   1. scope columns, so the scan can filter without joining entities;
+    //   2. the (category, workspace_hash, tg_count) band index;
+    //   3. a one-time signature backfill for rows the bounded lazy backfill
+    //      never reached, making "every ACTIVE row has a signature" an
+    //      invariant the scan can rely on. (Writers have maintained
+    //      signatures transactionally since v10; archived rows are excluded
+    //      — the scan's verify-on-hit self-heals any leftovers.)
+    // Backfill cost is one pass over unsigned active rows (~30-60s per
+    // 100K on desktop hardware), inside the migration transaction, once.
+    ensure_column(conn, "dedup_signatures", "category", "TEXT NOT NULL DEFAULT ''")?;
+    ensure_column(conn, "dedup_signatures", "workspace_hash", "TEXT NOT NULL DEFAULT ''")?;
+    // Scope-sync signature rows that predate the columns (idempotent: rows
+    // already synced match the subquery and are rewritten with equal values).
+    conn.execute_batch(
+        "UPDATE dedup_signatures SET
+           category = COALESCE((SELECT e.category FROM entities e
+                                WHERE e.id = dedup_signatures.entity_id), category),
+           workspace_hash = COALESCE((SELECT e.workspace_hash FROM entities e
+                                      WHERE e.id = dedup_signatures.entity_id), workspace_hash);",
+    )?;
+    // Drop signatures of archived entities: the old scan filtered archived=0
+    // via entities; the new signature-driven scan must not see them.
+    conn.execute_batch(
+        "DELETE FROM dedup_signatures WHERE entity_id IN
+           (SELECT id FROM entities WHERE archived = 1);
+         DELETE FROM dedup_signature_blobs WHERE entity_id IN
+           (SELECT id FROM entities WHERE archived = 1);",
+    )?;
+    // Backfill missing signatures for every remaining active row.
+    {
+        let mut missing = conn.prepare(
+            "SELECT e.id, e.body_json, e.category, e.workspace_hash
+             FROM entities e LEFT JOIN dedup_signatures s ON s.entity_id = e.id
+             WHERE e.archived = 0 AND s.entity_id IS NULL",
+        )?;
+        let rows: Vec<(String, String, String, String)> = missing
+            .query_map([], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })?
+            .flatten()
+            .collect();
+        for (id, body, category, ws) in rows {
+            let rs = crate::dedup::build_row_signature(&body);
+            conn.execute(
+                "INSERT OR REPLACE INTO dedup_signature_blobs (entity_id, sig) VALUES (?1, ?2)",
+                rusqlite::params![id, rs.sig],
+            )?;
+            conn.execute(
+                "INSERT OR REPLACE INTO dedup_signatures
+                 (entity_id, body_len, body_hash, tg_count, histo, category, workspace_hash)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![id, rs.body_len, rs.body_hash, rs.tg_count, rs.histo,
+                                  category, ws],
+            )?;
+        }
+    }
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_dedup_sig_band
+           ON dedup_signatures(category, workspace_hash, tg_count);",
+    )?;
+    // ── end v17 ──────────────────────────────────────────────────────────
 
     // Stamp the migration level so subsequent opens skip the probe block above.
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;

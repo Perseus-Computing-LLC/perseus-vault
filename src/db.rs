@@ -2129,278 +2129,241 @@ impl Database {
         workspace_hash: &str,
         body_json: &str,
         threshold: f64,
-        fts_prefilter: bool,
     ) -> Result<Option<String>, Box<dyn std::error::Error>> {
         let conn = self.conn()?;
-        Self::find_near_duplicate_with_conn(
-            &conn,
-            category,
-            workspace_hash,
-            body_json,
-            threshold,
-            fts_prefilter,
-        )
+        Self::find_near_duplicate_with_conn(&conn, category, workspace_hash, body_json, threshold)
     }
-
-    /// How many missing/stale row signatures one dedup scan will rebuild and
-    /// write back (#392). Bounded so a first scan over a large pre-migration
-    /// store doesn't turn into an unbounded write burst; the store converges
-    /// over successive scans.
-    const DEDUP_SIG_BACKFILL_CAP: usize = 512;
 
     /// #397: `find_near_duplicate` on the CALLER's already-held connection, so
     /// remember's create path uses exactly one pooled connection per request.
     ///
-    /// #392: candidates are compared via per-row STORED trigram signatures
-    /// (`dedup_signatures`, written at insert/update time from the stored
-    /// body_json column value) instead of rebuilding each candidate's trigram
-    /// set from its body on every call — the O(M·N) rebuild was ~30µs per
-    /// candidate at 1KB bodies, a 1.6s synchronous stall per insert at 50k
-    /// rows. The signature path is LOSSLESS: it returns exactly the verdict
-    /// the exhaustive trigram-Jaccard scan returns (see src/dedup.rs for the
-    /// packing-injectivity and prune-bound proofs); rows without a (fresh)
-    /// signature take the old rebuild path and get their signature written
-    /// back in bounded batches.
+    /// v17 (#476): the scan drives off `dedup_signatures` ALONE — it never
+    /// joins or hydrates entity rows. The previous shape (entities LEFT JOIN
+    /// signatures) materialized every same-category row's multi-KB body AND
+    /// recomputed `body_hash64` over it per candidate as the freshness guard:
+    /// O(N·body_size) per write, measured as the quadratic bulk-load curve in
+    /// benchmark/scale (141/s @10K → 7/s @100K sustained). Now:
+    ///
+    ///   1. SQL band prune on the (category, workspace_hash, tg_count) index:
+    ///      Jaccard >= t requires min(a,b)/max(a,b) >= t (|A∩B| <= min,
+    ///      union >= max), so only signatures with tg_count in
+    ///      [ceil(t·a), floor(a/t)] can qualify — a provably lossless bound.
+    ///   2. The surviving candidates go through the same lossless count-bound
+    ///      + histogram-ceiling prunes and the exact signature-merge verdict
+    ///      (src/dedup.rs) as before.
+    ///   3. Freshness moves from scan-time (hash EVERY body, every write) to
+    ///      VERIFY-ON-HIT: only a candidate whose signature verdict is "dup"
+    ///      gets its entity row fetched and re-checked (hash + scope +
+    ///      archived). A stale/moved/archived signature self-heals (repair or
+    ///      delete) and the scan continues. The rare damage a stale signature
+    ///      can now cause is a MISSED dedup (an extra row stored) — the
+    ///      previous guard taxed every write for everyone to prevent exactly
+    ///      that benign case; signature-unaware writers (rolled-back pre-v10
+    ///      binary, direct SQL) are the documented rare exception, and
+    ///      "every active row has a signature" is a v17 migration invariant.
+    ///
+    /// Semantics preserved: the dup/not-dup verdict for every candidate is
+    /// the same expression the exhaustive scan computed. When SEVERAL rows
+    /// clear the threshold, which id is returned follows signature-index
+    /// order (tg_count, then entity_id) instead of the old entities scan
+    /// order — deterministic, but not necessarily the same row as pre-v17.
     fn find_near_duplicate_with_conn(
         conn: &rusqlite::Connection,
         category: &str,
         workspace_hash: &str,
         body_json: &str,
         threshold: f64,
-        fts_prefilter: bool,
     ) -> Result<Option<String>, Box<dyn std::error::Error>> {
-        // Precompute the new body's trigram set ONCE rather than rebuilding it
-        // for every candidate inside trigram_similarity (it was reconstructed on
-        // each comparison — #209). The exact-match / empty cases below preserve
-        // trigram_similarity's prior semantics exactly.
         if body_json.is_empty() {
             return Ok(None);
         }
-        // Packed sorted-set form of the target's trigrams: same cardinality
-        // and intersections as the HashSet<[char;3]> form (injective packing),
-        // so Jaccard over it is bit-identical to the old computation.
         let target = crate::dedup::packed_trigrams(body_json);
         let target_histo = crate::dedup::histogram(&target);
-
-        // Opt-in FTS candidate prefilter (#228), gated by the caller. The exact
-        // cost of dedup on bulk import is the exhaustive trigram comparison
-        // against every non-archived row in the category (O(M*N) over an import of
-        // M rows). When enabled, only same-category rows that share at least one
-        // FTS token with the new body are compared, which collapses that cost for
-        // categories with diverse bodies. This is a HEURISTIC, not lossless: a
-        // near-duplicate that shares no FTS token with the new body (e.g. one
-        // differing only in punctuation the tokenizer drops) can slip through and
-        // be stored as a separate entity. The default full scan stays exact.
-        // entities_fts holds the plaintext body even under encryption, so the
-        // prefilter works on encrypted DBs too.
-        let mut match_query = String::new();
-        if fts_prefilter {
-            // OR the body's distinct tokens into a single MATCH expression. Cap
-            // the term count so a very large body can't build a pathological FTS
-            // query; the cap only narrows candidates further (still a prefilter).
-            let mut seen = std::collections::HashSet::new();
-            let terms: Vec<String> = body_json
-                .split_whitespace()
-                .filter(|w| seen.insert(*w))
-                .take(64)
-                .map(|w| format!("\"{}\"", w.replace('"', "\"\"")))
-                .collect();
-            if !terms.is_empty() {
-                match_query = terms.join(" OR ");
-            }
-        }
-
-        // The LEFT JOIN pulls each candidate's stored signature alongside the
-        // row. `entities` stays the outer table (LEFT JOIN pins it), so the
-        // candidate iteration order — and with it WHICH id is returned when
-        // several rows clear the threshold — is the same as the old
-        // single-table scan's.
-        let mut stmt = if match_query.is_empty() {
-            conn.prepare(
-                "SELECT e.id, e.body_json, s.body_len, s.body_hash, s.tg_count, s.histo \
-                 FROM entities e LEFT JOIN dedup_signatures s ON s.entity_id = e.id \
-                 WHERE e.category = ?1 AND e.workspace_hash = ?2 AND e.archived = 0",
-            )?
-        } else {
-            conn.prepare(
-                "SELECT e.id, e.body_json, s.body_len, s.body_hash, s.tg_count, s.histo \
-                 FROM entities e LEFT JOIN dedup_signatures s ON s.entity_id = e.id \
-                 WHERE e.category = ?1 AND e.workspace_hash = ?2 AND e.archived = 0 \
-                   AND e.rowid IN (SELECT rowid FROM entities_fts WHERE entities_fts MATCH ?3)",
-            )?
-        };
-        // Point lookup for the exact set of a candidate that survives both
-        // prunes — deliberately NOT joined into the scan so the multi-KB
-        // blobs never enter the scan's page footprint. Prepared lazily: most
-        // scans never need it.
-        let mut sig_stmt: Option<rusqlite::Statement<'_>> = None;
-        let mut rows = if match_query.is_empty() {
-            stmt.query(params![category, workspace_hash])?
-        } else {
-            stmt.query(params![category, workspace_hash, match_query])?
-        };
-
         let a = target.len();
-        let target_len = a as f64;
-        // Missing/stale signatures rebuilt during this scan, written back
-        // best-effort after it (bounded — see DEDUP_SIG_BACKFILL_CAP).
-        let mut pending: Vec<(String, crate::dedup::RowSignature)> = Vec::new();
+
+        // Lossless tg_count band (see doc comment). threshold is the
+        // remember() constant 0.7 in production; guard the general case.
+        let (band_lo, band_hi) = if a == 0 {
+            // Sub-3-char body: no trigrams. The only candidates the old scan
+            // could match are byte-identical bodies (sim forced to 1.0), and
+            // an identical body has an identical (empty) set — band [0, 0].
+            (0i64, 0i64)
+        } else if threshold <= 0.0 {
+            (0i64, i64::MAX)
+        } else {
+            (
+                (threshold * a as f64).ceil() as i64,
+                (a as f64 / threshold).floor() as i64,
+            )
+        };
+
+        let mut stmt = conn.prepare(
+            "SELECT s.entity_id, s.body_len, s.body_hash, s.tg_count, s.histo \
+             FROM dedup_signatures s \
+             WHERE s.category = ?1 AND s.workspace_hash = ?2 \
+               AND s.tg_count BETWEEN ?3 AND ?4",
+        )?;
+        // Point lookups, prepared lazily — most scans never need them.
+        let mut sig_stmt: Option<rusqlite::Statement<'_>> = None;
+        let mut hit_stmt: Option<rusqlite::Statement<'_>> = None;
+        let mut rows = stmt.query(params![category, workspace_hash, band_lo, band_hi])?;
+
+        // Signatures found stale/orphaned during the scan: repaired or
+        // deleted best-effort AFTER it (never inside the read loop).
+        let mut repair: Vec<(String, crate::dedup::RowSignature)> = Vec::new();
+        let mut evict: Vec<String> = Vec::new();
         let mut found: Option<String> = None;
 
-        while let Some(row) = rows.next()? {
-            // get_ref borrows straight out of the row — no per-candidate
-            // String/Vec allocations on the hot path.
-            let id_ref = row.get_ref(0)?;
-            let existing_body = row.get_ref(1)?.as_str()?;
+        'scan: while let Some(row) = rows.next()? {
+            let cand_id: String = row.get(0)?;
+            let sig_body_len: i64 = row.get(1)?;
+            let sig_body_hash: i64 = row.get(2)?;
+            let b = row.get::<_, i64>(3)?.max(0) as usize;
 
-            // Fresh stored signature metadata, if any. body_len must match the
-            // fetched body's byte length — a stale signature (some path
-            // rewrote the body without maintaining it) must not be trusted;
-            // it falls back to the rebuild path below and gets repaired. Only
-            // the small meta columns ride the scan; the multi-KB exact set
-            // lives in dedup_signature_blobs and is point-fetched only for
-            // candidates that survive both prunes.
-            let meta: Option<usize> = match (row.get_ref(2)?, row.get_ref(3)?, row.get_ref(4)?) {
-                (
-                    rusqlite::types::ValueRef::Integer(body_len),
-                    rusqlite::types::ValueRef::Integer(body_hash),
-                    rusqlite::types::ValueRef::Integer(tg_count),
-                ) if body_len == existing_body.len() as i64
-                    && tg_count >= 0
-                    // Exact half of the guard, checked after the free length
-                    // compare: a same-length rewrite by a signature-unaware
-                    // writer (rolled-back pre-v10 binary, direct SQL) leaves
-                    // the length intact but never the content hash.
-                    && body_hash == crate::dedup::body_hash64(existing_body) =>
-                {
-                    Some(tg_count as usize)
-                }
-                _ => None,
-            };
-
-            // Rows without a fresh signature get one queued for write-back
-            // regardless of which verdict branch runs below — so the store
-            // converges even for rows the prefilters never touch. Bounded by
-            // the cap; a one-time build cost per legacy row.
-            if meta.is_none() && pending.len() < Self::DEDUP_SIG_BACKFILL_CAP {
-                if let rusqlite::types::ValueRef::Text(t) = id_ref {
-                    pending.push((
-                        String::from_utf8_lossy(t).into_owned(),
-                        crate::dedup::build_row_signature(existing_body),
-                    ));
-                }
-            }
-
-            // `is_dup` mirrors the old `sim >= threshold` verdict exactly; the
-            // empty/equality branches are the old ones verbatim (sim 0.0 / 1.0).
-            let is_dup = if existing_body.is_empty() {
-                0.0 >= threshold
-            } else if existing_body == body_json {
-                1.0 >= threshold
-            } else if let Some(b) = meta {
-                // ── Stored-signature path (#392) ─────────────────────────
-                if a == 0 || b == 0 {
-                    // exact_jaccard's empty-set guard: sim = 0.0.
-                    0.0 >= threshold
+            // ── Lossless prunes on signature metadata alone ──────────────
+            let sig_verdict: Option<bool> = if a == 0 || b == 0 {
+                // Empty set on either side. exact_jaccard says 0.0, but the
+                // old scan forced byte-identical bodies to 1.0 — for a == 0
+                // that case is alive (band [0,0]), so defer to verify-on-hit
+                // when the stored lengths even permit equality.
+                if a == 0 && b == 0 && sig_body_len == body_json.len() as i64 {
+                    Some(true) // provisional; verify-on-hit compares bodies
                 } else {
-                    // Lossless count ceiling: i <= min(a,b), u >= a+b-min, and
-                    // x/(a+b-x) is increasing in x, so
-                    // sim <= min/(a+b-min). Integer→f64 conversion and f64
-                    // division are monotone, so a bound below the threshold
-                    // proves the verdict is false.
-                    let min = a.min(b);
-                    let count_bound = (min as f64) / ((a + b - min) as f64);
-                    if count_bound < threshold {
-                        false
-                    } else {
-                        // Lossless histogram ceiling on the intersection
-                        // (Σ min of bucket counts — see dedup::histogram);
-                        // clamped by min(a,b), the other valid ceiling.
-                        let histo_ok = match (&target_histo, row.get_ref(5)?) {
-                            (Some(th), rusqlite::types::ValueRef::Blob(ch))
-                                if ch.len() == th.len() =>
-                            {
-                                let s = crate::dedup::histo_intersection_ceiling(th, ch)
-                                    .min(min);
-                                ((s as f64) / ((a + b - s) as f64)) >= threshold
-                            }
-                            _ => true, // no histogram — can't prune, verify
-                        };
-                        if !histo_ok {
-                            false
-                        } else {
-                            // Survivor: fetch the exact set and merge. A
-                            // missing blob row (inconsistent side tables) is
-                            // treated like a malformed blob — rebuild.
-                            if sig_stmt.is_none() {
-                                sig_stmt = Some(conn.prepare(
-                                    "SELECT sig FROM dedup_signature_blobs \
-                                     WHERE entity_id = ?1",
-                                )?);
-                            }
-                            let id_txt: &str = match id_ref {
-                                rusqlite::types::ValueRef::Text(t) => {
-                                    std::str::from_utf8(t).unwrap_or("")
-                                }
-                                _ => "",
-                            };
-                            let verdict = sig_stmt
-                                .as_mut()
-                                .unwrap()
-                                .query_row(params![id_txt], |r| r.get::<_, Vec<u8>>(0))
-                                .ok()
-                                .and_then(|sig| {
-                                    crate::dedup::jaccard_verdict_from_sig(
-                                        &target, &sig, b, threshold,
-                                    )
-                                });
-                            match verdict {
-                                Some(v) => v,
-                                None => {
-                                    // Malformed blob: never guess — rebuild
-                                    // from the body (old path) and queue a
-                                    // repair write-back.
-                                    if pending.len() < Self::DEDUP_SIG_BACKFILL_CAP {
-                                        if let rusqlite::types::ValueRef::Text(t) = id_ref {
-                                            pending.push((
-                                                String::from_utf8_lossy(t).into_owned(),
-                                                crate::dedup::build_row_signature(
-                                                    existing_body,
-                                                ),
-                                            ));
-                                        }
-                                    }
-                                    Self::dedup_verdict_from_body(
-                                        &target,
-                                        target_len,
-                                        existing_body,
-                                        threshold,
-                                    )
-                                }
-                            }
-                        }
-                    }
+                    Some(0.0 >= threshold)
                 }
             } else {
-                // ── No (fresh) stored signature: old rebuild path ─────────
-                Self::dedup_verdict_from_body(&target, target_len, existing_body, threshold)
+                let min = a.min(b);
+                let count_bound = (min as f64) / ((a + b - min) as f64);
+                if count_bound < threshold {
+                    Some(false)
+                } else {
+                    let histo_ok = match (&target_histo, row.get_ref(4)?) {
+                        (Some(th), rusqlite::types::ValueRef::Blob(ch))
+                            if ch.len() == th.len() =>
+                        {
+                            let s = crate::dedup::histo_intersection_ceiling(th, ch).min(min);
+                            ((s as f64) / ((a + b - s) as f64)) >= threshold
+                        }
+                        _ => true, // no histogram — can't prune, verify
+                    };
+                    if !histo_ok {
+                        Some(false)
+                    } else {
+                        // Survivor: fetch the exact set and merge.
+                        if sig_stmt.is_none() {
+                            sig_stmt = Some(conn.prepare(
+                                "SELECT sig FROM dedup_signature_blobs WHERE entity_id = ?1",
+                            )?);
+                        }
+                        sig_stmt
+                            .as_mut()
+                            .unwrap()
+                            .query_row(params![cand_id], |r| r.get::<_, Vec<u8>>(0))
+                            .ok()
+                            .and_then(|sig| {
+                                crate::dedup::jaccard_verdict_from_sig(
+                                    &target, &sig, b, threshold,
+                                )
+                            })
+                        // None (missing/malformed blob) falls through to the
+                        // verify-from-body path below.
+                    }
+                }
             };
 
+            if sig_verdict == Some(false) {
+                continue;
+            }
+
+            // ── Verify-on-hit (also the malformed-blob fallback) ─────────
+            // One entity point-fetch for this candidate only. Anything that
+            // disagrees with the signature self-heals; a verdict against the
+            // CURRENT body is authoritative either way.
+            if hit_stmt.is_none() {
+                hit_stmt = Some(conn.prepare(
+                    "SELECT body_json, category, workspace_hash, archived \
+                     FROM entities WHERE id = ?1",
+                )?);
+            }
+            let hit: Option<(String, String, String, i64)> = hit_stmt
+                .as_mut()
+                .unwrap()
+                .query_row(params![cand_id], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                })
+                .ok();
+            let Some((body, e_cat, e_ws, e_archived)) = hit else {
+                evict.push(cand_id); // orphaned signature
+                continue;
+            };
+            if e_archived != 0 {
+                evict.push(cand_id); // archived after the signature was written
+                continue;
+            }
+            if e_cat != category || e_ws != workspace_hash {
+                // The entity moved scope; re-home its signature and move on —
+                // it is not a candidate for THIS scope.
+                repair.push((cand_id, crate::dedup::build_row_signature(&body)));
+                continue;
+            }
+            let fresh = sig_body_len == body.len() as i64
+                && sig_body_hash == crate::dedup::body_hash64(&body);
+            if !fresh {
+                // Stale signature (signature-unaware writer): repair it, and
+                // decide from the CURRENT body — identical semantics to the
+                // old rebuild path.
+                repair.push((cand_id.clone(), crate::dedup::build_row_signature(&body)));
+                if Self::dedup_verdict_from_body(&target, a as f64, &body, threshold) {
+                    found = Some(cand_id);
+                    break 'scan;
+                }
+                continue;
+            }
+            // Fresh signature. For the a == 0 provisional hit the verdict is
+            // byte equality (the old scan's forced-1.0 branch); for a
+            // malformed-blob fallback, decide from the body; otherwise the
+            // signature verdict was Some(true).
+            let is_dup = if a == 0 {
+                body == body_json
+            } else if sig_verdict.is_none() {
+                repair.push((cand_id.clone(), crate::dedup::build_row_signature(&body)));
+                Self::dedup_verdict_from_body(&target, a as f64, &body, threshold)
+            } else {
+                // Some(true) — but byte-identical bodies must stay a dup even
+                // at threshold 1.0 boundary semantics; the merge verdict
+                // already computes exactly that expression.
+                true
+            };
             if is_dup {
-                found = Some(match id_ref {
-                    rusqlite::types::ValueRef::Text(t) => String::from_utf8_lossy(t).into_owned(),
-                    _ => row.get::<_, String>(0)?,
-                });
-                break;
+                found = Some(cand_id);
+                break 'scan;
             }
         }
         drop(rows);
         drop(stmt);
+        drop(sig_stmt);
+        drop(hit_stmt);
 
-        // Best-effort backfill of the signatures rebuilt above, in one short
-        // transaction. Failures (concurrent writer, read-only DB) are benign:
-        // verdicts never depend on the write landing.
-        Self::flush_dedup_sig_backfill(conn, &pending);
+        // Best-effort self-healing, in one short transaction each. Failures
+        // (concurrent writer, read-only DB) are benign: verdicts never depend
+        // on these writes landing.
+        Self::flush_dedup_sig_backfill(conn, &repair);
+        if !evict.is_empty() {
+            let _ = conn.execute_batch("BEGIN IMMEDIATE;");
+            for id in &evict {
+                let _ = conn.execute(
+                    "DELETE FROM dedup_signatures WHERE entity_id = ?1",
+                    params![id],
+                );
+                let _ = conn.execute(
+                    "DELETE FROM dedup_signature_blobs WHERE entity_id = ?1",
+                    params![id],
+                );
+            }
+            if conn.execute_batch("COMMIT;").is_err() {
+                let _ = conn.execute_batch("ROLLBACK;");
+            }
+        }
 
         Ok(found)
     }
@@ -2461,28 +2424,37 @@ impl Database {
             // signature was built from; a rewrite that committed after our
             // scan wins (its transaction already carries the fresh
             // signature).
-            let unchanged = conn
+            let fresh_scope = conn
                 .query_row(
-                    "SELECT body_json FROM entities WHERE id = ?1",
+                    "SELECT body_json, category, workspace_hash FROM entities WHERE id = ?1",
                     params![id],
-                    |r| r.get::<_, String>(0),
+                    |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                        ))
+                    },
                 )
-                .map(|b| {
-                    b.len() as i64 == rs.body_len
-                        && crate::dedup::body_hash64(&b) == rs.body_hash
-                })
-                .unwrap_or(false);
-            if !unchanged {
+                .ok()
+                .and_then(|(b, cat, ws)| {
+                    (b.len() as i64 == rs.body_len
+                        && crate::dedup::body_hash64(&b) == rs.body_hash)
+                        .then_some((cat, ws))
+                });
+            let Some((category, workspace_hash)) = fresh_scope else {
                 continue;
-            }
+            };
             let _ = conn.execute(
                 "INSERT OR REPLACE INTO dedup_signature_blobs (entity_id, sig) VALUES (?1, ?2)",
                 params![id, rs.sig],
             );
             let _ = conn.execute(
                 "INSERT OR REPLACE INTO dedup_signatures \
-                 (entity_id, body_len, body_hash, tg_count, histo) VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![id, rs.body_len, rs.body_hash, rs.tg_count, rs.histo],
+                 (entity_id, body_len, body_hash, tg_count, histo, category, workspace_hash) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![id, rs.body_len, rs.body_hash, rs.tg_count, rs.histo,
+                        category, workspace_hash],
             );
         }
         if conn.execute_batch("COMMIT;").is_err() {
@@ -2506,6 +2478,16 @@ impl Database {
         stored_body: &str,
     ) -> rusqlite::Result<()> {
         let rs = crate::dedup::build_row_signature(stored_body);
+        // v17 (#476): the signature row carries the entity's scope so the
+        // dedup scan can filter on the signatures table alone (never joining
+        // — and therefore never hydrating — entity bodies). Read the scope
+        // from the row inside the caller's transaction: it cannot drift from
+        // the entity, and every call site writes the entity row first.
+        let (category, workspace_hash): (String, String) = conn.query_row(
+            "SELECT category, workspace_hash FROM entities WHERE id = ?1",
+            params![entity_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
         // Blob first, meta second: the scan trusts a row only via the meta
         // table's freshness columns, so within the (caller-supplied)
         // transaction the meta row never points at a not-yet-written blob.
@@ -2515,8 +2497,10 @@ impl Database {
         )?;
         conn.execute(
             "INSERT OR REPLACE INTO dedup_signatures \
-             (entity_id, body_len, body_hash, tg_count, histo) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![entity_id, rs.body_len, rs.body_hash, rs.tg_count, rs.histo],
+             (entity_id, body_len, body_hash, tg_count, histo, category, workspace_hash) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![entity_id, rs.body_len, rs.body_hash, rs.tg_count, rs.histo,
+                    category, workspace_hash],
         )?;
         Ok(())
     }
@@ -2953,12 +2937,11 @@ impl Database {
             // Check for near-duplicates before inserting (unless the caller is
             // a file-semantics writer — see remember_skip_dedup).
             let dup_threshold = 0.7; // 70% trigram similarity
-            // MIMIR_DEDUP_FTS_PREFILTER (default off) trades exact dedup for an
-            // FTS candidate prefilter that collapses the O(M*N) bulk-import cost.
-            // See find_near_duplicate for the lossiness tradeoff. (#228)
-            let fts_prefilter = std::env::var("MIMIR_DEDUP_FTS_PREFILTER")
-                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                .unwrap_or(false);
+            // v17 (#476): MIMIR_DEDUP_FTS_PREFILTER is retired. The lossy #228
+            // prefilter existed to collapse the entities-walk cost; the scan
+            // is now signature-driven + band-indexed (exact, and faster than
+            // the prefilter ever was — the 64-term MATCH per write measured
+            // SLOWER than the scan it pruned, see #476's A/B).
             if !skip_dedup {
                 // #397: run the dedup scan on the connection this remember()
                 // already holds — a nested self.conn() here held TWO pooled
@@ -2969,7 +2952,6 @@ impl Database {
                     &entity.workspace_hash,
                     &entity.body_json,
                     dup_threshold,
-                    fts_prefilter,
                 ) {
                     // Near-duplicate found — bump its importance instead of creating new
                     let _ = conn.execute(
@@ -12798,7 +12780,7 @@ mod tests {
         ];
         for probe in probes {
             let got = db
-                .find_near_duplicate("insight", "", probe, threshold, false)
+                .find_near_duplicate("insight", "", probe, threshold)
                 .unwrap()
                 .is_some();
             assert_eq!(
@@ -12837,7 +12819,7 @@ mod tests {
             "probe must be a genuine near-duplicate"
         );
         assert!(
-            db.find_near_duplicate("insight", "", token_sharing_probe, threshold, true)
+            db.find_near_duplicate("insight", "", token_sharing_probe, threshold)
                 .unwrap()
                 .is_some(),
             "FTS prefilter should find a token-sharing near-duplicate"
@@ -12854,13 +12836,13 @@ mod tests {
             "probe must be a genuine near-duplicate"
         );
         assert!(
-            db.find_near_duplicate("insight", "", no_shared_token_probe, threshold, false)
+            db.find_near_duplicate("insight", "", no_shared_token_probe, threshold)
                 .unwrap()
                 .is_some(),
             "exact scan should find the no-shared-token near-duplicate"
         );
         assert!(
-            db.find_near_duplicate("insight", "", no_shared_token_probe, threshold, true)
+            db.find_near_duplicate("insight", "", no_shared_token_probe, threshold)
                 .unwrap()
                 .is_none(),
             "FTS prefilter is expected to miss a near-duplicate sharing no token"
@@ -13216,7 +13198,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            db.find_near_duplicate("note", "", probe, threshold, false).unwrap(),
+            db.find_near_duplicate("note", "", probe, threshold).unwrap(),
             reference_find_near_duplicate(&conn, "note", "", probe, threshold, false),
             "stale signature must not change the verdict"
         );
@@ -13232,7 +13214,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            db.find_near_duplicate("note", "", probe, threshold, false).unwrap(),
+            db.find_near_duplicate("note", "", probe, threshold).unwrap(),
             reference_find_near_duplicate(&conn, "note", "", probe, threshold, false),
             "malformed signature must not change the verdict"
         );
@@ -13305,7 +13287,7 @@ mod tests {
         let want = reference_find_near_duplicate(&conn, "note", "", &probe, threshold, false);
         assert!(want.is_some(), "precondition: probe is a genuine near-duplicate");
         assert_eq!(
-            db.find_near_duplicate("note", "", &probe, threshold, false).unwrap(),
+            db.find_near_duplicate("note", "", &probe, threshold).unwrap(),
             want,
             "verdict after a lost flush race must match the exhaustive scan"
         );
@@ -13346,7 +13328,7 @@ mod tests {
         let want = reference_find_near_duplicate(&conn, "note", "", &probe, threshold, false);
         assert!(want.is_some(), "precondition: probe is a genuine near-duplicate");
         assert_eq!(
-            db.find_near_duplicate("note", "", &probe, threshold, false).unwrap(),
+            db.find_near_duplicate("note", "", &probe, threshold).unwrap(),
             want,
             "same-length rewrite by a signature-unaware writer must not change verdicts"
         );
@@ -13412,7 +13394,7 @@ mod tests {
         // match — the historical encrypted-dedup behavior).
         for probe in [plain, near] {
             let want = reference_find_near_duplicate(&conn, "note", "", probe, 0.7, false);
-            let got = db.find_near_duplicate("note", "", probe, 0.7, false).unwrap();
+            let got = db.find_near_duplicate("note", "", probe, 0.7).unwrap();
             assert_eq!(got, want, "encrypted-store verdict divergence for {probe:?}");
         }
 
@@ -13621,14 +13603,14 @@ mod tests {
         let conn = db.conn().unwrap();
         // Warm the page cache so both paths are measured hot.
         for p in probes.iter().take(3) {
-            let _ = db.find_near_duplicate("bench", "", p, 0.7, false).unwrap();
+            let _ = db.find_near_duplicate("bench", "", p, 0.7).unwrap();
             let _ = reference_find_near_duplicate(&conn, "bench", "", p, 0.7, false);
         }
         let mut new_ms = Vec::new();
         let mut old_ms = Vec::new();
         for p in &probes {
             let t = Instant::now();
-            let got = db.find_near_duplicate("bench", "", p, 0.7, false).unwrap();
+            let got = db.find_near_duplicate("bench", "", p, 0.7).unwrap();
             new_ms.push(t.elapsed().as_secs_f64() * 1e3);
             let t = Instant::now();
             let want = reference_find_near_duplicate(&conn, "bench", "", p, 0.7, false);
