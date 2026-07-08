@@ -4,6 +4,49 @@ Every entry: fixed hardware, named binary/commit, the profile that led to the
 change, and the numbers. Companion to `benchmark/scale/` (signed baselines +
 CI budgets) and the #473 epic's rule: no claim without a rerunnable script.
 
+## #507 — dense recall: covering index for the phase-0 signature scan (v18)
+
+**Hardware:** same box as #476. A/B on the IDENTICAL loaded 100K store (kept
+from the scale harness), 50 queries/mode, before = the #476-merged binary,
+after = this change; the after binary's first open runs the v18 migration.
+
+### Where the time went
+
+`dense_search` phase 0 — the "cheap" sign-bit prefilter — and the embedded-row
+count both predicate on `embedding IS NOT NULL`. `embedding`/`emb_sig` are
+late ALTER columns stored AFTER `body_json` in each record, so evaluating the
+predicate (and reading `emb_sig`) walked every row's multi-KB body overflow
+chain: ~900MB of page reads per dense query at 100K. `embedding_coverage()`,
+consulted per recall to pick the default mode, paid the same walk.
+
+### The fix (v18)
+
+`idx_entities_dense_sig ON entities(archived, id, emb_sig) WHERE emb_sig IS
+NOT NULL` — every column the phase-0 queries touch is an index column, so
+they plan as USING COVERING INDEX (~60B/row; zero record reads), pinned by a
+plan-text regression test. The queries re-key on `emb_sig IS NOT NULL`, made
+exact by the v18 invariant "embedded ⟺ signed": the migration backfills
+`emb_sig` from every stored embedding (pure sign-bit recompute, no model),
+and writers already set/clear both columns together. Two variants that do
+NOT work, for the record: the `embedding IS NOT NULL` spelling never covers
+(residual predicate seeks the table), and an expression index only covers on
+SQLite ≥ 3.5x — newer than the bundled engine.
+
+### Numbers (100K entities, identical store)
+
+| Mode | Before p50/p99 | After p50/p99 | Δ p50 |
+| --- | --- | --- | --- |
+| dense | 360.3 / 390.9 ms | **24.9 / 29.3 ms** | **14.5×** |
+| hybrid | 593.9 / 620.7 ms | 308.4 / 325.3 ms | 1.9× |
+| fts5 | 14.6 / 17.9 ms | 17.0 / 19.4 ms | unchanged (noise) |
+
+### Residual (next target)
+
+Hybrid ≫ dense + fts5 (308 vs ~42 ms): roughly 265ms lives in the hybrid-only
+machinery (RRF fusion candidate over-fetch and hydration, query expansion,
+graph expand's per-candidate link following) — filed as its own issue with
+this A/B as the baseline.
+
 ## #476 — write path: signature-driven near-duplicate scan (v17)
 
 **Hardware:** AMD64 16-core (AMD Family 26), Windows 11 · `benchmark/scale/run.py`,
