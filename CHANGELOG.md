@@ -5,6 +5,22 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
 
 ## [Unreleased]
 
+### Performance
+- **Write path: signature-driven near-duplicate scan** (#476, schema v17). The per-write
+  dedup scan hydrated and re-hashed every same-category entity body (O(N·body_size) per
+  insert) — the measured cause of the quadratic bulk-load curve. It now walks only the
+  small `dedup_signatures` rows, band-pruned in SQL by the lossless trigram-count ratio
+  bound, and touches an entity body only on an actual hit (verify-on-hit freshness with
+  self-healing repair; provably no false positives). Measured: 10K load 141→554/s (3.9×),
+  100K load 7→39/s (5.6×, ~4h→43min), 100K fts5 p99 182→22ms; recall/`as_of`/cold-start
+  unchanged. See PERF.md. The v17 migration adds scope columns + the band index and
+  eagerly backfills signatures for every active row (one-time, ~30-60s per 100K rows).
+  The lossy opt-in `MIMIR_DEDUP_FTS_PREFILTER` (#228) is retired — it measured slower
+  than the exact scan it pruned. Deliberate trade, pinned by tests: a row rewritten
+  behind the engine's back (direct SQL, rolled-back pre-v10 binary) can be MISSED by
+  dedup (one extra stored row) until its signature self-heals — it can never cause a
+  false positive.
+
 ## [2.19.1] - 2026-07-07
 
 ### Fixed
