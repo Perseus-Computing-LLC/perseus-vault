@@ -1522,8 +1522,15 @@ impl Database {
         // normalized text embeddings.
         let pool_target = |limit: usize| (limit.saturating_mul(16)).clamp(512, 4096);
 
+        // v18 (#507): keyed on emb_sig so this count (and the phase-0 scan
+        // below) run as USING COVERING INDEX over idx_entities_dense_sig —
+        // the `embedding IS NOT NULL` spelling leaves a residual predicate
+        // that seeks every row's record, walking multi-KB body overflow
+        // chains (~900MB/query at 100K; the measured 390ms dense p50).
+        // "embedded ⟺ signed" is the v18 invariant: writers set/clear both
+        // columns together and the migration backfilled legacy rows.
         let embedded_rows: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM entities WHERE archived = 0 AND embedding IS NOT NULL",
+            "SELECT COUNT(*) FROM entities WHERE archived = 0 AND emb_sig IS NOT NULL",
             [],
             |r| r.get(0),
         )?;
@@ -1560,32 +1567,32 @@ impl Database {
             // Rows with a NULL signature (written by a pre-v6 binary after
             // migration) are always included so they can't be silently lost.
             let query_sig = embedding_signature(query_vec);
+            // Covering-index scan (v18, #507) — see the count query's comment.
+            // Rows with an embedding but no signature no longer exist by the
+            // v18 invariant (the migration backfilled them; writers maintain
+            // both columns atomically), so the old unsigned-rows escape hatch
+            // is gone with the invariant that made it necessary.
             let mut stmt = conn.prepare(&format!(
                 "SELECT id, emb_sig FROM entities \
-                 WHERE archived = 0 AND embedding IS NOT NULL LIMIT {}",
+                 WHERE archived = 0 AND emb_sig IS NOT NULL LIMIT {}",
                 max_scan
             ))?;
             let rows = stmt.query_map([], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
-                    row.get::<_, Option<Vec<u8>>>(1)?,
+                    row.get::<_, Vec<u8>>(1)?,
                 ))
             })?;
             let mut ranked: Vec<(u32, String)> = Vec::new();
-            let mut unsigned_ids: Vec<String> = Vec::new();
             for row in rows {
                 let (id, sig) = row?;
-                match sig {
-                    Some(s) => ranked.push((signature_hamming(&query_sig, &s), id)),
-                    None => unsigned_ids.push(id),
-                }
+                ranked.push((signature_hamming(&query_sig, &sig), id));
             }
             let pool = pool_target(limit);
             ranked.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
             ranked.truncate(pool);
-            let mut pool_ids: Vec<String> =
+            let pool_ids: Vec<String> =
                 ranked.into_iter().map(|(_, id)| id).collect();
-            pool_ids.append(&mut unsigned_ids);
 
             // Fetch full embeddings for the pool only (chunked IN to bound
             // SQL variable count).
@@ -15217,6 +15224,33 @@ mod tests {
             "archived entity must not be returned"
         );
 
+        let _ = fs::remove_file(&path);
+    }
+
+    /// v18 (#507): the phase-0 signature scan and the embedded-row count must
+    /// plan as USING COVERING INDEX — the whole point of
+    /// idx_entities_dense_sig is that neither query touches an entity RECORD
+    /// (embedding/emb_sig are late ALTER columns stored after body_json, so a
+    /// record read walks the body's multi-KB overflow chain; that was the
+    /// measured 390ms dense p50 at 100K). Pinning the plan text makes a
+    /// schema or query-spelling drift fail loudly instead of silently
+    /// reverting to ~30x slower dense recall.
+    #[test]
+    fn dense_phase0_queries_plan_as_covering_index() {
+        let (db, path) = temp_db();
+        let conn = db.conn().unwrap();
+        for q in [
+            "SELECT COUNT(*) FROM entities WHERE archived = 0 AND emb_sig IS NOT NULL",
+            "SELECT id, emb_sig FROM entities WHERE archived = 0 AND emb_sig IS NOT NULL LIMIT 50000",
+        ] {
+            let plan: String = conn
+                .query_row(&format!("EXPLAIN QUERY PLAN {q}"), [], |r| r.get(3))
+                .unwrap();
+            assert!(
+                plan.contains("COVERING INDEX idx_entities_dense_sig"),
+                "dense phase-0 query must be covering, got plan: {plan} for {q}"
+            );
+        }
         let _ = fs::remove_file(&path);
     }
 

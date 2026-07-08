@@ -214,7 +214,20 @@ CREATE INDEX IF NOT EXISTS idx_entity_history_catkey ON entity_history(category,
 /// (and re-hashing) every same-category entity body per write, which was
 /// O(N·body_size) per insert and the cause of the #474-measured quadratic
 /// bulk-load curve (141/s @10K → 7/s @100K).
-const SCHEMA_VERSION: i64 = 17;
+///
+/// v18 (#507): covering partial index for dense search's phase-0 signature
+/// scan and embedded-row count. `embedding`/`emb_sig` are late ALTER columns
+/// stored AFTER body_json in each record, so "read id + emb_sig for every
+/// embedded row" walked every row's multi-KB overflow chain — ~900MB of page
+/// reads per dense query at 100K (390ms p50). The index is keyed on
+/// `emb_sig IS NOT NULL` (all its columns are index columns, so the residual
+/// predicate evaluates from the index and the scan covers on the bundled
+/// SQLite; the `embedding IS NOT NULL` spelling never covers, and an
+/// expression-index variant only covers on SQLite ≥3.5x). The migration
+/// backfills emb_sig from every stored embedding (a pure function of the
+/// vector), making "embedded ⟺ signed" an invariant — writers already set
+/// and clear both columns together.
+const SCHEMA_VERSION: i64 = 18;
 
 /// Initialize the v0.2.0 schema on a fresh database.
 pub fn initialize_schema(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
@@ -636,6 +649,37 @@ fn apply_migrations(conn: &Connection) -> Result<(), Box<dyn std::error::Error>>
            ON dedup_signatures(category, workspace_hash, tg_count);",
     )?;
     // ── end v17 ──────────────────────────────────────────────────────────
+
+    // ── v18 (#507): dense-search covering index ──────────────────────────
+    // See the SCHEMA_VERSION doc comment. Order matters: backfill the
+    // signatures FIRST (pure recompute from the stored vector — no model, no
+    // key), so the invariant "embedding IS NOT NULL ⟺ emb_sig IS NOT NULL"
+    // holds before any query relies on the emb_sig-keyed index.
+    {
+        let mut missing = conn.prepare(
+            "SELECT id, embedding FROM entities \
+             WHERE embedding IS NOT NULL AND emb_sig IS NULL",
+        )?;
+        let rows: Vec<(String, Vec<u8>)> = missing
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .flatten()
+            .collect();
+        for (id, blob) in rows {
+            let vec: Vec<f32> = blob
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect();
+            conn.execute(
+                "UPDATE entities SET emb_sig = ?1 WHERE id = ?2",
+                rusqlite::params![crate::db::embedding_signature(&vec), id],
+            )?;
+        }
+    }
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_entities_dense_sig
+           ON entities(archived, id, emb_sig) WHERE emb_sig IS NOT NULL;",
+    )?;
+    // ── end v18 ──────────────────────────────────────────────────────────
 
     // Stamp the migration level so subsequent opens skip the probe block above.
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
