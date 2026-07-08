@@ -1545,11 +1545,22 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM entities WHERE id='v10-keep'", [], |r| r.get(0))
             .unwrap();
         assert_eq!(kept, 1, "migration must not drop data");
-        // Lazy backfill: the migration itself writes NO signatures.
-        let sigs: i64 = conn
-            .query_row("SELECT COUNT(*) FROM dedup_signatures", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(sigs, 0, "v10 must not eagerly backfill signatures");
+        // v17 (#476): the migration EAGERLY backfills — "every active row has
+        // a signature" is now the invariant the signature-driven scan relies
+        // on (the pre-v17 lazy backfill rode the entities walk the scan no
+        // longer does). The signature must describe the stored body exactly,
+        // with the row's scope columns.
+        let (blen, cat, ws): (i64, String, String) = conn
+            .query_row(
+                "SELECT body_len, category, workspace_hash FROM dedup_signatures \
+                 WHERE entity_id='v10-keep'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .expect("v17 must eagerly backfill the legacy row's signature");
+        assert_eq!(blen, 2, "signature must describe the stored body ('{{}}')");
+        assert_eq!(cat, "note");
+        assert_eq!(ws, "");
     }
 
     #[test]
