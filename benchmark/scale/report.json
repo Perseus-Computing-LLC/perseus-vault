@@ -1,0 +1,142 @@
+{
+  "benchmark": "scale",
+  "issue": "#474",
+  "meta": {
+    "binary": "perseus-vault 2.19.0",
+    "commit": "166d9f2baaf1",
+    "hardware": {
+      "machine": "AMD64",
+      "processor": "AMD64 Family 26 Model 68 Stepping 0, AuthenticAMD",
+      "cpus": 16,
+      "os": "Windows 11",
+      "python": "3.14.2"
+    },
+    "queries_per_metric": 100,
+    "transport": "MCP stdio, one persistent process per corpus size"
+  },
+  "runs": {
+    "10000": {
+      "entities": 10000,
+      "write": {
+        "count": 10000,
+        "elapsed_s": 71.1,
+        "docs_per_sec": 141,
+        "first_10pct_docs_per_sec": 1107,
+        "last_10pct_docs_per_sec": 68
+      },
+      "embed": {
+        "embedded": 2086,
+        "elapsed_s": 11.7,
+        "embeds_per_sec": 178
+      },
+      "recall": {
+        "fts5": {
+          "p50_ms": 2.3,
+          "p95_ms": 2.71,
+          "p99_ms": 6.04,
+          "avg_ms": 2.95,
+          "n": 100
+        },
+        "dense": {
+          "p50_ms": 13.25,
+          "p95_ms": 15.49,
+          "p99_ms": 16.56,
+          "avg_ms": 13.75,
+          "n": 100
+        },
+        "hybrid": {
+          "p50_ms": 19.61,
+          "p95_ms": 22.43,
+          "p99_ms": 22.99,
+          "avg_ms": 20.27,
+          "n": 100
+        }
+      },
+      "as_of": {
+        "p50_ms": 0.11,
+        "p95_ms": 0.22,
+        "p99_ms": 0.34,
+        "avg_ms": 0.13,
+        "n": 100
+      },
+      "temporal_recall": {
+        "p50_ms": 2.61,
+        "p95_ms": 3.08,
+        "p99_ms": 3.43,
+        "avg_ms": 2.7,
+        "n": 100
+      },
+      "db": {
+        "file_bytes": 91320320,
+        "file_mb": 87.1,
+        "active_entities": 9999
+      },
+      "cold_start": {
+        "first_query_ms_min": 24.7,
+        "first_query_ms_median": 24.8
+      }
+    },
+    "100000": {
+      "entities": 100000,
+      "write": {
+        "count": 100000,
+        "elapsed_s": 14454.0,
+        "docs_per_sec": 7,
+        "first_10pct_docs_per_sec": 117,
+        "last_10pct_docs_per_sec": 3
+      },
+      "embed": {
+        "embedded": 1803,
+        "elapsed_s": 12.8,
+        "embeds_per_sec": 140
+      },
+      "recall": {
+        "fts5": {
+          "p50_ms": 16.53,
+          "p95_ms": 22.71,
+          "p99_ms": 181.66,
+          "avg_ms": 20.29,
+          "n": 100
+        },
+        "dense": {
+          "p50_ms": 390.53,
+          "p95_ms": 432.4,
+          "p99_ms": 446.9,
+          "avg_ms": 386.75,
+          "n": 100
+        },
+        "hybrid": {
+          "p50_ms": 597.41,
+          "p95_ms": 630.68,
+          "p99_ms": 639.11,
+          "avg_ms": 600.59,
+          "n": 100
+        }
+      },
+      "as_of": {
+        "p50_ms": 0.12,
+        "p95_ms": 0.23,
+        "p99_ms": 0.32,
+        "avg_ms": 0.13,
+        "n": 100
+      },
+      "temporal_recall": {
+        "p50_ms": 11.66,
+        "p95_ms": 12.19,
+        "p99_ms": 13.47,
+        "avg_ms": 11.86,
+        "n": 100
+      },
+      "db": {
+        "file_bytes": 928473088,
+        "file_mb": 885.5,
+        "active_entities": 99832
+      },
+      "cold_start": {
+        "first_query_ms_min": 55.7,
+        "first_query_ms_median": 70.2
+      }
+    }
+  },
+  "signature_sha256": "131a60eaa6fc3853604d60d13387a0ca203b245fb5e022f580a8d137fc1bf3c8"
+}
