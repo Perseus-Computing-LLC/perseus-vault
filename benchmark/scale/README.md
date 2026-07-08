@@ -7,39 +7,43 @@ deterministic (seeded corpus), no network, no API key.
 
 ## Measured baselines (committed `report.json`)
 
-First clean run — perseus-vault 2.19.0, AMD64 16-core, Windows 11 (full
+Post-optimization run — v2.19.1 main with #476 (signature-driven dedup scan)
+and #507 (covering dense index) merged; AMD64 16-core, Windows 11 (full
 hardware + commit in `report.json`, sha256-signed):
 
 | Metric | 10K | 100K |
 | --- | --- | --- |
-| Write throughput, sustained | 141/s | **7/s** |
-| Write throughput, first→last 10% | 1107/s → 68/s | 117/s → **3/s** |
-| fts5 recall p50 / p99 | 2.3 / 6.0 ms | 16.5 / 181.7 ms |
-| dense recall p50 / p99 | 13.3 / 16.6 ms | 390.5 / 446.9 ms |
-| hybrid recall p50 / p99 | 19.6 / 23.0 ms | 597.4 / 639.1 ms |
-| `as_of` point lookup p99 | 0.34 ms | **0.32 ms** |
-| temporal recall (`as_of_unix_ms`) p50 / p99 | 2.6 / 3.4 ms | 11.7 / 13.5 ms |
-| Cold start (spawn + init + first query) | 24.8 ms | 70.2 ms |
-| DB on disk | 87 MB | 886 MB |
+| Write throughput, sustained | 529/s | 46/s |
+| Write throughput, first→last 10% | 1698/s → 328/s | 542/s → 21/s |
+| fts5 recall p50 / p99 | 3.8 / 8.9 ms | 14.3 / 19.1 ms |
+| dense recall p50 / p99 | 11.2 / 14.0 ms | 22.8 / 24.9 ms |
+| hybrid recall p50 / p99 | 31.1 / 33.9 ms | 263.4 / 282.2 ms |
+| `as_of` point lookup p50 | 0.12 ms | 0.11 ms |
+| temporal recall p50 | 3.1 ms | 11.3 ms |
+| Cold start (spawn + init + first query) | 26.8 ms | 54.7 ms |
+| DB on disk | ~87 MB | ~890 MB |
 
-Two headlines:
+Headlines:
 
-- **Bi-temporal stays flat at scale.** `as_of` point lookups are ~0.3 ms p99 at
-  both 10K and 100K, and transaction-time reconstruction recall is 13.5 ms p99
-  at 100K. The differentiator holds.
-- **The write path degrades super-linearly** — sustained throughput drops
-  141/s → 7/s from 10K → 100K, and within a single 100K load the last 10% runs
-  at 3/s (a 100K bulk load takes ~4h). This is the documented input to the
-  #476 write-path optimization; the budgets below lock in "no worse" until it
-  lands, then get tightened.
+- **Bi-temporal stays flat at scale.** `as_of` point lookups sit at ~0.1 ms p50
+  at both 10K and 100K, and transaction-time reconstruction recall is under
+  15 ms p99 at 100K. The differentiator holds.
+- **The write path is fixed.** The first baseline measured 141/s → 7/s from
+  10K → 100K (a ~4h bulk load, O(N·body_size) dedup scan per write); after
+  #476 it is 529/s → 46/s and a 100K load takes ~40 minutes. History and
+  methodology in PERF.md.
+- **Dense recall is flat-ish at scale.** 390 ms p50 @100K before #507's
+  covering index; 22.8 ms after. Hybrid still carries ~240 ms of fusion-
+  machinery overhead beyond its arms — tracked in #511 with this report as
+  the baseline.
 
 ## Running
 
 ```bash
 cargo build --release
-python benchmark/scale/run.py                          # 10K + 100K (~4.5h, see above)
-python benchmark/scale/run.py --sizes 10000            # quick (~3 min)
-python benchmark/scale/run.py --sizes 1000000          # 1M — manual only, ~days until #476
+python benchmark/scale/run.py                          # 10K + 100K (~45 min)
+python benchmark/scale/run.py --sizes 10000            # quick (~1 min)
+python benchmark/scale/run.py --sizes 1000000          # 1M — manual/nightly (~7h extrapolated)
 python benchmark/scale/run.py --skip-embed             # no dense index build
 ```
 
@@ -55,22 +59,24 @@ doesn't flake and a failure means a genuine regression. Override any budget via
 
 | Budget | 10K | 100K | Env override |
 | --- | --- | --- | --- |
-| Write throughput (sustained) | ≥ 50/s | ≥ 3/s | `SCALE_BUDGET_WRITE_DOCS_PER_SEC` |
-| Write throughput (last 10%) | ≥ 20/s | ≥ 1/s | `SCALE_BUDGET_WRITE_LAST10_DOCS_PER_SEC` |
-| fts5 recall p99 | ≤ 30 ms | ≤ 500 ms | `SCALE_BUDGET_FTS5_P99_MS` |
-| dense recall p99 | ≤ 60 ms | ≤ 1200 ms | `SCALE_BUDGET_DENSE_P99_MS` |
-| hybrid recall p99 | ≤ 80 ms | ≤ 1800 ms | `SCALE_BUDGET_HYBRID_P99_MS` |
+| Write throughput (sustained) | ≥ 150/s | ≥ 15/s | `SCALE_BUDGET_WRITE_DOCS_PER_SEC` |
+| Write throughput (last 10%) | ≥ 100/s | ≥ 7/s | `SCALE_BUDGET_WRITE_LAST10_DOCS_PER_SEC` |
+| fts5 recall p99 | ≤ 30 ms | ≤ 100 ms | `SCALE_BUDGET_FTS5_P99_MS` |
+| dense recall p99 | ≤ 60 ms | ≤ 150 ms | `SCALE_BUDGET_DENSE_P99_MS` |
+| hybrid recall p99 | ≤ 120 ms | ≤ 1000 ms | `SCALE_BUDGET_HYBRID_P99_MS` |
 | `as_of` p99 | ≤ 5 ms | ≤ 5 ms | `SCALE_BUDGET_AS_OF_P99_MS` |
 | temporal recall p99 | ≤ 15 ms | ≤ 50 ms | `SCALE_BUDGET_TEMPORAL_RECALL_P99_MS` |
-| Cold start (median) | ≤ 500 ms | ≤ 1000 ms | `SCALE_BUDGET_COLD_START_MS` |
+| Cold start (median) | ≤ 500 ms | ≤ 500 ms | `SCALE_BUDGET_COLD_START_MS` |
 
-CI (`scale-gate.yml`): the **10K gate runs on every push to main** (minutes);
-the **100K run is weekly** (fits the 6h job limit at today's ~4h load) and on
-`workflow_dispatch`. When #476 lands, move 100K into the push path and tighten
-the write floors.
+Hybrid's 100K budget stays deliberately loose until #511 lands, then tightens.
+
+CI (`scale-gate.yml`): the **10K gate runs on every push to main** (about a
+minute of load); the **100K run is weekly** (~45 min post-#476) and on
+`workflow_dispatch`.
 
 ## 1M note
 
-1M is deliberately manual until #476: extrapolating today's write curve puts a
-1M load at multiple days. If anything ELSE degrades non-linearly on your
-hardware (recall, as_of, cold start), file a follow-up with the profile.
+1M is manual/nightly: at the post-#476 write rate a 1M load extrapolates to
+roughly 7 hours — feasible on a dedicated box, not in a CI job. If anything
+degrades non-linearly on your hardware (recall, as_of, cold start), file a
+follow-up with the profile.

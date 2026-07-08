@@ -26,30 +26,30 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 
 # Measured baselines live in report.json; budgets carry ~3x headroom (more on
-# sub-millisecond metrics, where absolute jitter dominates). The 100K write
-# floors look grim because the O(N)-ish per-write dedup/embed cost is real —
-# documented reality, locked in so it can only improve (#476 tracks the fix;
-# tighten these when it lands).
+# sub-millisecond metrics, where absolute jitter dominates). Tightened after
+# #476 (signature-driven dedup scan: 100K load 7 -> 46/s) and #507 (covering
+# dense index: dense p99 447 -> 25ms) so the wins cannot silently regress.
+# Hybrid stays loose pending #511 (fusion-machinery overhead).
 DEFAULT_BUDGETS = {
     10_000: {
-        "WRITE_DOCS_PER_SEC": 50,          # measured 141
-        "WRITE_LAST10_DOCS_PER_SEC": 20,   # measured 68
-        "FTS5_P99_MS": 30,                 # measured 6.0
-        "DENSE_P99_MS": 60,                # measured 16.6
-        "HYBRID_P99_MS": 80,               # measured 23.0
-        "AS_OF_P99_MS": 5,                 # measured 0.34
+        "WRITE_DOCS_PER_SEC": 150,         # measured 529 (was 141 pre-#476)
+        "WRITE_LAST10_DOCS_PER_SEC": 100,  # measured 328 (was 68)
+        "FTS5_P99_MS": 30,                 # measured 8.9
+        "DENSE_P99_MS": 60,                # measured 14.0
+        "HYBRID_P99_MS": 120,              # measured 33.9
+        "AS_OF_P99_MS": 5,                 # measured 0.3
         "TEMPORAL_RECALL_P99_MS": 15,      # measured 3.4
-        "COLD_START_MS": 500,              # measured 24.8
+        "COLD_START_MS": 500,              # measured 26.8
     },
     100_000: {
-        "WRITE_DOCS_PER_SEC": 3,           # measured 7 (see #476)
-        "WRITE_LAST10_DOCS_PER_SEC": 1,    # measured 3 (see #476)
-        "FTS5_P99_MS": 500,                # measured 181.7 (p95 22.7)
-        "DENSE_P99_MS": 1200,              # measured 446.9
-        "HYBRID_P99_MS": 1800,             # measured 639.1
-        "AS_OF_P99_MS": 5,                 # measured 0.32 — flat 10K→100K
-        "TEMPORAL_RECALL_P99_MS": 50,      # measured 13.5
-        "COLD_START_MS": 1000,             # measured 70.2 @ 885MB
+        "WRITE_DOCS_PER_SEC": 15,          # measured 46 (was 7 pre-#476)
+        "WRITE_LAST10_DOCS_PER_SEC": 7,    # measured 21 (was 3)
+        "FTS5_P99_MS": 100,                # measured 19.1 (was 181.7)
+        "DENSE_P99_MS": 150,               # measured 24.9 (was 446.9, #507)
+        "HYBRID_P99_MS": 1000,             # measured 282.2 (#511 tightens)
+        "AS_OF_P99_MS": 5,                 # measured 0.3 — flat 10K→100K
+        "TEMPORAL_RECALL_P99_MS": 50,      # measured 13.3
+        "COLD_START_MS": 500,              # measured 54.7 @ ~890MB
     },
 }
 

@@ -206,6 +206,15 @@ def run_size(binary, n, queries, skip_embed, keep_db=False):
             out["embed"] = {"embedded": embedded, "elapsed_s": round(el, 1),
                             "embeds_per_sec": round(embedded / el) if el > 0 else None}
             print(f"[{n:,}] embed: {embedded} in {el:.0f}s", flush=True)
+            if embedded == 0:
+                # The async auto-embedder can cover every row during the load
+                # (fast machines / small corpora), leaving the batch pass
+                # nothing to do — dense coverage exists even though this
+                # backfill embedded 0. Probe instead of gating on the batch.
+                probe = v.call("mimir_recall", {"query": "entity 1 group 1",
+                                                "mode": "dense", "limit": 1})
+                if isinstance(probe, dict) and probe.get("items"):
+                    embedded = -1  # sentinel: coverage via auto-embed
             if embedded:
                 modes += ["dense", "hybrid"]
 
