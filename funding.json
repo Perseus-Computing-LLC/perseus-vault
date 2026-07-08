@@ -1,0 +1,112 @@
+{
+  "version": "v1.1.0",
+  "entity": {
+    "type": "organisation",
+    "role": "owner",
+    "name": "Perseus Computing LLC",
+    "email": "perseus@perseus.observer",
+    "description": "Perseus Computing LLC is a US-owned small business (a Wyoming LLC) building open-source, local-first memory infrastructure for AI agents. Our flagship project, Perseus Vault, is an MIT-licensed, single-binary MCP memory server developed entirely in the open. Grant funding sustains ongoing maintenance, security hardening, external cryptographic review, supply-chain attestation, and new capabilities that keep the project free and self-hostable for everyone.",
+    "webpageUrl": {
+      "url": "https://mimir.perseus.observer",
+      "wellKnown": "https://mimir.perseus.observer/.well-known/funding-manifest-urls"
+    }
+  },
+  "projects": [
+    {
+      "guid": "perseus-vault",
+      "name": "Perseus Vault",
+      "description": "Perseus Vault is a single ~8MB Rust binary that gives AI agents durable, portable memory across sessions with no Docker, no Postgres, and no cloud. It is MCP-native (55 tools), local-first, and fully air-gapped by default: AES-256-GCM encryption at rest, hybrid BM25 + dense-vector + RRF search, bi-temporal (transaction-time and valid-time) history, an immutable audit journal with chain-of-custody, an entity link graph with GraphRAG community detection, and biomimetic Ebbinghaus decay for memory lifecycle management. Bundled in-process embeddings (a quantized all-MiniLM-L6-v2 model) make semantic search work with zero config and zero network. Ready-to-use adapters ship for LangGraph, CrewAI, AutoGen, LangChain, PydanticAI, Haystack, and Google ADK. MIT-licensed and designed for privacy-sensitive and government deployment (published SBOM, offline operation, encryption at rest).",
+      "webpageUrl": {
+        "url": "https://mimir.perseus.observer",
+        "wellKnown": "https://mimir.perseus.observer/.well-known/funding-manifest-urls"
+      },
+      "repositoryUrl": {
+        "url": "https://github.com/Perseus-Computing-LLC/perseus-vault",
+        "wellKnown": ""
+      },
+      "licenses": [
+        "spdx:MIT"
+      ],
+      "tags": [
+        "ai",
+        "memory",
+        "mcp",
+        "agents",
+        "rust",
+        "local-first",
+        "encryption",
+        "vector-search",
+        "knowledge-graph",
+        "privacy"
+      ]
+    }
+  ],
+  "funding": {
+    "channels": [
+      {
+        "guid": "bank-transfer",
+        "type": "bank",
+        "address": "Perseus Computing LLC (Wyoming LLC) — ACH/wire details provided securely upon award. Contact perseus@perseus.observer.",
+        "description": "Direct bank transfer (ACH/wire) to Perseus Computing LLC. Account details are shared securely once a grant is awarded."
+      },
+      {
+        "guid": "website",
+        "type": "other",
+        "address": "https://perseus.observer",
+        "description": "Project home and primary point of contact for funding and grant inquiries: perseus@perseus.observer."
+      }
+    ],
+    "plans": [
+      {
+        "guid": "annual-full",
+        "status": "active",
+        "name": "Annual development grant (full ask)",
+        "description": "Funds one full year of maintainer time and roadmap delivery: external cryptographic review of the audit chain, SLSA supply-chain attestation, performance-at-scale work, expanded framework adapters, and federal-deployment compliance (SBOM, air-gapped packaging).",
+        "amount": 100000,
+        "currency": "USD",
+        "frequency": "yearly",
+        "channels": [
+          "bank-transfer",
+          "website"
+        ]
+      },
+      {
+        "guid": "half-year",
+        "status": "active",
+        "name": "Half-year milestone",
+        "description": "Six months of focused development on a prioritized milestone, such as the external cryptographic review of the audit chain or the performance and scale epic.",
+        "amount": 50000,
+        "currency": "USD",
+        "frequency": "yearly",
+        "channels": [
+          "bank-transfer"
+        ]
+      },
+      {
+        "guid": "single-tranche",
+        "status": "active",
+        "name": "Single milestone tranche",
+        "description": "A $25,000 tranche funding one discrete milestone: e.g., SLSA build attestation, a new framework adapter suite, or web dashboard and observability work. Grants combine in $25K multiples up to $100K/year.",
+        "amount": 25000,
+        "currency": "USD",
+        "frequency": "yearly",
+        "channels": [
+          "bank-transfer"
+        ]
+      },
+      {
+        "guid": "flexible",
+        "status": "active",
+        "name": "Flexible contribution",
+        "description": "Any amount (FLOSS/fund minimum is $10,000) toward general maintenance and long-term open-source sustainability of Perseus Vault.",
+        "amount": 0,
+        "currency": "USD",
+        "frequency": "one-time",
+        "channels": [
+          "bank-transfer",
+          "website"
+        ]
+      }
+    ]
+  }
+}
