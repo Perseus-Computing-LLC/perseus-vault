@@ -565,13 +565,18 @@ impl Database {
     /// #271: count of non-archived entities that carry a stored dense embedding.
     /// Used by recall to decide whether hybrid (dense+keyword) should be the
     /// default mode. Returns 0 on any error so recall degrades to keyword search.
+    ///
+    /// v18 (#507): keyed on emb_sig (the "embedded ⟺ signed" invariant) so
+    /// this per-recall count runs as USING COVERING INDEX — the embedding
+    /// spelling walked every row's record (~120ms at 100K, paid by EVERY
+    /// recall that consulted coverage to pick its mode).
     pub fn embedding_coverage(&self) -> i64 {
         let conn = match self.conn() {
             Ok(c) => c,
             Err(_) => return 0,
         };
         conn.query_row(
-            "SELECT COUNT(*) FROM entities WHERE embedding IS NOT NULL AND archived = 0",
+            "SELECT COUNT(*) FROM entities WHERE archived = 0 AND emb_sig IS NOT NULL",
             [],
             |r| r.get(0),
         )
