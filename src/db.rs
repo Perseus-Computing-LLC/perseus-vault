@@ -605,6 +605,20 @@ impl Database {
         self.llm_config.embedding_endpoint = None; // prefer local ONNX over remote
     }
 
+    /// LLM request timeout (#528): default 30s, overridable via
+    /// MIMIR_LLM_TIMEOUT_SECS. A large model served cold (first mimir_ask
+    /// loading weights into VRAM) routinely needs more than 30s; junk or
+    /// zero values fall back to the default rather than erroring.
+    pub fn parse_llm_timeout(raw: Option<&str>) -> u64 {
+        raw.and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|&s| s > 0)
+            .unwrap_or(30)
+    }
+
+    fn llm_timeout_secs() -> u64 {
+        Self::parse_llm_timeout(std::env::var("MIMIR_LLM_TIMEOUT_SECS").ok().as_deref())
+    }
+
     pub fn set_llm(
         &mut self,
         enabled: bool,
@@ -618,7 +632,7 @@ impl Database {
             enabled,
             endpoint: endpoint.to_string(),
             model: model.to_string(),
-            timeout_secs: 30,
+            timeout_secs: Self::llm_timeout_secs(),
             api_key: api_key.map(|s| s.to_string()),
             embedding_endpoint: embedding_endpoint.map(|s| s.to_string()),
             embedding_model_name: embedding_model_name.map(|s| s.to_string()),
@@ -14288,6 +14302,17 @@ mod tests {
         assert!(!keep_row.archived);
 
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn llm_timeout_env_parses_with_safe_fallback() {
+        // #528: default 30, valid override honored, junk/zero fall back.
+        assert_eq!(Database::parse_llm_timeout(None), 30);
+        assert_eq!(Database::parse_llm_timeout(Some("300")), 300);
+        assert_eq!(Database::parse_llm_timeout(Some(" 120 ")), 120);
+        assert_eq!(Database::parse_llm_timeout(Some("0")), 30);
+        assert_eq!(Database::parse_llm_timeout(Some("-5")), 30);
+        assert_eq!(Database::parse_llm_timeout(Some("soon")), 30);
     }
 
     #[test]
