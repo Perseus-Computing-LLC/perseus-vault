@@ -70,6 +70,12 @@ struct Cli {
     #[arg(long)]
     embedding_model: Option<String>,
 
+    /// Model NAME sent to the remote embedding endpoint (e.g. `nomic-embed-text`).
+    /// Distinct from --embedding-model (a local ONNX file path). When unset, the
+    /// chat model name is reused, which fails (HTTP 501) on chat-only models (#525).
+    #[arg(long)]
+    embedding_model_name: Option<String>,
+
     /// Ollama model name (default: llama3)
     #[arg(long, default_value_t = String::from("llama3"))]
     llm_model: String,
@@ -188,6 +194,12 @@ enum Commands {
         /// Path to ONNX embedding model (enables local embeddings, no Ollama required)
         #[arg(long)]
         embedding_model: Option<String>,
+
+        /// Model NAME sent to the remote embedding endpoint (e.g. `nomic-embed-text`).
+        /// Distinct from --embedding-model (a local ONNX file path). When unset, the
+        /// chat model name is reused, which fails (HTTP 501) on chat-only models (#525).
+        #[arg(long)]
+        embedding_model_name: Option<String>,
 
         /// Ollama model name (default: llama3)
         #[arg(long, default_value_t = String::from("llama3"))]
@@ -1809,6 +1821,7 @@ fn main() {
             ref embedding_endpoint,
             ref llm_model,
             embedding_model: ref embedding_model_path,
+            ref embedding_model_name,
             ref connectors_config,
             ref web_auth_token,
             ref transport,
@@ -1855,6 +1868,7 @@ fn main() {
                     llm_model,
                     llm_api_key.as_deref(),
                     effective_embedding,
+                    embedding_model_name.as_deref(),
                 );
                 eprintln!(
                     "mimir: LLM enabled (endpoint: {}, model: {})",
@@ -2028,6 +2042,7 @@ fn main() {
                     &cli.llm_model,
                     cli.llm_api_key.as_deref(),
                     cli.embedding_endpoint.as_deref(),
+                    cli.embedding_model_name.as_deref(),
                 );
                 eprintln!(
                     "mimir: LLM enabled (endpoint: {}, model: {})",

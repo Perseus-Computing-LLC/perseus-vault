@@ -150,6 +150,12 @@ pub struct LlmConfig {
     /// Separate embedding endpoint (defaults to Ollama /api/embed derived from endpoint).
     /// Supports OpenAI-compatible /v1/embeddings format.
     pub embedding_endpoint: Option<String>,
+    /// Model name sent in the embedding request body. When unset, falls back to
+    /// `model` (the chat model) for backward compatibility. Set this when the
+    /// embedding endpoint serves a dedicated embedding model (e.g. Ollama
+    /// `nomic-embed-text`) distinct from the chat model — otherwise a chat-only
+    /// model returns HTTP 501 and dense/hybrid recall silently degrade (#525).
+    pub embedding_model_name: Option<String>,
 }
 
 impl Default for LlmConfig {
@@ -161,6 +167,7 @@ impl Default for LlmConfig {
             timeout_secs: 30,
             api_key: None,
             embedding_endpoint: None,
+            embedding_model_name: None,
         }
     }
 }
@@ -605,6 +612,7 @@ impl Database {
         model: &str,
         api_key: Option<&str>,
         embedding_endpoint: Option<&str>,
+        embedding_model_name: Option<&str>,
     ) {
         self.llm_config = LlmConfig {
             enabled,
@@ -613,6 +621,7 @@ impl Database {
             timeout_secs: 30,
             api_key: api_key.map(|s| s.to_string()),
             embedding_endpoint: embedding_endpoint.map(|s| s.to_string()),
+            embedding_model_name: embedding_model_name.map(|s| s.to_string()),
         };
     }
 
@@ -1264,8 +1273,16 @@ impl Database {
         // Detect OpenAI-compatible format: endpoint contains /v1/
         let is_openai = effective_endpoint.contains("/v1/");
 
+        // Use the dedicated embedding model name when configured, otherwise fall
+        // back to the chat model for backward compatibility. Sending a chat-only
+        // model here makes Ollama return HTTP 501 and dense/hybrid recall silently
+        // degrade to empty (#525).
+        let embed_model = llm_config
+            .embedding_model_name
+            .as_deref()
+            .unwrap_or(&llm_config.model);
         let body = serde_json::json!({
-            "model": llm_config.model,
+            "model": embed_model,
             "input": text,
         });
         let body_str = serde_json::to_string(&body)?;
@@ -18427,6 +18444,7 @@ mod tests {
             "fake-embed",
             None,
             Some(&format!("http://127.0.0.1:{port}/api/embed")),
+            None,
         );
         (db, path, accepted)
     }
@@ -20133,6 +20151,26 @@ mod tests {
             audit_payload_commitment("a", "b", "", "", "", "", "", ""),
             audit_payload_commitment("", "ab", "", "", "", "", "", ""),
         );
+    }
+
+    #[test]
+    fn embedding_model_name_overrides_chat_model_else_falls_back() {
+        // #525: the embed request must use embedding_model_name when set, and
+        // fall back to the chat model when it is not (backward compatibility).
+        let mut cfg = LlmConfig {
+            enabled: true,
+            endpoint: "http://localhost:11434/api/generate".to_string(),
+            model: "qwen2.5:14b-instruct".to_string(),
+            timeout_secs: 30,
+            api_key: None,
+            embedding_endpoint: Some("http://localhost:11434/api/embed".to_string()),
+            embedding_model_name: None,
+        };
+        let resolved = cfg.embedding_model_name.as_deref().unwrap_or(&cfg.model);
+        assert_eq!(resolved, "qwen2.5:14b-instruct");
+        cfg.embedding_model_name = Some("nomic-embed-text".to_string());
+        let resolved = cfg.embedding_model_name.as_deref().unwrap_or(&cfg.model);
+        assert_eq!(resolved, "nomic-embed-text");
     }
 }
 
