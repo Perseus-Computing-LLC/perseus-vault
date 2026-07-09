@@ -710,7 +710,7 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
   },
   {
     "name": "mimir_ask",
-    "description": "Ask a natural language question and get a grounded answer from stored memories via RAG. Internally recalls top-k entities, assembles context, and queries the configured LLM (Ollama) for an answer with cited sources. Requires --llm-endpoint to be set.",
+    "description": "Ask a natural language question and get a grounded answer from stored memories via RAG. Internally recalls top-k entities, assembles context, and queries the configured LLM (Ollama) for an answer with cited sources. Requires --llm-endpoint to be set. LLM request timeout defaults to 30s; set MIMIR_LLM_TIMEOUT_SECS for large/cold models that need longer to load (#528).",
     "inputSchema": {
       "type": "object",
       "properties": {
