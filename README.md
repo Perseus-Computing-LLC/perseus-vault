@@ -10,7 +10,7 @@
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 [![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](https://rust-lang.org)
-[![Version](https://img.shields.io/badge/version-2.17.0-green.svg)](https://github.com/Perseus-Computing-LLC/perseus-vault/releases)
+[![Version](https://img.shields.io/badge/version-2.19.1-green.svg)](https://github.com/Perseus-Computing-LLC/perseus-vault/releases)
 [![LangGraph](https://img.shields.io/badge/integrations-LangGraph-blue)](integrations/langgraph/)
 [![CrewAI](https://img.shields.io/badge/integrations-CrewAI-orange)](integrations/crewai/)
 [![AutoGen](https://img.shields.io/badge/integrations-AutoGen-purple)](integrations/autogen/)
@@ -111,7 +111,6 @@ local-first, zero-dependency, AND agent-first.
 | **Journal Audit Trail** | ✅ Immutable | ❌ | ❌ | ❌ |
 | **State Management** | ✅ Key-value + TTL | ❌ | ❌ | ❌ |
 | **MCP Tools** | 55 | 5 | 8 | 0 |
-| **GitHub Stars** | ~20 | ~55K | ~15K | ~3K |
 | **License** | MIT | Apache 2.0 | Apache 2.0 | Apache 2.0 |
 
 [Full comparison: Perseus Vault vs Mem0 →](docs/comparison/mimir-vs-mem0.md)
