@@ -1,0 +1,44 @@
+{
+  "system": "mem0",
+  "tier": "2xH100-80GB",
+  "task": "LOCOMO-style memory recall",
+  "chat_model": "qwen2.5:14b-instruct",
+  "source": "measured",
+  "summary": {
+    "seed_secs": 4.54,
+    "recall_accuracy": 0.8,
+    "mean_search_latency_s": 0.03
+  },
+  "probes": [
+    {
+      "q": "Can the system work without any internet connection, and how?",
+      "correct": false,
+      "latency_s": 0.03,
+      "retrieved": "User mentioned that entities in Perseus Vault are encrypted at rest using AES-256-GCM, with keys unique to each workspace User explained that Perseus Vault uses hybrid recall to fuse dense vector sear"
+    },
+    {
+      "q": "How does it distinguish what was believed versus what was true at a past time?",
+      "correct": true,
+      "latency_s": 0.03,
+      "retrieved": "User explained that Perseus Vault uses bi-temporal versioning to track both transaction time (when recorded) and valid time (when true) User explained that Ebbinghaus decay fades unused memories in Pe"
+    },
+    {
+      "q": "What happens to memories that are never accessed?",
+      "correct": true,
+      "latency_s": 0.03,
+      "retrieved": "User explained that Ebbinghaus decay fades unused memories in Perseus Vault, while consolidation merges cold ones into durable insights User mentioned that Perseus Vault stores memories in SQLite usin"
+    },
+    {
+      "q": "How does it combine keyword and semantic search?",
+      "correct": true,
+      "latency_s": 0.04,
+      "retrieved": "User explained that Perseus Vault uses hybrid recall to fuse dense vector search with FTS5 keyword search via reciprocal rank fusion User mentioned that Perseus Vault stores memories in SQLite using F"
+    },
+    {
+      "q": "Is stored data protected if the database file is stolen?",
+      "correct": true,
+      "latency_s": 0.04,
+      "retrieved": "User mentioned that Perseus Vault stores memories in SQLite using FTS5 and optionally uses dense embeddings via Ollama User mentioned that entities in Perseus Vault are encrypted at rest using AES-256"
+    }
+  ]
+}

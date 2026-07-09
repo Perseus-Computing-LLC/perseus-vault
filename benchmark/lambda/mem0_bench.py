@@ -80,8 +80,11 @@ def main():
     for q, keys in QUESTIONS:
         t = time.time()
         try:
-            res = mem.search(q, user_id="bench", limit=5)
-            # Mem0 returns dict with 'results' or a list depending on version
+            # Mem0 2.x: user_id must go through filters=, not a top-level kwarg.
+            try:
+                res = mem.search(q, filters={"user_id": "bench"}, limit=5)
+            except TypeError:
+                res = mem.search(q, user_id="bench", limit=5)  # older API fallback
             hits = res.get("results", res) if isinstance(res, dict) else res
             joined = " ".join(str(h.get("memory", h)) if isinstance(h, dict) else str(h)
                               for h in (hits or []))

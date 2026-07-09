@@ -100,6 +100,27 @@ if ql:
         "mimir_ask grounded QA — model quality vs latency (both pre-warmed)",
         series, groups, maxv=max(3.0, max(v for vs in series.values() for v in vs))))
 
+# 4. Competitive: Perseus Vault vs Mem0 (same box, local Ollama)
+mem0 = load("mem0_bench.json")
+if mem0 and mem0.get("summary") and ql:
+    pv14 = next((m for m in ql["models"] if "14b" in m["model"]), ql["models"][0])
+    svg = ['<svg width="640" height="90" font-family="system-ui">']
+    rows = [("Perseus Vault (mimir_ask RAG)", pv14["summary"]["accuracy"], "#5fd18b"),
+            ("Mem0 (search)", mem0["summary"]["recall_accuracy"], "#e0a56b")]
+    for i, (lab, v, c) in enumerate(rows):
+        y = 6 + i * 34
+        bw = int((640 - 260 - 60) * v)
+        svg.append(f'<text x="0" y="{y+18}" font-size="11" fill="#ccc">{html.escape(lab)}</text>')
+        svg.append(f'<rect x="260" y="{y}" width="{max(bw,1)}" height="24" rx="3" fill="{c}"/>')
+        svg.append(f'<text x="{266+bw}" y="{y+18}" font-size="11" fill="#eee">{v:g}</text>')
+    svg.append('</svg>')
+    note = ("Both fully local on the same box (Ollama qwen2.5:14b + nomic-embed-text). "
+            "Perseus Vault does full RAG answer generation + citation (~0.9s); "
+            "Mem0 returns raw retrieved memories (~0.03s). Recall accuracy on the same "
+            "LOCOMO-style fact set.")
+    sections.append(f'<section><h2>Competitive: memory recall accuracy, same hardware</h2>'
+                    f'{"".join(svg)}<div class="leg">{html.escape(note)}</div></section>')
+
 doc = f"""<!doctype html><html><head><meta charset="utf-8">
 <title>Perseus Vault — Dynamic Range Benchmarks</title>
 <style>
