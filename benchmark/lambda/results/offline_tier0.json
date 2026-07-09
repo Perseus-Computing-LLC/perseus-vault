@@ -1,0 +1,8 @@
+{
+  "tier": "0-offline-airgapped",
+  "mode": "--offline (zero network, no LLM/embed endpoint)",
+  "created": 5,
+  "persisted": 5,
+  "fts5_recall@3": 1.0,
+  "fts5_p50_ms": 0.28
+}

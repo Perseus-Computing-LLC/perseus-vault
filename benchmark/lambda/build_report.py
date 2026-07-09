@@ -61,6 +61,16 @@ def line_chart(title, xs, ys, xlabel, ylabel, w=640, h=260):
 
 sections = []
 
+# 0. Tier-0 offline / air-gapped proof (the "runs on nothing" bookend)
+off = load("offline_tier0.json")
+if off:
+    note = (f"Fully air-gapped: {off['mode']}. {off['created']} writes, "
+            f"{off['persisted']} persisted, FTS5 recall@3 = {off['fts5_recall@3']} "
+            f"at {off['fts5_p50_ms']}ms p50 — core memory + keyword search with ZERO "
+            f"network calls (IL5 / ICD-503 / classified). No GPU, no LLM, no embed endpoint.")
+    sections.append(f'<section><h2>Tier 0 — offline / air-gapped (zero network)</h2>'
+                    f'<div class="leg">{html.escape(note)}</div></section>')
+
 # 1. Recall@k at scale
 scale = load("scale_10k_distinct.json")
 if scale:
