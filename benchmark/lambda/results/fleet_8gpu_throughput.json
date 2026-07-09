@@ -1,0 +1,82 @@
+{
+  "tier": "8xH100-80GB-fleet",
+  "n_daemons": 8,
+  "model": "nomic-embed-text",
+  "arch": "client round-robin across per-GPU pinned Ollama daemons",
+  "levels": [
+    {
+      "concurrency": 1,
+      "requests": 1600,
+      "wall_secs": 55.85,
+      "aggregate_eps": 28.6,
+      "p50_req_ms": 34.5,
+      "p99_req_ms": 43.9
+    },
+    {
+      "concurrency": 2,
+      "requests": 1600,
+      "wall_secs": 27.37,
+      "aggregate_eps": 58.5,
+      "p50_req_ms": 34.0,
+      "p99_req_ms": 37.7
+    },
+    {
+      "concurrency": 4,
+      "requests": 1600,
+      "wall_secs": 14.47,
+      "aggregate_eps": 110.6,
+      "p50_req_ms": 36.0,
+      "p99_req_ms": 40.3
+    },
+    {
+      "concurrency": 8,
+      "requests": 1600,
+      "wall_secs": 8.06,
+      "aggregate_eps": 198.5,
+      "p50_req_ms": 40.0,
+      "p99_req_ms": 46.7
+    },
+    {
+      "concurrency": 16,
+      "requests": 1600,
+      "wall_secs": 4.93,
+      "aggregate_eps": 324.4,
+      "p50_req_ms": 48.6,
+      "p99_req_ms": 69.1
+    },
+    {
+      "concurrency": 32,
+      "requests": 1600,
+      "wall_secs": 3.27,
+      "aggregate_eps": 489.2,
+      "p50_req_ms": 64.3,
+      "p99_req_ms": 79.0
+    },
+    {
+      "concurrency": 48,
+      "requests": 1600,
+      "wall_secs": 2.64,
+      "aggregate_eps": 605.1,
+      "p50_req_ms": 77.9,
+      "p99_req_ms": 93.3
+    },
+    {
+      "concurrency": 64,
+      "requests": 1600,
+      "wall_secs": 2.46,
+      "aggregate_eps": 650.8,
+      "p50_req_ms": 95.9,
+      "p99_req_ms": 121.7
+    },
+    {
+      "concurrency": 96,
+      "requests": 1600,
+      "wall_secs": 2.74,
+      "aggregate_eps": 583.9,
+      "p50_req_ms": 157.7,
+      "p99_req_ms": 250.4
+    }
+  ],
+  "peak_eps": 650.8,
+  "scaling_vs_serial": 22.76
+}

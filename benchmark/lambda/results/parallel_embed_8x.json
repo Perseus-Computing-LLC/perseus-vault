@@ -1,0 +1,51 @@
+{
+  "tier": "8xH100-80GB",
+  "endpoint": "http://localhost:11434/api/embed",
+  "model": "nomic-embed-text",
+  "levels": [
+    {
+      "concurrency": 1,
+      "requests": 400,
+      "wall_secs": 13.67,
+      "aggregate_eps": 29.3,
+      "p50_req_ms": 34.1
+    },
+    {
+      "concurrency": 2,
+      "requests": 400,
+      "wall_secs": 7.4,
+      "aggregate_eps": 54.0,
+      "p50_req_ms": 36.5
+    },
+    {
+      "concurrency": 4,
+      "requests": 400,
+      "wall_secs": 4.23,
+      "aggregate_eps": 94.6,
+      "p50_req_ms": 42.0
+    },
+    {
+      "concurrency": 8,
+      "requests": 400,
+      "wall_secs": 3.05,
+      "aggregate_eps": 131.2,
+      "p50_req_ms": 60.4
+    },
+    {
+      "concurrency": 16,
+      "requests": 400,
+      "wall_secs": 2.92,
+      "aggregate_eps": 137.2,
+      "p50_req_ms": 116.0
+    },
+    {
+      "concurrency": 32,
+      "requests": 400,
+      "wall_secs": 2.98,
+      "aggregate_eps": 134.4,
+      "p50_req_ms": 238.9
+    }
+  ],
+  "peak_eps": 137.2,
+  "scaling_vs_serial": 4.68
+}

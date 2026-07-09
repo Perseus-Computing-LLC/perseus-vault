@@ -1,0 +1,98 @@
+{
+  "tier": "2xH100-80GB",
+  "task": "mimir_ask grounded QA",
+  "models": [
+    {
+      "model": "qwen2.5:14b-instruct",
+      "probes": [
+        {
+          "q": "Can Perseus Vault work without any internet connection, and how?",
+          "correct": true,
+          "has_citation": true,
+          "latency_s": 0.91,
+          "answer": "Yes, Perseus Vault can operate without an internet connection. It does so by running in an air-gapped environment where the option `--offline` is enabled. This mode disables all network calls to meet Information Lifecycle Management Level 5 (IL5) and Interface Control Document-50"
+        },
+        {
+          "q": "How does the vault answer 'what did we believe last week' versus 'what was true last week'?",
+          "correct": true,
+          "has_citation": true,
+          "latency_s": 1.48,
+          "answer": "Based on the context provided, Perseus Vault utilizes bi-temporal versioning which tracks both transaction time (when recorded) and valid time (when true). This mechanism allows distinguishing between \"what did we believe last week\" (transaction time) versus \"what was true last w"
+        },
+        {
+          "q": "What happens to memories that are never accessed?",
+          "correct": true,
+          "has_citation": true,
+          "latency_s": 0.6,
+          "answer": "According to the given context [key: f3], Ebbinghaus decay affects unused memories. This implies that memories which are never accessed will fade over time due to this decay process."
+        },
+        {
+          "q": "How does the vault combine keyword and semantic search?",
+          "correct": true,
+          "has_citation": true,
+          "latency_s": 0.8,
+          "answer": "The vault combines keyword and semantic search through hybrid recall, which integrates dense vector search with FTS5 (Full-Text Search) keyword search via reciprocal rank fusion. This method enhances the retrieval process by merging the strengths of both keyword-based and semanti"
+        },
+        {
+          "q": "Is stored data protected if the database file is stolen?",
+          "correct": true,
+          "has_citation": true,
+          "latency_s": 1.64,
+          "answer": "Based on the given context [key: f1], it mentions that the vault operates in an \"air-gapped\" manner, meaning it is isolated from any network connections. This significantly reduces the risk of remote attacks and data breaches. However, the context does not provide specific detail"
+        }
+      ],
+      "summary": {
+        "accuracy": 1.0,
+        "citation_rate": 1.0,
+        "mean_latency_s": 1.09,
+        "p50_latency_s": 0.91
+      }
+    },
+    {
+      "model": "qwen2.5:72b-instruct",
+      "probes": [
+        {
+          "q": "Can Perseus Vault work without any internet connection, and how?",
+          "correct": true,
+          "has_citation": true,
+          "latency_s": 2.4,
+          "answer": "Yes, Perseus Vault can operate without an internet connection. It achieves this by running fully air-gapped, which means that it operates in an offline mode where all network calls are disabled for compliance with IL5/ICD-503 standards [f1]. This ensures that the vault can be use"
+        },
+        {
+          "q": "How does the vault answer 'what did we believe last week' versus 'what was true last week'?",
+          "correct": true,
+          "has_citation": true,
+          "latency_s": 2.3,
+          "answer": "The vault can answer 'what did we believe last week' versus 'what was true last week' through bi-temporal versioning. This method tracks both transaction time (when information was recorded) and valid time (when the information was actually true), allowing for differentiation bet"
+        },
+        {
+          "q": "What happens to memories that are never accessed?",
+          "correct": true,
+          "has_citation": true,
+          "latency_s": 1.21,
+          "answer": "According to the Ebbinghaus theory mentioned in [key: f3], unused memories undergo decay, meaning they fade over time if not accessed or reinforced."
+        },
+        {
+          "q": "How does the vault combine keyword and semantic search?",
+          "correct": true,
+          "has_citation": true,
+          "latency_s": 1.41,
+          "answer": "The vault combines keyword and semantic search through hybrid recall, which merges dense vector search (for semantic similarity) with FTS5 keyword search using reciprocal rank fusion. [f4] [f0]"
+        },
+        {
+          "q": "Is stored data protected if the database file is stolen?",
+          "correct": true,
+          "has_citation": true,
+          "latency_s": 3.72,
+          "answer": "Based on the provided context [f1], it indicates that the vault operates in a fully air-gapped environment, meaning it is disconnected from any networks. This can help prevent unauthorized access to the data while it is being used within the vault. However, if the database file i"
+        }
+      ],
+      "summary": {
+        "accuracy": 1.0,
+        "citation_rate": 1.0,
+        "mean_latency_s": 2.21,
+        "p50_latency_s": 2.3
+      }
+    }
+  ]
+}
