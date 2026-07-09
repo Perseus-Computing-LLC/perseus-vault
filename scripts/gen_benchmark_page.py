@@ -166,10 +166,12 @@ def sec_scale(s):
         r = s["runs"][size]
         rec = r.get("recall", {})
         f = rec.get("fts5", {})
+        d = rec.get("dense", {})
         h = rec.get("hybrid", {})
         rows += (f"<tr><th>{int(size):,}</th>"
                  f"<td>{r['write']['docs_per_sec']}/s</td>"
                  f"<td>{f.get('p50_ms', 'n/a')} / {f.get('p99_ms', 'n/a')} ms</td>"
+                 f"<td>{d.get('p50_ms', 'n/a')} / {d.get('p99_ms', 'n/a')} ms</td>"
                  f"<td>{h.get('p50_ms', 'n/a')} / {h.get('p99_ms', 'n/a')} ms</td>"
                  f"<td>{r['as_of']['p99_ms']} ms</td>"
                  f"<td>{r['cold_start']['first_query_ms_median']} ms</td></tr>")
@@ -181,7 +183,7 @@ def sec_scale(s):
   per metric. Hardware named in the report: {esc(hw['os'])}, {hw['cpus']} cores. Bi-temporal point
   lookups stay flat from 10K to 100K entities; that column is the differentiator.</p>
   <div class="tablewrap"><table><thead><tr><th>entities</th><th>write sustained</th>
-  <th>fts5 p50/p99</th><th>hybrid p50/p99</th><th>as_of p99</th><th>cold start</th></tr></thead>
+  <th>fts5 p50/p99</th><th>dense p50/p99</th><th>hybrid p50/p99</th><th>as_of p99</th><th>cold start</th></tr></thead>
   <tbody>{rows}</tbody></table></div>
   {src_link('scale/report.json', s.get('signature_sha256'))}
 </section>"""
