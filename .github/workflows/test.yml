@@ -95,6 +95,38 @@ jobs:
       - name: Run tests
         run: cargo test --verbose
 
+  # Guard the default build on OLD glibc (#526): ubuntu-latest is 24.04
+  # (glibc 2.39), so the `test` job can't catch it, but the prebuilt ONNX
+  # Runtime that `ort` downloads is compiled against glibc >= 2.38 and
+  # references the C23 `__isoc23_strto*` symbols. On Ubuntu 22.04 (glibc 2.35
+  # — the dominant cloud/CI base image) the DEFAULT `cargo build` failed to
+  # LINK until src/glibc_compat.rs added forwarding shims for those symbols.
+  # Linking is the failure mode, and a debug build links too, so a plain
+  # `cargo build` on an explicit 22.04 runner is the regression guard.
+  default-build-glibc235:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache embedding model
+        uses: actions/cache@v4
+        with:
+          path: .model-cache
+          key: minilm-l6-v2-qint8-v1
+      - name: Fetch embedding model (if not cached)
+        shell: bash
+        run: |
+          mkdir -p .model-cache
+          base=https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main
+          [ -s .model-cache/model_qint8_avx512_vnni.onnx ] || curl -fL "$base/onnx/model_qint8_avx512_vnni.onnx" -o .model-cache/model_qint8_avx512_vnni.onnx
+          [ -s .model-cache/tokenizer.json ] || curl -fL "$base/tokenizer.json" -o .model-cache/tokenizer.json
+          cp .model-cache/model_qint8_avx512_vnni.onnx .model-cache/model_quantized.onnx
+      - name: Confirm host glibc is < 2.38
+        run: ldd --version | head -1
+      - name: Build (default features, must link on glibc 2.35)
+        run: cargo build --verbose
+
   # Guard the lean escape hatch: the binary must still build without the embedding
   # stack for size-sensitive / unsupported-platform users.
   lite-build:

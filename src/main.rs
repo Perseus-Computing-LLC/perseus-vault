@@ -5,6 +5,11 @@ mod dedup;
 mod embedding;
 mod encryption;
 mod extraction;
+// __isoc23_strto* link shims so the default (bundled-embeddings) build links
+// against the prebuilt ONNX Runtime on glibc < 2.38 hosts, e.g. Ubuntu 22.04
+// — the dominant cloud/CI base image (#526).
+#[cfg(all(feature = "bundled-embeddings", target_os = "linux", target_env = "gnu"))]
+mod glibc_compat;
 mod httplimit;
 mod mcp;
 mod models;
