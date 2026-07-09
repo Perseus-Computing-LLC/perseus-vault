@@ -2570,6 +2570,20 @@ impl Database {
         self.remember_impl(entity, false, valid_from, valid_to)
     }
 
+    /// `remember_with_validity` with caller-controlled dedup (#531): the MCP
+    /// remember tool exposes `skip_dedup` so bulk/API writers whose records
+    /// are templated (and therefore trigram-similar by construction) can make
+    /// every acknowledged write actually create its key.
+    pub fn remember_with_options(
+        &self,
+        entity: &Entity,
+        skip_dedup: bool,
+        valid_from: Option<i64>,
+        valid_to: Option<i64>,
+    ) -> Result<(String, String), Box<dyn std::error::Error>> {
+        self.remember_impl(entity, skip_dedup, valid_from, valid_to)
+    }
+
     fn remember_impl(
         &self,
         entity: &Entity,

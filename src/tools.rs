@@ -117,6 +117,12 @@ pub struct RememberArgs {
     /// actually informed a later write" signal that feeds decay and ranking.
     #[serde(default, deserialize_with = "null_as_default")]
     pub derived_from: Vec<DerivedFromRef>,
+    /// #531: opt out of near-duplicate merging for this write. Bulk/API
+    /// writers storing many templated records (which sit above the trigram
+    /// similarity threshold by construction) need each acknowledged write to
+    /// actually create its key.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub skip_dedup: bool,
 }
 
 /// #487: a `derived_from` citation — either an entity id (`"mem-..."`, as
@@ -699,7 +705,7 @@ pub fn handle_remember(db: &Database, args: Value) -> Result<String, String> {
     }
 
     let (eid, action) = db
-        .remember_with_validity(&entity, a.valid_from_unix_ms, a.valid_to_unix_ms)
+        .remember_with_options(&entity, a.skip_dedup, a.valid_from_unix_ms, a.valid_to_unix_ms)
         .map_err(|e| format!("Remember failed: {}", e))?;
 
     // #487: auto-reinforce the cited sources. Runs AFTER the write succeeded
@@ -755,6 +761,18 @@ pub fn handle_remember(db: &Database, args: Value) -> Result<String, String> {
         "category": entity.category,
         "key": entity.key,
     });
+    // #531: a near-duplicate merge is an accepted-but-not-created write —
+    // make it impossible to miss for callers that don't parse the action
+    // string (bulk ingest scripts acked 2,000 writes that became ~5 rows).
+    if action.starts_with("deduped") {
+        result["deduped"] = json!(true);
+        result["merged_into"] = json!(eid);
+        result["hint"] = json!(
+            "body was >=70% trigram-similar to an existing entity in this \
+             category+workspace, so no new entity was created; pass \
+             skip_dedup=true to force a distinct write"
+        );
+    }
     if let Some(dr) = derived_report {
         result["derived_from"] = dr;
     }
@@ -4091,6 +4109,51 @@ mod tests {
         assert_eq!(v["valid_from_unix_ms"], json!(t0), "{r}");
         assert_eq!(v["valid_to_unix_ms"], json!(t5), "{r}");
         assert_eq!(v["is_live_version"], json!(false), "{r}");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn remember_surfaces_dedup_and_skip_dedup_creates() {
+        // #531: 2,000 acknowledged bulk writes silently collapsed to a
+        // handful of rows via near-duplicate merging, with nothing in the
+        // result signaling it. The merge must be explicit in the result, and
+        // skip_dedup must let a bulk writer opt out.
+        let (db, path) = temp_db();
+
+        let r = handle_remember(
+            &db,
+            json!({"category": "bulk", "key": "line-0001",
+                   "body_json": "{\"note\":\"bulk line 0001 of the ingest benchmark burst\"}"}),
+        )
+        .expect("first write");
+        let v: Value = serde_json::from_str(&r).unwrap();
+        assert_eq!(v["action"], json!("created"), "{r}");
+        assert!(v.get("deduped").is_none(), "created write must not carry dedup fields: {r}");
+        let first_id = v["id"].as_str().unwrap().to_string();
+
+        // Same template, new key, no skip_dedup: merged — and says so.
+        let r = handle_remember(
+            &db,
+            json!({"category": "bulk", "key": "line-0002",
+                   "body_json": "{\"note\":\"bulk line 0002 of the ingest benchmark burst\"}"}),
+        )
+        .expect("near-dup write");
+        let v: Value = serde_json::from_str(&r).unwrap();
+        assert_eq!(v["deduped"], json!(true), "{r}");
+        assert_eq!(v["merged_into"], json!(first_id), "{r}");
+        assert!(v["hint"].as_str().unwrap().contains("skip_dedup"), "{r}");
+
+        // skip_dedup=true: the same shape of write must actually create.
+        let r = handle_remember(
+            &db,
+            json!({"category": "bulk", "key": "line-0003", "skip_dedup": true,
+                   "body_json": "{\"note\":\"bulk line 0003 of the ingest benchmark burst\"}"}),
+        )
+        .expect("skip_dedup write");
+        let v: Value = serde_json::from_str(&r).unwrap();
+        assert_eq!(v["action"], json!("created"), "{r}");
+        assert_ne!(v["id"], json!(first_id), "{r}");
 
         let _ = std::fs::remove_file(&path);
     }
