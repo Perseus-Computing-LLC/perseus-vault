@@ -395,6 +395,14 @@ def main():
                     help="Token-per-minute budget for API pacing (default 25000, safely under "
                          "OpenAI Tier-1 gpt-4o's 30k TPM; 0 disables pacing). Answerer and "
                          "judge calls share the budget.")
+    ap.add_argument("--resume", action="store_true",
+                    help="#518: resume from the progress journal — already-judged questions are "
+                         "skipped (their verdicts reload from disk); errored questions are "
+                         "retried. The journal must match this run's config exactly.")
+    ap.add_argument("--journal", default=None,
+                    help="Progress journal path (default: <outdir>/qa_progress-<split>-<model>.jsonl). "
+                         "Appended after EVERY judged question, so a killed run loses at most "
+                         "the question in flight.")
     ap.add_argument("--out", default=str(HERE / "qa_report.json"))
     ap.add_argument("--outdir", default=str(HERE), help="Where hypotheses-*.jsonl files go")
     args = ap.parse_args()
@@ -447,16 +455,82 @@ def main():
     budget = TokenBudget(args.tpm) if (live and args.tpm) else None
     t0 = time.time()
 
+    # ── #518: crash-safe progress journal + resume ─────────────────────────
+    # One JSON line per judged (question, system), appended and flushed as it
+    # happens — a killed run (crash, reboot, quota exhaustion, parent-process
+    # teardown) loses at most the question in flight, never the run. The first
+    # line pins the run config; --resume refuses a mismatched journal rather
+    # than silently blending two configurations. The signed report is still
+    # produced ONLY at completion over the full verdict set: a partial journal
+    # is never signed and never quotable.
+    model_tag = ("mock" if args.mock_llm else args.model).replace("/", "_")
+    journal_path = Path(args.journal) if args.journal else \
+        Path(args.outdir) / f"qa_progress-{args.split}-{model_tag}.jsonl"
+    run_config = {"split": args.split, "n": len(data),
+                  "systems": sorted(args.systems),
+                  "model": "mock" if args.mock_llm else args.model,
+                  "judge": "mock" if args.mock_llm else args.judge,
+                  "k": args.k}
+    done = {}
+    journal = None
+    if not args.dry_run:
+        resume_ok = False
+        if args.resume and journal_path.exists():
+            lines = [json.loads(ln) for ln in
+                     journal_path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+            if not lines or "_config" not in lines[0]:
+                sys.exit(f"error: --resume: {journal_path} has no config header — "
+                         "not a progress journal (delete it or pass --journal).")
+            if lines[0]["_config"] != run_config:
+                sys.exit("error: --resume config mismatch:\n"
+                         f"  journal: {lines[0]['_config']}\n  current: {run_config}\n"
+                         "Delete the journal (or pass --journal) to start fresh.")
+            for rec in lines[1:]:
+                # Completed verdicts reload; errored questions retry.
+                if rec.get("error") is None:
+                    done[(rec["question_id"], rec["system"])] = rec
+            resume_ok = True
+            print(f"  resume: {len(done)} judged answers reloaded from "
+                  f"{journal_path.name}; errored/unfinished questions will run.")
+        journal = open(journal_path, "a" if resume_ok else "w", encoding="utf-8")
+        if not resume_ok:
+            journal.write(json.dumps({"_config": run_config}) + "\n")
+            journal.flush()
+        # Seed the accumulators from the reloaded verdicts so the final report
+        # covers the WHOLE run, not just this process's share.
+        for rec in done.values():
+            tok[rec["system"]] += rec.get("tokens_est", 0)
+            nsess[rec["system"]] += rec.get("sessions", 0)
+            hyps[rec["system"]].append({"question_id": rec["question_id"],
+                                        "hypothesis": rec.get("hypothesis", "")})
+            verdicts.append({k: rec.get(k) for k in
+                             ("question_id", "question_type", "system",
+                              "abstention", "correct", "error", "judge_raw")})
+
+    def record(rec, hypothesis, tokens_est, sessions):
+        """Append a verdict to memory AND the crash-safe journal."""
+        verdicts.append(rec)
+        if journal:
+            journal.write(json.dumps({**rec, "hypothesis": hypothesis,
+                                      "tokens_est": tokens_est,
+                                      "sessions": sessions}) + "\n")
+            journal.flush()
+
     for idx, inst in enumerate(data):
         qid = inst["question_id"]
         qtype = inst.get("question_type", "unknown")
         is_abs = qid.endswith("_abs")
+        # #518: fully-judged instances skip even the (expensive) re-ingest.
+        if not args.dry_run and all((qid, s) in done for s in args.systems):
+            continue
         srv = None
         if need_mimir:
             wipe()
             srv = MimirServer(binary, db)
         try:
             for system in args.systems:
+                if (qid, system) in done:
+                    continue
                 ctx, chosen = build_context(system, inst, srv, qid, args.k)
                 prompt = ANSWER_PROMPT.format(context=ctx, question=inst["question"],
                                               question_date=inst.get("question_date", "unknown"))
@@ -466,6 +540,7 @@ def main():
                     hyps[system].append({"question_id": qid, "hypothesis": ""})
                     continue
 
+                q_tokens = est_tokens(prompt)
                 if args.mock_llm:
                     ans = mock_answer(inst, idx)
                 else:
@@ -474,13 +549,14 @@ def main():
                     except Exception as e:
                         # A rate-limited/failed question must NEVER deflate accuracy:
                         # record it as answer_error and exclude it from the denominator.
+                        # (--resume retries it: errored records don't enter `done`.)
                         print(f"  !! ANSWER_ERROR on {qid}/{system} (excluded from accuracy): {e}",
                               file=sys.stderr)
                         hyps[system].append({"question_id": qid, "hypothesis": ""})
-                        verdicts.append({"question_id": qid, "question_type": qtype,
-                                         "system": system, "abstention": is_abs,
-                                         "correct": None, "error": "answer_error",
-                                         "judge_raw": None})
+                        record({"question_id": qid, "question_type": qtype,
+                                "system": system, "abstention": is_abs,
+                                "correct": None, "error": "answer_error",
+                                "judge_raw": None}, "", q_tokens, len(chosen))
                         continue
                 hyps[system].append({"question_id": qid, "hypothesis": ans})
 
@@ -494,28 +570,36 @@ def main():
                     except Exception as e:
                         print(f"  !! JUDGE_ERROR on {qid}/{system} (excluded from accuracy): {e}",
                               file=sys.stderr)
-                        verdicts.append({"question_id": qid, "question_type": qtype,
-                                         "system": system, "abstention": is_abs,
-                                         "correct": None, "error": "judge_error",
-                                         "judge_raw": None})
+                        record({"question_id": qid, "question_type": qtype,
+                                "system": system, "abstention": is_abs,
+                                "correct": None, "error": "judge_error",
+                                "judge_raw": None}, ans, q_tokens, len(chosen))
                         continue
                 correct = jraw.strip().lower().startswith("yes")
-                verdicts.append({"question_id": qid, "question_type": qtype, "system": system,
-                                 "abstention": is_abs, "correct": correct, "error": None,
-                                 "judge_raw": jraw.strip()[:40]})
+                record({"question_id": qid, "question_type": qtype, "system": system,
+                        "abstention": is_abs, "correct": correct, "error": None,
+                        "judge_raw": jraw.strip()[:40]}, ans, q_tokens, len(chosen))
         finally:
             if srv:
                 srv.close()
-        if (idx + 1) % 25 == 0 or (idx + 1) == len(data):
-            print(f"  {idx + 1}/{len(data)}  ({time.time() - t0:.0f}s)", flush=True)
+        # #518: per-question progress with a running graded accuracy, so a
+        # backgrounded run is observable from its output file.
+        graded_so_far = [v for v in verdicts if v.get("error") is None]
+        acc_so_far = (sum(1 for v in graded_so_far if v["correct"])
+                      / max(1, len(graded_so_far)) * 100)
+        print(f"  {idx + 1}/{len(data)}  graded={len(graded_so_far)} "
+              f"acc={acc_so_far:.1f}%  ({time.time() - t0:.0f}s)", flush=True)
     if need_mimir:
         wipe()
+    if journal:
+        journal.close()
 
     n = len(data)
     # Hypotheses files in LongMemEval's official format, so their evaluate_qa.py
     # can independently cross-check our judge. Skipped in dry-run (empty).
+    # (On a resumed run, reloaded answers come first — evaluate_qa.py keys on
+    # question_id, so order is immaterial.)
     if not args.dry_run:
-        model_tag = ("mock" if args.mock_llm else args.model).replace("/", "_")
         for system in args.systems:
             out = Path(args.outdir) / f"hypotheses-{system}-{model_tag}.jsonl"
             out.write_text("\n".join(json.dumps(h) for h in hyps[system]) + "\n", encoding="utf-8")
