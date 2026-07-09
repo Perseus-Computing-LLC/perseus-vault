@@ -1,0 +1,73 @@
+{
+  "tier": "2xH100-80GB",
+  "corpus": {
+    "entities": 10000,
+    "clusters": 1250,
+    "per_cluster": 8,
+    "queries": 2500
+  },
+  "summary": {
+    "seed": {
+      "secs": 30.62,
+      "entities_per_sec": 326.5
+    },
+    "embedding": {
+      "entities_embedded": 9997,
+      "secs": 741.88,
+      "entities_per_sec": 13.5,
+      "stored_coverage": 9997,
+      "backend": "nomic-embed-text (2xH100-80GB)"
+    },
+    "recall@1": {
+      "fts5": {
+        "recall": 0.002,
+        "p50_ms": 1.2,
+        "p99_ms": 3.5
+      },
+      "dense": {
+        "recall": 0.563,
+        "p50_ms": 38.1,
+        "p99_ms": 43.2
+      },
+      "hybrid": {
+        "recall": 0.9,
+        "p50_ms": 39.6,
+        "p99_ms": 45.2
+      }
+    },
+    "recall@5": {
+      "fts5": {
+        "recall": 0.008,
+        "p50_ms": 1.9,
+        "p99_ms": 4.4
+      },
+      "dense": {
+        "recall": 0.795,
+        "p50_ms": 38.2,
+        "p99_ms": 43.9
+      },
+      "hybrid": {
+        "recall": 1.0,
+        "p50_ms": 39.8,
+        "p99_ms": 45.9
+      }
+    },
+    "recall@10": {
+      "fts5": {
+        "recall": 0.011,
+        "p50_ms": 2.7,
+        "p99_ms": 13.3
+      },
+      "dense": {
+        "recall": 0.862,
+        "p50_ms": 39.1,
+        "p99_ms": 44.8
+      },
+      "hybrid": {
+        "recall": 1.0,
+        "p50_ms": 40.6,
+        "p99_ms": 46.8
+      }
+    }
+  }
+}
