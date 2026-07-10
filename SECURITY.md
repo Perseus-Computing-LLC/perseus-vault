@@ -35,7 +35,10 @@ We support responsible disclosure and will credit reporters who follow this poli
 
 > Maintainers: the internal process behind these commitments (handler roles,
 > severity rubric, embargo and CVE handling) is documented in
-> [`docs/vuln-response.md`](docs/vuln-response.md).
+> [`docs/vuln-response.md`](docs/vuln-response.md). For the full map of security
+> documents, the access-privileges register, and the milestones that gate when
+> we escalate security effort, see [`docs/SECURITY-INDEX.md`](docs/SECURITY-INDEX.md)
+> and [`docs/SECURITY-MILESTONES.md`](docs/SECURITY-MILESTONES.md).
 
 ---
 
