@@ -2,24 +2,47 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.Perseus-Computing-LLC/perseus-vault",
   "title": "Perseus Vault (formerly Mimir/Mneme), persistent memory engine for AI agents",
-  "description": "Local-first MCP memory server: SQLite, FTS5 and vector search, AES-256-GCM. 57 tools, no cloud.",
+  "description": "Persistent, deterministic memory for AI agents. Local-first: SQLite, FTS5, AES-256-GCM, 57 tools.",
   "version": "2.17.4",
-  "packages": [{
-    "registryType": "oci",
-    "identifier": "ghcr.io/perseus-computing-llc/perseus-vault:2.17.4",
-    "transport": {"type": "stdio"},
-    "runtimeHint": "docker",
-    "runtimeArguments": [
-      {"type": "named", "name": "-i"},
-      {"type": "named", "name": "--rm"},
-      {"type": "named", "name": "-v", "value": "mimir-data:/data"}
-    ],
-    "packageArguments": [
-      {"type": "positional", "value": "serve"},
-      {"type": "positional", "value": "--db"},
-      {"type": "positional", "value": "/data/perseus-vault.db"}
-    ]
-  }],
+  "packages": [
+    {
+      "registryType": "oci",
+      "identifier": "ghcr.io/perseus-computing-llc/perseus-vault:2.17.4",
+      "transport": {
+        "type": "stdio"
+      },
+      "runtimeHint": "docker",
+      "runtimeArguments": [
+        {
+          "type": "named",
+          "name": "-i"
+        },
+        {
+          "type": "named",
+          "name": "--rm"
+        },
+        {
+          "type": "named",
+          "name": "-v",
+          "value": "mimir-data:/data"
+        }
+      ],
+      "packageArguments": [
+        {
+          "type": "positional",
+          "value": "serve"
+        },
+        {
+          "type": "positional",
+          "value": "--db"
+        },
+        {
+          "type": "positional",
+          "value": "/data/perseus-vault.db"
+        }
+      ]
+    }
+  ],
   "websiteUrl": "https://github.com/Perseus-Computing-LLC/perseus-vault",
   "repository": {
     "source": "github",
