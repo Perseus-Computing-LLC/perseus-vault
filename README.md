@@ -131,6 +131,11 @@ Perseus Vault handles production workloads on modest hardware:
 
 Run it yourself: `cargo test stress_100k --release -- --ignored --nocapture`
 
+Deploying beside a model server on a GPU host (vLLM on MI300X/H100)? See the
+[AMD MI300X deployment reference](docs/deployment-amd-mi300x.md) — measured
+co-residency numbers plus the `/dev/shm`, PID-1, and version-pinning gotchas
+that break these stacks in practice.
+
 ## Framework Integrations
 
 Ready-to-use adapters that make Perseus Vault the default memory backend for
