@@ -2,9 +2,9 @@
   "manifest_version": "0.3",
   "name": "perseus-vault",
   "version": "2.17.4",
-  "display_name": "Perseus Vault — Persistent Memory for Claude (formerly Mimir/Mneme)",
-  "description": "Persistent cross-session memory for Claude. 57 MCP tools: remember, recall, search, link entities, journal audit trail, state management, AES-256-GCM encryption. Local-first, single Rust binary, zero cloud dependencies.",
-  "long_description": "Perseus Vault (formerly \"Mimir\", then \"Mneme\") gives Claude durable memory across sessions. It is a single Rust binary (~8MB) with an embedded SQLite database — no Docker, no Postgres, no cloud. Features include:\n\n- **57 MCP tools** for entity storage, hybrid search (FTS5 + dense vector), knowledge-graph traversal, journal audit trail, and state management\n- **AES-256-GCM encryption at rest** (optional, transparent)\n- **Fully local** — never phones home, no telemetry, air-gapped by default\n- **Agent-first design** — entity lifecycle with Ebbinghaus decay, auto-promotion, archiving\n- **Works with any MCP host** — Claude Desktop, Claude Code, Cursor, Hermes Agent, Perseus, and more\n\nInstall in one line: `curl -sSf https://raw.githubusercontent.com/Perseus-Computing-LLC/perseus-vault/main/scripts/install.sh | sh`",
+  "display_name": "Perseus Vault \u2014 Persistent Memory for Claude (formerly Mimir/Mneme)",
+  "description": "Persistent, deterministic memory for AI agents \u2014 they guess, we remember. 57 MCP tools: remember, recall, search, link entities, bi-temporal journal + audit trail, state management, AES-256-GCM encryption. Local-first, single Rust binary, zero cloud dependencies.",
+  "long_description": "Perseus Vault (formerly \"Mimir\", then \"Mneme\") gives Claude durable memory across sessions. It is a single Rust binary (~8MB) with an embedded SQLite database \u2014 no Docker, no Postgres, no cloud. Features include:\n\n- **57 MCP tools** for entity storage, hybrid search (FTS5 + dense vector), knowledge-graph traversal, journal audit trail, and state management\n- **AES-256-GCM encryption at rest** (optional, transparent)\n- **Fully local** \u2014 never phones home, no telemetry, air-gapped by default\n- **Agent-first design** \u2014 entity lifecycle with Ebbinghaus decay, auto-promotion, archiving\n- **Works with any MCP host** \u2014 Claude Desktop, Claude Code, Cursor, Hermes Agent, Perseus, and more\n\nInstall in one line: `curl -sSf https://raw.githubusercontent.com/Perseus-Computing-LLC/perseus-vault/main/scripts/install.sh | sh`",
   "author": {
     "name": "Perseus Computing LLC",
     "email": "privacy@perseus.observer",
@@ -18,7 +18,17 @@
   "documentation": "https://github.com/Perseus-Computing-LLC/perseus-vault#readme",
   "license": "MIT",
   "icon": "icon.png",
-  "keywords": ["memory", "persistent-memory", "mcp", "local-first", "encryption", "sqlite", "fts5", "hybrid-search", "agent-memory"],
+  "keywords": [
+    "memory",
+    "persistent-memory",
+    "mcp",
+    "local-first",
+    "encryption",
+    "sqlite",
+    "fts5",
+    "hybrid-search",
+    "agent-memory"
+  ],
   "privacy_policies": [
     "https://github.com/Perseus-Computing-LLC/perseus-vault#privacy-policy"
   ],
@@ -27,7 +37,9 @@
     "entry_point": "server/perseus-vault",
     "mcp_config": {
       "command": "${__dirname}/server/perseus-vault",
-      "args": ["serve"],
+      "args": [
+        "serve"
+      ],
       "platform_overrides": {
         "win32": {
           "command": "${__dirname}/server/perseus-vault.exe"
@@ -40,6 +52,10 @@
   },
   "compatibility": {
     "claude_desktop": ">=1.0.0",
-    "platforms": ["darwin", "win32", "linux"]
+    "platforms": [
+      "darwin",
+      "win32",
+      "linux"
+    ]
   }
 }
