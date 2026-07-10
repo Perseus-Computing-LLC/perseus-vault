@@ -269,6 +269,15 @@ impl RecallTimer {
         }
     }
 
+    /// Record an externally measured duration (e.g. a stage that ran on
+    /// another thread, concurrent with the main sequence) without moving the
+    /// sequential stage boundary.
+    pub(crate) fn record(&mut self, name: &'static str, ms: f64) {
+        if let Some(s) = self.state.as_mut() {
+            s.stages.push((name, ms));
+        }
+    }
+
     /// Emit the one-line attribution to stderr and consume the timer.
     pub(crate) fn finish(self, mode: &str) {
         if let Some(s) = self.state {
@@ -3339,12 +3348,48 @@ impl Database {
                 // the id tie-break keep the result byte-stable run-to-run.
                 let limit = params.limit.max(0) as usize;
                 let candidate_k = limit.saturating_mul(5).clamp(1, 1000).max(limit.min(1000));
-                let dense_scored = self.dense_search(query_vec, candidate_k)?;
-                timer.stage("dense");
                 let mut wide = params.clone();
                 wide.limit = candidate_k as i64;
-                let sparse_scored = self.fts5_bm25_search(&wide)?;
-                timer.stage("sparse");
+                // #511: the two arms are independent, read-only queries on
+                // separate pooled connections (`Database` is shared as
+                // `Arc<Database>` across server threads already — #210), so
+                // run them concurrently: hybrid pays max(dense, sparse)
+                // instead of dense + sparse. With a size-1 pool the arms
+                // simply serialize on connection acquisition — no deadlock,
+                // since neither arm holds one connection while waiting for a
+                // second. Errors cross the thread boundary as strings
+                // (`Box<dyn Error>` is not `Send`).
+                let timing_on = RecallTimer::enabled();
+                let arm_clock = |on: bool| on.then(std::time::Instant::now);
+                let arm_ms = |t0: Option<std::time::Instant>| {
+                    t0.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0)
+                };
+                let (dense_res, sparse_res, dense_ms, sparse_ms) =
+                    std::thread::scope(|s| {
+                        let sparse_handle = s.spawn(|| {
+                            let t0 = arm_clock(timing_on);
+                            let r = self
+                                .fts5_bm25_search(&wide)
+                                .map_err(|e| e.to_string());
+                            (r, arm_ms(t0))
+                        });
+                        let t0 = arm_clock(timing_on);
+                        let dense_res = self
+                            .dense_search(query_vec, candidate_k)
+                            .map_err(|e| e.to_string());
+                        let dense_ms = arm_ms(t0);
+                        let (sparse_res, sparse_ms) = sparse_handle
+                            .join()
+                            .unwrap_or_else(|_| {
+                                (Err("hybrid sparse arm panicked".to_string()), 0.0)
+                            });
+                        (dense_res, sparse_res, dense_ms, sparse_ms)
+                    });
+                let dense_scored = dense_res?;
+                let sparse_scored = sparse_res?;
+                timer.stage("arms");
+                timer.record("dense", dense_ms);
+                timer.record("sparse", sparse_ms);
                 let sparse_weight = crate::db::sparse_arm_weight(sparse_scored.len());
 
                 // Graph-expansion arm (#steal-3, competitive research): one-hop
