@@ -5,6 +5,8 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
 
 ## [Unreleased]
 
+## [2.20.0] - 2026-07-10
+
 ### Added
 - **`mimir_check_failure_pattern` — failure-pattern / deja-vu guard** (#521). A lightweight
   pre-retry check: pass the command line or approach you are about to (re)try and get back
