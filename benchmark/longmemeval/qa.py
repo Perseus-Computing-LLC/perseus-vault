@@ -89,44 +89,53 @@ PRICING = {
 }
 FALLBACK_PRICE = (2.50, 10.00)  # assume gpt-4o pricing for unknown models
 
+# Answer-generation prompt — ported VERBATIM from LongMemEval's official harness
+# (xiaowu0162/LongMemEval, src/generation/run_generation.py, default non-CoT
+# template). Carries NO "say you don't know if not present" instruction: an
+# earlier revision of this harness added one, which made the model reflexively
+# abstain on preference/aggregation questions and depressed the score ~18 points
+# (single-session-preference collapsed to 1/30 — every failure the literal
+# string "I don't know"). The official prompt relies on natural model behavior;
+# abstention (_abs) instances are graded by the official abstention judge below.
+# Matching the official prompt is what makes the number comparable to Zep's.
 ANSWER_PROMPT = (
-    "You are answering a question using the provided chat history between a user and an "
-    "assistant. Use only the history. If the answer is not present in the history, say you "
-    "don't know.\n\n"
-    "Chat history:\n{context}\n\n"
-    "Current date: {question_date}\n"
+    "I will give you several history chats between you and a user. Please answer "
+    "the question based on the relevant chat history.\n\n\n"
+    "History Chats:\n\n{context}\n\n"
+    "Current Date: {question_date}\n"
     "Question: {question}\n"
     "Answer:"
 )
 
-# The judge prompts are committed here verbatim so the grading is auditable.
-JUDGE_PROMPT = (
-    "You are a strict grader for a question-answering benchmark.\n"
-    "You are given a question, the gold (correct) answer, and a model's answer.\n"
-    "The model's answer is correct only if it contains, or is semantically equivalent to, "
-    "the gold answer. A partial answer, a hedge that contradicts the gold answer, or an "
-    "incorrect claim about the asked fact makes it incorrect.\n"
-    "Respond with exactly one word: yes (correct) or no (incorrect).\n\n"
-    "Question: {question}\n"
-    "Gold answer: {gold}\n"
-    "Model answer: {answer}\n"
-    "Verdict (yes or no):"
-)
 
-# LongMemEval abstention instances (question_id ending in \"_abs\"): the haystack
-# deliberately lacks the evidence, so the CORRECT behavior is to abstain.
-JUDGE_PROMPT_ABSTAIN = (
-    "You are a strict grader for a question-answering benchmark.\n"
-    "For this question the required information is NOT present in the model's source "
-    "material, so the correct behavior is to abstain: say the information is unavailable "
-    "or that it does not know.\n"
-    "Respond with exactly one word: yes if the model's answer abstains (does not commit "
-    "to a specific answer), or no if it asserts an answer.\n\n"
-    "Question: {question}\n"
-    "Reference note (what a fully-informed system would know): {gold}\n"
-    "Model answer: {answer}\n"
-    "Verdict (yes or no):"
-)
+def get_anscheck_prompt(task, question, answer, response, abstention=False):
+    """Judge prompt, ported VERBATIM from LongMemEval's official metric
+    (xiaowu0162/LongMemEval, src/evaluation/evaluate_qa.py::get_anscheck_prompt).
+
+    An earlier revision used one homegrown "does the response contain the gold
+    answer" judge for every type. That deviated from the official per-type
+    metric Zep was measured against: temporal answers were penalized for
+    off-by-one day counts (official metric explicitly forgives them), and
+    single-session-preference gold is a *rubric* describing a good personalized
+    reply — the homegrown judge treated that paragraph as a string the answer
+    had to contain, which almost nothing passes. The official per-type judge
+    grades exactly as the benchmark defines; verified to reproduce our number
+    bit-for-bit via the authors' own evaluate_qa.py.
+    """
+    if not abstention:
+        if task in ('single-session-user', 'single-session-assistant', 'multi-session'):
+            template = "I will give you a question, a correct answer, and a response from a model. Please answer yes if the response contains the correct answer. Otherwise, answer no. If the response is equivalent to the correct answer or contains all the intermediate steps to get the correct answer, you should also answer yes. If the response only contains a subset of the information required by the answer, answer no. \n\nQuestion: {}\n\nCorrect Answer: {}\n\nModel Response: {}\n\nIs the model response correct? Answer yes or no only."
+        elif task == 'temporal-reasoning':
+            template = "I will give you a question, a correct answer, and a response from a model. Please answer yes if the response contains the correct answer. Otherwise, answer no. If the response is equivalent to the correct answer or contains all the intermediate steps to get the correct answer, you should also answer yes. If the response only contains a subset of the information required by the answer, answer no. In addition, do not penalize off-by-one errors for the number of days. If the question asks for the number of days/weeks/months, etc., and the model makes off-by-one errors (e.g., predicting 19 days when the answer is 18), the model's response is still correct. \n\nQuestion: {}\n\nCorrect Answer: {}\n\nModel Response: {}\n\nIs the model response correct? Answer yes or no only."
+        elif task == 'knowledge-update':
+            template = "I will give you a question, a correct answer, and a response from a model. Please answer yes if the response contains the correct answer. Otherwise, answer no. If the response contains some previous information along with an updated answer, the response should be considered as correct as long as the updated answer is the required answer.\n\nQuestion: {}\n\nCorrect Answer: {}\n\nModel Response: {}\n\nIs the model response correct? Answer yes or no only."
+        elif task == 'single-session-preference':
+            template = "I will give you a question, a rubric for desired personalized response, and a response from a model. Please answer yes if the response satisfies the desired response. Otherwise, answer no. The model does not need to reflect all the points in the rubric. The response is correct as long as it recalls and utilizes the user's personal information correctly.\n\nQuestion: {}\n\nRubric: {}\n\nModel Response: {}\n\nIs the model response correct? Answer yes or no only."
+        else:
+            template = "I will give you a question, a correct answer, and a response from a model. Please answer yes if the response contains the correct answer. Otherwise, answer no. If the response is equivalent to the correct answer or contains all the intermediate steps to get the correct answer, you should also answer yes. If the response only contains a subset of the information required by the answer, answer no. \n\nQuestion: {}\n\nCorrect Answer: {}\n\nModel Response: {}\n\nIs the model response correct? Answer yes or no only."
+    else:
+        template = "I will give you an unanswerable question, an explanation, and a response from a model. Please answer yes if the model correctly identifies the question as unanswerable. The model could say that the information is incomplete, or some other information is given but the asked information is not.\n\nQuestion: {}\n\nExplanation: {}\n\nModel Response: {}\n\nDoes the model correctly identify the question as unanswerable? Answer yes or no only."
+    return template.format(question, answer, response)
 
 
 def est_tokens(text):
@@ -560,8 +569,8 @@ def main():
                         continue
                 hyps[system].append({"question_id": qid, "hypothesis": ans})
 
-                jt = JUDGE_PROMPT_ABSTAIN if is_abs else JUDGE_PROMPT
-                jp = jt.format(question=inst["question"], gold=inst["answer"], answer=ans or "(no answer)")
+                jp = get_anscheck_prompt(qtype, inst["question"], inst["answer"],
+                                         ans or "(no answer)", abstention=is_abs)
                 if args.mock_llm:
                     jraw = mock_judge(inst, ans)
                 else:
