@@ -6,6 +6,7 @@ Ready-to-use adapters that connect Perseus Vault to popular AI agent frameworks.
 
 | Framework | Type | Directory |
 |---|---|---|
+| **Python Client** | Official stdio transport client | [`client/`](client/) |
 | **LangGraph** (LangChain) | `BaseStore` implementation | [`langgraph/`](langgraph/) |
 | **CrewAI** | Agent Tool | [`crewai/`](crewai/) |
 | **AutoGen** (AG2 / autogen-core) | `Memory` implementation | [`autogen/`](autogen/) |
