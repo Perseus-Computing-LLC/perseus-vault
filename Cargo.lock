@@ -1878,6 +1878,7 @@ dependencies = [
  "base64 0.22.1",
  "clap",
  "futures",
+ "libc",
  "ndarray",
  "notify",
  "ort",
