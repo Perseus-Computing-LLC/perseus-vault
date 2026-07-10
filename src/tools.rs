@@ -1511,6 +1511,385 @@ pub fn handle_timeline(db: &Database, args: Value) -> Result<String, String> {
     Ok(result.to_string())
 }
 
+// ─── #521: failure-pattern / deja-vu guard ───────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct CheckFailurePatternArgs {
+    /// The command line or approach description the agent is about to (re)try.
+    pub action: String,
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub workspace_hash: String,
+    #[serde(
+        default = "default_failure_pattern_limit",
+        deserialize_with = "null_as_default_failure_pattern_limit"
+    )]
+    pub limit: i64,
+}
+
+fn default_failure_pattern_limit() -> i64 {
+    5
+}
+
+null_as_named_default!(
+    null_as_default_failure_pattern_limit,
+    i64,
+    default_failure_pattern_limit
+);
+
+/// Minimum blended relevance for a candidate to count as a deja-vu match.
+/// Well below an exact command retry (~0.9+) and a paraphrased approach
+/// (~0.6), well above incidental single-token overlap (~0.1).
+const FAILURE_MIN_RELEVANCE: f64 = 0.3;
+
+/// Recency half-life for failure-match ranking: a month-old failure carries
+/// half the recency weight of one recorded just now.
+const FAILURE_RECENCY_HALF_LIFE_MS: f64 = 30.0 * 24.0 * 3600.0 * 1000.0;
+
+/// Clip a string to at most `max` bytes on a char boundary.
+fn clip_str(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+/// Content tokens of the (lowercased) action: alphanumeric runs of >= 3
+/// chars, minus a tiny stopword list, sorted + deduplicated.
+fn failure_action_tokens(action_lc: &str) -> Vec<String> {
+    const STOP: &[&str] = &[
+        "the", "and", "for", "with", "that", "this", "from", "into", "over", "then", "was",
+        "were", "are", "has", "have", "had", "not", "but", "its", "you", "your", "when", "what",
+        "will",
+    ];
+    let mut toks: Vec<String> = action_lc
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| t.len() >= 3 && !STOP.contains(t))
+        .map(|t| t.to_string())
+        .collect();
+    toks.sort();
+    toks.dedup();
+    toks
+}
+
+/// Fraction of the action's trigram set present in the candidate's set —
+/// asymmetric containment, not Jaccard, because the candidate (a journal
+/// payload or entity body) is usually much longer than the action and would
+/// otherwise drown the similarity in its own union size. Both inputs are the
+/// sorted/deduplicated sets `dedup::packed_trigrams` produces.
+fn trigram_containment(needle: &[u64], hay: &[u64]) -> f64 {
+    if needle.is_empty() {
+        return 0.0;
+    }
+    let (mut i, mut j, mut inter) = (0usize, 0usize, 0usize);
+    while i < needle.len() && j < hay.len() {
+        match needle[i].cmp(&hay[j]) {
+            std::cmp::Ordering::Less => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+            std::cmp::Ordering::Equal => {
+                inter += 1;
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    inter as f64 / needle.len() as f64
+}
+
+/// Blended action-vs-candidate relevance in [0, 1]: character-trigram
+/// containment (existing #531 dedup machinery — catches exact and near-exact
+/// command retries) plus token overlap (catches paraphrased approaches).
+fn failure_relevance(action_tris: &[u64], action_tokens: &[String], haystack_lc: &str) -> f64 {
+    let hay_tris = crate::dedup::packed_trigrams(haystack_lc);
+    let containment = trigram_containment(action_tris, &hay_tris);
+    let token_frac = if action_tokens.is_empty() {
+        0.0
+    } else {
+        action_tokens
+            .iter()
+            .filter(|t| haystack_lc.contains(t.as_str()))
+            .count() as f64
+            / action_tokens.len() as f64
+    };
+    0.6 * containment + 0.4 * token_frac
+}
+
+/// Final ranking score: relevance modulated by recency and trust, all from
+/// existing scoring fields. `trust` is `(verified ? 1.0 : certainty)` blended
+/// with `decay_score` for entities, and a neutral 0.5 for journal events
+/// (which carry no trust/decay fields). Relevance dominates; recency + trust
+/// break ties among comparable matches.
+fn failure_score(relevance: f64, now: i64, created_ms: i64, trust: f64) -> f64 {
+    let age = (now - created_ms).max(0) as f64;
+    let recency = 0.5f64.powf(age / FAILURE_RECENCY_HALF_LIFE_MS);
+    relevance * (0.60 + 0.25 * recency + 0.15 * trust.clamp(0.0, 1.0))
+}
+
+/// First present key (as a compact string) across a list of JSON-object
+/// payloads. Non-string values are rendered compactly. Returns None when no
+/// payload has any of the keys.
+fn first_payload_field(payloads: &[&str], keys: &[&str]) -> Option<String> {
+    for payload in payloads {
+        let Ok(Value::Object(map)) = serde_json::from_str::<Value>(payload) else {
+            continue;
+        };
+        for key in keys {
+            match map.get(*key) {
+                Some(Value::String(s)) if !s.is_empty() => {
+                    return Some(clip_str(s, 400).to_string())
+                }
+                Some(Value::Null) | None => {}
+                Some(v) => return Some(clip_str(&v.to_string(), 400).to_string()),
+            }
+        }
+    }
+    None
+}
+
+/// A payload excerpt for fallback display: raw JSON clipped to 300 bytes,
+/// empty for the "{}"/empty placeholders.
+fn payload_excerpt(payload: &str) -> String {
+    let t = payload.trim();
+    if t.is_empty() || t == "{}" || t == "null" {
+        String::new()
+    } else {
+        clip_str(t, 300).to_string()
+    }
+}
+
+/// #521: does this entity DESCRIBE a failure/pitfall? Marker scan over
+/// category, type, tags, and body — the same marker list the journal arm's
+/// SQL prefilter uses (`db::FAILURE_MARKERS`).
+fn is_failure_entity(e: &Entity) -> bool {
+    let hay = format!(
+        "{} {} {} {}",
+        e.category,
+        e.entity_type,
+        e.tags.join(" "),
+        clip_str(&e.body_json, 32 * 1024)
+    )
+    .to_lowercase();
+    crate::db::FAILURE_MARKERS.iter().any(|m| hay.contains(m))
+}
+
+/// #521: `mimir_check_failure_pattern` — the deja-vu guard. Given an action
+/// (command line or approach description), search prior failures in BOTH the
+/// journal (error events + failure-marked payloads) and the entity store
+/// (failure/pitfall/root-cause memories, via the existing FTS5 recall), rank
+/// by relevance x (recency + trust/decay), and return matches plus a one-line
+/// warning. Read-only by contract: the entity search runs with
+/// `skip_side_effects` so checking never bumps retrieval counts or decay.
+pub fn handle_check_failure_pattern(db: &Database, args: Value) -> Result<String, String> {
+    let a: CheckFailurePatternArgs = serde_json::from_value(args)
+        .map_err(|e| format!("Invalid check_failure_pattern arguments: {}", e))?;
+
+    // #433 pattern: bound input sizes up front.
+    const MAX_ACTION_LEN: usize = 16 * 1024;
+    const MAX_WORKSPACE_LEN: usize = 256;
+    if a.action.len() > MAX_ACTION_LEN {
+        return Err(format!(
+            "action too long: {} bytes (max {})",
+            a.action.len(),
+            MAX_ACTION_LEN
+        ));
+    }
+    if a.workspace_hash.len() > MAX_WORKSPACE_LEN {
+        return Err(format!(
+            "workspace_hash too long: {} bytes (max {})",
+            a.workspace_hash.len(),
+            MAX_WORKSPACE_LEN
+        ));
+    }
+    let action = a.action.trim();
+    if action.is_empty() {
+        return Err(
+            "action is required: pass the command line or approach description you are about to retry"
+                .to_string(),
+        );
+    }
+    let limit = a.limit.clamp(1, 50);
+    let ws: Option<String> = if a.workspace_hash.is_empty() {
+        None
+    } else {
+        Some(a.workspace_hash.clone())
+    };
+
+    let action_lc = action.to_lowercase();
+    let action_tris = crate::dedup::packed_trigrams(&action_lc);
+    let action_tokens = failure_action_tokens(&action_lc);
+    let now = now_ms();
+
+    // Sort key: score desc, then recency desc for ties.
+    let mut scored: Vec<(f64, i64, Value)> = Vec::new();
+
+    // ── Journal arm: error events + failure-marked acted/forward payloads ──
+    const JOURNAL_SCAN_CAP: i64 = 1000;
+    let events = db
+        .failure_journal_candidates(ws.as_deref(), JOURNAL_SCAN_CAP)
+        .map_err(|e| format!("check_failure_pattern journal query failed: {}", e))?;
+    for ev in &events {
+        let hay = format!(
+            "{} {} {} {} {}",
+            ev.category,
+            ev.key,
+            clip_str(&ev.evaluated_json, 16 * 1024),
+            clip_str(&ev.acted_json, 16 * 1024),
+            clip_str(&ev.forward_json, 16 * 1024)
+        )
+        .to_lowercase();
+        let relevance = failure_relevance(&action_tris, &action_tokens, &hay);
+        if relevance < FAILURE_MIN_RELEVANCE {
+            continue;
+        }
+        let score = failure_score(relevance, now, ev.created_at_unix_ms, 0.5);
+        let what_failed = first_payload_field(
+            &[&ev.acted_json, &ev.evaluated_json],
+            &["what_failed", "command", "action", "what", "summary", "content", "text", "description"],
+        )
+        .unwrap_or_else(|| {
+            let acted = payload_excerpt(&ev.acted_json);
+            if acted.is_empty() {
+                payload_excerpt(&ev.evaluated_json)
+            } else {
+                acted
+            }
+        });
+        let cause = first_payload_field(
+            &[&ev.acted_json, &ev.evaluated_json],
+            &["cause", "root_cause", "error", "failure", "why", "result"],
+        )
+        .unwrap_or_default();
+        let resolution = first_payload_field(
+            &[&ev.forward_json],
+            &["resolution", "fix", "plan", "next", "takeaway", "lesson", "workaround"],
+        )
+        .unwrap_or_else(|| payload_excerpt(&ev.forward_json));
+        scored.push((
+            score,
+            ev.created_at_unix_ms,
+            json!({
+                "source": "journal",
+                "ref": ev.id,
+                "when": ev.created_at_unix_ms,
+                "what_failed": what_failed,
+                "cause": cause,
+                "resolution": resolution,
+                "score": (score * 1000.0).round() / 1000.0,
+            }),
+        ));
+    }
+
+    // ── Entity arm: failure/pitfall memories via the existing FTS5 recall ──
+    const ENTITY_POOL: i64 = 50;
+    let params = RecallParams {
+        query: action.to_string(),
+        limit: ENTITY_POOL,
+        // Pure read (#521): the guard must never reinforce/decay what it scans.
+        skip_side_effects: true,
+        mode: SearchMode::Fts5,
+        workspace_hash: ws.clone(),
+        // #485 widening: with a workspace set, also consider GLOBAL ('')
+        // failures at full weight — a global "this command breaks" memory
+        // should still warn — while other workspaces stay invisible.
+        scope_weight: if ws.is_some() { Some(1.0) } else { None },
+        ..RecallParams::default()
+    };
+    let entities = db
+        .recall(&params)
+        .map_err(|e| format!("check_failure_pattern entity search failed: {}", e))?;
+    for e in &entities {
+        if !is_failure_entity(e) {
+            continue;
+        }
+        let hay = format!(
+            "{} {} {} {}",
+            e.category,
+            e.key,
+            e.tags.join(" "),
+            clip_str(&e.body_json, 32 * 1024)
+        )
+        .to_lowercase();
+        let relevance = failure_relevance(&action_tris, &action_tokens, &hay);
+        if relevance < FAILURE_MIN_RELEVANCE {
+            continue;
+        }
+        let trust_base = if e.verified { 1.0 } else { e.certainty };
+        let trust = (trust_base.clamp(0.0, 1.0) + e.decay_score.clamp(0.0, 1.0)) / 2.0;
+        let score = failure_score(relevance, now, e.created_at_unix_ms, trust);
+        let what_failed = first_payload_field(
+            &[&e.body_json],
+            &["what_failed", "command", "action", "content", "summary", "title", "text"],
+        )
+        .unwrap_or_else(|| format!("{}/{}", e.category, e.key));
+        let cause = first_payload_field(
+            &[&e.body_json],
+            &["cause", "root_cause", "error", "failure", "why"],
+        )
+        .unwrap_or_default();
+        let resolution = first_payload_field(
+            &[&e.body_json],
+            &["resolution", "fix", "lesson", "takeaway", "workaround", "recommendation"],
+        )
+        .unwrap_or_default();
+        scored.push((
+            score,
+            e.created_at_unix_ms,
+            json!({
+                "source": "entity",
+                "ref": format!("{}/{}", e.category, e.key),
+                "id": e.id,
+                "when": e.created_at_unix_ms,
+                "what_failed": what_failed,
+                "cause": cause,
+                "resolution": resolution,
+                "score": (score * 1000.0).round() / 1000.0,
+            }),
+        ));
+    }
+
+    scored.sort_by(|a, b| {
+        b.0.partial_cmp(&a.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(b.1.cmp(&a.1))
+    });
+    scored.truncate(limit as usize);
+
+    if scored.is_empty() {
+        return Ok(json!({
+            "matches": [],
+            "deja_vu": false,
+            "message": "no prior failures recorded matching this action",
+        })
+        .to_string());
+    }
+
+    let top = &scored[0].2;
+    let top_what = clip_str(top["what_failed"].as_str().unwrap_or(""), 120);
+    let top_cause = clip_str(top["cause"].as_str().unwrap_or(""), 120);
+    let cause_part = if top_cause.is_empty() {
+        String::new()
+    } else {
+        format!(" (cause: {})", top_cause)
+    };
+    let warning = format!(
+        "deja-vu: {} prior recorded failure(s) match this action; most similar: \"{}\"{} — review the matches (cause/resolution) before retrying.",
+        scored.len(),
+        top_what,
+        cause_part
+    );
+
+    let matches: Vec<Value> = scored.into_iter().map(|(_, _, v)| v).collect();
+    Ok(json!({
+        "matches": matches,
+        "deja_vu": true,
+        "warning": warning,
+    })
+    .to_string())
+}
+
 pub fn handle_state_set(db: &Database, args: Value) -> Result<String, String> {
     let a: StateSetArgs =
         serde_json::from_value(args).map_err(|e| format!("Invalid state_set arguments: {}", e))?;
@@ -5000,6 +5379,301 @@ mod tests {
         .expect("tightening supersede");
         let v: Value = serde_json::from_str(&r).unwrap();
         assert_eq!(v["from_valid_to_unix_ms"], json!(vt - 10_000), "{r}");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ─── #521: failure-pattern / deja-vu guard ───────────────────
+
+    /// Seed a journal failure event directly (so tests control the timestamp
+    /// and workspace, unlike handle_journal which stamps now/derives ws).
+    fn seed_failure_event(db: &Database, id: &str, acted: &str, forward: &str, ws: &str, at: i64) {
+        db.journal(&JournalEvent {
+            id: id.to_string(),
+            event_type: "error".to_string(),
+            evaluated_json: "{}".to_string(),
+            acted_json: acted.to_string(),
+            forward_json: forward.to_string(),
+            category: String::new(),
+            key: String::new(),
+            entity_id: String::new(),
+            agent_id: String::new(),
+            workspace_hash: ws.to_string(),
+            created_at_unix_ms: at,
+        })
+        .expect("seed journal failure");
+    }
+
+    #[test]
+    fn check_failure_pattern_matches_journal_and_entity_failures() {
+        let (db, path) = temp_db();
+
+        // A journal-recorded command failure…
+        seed_failure_event(
+            &db,
+            "jrn-fp-1",
+            r#"{"command": "cargo build --no-default-features", "error": "LNK1120 unresolved external symbol"}"#,
+            r#"{"resolution": "run under vcvars64 with the MSVC toolchain"}"#,
+            "",
+            now_ms(),
+        );
+        // …and a remembered pitfall entity.
+        handle_remember(
+            &db,
+            json!({"category": "pitfall", "key": "npm-publish-otp",
+                   "tags": ["failure", "npm"],
+                   "body_json": "{\"content\":\"npm publish fails without OTP: E401 one-time password required\",\"resolution\":\"re-run npm publish --otp=<code>\"}"}),
+        )
+        .expect("remember pitfall");
+
+        // Retry of the failed command → journal match, deja_vu, warning.
+        let r = handle_check_failure_pattern(
+            &db,
+            json!({"action": "cargo build --no-default-features"}),
+        )
+        .expect("check journal arm");
+        let v: Value = serde_json::from_str(&r).unwrap();
+        assert_eq!(v["deja_vu"], json!(true), "{r}");
+        assert_eq!(v["matches"][0]["source"], json!("journal"), "{r}");
+        assert_eq!(v["matches"][0]["ref"], json!("jrn-fp-1"), "{r}");
+        assert!(
+            v["matches"][0]["what_failed"].as_str().unwrap().contains("cargo build"),
+            "{r}"
+        );
+        assert!(
+            v["matches"][0]["cause"].as_str().unwrap().contains("LNK1120"),
+            "{r}"
+        );
+        assert!(
+            v["matches"][0]["resolution"].as_str().unwrap().contains("vcvars64"),
+            "{r}"
+        );
+        let warning = v["warning"].as_str().expect("warning present");
+        assert!(warning.contains("deja-vu"), "{warning}");
+        assert!(!warning.contains('\n'), "warning must be one line: {warning}");
+
+        // Retry of the remembered pitfall → entity match with cause/resolution.
+        let r = handle_check_failure_pattern(&db, json!({"action": "npm publish"}))
+            .expect("check entity arm");
+        let v: Value = serde_json::from_str(&r).unwrap();
+        assert_eq!(v["deja_vu"], json!(true), "{r}");
+        assert_eq!(v["matches"][0]["source"], json!("entity"), "{r}");
+        assert_eq!(v["matches"][0]["ref"], json!("pitfall/npm-publish-otp"), "{r}");
+        assert!(
+            v["matches"][0]["resolution"].as_str().unwrap().contains("--otp"),
+            "{r}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn check_failure_pattern_empty_state_is_unambiguous() {
+        let (db, path) = temp_db();
+        // A recorded failure that does NOT match the action, plus a non-failure
+        // entity that DOES lexically match — neither may produce a deja-vu.
+        seed_failure_event(
+            &db,
+            "jrn-fp-other",
+            r#"{"command": "cargo build --no-default-features", "error": "LNK1120"}"#,
+            "{}",
+            "",
+            now_ms(),
+        );
+        handle_remember(
+            &db,
+            json!({"category": "convention", "key": "git-push-style",
+                   "body_json": "{\"content\":\"git push origin main is the normal successful deploy flow\"}"}),
+        )
+        .expect("non-failure entity");
+
+        let r = handle_check_failure_pattern(&db, json!({"action": "git push origin main"}))
+            .expect("check empty state");
+        let v: Value = serde_json::from_str(&r).unwrap();
+        assert_eq!(v["deja_vu"], json!(false), "{r}");
+        assert_eq!(v["matches"], json!([]), "{r}");
+        assert_eq!(
+            v["message"],
+            json!("no prior failures recorded matching this action"),
+            "{r}"
+        );
+        assert!(v.get("warning").is_none(), "no warning on empty state: {r}");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn check_failure_pattern_ranks_recent_failures_first() {
+        let (db, path) = temp_db();
+        let now = now_ms();
+        let ninety_days = 90 * 24 * 3600 * 1000i64;
+        seed_failure_event(
+            &db,
+            "jrn-fp-old",
+            r#"{"command": "docker compose up vault", "error": "port 8200 already in use"}"#,
+            "{}",
+            "",
+            now - ninety_days,
+        );
+        seed_failure_event(
+            &db,
+            "jrn-fp-new",
+            r#"{"command": "docker compose up vault", "error": "port 8200 already in use"}"#,
+            "{}",
+            "",
+            now,
+        );
+
+        let r = handle_check_failure_pattern(&db, json!({"action": "docker compose up vault"}))
+            .expect("check ranking");
+        let v: Value = serde_json::from_str(&r).unwrap();
+        assert_eq!(v["deja_vu"], json!(true), "{r}");
+        let matches = v["matches"].as_array().unwrap();
+        assert_eq!(matches.len(), 2, "{r}");
+        assert_eq!(matches[0]["ref"], json!("jrn-fp-new"), "recent first: {r}");
+        assert_eq!(matches[1]["ref"], json!("jrn-fp-old"), "{r}");
+        assert!(
+            matches[0]["score"].as_f64().unwrap() > matches[1]["score"].as_f64().unwrap(),
+            "recency must break the equal-relevance tie: {r}"
+        );
+
+        // limit clamps the result set (and a junk limit is clamped, not fatal).
+        let r = handle_check_failure_pattern(
+            &db,
+            json!({"action": "docker compose up vault", "limit": 1}),
+        )
+        .expect("limit=1");
+        let v: Value = serde_json::from_str(&r).unwrap();
+        assert_eq!(v["matches"].as_array().unwrap().len(), 1, "{r}");
+        assert_eq!(v["matches"][0]["ref"], json!("jrn-fp-new"), "{r}");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn check_failure_pattern_scopes_by_workspace_but_sees_global() {
+        let (db, path) = temp_db();
+        // ws-a journal failure + ws-a entity failure + one GLOBAL entity failure.
+        seed_failure_event(
+            &db,
+            "jrn-fp-wsa",
+            r#"{"command": "terraform apply prod", "error": "state lock held"}"#,
+            "{}",
+            "ws-a",
+            now_ms(),
+        );
+        handle_remember(
+            &db,
+            json!({"category": "pitfall", "key": "tf-apply-lock", "workspace_hash": "ws-a",
+                   "body_json": "{\"content\":\"terraform apply prod failed: state lock held by stale run\"}"}),
+        )
+        .expect("ws-a pitfall");
+        handle_remember(
+            &db,
+            json!({"category": "pitfall", "key": "tf-apply-global",
+                   "body_json": "{\"content\":\"terraform apply prod is broken on the v1 module, pin v0.9\"}"}),
+        )
+        .expect("global pitfall");
+
+        // From another workspace: ws-a's failures are invisible, but the
+        // GLOBAL (unscoped) failure still warns.
+        let r = handle_check_failure_pattern(
+            &db,
+            json!({"action": "terraform apply prod", "workspace_hash": "ws-b"}),
+        )
+        .expect("ws-b check");
+        let v: Value = serde_json::from_str(&r).unwrap();
+        let refs: Vec<&str> = v["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["ref"].as_str().unwrap())
+            .collect();
+        assert!(
+            !refs.contains(&"jrn-fp-wsa") && !refs.contains(&"pitfall/tf-apply-lock"),
+            "ws-a failures must not leak into ws-b: {r}"
+        );
+        assert!(
+            refs.contains(&"pitfall/tf-apply-global"),
+            "global failures must still warn in any workspace: {r}"
+        );
+
+        // From ws-a: everything (own + global) surfaces.
+        let r = handle_check_failure_pattern(
+            &db,
+            json!({"action": "terraform apply prod", "workspace_hash": "ws-a"}),
+        )
+        .expect("ws-a check");
+        let v: Value = serde_json::from_str(&r).unwrap();
+        let refs: Vec<&str> = v["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["ref"].as_str().unwrap())
+            .collect();
+        for expected in ["jrn-fp-wsa", "pitfall/tf-apply-lock", "pitfall/tf-apply-global"] {
+            assert!(refs.contains(&expected), "missing {expected}: {r}");
+        }
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn check_failure_pattern_is_a_pure_read() {
+        let (db, path) = temp_db();
+        handle_remember(
+            &db,
+            json!({"category": "pitfall", "key": "flaky-test",
+                   "body_json": "{\"content\":\"running the concurrent_writer test in CI fails intermittently\"}"}),
+        )
+        .expect("pitfall");
+
+        for _ in 0..3 {
+            let r = handle_check_failure_pattern(
+                &db,
+                json!({"action": "running the concurrent_writer test"}),
+            )
+            .expect("check");
+            let v: Value = serde_json::from_str(&r).unwrap();
+            assert_eq!(v["deja_vu"], json!(true), "{r}");
+        }
+
+        let e = db.get_entity("pitfall", "flaky-test").unwrap().unwrap();
+        assert_eq!(
+            e.retrieval_count, 0,
+            "the guard must never reinforce what it scans (skip_side_effects)"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn check_failure_pattern_bounds_inputs() {
+        let (db, path) = temp_db();
+
+        let err = handle_check_failure_pattern(&db, json!({"action": "   "}))
+            .expect_err("blank action must be rejected");
+        assert!(err.contains("action is required"), "{err}");
+
+        let err = handle_check_failure_pattern(
+            &db,
+            json!({"action": "x".repeat(16 * 1024 + 1)}),
+        )
+        .expect_err("oversized action must be rejected (#433 pattern)");
+        assert!(err.contains("action too long"), "{err}");
+
+        let err = handle_check_failure_pattern(
+            &db,
+            json!({"action": "ls", "workspace_hash": "w".repeat(257)}),
+        )
+        .expect_err("oversized workspace_hash must be rejected");
+        assert!(err.contains("workspace_hash too long"), "{err}");
+
+        // Explicit null limit falls back to the default instead of erroring (#330).
+        let r = handle_check_failure_pattern(&db, json!({"action": "ls -la", "limit": null}))
+            .expect("null limit uses the default");
+        let v: Value = serde_json::from_str(&r).unwrap();
+        assert_eq!(v["deja_vu"], json!(false), "{r}");
 
         let _ = std::fs::remove_file(&path);
     }

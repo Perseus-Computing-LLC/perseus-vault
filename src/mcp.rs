@@ -1527,6 +1527,59 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
     "title": "Append Journal Entry"
   },
   {
+    "name": "mimir_check_failure_pattern",
+    "description": "Deja-vu guard (#521): call BEFORE retrying a failed command or committing to an approach. Checks the action against previously recorded failures in both the journal (error events and failure-marked acted/forward payloads) and the entity store (failure/pitfall/root-cause memories), ranked by similarity, recency, and trust. Returns matching prior failures with the recorded cause and resolution, a deja_vu flag, and a one-line warning when the action was already tried and failed. Read-only: never bumps retrieval counts or decay. Record failures via mimir_journal (event_type 'error') or mimir_remember so the guard can find them.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "action": {
+          "type": "string",
+          "description": "The command line or approach description you are about to (re)try, e.g. 'cargo build --no-default-features' or 'parse the changelog with a regex'"
+        },
+        "workspace_hash": {
+          "type": "string",
+          "description": "Workspace scope filter. When set, only failures recorded in this workspace (plus global, unscoped ones) are matched; other workspaces' failures never leak. Omit for no workspace filtering."
+        },
+        "limit": {
+          "type": "integer",
+          "default": 5,
+          "description": "Maximum number of matches to return (1-50)"
+        }
+      },
+      "required": [
+        "action"
+      ]
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "matches": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          },
+          "description": "Prior failures matching the action, best first. Each: {source: 'journal'|'entity', ref, when (unix ms), what_failed, cause, resolution, score}"
+        },
+        "deja_vu": {
+          "type": "boolean",
+          "description": "True when at least one prior recorded failure matches the action"
+        },
+        "warning": {
+          "type": "string",
+          "description": "One-line agent-actionable deja-vu warning (present only when matches exist)"
+        },
+        "message": {
+          "type": "string",
+          "description": "Unambiguous empty state ('no prior failures recorded matching this action') when nothing matches"
+        }
+      }
+    },
+    "annotations": {
+      "readOnlyHint": true
+    },
+    "title": "Check Failure Pattern (Deja-Vu Guard)"
+  },
+  {
     "name": "mimir_timeline",
     "description": "Query journal events by time range with optional filters for event type, category, or entity. Use this to reconstruct the decision history and understand what happened when.",
     "inputSchema": {
@@ -3724,6 +3777,10 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
 
         "mimir_journal" => tools::handle_journal(db, args).map_err(|e| e.to_string()),
 
+        "mimir_check_failure_pattern" => {
+            tools::handle_check_failure_pattern(db, args).map_err(|e| e.to_string())
+        }
+
         "mimir_timeline" => tools::handle_timeline(db, args).map_err(|e| e.to_string()),
 
         "mimir_state_set" => tools::handle_state_set(db, args).map_err(|e| e.to_string()),
@@ -3854,6 +3911,51 @@ mod tests {
         let v: Value = serde_json::from_str(&r).unwrap();
         assert_eq!(v["fallback"], json!("consolidate"), "got: {r}");
         assert_eq!(v["dry_run"], json!(true));
+
+        let _ = fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn check_failure_pattern_is_registered_and_dispatches_under_aliases() {
+        // #521: tools/list must expose the deja-vu guard under the canonical
+        // name AND the rename-transition aliases (which come from the shared
+        // alias synthesis, not hand-duplicated entries).
+        let listed = list_tools(Some(json!(1)));
+        let tools_json = serde_json::to_string(&listed.result).unwrap();
+        for name in [
+            "\"mimir_check_failure_pattern\"",
+            "\"mneme_check_failure_pattern\"",
+            "\"perseus_vault_check_failure_pattern\"",
+        ] {
+            assert!(tools_json.contains(name), "tools/list missing {name}");
+        }
+
+        let db_path = std::env::temp_dir()
+            .join(format!("mimir-fpguard-{}.db", uuid::Uuid::new_v4()));
+        let db = Database::open(db_path.to_str().expect("temp db path")).expect("open temp db");
+
+        // Alias prefixes normalize into the same handler; empty store answers
+        // with the unambiguous empty state.
+        let r = call_tool(
+            "perseus_vault_check_failure_pattern",
+            &db,
+            json!({"action": "cargo build --release"}),
+            None,
+        );
+        let v: Value = serde_json::from_str(&r).unwrap();
+        assert_eq!(v["deja_vu"], json!(false), "got: {r}");
+        assert!(
+            v["message"]
+                .as_str()
+                .unwrap()
+                .contains("no prior failures recorded matching this action"),
+            "got: {r}"
+        );
+
+        // Missing required `action` → clean MCP tool error (isError, §3.3).
+        let r = call_tool("mimir_check_failure_pattern", &db, json!({}), None);
+        let v: Value = serde_json::from_str(&r).unwrap();
+        assert_eq!(v["isError"], json!(true), "got: {r}");
 
         let _ = fs::remove_file(&db_path);
     }

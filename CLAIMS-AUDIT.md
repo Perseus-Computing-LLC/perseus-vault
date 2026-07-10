@@ -8,10 +8,11 @@
 
 Claims verified against `src/`:
 
-- **55 MCP tools** — exactly 55 distinct `mimir_*` tool names registered in
+- **56 MCP tools** — exactly 56 distinct `mimir_*` tool names registered in
   source (`src/mcp.rs` TOOLS schema); each is additionally exposed under
   `mneme_*` and `perseus_vault_*` aliases (same handler, not counted).
-  README badge, comparison table, and the "55 MCP Tools" section all agree. ✓
+  README badge, comparison table, and the "56 MCP Tools" section all agree. ✓
+  (Recount 2026-07-09: 56 after `mimir_check_failure_pattern`, #521.)
 
   Verify the count against source (this is the authoritative command — re-run
   it and update README/manifest.json/glama.json whenever a tool is added):
