@@ -298,21 +298,16 @@ fn perseus_vault_alias_tool(tool: &serde_json::Value) -> Option<serde_json::Valu
     Some(alias)
 }
 
-/// Build the tools/list response with the full tool registry (each tool plus
-/// its mneme_*/perseus_vault_* aliases) including outputSchema and annotations.
-fn list_tools(id: Option<Value>) -> JsonRpcResponse {
-    // The tool registry is a compile-time constant. Parse it exactly once per
-    // process and reuse the cached Value instead of re-parsing ~1.8k lines of
-    // JSON on every tools/list request (perf review #208).
-    //
-    // Mneme rename (transition release): the canonical registry below still
-    // declares every tool under its original "mimir_*" name. We additionally
-    // synthesize a "mneme_*" alias entry for each one so clients that have
-    // already moved to the new product name see matching tools/list output.
-    // Both names dispatch to the same handler in `call_tool` below.
-    static TOOLS: OnceLock<serde_json::Value> = OnceLock::new();
-    let tools_json = TOOLS.get_or_init(|| {
-        let base = serde_json::from_str::<serde_json::Value>(
+/// Parse-once cache of the canonical tool registry. Every tool is declared
+/// under its original `mimir_*` name; rename-transition aliases (`mneme_*`,
+/// `perseus_vault_*`) are synthesized on top of this at advertise time by
+/// `build_tools_array`. The registry is a compile-time constant, parsed exactly
+/// once per process instead of re-parsing ~3.5k lines of JSON on every
+/// tools/list request (perf review #208).
+fn tool_registry_base() -> &'static Vec<serde_json::Value> {
+    static BASE: OnceLock<Vec<serde_json::Value>> = OnceLock::new();
+    BASE.get_or_init(|| {
+        serde_json::from_str::<serde_json::Value>(
         r###"[
   {
     "name": "mimir_remember",
@@ -3794,12 +3789,45 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
     },
     "title": "Global Recall (GraphRAG)"
   }
-]"###
-        ).expect("tools JSON must be valid");
+]"###,
+        )
+        .expect("tools JSON must be valid")
+        .as_array()
+        .expect("tools registry must be a JSON array")
+        .clone()
+    })
+}
 
-        let base_array = base.as_array().expect("tools registry must be a JSON array");
-        let mut aliased: Vec<serde_json::Value> = Vec::with_capacity(base_array.len() * 3);
-        for tool in base_array {
+/// Whether tools/list advertises all three rename-transition prefixes
+/// (`mimir_`/`mneme_`/`perseus_vault_`) or only the canonical
+/// `perseus_vault_*` set. Legacy names stay dispatchable via `call_tool`
+/// regardless — this controls only what is *advertised*, so a client sees one
+/// copy of each tool instead of three (the 3× manifest was tripling the
+/// tool-schema payload on every request for every connected client).
+///
+/// Default (unset or "canonical"): canonical-only. Opt back into the historical
+/// 3× manifest with `PERSEUS_VAULT_TOOL_ALIASES=all` (the legacy env
+/// `MIMIR_TOOL_ALIASES` is also honored, with `PERSEUS_VAULT_` taking
+/// precedence).
+fn advertise_all_aliases() -> bool {
+    let mode = std::env::var("PERSEUS_VAULT_TOOL_ALIASES")
+        .or_else(|_| std::env::var("MIMIR_TOOL_ALIASES"))
+        .unwrap_or_default();
+    matches!(
+        mode.trim().to_ascii_lowercase().as_str(),
+        "all" | "legacy" | "1" | "true"
+    )
+}
+
+/// Build the advertised tool array from the canonical registry. When
+/// `advertise_all` is false, only the canonical `perseus_vault_*` name is
+/// emitted for each tool; when true, all three rename-transition prefixes are
+/// emitted (the historical behavior).
+fn build_tools_array(base_array: &[serde_json::Value], advertise_all: bool) -> serde_json::Value {
+    let mut aliased: Vec<serde_json::Value> =
+        Vec::with_capacity(base_array.len() * if advertise_all { 3 } else { 1 });
+    for tool in base_array {
+        if advertise_all {
             aliased.push(tool.clone());
             if let Some(mneme_alias) = mneme_alias_tool(tool) {
                 aliased.push(mneme_alias);
@@ -3807,9 +3835,26 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
             if let Some(vault_alias) = perseus_vault_alias_tool(tool) {
                 aliased.push(vault_alias);
             }
+        } else {
+            // Canonical-only: advertise the perseus_vault_* name. A tool that
+            // (unexpectedly) isn't mimir_*-prefixed passes through unchanged.
+            aliased.push(perseus_vault_alias_tool(tool).unwrap_or_else(|| tool.clone()));
         }
-        serde_json::Value::Array(aliased)
-    });
+    }
+    serde_json::Value::Array(aliased)
+}
+
+/// Build the tools/list response. The canonical registry is parsed once
+/// (`tool_registry_base`); the advertised array is cached per advertise-mode so
+/// repeated tools/list calls don't re-synthesize it (perf review #208).
+fn list_tools(id: Option<Value>) -> JsonRpcResponse {
+    static TOOLS_ALL: OnceLock<serde_json::Value> = OnceLock::new();
+    static TOOLS_CANONICAL: OnceLock<serde_json::Value> = OnceLock::new();
+    let tools_json = if advertise_all_aliases() {
+        TOOLS_ALL.get_or_init(|| build_tools_array(tool_registry_base(), true))
+    } else {
+        TOOLS_CANONICAL.get_or_init(|| build_tools_array(tool_registry_base(), false))
+    };
 
     JsonRpcResponse {
         jsonrpc: "2.0".to_string(),
@@ -3966,13 +4011,53 @@ mod tests {
     use super::*;
     use std::fs;
 
+    /// Tool names advertised by tools/list for a given advertise-mode. Bypasses
+    /// the env var + OnceLock caching in `list_tools` so the two modes can be
+    /// asserted deterministically in the same process (no cross-test races).
+    fn advertised_names(advertise_all: bool) -> Vec<String> {
+        build_tools_array(tool_registry_base(), advertise_all)
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn tool_aliases_default_to_canonical_only() {
+        // The regression this guards (#tool-alias-triple): every connected
+        // client was loading each tool three times (mimir_/mneme_/perseus_vault_),
+        // tripling the tool-schema payload on every request. Default advertise
+        // mode must emit exactly one canonical `perseus_vault_*` copy per tool.
+        let canonical = advertised_names(false);
+        let all = advertised_names(true);
+        assert_eq!(
+            all.len(),
+            canonical.len() * 3,
+            "all-aliases must advertise 3× the canonical set"
+        );
+        assert!(
+            canonical.iter().all(|n| n.starts_with("perseus_vault_")),
+            "canonical mode must advertise only perseus_vault_* names"
+        );
+        assert!(
+            !canonical.iter().any(|n| n.starts_with("mimir_") || n.starts_with("mneme_")),
+            "canonical mode must not advertise legacy mimir_/mneme_ names"
+        );
+    }
+
     #[test]
     fn dream_is_registered_with_aliases_and_errors_cleanly_without_llm() {
-        // tools/list must expose mimir_dream and its rename-transition aliases.
-        let listed = list_tools(Some(json!(1)));
-        let tools_json = serde_json::to_string(&listed.result).unwrap();
-        for name in ["\"mimir_dream\"", "\"mneme_dream\"", "\"perseus_vault_dream\""] {
-            assert!(tools_json.contains(name), "tools/list missing {name}");
+        // Default advertises only the canonical name; the legacy prefixes stay
+        // dispatchable (asserted via call_tool below) but unadvertised. Opt-in
+        // `all` restores every rename-transition alias.
+        assert!(advertised_names(false).contains(&"perseus_vault_dream".to_string()));
+        assert!(!advertised_names(false).contains(&"mimir_dream".to_string()));
+        for name in ["mimir_dream", "mneme_dream", "perseus_vault_dream"] {
+            assert!(
+                advertised_names(true).contains(&name.to_string()),
+                "all-aliases missing {name}"
+            );
         }
 
         let db_path = std::env::temp_dir()
@@ -4014,14 +4099,16 @@ mod tests {
         // #521: tools/list must expose the deja-vu guard under the canonical
         // name AND the rename-transition aliases (which come from the shared
         // alias synthesis, not hand-duplicated entries).
-        let listed = list_tools(Some(json!(1)));
-        let tools_json = serde_json::to_string(&listed.result).unwrap();
+        assert!(advertised_names(false).contains(&"perseus_vault_check_failure_pattern".to_string()));
         for name in [
-            "\"mimir_check_failure_pattern\"",
-            "\"mneme_check_failure_pattern\"",
-            "\"perseus_vault_check_failure_pattern\"",
+            "mimir_check_failure_pattern",
+            "mneme_check_failure_pattern",
+            "perseus_vault_check_failure_pattern",
         ] {
-            assert!(tools_json.contains(name), "tools/list missing {name}");
+            assert!(
+                advertised_names(true).contains(&name.to_string()),
+                "all-aliases missing {name}"
+            );
         }
 
         let db_path = std::env::temp_dir()
@@ -4059,14 +4146,12 @@ mod tests {
         // #520: tools/list must expose the capture pipeline under the
         // canonical name AND the rename-transition aliases (which come from
         // the shared alias synthesis, not hand-duplicated entries).
-        let listed = list_tools(Some(json!(1)));
-        let tools_json = serde_json::to_string(&listed.result).unwrap();
-        for name in [
-            "\"mimir_capture\"",
-            "\"mneme_capture\"",
-            "\"perseus_vault_capture\"",
-        ] {
-            assert!(tools_json.contains(name), "tools/list missing {name}");
+        assert!(advertised_names(false).contains(&"perseus_vault_capture".to_string()));
+        for name in ["mimir_capture", "mneme_capture", "perseus_vault_capture"] {
+            assert!(
+                advertised_names(true).contains(&name.to_string()),
+                "all-aliases missing {name}"
+            );
         }
 
         let db_path = std::env::temp_dir()
@@ -4189,14 +4274,7 @@ mod tests {
             .join(format!("mimir-bitemporal-tools-{}.db", uuid::Uuid::new_v4()));
         let db = Database::open(db_path.to_str().expect("temp db path")).expect("open temp db");
 
-        let listed = list_tools(Some(json!(1)));
-        let tools = listed.result.expect("tools/list result")["tools"].clone();
-        let names: Vec<String> = tools
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|t| t["name"].as_str().unwrap().to_string())
-            .collect();
+        let names = advertised_names(true);
         for expect in [
             "mimir_valid_at",
             "mneme_valid_at",
@@ -4207,6 +4285,11 @@ mod tests {
         ] {
             assert!(names.contains(&expect.to_string()), "missing tool {expect}");
         }
+        // Canonical default advertises exactly the perseus_vault_* variants.
+        let canonical = advertised_names(false);
+        assert!(canonical.contains(&"perseus_vault_valid_at".to_string()));
+        assert!(canonical.contains(&"perseus_vault_bitemporal".to_string()));
+        assert!(!canonical.contains(&"mimir_valid_at".to_string()));
 
         // Round-trip through call_tool under every prefix.
         let stored = call_tool(
@@ -4427,9 +4510,8 @@ mod tests {
         assert!(rv.get("isError").is_none(), "got: {recall}");
         assert_eq!(rv["communities"].as_array().unwrap().len(), 1, "got: {recall}");
 
-        // tools/list advertises all three (x3 with aliases).
-        let listed = list_tools(Some(json!(1)));
-        let tools_arr = listed.result.unwrap()["tools"].as_array().unwrap().clone();
+        // In `all` mode tools/list advertises every prefix (x3 with aliases).
+        let all = advertised_names(true);
         for tool in [
             "mimir_communities",
             "mimir_community_summary",
@@ -4437,11 +4519,12 @@ mod tests {
             "mneme_global_recall",
             "perseus_vault_communities",
         ] {
-            assert!(
-                tools_arr.iter().any(|t| t["name"] == tool),
-                "tools/list must advertise {tool}"
-            );
+            assert!(all.contains(&tool.to_string()), "all-aliases must advertise {tool}");
         }
+        // Canonical default advertises only the perseus_vault_* variants.
+        let canonical = advertised_names(false);
+        assert!(canonical.contains(&"perseus_vault_global_recall".to_string()));
+        assert!(!canonical.contains(&"mimir_global_recall".to_string()));
 
         drop(db);
         let _ = fs::remove_file(&db_path);

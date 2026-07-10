@@ -179,6 +179,17 @@ Any MCP-compatible framework works with Perseus Vault directly. See
 
 ## 57 MCP Tools
 
+> **Tool names & the `perseus_vault_` prefix.** The tables below use the
+> historical `mimir_*` names, but by default the server now advertises each tool
+> **once**, under its canonical `perseus_vault_*` name (e.g. `perseus_vault_remember`).
+> The legacy `mimir_*` and `mneme_*` names remain fully *callable* — every prefix
+> dispatches to the same handler — they are just no longer advertised in
+> `tools/list`. This keeps the advertised manifest at 57 tools instead of 171
+> (57 × 3), so connected clients don't reload a tripled tool-schema payload on
+> every request. To restore the historical behaviour of advertising all three
+> prefixes, set `PERSEUS_VAULT_TOOL_ALIASES=all` (the legacy env
+> `MIMIR_TOOL_ALIASES` is also honoured; `PERSEUS_VAULT_` takes precedence).
+
 ### Entity CRUD
 | Tool | Description |
 |---|---|

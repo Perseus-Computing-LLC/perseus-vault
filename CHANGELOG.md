@@ -51,6 +51,20 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
   docs/capture.md for on_insight and SessionEnd wiring; end-of-session order is capture, then
   `maintain`).
 
+### Changed
+- **`tools/list` advertises the canonical `perseus_vault_*` names only by default**
+  — the tool manifest is no longer tripled. Since the Mimir→Mneme→Perseus Vault renames,
+  every tool was advertised three times (`mimir_*`, `mneme_*`, `perseus_vault_*`), so a
+  57-tool server exposed 171 entries. MCP clients that preload tool schemas (Rovo Dev,
+  OpenWebUI/Minions, and others) reloaded that tripled ~260 KB payload on **every request**
+  — reported in the field as context being "triple-input" each turn. The server now emits
+  one canonical `perseus_vault_*` copy per tool (171 → 57). The legacy `mimir_*`/`mneme_*`
+  names remain fully **callable** — `call_tool` still normalizes every prefix to the same
+  handler — they are simply no longer advertised, so no existing client that calls them by
+  name breaks. Opt back into advertising all three prefixes with
+  `PERSEUS_VAULT_TOOL_ALIASES=all` (legacy env `MIMIR_TOOL_ALIASES` also honored;
+  `PERSEUS_VAULT_` takes precedence).
+
 ### Performance
 - **Hybrid recall at 100K: 295.5 → 80.9 ms p50 (3.7×)** (#511). Hybrid — the default
   recall mode — carried ~250 ms of cost beyond its dense + fts5 arms at 100K entities.
