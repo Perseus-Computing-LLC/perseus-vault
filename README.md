@@ -91,6 +91,10 @@ everywhere. Run `perseus-vault doctor` to validate your install and print this m
 
 Copy-paste config snippets for each: **[docs/clients/](docs/clients/)**.
 
+Then wire the **recall → work → capture → consolidate** loop to your client's
+session events (SessionStart/Stop hooks for Claude Code, Codex, and Cursor,
+plus a portable AGENTS.md fallback): **[docs/lifecycle-hooks.md](docs/lifecycle-hooks.md)**.
+
 ## Why Perseus Vault
 
 Perseus Vault is the **only** memory engine that is simultaneously MCP-native,

@@ -20,6 +20,11 @@ into context before the model sees the prompt, instead of depending on the
 agent remembering to call `perseus_vault_recall_when` itself. `--json` emits
 structured output for programmatic hooks.
 
+Once your client is configured, see **[docs/lifecycle-hooks.md](../lifecycle-hooks.md)**
+for the session lifecycle hook contract — copy-paste SessionStart/Stop hook
+snippets for Claude Code, Codex, and Cursor that wire the recall → capture →
+consolidate loop to session events, plus a portable AGENTS.md fallback.
+
 | Client | Status | Config file | Notes |
 |---|---|---|---|
 | Claude Desktop | ✅ Works | `claude_desktop_config.json` | Most common host |
