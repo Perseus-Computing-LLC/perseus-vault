@@ -33,6 +33,23 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
   writes nothing. The verb now also replaces pre-rename `mimir`/`mneme` server entries
   with the canonical `perseus-vault` one instead of duplicating them, and ends by printing
   the save-in-one-session/recall-in-another verify walkthrough.
+- **Opt-in in-session memory capture** (#520): new CLI verb `perseus-vault capture` (stdin or
+  `--file`; plain text, markdown, or JSONL — auto-detected) and MCP tool `mimir_capture`
+  (aliases `perseus_vault_capture`/`mneme_capture`) that distill a session transcript or
+  insight payload into durable entities the moment a problem is solved, instead of waiting for
+  a scheduled harvest. The default distiller is fully local and deterministic (no LLM, no
+  network): headed sections / paragraphs / JSONL records become candidate notes, classified by
+  cheap keyword signals into root-cause / pitfall / decision / pattern / takeaway (failure
+  markers aligned with the #521 deja-vu guard) and written through the normal remember path
+  with `source="capture"`, layer buffer, moderate importance. `--llm` distills via the
+  configured `--llm-endpoint` instead and falls back to the rule-based path on any LLM
+  failure/timeout (#528 `MIMIR_LLM_TIMEOUT_SECS`). Flood control by design: trigram
+  near-duplicate merging stays ON (re-captured solved problems merge instead of piling up),
+  same-headline notes update in place, writes are hard-capped per invocation (20, lowerable via
+  `max_entities`; dropped notes are reported), and `--dry-run` previews. Off by default: capture
+  only happens when explicitly invoked (CLI / tool / user-written lifecycle hook — see
+  docs/capture.md for on_insight and SessionEnd wiring; end-of-session order is capture, then
+  `maintain`).
 
 ### Performance
 - **Write path: signature-driven near-duplicate scan** (#476, schema v17). The per-write

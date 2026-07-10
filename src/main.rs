@@ -1,3 +1,4 @@
+mod capture;
 mod communities;
 mod connectors;
 mod db;
@@ -514,6 +515,54 @@ enum Commands {
         #[arg(long)]
         legacy_context: bool,
     },
+
+    /// #520: opt-in in-session memory capture. Distill a transcript /
+    /// insight payload (stdin or --file; plain text, markdown, or JSONL —
+    /// auto-detected) into durable memory entities via a fully local,
+    /// deterministic rule-based distiller (or the configured LLM with
+    /// --llm, falling back to the rule-based path on any LLM failure), and
+    /// write them through the normal remember path with source="capture".
+    /// Near-duplicate merging stays ON and writes are capped per invocation
+    /// (anti-flood). Nothing runs automatically: capture happens only when
+    /// explicitly invoked — wire it to a lifecycle hook (on_insight /
+    /// SessionEnd, followed by `maintain`) for automatic in-session capture.
+    Capture {
+        /// SQLite database path
+        #[arg(long, default_value_t = default_db_path())]
+        db: String,
+        /// Read the payload from this file instead of stdin
+        #[arg(long)]
+        file: Option<String>,
+        /// Workspace hash to scope captured entities to
+        #[arg(long)]
+        workspace_hash: Option<String>,
+        /// Agent ID recorded on captured entities
+        #[arg(long)]
+        agent_id: Option<String>,
+        /// Anti-flood cap: max entities written per invocation (clamped to 20)
+        #[arg(long, default_value_t = 20)]
+        max_entities: i64,
+        /// Distill and print what would be written without storing anything
+        #[arg(long)]
+        dry_run: bool,
+        /// Distill via the configured LLM endpoint (requires --llm-endpoint;
+        /// falls back to the local rule-based distiller on any LLM error or
+        /// timeout — see MIMIR_LLM_TIMEOUT_SECS, #528)
+        #[arg(long)]
+        llm: bool,
+        /// LLM endpoint for --llm (same semantics as serve's --llm-endpoint)
+        #[arg(long)]
+        llm_endpoint: Option<String>,
+        /// API key for the LLM endpoint (Bearer token)
+        #[arg(long)]
+        llm_api_key: Option<String>,
+        /// LLM model name (default: llama3)
+        #[arg(long, default_value_t = String::from("llama3"))]
+        llm_model: String,
+        /// Path to AES-256-GCM encryption key file (base64-encoded, 32 bytes)
+        #[arg(long)]
+        encryption_key: Option<String>,
+    },
 }
 
 impl Commands {
@@ -538,7 +587,8 @@ impl Commands {
             | Commands::Purge { db, .. }
             | Commands::Doctor { db, .. }
             | Commands::Connect { db, .. }
-            | Commands::Prepare { db, .. } => Some(db),
+            | Commands::Prepare { db, .. }
+            | Commands::Capture { db, .. } => Some(db),
             Commands::ObsidianSync { .. } | Commands::Migrate { .. } | Commands::Keygen { .. } => {
                 None
             }
@@ -1950,6 +2000,32 @@ fn run_prepare(
     println!("{}", render_prepare_block(&recall_when_hits, &context_block.markdown));
 }
 
+/// #520: `perseus-vault capture` — the CLI face of the shared capture
+/// pipeline (`tools::handle_capture`, the same code path as the
+/// `mimir_capture` MCP tool). Builds the tool-args JSON from the CLI flags
+/// and returns the pipeline's structured report, so the verb is testable on
+/// a temp database without stdin plumbing.
+fn run_capture(
+    database: &db::Database,
+    payload: &str,
+    workspace_hash: Option<&str>,
+    agent_id: Option<&str>,
+    max_entities: i64,
+    dry_run: bool,
+    llm: bool,
+) -> Result<serde_json::Value, String> {
+    let args = serde_json::json!({
+        "text": payload,
+        "workspace_hash": workspace_hash.unwrap_or(""),
+        "agent_id": agent_id.unwrap_or(""),
+        "max_entities": max_entities,
+        "dry_run": dry_run,
+        "llm": llm,
+    });
+    let out = tools::handle_capture(database, args)?;
+    serde_json::from_str(&out).map_err(|e| format!("capture result serialization failed: {}", e))
+}
+
 /// Pure rendering step for `perseus-vault prepare`'s non-JSON output — split
 /// out from `run_prepare` so the markdown assembly (recall_when section
 /// present iff there are trigger matches, always-on/context section
@@ -2239,6 +2315,75 @@ fn main() {
                 Ok(d) => print_json(&d),
                 Err(e) => {
                     eprintln!("mimir: state-digest failed: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        Some(Commands::Capture {
+            db: ref db_path,
+            ref file,
+            ref workspace_hash,
+            ref agent_id,
+            max_entities,
+            dry_run,
+            llm,
+            ref llm_endpoint,
+            ref llm_api_key,
+            ref llm_model,
+            ref encryption_key,
+        }) => {
+            // Payload: --file wins; otherwise read stdin to EOF (the
+            // hook-friendly shape: `... | perseus-vault capture`).
+            let payload = match file {
+                Some(path) => match std::fs::read_to_string(path) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("perseus-vault: capture: failed to read {}: {}", path, e);
+                        std::process::exit(1);
+                    }
+                },
+                None => {
+                    use std::io::Read as _;
+                    let mut buf = String::new();
+                    if let Err(e) = std::io::stdin().read_to_string(&mut buf) {
+                        eprintln!("perseus-vault: capture: failed to read stdin: {}", e);
+                        std::process::exit(1);
+                    }
+                    buf
+                }
+            };
+
+            let mut database = open_db_or_exit(db_path);
+            if let Some(ref key_file) = encryption_key {
+                if let Err(e) = database.set_encryption(key_file) {
+                    eprintln!("perseus-vault: capture: encryption setup failed: {}", e);
+                    std::process::exit(1);
+                }
+            }
+            // --llm needs an endpoint; without one, handle_capture degrades
+            // gracefully to the rule-based distiller (and says so).
+            if llm {
+                if let Some(ref endpoint) = llm_endpoint {
+                    database.set_llm(true, endpoint, llm_model, llm_api_key.as_deref(), None, None);
+                }
+            }
+
+            match run_capture(
+                &database,
+                &payload,
+                workspace_hash.as_deref(),
+                agent_id.as_deref(),
+                max_entities,
+                dry_run,
+                llm,
+            ) {
+                Ok(result) => print_json(&result),
+                Err(e) => {
+                    // #516 pattern: machine-checkable JSON on stdout paired
+                    // with the non-zero exit, so output-parsing callers can't
+                    // mistake a failed capture for a persisted one.
+                    print_json(&serde_json::json!({ "ok": false, "error": e }));
+                    eprintln!("perseus-vault: capture failed: {}", e);
                     std::process::exit(1);
                 }
             }
@@ -3155,6 +3300,115 @@ mod tests {
             Some(Commands::Serve { db, .. }) => assert_eq!(db, "/tmp/top.db"),
             _ => panic!("expected serve subcommand"),
         }
+    }
+
+    #[test]
+    fn parses_capture_with_defaults_and_flags() {
+        // #520: defaults are conservative — stdin payload, cap 20, no
+        // dry-run, no LLM. Off by default at the product level: `capture`
+        // only runs when explicitly invoked.
+        let cli = Cli::parse_from(["perseus-vault", "capture", "--db", "/tmp/cap.db"]);
+        match cli.command {
+            Some(Commands::Capture {
+                db,
+                file,
+                max_entities,
+                dry_run,
+                llm,
+                ..
+            }) => {
+                assert_eq!(db, "/tmp/cap.db");
+                assert!(file.is_none());
+                assert_eq!(max_entities, 20);
+                assert!(!dry_run);
+                assert!(!llm);
+            }
+            _ => panic!("expected capture subcommand"),
+        }
+
+        let cli = Cli::parse_from([
+            "perseus-vault",
+            "capture",
+            "--file",
+            "/tmp/transcript.jsonl",
+            "--workspace-hash",
+            "ws-1",
+            "--max-entities",
+            "5",
+            "--dry-run",
+            "--llm",
+            "--llm-endpoint",
+            "http://localhost:11434/api/generate",
+        ]);
+        match cli.command {
+            Some(Commands::Capture {
+                file,
+                workspace_hash,
+                max_entities,
+                dry_run,
+                llm,
+                llm_endpoint,
+                ..
+            }) => {
+                assert_eq!(file.as_deref(), Some("/tmp/transcript.jsonl"));
+                assert_eq!(workspace_hash.as_deref(), Some("ws-1"));
+                assert_eq!(max_entities, 5);
+                assert!(dry_run);
+                assert!(llm);
+                assert!(llm_endpoint.unwrap().contains("11434"));
+            }
+            _ => panic!("expected capture subcommand"),
+        }
+
+        // #313: the top-level --db propagates like every other verb.
+        let mut cli = Cli::parse_from(["perseus-vault", "--db", "/tmp/top-cap.db", "capture"]);
+        apply_top_level_db(&mut cli);
+        match cli.command {
+            Some(Commands::Capture { db, .. }) => assert_eq!(db, "/tmp/top-cap.db"),
+            _ => panic!("expected capture subcommand"),
+        }
+    }
+
+    #[test]
+    fn capture_verb_roundtrips_on_a_temp_db() {
+        // #520: the CLI verb's code path (run_capture → tools::handle_capture)
+        // end to end on a temp database: distill, write, then re-capture and
+        // watch the flood control (same key → update, not a sibling row).
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("mimir-test-capture-cli-{}.db", uuid::Uuid::new_v4()));
+        let path_str = path.to_str().unwrap().to_string();
+        let database = db::Database::open(&path_str).expect("open temp db");
+
+        let payload = "# Root cause of the flaky test\n\
+                       The recall-gate test failed because the dense model cache was cold.\n\n\
+                       # Standing decision\n\
+                       We decided to rerun flaky suites once before investigating.";
+        let v = run_capture(&database, payload, Some("ws-cli"), Some("cli-agent"), 20, false, false)
+            .expect("capture must succeed");
+        assert_eq!(v["captured"], serde_json::json!(2), "{v}");
+        assert_eq!(v["created"], serde_json::json!(2), "{v}");
+
+        // Re-capturing the identical payload must not flood the store.
+        let v = run_capture(&database, payload, Some("ws-cli"), None, 20, false, false)
+            .expect("re-capture must succeed");
+        assert_eq!(v["created"], serde_json::json!(0), "{v}");
+        let stats = database.stats().expect("stats");
+        assert_eq!(stats.total_entities, 2, "re-capture must not add rows");
+
+        // dry_run distills but writes nothing.
+        let v = run_capture(&database, "A brand new durable takeaway about caching.", None, None, 20, true, false)
+            .expect("dry-run capture");
+        assert_eq!(v["dry_run"], serde_json::json!(true));
+        let stats = database.stats().expect("stats");
+        assert_eq!(stats.total_entities, 2);
+
+        // Empty payload surfaces the pipeline's error through the CLI path.
+        let err = run_capture(&database, "   ", None, None, 20, false, false)
+            .expect_err("empty payload must error");
+        assert!(err.contains("text is required"), "{err}");
+
+        drop(database);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

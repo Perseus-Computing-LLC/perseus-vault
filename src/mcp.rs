@@ -2215,6 +2215,98 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
     "title": "Extract Structured Knowledge"
   },
   {
+    "name": "mimir_capture",
+    "description": "Opt-in in-session memory capture (#520): distill a session transcript or insight payload into durable memory entities the moment a problem is solved, instead of waiting for a scheduled harvest. Splits the payload into candidate notes (headed sections, paragraphs, or JSONL records — auto-detected), classifies each by cheap local signals into root-cause / pitfall / decision / pattern / takeaway, and writes each through the normal remember path with source='capture' (layer buffer, moderate importance). Fully local and deterministic by default — no LLM, no network; pass llm=true to distill via the configured --llm-endpoint instead (falls back to the rule-based path on any LLM failure or timeout). Anti-flood by design: near-duplicate merging stays ON (a re-captured solved problem merges into the existing memory), same-headline notes update in place, and writes are capped per invocation with dropped notes reported. Nothing runs automatically — capture happens only when this tool (or the `perseus-vault capture` CLI verb) is explicitly invoked, e.g. from an on_insight or SessionEnd lifecycle hook (run `maintain` after end-of-session capture).",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "text": {
+          "type": "string",
+          "description": "The transcript / insight payload to distill. Plain text, markdown (headed sections become separate notes), or JSONL (one note per record, using its content/text/insight/lesson/summary/message field)."
+        },
+        "workspace_hash": {
+          "type": "string",
+          "description": "Workspace hash to scope the captured entities to. Omit for unscoped (global) capture."
+        },
+        "agent_id": {
+          "type": "string",
+          "description": "Agent ID recorded on the captured entities."
+        },
+        "max_entities": {
+          "type": "integer",
+          "default": 20,
+          "description": "Anti-flood cap: max entities written by this invocation (1-20; callers can lower the cap, not raise it). Notes beyond the cap are dropped and counted in the result."
+        },
+        "dry_run": {
+          "type": "boolean",
+          "default": false,
+          "description": "Distill and return the would-be notes without writing anything."
+        },
+        "llm": {
+          "type": "boolean",
+          "default": false,
+          "description": "Distill via the configured LLM endpoint instead of the local rule-based distiller. Requires --llm-endpoint; falls back to the rule-based path on any LLM failure (the result's llm_fallback field says why)."
+        }
+      },
+      "required": [
+        "text"
+      ]
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "captured": {
+          "type": "integer",
+          "description": "Number of notes distilled (and written, unless dry_run)"
+        },
+        "created": {
+          "type": "integer",
+          "description": "Notes that created a new entity"
+        },
+        "updated": {
+          "type": "integer",
+          "description": "Notes that updated an existing entity in place (same category+key)"
+        },
+        "merged": {
+          "type": "integer",
+          "description": "Notes merged into an existing near-duplicate entity by the trigram dedup (the capture flood control)"
+        },
+        "candidates": {
+          "type": "integer",
+          "description": "Candidate notes found in the payload before capping"
+        },
+        "dropped": {
+          "type": "integer",
+          "description": "Candidate notes dropped by the per-invocation cap"
+        },
+        "dry_run": {
+          "type": "boolean",
+          "description": "True when nothing was written"
+        },
+        "distiller": {
+          "type": "string",
+          "description": "'rule_based' or 'llm' — which distiller produced the notes"
+        },
+        "llm_fallback": {
+          "type": "string",
+          "description": "Present when llm=true was requested but the rule-based path was used; says why"
+        },
+        "notes": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          },
+          "description": "Per-note report: {id, key, type, summary, action}"
+        },
+        "message": {
+          "type": "string",
+          "description": "Unambiguous empty state when the payload contained nothing durable"
+        }
+      }
+    },
+    "title": "Capture Session Insights"
+  },
+  {
     "name": "mimir_traverse",
     "description": "Walk the entity link graph starting from a given entity up to a configurable depth. Returns a chain of linked entities — useful for exploring dependencies, decision trees, and relationship graphs built via mimir_link.",
     "inputSchema": {
@@ -3806,6 +3898,8 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
 
         "mimir_extract" => tools::handle_extract(db, args).map_err(|e| e.to_string()),
 
+        "mimir_capture" => tools::handle_capture(db, args).map_err(|e| e.to_string()),
+
         "mimir_traverse" => Ok(tools::handle_traverse(db, args)),
         "mimir_score" => Ok(tools::handle_score(db, args)),
         "mimir_follow" => tools::handle_follow(db, args).map_err(|e| e.to_string()),
@@ -3954,6 +4048,46 @@ mod tests {
 
         // Missing required `action` → clean MCP tool error (isError, §3.3).
         let r = call_tool("mimir_check_failure_pattern", &db, json!({}), None);
+        let v: Value = serde_json::from_str(&r).unwrap();
+        assert_eq!(v["isError"], json!(true), "got: {r}");
+
+        let _ = fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn capture_is_registered_and_dispatches_under_aliases() {
+        // #520: tools/list must expose the capture pipeline under the
+        // canonical name AND the rename-transition aliases (which come from
+        // the shared alias synthesis, not hand-duplicated entries).
+        let listed = list_tools(Some(json!(1)));
+        let tools_json = serde_json::to_string(&listed.result).unwrap();
+        for name in [
+            "\"mimir_capture\"",
+            "\"mneme_capture\"",
+            "\"perseus_vault_capture\"",
+        ] {
+            assert!(tools_json.contains(name), "tools/list missing {name}");
+        }
+
+        let db_path = std::env::temp_dir()
+            .join(format!("mimir-capture-{}.db", uuid::Uuid::new_v4()));
+        let db = Database::open(db_path.to_str().expect("temp db path")).expect("open temp db");
+
+        // Alias prefixes normalize into the same handler; a real payload
+        // distills and writes through the remember path.
+        let r = call_tool(
+            "perseus_vault_capture",
+            &db,
+            json!({"text": "The deploy failed because the schema version was never bumped."}),
+            None,
+        );
+        let v: Value = serde_json::from_str(&r).unwrap();
+        assert_eq!(v["captured"], json!(1), "got: {r}");
+        assert_eq!(v["created"], json!(1), "got: {r}");
+        assert_eq!(v["notes"][0]["type"], json!("root-cause"), "got: {r}");
+
+        // Empty payload → clean MCP tool error (isError, spec §3.3).
+        let r = call_tool("mimir_capture", &db, json!({"text": "  "}), None);
         let v: Value = serde_json::from_str(&r).unwrap();
         assert_eq!(v["isError"], json!(true), "got: {r}");
 

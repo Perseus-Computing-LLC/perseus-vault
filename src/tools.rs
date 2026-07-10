@@ -2103,6 +2103,207 @@ pub fn handle_extract(db: &Database, args: Value) -> Result<String, String> {
     .to_string())
 }
 
+// ─── #520: opt-in in-session memory capture ──────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct CaptureArgs {
+    /// The transcript / insight payload to distill (plain text, markdown,
+    /// or JSONL — auto-detected).
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub text: String,
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub workspace_hash: String,
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub agent_id: String,
+    /// Anti-flood cap: max entities written by this invocation. Clamped to
+    /// [`crate::capture::MAX_CAPTURE_NOTES`] — callers can lower, not raise.
+    #[serde(
+        default = "default_capture_max",
+        deserialize_with = "null_as_default_capture_max"
+    )]
+    pub max_entities: i64,
+    /// Preview: distill and report, write nothing.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub dry_run: bool,
+    /// Distill via the configured LLM endpoint instead of the local
+    /// rule-based distiller. Falls back to the rule-based path on ANY LLM
+    /// failure (not configured, transport error, timeout — #528
+    /// MIMIR_LLM_TIMEOUT_SECS — or unparseable output).
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub llm: bool,
+}
+
+fn default_capture_max() -> i64 {
+    crate::capture::MAX_CAPTURE_NOTES as i64
+}
+
+null_as_named_default!(null_as_default_capture_max, i64, default_capture_max);
+
+/// #520: `mimir_capture` / `perseus-vault capture` — the shared in-session
+/// capture pipeline. Distills a transcript/insight payload into durable
+/// notes (root-cause / pitfall / decision / pattern / takeaway) and writes
+/// each through the normal remember path with `source="capture"`, layer
+/// "buffer", moderate importance.
+///
+/// Flood control, by design (#520): the trigram near-duplicate merge stays
+/// ON (a re-captured solved problem merges into the existing memory instead
+/// of piling up siblings), the same-summary slug key updates in place, and
+/// the per-invocation cap is hard (dropped notes are reported, not silently
+/// eaten). Off by default at the product level: nothing calls this unless a
+/// user/hook explicitly invokes the tool or CLI verb.
+pub fn handle_capture(db: &Database, args: Value) -> Result<String, String> {
+    let a: CaptureArgs =
+        serde_json::from_value(args).map_err(|e| format!("Invalid capture arguments: {}", e))?;
+
+    // #433 pattern: bound input sizes up front (same body cap as remember).
+    const MAX_TEXT_LEN: usize = 4 * 1024 * 1024; // 4 MiB
+    const MAX_WORKSPACE_LEN: usize = 256;
+    if a.text.len() > MAX_TEXT_LEN {
+        return Err(format!(
+            "text too long: {} bytes (max {})",
+            a.text.len(),
+            MAX_TEXT_LEN
+        ));
+    }
+    if a.workspace_hash.len() > MAX_WORKSPACE_LEN {
+        return Err(format!(
+            "workspace_hash too long: {} bytes (max {})",
+            a.workspace_hash.len(),
+            MAX_WORKSPACE_LEN
+        ));
+    }
+    if a.text.trim().is_empty() {
+        return Err(
+            "text is required: pass the transcript or insight payload to distill".to_string(),
+        );
+    }
+    let max_notes = a.max_entities.clamp(1, crate::capture::MAX_CAPTURE_NOTES as i64) as usize;
+
+    // Distiller selection: rule-based is the floor; the LLM path degrades to
+    // it on any failure so a capture invocation never comes back empty-handed
+    // because a model was slow, down, or chatty.
+    let mut distiller = "rule_based";
+    let mut llm_fallback: Option<String> = None;
+    let report = if a.llm {
+        if !db.llm_enabled() {
+            llm_fallback = Some(
+                "LLM is not enabled (set --llm-endpoint); used the local rule-based distiller"
+                    .to_string(),
+            );
+            crate::capture::distill(&a.text, max_notes)
+        } else {
+            // Existing #365 completion helper: gated on llm_config.enabled,
+            // with the #528 MIMIR_LLM_TIMEOUT_SECS transport timeout applied.
+            match db.llm_generate(&crate::capture::llm_prompt(&a.text)) {
+                Ok(raw) => match crate::capture::parse_llm_notes(&raw, max_notes) {
+                    Some(r) => {
+                        distiller = "llm";
+                        r
+                    }
+                    None => {
+                        llm_fallback = Some(
+                            "LLM returned unparseable output; used the local rule-based distiller"
+                                .to_string(),
+                        );
+                        crate::capture::distill(&a.text, max_notes)
+                    }
+                },
+                Err(e) => {
+                    llm_fallback = Some(format!(
+                        "LLM call failed ({}); used the local rule-based distiller",
+                        e
+                    ));
+                    crate::capture::distill(&a.text, max_notes)
+                }
+            }
+        }
+    } else {
+        crate::capture::distill(&a.text, max_notes)
+    };
+
+    let mut written = Vec::with_capacity(report.notes.len());
+    let (mut created, mut updated, mut merged) = (0i64, 0i64, 0i64);
+    for note in &report.notes {
+        let now = now_ms();
+        let raw_id = Uuid::new_v4().to_string().replace('-', "");
+        let id = format!("mem-{}", &raw_id[..12.min(raw_id.len())]);
+        let body = json!({ "content": note.content, "summary": note.summary }).to_string();
+        let entity = Entity {
+            id,
+            category: "capture".to_string(),
+            key: note.key.clone(),
+            body_json: body,
+            status: "active".to_string(),
+            entity_type: note.entity_type.clone(),
+            tags: vec!["capture".to_string()],
+            decay_score: 0.6, // moderate importance: fresh, unreviewed
+            retrieval_count: 0,
+            layer: "buffer".to_string(),
+            topic_path: String::new(),
+            archived: false,
+            archive_reason: String::new(),
+            links: vec![],
+            verified: false,
+            source: "capture".to_string(),
+            always_on: false,
+            certainty: 0.6,
+            workspace_hash: a.workspace_hash.clone(),
+            agent_id: a.agent_id.clone(),
+            visibility: "workspace".to_string(),
+            created_at_unix_ms: now,
+            last_accessed_unix_ms: now,
+            follow_count: 0,
+            miss_count: 0,
+            follow_rate: 0.0,
+            efficacy_status: "unverified".to_string(),
+            embedding: None,
+        };
+
+        let (eid, action) = if a.dry_run {
+            (String::new(), "dry-run (not written)".to_string())
+        } else {
+            // Anti-flood: dedup deliberately stays ON (never skip_dedup here)
+            // — near-dup merging IS the capture flood control (#520).
+            db.remember_with_options(&entity, false, None, None)
+                .map_err(|e| format!("Capture write failed for key '{}': {}", note.key, e))?
+        };
+        if action == "created" {
+            created += 1;
+        } else if action == "updated" {
+            updated += 1;
+        } else if action.starts_with("deduped") {
+            merged += 1;
+        }
+        written.push(json!({
+            "id": if eid.is_empty() { Value::Null } else { json!(eid) },
+            "key": note.key,
+            "type": note.entity_type,
+            "summary": note.summary,
+            "action": action,
+        }));
+    }
+
+    let mut result = json!({
+        "captured": report.notes.len(),
+        "created": created,
+        "updated": updated,
+        "merged": merged,
+        "candidates": report.candidates,
+        "dropped": report.dropped,
+        "dry_run": a.dry_run,
+        "distiller": distiller,
+        "notes": written,
+    });
+    if let Some(reason) = llm_fallback {
+        result["llm_fallback"] = json!(reason);
+    }
+    if report.notes.is_empty() {
+        result["message"] =
+            json!("nothing durable found in the payload (rule-based distiller is precision-over-recall)");
+    }
+    Ok(result.to_string())
+}
+
 #[derive(Debug, Deserialize)]
 pub struct VaultExportArgs {
     pub vault_dir: String,
@@ -3669,6 +3870,136 @@ mod tests {
             json!({"query": "x", "workspace_hash": "ws-a", "scope_weight": 0.5}),
         )
         .expect("valid scope_weight must be accepted");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ─── #520: in-session capture pipeline ───────────────────────
+
+    #[test]
+    fn capture_roundtrip_classifies_and_writes_with_capture_source() {
+        let (db, path) = temp_db();
+        let payload = "# Root cause of the deploy failure\n\
+                       The deploy failed because the schema version was never bumped by #487.\n\n\
+                       # Toolchain decision\n\
+                       We decided to standardize on the MSVC toolchain for Windows builds.";
+        let r = handle_capture(&db, json!({"text": payload, "workspace_hash": "ws-cap"}))
+            .expect("capture must succeed");
+        let v: Value = serde_json::from_str(&r).unwrap();
+        assert_eq!(v["captured"], json!(2), "{r}");
+        assert_eq!(v["created"], json!(2), "{r}");
+        assert_eq!(v["distiller"], json!("rule_based"), "{r}");
+        assert_eq!(v["notes"][0]["type"], json!("root-cause"), "{r}");
+        assert_eq!(v["notes"][1]["type"], json!("decision"), "{r}");
+
+        // The entities landed via the normal remember path with the capture
+        // provenance: category "capture", source "capture", layer buffer.
+        let key = v["notes"][0]["key"].as_str().unwrap();
+        let ent = db
+            .get_entity("capture", key)
+            .expect("get_entity")
+            .expect("captured entity must exist");
+        assert_eq!(ent.source, "capture");
+        assert_eq!(ent.layer, "buffer");
+        assert_eq!(ent.workspace_hash, "ws-cap");
+        assert!(ent.body_json.contains("schema version"), "{}", ent.body_json);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn capture_near_duplicate_merges_instead_of_flooding() {
+        // #520 anti-flood: the trigram dedup stays ON for captures — a
+        // re-captured solved problem (slightly reworded, different headline
+        // → different key) merges into the existing memory instead of
+        // creating a sibling row.
+        let (db, path) = temp_db();
+        let first = "Fix for the FK constraint failure: the migration failed because \
+                     the foreign key constraint on entities was validated before the \
+                     backfill ran, so ordering the backfill first resolves it.";
+        let r = handle_capture(&db, json!({"text": first})).expect("first capture");
+        let v: Value = serde_json::from_str(&r).unwrap();
+        assert_eq!(v["created"], json!(1), "{r}");
+
+        // Near-identical wording, different first line → different slug key.
+        let second = "Another note: the migration failed because the foreign key \
+                      constraint on entities was validated before the backfill ran, \
+                      so ordering the backfill first resolves it.";
+        let r = handle_capture(&db, json!({"text": second})).expect("second capture");
+        let v: Value = serde_json::from_str(&r).unwrap();
+        assert_eq!(v["created"], json!(0), "near-dup must not create: {r}");
+        assert_eq!(v["merged"], json!(1), "near-dup must merge: {r}");
+        assert!(
+            v["notes"][0]["action"].as_str().unwrap().starts_with("deduped"),
+            "{r}"
+        );
+
+        // Identical payload again: same summary → same key → in-place update.
+        let r = handle_capture(&db, json!({"text": first})).expect("re-capture");
+        let v: Value = serde_json::from_str(&r).unwrap();
+        assert_eq!(v["created"], json!(0), "{r}");
+        assert_eq!(v["updated"].as_i64().unwrap() + v["merged"].as_i64().unwrap(), 1, "{r}");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn capture_caps_writes_and_dry_run_writes_nothing() {
+        let (db, path) = temp_db();
+        let payload = (0..30)
+            .map(|i| format!("Durable takeaway number {i} about the capture cap behavior."))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+
+        // dry_run: full report, zero writes.
+        let r = handle_capture(&db, json!({"text": payload, "dry_run": true, "max_entities": 100}))
+            .expect("dry-run capture");
+        let v: Value = serde_json::from_str(&r).unwrap();
+        assert_eq!(v["dry_run"], json!(true));
+        assert_eq!(v["captured"], json!(20), "hard cap even when asked for 100: {r}");
+        assert_eq!(v["dropped"], json!(10), "{r}");
+        assert_eq!(v["created"], json!(0), "{r}");
+        let stats = db.stats().expect("stats");
+        assert_eq!(stats.total_entities, 0, "dry-run must write nothing");
+
+        // Real run with a lowered cap. The three templated notes are >=70%
+        // trigram-similar by construction, so the second flood-control layer
+        // (dedup, deliberately ON for captures) merges them into one row —
+        // cap AND dedup both bounding the write volume is the #520 design.
+        let r = handle_capture(&db, json!({"text": payload, "max_entities": 3}))
+            .expect("capped capture");
+        let v: Value = serde_json::from_str(&r).unwrap();
+        assert_eq!(v["captured"], json!(3), "{r}");
+        assert_eq!(v["dropped"], json!(27), "{r}");
+        assert_eq!(v["created"], json!(1), "{r}");
+        assert_eq!(v["merged"], json!(2), "{r}");
+        let stats = db.stats().expect("stats");
+        assert_eq!(stats.total_entities, 1);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn capture_llm_flag_degrades_gracefully_without_endpoint() {
+        // llm=true with no --llm-endpoint configured must NOT error: the
+        // rule-based distiller is the floor, and the result says why.
+        let (db, path) = temp_db();
+        let r = handle_capture(
+            &db,
+            json!({"text": "Lesson: always trim PATH before invoking vcvars.", "llm": true}),
+        )
+        .expect("llm capture must fall back, not fail");
+        let v: Value = serde_json::from_str(&r).unwrap();
+        assert_eq!(v["distiller"], json!("rule_based"), "{r}");
+        assert!(
+            v["llm_fallback"].as_str().unwrap().contains("not enabled"),
+            "{r}"
+        );
+        assert_eq!(v["captured"], json!(1), "{r}");
+
+        // Empty text is the only hard error.
+        let err = handle_capture(&db, json!({"text": ""})).expect_err("empty text");
+        assert!(err.contains("text is required"), "{err}");
+
         let _ = std::fs::remove_file(&path);
     }
 
