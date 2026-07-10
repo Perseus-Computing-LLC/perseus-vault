@@ -40,6 +40,7 @@ notify = "6"
 serde_yaml = "0.9"
 async-stream = "0.3"
 futures = "0.3"
+libc = "0.2"
 
 # Optional: bundled embedding model (all-MiniLM-L6-v2 via ONNX Runtime)
 ort = { version = "2.0.0-rc.12", optional = true, features = ["download-binaries"] }
