@@ -126,6 +126,22 @@ mimir --encryption-key ~/.mimir/secret.key    # start with encryption on
 
 ---
 
+## Verifying releases
+
+Release binaries carry **signed SLSA build provenance** (Sigstore-signed, via
+GitHub Artifact Attestations). After downloading a release archive you can
+verify it was built by our release workflow from this repository:
+
+```bash
+gh attestation verify perseus-vault-lite-x86_64-unknown-linux-musl.tar.gz \
+  --repo Perseus-Computing-LLC/perseus-vault
+```
+
+A successful verification confirms the artifact's provenance (repo, workflow,
+commit) and that it has not been tampered with since it was built.
+
+---
+
 ## Contact
 
 Security: **perseus@perseus.observer**
