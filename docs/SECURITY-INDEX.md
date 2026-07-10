@@ -43,7 +43,7 @@ access can be reviewed and revoked. No keys or tokens appear here.
 
 | Privilege | Holder(s) | Notes |
 |---|---|---|
-| Repository admin | Thomas Connally (`tcconnally`) | Sole repo-admin as of 2026-07-10. Mark Thrailkill contributes via org write access — `[CONFIRM whether Mark should hold admin]` |
+| Repository admin | Thomas Connally (`tcconnally`), Mark Thrailkill | Both hold repo admin as of 2026-07-10. |
 | Merge to protected `main` | via PR + required `test` check | ✅ Verified: `main` is protected and requires the `test` status check. No direct pushes. |
 | Release / publish (crates.io, GHCR, MCP registry) | `[CONFIRM token holder(s)]` | Publishing credentials held out-of-band, not in repo |
 | Release signing / provenance | *none yet* | Signed releases + SLSA provenance are a tracked milestone (§ SECURITY-MILESTONES) |
