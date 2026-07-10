@@ -172,6 +172,30 @@ impl Default for LlmConfig {
     }
 }
 
+/// #521: lowercase text markers that indicate a stored record DESCRIBES A
+/// FAILURE. Shared by the failure-pattern guard's two arms: the journal
+/// candidate query (`failure_journal_candidates`, SQL LIKE prefilter) and the
+/// entity-store filter in `tools::handle_check_failure_pattern`. Substring
+/// semantics: "fail" covers failed/failure/failing. Deliberately excludes
+/// "bug" ("debug" would false-positive on routine payloads).
+pub(crate) const FAILURE_MARKERS: &[&str] = &[
+    "fail",
+    "error",
+    "pitfall",
+    "broke",
+    "mistake",
+    "wrong",
+    "regression",
+    "root cause",
+    "root-cause",
+    "doesn't work",
+    "does not work",
+    "didn't work",
+    "did not work",
+    "incident",
+    "postmortem",
+];
+
 /// Categories kept out of the shared recall/context ranking surface unless a
 /// caller asks for them explicitly (by `category`). Default: `conversation` —
 /// raw auto-captured turns otherwise dominate broad recall and bury curated
@@ -4803,6 +4827,90 @@ impl Database {
                 // Not selected by this listing query; purge-scoping metadata only.
                 workspace_hash: String::new(),
                 created_at_unix_ms: row.get(9)?,
+            })
+        })?;
+
+        let mut items = Vec::new();
+        for row in rows {
+            items.push(row?);
+        }
+        Ok(items)
+    }
+
+    /// #521: journal-side candidate query for the failure-pattern / deja-vu
+    /// guard (`mimir_check_failure_pattern`). Returns the most recent journal
+    /// events that RECORD A FAILURE — `event_type = 'error'`, or a payload
+    /// that mentions one of [`FAILURE_MARKERS`] — most recent first, capped
+    /// at `scan_cap`. Relevance scoring against the caller's action happens
+    /// in the tool handler; this only narrows the scan to failure records.
+    ///
+    /// Workspace scoping mirrors recall's #485 widened filter: with a
+    /// non-empty `workspace_hash`, only events stamped with that workspace
+    /// (plus global/unscoped '' events) are returned — other workspaces'
+    /// events never leak (#417 scoping). `None` = no workspace filtering.
+    ///
+    /// Pure read: no reinforcement, no decay side effects.
+    pub fn failure_journal_candidates(
+        &self,
+        workspace_hash: Option<&str>,
+        scan_cap: i64,
+    ) -> Result<Vec<JournalEvent>, Box<dyn std::error::Error>> {
+        let conn = self.conn()?;
+
+        // Failure prefilter: an explicit error event, or a payload whose text
+        // mentions a failure marker. LIKE over the lowercased payload keeps
+        // this on the existing storage model (no new table/index, #521); the
+        // ORDER BY ... LIMIT bound and the marker prefilter keep the scan from
+        // returning the whole journal.
+        let haystack = "lower(evaluated_json || ' ' || acted_json || ' ' || forward_json)";
+        let marker_clauses = FAILURE_MARKERS
+            .iter()
+            .map(|m| format!("{haystack} LIKE '%{}%'", m.replace('\'', "''")))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+
+        let mut sql = format!(
+            "SELECT id, event_type, evaluated_json, acted_json, forward_json,
+                    category, key, entity_id, agent_id, workspace_hash, created_at_unix_ms
+             FROM journal
+             WHERE (event_type = 'error' OR {marker_clauses})"
+        );
+
+        let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        if let Some(ws) = workspace_hash {
+            if !ws.is_empty() {
+                sql.push_str(&format!(
+                    " AND workspace_hash IN (?{}, '')",
+                    param_values.len() + 1
+                ));
+                param_values.push(Box::new(ws.to_string()));
+            }
+        }
+
+        let safe_cap = scan_cap.clamp(1, 5000);
+        sql.push_str(&format!(
+            " ORDER BY created_at_unix_ms DESC LIMIT ?{}",
+            param_values.len() + 1
+        ));
+        param_values.push(Box::new(safe_cap));
+
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            param_values.iter().map(|p| p.as_ref()).collect();
+
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(param_refs.as_slice(), |row| {
+            Ok(JournalEvent {
+                id: row.get(0)?,
+                event_type: row.get(1)?,
+                evaluated_json: row.get(2)?,
+                acted_json: row.get(3)?,
+                forward_json: row.get(4)?,
+                category: row.get(5)?,
+                key: row.get(6)?,
+                entity_id: row.get(7)?,
+                agent_id: row.get::<_, Option<String>>(8).unwrap_or(None).unwrap_or_default(),
+                workspace_hash: row.get::<_, Option<String>>(9).unwrap_or(None).unwrap_or_default(),
+                created_at_unix_ms: row.get(10)?,
             })
         })?;
 
@@ -15095,6 +15203,77 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_type, "decision");
         assert!(events[0].acted_json.contains("pg"));
+
+        let _ = fs::remove_file(&path);
+    }
+
+    // ─── #521: failure-pattern guard journal candidates ──────────
+
+    #[test]
+    fn failure_journal_candidates_filter_scope_and_order() {
+        let (db, path) = temp_db();
+        let now = now_ms();
+        let mk = |id: &str, event_type: &str, acted: &str, ws: &str, at: i64| JournalEvent {
+            id: id.to_string(),
+            event_type: event_type.to_string(),
+            evaluated_json: "{}".to_string(),
+            acted_json: acted.to_string(),
+            forward_json: "{}".to_string(),
+            category: String::new(),
+            key: String::new(),
+            entity_id: String::new(),
+            agent_id: String::new(),
+            workspace_hash: ws.to_string(),
+            created_at_unix_ms: at,
+        };
+
+        // (a) explicit error event — always a candidate, even with a bland payload.
+        db.journal(&mk("jrn-err", "error", r#"{"command": "make deploy"}"#, "", now - 3000))
+            .unwrap();
+        // (b) decision event whose payload MENTIONS a failure marker.
+        db.journal(&mk(
+            "jrn-marked",
+            "decision",
+            r#"{"what": "retried the migration, it failed on the FK constraint"}"#,
+            "",
+            now - 2000,
+        ))
+        .unwrap();
+        // (c) success-y decision event — must NOT be a candidate.
+        db.journal(&mk(
+            "jrn-ok",
+            "decision",
+            r#"{"what": "release went smoothly, all checks green"}"#,
+            "",
+            now - 1000,
+        ))
+        .unwrap();
+        // (d) failure in another workspace — excluded under a ws filter.
+        db.journal(&mk(
+            "jrn-other-ws",
+            "error",
+            r#"{"command": "kubectl apply"}"#,
+            "ws-other",
+            now,
+        ))
+        .unwrap();
+
+        // Unscoped: all failure records, most recent first, no success rows.
+        let got = db.failure_journal_candidates(None, 100).unwrap();
+        let ids: Vec<&str> = got.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, vec!["jrn-other-ws", "jrn-marked", "jrn-err"], "{ids:?}");
+        // workspace_hash round-trips (timeline() drops it; this query must not).
+        assert_eq!(got[0].workspace_hash, "ws-other");
+
+        // Workspace-scoped: own + global rows only; other workspaces never leak.
+        let got = db.failure_journal_candidates(Some("ws-mine"), 100).unwrap();
+        let ids: Vec<&str> = got.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, vec!["jrn-marked", "jrn-err"], "{ids:?}");
+
+        // scan_cap bounds the scan (newest kept).
+        let got = db.failure_journal_candidates(None, 1).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].id, "jrn-other-ws");
 
         let _ = fs::remove_file(&path);
     }

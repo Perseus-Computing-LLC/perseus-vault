@@ -5,6 +5,19 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
 
 ## [Unreleased]
 
+### Added
+- **`mimir_check_failure_pattern` — failure-pattern / deja-vu guard** (#521). A lightweight
+  pre-retry check: pass the command line or approach you are about to (re)try and get back
+  matching prior failures — from BOTH the journal (`error` events and failure-marked
+  `acted`/`forward` payloads) and the entity store (failure/pitfall/root-cause memories via
+  the existing FTS5 recall) — each with the recorded cause and resolution, ranked by
+  similarity × (recency + trust/decay). Returns a `deja_vu` flag and a one-line
+  agent-actionable warning when the action was already tried and failed, and an unambiguous
+  "no prior failures recorded matching this action" empty state otherwise. Read-only by
+  contract (never bumps retrieval counts or decay), workspace-scoped (own + global failures
+  only; other workspaces never leak), local and deterministic, no new storage model.
+  Exposed under all three tool-name prefixes like every other tool. Tool count: 55 → 56.
+
 ### Performance
 - **Write path: signature-driven near-duplicate scan** (#476, schema v17). The per-write
   dedup scan hydrated and re-hashed every same-category entity body (O(N·body_size) per
