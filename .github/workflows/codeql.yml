@@ -1,0 +1,39 @@
+name: CodeQL
+
+# Static analysis (SAST) for the Rust source. Complements audit.yml, which only
+# covers *dependency* CVEs via cargo-audit — CodeQL scans our own code for
+# defects (injection, insecure patterns, etc.). Free for this public repo.
+# Findings surface in the repo's Security tab; this workflow does not gate merges.
+#
+# Rust is analyzed with build-mode: none (buildless extraction, GA since Oct
+# 2025) — no cargo build required, which also sidesteps this crate's
+# feature/toolchain-specific build quirks. rustup/cargo are preinstalled on the
+# ubuntu-latest runner, which the Rust extractor needs.
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  schedule:
+    - cron: "0 8 * * 2"   # weekly (Tue 08:00 UTC)
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  analyze:
+    name: Analyze (rust)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: rust
+          build-mode: none
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:rust"
