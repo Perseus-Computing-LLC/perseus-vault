@@ -70,6 +70,13 @@ Ask:
 You should see `mimir_remember`, `mimir_recall`, `mimir_context`, and other
 Perseus Vault tools in the tool list.
 
+### 5. Wire the lifecycle loop (optional)
+
+Claude Code supports `SessionStart`/`SessionEnd` hooks in `.claude/settings.json`
+that can seed each session with recalled memories and run vault hygiene when a
+session ends. See [docs/lifecycle-hooks.md](../lifecycle-hooks.md) for the
+contract and copy-paste snippets.
+
 ## Usage Patterns
 
 ### Persisting decisions across sessions

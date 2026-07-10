@@ -69,6 +69,13 @@ Create or edit `~/.cursor/mcp.json`:
 
 > Use Perseus Vault to check if you have any stored context for this project.
 
+### 5. Wire the lifecycle loop (optional)
+
+Cursor supports agent lifecycle hooks in `.cursor/hooks.json` (`sessionStart`
+can inject recalled memories as context; `stop` can trigger vault hygiene).
+See [docs/lifecycle-hooks.md](../lifecycle-hooks.md) for the contract and
+copy-paste snippets.
+
 ## Usage Patterns
 
 ### In Chat mode
