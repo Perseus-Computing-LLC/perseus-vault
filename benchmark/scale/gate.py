@@ -27,16 +27,18 @@ HERE = Path(__file__).resolve().parent
 
 # Measured baselines live in report.json; budgets carry ~3x headroom (more on
 # sub-millisecond metrics, where absolute jitter dominates). Tightened after
-# #476 (signature-driven dedup scan: 100K load 7 -> 46/s) and #507 (covering
-# dense index: dense p99 447 -> 25ms) so the wins cannot silently regress.
-# Hybrid stays loose pending #511 (fusion-machinery overhead).
+# #476 (signature-driven dedup scan: 100K load 7 -> 46/s), #507 (covering
+# dense index: dense p99 447 -> 25ms), and #511 (hybrid sparse-arm hydration
+# + concurrent arms: hybrid p99 337 -> 94ms @100K) so the wins cannot
+# silently regress — the 100K hybrid budget sits deliberately BELOW the
+# pre-#511 p99 (282-337ms on the baseline box).
 DEFAULT_BUDGETS = {
     10_000: {
         "WRITE_DOCS_PER_SEC": 150,         # measured 529 (was 141 pre-#476)
         "WRITE_LAST10_DOCS_PER_SEC": 100,  # measured 328 (was 68)
         "FTS5_P99_MS": 30,                 # measured 8.9
         "DENSE_P99_MS": 60,                # measured 14.0
-        "HYBRID_P99_MS": 120,              # measured 33.9
+        "HYBRID_P99_MS": 100,              # measured 24.6 (was 33.9 pre-#511)
         "AS_OF_P99_MS": 5,                 # measured 0.3
         "TEMPORAL_RECALL_P99_MS": 15,      # measured 3.4
         "COLD_START_MS": 500,              # measured 26.8
@@ -46,7 +48,7 @@ DEFAULT_BUDGETS = {
         "WRITE_LAST10_DOCS_PER_SEC": 7,    # measured 21 (was 3)
         "FTS5_P99_MS": 100,                # measured 19.1 (was 181.7)
         "DENSE_P99_MS": 150,               # measured 24.9 (was 446.9, #507)
-        "HYBRID_P99_MS": 1000,             # measured 282.2 (#511 tightens)
+        "HYBRID_P99_MS": 250,              # measured 93.8 (was 337, #511 locked)
         "AS_OF_P99_MS": 5,                 # measured 0.3 — flat 10K→100K
         "TEMPORAL_RECALL_P99_MS": 50,      # measured 13.3
         "COLD_START_MS": 500,              # measured 54.7 @ ~890MB

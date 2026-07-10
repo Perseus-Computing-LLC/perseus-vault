@@ -52,6 +52,24 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
   `maintain`).
 
 ### Performance
+- **Hybrid recall at 100K: 295.5 → 80.9 ms p50 (3.7×)** (#511). Hybrid — the default
+  recall mode — carried ~250 ms of cost beyond its dense + fts5 arms at 100K entities.
+  Profile-first attribution (via the new opt-in `MIMIR_RECALL_TIMING=1` stage timing, a
+  permanent zero-cost-when-off observability surface on the recall path) cleared every
+  suspect in the issue — RRF over-fetch/hydration, query expansion, graph expand, and the
+  post-RRF weighting passes measure ≤0.5 ms combined — and pinned 88% on the sparse arm:
+  its single SQL joined every FTS match to `entities` and evaluated the full row (body
+  overflow chains included) before `ORDER BY rank LIMIT k` could discard it (the
+  #476/#507 disease, third instance). Fixed exactness-preserving: (1) two-phase BM25 —
+  rank `rowid + bm25()` entirely inside the FTS index, hydrate + metadata-filter only a
+  bounded pool, widen once then fall back to the exact single-query plan; (2) the dense
+  and sparse arms now run concurrently (independent read-only queries on separate pooled
+  connections), so hybrid pays max(arms) instead of their sum. Measured on the identical
+  loaded 100K store: hybrid p50/p99 295.5/337.0 → 80.9/93.8 ms — within 2× of the sum of
+  its arms; dense/fts5 unchanged; recall@5 regression 0 (deterministic recall benchmark
+  byte-identical, LongMemEval retrieval subset recall@5/@10 unchanged). Scale-gate hybrid
+  p99 budget tightened 1000 → 250 ms (100K) and 120 → 100 ms (10K) to lock the win.
+  Attribution tables + methodology in PERF.md.
 - **Write path: signature-driven near-duplicate scan** (#476, schema v17). The per-write
   dedup scan hydrated and re-hashed every same-category entity body (O(N·body_size) per
   insert) — the measured cause of the quadratic bulk-load curve. It now walks only the

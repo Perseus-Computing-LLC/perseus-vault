@@ -3,7 +3,7 @@
   "issue": "#474",
   "meta": {
     "binary": "perseus-vault 2.19.1",
-    "commit": "fef14346f8cc",
+    "commit": "3ed4e5a4ae92",
     "hardware": {
       "machine": "AMD64",
       "processor": "AMD64 Family 26 Model 68 Stepping 0, AuthenticAMD",
@@ -19,10 +19,10 @@
       "entities": 10000,
       "write": {
         "count": 10000,
-        "elapsed_s": 18.9,
-        "docs_per_sec": 529,
-        "first_10pct_docs_per_sec": 1698,
-        "last_10pct_docs_per_sec": 328
+        "elapsed_s": 20.9,
+        "docs_per_sec": 479,
+        "first_10pct_docs_per_sec": 1370,
+        "last_10pct_docs_per_sec": 288
       },
       "embed": {
         "embedded": 0,
@@ -31,112 +31,112 @@
       },
       "recall": {
         "fts5": {
-          "p50_ms": 3.8,
-          "p95_ms": 4.99,
-          "p99_ms": 8.87,
-          "avg_ms": 3.54,
+          "p50_ms": 3.14,
+          "p95_ms": 5.2,
+          "p99_ms": 9.62,
+          "avg_ms": 3.46,
           "n": 100
         },
         "dense": {
-          "p50_ms": 11.15,
-          "p95_ms": 11.66,
-          "p99_ms": 13.99,
-          "avg_ms": 11.24,
+          "p50_ms": 11.96,
+          "p95_ms": 13.08,
+          "p99_ms": 14.29,
+          "avg_ms": 12.05,
           "n": 100
         },
         "hybrid": {
-          "p50_ms": 31.14,
-          "p95_ms": 32.28,
-          "p99_ms": 33.87,
-          "avg_ms": 29.87,
+          "p50_ms": 19.03,
+          "p95_ms": 23.12,
+          "p99_ms": 24.56,
+          "avg_ms": 19.23,
           "n": 100
         }
       },
       "as_of": {
-        "p50_ms": 0.12,
-        "p95_ms": 0.21,
-        "p99_ms": 0.24,
-        "avg_ms": 0.13,
+        "p50_ms": 0.17,
+        "p95_ms": 0.34,
+        "p99_ms": 0.53,
+        "avg_ms": 0.2,
         "n": 100
       },
       "temporal_recall": {
-        "p50_ms": 3.08,
-        "p95_ms": 4.59,
-        "p99_ms": 6.92,
-        "avg_ms": 3.4,
+        "p50_ms": 3.65,
+        "p95_ms": 4.85,
+        "p99_ms": 13.7,
+        "avg_ms": 3.82,
         "n": 100
       },
       "db": {
-        "file_bytes": 69722112,
-        "file_mb": 66.5,
+        "file_bytes": 69382144,
+        "file_mb": 66.2,
         "active_entities": 9999
       },
       "cold_start": {
-        "first_query_ms_min": 26.7,
-        "first_query_ms_median": 26.8
+        "first_query_ms_min": 54.7,
+        "first_query_ms_median": 56.6
       }
     },
     "100000": {
       "entities": 100000,
       "write": {
         "count": 100000,
-        "elapsed_s": 2171.5,
-        "docs_per_sec": 46,
-        "first_10pct_docs_per_sec": 542,
-        "last_10pct_docs_per_sec": 21
+        "elapsed_s": 2521.5,
+        "docs_per_sec": 40,
+        "first_10pct_docs_per_sec": 469,
+        "last_10pct_docs_per_sec": 18
       },
       "embed": {
-        "embedded": 8573,
-        "elapsed_s": 48.1,
-        "embeds_per_sec": 178
+        "embedded": 8115,
+        "elapsed_s": 49.4,
+        "embeds_per_sec": 164
       },
       "recall": {
         "fts5": {
-          "p50_ms": 14.26,
-          "p95_ms": 15.55,
-          "p99_ms": 19.07,
-          "avg_ms": 16.33,
+          "p50_ms": 15.67,
+          "p95_ms": 19.92,
+          "p99_ms": 23.23,
+          "avg_ms": 18.82,
           "n": 100
         },
         "dense": {
-          "p50_ms": 22.82,
-          "p95_ms": 24.13,
-          "p99_ms": 24.88,
-          "avg_ms": 23.01,
+          "p50_ms": 25.43,
+          "p95_ms": 32.4,
+          "p99_ms": 32.78,
+          "avg_ms": 26.64,
           "n": 100
         },
         "hybrid": {
-          "p50_ms": 263.37,
-          "p95_ms": 270.14,
-          "p99_ms": 282.15,
-          "avg_ms": 264.26,
+          "p50_ms": 79.73,
+          "p95_ms": 89.37,
+          "p99_ms": 92.86,
+          "avg_ms": 80.11,
           "n": 100
         }
       },
       "as_of": {
-        "p50_ms": 0.11,
-        "p95_ms": 0.14,
-        "p99_ms": 0.18,
-        "avg_ms": 0.11,
+        "p50_ms": 0.12,
+        "p95_ms": 0.29,
+        "p99_ms": 0.46,
+        "avg_ms": 0.15,
         "n": 100
       },
       "temporal_recall": {
-        "p50_ms": 11.33,
-        "p95_ms": 12.14,
-        "p99_ms": 13.77,
-        "avg_ms": 11.56,
+        "p50_ms": 12.51,
+        "p95_ms": 18.39,
+        "p99_ms": 19.28,
+        "avg_ms": 13.52,
         "n": 100
       },
       "db": {
-        "file_bytes": 937107456,
-        "file_mb": 893.7,
+        "file_bytes": 937574400,
+        "file_mb": 894.1,
         "active_entities": 99832
       },
       "cold_start": {
-        "first_query_ms_min": 49.0,
-        "first_query_ms_median": 54.7
+        "first_query_ms_min": 53.3,
+        "first_query_ms_median": 58.2
       }
     }
   },
-  "signature_sha256": "6a4bf67281b1659d937e94b01c6a028522f1d5b2dd8c3461dce4ea981e4bfafa"
+  "signature_sha256": "c688a8490cc11e8461569d9559b69e99133b041b4de115d0cae39096e6abd53b"
 }

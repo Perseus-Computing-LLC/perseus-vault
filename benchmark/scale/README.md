@@ -7,35 +7,38 @@ deterministic (seeded corpus), no network, no API key.
 
 ## Measured baselines (committed `report.json`)
 
-Post-optimization run — v2.19.1 main with #476 (signature-driven dedup scan)
-and #507 (covering dense index) merged; AMD64 16-core, Windows 11 (full
-hardware + commit in `report.json`, sha256-signed):
+Post-optimization run — v2.19.1 main with #476 (signature-driven dedup scan),
+#507 (covering dense index), and #511 (hybrid sparse-arm hydration +
+concurrent arms) merged; AMD64 16-core, Windows 11 (full hardware + commit in
+`report.json`, sha256-signed):
 
 | Metric | 10K | 100K |
 | --- | --- | --- |
-| Write throughput, sustained | 529/s | 46/s |
-| Write throughput, first→last 10% | 1698/s → 328/s | 542/s → 21/s |
-| fts5 recall p50 / p99 | 3.8 / 8.9 ms | 14.3 / 19.1 ms |
-| dense recall p50 / p99 | 11.2 / 14.0 ms | 22.8 / 24.9 ms |
-| hybrid recall p50 / p99 | 31.1 / 33.9 ms | 263.4 / 282.2 ms |
-| `as_of` point lookup p50 | 0.12 ms | 0.11 ms |
-| temporal recall p50 | 3.1 ms | 11.3 ms |
-| Cold start (spawn + init + first query) | 26.8 ms | 54.7 ms |
-| DB on disk | ~87 MB | ~890 MB |
+| Write throughput, sustained | 479/s | 40/s |
+| Write throughput, first→last 10% | 1370/s → 288/s | 469/s → 18/s |
+| fts5 recall p50 / p99 | 3.1 / 9.6 ms | 15.7 / 23.2 ms |
+| dense recall p50 / p99 | 12.0 / 14.3 ms | 25.4 / 32.8 ms |
+| hybrid recall p50 / p99 | 19.0 / 24.6 ms | 79.7 / 92.9 ms |
+| `as_of` point lookup p50 | 0.17 ms | 0.12 ms |
+| temporal recall p50 | 3.7 ms | 12.5 ms |
+| Cold start (spawn + init + first query) | 56.6 ms | 58.2 ms |
+| DB on disk | ~66 MB | ~890 MB |
 
 Headlines:
 
 - **Bi-temporal stays flat at scale.** `as_of` point lookups sit at ~0.1 ms p50
   at both 10K and 100K, and transaction-time reconstruction recall is under
-  15 ms p99 at 100K. The differentiator holds.
+  20 ms p99 at 100K. The differentiator holds.
 - **The write path is fixed.** The first baseline measured 141/s → 7/s from
   10K → 100K (a ~4h bulk load, O(N·body_size) dedup scan per write); after
-  #476 it is 529/s → 46/s and a 100K load takes ~40 minutes. History and
+  #476 it is ~480/s → ~40/s and a 100K load takes ~40 minutes. History and
   methodology in PERF.md.
-- **Dense recall is flat-ish at scale.** 390 ms p50 @100K before #507's
-  covering index; 22.8 ms after. Hybrid still carries ~240 ms of fusion-
-  machinery overhead beyond its arms — tracked in #511 with this report as
-  the baseline.
+- **Recall is flat-ish at scale in every mode.** Dense: 390 ms p50 @100K
+  before #507's covering index, ~25 ms after. Hybrid (the default mode):
+  263 ms p50 @100K before #511, 79.7 ms after — the "fusion-machinery
+  overhead" was the sparse arm hydrating every FTS match; it now ranks
+  inside the FTS index and the two arms run concurrently. Attribution
+  tables in PERF.md.
 
 ## Running
 
@@ -63,12 +66,14 @@ doesn't flake and a failure means a genuine regression. Override any budget via
 | Write throughput (last 10%) | ≥ 100/s | ≥ 7/s | `SCALE_BUDGET_WRITE_LAST10_DOCS_PER_SEC` |
 | fts5 recall p99 | ≤ 30 ms | ≤ 100 ms | `SCALE_BUDGET_FTS5_P99_MS` |
 | dense recall p99 | ≤ 60 ms | ≤ 150 ms | `SCALE_BUDGET_DENSE_P99_MS` |
-| hybrid recall p99 | ≤ 120 ms | ≤ 1000 ms | `SCALE_BUDGET_HYBRID_P99_MS` |
+| hybrid recall p99 | ≤ 100 ms | ≤ 250 ms | `SCALE_BUDGET_HYBRID_P99_MS` |
 | `as_of` p99 | ≤ 5 ms | ≤ 5 ms | `SCALE_BUDGET_AS_OF_P99_MS` |
 | temporal recall p99 | ≤ 15 ms | ≤ 50 ms | `SCALE_BUDGET_TEMPORAL_RECALL_P99_MS` |
 | Cold start (median) | ≤ 500 ms | ≤ 500 ms | `SCALE_BUDGET_COLD_START_MS` |
 
-Hybrid's 100K budget stays deliberately loose until #511 lands, then tightens.
+Hybrid's 100K budget was tightened by #511 (1000 → 250 ms) and now sits
+deliberately BELOW the pre-#511 measured p99 (282–337 ms), so the sparse-arm
+hydration disease cannot silently return.
 
 CI (`scale-gate.yml`): the **10K gate runs on every push to main** (about a
 minute of load); the **100K run is weekly** (~45 min post-#476) and on

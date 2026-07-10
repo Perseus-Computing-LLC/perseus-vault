@@ -54,6 +54,89 @@ recorded here: single-process serving-throughput floors from earlier runs
 `python benchmark/contention/live_bench.py --gpu-price <$/hr> --vllm-log
 <log>`; synthetic row via `python benchmark/contention/burn_bench.py`.
 
+## #511 — hybrid recall: the "fusion-machinery overhead" was the sparse arm's join-per-match hydration
+
+**Hardware:** same box as #476/#507 (AMD64 16-core, Windows 11). A/B on an
+IDENTICAL loaded 100K store (seeded once by `benchmark/scale/run.py
+--keep-db` on post-#543 main, kept), 100 queries/mode over MCP stdio with the
+scale harness's exact query shape and limit, before = main + the timing
+instrumentation only, after = this change. Every number below is `measured`.
+
+### Where the time went (stage attribution, new `MIMIR_RECALL_TIMING=1`)
+
+Windows has no cheap flamegraph story for a release binary driven over MCP
+stdio, so this change adds the permanent alternative: opt-in per-stage timing
+on the recall path (`MIMIR_RECALL_TIMING=1`, one line per query to stderr,
+zero cost when off). 30 timed hybrid queries at 100K, p50 per stage:
+
+| Stage | Before | After | data_source |
+| --- | --- | --- | --- |
+| embed (query vector) | 6.1 ms | 6.2 ms | measured |
+| dense arm | 23.1 ms | 25.4 ms (concurrent) | measured |
+| **sparse arm (BM25)** | **247.4 ms** | **60.3 ms (concurrent)** | measured |
+| graph expand | 0.02 ms | 0.02 ms | measured |
+| RRF fuse | 0.10 ms | 0.09 ms | measured |
+| usefulness boost | 0.45 ms | 0.33 ms | measured |
+| metadata filter + truncate | 0.01 ms | 0.01 ms | measured |
+| **total** | **277.0 ms** | **67.2 ms** | measured |
+
+The issue's suspects, settled by the profile: RRF candidate over-fetch +
+hydration, query expansion, graph expand's link following, and the post-RRF
+weighting passes are **all ≤ 0.5 ms combined**. 88% of hybrid's cost was the
+sparse arm: its single SQL joined EVERY FTS match to `entities` and evaluated
+the full 24-column row — multi-KB `body_json` overflow chains included —
+before `ORDER BY rank LIMIT k` could discard it. A broad term matches most of
+the corpus, so that was ~100K record reads per hybrid recall: the #476/#507
+disease, third instance, hiding in the FTS5→entities join.
+
+### The fix (two changes, exactness-preserving)
+
+1. **Two-phase BM25 (`fts5_bm25_search`):** phase 1 ranks `rowid + bm25()`
+   entirely inside the FTS index — the `entities` table is never touched;
+   phase 2 hydrates and metadata-filters only a bounded pool (3× the arm's
+   limit, floor 128) in rank order. If filters eat the whole pool it widens
+   once (4096), then falls back to the exact single-query plan — the answer
+   is never silently truncated, and both plans share one predicate builder so
+   they cannot drift. Result sets are identical (see recall gates below).
+2. **Concurrent arms:** the dense and sparse arms are independent read-only
+   queries on separate pooled connections (`Database` is already shared as
+   `Arc<Database>` across server threads, #210) — hybrid now pays
+   max(dense, sparse) instead of dense + sparse.
+
+### Numbers (100K entities, identical store, 100 queries/mode)
+
+| Mode | Before p50/p99 | After p50/p99 | Δ p50 |
+| --- | --- | --- | --- |
+| hybrid | 295.5 / 337.0 ms | **80.9 / 93.8 ms** | **3.7×** |
+| dense | 25.5 / 31.0 ms | 25.1 / 30.9 ms | unchanged |
+| fts5 | 16.5 / 19.9 ms | 17.0 / 20.7 ms | unchanged (noise) |
+
+Hybrid vs the sum of its arms: 7.0× before (295.5 vs ~42 ms) → **1.9×
+after** (80.9 vs ~42 ms) — inside the issue's ≤2× acceptance target. The
+scale-gate hybrid p99 budget tightens 1000 → 250 ms so the before-state
+(p99 ≥ 282 ms on this box) can never silently return.
+
+### Recall-quality gates (before AND after, same stores/seeds)
+
+* `benchmark/recall/` (deterministic, bundled ONNX): **byte-identical** —
+  same report signature (`d78c7240…`), hybrid recall@5 95.8 both sides.
+  recall@5 regression: **0 pt**.
+* `benchmark/longmemeval/` retrieval-only (no LLM, no API key), first 100
+  instances, paired: recall@5 93.0 → 93.0, recall@10 99.0 → 99.0. recall@1/@3
+  wobble ±3 pt run-to-run in this regime, but the baseline binary differs
+  from ITSELF on 53/100 per-question top-10s across reruns (async
+  auto-embed-on-write race in the harness's ingest-then-immediately-query
+  loop) — the wobble is harness self-noise, not a ranking change; the
+  deterministic harness above is the ranking gate.
+
+### Residual (next target)
+
+The remaining hybrid-over-dense cost IS the sparse arm now: BM25 must score
+every FTS match to rank them (~60 ms for ~100K matched rows), an engine-level
+O(matches) floor for broad terms, concurrent with (and larger than) the dense
+arm. Shrinking it means capping or pre-pruning the match set — a recall
+trade, not free machinery — so it stays out of scope here.
+
 ## #507 — dense recall: covering index for the phase-0 signature scan (v18)
 
 **Hardware:** same box as #476. A/B on the IDENTICAL loaded 100K store (kept
