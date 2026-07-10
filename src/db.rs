@@ -2957,8 +2957,11 @@ impl Database {
                 params![entity.body_json, id],
             )?;
             if fts_rows == 0 {
+                // OR REPLACE (#517): same self-heal as the insert path — the
+                // UPDATE above matching 0 rows means no live FTS row is keyed
+                // to this entity, so anything at its rowid is drift.
                 tx.execute(
-                    "INSERT INTO entities_fts (rowid, body_json)
+                    "INSERT OR REPLACE INTO entities_fts (rowid, body_json)
                      VALUES ((SELECT rowid FROM entities WHERE id = ?2), ?1)",
                     params![entity.body_json, id],
                 )?;
@@ -3072,9 +3075,15 @@ impl Database {
                 ],
             )?;
 
-            // Add to FTS5 index
+            // Add to FTS5 index. OR REPLACE (#517): if a drifted/orphaned FTS
+            // row already occupies this rowid (its entity was deleted without
+            // FTS cleanup, and SQLite reused the rowid), a plain INSERT fails
+            // with a bare "constraint failed" and EVERY subsequent write is
+            // bricked until a manual reindex. The row at this rowid must
+            // mirror the entity just inserted, so replacing is always correct
+            // and self-heals that drift per-write.
             tx.execute(
-                "INSERT INTO entities_fts (rowid, body_json) VALUES (last_insert_rowid(), ?1)",
+                "INSERT OR REPLACE INTO entities_fts (rowid, body_json) VALUES (last_insert_rowid(), ?1)",
                 params![entity.body_json],
             )?;
             // #392: store the row's dedup signature (derived from the STORED
@@ -14327,6 +14336,55 @@ mod tests {
         assert_eq!(Database::parse_llm_timeout(Some("0")), 30);
         assert_eq!(Database::parse_llm_timeout(Some("-5")), 30);
         assert_eq!(Database::parse_llm_timeout(Some("soon")), 30);
+    }
+
+    #[test]
+    fn write_self_heals_orphaned_fts_rowid_collision() {
+        // #517: an orphaned FTS row left behind at a reused rowid (entity
+        // deleted without FTS cleanup) made every subsequent write fail with
+        // a bare "constraint failed" until a manual reindex. The write path
+        // must replace the orphan and succeed.
+        let (db, path) = temp_db();
+
+        let first = make_entity("f1", "decision", "first", "{\"body\":\"reactor coolant loop schedule\"}");
+        db.remember(&first).unwrap();
+
+        // Plant drift: an orphaned FTS row at the rowid the NEXT insert will get.
+        let next_rowid: i64 = db
+            .conn().unwrap()
+            .query_row("SELECT MAX(rowid) + 1 FROM entities", [], |r| r.get(0))
+            .unwrap();
+        db.conn().unwrap()
+            .execute(
+                "INSERT INTO entities_fts (rowid, body_json) VALUES (?1, 'orphaned drift row')",
+                params![next_rowid],
+            )
+            .unwrap();
+
+        // Body deliberately dissimilar to `first` so trigram dedup stays out
+        // of the way and the insert path actually runs.
+        let second = make_entity("f2", "roadmap", "second", "{\"body\":\"quarterly hiring plan for the antarctic office\"}");
+        let (id, action) = db
+            .remember(&second)
+            .expect("write into drifted FTS index must self-heal, not fail");
+        assert_eq!(action, "created");
+
+        // The FTS row at the collision rowid must now mirror the new entity.
+        let fts_body: String = db
+            .conn().unwrap()
+            .query_row(
+                "SELECT body_json FROM entities_fts
+                 WHERE rowid = (SELECT rowid FROM entities WHERE id = ?1)",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            fts_body.contains("antarctic"),
+            "FTS row must hold the new entity's body, got: {fts_body}"
+        );
+
+        let _ = fs::remove_file(&path);
     }
 
     #[test]

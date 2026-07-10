@@ -3,6 +3,8 @@
 Every entry: fixed hardware, named binary/commit, the profile that led to the
 change, and the numbers. Companion to `benchmark/scale/` (signed baselines +
 CI budgets) and the #473 epic's rule: no claim without a rerunnable script.
+GPU co-residency numbers (recall under 100% MI300X load) live in
+[`docs/deployment-amd-mi300x.md`](docs/deployment-amd-mi300x.md).
 
 ## #530 — GPU contention + agent economics: recall unaffected at 100% accelerator load
 
