@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "perseus-vault-client"
+version = "0.1.0"
+description = "Official dependency-free Python client for the Perseus Vault MCP stdio transport"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Perseus Computing LLC" }]
+keywords = ["perseus-vault", "memory", "mcp", "agents", "json-rpc", "client"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Intended Audience :: Developers",
+    "Topic :: Software Development :: Libraries",
+]
+# Zero runtime dependencies — pure standard library on purpose.
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[project.urls]
+Homepage = "https://github.com/Perseus-Computing-LLC/perseus-vault"
+Repository = "https://github.com/Perseus-Computing-LLC/perseus-vault"
+
+[tool.setuptools]
+packages = ["perseus_vault_client"]
+package-dir = { "" = "." }
