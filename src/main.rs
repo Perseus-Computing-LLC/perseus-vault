@@ -124,7 +124,8 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Write a memory entity directly to the database.
-    /// Category and key must be unique for active entities.
+    /// Category and key identify an entity within a workspace: writing to an
+    /// existing category+key updates it in place (reviving it if archived).
     Write {
         /// SQLite database path
         #[arg(long, default_value_t = default_db_path())]
@@ -1668,6 +1669,10 @@ fn main() {
                     print_json(&serde_json::json!({ "ok": true, "id": id, "action": action }));
                 }
                 Err(e) => {
+                    // #516: pair the non-zero exit with machine-checkable JSON
+                    // on stdout, so callers that parse output instead of $?
+                    // still can't mistake a failed write for a persisted one.
+                    print_json(&serde_json::json!({ "ok": false, "error": e.to_string() }));
                     eprintln!("mimir: write failed: {}", e);
                     std::process::exit(1);
                 }
