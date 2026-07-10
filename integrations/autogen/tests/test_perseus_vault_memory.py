@@ -3,7 +3,7 @@
 autogen-core (and its dependency tree) need not be installed to exercise the
 Perseus Vault wiring: we stub the ``autogen_core`` modules the adapter imports with
 minimal stand-ins, then drive the memory against Perseus Vault's real MCP JSON-RPC
-envelope via a fake persistent-stdio subprocess.
+envelope via a fake VaultClient.
 """
 
 from __future__ import annotations
@@ -81,82 +81,40 @@ def PerseusVaultMemory():
     return cls
 
 
-# ── fake persistent-stdio Popen ─────────────────────────────────────
+# ── fake VaultClient ────────────────────────────────────────────────
 
-def _fake_popen(routes):
-    """Build a FakePopen whose stdout replays JSON-RPC responses.
+def _make_fake_client(routes):
+    """Build a fake ``VaultClient`` driven by ``routes``.
 
-    ``routes`` maps a tool name → callable(args) -> payload dict. The fake
-    answers the initialize handshake with ``{}`` and each ``tools/call`` with
-    the MCP envelope wrapping the routed payload.
+    ``routes`` maps a Perseus Vault tool name to a callable(arguments) -> payload
+    dict. The memory now talks to the shared ``perseus_vault_client.VaultClient``
+    (hardened stdio transport lives there), so we patch that seam instead of the
+    subprocess: ``call_tool_raw`` returns the payload wrapped in Perseus Vault's
+    real MCP envelope (``structuredContent`` + ``content[0].text``).
     """
-    class FakeStdout:
-        def __init__(self):
-            self._lines = []
 
-        def push(self, line):
-            self._lines.append(line)
-
-        def readline(self):
-            if self._lines:
-                return self._lines.pop(0)
-            return ""
-
-    class FakePopen:
+    class FakeClient:
         def __init__(self, *args, **kwargs):
-            self._stdout = FakeStdout()
-            self.stderr = None
+            self.args = args
+            self.kwargs = kwargs
 
-            class _Stdin:
-                def __init__(self, outer):
-                    self.outer = outer
+        def call_tool_raw(self, name, arguments):
+            payload = routes[name](arguments)
+            return {
+                "content": [{"type": "text", "text": json.dumps(payload)}],
+                "structuredContent": payload,
+            }
 
-                def write(self, data):
-                    for line in data.splitlines():
-                        line = line.strip()
-                        if not line:
-                            continue
-                        msg = json.loads(line)
-                        mid = msg.get("id")
-                        if msg.get("method") == "initialize":
-                            self.outer._stdout.push(
-                                json.dumps({"jsonrpc": "2.0", "id": mid, "result": {}}) + "\n"
-                            )
-                        elif msg.get("method") == "tools/call":
-                            name = msg["params"]["name"]
-                            payload = routes[name](msg["params"]["arguments"])
-                            env = {
-                                "jsonrpc": "2.0",
-                                "id": mid,
-                                "result": {
-                                    "content": [{"type": "text", "text": json.dumps(payload)}],
-                                    "structuredContent": payload,
-                                },
-                            }
-                            self.outer._stdout.push(json.dumps(env) + "\n")
-
-                def flush(self):
-                    pass
-
-                def close(self):
-                    pass
-
-            self.stdin = _Stdin(self)
-
-        @property
-        def stdout(self):
-            return self._stdout
-
-        def poll(self):
-            return None
-
-        def wait(self, timeout=None):
-            return 0
-
-        def kill(self):
+        def close(self):
             pass
 
-    return FakePopen
+    return FakeClient
+
+
+def _patch(monkeypatch, routes):
+    # PerseusVaultMemory builds a VaultClient lazily via _get_client(); swap the
+    # class the module imported so the memory drives our fake transport.
+    monkeypatch.setattr("perseus_vault_autogen.VaultClient", _make_fake_client(routes))
 
 
 def _run(coro):
@@ -174,9 +132,7 @@ def test_add_sends_remember_with_routing(monkeypatch, PerseusVaultMemory):
         captured.update(args)
         return {"id": "mem-1", "status": "ok"}
 
-    monkeypatch.setattr(
-        "perseus_vault_autogen.subprocess.Popen", _fake_popen({"perseus_vault_remember": remember})
-    )
+    _patch(monkeypatch, {"perseus_vault_remember": remember})
     mem = PerseusVaultMemory()
     content = MemoryContent(
         content="user prefers dark mode",
@@ -200,9 +156,7 @@ def test_add_auto_key_when_missing(monkeypatch, PerseusVaultMemory):
         captured.update(args)
         return {"status": "ok"}
 
-    monkeypatch.setattr(
-        "perseus_vault_autogen.subprocess.Popen", _fake_popen({"perseus_vault_remember": remember})
-    )
+    _patch(monkeypatch, {"perseus_vault_remember": remember})
     mem = PerseusVaultMemory(category="autogen")
     _run(mem.add(MemoryContent(content="x", mime_type=MemoryMimeType.TEXT)))
 
@@ -224,9 +178,7 @@ def test_query_parses_structured_items(monkeypatch, PerseusVaultMemory):
             "total": 1,
         }
 
-    monkeypatch.setattr(
-        "perseus_vault_autogen.subprocess.Popen", _fake_popen({"perseus_vault_recall": recall})
-    )
+    _patch(monkeypatch, {"perseus_vault_recall": recall})
     mem = PerseusVaultMemory()
     result = _run(mem.query("theme"))
 
@@ -243,9 +195,7 @@ def test_update_context_injects_system_message(monkeypatch, PerseusVaultMemory):
     def context(args):
         return {"context": "## Memory\n- user prefers dark mode"}
 
-    monkeypatch.setattr(
-        "perseus_vault_autogen.subprocess.Popen", _fake_popen({"perseus_vault_context": context})
-    )
+    _patch(monkeypatch, {"perseus_vault_context": context})
     mem = PerseusVaultMemory()
     ctx = ChatCompletionContext()
     result = _run(mem.update_context(ctx))
@@ -261,9 +211,7 @@ def test_update_context_empty_is_noop(monkeypatch, PerseusVaultMemory):
     def context(args):
         return {"context": ""}
 
-    monkeypatch.setattr(
-        "perseus_vault_autogen.subprocess.Popen", _fake_popen({"perseus_vault_context": context})
-    )
+    _patch(monkeypatch, {"perseus_vault_context": context})
     mem = PerseusVaultMemory()
     ctx = ChatCompletionContext()
     result = _run(mem.update_context(ctx))
@@ -279,9 +227,7 @@ def test_clear_prunes_category(monkeypatch, PerseusVaultMemory):
         captured.update(args)
         return {"archived": 3}
 
-    monkeypatch.setattr(
-        "perseus_vault_autogen.subprocess.Popen", _fake_popen({"perseus_vault_prune": prune})
-    )
+    _patch(monkeypatch, {"perseus_vault_prune": prune})
     mem = PerseusVaultMemory(category="autogen")
     _run(mem.clear())
     assert captured["category"] == "autogen"
