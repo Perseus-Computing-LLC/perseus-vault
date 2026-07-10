@@ -33,6 +33,10 @@ small business and treats security reports as confidential until a fix is publis
 
 We support responsible disclosure and will credit reporters who follow this policy.
 
+> Maintainers: the internal process behind these commitments (handler roles,
+> severity rubric, embargo and CVE handling) is documented in
+> [`docs/vuln-response.md`](docs/vuln-response.md).
+
 ---
 
 ## Security Model
