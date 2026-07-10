@@ -129,4 +129,13 @@ mimir --encryption-key ~/.mimir/secret.key    # start with encryption on
 ## Contact
 
 Security: **perseus@perseus.observer**
-PGP key: Available on request
+
+**PGP** — encrypt sensitive reports to our security key:
+
+```
+Fingerprint: 92C8 E815 1A60 DB38 46DB  420B 029A 35A6 A22B 287E
+```
+
+Fetch it from [keys.openpgp.org](https://keys.openpgp.org/search?q=perseus@perseus.observer)
+(`gpg --keyserver hkps://keys.openpgp.org --recv-keys 92C8E8151A60DB3846DB420B029A35A6A22B287E`)
+and verify the fingerprint above before use.

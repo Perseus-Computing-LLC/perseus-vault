@@ -43,8 +43,8 @@ access can be reviewed and revoked. No keys or tokens appear here.
 
 | Privilege | Holder(s) | Notes |
 |---|---|---|
-| Repository admin | Thomas Connally, Mark Thrailkill | `[CONFIRM roster]` |
-| Merge to protected `main` | via PR + required `test` check | No direct pushes; branch protection enforced |
+| Repository admin | Thomas Connally (`tcconnally`) | Sole repo-admin as of 2026-07-10. Mark Thrailkill contributes via org write access — `[CONFIRM whether Mark should hold admin]` |
+| Merge to protected `main` | via PR + required `test` check | ✅ Verified: `main` is protected and requires the `test` status check. No direct pushes. |
 | Release / publish (crates.io, GHCR, MCP registry) | `[CONFIRM token holder(s)]` | Publishing credentials held out-of-band, not in repo |
 | Release signing / provenance | *none yet* | Signed releases + SLSA provenance are a tracked milestone (§ SECURITY-MILESTONES) |
 | Security disclosure — primary handler | Thomas Connally (perseus@perseus.observer) | See [`vuln-response.md`](./vuln-response.md) |
