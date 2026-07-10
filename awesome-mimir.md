@@ -71,11 +71,11 @@ Tested and confirmed working with:
 
 ## Tools & Plugins
 
-### Perseus Vault Itself (56 MCP Tools)
+### Perseus Vault Itself (57 MCP Tools)
 
 | Category | Tools |
 |---|---|
-| **Entity CRUD** | `mimir_remember`, `mimir_recall`, `mimir_recall_when`, `mimir_get_entity`, `mimir_forget` |
+| **Entity CRUD** | `mimir_remember`, `mimir_recall`, `mimir_recall_when`, `mimir_get_entity`, `mimir_capture`, `mimir_forget` |
 | **Graph** | `mimir_link`, `mimir_unlink`, `mimir_traverse` |
 | **Journal** | `mimir_journal`, `mimir_check_failure_pattern`, `mimir_timeline` |
 | **State** | `mimir_state_set`, `mimir_state_get`, `mimir_state_delete`, `mimir_state_list` |
@@ -111,7 +111,7 @@ Why Perseus Vault stands out:
 
 | Feature | Perseus Vault | Mem0 | Letta | Zep |
 |---|---|---|---|---|
-| **MCP-Native** | ✅ 56 tools | ❌ | ❌ | ❌ |
+| **MCP-Native** | ✅ 57 tools | ❌ | ❌ | ❌ |
 | **Local-First** | ✅ Single binary | ❌ Cloud-dependent | ❌ Docker + Postgres | ❌ Docker + Postgres |
 | **Zero Dependencies** | ✅ SQLite bundled | ❌ Python + vector DB | ❌ Python + Postgres | ❌ Go + Postgres |
 | **Encryption at Rest** | ✅ AES-256-GCM | ❌ | ❌ | ❌ |

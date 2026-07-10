@@ -500,6 +500,23 @@ mod tests {
     }
 
     #[test]
+    fn failure_markers_align_with_the_deja_vu_guard() {
+        // Alignment pin (#521): every capture failure marker must be one the
+        // deja-vu guard (`db::FAILURE_MARKERS`) also recognizes, so a
+        // captured pitfall is findable by mimir_check_failure_pattern. The
+        // guard's list may be a superset (e.g. "root cause"/"root-cause"
+        // live in ROOT_CAUSE_MARKERS here, which classify() checks first).
+        for m in FAILURE_MARKERS {
+            assert!(
+                crate::db::FAILURE_MARKERS.contains(m),
+                "capture failure marker {m:?} missing from db::FAILURE_MARKERS — \
+                 keep the two lists aligned so captured pitfalls stay findable \
+                 by the deja-vu guard"
+            );
+        }
+    }
+
+    #[test]
     fn summary_and_key_are_stable_and_bounded() {
         let text = "## The Fix: bump SCHEMA_VERSION on every new ensure_column!\nDetails follow.";
         let summary = summary_line(text);

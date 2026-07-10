@@ -8,11 +8,12 @@
 
 Claims verified against `src/`:
 
-- **56 MCP tools** — exactly 56 distinct `mimir_*` tool names registered in
+- **57 MCP tools** — exactly 57 distinct `mimir_*` tool names registered in
   source (`src/mcp.rs` TOOLS schema); each is additionally exposed under
   `mneme_*` and `perseus_vault_*` aliases (same handler, not counted).
-  README badge, comparison table, and the "56 MCP Tools" section all agree. ✓
-  (Recount 2026-07-09: 56 after `mimir_check_failure_pattern`, #521.)
+  README badge, comparison table, and the "57 MCP Tools" section all agree. ✓
+  (Recount 2026-07-09: 56 after `mimir_check_failure_pattern`, #521; 57
+  after `mimir_capture`, #520.)
 
   Verify the count against source (this is the authoritative command — re-run
   it and update README/manifest.json/glama.json whenever a tool is added):
@@ -34,5 +35,6 @@ Claims verified against `src/`:
   follow-up mimir_history). v2.13.0: 49 (#327 mimir_consolidate, #332
   mimir_follow, #345 mimir_memories). Post-v2.13.0: 53 (#365
   mimir_communities, mimir_community_summary, mimir_global_recall; #364
-  mimir_dream). Now **55** (#363 mimir_valid_at, mimir_bitemporal).
+  mimir_dream). 55 (#363 mimir_valid_at, mimir_bitemporal). 56 (#521
+  mimir_check_failure_pattern). Now **57** (#520 mimir_capture).
   Earlier figures kept as historical record only.

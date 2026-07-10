@@ -14,7 +14,7 @@
 [![LangGraph](https://img.shields.io/badge/integrations-LangGraph-blue)](integrations/langgraph/)
 [![CrewAI](https://img.shields.io/badge/integrations-CrewAI-orange)](integrations/crewai/)
 [![AutoGen](https://img.shields.io/badge/integrations-AutoGen-purple)](integrations/autogen/)
-[![MCP Tools](https://img.shields.io/badge/MCP%20tools-56-brightgreen)]()
+[![MCP Tools](https://img.shields.io/badge/MCP%20tools-57-brightgreen)]()
 
 Perseus Vault is a single Rust binary that gives AI agents durable memory across sessions.
 **One binary. One file. No Docker. No Postgres. No cloud.** Just persistent memory
@@ -122,7 +122,7 @@ local-first, zero-dependency, AND agent-first.
 |---|---|---|---|---|
 | **Deployment** | Single binary (~8MB) | Cloud + self-host | Docker/Postgres | Docker/Postgres |
 | **Dependencies** | None (SQLite embedded) | Python + vector DB | Postgres + Python | Postgres + Go |
-| **MCP-Native** | ✅ 56 tools | ❌ Not MCP-native | ❌ Not MCP-native | ❌ Not MCP-native |
+| **MCP-Native** | ✅ 57 tools | ❌ Not MCP-native | ❌ Not MCP-native | ❌ Not MCP-native |
 | **Offline/Local** | ✅ Fully local | Cloud-dependent | Docker needed | Docker needed |
 | **Encryption** | AES-256-GCM ✅ | ❌ | ❌ | ❌ |
 | **Hybrid Search** | BM25 + Dense + RRF | Vector only | Vector only | Vector + Graph |
@@ -130,7 +130,7 @@ local-first, zero-dependency, AND agent-first.
 | **Entity Graph** | Link + Traverse | ❌ | ❌ | ✅ |
 | **Journal Audit Trail** | ✅ Immutable | ❌ | ❌ | ❌ |
 | **State Management** | ✅ Key-value + TTL | ❌ | ❌ | ❌ |
-| **MCP Tools** | 56 | 5 | 8 | 0 |
+| **MCP Tools** | 57 | 5 | 8 | 0 |
 | **License** | MIT | Apache 2.0 | Apache 2.0 | Apache 2.0 |
 
 [Full comparison: Perseus Vault vs Mem0 →](docs/comparison/mimir-vs-mem0.md)
@@ -176,7 +176,7 @@ Each adapter:
 Any MCP-compatible framework works with Perseus Vault directly. See
 [Awesome Mimir](awesome-mimir.md) for the full list.
 
-## 56 MCP Tools
+## 57 MCP Tools
 
 ### Entity CRUD
 | Tool | Description |
@@ -202,6 +202,7 @@ Any MCP-compatible framework works with Perseus Vault directly. See
 | `mimir_ingest` | Trigger connector syncs (GitHub, file watcher). |
 | `mimir_ingest_file` | Locally extract a document's text (plaintext/markdown always; DOCX/PDF with the `multimodal` feature) and store it as a recallable entity. |
 | `mimir_extract` | Local, deterministic, rule-based knowledge extraction (facts / preferences / temporal events / episodes) from text or a stored entity. Read-only. |
+| `mimir_capture` | Opt-in in-session capture (#520): distill a transcript/insight payload (text, markdown, or JSONL) into durable entities (root-cause / pitfall / decision / pattern / takeaway) the moment a problem is solved. Local rule-based distiller by default, optional `llm: true` with graceful fallback; near-dup merging stays ON plus a per-invocation cap (anti-flood). Also a CLI verb: `perseus-vault capture`. |
 | `mimir_memories` | Anthropic memory-tool compatible file interface (`view`/`create`/`str_replace`/`insert`/`delete`/`rename` under `/memories`), backed by vault entities. |
 
 ### Graph
