@@ -85,6 +85,12 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
   dedup (one extra stored row) until its signature self-heals — it can never cause a
   false positive.
 
+### Distribution
+- **Listed on [mcpservers.org](https://mcpservers.org/servers/perseus-computing-llc/perseus-vault)**
+  (Awesome MCP Servers) — the directory crawls the Official MCP Registry entry
+  (registry.modelcontextprotocol.io), joining the Glama / PulseMCP / mcp.so listings noted
+  under the 2.7.0 registry-publish entry below.
+
 ## [2.19.1] - 2026-07-07
 
 ### Fixed

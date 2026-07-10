@@ -49,7 +49,7 @@ Zero runtime dependencies. Structured entity model with journal events and state
 - **Synthesis:** chain traversal (`mimir_traverse`), quality scoring (`mimir_score`), conflict detection (`mimir_conflicts`), RAG (`mimir_ask`)
 - **Vault & portability:** `.md` export/import (`mimir_vault_export`/`import`) — human-readable, git-trackable, Obsidian-compatible
 - **Connectors:** GitHub issues + file watcher via `mimir_ingest`
-- **Security & ops:** AES-256-GCM encryption at rest, web dashboard, Smithery/Glama listings
+- **Security & ops:** AES-256-GCM encryption at rest, web dashboard, Smithery/Glama/mcpservers.org listings
 
 ### v1.1 – v2.0 — Ecosystem, multi-agent, platform ✅ (2026-06)
 - **Ecosystem:** framework adapters for **LangGraph, CrewAI, AutoGen** (`integrations/`), an **Obsidian plugin**,

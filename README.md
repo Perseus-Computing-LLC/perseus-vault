@@ -15,6 +15,7 @@
 [![CrewAI](https://img.shields.io/badge/integrations-CrewAI-orange)](integrations/crewai/)
 [![AutoGen](https://img.shields.io/badge/integrations-AutoGen-purple)](integrations/autogen/)
 [![MCP Tools](https://img.shields.io/badge/MCP%20tools-57-brightgreen)]()
+[![Listed on mcpservers.org](https://img.shields.io/badge/listed-mcpservers.org-blue)](https://mcpservers.org/servers/perseus-computing-llc/perseus-vault)
 
 Perseus Vault is a single Rust binary that gives AI agents durable memory across sessions.
 **One binary. One file. No Docker. No Postgres. No cloud.** Just persistent memory

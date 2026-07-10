@@ -218,3 +218,4 @@ perseus-vault --db ~/.openclaw/mimir/mimir.db --vault-export ~/mimir-vault/
 - Website: https://perseus.observer/perseus-vault
 - Python client: https://pypi.org/project/mimir-client/
 - Smithery: https://smithery.ai/server/mimir
+- mcpservers.org: https://mcpservers.org/servers/perseus-computing-llc/perseus-vault
