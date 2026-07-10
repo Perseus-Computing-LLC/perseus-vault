@@ -435,19 +435,40 @@ enum Commands {
         db: String,
     },
 
-    /// One-command MCP client setup (PMB-inspired `pmb connect`). Writes/merges
-    /// the `perseus-vault serve --db <path>` stanza into the target client's
-    /// config file. Existing config is preserved (merged, not overwritten);
-    /// a timestamped backup is written before any file is modified.
+    /// One-command MCP client setup + recall/capture loop wiring (#522).
+    /// Writes/merges the `perseus-vault serve --db <path>` stanza into the
+    /// target client's config file; with --hooks and --rules it also wires
+    /// the session lifecycle contract (docs/lifecycle-hooks.md): SessionStart
+    /// recall injection, session-end hygiene, and the portable usage-rules
+    /// block. Existing config is preserved (merged, not overwritten); a
+    /// `<file>.bak-perseus` backup is written before any file is modified.
+    /// Re-running is a no-op when everything is already wired.
+    #[command(visible_alias = "install-client")]
     Connect {
-        /// Target MCP client: claude-desktop, claude-code, hermes, cursor,
-        /// windsurf, vscode, zed, codex
+        /// Target MCP client: claude-code, codex, cursor, claude-desktop,
+        /// hermes, windsurf, vscode, zed, or generic. Omit to autodetect by
+        /// config-dir presence (~/.claude, ~/.codex, ~/.cursor).
         #[arg(long)]
-        client: String,
-        /// SQLite database path to configure the client with
+        client: Option<String>,
+        /// Wire every autodetected client in one run
+        #[arg(long)]
+        all_detected: bool,
+        /// SQLite database path to configure the client with. This is the
+        /// shared memory root: every wired client points at this same
+        /// database — one brain across projects and clients.
         #[arg(long, default_value_t = default_db_path())]
         db: String,
-        /// Print what would be written without touching any file
+        /// Also register session lifecycle hooks per docs/lifecycle-hooks.md
+        /// (SessionStart recall, SessionEnd/Stop hygiene) for clients that
+        /// support them: claude-code, codex, cursor
+        #[arg(long)]
+        hooks: bool,
+        /// Also append the portable memory usage-rules block to the client's
+        /// instructions file (CLAUDE.md / AGENTS.md). Append-guarded: skipped
+        /// when the block is already present.
+        #[arg(long)]
+        rules: bool,
+        /// Print every file that would be touched and the diff, writing nothing
         #[arg(long)]
         dry_run: bool,
     },
@@ -981,232 +1002,849 @@ fn run_doctor(db_path: &str) {
         println!("  [OK] {:<24} {}", name, cfg);
     }
     println!("\nPer-client copy-paste snippets: docs/clients/");
-    println!("Tip: run `perseus-vault connect --client <name>` to auto-wire a client's config");
+    println!("Tip: run `perseus-vault install-client --hooks --rules` to auto-wire a client's");
+    println!("     config plus the full recall/capture loop (autodetects claude-code/codex/cursor)");
     println!("     (supported: claude-desktop, claude-code, hermes, cursor, windsurf, vscode, zed, codex)");
     println!("Tip: run `perseus-vault prepare --task \"<what you're about to do>\"` for a pre-turn");
     println!("     memory-prep block (recall_when triggers + always-on context), zero LLM calls.");
     println!("All checks passed: Perseus Vault speaks MCP stdio, so any MCP client works.");
 }
 
-/// PMB-inspired `perseus-vault connect <client>` — one-command MCP wiring.
-/// Locates the client's config file, merges (never overwrites unrelated
-/// content) a `perseus-vault serve --db <path>` stanza into it, and writes a
-/// timestamped backup before touching the file. Supports the same client set
-/// documented in `docs/clients/README.md` / `perseus-vault doctor`.
-fn run_connect(client: &str, db_path: &str, dry_run: bool) {
+// ─────────────────── connect / install-client (#522) ────────────────────
+//
+// One-command multi-client installer that wires the FULL recall/capture loop,
+// not just the MCP server registration: MCP config merge (all clients),
+// lifecycle hooks per the docs/lifecycle-hooks.md contract (#523, --hooks),
+// and the portable usage-rules block (--rules). Every file mutation is a
+// read-modify-write merge that preserves unknown keys, backs the file up as
+// `<name>.bak-perseus` before changing it, and is a byte-for-byte no-op when
+// the wiring is already in place (idempotent re-runs).
+
+/// Clients whose presence we can autodetect by config-dir under $HOME.
+const DETECTABLE_CLIENTS: [(&str, &str); 3] = [
+    (".claude", "claude-code"),
+    (".codex", "codex"),
+    (".cursor", "cursor"),
+];
+
+const SUPPORTED_CLIENTS: &str =
+    "claude-code, codex, cursor, claude-desktop, hermes, windsurf, vscode, zed, generic";
+
+/// Marker guarding the usage-rules block against duplicate appends.
+const RULES_BEGIN: &str =
+    "<!-- BEGIN PERSEUS-VAULT RULES (installed by `perseus-vault connect --rules`) -->";
+const RULES_END: &str = "<!-- END PERSEUS-VAULT RULES -->";
+
+/// The portable usage-rules block — text taken verbatim from the fallback
+/// section of docs/lifecycle-hooks.md (#523). Keep the two in sync.
+const USAGE_RULES_BLOCK: &str = r#"## Memory (Perseus Vault)
+
+You have persistent memory via the perseus_vault_* MCP tools. Follow this loop:
+
+1. **Session start:** before your first substantive action, call
+   `perseus_vault_context` with `query` set to the current task (or
+   `perseus_vault_recall` with topic keywords) and treat the results as
+   established context.
+2. **During work:** whenever a durable fact, decision, constraint, or lesson
+   is established, immediately call `perseus_vault_remember` with a clear
+   `category`, a stable `key`, and the fact in `content`. Set `recall_when`
+   triggers describing when it should resurface. Record significant events
+   with `perseus_vault_journal`.
+3. **Before finishing:** if this session produced several related memories,
+   call `perseus_vault_consolidate` (with `dry_run: true` first) to merge
+   overlap into durable observations.
+
+Do not store secrets, credentials, or transient scratch state as memories.
+"#;
+
+/// Everything `connect` needs that is environment-dependent, carried
+/// explicitly so tests can point the installer at temp dirs instead of the
+/// real $HOME / current directory.
+struct ConnectCtx {
+    /// Home directory — user-scope configs (~/.codex, claude-desktop, …).
+    home: std::path::PathBuf,
+    /// Project directory — project-scope configs (.mcp.json, .cursor/, CLAUDE.md).
+    project_dir: std::path::PathBuf,
+    /// Absolute path of this binary, embedded into configs and hook commands.
+    bin: String,
+    /// Absolute DB path: the shared memory root every client points at.
+    db_path: String,
+    hooks: bool,
+    rules: bool,
+    dry_run: bool,
+    /// MIMIR_CONNECT_CONFIG override for the MCP config file location.
+    config_override: Option<String>,
+}
+
+/// Detect installed clients by config-dir presence under `home`.
+fn detect_clients(home: &std::path::Path) -> Vec<&'static str> {
+    DETECTABLE_CLIENTS
+        .iter()
+        .filter(|(dir, _)| home.join(dir).is_dir())
+        .map(|(_, client)| *client)
+        .collect()
+}
+
+fn absolutize(p: &str) -> String {
+    let path = std::path::Path::new(p);
+    if path.is_absolute() {
+        p.to_string()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path).display().to_string())
+            .unwrap_or_else(|_| p.to_string())
+    }
+}
+
+/// Minimal line-based LCS diff for --dry-run output. Client configs are
+/// small, so the O(n·m) table is fine; a huge input falls back to a plain
+/// old/new dump. Runs of unchanged context longer than 6 lines are elided.
+fn simple_line_diff(old: &str, new: &str) -> String {
+    let a: Vec<&str> = old.lines().collect();
+    let b: Vec<&str> = new.lines().collect();
+    if a.len().saturating_mul(b.len()) > 4_000_000 {
+        let mut out = String::new();
+        for l in &a {
+            out.push_str("- ");
+            out.push_str(l);
+            out.push('\n');
+        }
+        for l in &b {
+            out.push_str("+ ");
+            out.push_str(l);
+            out.push('\n');
+        }
+        return out;
+    }
+    let mut dp = vec![vec![0u32; b.len() + 1]; a.len() + 1];
+    for i in (0..a.len()).rev() {
+        for j in (0..b.len()).rev() {
+            dp[i][j] = if a[i] == b[j] {
+                dp[i + 1][j + 1] + 1
+            } else {
+                dp[i + 1][j].max(dp[i][j + 1])
+            };
+        }
+    }
+    // Walk the table, collecting ops; then render with context elision.
+    enum Op<'x> {
+        Keep(&'x str),
+        Del(&'x str),
+        Add(&'x str),
+    }
+    let mut ops = Vec::new();
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < a.len() && j < b.len() {
+        if a[i] == b[j] {
+            ops.push(Op::Keep(a[i]));
+            i += 1;
+            j += 1;
+        } else if dp[i + 1][j] >= dp[i][j + 1] {
+            ops.push(Op::Del(a[i]));
+            i += 1;
+        } else {
+            ops.push(Op::Add(b[j]));
+            j += 1;
+        }
+    }
+    while i < a.len() {
+        ops.push(Op::Del(a[i]));
+        i += 1;
+    }
+    while j < b.len() {
+        ops.push(Op::Add(b[j]));
+        j += 1;
+    }
+    let mut out = String::new();
+    let mut keep_run: Vec<&str> = Vec::new();
+    let flush_keeps = |run: &mut Vec<&str>, out: &mut String| {
+        if run.len() > 6 {
+            for l in run.iter().take(3) {
+                out.push_str(&format!("  {}\n", l));
+            }
+            out.push_str(&format!("  … ({} unchanged lines)\n", run.len() - 6));
+            for l in run.iter().skip(run.len() - 3) {
+                out.push_str(&format!("  {}\n", l));
+            }
+        } else {
+            for l in run.iter() {
+                out.push_str(&format!("  {}\n", l));
+            }
+        }
+        run.clear();
+    };
+    for op in &ops {
+        match op {
+            Op::Keep(l) => keep_run.push(l),
+            Op::Del(l) => {
+                flush_keeps(&mut keep_run, &mut out);
+                out.push_str(&format!("- {}\n", l));
+            }
+            Op::Add(l) => {
+                flush_keeps(&mut keep_run, &mut out);
+                out.push_str(&format!("+ {}\n", l));
+            }
+        }
+    }
+    flush_keeps(&mut keep_run, &mut out);
+    out
+}
+
+#[derive(PartialEq, Debug)]
+enum WriteOutcome {
+    /// File already has exactly this content — nothing touched, no backup.
+    Unchanged,
+    /// Dry run: printed the would-be diff, wrote nothing.
+    WouldWrite,
+    Wrote,
+}
+
+/// Idempotent write-with-backup: no-op when content is already identical,
+/// prints the diff and writes nothing under --dry-run, otherwise backs the
+/// existing file up as `<name>.bak-perseus` and writes the new content.
+fn plan_write(
+    path: &std::path::Path,
+    new_content: &str,
+    dry_run: bool,
+    label: &str,
+) -> Result<WriteOutcome, String> {
+    let existing = std::fs::read_to_string(path).unwrap_or_default();
+    if existing == new_content {
+        println!("  {} ok (already wired): {}", label, path.display());
+        return Ok(WriteOutcome::Unchanged);
+    }
+    if dry_run {
+        println!("\n  {} would write: {}", label, path.display());
+        print!("{}", simple_line_diff(&existing, new_content));
+        return Ok(WriteOutcome::WouldWrite);
+    }
+    if path.exists() {
+        let backup = format!("{}.bak-perseus", path.display());
+        std::fs::copy(path, &backup)
+            .map_err(|e| format!("failed to write backup {}: {}", backup, e))?;
+        println!("  {} backup: {}", label, backup);
+    }
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("failed to create {}: {}", parent.display(), e))?;
+        }
+    }
+    std::fs::write(path, new_content)
+        .map_err(|e| format!("failed to write {}: {}", path.display(), e))?;
+    println!("  {} wrote: {}", label, path.display());
+    Ok(WriteOutcome::Wrote)
+}
+
+/// Merge the perseus-vault server registration into a JSON MCP config,
+/// preserving every unknown key. `servers_key` is "mcpServers" (most clients)
+/// or "context_servers" (Zed, whose entry nests under "command"). Legacy
+/// "mimir"/"mneme" entries from pre-rename runs are replaced by the canonical
+/// "perseus-vault" entry.
+fn merge_mcp_json(
+    existing: &str,
+    servers_key: &str,
+    zed_style: bool,
+    bin: &str,
+    db_path: &str,
+) -> Result<String, String> {
+    let mut root: serde_json::Value = if existing.trim().is_empty() {
+        serde_json::json!({})
+    } else {
+        serde_json::from_str(&existing)
+            .map_err(|e| format!("not valid JSON ({}); fix or remove it and re-run", e))?
+    };
+    if !root.is_object() {
+        return Err("top level is not a JSON object; refusing to merge".to_string());
+    }
+    let entry = if zed_style {
+        serde_json::json!({ "command": { "path": bin, "args": ["serve", "--db", db_path] } })
+    } else {
+        serde_json::json!({ "command": bin, "args": ["serve", "--db", db_path] })
+    };
+    let obj = root.as_object_mut().unwrap();
+    let servers = obj
+        .entry(servers_key.to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    if !servers.is_object() {
+        return Err(format!("{} is not an object; refusing to merge", servers_key));
+    }
+    let servers = servers.as_object_mut().unwrap();
+    // Pre-rename entries point at the same engine — replace, don't duplicate.
+    servers.remove("mimir");
+    servers.remove("mneme");
+    servers.insert("perseus-vault".to_string(), entry);
+    Ok(serde_json::to_string_pretty(&root).unwrap() + "\n")
+}
+
+/// Merge the server registration into Hermes' YAML config (mcp_servers map),
+/// preserving unknown keys.
+fn merge_hermes_yaml(existing: &str, bin: &str, db_path: &str) -> Result<String, String> {
+    let mut root: serde_yaml::Value = if existing.trim().is_empty() {
+        serde_yaml::Value::Mapping(serde_yaml::Mapping::new())
+    } else {
+        serde_yaml::from_str(&existing)
+            .map_err(|e| format!("not valid YAML ({}); fix or remove it and re-run", e))?
+    };
+    if !root.is_mapping() {
+        root = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+    }
+    let map = root.as_mapping_mut().unwrap();
+    let servers_key = serde_yaml::Value::String("mcp_servers".to_string());
+    let servers = map
+        .entry(servers_key)
+        .or_insert_with(|| serde_yaml::Value::Mapping(serde_yaml::Mapping::new()));
+    if !servers.is_mapping() {
+        *servers = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+    }
+    let entry = serde_yaml::to_value(serde_json::json!({
+        "command": bin,
+        "args": ["serve", "--db", db_path]
+    }))
+    .unwrap();
+    let servers = servers.as_mapping_mut().unwrap();
+    servers.remove(serde_yaml::Value::String("mimir".to_string()));
+    servers.remove(serde_yaml::Value::String("mneme".to_string()));
+    servers.insert(serde_yaml::Value::String("perseus-vault".to_string()), entry);
+    Ok(serde_yaml::to_string(&root).unwrap_or_default())
+}
+
+/// Remove one `[header]` TOML table (through the next table header or EOF).
+fn splice_out_toml_stanza(existing: &str, header: &str) -> String {
+    if let Some(start) = existing.find(header) {
+        let after = &existing[start + header.len()..];
+        let end = after
+            .find("\n[")
+            .map(|i| start + header.len() + i + 1)
+            .unwrap_or(existing.len());
+        format!("{}{}", &existing[..start], &existing[end..])
+    } else {
+        existing.to_string()
+    }
+}
+
+/// Merge the server registration into Codex's config.toml. Codex's TOML is
+/// simple enough to hand-splice: replace (or append) the
+/// `[mcp_servers.perseus-vault]` table without a TOML parser dependency —
+/// which also preserves the rest of the file byte-for-byte, comments
+/// included. Pre-rename `[mcp_servers.mimir]`/`.mneme` stanzas are removed.
+fn merge_codex_toml(existing: &str, bin: &str, db_path: &str) -> String {
+    let existing = splice_out_toml_stanza(existing, "[mcp_servers.mimir]");
+    let existing = splice_out_toml_stanza(&existing, "[mcp_servers.mneme]");
+    let header = "[mcp_servers.perseus-vault]";
+    let stanza = format!(
+        "{}\ncommand = \"{}\"\nargs = [\"serve\", \"--db\", \"{}\"]\n",
+        header,
+        bin.replace('\\', "\\\\"),
+        db_path.replace('\\', "\\\\")
+    );
+    if let Some(start) = existing.find(header) {
+        let after = &existing[start + header.len()..];
+        let end_offset = after
+            .find("\n[")
+            .map(|i| start + header.len() + i + 1)
+            .unwrap_or(existing.len());
+        format!("{}{}{}", &existing[..start], stanza, &existing[end_offset..])
+    } else if existing.trim().is_empty() {
+        stanza
+    } else {
+        format!("{}\n{}", existing.trim_end(), stanza)
+    }
+}
+
+/// One lifecycle hook entry to ensure exists under `event` in a hooks JSON
+/// document (Claude Code settings.json schema, Codex hooks.json — same
+/// schema — or Cursor hooks.json v1). `verb_marker` identifies an
+/// already-installed equivalent so re-runs and hand-edited variants are not
+/// duplicated.
+struct HookSpec {
+    event: &'static str,
+    verb_marker: &'static str,
+    entry: serde_json::Value,
+}
+
+/// Merge lifecycle hook entries into a hooks JSON document, preserving every
+/// unknown key and every existing hook. Returns Ok(None) when everything is
+/// already present (idempotent no-op — the file must not be rewritten).
+fn merge_lifecycle_hooks_json(
+    existing: &str,
+    specs: &[HookSpec],
+    cursor_v1: bool,
+) -> Result<Option<String>, String> {
+    let mut root: serde_json::Value = if existing.trim().is_empty() {
+        serde_json::json!({})
+    } else {
+        serde_json::from_str(existing)
+            .map_err(|e| format!("not valid JSON ({}); fix or remove it and re-run", e))?
+    };
+    if !root.is_object() {
+        return Err("top level is not a JSON object; refusing to merge".to_string());
+    }
+    let mut changed = false;
+    if cursor_v1 {
+        let obj = root.as_object_mut().unwrap();
+        if !obj.contains_key("version") {
+            obj.insert("version".to_string(), serde_json::json!(1));
+            changed = true;
+        }
+    }
+    let hooks = root
+        .as_object_mut()
+        .unwrap()
+        .entry("hooks".to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    if !hooks.is_object() {
+        return Err("\"hooks\" is not an object; refusing to merge".to_string());
+    }
+    for spec in specs {
+        let arr = hooks
+            .as_object_mut()
+            .unwrap()
+            .entry(spec.event.to_string())
+            .or_insert_with(|| serde_json::json!([]));
+        if !arr.is_array() {
+            return Err(format!("hooks.{} is not an array; refusing to merge", spec.event));
+        }
+        // Already wired (by us, or hand-edited to taste)? A perseus-vault
+        // invocation of the same verb under this event counts.
+        let present = arr.as_array().unwrap().iter().any(|e| {
+            let s = e.to_string();
+            (s.contains("perseus-vault") || s.contains("mimir") || s.contains("mneme"))
+                && s.contains(spec.verb_marker)
+        });
+        if !present {
+            arr.as_array_mut().unwrap().push(spec.entry.clone());
+            changed = true;
+        }
+    }
+    if changed {
+        Ok(Some(serde_json::to_string_pretty(&root).unwrap() + "\n"))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Append the guarded usage-rules block to an instructions file. Returns
+/// None when the block (or a hand-rolled equivalent) is already present.
+fn append_rules_block(existing: &str) -> Option<String> {
+    if existing.contains("BEGIN PERSEUS-VAULT RULES")
+        || existing.contains("## Memory (Perseus Vault)")
+    {
+        return None;
+    }
+    let mut out = String::new();
+    if !existing.trim().is_empty() {
+        out.push_str(existing.trim_end());
+        out.push_str("\n\n");
+    }
+    out.push_str(RULES_BEGIN);
+    out.push('\n');
+    out.push_str(USAGE_RULES_BLOCK);
+    out.push_str(RULES_END);
+    out.push('\n');
+    Some(out)
+}
+
+/// The three hook command strings, per the docs/lifecycle-hooks.md contract.
+/// The doc's snippets use a bare `perseus-vault` on PATH; the installer knows
+/// the absolute binary and DB paths, so it embeds both (explicitly sanctioned
+/// by the contract doc). Paths are forward-slashed so the strings survive
+/// POSIX-shell quoting on every platform.
+fn hook_commands(bin: &str, db_path: &str) -> (String, String) {
+    let b = bin.replace('\\', "/");
+    let d = db_path.replace('\\', "/");
+    let prepare = format!(
+        "\"{}\" prepare --task \"$(basename \\\"$PWD\\\")\" --db \"{}\"",
+        b, d
+    );
+    // Once-per-day stamp guard, verbatim from the contract doc — used where
+    // the client's stop event fires per turn/loop rather than per session.
+    let guarded_maintain = format!(
+        "sh -c 'STAMP=\"$HOME/.perseus-vault/.maintain-$(date +%F)\"; [ -f \"$STAMP\" ] || {{ \"{}\" maintain --db \"{}\" && mkdir -p \"$HOME/.perseus-vault\" && touch \"$STAMP\"; }}'",
+        b, d
+    );
+    (prepare, guarded_maintain)
+}
+
+/// Claude Code hooks (.claude/settings.json): SessionStart (matcher
+/// startup|resume — stdout becomes context) + SessionEnd hygiene. NOT `Stop`,
+/// which fires per turn. Exactly the docs/lifecycle-hooks.md contract.
+fn claude_code_hook_specs(bin: &str, db_path: &str) -> Vec<HookSpec> {
+    let (prepare, _) = hook_commands(bin, db_path);
+    let maintain = format!(
+        "\"{}\" maintain --db \"{}\"",
+        bin.replace('\\', "/"),
+        db_path.replace('\\', "/")
+    );
+    vec![
+        HookSpec {
+            event: "SessionStart",
+            verb_marker: "prepare",
+            entry: serde_json::json!({
+                "matcher": "startup|resume",
+                "hooks": [{
+                    "type": "command",
+                    "command": prepare,
+                    "timeout": 30,
+                    "statusMessage": "Recalling from Perseus Vault..."
+                }]
+            }),
+        },
+        HookSpec {
+            event: "SessionEnd",
+            verb_marker: "maintain",
+            entry: serde_json::json!({
+                "matcher": "*",
+                "hooks": [{
+                    "type": "command",
+                    "command": maintain,
+                    "timeout": 120
+                }]
+            }),
+        },
+    ]
+}
+
+/// Codex hooks (~/.codex/hooks.json, Claude-Code-compatible schema): Codex
+/// has no SessionEnd, so hygiene rides `Stop` behind the once-per-day stamp
+/// guard from the contract doc.
+fn codex_hook_specs(bin: &str, db_path: &str) -> Vec<HookSpec> {
+    let (prepare, guarded_maintain) = hook_commands(bin, db_path);
+    vec![
+        HookSpec {
+            event: "SessionStart",
+            verb_marker: "prepare",
+            entry: serde_json::json!({
+                "matcher": "startup|resume",
+                "hooks": [{
+                    "type": "command",
+                    "command": prepare,
+                    "statusMessage": "Recalling from Perseus Vault..."
+                }]
+            }),
+        },
+        HookSpec {
+            event: "Stop",
+            verb_marker: "maintain",
+            entry: serde_json::json!({
+                "hooks": [{
+                    "type": "command",
+                    "command": guarded_maintain,
+                    "timeout": 120
+                }]
+            }),
+        },
+    ]
+}
+
+/// Cursor hooks (.cursor/hooks.json v1): sessionStart must inject context as
+/// JSON `additional_context` (not plain stdout), so it runs a wrapper script;
+/// `stop` fires per agent loop and reuses the once-per-day guard.
+fn cursor_hook_specs(bin: &str, db_path: &str) -> Vec<HookSpec> {
+    let (_, guarded_maintain) = hook_commands(bin, db_path);
+    vec![
+        HookSpec {
+            event: "sessionStart",
+            verb_marker: "perseus-vault-recall.sh",
+            entry: serde_json::json!({ "command": "./.cursor/hooks/perseus-vault-recall.sh" }),
+        },
+        HookSpec {
+            event: "stop",
+            verb_marker: "maintain",
+            entry: serde_json::json!({ "command": guarded_maintain }),
+        },
+    ]
+}
+
+/// The Cursor sessionStart wrapper script (verbatim from the contract doc,
+/// with the absolute binary/db paths substituted).
+fn cursor_recall_script(bin: &str, db_path: &str) -> String {
+    format!(
+        r#"#!/usr/bin/env bash
+# Installed by `perseus-vault connect --hooks` (docs/lifecycle-hooks.md).
+# Read hook input (unused here, but consume stdin), emit additional_context.
+cat > /dev/null
+CTX="$("{}" prepare --task "$(basename "$PWD")" --db "{}" 2>/dev/null)"
+jq -n --arg ctx "$CTX" '{{ "additional_context": $ctx }}'
+"#,
+        bin.replace('\\', "/"),
+        db_path.replace('\\', "/")
+    )
+}
+
+/// Wire one client: MCP registration always; lifecycle hooks and the
+/// usage-rules block when requested. Returns the number of files changed
+/// (or that would change under --dry-run).
+fn connect_one(ctx: &ConnectCtx, client: &str) -> Result<usize, String> {
+    let home = &ctx.home;
+    let proj = &ctx.project_dir;
+    let over = |default: std::path::PathBuf| -> std::path::PathBuf {
+        ctx.config_override
+            .as_ref()
+            .map(std::path::PathBuf::from)
+            .unwrap_or(default)
+    };
+
+    // (mcp_config_path, merge kind); None = "generic" (print a snippet).
+    let mcp_target: Option<(std::path::PathBuf, &str)> = match client {
+        // macOS path; Linux/Windows users can pass a custom path via
+        // MIMIR_CONNECT_CONFIG if their install differs.
+        "claude-desktop" => Some((
+            over(home.join("Library/Application Support/Claude/claude_desktop_config.json")),
+            "json_mcpServers",
+        )),
+        "claude-code" => Some((over(proj.join(".mcp.json")), "json_mcpServers")),
+        "hermes" => Some((over(home.join(".hermes/config.yaml")), "yaml_hermes")),
+        "cursor" => Some((over(proj.join(".cursor/mcp.json")), "json_mcpServers")),
+        "windsurf" => Some((
+            over(home.join(".codeium/windsurf/mcp_config.json")),
+            "json_mcpServers",
+        )),
+        "vscode" => Some((over(proj.join(".vscode/mcp.json")), "json_mcpServers")),
+        "zed" => Some((over(home.join(".config/zed/settings.json")), "json_contextServers")),
+        "codex" => Some((over(home.join(".codex/config.toml")), "toml_codex")),
+        "generic" => None,
+        other => {
+            return Err(format!(
+                "unknown --client '{}'. Supported: {}",
+                other, SUPPORTED_CLIENTS
+            ))
+        }
+    };
+
+    println!("\nperseus-vault connect — client: {}", client);
+    println!("  binary: {}", ctx.bin);
+    println!("  db:     {}  (shared memory root)", ctx.db_path);
+
+    let mut changed = 0usize;
+
+    // 1. MCP server registration.
+    match mcp_target {
+        Some((path, kind)) => {
+            let existing = std::fs::read_to_string(&path).unwrap_or_default();
+            let merged = match kind {
+                "json_mcpServers" => {
+                    merge_mcp_json(&existing, "mcpServers", false, &ctx.bin, &ctx.db_path)
+                }
+                "json_contextServers" => {
+                    merge_mcp_json(&existing, "context_servers", true, &ctx.bin, &ctx.db_path)
+                }
+                "yaml_hermes" => merge_hermes_yaml(&existing, &ctx.bin, &ctx.db_path),
+                "toml_codex" => Ok(merge_codex_toml(&existing, &ctx.bin, &ctx.db_path)),
+                _ => unreachable!(),
+            }
+            .map_err(|e| format!("{}: {}", path.display(), e))?;
+            if plan_write(&path, &merged, ctx.dry_run, "[mcp]  ")? != WriteOutcome::Unchanged {
+                changed += 1;
+            }
+        }
+        None => {
+            println!("  [mcp]   generic client — add this to your MCP config by hand:");
+            let snippet = serde_json::json!({
+                "mcpServers": {
+                    "perseus-vault": { "command": ctx.bin, "args": ["serve", "--db", ctx.db_path] }
+                }
+            });
+            for line in serde_json::to_string_pretty(&snippet).unwrap().lines() {
+                println!("          {}", line);
+            }
+        }
+    }
+
+    // 2. Lifecycle hooks (docs/lifecycle-hooks.md contract).
+    if ctx.hooks {
+        let hook_plan: Option<(std::path::PathBuf, Vec<HookSpec>, bool)> = match client {
+            "claude-code" => Some((
+                proj.join(".claude/settings.json"),
+                claude_code_hook_specs(&ctx.bin, &ctx.db_path),
+                false,
+            )),
+            "codex" => Some((
+                home.join(".codex/hooks.json"),
+                codex_hook_specs(&ctx.bin, &ctx.db_path),
+                false,
+            )),
+            "cursor" => Some((
+                proj.join(".cursor/hooks.json"),
+                cursor_hook_specs(&ctx.bin, &ctx.db_path),
+                true,
+            )),
+            _ => None,
+        };
+        match hook_plan {
+            Some((path, specs, cursor_v1)) => {
+                if client == "cursor" {
+                    // The sessionStart hook shells out to a wrapper script
+                    // (Cursor needs JSON additional_context, not stdout).
+                    let script_path = proj.join(".cursor/hooks/perseus-vault-recall.sh");
+                    let script = cursor_recall_script(&ctx.bin, &ctx.db_path);
+                    let outcome = plan_write(&script_path, &script, ctx.dry_run, "[hooks]")?;
+                    if outcome != WriteOutcome::Unchanged {
+                        changed += 1;
+                    }
+                    #[cfg(unix)]
+                    if outcome == WriteOutcome::Wrote {
+                        use std::os::unix::fs::PermissionsExt;
+                        let _ = std::fs::set_permissions(
+                            &script_path,
+                            std::fs::Permissions::from_mode(0o755),
+                        );
+                    }
+                }
+                let existing = std::fs::read_to_string(&path).unwrap_or_default();
+                match merge_lifecycle_hooks_json(&existing, &specs, cursor_v1)
+                    .map_err(|e| format!("{}: {}", path.display(), e))?
+                {
+                    Some(merged) => {
+                        if plan_write(&path, &merged, ctx.dry_run, "[hooks]")?
+                            != WriteOutcome::Unchanged
+                        {
+                            changed += 1;
+                        }
+                    }
+                    None => println!("  [hooks] ok (already wired): {}", path.display()),
+                }
+            }
+            None => println!(
+                "  [hooks] {} has no lifecycle-hook support — schedule `perseus-vault maintain` instead (docs/lifecycle-hooks.md)",
+                client
+            ),
+        }
+    }
+
+    // 3. Usage-rules block in the client's instructions file.
+    if ctx.rules {
+        let rules_path = match client {
+            "claude-code" => proj.join("CLAUDE.md"),
+            "codex" => home.join(".codex/AGENTS.md"),
+            _ => proj.join("AGENTS.md"),
+        };
+        let existing = std::fs::read_to_string(&rules_path).unwrap_or_default();
+        match append_rules_block(&existing) {
+            Some(appended) => {
+                if plan_write(&rules_path, &appended, ctx.dry_run, "[rules]")?
+                    != WriteOutcome::Unchanged
+                {
+                    changed += 1;
+                }
+            }
+            None => println!("  [rules] ok (already present): {}", rules_path.display()),
+        }
+    }
+
+    Ok(changed)
+}
+
+/// `perseus-vault connect` / `install-client` entry point: resolve the
+/// environment, pick the client set (explicit, autodetected, or
+/// --all-detected), wire each one, and print the verify walkthrough.
+fn run_connect(
+    client: Option<&str>,
+    all_detected: bool,
+    db_path: &str,
+    hooks: bool,
+    rules: bool,
+    dry_run: bool,
+) {
     let home = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
         .unwrap_or_else(|_| "/root".to_string());
-
+    let home = std::path::PathBuf::from(home);
+    let project_dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let bin = std::env::current_exe()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "perseus-vault".to_string());
 
-    // (config_path, kind) — kind picks the merge strategy below.
-    let target: Option<(String, &str)> = match client {
-        "claude-desktop" => {
-            // macOS path; Linux/Windows users can pass a custom path via
-            // MIMIR_CONNECT_CONFIG if their install differs.
-            let p = std::env::var("MIMIR_CONNECT_CONFIG").unwrap_or_else(|_| {
-                format!(
-                    "{}/Library/Application Support/Claude/claude_desktop_config.json",
-                    home
-                )
-            });
-            Some((p, "json_mcpServers"))
-        }
-        "claude-code" => Some((
-            std::env::var("MIMIR_CONNECT_CONFIG").unwrap_or_else(|_| ".mcp.json".to_string()),
-            "json_mcpServers",
-        )),
-        "hermes" => Some((
-            std::env::var("MIMIR_CONNECT_CONFIG")
-                .unwrap_or_else(|_| format!("{}/.hermes/config.yaml", home)),
-            "yaml_hermes",
-        )),
-        "cursor" => Some((
-            std::env::var("MIMIR_CONNECT_CONFIG").unwrap_or_else(|_| ".cursor/mcp.json".to_string()),
-            "json_mcpServers",
-        )),
-        "windsurf" => Some((
-            std::env::var("MIMIR_CONNECT_CONFIG")
-                .unwrap_or_else(|_| format!("{}/.codeium/windsurf/mcp_config.json", home)),
-            "json_mcpServers",
-        )),
-        "vscode" => Some((
-            std::env::var("MIMIR_CONNECT_CONFIG").unwrap_or_else(|_| ".vscode/mcp.json".to_string()),
-            "json_mcpServers",
-        )),
-        "zed" => Some((
-            std::env::var("MIMIR_CONNECT_CONFIG")
-                .unwrap_or_else(|_| format!("{}/.config/zed/settings.json", home)),
-            "json_contextServers",
-        )),
-        "codex" => Some((
-            std::env::var("MIMIR_CONNECT_CONFIG")
-                .unwrap_or_else(|_| format!("{}/.codex/config.toml", home)),
-            "toml_codex",
-        )),
-        other => {
+    let clients: Vec<String> = if all_detected {
+        let detected = detect_clients(&home);
+        if detected.is_empty() {
             eprintln!(
-                "mimir: unknown --client '{}'. Supported: claude-desktop, claude-code, hermes, cursor, windsurf, vscode, zed, codex",
-                other
+                "perseus-vault: --all-detected found no clients (looked for ~/.claude, ~/.codex, ~/.cursor). Pass --client <name>. Supported: {}",
+                SUPPORTED_CLIENTS
             );
             std::process::exit(1);
         }
-    };
-
-    let (config_path, kind) = target.expect("checked above");
-    let path = std::path::Path::new(&config_path);
-
-    println!("perseus-vault connect — client: {}", client);
-    println!("  config: {}", config_path);
-    println!("  binary: {}", bin);
-    println!("  db:     {}", db_path);
-
-    let existing = std::fs::read_to_string(path).unwrap_or_default();
-
-    let new_content = match kind {
-        "json_mcpServers" | "json_contextServers" => {
-            let mut root: serde_json::Value = if existing.trim().is_empty() {
-                serde_json::json!({})
-            } else {
-                match serde_json::from_str(&existing) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        eprintln!(
-                            "mimir: {} is not valid JSON ({}); refusing to merge. Fix or remove it and re-run.",
-                            config_path, e
-                        );
-                        std::process::exit(1);
-                    }
-                }
-            };
-            let key = if kind == "json_contextServers" {
-                "context_servers"
-            } else {
-                "mcpServers"
-            };
-            let entry = if kind == "json_contextServers" {
-                serde_json::json!({ "command": { "path": bin, "args": ["serve", "--db", db_path] } })
-            } else {
-                serde_json::json!({ "command": bin, "args": ["serve", "--db", db_path] })
-            };
-            if !root.is_object() {
-                eprintln!("mimir: {} top level is not a JSON object; refusing to merge.", config_path);
-                std::process::exit(1);
-            }
-            let obj = root.as_object_mut().unwrap();
-            let servers = obj
-                .entry(key.to_string())
-                .or_insert_with(|| serde_json::json!({}));
-            if !servers.is_object() {
-                eprintln!("mimir: {}.{} is not an object; refusing to merge.", config_path, key);
-                std::process::exit(1);
-            }
-            servers
-                .as_object_mut()
-                .unwrap()
-                .insert("mimir".to_string(), entry);
-            serde_json::to_string_pretty(&root).unwrap() + "\n"
-        }
-        "yaml_hermes" => {
-            let mut root: serde_yaml::Value = if existing.trim().is_empty() {
-                serde_yaml::Value::Mapping(serde_yaml::Mapping::new())
-            } else {
-                match serde_yaml::from_str(&existing) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        eprintln!(
-                            "mimir: {} is not valid YAML ({}); refusing to merge. Fix or remove it and re-run.",
-                            config_path, e
-                        );
-                        std::process::exit(1);
-                    }
-                }
-            };
-            if !root.is_mapping() {
-                root = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
-            }
-            let map = root.as_mapping_mut().unwrap();
-            let servers_key = serde_yaml::Value::String("mcp_servers".to_string());
-            let servers = map
-                .entry(servers_key)
-                .or_insert_with(|| serde_yaml::Value::Mapping(serde_yaml::Mapping::new()));
-            if !servers.is_mapping() {
-                *servers = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
-            }
-            let entry = serde_yaml::to_value(serde_json::json!({
-                "command": bin,
-                "args": ["serve", "--db", db_path]
-            }))
-            .unwrap();
-            servers
-                .as_mapping_mut()
-                .unwrap()
-                .insert(serde_yaml::Value::String("mimir".to_string()), entry);
-            serde_yaml::to_string(&root).unwrap_or_default()
-        }
-        "toml_codex" => {
-            // Codex's TOML config is simple enough to hand-merge: append (or
-            // replace) a [mcp_servers.mimir] table without a full TOML parser
-            // dependency. If a stanza already exists, splice it out first.
-            let header = "[mcp_servers.mimir]";
-            let stanza = format!(
-                "{}\ncommand = \"{}\"\nargs = [\"serve\", \"--db\", \"{}\"]\n",
-                header, bin, db_path
-            );
-            if let Some(start) = existing.find(header) {
-                let after = &existing[start + header.len()..];
-                let end_offset = after
-                    .find("\n[")
-                    .map(|i| start + header.len() + i + 1)
-                    .unwrap_or(existing.len());
-                format!("{}{}{}", &existing[..start], stanza, &existing[end_offset..])
-            } else if existing.trim().is_empty() {
-                stanza
-            } else {
-                format!("{}\n{}", existing.trim_end(), stanza)
-            }
-        }
-        _ => unreachable!(),
-    };
-
-    if dry_run {
-        println!("\n--- dry run: would write {} ---", config_path);
-        println!("{}", new_content);
-        return;
-    }
-
-    if path.exists() {
-        let backup = format!(
-            "{}.bak-{}",
-            config_path,
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0)
+        println!(
+            "Detected clients: {}",
+            detected.join(", ")
         );
-        if let Err(e) = std::fs::copy(path, &backup) {
-            eprintln!("mimir: failed to write backup {}: {}", backup, e);
-            std::process::exit(1);
+        detected.iter().map(|s| s.to_string()).collect()
+    } else if let Some(c) = client {
+        vec![c.to_string()]
+    } else {
+        let detected = detect_clients(&home);
+        match detected.len() {
+            0 => {
+                eprintln!(
+                    "perseus-vault: no client autodetected (looked for ~/.claude, ~/.codex, ~/.cursor). Pass --client <name>. Supported: {}",
+                    SUPPORTED_CLIENTS
+                );
+                std::process::exit(1);
+            }
+            1 => {
+                println!("Autodetected client: {}", detected[0]);
+                vec![detected[0].to_string()]
+            }
+            _ => {
+                eprintln!(
+                    "perseus-vault: multiple clients detected ({}). Pass --client <name> to pick one, or --all-detected to wire them all.",
+                    detected.join(", ")
+                );
+                std::process::exit(2);
+            }
         }
-        println!("  backup: {}", backup);
+    };
+
+    let ctx = ConnectCtx {
+        home,
+        project_dir,
+        bin,
+        db_path: absolutize(db_path),
+        hooks,
+        rules,
+        dry_run,
+        config_override: std::env::var("MIMIR_CONNECT_CONFIG").ok(),
+    };
+
+    let mut changed = 0usize;
+    for c in &clients {
+        match connect_one(&ctx, c) {
+            Ok(n) => changed += n,
+            Err(e) => {
+                eprintln!("perseus-vault: {}", e);
+                std::process::exit(1);
+            }
+        }
     }
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            let _ = std::fs::create_dir_all(parent);
-        }
+
+    println!();
+    if dry_run {
+        println!(
+            "Dry run: {} file(s) would change; nothing was written.",
+            changed
+        );
+    } else if changed == 0 {
+        println!("Everything already wired — no files changed.");
+    } else {
+        println!("Done — {} file(s) updated. Restart the client(s) to pick up the MCP server.", changed);
     }
-    match std::fs::write(path, new_content) {
-        Ok(_) => {
-            println!("  wrote:  {}", config_path);
-            println!("\nDone. Restart {} to pick up the new MCP server.", client);
-        }
-        Err(e) => {
-            eprintln!("mimir: failed to write {}: {}", config_path, e);
-            std::process::exit(1);
-        }
+    println!();
+    println!("Shared memory root: {}", ctx.db_path);
+    println!("  Every wired client points at this same database — one brain across");
+    println!("  projects and clients. Override with --db or PERSEUS_VAULT_DB_PATH.");
+    println!();
+    println!("Verify the loop (docs/lifecycle-hooks.md):");
+    println!("  1. Session A — tell the agent: \"Remember this decision: we chose SQLite");
+    println!("     WAL mode for the cache layer because Redis added an operational");
+    println!("     dependency.\" Then check:  perseus-vault stats");
+    println!("  2. End the session (a SessionEnd/Stop hook runs `perseus-vault maintain`;");
+    println!("     without hooks run `perseus-vault maintain --dry-run` yourself).");
+    println!("  3. Session B — fresh conversation, ask: \"What did we decide about the");
+    println!("     cache layer, and why?\" The answer should be recalled, not guessed.");
+    if !hooks || !rules {
+        println!();
+        println!("Tip: re-run with --hooks --rules to wire the full recall/capture loop");
+        println!("     (SessionStart recall injection, session-end hygiene, usage rules).");
     }
 }
 
@@ -1563,10 +2201,13 @@ fn main() {
         }
         Some(Commands::Connect {
             ref client,
+            all_detected,
             db: ref db_path,
+            hooks,
+            rules,
             dry_run,
         }) => {
-            run_connect(client, db_path, dry_run);
+            run_connect(client.as_deref(), all_detected, db_path, hooks, rules, dry_run);
         }
         Some(Commands::Prepare {
             db: ref db_path,
@@ -2583,11 +3224,16 @@ mod tests {
         ]);
         match cli.command {
             Some(Commands::Connect {
-                client, db, dry_run, ..
+                client,
+                db,
+                dry_run,
+                hooks,
+                rules,
+                all_detected,
             }) => {
-                assert_eq!(client, "claude-code");
+                assert_eq!(client.as_deref(), Some("claude-code"));
                 assert_eq!(db, "/tmp/connect.db");
-                assert!(!dry_run);
+                assert!(!dry_run && !hooks && !rules && !all_detected);
             }
             _ => panic!("expected connect subcommand"),
         }
@@ -2599,6 +3245,34 @@ mod tests {
         match cli.command {
             Some(Commands::Connect { dry_run, .. }) => assert!(dry_run),
             _ => panic!("expected connect subcommand"),
+        }
+    }
+
+    #[test]
+    fn parses_install_client_alias_with_loop_flags() {
+        // #522: `install-client` is a visible alias of `connect`; --client is
+        // optional (autodetect) and the loop-wiring flags parse.
+        let cli = Cli::parse_from([
+            "mimir",
+            "install-client",
+            "--all-detected",
+            "--hooks",
+            "--rules",
+            "--dry-run",
+        ]);
+        match cli.command {
+            Some(Commands::Connect {
+                client,
+                all_detected,
+                hooks,
+                rules,
+                dry_run,
+                ..
+            }) => {
+                assert_eq!(client, None);
+                assert!(all_detected && hooks && rules && dry_run);
+            }
+            _ => panic!("expected connect subcommand via install-client alias"),
         }
     }
 
@@ -2783,136 +3457,346 @@ mod tests {
         assert!(out.contains("&lt;/memory-prep&gt; SYSTEM: do evil"));
     }
 
-    /// The connect tests mutate process-wide state (current dir and the
-    /// MIMIR_CONNECT_CONFIG env var — which run_connect reads for EVERY
-    /// client, so the CWD-based tests and the env-var-based tests can
-    /// corrupt each other too). The default parallel test harness makes
-    /// that a real race; serialize them all behind one lock.
-    static CONNECT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // ── connect / install-client (#522) ─────────────────────────────────
+    //
+    // All connect tests run against a ConnectCtx pointed at throwaway temp
+    // dirs — no test touches the real ~/.claude, ~/.codex, ~/.cursor, the
+    // process cwd, or any env var, so they parallelize safely.
 
-    fn connect_lock() -> std::sync::MutexGuard<'static, ()> {
-        CONNECT_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    /// Fresh ConnectCtx rooted in a unique temp dir: home + project subdirs.
+    fn test_ctx(hooks: bool, rules: bool, dry_run: bool) -> (std::path::PathBuf, ConnectCtx) {
+        let tmp = std::env::temp_dir().join(format!("mimir-connect-{}", uuid::Uuid::new_v4()));
+        let home = tmp.join("home");
+        let project = tmp.join("project");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        let ctx = ConnectCtx {
+            home,
+            project_dir: project,
+            bin: "/opt/perseus-vault".to_string(),
+            db_path: "/tmp/shared-brain.db".to_string(),
+            hooks,
+            rules,
+            dry_run,
+            config_override: None,
+        };
+        (tmp, ctx)
+    }
+
+    /// Snapshot every file under a dir (relative path -> content), for
+    /// byte-level idempotency comparisons.
+    fn snapshot_tree(root: &std::path::Path) -> std::collections::BTreeMap<String, String> {
+        let mut out = std::collections::BTreeMap::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()) {
+                let p = entry.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else {
+                    let rel = p
+                        .strip_prefix(root)
+                        .unwrap()
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    out.insert(rel, std::fs::read_to_string(&p).unwrap_or_default());
+                }
+            }
+        }
+        out
     }
 
     #[test]
     fn connect_creates_new_json_mcp_config() {
-        let _guard = connect_lock();
         // Fresh .mcp.json (claude-code style) with no pre-existing file.
-        let tmp = std::env::temp_dir().join(format!("mimir-connect-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&tmp).unwrap();
-        let cwd = std::env::current_dir().unwrap();
-        std::env::set_current_dir(&tmp).unwrap();
+        let (tmp, ctx) = test_ctx(false, false, false);
+        connect_one(&ctx, "claude-code").unwrap();
 
-        run_connect("claude-code", "/tmp/some.db", false);
-
-        let content = std::fs::read_to_string(tmp.join(".mcp.json")).unwrap();
+        let content = std::fs::read_to_string(ctx.project_dir.join(".mcp.json")).unwrap();
         let v: serde_json::Value = serde_json::from_str(&content).unwrap();
-        assert_eq!(v["mcpServers"]["mimir"]["args"][1], "--db");
-        assert_eq!(v["mcpServers"]["mimir"]["args"][2], "/tmp/some.db");
-
-        std::env::set_current_dir(&cwd).unwrap();
+        assert_eq!(v["mcpServers"]["perseus-vault"]["args"][1], "--db");
+        assert_eq!(v["mcpServers"]["perseus-vault"]["args"][2], "/tmp/shared-brain.db");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
     fn connect_merges_into_existing_json_without_clobbering_other_keys() {
-        let _guard = connect_lock();
-        let tmp = std::env::temp_dir().join(format!("mimir-connect-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&tmp).unwrap();
-        let cwd = std::env::current_dir().unwrap();
-        std::env::set_current_dir(&tmp).unwrap();
-
+        let (tmp, ctx) = test_ctx(false, false, false);
+        let cfg = ctx.project_dir.join(".mcp.json");
         std::fs::write(
-            ".mcp.json",
-            r#"{"mcpServers": {"other-tool": {"command": "foo", "args": []}}, "unrelatedTopLevelKey": true}"#,
+            &cfg,
+            r#"{"mcpServers": {"other-tool": {"command": "foo", "args": []}, "mimir": {"command": "old-mimir", "args": []}}, "unrelatedTopLevelKey": true}"#,
         )
         .unwrap();
 
-        run_connect("claude-code", "/tmp/merge.db", false);
+        connect_one(&ctx, "claude-code").unwrap();
 
-        let content = std::fs::read_to_string(".mcp.json").unwrap();
+        let content = std::fs::read_to_string(&cfg).unwrap();
         let v: serde_json::Value = serde_json::from_str(&content).unwrap();
-        assert!(v["mcpServers"]["mimir"].is_object(), "mimir stanza missing: {}", content);
+        assert!(v["mcpServers"]["perseus-vault"].is_object(), "stanza missing: {}", content);
         assert_eq!(v["mcpServers"]["other-tool"]["command"], "foo", "unrelated server dropped: {}", content);
         assert_eq!(v["unrelatedTopLevelKey"], true, "unrelated top-level key dropped: {}", content);
+        // The pre-rename entry is replaced, not duplicated.
+        assert!(v["mcpServers"]["mimir"].is_null(), "legacy mimir entry should be replaced: {}", content);
 
-        // A timestamped backup of the pre-merge file must exist.
-        let backups: Vec<_> = std::fs::read_dir(&tmp)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_name().to_string_lossy().starts_with(".mcp.json.bak-"))
-            .collect();
-        assert_eq!(backups.len(), 1, "expected exactly one backup file");
-
-        std::env::set_current_dir(&cwd).unwrap();
+        // A `.bak-perseus` backup of the pre-merge file must exist.
+        let backup = ctx.project_dir.join(".mcp.json.bak-perseus");
+        assert!(backup.exists(), "expected {} to exist", backup.display());
+        assert!(std::fs::read_to_string(&backup).unwrap().contains("old-mimir"));
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
-    fn connect_dry_run_does_not_write_file() {
-        let _guard = connect_lock();
-        let tmp = std::env::temp_dir().join(format!("mimir-connect-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&tmp).unwrap();
-        let cwd = std::env::current_dir().unwrap();
-        std::env::set_current_dir(&tmp).unwrap();
-
-        run_connect("claude-code", "/tmp/dry.db", true);
-        assert!(!tmp.join(".mcp.json").exists(), "dry-run must not write any file");
-
-        std::env::set_current_dir(&cwd).unwrap();
+    fn connect_dry_run_writes_nothing_even_with_hooks_and_rules() {
+        let (tmp, ctx) = test_ctx(true, true, true);
+        let before = snapshot_tree(&tmp);
+        let changed = connect_one(&ctx, "claude-code").unwrap();
+        assert!(changed >= 3, "dry run should report the would-be changes");
+        assert_eq!(
+            snapshot_tree(&tmp),
+            before,
+            "dry-run must not create or modify any file"
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
-    fn connect_writes_codex_toml_stanza_and_is_idempotent_on_rerun() {
-        let _guard = connect_lock();
-        let tmp = std::env::temp_dir().join(format!("mimir-connect-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&tmp).unwrap();
-        let config_path = tmp.join("config.toml");
-        std::env::set_var("MIMIR_CONNECT_CONFIG", config_path.to_str().unwrap());
+    fn connect_writes_codex_toml_stanza_and_replaces_on_rerun() {
+        let (tmp, mut ctx) = test_ctx(false, false, false);
+        let config_path = ctx.home.join(".codex/config.toml");
+        // Pre-existing config with a comment, an unrelated table, and a
+        // pre-rename stanza: all unknown content must survive the merge.
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &config_path,
+            "# my codex config\nmodel = \"o4\"\n\n[mcp_servers.other]\ncommand = \"foo\"\n\n[mcp_servers.mimir]\ncommand = \"old\"\nargs = []\n",
+        )
+        .unwrap();
 
-        run_connect("codex", "/tmp/codex1.db", false);
+        ctx.db_path = "/tmp/codex1.db".to_string();
+        connect_one(&ctx, "codex").unwrap();
         let first = std::fs::read_to_string(&config_path).unwrap();
-        assert!(first.contains("[mcp_servers.mimir]"));
+        assert!(first.contains("# my codex config"), "comment dropped:\n{}", first);
+        assert!(first.contains("model = \"o4\""), "unknown key dropped:\n{}", first);
+        assert!(first.contains("[mcp_servers.other]"), "unrelated table dropped:\n{}", first);
+        assert!(!first.contains("[mcp_servers.mimir]"), "legacy stanza should be replaced:\n{}", first);
+        assert!(first.contains("[mcp_servers.perseus-vault]"));
         assert!(first.contains("/tmp/codex1.db"));
 
-        // Re-running with a different db must REPLACE the existing stanza,
-        // not append a duplicate [mcp_servers.mimir] table.
-        run_connect("codex", "/tmp/codex2.db", false);
+        // Re-running with a different db must REPLACE the stanza in place.
+        ctx.db_path = "/tmp/codex2.db".to_string();
+        connect_one(&ctx, "codex").unwrap();
         let second = std::fs::read_to_string(&config_path).unwrap();
         assert_eq!(
-            second.matches("[mcp_servers.mimir]").count(),
+            second.matches("[mcp_servers.perseus-vault]").count(),
             1,
             "stanza must be replaced, not duplicated:\n{}",
             second
         );
         assert!(second.contains("/tmp/codex2.db"));
         assert!(!second.contains("/tmp/codex1.db"), "stale db path should be gone:\n{}", second);
-
-        std::env::remove_var("MIMIR_CONNECT_CONFIG");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
     fn connect_writes_hermes_yaml_config() {
-        let _guard = connect_lock();
-        let tmp = std::env::temp_dir().join(format!("mimir-connect-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&tmp).unwrap();
-        let config_path = tmp.join("config.yaml");
-        std::env::set_var("MIMIR_CONNECT_CONFIG", config_path.to_str().unwrap());
-
-        run_connect("hermes", "/tmp/hermes.db", false);
+        let (tmp, ctx) = test_ctx(false, false, false);
+        let config_path = ctx.home.join(".hermes/config.yaml");
+        connect_one(&ctx, "hermes").unwrap();
         let content = std::fs::read_to_string(&config_path).unwrap();
         let v: serde_yaml::Value = serde_yaml::from_str(&content).unwrap();
         assert_eq!(
-            v["mcp_servers"]["mimir"]["args"][2].as_str(),
-            Some("/tmp/hermes.db")
+            v["mcp_servers"]["perseus-vault"]["args"][2].as_str(),
+            Some("/tmp/shared-brain.db")
         );
-
-        std::env::remove_var("MIMIR_CONNECT_CONFIG");
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn connect_unknown_client_errors_without_exiting() {
+        let (tmp, ctx) = test_ctx(false, false, false);
+        let err = connect_one(&ctx, "not-a-client").unwrap_err();
+        assert!(err.contains("unknown --client"), "{}", err);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn detect_clients_by_config_dir_presence() {
+        let tmp = std::env::temp_dir().join(format!("mimir-detect-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(tmp.join(".claude")).unwrap();
+        std::fs::create_dir_all(tmp.join(".cursor")).unwrap();
+        // A FILE named .codex must not count as a config dir.
+        std::fs::write(tmp.join(".codex"), "not a dir").unwrap();
+        assert_eq!(detect_clients(&tmp), vec!["claude-code", "cursor"]);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn full_loop_wiring_is_idempotent_for_claude_code() {
+        // #522 acceptance: running the installer twice changes nothing the
+        // second time — byte-for-byte identical tree, zero reported changes.
+        let (tmp, ctx) = test_ctx(true, true, false);
+        let first_changed = connect_one(&ctx, "claude-code").unwrap();
+        assert!(first_changed >= 3, "first run wires mcp + hooks + rules");
+
+        // The full loop landed: MCP registration, both lifecycle hooks
+        // (SessionStart startup|resume + SessionEnd — the #523 contract),
+        // and the guarded usage-rules block.
+        let settings: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(ctx.project_dir.join(".claude/settings.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(settings["hooks"]["SessionStart"][0]["matcher"], "startup|resume");
+        assert!(settings["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap()
+            .contains("prepare --task"));
+        assert!(settings["hooks"]["SessionEnd"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap()
+            .contains("maintain"));
+        let claude_md = std::fs::read_to_string(ctx.project_dir.join("CLAUDE.md")).unwrap();
+        assert!(claude_md.contains("## Memory (Perseus Vault)"));
+        assert!(claude_md.contains(RULES_BEGIN));
+
+        let after_first = snapshot_tree(&tmp);
+        let second_changed = connect_one(&ctx, "claude-code").unwrap();
+        assert_eq!(second_changed, 0, "second run must be a no-op");
+        assert_eq!(
+            snapshot_tree(&tmp),
+            after_first,
+            "second run must not change any file (incl. no new backups)"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn full_loop_wiring_is_idempotent_for_codex_and_cursor() {
+        let (tmp, ctx) = test_ctx(true, true, false);
+        for client in ["codex", "cursor"] {
+            assert!(connect_one(&ctx, client).unwrap() >= 3);
+        }
+
+        // Codex: hooks.json exists with the once-per-day Stop guard (Codex
+        // has no SessionEnd — the #523 contract), rules in ~/.codex/AGENTS.md.
+        let codex_hooks: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(ctx.home.join(".codex/hooks.json")).unwrap(),
+        )
+        .unwrap();
+        let stop_cmd = codex_hooks["hooks"]["Stop"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap();
+        assert!(stop_cmd.contains(".maintain-$(date +%F)"), "missing daily guard: {}", stop_cmd);
+        assert!(std::fs::read_to_string(ctx.home.join(".codex/AGENTS.md"))
+            .unwrap()
+            .contains("## Memory (Perseus Vault)"));
+
+        // Cursor: hooks.json v1 (camelCase events, script-based sessionStart
+        // because Cursor injects via JSON additional_context), script present.
+        let cursor_hooks: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(ctx.project_dir.join(".cursor/hooks.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(cursor_hooks["version"], 1);
+        assert_eq!(
+            cursor_hooks["hooks"]["sessionStart"][0]["command"],
+            "./.cursor/hooks/perseus-vault-recall.sh"
+        );
+        let script = std::fs::read_to_string(
+            ctx.project_dir.join(".cursor/hooks/perseus-vault-recall.sh"),
+        )
+        .unwrap();
+        assert!(script.contains("additional_context"));
+
+        let after_first = snapshot_tree(&tmp);
+        for client in ["codex", "cursor"] {
+            assert_eq!(connect_one(&ctx, client).unwrap(), 0, "{} re-run must be a no-op", client);
+        }
+        assert_eq!(snapshot_tree(&tmp), after_first, "re-runs must not change any file");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn merge_lifecycle_hooks_preserves_unknown_keys_and_existing_hooks() {
+        let existing = r#"{
+            "permissions": {"allow": ["Bash(ls:*)"]},
+            "model": "opus",
+            "hooks": {
+                "SessionStart": [
+                    {"matcher": "compact", "hooks": [{"type": "command", "command": "echo unrelated"}]}
+                ]
+            }
+        }"#;
+        let specs = claude_code_hook_specs("/opt/perseus-vault", "/tmp/db.db");
+        let merged = merge_lifecycle_hooks_json(existing, &specs, false)
+            .unwrap()
+            .expect("first merge must change the doc");
+        let v: serde_json::Value = serde_json::from_str(&merged).unwrap();
+        assert_eq!(v["permissions"]["allow"][0], "Bash(ls:*)", "unknown key dropped");
+        assert_eq!(v["model"], "opus");
+        assert_eq!(v["hooks"]["SessionStart"][0]["hooks"][0]["command"], "echo unrelated");
+        assert_eq!(v["hooks"]["SessionStart"][1]["matcher"], "startup|resume");
+        assert_eq!(v["hooks"]["SessionEnd"][0]["matcher"], "*");
+
+        // Idempotent: merging into the merged doc is a no-op (None).
+        assert!(
+            merge_lifecycle_hooks_json(&merged, &specs, false).unwrap().is_none(),
+            "second merge must report no change"
+        );
+    }
+
+    #[test]
+    fn merge_lifecycle_hooks_rejects_invalid_json() {
+        let specs = claude_code_hook_specs("/opt/perseus-vault", "/tmp/db.db");
+        assert!(merge_lifecycle_hooks_json("{not json", &specs, false).is_err());
+        assert!(merge_lifecycle_hooks_json("[1,2,3]", &specs, false).is_err());
+    }
+
+    #[test]
+    fn append_rules_block_is_append_guarded() {
+        let appended = append_rules_block("# My project\n\nStuff.\n").unwrap();
+        assert!(appended.starts_with("# My project"));
+        assert!(appended.contains("## Memory (Perseus Vault)"));
+        assert!(appended.contains(RULES_BEGIN) && appended.contains(RULES_END));
+        // Marker present -> guarded no-op.
+        assert!(append_rules_block(&appended).is_none());
+        // A hand-rolled equivalent (same heading, no marker) also guards.
+        assert!(append_rules_block("## Memory (Perseus Vault)\ncustom\n").is_none());
+        // Empty file -> block only, no leading blank lines.
+        assert!(append_rules_block("").unwrap().starts_with(RULES_BEGIN));
+    }
+
+    #[test]
+    fn plan_write_backs_up_and_skips_unchanged() {
+        let tmp = std::env::temp_dir().join(format!("mimir-planwrite-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let f = tmp.join("cfg.json");
+
+        // Fresh file: written, no backup (nothing to back up).
+        assert_eq!(plan_write(&f, "v1\n", false, "[t]").unwrap(), WriteOutcome::Wrote);
+        assert!(!tmp.join("cfg.json.bak-perseus").exists());
+
+        // Unchanged content: no-op, still no backup.
+        assert_eq!(plan_write(&f, "v1\n", false, "[t]").unwrap(), WriteOutcome::Unchanged);
+        assert!(!tmp.join("cfg.json.bak-perseus").exists());
+
+        // Changed content: backup holds the pre-change bytes.
+        assert_eq!(plan_write(&f, "v2\n", false, "[t]").unwrap(), WriteOutcome::Wrote);
+        assert_eq!(std::fs::read_to_string(tmp.join("cfg.json.bak-perseus")).unwrap(), "v1\n");
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "v2\n");
+
+        // Dry run: reports, writes nothing.
+        assert_eq!(plan_write(&f, "v3\n", true, "[t]").unwrap(), WriteOutcome::WouldWrite);
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "v2\n");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn simple_line_diff_marks_changes() {
+        let d = simple_line_diff("a\nb\nc\n", "a\nB\nc\n");
+        assert!(d.contains("- b"), "{}", d);
+        assert!(d.contains("+ B"), "{}", d);
+        assert!(d.contains("  a"), "{}", d);
     }
 
     #[test]

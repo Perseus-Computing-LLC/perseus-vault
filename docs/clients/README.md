@@ -8,9 +8,14 @@ perseus-vault serve
 ```
 
 Run `perseus-vault doctor` to validate your install and print this matrix locally.
-Run `perseus-vault connect --client <name>` to auto-wire a client's config file
-(merges a `perseus-vault` MCP stanza into it, backing up the original first — no
-manual JSON/YAML/TOML editing required).
+Run `perseus-vault install-client` (alias of `connect`) to auto-wire a client's
+config file — autodetects Claude Code / Codex / Cursor, or pass `--client <name>`
+(`--all-detected` wires every detected client). It merges a `perseus-vault` MCP
+stanza into the config (backing the original up as `<file>.bak-perseus` — no
+manual JSON/YAML/TOML editing required), and with `--hooks --rules` it also
+wires the full recall/capture loop: session lifecycle hooks plus the memory
+usage-rules block per [docs/lifecycle-hooks.md](../lifecycle-hooks.md).
+`--dry-run` previews every change; re-running is a no-op.
 Run `perseus-vault prepare --task "<what you're about to do>"` for a pre-turn
 memory-prep block — combines `recall_when` (proactive trigger matches
 against the task text) and `context` (always-on + recent entities) into a

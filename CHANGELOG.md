@@ -17,6 +17,22 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
   contract (never bumps retrieval counts or decay), workspace-scoped (own + global failures
   only; other workspaces never leak), local and deterministic, no new storage model.
   Exposed under all three tool-name prefixes like every other tool. Tool count: 55 → 56.
+- **`install-client` — one-command multi-client loop wiring** (#522). `perseus-vault
+  install-client` (a visible alias of the extended `connect` verb) now wires the FULL
+  recall/capture loop, not just the MCP registration: `--client` is optional (autodetects
+  claude-code/codex/cursor by config-dir presence; `--all-detected` wires every detected
+  client, `generic` prints a copy-paste stanza), every client is pointed at ONE shared
+  memory database (the resolved `--db` path — one brain across projects and clients),
+  `--hooks` registers the session lifecycle hooks per the docs/lifecycle-hooks.md contract
+  (#523: Claude Code SessionStart `startup|resume` + SessionEnd; Codex Stop behind a
+  once-per-day guard; Cursor hooks.json v1 with a JSON `additional_context` wrapper
+  script), and `--rules` appends the portable usage-rules block to CLAUDE.md/AGENTS.md
+  (append-guarded). Every file mutation is a merge that preserves unknown keys, backs the
+  file up as `<name>.bak-perseus` first, and is skipped when already in place — re-running
+  changes nothing. `--dry-run` prints every file it would touch with a line diff and
+  writes nothing. The verb now also replaces pre-rename `mimir`/`mneme` server entries
+  with the canonical `perseus-vault` one instead of duplicating them, and ends by printing
+  the save-in-one-session/recall-in-another verify walkthrough.
 
 ### Performance
 - **Write path: signature-driven near-duplicate scan** (#476, schema v17). The per-write

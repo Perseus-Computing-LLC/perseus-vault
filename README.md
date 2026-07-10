@@ -47,7 +47,23 @@ perseus-vault serve --db ~/.mimir/data/perseus-vault.db
 > `--force` re-signs an already-signed binary (needed after every rebuild); the
 > step is harmless on Intel macOS and unnecessary on Linux/Windows.
 
-Connect any MCP host (Claude Desktop, Cursor, Hermes Agent, Perseus, etc.):
+Then wire your MCP client(s) — and the full recall/capture loop — in one command:
+
+```bash
+perseus-vault install-client --hooks --rules
+```
+
+This autodetects Claude Code / Codex / Cursor (pass `--client <name>` for
+claude-desktop, hermes, windsurf, vscode, zed, or generic; `--all-detected`
+wires every detected client), merges the MCP server registration into the
+client's config without clobbering anything (a `.bak-perseus` backup is
+written first), points every client at **one shared memory database**,
+registers the session lifecycle hooks (recall injection on SessionStart,
+hygiene on session end — the `docs/lifecycle-hooks.md` contract), and appends
+the memory usage rules to `CLAUDE.md`/`AGENTS.md`. Re-running is a no-op; add
+`--dry-run` to preview every file it would touch.
+
+Or connect any MCP host by hand (Claude Desktop, Cursor, Hermes Agent, Perseus, etc.):
 
 ```json
 {
