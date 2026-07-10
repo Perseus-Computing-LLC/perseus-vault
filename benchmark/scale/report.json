@@ -3,7 +3,7 @@
   "issue": "#474",
   "meta": {
     "binary": "perseus-vault 2.19.1",
-    "commit": "3ed4e5a4ae92",
+    "commit": "a9b7a3f",
     "hardware": {
       "machine": "AMD64",
       "processor": "AMD64 Family 26 Model 68 Stepping 0, AuthenticAMD",
