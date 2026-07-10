@@ -215,6 +215,73 @@ fn excluded_recall_categories() -> &'static Vec<String> {
     })
 }
 
+/// #511: opt-in, stage-level wall-clock attribution for the recall paths.
+///
+/// Enabled by setting `MIMIR_RECALL_TIMING` to any non-empty value other than
+/// `0`; the flag is read once per process. When enabled, `recall()` emits a
+/// single machine-greppable line per query to **stderr** (never stdout — that
+/// is the MCP protocol stream):
+///
+/// ```text
+/// [recall-timing] mode=hybrid total_ms=308.412 embed=11.204 dense=13.881 sparse=245.031 ...
+/// ```
+///
+/// When disabled (the default) every method is a single cached-bool check and
+/// no `Instant` is ever taken, so the production hot path pays nothing. This
+/// exists because Windows has no cheap flamegraph story for a release binary
+/// driven over MCP stdio; it is the permanent profiling surface that produced
+/// (and re-verifies) the attribution tables in PERF.md.
+pub(crate) struct RecallTimer {
+    /// `None` when timing is disabled — all methods no-op.
+    state: Option<RecallTimerState>,
+}
+
+struct RecallTimerState {
+    t0: std::time::Instant,
+    last: std::time::Instant,
+    stages: Vec<(&'static str, f64)>,
+}
+
+impl RecallTimer {
+    fn enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| {
+            std::env::var("MIMIR_RECALL_TIMING")
+                .map(|v| !v.is_empty() && v != "0")
+                .unwrap_or(false)
+        })
+    }
+
+    pub(crate) fn start() -> Self {
+        let state = Self::enabled().then(|| {
+            let now = std::time::Instant::now();
+            RecallTimerState { t0: now, last: now, stages: Vec::with_capacity(8) }
+        });
+        RecallTimer { state }
+    }
+
+    /// Record the time since the previous stage boundary under `name`.
+    pub(crate) fn stage(&mut self, name: &'static str) {
+        if let Some(s) = self.state.as_mut() {
+            let now = std::time::Instant::now();
+            s.stages.push((name, now.duration_since(s.last).as_secs_f64() * 1000.0));
+            s.last = now;
+        }
+    }
+
+    /// Emit the one-line attribution to stderr and consume the timer.
+    pub(crate) fn finish(self, mode: &str) {
+        if let Some(s) = self.state {
+            let total = s.t0.elapsed().as_secs_f64() * 1000.0;
+            let mut line = format!("[recall-timing] mode={mode} total_ms={total:.3}");
+            for (name, ms) in &s.stages {
+                line.push_str(&format!(" {name}={ms:.3}"));
+            }
+            eprintln!("{line}");
+        }
+    }
+}
+
 impl Database {
     /// Canonical AAD (additional authenticated data) binding ciphertext to its
     /// (category, key) identity. Length-prefixed so the encoding is
@@ -3207,6 +3274,9 @@ impl Database {
     }
 
     pub fn recall(&self, params: &RecallParams) -> Result<Vec<Entity>, Box<dyn std::error::Error>> {
+        // #511: stage-level attribution, opt-in via MIMIR_RECALL_TIMING=1.
+        // No-op (single cached-bool check per stage) when disabled.
+        let mut timer = RecallTimer::start();
         // Dense vector search path
         if params.mode == crate::models::SearchMode::Dense
             || params.mode == crate::models::SearchMode::Hybrid
@@ -3224,6 +3294,7 @@ impl Database {
                 }
                 None => None,
             };
+            timer.stage("embed");
 
             if let Some(query_vec) = query_vec {
                 if params.mode == crate::models::SearchMode::Dense {
@@ -3237,6 +3308,7 @@ impl Database {
                     let candidate_k =
                         limit.saturating_mul(5).clamp(1, 1000).max(limit.min(1000));
                     let dense_results = self.dense_search(query_vec, candidate_k)?;
+                    timer.stage("dense");
                     // #485: apply the scope preference while similarity scores
                     // are still attached, before they're dropped below.
                     let dense_results = Self::apply_scope_rank_weight(dense_results, params);
@@ -3245,6 +3317,8 @@ impl Database {
                     Self::retain_metadata_filters(&mut out, params);
                     out.truncate(limit);
                     self.reinforce_if_requested(params, &out)?;
+                    timer.stage("filter");
+                    timer.finish("dense");
                     return Ok(out);
                 }
 
@@ -3266,9 +3340,11 @@ impl Database {
                 let limit = params.limit.max(0) as usize;
                 let candidate_k = limit.saturating_mul(5).clamp(1, 1000).max(limit.min(1000));
                 let dense_scored = self.dense_search(query_vec, candidate_k)?;
+                timer.stage("dense");
                 let mut wide = params.clone();
                 wide.limit = candidate_k as i64;
                 let sparse_scored = self.fts5_bm25_search(&wide)?;
+                timer.stage("sparse");
                 let sparse_weight = crate::db::sparse_arm_weight(sparse_scored.len());
 
                 // Graph-expansion arm (#steal-3, competitive research): one-hop
@@ -3292,6 +3368,7 @@ impl Database {
                     }
                 }
                 let graph_scored = self.graph_expand(&graph_seeds, candidate_k)?;
+                timer.stage("graph");
                 let graph_weight = crate::db::graph_arm_weight(graph_scored.len());
 
                 let fused = if graph_scored.is_empty() {
@@ -3333,12 +3410,14 @@ impl Database {
                         now_ms(),
                     )
                 };
+                timer.stage("fuse");
                 // #487: usefulness term in the composite rank expression —
                 // Belief Memory's `(1.0 + usefulness())`. Applied over the
                 // fused candidate pool BEFORE the metadata filter + truncate,
                 // so a cited-and-reused memory ranked just past `limit` can
                 // still make the cut over a never-reused near-tie.
                 let fused = self.apply_usefulness_rank_boost(fused)?;
+                timer.stage("usefulness");
                 // #485: scope preference in the same first-phase expression —
                 // broader-scope (global) hits fused at `scope_weight`.
                 let fused = Self::apply_scope_rank_weight(fused, params);
@@ -3352,12 +3431,15 @@ impl Database {
                 Self::retain_metadata_filters(&mut out, params);
                 out.truncate(limit);
                 self.reinforce_if_requested(params, &out)?;
+                timer.stage("filter");
+                timer.finish("hybrid");
                 return Ok(out);
             }
             // Empty query: nothing to embed, fall through to FTS5
         }
 
         let mut results = self.fts5_search(params)?;
+        timer.stage("keyword");
         Self::retain_layer(&mut results, params);
         // #485: the keyword path's ordering carries no relevance score to
         // multiply, so the scope preference is a stable two-tier sort —
@@ -3366,6 +3448,7 @@ impl Database {
         if Self::scope_pref(params).is_some() {
             results.sort_by_key(|e| e.workspace_hash.is_empty());
         }
+        timer.finish("fts5");
         Ok(results)
     }
 
@@ -3961,10 +4044,185 @@ impl Database {
             .collect::<Vec<_>>()
             .join(" OR ");
 
-        let mut conditions: Vec<String> = vec!["e.archived = 0".to_string()];
+        let safe_limit = params.limit.clamp(0, 1000) as usize;
+        if safe_limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        // ── #511: two-phase plan — rank inside the FTS index, hydrate a pool ──
+        //
+        // The single-query plan below (kept as the fallback) joins every FTS
+        // match to `entities` and evaluates the full 24-column SELECT — body
+        // included — for each one before ORDER BY rank LIMIT k can discard it.
+        // A broad term matches most of the corpus, so at 100K entities that is
+        // ~100K multi-KB record reads walking body overflow chains per hybrid
+        // recall: measured 224ms of the 265ms hybrid-only overhead (PERF.md
+        // #511 — the #476/#507 disease, third instance). Phase 1 ranks with
+        // rowid + bm25() only, entirely inside the FTS index (entities is
+        // never touched); phase 2 hydrates and metadata-filters just the
+        // fetched pool. Filters live in `bm25_metadata_conditions`, shared
+        // with the fallback so the two plans cannot drift.
+        //
+        // Exactness: bm25 rank does not depend on the join, and the pool is
+        // consumed in (rank, rowid) order with the same predicates applied, so
+        // the result equals the fallback's whenever the pool covers the top
+        // `safe_limit` filtered hits. If filters eat the whole pool (kept <
+        // safe_limit with matches left over), retry once at MAX_FETCH, then
+        // fall back to the exact single-query plan — worst case is bounded and
+        // the answer is never silently truncated.
+        const BM25_FIRST_FETCH_MIN: usize = 128;
+        const BM25_MAX_FETCH: usize = 4096;
+        let mut fetch = safe_limit
+            .saturating_mul(3)
+            .clamp(BM25_FIRST_FETCH_MIN, BM25_MAX_FETCH);
+        loop {
+            let mut stmt = conn.prepare(
+                "SELECT rowid, bm25(entities_fts) AS rank FROM entities_fts \
+                 WHERE entities_fts MATCH ?1 ORDER BY rank ASC, rowid ASC LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(
+                rusqlite::params![fts_query, fetch as i64],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?)),
+            )?;
+            let mut ranked: Vec<(i64, f64)> = Vec::with_capacity(fetch.min(1024));
+            for r in rows {
+                ranked.push(r?);
+            }
+            if ranked.is_empty() {
+                return Ok(Vec::new());
+            }
+            let exhausted = ranked.len() < fetch;
+            drop(stmt);
+            let out = self.bm25_hydrate_filtered(&conn, &ranked, params, safe_limit)?;
+            if out.len() == safe_limit || exhausted {
+                return Ok(out);
+            }
+            if fetch >= BM25_MAX_FETCH {
+                break; // pathologically selective filters: exact fallback below
+            }
+            fetch = BM25_MAX_FETCH;
+        }
+
+        // ── Fallback: the pre-#511 single-query plan (exact, join-per-match) ──
         let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
         // ?1 is always the FTS MATCH expression.
         param_values.push(Box::new(fts_query));
+        let conditions = Self::bm25_metadata_conditions(params, &mut param_values);
+
+        let limit_idx = param_values.len() + 1;
+        param_values.push(Box::new(safe_limit as i64));
+
+        // bm25(entities_fts) is the trailing column (index 24); the leading 24
+        // columns match `entity_from_row`'s expected layout exactly.
+        let sql = format!(
+            "SELECT e.id, e.category, e.key, e.body_json, e.status, e.type, e.tags,
+                    e.decay_score, e.retrieval_count, e.layer, e.topic_path,
+                    e.archived, e.archive_reason, e.links, e.verified, e.source,
+                    e.created_at_unix_ms, e.last_accessed_unix_ms, NULL as embedding,
+                    e.always_on, e.certainty, e.workspace_hash, e.agent_id, e.visibility,
+                    bm25(entities_fts) AS rank
+             FROM entities_fts
+             JOIN entities e ON e.rowid = entities_fts.rowid
+             WHERE entities_fts MATCH ?1 AND {conditions}
+             ORDER BY rank ASC
+             LIMIT ?{limit_idx}",
+            conditions = conditions.join(" AND "),
+        );
+
+        let enc = self.encryption.as_ref();
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            param_values.iter().map(|p| p.as_ref()).collect();
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(param_refs.as_slice(), |row| {
+            let entity = entity_from_row(row, enc)?;
+            let bm25: f64 = row.get(24)?;
+            // Flip sign so higher = more relevant (BM25 is more-negative-is-better).
+            Ok((entity, -bm25))
+        })?;
+
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// #511 phase 2: hydrate a bm25-ranked rowid pool and apply the sparse
+    /// arm's metadata predicates, emitting `(entity, -bm25)` in (rank, rowid)
+    /// order, truncated to `safe_limit`. Chunked IN(...) like `graph_expand`
+    /// so the SQL variable count stays bounded; per-row cost is paid for the
+    /// pool only, never for the whole match set.
+    fn bm25_hydrate_filtered(
+        &self,
+        conn: &rusqlite::Connection,
+        ranked: &[(i64, f64)],
+        params: &RecallParams,
+        safe_limit: usize,
+    ) -> Result<Vec<(Entity, f64)>, Box<dyn std::error::Error>> {
+        let enc = self.encryption.as_ref();
+        let mut out: Vec<(Entity, f64)> = Vec::with_capacity(safe_limit.min(ranked.len()));
+        'chunks: for chunk in ranked.chunks(500) {
+            let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+            let conditions = Self::bm25_metadata_conditions(params, &mut param_values);
+            let base = param_values.len();
+            let placeholders = (1..=chunk.len())
+                .map(|i| format!("?{}", base + i))
+                .collect::<Vec<_>>()
+                .join(", ");
+            for (rowid, _) in chunk {
+                param_values.push(Box::new(*rowid));
+            }
+            // e.rowid is the trailing column (index 24); the leading 24
+            // columns match `entity_from_row`'s expected layout exactly.
+            let sql = format!(
+                "SELECT e.id, e.category, e.key, e.body_json, e.status, e.type, e.tags,
+                        e.decay_score, e.retrieval_count, e.layer, e.topic_path,
+                        e.archived, e.archive_reason, e.links, e.verified, e.source,
+                        e.created_at_unix_ms, e.last_accessed_unix_ms, NULL as embedding,
+                        e.always_on, e.certainty, e.workspace_hash, e.agent_id, e.visibility,
+                        e.rowid
+                 FROM entities e
+                 WHERE {conditions} AND e.rowid IN ({placeholders})",
+                conditions = conditions.join(" AND "),
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                param_values.iter().map(|p| p.as_ref()).collect();
+            let rows = stmt.query_map(param_refs.as_slice(), |row| {
+                let entity = entity_from_row(row, enc)?;
+                let rowid: i64 = row.get(24)?;
+                Ok((rowid, entity))
+            })?;
+            let mut by_rowid: std::collections::HashMap<i64, Entity> =
+                std::collections::HashMap::new();
+            for r in rows {
+                let (rowid, e) = r?;
+                by_rowid.insert(rowid, e);
+            }
+            for (rowid, rank) in chunk {
+                if let Some(e) = by_rowid.remove(rowid) {
+                    // Flip sign so higher = more relevant (BM25 is
+                    // more-negative-is-better).
+                    out.push((e, -rank));
+                    if out.len() == safe_limit {
+                        break 'chunks;
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// The sparse arm's metadata predicates over alias `e` (everything except
+    /// the FTS MATCH itself), pushing bind values with ?N numbering that
+    /// continues from `param_values`' current length. Shared by the #511
+    /// two-phase plan and the single-query fallback in `fts5_bm25_search` so
+    /// the two plans' filters can never drift apart.
+    fn bm25_metadata_conditions(
+        params: &RecallParams,
+        param_values: &mut Vec<Box<dyn rusqlite::types::ToSql>>,
+    ) -> Vec<String> {
+        let mut conditions: Vec<String> = vec!["e.archived = 0".to_string()];
 
         if let Some(ref cat) = params.category {
             if !cat.is_empty() {
@@ -4031,43 +4289,7 @@ impl Database {
             }
         }
 
-        let safe_limit = params.limit.clamp(0, 1000);
-        let limit_idx = param_values.len() + 1;
-        param_values.push(Box::new(safe_limit));
-
-        // bm25(entities_fts) is the trailing column (index 24); the leading 24
-        // columns match `entity_from_row`'s expected layout exactly.
-        let sql = format!(
-            "SELECT e.id, e.category, e.key, e.body_json, e.status, e.type, e.tags,
-                    e.decay_score, e.retrieval_count, e.layer, e.topic_path,
-                    e.archived, e.archive_reason, e.links, e.verified, e.source,
-                    e.created_at_unix_ms, e.last_accessed_unix_ms, NULL as embedding,
-                    e.always_on, e.certainty, e.workspace_hash, e.agent_id, e.visibility,
-                    bm25(entities_fts) AS rank
-             FROM entities_fts
-             JOIN entities e ON e.rowid = entities_fts.rowid
-             WHERE entities_fts MATCH ?1 AND {conditions}
-             ORDER BY rank ASC
-             LIMIT ?{limit_idx}",
-            conditions = conditions.join(" AND "),
-        );
-
-        let enc = self.encryption.as_ref();
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            param_values.iter().map(|p| p.as_ref()).collect();
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(param_refs.as_slice(), |row| {
-            let entity = entity_from_row(row, enc)?;
-            let bm25: f64 = row.get(24)?;
-            // Flip sign so higher = more relevant (BM25 is more-negative-is-better).
-            Ok((entity, -bm25))
-        })?;
-
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r?);
-        }
-        Ok(out)
+        conditions
     }
 
     /// #105: Apply per-keyword halving diversity quota.
@@ -17211,6 +17433,82 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 0, "fts5_bm25_search must not mutate retrieval_count");
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn fts5_bm25_two_phase_pool_survives_filter_heavy_corpora() {
+        // #511: the sparse arm now ranks rowids INSIDE the FTS index (no join)
+        // and hydrates + metadata-filters only a bounded pool. When the filters
+        // (here: the default exclusion of the `conversation` category, #298)
+        // eat the entire first pool, the arm must widen its fetch and still
+        // return every in-scope hit — never silently truncate the arm, and
+        // never leak an excluded row.
+        let (db, path) = temp_db();
+        let insert = |id: &str, category: &str, body: &str| {
+            let conn = db.conn().unwrap();
+            conn.execute(
+                "INSERT INTO entities (id, category, key, body_json, type, status,
+                    retrieval_count, last_accessed_unix_ms, created_at_unix_ms,
+                    decay_score, layer, archived)
+                 VALUES (?1, ?2, ?1, ?3, 'insight', 'active', 0, 0, 0, 1.0, 'working', 0)",
+                params![id, category, body],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO entities_fts (rowid, body_json)
+                 VALUES ((SELECT rowid FROM entities WHERE id = ?1), ?2)",
+                params![id, body],
+            )
+            .unwrap();
+        };
+
+        // 300 excluded-category rows that match the term strongly (high term
+        // frequency, short bodies) — they own the top of the raw bm25 ranking
+        // and overflow the first 128-row pool.
+        for i in 0..300 {
+            insert(
+                &format!("noise-{i:04}"),
+                "conversation",
+                &format!(r#"{{"note":"zebrafinch zebrafinch zebrafinch turn {i}"}}"#),
+            );
+        }
+        // 3 in-scope rows that match the same term weakly (single mention,
+        // longer body) — bm25 ranks them below every noise row.
+        for i in 0..3 {
+            insert(
+                &format!("wanted-{i}"),
+                "insight",
+                &format!(
+                    r#"{{"note":"one zebrafinch note {i} with a much longer body of trailing prose to depress its bm25 relevance well below the chatty noise rows"}}"#
+                ),
+            );
+        }
+
+        let out = db
+            .fts5_bm25_search(&RecallParams {
+                query: "zebrafinch".to_string(),
+                limit: 10,
+                ..RecallParams::default()
+            })
+            .unwrap();
+        let ids: Vec<&str> = out.iter().map(|(e, _)| e.id.as_str()).collect();
+        assert!(
+            !ids.iter().any(|id| id.starts_with("noise-")),
+            "excluded-category rows must never leak into the sparse arm, got {ids:?}"
+        );
+        assert_eq!(
+            ids.len(),
+            3,
+            "all in-scope hits must survive a filter-heavy pool (widened fetch), got {ids:?}"
+        );
+        for i in 0..3 {
+            assert!(
+                ids.contains(&format!("wanted-{i}").as_str()),
+                "wanted-{i} missing from {ids:?}"
+            );
+        }
 
         let _ = fs::remove_file(&path);
     }
