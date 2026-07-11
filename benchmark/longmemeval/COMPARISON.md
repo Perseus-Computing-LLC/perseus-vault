@@ -8,21 +8,37 @@ unnamed/nonexistent model and mixed splits and judges. We do not do that again.
 
 ## The scoreboard
 
-| system | LongMemEval QA accuracy | answerer | judge | split | source |
-|---|---:|---|---|---|---|
-| **Perseus Vault** | **73.8% mean** (72.8 / 73.6 / 75.0 across 3 full runs) | `gpt-4o-2024-08-06` (pinned) | `gpt-4o-2024-08-06`, LongMemEval **official** per-type judge | `longmemeval_s` (500) | [`qa_report.json`](qa_report.json), [`qa_report_seed2.json`](qa_report_seed2.json), [`qa_report_seed3.json`](qa_report_seed3.json) (all signed), this repo |
-| Zep | 63.8% (published) | "GPT-4o" (snapshot not stated) | not stated | LongMemEval `_s` (as published) | Zep's published claim, cited in #475 |
-| Mem0 | 49.0% (published) | "GPT-4o" (snapshot not stated) | not stated | LongMemEval `_s` (as published) | published claim, cited in #475 |
+LongMemEval ships **two** official answer prompts (`run_generation.py`: plain
+and `cot=true` step-by-step). Both rows below are 100% official methodology;
+they differ **only** in which official prompt the answerer used. Zep's
+publication does not state which variant they used, so the comparison is
+flagged per-row, not blended.
 
-**Perseus Vault scores 73.8% mean over three independent full runs (range
-72.8–75.0, stdev 1.1) — the *worst* run beats Zep's published 63.8% by 9.0
-points** — under the official LongMemEval metric. Independently confirmed: run
-2's 500 answers, re-graded by LongMemEval's own `src/evaluation/evaluate_qa.py`,
-produce **368/500 = 73.60%**, matching this harness bit-for-bit (see
-[`official-eval-results-gpt-4o.jsonl`](official-eval-results-gpt-4o.jsonl)).
-Per-type results are highly stable across runs: single-session-assistant scored
-100.0% and single-session-user 95.7% in all three; the weakest category
-(preference) stayed within 26.7–30.0%.
+| system | LongMemEval QA accuracy | answer prompt | answerer | judge | split | source |
+|---|---:|---|---|---|---|---|
+| **Perseus Vault (official CoT)** | **79.0% mean** (80.0 / 78.6 / 78.4 across 3 full runs) | `official-cot` (`qa.py --cot`) | `gpt-4o-2024-08-06` (pinned) | `gpt-4o-2024-08-06`, LongMemEval **official** per-type judge | `longmemeval_s` (500) | [`qa_report_cot.json`](qa_report_cot.json), [`qa_report_cot_seed2.json`](qa_report_cot_seed2.json), [`qa_report_cot_seed3.json`](qa_report_cot_seed3.json) (all signed), this repo |
+| **Perseus Vault (plain)** | **73.8% mean** (72.8 / 73.6 / 75.0 across 3 full runs) | `plain` | `gpt-4o-2024-08-06` (pinned) | same official judge | `longmemeval_s` (500) | [`qa_report.json`](qa_report.json), [`qa_report_seed2.json`](qa_report_seed2.json), [`qa_report_seed3.json`](qa_report_seed3.json) (all signed), this repo |
+| Zep | 63.8% (published) | not stated | "GPT-4o" (snapshot not stated) | not stated | LongMemEval `_s` (as published) | Zep's published claim, cited in #475 |
+| Mem0 | 49.0% (published) | not stated | "GPT-4o" (snapshot not stated) | not stated | LongMemEval `_s` (as published) | published claim, cited in #475 |
+
+**With LongMemEval's own official CoT answer prompt, Perseus Vault scores 79.0%
+mean over three independent full runs (range 78.4–80.0, stdev 0.9) — the
+*worst* CoT run beats Zep's published 63.8% by 14.6 points; even the worst
+plain-prompt run beats it by 9.0.** The CoT gain over plain (+5.2 mean) is
+exactly where the #580 retrieval diagnostic predicted: 69% of consistent
+plain-prompt failures were reasoning-over-correctly-retrieved-evidence, and the
+step-by-step prompt recovers a large share of them (preference 28.9% → 57.8%
+mean; temporal 69.2% → 76.2% mean). Abstention stayed healthy across the CoT
+runs (86.7 / 83.3 / 80.0) — no robustness trade.
+
+Independently confirmed, one run per prompt variant, re-graded by LongMemEval's
+own `src/evaluation/evaluate_qa.py`: plain run 2 produced **368/500 = 73.60%**
+(bit-for-bit match, [`official-eval-results-gpt-4o.jsonl`](official-eval-results-gpt-4o.jsonl));
+the CoT primary run's 500 answers ([`hypotheses-cot-mimir-gpt-4o-2024-08-06.jsonl`](hypotheses-cot-mimir-gpt-4o-2024-08-06.jsonl))
+re-grade to the **identical aggregate 400/500 = 80.00%**, with 4 individual
+judge verdicts differing (2 flips in each direction — normal LLM-judge
+nondeterminism at temperature 0, net zero; see
+[`official-eval-results-cot-gpt-4o.jsonl`](official-eval-results-cot-gpt-4o.jsonl)).
 
 > **Still confirm before external publication:** the primary source of Zep's
 > 63.8% and the exact split + GPT-4o snapshot Zep used. Our answerer is pinned to
@@ -32,8 +48,27 @@ Per-type results are highly stable across runs: single-session-assistant scored
 
 ## By question type
 
-The signed run-2 report's `by_question_type`. Temporal reasoning is broken out because
-the bi-temporal engine is supposed to shine there.
+### Official CoT prompt (primary run, signed `qa_report_cot.json`)
+
+| question type | n | correct | accuracy |
+|---|---:|---:|---:|
+| single-session-assistant | 56 | 56 | 100.0% |
+| single-session-user | 70 | 68 | 97.1% |
+| knowledge-update | 78 | 63 | 80.8% |
+| **temporal-reasoning** | 133 | 103 | **77.4%** |
+| multi-session | 133 | 92 | 69.2% |
+| single-session-preference | 30 | 18 | 60.0% |
+| — abstention subset (`_abs`) | 30 | 26 | 86.7% |
+| **overall** | **500** | **400** | **80.0%** |
+
+The two categories the CoT prompt moves most are exactly the two the plain-prompt
+failure analysis (#579/#580) attributed to reasoning rather than retrieval:
+preference **30.0% → 60.0%** and temporal **69.2% → 77.4%** on the primary runs.
+`multi-session` improves less (63.2% → 69.2%) because a large share of its
+remaining misses are *retrieval* (aggregation questions needing 2–4 sessions) —
+tracked as engine work out of #580's case studies, not papered over.
+
+### Plain prompt (run 2, signed `qa_report.json` — non-CoT reference)
 
 | question type | n | correct | accuracy |
 |---|---:|---:|---:|
@@ -98,20 +133,39 @@ tuning toward gold answers was done, and none is acceptable here.**
 - **Retrieval:** perseus-vault hybrid recall, top-k 10, bundled ONNX embeddings,
   real binary (`perseus-vault 2.19.1`) over MCP stdio. Full k=10 context on every
   question (avg 9.9 sessions / ~25k tokens per prompt; no truncation).
-- **Provenance:** signature `929623670d8bcc67…d064345` over the per-question
-  verdict set; hardware, elapsed (55.8 min at 400k TPM), and config all in
-  [`qa_report.json`](qa_report.json).
+- **Answer prompt:** both official variants, recorded as `answer_prompt` in
+  every report and folded into the run signature (a CoT number can never be
+  silently blended with a plain-prompt one): `plain` for the 73.8% rows,
+  `official-cot` (`run_generation.py` cot=true, ported verbatim; `qa.py --cot`,
+  max_tokens 1200, final `Answer:` line parsed for judging) for the 79.0% rows.
+- **Provenance:** plain run 2 signature `929623670d8bcc67…d064345`; CoT runs
+  `20327b31b5940f58…` / `7c8ce1b406c0cc4b…` / `eb848e786677a8d1…` — each over
+  the per-question verdict set; hardware, elapsed, and config all in the
+  respective `qa_report*.json`.
 
 ## Caveats (read before quoting the number)
 
+- **Say which prompt variant you are quoting.** 79.0% is the `official-cot`
+  mean; 73.8% is the `plain` mean. Both are official LongMemEval prompts, but
+  they are different numbers under different (official) conditions — every
+  quote must carry its `answer_prompt` label. Zep's publication does not state
+  their variant; flag that when comparing, never blend. Anything beyond the two
+  official prompts is out of bounds for published numbers.
 - **Run-to-run variance.** LLM answering/grading at temperature 0 is still not
-  perfectly deterministic. Three independent full runs scored 73.6 / 75.0 / 72.8
-  (mean 73.8, spread 2.2 points, stdev 1.1) — all three signed reports are
-  committed here. Quote the mean with the range, not a single run's number.
+  perfectly deterministic. CoT: three independent full runs scored 80.0 / 78.6 /
+  78.4 (mean 79.0, spread 1.6 points, stdev 0.9). Plain: 73.6 / 75.0 / 72.8
+  (mean 73.8, spread 2.2, stdev 1.1). All six signed reports are committed
+  here. Quote the mean with the range, not a single run's number.
+- **The CoT primary run was resumed.** `qa_report_cot.json` was produced across
+  multiple process invocations via the crash-safe `--resume` journal (one
+  interruption was an API-quota outage); the config signature guarantees all
+  500 verdicts were produced under the same pinned config, and two
+  uninterrupted seeds confirm the number.
 - **Zep's conditions are quoted, not verified.** We have not reproduced Zep's own
   run; 63.8% is their published claim. State that when comparing.
-- **Preference is weak (30%).** If a competitor stresses preference specifically,
-  that is our soft spot today. Own it.
+- **Preference is still the weakest category (60% CoT / 30% plain).** The CoT
+  prompt doubled it, but if a competitor stresses preference specifically, that
+  remains our soft spot. Own it.
 
 ## Reproduce
 
@@ -127,12 +181,17 @@ python benchmark/longmemeval/qa.py --mock-llm --limit 5
 python benchmark/longmemeval/qa.py --limit 10
 
 # 4. The full number (500 questions; prints a cost estimate, requires --yes)
-python benchmark/longmemeval/qa.py --yes
+python benchmark/longmemeval/qa.py --yes            # plain official prompt
+python benchmark/longmemeval/qa.py --yes --cot      # official CoT prompt (the 79.0% row)
 
 # 5. Independent re-grade with LongMemEval's official evaluator
-#    (produces the same 368/500 = 73.60%)
+#    (plain run 2 reproduces 368/500 = 73.60%; the CoT hypotheses file
+#    re-grades the 80.0% primary run)
 python evaluate_qa.py gpt-4o \
   benchmark/longmemeval/hypotheses-mimir-gpt-4o-2024-08-06.jsonl \
+  benchmark/longmemeval/longmemeval_s_cleaned.json
+python evaluate_qa.py gpt-4o \
+  benchmark/longmemeval/hypotheses-cot-mimir-gpt-4o-2024-08-06.jsonl \
   benchmark/longmemeval/longmemeval_s_cleaned.json
 ```
 

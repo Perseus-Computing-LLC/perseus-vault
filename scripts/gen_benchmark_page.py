@@ -126,7 +126,42 @@ def sec_retrieval(r):
 </section>"""
 
 
-def sec_qa(qa, seeds=()):
+def _run_accs(primary, seeds):
+    """[accuracy, ...] across a primary report + its seed reports."""
+    out = []
+    for r in [primary] + list(seeds):
+        if not r:
+            continue
+        a = (r.get("systems", {}).get("mimir", {}) or r.get("mimir", {})).get("accuracy")
+        if a is not None:
+            out.append(a)
+    return out
+
+
+def sec_qa_cot(cot, cot_seeds=()):
+    """#579: the official-CoT prompt distribution, rendered as its own labeled
+    stat — never blended into the plain-prompt headline. LongMemEval ships two
+    official answer prompts; every number must carry its answer_prompt."""
+    accs = _run_accs(cot, cot_seeds)
+    if not accs:
+        return ""
+    mean = sum(accs) / len(accs) * 100
+    lo, hi = min(accs) * 100, max(accs) * 100
+    links = src_link('longmemeval/qa_report_cot.json', cot.get('signature_sha256')) + "".join(
+        src_link(f'longmemeval/qa_report_cot_seed{i}.json', s.get('signature_sha256'))
+        for i, s in enumerate(cot_seeds, start=2) if s)
+    return f"""
+  <div class="stats"><div class='stat big'><div class='v'>{mean:.1f}%</div>
+  <div class='l'>with LongMemEval's official CoT answer prompt (<code>answer_prompt: official-cot</code>) &mdash;
+  mean of {len(accs)} independent signed full runs (range {lo:.1f}&ndash;{hi:.1f}%)</div></div></div>
+  <p class="note">The benchmark ships two official answer prompts (plain and step-by-step CoT);
+  both distributions above are 100% official methodology and differ only in that flag &mdash;
+  each number carries its <code>answer_prompt</code>, recorded in the signed report.
+  Zep's publication does not state which variant they used, so the comparison is flagged, not blended.</p>
+  {links}"""
+
+
+def sec_qa(qa, seeds=(), cot_html=""):
     zep_line = ('Zep publishes <b>63.8%</b> on LongMemEval with GPT-4o '
                 '(<a href="https://arxiv.org/abs/2501.13956">their paper</a>).')
     if not qa:
@@ -178,6 +213,7 @@ def sec_qa(qa, seeds=()):
   Where conditions differ from a competitor's published run, the comparison is flagged, not blended.
   Per-type table is from the primary run's signed report.</p>
   <div class="stats">{acc_html}</div>
+  {cot_html}
   {cat_table}
   {src_link('longmemeval/qa_report.json', qa.get('signature_sha256'))}
   {seed_links}
@@ -288,13 +324,17 @@ def main():
     qa = load("longmemeval/qa_report.json")
     qa_seeds = [load("longmemeval/qa_report_seed2.json"),
                 load("longmemeval/qa_report_seed3.json")]
+    qa_cot = load("longmemeval/qa_report_cot.json")
+    qa_cot_seeds = [load("longmemeval/qa_report_cot_seed2.json"),
+                    load("longmemeval/qa_report_cot_seed3.json")]
     scale = load("scale/report.json")
     temporal = load("temporal/report.json")
     gauntlet = load("temporal/gauntlet_report.json")
     commit = commit_sha()
     today = _dt.date.today().isoformat()
 
-    body = (sec_matrix() + sec_retrieval(recall) + sec_qa(qa, qa_seeds) + sec_scale(scale)
+    body = (sec_matrix() + sec_retrieval(recall)
+            + sec_qa(qa, qa_seeds, cot_html=sec_qa_cot(qa_cot, qa_cot_seeds)) + sec_scale(scale)
             + sec_temporal(temporal, gauntlet) + sec_reproduce(commit))
 
     page = f"""<!DOCTYPE html>
