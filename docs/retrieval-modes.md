@@ -86,13 +86,18 @@ perseus_vault_recall { "query": "decay policy", "mode": "fts5", "as_of_unix_ms":
   store's default order. Wildcards are **not** globs — `query="*"` is treated as
   the literal FTS5 term `*` and matches nothing (0 results). To "list all", pass
   `query=""`; to search, pass real terms.
-- **Paginated enumeration / scan.** `limit` caps a single page and `offset`
-  skips rows, so a whole category is walked deterministically by paging with a
-  fixed `limit` and advancing `offset` (`0`, `limit`, `2*limit`, …) until a page
-  returns fewer than `limit` rows. Use `mode="fts5"` for enumeration — it is the
-  deterministic, embedding-free arm, so the order is stable across pages. The
-  official Python client wraps this as `VaultClient.scan(category)`, which pages
-  under the hood and returns the entire category without a magic cap.
+- **Paginated enumeration / scan (#562).** The first-class enumeration path is
+  the dedicated **`perseus_vault_scan`** tool: keyset pages ordered by immutable
+  entity `id ASC` with a `next_cursor` / `has_more` continuation contract. Call
+  it with no cursor for the first page, then feed each page's `next_cursor` back
+  in until `has_more` is false — every entity in scope is returned exactly once.
+  It is read-only (no retrieval-count/decay side-effects) and has no depth cap.
+  Prefer it over paging `recall(query="")` with `offset`: recall's ranking keys
+  (`retrieval_count`, `last_accessed`) *mutate* as recalls reinforce entities,
+  so offset pages can skip or repeat rows under concurrent use, and recall's
+  `offset` is clamped at 10,000. The official Python client's
+  `VaultClient.scan(category)` uses the scan tool automatically (falling back to
+  offset-paged recall only on pre-#562 servers).
 - **Offline by default.** FTS5, dense (bundled model), hybrid, graph, and
   temporal modes all run with **zero network calls**. Dense embeddings can
   optionally be generated via Ollama or an OpenAI-compatible endpoint

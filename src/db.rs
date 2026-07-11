@@ -6006,6 +6006,84 @@ impl Database {
         Ok(count)
     }
 
+    /// #562: deterministic keyset enumeration — the first-class "list every
+    /// entity in a category" path that recall's empty-query mode cannot be:
+    /// recall orders by `retrieval_count DESC, last_accessed_unix_ms DESC`,
+    /// and BOTH keys mutate on every reinforcing recall, so offset pagination
+    /// over that ordering can skip or repeat rows between pages (and its
+    /// offset is capped at 10,000). This scan orders by immutable `id ASC`
+    /// and resumes from a cursor (`id > after_id`), so every row that exists
+    /// for the duration of the scan is returned exactly once, no matter how
+    /// many reinforcing recalls run in between and with no depth cap.
+    ///
+    /// Pure read: no retrieval-count/last-accessed side-effects — enumerating
+    /// a category for export/sync must not distort the decay ranking.
+    /// `workspace_hash` keeps the strict #408 semantics (`Some("")` = only
+    /// global rows; `None` = unscoped). Rows written mid-scan land at their
+    /// uuid-derived id position and may or may not be seen — standard keyset
+    /// behavior; re-scan for a post-write snapshot.
+    pub fn scan_entities(
+        &self,
+        category: Option<&str>,
+        workspace_hash: Option<&str>,
+        include_archived: bool,
+        after_id: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<Entity>, Box<dyn std::error::Error>> {
+        let conn = self.conn()?;
+        let mut sql = String::from(
+            "SELECT id, category, key, body_json, status, type, tags,
+                    decay_score, retrieval_count, layer, topic_path,
+                    archived, archive_reason, links, verified, source,
+                    created_at_unix_ms, last_accessed_unix_ms, NULL as embedding,
+                    always_on, certainty, workspace_hash, agent_id, visibility,
+                    follow_count, miss_count, follow_rate, efficacy_status
+             FROM entities WHERE 1=1",
+        );
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+
+        if !include_archived {
+            sql.push_str(" AND archived = 0");
+        }
+        if let Some(cat) = category {
+            if !cat.is_empty() {
+                sql.push_str(&format!(" AND category = ?{}", params.len() + 1));
+                params.push(Box::new(cat.to_string()));
+            }
+        }
+        if let Some(ws) = workspace_hash {
+            sql.push_str(&format!(" AND workspace_hash = ?{}", params.len() + 1));
+            params.push(Box::new(ws.to_string()));
+        }
+        if let Some(cursor) = after_id {
+            if !cursor.is_empty() {
+                sql.push_str(&format!(" AND id > ?{}", params.len() + 1));
+                params.push(Box::new(cursor.to_string()));
+            }
+        }
+
+        sql.push_str(" ORDER BY id ASC");
+        // 1001, not 1000: the tools layer fetches page_limit + 1 (max 1000+1)
+        // as a has-more sentinel; clamping the sentinel away would report the
+        // final full page of a max-size scan as the last one even when more
+        // rows exist.
+        let safe_limit = limit.clamp(1, 1001);
+        sql.push_str(&format!(" LIMIT ?{}", params.len() + 1));
+        params.push(Box::new(safe_limit));
+
+        let mut stmt = conn.prepare(&sql)?;
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params.iter().map(|p| p.as_ref()).collect();
+        let enc = self.encryption.as_ref();
+        let rows = stmt.query_map(param_refs.as_slice(), |row| entity_from_row(row, enc))?;
+
+        let mut items = Vec::new();
+        for row in rows {
+            items.push(row?);
+        }
+        Ok(items)
+    }
+
     /// Get recent journal events.
     ///
     /// NOTE: as of #417 the `journal` table has a `workspace_hash` column
@@ -14203,6 +14281,104 @@ mod tests {
         let params2 = RecallParams::default();
         let results2 = db.recall(&params2).unwrap();
         assert_eq!(results2.len(), 2);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    // ─── #562: deterministic keyset enumeration ──────────────────────────
+    // scan_entities must walk a whole category exactly once via the id
+    // cursor, even while reinforcing recalls mutate the ranking keys
+    // (retrieval_count / last_accessed) that make recall's offset paging
+    // skip or repeat rows. Also pins the scope rules: archived rows are
+    // excluded unless requested, and workspace_hash keeps the strict #408
+    // semantics (Some("") = only global rows).
+    #[test]
+    fn scan_entities_enumerates_exactly_once_with_cursor() {
+        let (db, path) = temp_db();
+
+        for i in 0..25 {
+            let e = make_entity(
+                &format!("scan-{:02}", i),
+                "scan-cat",
+                &format!("k{:02}", i),
+                &format!(r#"{{"d": "unique scan body row {} filler {}"}}"#, i, i * 31),
+            );
+            db.remember_skip_dedup(&e).unwrap();
+        }
+        // Out-of-scope rows: another category, another workspace, archived.
+        db.remember_skip_dedup(&make_entity(
+            "other-1",
+            "other-cat",
+            "ok",
+            r#"{"d": "row in a different category entirely"}"#,
+        ))
+        .unwrap();
+        let mut ws_row = make_entity(
+            "scan-ws",
+            "scan-cat",
+            "kws",
+            r#"{"d": "row scoped to a non-global workspace"}"#,
+        );
+        ws_row.workspace_hash = "ws-x".to_string();
+        db.remember_skip_dedup(&ws_row).unwrap();
+        db.remember_skip_dedup(&make_entity(
+            "scan-arch",
+            "scan-cat",
+            "karch",
+            r#"{"d": "archived row that default scans must skip"}"#,
+        ))
+        .unwrap();
+        db.conn()
+            .unwrap()
+            .execute("UPDATE entities SET archived = 1 WHERE id = 'scan-arch'", [])
+            .unwrap();
+
+        // Page through the category (unscoped: 25 global + 1 ws-x = 26 live
+        // rows), interleaving a reinforcing recall between every page.
+        let mut seen: Vec<String> = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let page = db
+                .scan_entities(Some("scan-cat"), None, false, cursor.as_deref(), 10)
+                .unwrap();
+            let recall_params = RecallParams {
+                category: Some("scan-cat".to_string()),
+                limit: 10,
+                ..RecallParams::default()
+            };
+            db.recall(&recall_params).unwrap();
+            if page.is_empty() {
+                break;
+            }
+            cursor = page.last().map(|e| e.id.clone());
+            let short = (page.len() as i64) < 10;
+            seen.extend(page.into_iter().map(|e| e.id));
+            if short {
+                break;
+            }
+        }
+        assert_eq!(seen.len(), 26, "every live in-category row exactly once: {seen:?}");
+        let unique: std::collections::HashSet<&String> = seen.iter().collect();
+        assert_eq!(unique.len(), 26, "no row may repeat across pages: {seen:?}");
+        let mut sorted = seen.clone();
+        sorted.sort();
+        assert_eq!(seen, sorted, "pages must be ordered by immutable id ASC");
+        assert!(
+            !seen.iter().any(|id| id == "scan-arch" || id == "other-1"),
+            "archived and cross-category rows must not appear: {seen:?}"
+        );
+
+        // Strict workspace scoping: Some("") targets only the global rows.
+        let global = db
+            .scan_entities(Some("scan-cat"), Some(""), false, None, 1000)
+            .unwrap();
+        assert_eq!(global.len(), 25, "Some(\"\") = global rows only (#408)");
+
+        // include_archived opts the soft-deleted row back in.
+        let with_archived = db
+            .scan_entities(Some("scan-cat"), None, true, None, 1000)
+            .unwrap();
+        assert_eq!(with_archived.len(), 27, "include_archived adds the archived row");
 
         let _ = fs::remove_file(&path);
     }

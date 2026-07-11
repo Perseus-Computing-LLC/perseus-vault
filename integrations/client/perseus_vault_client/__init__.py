@@ -346,11 +346,41 @@ class VaultClient:
     def scan(
         self, category: str, *, page_size: int = 100, max_items: Optional[int] = None
     ) -> List[Dict[str, Any]]:
-        """Enumerate every entity in a category via paginated empty-query recall.
+        """Enumerate every entity in a category.
 
-        Pages with ``offset`` until fewer than ``page_size`` rows come back,
-        so callers get the whole category rather than a single truncated page.
+        Prefers the server-side ``scan`` tool (#562): keyset pages ordered by
+        immutable entity id with a continuation cursor, so the walk is
+        deterministic (recall reinforcement cannot skip/repeat rows), free of
+        recall's offset cap, and side-effect-free. Falls back to legacy
+        offset-paged empty-query recall on servers that predate the tool.
         """
+        out: List[Dict[str, Any]] = []
+        cursor: Optional[str] = None
+        while True:
+            args: Dict[str, Any] = {"category": category, "limit": page_size}
+            if cursor:
+                args["cursor"] = cursor
+            res = self.call_tool(self._tool("scan"), args)
+            if not isinstance(res, dict) or "items" not in res:
+                # Pre-#562 server: no scan tool. Legacy offset paging.
+                return self._scan_via_recall_offset(
+                    category, page_size=page_size, max_items=max_items
+                )
+            out.extend(self._normalize_items(res))
+            if max_items is not None and len(out) >= max_items:
+                return out[:max_items]
+            cursor = res.get("next_cursor")
+            if not res.get("has_more") or not cursor:
+                break
+        return out
+
+    def _scan_via_recall_offset(
+        self, category: str, *, page_size: int = 100, max_items: Optional[int] = None
+    ) -> List[Dict[str, Any]]:
+        """Legacy enumeration for servers without the ``scan`` tool: page
+        empty-query fts5 recall with ``offset`` until a short page. Subject to
+        recall's ordering side-effects and offset cap; upgrade the server for
+        the deterministic path."""
         out: List[Dict[str, Any]] = []
         offset = 0
         while True:

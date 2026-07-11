@@ -5,6 +5,25 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
 
 ## [Unreleased]
 
+### Added
+- **`mimir_scan` — deterministic paginated enumeration** (#562). First-class
+  "list all / export / sync / reset" path: pages a category (or the whole store)
+  by immutable `id ASC` with a keyset continuation cursor (`next_cursor` /
+  `has_more`), so callers walk every entity exactly once — unlike paging
+  `recall(query="")` with `offset`, whose ranking keys (`retrieval_count`,
+  `last_accessed`) mutate as recalls reinforce entities (pages can skip or
+  repeat rows) and whose offset is clamped at 10,000. Read-only by contract
+  (no retrieval-count/decay side-effects), optional `workspace_hash` scoping
+  (strict #408 semantics) and `include_archived`. The Python client's
+  `VaultClient.scan()` now uses the tool automatically, falling back to legacy
+  offset paging on pre-#562 servers. Tool count: 57 → 58.
+
+### Documentation
+- **Recall query contract made explicit** (#562): `query=""` is the match-all /
+  enumeration path; `"*"` and other wildcards are literal FTS5 terms, **not**
+  globs (`"*"` matches nothing). Documented in the `recall` tool schema, README
+  tool table, and docs/retrieval-modes.md, and pinned by tests.
+
 ## [2.20.0] - 2026-07-10
 
 ### Added

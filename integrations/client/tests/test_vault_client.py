@@ -58,6 +58,30 @@ class _FakeVault(VaultClient):
             # Honor offset + limit so paginated scan() terminates like the real vault.
             page = matched[offset:offset + limit]
             return {"items": page, "total": len(matched)}
+        if short == "scan":
+            # Emulate the server-side keyset scan (#562): stable id order,
+            # continuation cursor, has_more sentinel.
+            cat = arguments.get("category")
+            limit = arguments.get("limit", 100)
+            cursor = arguments.get("cursor")
+            rows = sorted(
+                (f"{c}/{k}", k, body)
+                for (c, k), body in self.entities.items()
+                if cat is None or c == cat
+            )
+            if cursor:
+                rows = [r for r in rows if r[0] > cursor]
+            page = rows[:limit]
+            has_more = len(rows) > limit
+            return {
+                "items": [
+                    {"id": rid, "key": k, "body_json": json.dumps(b), "score": None}
+                    for rid, k, b in page
+                ],
+                "total": len(page),
+                "has_more": has_more,
+                "next_cursor": page[-1][0] if has_more and page else None,
+            }
         if short == "prune":
             cat = arguments.get("category")
             if arguments.get("purge_all"):
@@ -139,6 +163,22 @@ def test_scan_respects_max_items():
     for i in range(50):
         v.remember("bulk", f"k{i}", {"content": f"item {i}"})
     assert len(v.scan("bulk", page_size=10, max_items=25)) == 25
+
+
+def test_scan_falls_back_on_pre562_server():
+    # A server without the scan tool answers with an isError text payload,
+    # which call_tool surfaces as a plain string — scan() must fall back to
+    # legacy offset-paged empty-query recall and still return everything.
+    v = _FakeVault()
+    for i in range(30):
+        v.remember("bulk", f"k{i}", {"content": f"item number {i}"})
+    orig = v.call_tool
+    def call_tool(name, args):
+        if name.endswith("_scan"):
+            return "Unknown tool: perseus_vault_scan"
+        return orig(name, args)
+    v.call_tool = call_tool
+    assert len(v.scan("bulk", page_size=10)) == 30
 
 
 def test_prune_purge_all_scopes_to_category():
