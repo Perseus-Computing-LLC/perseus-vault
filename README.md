@@ -310,6 +310,13 @@ perseus-vault obsidian-sync  ~/obsidian-vault/Perseus Vault/ --watch  # continuo
 perseus-vault keygen --key-file ~/.mimir/secret.key
 ```
 
+> **Manual DB edits.** The maintenance verbs above and the normal MCP write path
+> keep the FTS5 index in sync automatically. Editing the `entities` table
+> **directly** with `sqlite3` (a manual `DELETE`/`UPDATE`) bypasses that sync and
+> can leave orphaned index rows — "ghost" recall hits for content that is already
+> gone. After any direct SQL edit, run `perseus-vault maintain --db <path>` (or
+> `perseus-vault reindex`) to reconcile the FTS index.
+
 ### Flags
 
 | Flag | Description |
