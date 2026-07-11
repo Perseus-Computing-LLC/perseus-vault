@@ -59,3 +59,37 @@ coverage; the harness is dataset-agnostic.
 correct version at every probed instant, and recall is live-only across all
 scenarios. *(Measured on the bundled MSVC build, Windows 11; the methodology and
 verdicts are the point and are platform-independent.)*
+
+## Three-axis gauntlet (full SQL:2011 bi-temporal)
+
+Where `run.py` above proves the **transaction-time** axis with fact-overwrite
+scenarios, [`gauntlet.py`](./gauntlet.py) is the full **three-axis** suite (#553).
+It drives the real binary over MCP stdio through the hard bi-temporal cases that
+single-axis competitors get wrong:
+
+| Axis | MCP tool | Question it answers |
+|---|---|---|
+| transaction-time | `mimir_as_of` | "what did we **believe** at tx T" |
+| valid/application-time | `mimir_valid_at` | "what was **true** in the world at valid T, per current knowledge" |
+| full bi-temporal | `mimir_bitemporal` | "as of belief at tx_at, what was true at valid_at" |
+
+Scenarios: retroactive correction, proactive/future-dated facts,
+belief-vs-truth divergence, **out-of-order arrival** (a later-recorded fact with
+an *earlier* valid period must still stitch the timeline correctly), and closed
+periods.
+
+Run it (one command, fully offline — no network, no API key, no LLM):
+
+```bash
+cargo build --release
+python benchmark/temporal/gauntlet.py --bin target/release/perseus-vault
+```
+
+### Results (committed [`gauntlet_report.json`](./gauntlet_report.json))
+
+`perseus-vault-bitemporal-gauntlet`: **13/13 checks, 100% accuracy** across all
+three axes (valid-time 10/10, transaction-time 1/1, bi-temporal 2/2) — including
+out-of-order arrival, which naive valid-time stores mis-order. Day offsets are
+resolved against a runtime anchor so absolute times vary run-to-run, but the
+PASS/FAIL verdicts and their `signature_sha256` are deterministic for a correct
+implementation. CI gates on this via [`gate.py`](./gate.py).

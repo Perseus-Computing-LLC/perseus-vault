@@ -131,6 +131,34 @@ Recall quality measured on LongMemEval's **official** harness, not a home-grown 
 
 `longmemeval_s` (500 questions), gpt-4o-2024-08-06 answerer + LongMemEval's official judge; competitor numbers are their published values. [Methodology & signed results →](benchmark/longmemeval/COMPARISON.md)
 
+### Bi-temporal time-travel (three-axis)
+
+Our strongest structural differentiator — full **SQL:2011 bi-temporal** history
+(transaction-time *and* valid-time) — measured against a reproducible,
+**fully offline** gauntlet. It drives the real shipped binary over MCP stdio
+through the hard cases single-axis competitors get wrong (retroactive
+corrections, proactive future-dated facts, out-of-order arrival, belief-vs-truth
+divergence, closed periods):
+
+| Axis | Question it answers | Checks | Pass |
+|---|---|---|---|
+| **valid-time** (`valid_at`) | "what was true in the world at T" | 10 | 10 |
+| **transaction-time** (`as_of`) | "what did we believe at T" | 1 | 1 |
+| **bi-temporal** (`bitemporal`) | "as of belief at T, what was true at V" | 2 | 2 |
+| **Total** | | **13** | **13 (100%)** |
+
+Reproduce with a single command (no API key, no network, no LLM):
+
+```bash
+cargo build --release
+python benchmark/temporal/gauntlet.py --bin target/release/perseus-vault
+```
+
+The PASS/FAIL verdicts are deterministic (wall-clock timestamps vary, verdicts
+do not), so a correct build re-runs to an identical `signature_sha256`. The
+committed [`gauntlet_report.json`](benchmark/temporal/gauntlet_report.json) is
+the reference. [Methodology & dataset →](benchmark/temporal/README.md)
+
 ### Comparison Matrix
 
 | | Perseus Vault | Mem0 | Letta | Zep |

@@ -5,7 +5,7 @@
     "role": "owner",
     "name": "Perseus Computing LLC",
     "email": "perseus@perseus.observer",
-    "description": "Perseus Computing LLC is a US-owned small business (a Wyoming LLC) building open-source, local-first memory infrastructure for AI agents. Our flagship project, Perseus Vault, is an MIT-licensed, single-binary MCP memory server developed entirely in the open. Grant funding sustains ongoing maintenance, security hardening, external cryptographic review, supply-chain attestation, and new capabilities that keep the project free and self-hostable for everyone.",
+    "description": "Perseus Computing builds open-source (MIT) memory & context infrastructure for AI agents. Open formats, local-first, zero telemetry, no vendor lock-in. Two products: the Perseus context engine (perseus-ctx) and Perseus Vault, an encrypted persistent-memory MCP server. Both run entirely on your own hardware, air-gap ready, and export to open formats (plain Markdown, plain files).",
     "webpageUrl": {
       "url": "https://mimir.perseus.observer",
       "wellKnown": "https://mimir.perseus.observer/.well-known/funding-manifest-urls"

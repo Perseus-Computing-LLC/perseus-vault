@@ -9,6 +9,7 @@ Ready-to-use adapters that connect Perseus Vault to popular AI agent frameworks.
 | **Python Client** | Official stdio transport client | [`client/`](client/) |
 | **LangGraph** (LangChain) | `BaseStore` implementation | [`langgraph/`](langgraph/) |
 | **CrewAI** | Agent Tool | [`crewai/`](crewai/) |
+| **PraisonAI** | `MemoryProtocol` adapter | [`praison/`](praison/) |
 | **AutoGen** (AG2 / autogen-core) | `Memory` implementation | [`autogen/`](autogen/) |
 | **FastMCP EventStore** (MCP SDK) | `EventStore` implementation | [`perseus-vault-persist/`](perseus-vault-persist/) |
 | **Claude Code** (Anthropic) | MCP server config | [`../docs/integration/claude-code.md`](../docs/integration/claude-code.md) |

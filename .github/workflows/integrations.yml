@@ -28,6 +28,10 @@ jobs:
             extra_deps: ""
           - adapter: crewai
             extra_deps: ""
+          # praison tests drive a fake VaultClient and self-skip the Protocol
+          # conformance check when praisonaiagents is absent — no install needed.
+          - adapter: praison
+            extra_deps: ""
           # langgraph adapter imports langgraph.store.base at module load,
           # so the real package must be present to collect the tests.
           - adapter: langgraph
