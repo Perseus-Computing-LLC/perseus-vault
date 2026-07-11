@@ -6,7 +6,7 @@
 
 <!-- mcp-name: io.github.Perseus-Computing-LLC/perseus-vault -->
 
-> **Persistent Memory for AI Agents — MCP-Native. Local-First. Zero Dependencies.**
+> **Persistent, encrypted memory for AI agents. One Rust binary, one file, no cloud.**
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 [![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](https://rust-lang.org)
@@ -17,9 +17,11 @@
 [![MCP Tools](https://img.shields.io/badge/MCP%20tools-57-brightgreen)]()
 [![Listed on mcpservers.org](https://img.shields.io/badge/listed-mcpservers.org-blue)](https://mcpservers.org/servers/perseus-computing-llc/perseus-vault)
 
-Perseus Vault is a single Rust binary that gives AI agents durable memory across sessions.
-**One binary. One file. No Docker. No Postgres. No cloud.** Just persistent memory
-that works with any MCP host.
+Give your agents memory that survives the session, so they stop re-deriving what they
+already learned and stop repeating past mistakes. Hybrid recall (BM25 + dense + RRF),
+bi-temporal history, and **AES-256-GCM** at rest, exposed as **57 MCP tools** that work
+with any host. **73.6% on LongMemEval's official harness** (vs Zep 63.8%, Mem0 49.0%).
+**One binary. One file. No Docker. No Postgres. No cloud.** Local-first, air-gap ready, MIT.
 
 ## One-Line Install
 
@@ -116,6 +118,18 @@ plus a portable AGENTS.md fallback): **[docs/lifecycle-hooks.md](docs/lifecycle-
 
 Perseus Vault is the **only** memory engine that is simultaneously MCP-native,
 local-first, zero-dependency, AND agent-first.
+
+### LongMemEval QA (official harness)
+
+Recall quality measured on LongMemEval's **official** harness, not a home-grown script:
+
+| Memory engine | QA accuracy |
+|---|---|
+| **Perseus Vault** | **73.6%** |
+| Zep | 63.8% (published) |
+| Mem0 | 49.0% (published) |
+
+`longmemeval_s` (500 questions), gpt-4o-2024-08-06 answerer + LongMemEval's official judge; competitor numbers are their published values. [Methodology & signed results →](benchmark/longmemeval/COMPARISON.md)
 
 ### Comparison Matrix
 
