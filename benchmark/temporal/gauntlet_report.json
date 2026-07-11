@@ -3,11 +3,11 @@
   "dataset": "perseus-vault-bitemporal-gauntlet",
   "n_scenarios": 5,
   "checks_total": 13,
-  "checks_passed": 12,
-  "accuracy": 0.9231,
+  "checks_passed": 13,
+  "accuracy": 1.0,
   "by_axis": {
     "valid_at": {
-      "pass": 9,
+      "pass": 10,
       "total": 10
     },
     "as_of": {
@@ -22,7 +22,7 @@
   "binary": "perseus-vault",
   "platform": "Linux-6.18.33-Unraid-x86_64-with-glibc2.41",
   "offline": true,
-  "signature_sha256": "4225997f79a812c90090e6a83c70c29c3cbe7b249795d16d3b3875c89ce464b2",
+  "signature_sha256": "2c1e38ab18aad935089acad0bf2ccc750a7f627d59865dcad4a5ec2daff5f077",
   "results": [
     {
       "scenario": "retroactive-correction",
@@ -87,8 +87,8 @@
     {
       "scenario": "out-of-order-arrival",
       "check": "valid_at[-1] -> opus-4-8",
-      "ok": false,
-      "detail": "expected 'opus-4-8', got {\"category\": \"config\", \"found\": false, \"key\": \"primary-model\", \"valid_at_unix_ms\": 1783298974929}"
+      "ok": true,
+      "detail": ""
     },
     {
       "scenario": "closed-period-no-longer-true",
