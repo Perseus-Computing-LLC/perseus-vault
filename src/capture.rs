@@ -439,6 +439,129 @@ pub fn parse_llm_notes(raw: &str, max_notes: usize) -> Option<DistillReport> {
     })
 }
 
+// ─── #563: consume / prune-source ────────────────────────────────
+//
+// After a successful non-dry-run capture, remove exactly the captured regions
+// from the source file so a write-buffer (e.g. an AGENTS.local.md that a host
+// agent inlines every turn) does not accumulate durably-stored blocks forever.
+// The removal is scoped to the captured records only; surrounding non-captured
+// content (headers, rules, pointers) is left untouched.
+
+/// Remove each captured note's region from `source`, returning the rewritten
+/// text and the number of regions actually removed.
+///
+/// Matching is line-based and whitespace-tolerant: a note's region is the
+/// contiguous run of source lines whose trimmed text equals the note's content
+/// lines (the distiller trims candidates, so byte-equality on the raw source
+/// would miss). Only lines belonging to a captured note are dropped — headers,
+/// rules, and pointers that were never captured survive. Blank lines left
+/// behind by a removal are collapsed so the file does not grow a run of gaps.
+pub fn prune_captured_regions(source: &str, notes: &[CaptureNote]) -> (String, usize) {
+    let src_lines: Vec<&str> = source.lines().collect();
+    let mut removed_flags = vec![false; src_lines.len()];
+    let mut removed = 0usize;
+
+    for note in notes {
+        let note_lines: Vec<&str> = note.content.lines().collect();
+        if note_lines.is_empty() {
+            continue;
+        }
+        // Find the first not-yet-removed window matching the note's lines.
+        let n = note_lines.len();
+        let mut found = None;
+        if n <= src_lines.len() {
+            for i in 0..=(src_lines.len() - n) {
+                if (i..i + n).any(|k| removed_flags[k]) {
+                    continue;
+                }
+                if (0..n).all(|k| src_lines[i + k].trim() == note_lines[k].trim()) {
+                    found = Some(i);
+                    break;
+                }
+            }
+        }
+        if let Some(i) = found {
+            for k in i..i + n {
+                removed_flags[k] = true;
+            }
+            removed += 1;
+        }
+    }
+
+    if removed == 0 {
+        return (source.to_string(), 0);
+    }
+
+    // Rebuild from the surviving lines, collapsing 2+ consecutive blank lines
+    // (which a removal can create) down to one.
+    let mut out_lines: Vec<&str> = Vec::with_capacity(src_lines.len());
+    let mut prev_blank = false;
+    for (idx, line) in src_lines.iter().enumerate() {
+        if removed_flags[idx] {
+            continue;
+        }
+        let is_blank = line.trim().is_empty();
+        if is_blank && prev_blank {
+            continue;
+        }
+        out_lines.push(line);
+        prev_blank = is_blank;
+    }
+    // Drop leading/trailing blank lines introduced by boundary removals.
+    while out_lines.first().is_some_and(|l| l.trim().is_empty()) {
+        out_lines.remove(0);
+    }
+    while out_lines.last().is_some_and(|l| l.trim().is_empty()) {
+        out_lines.pop();
+    }
+
+    let mut rebuilt = out_lines.join("\n");
+    // Preserve a single trailing newline if the original had one and there is
+    // still content.
+    if !rebuilt.is_empty() && source.ends_with('\n') {
+        rebuilt.push('\n');
+    }
+    (rebuilt, removed)
+}
+
+/// Read `path`, prune the captured regions, and — if anything was removed —
+/// rewrite it atomically (temp file in the same directory + rename), leaving a
+/// timestamped-content `<path>.bak` of the original. Returns the number of
+/// regions removed (0 leaves the file, and any `.bak`, untouched).
+///
+/// This is the file side of `capture --consume`; it never runs under
+/// `--dry-run` and is only called when the capture actually stored something,
+/// so it can never delete source content that was not durably persisted.
+pub fn consume_source_file(
+    path: &std::path::Path,
+    notes: &[CaptureNote],
+) -> std::io::Result<usize> {
+    let original = std::fs::read_to_string(path)?;
+    let (pruned, removed) = prune_captured_regions(&original, notes);
+    if removed == 0 {
+        return Ok(0);
+    }
+
+    // Back up the original first, then write the pruned content atomically.
+    let bak = {
+        let mut p = path.as_os_str().to_os_string();
+        p.push(".bak");
+        std::path::PathBuf::from(p)
+    };
+    std::fs::write(&bak, original.as_bytes())?;
+
+    let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let tmp = dir.join(format!(
+        ".{}.capture-tmp",
+        path.file_name()
+            .map(|f| f.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "source".to_string())
+    ));
+    std::fs::write(&tmp, pruned.as_bytes())?;
+    std::fs::rename(&tmp, path)?;
+    Ok(removed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -588,5 +711,76 @@ mod tests {
             parse_llm_notes(r#"{"notes": [{"type": "takeaway", "summary": "Just this"}]}"#, 20)
                 .unwrap();
         assert_eq!(report.notes[0].content, "Just this");
+    }
+
+    // ─── #563 consume / prune-source ─────────────────────────────
+
+    fn note(content: &str) -> CaptureNote {
+        let summary = summary_line(content);
+        CaptureNote {
+            entity_type: classify(content).to_string(),
+            key: key_for(&summary),
+            summary,
+            content: content.to_string(),
+        }
+    }
+
+    #[test]
+    fn prune_removes_only_captured_blocks_and_keeps_headers() {
+        let source = "# AGENTS.local.md\n\
+                      Standing rule: always run the smoke suite.\n\n\
+                      ### 2026-07-10\n\
+                      The deploy failed because the schema version was never bumped.\n\n\
+                      ### 2026-07-11\n\
+                      Decided to standardize on the MSVC toolchain for Windows builds.\n";
+        // Capture the two dated blocks (as the distiller would).
+        let notes = vec![
+            note("### 2026-07-10\nThe deploy failed because the schema version was never bumped."),
+            note("### 2026-07-11\nDecided to standardize on the MSVC toolchain for Windows builds."),
+        ];
+        let (pruned, removed) = prune_captured_regions(source, &notes);
+        assert_eq!(removed, 2, "both captured blocks must be removed");
+        // Header + standing rule survive; captured bodies are gone.
+        assert!(pruned.contains("# AGENTS.local.md"));
+        assert!(pruned.contains("Standing rule"));
+        assert!(!pruned.contains("schema version was never bumped"));
+        assert!(!pruned.contains("MSVC toolchain"));
+    }
+
+    #[test]
+    fn prune_is_a_noop_when_nothing_matches() {
+        let source = "# Header\nUncaptured content only.\n";
+        let notes = vec![note("Something entirely different that is not in the file at all.")];
+        let (pruned, removed) = prune_captured_regions(source, &notes);
+        assert_eq!(removed, 0);
+        assert_eq!(pruned, source, "no match => source is returned verbatim");
+    }
+
+    #[test]
+    fn consume_source_file_rewrites_atomically_and_backs_up() {
+        let dir = std::env::temp_dir().join(format!("capture-consume-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("AGENTS.local.md");
+        let source = "# Pointers\nSee the vault.\n\n\
+                      ### 2026-07-10\n\
+                      Root cause: the linker needed vcvars in PATH.\n";
+        std::fs::write(&path, source).unwrap();
+
+        let notes = vec![note(
+            "### 2026-07-10\nRoot cause: the linker needed vcvars in PATH.",
+        )];
+        let removed = consume_source_file(&path, &notes).unwrap();
+        assert_eq!(removed, 1);
+
+        // Source no longer holds the captured block, but keeps the header.
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(after.contains("# Pointers"));
+        assert!(!after.contains("vcvars in PATH"));
+
+        // A .bak with the ORIGINAL content exists.
+        let bak = std::fs::read_to_string(dir.join("AGENTS.local.md.bak")).unwrap();
+        assert_eq!(bak, source, "backup must hold the pre-prune original");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
