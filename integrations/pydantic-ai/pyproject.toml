@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "perseus-vault-pydantic-ai"
+version = "0.1.0"
+description = "Perseus Vault persistent local-first memory capability for Pydantic AI agents"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Perseus Computing LLC" }]
+keywords = ["pydantic-ai", "perseus-vault", "memory", "mcp", "agents", "capability"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+# pydantic-ai already ships the MCP/stdio machinery this builds on.
+dependencies = [
+    "pydantic-ai>=2.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-asyncio"]
+
+[project.urls]
+Homepage = "https://github.com/Perseus-Computing-LLC/perseus-vault"
+Repository = "https://github.com/Perseus-Computing-LLC/perseus-vault"
+
+[tool.setuptools]
+packages = ["perseus_vault_pydantic_ai"]
+package-dir = { "" = "." }
