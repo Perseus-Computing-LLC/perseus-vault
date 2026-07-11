@@ -101,11 +101,13 @@ jobs:
             os: ubuntu-latest
           - target: aarch64-apple-darwin
             os: macos-14
-          # macOS Intel — the Anthropic MCP Directory listing declares darwin
-          # support, so Intel Macs get a prebuilt full binary too (previously
-          # skipped over macos-13 queue latency; accepted for complete coverage).
-          - target: x86_64-apple-darwin
-            os: macos-13
+          # macOS Intel (x86_64-apple-darwin) is intentionally NOT built here:
+          # GitHub's free macos-13 Intel runners are being retired and routinely
+          # sit queued for 45+ min, which stalled the whole release (and blocked
+          # the attest job that needs every leg). Apple-Silicon Macs are covered
+          # by aarch64-apple-darwin above; Intel Macs fall back to the lite
+          # (musl is Linux-only, so on Intel mac: source build or Rosetta on the
+          # arm64 binary). Revisit if/when a reliable Intel-mac runner returns.
           # Windows — bundled-embeddings links on MSVC (see Cargo.toml #222); no
           # openssl in the dep tree (ureq/rustls + bundled sqlite), so no system
           # libs are required.
@@ -143,10 +145,15 @@ jobs:
   # build/upload here is fused inside taiki-e's action, so rather than reach into
   # its internals we re-download the just-published assets and attest them by
   # digest — decoupled and robust. Tag pushes only; nothing to attest on dry-runs.
+  #
+  # `!cancelled()` (rather than plain success) means a single flaky/failed build
+  # leg cannot block provenance for every other binary: attest still runs and
+  # signs whatever assets did upload. It errors only if the release has no
+  # assets at all (a wholly-failed release, which should be red).
   attest:
     name: attest release provenance
     needs: [lite, full]
-    if: startsWith(github.ref, 'refs/tags/')
+    if: ${{ !cancelled() && startsWith(github.ref, 'refs/tags/') }}
     runs-on: ubuntu-latest
     permissions:
       contents: read       # download the release assets
