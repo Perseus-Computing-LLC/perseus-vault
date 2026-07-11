@@ -10,7 +10,7 @@ unnamed/nonexistent model and mixed splits and judges. We do not do that again.
 
 | system | LongMemEval QA accuracy | answerer | judge | split | source |
 |---|---:|---|---|---|---|
-| **Perseus Vault** | **73.8% mean** (72.8 / 73.6 / 75.0 across 3 full runs) | `gpt-4o-2024-08-06` (pinned) | `gpt-4o-2024-08-06`, LongMemEval **official** per-type judge | `longmemeval_s` (500) | [`report.json`](report.json), [`report_seed2.json`](report_seed2.json), [`report_seed3.json`](report_seed3.json) (all signed), this repo |
+| **Perseus Vault** | **73.8% mean** (72.8 / 73.6 / 75.0 across 3 full runs) | `gpt-4o-2024-08-06` (pinned) | `gpt-4o-2024-08-06`, LongMemEval **official** per-type judge | `longmemeval_s` (500) | [`qa_report.json`](qa_report.json), [`qa_report_seed2.json`](qa_report_seed2.json), [`qa_report_seed3.json`](qa_report_seed3.json) (all signed), this repo |
 | Zep | 63.8% (published) | "GPT-4o" (snapshot not stated) | not stated | LongMemEval `_s` (as published) | Zep's published claim, cited in #475 |
 | Mem0 | 49.0% (published) | "GPT-4o" (snapshot not stated) | not stated | LongMemEval `_s` (as published) | published claim, cited in #475 |
 
@@ -32,7 +32,7 @@ Per-type results are highly stable across runs: single-session-assistant scored
 
 ## By question type
 
-The signed report's `by_question_type`. Temporal reasoning is broken out because
+The signed run-2 report's `by_question_type`. Temporal reasoning is broken out because
 the bi-temporal engine is supposed to shine there.
 
 | question type | n | correct | accuracy |
@@ -100,7 +100,7 @@ tuning toward gold answers was done, and none is acceptable here.**
   question (avg 9.9 sessions / ~25k tokens per prompt; no truncation).
 - **Provenance:** signature `929623670d8bcc67…d064345` over the per-question
   verdict set; hardware, elapsed (55.8 min at 400k TPM), and config all in
-  [`report.json`](report.json).
+  [`qa_report.json`](qa_report.json).
 
 ## Caveats (read before quoting the number)
 
