@@ -2,7 +2,8 @@
 
 CrewAI (and its heavy dependency tree) need not be installed to exercise the
 Perseus Vault wiring: we stub ``crewai.tools.BaseTool`` with a minimal base class, then
-drive the tool against Perseus Vault's real MCP JSON-RPC envelope via a fake subprocess.
+drive the tool against Perseus Vault's real MCP JSON-RPC envelope via a fake
+VaultClient.
 """
 
 from __future__ import annotations
@@ -38,84 +39,38 @@ def PerseusVaultMemoryTool():
     return tool_cls
 
 
-def _fake_popen(routes):
-    """Build a FakePopen whose stdout replays JSON-RPC responses over the
-    persistent stdio session the tool uses (write/readline, not communicate).
+def _make_fake_client(routes):
+    """Build a fake ``VaultClient`` driven by ``routes``.
 
-    ``routes`` maps a tool name → callable(args) -> payload dict. The fake
-    answers the initialize handshake with ``{}`` and each ``tools/call`` with
-    the MCP envelope wrapping the routed payload.
+    ``routes`` maps a Perseus Vault tool name to a callable(arguments) -> payload
+    dict. The tool now talks to the shared ``perseus_vault_client.VaultClient``
+    (hardened stdio transport lives there), so we patch that seam instead of the
+    subprocess: ``call_tool_raw`` returns the payload wrapped in Perseus Vault's
+    real MCP envelope (``structuredContent`` + ``content[0].text``).
     """
-    class FakeStdout:
-        def __init__(self):
-            self._lines = []
 
-        def push(self, line):
-            self._lines.append(line)
-
-        def readline(self):
-            if self._lines:
-                return self._lines.pop(0)
-            return ""
-
-    class FakePopen:
-        last_input = None
-
+    class FakeClient:
         def __init__(self, *args, **kwargs):
-            self._stdout = FakeStdout()
-            self.stderr = None
+            self.args = args
+            self.kwargs = kwargs
 
-            class _Stdin:
-                def __init__(self, outer):
-                    self.outer = outer
+        def call_tool_raw(self, name, arguments):
+            payload = routes[name](arguments)
+            return {
+                "content": [{"type": "text", "text": json.dumps(payload)}],
+                "structuredContent": payload,
+            }
 
-                def write(self, data):
-                    FakePopen.last_input = data
-                    for line in data.splitlines():
-                        line = line.strip()
-                        if not line:
-                            continue
-                        msg = json.loads(line)
-                        mid = msg.get("id")
-                        if msg.get("method") == "initialize":
-                            self.outer._stdout.push(
-                                json.dumps({"jsonrpc": "2.0", "id": mid, "result": {}}) + "\n"
-                            )
-                        elif msg.get("method") == "tools/call":
-                            name = msg["params"]["name"]
-                            payload = routes[name](msg["params"]["arguments"])
-                            env = {
-                                "jsonrpc": "2.0",
-                                "id": mid,
-                                "result": {
-                                    "content": [{"type": "text", "text": json.dumps(payload)}],
-                                    "structuredContent": payload,
-                                },
-                            }
-                            self.outer._stdout.push(json.dumps(env) + "\n")
-
-                def flush(self):
-                    pass
-
-                def close(self):
-                    pass
-
-            self.stdin = _Stdin(self)
-
-        @property
-        def stdout(self):
-            return self._stdout
-
-        def poll(self):
-            return None
-
-        def wait(self, timeout=None):
-            return 0
-
-        def kill(self):
+        def close(self):
             pass
 
-    return FakePopen
+    return FakeClient
+
+
+def _patch(monkeypatch, routes):
+    # PerseusVaultMemoryTool builds a VaultClient lazily via _get_client(); swap the
+    # class the module imported so the tool drives our fake transport.
+    monkeypatch.setattr("perseus_vault_crewai.VaultClient", _make_fake_client(routes))
 
 
 def test_remember_sends_type(monkeypatch, PerseusVaultMemoryTool):
@@ -125,9 +80,7 @@ def test_remember_sends_type(monkeypatch, PerseusVaultMemoryTool):
         captured.update(args)
         return {"id": "mem-1", "status": "ok"}
 
-    monkeypatch.setattr(
-        "perseus_vault_crewai.subprocess.Popen", _fake_popen({"perseus_vault_remember": remember})
-    )
+    _patch(monkeypatch, {"perseus_vault_remember": remember})
     tool = PerseusVaultMemoryTool()
     out = tool._remember(category="crewai", key="k1", content="hello world")
 
@@ -150,9 +103,7 @@ def test_recall_parses_structured_items(monkeypatch, PerseusVaultMemoryTool):
             "total": 1,
         }
 
-    monkeypatch.setattr(
-        "perseus_vault_crewai.subprocess.Popen", _fake_popen({"perseus_vault_recall": recall})
-    )
+    _patch(monkeypatch, {"perseus_vault_recall": recall})
     tool = PerseusVaultMemoryTool()
     out = tool._recall(query="answer")
 
