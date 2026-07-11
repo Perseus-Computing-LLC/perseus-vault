@@ -533,6 +533,12 @@ enum Commands {
         /// Read the payload from this file instead of stdin
         #[arg(long)]
         file: Option<String>,
+        /// #563: after a successful non-dry-run capture, atomically remove the
+        /// captured blocks from the --file source (temp file + rename, leaving
+        /// a .bak). No-op under --dry-run, when nothing is captured, or when
+        /// reading from stdin (no source file to prune). Alias: --prune-source.
+        #[arg(long, alias = "prune-source")]
+        consume: bool,
         /// Workspace hash to scope captured entities to
         #[arg(long)]
         workspace_hash: Option<String>,
@@ -2013,6 +2019,8 @@ fn run_capture(
     max_entities: i64,
     dry_run: bool,
     llm: bool,
+    consume: bool,
+    source_file: Option<&str>,
 ) -> Result<serde_json::Value, String> {
     let args = serde_json::json!({
         "text": payload,
@@ -2021,6 +2029,8 @@ fn run_capture(
         "max_entities": max_entities,
         "dry_run": dry_run,
         "llm": llm,
+        "consume": consume,
+        "source_file": source_file,
     });
     let out = tools::handle_capture(database, args)?;
     serde_json::from_str(&out).map_err(|e| format!("capture result serialization failed: {}", e))
@@ -2322,6 +2332,7 @@ fn main() {
         Some(Commands::Capture {
             db: ref db_path,
             ref file,
+            consume,
             ref workspace_hash,
             ref agent_id,
             max_entities,
@@ -2376,6 +2387,8 @@ fn main() {
                 max_entities,
                 dry_run,
                 llm,
+                consume,
+                file.as_deref(),
             ) {
                 Ok(result) => print_json(&result),
                 Err(e) => {
@@ -3383,27 +3396,27 @@ mod tests {
                        The recall-gate test failed because the dense model cache was cold.\n\n\
                        # Standing decision\n\
                        We decided to rerun flaky suites once before investigating.";
-        let v = run_capture(&database, payload, Some("ws-cli"), Some("cli-agent"), 20, false, false)
+        let v = run_capture(&database, payload, Some("ws-cli"), Some("cli-agent"), 20, false, false, false, None)
             .expect("capture must succeed");
         assert_eq!(v["captured"], serde_json::json!(2), "{v}");
         assert_eq!(v["created"], serde_json::json!(2), "{v}");
 
         // Re-capturing the identical payload must not flood the store.
-        let v = run_capture(&database, payload, Some("ws-cli"), None, 20, false, false)
+        let v = run_capture(&database, payload, Some("ws-cli"), None, 20, false, false, false, None)
             .expect("re-capture must succeed");
         assert_eq!(v["created"], serde_json::json!(0), "{v}");
         let stats = database.stats().expect("stats");
         assert_eq!(stats.total_entities, 2, "re-capture must not add rows");
 
         // dry_run distills but writes nothing.
-        let v = run_capture(&database, "A brand new durable takeaway about caching.", None, None, 20, true, false)
+        let v = run_capture(&database, "A brand new durable takeaway about caching.", None, None, 20, true, false, false, None)
             .expect("dry-run capture");
         assert_eq!(v["dry_run"], serde_json::json!(true));
         let stats = database.stats().expect("stats");
         assert_eq!(stats.total_entities, 2);
 
         // Empty payload surfaces the pipeline's error through the CLI path.
-        let err = run_capture(&database, "   ", None, None, 20, false, false)
+        let err = run_capture(&database, "   ", None, None, 20, false, false, false, None)
             .expect_err("empty payload must error");
         assert!(err.contains("text is required"), "{err}");
 

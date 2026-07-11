@@ -543,7 +543,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
       "properties": {
         "query": {
           "type": "string",
-          "description": "Search query — words are OR'd together for broad recall"
+          "description": "Search query — words are OR'd together for broad recall. An EMPTY string (\"\") is the match-all / enumeration path: it drops the keyword predicate and returns every entity in scope (respecting category/type/limit/offset), so it is the way to 'list all' a category. Wildcards are NOT globs: \"*\" is a literal FTS5 term and matches nothing — pass \"\" to enumerate, not \"*\"."
         },
         "category": {
           "type": "string",
@@ -2341,6 +2341,15 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
           "type": "boolean",
           "default": false,
           "description": "Distill via the configured LLM endpoint instead of the local rule-based distiller. Requires --llm-endpoint; falls back to the rule-based path on any LLM failure (the result's llm_fallback field says why)."
+        },
+        "consume": {
+          "type": "boolean",
+          "default": false,
+          "description": "#563: after a SUCCESSFUL non-dry-run capture, atomically remove exactly the captured regions from source_file (temp file + rename, leaving a <source_file>.bak). Scoped to captured records only — surrounding headers/rules/pointers are left untouched. No-op under dry_run, when nothing was captured, or when source_file is unset, so it can never delete content that was not durably stored. Use it to keep a host-inlined write-buffer (e.g. an AGENTS.local.md the agent loads every turn) from accumulating already-stored blocks forever. The result reports 'consumed' (regions removed) and 'source_backup'."
+        },
+        "source_file": {
+          "type": "string",
+          "description": "#563: path to the file the payload came from. Required for consume to have anything to prune; ignored when consume is false."
         }
       },
       "required": [
@@ -2396,6 +2405,14 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
         "message": {
           "type": "string",
           "description": "Unambiguous empty state when the payload contained nothing durable"
+        },
+        "consumed": {
+          "type": "integer",
+          "description": "#563: number of captured regions removed from source_file (0 unless consume=true and the prune ran). See source_backup / consume_skipped / consume_error."
+        },
+        "source_backup": {
+          "type": "string",
+          "description": "#563: path to the pre-prune backup (<source_file>.bak) written when consumed > 0"
         }
       }
     },

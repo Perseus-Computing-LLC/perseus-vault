@@ -2131,6 +2131,15 @@ pub struct CaptureArgs {
     /// MIMIR_LLM_TIMEOUT_SECS — or unparseable output).
     #[serde(default, deserialize_with = "null_as_default")]
     pub llm: bool,
+    /// #563: after a successful non-dry-run capture, atomically remove the
+    /// captured regions from `source_file` (leaving a `.bak`). No-op under
+    /// `dry_run`, when nothing was captured, or when `source_file` is unset.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub consume: bool,
+    /// #563: path to the source file the payload was read from. Required for
+    /// `consume` to have anything to prune; ignored otherwise.
+    #[serde(default)]
+    pub source_file: Option<String>,
 }
 
 fn default_capture_max() -> i64 {
@@ -2300,6 +2309,39 @@ pub fn handle_capture(db: &Database, args: Value) -> Result<String, String> {
     if report.notes.is_empty() {
         result["message"] =
             json!("nothing durable found in the payload (rule-based distiller is precision-over-recall)");
+    }
+
+    // #563 consume / prune-source: after a SUCCESSFUL non-dry-run capture,
+    // remove exactly the captured regions from the source file so a
+    // host-inlined write-buffer doesn't accumulate durably-stored blocks
+    // forever. Guarded so it can never delete content that wasn't persisted:
+    // skipped under dry_run, when nothing was captured, or with no source_file.
+    if a.consume {
+        if a.dry_run {
+            result["consumed"] = json!(0);
+            result["consume_skipped"] = json!("dry_run");
+        } else if report.notes.is_empty() {
+            result["consumed"] = json!(0);
+            result["consume_skipped"] = json!("nothing captured");
+        } else if let Some(ref src) = a.source_file {
+            match crate::capture::consume_source_file(std::path::Path::new(src), &report.notes) {
+                Ok(removed) => {
+                    result["consumed"] = json!(removed);
+                    if removed > 0 {
+                        result["source_backup"] = json!(format!("{}.bak", src));
+                    }
+                }
+                Err(e) => {
+                    // The capture itself succeeded and is durable; surface the
+                    // prune failure without failing the whole call.
+                    result["consumed"] = json!(0);
+                    result["consume_error"] = json!(format!("failed to prune {}: {}", src, e));
+                }
+            }
+        } else {
+            result["consumed"] = json!(0);
+            result["consume_skipped"] = json!("no source_file provided");
+        }
     }
     Ok(result.to_string())
 }

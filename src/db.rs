@@ -18251,6 +18251,78 @@ mod tests {
         }
     }
 
+    /// #562: enumeration semantics. An EMPTY query is the match-all path and a
+    /// literal "*" matches nothing; paging with limit+offset walks the WHOLE
+    /// category deterministically across multiple calls (> limit entities).
+    #[test]
+    fn empty_query_enumerates_and_wildcard_is_literal_with_stable_paging() {
+        let (db, path) = temp_db();
+        // 25 entities in one category, plus rows in other scopes to prove the
+        // enumeration respects the category filter.
+        for i in 0..25 {
+            seed_plain_entity(
+                &db,
+                &format!("scan-{i:03}"),
+                &format!(r#"{{"content":"scan corpus row {i}"}}"#),
+                "scancat",
+                0,
+                0,
+                false,
+            );
+        }
+        seed_plain_entity(&db, "other-1", r#"{"content":"different scope"}"#, "othercat", 0, 0, false);
+
+        let enum_params = |limit: i64, offset: i64| crate::models::RecallParams {
+            query: String::new(), // empty = match-all / enumeration
+            category: Some("scancat".to_string()),
+            limit,
+            offset,
+            skip_side_effects: true,
+            ..Default::default()
+        };
+
+        // Empty query returns the whole category (capped by limit), never the
+        // other-scope row.
+        let all = db.recall(&enum_params(1000, 0)).unwrap();
+        assert_eq!(all.len(), 25, "empty query must enumerate the full category");
+        assert!(
+            all.iter().all(|e| e.category == "scancat"),
+            "enumeration must respect the category filter"
+        );
+
+        // A literal "*" is NOT a glob: it is an FTS term that matches nothing.
+        let star = crate::models::RecallParams {
+            query: "*".to_string(),
+            category: Some("scancat".to_string()),
+            limit: 1000,
+            skip_side_effects: true,
+            ..Default::default()
+        };
+        assert!(
+            db.recall(&star).unwrap().is_empty(),
+            "'*' must be a literal term matching nothing, not a wildcard"
+        );
+
+        // Paginate the full set with limit=10 across 3 pages; the union must be
+        // exactly the 25 distinct entities with no overlap or gap.
+        let page = |off: i64| {
+            db.recall(&enum_params(10, off))
+                .unwrap()
+                .into_iter()
+                .map(|e| e.id)
+                .collect::<Vec<_>>()
+        };
+        let (p0, p1, p2) = (page(0), page(10), page(20));
+        assert_eq!(p0.len(), 10);
+        assert_eq!(p1.len(), 10);
+        assert_eq!(p2.len(), 5, "final page returns the remainder (< limit)");
+        let mut union: Vec<String> = [p0, p1, p2].concat();
+        union.sort();
+        union.dedup();
+        assert_eq!(union.len(), 25, "paging must cover every entity exactly once");
+        let _ = fs::remove_file(&path);
+    }
+
     fn explain_plan(
         conn: &rusqlite::Connection,
         sql: &str,
