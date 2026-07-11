@@ -160,6 +160,53 @@ judge by feeding the emitted `hypotheses-<system>-<model>.jsonl` to their
 `src/evaluation/evaluate_qa.py`. Run every system through the **same** models,
 and report the LLM and judge by name beside the number (see COMPARISON.md).
 
+## Chain-of-thought answer prompt (#579)
+
+LongMemEval ships **two** official answer prompts: a direct one (the default
+here) and a chain-of-thought variant (`run_generation.py cot=true`). The
+retrieval diagnostic below attributed the majority of consistent QA failures to
+*reasoning over correctly-retrieved evidence*, not retrieval — the class CoT
+addresses. Run the official CoT prompt with `--cot`:
+
+```bash
+python qa.py --data longmemeval_s_cleaned.json --cot --k 10 --yes \
+    --journal cot_full.jsonl --out cot_report.json
+```
+
+`--cot` uses LongMemEval's own CoT prompt (still 100% official methodology),
+raises the answer `max_tokens` to 1200, and parses the final `Answer:` line for
+judging. Both the journal `_config` and the report carry
+`answer_prompt: "official-cot"` (vs `"plain"`), and the run signature includes
+it — a CoT number can never be silently blended with a plain-prompt one. Use
+`--only-types single-session-preference multi-session temporal-reasoning` to run
+a weak-category slice cheaply. **A single run's number is never quoted alone**
+(see the honesty notes) — confirm with ≥2 seeds and, ideally, an independent
+re-grade via the authors' `evaluate_qa.py` on the emitted `hypotheses-*.jsonl`.
+
+## Retrieval coverage diagnostic (offline, judge-free — #580)
+
+`retrieval_diag.py` isolates the *retrieval* half of QA failure with **no LLM,
+no judge, no API cost**. It replays the identical benchmark ingest + hybrid
+recall for every question at a deep top-K and records where each gold evidence
+session ranked, then reports gold-evidence **coverage@k**:
+
+```bash
+python retrieval_diag.py --data longmemeval_s_cleaned.json \
+    --bin ../../target/release/perseus-vault --k 50 --out diag_report.json
+```
+
+It also works as a **coverage regression guard** — fail CI when recall drops:
+
+```bash
+python retrieval_diag.py --data longmemeval_s_cleaned.json \
+    --bin ../../target/release/perseus-vault --min-coverage-at 20:0.95
+```
+
+`--min-coverage-at K:FRAC` exits non-zero if coverage@K falls below the floor.
+The report buckets misses into **k-recoverable** (gold ranked 11–K, a deeper k
+would catch them) and **hard** (a gold session absent from the top-K entirely —
+the interesting engine cases for multi-query / aggregation-aware retrieval).
+
 ## Honesty notes (read before quoting a number)
 
 - This is a **retrieval** number, not end-to-end QA accuracy. Do not compare it to
