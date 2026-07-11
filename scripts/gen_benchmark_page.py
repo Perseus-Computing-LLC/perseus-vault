@@ -126,7 +126,7 @@ def sec_retrieval(r):
 </section>"""
 
 
-def sec_qa(qa):
+def sec_qa(qa, seeds=()):
     zep_line = ('Zep publishes <b>63.8%</b> on LongMemEval with GPT-4o '
                 '(<a href="https://arxiv.org/abs/2501.13956">their paper</a>).')
     if not qa:
@@ -140,21 +140,47 @@ def sec_qa(qa):
 </section>"""
     overall = qa.get("systems", {}).get("mimir", {}) or qa.get("mimir", {})
     acc = overall.get("accuracy")
-    acc_html = f"<div class='stat big'><div class='v'>{acc * 100:.1f}%</div><div class='l'>accuracy ({esc(qa.get('answerer', qa.get('model', 'pinned model')))})</div></div>" if acc is not None else ""
+    # Multi-seed (#475): when confirmation seed reports exist, the headline is the
+    # mean across all runs with the range — a single run's number is never quoted
+    # alone once a distribution is available.
+    seed_accs = [s.get("systems", {}).get("mimir", {}).get("accuracy")
+                 for s in seeds if s]
+    all_accs = [a for a in [acc] + seed_accs if a is not None]
+    answerer = esc(qa.get('answerer_model', qa.get('answerer', qa.get('model', 'pinned model'))))
+    if len(all_accs) > 1:
+        mean = sum(all_accs) / len(all_accs)
+        lo, hi = min(all_accs) * 100, max(all_accs) * 100
+        acc_html = (f"<div class='stat big'><div class='v'>{mean * 100:.1f}%</div>"
+                    f"<div class='l'>mean of {len(all_accs)} independent full runs "
+                    f"(range {lo:.1f}&ndash;{hi:.1f}%, {answerer})</div></div>")
+        runs_note = (f" The headline is the mean of {len(all_accs)} independent signed runs "
+                     f"({' / '.join(f'{a*100:.1f}%' for a in all_accs)}); the worst run scores "
+                     f"{lo - 63.8:+.1f} points vs Zep's published number.")
+    elif acc is not None:
+        acc_html = f"<div class='stat big'><div class='v'>{acc * 100:.1f}%</div><div class='l'>accuracy ({answerer})</div></div>"
+        runs_note = ""
+    else:
+        acc_html, runs_note = "", ""
     cats = overall.get("by_question_type", {})
     cat_rows = "".join(
-        f"<tr><th>{esc(k)}</th><td>{v.get('correct', '?')}/{v.get('graded', '?')}</td>"
+        f"<tr><th>{esc(k)}</th><td>{v.get('correct', '?')}/{v.get('graded', v.get('n', '?'))}</td>"
         f"<td>{(v.get('accuracy', 0) * 100):.1f}%</td></tr>"
         for k, v in sorted(cats.items())) if isinstance(cats, dict) else ""
     cat_table = f"<div class='tablewrap'><table><thead><tr><th>question type</th><th>correct</th><th>accuracy</th></tr></thead><tbody>{cat_rows}</tbody></table></div>" if cat_rows else ""
+    seed_links = "".join(
+        src_link(f'longmemeval/qa_report_seed{i}.json', s.get('signature_sha256'))
+        for i, s in enumerate(seeds, start=2) if s)
     return f"""
 <section id="qa">
   <h2>End-to-end QA vs Zep</h2>
   <p class="note">{zep_line} Ours below: identical split, pinned answerer and judge named in the
-  report. Where conditions differ from a competitor's published run, the comparison is flagged, not blended.</p>
+  report, LongMemEval's official per-type judge prompts.{runs_note}
+  Where conditions differ from a competitor's published run, the comparison is flagged, not blended.
+  Per-type table is from the primary run's signed report.</p>
   <div class="stats">{acc_html}</div>
   {cat_table}
   {src_link('longmemeval/qa_report.json', qa.get('signature_sha256'))}
+  {seed_links}
 </section>"""
 
 
@@ -260,13 +286,15 @@ def main():
 
     recall = load("longmemeval/report.json")
     qa = load("longmemeval/qa_report.json")
+    qa_seeds = [load("longmemeval/qa_report_seed2.json"),
+                load("longmemeval/qa_report_seed3.json")]
     scale = load("scale/report.json")
     temporal = load("temporal/report.json")
     gauntlet = load("temporal/gauntlet_report.json")
     commit = commit_sha()
     today = _dt.date.today().isoformat()
 
-    body = (sec_matrix() + sec_retrieval(recall) + sec_qa(qa) + sec_scale(scale)
+    body = (sec_matrix() + sec_retrieval(recall) + sec_qa(qa, qa_seeds) + sec_scale(scale)
             + sec_temporal(temporal, gauntlet) + sec_reproduce(commit))
 
     page = f"""<!DOCTYPE html>
