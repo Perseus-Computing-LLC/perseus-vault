@@ -17,9 +17,15 @@ Defaults (all overridable, always recorded in the report):
   retrieval hybrid, top-k 10    (recall@10 = 99.2% per benchmark/longmemeval/report.json)
 
 Systems (same idea as before; run every system through the SAME model):
+  stateless    no history at all: question only                    (arm 0 — why memory exists)
   mimir        top-k sessions from perseus-vault hybrid retrieval  (the product)
-  fullcontext  every haystack session concatenated                 (no-memory baseline)
+  fullcontext  every haystack session concatenated                 (no-memory-layer baseline)
   oracle       only the gold evidence sessions                     (upper bound)
+
+Every live verdict records the API-billed prompt/completion tokens for both the
+answerer and the judge (`ans_usage`/`judge_usage`, aggregated per system as
+`api_usage_tokens`). Provider-billed tokens — not estimates — are what feed the
+CPST (cost per successfully completed task) accounting in cpst.py.
 
 API key: env OPENAI_API_KEY, else the file ~/.openai_key (contents, whitespace
 stripped). The key is NEVER printed or logged. OPENAI_BASE_URL overrides the
@@ -241,10 +247,14 @@ def call_llm(base_url, api_key, model, prompt, budget=None, max_retries=12):
             })
             with urllib.request.urlopen(req, timeout=120) as resp:
                 out = json.loads(resp.read())
+            usage = out.get("usage") or {}
             if budget:
-                usage = out.get("usage") or {}
                 budget.settle(ev, usage.get("total_tokens") or est)
-            return out["choices"][0]["message"]["content"].strip()
+            # API-reported usage is the ground truth for cost accounting (#CPST):
+            # estimates pace the budget, but only provider-billed tokens are quotable.
+            return (out["choices"][0]["message"]["content"].strip(),
+                    {"prompt_tokens": usage.get("prompt_tokens", 0),
+                     "completion_tokens": usage.get("completion_tokens", 0)})
         except urllib.error.HTTPError as e:
             if e.code == 429 or e.code >= 500:
                 if budget:
@@ -272,12 +282,13 @@ def call_llm(base_url, api_key, model, prompt, budget=None, max_retries=12):
 # ── Mock LLM (plumbing smoke test; deterministic, no key, no network) ──────────
 def mock_answer(inst, idx):
     """Even instances answer with the gold text, odd ones abstain — so BOTH
-    judge verdict paths (yes and no) are exercised end-to-end."""
-    return inst["answer"] if idx % 2 == 0 else "I don't know."
+    judge verdict paths (yes and no) are exercised end-to-end. Gold answers
+    can be non-string (ints in longmemeval_s), so coerce."""
+    return str(inst["answer"]) if idx % 2 == 0 else "I don't know."
 
 
 def mock_judge(inst, answer):
-    ans = answer.lower()
+    ans = str(answer).lower()
     if inst["question_id"].endswith("_abs"):
         abstained = any(p in ans for p in ("don't know", "do not know", "not available",
                                            "no information", "cannot"))
@@ -299,7 +310,11 @@ def build_context(system, inst, srv, qid, k):
     dates = inst.get("haystack_dates") or [None] * len(sids)
     by_id = {sid: (turns, d) for sid, turns, d in zip(sids, sessions, dates)}
 
-    if system == "fullcontext":
+    if system == "stateless":
+        # No memory of any kind: the agent answers from the question alone.
+        # This is the "why does the memory category exist at all" arm.
+        chosen = []
+    elif system == "fullcontext":
         chosen = sids
     elif system == "oracle":
         chosen = inst.get("answer_session_ids", [])
@@ -325,7 +340,8 @@ def build_context(system, inst, srv, qid, k):
             turns, d = by_id[sid]
             hdr = f"[session {sid}" + (f" | {d}" if d else "") + "]"
             blocks.append(f"{hdr}\n{session_text(turns)}")
-    return "\n\n".join(blocks), [s for s in chosen if s in by_id]
+    ctx = "\n\n".join(blocks) or "(no prior conversation history is available)"
+    return ctx, [s for s in chosen if s in by_id]
 
 
 def price_for(model):
@@ -344,7 +360,7 @@ def estimate_cost(data, systems, k, model, judge):
     avg_n = sum(sess_counts) / max(1, len(sess_counts))
 
     ctx_per_system = {"mimir": k * avg_sess, "fullcontext": avg_n * avg_sess,
-                      "oracle": 2 * avg_sess}
+                      "oracle": 2 * avg_sess, "stateless": 12}
     n = len(data)
     answer_out, judge_in_fixed, judge_out = 150, 250, 5
     a_in, a_out = price_for(model)
@@ -387,8 +403,11 @@ def main():
     ap.add_argument("--split", default="s", choices=["s", "m"],
                     help="LongMemEval split; 's' (500 instances) is what Zep reports on")
     ap.add_argument("--systems", nargs="+", default=["mimir"],
-                    choices=["fullcontext", "mimir", "oracle"],
-                    help="Run every system through the SAME model (default: mimir only)")
+                    choices=["stateless", "fullcontext", "mimir", "oracle"],
+                    help="Run every system through the SAME model (default: mimir only). "
+                         "stateless = no history at all (arm 0); fullcontext = whole "
+                         "haystack stuffed (no-memory-layer baseline); mimir = the product; "
+                         "oracle = gold evidence only (upper bound)")
     ap.add_argument("--model", default=DEFAULT_ANSWERER, help=f"Answerer model id (default {DEFAULT_ANSWERER})")
     ap.add_argument("--judge", default=DEFAULT_JUDGE, help=f"Judge model id (default {DEFAULT_JUDGE})")
     ap.add_argument("--k", type=int, default=10, help="Sessions retrieved for the mimir system (default 10)")
@@ -514,7 +533,8 @@ def main():
                                         "hypothesis": rec.get("hypothesis", "")})
             verdicts.append({k: rec.get(k) for k in
                              ("question_id", "question_type", "system",
-                              "abstention", "correct", "error", "judge_raw")})
+                              "abstention", "correct", "error", "judge_raw",
+                              "ans_usage", "judge_usage")})
 
     def record(rec, hypothesis, tokens_est, sessions):
         """Append a verdict to memory AND the crash-safe journal."""
@@ -550,11 +570,12 @@ def main():
                     continue
 
                 q_tokens = est_tokens(prompt)
+                a_usage = {}
                 if args.mock_llm:
                     ans = mock_answer(inst, idx)
                 else:
                     try:
-                        ans = call_llm(base_url, api_key, args.model, prompt, budget)
+                        ans, a_usage = call_llm(base_url, api_key, args.model, prompt, budget)
                     except Exception as e:
                         # A rate-limited/failed question must NEVER deflate accuracy:
                         # record it as answer_error and exclude it from the denominator.
@@ -565,29 +586,33 @@ def main():
                         record({"question_id": qid, "question_type": qtype,
                                 "system": system, "abstention": is_abs,
                                 "correct": None, "error": "answer_error",
-                                "judge_raw": None}, "", q_tokens, len(chosen))
+                                "judge_raw": None, "ans_usage": None,
+                                "judge_usage": None}, "", q_tokens, len(chosen))
                         continue
                 hyps[system].append({"question_id": qid, "hypothesis": ans})
 
                 jp = get_anscheck_prompt(qtype, inst["question"], inst["answer"],
                                          ans or "(no answer)", abstention=is_abs)
+                j_usage = {}
                 if args.mock_llm:
                     jraw = mock_judge(inst, ans)
                 else:
                     try:
-                        jraw = call_llm(base_url, api_key, args.judge, jp, budget)
+                        jraw, j_usage = call_llm(base_url, api_key, args.judge, jp, budget)
                     except Exception as e:
                         print(f"  !! JUDGE_ERROR on {qid}/{system} (excluded from accuracy): {e}",
                               file=sys.stderr)
                         record({"question_id": qid, "question_type": qtype,
                                 "system": system, "abstention": is_abs,
                                 "correct": None, "error": "judge_error",
-                                "judge_raw": None}, ans, q_tokens, len(chosen))
+                                "judge_raw": None, "ans_usage": a_usage or None,
+                                "judge_usage": None}, ans, q_tokens, len(chosen))
                         continue
                 correct = jraw.strip().lower().startswith("yes")
                 record({"question_id": qid, "question_type": qtype, "system": system,
                         "abstention": is_abs, "correct": correct, "error": None,
-                        "judge_raw": jraw.strip()[:40]}, ans, q_tokens, len(chosen))
+                        "judge_raw": jraw.strip()[:40], "ans_usage": a_usage or None,
+                        "judge_usage": j_usage or None}, ans, q_tokens, len(chosen))
         finally:
             if srv:
                 srv.close()
@@ -657,6 +682,14 @@ def main():
                            "accuracy": round(sum(v["correct"] for v in abst) / len(abst), 4) if abst else None},
             "avg_context_tokens_est": round(tok[system] / n),
             "avg_sessions_in_context": round(nsess[system] / n, 1),
+            # API-billed tokens (ground truth for CPST cost accounting).
+            # Zero when --mock-llm / --dry-run or resumed from a pre-usage journal.
+            "api_usage_tokens": {
+                "answer_prompt": sum((v.get("ans_usage") or {}).get("prompt_tokens", 0) for v in vs),
+                "answer_completion": sum((v.get("ans_usage") or {}).get("completion_tokens", 0) for v in vs),
+                "judge_prompt": sum((v.get("judge_usage") or {}).get("prompt_tokens", 0) for v in vs),
+                "judge_completion": sum((v.get("judge_usage") or {}).get("completion_tokens", 0) for v in vs),
+            },
         }
         if answer_errors or judge_errors:
             print(f"  !! {system}: {answer_errors} answer_error(s) + {judge_errors} judge_error(s) "
@@ -698,7 +731,8 @@ def main():
         "signature_sha256": signature,
         "per_question": [{"question_id": v["question_id"], "question_type": v["question_type"],
                           "system": v["system"], "correct": v["correct"],
-                          "error": v["error"]} for v in verdicts],
+                          "error": v["error"], "ans_usage": v.get("ans_usage"),
+                          "judge_usage": v.get("judge_usage")} for v in verdicts],
     }
     Path(args.out).write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
 
