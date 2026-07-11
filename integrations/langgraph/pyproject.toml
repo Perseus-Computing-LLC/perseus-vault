@@ -18,6 +18,7 @@ classifiers = [
 ]
 dependencies = [
     "langgraph>=0.2.0",
+    "perseus-vault-client>=0.1.0",
 ]
 
 [project.optional-dependencies]

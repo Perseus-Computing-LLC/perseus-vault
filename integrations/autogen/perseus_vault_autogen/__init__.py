@@ -34,9 +34,7 @@ DB open + init handshake).
 from __future__ import annotations
 
 import json
-import subprocess
 import time
-import threading
 import logging
 from pathlib import Path
 from typing import Any, Optional
@@ -51,6 +49,8 @@ from autogen_core.memory import (
 )
 from autogen_core.model_context import ChatCompletionContext
 from autogen_core.models import SystemMessage
+
+from perseus_vault_client import VaultClient
 
 logger = logging.getLogger(__name__)
 
@@ -97,103 +97,43 @@ class PerseusVaultMemory(Memory):
         self.encryption_key = encryption_key
         self.llm_endpoint = llm_endpoint
         self.llm_model = llm_model
-
-        # Persistent session — spawned lazily on first call
-        self._proc: Optional[subprocess.Popen] = None
-        self._req_id: int = 0
-        self._lock = threading.Lock()
+        self._client: Optional[VaultClient] = None
 
     # ── session management ──────────────────────────────────────────
 
-    def _ensure_session(self):
-        """Spawn a persistent perseus-vault process if one isn't already running."""
-        if self._proc is not None and self._proc.poll() is None:
-            return  # already alive
+    def _get_client(self) -> VaultClient:
+        """Lazily build the shared VaultClient (hardened stdio transport).
 
-        args = [self.binary, "serve", "--db", self.db_path]
-        if self.encryption_key:
-            args.extend(["--encryption-key", self.encryption_key])
-        if self.llm_endpoint:
-            args.extend(["--llm-endpoint", self.llm_endpoint])
-        if self.llm_model:
-            args.extend(["--llm-model", self.llm_model])
-
-        self._proc = subprocess.Popen(
-            args,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        self._req_id = 0
-
-        init_id = self._next_id()
-        init_req = json.dumps({
-            "jsonrpc": "2.0",
-            "id": init_id,
-            "method": "initialize",
-            "params": {
-                "protocolVersion": "2024-11-05",
-                "capabilities": {},
-                "clientInfo": {"name": "autogen-perseus-vault", "version": "1.0.0"},
-            },
-        })
-        try:
-            self._proc.stdin.write(init_req + "\n")
-            self._proc.stdin.flush()
-        except (BrokenPipeError, OSError):
-            self._proc = None
-            raise RuntimeError("Failed to initialize perseus-vault process")
-
-        # Read the initialize response (ignore — just consume it)
-        self._read_response(init_id)
-
-    def _next_id(self) -> int:
-        self._req_id += 1
-        return self._req_id
-
-    def _read_response(self, expect_id: int) -> Optional[dict]:
-        """Read newline-delimited JSON from stdout until we find a response
-        whose ``id`` matches *expect_id*. Returns the parsed message or
-        ``None`` if the process died or timed out."""
-        assert self._proc is not None
-
-        deadline = time.monotonic() + self.timeout
-        while time.monotonic() < deadline:
-            if self._proc.poll() is not None:
-                return None
-            line = self._proc.stdout.readline()
-            if not line:
-                time.sleep(0.01)
-                continue
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                msg = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(msg, dict) and msg.get("id") == expect_id:
-                return msg
-        return None
+        The ``llm_endpoint`` / ``llm_model`` options map onto Perseus Vault
+        CLI flags (``--llm-endpoint`` / ``--llm-model``) passed as extra serve
+        args; the client itself owns process lifecycle, the handshake, timeouts,
+        and reconnection.
+        """
+        if self._client is None:
+            extra_args = []
+            if self.llm_endpoint:
+                extra_args += ["--llm-endpoint", self.llm_endpoint]
+            if self.llm_model:
+                extra_args += ["--llm-model", self.llm_model]
+            self._client = VaultClient(
+                binary=self.binary,
+                db_path=self.db_path,
+                encryption_key=self.encryption_key,
+                timeout=self.timeout,
+                extra_args=extra_args or None,
+            )
+        return self._client
 
     def _close_session(self):
-        """Shut down the persistent perseus-vault process."""
-        if self._proc is None:
-            return
-        try:
-            self._proc.stdin.close()
-        except (BrokenPipeError, OSError):
-            pass
-        try:
-            self._proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            self._proc.kill()
-            self._proc.wait()
-        self._proc = None
+        if self._client is not None:
+            self._client.close()
+            self._client = None
 
     def __del__(self):
-        self._close_session()
+        try:
+            self._close_session()
+        except Exception:
+            pass
 
     # ── MCP call ────────────────────────────────────────────────────
 
@@ -225,35 +165,18 @@ class PerseusVaultMemory(Memory):
         return {}
 
     def _call_perseus_vault(self, method: str, params: dict) -> dict:
-        """Call a Perseus Vault MCP tool via the persistent stdio session."""
-        with self._lock:
-            try:
-                self._ensure_session()
-            except RuntimeError as e:
-                return {"error": str(e)}
+        """Call a Perseus Vault MCP tool via the shared VaultClient.
 
-            req_id = self._next_id()
-            call_req = json.dumps({
-                "jsonrpc": "2.0",
-                "id": req_id,
-                "method": "tools/call",
-                "params": {"name": method, "arguments": params},
-            })
-
-            try:
-                self._proc.stdin.write(call_req + "\n")
-                self._proc.stdin.flush()
-            except (BrokenPipeError, OSError):
-                self._proc = None
-                return {"error": "perseus-vault process died — call re-spawns"}
-
-            response = self._read_response(req_id)
-            if response is None:
-                self._close_session()
-                return {"error": "no response from perseus-vault (process may have exited)"}
-            if response.get("error"):
-                return {"error": response["error"]}
-            return self._unwrap_result(response.get("result", {}))
+        The client spawns the process once and reuses it across calls (with
+        hardened handshake, timeout-teardown, and auto-respawn). Returns the
+        unwrapped Perseus Vault payload dict, identical to before.
+        """
+        try:
+            client = self._get_client()
+            result = client.call_tool_raw(method, params)
+        except Exception as e:
+            raise RuntimeError(f"Perseus Vault call failed ({method}): {e}")
+        return self._unwrap_result(result)
 
     # ── AutoGen Memory protocol ─────────────────────────────────────
 

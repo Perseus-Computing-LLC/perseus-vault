@@ -19,6 +19,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # The shared stdio-transport client. Pure stdlib; its real-binary
+          # test self-skips when perseus-vault isn't on PATH.
+          - adapter: client
+            extra_deps: ""
           # autogen & crewai tests stub their framework deps — no install needed.
           - adapter: autogen
             extra_deps: ""
@@ -42,6 +46,13 @@ jobs:
 
       - name: Install test deps
         run: pip install pytest pytest-asyncio ${{ matrix.extra_deps }}
+
+      - name: Install perseus-vault-client (shared stdio transport)
+        # The langgraph/crewai/autogen adapters import perseus_vault_client at
+        # module load. It's a local path package (not published to PyPI), so it
+        # must be installed from the repo. Harmless for adapters that don't use
+        # it (e.g. perseus-vault-persist).
+        run: pip install ./integrations/client
 
       - name: Run ${{ matrix.adapter }} adapter tests
         working-directory: integrations/${{ matrix.adapter }}
