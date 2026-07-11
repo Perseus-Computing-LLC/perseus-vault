@@ -24,9 +24,7 @@ Usage:
 from __future__ import annotations
 
 import json
-import subprocess
 import time
-import threading
 import logging
 from collections.abc import Iterable
 from datetime import datetime, timezone
@@ -34,6 +32,8 @@ from pathlib import Path
 from typing import Any, Literal, Optional
 
 from langgraph.store.base import BaseStore, Item, SearchItem, Op, Result
+
+from perseus_vault_client import VaultClient
 
 # The "no TTL given" sentinel was renamed NOT_GIVEN -> NOT_PROVIDED in
 # LangGraph 1.0. Support both so the adapter imports across versions.
@@ -87,92 +87,44 @@ class PerseusVaultStore(BaseStore):
         self.encryption_key = encryption_key
         self.ollama_url = ollama_url
         self.embedding_model = embedding_model
-        self._proc: Optional[subprocess.Popen] = None
-        self._req_id: int = 0
-        self._lock = threading.Lock()
+        self._client: Optional[VaultClient] = None
 
-    def _ensure_session(self):
-        """Spawn a persistent perseus-vault process if one isn't already running."""
-        if self._proc is not None and self._proc.poll() is None:
-            return
+    def _get_client(self) -> VaultClient:
+        """Lazily build the shared VaultClient (hardened stdio transport).
 
-        args = [self.binary, "serve", "--db", self.db_path]
-        if self.encryption_key:
-            args.extend(["--encryption-key", self.encryption_key])
-        # ollama_url maps to Perseus Vault's --llm-endpoint (there is no --ollama-url flag).
-        if self.ollama_url:
-            args.extend(["--llm-endpoint", self.ollama_url])
-        # embedding_model maps to --llm-model for Ollama-backed embeddings.
-        # (Perseus Vault's --embedding-model expects an ONNX model *path*, not a name.)
-        if self.embedding_model:
-            args.extend(["--llm-model", self.embedding_model])
-
-        self._proc = subprocess.Popen(
-            args,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        self._req_id = 0
-
-        # Send initialize
-        init_id = self._req_id + 1
-        self._req_id = init_id
-        init_req = json.dumps({
-            "jsonrpc": "2.0", "id": init_id,
-            "method": "initialize",
-            "params": {
-                "protocolVersion": "2024-11-05",
-                "capabilities": {},
-                "clientInfo": {"name": "langgraph-perseus-vault", "version": "1.0.0"},
-            },
-        })
-        try:
-            self._proc.stdin.write(init_req + "\n")
-            self._proc.stdin.flush()
-        except (BrokenPipeError, OSError):
-            self._proc = None
-            raise RuntimeError("Failed to initialize perseus-vault process")
-
-        # Read the initialize response
-        self._read_response(init_id)
-
-    def _read_response(self, expect_id: int) -> Optional[dict]:
-        """Read a single JSON-RPC response matching *expect_id*."""
-        assert self._proc is not None
-        deadline = time.monotonic() + self.timeout
-        while time.monotonic() < deadline:
-            if self._proc.poll() is not None:
-                return None
-            line = self._proc.stdout.readline()
-            if not line:
-                time.sleep(0.01)
-                continue
-            try:
-                msg = json.loads(line.strip())
-            except json.JSONDecodeError:
-                continue
-            if isinstance(msg, dict) and msg.get("id") == expect_id:
-                return msg
-        return None
+        The ``ollama_url`` / ``embedding_model`` options map onto Perseus Vault
+        CLI flags (``--llm-endpoint`` / ``--llm-model``) passed as extra serve
+        args; the client itself owns process lifecycle, the handshake, timeouts,
+        and reconnection.
+        """
+        if self._client is None:
+            extra_args = []
+            if self.ollama_url:
+                # maps to --llm-endpoint (there is no --ollama-url flag)
+                extra_args += ["--llm-endpoint", self.ollama_url]
+            if self.embedding_model:
+                # maps to --llm-model for Ollama-backed embeddings
+                # (--embedding-model expects an ONNX model *path*, not a name)
+                extra_args += ["--llm-model", self.embedding_model]
+            self._client = VaultClient(
+                binary=self.binary,
+                db_path=self.db_path,
+                encryption_key=self.encryption_key,
+                timeout=self.timeout,
+                extra_args=extra_args or None,
+            )
+        return self._client
 
     def _close_session(self):
-        if self._proc is None:
-            return
-        try:
-            self._proc.stdin.close()
-        except OSError:
-            pass
-        try:
-            self._proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            self._proc.kill()
-            self._proc.wait()
-        self._proc = None
+        if self._client is not None:
+            self._client.close()
+            self._client = None
 
     def __del__(self):
-        self._close_session()
+        try:
+            self._close_session()
+        except Exception:
+            pass
 
     def _namespace_to_category(self, namespace: tuple[str, ...]) -> str:
         """Convert LangGraph namespace tuple to Perseus Vault category string."""
@@ -211,41 +163,18 @@ class PerseusVaultStore(BaseStore):
         return {}
 
     def _call_perseus_vault(self, method: str, params: dict) -> dict:
-        """Call a Perseus Vault MCP tool via the persistent stdio session.
+        """Call a Perseus Vault MCP tool via the shared VaultClient.
 
-        The process is spawned once on first call and reused across all
-        subsequent calls — no per-call cold-start overhead.
+        The client spawns the process once and reuses it across calls (with
+        hardened handshake, timeout-teardown, and auto-respawn). Returns the
+        unwrapped Perseus Vault payload dict, identical to before.
         """
-        with self._lock:
-            try:
-                self._ensure_session()
-            except RuntimeError as e:
-                raise RuntimeError(f"Perseus Vault session failed: {e}")
-
-            # No init response to consume — _ensure_session already read it
-
-            req_id = self._req_id + 2
-            call_req = json.dumps({
-                "jsonrpc": "2.0", "id": req_id,
-                "method": "tools/call",
-                "params": {"name": method, "arguments": params},
-            })
-
-            try:
-                self._proc.stdin.write(call_req + "\n")
-                self._proc.stdin.flush()
-                self._req_id = req_id
-            except (BrokenPipeError, OSError):
-                self._proc = None
-                raise RuntimeError("Perseus Vault process died during call")
-
-            response = self._read_response(req_id)
-            if response is None:
-                self._close_session()
-                raise RuntimeError(f"No response from Perseus Vault for {method}")
-            if response.get("error"):
-                raise RuntimeError(f"Perseus Vault error ({method}): {response['error']}")
-            return self._unwrap_result(response.get("result", {}))
+        try:
+            client = self._get_client()
+            result = client.call_tool_raw(method, params)
+        except Exception as e:
+            raise RuntimeError(f"Perseus Vault call failed ({method}): {e}")
+        return self._unwrap_result(result)
 
     @staticmethod
     def _ms_to_dt(ms: Any) -> datetime:

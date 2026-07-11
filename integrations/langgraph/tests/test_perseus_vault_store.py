@@ -15,89 +15,38 @@ import pytest
 from perseus_vault_langgraph import PerseusVaultStore
 
 
-def _make_fake_popen(routes):
-    """Build a fake ``subprocess.Popen`` driven by ``routes``.
+def _make_fake_client(routes):
+    """Build a fake ``VaultClient`` driven by ``routes``.
 
-    ``routes`` maps a Perseus Vault tool name to a callable(arguments) -> payload dict.
-    The fake drives the persistent stdio session the store uses (write/readline,
-    not communicate): each ``initialize`` write gets an empty result and each
-    ``tools/call`` write gets the routed payload in Perseus Vault's real MCP envelope.
+    ``routes`` maps a Perseus Vault tool name to a callable(arguments) -> payload
+    dict. The store now talks to the shared ``perseus_vault_client.VaultClient``
+    (hardened stdio transport lives there), so we patch that seam instead of the
+    subprocess: ``call_tool_raw`` returns the payload wrapped in Perseus Vault's
+    real MCP envelope (``structuredContent`` + ``content[0].text``).
     """
 
-    class FakeStdout:
-        def __init__(self):
-            self._lines = []
-
-        def push(self, line):
-            self._lines.append(line)
-
-        def readline(self):
-            if self._lines:
-                return self._lines.pop(0)
-            return ""
-
-    class FakePopen:
-        last_input: str | None = None
-
+    class FakeClient:
         def __init__(self, *args, **kwargs):
-            self.args = args[0] if args else kwargs.get("args")
-            self._stdout = FakeStdout()
-            self.stderr = None
+            self.args = args
+            self.kwargs = kwargs
 
-            class _Stdin:
-                def __init__(self, outer):
-                    self.outer = outer
+        def call_tool_raw(self, name, arguments):
+            payload = routes[name](arguments)
+            return {
+                "content": [{"type": "text", "text": json.dumps(payload)}],
+                "structuredContent": payload,
+            }
 
-                def write(self, data):
-                    FakePopen.last_input = data
-                    for line in data.splitlines():
-                        line = line.strip()
-                        if not line:
-                            continue
-                        msg = json.loads(line)
-                        mid = msg.get("id")
-                        if msg.get("method") == "initialize":
-                            self.outer._stdout.push(json.dumps({
-                                "jsonrpc": "2.0", "id": mid,
-                                "result": {"protocolVersion": "2024-11-05"},
-                            }) + "\n")
-                        elif msg.get("method") == "tools/call":
-                            name = msg["params"]["name"]
-                            payload = routes[name](msg["params"]["arguments"])
-                            self.outer._stdout.push(json.dumps({
-                                "jsonrpc": "2.0", "id": mid,
-                                "result": {
-                                    "content": [{"type": "text", "text": json.dumps(payload)}],
-                                    "structuredContent": payload,
-                                },
-                            }) + "\n")
-
-                def flush(self):
-                    pass
-
-                def close(self):
-                    pass
-
-            self.stdin = _Stdin(self)
-
-        @property
-        def stdout(self):
-            return self._stdout
-
-        def poll(self):
-            return None
-
-        def wait(self, timeout=None):
-            return 0
-
-        def kill(self):
+        def close(self):
             pass
 
-    return FakePopen
+    return FakeClient
 
 
 def _patch(monkeypatch, routes):
-    monkeypatch.setattr("perseus_vault_langgraph.subprocess.Popen", _make_fake_popen(routes))
+    # PerseusVaultStore builds a VaultClient lazily via _get_client(); swap the
+    # class the module imported so the store drives our fake transport.
+    monkeypatch.setattr("perseus_vault_langgraph.VaultClient", _make_fake_client(routes))
 
 
 def test_get_parses_structured_content(monkeypatch):

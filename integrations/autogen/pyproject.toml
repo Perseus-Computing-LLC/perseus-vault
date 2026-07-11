@@ -18,6 +18,7 @@ classifiers = [
 ]
 dependencies = [
     "autogen-core>=0.4.0",
+    "perseus-vault-client>=0.1.0",
 ]
 
 [project.optional-dependencies]
