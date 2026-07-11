@@ -1,0 +1,57 @@
+{
+  "metric": "CPST (answerer USD per correctly answered question)",
+  "subset": "longmemeval_s_subset100.manifest.json",
+  "n_questions": 100,
+  "rows": [
+    {
+      "system": "fullcontext",
+      "model": "gpt-4o-2024-08-06",
+      "n": 100,
+      "accuracy": 0.7,
+      "answer_prompt_tokens": 10401547,
+      "answer_completion_tokens": 8617,
+      "avg_prompt_tokens_per_q": 104015,
+      "answer_cost_usd": 26.09,
+      "cpst_usd": 0.3727,
+      "judge_cost_usd_overhead": 0.0603,
+      "partial_usage_questions": 0
+    },
+    {
+      "system": "mimir",
+      "model": "gpt-4o-2024-08-06",
+      "n": 100,
+      "accuracy": 0.8,
+      "answer_prompt_tokens": 2526982,
+      "answer_completion_tokens": 7156,
+      "avg_prompt_tokens_per_q": 25270,
+      "answer_cost_usd": 6.389,
+      "cpst_usd": 0.0799,
+      "judge_cost_usd_overhead": 0.0565,
+      "partial_usage_questions": 0
+    },
+    {
+      "system": "stateless",
+      "model": "gpt-4o-2024-08-06",
+      "n": 100,
+      "accuracy": 0.12,
+      "answer_prompt_tokens": 8059,
+      "answer_completion_tokens": 6086,
+      "avg_prompt_tokens_per_q": 81,
+      "answer_cost_usd": 0.081,
+      "cpst_usd": 0.0068,
+      "judge_cost_usd_overhead": 0.0539,
+      "partial_usage_questions": 0
+    }
+  ],
+  "excluded": [],
+  "provenance": [
+    {
+      "file": "qa_report_cpst100.json",
+      "signature_sha256": "e08092557d0fb639b4c3e25f6a5eaa39dbb9dea23f74a2ed94e7c9fd4fa8ef07",
+      "answerer_model": "gpt-4o-2024-08-06",
+      "judge_model": "gpt-4o-2024-08-06",
+      "commit": "42e8fd1b252684636fdd0d4bbe053a7da86be93b"
+    }
+  ],
+  "accounting": "answerer tokens only, API-billed; judge shown as overhead; retrieval/embeddings are local (no API cost)"
+}

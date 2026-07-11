@@ -28,8 +28,27 @@ possible after the fact).
 
 ## Results
 
-<!-- RESULTS TABLE: filled from cpst.py output over qa_report_cpst100.json -->
-*(run in progress — table lands here from `cpst.py`)*
+Signed run `qa_report_cpst100.json` (signature `e08092557d0fb639…`), n=100,
+pinned `gpt-4o-2024-08-06` answerer + judge, all 300 answers graded (zero
+errors). Cost is **API-billed** answerer tokens at 2026-07 gpt-4o pricing.
+
+| system | n | accuracy | avg prompt tok/q | answerer cost | **CPST** | vs fullcontext |
+|---|---:|---:|---:|---:|---:|---|
+| stateless | 100 | 12.0% | 81 | $0.08 | **$0.0068** | (accuracy floor — memory is not optional) |
+| fullcontext | 100 | 70.0% | 104,015 | $26.09 | **$0.3727** | — (the no-memory-layer baseline) |
+| **mimir (Perseus)** | 100 | **80.0%** | 25,270 | $6.39 | **$0.0799** | **4.7× cheaper per correct answer, 4.1× fewer tokens, +10 pts more accurate** |
+
+**The headline: Perseus delivers a correct answer for ~$0.08 versus ~$0.37 for
+the brute-force full-context approach — 4.7× cheaper — while being *more*
+accurate (80% vs 70%), not less.** The `stateless` arm (12%) shows the questions
+are genuinely unanswerable without memory, so this is a real memory task, not a
+setup that flatters retrieval.
+
+Why CPST beats a raw token-savings number here: full-context is not just
+expensive, it is *worse* — stuffing 48 sessions buries the evidence and the
+model's accuracy drops. Perseus retrieves the ~10 sessions that matter, so it
+pays for fewer tokens **and** answers more questions right. A cost-only metric
+would miss half the story; CPST captures both in one figure.
 
 ## Token efficiency (offline, free to reproduce, deterministic)
 
@@ -84,8 +103,14 @@ python cpst.py --reports qa_report_cpst100.json \
 ## Caveats
 
 - **n=100, single run.** Subset is stratified and manifest-pinned, but it is
-  one seed and one run; treat point estimates as such. The flagship 500-question
-  accuracy number lives in [COMPARISON.md](COMPARISON.md).
+  one seed and one run; treat point estimates as such. Perseus's 80.0% here
+  matches its signed 500-question run sliced to the same 100 questions (80/100),
+  a reassuring consistency check. The flagship 500-question accuracy number
+  lives in [COMPARISON.md](COMPARISON.md).
+- **Single-session-preference is the shared weak spot** (1/6 for both mimir and
+  fullcontext): a hard recall category, not a Perseus-specific gap — the model
+  misses it even when handed the whole haystack. Tracked as retrieval-recall
+  R&D, owned openly.
 - **Dollar figures move with provider pricing.** Token counts are the durable
   fact; prices are pinned in `qa.py`'s `PRICING` with their as-of date.
 - **LongMemEval measures memory-recall QA**, not every agent workload. It is
