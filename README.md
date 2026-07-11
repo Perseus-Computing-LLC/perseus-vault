@@ -217,6 +217,8 @@ Any MCP-compatible framework works with Perseus Vault directly. See
 | `mimir_capture` | Opt-in in-session capture (#520): distill a transcript/insight payload (text, markdown, or JSONL) into durable entities (root-cause / pitfall / decision / pattern / takeaway) the moment a problem is solved. Local rule-based distiller by default, optional `llm: true` with graceful fallback; near-dup merging stays ON plus a per-invocation cap (anti-flood). Also a CLI verb: `perseus-vault capture`. |
 | `mimir_memories` | Anthropic memory-tool compatible file interface (`view`/`create`/`str_replace`/`insert`/`delete`/`rename` under `/memories`), backed by vault entities. |
 
+> 📖 **[docs/retrieval-modes.md](docs/retrieval-modes.md)** — one enumerated reference for every retrieval mode (keyword · dense · hybrid · graph · GraphRAG · proactive `recall_when` · temporal `as_of`): mechanism, when to use, invocation, and examples.
+
 ### Graph
 | Tool | Description |
 |---|---|
