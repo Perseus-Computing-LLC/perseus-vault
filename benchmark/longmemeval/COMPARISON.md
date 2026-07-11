@@ -10,22 +10,25 @@ unnamed/nonexistent model and mixed splits and judges. We do not do that again.
 
 | system | LongMemEval QA accuracy | answerer | judge | split | source |
 |---|---:|---|---|---|---|
-| **Perseus Vault** | **73.6%** | `gpt-4o-2024-08-06` (pinned) | `gpt-4o-2024-08-06`, LongMemEval **official** per-type judge | `longmemeval_s` (500) | [`report.json`](report.json) (signed), this repo |
+| **Perseus Vault** | **73.8% mean** (72.8 / 73.6 / 75.0 across 3 full runs) | `gpt-4o-2024-08-06` (pinned) | `gpt-4o-2024-08-06`, LongMemEval **official** per-type judge | `longmemeval_s` (500) | [`report.json`](report.json), [`report_seed2.json`](report_seed2.json), [`report_seed3.json`](report_seed3.json) (all signed), this repo |
 | Zep | 63.8% (published) | "GPT-4o" (snapshot not stated) | not stated | LongMemEval `_s` (as published) | Zep's published claim, cited in #475 |
 | Mem0 | 49.0% (published) | "GPT-4o" (snapshot not stated) | not stated | LongMemEval `_s` (as published) | published claim, cited in #475 |
 
-**Perseus Vault scores 73.6% — 9.8 points above Zep's published 63.8%** — under
-the official LongMemEval metric. Independently confirmed: the same 500 answers,
-re-graded by LongMemEval's own `src/evaluation/evaluate_qa.py`, produce
-**368/500 = 73.60%**, matching this harness bit-for-bit (see
+**Perseus Vault scores 73.8% mean over three independent full runs (range
+72.8–75.0, stdev 1.1) — the *worst* run beats Zep's published 63.8% by 9.0
+points** — under the official LongMemEval metric. Independently confirmed: run
+2's 500 answers, re-graded by LongMemEval's own `src/evaluation/evaluate_qa.py`,
+produce **368/500 = 73.60%**, matching this harness bit-for-bit (see
 [`official-eval-results-gpt-4o.jsonl`](official-eval-results-gpt-4o.jsonl)).
+Per-type results are highly stable across runs: single-session-assistant scored
+100.0% and single-session-user 95.7% in all three; the weakest category
+(preference) stayed within 26.7–30.0%.
 
 > **Still confirm before external publication:** the primary source of Zep's
 > 63.8% and the exact split + GPT-4o snapshot Zep used. Our answerer is pinned to
 > `gpt-4o-2024-08-06` (the closest snapshot to an unspecified "GPT-4o"); if Zep
 > used a different snapshot the comparison carries a "close but not identical
-> answerer" caveat. This is a single signed run — see *Caveats* for the
-> nondeterminism note and the recommended multi-seed confirmation.
+> answerer" caveat.
 
 ## By question type
 
@@ -101,10 +104,10 @@ tuning toward gold answers was done, and none is acceptable here.**
 
 ## Caveats (read before quoting the number)
 
-- **Single run.** LLM grading at temperature 0 is still not perfectly
-  deterministic. 73.6% is one signed run. Before external publication, run 2–3
-  seeds and report mean ± spread (cheap now: ~55 min/run). Treat 73.6% as the
-  point estimate, not a proven ceiling.
+- **Run-to-run variance.** LLM answering/grading at temperature 0 is still not
+  perfectly deterministic. Three independent full runs scored 73.6 / 75.0 / 72.8
+  (mean 73.8, spread 2.2 points, stdev 1.1) — all three signed reports are
+  committed here. Quote the mean with the range, not a single run's number.
 - **Zep's conditions are quoted, not verified.** We have not reproduced Zep's own
   run; 63.8% is their published claim. State that when comparing.
 - **Preference is weak (30%).** If a competitor stresses preference specifically,
