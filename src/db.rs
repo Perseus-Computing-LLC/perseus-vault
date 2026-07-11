@@ -1254,25 +1254,70 @@ impl Database {
                 Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
             })?;
 
+            // #592: stop hammering a persistently-failing embed backend. If the
+            // endpoint rejects every request (e.g. HTTP 501 from posting the chat
+            // model to /api/embed, #591/#525), a bare `embedded: 0` is
+            // indistinguishable from "nothing left to embed", so a caller looping
+            // "until 0 newly embedded" spins forever with the GPU idle. We now (a)
+            // abort after a run of consecutive failures with zero successes and
+            // (b) surface a distinct top-level `error`/`aborted` signal.
+            const EMBED_FAIL_ABORT: usize = 5;
             let mut embedded = 0usize;
-            let mut errors = Vec::new();
+            let mut attempted = 0usize;
+            let mut errors: Vec<String> = Vec::new();
+            let mut consecutive_failures = 0usize;
+            let mut aborted = false;
             for row in rows {
                 let (id, body) = row?;
+                attempted += 1;
                 match self.generate_embedding_with_fallback(&body) {
                     Ok(vec) => {
                         // #397: reuse the connection held since the top of
                         // embed_entity — no nested pool draw.
                         Self::store_embedding_with_conn(&conn, &id, &vec)?;
                         embedded += 1;
+                        consecutive_failures = 0;
                     }
-                    Err(e) => errors.push(format!("{}: {}", id, e)),
+                    Err(e) => {
+                        errors.push(format!("{}: {}", id, e));
+                        consecutive_failures += 1;
+                        // Only abort while we've made NO progress — a backend that
+                        // embedded some rows then hit a transient error should run
+                        // the batch out and report the failures, not bail early.
+                        if embedded == 0 && consecutive_failures >= EMBED_FAIL_ABORT {
+                            aborted = true;
+                            break;
+                        }
+                    }
                 }
             }
-            return Ok(serde_json::json!({
+            let failed = errors.len();
+            let mut result = serde_json::json!({
                 "embedded": embedded,
                 "batch_category": cat,
-                "errors": errors,
-            }));
+                "attempted": attempted,
+                "failed": failed,
+                // Cap the detail array so a large failing batch can't return a
+                // multi-thousand-line payload.
+                "errors": errors.iter().take(20).cloned().collect::<Vec<String>>(),
+            });
+            // A distinct top-level signal so an automated loop can tell "the
+            // backend is rejecting every request" apart from "all done" — the
+            // per-row error string carries the HTTP status (e.g. "http status: 501").
+            if let Some(last) = errors.last() {
+                result["error"] = serde_json::json!(last);
+            }
+            if aborted {
+                result["aborted"] = serde_json::json!(true);
+                result["abort_reason"] = serde_json::json!(format!(
+                    "aborted after {} consecutive embed-backend failures with 0 successes — \
+                     the embedding endpoint is rejecting every request (check \
+                     --embedding-model-name and --embedding-endpoint). Last error: {}",
+                    consecutive_failures,
+                    errors.last().map(String::as_str).unwrap_or("unknown"),
+                ));
+            }
+            return Ok(result);
         }
 
         // Single entity mode: require category + key. get_entity and
