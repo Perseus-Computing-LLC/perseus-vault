@@ -113,6 +113,41 @@ ANSWER_PROMPT = (
     "Answer:"
 )
 
+# #579: LongMemEval's OFFICIAL chain-of-thought answer prompt variant. The
+# benchmark ships BOTH prompts (run_generation.py cot=true); this is still 100%
+# official methodology — it is not a homegrown prompt. It asks the model to
+# reason step-by-step before answering, which the retrieval diagnostic (#580)
+# showed recovers the large "evidence-was-retrieved-but-reasoning-failed" class
+# (89 of 129 consistent failures). Reports/journals MUST record which prompt was
+# used (answer_prompt: plain | official-cot) so a CoT number is never silently
+# blended with a plain-prompt one.
+ANSWER_PROMPT_COT = (
+    "I will give you several history chats between you and a user. Please answer "
+    "the question based on the relevant chat history.\n\n\n"
+    "History Chats:\n\n{context}\n\n"
+    "Current Date: {question_date}\n"
+    "Question: {question}\n\n"
+    "Let's think step by step, then give the final answer. "
+    "Reason briefly over the relevant chat history, then end with a line that "
+    "starts with 'Answer:' followed by the final answer.\n"
+)
+
+
+def extract_cot_answer(text):
+    """Pull the final answer out of a CoT response. The prompt asks the model to
+    end with a line 'Answer: <final>'; return the text after the LAST such
+    marker (case-insensitive). Falls back to the full response when no marker is
+    present, so the judge still sees the reasoning-embedded answer rather than
+    an empty string."""
+    if not text:
+        return text
+    marker = None
+    lower = text.lower()
+    idx = lower.rfind("answer:")
+    if idx != -1:
+        marker = text[idx + len("answer:"):].strip()
+    return marker if marker else text.strip()
+
 
 def get_anscheck_prompt(task, question, answer, response, abstention=False):
     """Judge prompt, ported VERBATIM from LongMemEval's official metric
@@ -228,14 +263,19 @@ def _retry_delay(err, attempt):
     return min(60.0, 2 ** attempt) + random.uniform(0, 1)
 
 
-def call_llm(base_url, api_key, model, prompt, budget=None, max_retries=12):
+def call_llm(base_url, api_key, model, prompt, budget=None, max_retries=12, max_tokens=None):
     """One chat completion at temperature 0. Token-paced via `budget`, honors
     Retry-After on 429, exponential backoff otherwise. Raises only after
-    max_retries — callers record that as answer_error, never as a wrong answer."""
-    body = json.dumps({
+    max_retries — callers record that as answer_error, never as a wrong answer.
+    `max_tokens` caps the completion (the #579 CoT prompt needs room to reason:
+    pass ~1200; None leaves the provider default)."""
+    payload = {
         "model": model, "temperature": 0,
         "messages": [{"role": "user", "content": prompt}],
-    }).encode()
+    }
+    if max_tokens is not None:
+        payload["max_tokens"] = max_tokens
+    body = json.dumps(payload).encode()
     url = base_url.rstrip("/") + "/chat/completions"
     est = est_tokens(prompt) + 300  # request + response headroom
     for attempt in range(max_retries):
@@ -412,6 +452,17 @@ def main():
     ap.add_argument("--judge", default=DEFAULT_JUDGE, help=f"Judge model id (default {DEFAULT_JUDGE})")
     ap.add_argument("--k", type=int, default=10, help="Sessions retrieved for the mimir system (default 10)")
     ap.add_argument("--limit", type=int, default=0, help="Only run the first N instances (0 = all; smoke tests)")
+    ap.add_argument("--cot", action="store_true",
+                    help="#579: use LongMemEval's OFFICIAL chain-of-thought answer prompt (still "
+                         "official methodology; the benchmark ships both). Raises the answer max_tokens "
+                         "to 1200 and parses the final 'Answer:' line. Recorded as answer_prompt="
+                         "'official-cot' in the journal config and report so it is never blended "
+                         "with a plain-prompt number.")
+    ap.add_argument("--only-types", nargs="+", default=None, metavar="TYPE",
+                    help="#579: restrict the run to these question_type categories (e.g. "
+                         "single-session-preference multi-session temporal-reasoning) — for the "
+                         "weak-category slice experiments. Pinned into the journal config so a "
+                         "--resume can't silently mix a slice with a full run.")
     ap.add_argument("--bin", default=None, help="perseus-vault binary (else auto-located / MIMIR_BIN)")
     ap.add_argument("--mock-llm", action="store_true",
                     help="Stub the answerer+judge (deterministic, no key, no network): proves the plumbing")
@@ -443,6 +494,15 @@ def main():
                  f"resolve/main/longmemeval_{args.split}_cleaned.json -o {data_path}")
     full = json.loads(data_path.read_text(encoding="utf-8"))
     split_size = len(full)
+    # #579: category slice filter, applied BEFORE --limit so `--only-types X
+    # --limit 50` means "first 50 of type X", not "of the first 50, those of
+    # type X".
+    if args.only_types:
+        only = set(args.only_types)
+        full = [inst for inst in full if inst.get("question_type") in only]
+        if not full:
+            sys.exit(f"error: --only-types {sorted(only)} matched no instances "
+                     f"in {data_path.name}")
     data = full[: args.limit] if args.limit else full
 
     live = not (args.mock_llm or args.dry_run)
@@ -498,7 +558,9 @@ def main():
                   "systems": sorted(args.systems),
                   "model": "mock" if args.mock_llm else args.model,
                   "judge": "mock" if args.mock_llm else args.judge,
-                  "k": args.k}
+                  "k": args.k,
+                  "answer_prompt": "official-cot" if args.cot else "plain",
+                  "only_types": sorted(args.only_types) if args.only_types else None}
     done = {}
     journal = None
     if not args.dry_run:
@@ -561,7 +623,8 @@ def main():
                 if (qid, system) in done:
                     continue
                 ctx, chosen = build_context(system, inst, srv, qid, args.k)
-                prompt = ANSWER_PROMPT.format(context=ctx, question=inst["question"],
+                answer_tmpl = ANSWER_PROMPT_COT if args.cot else ANSWER_PROMPT
+                prompt = answer_tmpl.format(context=ctx, question=inst["question"],
                                               question_date=inst.get("question_date", "unknown"))
                 tok[system] += est_tokens(prompt)
                 nsess[system] += len(chosen)
@@ -575,7 +638,10 @@ def main():
                     ans = mock_answer(inst, idx)
                 else:
                     try:
-                        ans, a_usage = call_llm(base_url, api_key, args.model, prompt, budget)
+                        # #579: CoT needs completion room to reason (1200 tok);
+                        # the plain prompt keeps the provider default.
+                        ans, a_usage = call_llm(base_url, api_key, args.model, prompt, budget,
+                                                max_tokens=1200 if args.cot else None)
                     except Exception as e:
                         # A rate-limited/failed question must NEVER deflate accuracy:
                         # record it as answer_error and exclude it from the denominator.
@@ -589,6 +655,10 @@ def main():
                                 "judge_raw": None, "ans_usage": None,
                                 "judge_usage": None}, "", q_tokens, len(chosen))
                         continue
+                # #579: under CoT the model reasons then emits 'Answer: <final>';
+                # judge the final answer, not the whole reasoning trace.
+                if args.cot:
+                    ans = extract_cot_answer(ans)
                 hyps[system].append({"question_id": qid, "hypothesis": ans})
 
                 jp = get_anscheck_prompt(qtype, inst["question"], inst["answer"],
@@ -703,6 +773,8 @@ def main():
         "split": f"longmemeval_{args.split}", "n": n,
         "answerer": "mock" if args.mock_llm else args.model,
         "judge": "mock" if args.mock_llm else args.judge,
+        "answer_prompt": "official-cot" if args.cot else "plain",
+        "only_types": sorted(args.only_types) if args.only_types else None,
         "verdicts": sorted([v["question_id"], v["system"], v["correct"]] for v in verdicts),
     }, sort_keys=True)
     signature = hashlib.sha256(sig_payload.encode("utf-8")).hexdigest()
@@ -715,6 +787,11 @@ def main():
         "split_size": split_size,
         "n_instances": n,
         "mock_llm": args.mock_llm,
+        # #579: which official answer prompt produced these numbers. NEVER blend
+        # a CoT accuracy with a plain-prompt one — the scoreboard must state this
+        # next to any competitor row.
+        "answer_prompt": "official-cot" if args.cot else "plain",
+        "only_types": sorted(args.only_types) if args.only_types else None,
         "answerer_model": "mock" if args.mock_llm else args.model,
         "judge_model": "mock" if args.mock_llm else args.judge,
         "temperature": 0,
