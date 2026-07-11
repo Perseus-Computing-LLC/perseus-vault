@@ -987,6 +987,81 @@ pub fn handle_semantic_search(db: &Database, args: Value) -> Result<String, Stri
     Ok(result.to_string())
 }
 
+#[derive(Debug, Deserialize)]
+pub struct ScanArgs {
+    #[serde(default)]
+    pub category: Option<String>,
+    #[serde(default)]
+    pub workspace_hash: Option<String>,
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub include_archived: bool,
+    /// Opaque continuation cursor: the `next_cursor` from the previous page.
+    /// Omit (or pass "") for the first page.
+    #[serde(default)]
+    pub cursor: Option<String>,
+    #[serde(
+        default = "default_scan_limit",
+        deserialize_with = "null_as_default_scan_limit"
+    )]
+    pub limit: i64,
+}
+
+fn default_scan_limit() -> i64 {
+    100
+}
+
+fn null_as_default_scan_limit<'de, D>(de: D) -> Result<i64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt = Option::<i64>::deserialize(de)?;
+    Ok(opt.unwrap_or_else(default_scan_limit))
+}
+
+/// #562: `mimir_scan` — deterministic paginated enumeration of a category (or
+/// the whole store). Unlike `recall(query="")`, whose ranking keys mutate on
+/// every reinforcing recall (so offset pages can skip/repeat rows) and whose
+/// offset is capped, scan pages by immutable `id ASC` with a keyset cursor:
+/// call repeatedly, feeding each page's `next_cursor` back in, until
+/// `has_more` is false — every entity in scope is returned exactly once.
+/// Read-only: no retrieval-count/decay side-effects.
+pub fn handle_scan(db: &Database, args: Value) -> Result<String, String> {
+    let a: ScanArgs =
+        serde_json::from_value(args).map_err(|e| format!("Invalid scan arguments: {}", e))?;
+
+    let limit = a.limit.clamp(1, 1000);
+    // Fetch one extra row to learn whether another page exists without a
+    // second COUNT query; the sentinel row is not returned.
+    let mut entities = db
+        .scan_entities(
+            a.category.as_deref(),
+            a.workspace_hash.as_deref(),
+            a.include_archived,
+            a.cursor.as_deref(),
+            limit + 1,
+        )
+        .map_err(|e| format!("Scan failed: {}", e))?;
+
+    let has_more = entities.len() as i64 > limit;
+    if has_more {
+        entities.truncate(limit as usize);
+    }
+    let next_cursor = if has_more {
+        entities.last().map(|e| e.id.clone())
+    } else {
+        None
+    };
+
+    let items: Vec<serde_json::Value> = entities.iter().map(|e| e.to_json_expanded()).collect();
+    Ok(json!({
+        "items": items,
+        "total": items.len(),
+        "has_more": has_more,
+        "next_cursor": next_cursor,
+    })
+    .to_string())
+}
+
 /// Run recall with stemming-based query expansion, merging results from
 /// the original query and up to `n_variants` stemmed alternatives.
 fn handle_recall_with_expansion(db: &Database, a: &RecallArgs) -> Result<String, String> {
@@ -3912,6 +3987,104 @@ mod tests {
             json!({"query": "x", "workspace_hash": "ws-a", "scope_weight": 0.5}),
         )
         .expect("valid scope_weight must be accepted");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ─── #562: paginated scan tool + recall enumeration contract ─────────
+
+    #[test]
+    fn scan_tool_pages_entire_category_with_cursor() {
+        let (db, path) = temp_db();
+        for i in 0..25 {
+            handle_remember(
+                &db,
+                json!({
+                    "category": "scan-cat",
+                    "key": format!("k{:02}", i),
+                    "body_json": format!(
+                        r#"{{"d": "unique scan tool body row {} filler {}"}}"#,
+                        i,
+                        i * 37
+                    ),
+                    "skip_dedup": true,
+                }),
+            )
+            .expect("remember");
+        }
+
+        let mut keys: Vec<String> = Vec::new();
+        let mut pages = 0;
+        let mut cursor: Option<String> = None;
+        loop {
+            let mut args = json!({"category": "scan-cat", "limit": 10});
+            if let Some(c) = &cursor {
+                args["cursor"] = json!(c);
+            }
+            let page: Value =
+                serde_json::from_str(&handle_scan(&db, args).expect("scan")).unwrap();
+            pages += 1;
+            // A reinforcing recall between pages mutates the ranking keys that
+            // break offset paging — the keyset walk must be unaffected.
+            handle_recall(&db, json!({"query": "", "category": "scan-cat"})).expect("recall");
+            for item in page["items"].as_array().expect("items") {
+                keys.push(item["key"].as_str().expect("key").to_string());
+            }
+            if !page["has_more"].as_bool().expect("has_more") {
+                assert!(
+                    page["next_cursor"].is_null(),
+                    "final page must have a null cursor: {page}"
+                );
+                break;
+            }
+            cursor = Some(
+                page["next_cursor"]
+                    .as_str()
+                    .expect("non-final page must carry a cursor")
+                    .to_string(),
+            );
+        }
+        assert_eq!(pages, 3, "25 rows at limit 10 = 3 pages");
+        assert_eq!(keys.len(), 25, "every row exactly once: {keys:?}");
+        let unique: std::collections::HashSet<&String> = keys.iter().collect();
+        assert_eq!(unique.len(), 25, "no duplicates across pages: {keys:?}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // #562: the documented recall query contract — "" is match-all
+    // enumeration; "*" is a literal FTS5 term (not a glob) and matches nothing.
+    #[test]
+    fn recall_empty_query_enumerates_and_star_is_literal() {
+        let (db, path) = temp_db();
+        for i in 0..3 {
+            handle_remember(
+                &db,
+                json!({
+                    "category": "enum-cat",
+                    "key": format!("k{i}"),
+                    "body_json": format!(
+                        r#"{{"d": "distinct enumeration contract body {} pad {}"}}"#,
+                        i,
+                        i * 41
+                    ),
+                    "skip_dedup": true,
+                }),
+            )
+            .expect("remember");
+        }
+
+        let all: Value = serde_json::from_str(
+            &handle_recall(&db, json!({"query": "", "category": "enum-cat", "limit": 10}))
+                .expect("recall"),
+        )
+        .unwrap();
+        assert_eq!(all["total"], json!(3), "empty query = match-all enumeration: {all}");
+
+        let star: Value = serde_json::from_str(
+            &handle_recall(&db, json!({"query": "*", "category": "enum-cat", "limit": 10}))
+                .expect("recall"),
+        )
+        .unwrap();
+        assert_eq!(star["total"], json!(0), "'*' is a literal term, not a glob: {star}");
         let _ = std::fs::remove_file(&path);
     }
 

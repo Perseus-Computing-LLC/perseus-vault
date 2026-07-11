@@ -751,6 +751,64 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     }
   },
   {
+    "name": "mimir_scan",
+    "description": "Enumerate every entity in a category (or the whole store) deterministically, page by page (#562). This is the first-class 'list all / export / sync / reset' path: pages are keyed by immutable entity id (ascending) with a continuation cursor, so repeated calls walk the full set exactly once — unlike recall(query=\"\") pagination, whose relevance ordering mutates as recalls reinforce entities (pages can skip or repeat rows) and whose offset is capped. Call with no cursor for the first page, then pass back next_cursor until has_more is false. Read-only: scanning does not bump retrieval counts or decay. Note the recall query contract this complements: recall's query=\"\" is match-all enumeration; \"*\" is a literal FTS5 term (NOT a glob) and matches nothing.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "category": {
+          "type": "string",
+          "description": "Category to enumerate, e.g. 'decision'. Omit or pass \"\" to scan every category (no category is excluded — unlike recall, which hides high-volume categories such as 'conversation' unless explicitly requested)."
+        },
+        "workspace_hash": {
+          "type": "string",
+          "description": "Workspace scope filter. When set, only entities with exactly this workspace_hash are returned (\"\" targets only global entities). Omit for unscoped."
+        },
+        "include_archived": {
+          "type": "boolean",
+          "default": false,
+          "description": "Include archived (soft-deleted) entities in the scan."
+        },
+        "cursor": {
+          "type": "string",
+          "description": "Continuation cursor: the next_cursor value from the previous page. Omit for the first page."
+        },
+        "limit": {
+          "type": "integer",
+          "default": 100,
+          "description": "Page size (1–1000)."
+        }
+      },
+      "required": []
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "items": {
+          "type": "array",
+          "items": { "type": "object" },
+          "description": "Entities in this page, ordered by id ascending, with expanded body_json fields at top level."
+        },
+        "total": {
+          "type": "integer",
+          "description": "Number of entities in this page."
+        },
+        "has_more": {
+          "type": "boolean",
+          "description": "True when another page exists."
+        },
+        "next_cursor": {
+          "type": ["string", "null"],
+          "description": "Pass this as `cursor` to fetch the next page. Null on the final page."
+        }
+      }
+    },
+    "annotations": {
+      "readOnlyHint": true
+    },
+    "title": "Scan / Enumerate Entities"
+  },
+  {
     "name": "mimir_semantic_search",
     "description": "Dense-only semantic search: find entities by meaning, ranked purely by embedding similarity (no keyword fallback). On by default via the bundled in-process ONNX model — zero config, zero network. A one-tool shortcut for 'find things like this'. For fused keyword+vector results use mimir_recall.",
     "inputSchema": {
@@ -4003,6 +4061,8 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
         "mimir_recall" => tools::handle_recall(db, args).map_err(|e| e.to_string()),
 
         "mimir_recall_layer" => tools::handle_recall_layer(db, args).map_err(|e| e.to_string()),
+
+        "mimir_scan" => tools::handle_scan(db, args).map_err(|e| e.to_string()),
 
         "mimir_semantic_search" => {
             tools::handle_semantic_search(db, args).map_err(|e| e.to_string())
