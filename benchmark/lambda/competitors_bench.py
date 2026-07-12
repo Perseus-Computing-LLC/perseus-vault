@@ -63,7 +63,7 @@ def timed_recall(fn):
 def bench_perseus(bin_path, db, ollama):
     os.system("rm -f %s*" % db)
     m = MCP([bin_path, "serve", "--db", db,
-             "--llm-endpoint", ollama + "/api/generate", "--llm-model", "nomic-embed-text",
+             "--llm-endpoint", ollama + "/api/generate", "--llm-model", "qwen2.5:14b-instruct",
              "--embedding-endpoint", ollama + "/api/embed", "--embedding-model-name", "nomic-embed-text"])
     for i, f in enumerate(FACTS):
         m.tool("mimir_remember", {"category": "kb", "key": "f%d" % i,
@@ -193,6 +193,36 @@ def bench_zep(ollama):
     except Exception: pass
     return out
 
+def bench_zep_repeated(ollama, n=3):
+    """Local Graphiti entity/edge extraction is lossy AND stochastic (qwen2.5:14b),
+    so a single run is not a stable figure. Seed a fresh graph and re-measure n
+    times, reporting the mean with per-run spread, LongMemEval-harness style."""
+    if os.environ.get("ZEP_API_URL"):
+        # Cloud path reuses one session (repeat adds would duplicate the corpus)
+        # and doesn't have the local-extraction stochasticity this guards against.
+        return bench_zep(ollama)
+    runs = [bench_zep(ollama) for _ in range(max(1, n))]
+    measured = [r for r in runs if r.get("source") == "measured"]
+    if not measured:
+        return runs[-1]
+    accs = [r["recall_accuracy"] for r in measured]
+    lats = [r["p50_latency_ms"] for r in measured]
+    out = dict(measured[-1])
+    out["recall_accuracy"] = round(statistics.mean(accs), 3)
+    out["p50_latency_ms"] = round(statistics.mean(lats), 1)
+    out["runs"] = {"n": len(measured), "requested": max(1, n),
+                   "recall_per_run": accs,
+                   "recall_min": min(accs), "recall_max": max(accs),
+                   "graphs": [r.get("graph") for r in measured]}
+    failed = len(runs) - len(measured)
+    if failed:
+        out["runs"]["failed"] = failed
+        out["runs"]["last_failure"] = {k: runs[-1][k] for k in ("source", "error")
+                                       if k in runs[-1]} if runs[-1].get("source") != "measured" else None
+    if len(measured) > 1:
+        out["method"] += " — mean of %d runs" % len(measured)
+    return out
+
 # ---------------- Letta (MemGPT) ----------------
 def bench_letta(ollama):
     r = {"system": "letta", "method": "agent memory (archival vector store)", "source": "measured"}
@@ -254,12 +284,14 @@ def main():
     ap.add_argument("--db", default="/tmp/cmp_pv.db")
     ap.add_argument("--ollama-base", default="http://localhost:11434")
     ap.add_argument("--out-dir", default=".")
+    ap.add_argument("--zep-runs", type=int, default=3,
+                    help="repeat the Zep/Graphiti seed+recall cycle N times and report the mean (local extraction is stochastic)")
     a = ap.parse_args()
     ob = a.ollama_base
 
     print("Perseus Vault..."); pv = bench_perseus(a.bin, a.db, ob)
     print("Mem0...");          m0 = bench_mem0(ob)
-    print("Zep...");           zp = bench_zep(ob)
+    print("Zep...");           zp = bench_zep_repeated(ob, a.zep_runs)
     print("Letta...");         lt = bench_letta(ob)
 
     report = {"task": "same corpus, same box, local Ollama (qwen2.5:14b + nomic-embed-text)",
