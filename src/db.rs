@@ -3565,6 +3565,13 @@ impl Database {
                 // #485: scope preference in the same first-phase expression —
                 // broader-scope (global) hits fused at `scope_weight`.
                 let fused = Self::apply_scope_rank_weight(fused, params);
+                // #590: event-time supersession-aware tiebreak (OFF by default).
+                // Within a near-tie score bucket, the later-dated version wins —
+                // so an updated fact outranks the stale one it supersedes. No-op
+                // unless PERSEUS_VAULT_SUPERSEDE_RECENCY is set. Runs last so it
+                // has the final say on order (nothing re-sorts after it).
+                let fused = Self::apply_supersede_recency(fused);
+                timer.stage("supersede");
                 let mut out: Vec<Entity> = fused.into_iter().map(|(e, _)| e).collect();
                 Self::retain_layer(&mut out, params);
                 // Apply the same metadata predicates as fts5_search: the dense
@@ -3635,6 +3642,48 @@ impl Database {
             }
         }
         scored
+    }
+
+    /// #590: event-time, supersession-aware re-rank for the hybrid fusion.
+    ///
+    /// Knowledge-update questions ask for the LATEST value of a fact that
+    /// recurs across several sessions with different values ("what is my
+    /// current rent?", "my personal-best 5K time?"). Relevance-ranked hybrid
+    /// recall carries no recency signal, so the *stale* version frequently
+    /// ranks at or above the *update* — the answerer is then fed the outdated
+    /// value and picks wrong (offline `version_inversion.py` measures this as a
+    /// ~53% inversion rate on the LongMemEval knowledge-update slice). The
+    /// existing #235 recency arm keys on `created_at_unix_ms`, which is uniform
+    /// when a corpus is bulk-ingested (the whole LongMemEval haystack shares an
+    /// ingest instant), so it cannot separate versions.
+    ///
+    /// This pass keys on an EVENT date parsed from the entity itself (a
+    /// `session date:` line, or a structured `date`/`valid_from`/`event_date`
+    /// field in `body_json`) and applies it as a **bucketed tiebreak**: fused
+    /// scores are quantized, and *within* a near-tie bucket the later-dated
+    /// entity wins. Across buckets, relevance still dominates — a clearly more
+    /// relevant hit is never displaced by a newer but weaker one — so coverage
+    /// of strongly-ranked gold is preserved. Stale and update versions of the
+    /// same fact score near-identically (same topic, same entities), so they
+    /// land in the same bucket, which is exactly where the recency tiebreak
+    /// applies. Entities with no parseable event date sink within their bucket
+    /// (never promoted).
+    ///
+    /// OFF by default — a no-op unless `PERSEUS_VAULT_SUPERSEDE_RECENCY` is set
+    /// to `1`/`true`/`on`, so recall stays byte-identical to prior behavior.
+    /// The bucket width is tunable via `PERSEUS_VAULT_SUPERSEDE_QUANTUM`
+    /// (default 0.0008, ~2–3 adjacent RRF ranks). Read-only: ordering only, no
+    /// access-state writes — hybrid recall stays idempotent (#247).
+    fn apply_supersede_recency(fused: Vec<(Entity, f64)>) -> Vec<(Entity, f64)> {
+        if fused.len() < 2 || !supersede_recency_enabled() {
+            return fused;
+        }
+        let quantum = std::env::var("PERSEUS_VAULT_SUPERSEDE_QUANTUM")
+            .ok()
+            .and_then(|s| s.parse::<f64>().ok())
+            .filter(|q| *q > 0.0)
+            .unwrap_or(0.0008);
+        supersede_reorder(fused, quantum)
     }
 
     /// #487: multiply each fused score by the usefulness weight — memories
@@ -10193,6 +10242,172 @@ pub(crate) fn sparse_arm_weight(n_hits: usize) -> f64 {
 /// relevance ranking untouched. Entities with an unset (`<= 0`)
 /// `created_at_unix_ms` are never penalized (factor 1.0).
 
+/// #590: is the event-time supersession tiebreak enabled? OFF by default.
+pub fn supersede_recency_enabled() -> bool {
+    matches!(
+        std::env::var("PERSEUS_VAULT_SUPERSEDE_RECENCY").as_deref(),
+        Ok("1") | Ok("true") | Ok("on") | Ok("TRUE") | Ok("yes")
+    )
+}
+
+/// #590: derive a sortable event-date key for an entity, or None when the
+/// entity carries no parseable event date. Preference order:
+///   1. a structured `event_date` / `valid_from` / `date` / `session_date` /
+///      `timestamp` string field in `body_json` (real deployments),
+///   2. a `session date:` line inside the `note` body (the LongMemEval shape),
+///   3. a `session date:` line anywhere in the raw `body_json`.
+/// It deliberately does NOT fall back to `created_at` (bulk-ingested corpora
+/// share one ingest instant, which is exactly the signal that fails here) and
+/// does NOT trust arbitrary dates mentioned in free chat text — only an
+/// explicit event/session-date marker.
+pub fn entity_event_date_key(e: &crate::models::Entity) -> Option<i64> {
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&e.body_json) {
+        for key in ["event_date", "valid_from", "date", "session_date", "timestamp"] {
+            if let Some(s) = v.get(key).and_then(|x| x.as_str()) {
+                if let Some(k) = parse_event_date_key(s) {
+                    return Some(k);
+                }
+            }
+        }
+        if let Some(note) = v.get("note").and_then(|x| x.as_str()) {
+            if let Some(rest) = session_date_field(note) {
+                if let Some(k) = parse_event_date_key(rest) {
+                    return Some(k);
+                }
+            }
+        }
+    }
+    if let Some(rest) = session_date_field(&e.body_json) {
+        if let Some(k) = parse_event_date_key(rest) {
+            return Some(k);
+        }
+    }
+    None
+}
+
+/// Return the text following an explicit `session date:` marker, up to the end
+/// of that line. `date:` alone is intentionally excluded — it is a substring of
+/// words like `update:` and would mis-fire.
+fn session_date_field(text: &str) -> Option<&str> {
+    for marker in ["session date:", "Session date:", "session_date:"] {
+        if let Some(p) = text.find(marker) {
+            let rest = &text[p + marker.len()..];
+            let end = rest.find('\n').unwrap_or(rest.len());
+            return Some(&rest[..end]);
+        }
+    }
+    None
+}
+
+/// Parse the first `YYYY[-/]MM[-/]DD` (with an optional `HH:MM`) found in `text`
+/// into a monotone, lexicographically-ordered integer key
+/// (`Y*1e8 + M*1e6 + D*1e4 + h*100 + m`). Ordering only — not a real epoch — so
+/// no calendar/timezone math is needed and it stays deterministic. Handles the
+/// LongMemEval `2023/05/23 (Tue) 13:01` shape and plain ISO `2023-05-23`.
+pub fn parse_event_date_key(text: &str) -> Option<i64> {
+    let b = text.as_bytes();
+    let n = b.len();
+    let is_d = |x: u8| x.is_ascii_digit();
+    let mut i = 0usize;
+    while i + 10 <= n {
+        if is_d(b[i]) && is_d(b[i + 1]) && is_d(b[i + 2]) && is_d(b[i + 3])
+            && (b[i + 4] == b'-' || b[i + 4] == b'/')
+        {
+            let sep = b[i + 4];
+            let year: i64 = text[i..i + 4].parse().ok()?;
+            // month (1–2 digits) sep day (1–2 digits)
+            let ms = i + 5;
+            let mut j = ms;
+            while j < n && is_d(b[j]) && j - ms < 2 {
+                j += 1;
+            }
+            if j == ms || j >= n || b[j] != sep {
+                i += 1;
+                continue;
+            }
+            let month: i64 = text[ms..j].parse().ok()?;
+            let ds = j + 1;
+            let mut k = ds;
+            while k < n && is_d(b[k]) && k - ds < 2 {
+                k += 1;
+            }
+            if k == ds {
+                i += 1;
+                continue;
+            }
+            let day: i64 = text[ds..k].parse().ok()?;
+            if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+                i += 1;
+                continue;
+            }
+            // optional HH:MM within a short window after the date
+            let (mut hour, mut minute) = (0i64, 0i64);
+            let win = (k + 24).min(n);
+            let mut p = k;
+            while p + 3 <= win {
+                if is_d(b[p]) {
+                    let hs = p;
+                    let mut h = p;
+                    while h < win && is_d(b[h]) && h - hs < 2 {
+                        h += 1;
+                    }
+                    if h < win && b[h] == b':' {
+                        let mns = h + 1;
+                        let mut m = mns;
+                        while m < win && is_d(b[m]) && m - mns < 2 {
+                            m += 1;
+                        }
+                        if m > mns {
+                            let hh: i64 = text[hs..h].parse().unwrap_or(0);
+                            let mm: i64 = text[mns..m].parse().unwrap_or(0);
+                            if hh < 24 && mm < 60 {
+                                hour = hh;
+                                minute = mm;
+                            }
+                            break;
+                        }
+                    }
+                }
+                p += 1;
+            }
+            return Some(
+                year * 100_000_000 + month * 1_000_000 + day * 10_000 + hour * 100 + minute,
+            );
+        }
+        i += 1;
+    }
+    None
+}
+
+/// #590: pure reorder — the env-free core of `apply_supersede_recency`, split
+/// out so it is unit-testable without setting process-global env vars.
+///
+/// Stable total order on `(score bucket desc, event-date desc, id asc)` where
+/// the bucket is `floor(score / quantum)`. Across buckets, relevance dominates;
+/// within a near-tie bucket, the later event date wins (undated entities carry
+/// `i64::MIN`, so they sink within their bucket and are never promoted).
+pub fn supersede_reorder(
+    fused: Vec<(crate::models::Entity, f64)>,
+    quantum: f64,
+) -> Vec<(crate::models::Entity, f64)> {
+    if fused.len() < 2 || quantum <= 0.0 {
+        return fused;
+    }
+    let keys: Vec<i64> = fused
+        .iter()
+        .map(|(e, _)| entity_event_date_key(e).unwrap_or(i64::MIN))
+        .collect();
+    let mut idx: Vec<usize> = (0..fused.len()).collect();
+    idx.sort_by(|&a, &b| {
+        let ba = (fused[a].1 / quantum).floor() as i64;
+        let bb = (fused[b].1 / quantum).floor() as i64;
+        bb.cmp(&ba)
+            .then_with(|| keys[b].cmp(&keys[a]))
+            .then_with(|| fused[a].0.id.cmp(&fused[b].0.id))
+    });
+    idx.into_iter().map(|i| fused[i].clone()).collect()
+}
+
 pub fn reciprocal_rank_fusion(
     dense_results: &[(crate::models::Entity, f64)],
     sparse_results: &[(crate::models::Entity, f64)],
@@ -10722,6 +10937,85 @@ mod tests {
         let (db, path) = temp_db();
         assert!(db.health_check());
         let _ = fs::remove_file(&path);
+    }
+
+    // ─── #590: event-time supersession tiebreak ──────────────────────────
+    #[test]
+    fn parse_event_date_key_handles_longmemeval_and_iso() {
+        // LongMemEval "session date:" shape with day-of-week + time.
+        let a = super::parse_event_date_key("2023/05/23 (Tue) 13:01").unwrap();
+        let b = super::parse_event_date_key("2023/05/30 (Tue) 13:53").unwrap();
+        assert!(b > a, "later session date must sort higher: {b} vs {a}");
+        // Plain ISO, no time.
+        assert_eq!(
+            super::parse_event_date_key("hello 2024-01-02 world"),
+            Some(2024_01_02_0000)
+        );
+        // No date present.
+        assert_eq!(super::parse_event_date_key("no date here"), None);
+        // "update:" must NOT be mistaken for a date marker (regression guard on
+        // the session_date_field markers, exercised via entity extraction).
+        assert_eq!(super::parse_event_date_key("update: shipped"), None);
+    }
+
+    #[test]
+    fn entity_event_date_key_prefers_session_date_line() {
+        let note = r#"{"note": "session date: 2023/05/30 (Tue) 13:53\nuser: hi"}"#;
+        let e = make_entity("e1", "q", "s1", note);
+        assert_eq!(super::entity_event_date_key(&e), Some(2023_05_30_1353));
+        // Structured field wins and is read even without a note line.
+        let structured = r#"{"event_date": "2022-12-31", "note": "no marker"}"#;
+        let e2 = make_entity("e2", "q", "s2", structured);
+        assert_eq!(super::entity_event_date_key(&e2), Some(2022_12_31_0000));
+        // No event date anywhere -> None (never falls back to created_at).
+        let e3 = make_entity("e3", "q", "s3", r#"{"note": "just chatting"}"#);
+        assert_eq!(super::entity_event_date_key(&e3), None);
+    }
+
+    #[test]
+    fn supersede_reorder_promotes_later_version_within_a_tie_bucket() {
+        // Two near-tie candidates (same fact, different values, different dates)
+        // plus an unrelated stronger hit. Stale is ranked above update at input.
+        let stale = make_entity("id-stale", "q", "s-old",
+            r#"{"note": "session date: 2023/05/23 (Tue) 13:01\nbest 5k: 27:12"}"#);
+        let update = make_entity("id-update", "q", "s-new",
+            r#"{"note": "session date: 2023/05/30 (Tue) 13:53\nbest 5k: 25:40"}"#);
+        let other = make_entity("id-other", "q", "s-oth",
+            r#"{"note": "session date: 2023/01/01 (Sun) 00:00\nunrelated"}"#);
+        // other clearly most relevant (own bucket); stale/update near-tie.
+        let fused = vec![
+            (other.clone(), 0.0200),
+            (stale.clone(), 0.0164),
+            (update.clone(), 0.0161),
+        ];
+        let out = super::supersede_reorder(fused, 0.0008);
+        let order: Vec<&str> = out.iter().map(|(e, _)| e.id.as_str()).collect();
+        // Relevance still wins across buckets; within the stale/update tie the
+        // later-dated update is promoted above the stale version.
+        assert_eq!(order, vec!["id-other", "id-update", "id-stale"]);
+    }
+
+    #[test]
+    fn supersede_reorder_never_crosses_score_buckets() {
+        // A far-stronger but OLDER hit must not be displaced by a newer weaker one.
+        let strong_old = make_entity("id-strong", "q", "a",
+            r#"{"note": "session date: 2020/01/01 (Wed) 00:00\nx"}"#);
+        let weak_new = make_entity("id-weak", "q", "b",
+            r#"{"note": "session date: 2025/12/31 (Wed) 23:59\ny"}"#);
+        let fused = vec![(strong_old.clone(), 0.05), (weak_new.clone(), 0.01)];
+        let out = super::supersede_reorder(fused, 0.0008);
+        assert_eq!(out[0].0.id, "id-strong", "relevance must dominate across buckets");
+    }
+
+    #[test]
+    fn supersede_reorder_is_identity_when_disabled_quantum() {
+        let a = make_entity("a", "q", "a", r#"{"note": "session date: 2023/01/01 (Sun) 00:00"}"#);
+        let b = make_entity("b", "q", "b", r#"{"note": "session date: 2024/01/01 (Mon) 00:00"}"#);
+        let fused = vec![(a.clone(), 0.02), (b.clone(), 0.01)];
+        // quantum <= 0 is treated as "off": order preserved exactly.
+        let out = super::supersede_reorder(fused.clone(), 0.0);
+        assert_eq!(out.iter().map(|(e, _)| e.id.clone()).collect::<Vec<_>>(),
+                   vec!["a".to_string(), "b".to_string()]);
     }
 
     // ─── #486: cross-scope promotion ─────────────────────────────────────
