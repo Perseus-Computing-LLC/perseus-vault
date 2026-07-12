@@ -26,8 +26,20 @@ terminate(){
   local id="${ID:-$(cat "$IDFILE" 2>/dev/null)}"
   [ -z "$id" ] && return
   log "TERMINATING $id"
-  api -X POST "$API/instance-operations/terminate" -H "Content-Type: application/json" -d "{\"instance_ids\":[\"$id\"]}" >/dev/null
-  sleep 6; log "instances running after terminate: $(count_running)"; rm -f "$IDFILE"
+  # Lambda terminate is ASYNC and a single call can silently not take (observed
+  # 2026-07-12: instance still 'active' minutes after one call — credit leak).
+  # Verify OUR OWN id left GET /instances; retry until it does. Never gate on a
+  # bare running count: parallel seats inflate it.
+  local i
+  for i in $(seq 1 6); do
+    api -X POST "$API/instance-operations/terminate" -H "Content-Type: application/json" -d "{\"instance_ids\":[\"$id\"]}" >/dev/null
+    sleep 10
+    if ! api "$API/instances" | grep -q "$id"; then
+      log "terminate confirmed: $id absent from GET /instances"; rm -f "$IDFILE"; return
+    fi
+    log "instance $id still present after terminate attempt $i/6; retrying"
+  done
+  log "WARNING: $id STILL PRESENT after 6 terminate attempts — MANUAL REAP REQUIRED (id kept in $IDFILE)"
 }
 trap terminate EXIT INT TERM
 mkdir -p "$RES"
