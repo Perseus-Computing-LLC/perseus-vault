@@ -30,13 +30,17 @@ for i in $(seq 0 $((NGPU-1))); do
 done
 
 echo "==> waiting for daemons + warming nomic-embed-text on each GPU"
+WARM_PIDS=()
 for i in $(seq 0 $((NGPU-1))); do
   port=$((BASE_PORT + i))
   for t in $(seq 1 30); do curl -sf http://127.0.0.1:$port/api/tags >/dev/null 2>&1 && break; sleep 2; done
   # warm the embed model into THIS gpu's daemon
   curl -s http://127.0.0.1:$port/api/embed -d '{"model":"nomic-embed-text","input":"warm"}' >/dev/null &
+  WARM_PIDS+=($!)
 done
-wait
+# Wait ONLY for the warm curls -- a bare `wait` also blocks on the nohup'd
+# `ollama serve` daemons above, which never exit, hanging this script forever.
+wait "${WARM_PIDS[@]}"
 echo "   all daemons warmed"
 
 echo "==> installing + configuring nginx round-robin load balancer on :8080"
@@ -44,13 +48,21 @@ command -v nginx >/dev/null || { sudo apt-get update -qq && sudo apt-get install
 sudo tee /etc/nginx/conf.d/ollama_lb.conf >/dev/null <<EOF
 upstream ollama_fleet {
 $(echo -e "$UPSTREAMS")
+    keepalive 32;
 }
 server {
     listen 8080;
     location / {
         proxy_pass http://ollama_fleet;
+        # Ollama yields an empty body through the proxy unless we speak HTTP/1.1
+        # with keep-alive cleared and buffering off; without these the LB 200s on
+        # /api/tags but returns empty /api/embed responses.
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_set_header Host 127.0.0.1;
+        proxy_buffering off;
         proxy_connect_timeout 5s;
-        proxy_read_timeout 120s;
+        proxy_read_timeout 300s;
     }
 }
 EOF
