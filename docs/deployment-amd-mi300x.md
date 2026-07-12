@@ -135,10 +135,12 @@ That line — weights actually loaded, KV cache actually allocated — is the
 honest per-card agent ceiling, and what we recommend quoting in deployment
 docs and capacity plans:
 
-| Card | Measured ceiling (72B bf16, 8192-token requests) |
-|---|---|
-| MI300X (192 GB HBM) | **15.3** concurrent agents |
-| 2×H100 (best boot achieved) | **5.0** concurrent agents |
+| Card(s) | GPUs | Measured ceiling (72B bf16, 8192-token requests) |
+|---|---|---|
+| MI300X (192 GB HBM) | **1** | **15.3** concurrent agents |
+| 2×H100 (best boot achieved) | 2 | **5.0** concurrent agents |
+| 2×A100 80GB (eager@0.97, same config as the H100 row) | 2 | **6.37** concurrent agents |
+| 8×A100 40GB (standard boot) | 8 | **57.9** concurrent agents — **7.2/card**; the pooled 320 GB is heavily overprovisioned for a ~136 GB model, so KV headroom (and the resulting $0.275/agent-hr) is flattered. Never quote it without the GPU count: per card the MI300X leads 15.3 vs 7.2 and wins 1.9× on $/agent-hour |
 
 The idealized `(HBM − weights) / KV-per-request` arithmetic **overestimates**
 (~20 vs 15.3 measured on MI300X) because it ignores activation memory,

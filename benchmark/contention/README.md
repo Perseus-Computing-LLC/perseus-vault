@@ -78,6 +78,12 @@ runs)** — and **+0.6%** under a synthetic 100%-utilization matmul
 tokens** (untuned bf16). Cross-vendor baseline (Lambda 2×H100 SXM, same
 model + vLLM): best boot **5.0 agents → $1.68/agent-hr** → **11.7×**
 measured-vs-measured in the MI300X's favor (1×H100 cannot load the model).
+Also measured, same methodology (2026-07-11/12): **2× A100 80GB** (RunPod
+$2.78/hr, identical eager@0.97 config) **6.37 agents → $0.436/agent-hr**, and
+**8× A100 40GB** (Lambda $15.92/hr) **57.9 agents → $0.275/agent-hr** — note
+the GPU count: that last figure is **eight cards** whose pooled 320 GB is
+heavily overprovisioned for a ~136 GB model (inflated KV headroom); per card
+the MI300X leads 15.3 vs 7.2 agents and wins 1.9× on $/agent-hour.
 
 ## Honesty notes
 
