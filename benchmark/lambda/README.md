@@ -21,6 +21,17 @@ at scale** (0.2% @1 on 10k distinct entities); **hybrid holds 90% @1 / 100% @5**
 reciprocal-rank fusion recovering dense's rank-1 dilution. This is the core argument
 for vector + hybrid recall in agentic memory.
 
+### 1b. Recall by mode — 100,000 distinct entities (1×H100)
+| recall@k | keyword (fts5) | dense | hybrid |
+|---|---|---|---|
+| @1 | 0.003 | 0.680 | **0.785** |
+| @5 | 0.015 | 0.859 | **1.000** |
+| @10 | 0.029 | 0.899 | **1.000** |
+
+At **100K** entities the gap *widens*: hybrid is perfect @5 while keyword lands ~1.5%
+of the time — a **~66× gap**. See `results/scale_100k_distinct.json`. Same-box, fully
+local head-to-head: **Perseus Vault 1.00 vs Mem0 0.60** recall accuracy (~40ms p50).
+
 ### 2. Multi-GPU throughput — 8×H100 fleet
 Peak **651 embeddings/sec** at concurrency 64 — **22.8× the single-thread baseline**
 and **~4.7× a single Ollama daemon's saturation ceiling (~137 eps)**. Achieved with
@@ -47,7 +58,29 @@ for grounded recall — reinforcing the edge/offline story.
 | `rag_bench.py` | MCP JSON-RPC driver + single-endpoint RAG smoke bench |
 | `build_report.py` | Render `results/*.json` → self-contained `results.html` |
 | `check_8x.py` / `poll_8x.sh` | Detect high-end multi-GPU capacity on Lambda |
+| `competitors_bench.py` | Same-box recall vs Mem0 / Zep / Letta (honest labeling — never fabricates a number for a stack that won't run locally) |
+| `campaign_run.sh` | **Generic self-terminating campaign runner.** Launches a GPU box, provisions, gates, runs an arbitrary `REMOTE_CMD`, pulls `PULL_FILES`, and ALWAYS terminates (EXIT trap + deadline). |
+| `run_scale100k_durable.sh` | Durable scale run: DB + result on the persistent FS, resumable via `--skip-seed`, terminates only on a DONE marker or hard deadline (transient SSH failures are retried, never fatal) |
+| `orchestrate_campaigns.sh` | Chains campaigns back-to-back, non-overlapping |
+| `gate.sh` | **Readiness gate** (run on the box): require a real `generate` (text) AND a real `embed` (dim>100) before benchmarking — stops connection-refused errors being recorded as fake 0.0 recall |
+| `coldstart_capture.sh` | Time a bare box → first grounded RAG answer; refuses to record a fake time if the answer errors |
 | `teardown_checklist.md` | Save results + terminate (avoid credit leak) |
+
+### Orchestration env vars
+
+The launcher scripts (`campaign_run.sh`, `run_scale100k_durable.sh`) read these from the
+environment so no machine-specific paths or secrets are baked in:
+
+| Var | Purpose | Default |
+|---|---|---|
+| `LAMBDA_KEY_FILE` | Path to a file containing your Lambda Cloud API key (required) | — |
+| `LAMBDA_SSH_KEY` | Private SSH key registered with Lambda (key name `hermes`) | `$HOME/.ssh/lambda_ed25519` |
+| `KITDIR` | Local kit dir (results + instance-id state land here) | the script's own directory |
+
+Lambda API auth is HTTP basic with the key as the username: `curl -u "$KEY:" …`. The
+persistent FS `perseus-vault-fs-south` (us-south-2) is expected to hold the prebuilt binary
+and Ollama models; a fresh box still runs `provision.sh` first (Ollama is NOT preinstalled —
+the ephemeral disk is wiped each boot; only the FS persists).
 
 ## Reproduce
 
