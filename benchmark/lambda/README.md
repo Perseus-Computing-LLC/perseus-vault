@@ -54,6 +54,8 @@ and **~4.7× a single Ollama daemon's saturation ceiling (~137 eps)**. Achieved 
 load balancer (`serve_fleet.sh` / `parallel_embed_fleet.py`). Near-linear per-GPU
 scaling to ~concurrency 32-48, rolling off as request queuing dominates.
 
+> **Re-validation 2026-07-12:** 100K recall-hold re-confirmed — hybrid recall@5 = recall@10 = **1.0** (matches §1 exactly; the fleet throughput win costs no accuracy). 8×H100 had zero in-region (us-south-2) capacity across the poll window, so the largest available in-region multi-GPU (8× Tesla V100) was used as a labeled fallback: peak **432 emb/s @ conc 64** — see `results/fleet_8gpu_v100_throughput.json` and `results/fleet100k_recall.json`. The 651 emb/s figure above is the H100 headline and is **retained unrefreshed** (not overwritten with V100 data). Caveat: today the vault's own embed path (`mimir_embed`) is sequential and cannot reach these fleet rates — see [#601](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/601).
+
 ### 3. Model quality vs latency — mimir_ask grounded QA
 Both `qwen2.5:14b` and `qwen2.5:72b` scored **100% accuracy with citations** (pre-warmed).
 14B at ~2.5× lower latency. Takeaway: when retrieval is strong, a smaller model suffices
