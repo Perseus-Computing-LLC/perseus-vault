@@ -8,7 +8,7 @@
 | **Language** | Rust | Python |
 | **Deployment** | Single binary (~8MB) | Cloud API or self-host (Python + vector DB) |
 | **Dependencies** | Zero (SQLite bundled) | Python runtime + PostgreSQL/Qdrant/Neo4j |
-| **MCP-Native** | ✅ 36 tools, full MCP | ❌ Not MCP-native |
+| **MCP-Native** | ✅ 58 MCP tools | ❌ Not MCP-native |
 | **Offline/Local** | ✅ Fully local, no network | ❌ Cloud-dependent; self-host needs infra |
 | **Encryption** | AES-256-GCM at rest | ❌ |
 | **Search** | FTS5 + Dense + RRF hybrid | Vector only |
@@ -101,9 +101,9 @@ Mem0 stores flat memory entries with metadata. No structured entity model,
 no decay lifecycle, no journal, no state management. It's a simpler model
 that works well for straightforward RAG use cases.
 
-## MCP Tools: 36 vs 5
+## MCP Tools: 58 vs 5
 
-Perseus Vault exposes 36 MCP tools covering the full memory lifecycle:
+Perseus Vault exposes 58 MCP tools covering the full memory lifecycle:
 
 | Category | Perseus Vault Tools |
 |---|---|

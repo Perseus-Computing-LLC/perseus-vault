@@ -4224,6 +4224,67 @@ mod tests {
     }
 
     #[test]
+    fn docs_tool_count_matches_registry() {
+        // #610: comparison docs said "36 tools" while the README said 57 and the
+        // registry had 58. The registry is the single source of truth; every
+        // documented count must match it, in three forms:
+        //   A. the README shield badge  ..badge/MCP%20tools-<n>-..
+        //   B. any "<n> MCP tools" phrase (vault's own count always uses this
+        //      adjacency; competitor counts must not, e.g. write "vs zero")
+        //   C. table rows "| **MCP Tools** | <n> | ..." and headings
+        //      "## MCP Tools: <n> vs ..." — vault's column/count comes first
+        let n = tool_registry_base().len();
+
+        let first_int = |s: &str| -> Option<usize> {
+            let start = s.find(|c: char| c.is_ascii_digit())?;
+            let digits: String = s[start..].chars().take_while(|c| c.is_ascii_digit()).collect();
+            digits.parse().ok()
+        };
+        // Integer immediately preceding byte offset `at`, skipping ** ( and spaces.
+        let int_before = |s: &str, at: usize| -> Option<usize> {
+            let trimmed = s[..at].trim_end_matches(|c: char| c.is_whitespace() || c == '*' || c == '(');
+            let digits: Vec<char> = trimmed
+                .chars()
+                .rev()
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
+            digits.iter().rev().collect::<String>().parse().ok()
+        };
+
+        let docs: [(&str, &str); 4] = [
+            ("README.md", include_str!("../README.md")),
+            ("docs/comparison/mimir-vs-zep.md", include_str!("../docs/comparison/mimir-vs-zep.md")),
+            ("docs/comparison/mimir-vs-letta.md", include_str!("../docs/comparison/mimir-vs-letta.md")),
+            ("docs/comparison/mimir-vs-mem0.md", include_str!("../docs/comparison/mimir-vs-mem0.md")),
+        ];
+        for (path, text) in docs {
+            // Form A: shield badge
+            for (i, _) in text.match_indices("MCP%20tools-") {
+                let claimed = first_int(&text[i + "MCP%20tools-".len()..]);
+                assert_eq!(claimed, Some(n), "{path}: badge count != registry ({n})");
+            }
+            // Form B: "<n> MCP tools" (case-insensitive; ASCII docs, so byte
+            // offsets in the lowercased copy line up with the original)
+            let lower = text.to_lowercase();
+            for (i, _) in lower.match_indices("mcp tools") {
+                if let Some(claimed) = int_before(text, i) {
+                    assert_eq!(
+                        claimed, n,
+                        "{path}: '<n> MCP tools' phrase says {claimed}, registry has {n}"
+                    );
+                }
+            }
+            // Form C: table rows and comparison headings (vault count first)
+            for line in text.lines() {
+                if line.contains("| **MCP Tools** |") || line.starts_with("## MCP Tools:") {
+                    let claimed = first_int(line);
+                    assert_eq!(claimed, Some(n), "{path}: line {line:?} count != registry ({n})");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn dream_is_registered_with_aliases_and_errors_cleanly_without_llm() {
         // Default advertises only the canonical name; the legacy prefixes stay
         // dispatchable (asserted via call_tool below) but unadvertised. Opt-in
