@@ -4,161 +4,34 @@
   "dataset": "longmemeval_s_cleaned.json",
   "split": "longmemeval_s",
   "split_size": 500,
-  "n_instances": 500,
-  "n_scored": 500,
+  "n_instances": 78,
+  "n_scored": 78,
   "retrieval": {
     "mode": "hybrid",
-    "k": 50,
+    "k": 20,
     "trust_weight": 0,
     "min_decay": 0
   },
   "coverage_at_k": {
-    "@5": 0.862,
-    "@10": 0.946,
-    "@20": 0.976,
-    "@30": 0.99,
-    "@50": 1.0
+    "@5": 0.9487,
+    "@10": 0.9744,
+    "@20": 1.0
   },
   "k_recoverable": [
     {
-      "question_id": "gpt4_1916e0ea",
-      "worst_rank": 11,
-      "question_type": "temporal-reasoning"
-    },
-    {
-      "question_id": "gpt4_68e94288",
-      "worst_rank": 11,
-      "question_type": "temporal-reasoning"
-    },
-    {
-      "question_id": "gpt4_2f56ae70",
-      "worst_rank": 11,
-      "question_type": "temporal-reasoning"
-    },
-    {
-      "question_id": "45dc21b6",
-      "worst_rank": 11,
+      "question_id": "0977f2af",
+      "worst_rank": 12,
       "question_type": "knowledge-update"
-    },
-    {
-      "question_id": "gpt4_15e38248",
-      "worst_rank": 12,
-      "question_type": "multi-session"
-    },
-    {
-      "question_id": "gpt4_7abb270c",
-      "worst_rank": 12,
-      "question_type": "temporal-reasoning"
-    },
-    {
-      "question_id": "726462e0",
-      "worst_rank": 13,
-      "question_type": "single-session-user"
-    },
-    {
-      "question_id": "eac54add",
-      "worst_rank": 13,
-      "question_type": "temporal-reasoning"
-    },
-    {
-      "question_id": "157a136e",
-      "worst_rank": 14,
-      "question_type": "multi-session"
-    },
-    {
-      "question_id": "8e91e7d9",
-      "worst_rank": 14,
-      "question_type": "multi-session"
-    },
-    {
-      "question_id": "gpt4_e061b84f",
-      "worst_rank": 14,
-      "question_type": "temporal-reasoning"
-    },
-    {
-      "question_id": "982b5123_abs",
-      "worst_rank": 14,
-      "question_type": "temporal-reasoning"
     },
     {
       "question_id": "2698e78f_abs",
-      "worst_rank": 14,
+      "worst_rank": 13,
       "question_type": "knowledge-update"
-    },
-    {
-      "question_id": "a1cc6108",
-      "worst_rank": 15,
-      "question_type": "multi-session"
-    },
-    {
-      "question_id": "10d9b85a",
-      "worst_rank": 18,
-      "question_type": "multi-session"
-    },
-    {
-      "question_id": "gpt4_1e4a8aec",
-      "worst_rank": 22,
-      "question_type": "temporal-reasoning"
-    },
-    {
-      "question_id": "d6233ab6",
-      "worst_rank": 24,
-      "question_type": "single-session-preference"
-    },
-    {
-      "question_id": "gpt4_194be4b3",
-      "worst_rank": 25,
-      "question_type": "multi-session"
-    },
-    {
-      "question_id": "1a8a66a6",
-      "worst_rank": 26,
-      "question_type": "multi-session"
-    },
-    {
-      "question_id": "gpt4_f2262a51",
-      "worst_rank": 28,
-      "question_type": "multi-session"
-    },
-    {
-      "question_id": "81507db6",
-      "worst_rank": 28,
-      "question_type": "multi-session"
-    },
-    {
-      "question_id": "ba358f49",
-      "worst_rank": 28,
-      "question_type": "multi-session"
-    },
-    {
-      "question_id": "gpt4_e061b84g",
-      "worst_rank": 33,
-      "question_type": "temporal-reasoning"
-    },
-    {
-      "question_id": "gpt4_d6585ce8",
-      "worst_rank": 37,
-      "question_type": "temporal-reasoning"
-    },
-    {
-      "question_id": "4dfccbf8",
-      "worst_rank": 37,
-      "question_type": "temporal-reasoning"
-    },
-    {
-      "question_id": "gpt4_4929293b",
-      "worst_rank": 39,
-      "question_type": "temporal-reasoning"
-    },
-    {
-      "question_id": "6d550036",
-      "worst_rank": 41,
-      "question_type": "multi-session"
     }
   ],
   "hard_misses": [],
   "binary": "perseus-vault.exe",
   "platform": "Windows-11-10.0.26200-SP0",
   "offline": true,
-  "signature_sha256": "80dcf72a984ab8b60648bd439342fda26953f2778269497981119f85da41cc02"
+  "signature_sha256": "396ad6dd9ce3cfe3896064520f0e381983caffb7219fa1c8037ea4786ca1b851"
 }
