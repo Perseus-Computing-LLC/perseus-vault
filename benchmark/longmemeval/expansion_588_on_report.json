@@ -1,0 +1,169 @@
+{
+  "benchmark": "perseus-vault-longmemeval-retrieval-coverage",
+  "metric": "gold-evidence coverage@k (offline, judge-free)",
+  "dataset": "longmemeval_s_cleaned.json",
+  "split": "longmemeval_s",
+  "split_size": 500,
+  "n_instances": 500,
+  "n_scored": 500,
+  "retrieval": {
+    "mode": "hybrid",
+    "k": 50,
+    "trust_weight": 0,
+    "min_decay": 0
+  },
+  "coverage_at_k": {
+    "@5": 0.846,
+    "@10": 0.944,
+    "@20": 0.982,
+    "@30": 0.992,
+    "@50": 1.0
+  },
+  "k_recoverable": [
+    {
+      "question_id": "88432d0a_abs",
+      "worst_rank": 11,
+      "question_type": "multi-session"
+    },
+    {
+      "question_id": "726462e0",
+      "worst_rank": 12,
+      "question_type": "single-session-user"
+    },
+    {
+      "question_id": "gpt4_d84a3211",
+      "worst_rank": 12,
+      "question_type": "multi-session"
+    },
+    {
+      "question_id": "88432d0a",
+      "worst_rank": 12,
+      "question_type": "multi-session"
+    },
+    {
+      "question_id": "gpt4_731e37d7",
+      "worst_rank": 12,
+      "question_type": "multi-session"
+    },
+    {
+      "question_id": "gpt4_372c3eed",
+      "worst_rank": 12,
+      "question_type": "multi-session"
+    },
+    {
+      "question_id": "gpt4_1916e0ea",
+      "worst_rank": 12,
+      "question_type": "temporal-reasoning"
+    },
+    {
+      "question_id": "0977f2af",
+      "worst_rank": 12,
+      "question_type": "knowledge-update"
+    },
+    {
+      "question_id": "8e91e7d9",
+      "worst_rank": 13,
+      "question_type": "multi-session"
+    },
+    {
+      "question_id": "gpt4_1e4a8aec",
+      "worst_rank": 13,
+      "question_type": "temporal-reasoning"
+    },
+    {
+      "question_id": "2698e78f_abs",
+      "worst_rank": 13,
+      "question_type": "knowledge-update"
+    },
+    {
+      "question_id": "81507db6",
+      "worst_rank": 14,
+      "question_type": "multi-session"
+    },
+    {
+      "question_id": "982b5123_abs",
+      "worst_rank": 14,
+      "question_type": "temporal-reasoning"
+    },
+    {
+      "question_id": "5c40ec5b",
+      "worst_rank": 14,
+      "question_type": "knowledge-update"
+    },
+    {
+      "question_id": "gpt4_f2262a51",
+      "worst_rank": 15,
+      "question_type": "multi-session"
+    },
+    {
+      "question_id": "129d1232",
+      "worst_rank": 15,
+      "question_type": "multi-session"
+    },
+    {
+      "question_id": "gpt4_e061b84f",
+      "worst_rank": 15,
+      "question_type": "temporal-reasoning"
+    },
+    {
+      "question_id": "gpt4_372c3eed_abs",
+      "worst_rank": 16,
+      "question_type": "multi-session"
+    },
+    {
+      "question_id": "gpt4_68e94288",
+      "worst_rank": 17,
+      "question_type": "temporal-reasoning"
+    },
+    {
+      "question_id": "d6233ab6",
+      "worst_rank": 21,
+      "question_type": "single-session-preference"
+    },
+    {
+      "question_id": "10d9b85a",
+      "worst_rank": 23,
+      "question_type": "multi-session"
+    },
+    {
+      "question_id": "gpt4_194be4b3",
+      "worst_rank": 24,
+      "question_type": "multi-session"
+    },
+    {
+      "question_id": "gpt4_d6585ce8",
+      "worst_rank": 24,
+      "question_type": "temporal-reasoning"
+    },
+    {
+      "question_id": "1a8a66a6",
+      "worst_rank": 30,
+      "question_type": "multi-session"
+    },
+    {
+      "question_id": "gpt4_e061b84g",
+      "worst_rank": 31,
+      "question_type": "temporal-reasoning"
+    },
+    {
+      "question_id": "4dfccbf8",
+      "worst_rank": 37,
+      "question_type": "temporal-reasoning"
+    },
+    {
+      "question_id": "6d550036",
+      "worst_rank": 39,
+      "question_type": "multi-session"
+    },
+    {
+      "question_id": "gpt4_4929293b",
+      "worst_rank": 42,
+      "question_type": "temporal-reasoning"
+    }
+  ],
+  "hard_misses": [],
+  "binary": "perseus-vault.exe",
+  "platform": "Windows-11-10.0.26200-SP0",
+  "offline": true,
+  "signature_sha256": "466ed1369f240f7d38e7791edca8fe704727281894c7332bc7b4833bfdd61efe"
+}
