@@ -3555,6 +3555,68 @@ impl Database {
                     )
                 };
                 timer.stage("fuse");
+                // #588: rule-pack multi-query expansion (OFF by default). Fuse
+                // the base ranking with one equal-voice arm per sub-query via a
+                // single flat RRF pass (the symmetric N-arm form the oracle
+                // validated), the base arm up-weighted so expansions can only
+                // *lift* evidence the original phrasing missed, never displace a
+                // strong base hit. No-op offline when disabled; the online path
+                // swaps the rule pack for an LLM decomposition.
+                let mut fused = fused;
+                if crate::db::query_expansion_enabled() && !params.query.trim().is_empty() {
+                    let subs = crate::db::expand_query(&params.query);
+                    if !subs.is_empty() {
+                        let base_w = std::env::var("PERSEUS_VAULT_EXPANSION_BASE_WEIGHT")
+                            .ok()
+                            .and_then(|s| s.parse::<f64>().ok())
+                            .filter(|w| *w > 0.0)
+                            .unwrap_or(1.5);
+                        let exp_w = std::env::var("PERSEUS_VAULT_EXPANSION_WEIGHT")
+                            .ok()
+                            .and_then(|s| s.parse::<f64>().ok())
+                            .filter(|w| *w > 0.0)
+                            .unwrap_or(1.0);
+                        let mut by_id: std::collections::HashMap<String, crate::models::Entity> =
+                            std::collections::HashMap::new();
+                        for (e, _) in &fused {
+                            by_id.entry(e.id.clone()).or_insert_with(|| e.clone());
+                        }
+                        let mut arms: Vec<(Vec<String>, f64)> = Vec::with_capacity(subs.len() + 1);
+                        arms.push((fused.iter().map(|(e, _)| e.id.clone()).collect(), base_w));
+                        for sub in &subs {
+                            // one hybrid list per sub-query (dense + sparse, fused).
+                            let d = self
+                                .generate_embedding_with_fallback(sub)
+                                .ok()
+                                .and_then(|emb| self.dense_search(&emb, candidate_k).ok())
+                                .unwrap_or_default();
+                            let mut sp = wide.clone();
+                            sp.query = sub.clone();
+                            let s = self.fts5_bm25_search(&sp).unwrap_or_default();
+                            let sub_fused = crate::db::reciprocal_rank_fusion(
+                                &d,
+                                &s,
+                                60.0,
+                                candidate_k,
+                                crate::db::sparse_arm_weight(s.len()),
+                                params.recency_half_life_secs,
+                                now_ms(),
+                            );
+                            for (e, _) in &sub_fused {
+                                by_id.entry(e.id.clone()).or_insert_with(|| e.clone());
+                            }
+                            arms.push((sub_fused.iter().map(|(e, _)| e.id.clone()).collect(), exp_w));
+                        }
+                        fused = crate::db::flat_rrf(&arms, &by_id, candidate_k);
+                    }
+                    timer.stage("expand");
+                }
+                // #588: date-aware arm (OFF by default). When the query carries a
+                // relative-date expression and a query-date anchor is set, move
+                // candidates whose event date falls in the resolved window to the
+                // front — the lever for date-keyed questions (e.g. "two weeks
+                // ago") where topical recall alone under-ranks the dated session.
+                let fused = crate::db::apply_date_window(fused, &params.query);
                 // #487: usefulness term in the composite rank expression —
                 // Belief Memory's `(1.0 + usefulness())`. Applied over the
                 // fused candidate pool BEFORE the metadata filter + truncate,
@@ -10408,6 +10470,329 @@ pub fn supersede_reorder(
     idx.into_iter().map(|i| fused[i].clone()).collect()
 }
 
+// ─────────────────────────── #588: multi-query expansion ───────────────────
+/// Is rule-pack multi-query expansion enabled? OFF by default.
+pub fn query_expansion_enabled() -> bool {
+    matches!(
+        std::env::var("PERSEUS_VAULT_QUERY_EXPANSION").as_deref(),
+        Ok("1") | Ok("true") | Ok("on") | Ok("TRUE") | Ok("yes")
+    )
+}
+
+/// Offline, LLM-free query expansion — the graceful-degradation arm (the online
+/// path substitutes an LLM decomposition, #588). Returns EXTRA sub-queries;
+/// the caller fuses each as its own equal-voice RRF arm alongside the original
+/// (the pattern the #588 oracle validated, recovering 8/9 hard misses). Three
+/// families from the #580 case study: self-age hop, aggregation-core, and a
+/// small synonym/instance lexicon. Conservative: fires only on recognizable
+/// shapes, caps the fan-out.
+pub fn expand_query(query: &str) -> Vec<String> {
+    let ql = query.to_lowercase();
+    let mut out: Vec<String> = Vec::new();
+
+    // Proper-noun / capitalized tokens from the ORIGINAL (entities the question
+    // pivots on — "Alex", "Rachel", "Austin"): kept to bridge a hop sub-query
+    // back to the event context ("Alex born age").
+    let nouns: Vec<&str> = query
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| w.len() > 2 && w.chars().next().is_some_and(|c| c.is_ascii_uppercase()))
+        .filter(|w| {
+            !matches!(*w, "How" | "What" | "When" | "Where" | "Who" | "Why" | "Which" | "The")
+        })
+        .collect();
+
+    // (1) self-age hop: the evidence states the user's age, not the event.
+    let age_q = ql.contains("how old")
+        || ql.contains("how many years will i")
+        || ql.contains("how many years old")
+        || ql.contains("what age");
+    if age_q {
+        // Entity-bridged residue first so it survives the fan-out cap — it's the
+        // strongest hop signal ("Alex born age" ties the age hop to the event).
+        if !nouns.is_empty() {
+            out.push(format!("{} age born", nouns.join(" ")));
+        }
+        for s in ["my age", "how old am i", "i just turned"] {
+            out.push(s.to_string());
+        }
+    }
+
+    // (2) aggregation core: bare topic phrase for diversity-first enumeration.
+    if let Some(core) = aggregation_core(&ql) {
+        if core.len() >= 3 {
+            out.push(core);
+        }
+    }
+
+    // (3) synonym / instance expansion: small, general lexicon.
+    let syn: &[(&str, &str)] = &[
+        ("movie", "film festival screening"),
+        ("movies", "film festival screening"),
+        ("film", "movie festival screening"),
+        ("festival", "film festival screening event"),
+        ("festivals", "film festival screening event"),
+        ("doctor", "physician specialist dermatologist appointment"),
+        ("doctors", "physician specialist dermatologist appointment"),
+        ("concert", "musical event show gig performance live music"),
+        ("concerts", "musical event show gig performance live music"),
+        ("attended", "participated went to visited"),
+        ("attend", "participate visit"),
+        ("trip", "travel vacation visit"),
+        ("trips", "travel vacation visits"),
+        ("job", "work position role employer"),
+        ("restaurant", "dining ate meal"),
+    ];
+    let mut extra: Vec<&str> = Vec::new();
+    for (k, v) in syn {
+        if ql.split(|c: char| !c.is_alphanumeric()).any(|w| w == *k) {
+            extra.push(v);
+        }
+    }
+    if !extra.is_empty() {
+        out.push(format!("{} {}", query, extra.join(" ")));
+    }
+
+    // dedup (case-insensitive), drop the original, cap fan-out at 4 (per #588:
+    // the original stays up-weighted, expansions are capped to bound dilution).
+    let mut seen = std::collections::HashSet::new();
+    seen.insert(ql);
+    let mut deduped = Vec::new();
+    for s in out {
+        if seen.insert(s.to_lowercase()) {
+            deduped.push(s);
+        }
+        if deduped.len() >= 4 {
+            break;
+        }
+    }
+    deduped
+}
+
+/// Strip interrogative scaffolding from an aggregation question → bare topic
+/// phrase (lowercased). None when not aggregation-shaped.
+fn aggregation_core(ql: &str) -> Option<String> {
+    let triggers = [
+        "how many", "how much", "number of", "the order of", "order of", "list all",
+        "list the", "list of", "count of",
+    ];
+    if !triggers.iter().any(|t| ql.contains(t)) {
+        return None;
+    }
+    let mut s = ql.to_string();
+    for lead in [
+        "what is the order of", "what's the order of", "the order of", "order of",
+        "how many different", "how many", "how much", "number of", "list all of",
+        "list all", "list the", "list of", "count of", "which",
+    ] {
+        if let Some(rest) = s.strip_prefix(lead) {
+            s = rest.trim().to_string();
+            break;
+        }
+    }
+    for cut in [
+        " that i ", " did i ", " have i ", " i attended", " i visited", " i went",
+        " i did", " i have",
+    ] {
+        if let Some(idx) = s.find(cut) {
+            s.truncate(idx);
+        }
+    }
+    let core = s.trim_end_matches(|c: char| !c.is_alphanumeric()).trim();
+    let core = core.trim_start_matches("the ").trim_start_matches("a ").trim();
+    if core.is_empty() {
+        None
+    } else {
+        Some(core.to_string())
+    }
+}
+
+/// Weighted flat Reciprocal Rank Fusion over N ranked id-lists (the #588
+/// multi-query fuse). Each arm contributes `weight / (60 + rank)`; entities are
+/// hydrated from `by_id`. Deterministic tie-break (score desc, id asc),
+/// truncated to `limit`. This is the symmetric N-arm form the oracle used —
+/// distinct from the pairwise `reciprocal_rank_fusion` the base path composes.
+pub fn flat_rrf(
+    arms: &[(Vec<String>, f64)],
+    by_id: &std::collections::HashMap<String, crate::models::Entity>,
+    limit: usize,
+) -> Vec<(crate::models::Entity, f64)> {
+    let mut scores: std::collections::HashMap<&str, f64> = std::collections::HashMap::new();
+    for (ids, w) in arms {
+        for (rank, id) in ids.iter().enumerate() {
+            *scores.entry(id.as_str()).or_insert(0.0) += w / (60.0 + (rank + 1) as f64);
+        }
+    }
+    let mut out: Vec<(crate::models::Entity, f64)> = scores
+        .into_iter()
+        .filter_map(|(id, sc)| by_id.get(id).map(|e| (e.clone(), sc)))
+        .collect();
+    out.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.id.cmp(&b.0.id))
+    });
+    out.truncate(limit);
+    out
+}
+
+// ─────────────────────────── #588: date-aware arm ──────────────────────────
+/// Is the date-aware arm enabled? OFF by default.
+pub fn date_arm_enabled() -> bool {
+    matches!(
+        std::env::var("PERSEUS_VAULT_DATE_ARM").as_deref(),
+        Ok("1") | Ok("true") | Ok("on") | Ok("TRUE") | Ok("yes")
+    )
+}
+
+/// Days since 1970-01-01 for a proleptic-Gregorian date (Howard Hinnant's
+/// `days_from_civil`). Ordering/interval arithmetic only.
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
+/// Parse the first `YYYY[-/]MM[-/]DD` in `text` into (y, m, d).
+fn parse_ymd(text: &str) -> Option<(i64, i64, i64)> {
+    let b = text.as_bytes();
+    let n = b.len();
+    let is_d = |x: u8| x.is_ascii_digit();
+    let mut i = 0usize;
+    while i + 8 <= n {
+        if is_d(b[i]) && is_d(b[i + 1]) && is_d(b[i + 2]) && is_d(b[i + 3])
+            && (b[i + 4] == b'-' || b[i + 4] == b'/')
+        {
+            let sep = b[i + 4];
+            let year: i64 = text[i..i + 4].parse().ok()?;
+            let ms = i + 5;
+            let mut j = ms;
+            while j < n && is_d(b[j]) && j - ms < 2 {
+                j += 1;
+            }
+            if j == ms || j >= n || b[j] != sep {
+                i += 1;
+                continue;
+            }
+            let month: i64 = text[ms..j].parse().ok()?;
+            let ds = j + 1;
+            let mut k = ds;
+            while k < n && is_d(b[k]) && k - ds < 2 {
+                k += 1;
+            }
+            if k == ds {
+                i += 1;
+                continue;
+            }
+            let day: i64 = text[ds..k].parse().ok()?;
+            if (1..=12).contains(&month) && (1..=31).contains(&day) {
+                return Some((year, month, day));
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// The query-date anchor (days since epoch) from `PERSEUS_VAULT_QUERY_DATE`
+/// (e.g. the LongMemEval `question_date`); None when unset/unparseable.
+fn query_anchor_days() -> Option<i64> {
+    let raw = std::env::var("PERSEUS_VAULT_QUERY_DATE").ok()?;
+    let (y, m, d) = parse_ymd(&raw)?;
+    Some(days_from_civil(y, m, d))
+}
+
+/// Parse a relative-date expression ("two weeks ago", "3 days ago", "last
+/// month", "in the past two months") into an offset in DAYS before the anchor.
+/// Returns None when the query has no such expression.
+fn parse_relative_offset_days(ql: &str) -> Option<i64> {
+    let num = |w: &str| -> Option<i64> {
+        match w {
+            "a" | "an" | "one" | "last" => Some(1),
+            "two" | "couple" => Some(2),
+            "three" => Some(3),
+            "four" => Some(4),
+            "five" => Some(5),
+            "six" => Some(6),
+            "seven" => Some(7),
+            _ => w.parse::<i64>().ok(),
+        }
+    };
+    let toks: Vec<&str> = ql.split(|c: char| !c.is_alphanumeric()).filter(|s| !s.is_empty()).collect();
+    let unit_days = |u: &str| -> Option<i64> {
+        if u.starts_with("day") { Some(1) }
+        else if u.starts_with("week") { Some(7) }
+        else if u.starts_with("month") { Some(30) }
+        else if u.starts_with("year") { Some(365) }
+        else { None }
+    };
+    // "<n> <unit> ago" / "past <n> <unit>" / "last <unit>"
+    for i in 0..toks.len() {
+        if let Some(ud) = unit_days(toks[i]) {
+            // n before the unit
+            let n = if i >= 1 { num(toks[i - 1]) } else { None };
+            let has_ago = toks.get(i + 1).is_some_and(|w| *w == "ago")
+                || (i >= 2 && toks[i - 2] == "past")
+                || (i >= 1 && toks[i - 1] == "last");
+            if has_ago {
+                return Some(n.unwrap_or(1) * ud);
+            }
+        }
+    }
+    None
+}
+
+/// #588 date-aware boost: when the date arm is enabled, the query carries a
+/// relative-date expression, and an anchor is set, move candidates whose event
+/// date falls within `±window` days of the resolved target date to the front
+/// (stable within each partition). Matches the oracle's residue+window recipe.
+/// No-op when any precondition is missing.
+pub fn apply_date_window(
+    fused: Vec<(crate::models::Entity, f64)>,
+    query: &str,
+) -> Vec<(crate::models::Entity, f64)> {
+    if fused.len() < 2 || !date_arm_enabled() {
+        return fused;
+    }
+    let anchor = match query_anchor_days() {
+        Some(a) => a,
+        None => return fused,
+    };
+    let offset = match parse_relative_offset_days(&query.to_lowercase()) {
+        Some(o) => o,
+        None => return fused,
+    };
+    let window: i64 = std::env::var("PERSEUS_VAULT_DATE_WINDOW")
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok())
+        .filter(|w| *w >= 0)
+        .unwrap_or(3);
+    let target = anchor - offset;
+    let (mut in_win, mut rest): (Vec<_>, Vec<_>) = (Vec::new(), Vec::new());
+    for (e, s) in fused.into_iter() {
+        let hit = entity_event_days(&e).is_some_and(|d| (d - target).abs() <= window);
+        if hit {
+            in_win.push((e, s));
+        } else {
+            rest.push((e, s));
+        }
+    }
+    in_win.extend(rest);
+    in_win
+}
+
+/// Event date of an entity as days-since-epoch (parsed from a `session date:`
+/// line or a structured date field), or None.
+fn entity_event_days(e: &crate::models::Entity) -> Option<i64> {
+    let key = entity_event_date_key(e)?; // Y*1e8 + M*1e6 + D*1e4 + h*100 + m
+    let y = key / 100_000_000;
+    let m = (key / 1_000_000) % 100;
+    let d = (key / 10_000) % 100;
+    Some(days_from_civil(y, m, d))
+}
+
 pub fn reciprocal_rank_fusion(
     dense_results: &[(crate::models::Entity, f64)],
     sparse_results: &[(crate::models::Entity, f64)],
@@ -10937,6 +11322,74 @@ mod tests {
         let (db, path) = temp_db();
         assert!(db.health_check());
         let _ = fs::remove_file(&path);
+    }
+
+    // ─── #588: multi-query expansion + date arm ──────────────────────────
+    #[test]
+    fn expand_query_families() {
+        let a = super::expand_query("How old was I when Alex was born?");
+        assert!(a.iter().any(|s| s.contains("my age") || s.contains("how old am i")));
+        assert!(a.iter().any(|s| s.to_lowercase().contains("alex")), "hop keeps the pivot entity: {a:?}");
+
+        let f = super::expand_query("How many movie festivals that I attended?");
+        assert!(f.iter().any(|s| s.contains("movie festivals")), "aggregation core: {f:?}");
+        assert!(f.iter().any(|s| s.contains("film")), "movie→film synonym: {f:?}");
+
+        let d = super::expand_query("How many different doctors did I visit?");
+        assert!(d.iter().any(|s| s.contains("dermatologist") || s.contains("physician")));
+
+        // conservative: a plain factual question expands to nothing.
+        assert!(super::expand_query("What did the assistant recommend for my headache?").is_empty());
+        assert!(super::expand_query("How old was I when Alex was born?").len() <= 4, "fan-out capped");
+    }
+
+    #[test]
+    fn aggregation_core_extracts_topic() {
+        assert_eq!(super::aggregation_core("how many movie festivals that i attended?").as_deref(),
+                   Some("movie festivals"));
+        assert_eq!(super::aggregation_core("what is the order of the concerts i attended").as_deref(),
+                   Some("concerts"));
+        assert_eq!(super::aggregation_core("what did i eat"), None);
+    }
+
+    #[test]
+    fn parse_relative_offset_days_variants() {
+        assert_eq!(super::parse_relative_offset_days("what did i do two weeks ago"), Some(14));
+        assert_eq!(super::parse_relative_offset_days("gardening 3 days ago"), Some(3));
+        assert_eq!(super::parse_relative_offset_days("in the past two months"), Some(60));
+        assert_eq!(super::parse_relative_offset_days("what happened last week"), Some(7));
+        assert_eq!(super::parse_relative_offset_days("what is my favorite color"), None);
+    }
+
+    #[test]
+    fn days_from_civil_and_ymd_intervals() {
+        // 14-day interval resolves correctly across a month boundary.
+        let a = super::days_from_civil(2023, 5, 5);
+        let b = super::days_from_civil(2023, 4, 21);
+        assert_eq!(a - b, 14);
+        assert_eq!(super::parse_ymd("2023/05/05 (Fri) 16:42"), Some((2023, 5, 5)));
+        assert_eq!(super::parse_ymd("no date"), None);
+        // entity_event_days round-trips a session-date body.
+        let e = make_entity("e", "q", "s", r#"{"note": "session date: 2023/04/21 (Fri) 09:00\nx"}"#);
+        assert_eq!(super::entity_event_days(&e), Some(super::days_from_civil(2023, 4, 21)));
+    }
+
+    #[test]
+    fn flat_rrf_up_weights_base_and_fuses() {
+        let e = |id: &str| make_entity(id, "q", id, r#"{"note":"x"}"#);
+        let mut by_id = std::collections::HashMap::new();
+        for id in ["a", "b", "c"] {
+            by_id.insert(id.to_string(), e(id));
+        }
+        // base ranks a>b (up-weighted); a disjoint expansion arm ranks c>...
+        // a stays on top; c (only in the expansion) still surfaces.
+        let arms = vec![
+            (vec!["a".to_string(), "b".to_string()], 1.5),
+            (vec!["c".to_string()], 1.0),
+        ];
+        let out = super::flat_rrf(&arms, &by_id, 10);
+        assert_eq!(out[0].0.id, "a", "up-weighted base wins the top slot");
+        assert!(out.iter().any(|(x, _)| x.id == "c"), "expansion-only hit surfaces");
     }
 
     // ─── #590: event-time supersession tiebreak ──────────────────────────
