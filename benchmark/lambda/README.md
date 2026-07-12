@@ -29,8 +29,23 @@ for vector + hybrid recall in agentic memory.
 | @10 | 0.029 | 0.899 | **1.000** |
 
 At **100K** entities the gap *widens*: hybrid is perfect @5 while keyword lands ~1.5%
-of the time — a **~66× gap**. See `results/scale_100k_distinct.json`. Same-box, fully
-local head-to-head: **Perseus Vault 1.00 vs Mem0 0.60** recall accuracy (~40ms p50).
+of the time — a **~66× gap**. See `results/scale_100k_distinct.json`.
+
+### 1c. Competitive recall — same box, same corpus, all fully local (1×H100)
+Every system stood up and run live against the same local Ollama
+(`qwen2.5:14b-instruct` + `nomic-embed-text`); identical facts, queries, substring judge.
+
+| System | Recall | p50 | Stack |
+|---|---|---|---|
+| **Perseus Vault** (hybrid) | **1.00** | 35.6 ms | single ~8MB binary, in-process |
+| Letta (archival / pgvector) | 1.00 | 135.5 ms | server + Postgres/pgvector |
+| Mem0 (vector) | 0.60 | 37.9 ms | Python + Qdrant |
+| Zep (Graphiti temporal KG) | 0.20 | 49.7 ms | server + Neo4j; KG built by local model |
+
+No fabricated numbers: Zep's deprecated CE server / Cloud-only memory API means we measure
+its real OSS engine (Graphiti on Neo4j), whose 0.20 reflects lossy *local-model* graph
+extraction, not Zep Cloud (frontier models). See `results/competitors.json` and
+`competitors_bench.py`.
 
 ### 2. Multi-GPU throughput — 8×H100 fleet
 Peak **651 embeddings/sec** at concurrency 64 — **22.8× the single-thread baseline**
@@ -55,6 +70,7 @@ for grounded recall — reinforcing the edge/offline story.
 | `parallel_embed_fleet.py` | Aggregate embedding throughput vs concurrency across the fleet |
 | `quality_lift.py` | mimir_ask accuracy/latency across chat models (14B vs 72B) |
 | `mem0_bench.py` | Competitive: same recall task against Mem0, same box + Ollama |
+| `competitors_bench.py` | Competitive 4-way: same recall task vs Mem0, Zep (Graphiti/Neo4j) and Letta (pgvector), same box + Ollama → `results/competitors.json` |
 | `rag_bench.py` | MCP JSON-RPC driver + single-endpoint RAG smoke bench |
 | `build_report.py` | Render `results/*.json` → self-contained `results.html` |
 | `check_8x.py` / `poll_8x.sh` | Detect high-end multi-GPU capacity on Lambda |

@@ -16,6 +16,23 @@
 | **Encryption** | AES-256-GCM | ❌ |
 | **License** | MIT | Apache 2.0 |
 
+## Measured: same-box recall (fully local)
+
+Both run on one H100 against the same local Ollama (`qwen2.5:14b-instruct` +
+`nomic-embed-text`), identical fact set / queries / substring judge:
+
+| System | Recall | p50 |
+|---|---|---|
+| **Perseus Vault** (hybrid, in-process) | **1.00** | 35.6 ms |
+| Letta (archival memory / pgvector) | 1.00 | 135.5 ms |
+
+Letta was run live as the `letta/letta` server (bundled Postgres/pgvector) pointed at
+the same local Ollama; the identical facts were seeded into archival memory and queried
+via pgvector nearest-neighbor search. Both reach 1.00 recall on this corpus — the
+difference is operational: Perseus Vault answers in-process from a single binary at
+~35 ms, while Letta round-trips through a server + Postgres at ~135 ms p50. Full
+artifact: [`benchmark/lambda/results/competitors.json`](../../benchmark/lambda/results/competitors.json).
+
 ## Architecture: Composable vs Monolithic
 
 Perseus Vault is a **pure memory engine** — it does one thing (persistent memory) and

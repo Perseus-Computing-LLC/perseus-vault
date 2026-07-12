@@ -163,8 +163,8 @@ the reference. [Methodology & dataset →](benchmark/temporal/README.md)
 
 | | Perseus Vault | Mem0 | Letta | Zep |
 |---|---|---|---|---|
-| **Deployment** | Single binary (~8MB) | Cloud + self-host | Docker/Postgres | Docker/Postgres |
-| **Dependencies** | None (SQLite embedded) | Python + vector DB | Postgres + Python | Postgres + Go |
+| **Deployment** | Single binary (~8MB) | Cloud + self-host | Docker/Postgres | Docker/Neo4j |
+| **Dependencies** | None (SQLite embedded) | Python + vector DB | Postgres + Python | Neo4j + Go (Graphiti) |
 | **MCP-Native** | ✅ 57 tools | ❌ Not MCP-native | ❌ Not MCP-native | ❌ Not MCP-native |
 | **Offline/Local** | ✅ Fully local | Cloud-dependent | Docker needed | Docker needed |
 | **Encryption** | AES-256-GCM ✅ | ❌ | ❌ | ❌ |
@@ -214,17 +214,29 @@ recall@5 was 0.008 while hybrid was already 1.000; keyword-only memory silently
 degrades as an agent accumulates history, hybrid (BM25 + dense + reciprocal-rank
 fusion) does not. This is the core argument for Perseus Vault's hybrid retrieval.
 
-**Head-to-head, same box, same corpus, all fully local** (1×H100, Ollama):
+**Head-to-head, same box, same corpus, all fully local** (1×H100, Ollama —
+identical fact set, queries, and substring judge for every system):
 
 | System | Recall accuracy | p50 latency | Notes |
 |---|---|---|---|
-| **Perseus Vault** (hybrid) | **1.00** | 39.5 ms | single ~8MB binary |
-| Mem0 (vector) | 0.60 | 37.5 ms | Python + vector DB |
-| Zep / Letta | — | — | server-stack (graph DB / Postgres); not in-process, not run |
+| **Perseus Vault** (hybrid) | **1.00** | 35.6 ms | single ~8MB binary, in-process |
+| Letta (archival / pgvector) | 1.00 | 135.5 ms | server + Postgres/pgvector |
+| Mem0 (vector) | 0.60 | 37.9 ms | Python + vector DB |
+| Zep (Graphiti temporal KG) | 0.20 | 49.7 ms | server + Neo4j; graph extracted by local model |
+
+Every competitor was **stood up and run live** on the same box against the same
+local Ollama (`qwen2.5:14b-instruct` + `nomic-embed-text`) — no cloud, no fabricated
+numbers. Letta ran as the `letta/letta` server (bundled Postgres/pgvector) and matched
+Perseus Vault at 1.00. Zep's self-hosted Community Edition server is deprecated and its
+`zep_python` memory API is now Zep Cloud-only, so we measured Zep's actual OSS engine —
+Graphiti temporal KG on Neo4j — with entity/edge extraction *and* embeddings on the same
+local Ollama. Its 0.20 reflects the honest cost of building a knowledge graph with a
+**local** model (structured extraction is lossy: 5 entities / 2 edges from 6 facts) — not
+Zep Cloud, which uses frontier models. Full artifact + methodology:
+[`benchmark/lambda/results/competitors.json`](benchmark/lambda/results/competitors.json).
 
 **Cold-start:** a bare GPU box reaches its **first grounded RAG answer in 3.3s**
-(models staged on disk). Zep and Letta are labeled honestly rather than assigned a
-fabricated number — they cannot run purely local in-process the way this test does.
+(models staged on disk).
 
 Reproduce: [`benchmark/lambda/scale_bench.py`](benchmark/lambda/scale_bench.py) and
 [`competitors_bench.py`](benchmark/lambda/competitors_bench.py).
