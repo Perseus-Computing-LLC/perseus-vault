@@ -1,0 +1,177 @@
+corpus: 1000000 entities in 10000 clusters x 100; 20000 queries
+  seeded 100000/1000000 (286/s)
+  seeded 200000/1000000 (267/s)
+  seeded 300000/1000000 (265/s)
+  seeded 400000/1000000 (265/s)
+  seeded 500000/1000000 (265/s)
+  seeded 600000/1000000 (265/s)
+  seeded 700000/1000000 (266/s)
+  seeded 800000/1000000 (265/s)
+  seeded 900000/1000000 (266/s)
+seeded in 3746.9s (267/s)
+persisted entities (post-dedup): 995562
+fleet-embed: 995562 entities to embed across 2 daemons (ports 11434..11435), conc=64
+  embedded 50000/995562 (176/s, 0 err)
+  embedded 100000/995562 (183/s, 0 err)
+  embedded 150000/995562 (189/s, 0 err)
+  embedded 200000/995562 (191/s, 0 err)
+  embedded 250000/995562 (193/s, 0 err)
+  embedded 300000/995562 (194/s, 0 err)
+  embedded 350000/995562 (195/s, 0 err)
+  embedded 400000/995562 (195/s, 0 err)
+  embedded 450000/995562 (195/s, 0 err)
+  embedded 500000/995562 (195/s, 0 err)
+  embedded 550000/995562 (196/s, 0 err)
+  embedded 600000/995562 (196/s, 0 err)
+  embedded 650000/995562 (196/s, 0 err)
+  embedded 700000/995562 (196/s, 0 err)
+  embedded 750000/995562 (196/s, 0 err)
+  embedded 800000/995562 (196/s, 0 err)
+  embedded 850000/995562 (196/s, 0 err)
+  embedded 900000/995562 (196/s, 0 err)
+  embedded 950000/995562 (197/s, 0 err)
+fleet-embed done: 995562 embedded, 0 errors, 5060.0s (196.8/s), dim=768
+stored embedding coverage: 995562
+warm-set: 9937/10000 clusters represented in 50000 scan; 19874 reachable queries
+
+[recall:uniform] n=2000 queries
+  fts5: @1=0.001 @5=0.001 @10=0.003  p50=60.7ms
+  dense: @1=0.262 @5=0.458 @10=0.532  p50=126.4ms
+  hybrid: @1=0.634 @5=1.0 @10=1.0  p50=479.0ms
+
+[recall:warm_set] n=2000 queries
+  fts5: @1=0.0 @5=0.003 @10=0.003  p50=59.0ms
+  dense: @1=0.248 @5=0.436 @10=0.512  p50=126.9ms
+  hybrid: @1=0.595 @5=1.0 @10=1.0  p50=486.0ms
+
+{
+  "seed": {
+    "secs": 3746.85,
+    "entities_per_sec": 266.9
+  },
+  "embedding": {
+    "mode": "fleet",
+    "n_daemons": 2,
+    "entities_embedded": 995562,
+    "secs": 5059.97,
+    "entities_per_sec": 196.8,
+    "dim": 768,
+    "backend": "nomic-embed-text (2xGPU-fleet (gpu_2x_h100_sxm5, 1M entities))",
+    "stored_coverage": 995562
+  },
+  "warm_set_info": {
+    "max_scan": 50000,
+    "clusters_in_scan": 9937,
+    "clusters_total": 10000
+  },
+  "recall@1": {
+    "uniform": {
+      "fts5": {
+        "recall": 0.001,
+        "p50_ms": 60.7,
+        "p99_ms": 315.1
+      },
+      "dense": {
+        "recall": 0.262,
+        "p50_ms": 126.4,
+        "p99_ms": 164.7
+      },
+      "hybrid": {
+        "recall": 0.634,
+        "p50_ms": 479.0,
+        "p99_ms": 915.2
+      }
+    },
+    "warm_set": {
+      "fts5": {
+        "recall": 0.0,
+        "p50_ms": 59.0,
+        "p99_ms": 307.6
+      },
+      "dense": {
+        "recall": 0.248,
+        "p50_ms": 126.9,
+        "p99_ms": 131.6
+      },
+      "hybrid": {
+        "recall": 0.595,
+        "p50_ms": 486.0,
+        "p99_ms": 896.5
+      }
+    }
+  },
+  "recall@5": {
+    "uniform": {
+      "fts5": {
+        "recall": 0.001,
+        "p50_ms": 60.7,
+        "p99_ms": 315.1
+      },
+      "dense": {
+        "recall": 0.458,
+        "p50_ms": 126.4,
+        "p99_ms": 164.7
+      },
+      "hybrid": {
+        "recall": 1.0,
+        "p50_ms": 479.0,
+        "p99_ms": 915.2
+      }
+    },
+    "warm_set": {
+      "fts5": {
+        "recall": 0.003,
+        "p50_ms": 59.0,
+        "p99_ms": 307.6
+      },
+      "dense": {
+        "recall": 0.436,
+        "p50_ms": 126.9,
+        "p99_ms": 131.6
+      },
+      "hybrid": {
+        "recall": 1.0,
+        "p50_ms": 486.0,
+        "p99_ms": 896.5
+      }
+    }
+  },
+  "recall@10": {
+    "uniform": {
+      "fts5": {
+        "recall": 0.003,
+        "p50_ms": 60.7,
+        "p99_ms": 315.1
+      },
+      "dense": {
+        "recall": 0.532,
+        "p50_ms": 126.4,
+        "p99_ms": 164.7
+      },
+      "hybrid": {
+        "recall": 1.0,
+        "p50_ms": 479.0,
+        "p99_ms": 915.2
+      }
+    },
+    "warm_set": {
+      "fts5": {
+        "recall": 0.003,
+        "p50_ms": 59.0,
+        "p99_ms": 307.6
+      },
+      "dense": {
+        "recall": 0.512,
+        "p50_ms": 126.9,
+        "p99_ms": 131.6
+      },
+      "hybrid": {
+        "recall": 1.0,
+        "p50_ms": 486.0,
+        "p99_ms": 896.5
+      }
+    }
+  }
+}
+
+written: /lambda/nfs/perseus-vault-fs-south/bench/scale1m.json
