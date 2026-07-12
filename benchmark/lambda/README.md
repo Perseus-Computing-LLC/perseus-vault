@@ -76,7 +76,7 @@ for grounded recall — reinforcing the edge/offline story.
 | `rag_bench.py` | MCP JSON-RPC driver + single-endpoint RAG smoke bench |
 | `build_report.py` | Render `results/*.json` → self-contained `results.html` |
 | `check_8x.py` / `poll_8x.sh` | Detect high-end multi-GPU capacity on Lambda |
-| `competitors_bench.py` | Same-box recall vs Mem0 / Zep / Letta (honest labeling — never fabricates a number for a stack that won't run locally) |
+| `competitors_up.sh` / `competitors_down.sh` | One-command bring-up/teardown of the competitor stacks (Letta server + Neo4j-for-Graphiti, both on host network → local Ollama, clients pip-installed, health-gated) |
 | `campaign_run.sh` | **Generic self-terminating campaign runner.** Launches a GPU box, provisions, gates, runs an arbitrary `REMOTE_CMD`, pulls `PULL_FILES`, and ALWAYS terminates (EXIT trap + deadline). |
 | `run_scale100k_durable.sh` | Durable scale run: DB + result on the persistent FS, resumable via `--skip-seed`, terminates only on a DONE marker or hard deadline (transient SSH failures are retried, never fatal) |
 | `orchestrate_campaigns.sh` | Chains campaigns back-to-back, non-overlapping |

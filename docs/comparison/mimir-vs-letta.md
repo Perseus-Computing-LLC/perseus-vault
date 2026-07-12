@@ -9,7 +9,7 @@
 | **Language** | Rust | Python |
 | **Deployment** | Single binary (~8MB) | Docker + PostgreSQL |
 | **Dependencies** | Zero (SQLite bundled) | PostgreSQL, Python runtime |
-| **MCP Tools** | 36 | 8 |
+| **MCP Tools** | 55+ | 8 |
 | **Memory Model** | Structured entities + journal + state | Agent state with blocks |
 | **Composes with** | Any agent framework | Letta agents only |
 | **Offline** | ✅ Fully local | ❌ Requires PostgreSQL |
@@ -72,7 +72,7 @@ session.
 - You're building agents with CrewAI, LangGraph, AutoGen, or raw MCP
 - You want a **single binary** with no database to manage
 - You need **encryption at rest**
-- You want **36 MCP tools** for the full memory lifecycle
+- You want **55+ MCP tools** for the full memory lifecycle
 - You need fully offline/air-gapped operation
 
 ## When to Use Letta
@@ -106,9 +106,9 @@ This is effective for Letta's agent architecture but is **tied to Letta's
 agent loop**. The memory blocks are managed by the Letta runtime, not by
 a standalone memory service.
 
-## MCP Tools: 36 vs 8
+## MCP Tools: 55+ vs 8
 
-Perseus Vault's 36 MCP tools cover the entire memory surface. Letta exposes ~8 tools
+Perseus Vault's 55+ MCP tools cover the entire memory surface. Letta exposes ~8 tools
 focused on agent state management. Perseus Vault's additional tools enable:
 
 - **mimir_correct** — structured learning from errors
@@ -123,7 +123,7 @@ focused on agent state management. Perseus Vault's additional tools enable:
 **Perseus Vault's strengths vs Letta:**
 - Composable with any framework (not locked into one agent runtime)
 - Single binary, no PostgreSQL dependency
-- 36 MCP tools vs 8
+- 55+ MCP tools vs 8
 - Encryption at rest
 - Full entity lifecycle management
 - MIT license
