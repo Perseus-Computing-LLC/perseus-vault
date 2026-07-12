@@ -1,0 +1,72 @@
+{
+  "tier": "1xH100-SXM (100k entities)",
+  "corpus": {
+    "entities": 100000,
+    "clusters": 1000,
+    "per_cluster": 100,
+    "queries": 2000
+  },
+  "summary": {
+    "seed": {
+      "skipped": true
+    },
+    "embedding": {
+      "entities_embedded": 7561,
+      "secs": 497.73,
+      "entities_per_sec": 15.2,
+      "stored_coverage": 99526,
+      "backend": "nomic-embed-text (1xH100-SXM (100k entities))"
+    },
+    "recall@1": {
+      "fts5": {
+        "recall": 0.003,
+        "p50_ms": 6.9,
+        "p99_ms": 31.5
+      },
+      "dense": {
+        "recall": 0.68,
+        "p50_ms": 63.9,
+        "p99_ms": 85.5
+      },
+      "hybrid": {
+        "recall": 0.785,
+        "p50_ms": 94.7,
+        "p99_ms": 137.0
+      }
+    },
+    "recall@5": {
+      "fts5": {
+        "recall": 0.015,
+        "p50_ms": 7.5,
+        "p99_ms": 32.1
+      },
+      "dense": {
+        "recall": 0.859,
+        "p50_ms": 61.5,
+        "p99_ms": 78.6
+      },
+      "hybrid": {
+        "recall": 1.0,
+        "p50_ms": 93.1,
+        "p99_ms": 134.7
+      }
+    },
+    "recall@10": {
+      "fts5": {
+        "recall": 0.029,
+        "p50_ms": 8.2,
+        "p99_ms": 32.9
+      },
+      "dense": {
+        "recall": 0.899,
+        "p50_ms": 62.3,
+        "p99_ms": 89.4
+      },
+      "hybrid": {
+        "recall": 1.0,
+        "p50_ms": 95.6,
+        "p99_ms": 135.2
+      }
+    }
+  }
+}
