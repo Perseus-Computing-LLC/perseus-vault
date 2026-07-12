@@ -4193,6 +4193,33 @@ impl Database {
             return Ok(Vec::new());
         }
 
+        // ── #589: optional bounded-scan pre-rank for the 1M-corpus tail ──
+        //
+        // The two-phase plan below still asks SQLite to `ORDER BY rank ASC`
+        // over the WHOLE match set before the LIMIT can discard anything, so a
+        // corpus-common term ranks O(matches) rows — the measured 20ms@100K →
+        // 196ms@1M linear shape (#589, the #511 residual). When
+        // `MIMIR_BM25_SCAN_CAP` is > 0 we cap the work: enumerate at most `cap`
+        // matched rowids WITHOUT `ORDER BY` (FTS5 returns them in docid order
+        // and early-terminates at `cap`, scoring only those), then rank that
+        // bounded candidate set in Rust. Cost becomes O(cap), not O(matches).
+        //
+        // Exactness: when the true match set is ≤ `cap`, the capped scan sees
+        // every match and the in-Rust (rank, rowid) sort reproduces the exact
+        // path's result — so a cap comfortably above typical match counts is a
+        // no-op on selective queries and only trades recall on the broad-term
+        // tail. That recall/latency trade is a dial to be measured on the
+        // GAUNTLET ladder + the coverage gate; the default is 0 (off) so this
+        // is inert until deliberately enabled. `usize::MAX`-safe: 0 short-
+        // circuits to today's behavior.
+        let scan_cap = std::env::var("MIMIR_BM25_SCAN_CAP")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        if scan_cap > 0 {
+            return self.fts5_bm25_search_capped(&conn, &fts_query, params, safe_limit, scan_cap);
+        }
+
         // ── #511: two-phase plan — rank inside the FTS index, hydrate a pool ──
         //
         // The single-query plan below (kept as the fallback) joins every FTS
@@ -4289,6 +4316,60 @@ impl Database {
             out.push(r?);
         }
         Ok(out)
+    }
+
+    /// #589: the bounded-scan variant of the sparse arm, used when
+    /// `MIMIR_BM25_SCAN_CAP` is set. Enumerates at most `scan_cap` matched
+    /// rowids in docid order (no `ORDER BY rank`, so FTS5 early-terminates and
+    /// scores only what it returns), ranks that bounded candidate set in Rust,
+    /// then hydrates + metadata-filters the top `safe_limit` via the same
+    /// `bm25_hydrate_filtered` the exact plan uses. Cost is O(scan_cap) rather
+    /// than O(matches), which is what flattens the 1M-corpus latency tail.
+    ///
+    /// Recall trade: when the true match set exceeds `scan_cap` the candidates
+    /// are the first `scan_cap` by docid, not the globally top-ranked matches,
+    /// so a broad term can miss a high-bm25 row that sorts late in docid order.
+    /// When the match set is ≤ `scan_cap` the candidates ARE the whole match
+    /// set and the result is identical to the exact plan. Callers set the dial
+    /// against the coverage gate to pick a cap that keeps recall acceptable.
+    fn fts5_bm25_search_capped(
+        &self,
+        conn: &rusqlite::Connection,
+        fts_query: &str,
+        params: &RecallParams,
+        safe_limit: usize,
+        scan_cap: usize,
+    ) -> Result<Vec<(Entity, f64)>, Box<dyn std::error::Error>> {
+        // No `ORDER BY`: FTS5 yields matches in docid order and stops after
+        // `scan_cap` rows, computing bm25() only for those. `ORDER BY rank`
+        // here would force a full-match-set scoring pass — the very cost #589
+        // removes.
+        let mut stmt = conn.prepare(
+            "SELECT rowid, bm25(entities_fts) AS rank FROM entities_fts \
+             WHERE entities_fts MATCH ?1 LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(
+            rusqlite::params![fts_query, scan_cap as i64],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?)),
+        )?;
+        let mut ranked: Vec<(i64, f64)> = Vec::with_capacity(scan_cap.min(1024));
+        for r in rows {
+            ranked.push(r?);
+        }
+        drop(stmt);
+        if ranked.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Rank the bounded candidate set exactly as the FTS index would:
+        // bm25 ascending (more negative = more relevant), rowid ascending as
+        // the deterministic tiebreak — identical ordering to the exact plan's
+        // `ORDER BY rank ASC, rowid ASC`, just over ≤ scan_cap rows.
+        ranked.sort_by(|a, b| {
+            a.1.partial_cmp(&b.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        self.bm25_hydrate_filtered(conn, &ranked, params, safe_limit)
     }
 
     /// #511 phase 2: hydrate a bm25-ranked rowid pool and apply the sparse
@@ -17830,6 +17911,98 @@ mod tests {
             );
         }
 
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn fts5_bm25_capped_scan_matches_exact_plan_when_cap_covers_matches() {
+        // #589: the bounded-scan path (MIMIR_BM25_SCAN_CAP) must be an exact
+        // no-op whenever the cap is >= the true match count — same rows, same
+        // order, same scores as the exact two-phase plan — and must never
+        // mutate access state. It is tested directly (not via the env var,
+        // which is process-global and would race the parallel test runner);
+        // the public entry point just reads that var and delegates here.
+        let (db, path) = temp_db();
+        let insert = |id: &str, body: &str| {
+            let conn = db.conn().unwrap();
+            conn.execute(
+                "INSERT INTO entities (id, category, key, body_json, type, status,
+                    retrieval_count, last_accessed_unix_ms, created_at_unix_ms,
+                    decay_score, layer, archived)
+                 VALUES (?1, 'insight', ?1, ?2, 'insight', 'active', 0, 0, 0, 1.0, 'working', 0)",
+                params![id, body],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO entities_fts (rowid, body_json)
+                 VALUES ((SELECT rowid FROM entities WHERE id = ?1), ?2)",
+                params![id, body],
+            )
+            .unwrap();
+        };
+        // 40 rows matching "orbital" with varied term frequency + body length,
+        // so bm25 produces a non-trivial ranking (not docid order).
+        for i in 0..40 {
+            let reps = "orbital ".repeat(1 + (i % 5));
+            insert(
+                &format!("row-{i:03}"),
+                &format!(r#"{{"note":"{reps}mechanics discussion number {i} with trailing prose"}}"#),
+            );
+        }
+
+        let qp = RecallParams {
+            query: "orbital".to_string(),
+            limit: 10,
+            ..RecallParams::default()
+        };
+
+        // Exact plan (cap off).
+        let exact = db.fts5_bm25_search(&qp).unwrap();
+        assert_eq!(exact.len(), 10, "sanity: exact plan returns the top 10");
+
+        // Capped plan with cap >= the full match set (40) must be identical.
+        let conn = db.conn().unwrap();
+        let fts_query = "\"orbital\"*".to_string();
+        let capped = db
+            .fts5_bm25_search_capped(&conn, &fts_query, &qp, 10, 4096)
+            .unwrap();
+        let exact_ids: Vec<&str> = exact.iter().map(|(e, _)| e.id.as_str()).collect();
+        let capped_ids: Vec<&str> = capped.iter().map(|(e, _)| e.id.as_str()).collect();
+        assert_eq!(
+            capped_ids, exact_ids,
+            "cap covering the whole match set must reproduce the exact plan's order"
+        );
+        for ((e_ex, s_ex), (e_cap, s_cap)) in exact.iter().zip(capped.iter()) {
+            assert_eq!(e_ex.id, e_cap.id);
+            assert!(
+                (s_ex - s_cap).abs() < 1e-9,
+                "scores must match exactly for {}: {s_ex} vs {s_cap}",
+                e_ex.id
+            );
+        }
+
+        // A cap far below the match set still returns <= cap valid hits (a
+        // recall trade, never a crash or an over-long result).
+        let tiny = db
+            .fts5_bm25_search_capped(&conn, &fts_query, &qp, 10, 5)
+            .unwrap();
+        assert!(
+            tiny.len() <= 5 && !tiny.is_empty(),
+            "a cap of 5 bounds the candidate set to 5, got {}",
+            tiny.len()
+        );
+
+        // Read-only: no retrieval_count mutation from either capped call.
+        let touched: i64 = conn
+            .query_row(
+                "SELECT COALESCE(SUM(retrieval_count), 0) FROM entities",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(touched, 0, "capped sparse arm must not mutate access state");
+
+        drop(conn);
         let _ = fs::remove_file(&path);
     }
 
