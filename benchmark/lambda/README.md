@@ -29,8 +29,23 @@ for vector + hybrid recall in agentic memory.
 | @10 | 0.029 | 0.899 | **1.000** |
 
 At **100K** entities the gap *widens*: hybrid is perfect @5 while keyword lands ~1.5%
-of the time — a **~66× gap**. See `results/scale_100k_distinct.json`. Same-box, fully
-local head-to-head: **Perseus Vault 1.00 vs Mem0 0.60** recall accuracy (~40ms p50).
+of the time — a **~66× gap**. See `results/scale_100k_distinct.json`.
+
+### 1c. Competitive recall — same box, same corpus, all fully local (1×H100)
+Every system stood up and run live against the same local Ollama
+(`qwen2.5:14b-instruct` + `nomic-embed-text`); identical facts, queries, substring judge.
+
+| System | Recall | p50 | Stack |
+|---|---|---|---|
+| **Perseus Vault** (hybrid) | **1.00** | 35.6 ms | single ~8MB binary, in-process |
+| Letta (archival / pgvector) | 1.00 | 135.5 ms | server + Postgres/pgvector |
+| Mem0 (vector) | 0.60 | 37.9 ms | Python + Qdrant |
+| Zep (Graphiti temporal KG) | 0.20 | 49.7 ms | server + Neo4j; KG built by local model |
+
+No fabricated numbers: Zep's deprecated CE server / Cloud-only memory API means we measure
+its real OSS engine (Graphiti on Neo4j), whose 0.20 reflects lossy *local-model* graph
+extraction, not Zep Cloud (frontier models). See `results/competitors.json` and
+`competitors_bench.py`.
 
 ### 1c. Recall by mode — 1,000,000 distinct entities (2×H100 fleet)
 | recall@k | keyword (fts5) | dense | hybrid |
@@ -54,6 +69,8 @@ and **~4.7× a single Ollama daemon's saturation ceiling (~137 eps)**. Achieved 
 load balancer (`serve_fleet.sh` / `parallel_embed_fleet.py`). Near-linear per-GPU
 scaling to ~concurrency 32-48, rolling off as request queuing dominates.
 
+> **Re-validation 2026-07-12:** 100K recall-hold re-confirmed — hybrid recall@5 = recall@10 = **1.0** (matches §1 exactly; the fleet throughput win costs no accuracy). 8×H100 had zero in-region (us-south-2) capacity across the poll window, so the largest available in-region multi-GPU (8× Tesla V100) was used as a labeled fallback: peak **432 emb/s @ conc 64** — see `results/fleet_8gpu_v100_throughput.json` and `results/fleet100k_recall.json`. The 651 emb/s figure above is the H100 headline and is **retained unrefreshed** (not overwritten with V100 data). Caveat: today the vault's own embed path (`mimir_embed`) is sequential and cannot reach these fleet rates — see [#601](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/601).
+
 ### 3. Model quality vs latency — mimir_ask grounded QA
 Both `qwen2.5:14b` and `qwen2.5:72b` scored **100% accuracy with citations** (pre-warmed).
 14B at ~2.5× lower latency. Takeaway: when retrieval is strong, a smaller model suffices
@@ -71,10 +88,11 @@ for grounded recall — reinforcing the edge/offline story.
 | `parallel_embed_fleet.py` | Aggregate embedding throughput vs concurrency across the fleet |
 | `quality_lift.py` | mimir_ask accuracy/latency across chat models (14B vs 72B) |
 | `mem0_bench.py` | Competitive: same recall task against Mem0, same box + Ollama |
+| `competitors_bench.py` | Competitive 4-way: same recall task vs Mem0, Zep (Graphiti/Neo4j) and Letta (pgvector), same box + Ollama → `results/competitors.json` |
 | `rag_bench.py` | MCP JSON-RPC driver + single-endpoint RAG smoke bench |
 | `build_report.py` | Render `results/*.json` → self-contained `results.html` |
 | `check_8x.py` / `poll_8x.sh` | Detect high-end multi-GPU capacity on Lambda |
-| `competitors_bench.py` | Same-box recall vs Mem0 / Zep / Letta (honest labeling — never fabricates a number for a stack that won't run locally) |
+| `competitors_up.sh` / `competitors_down.sh` | One-command bring-up/teardown of the competitor stacks (Letta server + Neo4j-for-Graphiti, both on host network → local Ollama, clients pip-installed, health-gated) |
 | `campaign_run.sh` | **Generic self-terminating campaign runner.** Launches a GPU box, provisions, gates, runs an arbitrary `REMOTE_CMD`, pulls `PULL_FILES`, and ALWAYS terminates (EXIT trap + deadline). |
 | `run_scale100k_durable.sh` | Durable scale run: DB + result on the persistent FS, resumable via `--skip-seed`, terminates only on a DONE marker or hard deadline (transient SSH failures are retried, never fatal) |
 | `run_scale1m_durable.sh` | Durable **1M** run: polls for a multi-GPU node in us-south-2 (prefers 8×H100), brings up the per-GPU fleet, fleet-embeds, measures uniform + warm-set recall; same DONE/deadline self-termination discipline |

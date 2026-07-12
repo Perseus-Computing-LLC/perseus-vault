@@ -6,7 +6,7 @@ Client-side round-robin across N pinned Ollama daemons (one per GPU, ports
 concurrency rises, showing how throughput scales when every GPU has its own daemon
 (vs the single-daemon ~4.7x saturation).
 """
-import json, sys, time, urllib.request, statistics, itertools
+import json, sys, time, urllib.request, statistics, itertools, subprocess
 from concurrent.futures import ThreadPoolExecutor
 
 NGPU = int(sys.argv[2]) if len(sys.argv) > 2 else 8
@@ -15,6 +15,17 @@ BASE = 11434
 MODEL = "nomic-embed-text"
 N_PER_LEVEL = 1600
 PORTS = [BASE + i for i in range(NGPU)]
+
+def gpu_name():
+    # Honest hardware label: read the actual GPU from nvidia-smi rather than assume H100.
+    try:
+        o = subprocess.run(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+                           capture_output=True, text=True, timeout=15).stdout.strip().splitlines()
+        return o[0].strip() if o and o[0].strip() else "unknown-gpu"
+    except Exception:
+        return "unknown-gpu"
+
+GPU = gpu_name()
 
 def embed(args):
     i, port = args
@@ -40,7 +51,7 @@ def run_level(conc):
             "p99_req_ms": round(sorted(lats)[int(len(lats)*0.99)] * 1000, 1)}
 
 def main():
-    out = {"tier": f"{NGPU}xH100-80GB-fleet", "n_daemons": NGPU, "model": MODEL,
+    out = {"tier": f"{NGPU}x {GPU} fleet", "gpu": GPU, "n_daemons": NGPU, "model": MODEL,
            "arch": "client round-robin across per-GPU pinned Ollama daemons", "levels": []}
     embed((0, PORTS[0]))  # warm
     for conc in (1, 2, 4, 8, 16, 32, 48, 64, 96):

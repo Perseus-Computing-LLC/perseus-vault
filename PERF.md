@@ -38,15 +38,22 @@ if the recall path ever grows GPU or lock contention, these deltas move.
 
 ### Agent economics (measured throughput × measured rental price)
 
-| Metric | 1× MI300X | 2× H100 SXM (best boot) | data_source |
-| --- | --- | --- | --- |
-| Holds Qwen2.5-72B bf16 | one card | 1 card cannot load it; 2 required | measured |
-| Concurrent 8K-token agents/card(s) | **15.3** (vLLM KV-cache ceiling) | 5.0 (eager-only, 97% util — the only config that boots) | measured |
-| GPU $/agent-hour | **$0.143** ($2.19 ÷ 15.3) | $1.68 ($8.38 ÷ 5.0) | measured |
-| Sustained output tok/s | 658 | — | measured |
-| $/1M output tokens | **$0.92** (untuned bf16) | — | measured |
+| Metric | 1× MI300X | 2× H100 SXM (best boot) | 2× A100 80GB (eager@0.97) | 8× A100 40GB | data_source |
+| --- | --- | --- | --- | --- | --- |
+| **GPUs** (count the cards before comparing) | **1** | 2 | 2 | 8 | measured |
+| Holds Qwen2.5-72B bf16 | one card | 1 card cannot load it; 2 required | 2 required | needs the pooled 320 GB | measured |
+| Concurrent 8K-token agents (vLLM KV-cache ceiling) | **15.3** | 5.0 (eager-only, 97% util — the only config that boots) | 6.37 | 57.9 (**7.2/card**) | measured |
+| GPU $/agent-hour | **$0.143** ($2.19 ÷ 15.3) | $1.68 ($8.38 ÷ 5.0) | $0.436 ($2.78 ÷ 6.37) | $0.275 ($15.92 ÷ 57.9) | measured |
+| Sustained output tok/s | 658 | — | 746 | 2,304 | measured |
+| $/1M output tokens | **$0.92** (untuned bf16) | — | ~$1.04 | $1.92 | measured |
 
-Measured-vs-measured, the MI300X's $/agent-hour advantage is **11.7×**. Scope,
+Measured-vs-measured, the MI300X's $/agent-hour advantage is **11.7×** vs the
+2× H100. A100 rows measured 2026-07-11/12 (Lambda 8× A100 40GB SXM4 $15.92/hr;
+RunPod 2× A100 80GB SXM4 $2.78/hr at the identical eager@0.97 config as the
+H100 — same model, same vLLM 0.19.1). Read the 8× row with its GPU count: its
+$0.275/agent-hr comes from **eight cards** whose 320 GB is heavily
+overprovisioned for a ~136 GB model, inflating KV headroom — per card the
+MI300X leads **15.3 vs 7.2 agents** and wins **1.9×** on $/agent-hour. Scope,
 stated plainly: untuned out-of-the-box vLLM, bf16 weights, no FP8, no
 speculative decoding — treat the MI300X numbers as a floor. Deliberately NOT
 recorded here: single-process serving-throughput floors from earlier runs

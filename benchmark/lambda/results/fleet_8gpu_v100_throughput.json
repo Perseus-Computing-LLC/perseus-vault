@@ -1,0 +1,40 @@
+{
+  "tier": "8x Tesla V100-SXM2-16GB fleet",
+  "gpu": "Tesla V100-SXM2-16GB",
+  "n_daemons": 8,
+  "model": "nomic-embed-text",
+  "arch": "client round-robin across per-GPU pinned Ollama daemons",
+  "run_date": "2026-07-12",
+  "region": "us-south-2",
+  "instance_type": "gpu_8x_v100_n (8x Tesla V100 16GB, $6.32/hr)",
+  "note": "FALLBACK RUN. gpu_8x_h100_sxm5 had zero capacity in every Lambda region across the full ~30min poll window (all 8x and 4x H100 types were also empty). The persistent FS 'perseus-vault-fs-south' is region-locked to us-south-2, so an out-of-region 4xH100 could not be used. Per the benchmark's fallback rule, ran on the largest multi-GPU available in-region = 8x Tesla V100. The prior 8xH100 headline in fleet_8gpu_throughput.json (peak 650.8 eps @ conc64, 22.76x) is RETAINED UNREFRESHED because H100 could not be obtained; this file is a separate, honestly-labeled V100 data point, not an H100 refresh.",
+  "levels": [
+    {"concurrency": 1,  "requests": 1600, "wall_secs": 238.81, "aggregate_eps": 6.7,   "p50_req_ms": 149.5, "p99_req_ms": 166.0},
+    {"concurrency": 2,  "requests": 1600, "wall_secs": 116.62, "aggregate_eps": 13.7,  "p50_req_ms": 145.3, "p99_req_ms": 161.3},
+    {"concurrency": 4,  "requests": 1600, "wall_secs": 58.23,  "aggregate_eps": 27.5,  "p50_req_ms": 144.6, "p99_req_ms": 174.2},
+    {"concurrency": 8,  "requests": 1600, "wall_secs": 30.39,  "aggregate_eps": 52.7,  "p50_req_ms": 150.1, "p99_req_ms": 182.3},
+    {"concurrency": 16, "requests": 1600, "wall_secs": 16.94,  "aggregate_eps": 94.4,  "p50_req_ms": 167.8, "p99_req_ms": 199.8},
+    {"concurrency": 32, "requests": 1600, "wall_secs": 9.51,   "aggregate_eps": 168.3, "p50_req_ms": 187.2, "p99_req_ms": 233.5},
+    {"concurrency": 48, "requests": 1600, "wall_secs": 4.5,    "aggregate_eps": 355.5, "p50_req_ms": 128.6, "p99_req_ms": 224.4},
+    {"concurrency": 64, "requests": 1600, "wall_secs": 3.7,    "aggregate_eps": 432.2, "p50_req_ms": 141.8, "p99_req_ms": 232.2},
+    {"concurrency": 96, "requests": 1600, "wall_secs": 3.71,   "aggregate_eps": 431.5, "p50_req_ms": 217.6, "p99_req_ms": 269.2}
+  ],
+  "requested_levels": [1, 8, 16, 32, 48, 64],
+  "peak_eps": 432.2,
+  "peak_concurrency": 64,
+  "scaling_vs_serial": 64.51,
+  "scaling_note": "scaling_vs_serial = peak_eps / concurrency-1 baseline (432.2 / 6.7). The ratio is large only because the V100's ~150ms single-request embed latency makes the 1-thread baseline low (6.7 eps); it is NOT a claim that V100 scales better than H100. The comparable H100 figure (22.76x) had a faster 28.6 eps 1-thread baseline. The honest scale-out signal is the near-linear rise in aggregate_eps through concurrency 48-64 as the 8 pinned daemons saturate.",
+  "recall_hold": {
+    "confirmed": true,
+    "corpus_entities": 100000,
+    "stored_coverage": 99526,
+    "queries": 2000,
+    "hybrid_recall@5": 1.0,
+    "hybrid_recall@10": 1.0,
+    "hybrid_recall@1": 0.785,
+    "dense_recall@1_5_10": [0.68, 0.859, 0.899],
+    "fts5_recall@1_5_10": [0.003, 0.015, 0.029],
+    "artifact": "fleet100k_recall.json",
+    "note": "Recall re-measured to completion on a 1xH100 against the SAME pre-embedded 100k corpus (the 8xV100 run deadlined mid-recall because V100 query-embed latency ~235ms is too slow for 2000 queries x 9 passes). Recall is hardware-independent (depends on the corpus embeddings + query-embed model, and the recall loop is sequential so a fleet does not speed it up). Numbers match the prior single-GPU scale100k.json EXACTLY, confirming fleet embedding throughput costs no accuracy: hybrid recall@5 = 1.0 at 100K."
+  }
+}

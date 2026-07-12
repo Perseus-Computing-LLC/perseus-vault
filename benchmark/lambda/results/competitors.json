@@ -1,0 +1,88 @@
+{
+  "task": "same corpus, same box, local Ollama (qwen2.5:14b + nomic-embed-text)",
+  "measured": {
+    "perseus_vault": {
+      "source": "measured",
+      "method": "hybrid recall (dense+FTS5 RRF)",
+      "recall_accuracy": 1.0,
+      "p50_latency_ms": 35.6
+    },
+    "mem0": {
+      "system": "mem0",
+      "method": "vector search",
+      "source": "measured",
+      "recall_accuracy": 0.6,
+      "p50_latency_ms": 37.9
+    },
+    "zep": {
+      "system": "zep",
+      "method": "temporal knowledge graph (Graphiti + Neo4j, local Ollama)",
+      "source": "measured",
+      "recall_accuracy": 0.2,
+      "p50_latency_ms": 49.7,
+      "graph": {
+        "entities": 5,
+        "edges": 2,
+        "episodes_seeded": 6
+      },
+      "note": "Zep's engine runs fully local, but entity/edge extraction is done by the same local Ollama model (qwen2.5:14b). Local structured extraction is lossy, so the KG is sparse and recall reflects local-model extraction quality -- not Zep Cloud (which uses frontier models). This is the honest cost of running Zep's graph approach on a fully-local, air-gapped stack."
+    },
+    "letta": {
+      "system": "letta",
+      "method": "agent memory (archival vector store)",
+      "source": "measured",
+      "recall_accuracy": 1.0,
+      "p50_latency_ms": 135.5
+    }
+  },
+  "structural": [
+    [
+      "Runs fully offline / air-gapped",
+      "Yes",
+      "No",
+      "No",
+      "No",
+      "Perseus --offline: zero network, measured FTS5 recall 1.0"
+    ],
+    [
+      "Encryption at rest (AES-256-GCM)",
+      "Yes, built-in",
+      "No",
+      "No",
+      "No",
+      "Perseus per-workspace AAD-bound encryption"
+    ],
+    [
+      "Single self-contained binary",
+      "Yes",
+      "No (Py+vec DB)",
+      "No (server+Neo4j)",
+      "No (server+Postgres)",
+      "Perseus 12MB static binary, one data file"
+    ],
+    [
+      "Zero external services to run",
+      "Yes",
+      "No",
+      "No",
+      "No",
+      "Competitors need a DB/graph/agent server process"
+    ],
+    [
+      "No account / API key required",
+      "Yes",
+      "No",
+      "No",
+      "Partial",
+      "Perseus core works with zero cloud dependency"
+    ],
+    [
+      "Bi-temporal history / audit chain",
+      "Yes",
+      "No",
+      "Partial (temporal KG)",
+      "No",
+      "Perseus transaction+valid time + tamper-evident hash chain"
+    ]
+  ]
+}

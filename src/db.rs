@@ -1247,50 +1247,104 @@ impl Database {
             // its own self-drawing get_entity/store_embedding calls — a nested
             // pool draw that deadlocks at >= pool-size concurrent embeds.
             let conn = self.conn()?;
-            let mut stmt = conn.prepare(
-                "SELECT id, body_json FROM entities WHERE category = ?1 AND archived = 0 AND embedding IS NULL LIMIT ?2",
-            )?;
-            let rows = stmt.query_map(params![cat, params.batch_limit as i64], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-            })?;
+            let rows_vec: Vec<(String, String)> = {
+                let mut stmt = conn.prepare(
+                    "SELECT id, body_json FROM entities WHERE category = ?1 AND archived = 0 AND embedding IS NULL LIMIT ?2",
+                )?;
+                let rows = stmt.query_map(params![cat, params.batch_limit as i64], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                })?;
+                rows.collect::<Result<Vec<_>, _>>()?
+            };
 
             // #592: stop hammering a persistently-failing embed backend. If the
             // endpoint rejects every request (e.g. HTTP 501 from posting the chat
             // model to /api/embed, #591/#525), a bare `embedded: 0` is
             // indistinguishable from "nothing left to embed", so a caller looping
             // "until 0 newly embedded" spins forever with the GPU idle. We now (a)
-            // abort after a run of consecutive failures with zero successes and
-            // (b) surface a distinct top-level `error`/`aborted` signal.
+            // abort after a run of failures with zero successes and (b) surface a
+            // distinct top-level `error`/`aborted` signal.
             const EMBED_FAIL_ABORT: usize = 5;
+
+            // #601: this loop used to issue ONE blocking embed request at a time,
+            // so a multi-GPU fleet (or a single daemon with spare capacity) gave
+            // zero speedup — ~15 emb/s through this path vs 432–650 emb/s raw
+            // against the same daemons. Bounded worker pool instead:
+            // PERSEUS_VAULT_EMBED_CONCURRENCY (default 4, clamped 1..=64) threads
+            // pull rows from a shared cursor and embed via the same
+            // config-snapshot backend fn the #393 background worker uses. The
+            // #397 pool discipline holds: vectors are collected first and stored
+            // afterwards on the single connection held above — no pooled conn is
+            // held across an embed call and no worker draws one.
+            let concurrency = std::env::var("PERSEUS_VAULT_EMBED_CONCURRENCY")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .map(|n| n.clamp(1, 64))
+                .unwrap_or(4)
+                .min(rows_vec.len().max(1));
+
+            use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+            let cursor = AtomicUsize::new(0);
+            let successes = AtomicUsize::new(0);
+            let failures_before_success = AtomicUsize::new(0);
+            let abort_flag = AtomicBool::new(false);
+            let collected: std::sync::Mutex<Vec<(usize, Result<Vec<f32>, String>)>> =
+                std::sync::Mutex::new(Vec::with_capacity(rows_vec.len()));
+
+            std::thread::scope(|s| {
+                for _ in 0..concurrency {
+                    let emb_cfg = self.embedding_config.clone();
+                    let llm_cfg = self.llm_config.clone();
+                    let (rows_ref, cursor, successes, failures, abort_flag, collected) =
+                        (&rows_vec, &cursor, &successes, &failures_before_success, &abort_flag, &collected);
+                    s.spawn(move || loop {
+                        if abort_flag.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        let i = cursor.fetch_add(1, Ordering::Relaxed);
+                        if i >= rows_ref.len() {
+                            break;
+                        }
+                        let out = Self::generate_embedding_backend(&emb_cfg, &llm_cfg, &rows_ref[i].1)
+                            .map_err(|e| e.to_string());
+                        match &out {
+                            Ok(_) => {
+                                successes.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Err(_) => {
+                                // Only count toward the abort threshold while NO
+                                // request has succeeded — a backend that embedded
+                                // some rows then hit transient errors should run
+                                // the batch out and report failures, not bail.
+                                if successes.load(Ordering::Relaxed) == 0
+                                    && failures.fetch_add(1, Ordering::Relaxed) + 1 >= EMBED_FAIL_ABORT
+                                {
+                                    abort_flag.store(true, Ordering::Relaxed);
+                                }
+                            }
+                        }
+                        collected.lock().unwrap().push((i, out));
+                    });
+                }
+            });
+
+            let mut results = collected.into_inner().unwrap_or_else(|p| p.into_inner());
+            results.sort_by_key(|(i, _)| *i);
+            let attempted = results.len();
             let mut embedded = 0usize;
-            let mut attempted = 0usize;
             let mut errors: Vec<String> = Vec::new();
-            let mut consecutive_failures = 0usize;
-            let mut aborted = false;
-            for row in rows {
-                let (id, body) = row?;
-                attempted += 1;
-                match self.generate_embedding_with_fallback(&body) {
+            for (i, out) in results {
+                match out {
                     Ok(vec) => {
                         // #397: reuse the connection held since the top of
                         // embed_entity — no nested pool draw.
-                        Self::store_embedding_with_conn(&conn, &id, &vec)?;
+                        Self::store_embedding_with_conn(&conn, &rows_vec[i].0, &vec)?;
                         embedded += 1;
-                        consecutive_failures = 0;
                     }
-                    Err(e) => {
-                        errors.push(format!("{}: {}", id, e));
-                        consecutive_failures += 1;
-                        // Only abort while we've made NO progress — a backend that
-                        // embedded some rows then hit a transient error should run
-                        // the batch out and report the failures, not bail early.
-                        if embedded == 0 && consecutive_failures >= EMBED_FAIL_ABORT {
-                            aborted = true;
-                            break;
-                        }
-                    }
+                    Err(e) => errors.push(format!("{}: {}", rows_vec[i].0, e)),
                 }
             }
+            let aborted = abort_flag.load(Ordering::Relaxed) && embedded == 0;
             let failed = errors.len();
             let mut result = serde_json::json!({
                 "embedded": embedded,
@@ -1310,10 +1364,10 @@ impl Database {
             if aborted {
                 result["aborted"] = serde_json::json!(true);
                 result["abort_reason"] = serde_json::json!(format!(
-                    "aborted after {} consecutive embed-backend failures with 0 successes — \
+                    "aborted after {} embed-backend failures with 0 successes — \
                      the embedding endpoint is rejecting every request (check \
                      --embedding-model-name and --embedding-endpoint). Last error: {}",
-                    consecutive_failures,
+                    failures_before_success.load(Ordering::Relaxed),
                     errors.last().map(String::as_str).unwrap_or("unknown"),
                 ));
             }
@@ -19627,6 +19681,116 @@ mod tests {
             f32::from_le_bytes(after[0..4].try_into().unwrap()),
             expected_fake_vec_first("fake-embed", body_b),
             "the repair must embed the CURRENT body"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn batch_embed_concurrent_pool_repairs_every_row_with_correct_vectors() {
+        // #601: batch embedding now runs a bounded worker pool (default 4)
+        // instead of one blocking request at a time. Correctness contract: every
+        // NULL-embedding row in the category gets embedded, and each row's
+        // vector corresponds to ITS OWN body (a shuffle across concurrent
+        // responses would silently poison dense recall).
+        let (db, path, _accepted) =
+            db_with_fake_embed_endpoint(std::time::Duration::ZERO, None);
+        let n = 12;
+        for j in 0..n {
+            let body = format!(r#"{{"content":"concurrent embed row {j}"}}"#);
+            db.remember_skip_dedup(&make_entity(&format!("ce-{j}"), "cepool", &format!("ce-{j}"), &body))
+                .unwrap();
+        }
+        // Let the auto-embed queue drain, then clear every vector so the batch
+        // path (not the write-path worker) is what repairs them.
+        assert!(db.embed_queue_flush(std::time::Duration::from_secs(30)));
+        db.conn()
+            .unwrap()
+            .execute("UPDATE entities SET embedding = NULL WHERE category = 'cepool'", [])
+            .unwrap();
+
+        let report = db
+            .embed_entity(&EmbedParams {
+                text: None,
+                category: None,
+                key: None,
+                batch_category: Some("cepool".to_string()),
+                batch_limit: 100,
+            })
+            .unwrap();
+        assert_eq!(
+            report["embedded"].as_i64().unwrap(),
+            n as i64,
+            "every cleared row must be embedded, got {report}"
+        );
+        assert_eq!(report["failed"].as_i64().unwrap(), 0, "no failures expected: {report}");
+        for j in 0..n {
+            let body = format!(r#"{{"content":"concurrent embed row {j}"}}"#);
+            let ent = db.get_entity("cepool", &format!("ce-{j}")).unwrap().unwrap();
+            let raw = raw_embedding(&db, &ent.id).expect("vector stored");
+            assert_eq!(
+                f32::from_le_bytes(raw[0..4].try_into().unwrap()),
+                expected_fake_vec_first("fake-embed", &body),
+                "row ce-{j} must carry the vector of its own body"
+            );
+        }
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn batch_embed_aborts_early_when_backend_rejects_everything() {
+        // #592 semantics preserved under the #601 concurrent pool: a backend
+        // rejecting every request aborts the batch after the failure threshold
+        // with a distinct top-level signal, instead of grinding through the
+        // whole batch (or spinning a caller looping "until 0 embedded").
+        let (mut db, path) = temp_db();
+        let missing = std::env::temp_dir()
+            .join(format!("mimir-no-model-{}", uuid::Uuid::new_v4()))
+            .join("model.onnx");
+        db.set_embedding_model(missing.to_str().unwrap());
+        // A port with nothing listening: bind then drop to reserve-and-refuse.
+        let dead_port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        db.set_llm(
+            true,
+            &format!("http://127.0.0.1:{dead_port}/api/generate"),
+            "fake-embed",
+            None,
+            Some(&format!("http://127.0.0.1:{dead_port}/api/embed")),
+            None,
+        );
+        let total = 30;
+        for j in 0..total {
+            let body = format!(r#"{{"content":"doomed row {j}"}}"#);
+            db.remember_skip_dedup(&make_entity(&format!("ab-{j}"), "abpool", &format!("ab-{j}"), &body))
+                .unwrap();
+        }
+        db.embed_queue_flush(std::time::Duration::from_secs(30));
+        db.conn()
+            .unwrap()
+            .execute("UPDATE entities SET embedding = NULL WHERE category = 'abpool'", [])
+            .unwrap();
+
+        let report = db
+            .embed_entity(&EmbedParams {
+                text: None,
+                category: None,
+                key: None,
+                batch_category: Some("abpool".to_string()),
+                batch_limit: total,
+            })
+            .unwrap();
+        assert_eq!(report["embedded"].as_i64().unwrap(), 0, "nothing can embed: {report}");
+        assert_eq!(report["aborted"].as_bool(), Some(true), "must abort loudly: {report}");
+        assert!(
+            report["abort_reason"].as_str().unwrap_or("").contains("rejecting every request"),
+            "abort_reason must diagnose the backend: {report}"
+        );
+        let attempted = report["attempted"].as_i64().unwrap();
+        assert!(
+            attempted < total as i64,
+            "abort must stop before grinding the whole batch (attempted {attempted}/{total})"
         );
         let _ = fs::remove_file(&path);
     }

@@ -9,12 +9,29 @@
 | **Language** | Rust | Python |
 | **Deployment** | Single binary (~8MB) | Docker + PostgreSQL |
 | **Dependencies** | Zero (SQLite bundled) | PostgreSQL, Python runtime |
-| **MCP Tools** | 36 | 8 |
+| **MCP Tools** | 55+ | 8 |
 | **Memory Model** | Structured entities + journal + state | Agent state with blocks |
 | **Composes with** | Any agent framework | Letta agents only |
 | **Offline** | ✅ Fully local | ❌ Requires PostgreSQL |
 | **Encryption** | AES-256-GCM | ❌ |
 | **License** | MIT | Apache 2.0 |
+
+## Measured: same-box recall (fully local)
+
+Both run on one H100 against the same local Ollama (`qwen2.5:14b-instruct` +
+`nomic-embed-text`), identical fact set / queries / substring judge:
+
+| System | Recall | p50 |
+|---|---|---|
+| **Perseus Vault** (hybrid, in-process) | **1.00** | 35.6 ms |
+| Letta (archival memory / pgvector) | 1.00 | 135.5 ms |
+
+Letta was run live as the `letta/letta` server (bundled Postgres/pgvector) pointed at
+the same local Ollama; the identical facts were seeded into archival memory and queried
+via pgvector nearest-neighbor search. Both reach 1.00 recall on this corpus — the
+difference is operational: Perseus Vault answers in-process from a single binary at
+~35 ms, while Letta round-trips through a server + Postgres at ~135 ms p50. Full
+artifact: [`benchmark/lambda/results/competitors.json`](../../benchmark/lambda/results/competitors.json).
 
 ## Architecture: Composable vs Monolithic
 
@@ -55,7 +72,7 @@ session.
 - You're building agents with CrewAI, LangGraph, AutoGen, or raw MCP
 - You want a **single binary** with no database to manage
 - You need **encryption at rest**
-- You want **36 MCP tools** for the full memory lifecycle
+- You want **55+ MCP tools** for the full memory lifecycle
 - You need fully offline/air-gapped operation
 
 ## When to Use Letta
@@ -89,9 +106,9 @@ This is effective for Letta's agent architecture but is **tied to Letta's
 agent loop**. The memory blocks are managed by the Letta runtime, not by
 a standalone memory service.
 
-## MCP Tools: 36 vs 8
+## MCP Tools: 55+ vs 8
 
-Perseus Vault's 36 MCP tools cover the entire memory surface. Letta exposes ~8 tools
+Perseus Vault's 55+ MCP tools cover the entire memory surface. Letta exposes ~8 tools
 focused on agent state management. Perseus Vault's additional tools enable:
 
 - **mimir_correct** — structured learning from errors
@@ -106,7 +123,7 @@ focused on agent state management. Perseus Vault's additional tools enable:
 **Perseus Vault's strengths vs Letta:**
 - Composable with any framework (not locked into one agent runtime)
 - Single binary, no PostgreSQL dependency
-- 36 MCP tools vs 8
+- 55+ MCP tools vs 8
 - Encryption at rest
 - Full entity lifecycle management
 - MIT license

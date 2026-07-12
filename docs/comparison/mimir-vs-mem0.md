@@ -8,13 +8,28 @@
 | **Language** | Rust | Python |
 | **Deployment** | Single binary (~8MB) | Cloud API or self-host (Python + vector DB) |
 | **Dependencies** | Zero (SQLite bundled) | Python runtime + PostgreSQL/Qdrant/Neo4j |
-| **MCP-Native** | ✅ 36 tools, full MCP | ❌ Not MCP-native |
+| **MCP-Native** | ✅ 55+ tools, full MCP | ❌ Not MCP-native |
 | **Offline/Local** | ✅ Fully local, no network | ❌ Cloud-dependent; self-host needs infra |
 | **Encryption** | AES-256-GCM at rest | ❌ |
 | **Search** | FTS5 + Dense + RRF hybrid | Vector only |
 | **Memory Model** | Structured entities with journal | Flat memory entries |
 | **License** | MIT | Apache 2.0 |
 | **Embeddings** | Optional (Ollama or OpenAI-compatible) | Required (OpenAI default) |
+
+## Measured: same-box recall (fully local)
+
+Both run on one H100 against the same local Ollama (`qwen2.5:14b-instruct` +
+`nomic-embed-text`), identical fact set / queries / substring judge:
+
+| System | Recall | p50 |
+|---|---|---|
+| **Perseus Vault** (hybrid) | **1.00** | 35.6 ms |
+| Mem0 (vector search) | 0.60 | 37.9 ms |
+
+Mem0 was run live self-hosted (Qdrant vector store) against the same local Ollama.
+On this corpus Perseus Vault's hybrid retrieval (BM25 + dense + RRF) recovers every
+fact where Mem0's vector-only search misses on intent/paraphrase queries. Full
+artifact: [`benchmark/lambda/results/competitors.json`](../../benchmark/lambda/results/competitors.json).
 
 ## When to Use Perseus Vault
 
@@ -86,9 +101,9 @@ Mem0 stores flat memory entries with metadata. No structured entity model,
 no decay lifecycle, no journal, no state management. It's a simpler model
 that works well for straightforward RAG use cases.
 
-## MCP Tools: 36 vs 5
+## MCP Tools: 55+ vs 5
 
-Perseus Vault exposes 36 MCP tools covering the full memory lifecycle:
+Perseus Vault exposes 55+ MCP tools covering the full memory lifecycle:
 
 | Category | Perseus Vault Tools |
 |---|---|

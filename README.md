@@ -14,12 +14,12 @@
 [![LangGraph](https://img.shields.io/badge/integrations-LangGraph-blue)](integrations/langgraph/)
 [![CrewAI](https://img.shields.io/badge/integrations-CrewAI-orange)](integrations/crewai/)
 [![AutoGen](https://img.shields.io/badge/integrations-AutoGen-purple)](integrations/autogen/)
-[![MCP Tools](https://img.shields.io/badge/MCP%20tools-57-brightgreen)]()
+[![MCP Tools](https://img.shields.io/badge/MCP%20tools-55%2B-brightgreen)]()
 [![Listed on mcpservers.org](https://img.shields.io/badge/listed-mcpservers.org-blue)](https://mcpservers.org/servers/perseus-computing-llc/perseus-vault)
 
 Give your agents memory that survives the session, so they stop re-deriving what they
 already learned and stop repeating past mistakes. Hybrid recall (BM25 + dense + RRF),
-bi-temporal history, and **AES-256-GCM** at rest, exposed as **57 MCP tools** that work
+bi-temporal history, and **AES-256-GCM** at rest, exposed as **55+ MCP tools** that work
 with any host. **73.6% on LongMemEval's official harness** (vs Zep 63.8%, Mem0 49.0%).
 **One binary. One file. No Docker. No Postgres. No cloud.** Local-first, air-gap ready, MIT.
 
@@ -163,9 +163,9 @@ the reference. [Methodology & dataset →](benchmark/temporal/README.md)
 
 | | Perseus Vault | Mem0 | Letta | Zep |
 |---|---|---|---|---|
-| **Deployment** | Single binary (~8MB) | Cloud + self-host | Docker/Postgres | Docker/Postgres |
-| **Dependencies** | None (SQLite embedded) | Python + vector DB | Postgres + Python | Postgres + Go |
-| **MCP-Native** | ✅ 57 tools | ❌ Not MCP-native | ❌ Not MCP-native | ❌ Not MCP-native |
+| **Deployment** | Single binary (~8MB) | Cloud + self-host | Docker/Postgres | Docker/Neo4j |
+| **Dependencies** | None (SQLite embedded) | Python + vector DB | Postgres + Python | Neo4j + Go (Graphiti) |
+| **MCP-Native** | ✅ 55+ tools | ❌ Not MCP-native | ❌ Not MCP-native | ❌ Not MCP-native |
 | **Offline/Local** | ✅ Fully local | Cloud-dependent | Docker needed | Docker needed |
 | **Encryption** | AES-256-GCM ✅ | ❌ | ❌ | ❌ |
 | **Hybrid Search** | BM25 + Dense + RRF | Vector only | Vector only | Vector + Graph |
@@ -173,7 +173,7 @@ the reference. [Methodology & dataset →](benchmark/temporal/README.md)
 | **Entity Graph** | Link + Traverse | ❌ | ❌ | ✅ |
 | **Journal Audit Trail** | ✅ Immutable | ❌ | ❌ | ❌ |
 | **State Management** | ✅ Key-value + TTL | ❌ | ❌ | ❌ |
-| **MCP Tools** | 57 | 5 | 8 | 0 |
+| **MCP Tools** | 55+ | 5 | 8 | 0 |
 | **License** | MIT | Apache 2.0 | Apache 2.0 | Apache 2.0 |
 
 [Full comparison: Perseus Vault vs Mem0 →](docs/comparison/mimir-vs-mem0.md)
@@ -214,17 +214,29 @@ recall@5 was 0.008 while hybrid was already 1.000; keyword-only memory silently
 degrades as an agent accumulates history, hybrid (BM25 + dense + reciprocal-rank
 fusion) does not. This is the core argument for Perseus Vault's hybrid retrieval.
 
-**Head-to-head, same box, same corpus, all fully local** (1×H100, Ollama):
+**Head-to-head, same box, same corpus, all fully local** (1×H100, Ollama —
+identical fact set, queries, and substring judge for every system):
 
 | System | Recall accuracy | p50 latency | Notes |
 |---|---|---|---|
-| **Perseus Vault** (hybrid) | **1.00** | 39.5 ms | single ~8MB binary |
-| Mem0 (vector) | 0.60 | 37.5 ms | Python + vector DB |
-| Zep / Letta | — | — | server-stack (graph DB / Postgres); not in-process, not run |
+| **Perseus Vault** (hybrid) | **1.00** | 35.6 ms | single ~8MB binary, in-process |
+| Letta (archival / pgvector) | 1.00 | 135.5 ms | server + Postgres/pgvector |
+| Mem0 (vector) | 0.60 | 37.9 ms | Python + vector DB |
+| Zep (Graphiti temporal KG) | 0.20 | 49.7 ms | server + Neo4j; graph extracted by local model |
+
+Every competitor was **stood up and run live** on the same box against the same
+local Ollama (`qwen2.5:14b-instruct` + `nomic-embed-text`) — no cloud, no fabricated
+numbers. Letta ran as the `letta/letta` server (bundled Postgres/pgvector) and matched
+Perseus Vault at 1.00. Zep's self-hosted Community Edition server is deprecated and its
+`zep_python` memory API is now Zep Cloud-only, so we measured Zep's actual OSS engine —
+Graphiti temporal KG on Neo4j — with entity/edge extraction *and* embeddings on the same
+local Ollama. Its 0.20 reflects the honest cost of building a knowledge graph with a
+**local** model (structured extraction is lossy: 5 entities / 2 edges from 6 facts) — not
+Zep Cloud, which uses frontier models. Full artifact + methodology:
+[`benchmark/lambda/results/competitors.json`](benchmark/lambda/results/competitors.json).
 
 **Cold-start:** a bare GPU box reaches its **first grounded RAG answer in 3.3s**
-(models staged on disk). Zep and Letta are labeled honestly rather than assigned a
-fabricated number — they cannot run purely local in-process the way this test does.
+(models staged on disk).
 
 Reproduce: [`benchmark/lambda/scale_bench.py`](benchmark/lambda/scale_bench.py) and
 [`competitors_bench.py`](benchmark/lambda/competitors_bench.py).
@@ -254,16 +266,16 @@ Each adapter:
 Any MCP-compatible framework works with Perseus Vault directly. See
 [Awesome Mimir](awesome-mimir.md) for the full list.
 
-## 57 MCP Tools
+## 55+ MCP Tools
 
 > **Tool names & the `perseus_vault_` prefix.** The tables below use the
 > historical `mimir_*` names, but by default the server now advertises each tool
 > **once**, under its canonical `perseus_vault_*` name (e.g. `perseus_vault_remember`).
 > The legacy `mimir_*` and `mneme_*` names remain fully *callable* — every prefix
 > dispatches to the same handler — they are just no longer advertised in
-> `tools/list`. This keeps the advertised manifest at 58 tools instead of 174
-> (58 × 3), so connected clients don't reload a tripled tool-schema payload on
-> every request. To restore the historical behaviour of advertising all three
+> `tools/list`. This keeps the advertised manifest to one name per tool instead
+> of tripling it (3× alias bloat), so connected clients don't reload a tripled
+> tool-schema payload on every request. To restore the historical behaviour of advertising all three
 > prefixes, set `PERSEUS_VAULT_TOOL_ALIASES=all` (the legacy env
 > `MIMIR_TOOL_ALIASES` is also honoured; `PERSEUS_VAULT_` takes precedence).
 

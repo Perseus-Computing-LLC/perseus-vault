@@ -116,8 +116,17 @@ def recall_at_k(mcp, queries, k, mode, cluster_size):
     return statistics.mean(hits), lats
 
 def pct(xs, p):
-    xs = sorted(xs); 
+    xs = sorted(xs);
     return round(xs[min(len(xs)-1, int(len(xs)*p/100))], 1) if xs else None
+
+def checkpoint(out, path):
+    """Atomically persist partial results (temp + rename). Called after every
+    completed phase/pass so an interrupted run (deadline, preemption, SSH drop)
+    keeps everything finished so far instead of losing it all (#603)."""
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(out, f, indent=2)
+    os.replace(tmp, path)
 
 def main():
     ap = argparse.ArgumentParser()
@@ -130,6 +139,8 @@ def main():
     ap.add_argument("--per-cluster", type=int, default=8)
     ap.add_argument("--tier", default="unknown", help="hardware tier label for the report")
     ap.add_argument("--out", required=True)
+    ap.add_argument("--resume", action="store_true",
+                    help="load a partial --out from an interrupted run and skip recall passes already measured")
     a = ap.parse_args()
 
     rows, queries = gen_corpus(a.clusters, a.per_cluster)
@@ -146,6 +157,17 @@ def main():
     mcp = MCP(argv)
     out = {"tier": a.tier, "corpus": {"entities": total, "clusters": a.clusters,
            "per_cluster": a.per_cluster, "queries": len(queries)}, "summary": {}}
+    if a.resume and os.path.exists(a.out):
+        try:
+            prev = json.load(open(a.out))
+            if prev.get("corpus") == out["corpus"]:
+                out["summary"] = prev.get("summary", {})
+                print(f"resume: loaded partial results from {a.out} "
+                      f"({[k for k in out['summary'] if k.startswith('recall@')]} already present)")
+            else:
+                print("resume: corpus params differ from prior partial; starting fresh")
+        except Exception as e:
+            print(f"resume: could not load prior partial ({e}); starting fresh")
     try:
         # Seed (skippable: the corpus is deterministic, so a DB already seeded by a
         # prior run can be reused -- just re-embed + measure recall).
@@ -161,6 +183,7 @@ def main():
             out["summary"]["seed"] = {"secs": round(seed_dt,2),
                                       "entities_per_sec": round(total/seed_dt,1)}
             print(f"seeded in {seed_dt:.1f}s")
+        checkpoint(out, a.out)
 
         # Embed on GPU (per cluster category). embed_entity caps each call at
         # batch_limit and only touches entities lacking an embedding, so loop per
@@ -188,10 +211,17 @@ def main():
                                        "stored_coverage": embedded_count,
                                        "backend": f"{a.embedding_model} ({a.tier})"}
         print(f"embedded {n} in {emb_dt:.1f}s ({n/emb_dt:.1f}/s), stored_coverage={embedded_count}")
+        checkpoint(out, a.out)
 
-        # Recall@k across modes
+        # Recall@k across modes — checkpointed after EVERY (k, mode) pass so an
+        # interrupted long sweep keeps each finished pass (#603). With --resume,
+        # passes already measured (no error) are skipped.
         for k in (1, 5, 10):
             for mode in ("fts5", "dense", "hybrid"):
+                done = out["summary"].get(f"recall@{k}", {}).get(mode)
+                if a.resume and done and "error" not in done:
+                    print(f"recall@{k} {mode}: already measured, skipping (resume)")
+                    continue
                 try:
                     r, lats = recall_at_k(mcp, queries, k, mode, a.per_cluster)
                     out["summary"].setdefault(f"recall@{k}", {})[mode] = {
@@ -200,9 +230,11 @@ def main():
                     print(f"recall@{k} {mode}: {r:.3f}  p50={pct(lats,50)}ms")
                 except Exception as e:
                     out["summary"].setdefault(f"recall@{k}", {})[mode] = {"error": str(e)[:200]}
+                checkpoint(out, a.out)
     finally:
         mcp.close()
-    json.dump(out, open(a.out,"w"), indent=2)
+    out["summary"]["complete"] = True
+    checkpoint(out, a.out)
     print("\n" + json.dumps(out["summary"], indent=2))
     print(f"\nwritten: {a.out}")
 

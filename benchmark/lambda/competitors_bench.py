@@ -63,7 +63,7 @@ def timed_recall(fn):
 def bench_perseus(bin_path, db, ollama):
     os.system("rm -f %s*" % db)
     m = MCP([bin_path, "serve", "--db", db,
-             "--llm-endpoint", ollama + "/api/generate", "--llm-model", "nomic-embed-text",
+             "--llm-endpoint", ollama + "/api/generate", "--llm-model", "qwen2.5:14b-instruct",
              "--embedding-endpoint", ollama + "/api/embed", "--embedding-model-name", "nomic-embed-text"])
     for i, f in enumerate(FACTS):
         m.tool("mimir_remember", {"category": "kb", "key": "f%d" % i,
@@ -104,28 +104,124 @@ def bench_mem0(ollama):
         return " ".join(str(h.get("memory", h)) if isinstance(h, dict) else str(h) for h in (hh or []))
     return {**r, **timed_recall(q)}
 
-# ---------------- Zep (community / local graphiti core) ----------------
+# ---------------- Zep (Graphiti temporal KG + Neo4j, fully local) ----------------
+# Zep's self-hosted "Community Edition" server is deprecated (getzep/zep README:
+# "Zep Community Edition is no longer supported", code moved to legacy/), and the
+# zep_python v2 `memory` API (memory.add / search_sessions) targets Zep Cloud (SaaS,
+# requires an account+API key) -- it has no self-hostable server. Zep's OSS engine
+# is Graphiti (getzep/graphiti): a temporal knowledge graph over Neo4j. THAT is what
+# runs locally, so we measure Zep's real engine here: Graphiti + Neo4j with the LLM
+# (entity/edge extraction) and embedder both pointed at the SAME local Ollama the
+# other systems use. If ZEP_API_URL/ZEP_API_KEY are set we instead exercise that
+# cloud memory path (recorded as server_unavailable when unreachable) -- never faked.
 def bench_zep(ollama):
-    r = {"system": "zep", "method": "temporal knowledge graph", "source": "measured"}
+    # Cloud path (only if the user explicitly points at a Zep server) -----------
+    if os.environ.get("ZEP_API_URL"):
+        rc = {"system": "zep", "method": "Zep Cloud memory API", "source": "measured"}
+        try:
+            from zep_python.client import Zep
+        except Exception as e:
+            return {**rc, "source": "install_failed", "error": f"import zep_python: {e}"}
+        base = os.environ["ZEP_API_URL"]
+        try:
+            client = Zep(base_url=base, api_key=os.environ.get("ZEP_API_KEY", "local"))
+            sid = "cmp"
+            client.memory.add(session_id=sid, messages=[{"role": "user", "content": f} for f in FACTS])
+        except Exception as e:
+            return {**rc, "source": "server_unavailable", "error": f"Zep server at {base} unavailable: {e}"}
+        def q(query):
+            res = client.memory.search_sessions(text=query, session_ids=[sid], limit=3)
+            return " ".join(getattr(x, "content", str(x)) for x in (getattr(res, "results", res) or []))
+        return {**rc, **timed_recall(q)}
+
+    # Local OSS path: Graphiti temporal KG on Neo4j, all inference on local Ollama.
+    r = {"system": "zep", "method": "temporal knowledge graph (Graphiti + Neo4j, local Ollama)",
+         "source": "measured"}
     try:
-        from zep_python.client import Zep  # cloud SDK; local requires a running zep server
+        import asyncio, datetime
+        from graphiti_core import Graphiti
+        from graphiti_core.nodes import EpisodeType
+        from graphiti_core.llm_client.openai_client import OpenAIClient
+        from graphiti_core.llm_client.config import LLMConfig
+        from graphiti_core.embedder.openai import OpenAIEmbedder, OpenAIEmbedderConfig
+        from graphiti_core.cross_encoder.openai_reranker_client import OpenAIRerankerClient
     except Exception as e:
         return {**r, "source": "install_failed",
-                "error": f"import zep_python: {e}. Zep OSS needs a running zep+graphiti "
-                         f"server (docker) + Neo4j; not a pure-pip local lib. Recorded as "
-                         f"not-locally-runnable rather than faking a number."}
-    base = os.environ.get("ZEP_API_URL", "http://localhost:8000")
+                "error": f"import graphiti_core: {e}. Zep's OSS engine is Graphiti; "
+                         f"pip install graphiti-core + a running Neo4j is required."}
+    neo = os.environ.get("NEO4J_URI", "bolt://localhost:7687")
+    nuser = os.environ.get("NEO4J_USER", "neo4j")
+    npass = os.environ.get("NEO4J_PASSWORD", "password123")
+    oai = ollama.rstrip("/") + "/v1"  # Ollama's OpenAI-compatible endpoint
+    llm = OpenAIClient(config=LLMConfig(api_key="ollama", base_url=oai,
+            model="qwen2.5:14b-instruct", small_model="qwen2.5:14b-instruct"))
+    emb = OpenAIEmbedder(config=OpenAIEmbedderConfig(api_key="ollama", base_url=oai,
+            embedding_model="nomic-embed-text", embedding_dim=768))
+    rer = OpenAIRerankerClient(config=LLMConfig(api_key="ollama", base_url=oai,
+            model="qwen2.5:14b-instruct", small_model="qwen2.5:14b-instruct"))
+    loop = asyncio.new_event_loop()
     try:
-        client = Zep(base_url=base, api_key=os.environ.get("ZEP_API_KEY", "local"))
-        sid = "cmp"
-        client.memory.add(session_id=sid, messages=[{"role": "user", "content": f} for f in FACTS])
+        g = Graphiti(neo, nuser, npass, llm_client=llm, embedder=emb, cross_encoder=rer)
+        loop.run_until_complete(g.build_indices_and_constraints())
+        loop.run_until_complete(g.driver.execute_query("MATCH (n) DETACH DELETE n"))  # fresh graph
+        now = datetime.datetime.now(datetime.timezone.utc)
+        for i, f in enumerate(FACTS):  # sequential add: Graphiti extracts a KG per episode
+            loop.run_until_complete(g.add_episode(name="f%d" % i, episode_body=f,
+                source=EpisodeType.text, reference_time=now, source_description="seed"))
+        ents = loop.run_until_complete(g.driver.execute_query("MATCH (n:Entity) RETURN count(n)"))
+        edges = loop.run_until_complete(g.driver.execute_query("MATCH ()-[e:RELATES_TO]->() RETURN count(e)"))
+        def _n(x):
+            try: return x.records[0][0]
+            except Exception: return x[0][0][0]
+        n_ent, n_edge = _n(ents), _n(edges)
     except Exception as e:
+        try: loop.close()
+        except Exception: pass
         return {**r, "source": "server_unavailable",
-                "error": f"Zep server at {base} unavailable: {e}"}
+                "error": f"Graphiti/Neo4j at {neo} unavailable or seed failed: {e}"}
     def q(query):
-        res = client.memory.search_sessions(text=query, session_ids=[sid], limit=3)
-        return " ".join(getattr(x, "content", str(x)) for x in (getattr(res, "results", res) or []))
-    return {**r, **timed_recall(q)}
+        res = loop.run_until_complete(g.search(query))
+        return " ".join(getattr(x, "fact", "") for x in res[:3])
+    out = {**r, **timed_recall(q)}
+    out["graph"] = {"entities": n_ent, "edges": n_edge, "episodes_seeded": len(FACTS)}
+    out["note"] = ("Zep's engine runs fully local, but entity/edge extraction is done by "
+                   "the same local Ollama model (qwen2.5:14b). Local structured extraction "
+                   "is lossy, so the KG is sparse and recall reflects local-model extraction "
+                   "quality -- not Zep Cloud (which uses frontier models). This is the honest "
+                   "cost of running Zep's graph approach on a fully-local, air-gapped stack.")
+    try: loop.run_until_complete(g.close())
+    except Exception: pass
+    return out
+
+def bench_zep_repeated(ollama, n=3):
+    """Local Graphiti entity/edge extraction is lossy AND stochastic (qwen2.5:14b),
+    so a single run is not a stable figure. Seed a fresh graph and re-measure n
+    times, reporting the mean with per-run spread, LongMemEval-harness style."""
+    if os.environ.get("ZEP_API_URL"):
+        # Cloud path reuses one session (repeat adds would duplicate the corpus)
+        # and doesn't have the local-extraction stochasticity this guards against.
+        return bench_zep(ollama)
+    runs = [bench_zep(ollama) for _ in range(max(1, n))]
+    measured = [r for r in runs if r.get("source") == "measured"]
+    if not measured:
+        return runs[-1]
+    accs = [r["recall_accuracy"] for r in measured]
+    lats = [r["p50_latency_ms"] for r in measured]
+    out = dict(measured[-1])
+    out["recall_accuracy"] = round(statistics.mean(accs), 3)
+    out["p50_latency_ms"] = round(statistics.mean(lats), 1)
+    out["runs"] = {"n": len(measured), "requested": max(1, n),
+                   "recall_per_run": accs,
+                   "recall_min": min(accs), "recall_max": max(accs),
+                   "graphs": [r.get("graph") for r in measured]}
+    failed = len(runs) - len(measured)
+    if failed:
+        out["runs"]["failed"] = failed
+        out["runs"]["last_failure"] = {k: runs[-1][k] for k in ("source", "error")
+                                       if k in runs[-1]} if runs[-1].get("source") != "measured" else None
+    if len(measured) > 1:
+        out["method"] += " — mean of %d runs" % len(measured)
+    return out
 
 # ---------------- Letta (MemGPT) ----------------
 def bench_letta(ollama):
@@ -138,20 +234,29 @@ def bench_letta(ollama):
                          f"backed by Postgres/pgvector; not an in-process lib. Recorded as "
                          f"not-locally-runnable rather than faking a number."}
     base = os.environ.get("LETTA_BASE_URL", "http://localhost:8283")
+    # Embedding handle carries Ollama's :latest tag as the server registers it.
+    emb = os.environ.get("LETTA_EMBEDDING", "ollama/nomic-embed-text:latest")
+    mdl = os.environ.get("LETTA_MODEL", "ollama/qwen2.5:14b-instruct")
     try:
         client = Letta(base_url=base)
         agent = client.agents.create(
-            memory_blocks=[], model="ollama/qwen2.5:14b-instruct",
-            embedding="ollama/nomic-embed-text")
+            memory_blocks=[], model=mdl, embedding=emb, name="cmp_letta")
+        # Seed the identical corpus into Letta's archival (pgvector) memory.
         for f in FACTS:
             client.agents.passages.create(agent_id=agent.id, text=f)
     except Exception as e:
         return {**r, "source": "server_unavailable",
                 "error": f"Letta server at {base} unavailable: {e}"}
     def q(query):
-        res = client.agents.passages.search(agent_id=agent.id, query=query, limit=3)
-        return " ".join(getattr(p, "text", str(p)) for p in (res or []))
-    return {**r, **timed_recall(q)}
+        # Archival search embeds the query (Ollama) and does a pgvector NN lookup.
+        res = client.agents.passages.search(agent_id=agent.id, query=query, top_k=3)
+        items = getattr(res, "results", res) or []
+        return " ".join((getattr(p, "content", None) or getattr(p, "text", None) or str(p))
+                        for p in items[:3])
+    out = {**r, **timed_recall(q)}
+    try: client.agents.delete(agent.id)
+    except Exception: pass
+    return out
 
 STRUCTURAL = [
     ("Runs fully offline / air-gapped", "Yes", "No", "No", "No",
@@ -179,12 +284,14 @@ def main():
     ap.add_argument("--db", default="/tmp/cmp_pv.db")
     ap.add_argument("--ollama-base", default="http://localhost:11434")
     ap.add_argument("--out-dir", default=".")
+    ap.add_argument("--zep-runs", type=int, default=3,
+                    help="repeat the Zep/Graphiti seed+recall cycle N times and report the mean (local extraction is stochastic)")
     a = ap.parse_args()
     ob = a.ollama_base
 
     print("Perseus Vault..."); pv = bench_perseus(a.bin, a.db, ob)
     print("Mem0...");          m0 = bench_mem0(ob)
-    print("Zep...");           zp = bench_zep(ob)
+    print("Zep...");           zp = bench_zep_repeated(ob, a.zep_runs)
     print("Letta...");         lt = bench_letta(ob)
 
     report = {"task": "same corpus, same box, local Ollama (qwen2.5:14b + nomic-embed-text)",
