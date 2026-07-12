@@ -1,94 +1,89 @@
-# #590: event-time supersession-aware recall tiebreak (off by default)
+# #590: knowledge-update version-inversion — diagnosis, and why recall-time reranking doesn't fix it
 
-Free (judge-free, offline) before/after for the `PERSEUS_VAULT_SUPERSEDE_RECENCY`
-arm. All numbers are LongMemEval `_s` (500), bundled ONNX embeddings, hybrid
-recall, produced by `retrieval_diag.py` + `version_inversion.py` + `cov_by_type.py`
-on the release binary. Signed reports: [`supersede_590_off_report.json`](supersede_590_off_report.json)
-(baseline, flag off) and [`supersede_590_on_report.json`](supersede_590_on_report.json)
-(flag on, quantum 0.0008). Reproduce:
+> **Correction (supersedes the first version of this file, merged in #621).**
+> The earlier draft reported the recall-time tiebreak cutting knowledge-update
+> inversion 48.7%→28.2%→19.2%. Those numbers were measured on a **pre-#618
+> base**; re-measured on current `main` the mechanism is **ineffective** (it
+> fluctuates around the baseline). This file records the corrected, honest
+> result: a confirmed diagnosis + a measured negative result for recall-time
+> reranking, pointing the fix to ingest time.
 
-```bash
-# baseline
-python benchmark/longmemeval/retrieval_diag.py --data longmemeval_s_cleaned.json \
-  --bin target/release/perseus-vault --k 50 --journal off.jsonl --out off.json
-python benchmark/longmemeval/version_inversion.py --data longmemeval_s_cleaned.json --journal off.jsonl --k 10
-# arm on
-PERSEUS_VAULT_SUPERSEDE_RECENCY=1 python benchmark/longmemeval/retrieval_diag.py \
-  --data longmemeval_s_cleaned.json --bin target/release/perseus-vault --k 50 --journal on.jsonl --out on.json
-python benchmark/longmemeval/version_inversion.py --data longmemeval_s_cleaned.json --journal on.jsonl --k 10
-```
+Free (judge-free, offline) investigation of the knowledge-update ordering
+problem, on the LongMemEval `_s` knowledge-update slice (78 questions), release
+binary, bundled ONNX embeddings; no API key, no network.
 
-## The problem (confirmed offline)
+## Confirmed diagnosis (order, not recall)
 
-Knowledge-update questions ask for the **latest** value of a fact that recurs across several sessions with different values ("what is my current rent?", "my personal-best 5K time?"). Hybrid recall ranks by relevance and carries no recency signal, so the *stale* version frequently ranks at or above the *update* — the answerer is fed the outdated value and picks wrong.
+`version_inversion.py` on the 78 knowledge-update questions, top-10:
 
-I reproduced this with a new free diagnostic (`version_inversion.py`, already in the repo for #590): among knowledge-update questions whose gold evidence spans ≥2 dated sessions, how often the earlier ("stale") gold ranks at/above the later ("update") gold within top-k. **Recall is not the issue** — knowledge-update coverage@10 is ~97% (the gold sessions are almost always retrieved); the failure is *order*.
+| metric | value |
+|---|--:|
+| coverage@10 (gold retrieved) | 97.4% |
+| **version-inversion rate** (stale ranked ≥ update in top-10) | **~42–46%** (≈33–40/78) |
 
-Baseline (main, `PERSEUS_VAULT_SUPERSEDE_RECENCY` unset), LongMemEval `_s` knowledge-update slice (78 q), top-10:
+Recall is fine — the gold sessions are almost always retrieved; the *update* is
+just ordered at/below the *stale* version, so the answerer is fed the wrong
+value. (The raw count varies ±2–3 run-to-run; this exact-order metric is
+tie-sensitive.)
 
-```
-version-bearing (≥2 dated gold): 78
-stale ranked above update:       40
-→ inversion rate:                51.3%
-```
+The `#235` recency arm is inert here: the benchmark ingests every session at one
+`created_at` instant, so it can't separate versions. The discriminating signal
+is the **event date** in the body (`session date:`), which the prototype parses
+at recall time (`entity_event_date_key`).
 
-The existing #235 recency arm can't fix this: it keys on `created_at`, which is uniform for a bulk-ingested corpus (the whole LongMemEval haystack shares one ingest instant). The discriminating signal is the **event date** (`session date:` in the body; `created_at`/valid-time in real deployments).
+## Negative result: three recall-time mechanisms, none effective (current `main`)
 
-## The change
+All are OFF by default; all leave coverage@5/@10/@20 unchanged (94.9 / 97.4 /
+100.0 on the slice — regression-free). Inversion count out of 78, top-10:
 
-An **off-by-default** post-fusion tiebreak (`PERSEUS_VAULT_SUPERSEDE_RECENCY=1`):
+| mechanism | signal | OFF | on (swept) |
+|---|---|--:|--|
+| score-bucket near-tie tiebreak | RRF-score proximity | 33 | 35 / 40 / 36 / 34 / 36 (q=4e-4…6e-3) |
+| content cluster (union-find) | trigram similarity | 35 | 35 / 33 / 37 / 40 (sim 0.20…0.45) |
+| semantic cluster (union-find) | embedding cosine | 35 | 33 / 36 / 36 / 37 / 35 (cos 0.40…0.75) |
 
-1. Parse an **event date** per candidate — a `session date:` line, or a structured `date`/`valid_from`/`event_date` field in `body_json`. No parseable date ⇒ the candidate sinks within its bucket (never promoted); it never falls back to `created_at`.
-2. **Quantize** fused scores into near-tie buckets (`floor(score / quantum)`, `PERSEUS_VAULT_SUPERSEDE_QUANTUM`, default 0.0008).
-3. Sort by `(bucket desc, event-date desc, id asc)` — a valid total order. **Across** buckets relevance still dominates (a clearly more relevant hit is never displaced by a newer but weaker one, so strongly-ranked gold is preserved); **within** a near-tie bucket the later-dated version wins. Stale and update versions of the same fact score near-identically, so they land in the same bucket — exactly where the tiebreak fires.
+**None pushes inversion reliably below the ~33–40 baseline band; several land
+above it.** Why each fails on this benchmark:
 
-When the flag is unset, recall is byte-identical to prior behavior (the signed `run.py` / `retrieval_diag.py` signatures are unchanged), so the repo's determinism guarantee (#310) is intact.
+- **Clustering (content or embedding).** A fact's versions are *different
+  conversations* that each update one value — they share almost no content and
+  only weak embedding similarity, so union-find on either signal barely links
+  the true version pairs (fires on <1–2 questions even at very low thresholds).
+- **Score-bucket near-tie.** The tiebreak can only reorder candidates in the
+  same quantized score bucket. On current-`main` fusion the stale/update gold
+  usually do *not* share a bucket, so it reorders *unrelated* near-ties by date
+  — adding noise. (A pre-#618 build did show a clean reduction; #618's retrieval
+  changes moved the gold out of shared buckets and it vanished — a caution
+  against depending on incidental score proximity.)
 
-## Free before/after — knowledge-update inversion vs. quantum (78 q, top-10)
+Root cause: **recall-time reranking must *infer* which candidates are versions
+of the same fact, and on this benchmark there is no reliable recall-time signal
+to infer it from** (not content, not embedding, not score proximity).
 
-| quantum | inversions | rate | KU cov@5 | cov@10 | cov@20 | KU hard-miss |
-|--------:|-----------:|-----:|---------:|-------:|-------:|-------------:|
-| OFF (main) | 40 | 51.3% | 94.9% | 97.4% | 100% | 0 |
-| 0.0004 | 22 | 28.2% | 94.9% | 97.4% | 100% | 0 |
-| 0.0008 | 14 | 19.2% | 93.6% | 97.4% | 100% | 0 |
-| 0.0016 | 13 | 16.7% | 92.3% | 98.7% | 100% | 0 |
-| 0.0030 | 5 | 6.4% | 94.9% | 98.7% | 98.7% | 1 |
-| 0.0060 | 3 | 6.4% | 92.3% | 93.6% | 98.7% | 2 |
+## Recommendation: fix at ingest time (the issue author's flagged plan)
 
-At the default **0.0004** the inversion rate is nearly halved (**51.3% → 28.2%**) with **zero** change to knowledge-update coverage@k. Larger quanta drive inversions lower still, at a small and measurable coverage cost (0.0060 is clearly too aggressive — it starts dropping gold out of top-10).
+Versions should be *known*, not guessed:
 
-## Free before/after — general coverage ladder (full 500, k=50)
+1. **Engine** — `mimir_remember` accepts an explicit valid-time; recall exposes
+   it as a ranking signal (`entity_event_date_key` / `parse_event_date_key` here
+   are a first step).
+2. **Harness** — pass each session's `session date:` as that valid-time.
+3. **Version linking** — link same-fact/same-key sessions through the existing
+   supersede / bitemporal machinery (#363/#472) so "latest wins" is a lookup,
+   not an inference. (LongMemEval sessions carry unique keys and aren't
+   pre-linked, so a benchmark harness must also assign a shared key per fact —
+   the grouping problem that defeats the recall-time approaches, moved to where
+   the ground truth exists.)
 
-Baseline (`main`, flag off) is `0 hard-misses@50`, ALL-coverage `@5 87.4 / @10 94.6 / @20 97.6 / @30 99.0 / @50 100`. The tiebreak's effect on the general ladder, per quantum:
+## What ships / stays
 
-| metric | OFF | q0004 | q0008 (default) | q0030 |
-|---|--:|--:|--:|--:|
-| **KU version-inversion** (top-10) | 48.7% | 28.2% | **19.2%** | 6.4% |
-| all-types version-inversion (top-10) | 54.9% | 43.8% | 23.8% | 8.6% |
-| ALL coverage@5 | 87.4% | 86.6% | 86.2% | 83.2% |
-| ALL coverage@10 | 94.6% | 94.6% | **94.6%** | 93.8% |
-| ALL coverage@20 | 97.6% | 97.6% | **97.6%** | 96.8% |
-| ALL coverage@30 | 97.6→99.0% | 99.0% | 99.0% | 98.8% |
-| ALL coverage@50 | 100% | 100% | 100% | 100% |
-| hard-miss@50 | 0 | 0 | 0 | 0 |
+- `version_inversion.py` (diagnostic; #593) + `cov_by_type.py` (per-type
+  coverage@k) — reusable free-gate tooling.
+- `entity_event_date_key` / `parse_event_date_key` — event-date extraction the
+  ingest-time fix reuses.
+- `supersede_reorder` (off by default, `PERSEUS_VAULT_SUPERSEDE_RECENCY`) — kept
+  as a documented, measured dead-end and fallback; `main` behavior is
+  byte-identical when unset (signed signatures intact, #310).
 
-**At the default quantum 0.0008 the knowledge-update inversion rate drops 48.7% → 19.2% (−61%) and the all-types rate 54.9% → 23.8%, while coverage@10 / @20 / @30 / @50 are byte-for-byte unchanged.** The only cost is top-5 ordering: ALL coverage@5 dips 1.2pt (multi-session @5 81.2→78.9, single-session-preference @5 93.3→86.7 = 2 of 30). Since the product config retrieves k=10, the metric that matters is untouched.
-
-- **0.0004** is the most conservative setting: −0.8pt @5, everything else identical, KU inversion still down 42%.
-- **0.0030** cuts inversion hardest (KU 6.4%) but regresses the general ladder (multi-session @5 −9.8pt; @10/@20 slip ~1pt) — past the useful frontier.
-
-Default is **0.0008**; deployments that want zero @10-and-deeper movement AND minimal @5 movement can set 0.0004.
-
-## Named cases (from #590) — honest scope note
-
-On the **current** `main` binary both named cases are *already* correctly ordered (update ranked above stale): `852ce960` update@1/stale@2, `6a1eabeb` update@1/stale@3. So the specific two QA flips in the issue are not reproducible as retrieval inversions on today's engine (the #590 report predates recent retrieval changes). The phenomenon is nonetheless real and material in aggregate: **40 of 78** knowledge-update questions still rank a stale version at/above the update within top-10. This change targets that aggregate, not those two ids.
-
-## What's verified vs. deferred
-
-- **Verified free:** inversion-rate reduction + coverage-ladder non-regression (offline, judge-free, no API cost).
-- **Deferred to the paid pass:** whether the reduced inversion translates into QA accuracy on the knowledge-update slice (toward the full-context 89%), via `qa.py` with the pinned gpt-4o answerer+judge. Consolidated with #588 into a single metered run.
-
-## Productionization notes (beyond this prototype)
-
-- Move the flag/quantum from env to config (`recency.supersede`) alongside the #235 `recency_half_life_secs` arm.
-- For non-benchmark corpora, extend event-date extraction to real valid-time / `created_at` when versions are genuinely time-stamped, and tie into the existing supersede/bitemporal machinery (#363/#472) so in-corpus version links are explicit rather than inferred from score proximity.
+Signed current-`main` slice reports: [`supersede_590_off_report.json`](supersede_590_off_report.json),
+[`supersede_590_on_report.json`](supersede_590_on_report.json).

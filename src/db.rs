@@ -3663,17 +3663,28 @@ impl Database {
     /// scores are quantized, and *within* a near-tie bucket the later-dated
     /// entity wins. Across buckets, relevance still dominates — a clearly more
     /// relevant hit is never displaced by a newer but weaker one — so coverage
-    /// of strongly-ranked gold is preserved. Stale and update versions of the
-    /// same fact score near-identically (same topic, same entities), so they
-    /// land in the same bucket, which is exactly where the recency tiebreak
-    /// applies. Entities with no parseable event date sink within their bucket
-    /// (never promoted).
+    /// of strongly-ranked gold is preserved. Entities with no parseable event
+    /// date sink within their bucket (never promoted).
+    ///
+    /// MEASURED DEAD-END (kept off-by-default; see SUPERSEDE_590.md). On the
+    /// current-`main` LongMemEval knowledge-update slice this does NOT reliably
+    /// reduce the version-inversion rate — it fluctuates around the ~33–40/78
+    /// baseline. The reason: a fact's versions here are different conversations
+    /// updating one value, so they are neither content/embedding-similar (two
+    /// clustering variants also failed) NOR reliably in the same score bucket,
+    /// so the tiebreak can't identify them and reorders unrelated near-ties
+    /// instead. (An earlier build on a pre-#618 base showed a clean reduction;
+    /// the #618 retrieval changes moved the gold out of shared buckets and it
+    /// vanished.) The effective fix belongs at INGEST time — plumb a valid-time
+    /// via `mimir_remember` and link same-fact versions through the supersede/
+    /// bitemporal machinery (#363/#472) so versions are known, not inferred.
+    /// Retained as a documented fallback + the reusable `entity_event_date_key`.
     ///
     /// OFF by default — a no-op unless `PERSEUS_VAULT_SUPERSEDE_RECENCY` is set
     /// to `1`/`true`/`on`, so recall stays byte-identical to prior behavior.
-    /// The bucket width is tunable via `PERSEUS_VAULT_SUPERSEDE_QUANTUM`
-    /// (default 0.0008, ~2–3 adjacent RRF ranks). Read-only: ordering only, no
-    /// access-state writes — hybrid recall stays idempotent (#247).
+    /// Bucket width tunable via `PERSEUS_VAULT_SUPERSEDE_QUANTUM` (conservative
+    /// default 0.0004). Read-only: ordering only — hybrid recall stays
+    /// idempotent (#247).
     fn apply_supersede_recency(fused: Vec<(Entity, f64)>) -> Vec<(Entity, f64)> {
         if fused.len() < 2 || !supersede_recency_enabled() {
             return fused;
@@ -3682,7 +3693,7 @@ impl Database {
             .ok()
             .and_then(|s| s.parse::<f64>().ok())
             .filter(|q| *q > 0.0)
-            .unwrap_or(0.0008);
+            .unwrap_or(0.0004);
         supersede_reorder(fused, quantum)
     }
 
