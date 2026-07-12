@@ -10552,6 +10552,16 @@ pub fn expand_query(query: &str) -> Vec<String> {
         out.push(format!("{} {}", query, extra.join(" ")));
     }
 
+    // (4) temporal residue: for a relative-date question ("… two weeks ago"),
+    // strip the temporal phrase + interrogative scaffolding to the topical
+    // residue ("gardening activity"), so the dated evidence session enters the
+    // candidate pool — the date-aware arm then boosts the in-window one to the
+    // front (the oracle's residue+window recipe). Only fires when a relative-
+    // date expression is present.
+    if let Some(res) = temporal_residue(query) {
+        out.push(res);
+    }
+
     // dedup (case-insensitive), drop the original, cap fan-out at 4 (per #588:
     // the original stays up-weighted, expansions are capped to bound dilution).
     let mut seen = std::collections::HashSet::new();
@@ -10603,6 +10613,32 @@ fn aggregation_core(ql: &str) -> Option<String> {
         None
     } else {
         Some(core.to_string())
+    }
+}
+
+/// #588: topical residue of a relative-date question — the content tokens with
+/// the temporal phrase, interrogative scaffolding, and number/unit words
+/// removed. None unless the query carries a relative-date expression.
+fn temporal_residue(query: &str) -> Option<String> {
+    let ql = query.to_lowercase();
+    parse_relative_offset_days(&ql)?;
+    let drop: std::collections::HashSet<&str> = [
+        "what", "which", "when", "did", "do", "does", "i", "the", "a", "an", "in", "on",
+        "over", "past", "last", "ago", "my", "was", "were",
+        "one", "two", "three", "four", "five", "six", "seven", "couple",
+        "day", "days", "week", "weeks", "month", "months", "year", "years",
+    ]
+    .into_iter()
+    .collect();
+    let toks: Vec<&str> = ql
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty() && !drop.contains(w) && w.parse::<i64>().is_err())
+        .collect();
+    let residue = toks.join(" ");
+    if residue.len() >= 3 {
+        Some(residue)
+    } else {
+        None
     }
 }
 
@@ -10707,7 +10743,7 @@ fn query_anchor_days() -> Option<i64> {
 /// Parse a relative-date expression ("two weeks ago", "3 days ago", "last
 /// month", "in the past two months") into an offset in DAYS before the anchor.
 /// Returns None when the query has no such expression.
-fn parse_relative_offset_days(ql: &str) -> Option<i64> {
+fn parse_relative_offset_days(ql: &str) -> Option<(i64, i64)> {
     let num = |w: &str| -> Option<i64> {
         match w {
             "a" | "an" | "one" | "last" => Some(1),
@@ -10737,7 +10773,9 @@ fn parse_relative_offset_days(ql: &str) -> Option<i64> {
                 || (i >= 2 && toks[i - 2] == "past")
                 || (i >= 1 && toks[i - 1] == "last");
             if has_ago {
-                return Some(n.unwrap_or(1) * ud);
+                // (offset in days, unit granularity in days) — the caller scales
+                // the match window to the unit ("weeks ago" tolerates ±days).
+                return Some((n.unwrap_or(1) * ud, ud));
             }
         }
     }
@@ -10760,15 +10798,18 @@ pub fn apply_date_window(
         Some(a) => a,
         None => return fused,
     };
-    let offset = match parse_relative_offset_days(&query.to_lowercase()) {
+    let (offset, unit_days) = match parse_relative_offset_days(&query.to_lowercase()) {
         Some(o) => o,
         None => return fused,
     };
+    // Match tolerance scales to the temporal unit: "days ago" is precise,
+    // "weeks/months ago" is coarse. Clamp to [2, 10] days so a "months/years"
+    // unit can't over-boost. Overridable via PERSEUS_VAULT_DATE_WINDOW.
     let window: i64 = std::env::var("PERSEUS_VAULT_DATE_WINDOW")
         .ok()
         .and_then(|s| s.parse::<i64>().ok())
         .filter(|w| *w >= 0)
-        .unwrap_or(3);
+        .unwrap_or_else(|| unit_days.clamp(2, 10));
     let target = anchor - offset;
     let (mut in_win, mut rest): (Vec<_>, Vec<_>) = (Vec::new(), Vec::new());
     for (e, s) in fused.into_iter() {
@@ -11354,11 +11395,16 @@ mod tests {
 
     #[test]
     fn parse_relative_offset_days_variants() {
-        assert_eq!(super::parse_relative_offset_days("what did i do two weeks ago"), Some(14));
-        assert_eq!(super::parse_relative_offset_days("gardening 3 days ago"), Some(3));
-        assert_eq!(super::parse_relative_offset_days("in the past two months"), Some(60));
-        assert_eq!(super::parse_relative_offset_days("what happened last week"), Some(7));
+        assert_eq!(super::parse_relative_offset_days("what did i do two weeks ago"), Some((14, 7)));
+        assert_eq!(super::parse_relative_offset_days("gardening 3 days ago"), Some((3, 1)));
+        assert_eq!(super::parse_relative_offset_days("in the past two months"), Some((60, 30)));
+        assert_eq!(super::parse_relative_offset_days("what happened last week"), Some((7, 7)));
         assert_eq!(super::parse_relative_offset_days("what is my favorite color"), None);
+        // temporal residue strips the date phrase + scaffolding to the topic.
+        assert_eq!(
+            super::temporal_residue("What gardening-related activity did I do two weeks ago?").as_deref(),
+            Some("gardening related activity"));
+        assert_eq!(super::temporal_residue("what is my favorite color"), None);
     }
 
     #[test]
