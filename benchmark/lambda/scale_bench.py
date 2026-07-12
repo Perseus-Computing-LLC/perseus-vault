@@ -124,12 +124,11 @@ def main():
     ap.add_argument("--bin", required=True); ap.add_argument("--db", required=True)
     ap.add_argument("--llm-endpoint", required=True); ap.add_argument("--llm-model", required=True)
     ap.add_argument("--embedding-endpoint", required=True); ap.add_argument("--embedding-model", required=True)
+    ap.add_argument("--skip-seed", action="store_true",
+                    help="reuse entities already in --db (deterministic corpus); skip the remember phase")
     ap.add_argument("--clusters", type=int, default=200)
     ap.add_argument("--per-cluster", type=int, default=8)
     ap.add_argument("--tier", default="unknown", help="hardware tier label for the report")
-    ap.add_argument("--skip-seed", action="store_true",
-                    help="DB is already seeded (deterministic corpus) — skip the "
-                         "reseed and go straight to embed/query (#591)")
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
 
@@ -137,22 +136,21 @@ def main():
     total = len(rows)
     print(f"corpus: {total} entities in {a.clusters} clusters x {a.per_cluster}; {len(queries)} queries")
 
-    # #591: pass --embedding-model-name so the binary posts the EMBED model (not
-    # the chat model) to /api/embed. Without it Ollama rejects every request with
-    # HTTP 501 and the embed loop spins forever at 0 coverage. rag_bench.py /
-    # compare_matrix.py already pass it; scale_bench.py predated the #525 fix.
     argv = [a.bin, "serve", "--db", a.db,
             "--llm-endpoint", a.llm_endpoint, "--llm-model", a.llm_model,
             "--embedding-endpoint", a.embedding_endpoint,
+            # CRITICAL (#525): without --embedding-model-name the binary POSTs the
+            # CHAT model to /api/embed, which Ollama rejects with HTTP 501 and the
+            # embed loop spins forever at 0 coverage. Pin the real embed model.
             "--embedding-model-name", a.embedding_model]
     mcp = MCP(argv)
     out = {"tier": a.tier, "corpus": {"entities": total, "clusters": a.clusters,
            "per_cluster": a.per_cluster, "queries": len(queries)}, "summary": {}}
     try:
-        # Seed (skippable when the deterministic corpus is already in the DB —
-        # avoids a ~44-min reseed just to re-embed after fixing the embed model).
+        # Seed (skippable: the corpus is deterministic, so a DB already seeded by a
+        # prior run can be reused -- just re-embed + measure recall).
         if a.skip_seed:
-            print("skip-seed: reusing the already-seeded DB")
+            print("skip-seed: reusing entities already in DB")
             out["summary"]["seed"] = {"skipped": True}
         else:
             t0 = time.time()
