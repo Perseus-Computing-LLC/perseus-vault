@@ -278,6 +278,15 @@ Any MCP-compatible framework works with Perseus Vault directly. See
 > tool-schema payload on every request. To restore the historical behaviour of advertising all three
 > prefixes, set `PERSEUS_VAULT_TOOL_ALIASES=all` (the legacy env
 > `MIMIR_TOOL_ALIASES` is also honoured; `PERSEUS_VAULT_` takes precedence).
+>
+> **Client compatibility (#633).** Clients that *gate on the advertised list* —
+> they check `tools/list` before calling and skip tools they don't see — will
+> silently skip legacy `mimir_*` calls against a 2.x vault even though the call
+> itself would succeed. Known case: the `perseus` CLI **≤ 1.0.22** hard-codes
+> `mimir_recall` and degrades to empty local-only recall. Fix either side:
+> upgrade the CLI to **≥ 1.0.23** (calls canonical names, with dynamic
+> fallback), or set `PERSEUS_VAULT_TOOL_ALIASES=all` on the vault as a bridge
+> while older clients remain deployed.
 
 ### Entity CRUD
 | Tool | Description |
