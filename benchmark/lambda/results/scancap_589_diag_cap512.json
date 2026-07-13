@@ -1,0 +1,54 @@
+{
+  "benchmark": "perseus-vault-longmemeval-retrieval-coverage",
+  "metric": "gold-evidence coverage@k (offline, judge-free)",
+  "dataset": "longmemeval_s_subset100.json",
+  "split": "longmemeval_s",
+  "split_size": 100,
+  "n_instances": 100,
+  "n_scored": 100,
+  "retrieval": {
+    "mode": "hybrid",
+    "k": 50,
+    "trust_weight": 0,
+    "min_decay": 0
+  },
+  "coverage_at_k": {
+    "@5": 0.88,
+    "@10": 0.95,
+    "@20": 0.96,
+    "@30": 0.97,
+    "@50": 1.0
+  },
+  "k_recoverable": [
+    {
+      "question_id": "10d9b85a",
+      "worst_rank": 18,
+      "question_type": "multi-session"
+    },
+    {
+      "question_id": "gpt4_1e4a8aec",
+      "worst_rank": 22,
+      "question_type": "temporal-reasoning"
+    },
+    {
+      "question_id": "gpt4_4929293b",
+      "worst_rank": 39,
+      "question_type": "temporal-reasoning"
+    },
+    {
+      "question_id": "gpt4_e061b84g",
+      "worst_rank": 43,
+      "question_type": "temporal-reasoning"
+    },
+    {
+      "question_id": "6d550036",
+      "worst_rank": 44,
+      "question_type": "multi-session"
+    }
+  ],
+  "hard_misses": [],
+  "binary": "perseus-vault",
+  "platform": "Linux-6.8.0-60-generic-x86_64-with-glibc2.35",
+  "offline": true,
+  "signature_sha256": "d9533cce4894689e601ab9ddb1d5794eee145d9abd58d6cae080f458815a13d0"
+}

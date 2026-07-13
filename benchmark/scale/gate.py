@@ -53,6 +53,30 @@ DEFAULT_BUDGETS = {
         "TEMPORAL_RECALL_P99_MS": 50,      # measured 13.3
         "COLD_START_MS": 500,              # measured 54.7 @ ~890MB
     },
+    # 1M rung (#589). Keyword/hybrid latency budgets carry the corpus-scaling
+    # MEASURED on the #589 Lambda A10 run (benchmark/lambda/results/, 2026-07-12):
+    # broad-term keyword search is inherently ~5-6x slower at 1M than 100K — the
+    # UNPATCHED fts5 path scales the same way (broad p95 67ms@100K -> 396ms@1M),
+    # so this is FTS5 posting-list growth, not a regression. The two-phase sparse
+    # arm's ADDED O(matches) superlinearity (the #511 residual: broad p50
+    # 181ms@100K -> 2699ms@1M, ~15x) is what MIMIR_BM25_SCAN_CAP bounds: at
+    # cap=2048 the 1M broad-term sparse p50 drops to ~450ms (~5x, i.e. down to the
+    # inherent FTS floor), exact whenever the match set <= cap. The cap is OFF by
+    # default (opt-in dial, #617); these budgets therefore reflect the shipped
+    # cap=0 behavior with generous headroom. write/as_of/temporal/cold_start are
+    # EXTRAPOLATED from the 100K row (sublinear write degradation, ~10x data for
+    # cold start) pending a full scale-harness 1M load (~40h at 46 docs/s — see
+    # the #476 write-path note); tighten once that run exists.
+    1_000_000: {
+        "WRITE_DOCS_PER_SEC": 8,           # extrapolated from 46@100K (sublinear)
+        "WRITE_LAST10_DOCS_PER_SEC": 4,    # extrapolated from 21@100K
+        "FTS5_P99_MS": 900,                # measured broad fts5 p95 ~396ms @1M + headroom
+        "DENSE_P99_MS": 500,               # extrapolated: sig-prefilter ~linear in embedded rows
+        "HYBRID_P99_MS": 1500,             # cap=0 broad-tail dominated; opt-in cap bounds sparse arm
+        "AS_OF_P99_MS": 5,                 # point lookup — flat across scale
+        "TEMPORAL_RECALL_P99_MS": 100,     # extrapolated from 13.3@100K
+        "COLD_START_MS": 2000,             # extrapolated: ~10x data (~9GB)
+    },
 }
 
 
