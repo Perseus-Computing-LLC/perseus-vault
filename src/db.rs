@@ -3811,6 +3811,40 @@ impl Database {
         Ok(results)
     }
 
+    pub fn recall_batch(
+        &self,
+        queries: &[RecallParams],
+        limit: usize,
+    ) -> Result<Vec<(Entity, f64)>, Box<dyn std::error::Error>> {
+        if queries.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut all_results = Vec::new();
+        for params in queries {
+            let entities = self.recall(params)?;
+            let scored: Vec<(Entity, f64)> = entities.into_iter().map(|e| (e, 1.0)).collect();
+            all_results.push((scored, params.recency_half_life_secs));
+        }
+
+        let (mut fused, mut last_half_life) = all_results[0].clone();
+        for (next_res, next_half_life) in all_results.into_iter().skip(1) {
+            let half_life = next_half_life.or(last_half_life);
+            fused = crate::db::reciprocal_rank_fusion(
+                &fused,
+                &next_res,
+                60.0,
+                limit,
+                1.0,
+                half_life,
+                crate::db::now_ms(),
+            );
+            last_half_life = half_life;
+        }
+
+        Ok(fused)
+    }
+
     /// #485: does this params combination activate scope-preference widening?
     /// Requires an explicit `scope_weight` AND a non-empty workspace to
     /// prefer — a global ('') caller already IS the broader scope, so

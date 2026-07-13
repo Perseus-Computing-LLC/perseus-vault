@@ -714,6 +714,175 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Recall Entities"
   },
   {
+    "name": "mimir_recall_batch",
+    "description": "Recall entities across a batch of queries, fusing their results server-side using reciprocal rank fusion (RRF) to merge, deduplicate, and surface the most globally relevant memories first.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "queries": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "query": {
+                "type": "string",
+                "description": "Search query — words are OR'd together for broad recall. An EMPTY string (\"\") is the match-all / enumeration path."
+              },
+              "category": {
+                "type": "string",
+                "description": "Filter by category, e.g. 'decision' or 'architecture'"
+              },
+              "type": {
+                "type": "string",
+                "description": "Filter by entity type, e.g. 'insight' or 'reference'"
+              },
+              "limit": {
+                "type": "integer",
+                "default": 10,
+                "description": "Maximum number of results to return (max 1000)"
+              },
+              "offset": {
+                "type": "integer",
+                "default": 0,
+                "description": "Number of results to skip for pagination"
+              },
+              "min_decay": {
+                "type": "number",
+                "default": 0.0,
+                "description": "Minimum decay score threshold 0.0–1.0 — higher values return fresher results"
+              },
+              "topic_path": {
+                "type": "string",
+                "description": "Filter by topic path prefix, e.g. 'architecture/'"
+              },
+              "mode": {
+                "type": "string",
+                "default": "fts5",
+                "description": "Search mode: 'fts5' (keyword), 'dense' (vector), or 'hybrid' (fused via RRF)",
+                "enum": [
+                  "fts5",
+                  "dense",
+                  "hybrid"
+                ]
+              },
+              "include_archived": {
+                "type": "boolean",
+                "default": false,
+                "description": "Include archived (soft-deleted) entities in results"
+              },
+              "include_confidence": {
+                "type": "boolean",
+                "default": false,
+                "description": "Add a normalized confidence score (0.0-1.0) to each result, rolled up from rank, trust (verified/certainty), and decay. Presentation-only; does not change ranking."
+              },
+              "reinforce": {
+                "type": "boolean",
+                "default": false,
+                "description": "Opt-in reinforcement for mode='dense'/'hybrid': bump retrieval_count/last_accessed/decay on the returned hits so semantically-used memories resist decay."
+              },
+              "preview_cap": {
+                "type": "integer",
+                "description": "If set, truncate body_json at N chars and append drill-down footer."
+              },
+              "content_weight": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1,
+                "default": 0,
+                "description": "Additive boost for content witness — rewards entities whose body text literally contains query terms."
+              },
+              "trust_weight": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1,
+                "default": 0.15,
+                "description": "Additive boost for provenance/trust (default 0.15, on by default)."
+              },
+              "diversity_halving": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1,
+                "default": 1,
+                "description": "Per-keyword diversity quota factor (1.0=disabled)."
+              },
+              "recency_half_life_secs": {
+                "type": "number",
+                "minimum": 0,
+                "description": "Time-aware ranking for mode='hybrid' (default off)."
+              },
+              "workspace_hash": {
+                "type": "string",
+                "description": "Workspace scope filter."
+              },
+              "scope_weight": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1,
+                "description": "#485: scope as a ranking multiplier instead of a hard filter."
+              },
+              "agent_id": {
+                "type": "string",
+                "description": "Agent identity filter."
+              },
+              "layer": {
+                "type": "string",
+                "description": "Filter by memory layer (world, episodic, semantic)."
+              },
+              "as_of_unix_ms": {
+                "type": "integer",
+                "description": "Temporal RAG transaction-time."
+              },
+              "valid_at": {
+                "type": "integer",
+                "description": "Valid-time instant."
+              },
+              "valid_from_unix_ms": {
+                "type": "integer",
+                "description": "Valid-time period filter start."
+              },
+              "valid_to_unix_ms": {
+                "type": "integer",
+                "description": "Valid-time period filter end."
+              },
+              "valid_op": {
+                "type": "string",
+                "default": "overlaps",
+                "enum": ["overlaps", "contains"],
+                "description": "SQL:2011 period predicate for valid-time period filter."
+              }
+            },
+            "required": [
+              "query"
+            ]
+          }
+        }
+      },
+      "required": [
+        "queries"
+      ]
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "items": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          },
+          "description": "Matching entities fused from batch queries with expanded body_json fields at top level"
+        },
+        "total": {
+          "type": "integer",
+          "description": "Number of results returned"
+        }
+      }
+    },
+    "annotations": {
+      "readOnlyHint": true
+    },
+    "title": "Recall Entities Batch"
+  },
+  {
     "name": "mimir_recall_layer",
     "description": "Recall entities from a specific biomimetic memory layer (world, episodic, semantic).",
     "inputSchema": {
@@ -4059,6 +4228,8 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
         "mimir_remember" => tools::handle_remember(db, args).map_err(|e| e.to_string()),
 
         "mimir_recall" => tools::handle_recall(db, args).map_err(|e| e.to_string()),
+
+        "mimir_recall_batch" => tools::handle_recall_batch(db, args).map_err(|e| e.to_string()),
 
         "mimir_recall_layer" => tools::handle_recall_layer(db, args).map_err(|e| e.to_string()),
 
