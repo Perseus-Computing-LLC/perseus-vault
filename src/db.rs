@@ -4269,7 +4269,7 @@ impl Database {
         let rows = stmt.query_map(params![fts_query, (max as i64) + 1], |r| {
             r.get::<_, i64>(0)
         })?;
-        let mut out: Vec<i64> = Vec::new();
+        let mut out: Vec<i64> = Vec::with_capacity(max + 1);
         for r in rows {
             out.push(r?);
             if out.len() > max {
@@ -4304,11 +4304,11 @@ impl Database {
         let enc = self.encryption.as_ref();
         let rows = stmt.query_map(param_refs.as_slice(), |row| entity_from_row(row, enc))?;
 
-        let mut items = Vec::new();
+        let mut items = Vec::with_capacity(params.limit.max(0) as usize);
         // #207: collect matched ids and apply retrieval-count/recency/decay/layer
         // side-effects in one batched UPDATE after the loop, instead of one
         // write per returned row on this read-mostly hot path.
-        let mut hit_ids: Vec<String> = Vec::new();
+        let mut hit_ids: Vec<String> = Vec::with_capacity(params.limit.max(0) as usize);
         for row in rows {
             let mut entity = row?;
             if !params.skip_side_effects {
