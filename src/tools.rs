@@ -266,6 +266,13 @@ pub struct RecallArgs {
     pub valid_op: String,
 }
 
+pub type BatchQuery = RecallArgs;
+
+#[derive(Debug, Deserialize)]
+pub struct RecallBatchArgs {
+    pub queries: Vec<BatchQuery>,
+}
+
 /// #363: post-search valid-time filter shared by the plain and expansion
 /// recall paths. Applied AFTER ranking/limit, so it only ever narrows the
 /// result set (no re-ranking): callers that never pass valid-time filters get
@@ -931,6 +938,143 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
 
     if a.include_confidence {
         apply_confidence(&mut items_expanded, &entities);
+    }
+
+    let result = json!({
+        "items": items_expanded,
+        "total": items_expanded.len(),
+    });
+    Ok(result.to_string())
+}
+
+pub fn handle_recall_batch(db: &Database, args: Value) -> Result<String, String> {
+    let a: RecallBatchArgs =
+        serde_json::from_value(args).map_err(|e| format!("Invalid recall batch arguments: {}", e))?;
+
+    if a.queries.is_empty() {
+        return Ok(json!({
+            "items": Vec::<serde_json::Value>::new(),
+            "total": 0,
+        }).to_string());
+    }
+
+    // Validate valid_op and scope_weight for all queries
+    for q in &a.queries {
+        match q.valid_op.as_str() {
+            "" | "overlaps" | "contains" => {}
+            other => {
+                return Err(format!(
+                    "Invalid valid_op '{other}': expected 'overlaps' or 'contains'"
+                ))
+            }
+        }
+
+        if let Some(w) = q.scope_weight {
+            if !w.is_finite() || !(0.0..=1.0).contains(&w) {
+                return Err(format!(
+                    "scope_weight must be between 0.0 and 1.0, got {w}"
+                ));
+            }
+            if q.workspace_hash.as_deref().map_or(true, |ws| ws.is_empty()) {
+                return Err(
+                    "scope_weight requires a non-empty workspace_hash (the scope to prefer)"
+                        .to_string(),
+                );
+            }
+        }
+    }
+
+    let limit = a.queries.iter().map(|q| q.limit).max().unwrap_or(10) as usize;
+
+    // Run each query and apply temporal filtering if needed, then collect them for pairwise fusion
+    let mut all_results = Vec::new();
+    for q in &a.queries {
+        let mode = match q.mode.as_str() {
+            "dense" => SearchMode::Dense,
+            "hybrid" => SearchMode::Hybrid,
+            "fts5" => SearchMode::Fts5,
+            "" => {
+                if db.embedding_enabled() && db.embedding_coverage() > 0 {
+                    SearchMode::Hybrid
+                } else {
+                    SearchMode::Fts5
+                }
+            }
+            _ => SearchMode::Fts5,
+        };
+
+        let temporal_filtering =
+            q.valid_at.is_some() || q.valid_from_unix_ms.is_some() || q.valid_to_unix_ms.is_some() || q.as_of_unix_ms.is_some();
+
+        let params = RecallParams {
+            query: q.query.clone(),
+            category: q.category.clone(),
+            entity_type: q.entity_type.clone(),
+            limit: q.limit,
+            offset: q.offset,
+            min_decay: q.min_decay,
+            topic_path: q.topic_path.clone(),
+            include_archived: q.include_archived,
+            skip_side_effects: temporal_filtering,
+            mode,
+            embedding: None,
+            preview_cap: q.preview_cap,
+            always_on: q.always_on,
+            content_weight: q.content_weight,
+            trust_weight: q.trust_weight,
+            diversity_halving: q.diversity_halving,
+            diversity_per_query_share: 0.0,
+            recency_half_life_secs: q.recency_half_life_secs,
+            workspace_hash: q.workspace_hash.clone(),
+            scope_weight: q.scope_weight,
+            agent_id: q.agent_id.clone(),
+            visibility: None,
+            layer: q.layer.as_deref().filter(|s| !s.is_empty()).map(canonical_layer),
+            reinforce: q.reinforce,
+        };
+
+        let mut entities = db
+            .recall(&params)
+            .map_err(|e| format!("Recall failed: {}", e))?;
+
+        if temporal_filtering {
+            if q.as_of_unix_ms.is_some() || q.valid_at.is_some() {
+                let _ = temporal_resolve(db, q.as_of_unix_ms, q.valid_at, &mut entities)?;
+            } else {
+                valid_time_retain(db, None, q.valid_from_unix_ms, q.valid_to_unix_ms, &q.valid_op, &mut entities)?;
+            }
+        }
+
+        let scored: Vec<(Entity, f64)> = entities.into_iter().map(|e| (e, 1.0)).collect();
+        all_results.push((scored, q.recency_half_life_secs));
+    }
+
+    // Fuse pairwise
+    let (mut fused, mut last_half_life) = all_results[0].clone();
+    for (next_res, next_half_life) in all_results.into_iter().skip(1) {
+        let half_life = next_half_life.or(last_half_life);
+        fused = crate::db::reciprocal_rank_fusion(
+            &fused,
+            &next_res,
+            60.0,
+            limit,
+            1.0,
+            half_life,
+            crate::db::now_ms(),
+        );
+        last_half_life = half_life;
+    }
+
+    let mut items_expanded: Vec<serde_json::Value> = Vec::new();
+    let entities_only: Vec<Entity> = fused.iter().map(|(e, _)| e.clone()).collect();
+    for (entity, _score) in &fused {
+        items_expanded.push(entity.to_json_expanded());
+    }
+
+    // Apply confidence if requested by the first query
+    let include_confidence = a.queries.first().map_or(false, |q| q.include_confidence);
+    if include_confidence {
+        apply_confidence(&mut items_expanded, &entities_only);
     }
 
     let result = json!({
@@ -6624,6 +6768,49 @@ mod tests {
             json!({"category": "facts", "key": "normal-key", "body_json": "{\"a\":1}"}),
         )
         .expect("normally-sized remember must succeed");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_handle_recall_batch() {
+        let (db, path) = temp_db();
+
+        handle_remember(
+            &db,
+            json!({"category": "facts", "key": "key-alpha", "body_json": "{\"content\": \"rust compilation speed and cargo build systems\"}"}),
+        ).unwrap();
+
+        handle_remember(
+            &db,
+            json!({"category": "facts", "key": "key-beta", "body_json": "{\"content\": \"speeding up rust build pipelines using sccache\"}"}),
+        ).unwrap();
+
+        handle_remember(
+            &db,
+            json!({"category": "facts", "key": "key-gamma", "body_json": "{\"content\": \"python interpreter runtime optimizations\"}"}),
+        ).unwrap();
+
+        let empty_res = handle_recall_batch(&db, json!({"queries": []})).unwrap();
+        let empty_val: Value = serde_json::from_str(&empty_res).unwrap();
+        assert_eq!(empty_val["total"], json!(0));
+        assert!(empty_val["items"].as_array().unwrap().is_empty());
+
+        let res = handle_recall_batch(
+            &db,
+            json!({
+                "queries": [
+                    {"query": "rust", "category": "facts", "limit": 10},
+                    {"query": "sccache", "category": "facts", "limit": 10}
+                ]
+            }),
+        ).unwrap();
+
+        let val: Value = serde_json::from_str(&res).unwrap();
+        assert!(val["total"].as_i64().unwrap() >= 2);
+        let items = val["items"].as_array().unwrap();
+        assert_eq!(items[0]["key"], "key-beta");
+        assert_eq!(items[1]["key"], "key-alpha");
+
         let _ = std::fs::remove_file(&path);
     }
 }
