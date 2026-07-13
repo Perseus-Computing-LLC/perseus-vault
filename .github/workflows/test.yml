@@ -31,8 +31,8 @@ jobs:
         run: |
           mkdir -p .model-cache
           base=https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main
-          [ -s .model-cache/model_qint8_avx512_vnni.onnx ] || curl -fL "$base/onnx/model_qint8_avx512_vnni.onnx" -o .model-cache/model_qint8_avx512_vnni.onnx
-          [ -s .model-cache/tokenizer.json ] || curl -fL "$base/tokenizer.json" -o .model-cache/tokenizer.json
+          [ -s .model-cache/model_qint8_avx512_vnni.onnx ] || curl -fL --retry 5 --retry-all-errors "$base/onnx/model_qint8_avx512_vnni.onnx" -o .model-cache/model_qint8_avx512_vnni.onnx
+          [ -s .model-cache/tokenizer.json ] || curl -fL --retry 5 --retry-all-errors "$base/tokenizer.json" -o .model-cache/tokenizer.json
           # build.rs looks for these exact names:
           cp .model-cache/model_qint8_avx512_vnni.onnx .model-cache/model_quantized.onnx
       - name: Build
@@ -59,8 +59,8 @@ jobs:
         run: |
           mkdir -p .model-cache
           base=https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main
-          [ -s .model-cache/model_qint8_avx512_vnni.onnx ] || curl -fL "$base/onnx/model_qint8_avx512_vnni.onnx" -o .model-cache/model_qint8_avx512_vnni.onnx
-          [ -s .model-cache/tokenizer.json ] || curl -fL "$base/tokenizer.json" -o .model-cache/tokenizer.json
+          [ -s .model-cache/model_qint8_avx512_vnni.onnx ] || curl -fL --retry 5 --retry-all-errors "$base/onnx/model_qint8_avx512_vnni.onnx" -o .model-cache/model_qint8_avx512_vnni.onnx
+          [ -s .model-cache/tokenizer.json ] || curl -fL --retry 5 --retry-all-errors "$base/tokenizer.json" -o .model-cache/tokenizer.json
           cp .model-cache/model_qint8_avx512_vnni.onnx .model-cache/model_quantized.onnx
       - name: Build
         run: cargo build --verbose
@@ -87,8 +87,8 @@ jobs:
         run: |
           mkdir -p .model-cache
           base=https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main
-          [ -s .model-cache/model_qint8_avx512_vnni.onnx ] || curl -fL "$base/onnx/model_qint8_avx512_vnni.onnx" -o .model-cache/model_qint8_avx512_vnni.onnx
-          [ -s .model-cache/tokenizer.json ] || curl -fL "$base/tokenizer.json" -o .model-cache/tokenizer.json
+          [ -s .model-cache/model_qint8_avx512_vnni.onnx ] || curl -fL --retry 5 --retry-all-errors "$base/onnx/model_qint8_avx512_vnni.onnx" -o .model-cache/model_qint8_avx512_vnni.onnx
+          [ -s .model-cache/tokenizer.json ] || curl -fL --retry 5 --retry-all-errors "$base/tokenizer.json" -o .model-cache/tokenizer.json
           cp .model-cache/model_qint8_avx512_vnni.onnx .model-cache/model_quantized.onnx
       - name: Build
         run: cargo build --verbose
@@ -119,8 +119,8 @@ jobs:
         run: |
           mkdir -p .model-cache
           base=https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main
-          [ -s .model-cache/model_qint8_avx512_vnni.onnx ] || curl -fL "$base/onnx/model_qint8_avx512_vnni.onnx" -o .model-cache/model_qint8_avx512_vnni.onnx
-          [ -s .model-cache/tokenizer.json ] || curl -fL "$base/tokenizer.json" -o .model-cache/tokenizer.json
+          [ -s .model-cache/model_qint8_avx512_vnni.onnx ] || curl -fL --retry 5 --retry-all-errors "$base/onnx/model_qint8_avx512_vnni.onnx" -o .model-cache/model_qint8_avx512_vnni.onnx
+          [ -s .model-cache/tokenizer.json ] || curl -fL --retry 5 --retry-all-errors "$base/tokenizer.json" -o .model-cache/tokenizer.json
           cp .model-cache/model_qint8_avx512_vnni.onnx .model-cache/model_quantized.onnx
       - name: Confirm host glibc is < 2.38
         run: ldd --version | head -1

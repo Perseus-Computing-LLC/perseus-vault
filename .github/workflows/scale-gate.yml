@@ -30,6 +30,9 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # build.rs reads the bundled embedding model from here instead of hitting
+  # HuggingFace (#649: an HF CDN 403 outage failed every uncached build job).
+  MIMIR_BUNDLED_MODEL_DIR: ${{ github.workspace }}/.model-cache
 
 jobs:
   scale-gate:
@@ -39,6 +42,19 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+      - name: Cache embedding model
+        uses: actions/cache@v4
+        with:
+          path: .model-cache
+          key: minilm-l6-v2-qint8-v1
+      - name: Fetch embedding model (if not cached)
+        shell: bash
+        run: |
+          mkdir -p .model-cache
+          base=https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main
+          [ -s .model-cache/model_qint8_avx512_vnni.onnx ] || curl -fL --retry 5 --retry-all-errors "$base/onnx/model_qint8_avx512_vnni.onnx" -o .model-cache/model_qint8_avx512_vnni.onnx
+          [ -s .model-cache/tokenizer.json ] || curl -fL --retry 5 --retry-all-errors "$base/tokenizer.json" -o .model-cache/tokenizer.json
+          cp .model-cache/model_qint8_avx512_vnni.onnx .model-cache/model_quantized.onnx
       - name: Build (release, full — the dense path needs the embedding stack)
         run: cargo build --release
       - name: Set up Python

@@ -115,6 +115,7 @@ pub mod grpc {
                     follow_rate: 0.0,
                     efficacy_status: "unverified".to_string(),
                     embedding: None,
+                    _parsed_body: None,
                 };
                 let (id, action) = db.remember(&entity)?;
                 Ok(Response::new(RememberResponse { id, action, category: entity.category, key: entity.key }))
@@ -627,6 +628,7 @@ pub mod grpc {
                 follow_rate: 0.0,
                 efficacy_status: "unverified".to_string(),
                 embedding: None,
+                _parsed_body: None,
             };
             let p = entity_to_proto(&e);
             assert_eq!(p.id, "ent-1");
