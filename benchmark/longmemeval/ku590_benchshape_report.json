@@ -1,0 +1,47 @@
+{
+  "benchmark": "perseus-vault-longmemeval-retrieval-coverage",
+  "metric": "gold-evidence coverage@k (offline, judge-free)",
+  "dataset": "longmemeval_s_cleaned.json",
+  "split": "longmemeval_s",
+  "split_size": 500,
+  "n_instances": 78,
+  "n_scored": 78,
+  "retrieval": {
+    "mode": "hybrid",
+    "k": 50,
+    "trust_weight": 0,
+    "min_decay": 0
+  },
+  "ingest_shape": "unique-key-per-session (benchmark)",
+  "coverage_at_k": {
+    "@5": 0.9487,
+    "@10": 0.9744,
+    "@20": 1.0,
+    "@30": 1.0,
+    "@50": 1.0
+  },
+  "coverage_latest_at_k": {
+    "@5": 0.9615,
+    "@10": 1.0,
+    "@20": 1.0,
+    "@30": 1.0,
+    "@50": 1.0
+  },
+  "k_recoverable": [
+    {
+      "question_id": "0977f2af",
+      "worst_rank": 12,
+      "question_type": "knowledge-update"
+    },
+    {
+      "question_id": "2698e78f_abs",
+      "worst_rank": 13,
+      "question_type": "knowledge-update"
+    }
+  ],
+  "hard_misses": [],
+  "binary": "perseus-vault.exe",
+  "platform": "Windows-11-10.0.26200-SP0",
+  "offline": true,
+  "signature_sha256": "0e7aad0fbd849d73c9e04a3e43e160620eea968bbb83eab0672a8930e5eff5cf"
+}
