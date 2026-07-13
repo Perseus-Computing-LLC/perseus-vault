@@ -693,6 +693,7 @@ pub fn handle_remember(db: &Database, args: Value) -> Result<String, String> {
         follow_rate: 0.0,
         efficacy_status: "unverified".to_string(),
         embedding: None,
+        _parsed_body: None,
     };
 
     // #363: half-open [valid_from, valid_to) must be a real interval.
@@ -2341,6 +2342,7 @@ pub fn handle_capture(db: &Database, args: Value) -> Result<String, String> {
             follow_rate: 0.0,
             efficacy_status: "unverified".to_string(),
             embedding: None,
+            _parsed_body: None,
         };
 
         let (eid, action) = if a.dry_run {
@@ -2879,6 +2881,7 @@ pub fn handle_ingest_file(db: &Database, args: Value) -> Result<String, String> 
         follow_rate: 0.0,
         efficacy_status: "unverified".to_string(),
         embedding: None,
+        _parsed_body: None,
     };
     let (eid, action) = db
         .remember(&entity)
@@ -3825,6 +3828,7 @@ fn memories_write(
                 follow_rate: 0.0,
                 efficacy_status: "unverified".to_string(),
                 embedding: None,
+                _parsed_body: None,
             }
         }
     };

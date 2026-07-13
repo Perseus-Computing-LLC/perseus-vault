@@ -990,6 +990,7 @@ impl Database {
                             follow_rate: 0.0,
                             efficacy_status: "unverified".to_string(),
                             embedding: None,
+                            _parsed_body: None,
                         };
                         match self.remember(&entity) {
                             Ok(_) => ingested += 1,
@@ -7146,6 +7147,7 @@ impl Database {
                     follow_rate: 0.0,
                     efficacy_status: "unverified".to_string(),
                     embedding: None,
+                    _parsed_body: None,
                     created_at_unix_ms: now,
                     last_accessed_unix_ms: now,
                 };
@@ -7504,6 +7506,7 @@ impl Database {
                             follow_rate: 0.0,
                             efficacy_status: "unverified".to_string(),
                             embedding: None,
+                            _parsed_body: None,
                             created_at_unix_ms: now,
                             last_accessed_unix_ms: now,
                         };
@@ -8747,6 +8750,7 @@ last_accessed: {}
                 follow_rate: 0.0,
                 efficacy_status: "unverified".to_string(),
                 embedding: None,
+                _parsed_body: None,
             };
 
             match self.remember(&entity) {
@@ -9516,6 +9520,7 @@ last_accessed: {}
                 follow_rate: 0.0,
                 efficacy_status: "unverified".to_string(),
                 embedding: None,
+                _parsed_body: None,
                 created_at_unix_ms: now,
                 last_accessed_unix_ms: now,
             };
@@ -9815,6 +9820,7 @@ last_accessed: {}
             follow_rate: 0.0,
             efficacy_status: "unverified".to_string(),
             embedding: None,
+            _parsed_body: None,
             created_at_unix_ms: now,
             last_accessed_unix_ms: now,
         };
@@ -9965,6 +9971,7 @@ If no clear lessons found, return: {{"lessons": []}}"#,
                 follow_rate: 0.0,
                 efficacy_status: "unverified".to_string(),
                 embedding: None,
+                _parsed_body: None,
                 created_at_unix_ms: now,
                 last_accessed_unix_ms: now,
             };
@@ -10041,7 +10048,7 @@ If no clear lessons found, return: {{"lessons": []}}"#,
             miss_count: 0,
             follow_rate: 0.0,
             efficacy_status: "unverified".to_string(),
-            embedding: None, created_at_unix_ms: now,
+            embedding: None, _parsed_body: None, created_at_unix_ms: now,
             last_accessed_unix_ms: now,
         };
         self.remember(&entity)?;
@@ -11424,6 +11431,8 @@ fn entity_from_row(
         raw_body_json
     };
 
+    let parsed_body: Option<serde_json::Value> = serde_json::from_str(&body_json).ok();
+
     Ok(Entity {
         id: row.get(0)?,
         category: row.get(1)?,
@@ -11456,6 +11465,7 @@ fn entity_from_row(
             .unwrap_or(None)
             .unwrap_or_else(|| "unverified".to_string()),
         embedding: None,
+        _parsed_body: parsed_body,
     })
 }
 
@@ -11511,6 +11521,7 @@ mod tests {
             follow_rate: 0.0,
             efficacy_status: "unverified".to_string(),
             embedding: None,
+            _parsed_body: None,
         }
     }
 

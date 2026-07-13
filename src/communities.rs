@@ -846,6 +846,7 @@ impl Database {
             follow_rate: 0.0,
             efficacy_status: "unverified".to_string(),
             embedding: None,
+            _parsed_body: None,
         };
         // skip_dedup: the key IS the community id — a near-duplicate summary
         // for a different community must never merge into this key.
@@ -1085,6 +1086,7 @@ mod tests {
             follow_rate: 0.0,
             efficacy_status: "unverified".to_string(),
             embedding: None,
+            _parsed_body: None,
         };
         db.remember_skip_dedup(&entity).expect("remember");
     }

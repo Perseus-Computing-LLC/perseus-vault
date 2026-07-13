@@ -67,14 +67,17 @@ pub struct Entity {
     #[serde(skip)]
     #[allow(dead_code)]
     pub embedding: Option<Vec<f32>>,
+    #[serde(skip, default)]
+    pub _parsed_body: Option<serde_json::Value>,
 }
 
 impl Entity {
     pub fn to_json_expanded(&self) -> serde_json::Value {
         let mut val = serde_json::to_value(self).unwrap_or_else(|_| serde_json::json!({}));
-        if let Ok(serde_json::Value::Object(map)) =
-            serde_json::from_str::<serde_json::Value>(&self.body_json)
-        {
+        let body_val = self._parsed_body.as_ref().cloned().or_else(|| {
+            serde_json::from_str::<serde_json::Value>(&self.body_json).ok()
+        });
+        if let Some(serde_json::Value::Object(map)) = body_val {
             if let Some(obj) = val.as_object_mut() {
                 for (k, v) in map {
                     if k != "id" && k != "category" && k != "key" && k != "body_json" && k != "type"

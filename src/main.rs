@@ -2461,6 +2461,7 @@ fn main() {
                 follow_rate: 0.0,
                 efficacy_status: "unverified".to_string(),
                 embedding: None,
+                _parsed_body: None,
             };
 
             match database.remember(&entity) {
