@@ -17,7 +17,7 @@ This script demonstrates both behaviors on a real knowledge-update instance:
         --bin ../../target/release/perseus-vault.exe --id 852ce960
 """
 from __future__ import annotations
-import argparse, json, os, sys
+import argparse, json, os, re, sys
 from datetime import datetime
 from pathlib import Path
 
@@ -27,11 +27,13 @@ from run import MimirServer, session_text, find_binary  # noqa: E402
 
 
 def to_ms(datestr):
-    # LongMemEval date: "2023/08/11 (Fri) 00:01"
+    # LongMemEval date: "2023/08/11 (Fri) 00:01" — keep the time-of-day so
+    # same-day updates still order correctly.
+    s = re.sub(r"\s*\([^)]*\)\s*", " ", datestr).strip()
     try:
-        d = datetime.strptime(datestr.split(" (")[0], "%Y/%m/%d %H:%M")
+        d = datetime.strptime(s, "%Y/%m/%d %H:%M")
     except ValueError:
-        d = datetime.strptime(datestr.split(" ")[0], "%Y/%m/%d")
+        d = datetime.strptime(s.split(" ")[0], "%Y/%m/%d")
     return int(d.timestamp() * 1000)
 
 
