@@ -17,8 +17,10 @@ Exit 0 on pass, 1 on failure. Usage: python benchmark/recall/gate.py [--bin PATH
 import argparse
 import json
 import os
+import sqlite3
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -53,8 +55,13 @@ def find_binary(explicit):
 
 class Mimir:
     def __init__(self, binary, db):
+        # Capture stderr (#632): the binary reports embedding-backend failures
+        # there (rate-limited), so a gate failure can self-diagnose instead of
+        # reading as a retrieval regression.
+        self.stderr_path = db + ".stderr.log"
+        self._stderr = open(self.stderr_path, "w", encoding="utf-8")
         self.p = subprocess.Popen([binary, "--db", db], stdin=subprocess.PIPE,
-                                  stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                  stdout=subprocess.PIPE, stderr=self._stderr,
                                   text=True, encoding="utf-8", errors="replace")
         self._id = 0
         self._send({"jsonrpc": "2.0", "id": self._n(), "method": "initialize",
@@ -100,6 +107,45 @@ class Mimir:
             self.p.wait(timeout=30)
         except Exception:
             self.p.kill()
+        try:
+            self._stderr.close()
+        except Exception:
+            pass
+
+    def stderr_tail(self, lines=30):
+        try:
+            if not self._stderr.closed:
+                self._stderr.flush()
+            content = Path(self.stderr_path).read_text(encoding="utf-8", errors="replace")
+            return "\n".join(content.splitlines()[-lines:]) or "<stderr empty>"
+        except Exception:
+            return "<no stderr captured>"
+
+
+def wait_for_autoembed(db, expected, timeout_s=180):
+    """Block until auto-embed-on-write (#271/#393) has populated a vector for
+    every seeded memory, or time out. The embed worker is a background thread
+    by contract, so 'remember then immediately recall' RACES it — on a cold CI
+    runner the ONNX session init loses, dense reads zero vectors, and the gate
+    fails with dense=0.000 even though nothing regressed (#632, observed 2/2
+    first attempts on 2026-07-13). Waiting bounded-long tests the actual
+    invariant — vectors arrive WITHOUT a manual mimir_embed — instead of the
+    worker's scheduling luck; a genuinely broken embed path still fails, now
+    with a named cause. Returns the embedded-row count."""
+    deadline = time.time() + timeout_s
+    done = 0
+    while time.time() < deadline:
+        try:
+            conn = sqlite3.connect(db, timeout=10)
+            done = conn.execute(
+                "SELECT COUNT(*) FROM entities WHERE emb_sig IS NOT NULL").fetchone()[0]
+            conn.close()
+        except sqlite3.Error:
+            done = 0  # DB mid-write; retry
+        if done >= expected:
+            return done
+        time.sleep(0.5)
+    return done
 
 
 def recall_at(ranked, relevant, k):
@@ -140,6 +186,14 @@ def main():
         for mem in memories:
             m.call("mimir_remember", {"category": mem["category"], "key": mem["key"],
                                       "body_json": json.dumps({"note": mem["note"]}), "type": "fact"})
+        # #632: settle the ASYNC embed worker before measuring (see wait_for_autoembed).
+        embedded = wait_for_autoembed(db, len(memories))
+        if embedded < len(memories):
+            print(f"FAIL (infra, not retrieval): auto-embed produced {embedded}/{len(memories)} "
+                  f"vectors after 180s — embedding backend / model-cache problem "
+                  f"(MIMIR_BUNDLED_MODEL_DIR contents?), NOT a recall regression.")
+            print(f"--- binary stderr tail ---\n{m.stderr_tail()}")
+            return 1
         auto5 = fts5 = dense5 = 0.0
         auto_mrr = dense_mrr = 0.0
         for q in queries:
@@ -197,6 +251,8 @@ def main():
     if ok:
         print("PASS: the default path uses semantic search, ranks answers high, "
               "and fusion does not dilute the dense ranking.")
+    else:
+        print(f"--- binary stderr tail (#632 self-diagnosis) ---\n{m.stderr_tail()}")
     return 0 if ok else 1
 
 
