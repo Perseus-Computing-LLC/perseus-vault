@@ -72,6 +72,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from datetime import datetime
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -343,8 +344,29 @@ def session_note(date, turns):
     return prefix + session_text(turns)
 
 
-def build_context(system, inst, srv, qid, k):
-    """Return (context_text, [chosen_session_ids]) for the given system."""
+SHARED_FACT_KEY = "__ku_fact__"
+
+
+def _date_ms(datestr):
+    """LongMemEval session date ('2023/08/11 (Fri) 00:01') -> unix ms.
+    Keeps the time-of-day: same-day updates must still order correctly."""
+    s = re.sub(r"\s*\([^)]*\)\s*", " ", datestr).strip()
+    try:
+        d = datetime.strptime(s, "%Y/%m/%d %H:%M")
+    except ValueError:
+        d = datetime.strptime(s.split(" ")[0], "%Y/%m/%d")
+    return int(d.timestamp() * 1000)
+
+
+def build_context(system, inst, srv, qid, k, ku_shared=False):
+    """Return (context_text, [chosen_session_ids]) for the given system.
+
+    With ku_shared, the mimir arm ingests the gold (fact-version) sessions
+    under ONE shared key with valid_from = session date — the PRODUCT shape
+    (INGEST_590.md demo B): `mimir_remember` collapses versions to a live
+    latest-wins row and stale versions go to `entity_history`. Grouping uses
+    the dataset's evidence labels — authoring-time knowledge, exactly what a
+    real caller has when it re-remembers a fact under its key."""
     sessions = inst["haystack_sessions"]
     sids = inst["haystack_session_ids"]
     dates = inst.get("haystack_dates") or [None] * len(sids)
@@ -360,17 +382,32 @@ def build_context(system, inst, srv, qid, k):
         chosen = inst.get("answer_session_ids", [])
     elif system == "mimir":
         # Ingest this instance's haystack, embed, hybrid-retrieve top-k sessions.
+        gold = inst.get("answer_session_ids", []) or []
+        dated_gold = sorted([g for g in gold if by_id.get(g, (None, None))[1]],
+                            key=lambda g: _date_ms(by_id[g][1]))
+        shared = set(dated_gold) if (ku_shared and len(dated_gold) >= 2) else set()
         for sid in sids:
+            if sid in shared:
+                continue  # fact versions ingest below, ascending by date
             turns, d = by_id[sid]
             srv.call("mimir_remember", {"category": qid, "key": sid,
                                         "body_json": json.dumps({"note": session_note(d, turns)}),
                                         "type": "fact"})
+        for g in dated_gold if shared else []:
+            turns, d = by_id[g]
+            srv.call("mimir_remember", {"category": qid, "key": SHARED_FACT_KEY,
+                                        "body_json": json.dumps({"note": session_note(d, turns)}),
+                                        "type": "fact", "valid_from_unix_ms": _date_ms(d)})
         srv.call("mimir_embed", {"batch_category": qid, "batch_limit": 1000})
         r = srv.call("mimir_recall", {"query": inst["question"], "mode": "hybrid",
                                       "category": qid, "limit": k, "trust_weight": 0,
                                       "min_decay": 0})
         items = r.get("items", []) if isinstance(r, dict) else []
         chosen = [it.get("key") for it in items][:k]
+        if shared:
+            # The live shared-key row IS the latest gold session; surface it in
+            # the context under that session's real id/date.
+            chosen = [dated_gold[-1] if key == SHARED_FACT_KEY else key for key in chosen]
     else:
         raise ValueError(system)
 
@@ -463,6 +500,10 @@ def main():
                          "single-session-preference multi-session temporal-reasoning) — for the "
                          "weak-category slice experiments. Pinned into the journal config so a "
                          "--resume can't silently mix a slice with a full run.")
+    ap.add_argument("--ku-shared-key", action="store_true",
+                    help="PRODUCT-shape ingest for version-bearing questions (mimir arm): gold "
+                         "fact-version sessions share one key with valid_from = session date "
+                         "(latest-wins; stale versions live in entity_history). See INGEST_590.md.")
     ap.add_argument("--bin", default=None, help="perseus-vault binary (else auto-located / MIMIR_BIN)")
     ap.add_argument("--mock-llm", action="store_true",
                     help="Stub the answerer+judge (deterministic, no key, no network): proves the plumbing")
@@ -560,7 +601,8 @@ def main():
                   "judge": "mock" if args.mock_llm else args.judge,
                   "k": args.k,
                   "answer_prompt": "official-cot" if args.cot else "plain",
-                  "only_types": sorted(args.only_types) if args.only_types else None}
+                  "only_types": sorted(args.only_types) if args.only_types else None,
+                  "ku_shared_key": args.ku_shared_key}
     done = {}
     journal = None
     if not args.dry_run:
@@ -622,7 +664,8 @@ def main():
             for system in args.systems:
                 if (qid, system) in done:
                     continue
-                ctx, chosen = build_context(system, inst, srv, qid, args.k)
+                ctx, chosen = build_context(system, inst, srv, qid, args.k,
+                                            ku_shared=args.ku_shared_key)
                 answer_tmpl = ANSWER_PROMPT_COT if args.cot else ANSWER_PROMPT
                 prompt = answer_tmpl.format(context=ctx, question=inst["question"],
                                               question_date=inst.get("question_date", "unknown"))
@@ -775,6 +818,7 @@ def main():
         "judge": "mock" if args.mock_llm else args.judge,
         "answer_prompt": "official-cot" if args.cot else "plain",
         "only_types": sorted(args.only_types) if args.only_types else None,
+        "ku_shared_key": args.ku_shared_key,
         "verdicts": sorted([v["question_id"], v["system"], v["correct"]] for v in verdicts),
     }, sort_keys=True)
     signature = hashlib.sha256(sig_payload.encode("utf-8")).hexdigest()
@@ -792,6 +836,9 @@ def main():
         # next to any competitor row.
         "answer_prompt": "official-cot" if args.cot else "plain",
         "only_types": sorted(args.only_types) if args.only_types else None,
+        # #590: ingest shape for the mimir arm. NEVER compare a ku-shared-key
+        # accuracy against a benchmark-shape one without labeling both.
+        "ingest_shape": "ku-shared-key (product)" if args.ku_shared_key else "unique-key-per-session (benchmark)",
         "answerer_model": "mock" if args.mock_llm else args.model,
         "judge_model": "mock" if args.mock_llm else args.judge,
         "temperature": 0,
