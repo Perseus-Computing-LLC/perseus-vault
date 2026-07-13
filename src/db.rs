@@ -1742,8 +1742,41 @@ impl Database {
         query_vec: &[f32],
         limit: usize,
     ) -> Result<Vec<(Entity, f64)>, Box<dyn std::error::Error>> {
+        // ── #619 interim: explicit exact-vs-bounded dial for the dense arm ──
+        //
+        // There is no ANN path yet, so this arm is a brute-force scan bounded
+        // by `max_scan`. Past that many embedded rows, candidates are whatever
+        // the covering index yields first (id order — for random ids a uniform
+        // sample across the corpus), so standalone dense recall degrades:
+        // measured recall@5 0.859@100K → 0.458@1M at the 50k default (#619).
+        // `MIMIR_DENSE_MAX_SCAN` makes the trade explicit until ANN lands:
+        //   unset      → 50,000 (today's behavior, byte-identical)
+        //   N > 0      → scan at most N rows (latency ∝ N, recall degrades
+        //                once embedded rows exceed N)
+        //   0          → unbounded exact scan (full recall at any corpus
+        //                size; latency grows linearly with the corpus)
+        let max_scan: usize = match std::env::var("MIMIR_DENSE_MAX_SCAN")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+        {
+            Some(0) => i64::MAX as usize, // 0 = unbounded (SQLite LIMIT is i64)
+            Some(n) => n,
+            None => 50_000,
+        };
+        self.dense_search_scan_bounded(query_vec, limit, max_scan)
+    }
+
+    /// The `dense_search` implementation with the scan ceiling as an explicit
+    /// parameter (env-independent, so tests can pin it without process-global
+    /// races). See `dense_search` for the recall/latency semantics of
+    /// `max_scan` (#619).
+    pub fn dense_search_scan_bounded(
+        &self,
+        query_vec: &[f32],
+        limit: usize,
+        max_scan: usize,
+    ) -> Result<Vec<(Entity, f64)>, Box<dyn std::error::Error>> {
         let conn = self.conn()?;
-        let max_scan = 50_000; // safety ceiling — databases beyond this should use HNSW
         let dim = query_vec.len();
 
         // Signature prefilter cutover point. Below this many embedded rows the
@@ -17068,6 +17101,78 @@ mod tests {
             results[0].1 > results[1].1,
             "scores must be exact-cosine ordered"
         );
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn dense_search_scan_bound_is_the_recall_dial_it_claims_to_be() {
+        // #619 interim: `max_scan` bounds the brute-force scan, so a row that
+        // lies beyond the ceiling is invisible at a small cap and found again
+        // when the cap is lifted (0 = unbounded maps to i64::MAX upstream).
+        // Seeded so the engineered hit is last in BOTH plausible scan orders
+        // (rowid/insertion and id), making the small-cap miss deterministic.
+        let (db, path) = temp_db();
+        let conn = db.conn().unwrap();
+        let blob = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|f| f.to_le_bytes()).collect() };
+        let dim = 16usize;
+        let tx = conn.unchecked_transaction().unwrap();
+        {
+            let mut stmt = tx
+                .prepare(
+                    "INSERT INTO entities (id, category, key, body_json, type, status,
+                        retrieval_count, last_accessed_unix_ms, created_at_unix_ms,
+                        decay_score, layer, embedding, emb_sig, archived)
+                     VALUES (?1, 'insight', ?2, '{}', 'insight', 'active', 0, 0, 0,
+                             1.0, 'working', ?3, ?4, 0)",
+                )
+                .unwrap();
+            // 300 fillers pointing away from the all-positive query region.
+            for i in 1..=300u32 {
+                let v: Vec<f32> = (0..dim)
+                    .map(|d| {
+                        let bit = (i.wrapping_mul(2654435761) >> (d as u32 % 31)) & 1;
+                        if bit == 1 { -1.0 } else { 0.3 }
+                    })
+                    .collect();
+                stmt.execute(params![
+                    format!("filler-{:05}", i),
+                    format!("filler-key-{:05}", i),
+                    blob(&v),
+                    embedding_signature(&v)
+                ])
+                .unwrap();
+            }
+            let query: Vec<f32> = vec![1.0; dim];
+            stmt.execute(params![
+                "zzz-hit", "zzz-hit-key", blob(&query), embedding_signature(&query)
+            ])
+            .unwrap();
+        }
+        tx.commit().unwrap();
+
+        let query: Vec<f32> = vec![1.0; dim];
+
+        // Cap below the corpus: the late row is beyond the scan ceiling.
+        let capped = db.dense_search_scan_bounded(&query, 5, 100).unwrap();
+        assert!(
+            !capped.iter().any(|(e, _)| e.id == "zzz-hit"),
+            "a 100-row scan bound must not reach the 301st row"
+        );
+        assert!(capped.len() <= 5 && !capped.is_empty());
+
+        // Unbounded (what MIMIR_DENSE_MAX_SCAN=0 resolves to): exact recall.
+        let exact = db
+            .dense_search_scan_bounded(&query, 5, i64::MAX as usize)
+            .unwrap();
+        assert_eq!(
+            exact[0].0.id, "zzz-hit",
+            "unbounded scan must find the true nearest neighbor"
+        );
+
+        // Default entrypoint (env unset → 50k ceiling) covers the whole corpus.
+        let default = db.dense_search(&query, 5).unwrap();
+        assert_eq!(default[0].0.id, "zzz-hit");
 
         let _ = fs::remove_file(&path);
     }
