@@ -7,10 +7,9 @@ Perseus Vault reference stack." Everything here was learned (and measured,
 rented **MI300X** (ROCm) and a **2×H100** (CUDA) pod, under real inference
 load — not synthetic idle-host benchmarks.
 
-Full data + harness: [perseus-amd-act-ii](https://github.com/tcconnally/perseus-amd-act-ii)
-(`docs/BENCHMARKS.md` §3a–3b, `src/amd_live_benchmark.py`). The
-GPU-contention + agent-economics harness is being upstreamed into this repo
-as [`benchmark/contention/`](../benchmark/contention/) (#530).
+Full data + harness live in this repo: the GPU-contention + agent-economics
+harness is at [`benchmark/contention/`](../benchmark/contention/) (see its
+[`README.md`](../benchmark/contention/README.md); tracked in #530).
 
 ## TL;DR checklist
 
@@ -149,8 +148,8 @@ number; read the startup line.
 
 ## Reproducing
 
-- Raw data + methodology: [perseus-amd-act-ii `docs/BENCHMARKS.md` §3a–3b](https://github.com/tcconnally/perseus-amd-act-ii/blob/main/docs/BENCHMARKS.md)
-- Live-load harness: [`src/amd_live_benchmark.py`](https://github.com/tcconnally/perseus-amd-act-ii/blob/main/src/amd_live_benchmark.py)
+- Raw data + methodology: [`benchmark/contention/README.md`](../benchmark/contention/README.md)
+- Live-load harness: [`benchmark/contention/live_bench.py`](../benchmark/contention/live_bench.py)
 - In-repo (upstreaming via #530): [`benchmark/contention/`](../benchmark/contention/) —
   GPU-contention + agent-economics runs; companion to [`benchmark/scale/`](../benchmark/scale/)
   and [`PERF.md`](../PERF.md)

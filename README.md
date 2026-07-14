@@ -129,7 +129,7 @@ Recall quality measured on LongMemEval's **official** harness, not a home-grown 
 | Zep | 63.8% (published) |
 | Mem0 | 49.0% (published) |
 
-`longmemeval_s` (500 questions), gpt-4o-2024-08-06 answerer + LongMemEval's official judge; competitor numbers are their published values. [Methodology & signed results →](benchmark/longmemeval/COMPARISON.md)
+`longmemeval_s` (500 questions), gpt-4o-2024-08-06 answerer + LongMemEval's official judge; competitor numbers are their published values. Perseus Vault's 73.8% is the plain mean of 3 runs; 79.0% with official CoT. [Methodology & signed results →](benchmark/longmemeval/COMPARISON.md)
 
 ### Bi-temporal time-travel (three-axis)
 
@@ -163,7 +163,7 @@ the reference. [Methodology & dataset →](benchmark/temporal/README.md)
 
 | | Perseus Vault | Mem0 | Letta | Zep |
 |---|---|---|---|---|
-| **Deployment** | Single binary (~8MB) | Cloud + self-host | Docker/Postgres | Docker/Neo4j |
+| **Deployment** | Single binary | Cloud + self-host | Docker/Postgres | Docker/Neo4j |
 | **Dependencies** | None (SQLite embedded) | Python + vector DB | Postgres + Python | Neo4j + Go (Graphiti) |
 | **MCP-Native** | ✅ 55+ tools | ❌ Not MCP-native | ❌ Not MCP-native | ❌ Not MCP-native |
 | **Offline/Local** | ✅ Fully local | Cloud-dependent | Docker needed | Docker needed |
@@ -219,7 +219,7 @@ identical fact set, queries, and substring judge for every system):
 
 | System | Recall accuracy | p50 latency | Notes |
 |---|---|---|---|
-| **Perseus Vault** (hybrid) | **1.00** | 35.6 ms | single ~8MB binary, in-process |
+| **Perseus Vault** (hybrid) | **1.00** | 35.6 ms | single self-contained binary, in-process |
 | Letta (archival / pgvector) | 1.00 | 135.5 ms | server + Postgres/pgvector |
 | Mem0 (vector) | 0.60 | 37.9 ms | Python + vector DB |
 | Zep (Graphiti temporal KG) | 0.20 | 49.7 ms | server + Neo4j; graph extracted by local model |

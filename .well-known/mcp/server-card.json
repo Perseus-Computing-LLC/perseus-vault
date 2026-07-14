@@ -1,7 +1,7 @@
 {
   "serverInfo": {
-    "name": "mimir",
-    "version": "0.5.0"
+    "name": "perseus-vault",
+    "version": "2.20.2"
   },
   "authentication": {
     "required": false,

@@ -98,9 +98,9 @@ cargo build --release
 sudo cp target/release/perseus-vault /usr/local/bin/
 ```
 
-**Python client (optional, for scripts):**
+**Install the prebuilt binary (alternative to building from source):**
 ```bash
-pip install mimir-client
+curl -sSf https://raw.githubusercontent.com/Perseus-Computing-LLC/perseus-vault/main/scripts/install.sh | sh
 ```
 
 ### Step 2 — Configure Mimir as an MCP server in OpenClaw
@@ -216,6 +216,5 @@ perseus-vault --db ~/.openclaw/mimir/mimir.db --vault-export ~/mimir-vault/
 
 - GitHub: https://github.com/Perseus-Computing-LLC/perseus-vault
 - Website: https://perseus.observer/perseus-vault
-- Python client: https://pypi.org/project/mimir-client/
 - Smithery: https://smithery.ai/server/mimir
 - mcpservers.org: https://mcpservers.org/servers/perseus-computing-llc/perseus-vault

@@ -7,7 +7,7 @@
     "email": "perseus@perseus.observer",
     "description": "Perseus Computing builds open-source (MIT) memory & context infrastructure for AI agents. Open formats, local-first, zero telemetry, no vendor lock-in. Two products: the Perseus context engine (perseus-ctx) and Perseus Vault, an encrypted persistent-memory MCP server. Both run entirely on your own hardware, air-gap ready, and export to open formats (plain Markdown, plain files).",
     "webpageUrl": {
-      "url": "https://mimir.perseus.observer",
+      "url": "https://perseus.observer/vault",
       "wellKnown": "https://mimir.perseus.observer/.well-known/funding-manifest-urls"
     }
   },
@@ -15,9 +15,9 @@
     {
       "guid": "perseus-vault",
       "name": "Perseus Vault",
-      "description": "Perseus Vault is a single ~8MB Rust binary that gives AI agents durable, portable memory across sessions with no Docker, no Postgres, and no cloud. It is MCP-native (57 tools), local-first, and fully air-gapped by default: AES-256-GCM encryption at rest, hybrid BM25 + dense-vector + RRF search, bi-temporal (transaction-time and valid-time) history, an immutable audit journal with chain-of-custody, an entity link graph with GraphRAG community detection, and biomimetic Ebbinghaus decay for memory lifecycle management. Bundled in-process embeddings (a quantized all-MiniLM-L6-v2 model) make semantic search work with zero config and zero network. Ready-to-use adapters ship for LangGraph, CrewAI, AutoGen, LangChain, PydanticAI, Haystack, and Google ADK. MIT-licensed and designed for privacy-sensitive and government deployment (published SBOM, offline operation, encryption at rest).",
+      "description": "Perseus Vault is a single Rust binary that gives AI agents durable, portable memory across sessions with no Docker, no Postgres, and no cloud. It is MCP-native (55+ tools), local-first, and fully air-gapped by default: AES-256-GCM encryption at rest, hybrid BM25 + dense-vector + RRF search, bi-temporal (transaction-time and valid-time) history, an immutable audit journal with chain-of-custody, an entity link graph with GraphRAG community detection, and biomimetic Ebbinghaus decay for memory lifecycle management. Bundled in-process embeddings (a quantized all-MiniLM-L6-v2 model) make semantic search work with zero config and zero network. Ready-to-use adapters ship for LangGraph, CrewAI, AutoGen, LangChain, PydanticAI, Haystack, and Google ADK. MIT-licensed and designed for privacy-sensitive and government deployment (published SBOM, offline operation, encryption at rest).",
       "webpageUrl": {
-        "url": "https://mimir.perseus.observer",
+        "url": "https://perseus.observer/vault",
         "wellKnown": "https://mimir.perseus.observer/.well-known/funding-manifest-urls"
       },
       "repositoryUrl": {

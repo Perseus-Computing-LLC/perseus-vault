@@ -111,7 +111,7 @@ Why Perseus Vault stands out:
 
 | Feature | Perseus Vault | Mem0 | Letta | Zep |
 |---|---|---|---|---|
-| **MCP-Native** | ✅ 57 tools | ❌ | ❌ | ❌ |
+| **MCP-Native** | ✅ 55+ tools | ❌ | ❌ | ❌ |
 | **Local-First** | ✅ Single binary | ❌ Cloud-dependent | ❌ Docker + Postgres | ❌ Docker + Postgres |
 | **Zero Dependencies** | ✅ SQLite bundled | ❌ Python + vector DB | ❌ Python + Postgres | ❌ Go + Postgres |
 | **Encryption at Rest** | ✅ AES-256-GCM | ❌ | ❌ | ❌ |

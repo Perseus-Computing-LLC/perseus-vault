@@ -14,6 +14,9 @@ Local-first, encrypted, zero cloud dependencies — complementing ADK's InMemory
 ## Running
 
 ```bash
-pip install mimir crewai google-adk  # as needed
+# Install the Perseus Vault binary:
+curl -sSf https://raw.githubusercontent.com/Perseus-Computing-LLC/perseus-vault/main/scripts/install.sh | sh
+# Then install the example dependencies as needed:
+pip install crewai google-adk
 python examples/quickstart.py
 ```

@@ -2,12 +2,12 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.Perseus-Computing-LLC/perseus-vault",
   "title": "Perseus Vault (formerly Mimir/Mneme), persistent memory engine for AI agents",
-  "description": "Persistent, deterministic memory for AI agents. Local-first: SQLite, FTS5, AES-256-GCM, 57 tools.",
-  "version": "2.17.4",
+  "description": "Persistent, deterministic memory for AI agents. Local-first: SQLite, FTS5, AES-256-GCM, 55+ tools.",
+  "version": "2.20.2",
   "packages": [
     {
       "registryType": "oci",
-      "identifier": "ghcr.io/perseus-computing-llc/perseus-vault:2.17.4",
+      "identifier": "ghcr.io/perseus-computing-llc/perseus-vault:2.20.2",
       "transport": {
         "type": "stdio"
       },
