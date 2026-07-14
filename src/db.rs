@@ -1470,7 +1470,30 @@ impl Database {
         llm_config: &LlmConfig,
         text: &str,
     ) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
-        // 1. Local ONNX — if enabled and either the model is compiled in (#237)
+        // 1. EXPLICIT remote embedding endpoint: the operator passed
+        //    --embedding-endpoint, and explicit configuration outranks the
+        //    implicit bundled default. Before this, a default-features binary
+        //    silently embedded QUERIES with the bundled 384-dim model against
+        //    a corpus embedded at the endpoint's dimension — every candidate
+        //    then failed the dim filter and standalone dense recall returned
+        //    empty (measured live: 1M corpus at nomic-768, dense recall@5
+        //    0.458 lean build vs 0.000 default build, identical flags).
+        //    An explicit LOCAL model still wins overall: set_embedding_model
+        //    clears llm_config.embedding_endpoint ("prefer local ONNX").
+        if llm_config.enabled && llm_config.embedding_endpoint.is_some() {
+            match Self::call_ollama_embed(llm_config, text) {
+                Ok(vec) => return Ok(vec),
+                Err(e) => rate_limited_log(
+                    "remote-embed-fallback",
+                    &format!(
+                        "mimir: explicit embedding endpoint failed ({}), falling back to local...",
+                        e
+                    ),
+                ),
+            }
+        }
+
+        // 2. Local ONNX — if enabled and either the model is compiled in (#237)
         //    or a model file exists on disk.
         if embedding_config.enabled
             && (embedding_config.bundled || embedding_config.model_path.exists())
@@ -1486,7 +1509,8 @@ impl Database {
             }
         }
 
-        // 2. Remote endpoint (Ollama or OpenAI-compatible)
+        // 3. Remote endpoint derived from the LLM endpoint (no explicit
+        //    embedding endpoint — implicit remote stays BELOW the local model).
         if llm_config.enabled {
             return Self::call_ollama_embed(llm_config, text);
         }
@@ -2006,6 +2030,23 @@ impl Database {
             }
             fetched
         };
+
+        // A populated corpus that yields ZERO candidates is almost always a
+        // query-vs-stored embedding dimension mismatch (mixed backends: e.g.
+        // bundled 384-dim queries against an endpoint-embedded 768-dim corpus)
+        // — the dim filter above discards every row and recall silently
+        // returns empty. Say so instead (#226 spirit: no silent degradation).
+        if candidates.is_empty() && embedded_rows > 0 {
+            rate_limited_log(
+                "dense-dim-mismatch",
+                &format!(
+                    "mimir: dense_search produced 0 candidates from {} embedded rows — \
+                     query embedding dim {} likely mismatches the stored corpus dim \
+                     (mixed embedding backends?); dense recall will be empty",
+                    embedded_rows, dim
+                ),
+            );
+        }
 
         // Phase 2: score by cosine similarity, keep the top `limit` ids.
         let mut scored_ids: Vec<(String, f64)>;
@@ -20733,6 +20774,44 @@ mod tests {
             None,
         );
         (db, path, accepted)
+    }
+
+    #[test]
+    fn explicit_embedding_endpoint_outranks_bundled_model_for_queries() {
+        // Live incident (2026-07-13, the #619 1M validation): a default-features
+        // build silently embedded QUERIES with the bundled 384-dim model while
+        // the corpus was endpoint-embedded at 768 dims — every candidate failed
+        // the dim filter and standalone dense recall measured 0.000 at 1M
+        // (0.458 on a lean build, identical flags). Explicit
+        // --embedding-endpoint must WIN over the implicit bundled default.
+        //
+        // No set_embedding_model here: embedding_config stays at the build's
+        // default (bundled model present in default builds — the exact config
+        // that mis-routed). In lite builds the assertion holds trivially.
+        let (port, accepted) = spawn_fake_embed_server(std::time::Duration::ZERO);
+        let (mut db, path) = temp_db();
+        db.set_llm(
+            true,
+            &format!("http://127.0.0.1:{port}/api/generate"),
+            "fake-chat",
+            None,
+            Some(&format!("http://127.0.0.1:{port}/api/embed")),
+            Some("fake-embed"),
+        );
+        let vec = db
+            .generate_embedding_with_fallback("precedence probe")
+            .expect("explicit endpoint embed must succeed");
+        assert!(
+            accepted.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "explicit --embedding-endpoint was never called: the bundled model \
+             silently hijacked query embedding"
+        );
+        assert_eq!(
+            vec[0],
+            expected_fake_vec_first("fake-embed", "precedence probe"),
+            "returned vector must come from the endpoint, not the bundled model"
+        );
+        let _ = fs::remove_file(&path);
     }
 
     /// Spin until the fake server has accepted `n` connections — i.e. the
