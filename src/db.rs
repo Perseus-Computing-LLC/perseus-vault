@@ -1824,36 +1824,56 @@ impl Database {
             Some(n) => n,
             None => 50_000,
         };
-        // #619: opt-in resident sig cache — full-corpus Hamming prefilter
-        // coverage instead of the first `max_scan` rows (see `SigCache`).
-        let use_sig_cache = std::env::var("MIMIR_DENSE_SIG_CACHE")
-            .map(|v| v.trim() == "1")
-            .unwrap_or(false);
+        // #619: resident sig cache — full-corpus Hamming prefilter coverage
+        // instead of the first `max_scan` rows (see `SigCache`). Default is
+        // AUTO: the cache engages exactly when the corpus outgrows `max_scan`
+        // — below that the bounded scan already covers every row and behavior
+        // is unchanged; above it, the measured 1M numbers (PRs #652/#654) are
+        // hybrid@1 0.634 → 0.936 at +4ms p50 and dense@5 0.458 → 0.708 for
+        // ~140MB resident. `MIMIR_DENSE_SIG_CACHE` overrides:
+        //   unset / "auto" → engage when embedded rows > max_scan
+        //   "1"/"true"/"on"   → always (even under the bound; same results,
+        //                        trades memory for skipping the SQL sig scan)
+        //   "0"/"false"/"off" → never (pre-#655 opt-in behavior)
+        let use_sig_cache: Option<bool> = match std::env::var("MIMIR_DENSE_SIG_CACHE")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "" | "auto" => None,
+            "1" | "true" | "on" => Some(true),
+            _ => Some(false),
+        };
         self.dense_search_with_opts(query_vec, limit, max_scan, use_sig_cache)
     }
 
     /// The `dense_search` implementation with the scan ceiling as an explicit
     /// parameter (env-independent, so tests can pin it without process-global
     /// races). See `dense_search` for the recall/latency semantics of
-    /// `max_scan` (#619).
+    /// `max_scan` (#619). The sig cache is OFF here — this is the plain
+    /// bounded-scan primitive.
     pub fn dense_search_scan_bounded(
         &self,
         query_vec: &[f32],
         limit: usize,
         max_scan: usize,
     ) -> Result<Vec<(Entity, f64)>, Box<dyn std::error::Error>> {
-        self.dense_search_with_opts(query_vec, limit, max_scan, false)
+        self.dense_search_with_opts(query_vec, limit, max_scan, Some(false))
     }
 
     /// Full-option `dense_search` implementation: scan ceiling AND sig-cache
     /// toggle as explicit parameters, so tests exercise every mode without
-    /// process-global env races (#617/#627 pattern).
+    /// process-global env races (#617/#627 pattern). `use_sig_cache`:
+    /// `Some(bool)` forces the mode; `None` = AUTO — engage the cache exactly
+    /// when the corpus has outgrown `max_scan`, i.e. when the bounded scan
+    /// would start sampling instead of covering.
     pub fn dense_search_with_opts(
         &self,
         query_vec: &[f32],
         limit: usize,
         max_scan: usize,
-        use_sig_cache: bool,
+        use_sig_cache: Option<bool>,
     ) -> Result<Vec<(Entity, f64)>, Box<dyn std::error::Error>> {
         let conn = self.conn()?;
         let dim = query_vec.len();
@@ -1881,6 +1901,12 @@ impl Database {
             [],
             |r| r.get(0),
         )?;
+
+        // #619 AUTO resolution: the cache engages exactly when the bounded
+        // scan can no longer cover the corpus (under the bound the SQL scan
+        // sees every row and results are identical; an unbounded exact scan —
+        // max_scan = i64::MAX via MIMIR_DENSE_MAX_SCAN=0 — never auto-caches).
+        let use_sig_cache = use_sig_cache.unwrap_or(embedded_rows > max_scan as i64);
 
         // Phase 1 (#209): lightweight scan — read only id + embedding for scoring.
         // The old query hydrated EVERY candidate (decrypt body, parse tags/links)
@@ -17449,17 +17475,17 @@ mod tests {
         let query: Vec<f32> = vec![1.0; dim];
 
         // The SQL path at max_scan=100 cannot reach the 2201st row…
-        let bounded = db.dense_search_with_opts(&query, 5, 100, false).unwrap();
+        let bounded = db.dense_search_with_opts(&query, 5, 100, Some(false)).unwrap();
         assert!(!bounded.iter().any(|(e, _)| e.id == "zzz-hit"));
         // …the cache path finds it despite the same bound: full coverage.
-        let cached = db.dense_search_with_opts(&query, 5, 100, true).unwrap();
+        let cached = db.dense_search_with_opts(&query, 5, 100, Some(true)).unwrap();
         assert_eq!(cached[0].0.id, "zzz-hit", "sig cache must cover the whole corpus");
 
         // Stamp 1 — count change: archiving the hit must evict it on the very
         // next query (the cache rebuilds; archived rows are not in it).
         conn.execute("UPDATE entities SET archived = 1 WHERE id = 'zzz-hit'", [])
             .unwrap();
-        let after_archive = db.dense_search_with_opts(&query, 5, 100, true).unwrap();
+        let after_archive = db.dense_search_with_opts(&query, 5, 100, Some(true)).unwrap();
         assert!(
             !after_archive.iter().any(|(e, _)| e.id == "zzz-hit"),
             "archived row leaked from a stale sig cache"
@@ -17470,11 +17496,78 @@ mod tests {
         // SIG_WRITE_GEN; row count unchanged). The stale cache still holds its
         // old far-away signature — only the gen stamp can catch this.
         Database::store_embedding_with_conn(&conn, "filler-00042", &query).unwrap();
-        let after_reembed = db.dense_search_with_opts(&query, 5, 100, true).unwrap();
+        let after_reembed = db.dense_search_with_opts(&query, 5, 100, Some(true)).unwrap();
         assert_eq!(
             after_reembed[0].0.id, "filler-00042",
             "in-place re-embed missed: SIG_WRITE_GEN stamp failed"
         );
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn dense_sig_cache_auto_engages_exactly_when_corpus_outgrows_the_bound() {
+        // #619 default-on: AUTO (use_sig_cache = None) must engage the cache
+        // when embedded rows exceed max_scan — the point where the bounded
+        // scan starts sampling — and stay off (bounded semantics, including
+        // the bound's recall limitation) when the scan still covers the
+        // corpus. Corpus shape mirrors the scan-bound test: 2200 fillers plus
+        // a late-sorting engineered hit at both plausible scan orders.
+        let (db, path) = temp_db();
+        let conn = db.conn().unwrap();
+        let blob = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|f| f.to_le_bytes()).collect() };
+        let dim = 16usize;
+        let tx = conn.unchecked_transaction().unwrap();
+        {
+            let mut stmt = tx
+                .prepare(
+                    "INSERT INTO entities (id, category, key, body_json, type, status,
+                        retrieval_count, last_accessed_unix_ms, created_at_unix_ms,
+                        decay_score, layer, embedding, emb_sig, archived)
+                     VALUES (?1, 'insight', ?2, '{}', 'insight', 'active', 0, 0, 0,
+                             1.0, 'working', ?3, ?4, 0)",
+                )
+                .unwrap();
+            for i in 1..=2200u32 {
+                let v: Vec<f32> = (0..dim)
+                    .map(|d| {
+                        let bit = (i.wrapping_mul(2654435761) >> (d as u32 % 31)) & 1;
+                        if bit == 1 { -1.0 } else { 0.3 }
+                    })
+                    .collect();
+                stmt.execute(params![
+                    format!("filler-{:05}", i),
+                    format!("filler-key-{:05}", i),
+                    blob(&v),
+                    embedding_signature(&v)
+                ])
+                .unwrap();
+            }
+            let query: Vec<f32> = vec![1.0; dim];
+            stmt.execute(params![
+                "zzz-hit", "zzz-hit-key", blob(&query), embedding_signature(&query)
+            ])
+            .unwrap();
+        }
+        tx.commit().unwrap();
+
+        let query: Vec<f32> = vec![1.0; dim];
+
+        // 2201 rows > max_scan 100: AUTO engages the cache → full coverage.
+        let auto_over = db.dense_search_with_opts(&query, 5, 100, None).unwrap();
+        assert_eq!(
+            auto_over[0].0.id, "zzz-hit",
+            "AUTO must engage the sig cache once the corpus outgrows max_scan"
+        );
+
+        // max_scan covers the corpus: AUTO stays on the bounded path and the
+        // result matches the forced-off bounded scan exactly.
+        let auto_under = db.dense_search_with_opts(&query, 5, 50_000, None).unwrap();
+        let bounded = db.dense_search_with_opts(&query, 5, 50_000, Some(false)).unwrap();
+        let ids = |v: &Vec<(Entity, f64)>| v.iter().map(|(e, _)| e.id.clone()).collect::<Vec<_>>();
+        assert_eq!(ids(&auto_under), ids(&bounded),
+                   "AUTO under the bound must be the plain bounded scan");
+        assert_eq!(auto_under[0].0.id, "zzz-hit");
 
         let _ = fs::remove_file(&path);
     }
