@@ -138,13 +138,15 @@ enum Commands {
         #[arg(long)]
         key: String,
         /// Body of the entity as a JSON string (e.g., '{"content": "..."}')
-        #[arg(long)]
+        /// (`--body-json` is accepted as a back-compat alias)
+        #[arg(long, alias = "body-json")]
         body: String,
         /// Comma-separated tags (e.g., "urgent,feature-x")
         #[arg(long, default_value_t = String::new())]
         tags: String,
         /// Entity type (e.g., "insight", "plan", "observation")
-        #[arg(long, default_value_t = String::from("insight"))]
+        /// (`--type` is accepted as a back-compat alias)
+        #[arg(long, alias = "type", default_value_t = String::from("insight"))]
         entity_type: String,
         /// Importance score (0.0-1.0, default 0.5)
         #[arg(long, default_value_t = 0.5)]
@@ -3301,6 +3303,30 @@ mod tests {
         match cli.command {
             Some(Commands::Serve { db, .. }) => assert_eq!(db, "/tmp/mimir-serve.db"),
             _ => panic!("expected serve subcommand"),
+        }
+    }
+
+    #[test]
+    fn write_accepts_backcompat_flag_aliases() {
+        // #658: pre-rename runbooks/smoke tests used `--type` and `--body-json`.
+        // The current flags are `--entity-type` and `--body`; the old names are
+        // kept as clap aliases so stale scripts don't fail with a cryptic
+        // "unexpected argument" (the false-negative that polluted #657 triage).
+        let cli = Cli::parse_from([
+            "perseus-vault", "write",
+            "--category", "smoke_test",
+            "--key", "k1",
+            "--type", "reference",
+            "--body-json", r#"{"note":"x"}"#,
+        ]);
+        match cli.command {
+            Some(Commands::Write { category, key, entity_type, body, .. }) => {
+                assert_eq!(category, "smoke_test");
+                assert_eq!(key, "k1");
+                assert_eq!(entity_type, "reference", "--type must alias --entity-type");
+                assert_eq!(body, r#"{"note":"x"}"#, "--body-json must alias --body");
+            }
+            _ => panic!("expected write subcommand"),
         }
     }
 
