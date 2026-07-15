@@ -35,10 +35,12 @@ against for the general case — leave it on.
 | full_f32_exact_cosine | `embedding` | 1× | 32 | 0.486 | 0.684 | 0.754 | 650.1 ms | `scale1m_exact_ceiling.json` |
 | int4_sig4_coarse | `emb_sig4` | 8× | 4 | 0.497 | 0.722 | 0.791 | 395.6 ms | `scale1m_2c_on.json` |
 | **1bit_sig_prefilter_rerank** | `emb_sig` | 32× | 1 | 0.514 | 0.726 | 0.800 | 194.5 ms | `scale1m_default_500.json` **(SHIPPED DEFAULT)** |
-| pure_1bit_hamming_only | `emb_sig` | 32× | 1 | _pending_ | _pending_ | _pending_ | _pending_ | harness-ready via `MIMIR_DENSE_SIG_RERANK=0` (#630) |
+| pure_1bit_hamming_only | `emb_sig` | 32× | 1 | 0.132 | 0.312 | 0.412 | 184.3 ms | `scale1m_pure1bit.json` (prefilter, **no rerank**) |
 
-All three measured rows are signed (SHA-256 in `report.json` → `provenance`); `max_scan =
-50000`, `persisted = 995562` for each.
+All four rows are signed (SHA-256 in `report.json` → `provenance`); `max_scan =
+50000`, `persisted = 995562` for each. Note the last row: the 1-bit prefilter
+*without* the exact-cosine rerank collapses to 0.312 r@5 — the rerank, not the
+1-bit ranking, is what earns the shipped tier's 0.726 (never disable it).
 
 ---
 
@@ -87,10 +89,11 @@ vectors is the separate, pending model-weight axis.
 
 ---
 
-## Open measurement: pure 1-bit (no rerank)
+## Measured: the rerank is what matters (do not disable it)
 
-`DenseOpts.rerank` / env `MIMIR_DENSE_SIG_RERANK=0` (default **ON**) skips the phase-2
-cosine rerank, exposing the pure-1-bit Hamming-only row. This is opt-in; the default path
-is byte-identical to before. Measuring it upper-bounds what the exact rerank buys and
-should be run on an embedded corpus (next Lambda run or a local model). This is the only
-missing rung in the index ladder and is tracked under #630.
+`DenseOpts.rerank` / env `MIMIR_DENSE_SIG_RERANK=0` (default **ON**, default path
+byte-identical) skips the phase-2 cosine rerank. Measured on the 1M corpus, the pure
+1-bit prefilter scores **0.312 r@5** vs the shipped **0.726** — turning the rerank off
+saves ~10 ms and less-than-halves recall. The sign code is a strong candidate *filter*
+but a weak *ranker*; the exact-cosine rerank over the 1-bit-selected pool does the heavy
+lifting. Recommendation: never set `MIMIR_DENSE_SIG_RERANK=0` outside benchmarking.

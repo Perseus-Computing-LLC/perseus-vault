@@ -87,8 +87,22 @@
       "column": "emb_sig",
       "bits_per_dim": 1,
       "compression": "32x",
-      "status": "harness_ready_measurement_pending",
-      "note": "Hamming-only, no rerank (MIMIR_DENSE_SIG_RERANK=0, #630). Upper-bounds what the exact rerank buys; measure on an embedded corpus (next Lambda run or a local model)."
+      "note": "the 1-bit prefilter's candidate order WITHOUT the exact-cosine rerank (MIMIR_DENSE_SIG_RERANK=0, #630). Measures the prefilter ALONE: far below the reranked default (0.312 vs 0.726 r@5) at near-identical latency (~184 vs ~195 ms) — so the exact rerank over the 1-bit-selected pool is what does the denoising, not the 1-bit ranking. The prefilter is a filter, not a final ranker.",
+      "source": "scale1m_pure1bit.json",
+      "dense": {
+        "p50_ms": 184.3,
+        "p99_ms": 187.8,
+        "r@1": 0.132,
+        "r@5": 0.312,
+        "r@10": 0.412
+      },
+      "hybrid": {
+        "p50_ms": 398.6,
+        "p99_ms": 820.3,
+        "r@1": 0.86,
+        "r@5": 1,
+        "r@10": 1
+      }
     }
   ],
   "model_axis": {
@@ -121,6 +135,12 @@
     "scale1m_default_500.json": {
       "sha256": "902f6d040b24cab0624f2b1e64674f767da4522b46a3f0601229ae85d8ac6959",
       "tier": "sig619-DEFAULT-500q (gpu_2x_h100_sxm5, 1M reused corpus, local NVMe)",
+      "persisted": 995562,
+      "max_scan": 50000
+    },
+    "scale1m_pure1bit.json": {
+      "sha256": "c9d65475c8c658dd3e145c2f1f0b829bf644f5a2fb022b1014b5db14ff1b1f86",
+      "tier": "630-PURE1BIT-500q (gpu_1x_h100_sxm5, 1M reused corpus, local NVMe)",
       "persisted": 995562,
       "max_scan": 50000
     }

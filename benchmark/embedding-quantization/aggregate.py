@@ -76,11 +76,13 @@ TIERS = [
         "column": "emb_sig",
         "bits_per_dim": 1,
         "compression": "32x",
-        "source": None,
-        "status": "harness_ready_measurement_pending",
-        "note": "Hamming-only, no rerank (MIMIR_DENSE_SIG_RERANK=0, #630). "
-                "Upper-bounds what the exact rerank buys; measure on an "
-                "embedded corpus (next Lambda run or a local model).",
+        "source": "scale1m_pure1bit.json",
+        "note": "the 1-bit prefilter's candidate order WITHOUT the exact-cosine "
+                "rerank (MIMIR_DENSE_SIG_RERANK=0, #630). Measures the prefilter "
+                "ALONE: far below the reranked default (0.312 vs 0.726 r@5) at "
+                "near-identical latency (~184 vs ~195 ms) — so the exact rerank "
+                "over the 1-bit-selected pool is what does the denoising, not the "
+                "1-bit ranking. The prefilter is a filter, not a final ranker.",
     },
 ]
 

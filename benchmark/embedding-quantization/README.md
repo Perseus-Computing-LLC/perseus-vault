@@ -33,7 +33,7 @@ isolates what the compressed vector actually preserves.
 | `full_f32_exact_cosine` | 1x | 32 | 0.486 | 0.684 | 0.754 | 650.1 ms | `scale1m_exact_ceiling.json` |
 | `int4_sig4_coarse` | 8x | 4 | 0.497 | 0.722 | 0.791 | 395.6 ms | `scale1m_2c_on.json` |
 | `1bit_sig_prefilter_rerank` | 32x | 1 | 0.514 | 0.726 | 0.800 | 194.5 ms | `scale1m_default_500.json` (**shipped default**) |
-| `pure_1bit_hamming_only` | 32x | 1 | — pending — | | | | `MIMIR_DENSE_SIG_RERANK=0` (#630) |
+| `pure_1bit_hamming_only` | 32x | 1 | 0.132 | 0.312 | 0.412 | 184.3 ms | `scale1m_pure1bit.json` |
 
 ### Headline: more quantization gives both higher recall and lower latency
 
@@ -42,14 +42,18 @@ Counterintuitive, and all of it measured and signed: moving *down* the ladder
 cuts latency monotonically. The 1-bit prefilter (0.726 r@5 @ 194.5 ms) beats
 full-precision exact cosine (0.684 r@5 @ 650.1 ms) at every k.
 
-The mechanism is denoising. The 1-bit sign code discards magnitude, which
-drops cross-cluster cosine confusers that full-precision cosine ranks highly —
-so the coarser code is not just cheaper, it is a *cleaner* prefilter. It does
-this at 32x less index memory: ~96 bytes/vec versus ~3072 at 768-dim
-(int4 sits at ~384), i.e. ~96 MB resident for the 1-bit index at 1M.
+The mechanism is denoising, and the rerank-ablation below pins where it happens.
+The 1-bit sign code discards magnitude, so as a *filter* it drops cross-cluster
+confusers that full-precision cosine over-ranks — giving a cleaner candidate
+**set** than an unbounded exact scan. But the sign code is a poor *ranker* on its
+own (see [rerank ablation](#the-rerank-does-the-denoising)); the exact-cosine
+rerank over the 1-bit-selected pool restores the order. The net — better set +
+exact rerank — is what beats the f32 ceiling, at 32x less index memory:
+~96 bytes/vec versus ~3072 at 768-dim (int4 sits at ~384), i.e. ~96 MB resident
+for the 1-bit index at 1M.
 
-`gate.py` locks this ordering in: 1-bit dense r@5 must stay within `EPS` (0.01)
-below exact (it is above), and p50 must satisfy 1-bit < int4 < exact.
+`gate.py` locks this in: 1-bit dense r@5 ≥ exact − `EPS` (0.01); p50 ordering
+1-bit < int4 < exact; and the reranked default r@5 ≥ pure-prefilter r@5 + 0.2.
 
 ### Why standalone dense is the honest signal
 
@@ -76,15 +80,27 @@ that embedded the 1M corpus), not the bundled INT8 default. Whether the same
 denoising holds for the bundled MiniLM-384 is plausible but unmeasured; a
 FP16/BF16 or MiniLM re-run of the ladder is the (pending) model-weight axis.
 
-## The pending 1-bit row
+## The rerank does the denoising {#the-rerank-does-the-denoising}
 
 `pure_1bit_hamming_only` is the shipped 1-bit tier with the phase-2 exact-cosine
-rerank turned off — Hamming distance on the sign code only. It upper-bounds what
-the rerank buys. The harness is ready via `DenseOpts.rerank` /
-`MIMIR_DENSE_SIG_RERANK=0` (default ON; the default path is byte-identical, this
-is opt-in), but the number is not yet measured — it needs a real embedded corpus
-(next Lambda run or a local model), so it is recorded as
-`harness_ready_measurement_pending` rather than fabricated.
+rerank turned off (`DenseOpts.rerank` / `MIMIR_DENSE_SIG_RERANK=0`; default ON,
+default path byte-identical). Measured on the same 1M corpus/instance:
+
+| | dense r@1 | r@5 | r@10 | p50 |
+| --- | --- | --- | --- | --- |
+| 1-bit prefilter **+ rerank** (shipped) | 0.514 | **0.726** | 0.800 | 194.5 ms |
+| 1-bit prefilter, **no rerank** | 0.132 | **0.312** | 0.412 | 184.3 ms |
+
+Turning the rerank off saves ~10 ms and collapses recall (0.726 → 0.312 r@5).
+So the sign code is a strong candidate *filter* but a weak *ranker* — the
+exact-cosine rerank over the 1-bit-selected pool is what does the heavy lifting.
+The rerank is nearly free relative to what it buys: keep it on (it is, by
+default). This is why the shipped tier, not the raw 1-bit order, is the one that
+beats the f32 ceiling.
+
+For a **local, small-corpus** complement to this 1M number, `measure_1bit_small.py`
+(ONNX-direct, bundled MiniLM-384) measures the same pure-1-bit-vs-cosine question
+without Lambda — useful as a CI-able sanity check on the effect at small scale.
 
 ## Reproduce
 
@@ -103,11 +119,12 @@ its cited source file still hashes to the recorded value.
 
 `gate.py` reads the committed `report.json` and exits non-zero on any violation
 of: (1) denoising — 1-bit dense r@5 ≥ exact − 0.01; (2) latency ordering —
-1-bit p50 < int4 p50 < exact p50; (3) provenance — every measured tier cites a
-source with a recorded SHA-256.
+1-bit p50 < int4 p50 < exact p50; (3) rerank essential — reranked default r@5 ≥
+pure-prefilter r@5 + 0.2; (4) provenance — every measured tier cites a source
+with a recorded SHA-256.
 
-To measure the pending `pure_1bit_hamming_only` row, run the retrieval harness
-against an embedded corpus with `MIMIR_DENSE_SIG_RERANK=0`.
+The `pure_1bit_hamming_only` row is reproduced by rerunning the retrieval harness
+on the embedded corpus with `MIMIR_DENSE_SIG_RERANK=0` (`scale1m_pure1bit.json`).
 
 ## Source artifacts
 

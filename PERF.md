@@ -13,8 +13,9 @@ the stored vector must trade recall for speed; at 1M the opposite holds on the
 honest signal. This section records the index-quantization ladder and pins the
 two orthogonal quantization axes so future rows land in the right column.
 Companion artifacts: `benchmark/embedding-quantization/report.json` (the signed
-roll-up) and the three per-tier scale runs under `benchmark/lambda/results/`
-(`scale1m_exact_ceiling.json`, `scale1m_2c_on.json`, `scale1m_default_500.json`).
+roll-up) and the per-tier scale runs under `benchmark/lambda/results/`
+(`scale1m_exact_ceiling.json`, `scale1m_2c_on.json`, `scale1m_default_500.json`,
+`scale1m_pure1bit.json`).
 Continuation of #619 (the 1-bit prefilter campaign) — this is #619's ceiling
 measured against the full-precision cosine it was always compared to in
 principle but never head-to-head at scale.
@@ -53,7 +54,7 @@ the vector quantization actually does to ranking.
 | full f32 exact cosine | 1× | 32 | 0.486 | 0.684 | 0.754 | 650.1 ms | `scale1m_exact_ceiling.json` |
 | int4 (`emb_sig4`) coarse | 8× | 4 | 0.497 | 0.722 | 0.791 | 395.6 ms | `scale1m_2c_on.json` |
 | **1-bit prefilter + rerank (SHIPPED)** | **32×** | **1** | **0.514** | **0.726** | **0.800** | **194.5 ms** | `scale1m_default_500.json` |
-| pure 1-bit Hamming-only | 32× | 1 | *pending* | *pending* | *pending* | *pending* | harness-ready (`MIMIR_DENSE_SIG_RERANK=0`) |
+| pure 1-bit (prefilter, no rerank) | 32× | 1 | 0.132 | 0.312 | 0.412 | 184.3 ms | `scale1m_pure1bit.json` |
 
 The headline, counterintuitive and every row measured/signed: **more aggressive
 index quantization gives BOTH higher standalone-dense recall AND lower latency.**
@@ -65,16 +66,28 @@ magnitude keeps only the orthant, which discards cross-cluster cosine confusers
 the full-precision score ranks too highly. int4 sits monotonically between the
 two on both axes, confirming the trend isn't an artifact of the 1-bit endpoint.
 
-### Residual (harness-ready, measurement pending)
+### The rerank does the denoising, not the 1-bit ranking (measured)
 
 The shipped 1-bit tier is a **prefilter + exact-cosine rerank** — the Hamming
-scan picks the pool, phase-2 cosine reorders it. To expose the **pure 1-bit**
-row (Hamming-only, no rerank) and upper-bound what the rerank actually buys,
-this session adds `DenseOpts.rerank` / env `MIMIR_DENSE_SIG_RERANK=0` (default
-**ON**; the default path is byte-identical, the flag is opt-in). The row is left
-`pending` deliberately: it must be measured on an *embedded* corpus (the next
-Lambda run or a local model), not the sign-only synthetic, to be an honest
-number. The FP16/BF16 and NVFP4 model-axis rows are pending / #629 as above.
+scan picks the candidate pool, phase-2 cosine reorders it. `DenseOpts.rerank` /
+env `MIMIR_DENSE_SIG_RERANK=0` (added this cycle; default **ON**, default path
+byte-identical) turns the rerank off to measure the prefilter **alone**. Same
+1M corpus, same instance, 500 queries:
+
+| | dense r@1 | r@5 | r@10 | p50 |
+| --- | --- | --- | --- | --- |
+| 1-bit prefilter **+ rerank** (shipped) | 0.514 | **0.726** | 0.800 | 194.5 ms |
+| 1-bit prefilter, **no rerank** | 0.132 | **0.312** | 0.412 | 184.3 ms |
+
+Dropping the rerank saves ~10 ms and **halves-and-then-some** the recall
+(0.726 → 0.312 r@5). So the "1-bit beats the f32 ceiling" result above is NOT
+the 1-bit code being a better *ranker* — the sign code is a cheap, high-recall
+candidate *filter*, and the **exact-cosine rerank over that 1-bit-selected pool
+is what denoises** and delivers the 0.726. The rerank is nearly free and does
+the heavy lifting: keep it on (it is, by default). `gate.py` locks this in
+(reranked r@5 must exceed the pure-prefilter r@5 by ≥ 0.2).
+
+Still pending (model-weight axis): the FP16/BF16 row and NVFP4 — #629.
 
 ## #530 — GPU contention + agent economics: recall unaffected at 100% accelerator load
 

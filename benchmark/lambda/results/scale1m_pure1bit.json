@@ -1,0 +1,135 @@
+{
+  "tier": "630-PURE1BIT-500q (gpu_1x_h100_sxm5, 1M reused corpus, local NVMe)",
+  "corpus": {
+    "entities_generated": 1000000,
+    "clusters": 10000,
+    "per_cluster": 100,
+    "queries_generated": 20000,
+    "persisted": 995562
+  },
+  "summary": {
+    "seed": {
+      "skipped": true
+    },
+    "embedding": {
+      "mode": "binary-serial",
+      "entities_embedded": 0,
+      "secs": 0.0,
+      "entities_per_sec": 0.0,
+      "stored_coverage": 995562
+    },
+    "warm_set_info": {
+      "max_scan": 50000,
+      "clusters_in_scan": 9937,
+      "clusters_total": 10000
+    },
+    "recall@1": {
+      "uniform": {
+        "fts5": {
+          "recall": 0.0,
+          "p50_ms": 57.3,
+          "p99_ms": 310.4
+        },
+        "dense": {
+          "recall": 0.132,
+          "p50_ms": 184.3,
+          "p99_ms": 187.8
+        },
+        "hybrid": {
+          "recall": 0.86,
+          "p50_ms": 398.6,
+          "p99_ms": 820.3
+        }
+      },
+      "warm_set": {
+        "fts5": {
+          "recall": 0.0,
+          "p50_ms": 57.5,
+          "p99_ms": 310.6
+        },
+        "dense": {
+          "recall": 0.14,
+          "p50_ms": 207.0,
+          "p99_ms": 211.7
+        },
+        "hybrid": {
+          "recall": 0.834,
+          "p50_ms": 408.8,
+          "p99_ms": 845.7
+        }
+      }
+    },
+    "recall@5": {
+      "uniform": {
+        "fts5": {
+          "recall": 0.0,
+          "p50_ms": 57.3,
+          "p99_ms": 310.4
+        },
+        "dense": {
+          "recall": 0.312,
+          "p50_ms": 184.3,
+          "p99_ms": 187.8
+        },
+        "hybrid": {
+          "recall": 1.0,
+          "p50_ms": 398.6,
+          "p99_ms": 820.3
+        }
+      },
+      "warm_set": {
+        "fts5": {
+          "recall": 0.0,
+          "p50_ms": 57.5,
+          "p99_ms": 310.6
+        },
+        "dense": {
+          "recall": 0.342,
+          "p50_ms": 207.0,
+          "p99_ms": 211.7
+        },
+        "hybrid": {
+          "recall": 1.0,
+          "p50_ms": 408.8,
+          "p99_ms": 845.7
+        }
+      }
+    },
+    "recall@10": {
+      "uniform": {
+        "fts5": {
+          "recall": 0.0,
+          "p50_ms": 57.3,
+          "p99_ms": 310.4
+        },
+        "dense": {
+          "recall": 0.412,
+          "p50_ms": 184.3,
+          "p99_ms": 187.8
+        },
+        "hybrid": {
+          "recall": 1.0,
+          "p50_ms": 398.6,
+          "p99_ms": 820.3
+        }
+      },
+      "warm_set": {
+        "fts5": {
+          "recall": 0.002,
+          "p50_ms": 57.5,
+          "p99_ms": 310.6
+        },
+        "dense": {
+          "recall": 0.44,
+          "p50_ms": 207.0,
+          "p99_ms": 211.7
+        },
+        "hybrid": {
+          "recall": 1.0,
+          "p50_ms": 408.8,
+          "p99_ms": 845.7
+        }
+      }
+    }
+  }
+}

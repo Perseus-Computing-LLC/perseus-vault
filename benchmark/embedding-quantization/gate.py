@@ -53,7 +53,18 @@ def main():
         % (onebit["dense"]["p50_ms"], int4["dense"]["p50_ms"], exact["dense"]["p50_ms"]),
     )
 
-    # 3. Provenance — every measured tier cites a hashed source.
+    # 3. Rerank is essential — the exact-cosine rerank over the 1-bit-selected
+    #    pool is what does the denoising, NOT the 1-bit ranking. The shipped
+    #    default must beat the pure 1-bit prefilter (no rerank) by a wide margin.
+    pure = ladder.get("pure_1bit_hamming_only")
+    if pure and "dense" in pure:
+        check(
+            onebit["dense"]["r@5"] >= pure["dense"]["r@5"] + 0.2,
+            "rerank essential: reranked default r@5 (%.3f) >> pure-1-bit prefilter r@5 (%.3f)"
+            % (onebit["dense"]["r@5"], pure["dense"]["r@5"]),
+        )
+
+    # 4. Provenance — every measured tier cites a hashed source.
     for level, row in ladder.items():
         if "dense" in row:  # a measured tier
             src = row.get("source")
