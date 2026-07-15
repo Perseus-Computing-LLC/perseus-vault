@@ -978,6 +978,65 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Scan / Enumerate Entities"
   },
   {
+    "name": "mimir_hygiene",
+    "description": "Read-only hygiene report: surface likely low-signal memories so a startup-memory block stays dense without manual forensics. Scores every active memory by startup 'actionability' (the same signal as recall's startup mode) — concrete anchors like issue/ticket keys, #refs, paths, URLs, named systems, and decision/escalation language score high; vague, date-only titles (e.g. '2026-07-13') and very short bodies score low — and returns the worst offenders (below `threshold`) with the reasons they were flagged. Keyset-scans in pages; never bumps retrieval counts or decay. Use it to find archive/consolidate candidates before curating startup recall.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "category": {
+          "type": "string",
+          "description": "Restrict the scan to one category, e.g. 'memories'. Omit to scan every active category."
+        },
+        "threshold": {
+          "type": "number",
+          "default": 0.35,
+          "description": "Actionability score (0.0–1.0) below which a memory is flagged low-signal. Lower = stricter (fewer flags)."
+        },
+        "scan_limit": {
+          "type": "integer",
+          "default": 1000,
+          "description": "Maximum active memories to scan (1–10000)."
+        },
+        "limit": {
+          "type": "integer",
+          "default": 50,
+          "description": "Maximum flagged rows to return, worst first (1–1000)."
+        }
+      },
+      "required": []
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "scanned": {
+          "type": "integer",
+          "description": "Number of active memories inspected."
+        },
+        "flagged_count": {
+          "type": "integer",
+          "description": "Total memories below the threshold (may exceed the returned rows)."
+        },
+        "returned": {
+          "type": "integer",
+          "description": "Number of flagged rows in this response."
+        },
+        "threshold": {
+          "type": "number",
+          "description": "The actionability threshold applied."
+        },
+        "flagged": {
+          "type": "array",
+          "items": { "type": "object" },
+          "description": "Worst-first: {id, category, key, actionability, reasons[], retrieval_count}. reasons ∈ date_only_title | short_body | no_concrete_entities | low_actionability."
+        }
+      }
+    },
+    "annotations": {
+      "readOnlyHint": true
+    },
+    "title": "Startup-Memory Hygiene Report"
+  },
+  {
     "name": "mimir_semantic_search",
     "description": "Dense-only semantic search: find entities by meaning, ranked purely by embedding similarity (no keyword fallback). On by default via the bundled in-process ONNX model — zero config, zero network. A one-tool shortcut for 'find things like this'. For fused keyword+vector results use mimir_recall.",
     "inputSchema": {
@@ -4264,6 +4323,8 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
         "mimir_recall_layer" => tools::handle_recall_layer(db, args).map_err(|e| e.to_string()),
 
         "mimir_scan" => tools::handle_scan(db, args).map_err(|e| e.to_string()),
+
+        "mimir_hygiene" => tools::handle_hygiene(db, args).map_err(|e| e.to_string()),
 
         "mimir_semantic_search" => {
             tools::handle_semantic_search(db, args).map_err(|e| e.to_string())

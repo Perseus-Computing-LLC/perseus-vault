@@ -98,6 +98,15 @@ perseus_vault_recall { "query": "decay policy", "mode": "fts5", "as_of_unix_ms":
   `offset` is clamped at 10,000. The official Python client's
   `VaultClient.scan(category)` uses the scan tool automatically (falling back to
   offset-paged recall only on pre-#562 servers).
+- **Startup-optimized ranking (`startup: true`, #675/#676).** For startup /
+  pre-session recall, pass `startup: true`: recall over-fetches a candidate pool
+  and re-ranks it by **actionability** — memories that carry concrete anchors
+  (issue/ticket keys, `#refs`, paths, URLs, named systems, decision/escalation
+  language) outrank vague, date-only, or very short near-neighbors — then
+  truncates to `limit`. Each item also gets an `actionability` score (0.0–1.0).
+  Off by default (order is byte-identical without the flag). To find the
+  low-signal memories dragging a startup block down, run the read-only
+  **`perseus_vault_hygiene`** report.
 - **Offline by default.** FTS5, dense (bundled model), hybrid, graph, and
   temporal modes all run with **zero network calls**. Dense embeddings can
   optionally be generated via Ollama or an OpenAI-compatible endpoint

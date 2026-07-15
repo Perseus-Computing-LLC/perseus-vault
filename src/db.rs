@@ -10935,6 +10935,224 @@ pub(crate) fn usefulness_weight(usefulness_count: i64) -> f64 {
     1.0 + ((usefulness_count.max(0) as f64).ln_1p() * 0.1).min(0.4)
 }
 
+// ─── #675/#676: startup actionability scoring ───────────────────────────────
+//
+// A startup-memory block is judged by whether it CHANGES THE FIRST RETRIEVAL
+// MOVE, not just by topical relevance. In benchmarking, the high-value startup
+// facts carried concrete anchors — issue/ticket keys, #refs, named systems,
+// filing paths/URLs, escalation/decision language — while vague, date-only, or
+// very short entries cost tokens without changing the first move. These pure,
+// deterministic, offline helpers score that "actionability" so a caller can opt
+// into a startup-optimized recall order (#676) and surface low-signal entries
+// for cleanup (#675). They never run on the default recall path.
+
+/// The signal-bearing text of an entity: its key plus the human note/summary/
+/// content of its body. Cheap and allocation-light.
+fn actionability_text(e: &Entity) -> String {
+    let mut s = String::with_capacity(e.key.len() + 64);
+    s.push_str(&e.key);
+    s.push('\n');
+    let before = s.len();
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&e.body_json) {
+        for field in ["note", "summary", "content", "text", "title", "value"] {
+            if let Some(t) = v.get(field).and_then(|x| x.as_str()) {
+                s.push_str(t);
+                s.push('\n');
+            }
+        }
+    }
+    // No recognized body field matched → fall back to the raw body text so
+    // scoring still sees the content (e.g. a plain-string body_json).
+    if s.len() == before {
+        s.push_str(&e.body_json);
+    }
+    s
+}
+
+/// Whether the key is essentially just a date (`2026-07-13`, `2026/07/13`) — the
+/// canonical low-signal startup item (#675). Allows up to two stray letters
+/// (e.g. a `v` prefix) so a real titled memory that merely contains a date is
+/// not misflagged.
+fn key_is_date_only(key: &str) -> bool {
+    let key = key.trim();
+    !key.is_empty()
+        && parse_event_date_key(key).is_some()
+        && key.chars().filter(|c| c.is_ascii_alphabetic()).count() <= 2
+}
+
+/// True if the token looks like an issue/ticket key: ≥2 uppercase letters, a
+/// hyphen, then digits (e.g. `ACE-10669`, `PROJ-12`).
+fn is_issue_key(tok: &str) -> bool {
+    if let Some(dash) = tok.find('-') {
+        let (a, b) = (&tok[..dash], &tok[dash + 1..]);
+        return a.len() >= 2
+            && a.chars().all(|c| c.is_ascii_uppercase())
+            && !b.is_empty()
+            && b.chars().all(|c| c.is_ascii_digit());
+    }
+    false
+}
+
+/// True if the token is a standalone acronym/identifier: 2–6 chars, all
+/// uppercase/digits, at least one letter (e.g. `SAM`, `NSF`, `A100`).
+fn is_acronym(tok: &str) -> bool {
+    let n = tok.chars().count();
+    (2..=6).contains(&n)
+        && tok.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+        && tok.chars().any(|c| c.is_ascii_uppercase())
+}
+
+/// Count concrete-entity signals in `text`:
+/// (issue_keys, hash_refs, path_seps, urls, acronyms).
+fn count_concrete_signals(text: &str) -> (usize, usize, usize, usize, usize) {
+    let (mut issue_keys, mut hash_refs, mut paths, mut urls, mut acronyms) = (0, 0, 0, 0, 0);
+    if text.contains("http://") || text.contains("https://") {
+        urls += 1;
+    }
+    let b = text.as_bytes();
+    for i in 0..b.len() {
+        // #ref: '#' immediately followed by a digit.
+        if b[i] == b'#' && i + 1 < b.len() && b[i + 1].is_ascii_digit() {
+            hash_refs += 1;
+        }
+        // path separator flanked by alphanumerics (folder/sub, a\b).
+        if (b[i] == b'/' || b[i] == b'\\')
+            && i > 0
+            && i + 1 < b.len()
+            && b[i - 1].is_ascii_alphanumeric()
+            && b[i + 1].is_ascii_alphanumeric()
+        {
+            paths += 1;
+        }
+    }
+    for tok in text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-')) {
+        if is_issue_key(tok) {
+            issue_keys += 1;
+        }
+    }
+    for tok in text.split(|c: char| !c.is_ascii_alphanumeric()) {
+        if is_acronym(tok) {
+            acronyms += 1;
+        }
+    }
+    (issue_keys, hash_refs, paths, urls, acronyms)
+}
+
+/// Decision/escalation/anchor language — the phrasing of facts that changed the
+/// first retrieval move rather than generic background.
+fn has_action_language(lower: &str) -> bool {
+    const MARKERS: [&str; 13] = [
+        "escalat", "decision", "decided", "blocked", "deadline", "owner",
+        "root cause", "action item", "canonical", "source of truth", "incident",
+        "filed", "due date",
+    ];
+    MARKERS.iter().any(|m| lower.contains(m))
+}
+
+/// #676: startup-actionability score in [0.0, 1.0]. Centered at ~0.5 for a plain
+/// memory; boosted by concrete entities and decision language, damped for
+/// date-only titles and very short bodies.
+pub(crate) fn actionability_score(e: &Entity) -> f64 {
+    let text = actionability_text(e);
+    let trimmed = text.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    let key = e.key.trim();
+    let body_len = trimmed.len().saturating_sub(key.len());
+
+    let mut score = 0.5_f64;
+    let (issue_keys, hash_refs, paths, urls, acronyms) = count_concrete_signals(trimmed);
+    if issue_keys > 0 {
+        score += 0.22;
+    }
+    if hash_refs > 0 {
+        score += 0.12;
+    }
+    if paths > 0 {
+        score += 0.12;
+    }
+    if urls > 0 {
+        score += 0.10;
+    }
+    if acronyms >= 2 {
+        score += 0.10;
+    }
+    if has_action_language(&lower) {
+        score += 0.10;
+    }
+    if body_len >= 120 {
+        score += 0.06;
+    }
+    if body_len < 30 {
+        score -= 0.20;
+    }
+    if key_is_date_only(key) {
+        score -= 0.30;
+    }
+    score.clamp(0.0, 1.0)
+}
+
+/// Map an actionability score to a rank multiplier centered at 1.0 (neutral):
+/// 0.0 → 0.70 (damp), 0.5 → 1.0, 1.0 → 1.30 (boost). Bounded so the signal
+/// reorders near-ties without swamping the relevance signal.
+fn actionability_weight(score: f64) -> f64 {
+    0.70 + 0.60 * score
+}
+
+/// #675: the human-readable low-signal reasons for an entity, for the hygiene
+/// report. Empty when the entity is not low-signal.
+pub(crate) fn actionability_reasons(e: &Entity) -> Vec<&'static str> {
+    let text = actionability_text(e);
+    let trimmed = text.trim();
+    let key = e.key.trim();
+    let mut reasons = Vec::new();
+    if key_is_date_only(key) {
+        reasons.push("date_only_title");
+    }
+    if trimmed.len().saturating_sub(key.len()) < 30 {
+        reasons.push("short_body");
+    }
+    let (ik, hr, pa, ur, ac) = count_concrete_signals(trimmed);
+    if ik + hr + pa + ur == 0 && ac < 2 {
+        reasons.push("no_concrete_entities");
+    }
+    reasons
+}
+
+/// #676: startup-optimized re-rank. `entities` arrive in relevance order; assign
+/// an RRF-style base score by that rank, multiply by actionability weight, and
+/// re-sort so action-changing memories outrank vague/date-only near-neighbors.
+/// Deterministic tie-break (score desc, id asc). Truncates to `limit` (0 = all).
+/// Only invoked when a caller opts into startup ranking — default order is
+/// untouched.
+pub(crate) fn actionability_rerank(entities: Vec<Entity>, limit: usize) -> Vec<Entity> {
+    if entities.len() < 2 {
+        let mut e = entities;
+        if limit > 0 {
+            e.truncate(limit);
+        }
+        return e;
+    }
+    let mut scored: Vec<(f64, Entity)> = entities
+        .into_iter()
+        .enumerate()
+        .map(|(rank, e)| {
+            let base = 1.0 / (60.0 + rank as f64 + 1.0);
+            let w = actionability_weight(actionability_score(&e));
+            (base * w, e)
+        })
+        .collect();
+    scored.sort_by(|a, b| {
+        b.0.partial_cmp(&a.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.1.id.cmp(&b.1.id))
+    });
+    let mut out: Vec<Entity> = scored.into_iter().map(|(_, e)| e).collect();
+    if limit > 0 {
+        out.truncate(limit);
+    }
+    out
+}
+
 pub(crate) fn sparse_arm_weight(n_hits: usize) -> f64 {
     /// Equal-weight RRF: the keyword arm is as trustworthy as the dense arm once
     /// it has matched real, stopword-filtered content terms (#309).

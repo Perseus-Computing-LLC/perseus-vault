@@ -294,6 +294,7 @@ Any MCP-compatible framework works with Perseus Vault directly. See
 | `mimir_remember` | Store/update entity. Idempotent by (category, key); a content change snapshots the prior version into history. |
 | `mimir_recall` | Search with FTS5/dense/hybrid modes, filters, stemming expansion. Query contract (#562): `query=""` is match-all enumeration (the "list all" path); `"*"` and other wildcards are literal FTS5 terms, **not** globs — `"*"` matches nothing. |
 | `mimir_scan` | Deterministic paginated enumeration of a category or the whole store (#562): immutable `id ASC` keyset pages with a `next_cursor`/`has_more` contract, so export/sync/reset callers can walk every entity exactly once. Read-only — no retrieval-count/decay side-effects, no offset cap. |
+| `mimir_hygiene` | Read-only startup-memory hygiene report (#675): scores active memories by "actionability" (concrete anchors — issue keys, #refs, paths, URLs, decisions — vs vague/date-only/short) and lists the worst offenders with reasons, for archive/consolidate curation. |
 | `mimir_recall_layer` | Recall from a specific biomimetic layer (world, episodic, semantic). |
 | `mimir_recall_when` | Proactive just-in-time recall: surface entities whose `recall_when` triggers match. |
 | `mimir_get_entity` | Fetch one entity by ID with full `body_json`. |

@@ -264,6 +264,15 @@ pub struct RecallArgs {
     /// contains the whole queried period).
     #[serde(default, deserialize_with = "null_as_default")]
     pub valid_op: String,
+    /// #675/#676: opt-in startup-optimized ranking. When true, recall over-fetches
+    /// a candidate pool and re-ranks it by actionability — memories more likely to
+    /// change the first retrieval move (concrete entities: issue/ticket keys,
+    /// #refs, paths, URLs, named systems; decision/escalation language) outrank
+    /// vague, date-only, or very short near-neighbors — then truncates to `limit`.
+    /// Each returned item also carries an `actionability` score (0.0–1.0). Default
+    /// false: recall order is byte-identical to prior behavior.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub startup: bool,
 }
 
 pub type BatchQuery = RecallArgs;
@@ -909,11 +918,26 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
     let mode_for_side_effects = mode.clone();
     let reinforce_requested = a.reinforce;
 
+    // #675/#676: startup-optimized recall over-fetches a candidate pool, then
+    // re-ranks by actionability and truncates to the caller's limit below. Only
+    // when opted in (a.startup) and paging from the first page (offset 0) — so
+    // pagination semantics and the default recall path are untouched. The pool
+    // is read purely (skip_side_effects) so over-fetch doesn't reinforce rows
+    // that won't survive the truncate; survivors are reinforced afterwards.
+    let startup_rank = a.startup;
+    let requested_limit = a.limit;
+    let effective_limit = if startup_rank && a.offset == 0 {
+        requested_limit.saturating_mul(5).clamp(requested_limit, 200)
+    } else {
+        requested_limit
+    };
+    let defer_side_effects = temporal_filtering || (startup_rank && a.offset == 0);
+
     let params = RecallParams {
         query: a.query,
         category: a.category,
         entity_type: a.entity_type,
-        limit: a.limit,
+        limit: effective_limit,
         offset: a.offset,
         min_decay: a.min_decay,
         topic_path: a.topic_path,
@@ -925,7 +949,7 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
         // "what was true at T" would make the invisible entities immortal.
         // Side-effects are applied below to the SURVIVING hits only, mirroring
         // the expansion path. Unfiltered calls keep the original behavior.
-        skip_side_effects: temporal_filtering,
+        skip_side_effects: defer_side_effects,
         mode,
         embedding: None,
         preview_cap: a.preview_cap,
@@ -947,6 +971,13 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
         .recall(&params)
         .map_err(|e| format!("Recall failed: {}", e))?;
 
+    // #675/#676: re-rank the over-fetched pool by actionability and truncate to
+    // the caller's limit, so action-changing memories win the top-k over vague/
+    // date-only near-neighbors. No-op unless startup was requested.
+    if startup_rank && a.offset == 0 {
+        entities = crate::db::actionability_rerank(entities, requested_limit.max(0) as usize);
+    }
+
     // #472 Temporal RAG: an as_of (transaction) and/or valid_at (world) instant
     // reconstructs each hit's point-in-time body — valid_at alone now rebuilds
     // the historical world-version, not just a live-row narrow; as_of adds the
@@ -961,8 +992,10 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
 
     // #363 review: re-apply the deferred recall side-effects to the survivors,
     // under exactly the conditions the un-filtered path would have reinforced:
-    // fts5 always does; dense/hybrid only when the caller opted in.
-    if temporal_filtering
+    // fts5 always does; dense/hybrid only when the caller opted in. #675/#676:
+    // the startup path defers the same way (it over-fetched a pure-read pool),
+    // so its truncated survivors get reinforced here too.
+    if defer_side_effects
         && (mode_for_side_effects == SearchMode::Fts5 || reinforce_requested)
         && !entities.is_empty()
     {
@@ -1229,6 +1262,98 @@ where
 /// call repeatedly, feeding each page's `next_cursor` back in, until
 /// `has_more` is false — every entity in scope is returned exactly once.
 /// Read-only: no retrieval-count/decay side-effects.
+#[derive(Debug, Deserialize, Default)]
+pub struct HygieneArgs {
+    /// Restrict the scan to one category (default: all active memories).
+    #[serde(default)]
+    pub category: Option<String>,
+    /// Actionability below which a memory is flagged low-signal (default 0.35).
+    #[serde(default)]
+    pub threshold: Option<f64>,
+    /// Max memories to scan (default 1000, cap 10000).
+    #[serde(default)]
+    pub scan_limit: Option<i64>,
+    /// Max flagged rows to return, worst first (default 50, cap 1000).
+    #[serde(default)]
+    pub limit: Option<i64>,
+}
+
+/// #675: read-only hygiene report — surface likely low-signal memories (vague,
+/// date-only titles, very short bodies, no concrete entities) so a startup
+/// block can be kept dense without hand-forensics over the vault. Uses the same
+/// actionability scoring as startup recall (#676); keyset-scans active memories
+/// in pages (no recall side-effects) and returns the worst offenders with the
+/// reasons they were flagged.
+pub fn handle_hygiene(db: &Database, args: Value) -> Result<String, String> {
+    let a: HygieneArgs =
+        serde_json::from_value(args).map_err(|e| format!("Invalid hygiene arguments: {}", e))?;
+    let threshold = a.threshold.unwrap_or(0.35).clamp(0.0, 1.0);
+    let scan_cap = a.scan_limit.unwrap_or(1000).clamp(1, 10_000);
+    let report_cap = a.limit.unwrap_or(50).clamp(1, 1000) as usize;
+
+    let mut scanned = 0i64;
+    let mut flagged: Vec<(f64, serde_json::Value)> = Vec::new();
+    let mut cursor: Option<String> = None;
+    const PAGE: i64 = 500;
+    while scanned < scan_cap {
+        let want = PAGE.min(scan_cap - scanned);
+        // Over-fetch one row to learn whether another page exists (mirrors scan).
+        let batch = db
+            .scan_entities(a.category.as_deref(), None, false, cursor.as_deref(), want + 1)
+            .map_err(|e| format!("Hygiene scan failed: {}", e))?;
+        let has_more = batch.len() as i64 > want;
+        let take = if has_more { want as usize } else { batch.len() };
+        if take == 0 {
+            break;
+        }
+        cursor = batch.get(take - 1).map(|e| e.id.clone());
+        for e in batch.iter().take(take) {
+            scanned += 1;
+            let score = crate::db::actionability_score(e);
+            if score < threshold {
+                let mut reasons: Vec<String> = crate::db::actionability_reasons(e)
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect();
+                if reasons.is_empty() {
+                    reasons.push("low_actionability".to_string());
+                }
+                flagged.push((
+                    score,
+                    json!({
+                        "id": e.id,
+                        "category": e.category,
+                        "key": e.key,
+                        "actionability": (score * 1000.0).round() / 1000.0,
+                        "reasons": reasons,
+                        "retrieval_count": e.retrieval_count,
+                    }),
+                ));
+            }
+        }
+        if !has_more {
+            break;
+        }
+    }
+    // Worst (lowest actionability) first; deterministic id tiebreak.
+    flagged.sort_by(|x, y| {
+        x.0.partial_cmp(&y.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| x.1["id"].as_str().unwrap_or("").cmp(y.1["id"].as_str().unwrap_or("")))
+    });
+    let flagged_count = flagged.len();
+    let items: Vec<serde_json::Value> =
+        flagged.into_iter().take(report_cap).map(|(_, v)| v).collect();
+    Ok(json!({
+        "scanned": scanned,
+        "flagged_count": flagged_count,
+        "returned": items.len(),
+        "threshold": threshold,
+        "flagged": items,
+    })
+    .to_string())
+}
+
 pub fn handle_scan(db: &Database, args: Value) -> Result<String, String> {
     let a: ScanArgs =
         serde_json::from_value(args).map_err(|e| format!("Invalid scan arguments: {}", e))?;
