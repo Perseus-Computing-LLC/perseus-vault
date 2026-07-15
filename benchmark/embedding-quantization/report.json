@@ -1,0 +1,128 @@
+{
+  "benchmark": "embedding-quantization",
+  "issue": "#630",
+  "axes": {
+    "index_signature": "compression of the stored vector for the dense prefilter: full f32 cosine (1x) -> int4 emb_sig4 (8x) -> 1-bit emb_sig (32x)",
+    "model_weight": "generation of the embedding: INT8 (shipped MiniLM qint8) -> FP16/BF16 -> NVFP4"
+  },
+  "corpus": {
+    "scale": "1M",
+    "shape": "10000 clusters x 100",
+    "embedding_model": "nomic-embed-text 768-dim (endpoint; H100 fleet)",
+    "hardware": "gpu_2x_h100_sxm5",
+    "queries": 500
+  },
+  "honest_signal": "standalone dense recall (hybrid keyword arm saturates ~1.0 on the synthetic cluster markers)",
+  "index_axis_note": "f32/int4/1-bit tiers are derived from the stored vector; the 1M ladder fixes the base model at nomic-768, so it isolates the index axis apples-to-apples on that model. Whether the denoising holds identically for the bundled MiniLM-384 is plausible but unmeasured (the model-weight axis).",
+  "index_ladder": [
+    {
+      "level": "full_f32_exact_cosine",
+      "column": "embedding",
+      "bits_per_dim": 32,
+      "compression": "1x",
+      "note": "unbounded exact cosine — the full-precision ceiling",
+      "source": "scale1m_exact_ceiling.json",
+      "dense": {
+        "p50_ms": 650.1,
+        "p99_ms": 710.6,
+        "r@1": 0.486,
+        "r@5": 0.684,
+        "r@10": 0.754
+      },
+      "hybrid": {
+        "p50_ms": 754.7,
+        "p99_ms": 824.9,
+        "r@1": 0.934,
+        "r@5": 1,
+        "r@10": 1
+      }
+    },
+    {
+      "level": "int4_sig4_coarse",
+      "column": "emb_sig4",
+      "bits_per_dim": 4,
+      "compression": "8x",
+      "note": "resident int4 ADC signature coarse ranking (#619 step 2c')",
+      "source": "scale1m_2c_on.json",
+      "dense": {
+        "p50_ms": 395.6,
+        "p99_ms": 412.1,
+        "r@1": 0.497,
+        "r@5": 0.722,
+        "r@10": 0.791
+      },
+      "hybrid": {
+        "p50_ms": 465.4,
+        "p99_ms": 835.6,
+        "r@1": 0.95,
+        "r@5": 1,
+        "r@10": 1
+      }
+    },
+    {
+      "level": "1bit_sig_prefilter_rerank",
+      "column": "emb_sig",
+      "bits_per_dim": 1,
+      "compression": "32x",
+      "shipped_default": true,
+      "note": "1-bit Hamming prefilter + exact-cosine rerank — SHIPPED default",
+      "source": "scale1m_default_500.json",
+      "dense": {
+        "p50_ms": 194.5,
+        "p99_ms": 198,
+        "r@1": 0.514,
+        "r@5": 0.726,
+        "r@10": 0.8
+      },
+      "hybrid": {
+        "p50_ms": 384.1,
+        "p99_ms": 812.3,
+        "r@1": 0.96,
+        "r@5": 1,
+        "r@10": 1
+      }
+    },
+    {
+      "level": "pure_1bit_hamming_only",
+      "column": "emb_sig",
+      "bits_per_dim": 1,
+      "compression": "32x",
+      "status": "harness_ready_measurement_pending",
+      "note": "Hamming-only, no rerank (MIMIR_DENSE_SIG_RERANK=0, #630). Upper-bounds what the exact rerank buys; measure on an embedded corpus (next Lambda run or a local model)."
+    }
+  ],
+  "model_axis": {
+    "int8": {
+      "status": "shipped",
+      "note": "the bundled LOCAL default is all-MiniLM-L6-v2 qint8 (384-dim, INT8) — used for the offline/default path and the repo's 100K + LongMemEval numbers. NOTE: the 1M index ladder above was measured on the nomic-768 ENDPOINT model, not this bundled INT8 default (see corpus.embedding_model)"
+    },
+    "fp16_bf16": {
+      "status": "measurement_pending",
+      "note": "re-embed with the full-precision ONNX export + rerun the harness (cheap at 100K local)"
+    },
+    "nvfp4": {
+      "status": "deferred",
+      "note": "needs Blackwell-class hardware; the interesting question (larger embedder @ NVFP4 vs MiniLM-FP32 at equal memory) is tracked in #629"
+    }
+  },
+  "provenance": {
+    "scale1m_exact_ceiling.json": {
+      "sha256": "b4b5065795b901def32301541ac4e4ff3af58cc4f5db47ccfe4aba4c5a0460ff",
+      "tier": "sig619-EXACT-500q (gpu_2x_h100_sxm5, 1M reused corpus, local NVMe)",
+      "persisted": 995562,
+      "max_scan": 50000
+    },
+    "scale1m_2c_on.json": {
+      "sha256": "75160e84728da0be9edbeda9abab7a670a220caa439c3ef20693c98075c3c301",
+      "tier": "sig619-2c-ON (gpu_2x_h100_sxm5, 1M reused corpus, local NVMe)",
+      "persisted": 995562,
+      "max_scan": 50000
+    },
+    "scale1m_default_500.json": {
+      "sha256": "902f6d040b24cab0624f2b1e64674f767da4522b46a3f0601229ae85d8ac6959",
+      "tier": "sig619-DEFAULT-500q (gpu_2x_h100_sxm5, 1M reused corpus, local NVMe)",
+      "persisted": 995562,
+      "max_scan": 50000
+    }
+  }
+}

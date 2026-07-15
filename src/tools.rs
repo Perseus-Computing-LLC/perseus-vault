@@ -763,7 +763,13 @@ pub fn handle_remember(db: &Database, args: Value) -> Result<String, String> {
         Some(json!({"reinforced": reinforced, "not_found": not_found}))
     };
 
+    // #657: mirror the CLI write's #516 contract onto the MCP surface — every
+    // committed remember carries an explicit `ok: true`. `remember_with_options`
+    // only returns Ok after the row is written, so this marks durable commit.
+    // A degraded/empty/no-op response structurally lacks `ok`, so a caller that
+    // checks the field can never mistake a silent no-op for a persisted write.
     let mut result = json!({
+        "ok": true,
         "id": eid,
         "action": action,
         "category": entity.category,
@@ -5201,6 +5207,7 @@ mod tests {
         )
         .expect("first write");
         let v: Value = serde_json::from_str(&r).unwrap();
+        assert_eq!(v["ok"], json!(true), "#657: committed write must carry ok:true: {r}");
         assert_eq!(v["action"], json!("created"), "{r}");
         assert!(v.get("deduped").is_none(), "created write must not carry dedup fields: {r}");
         let first_id = v["id"].as_str().unwrap().to_string();
@@ -5213,6 +5220,7 @@ mod tests {
         )
         .expect("near-dup write");
         let v: Value = serde_json::from_str(&r).unwrap();
+        assert_eq!(v["ok"], json!(true), "#657: a dedup merge is still an accepted write: {r}");
         assert_eq!(v["deduped"], json!(true), "{r}");
         assert_eq!(v["merged_into"], json!(first_id), "{r}");
         assert!(v["hint"].as_str().unwrap().contains("skip_dedup"), "{r}");

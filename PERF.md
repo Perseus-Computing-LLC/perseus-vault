@@ -6,6 +6,76 @@ CI budgets) and the #473 epic's rule: no claim without a rerunnable script.
 GPU co-residency numbers (recall under 100% MI300X load) live in
 [`docs/deployment-amd-mi300x.md`](docs/deployment-amd-mi300x.md).
 
+## #630 — embedding quantization: aggressive index compression denoises AND speeds up dense recall
+
+Not a single before/after — a measured *ladder*. The intuition says compressing
+the stored vector must trade recall for speed; at 1M the opposite holds on the
+honest signal. This section records the index-quantization ladder and pins the
+two orthogonal quantization axes so future rows land in the right column.
+Companion artifacts: `benchmark/embedding-quantization/report.json` (the signed
+roll-up) and the three per-tier scale runs under `benchmark/lambda/results/`
+(`scale1m_exact_ceiling.json`, `scale1m_2c_on.json`, `scale1m_default_500.json`).
+Continuation of #619 (the 1-bit prefilter campaign) — this is #619's ceiling
+measured against the full-precision cosine it was always compared to in
+principle but never head-to-head at scale.
+
+### The honest signal
+
+1M corpus: 995,562 persisted rows, 10,000 clusters × 100, nomic-768 dim, 2× H100
+SXM5, 500 queries, uniform arm, `max_scan` 50,000. The recall number that means
+anything here is **standalone dense** recall. The hybrid keyword arm saturates
+~1.0 (r@5 = 1.000 at every tier) because the synthetic corpus tags each cluster
+with markers BM25 matches exactly — so hybrid recall is NOT the quantization
+signal and is deliberately excluded from the headline. Dense-only isolates what
+the vector quantization actually does to ranking.
+
+### The two axes (do not conflate them)
+
+1. **Index / signature quantization** — how the stored vector is compressed for
+   the dense prefilter: full f32 cosine (`embedding`, 1×) → int4 (`emb_sig4`,
+   8×) → 1-bit sign code (`emb_sig`, 32×). This is the ladder measured below.
+   The tiers are derived from whatever vector is stored, so the ladder isolates
+   this axis on a *fixed* base model (here nomic-768) across all three rungs.
+2. **Model-weight quantization** — how the embedding itself is generated. The
+   bundled **local default is INT8** (all-MiniLM-L6-v2 qint8, 384-dim), used for
+   the offline/default path and the repo's 100K + LongMemEval numbers. The 1M
+   ladder above, though, was measured on the **nomic-768 endpoint model**, not
+   this bundled default — so the model-weight axis is orthogonal and separately
+   (mostly) pending. FP16/BF16 is `measurement_pending` (re-embed with the
+   full-precision ONNX export and rerun — cheap at 100K local). NVFP4 is
+   deferred: it needs Blackwell-class hardware, and the interesting question (a
+   larger embedder at NVFP4 vs MiniLM-FP32 at equal memory) is tracked in #629.
+
+### Numbers (1M index-quantization ladder, standalone dense, 500 queries)
+
+| Tier | compression | bits/dim | dense r@1 | r@5 | r@10 | dense p50 | source artifact |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| full f32 exact cosine | 1× | 32 | 0.486 | 0.684 | 0.754 | 650.1 ms | `scale1m_exact_ceiling.json` |
+| int4 (`emb_sig4`) coarse | 8× | 4 | 0.497 | 0.722 | 0.791 | 395.6 ms | `scale1m_2c_on.json` |
+| **1-bit prefilter + rerank (SHIPPED)** | **32×** | **1** | **0.514** | **0.726** | **0.800** | **194.5 ms** | `scale1m_default_500.json` |
+| pure 1-bit Hamming-only | 32× | 1 | *pending* | *pending* | *pending* | *pending* | harness-ready (`MIMIR_DENSE_SIG_RERANK=0`) |
+
+The headline, counterintuitive and every row measured/signed: **more aggressive
+index quantization gives BOTH higher standalone-dense recall AND lower latency.**
+The 1-bit prefilter (**0.726 r@5 @ 194.5 ms**) beats full-precision exact cosine
+(**0.684 r@5 @ 650.1 ms**) — higher recall at every k, at **3.3× lower latency**
+and **32× less index memory** (~96 bytes/vec vs ~3072 at 768-dim; ~96 MB
+resident at 1M). The 1-bit sign code isn't just cheaper, it *denoises*: dropping
+magnitude keeps only the orthant, which discards cross-cluster cosine confusers
+the full-precision score ranks too highly. int4 sits monotonically between the
+two on both axes, confirming the trend isn't an artifact of the 1-bit endpoint.
+
+### Residual (harness-ready, measurement pending)
+
+The shipped 1-bit tier is a **prefilter + exact-cosine rerank** — the Hamming
+scan picks the pool, phase-2 cosine reorders it. To expose the **pure 1-bit**
+row (Hamming-only, no rerank) and upper-bound what the rerank actually buys,
+this session adds `DenseOpts.rerank` / env `MIMIR_DENSE_SIG_RERANK=0` (default
+**ON**; the default path is byte-identical, the flag is opt-in). The row is left
+`pending` deliberately: it must be measured on an *embedded* corpus (the next
+Lambda run or a local model), not the sign-only synthetic, to be an honest
+number. The FP16/BF16 and NVFP4 model-axis rows are pending / #629 as above.
+
 ## #530 — GPU contention + agent economics: recall unaffected at 100% accelerator load
 
 Not an optimization — a measured property of the architecture, recorded here

@@ -85,6 +85,13 @@ pub struct DenseOpts {
     pub use_sig_cache: Option<bool>,
     pub sig4_resident: Option<bool>,
     pub sig4_refine: Option<bool>,
+    /// #630: when `Some(false)`, skip the phase-2 exact-cosine rerank and
+    /// return the 1-bit Hamming-pool order directly — the "pure 1-bit" row
+    /// that upper-bounds how much recall the exact rerank is buying. Only
+    /// meaningful on the signature-prefilter path (≥ `DENSE_SIG_PREFILTER_MIN_ROWS`
+    /// embedded rows); the small-corpus exact path always reranks. `None` =
+    /// default (rerank ON — the shipped behavior).
+    pub rerank: Option<bool>,
 }
 
 struct SigCache {
@@ -1888,6 +1895,9 @@ impl Database {
             // refine of a 1-bit coarse pool cannot recover neighbors the
             // coarse ranking never kept. Env "1" re-enables for A/B.
             sig4_refine: tri("MIMIR_DENSE_SIG4"),
+            // #630: MIMIR_DENSE_SIG_RERANK=0 skips the exact-cosine rerank to
+            // measure the pure 1-bit (Hamming-only) recall row. Default ON.
+            rerank: tri("MIMIR_DENSE_SIG_RERANK"),
         };
         self.dense_search_with_opts(query_vec, limit, max_scan, opts)
     }
@@ -1957,6 +1967,12 @@ impl Database {
         let use_sig_cache = opts.use_sig_cache.unwrap_or(embedded_rows > max_scan as i64);
         let sig4_resident = opts.sig4_resident.unwrap_or(false);
         let sig4_refine = opts.sig4_refine.unwrap_or(false);
+        // #630: rerank ON by default. When OFF (pure 1-bit), the signature
+        // prefilter's Hamming order IS the final order — no exact-cosine pass.
+        let rerank = opts.rerank.unwrap_or(true);
+        // Only the signature-prefilter path has a Hamming pool to preserve;
+        // the small-corpus exact path (< MIN rows) always reranks.
+        let pure_1bit = !rerank && embedded_rows >= DENSE_SIG_PREFILTER_MIN_ROWS;
 
         // Phase 1 (#209): lightweight scan — read only id + embedding for scoring.
         // The old query hydrated EVERY candidate (decrypt body, parse tags/links)
@@ -2353,6 +2369,18 @@ impl Database {
                     }
                 }
             }
+            if pure_1bit {
+                // #630: restore the Hamming rank the `WHERE id IN (...)` fetch
+                // scrambled to rowid order, then keep only the top `limit` —
+                // no cosine rerank follows, so this IS the final order.
+                let pos: std::collections::HashMap<&str, usize> = pool_ids
+                    .iter()
+                    .enumerate()
+                    .map(|(i, id)| (id.as_str(), i))
+                    .collect();
+                fetched.sort_by_key(|(id, _)| *pos.get(id.as_str()).unwrap_or(&usize::MAX));
+                fetched.truncate(limit);
+            }
             fetched
         };
 
@@ -2374,7 +2402,19 @@ impl Database {
         }
 
         // Phase 2: score by cosine similarity, keep the top `limit` ids.
+        // #630 pure-1-bit: skip cosine entirely — `candidates` is already in
+        // Hamming order (best first) and truncated to `limit`. Assign a
+        // strictly-descending pseudo-score so the sort/truncate below preserve
+        // that order and phase 3 hydrates it. The returned score is rank-based,
+        // NOT a cosine similarity (callers treat it as opaque ordering).
         let mut scored_ids: Vec<(String, f64)>;
+        if pure_1bit {
+            scored_ids = candidates
+                .into_iter()
+                .enumerate()
+                .map(|(i, (id, _))| (id, -(i as f64)))
+                .collect();
+        } else {
         #[cfg(feature = "bundled-embeddings")]
         {
             // Batched cosine similarity using SIMD-accelerated ndarray ops.
@@ -2414,6 +2454,7 @@ impl Database {
                 .map(|(id, emb)| (id, cosine_with_query_norm(query_vec, q_norm, &emb)))
                 .collect();
         }
+        } // end else (non-pure-1-bit cosine rerank)
         scored_ids.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         scored_ids.truncate(limit);
         if scored_ids.is_empty() {
@@ -18141,6 +18182,103 @@ mod tests {
             results[0].0.id, "zzz-nosig4",
             "a NULL-sig4 row must ride the resident tier's reservation to the rerank"
         );
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn pure_1bit_no_rerank_returns_hamming_order() {
+        // #630: DenseOpts.rerank = Some(false) (env MIMIR_DENSE_SIG_RERANK=0)
+        // must return the 1-bit Hamming-pool order directly — no exact-cosine
+        // rerank. Defining property: results are ordered by NON-DECREASING
+        // Hamming distance from the query signature. The default (rerank on)
+        // reorders the same pool by exact cosine (scores descending).
+        let (db, path) = temp_db();
+        let conn = db.conn().unwrap();
+        let blob = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|f| f.to_le_bytes()).collect() };
+        let dim = 16usize;
+        let tx = conn.unchecked_transaction().unwrap();
+        {
+            let mut stmt = tx
+                .prepare(
+                    "INSERT INTO entities (id, category, key, body_json, type, status,
+                        retrieval_count, last_accessed_unix_ms, created_at_unix_ms,
+                        decay_score, layer, embedding, emb_sig, emb_sig4, archived)
+                     VALUES (?1, 'insight', ?2, '{}', 'insight', 'active', 0, 0, 0,
+                             1.0, 'working', ?3, ?4, ?5, 0)",
+                )
+                .unwrap();
+            // >= DENSE_SIG_PREFILTER_MIN_ROWS (2048) so the signature path engages.
+            for i in 1..=2300u32 {
+                let v: Vec<f32> = (0..dim)
+                    .map(|d| {
+                        let bit = (i.wrapping_mul(2654435761) >> (d as u32 % 31)) & 1;
+                        if bit == 1 { -1.0 } else { 0.3 }
+                    })
+                    .collect();
+                stmt.execute(params![
+                    format!("row-{:05}", i),
+                    format!("key-{:05}", i),
+                    blob(&v),
+                    embedding_signature(&v),
+                    embedding_sig4(&v)
+                ])
+                .unwrap();
+            }
+        }
+        tx.commit().unwrap();
+
+        let query: Vec<f32> = vec![1.0; dim];
+        let query_sig = embedding_signature(&query);
+        let ham = |id: &str| -> u32 {
+            let sig: Vec<u8> = conn
+                .query_row("SELECT emb_sig FROM entities WHERE id = ?1", params![id], |r| r.get(0))
+                .unwrap();
+            signature_hamming(&query_sig, &sig)
+        };
+
+        // Pure 1-bit: rerank OFF.
+        let pure = db
+            .dense_search_with_opts(&query, 10, 100, DenseOpts {
+                use_sig_cache: Some(true),
+                rerank: Some(false),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(pure.len(), 10, "pure-1-bit must return `limit` rows");
+        let dists: Vec<u32> = pure.iter().map(|(e, _)| ham(&e.id)).collect();
+        for w in dists.windows(2) {
+            assert!(
+                w[0] <= w[1],
+                "pure-1-bit results must be in non-decreasing Hamming order, got {dists:?}"
+            );
+        }
+
+        // Deterministic across calls.
+        let pure2 = db
+            .dense_search_with_opts(&query, 10, 100, DenseOpts {
+                use_sig_cache: Some(true),
+                rerank: Some(false),
+                ..Default::default()
+            })
+            .unwrap();
+        let ids1: Vec<&str> = pure.iter().map(|(e, _)| e.id.as_str()).collect();
+        let ids2: Vec<&str> = pure2.iter().map(|(e, _)| e.id.as_str()).collect();
+        assert_eq!(ids1, ids2, "pure-1-bit ordering must be deterministic");
+
+        // Default (rerank ON) still returns `limit` rows in cosine-descending
+        // order — the shipped behavior is unchanged.
+        let reranked = db
+            .dense_search_with_opts(&query, 10, 100, DenseOpts {
+                use_sig_cache: Some(true),
+                rerank: Some(true),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(reranked.len(), 10);
+        for w in reranked.windows(2) {
+            assert!(w[0].1 >= w[1].1, "rerank-on results must be cosine-descending");
+        }
 
         let _ = fs::remove_file(&path);
     }
