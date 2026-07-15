@@ -6,6 +6,17 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
 ## [Unreleased]
 
 ### Added
+- **Outcome-weighted recall ranking** (#681). The honest follow-rate efficacy
+  signal (`mimir_follow`) now feeds recall ranking, not just decay: a memory
+  that gets FOLLOWED is boosted (`1.0 + follow_rate * 0.3`, mirroring the decay
+  composite so the two never drift) and a 'dead' lesson (ignored despite
+  ≥ 5 attempts) is gently demoted (×0.5 — not the decay path's near-annihilating
+  ×0.05, so ranking never fully buries an otherwise-relevant hit). Folded into
+  the existing #487 usefulness rank pass (one primary-key lookup) and applied
+  over the fused candidate pool before truncation. On by default, bounded, and
+  a strict no-op on any memory without a follow/miss signal — so freshly
+  ingested corpora and every benchmark rank exactly as before. Kill-switch:
+  `PERSEUS_VAULT_OUTCOME_RANK=0`. Determinism (#247) preserved.
 - **`mimir_scan` — deterministic paginated enumeration** (#562). First-class
   "list all / export / sync / reset" path: pages a category (or the whole store)
   by immutable `id ASC` with a keyset continuation cursor (`next_cursor` /

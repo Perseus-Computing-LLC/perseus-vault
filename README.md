@@ -364,7 +364,7 @@ Any MCP-compatible framework works with Perseus Vault directly. See
 | `mimir_conflicts` | Detect conflicting entities via trigram similarity; opt-in `resolve=true` invalidates the lower-certainty side into history (reversible, dry-run by default). |
 | `mimir_correct` | Structured correction capture for learning from errors. |
 | `mimir_supersede` | Mark a new fact as superseding an old one (sets the old entity to `deprecated`). |
-| `mimir_follow` | Record whether an entity was actually FOLLOWED or MISSED — follow-rate efficacy signal that feeds decay scoring. |
+| `mimir_follow` | Record whether an entity was actually FOLLOWED or MISSED — follow-rate efficacy signal that feeds both decay scoring and outcome-weighted recall ranking (#681). |
 
 ### Vault & Federation
 | Tool | Description |

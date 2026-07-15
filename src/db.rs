@@ -4222,11 +4222,12 @@ impl Database {
                 // front — the lever for date-keyed questions (e.g. "two weeks
                 // ago") where topical recall alone under-ranks the dated session.
                 let fused = crate::db::apply_date_window(fused, &params.query);
-                // #487: usefulness term in the composite rank expression —
-                // Belief Memory's `(1.0 + usefulness())`. Applied over the
-                // fused candidate pool BEFORE the metadata filter + truncate,
-                // so a cited-and-reused memory ranked just past `limit` can
-                // still make the cut over a never-reused near-tie.
+                // #487 + #681: honest-usage terms in the composite rank
+                // expression — Belief Memory's `(1.0 + usefulness())` citation
+                // boost and the follow-rate efficacy multiplier. Applied over
+                // the fused candidate pool BEFORE the metadata filter +
+                // truncate, so a cited/followed memory ranked just past `limit`
+                // can still make the cut over a never-reused near-tie.
                 let fused = self.apply_usefulness_rank_boost(fused)?;
                 timer.stage("usefulness");
                 // #485: scope preference in the same first-phase expression —
@@ -4398,14 +4399,16 @@ impl Database {
         supersede_reorder(fused, quantum)
     }
 
-    /// #487: multiply each fused score by the usefulness weight — memories
-    /// repeatedly cited as `derived_from` sources outrank equally-relevant
-    /// never-reused ones. One primary-key IN-lookup over the candidate pool
-    /// (≤ candidate_k rows), touching only rows with a non-zero count, so the
-    /// common all-zero case is a single index probe and an unchanged order.
-    /// Read-only: ranking only, no access-state writes — hybrid recall stays
-    /// idempotent (#247). The re-sort mirrors reciprocal_rank_fusion's
-    /// deterministic tie-break (score desc, id asc).
+    /// #487 + #681: multiply each fused score by the honest-usage weights —
+    /// memories repeatedly cited as `derived_from` sources (#487 usefulness)
+    /// and memories that get FOLLOWED (#681 efficacy) outrank equally-relevant
+    /// never-reused / ignored ones; a 'dead' lesson is gently demoted. One
+    /// primary-key IN-lookup over the candidate pool (≤ candidate_k rows),
+    /// touching only rows that carry a signal, so the common no-signal case is
+    /// a single index probe and an unchanged order. Read-only: ranking only,
+    /// no access-state writes — hybrid recall stays idempotent (#247). The
+    /// re-sort mirrors reciprocal_rank_fusion's deterministic tie-break
+    /// (score desc, id asc).
     fn apply_usefulness_rank_boost(
         &self,
         mut fused: Vec<(Entity, f64)>,
@@ -4413,31 +4416,48 @@ impl Database {
         if fused.is_empty() {
             return Ok(fused);
         }
+        let outcome_on = outcome_rank_enabled();
         let conn = self.conn()?;
         let placeholders = vec!["?"; fused.len()].join(",");
+        // #487 usefulness (derived_from citations) + #681 efficacy (honest
+        // follow-rate) resolved in one primary-key IN-lookup. Only rows
+        // carrying an actual honest-usage signal are returned, so the common
+        // no-signal case stays a single index probe and an unchanged order.
         let sql = format!(
-            "SELECT id, usefulness_count FROM entities \
-             WHERE id IN ({placeholders}) AND usefulness_count > 0"
+            "SELECT id, usefulness_count, efficacy_status, follow_rate FROM entities \
+             WHERE id IN ({placeholders}) \
+               AND (usefulness_count > 0 OR efficacy_status IN ('useful','dead'))"
         );
         let mut stmt = conn.prepare(&sql)?;
         let id_params: Vec<&dyn rusqlite::ToSql> = fused
             .iter()
             .map(|(e, _)| &e.id as &dyn rusqlite::ToSql)
             .collect();
-        let mut counts: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+        let mut sig: std::collections::HashMap<String, (i64, String, f64)> =
+            std::collections::HashMap::new();
         let rows = stmt.query_map(id_params.as_slice(), |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1).unwrap_or(0),
+                r.get::<_, String>(2).unwrap_or_default(),
+                r.get::<_, f64>(3).unwrap_or(0.0),
+            ))
         })?;
         for row in rows {
-            let (id, c) = row?;
-            counts.insert(id, c);
+            let (id, c, status, rate) = row?;
+            sig.insert(id, (c, status, rate));
         }
-        if counts.is_empty() {
+        if sig.is_empty() {
             return Ok(fused);
         }
         for (entity, score) in fused.iter_mut() {
-            if let Some(&c) = counts.get(&entity.id) {
-                *score *= usefulness_weight(c);
+            if let Some((c, status, rate)) = sig.get(&entity.id) {
+                // #487 usefulness term (always on).
+                *score *= usefulness_weight(*c);
+                // #681 outcome (efficacy) term — governed by the kill-switch.
+                if outcome_on {
+                    *score *= efficacy_rank_weight(status, *rate);
+                }
             }
         }
         fused.sort_by(|a, b| {
@@ -10933,6 +10953,36 @@ fn cosine_with_query_norm(query: &[f32], q_norm: f64, b: &[f32]) -> f64 {
 /// relevance: 1 citation → ~1.07, 10 → ~1.24, cap 1.4 from ~55 citations.
 pub(crate) fn usefulness_weight(usefulness_count: i64) -> f64 {
     1.0 + ((usefulness_count.max(0) as f64).ln_1p() * 0.1).min(0.4)
+}
+
+/// #681: outcome-weighted recall — the honest follow-rate efficacy signal
+/// (`mimir_follow`) as a rank multiplier. It mirrors the "useful" arm of
+/// `decay_tick`'s efficacy composite (`1.0 + follow_rate * 0.3`) so the two
+/// honest-usage signals never drift: a lesson that gets FOLLOWED floats above
+/// an equally-relevant one that gets ignored. A 'dead' lesson (ignored despite
+/// >= FOLLOW_MIN_ATTEMPTS attempts) is demoted — but gently (0.5), not with the
+/// decay composite's near-annihilating 0.05, so ranking never fully buries an
+/// otherwise-relevant hit that may be the only match. `follow_rate` is clamped
+/// so a malformed row can't invert the sign. No-op until `efficacy_status`
+/// leaves 'unverified', so freshly-ingested corpora — and every benchmark —
+/// rank exactly as before.
+pub(crate) fn efficacy_rank_weight(efficacy_status: &str, follow_rate: f64) -> f64 {
+    match efficacy_status {
+        "useful" => 1.0 + follow_rate.clamp(0.0, 1.0) * 0.3,
+        "dead" => 0.5,
+        _ => 1.0,
+    }
+}
+
+/// #681: outcome-weighted recall is ON by default — it is mild, bounded, and a
+/// no-op on any memory without a follow/miss signal. The kill-switch mirrors
+/// the other recall-tuning env flags (accepts 0/false/off/no); it governs ONLY
+/// the new efficacy factor, never #487's usefulness term.
+pub fn outcome_rank_enabled() -> bool {
+    !matches!(
+        std::env::var("PERSEUS_VAULT_OUTCOME_RANK").as_deref(),
+        Ok("0") | Ok("false") | Ok("off") | Ok("FALSE") | Ok("no")
+    )
 }
 
 // ─── #675/#676: startup actionability scoring ───────────────────────────────
@@ -22845,6 +22895,66 @@ mod tests {
         }
         // else: dead entity was auto-archived, which is an even stronger pass.
 
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn efficacy_rank_weight_matches_decay_composite_and_is_bounded() {
+        // 'useful' mirrors decay_tick's `1.0 + follow_rate * 0.3` so the two
+        // honest-usage signals never drift.
+        assert!((efficacy_rank_weight("useful", 0.9) - 1.27).abs() < 1e-9);
+        assert!((efficacy_rank_weight("useful", 0.75) - 1.225).abs() < 1e-9);
+        // 'dead' is a gentle demotion for ranking (not the decay 0.05).
+        assert!((efficacy_rank_weight("dead", 0.05) - 0.5).abs() < 1e-9);
+        // no signal yet, or unknown status -> identity (no-op).
+        assert!((efficacy_rank_weight("unverified", 0.9) - 1.0).abs() < 1e-9);
+        assert!((efficacy_rank_weight("", 0.9) - 1.0).abs() < 1e-9);
+        // malformed follow_rate can't invert the sign or overshoot.
+        assert!((efficacy_rank_weight("useful", -5.0) - 1.0).abs() < 1e-9);
+        assert!((efficacy_rank_weight("useful", 42.0) - 1.3).abs() < 1e-9);
+    }
+
+    #[test]
+    fn outcome_rank_boost_floats_useful_over_dead_at_equal_relevance() {
+        // #681: with identical fused relevance scores, a FOLLOWED memory must
+        // outrank an IGNORED ('dead') one after the honest-usage rank boost.
+        let (db, path) = temp_db();
+        db.remember(&make_entity("e-u", "convention", "useful-rule", r#"{"note":"a"}"#))
+            .unwrap();
+        db.remember(&make_entity("e-d", "convention", "dead-rule", r#"{"note":"b"}"#))
+            .unwrap();
+        db.remember(&make_entity("e-n", "convention", "neutral-rule", r#"{"note":"c"}"#))
+            .unwrap();
+        {
+            let conn = db.conn().unwrap();
+            conn.execute(
+                "UPDATE entities SET efficacy_status='useful', follow_rate=0.9 WHERE key='useful-rule'",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE entities SET efficacy_status='dead', follow_rate=0.05 WHERE key='dead-rule'",
+                [],
+            )
+            .unwrap();
+        }
+        let u = db.get_entity("convention", "useful-rule").unwrap().unwrap();
+        let d = db.get_entity("convention", "dead-rule").unwrap().unwrap();
+        let n = db.get_entity("convention", "neutral-rule").unwrap().unwrap();
+        // Equal base relevance; input order puts 'dead' first to prove the
+        // reorder is driven by the outcome signal, not by input position.
+        let fused = vec![(d.clone(), 1.0), (n.clone(), 1.0), (u.clone(), 1.0)];
+        let out = db.apply_usefulness_rank_boost(fused).unwrap();
+        let order: Vec<&str> = out.iter().map(|(e, _)| e.key.as_str()).collect();
+        assert_eq!(
+            order,
+            vec!["useful-rule", "neutral-rule", "dead-rule"],
+            "useful floats up, dead sinks; neutral holds the middle"
+        );
+        // Concrete scores: useful 1.27, neutral 1.0, dead 0.5.
+        assert!((out[0].1 - 1.27).abs() < 1e-9);
+        assert!((out[1].1 - 1.0).abs() < 1e-9);
+        assert!((out[2].1 - 0.5).abs() < 1e-9);
         let _ = fs::remove_file(&path);
     }
 
