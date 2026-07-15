@@ -720,6 +720,79 @@ pub struct Stats {
     pub top_history_keys: serde_json::Value,
 }
 
+/// #677: cheap readiness snapshot surfaced by the `health` tool and the
+/// empty-recall diagnostic, so a silent-empty result is self-explaining
+/// (unhealthy DB vs genuinely empty store vs keyword-only / no-coverage
+/// semantic posture) instead of looking like a broken MCP child. Every field
+/// is a cheap covering-index count or a config read — safe to call before a
+/// recall-heavy workflow as a heartbeat.
+#[derive(Debug, Clone, Serialize)]
+pub struct Readiness {
+    /// `SELECT 1` succeeded against the pool.
+    pub db_responds: bool,
+    /// Non-archived entity count — the set recall actually reads.
+    pub active_memories: i64,
+    /// Non-archived entities carrying a stored dense embedding.
+    pub embedded_memories: i64,
+    /// Whether a dense-embedding backend is active (false on lite builds).
+    pub embedding_enabled: bool,
+}
+
+impl Readiness {
+    /// The store can serve a non-empty recall: the DB answers and at least one
+    /// active memory exists.
+    pub fn ready(&self) -> bool {
+        self.db_responds && self.active_memories > 0
+    }
+
+    /// Coarse semantic-recall posture for dense/hybrid callers:
+    /// - `"available"`   — backend on and at least one embedded memory
+    /// - `"no_coverage"` — backend on but nothing embedded yet (falls back to keyword)
+    /// - `"disabled"`    — no dense backend (keyword-only build/config)
+    pub fn semantic_recall(&self) -> &'static str {
+        if !self.embedding_enabled {
+            "disabled"
+        } else if self.embedded_memories > 0 {
+            "available"
+        } else {
+            "no_coverage"
+        }
+    }
+
+    /// Human-readable likely-cause warnings — empty when everything is nominal.
+    /// This is what a client prints instead of chasing a false "no memories
+    /// found" debugging path when recall comes back empty.
+    pub fn warnings(&self) -> Vec<String> {
+        let mut w = Vec::new();
+        if !self.db_responds {
+            w.push(
+                "database is not responding — recall and writes will fail until the vault process/DB is healthy"
+                    .to_string(),
+            );
+            // Downstream counts are meaningless when the DB is down.
+            return w;
+        }
+        if self.active_memories == 0 {
+            w.push(
+                "store has 0 active memories — recall will return empty until memories are written"
+                    .to_string(),
+            );
+        }
+        if self.embedding_enabled && self.active_memories > 0 && self.embedded_memories == 0 {
+            w.push(
+                "no active memories carry embeddings — dense/hybrid recall will fall back to keyword; run reindex/embed to restore semantic recall"
+                    .to_string(),
+            );
+        }
+        if !self.embedding_enabled {
+            w.push(
+                "semantic (dense/hybrid) backend is disabled — recall is keyword-only".to_string(),
+            );
+        }
+        w
+    }
+}
+
 /// Graph node for entity link visualization.
 #[derive(Debug, Clone, Serialize)]
 pub struct GraphNode {

@@ -2181,7 +2181,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
   },
   {
     "name": "mimir_health",
-    "description": "Check whether the Mneme server and its SQLite database are healthy. Returns a simple healthy/unhealthy status. Use this for health checks and monitoring, not for detailed stats (use mimir_stats).",
+    "description": "Cheap readiness probe for the vault server and its SQLite database. Returns healthy/unhealthy plus a readiness snapshot: `ready` (DB answers AND at least one active memory), `active_memories`, `embedded_memories`, `semantic_recall` (available|no_coverage|disabled), `db_path`, and `warnings[]` with likely causes. Call this before a recall-heavy workflow, or when recall unexpectedly returns empty, to tell an empty/degraded store apart from a broken MCP child. Use mimir_stats for detailed statistics.",
     "inputSchema": {
       "type": "object",
       "properties": {}
@@ -2195,7 +2195,37 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
             "healthy",
             "unhealthy"
           ],
-          "description": "Server health status"
+          "description": "Server health status (healthy iff the DB responds)"
+        },
+        "db_path": {
+          "type": "string",
+          "description": "Absolute path of the SQLite file this server is bound to (#671)"
+        },
+        "ready": {
+          "type": "boolean",
+          "description": "True when the DB responds AND the store has at least one active memory — i.e. recall can return non-empty results"
+        },
+        "active_memories": {
+          "type": "integer",
+          "description": "Count of non-archived memories (the set recall reads)"
+        },
+        "embedded_memories": {
+          "type": "integer",
+          "description": "Count of active memories carrying a dense embedding"
+        },
+        "semantic_recall": {
+          "type": "string",
+          "enum": [
+            "available",
+            "no_coverage",
+            "disabled"
+          ],
+          "description": "Dense/hybrid posture: available (backend on, coverage present), no_coverage (backend on, nothing embedded), or disabled (keyword-only build/config)"
+        },
+        "warnings": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Likely-cause messages for degraded/empty states; empty when nominal"
         }
       }
     },

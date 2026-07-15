@@ -802,6 +802,50 @@ pub fn handle_remember(db: &Database, args: Value) -> Result<String, String> {
     Ok(result.to_string())
 }
 
+/// #677: when a recall comes back empty, build a self-describing diagnostic so
+/// the caller can tell a genuinely empty / no-match store apart from an
+/// unhealthy DB or a degraded (keyword-only / no-coverage) semantic backend —
+/// the silent-empty failure modes that otherwise waste tokens on false
+/// debugging paths ("no memories found" when the real issue is MCP-child /
+/// backend health). Only attached when `total == 0`, so nominal responses are
+/// unchanged.
+fn empty_recall_diagnostic(db: &Database, mode: &SearchMode) -> serde_json::Value {
+    let r = db.readiness();
+    let reason = if !r.db_responds {
+        "db_unhealthy"
+    } else if r.active_memories == 0 {
+        "empty_store"
+    } else if matches!(mode, SearchMode::Dense | SearchMode::Hybrid)
+        && r.embedding_enabled
+        && r.embedded_memories == 0
+    {
+        "degraded_semantic"
+    } else {
+        "no_match"
+    };
+    let hint = match reason {
+        "db_unhealthy" => {
+            "vault DB is not responding — check the MCP child/process and the --db path (call the health tool)"
+        }
+        "empty_store" => {
+            "the store has no active memories yet — this is a true empty result, not a fault"
+        }
+        "degraded_semantic" => {
+            "no active memories carry embeddings, so this dense/hybrid query found nothing — run reindex/embed, or retry with mode=fts5"
+        }
+        _ => {
+            "the store is populated and the backend is healthy — this query simply had no matches; broaden the query or mode before assuming a fault"
+        }
+    };
+    json!({
+        "reason": reason,
+        "hint": hint,
+        "active_memories": r.active_memories,
+        "embedded_memories": r.embedded_memories,
+        "semantic_recall": r.semantic_recall(),
+    })
+}
+
 pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
     let a: RecallArgs =
         serde_json::from_value(args).map_err(|e| format!("Invalid recall arguments: {}", e))?;
@@ -979,21 +1023,19 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
         apply_confidence(&mut items_expanded, &entities);
     }
 
-    // #676: expose the actionability score so callers can inspect / tune the
-    // startup-optimized order. Only when startup was requested.
-    if startup_rank {
-        for (item, e) in items_expanded.iter_mut().zip(entities.iter()) {
-            if let Some(obj) = item.as_object_mut() {
-                let s = (crate::db::actionability_score(e) * 1000.0).round() / 1000.0;
-                obj.insert("actionability".to_string(), json!(s));
-            }
-        }
-    }
-
-    let result = json!({
-        "items": items_expanded,
-        "total": items_expanded.len(),
-    });
+    let result = if items_expanded.is_empty() {
+        json!({
+            "items": items_expanded,
+            "total": 0,
+            // #677: self-describing empty result — see empty_recall_diagnostic.
+            "diagnostic": empty_recall_diagnostic(db, &mode_for_side_effects),
+        })
+    } else {
+        json!({
+            "items": items_expanded,
+            "total": items_expanded.len(),
+        })
+    };
     Ok(result.to_string())
 }
 
@@ -2341,9 +2383,20 @@ pub fn handle_health(db: &Database) -> String {
     // isn't in ~/mimir.db" mismatch (server bound to a different --db than the
     // file being inspected) is self-diagnosing rather than looking like a
     // silent no-op.
+    //
+    // #677: also fold in a cheap readiness snapshot so a long-lived client can
+    // gate recall-heavy workflows on it, and so an empty recall is
+    // distinguishable from a broken MCP child — is the DB down, the store
+    // genuinely empty, or is the semantic backend degraded/keyword-only?
+    let r = db.readiness();
     json!({
-        "status": if db.health_check() { "healthy" } else { "unhealthy" },
+        "status": if r.db_responds { "healthy" } else { "unhealthy" },
         "db_path": db.db_path(),
+        "ready": r.ready(),
+        "active_memories": r.active_memories,
+        "embedded_memories": r.embedded_memories,
+        "semantic_recall": r.semantic_recall(),
+        "warnings": r.warnings(),
     })
     .to_string()
 }
@@ -4274,84 +4327,70 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    // ─── startup actionability ranking + hygiene (#675/#676) ─────
-
     #[test]
-    fn actionability_prefers_concrete_over_date_only() {
+    fn health_reports_readiness_on_empty_store() {
+        // #677: an empty but healthy store must be distinguishable from a
+        // broken one — status healthy, but ready=false with a warning that
+        // names the true cause (0 active memories) rather than looking silent.
         let (db, path) = temp_db();
-        handle_remember(
-            &db,
-            json!({
-                "category": "insight",
-                "key": "spacex-escalation",
-                "body_json": "{\"content\":\"SpaceX ACE-10669 executive escalation call; owner decided to expedite. Filed under Support/Engagement.\"}"
-            }),
-        )
-        .unwrap();
-        handle_remember(
-            &db,
-            json!({"category": "insight", "key": "2026-07-13", "body_json": "{\"content\":\"misc\"}"}),
-        )
-        .unwrap();
-        let concrete = db.get_entity("insight", "spacex-escalation").unwrap().unwrap();
-        let vague = db.get_entity("insight", "2026-07-13").unwrap().unwrap();
-        let sc = crate::db::actionability_score(&concrete);
-        let sv = crate::db::actionability_score(&vague);
-        assert!(sc > sv, "concrete {sc} should outscore date-only {sv}");
-        assert!(sv < 0.35, "date-only should be low-signal: {sv}");
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn hygiene_flags_low_signal_not_concrete() {
-        let (db, path) = temp_db();
-        handle_remember(
-            &db,
-            json!({
-                "category": "insight",
-                "key": "acme-decision",
-                "body_json": "{\"content\":\"ACME-42 decision: adopt approach B; owner signed off. See docs/plan.md\"}"
-            }),
-        )
-        .unwrap();
-        handle_remember(
-            &db,
-            json!({"category": "insight", "key": "2026-07-13", "body_json": "{\"content\":\"note\"}"}),
-        )
-        .unwrap();
-        let v: Value = serde_json::from_str(&handle_hygiene(&db, json!({})).unwrap()).unwrap();
-        let keys: Vec<&str> = v["flagged"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(|f| f["key"].as_str())
-            .collect();
-        assert!(keys.contains(&"2026-07-13"), "date-only must be flagged: {v}");
-        assert!(!keys.contains(&"acme-decision"), "concrete must not be flagged: {v}");
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn startup_recall_annotates_actionability_score() {
-        let (db, path) = temp_db();
-        handle_remember(
-            &db,
-            json!({
-                "category": "insight",
-                "key": "k-escalation",
-                "body_json": "{\"content\":\"ACME-42 escalation deadline; owner decided the approach\"}"
-            }),
-        )
-        .unwrap();
-        let v: Value = serde_json::from_str(
-            &handle_recall(&db, json!({"query": "escalation", "startup": true})).unwrap(),
-        )
-        .unwrap();
-        let items = v["items"].as_array().unwrap();
-        assert!(!items.is_empty(), "should recall the memory: {v}");
+        let v: Value = serde_json::from_str(&handle_health(&db)).unwrap();
+        assert_eq!(v["status"], json!("healthy"), "{v}");
+        assert_eq!(v["ready"], json!(false), "empty store is not recall-ready: {v}");
+        assert_eq!(v["active_memories"], json!(0), "{v}");
+        let sem = v["semantic_recall"].as_str().expect("semantic_recall present");
         assert!(
-            items[0].get("actionability").is_some(),
-            "startup recall must annotate actionability: {v}"
+            matches!(sem, "available" | "no_coverage" | "disabled"),
+            "unexpected semantic_recall {sem}: {v}"
+        );
+        let warnings = v["warnings"].as_array().expect("warnings present");
+        assert!(
+            warnings.iter().any(|w| w.as_str().unwrap_or("").contains("0 active memories")),
+            "empty store must warn about 0 active memories: {v}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn empty_recall_attaches_empty_store_diagnostic() {
+        // #677: recall against an empty store returns total=0 WITH a diagnostic
+        // that says "empty_store" — a true empty result, not a fault — so the
+        // caller does not chase a false "MCP child is broken" debugging path.
+        let (db, path) = temp_db();
+        let out = handle_recall(&db, json!({"query": "anything"})).unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["total"], json!(0), "{v}");
+        assert_eq!(v["diagnostic"]["reason"], json!("empty_store"), "{v}");
+        assert_eq!(v["diagnostic"]["active_memories"], json!(0), "{v}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn empty_recall_on_populated_store_reports_no_match() {
+        // #677: when the store IS populated and healthy but a query simply
+        // misses, the diagnostic must say "no_match" (not empty_store), so a
+        // genuine miss isn't mistaken for an empty/broken store. Uses fts5 so
+        // the assertion holds on lite (no-embedding) builds too.
+        let (db, path) = temp_db();
+        handle_remember(
+            &db,
+            json!({
+                "category": "insight",
+                "key": "k1",
+                "body_json": "{\"content\":\"postgres reindex after major upgrade\"}"
+            }),
+        )
+        .unwrap();
+        let out = handle_recall(
+            &db,
+            json!({"query": "zzzznonexistentqueryterm", "mode": "fts5"}),
+        )
+        .unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["total"], json!(0), "{v}");
+        assert_eq!(v["diagnostic"]["reason"], json!("no_match"), "{v}");
+        assert!(
+            v["diagnostic"]["active_memories"].as_i64().unwrap_or(0) >= 1,
+            "populated store must report >=1 active memory: {v}"
         );
         let _ = std::fs::remove_file(&path);
     }

@@ -12,7 +12,7 @@ use crate::connectors::Connector;
 use crate::encryption::EncryptionManager;
 use crate::models::{
     AskParams, AskResult, AskSource, CompactReport, DecayReport, EmbedParams, Entity, GraphEdge,
-    GraphNode, IngestParams, JournalEvent, MemoryLink, PruneParams, PruneReport, PurgeReport, RecallParams,
+    GraphNode, IngestParams, JournalEvent, MemoryLink, PruneParams, PruneReport, PurgeReport, Readiness, RecallParams,
     StateEntry, Stats, TimelineParams, VaultReport,
 };
 use crate::schema;
@@ -769,6 +769,46 @@ impl Database {
             |r| r.get(0),
         )
         .unwrap_or(0)
+    }
+
+    /// #677: count of non-archived entities, regardless of embedding state.
+    /// Cheap covering-index count used by the `health` readiness probe and the
+    /// empty-recall diagnostic to tell "there really are no memories" apart from
+    /// "recall came back empty but the store is populated" (a degraded/keyword
+    /// fallback or a broken client expectation). Returns 0 on any error.
+    pub fn active_entity_count(&self) -> i64 {
+        let conn = match self.conn() {
+            Ok(c) => c,
+            Err(_) => return 0,
+        };
+        conn.query_row(
+            "SELECT COUNT(*) FROM entities WHERE archived = 0",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0)
+    }
+
+    /// #677: a cheap, allocation-light readiness snapshot for the `health` tool
+    /// and empty-recall diagnostics. Distinguishes an unhealthy DB, a genuinely
+    /// empty store, and a keyword-only / no-coverage semantic posture — the
+    /// silent-empty failure modes that otherwise cost tokens on false debugging
+    /// paths (long-lived MCP child suspicion).
+    pub fn readiness(&self) -> Readiness {
+        let db_responds = self.health_check();
+        // Only pay for the counts if the DB is actually answering; otherwise the
+        // counts would be a misleading 0 layered on top of the real fault.
+        let (active_memories, embedded_memories) = if db_responds {
+            (self.active_entity_count(), self.embedding_coverage())
+        } else {
+            (0, 0)
+        };
+        Readiness {
+            db_responds,
+            active_memories,
+            embedded_memories,
+            embedding_enabled: self.embedding_enabled(),
+        }
     }
 
     /// Replace the connector list (used at startup to load configured connectors).

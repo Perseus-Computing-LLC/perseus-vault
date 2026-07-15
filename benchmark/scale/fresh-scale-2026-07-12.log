@@ -1,0 +1,34 @@
+[10,000] loading...
+[10,000] write: 536/s (first 10%: 1431/s, last 10%: 360/s)
+[10,000] embedding...
+[10,000] embed: 7317 in 48s
+[10,000] recall fts5: p50=2.2ms p99=6.17ms
+[10,000] recall dense: p50=9.94ms p99=12.71ms
+[10,000] recall hybrid: p50=12.75ms p99=16.62ms
+[10,000] as_of: p50=0.11ms · temporal recall p50=2.46ms
+[10,000] cold start: 26.2ms
+[100,000] loading...
+Traceback (most recent call last):
+  File "C:\Users\tccon\perseus-vault\benchmark\scale\run.py", line 342, in <module>
+    main()
+    ~~~~^^
+  File "C:\Users\tccon\perseus-vault\benchmark\scale\run.py", line 329, in main
+    report["runs"][str(n)] = run_size(binary, n, args.queries, args.skip_embed,
+                             ~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                                      keep_db=args.keep_db)
+                                      ^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\tccon\perseus-vault\benchmark\scale\run.py", line 166, in run_size
+    v.call("mimir_remember", {
+    ~~~~~~^^^^^^^^^^^^^^^^^^^^
+        "category": CATEGORIES[i % len(CATEGORIES)],
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    ...<2 lines>...
+        "type": "insight",
+        ^^^^^^^^^^^^^^^^^^
+    })
+    ^^
+  File "C:\Users\tccon\perseus-vault\benchmark\scale\run.py", line 104, in call
+    resp = self._read()
+  File "C:\Users\tccon\perseus-vault\benchmark\scale\run.py", line 93, in _read
+    raise RuntimeError("perseus-vault closed the stream")
+RuntimeError: perseus-vault closed the stream

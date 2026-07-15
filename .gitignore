@@ -1,4 +1,6 @@
 /target
+# Suffixed cargo build dirs from parallel benchmark builds (target-476, target-lite, ...)
+/target-*
 workdir/
 /build-mcpb/
 /dist/
