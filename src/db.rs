@@ -589,6 +589,18 @@ impl Database {
         }
     }
 
+    /// Absolute path of the SQLite file this instance is bound to. Surfaced in
+    /// `health` so a "wrote here, inspected there" mismatch (#657/#671 — an MCP
+    /// server launched with a different `--db` than the file the operator
+    /// queries, e.g. `~/mimir.db`) is immediately visible instead of looking
+    /// like a silent no-op. Falls back to the configured path if it cannot be
+    /// canonicalized (e.g. the file was removed).
+    pub fn db_path(&self) -> String {
+        std::fs::canonicalize(&self.db_path)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| self.db_path.clone())
+    }
+
     /// Enable encryption by loading the AES-256-GCM key from `key_file`.
     /// Returns an error if the key file cannot be read or is invalid.
     ///

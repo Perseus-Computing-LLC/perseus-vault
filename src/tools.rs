@@ -2201,11 +2201,15 @@ pub fn handle_state_list(db: &Database, args: Value) -> Result<String, String> {
 }
 
 pub fn handle_health(db: &Database) -> String {
-    if db.health_check() {
-        json!({ "status": "healthy" }).to_string()
-    } else {
-        json!({ "status": "unhealthy" }).to_string()
-    }
+    // #671: include the absolute db path so a "remember succeeded but the row
+    // isn't in ~/mimir.db" mismatch (server bound to a different --db than the
+    // file being inspected) is self-diagnosing rather than looking like a
+    // silent no-op.
+    json!({
+        "status": if db.health_check() { "healthy" } else { "unhealthy" },
+        "db_path": db.db_path(),
+    })
+    .to_string()
 }
 
 pub fn handle_stats(db: &Database) -> String {
@@ -4117,6 +4121,21 @@ mod tests {
         let path_str = path.to_str().unwrap().to_string();
         let db = Database::open(&path_str).expect("open test db");
         (db, path_str)
+    }
+
+    #[test]
+    fn health_reports_status_and_db_path() {
+        // #671: health must surface the absolute db path so a "wrote here,
+        // inspected ~/mimir.db there" mismatch is self-diagnosing.
+        let (db, path) = temp_db();
+        let v: Value = serde_json::from_str(&handle_health(&db)).unwrap();
+        assert_eq!(v["status"], json!("healthy"), "{v}");
+        let reported = v["db_path"].as_str().expect("db_path present");
+        assert!(!reported.is_empty(), "db_path must be non-empty: {v}");
+        // The reported path resolves to the same file the db was opened with.
+        let want = std::fs::canonicalize(&path).unwrap();
+        assert_eq!(std::path::Path::new(reported), want.as_path(), "{v}");
+        let _ = std::fs::remove_file(&path);
     }
 
     // ─── scope as a ranking multiplier (#485) ────────────────────
