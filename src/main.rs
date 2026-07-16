@@ -1985,6 +1985,9 @@ fn run_prepare(
                 mode: opts.mode.as_str().to_string(),
                 budget_chars: 0,
                 entities_injected: 0,
+                corpus_chars: 0,
+                estimated_corpus_tokens: 0,
+                estimated_injected_tokens: 0,
                 warnings: Vec::new(),
             }
         }
