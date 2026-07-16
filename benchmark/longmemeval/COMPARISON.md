@@ -16,8 +16,8 @@ flagged per-row, not blended.
 
 | system | LongMemEval QA accuracy | answer prompt | answerer | judge | split | source |
 |---|---:|---|---|---|---|---|
-| **Perseus Vault (official CoT)** | **79.0% mean** (80.0 / 78.6 / 78.4 across 3 full runs) | `official-cot` (`qa.py --cot`) | `gpt-4o-2024-08-06` (pinned) | `gpt-4o-2024-08-06`, LongMemEval **official** per-type judge | `longmemeval_s` (500) | [`qa_report_cot.json`](qa_report_cot.json), [`qa_report_cot_seed2.json`](qa_report_cot_seed2.json), [`qa_report_cot_seed3.json`](qa_report_cot_seed3.json) (all signed), this repo |
-| **Perseus Vault (plain)** | **73.8% mean** (72.8 / 73.6 / 75.0 across 3 full runs) | `plain` | `gpt-4o-2024-08-06` (pinned) | same official judge | `longmemeval_s` (500) | [`qa_report.json`](qa_report.json), [`qa_report_seed2.json`](qa_report_seed2.json), [`qa_report_seed3.json`](qa_report_seed3.json) (all signed), this repo |
+| **Perseus Vault (official CoT)** | **79.0% mean** (80.0 / 78.6 / 78.4 across 3 full runs) | `official-cot` (`qa.py --cot`) | `gpt-4o-2024-08-06` (pinned) | `gpt-4o-2024-08-06`, LongMemEval **official** per-type judge | `longmemeval_s` (500) | [`qa_report_cot.json`](qa_report_cot.json), [`qa_report_cot_seed2.json`](qa_report_cot_seed2.json), [`qa_report_cot_seed3.json`](qa_report_cot_seed3.json) (all content-hashed, sha256), this repo |
+| **Perseus Vault (plain)** | **73.8% mean** (72.8 / 73.6 / 75.0 across 3 full runs) | `plain` | `gpt-4o-2024-08-06` (pinned) | same official judge | `longmemeval_s` (500) | [`qa_report.json`](qa_report.json), [`qa_report_seed2.json`](qa_report_seed2.json), [`qa_report_seed3.json`](qa_report_seed3.json) (all content-hashed, sha256), this repo |
 | Zep | 63.8% (published) | not stated | "GPT-4o" (snapshot not stated) | not stated | LongMemEval `_s` (as published) | Zep's published claim, cited in #475 |
 | Mem0 | 49.0% (published) | not stated | "GPT-4o" (snapshot not stated) | not stated | LongMemEval `_s` (as published) | published claim, cited in #475 |
 
@@ -48,7 +48,7 @@ nondeterminism at temperature 0, net zero; see
 
 ## By question type
 
-### Official CoT prompt (primary run, signed `qa_report_cot.json`)
+### Official CoT prompt (primary run, content-hashed `qa_report_cot.json`)
 
 | question type | n | correct | accuracy |
 |---|---:|---:|---:|
@@ -68,7 +68,7 @@ preference **30.0% → 60.0%** and temporal **69.2% → 77.4%** on the primary r
 remaining misses are *retrieval* (aggregation questions needing 2–4 sessions) —
 tracked as engine work out of #580's case studies, not papered over.
 
-### Plain prompt (run 2, signed `qa_report.json` — non-CoT reference)
+### Plain prompt (run 2, content-hashed `qa_report.json`, non-CoT reference)
 
 | question type | n | correct | accuracy |
 |---|---:|---:|---:|
@@ -154,7 +154,7 @@ tuning toward gold answers was done, and none is acceptable here.**
 - **Run-to-run variance.** LLM answering/grading at temperature 0 is still not
   perfectly deterministic. CoT: three independent full runs scored 80.0 / 78.6 /
   78.4 (mean 79.0, spread 1.6 points, stdev 0.9). Plain: 73.6 / 75.0 / 72.8
-  (mean 73.8, spread 2.2, stdev 1.1). All six signed reports are committed
+  (mean 73.8, spread 2.2, stdev 1.1). All six content-hashed reports are committed
   here. Quote the mean with the range, not a single run's number.
 - **The CoT primary run was resumed.** `qa_report_cot.json` was produced across
   multiple process invocations via the crash-safe `--resume` journal (one

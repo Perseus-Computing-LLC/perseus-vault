@@ -38,7 +38,7 @@ curl -L https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned/resolve/m
 python benchmark/longmemeval/run.py --data longmemeval_s_cleaned.json
 ```
 
-Output: a signed `report.json` plus a console table. The run is offline and the
+Output: a content-hashed (sha256) `report.json` plus a console table. The run is offline and the
 metrics are **deterministic run-to-run** across every mode: `fts5` and the RRF
 fusion step always were (#247), and the embedding-backed `dense`/`hybrid`/`auto`
 modes are now too — the bundled ONNX backend is pinned to single-threaded,
@@ -62,9 +62,9 @@ embedding (and therefore a byte-identical signature) on every run.
 
 ## Results
 
-<!-- RESULTS-START (filled by the latest full run; see report.json for the signed copy) -->
+<!-- RESULTS-START (filled by the latest full run; see report.json for the content-hashed copy) -->
 Full LongMemEval `_s` split: **500 questions, 23,867 sessions, offline** on Windows 11
-with the release binary (bundled ONNX embeddings). Signed in `report.json`.
+with the release binary (bundled ONNX embeddings). Fingerprinted (sha256) in `report.json`.
 
 This is the **default user experience after #271**: a bare `mimir_remember` then
 `mimir_recall` with no manual `mimir_embed` and no `mode` argument
@@ -114,8 +114,8 @@ across all 500 rose. Reproduce the default experience:
 ingests the haystack into the real binary, hybrid-retrieves top-k sessions,
 answers with a **pinned, named** LLM (default `gpt-4o-2024-08-06`, temperature 0)
 and grades with a **pinned, named** judge (default `gpt-4o-2024-08-06`,
-temperature 0, strict yes/no prompt committed in `qa.py`). It writes a signed
-`qa_report.json` (models, split, per-category accuracy, commit, binary, verdict
+temperature 0, strict yes/no prompt committed in `qa.py`). It writes a
+content-hashed (sha256) `qa_report.json` (models, split, per-category accuracy, commit, binary, verdict
 sha256) plus hypotheses files in LongMemEval's official format so their
 `evaluate_qa.py` can cross-check our judge. See [COMPARISON.md](COMPARISON.md)
 for the comparison rules and the scoreboard vs Zep's published 63.8%.

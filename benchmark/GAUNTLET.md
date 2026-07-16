@@ -14,8 +14,8 @@ binary and the same API hold at every rung.*
   hardware, binary/commit, and a `data_source` tag: `measured` (timed live),
   `published-spec` (datasheet/price list, cited), or `projection` (derived, with
   assumptions stated). No projection is ever presented as measured.
-- **Regressions are locked out.** `benchmark/scale/gate.py` budgets + the signed
-  `report.json` fail CI if a number moves the wrong way.
+- **Regressions are locked out.** `benchmark/scale/gate.py` budgets + the
+  content-hashed (sha256) `report.json` fail CI if a number moves the wrong way.
 - **Never falsify a bench.** A worse number is recorded, flagged, and reported.
 
 ---
@@ -24,7 +24,7 @@ binary and the same API hold at every rung.*
 
 | Axis | What we measure | Harness | Gate |
 |---|---|---|---|
-| **Performance** | recall p50/p99 (fts5·dense·hybrid), write & embed throughput, `as_of` point lookup, temporal recall, cold start; perseus render time / directive cost | vault `benchmark/scale/`, `benchmark/contention/burn_bench.py`; perseus `benchmark/extreme_enterprise_benchmark.py` | `scale/gate.py` budgets; no regression vs signed `report.json` |
+| **Performance** | recall p50/p99 (fts5·dense·hybrid), write & embed throughput, `as_of` point lookup, temporal recall, cold start; perseus render time / directive cost | vault `benchmark/scale/`, `benchmark/contention/burn_bench.py`; perseus `benchmark/extreme_enterprise_benchmark.py` | `scale/gate.py` budgets; no regression vs the content-hashed `report.json` |
 | **Stability** | soak (RSS drift, latency drift over hours), fault injection (kill writer mid-flight, corrupt→recover, idle-watchdog self-heal, degradation banner), concurrency correctness (no lost/torn writes under the writer-family) | perseus `harness/load/{load_pass,resilience_pass}.py`; vault `concurrent_writer`/`concurrent_opens` tests | 0 lost writes; RSS flat over N h; self-heal verified |
 | **Security** | air-gap **0 network egress** under load; audit-chain (SHA-256 + keyed-MAC) integrity under concurrent writes + redaction; workspace-scoping isolation; `@query` double-gate | packet-capture harness; audit-chain verify; cross-workspace leak probe | 0 egress; chain verifies; cross-workspace leak = 0. External crypto review is the gate before any CMMC "audit trail" claim (see security SOW) |
 | **Scalability** | the R0→R4 ladder below — same binary, same API, documented break point | all of the above at increasing corpus / concurrency; `benchmark/lambda/` fleet for GPU rungs | same artifact clears every rung it claims; break point is stated, not hidden |

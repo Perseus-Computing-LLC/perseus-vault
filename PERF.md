@@ -1,8 +1,8 @@
 # PERF.md — measured optimizations (before/after)
 
 Every entry: fixed hardware, named binary/commit, the profile that led to the
-change, and the numbers. Companion to `benchmark/scale/` (signed baselines +
-CI budgets) and the #473 epic's rule: no claim without a rerunnable script.
+change, and the numbers. Companion to `benchmark/scale/` (content-hashed
+sha256 baselines + CI budgets) and the #473 epic's rule: no claim without a rerunnable script.
 GPU co-residency numbers (recall under 100% MI300X load) live in
 [`docs/deployment-amd-mi300x.md`](docs/deployment-amd-mi300x.md).
 
@@ -12,8 +12,8 @@ Not a single before/after — a measured *ladder*. The intuition says compressin
 the stored vector must trade recall for speed; at 1M the opposite holds on the
 honest signal. This section records the index-quantization ladder and pins the
 two orthogonal quantization axes so future rows land in the right column.
-Companion artifacts: `benchmark/embedding-quantization/report.json` (the signed
-roll-up) and the per-tier scale runs under `benchmark/lambda/results/`
+Companion artifacts: `benchmark/embedding-quantization/report.json` (the
+sha256-fingerprinted roll-up) and the per-tier scale runs under `benchmark/lambda/results/`
 (`scale1m_exact_ceiling.json`, `scale1m_2c_on.json`, `scale1m_default_500.json`,
 `scale1m_pure1bit.json`).
 Continuation of #619 (the 1-bit prefilter campaign) — this is #619's ceiling
@@ -56,7 +56,7 @@ the vector quantization actually does to ranking.
 | **1-bit prefilter + rerank (SHIPPED)** | **32×** | **1** | **0.514** | **0.726** | **0.800** | **194.5 ms** | `scale1m_default_500.json` |
 | pure 1-bit (prefilter, no rerank) | 32× | 1 | 0.132 | 0.312 | 0.412 | 184.3 ms | `scale1m_pure1bit.json` |
 
-The headline, counterintuitive and every row measured/signed: **more aggressive
+The headline, counterintuitive and every row measured and content-hashed: **more aggressive
 index quantization gives BOTH higher standalone-dense recall AND lower latency.**
 The 1-bit prefilter (**0.726 r@5 @ 194.5 ms**) beats full-precision exact cosine
 (**0.684 r@5 @ 650.1 ms**) — higher recall at every k, at **3.3× lower latency**

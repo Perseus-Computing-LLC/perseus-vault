@@ -60,8 +60,8 @@ prints the entity counts per tier.
 ## Status & reproducibility
 
 The harness and its gate are committed here. Published tier numbers come from a
-run on named hardware and are captured in `report.json` (signed per tier via the
-gauntlet signature) — **not hand-written**. The 1M/10M tiers are executed on the
+run on named hardware and are captured in `report.json` (content-hashed per
+tier via the gauntlet sha256 fingerprint), **not hand-written**. The 1M/10M tiers are executed on the
 benchmark fleet (they need real memory + minutes of population); their
 `report.json` is committed as the reference once produced. `--self-test` and the
 128K tier run anywhere.

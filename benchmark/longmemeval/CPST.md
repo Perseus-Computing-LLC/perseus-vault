@@ -28,7 +28,7 @@ possible after the fact).
 
 ## Results
 
-Signed run `qa_report_cpst100.json` (signature `e08092557d0fb639…`), n=100,
+Content-hashed run `qa_report_cpst100.json` (sha256 fingerprint `e08092557d0fb639…`), n=100,
 pinned `gpt-4o-2024-08-06` answerer + judge, all 300 answers graded (zero
 errors). Cost is **API-billed** answerer tokens at 2026-07 gpt-4o pricing.
 
@@ -104,7 +104,7 @@ python cpst.py --reports qa_report_cpst100.json \
 
 - **n=100, single run.** Subset is stratified and manifest-pinned, but it is
   one seed and one run; treat point estimates as such. Perseus's 80.0% here
-  matches its signed 500-question run sliced to the same 100 questions (80/100),
+  matches its content-hashed 500-question run sliced to the same 100 questions (80/100),
   a reassuring consistency check. The flagship 500-question accuracy number
   lives in [COMPARISON.md](COMPARISON.md).
 - **Single-session-preference is the shared weak spot** (1/6 for both mimir and

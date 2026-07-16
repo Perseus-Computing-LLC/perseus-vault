@@ -99,6 +99,19 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
   offset paging on pre-#562 servers. Tool count: 57 → 58.
 
 ### Documentation
+- **Claims hygiene pass** (#702): removed the unbacked 100K-entity insert-rate
+  figure from the README (no committed artifact backed it); the stress-test section
+  now quotes the committed `benchmark/scale/report.json` (479 docs/s sustained
+  MCP stdio writes at 10K, 40 docs/s durable at 100K, hybrid recall p50
+  19.03 ms / 79.73 ms). Refreshed CLAIMS-AUDIT.md: the sub-millisecond recall
+  entry is retired in favor of artifact-backed latencies, and the tool recount
+  note now says the registry has grown since the v2.13-era recount (published
+  figure stays "55+" by convention). Reworded "signed results/reports" to
+  "content-hashed (sha256)" across README/PERF/benchmark surfaces, since
+  `signature_sha256` is a self-computed content hash, not a cryptographic
+  signature (audit-chain, keyed-MAC, and release-signing docs untouched).
+  Clarified that `federate` is a local export / workspace-rename / re-import
+  with no network peers; the Windows-safe default path is tracked in #704.
 - **Recall query contract made explicit** (#562): `query=""` is the match-all /
   enumeration path; `"*"` and other wildcards are literal FTS5 terms, **not**
   globs (`"*"` matches nothing). Documented in the `recall` tool schema, README

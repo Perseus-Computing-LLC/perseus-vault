@@ -114,7 +114,9 @@ focused on agent state management. Perseus Vault's additional tools enable:
 - **mimir_correct** — structured learning from errors
 - **mimir_synthesize** — LLM session synthesis
 - **mimir_bench** — performance tracking
-- **mimir_federate** — cross-workspace entity sharing
+- **mimir_federate**: cross-workspace entity sharing, implemented as a local
+  export / workspace-rename / re-import (file based, no network peers); the
+  Windows-safe default path is tracked in #704
 - **mimir_vault_export/import** — portable markdown format
 - **mimir_purge** — permanent deletion with VACUUM reclaim
 

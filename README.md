@@ -133,7 +133,7 @@ Recall quality measured on LongMemEval's **official** harness, not a home-grown 
 | Zep | 63.8% (published) |
 | Mem0 | 49.0% (published) |
 
-`longmemeval_s` (500 questions), gpt-4o-2024-08-06 answerer + LongMemEval's official judge; competitor numbers are their published values. Perseus Vault's 73.8% is the plain mean of 3 runs; 79.0% with official CoT. [Methodology & signed results →](benchmark/longmemeval/COMPARISON.md)
+`longmemeval_s` (500 questions), gpt-4o-2024-08-06 answerer + LongMemEval's official judge; competitor numbers are their published values. Perseus Vault's 73.8% is the plain mean of 3 runs; 79.0% with official CoT. [Methodology & content-hashed (sha256) results →](benchmark/longmemeval/COMPARISON.md)
 
 ### Bi-temporal time-travel (three-axis)
 
@@ -186,17 +186,22 @@ the reference. [Methodology & dataset →](benchmark/temporal/README.md)
 
 ### Stress Test: 100K Entities
 
-Perseus Vault handles production workloads on modest hardware:
+Perseus Vault handles production workloads on modest hardware. The numbers
+below are from the committed artifact
+[`benchmark/scale/report.json`](benchmark/scale/report.json): the real release
+binary driven over MCP stdio (one persistent process per corpus size), AMD64
+16-core, Windows 11, every write durable before the next is sent.
 
-| Metric | Result |
-|---|---|
-| **100K entity insert** | 1.01s (98,732 entities/s) |
-| **FTS5 recall (10 results)** | 0.022s |
-| **Decay tick (100K entities)** | 1.317s (batched, transactional) |
-| **Memory (100K entities)** | ~85MB RSS |
-| **DB file size (100K)** | ~45MB (with FTS5 index) |
+| Metric | 10K | 100K |
+|---|---|---|
+| **Write throughput, sustained (MCP stdio)** | 479 docs/s | 40 docs/s |
+| **Hybrid recall p50** | 19.03 ms | 79.73 ms |
+| **FTS5 recall p50** | 3.14 ms | 15.67 ms |
 
-Run it yourself: `cargo test stress_100k --release -- --ignored --nocapture`
+Full percentiles, `as_of` point lookups, temporal recall, and cold-start
+numbers are in [`benchmark/scale/`](benchmark/scale/README.md).
+
+Run it yourself: `python benchmark/scale/run.py`
 
 ### Recall Accuracy at Scale: Keyword Collapses, Hybrid Holds
 
@@ -382,7 +387,7 @@ Any MCP-compatible framework works with Perseus Vault directly. See
 |---|---|
 | `mimir_vault_export` | Export entities to .md files with YAML frontmatter. |
 | `mimir_vault_import` | Import from .md vault directory (idempotent). |
-| `mimir_federate` | Copy entities between workspaces. |
+| `mimir_federate` | Copy entities between workspaces. This is a local export / workspace-rename / re-import (file based, no network peers); the Windows-safe default path is tracked in #704. |
 | `mimir_share` | Share one entity (by category + key) into another workspace, preserving content. |
 | `mimir_workspace_list` | List all distinct entity categories. |
 

@@ -83,7 +83,7 @@ Versions should be *known*, not guessed:
   ingest-time fix reuses.
 - `supersede_reorder` (off by default, `PERSEUS_VAULT_SUPERSEDE_RECENCY`) — kept
   as a documented, measured dead-end and fallback; `main` behavior is
-  byte-identical when unset (signed signatures intact, #310).
+  byte-identical when unset (sha256 fingerprints intact, #310).
 
-Signed current-`main` slice reports: [`supersede_590_off_report.json`](supersede_590_off_report.json),
+Content-hashed current-`main` slice reports: [`supersede_590_off_report.json`](supersede_590_off_report.json),
 [`supersede_590_on_report.json`](supersede_590_on_report.json).
