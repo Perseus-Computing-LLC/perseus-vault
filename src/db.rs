@@ -9941,11 +9941,12 @@ last_accessed: {}
         // Render.
         let entity_line = |entity: &crate::models::Entity, tag: &str| -> String {
             format!(
-                "- {}[{}] **{}** — {} (retrievals: {}, decay: {:.2})\n",
+                "- {}[{}] **{}** — {} (type: {}, retrievals: {}, decay: {:.2})\n",
                 tag,
                 sanitize_prompt_field(&entity.category),
                 sanitize_prompt_field(&entity.key),
                 sanitize_prompt_field(&truncate_str(&entity.body_json, 100)),
+                sanitize_prompt_field(&entity.entity_type),
                 entity.retrieval_count,
                 entity.decay_score,
             )
