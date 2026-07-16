@@ -10019,12 +10019,34 @@ last_accessed: {}
             ));
         }
 
+        let injected_chars = ctx.chars().count() as i64;
+        let estimated_injected_tokens = injected_chars / 4;
+        let conn = self.conn()?;
+        let corpus_chars: i64 = if let Some(ref w) = ws {
+            conn.query_row(
+                "SELECT COALESCE(SUM(LENGTH(body_json)), 0) FROM entities WHERE archived = 0 AND workspace_hash = ?1",
+                rusqlite::params![w],
+                |row| row.get(0)
+            ).unwrap_or(0)
+        } else {
+            conn.query_row(
+                "SELECT COALESCE(SUM(LENGTH(body_json)), 0) FROM entities WHERE archived = 0",
+                rusqlite::params![],
+                |row| row.get(0)
+            ).unwrap_or(0)
+        };
+        let estimated_corpus_tokens = corpus_chars / 4;
+
         Ok(crate::models::ContextBlock {
             markdown: ctx,
             mode: opts.mode.as_str().to_string(),
             budget_chars: budget,
             entities_injected: injected,
             warnings,
+            injected_chars,
+            estimated_injected_tokens,
+            corpus_chars,
+            estimated_corpus_tokens,
         })
     }
 

@@ -433,6 +433,10 @@ pub struct ContextBlock {
     pub entities_injected: i64,
     /// Soft warnings: always-on cap overflow, budget truncation.
     pub warnings: Vec<String>,
+    pub injected_chars: i64,
+    pub estimated_injected_tokens: i64,
+    pub corpus_chars: i64,
+    pub estimated_corpus_tokens: i64,
 }
 
 /// Parameters for timeline queries over the journal.

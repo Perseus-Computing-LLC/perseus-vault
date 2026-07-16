@@ -2579,6 +2579,10 @@ pub fn handle_context(db: &Database, args: Value) -> String {
                 "budget_chars": block.budget_chars,
                 "entities_injected": block.entities_injected,
                 "warnings": block.warnings,
+                "injected_chars": block.injected_chars,
+                "estimated_injected_tokens": block.estimated_injected_tokens,
+                "corpus_chars": block.corpus_chars,
+                "estimated_corpus_tokens": block.estimated_corpus_tokens,
             })
             .to_string()
         }
