@@ -10555,10 +10555,10 @@ last_accessed: {}
     ) -> Result<crate::models::CohereReport, Box<dyn std::error::Error>> {
         let conn = self.conn()?;
         let now = now_ms();
-        let mut promoted: i64 = 0;
-        let mut decayed: i64 = 0;
+        let mut _promoted: i64 = 0;
+        let mut _decayed: i64 = 0;
         let mut linked: i64 = 0;
-        let mut archived: i64 = 0;
+        let mut _archived: i64 = 0;
 
         // Count total examined
         let examined: i64 = conn.query_row(
