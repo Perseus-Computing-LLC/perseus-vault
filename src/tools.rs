@@ -3572,7 +3572,7 @@ pub fn handle_federate(db: &Database, args: Value) -> Result<String, String> {
         .map_err(|e| format!("Invalid federate arguments: {}", e))?;
 
     let vault_dir = if a.vault_dir.is_empty() {
-        "/tmp/mimir-federate".to_string()
+        std::env::temp_dir().join("mimir-federate").to_string_lossy().to_string()
     } else {
         a.vault_dir
     };
