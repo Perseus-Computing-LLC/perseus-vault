@@ -109,6 +109,9 @@ CREATE TABLE IF NOT EXISTS journal (
     -- chain so content tampering is detectable while the payload can still be
     -- redacted (the commitment survives). See docs/audit-chain-keyed-mac-design.md.
     payload_commitment TEXT DEFAULT '',
+    -- v23 (Chancery cross-ref, #6): writ ID from Chancery's `_meta` envelope,
+    -- so vault journal entries can be joined to Chancery writ records.
+    chancery_writ_id TEXT DEFAULT '',
     created_at_unix_ms INTEGER NOT NULL
 );
 
@@ -290,7 +293,13 @@ CREATE INDEX IF NOT EXISTS idx_agents_fleet ON agents(fleet_id);
 /// v22 (#684 Multi-agent scoping): the `agents` registry (trust_tier + fleet).
 /// Created idempotently; no backfill (new table). entities/journal already
 /// carry agent_id from v1.2.0.
-const SCHEMA_VERSION: i64 = 22;
+/// v23 (Chancery audit cross-referencing, #6): `chancery_writ_id` column on
+/// the journal table. When Chancery wraps an MCP server, it stamps every
+/// tools/call with `_meta.chancery/lease` — the writ's unique ID. This column
+/// records it so downstream audit queries can cross-reference vault journal
+/// entries against Chancery writ records. New column, backfill-free: no-op on
+/// fresh DBs; legacy rows get '' and are populated going forward.
+const SCHEMA_VERSION: i64 = 23;
 
 /// Initialize the v0.2.0 schema on a fresh database.
 pub fn initialize_schema(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
@@ -830,6 +839,16 @@ fn apply_migrations(conn: &Connection) -> Result<(), Box<dyn std::error::Error>>
          CREATE INDEX IF NOT EXISTS idx_agents_fleet ON agents(fleet_id);",
     )?;
     // ── end v22 ──────────────────────────────────────────────────────────
+
+    // ── v23 (Chancery cross-ref, #6): chancery_writ_id on journal ─────────
+    // New column on the journal table. When Chancery wraps an MCP server, it
+    // stamps every tools/call payload with `_meta.chancery/lease`; the vault
+    // records this in the journal so downstream audit queries can
+    // cross-reference against Chancery writ records. ALTER-probe pattern:
+    // idempotent and safe on pre-v23 stores. No backfill — legacy rows get
+    // '' (the column default) and are populated on all future journal writes.
+    ensure_column(conn, "journal", "chancery_writ_id", "TEXT DEFAULT ''")?;
+    // ── end v23 ──────────────────────────────────────────────────────────
 
     // Stamp the migration level so subsequent opens skip the probe block above.
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;

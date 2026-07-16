@@ -1986,6 +1986,10 @@ fn run_prepare(
                 budget_chars: 0,
                 entities_injected: 0,
                 warnings: Vec::new(),
+                injected_chars: 0,
+                estimated_injected_tokens: 0,
+                corpus_chars: 0,
+                estimated_corpus_tokens: 0,
             }
         }
     };

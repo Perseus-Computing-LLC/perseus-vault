@@ -17,6 +17,30 @@ use crate::models::{
 };
 use crate::schema;
 
+// Thread-local holding the chancery writ ID for the current MCP request.
+// When Chancery wraps an MCP server, it stamps `_meta.chancery/lease` on every
+// `tools/call` payload. This is extracted in `handle_request` (mcp.rs) and
+// stored here so `db.journal()` can stamp it on every audit entry created
+// during the request — no need to thread it through every handler.
+//
+// Reset to empty after each request. Multiple journal writes within one
+// request all inherit the same writ ID.
+thread_local! {
+    static CURRENT_CHANCERY_WRIT_ID: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
+/// Set the chancery writ ID for the current request's thread. Called from
+/// `handle_request` in mcp.rs before dispatching the tool call.
+pub fn set_chancery_writ_id(id: &str) {
+    CURRENT_CHANCERY_WRIT_ID.with(|cell| *cell.borrow_mut() = id.to_string());
+}
+
+/// Retrieve the current thread's chancery writ ID (empty string if none was
+/// set — the common case for non-Chancery-originated writes).
+pub fn chancery_writ_id() -> String {
+    CURRENT_CHANCERY_WRIT_ID.with(|cell| cell.borrow().clone())
+}
+
 /// Format a unix timestamp in milliseconds as an ISO 8601 UTC string.
 fn chrono_like(ms: i64) -> String {
     crate::util::format_iso8601(ms / 1000)
@@ -5643,12 +5667,17 @@ impl Database {
             &commitment,
         );
 
+        // v23: capture the thread-local chancery writ ID (set by the MCP
+        // handler from _meta.chancery/lease) so downstream audit queries can
+        // cross-reference against Chancery writ records.
+        let chancery_writ_id = crate::db::chancery_writ_id();
+
         conn.execute(
             "INSERT INTO journal
              (id, event_type, evaluated_json, acted_json, forward_json,
               category, key, entity_id, agent_id, audit_hash, workspace_hash,
-              payload_commitment, created_at_unix_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+              payload_commitment, chancery_writ_id, created_at_unix_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 event.id,
                 event.event_type,
@@ -5662,6 +5691,7 @@ impl Database {
                 computed_hash,
                 workspace_hash,
                 commitment,
+                chancery_writ_id,
                 event.created_at_unix_ms,
             ],
         )?;

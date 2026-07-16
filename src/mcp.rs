@@ -381,6 +381,19 @@ pub fn handle_request(
                 }
             }
 
+            // v23 (Chancery cross-ref, #6): extract the chancery writ ID from
+            // `_meta.chancery/lease` on the tools/call params envelope. When
+            // Chancery wraps an MCP server it stamps every request with this so
+            // the vault can record the writ in its journal audit trail. Set on a
+            // thread-local so `db.journal()` picks it up without threading it
+            // through every handler.
+            let chancery_writ_id = params
+                .get("_meta")
+                .and_then(|m| m.get("chancery/lease"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            crate::db::set_chancery_writ_id(chancery_writ_id);
+
             let result_text = call_tool(tool_name, db, tool_args, id.clone());
 
             // Try to parse the result as JSON for structuredContent
