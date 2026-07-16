@@ -96,12 +96,19 @@ pub struct MCPState {
     // concurrent requests without a Mutex (which would re-serialize them now
     // that the DB pool removed the other lock). handle_request takes &MCPState.
     pub initialized: std::sync::atomic::AtomicBool,
+    // #684: agent identity captured from the `initialize` handshake's
+    // clientInfo.name. Threaded into tool calls as `requesting_agent_id` so
+    // visibility enforcement knows who is asking. Empty when the client sent no
+    // clientInfo (single-agent / legacy) → unscoped, preserving old behavior.
+    // RwLock: set once at initialize, read per tools/call across the shared &state.
+    pub session_agent_id: std::sync::RwLock<String>,
 }
 
 impl MCPState {
     pub fn new() -> Self {
         MCPState {
             initialized: std::sync::atomic::AtomicBool::new(false),
+            session_agent_id: std::sync::RwLock::new(String::new()),
         }
     }
 }
@@ -307,6 +314,27 @@ pub fn handle_request(
                 })),
                 error: None,
             };
+            // #684: capture the client's identity from the handshake so
+            // subsequent tool calls can be attributed/visibility-scoped. MCP
+            // clientInfo.name (e.g. the agent's name); sanitized to a bounded
+            // token. Absent clientInfo → stays empty → unscoped.
+            if let Some(name) = req
+                .params
+                .as_ref()
+                .and_then(|p| p.get("clientInfo"))
+                .and_then(|c| c.get("name"))
+                .and_then(|n| n.as_str())
+            {
+                let sanitized: String = name
+                    .trim()
+                    .chars()
+                    .filter(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'))
+                    .take(128)
+                    .collect();
+                if let Ok(mut slot) = state.session_agent_id.write() {
+                    *slot = sanitized;
+                }
+            }
             state.initialized.store(true, std::sync::atomic::Ordering::Relaxed);
             Some(response)
         }
@@ -338,7 +366,20 @@ pub fn handle_request(
                 None => return Some(error_response(id, -32602, "Missing tool name")),
             };
 
-            let tool_args = params.get("arguments").cloned().unwrap_or(json!({}));
+            let mut tool_args = params.get("arguments").cloned().unwrap_or(json!({}));
+
+            // #684: stamp the captured session identity so tools that enforce
+            // visibility (recall) know who is asking, without the caller having
+            // to pass it. Only when non-empty and not already supplied; unknown
+            // to tools that don't read it (serde ignores it).
+            if let Ok(sid) = state.session_agent_id.read() {
+                if !sid.is_empty() {
+                    if let Some(obj) = tool_args.as_object_mut() {
+                        obj.entry("requesting_agent_id")
+                            .or_insert_with(|| json!(*sid));
+                    }
+                }
+            }
 
             let result_text = call_tool(tool_name, db, tool_args, id.clone());
 
@@ -4280,6 +4321,37 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
       }
     },
     "title": "Get Keystones"
+  },
+  {
+    "name": "mimir_agent",
+    "description": "Register/update or look up an agent in the multi-agent registry (#684). Agents carry a trust tier (0-3) that gates sensitive ops (e.g. authoring keystones needs tier >= 2) and drives visibility enforcement on recall: tier 0 = read own only, 1 = fleet, 2 = read all + write keystones, 3 = admin. Pass trust_tier (and optionally name/fleet_id) to upsert; omit trust_tier to just look up. entities/journal already stamp agent_id (v1.2.0); this adds the identity + tier metadata. NOTE: an empty/unknown agent has no registry row — unknown identified agents resolve to tier 0, and a caller with no session identity is unscoped.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "agent_id": { "type": "string", "description": "The agent's stable identifier (e.g. the MCP clientInfo name)." },
+        "name": { "type": "string", "description": "Human-readable name (upsert only)." },
+        "trust_tier": { "type": "integer", "description": "Trust tier 0-3. Provide to upsert; omit to look up. Clamped to [0,3]." },
+        "fleet_id": { "type": "string", "description": "Fleet/team the agent belongs to (used for 'fleet' visibility). Upsert only." }
+      },
+      "required": ["agent_id"]
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "found": { "type": "boolean" },
+        "created": { "type": "boolean", "description": "true if an upsert created a new registry row" },
+        "agent": {
+          "type": "object",
+          "properties": {
+            "agent_id": { "type": "string" },
+            "name": { "type": "string" },
+            "trust_tier": { "type": "integer" },
+            "fleet_id": { "type": "string" }
+          }
+        }
+      }
+    },
+    "title": "Agent Registry"
   }
 ]"###,
         )
@@ -4448,6 +4520,7 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
         "mimir_follow" => tools::handle_follow(db, args).map_err(|e| e.to_string()),
         "mimir_keystone_set" => tools::handle_keystone_set(db, args),
         "mimir_keystone_get" => tools::handle_keystone_get(db, args),
+        "mimir_agent" => tools::handle_agent(db, args),
         "mimir_conflicts" => Ok(tools::handle_conflicts(db, args)),
         "mimir_consolidate" => Ok(tools::handle_consolidate(db, args)),
         "mimir_dream" => tools::handle_dream(db, args),
@@ -4856,7 +4929,9 @@ mod tests {
             None,
         );
         assert!(low.contains("\"created\":true"), "{low}");
-        assert!(low.contains("\"trust_enforced\":true"), "{low}");
+        // #684: caller-asserted (no registered agent) → checked but not
+        // registry-enforced. trust_enforced reflects registry backing only.
+        assert!(low.contains("\"trust_enforced\":false"), "{low}");
         let _ = call_tool(
             "mimir_keystone_set",
             &db,
@@ -4987,6 +5062,59 @@ mod tests {
             json!(env!("CARGO_PKG_NAME")),
         );
 
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn initialize_captures_client_identity_and_scopes_recall() {
+        // #684: the initialize handshake's clientInfo.name is captured and
+        // stamped onto tool calls as requesting_agent_id, so a private entity is
+        // transparently hidden from a different client — no explicit arg needed.
+        let db_path = std::env::temp_dir()
+            .join(format!("mimir-clientinfo-{}.db", uuid::Uuid::new_v4()));
+        let db = Database::open(db_path.to_str().expect("temp db path")).expect("open temp db");
+        db.agent_upsert("alice", "Alice", 0, "eng").unwrap();
+        db.agent_upsert("bob", "Bob", 0, "eng").unwrap();
+        tools::handle_remember(
+            &db,
+            json!({"category": "notes", "key": "secret",
+                   "body_json": "{\"note\":\"quantum blueprint\"}",
+                   "visibility": "private", "agent_id": "alice"}),
+        )
+        .expect("private note");
+
+        let state = MCPState::new();
+        // Handshake as client "bob".
+        let init = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(1)),
+            method: "initialize".to_string(),
+            params: Some(json!({"clientInfo": {"name": "bob", "version": "1.0"}})),
+        };
+        handle_request(&init, &state, &db).expect("initialize");
+        assert_eq!(
+            *state.session_agent_id.read().unwrap(),
+            "bob",
+            "clientInfo.name must be captured"
+        );
+
+        // A plain recall (no requesting_agent_id arg) is transparently scoped to bob.
+        let call = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(2)),
+            method: "tools/call".to_string(),
+            params: Some(json!({
+                "name": "mimir_recall",
+                "arguments": {"query": "quantum", "mode": "fts5"}
+            })),
+        };
+        let resp = handle_request(&call, &state, &db).expect("recall response");
+        let structured = resp.result.expect("result")["structuredContent"].clone();
+        assert_eq!(
+            structured["total"],
+            json!(0),
+            "bob must not see alice's private note via the captured identity: {structured}"
+        );
         let _ = fs::remove_file(db_path);
     }
 

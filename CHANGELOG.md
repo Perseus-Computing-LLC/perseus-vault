@@ -20,6 +20,28 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
   seeded/deterministic corpus. Published tier numbers come from a run on named
   hardware (the heavy 1M/10M tiers on the benchmark fleet) — captured in a
   signed `report.json`, never hand-written.
+- **Multi-agent scoping — trust tiers + visibility enforcement** (#684). A new
+  `agents` registry (schema v22: `agent_id`, `name`, `trust_tier` 0-3,
+  `fleet_id`) plus the `mimir_agent` tool to register/look up agents.
+  `entities`/`journal` already carried `agent_id` (v1.2.0); this adds the trust
+  tier that gates sensitive ops and **enforces the previously stored-but-unused
+  `visibility` field** on recall:
+  - `can_read()` model — `private` → author (or admin) only; `fleet` → same
+    fleet or tier ≥ 2; `workspace`/`tenant`/`''` (the default) → everyone.
+  - The MCP transport now **captures the client's identity** from the
+    `initialize` handshake (`clientInfo.name`) and stamps it onto tool calls as
+    `requesting_agent_id`, so `recall` transparently drops entities the caller
+    may not see — no explicit arg required.
+  - Keystone authoring (#683) now gates on the **authoritative registered tier**
+    when the author is a known agent, replacing pure caller-assertion
+    (`trust_enforced=true` then means registry-backed).
+  - **Non-breaking:** an empty/unknown requester is unscoped (tier 3 = admin),
+    and the default `workspace` visibility is visible to all, so single-agent
+    deployments and every existing entity/benchmark are unaffected. Scoping only
+    hides `private`/`fleet` entities from identified, lower-tier agents.
+  - Follow-ups (noted, not yet wired): enforcement on the other read surfaces
+    (`ask`/`global_recall`/`memories`), automatic author `agent_id` population
+    from the session on writes, and per-agent recall tuning.
 - **Keystones — mandatory policy rules** (#683). A new `keystones` table
   (schema v21) plus `mimir_keystone_set` / `mimir_keystone_get` MCP tools.
   Keystones are directives fetched deterministically at session start (unlike

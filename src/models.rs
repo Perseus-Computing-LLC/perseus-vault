@@ -194,6 +194,18 @@ pub struct Keystone {
     pub updated_at_unix_ms: i64,
 }
 
+/// #684: a registered agent — identity + a trust tier (0-3) that gates
+/// sensitive ops and drives visibility enforcement on reads.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Agent {
+    pub agent_id: String,
+    pub name: String,
+    pub trust_tier: i64,
+    pub fleet_id: String,
+    pub created_at_unix_ms: i64,
+    pub updated_at_unix_ms: i64,
+}
+
 /// A key-value state entry with optional TTL.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StateEntry {

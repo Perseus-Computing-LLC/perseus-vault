@@ -229,6 +229,14 @@ pub struct RecallArgs {
     pub scope_weight: Option<f64>,
     #[serde(default)]
     pub agent_id: Option<String>,
+    /// #684: the identity of the agent making the request (distinct from
+    /// `agent_id`, which is an author FILTER). Stamped by the MCP transport from
+    /// the `initialize` handshake's clientInfo; used only for visibility
+    /// enforcement (`private`/`fleet` entities). Empty/absent → unscoped, so
+    /// single-agent callers and default `workspace`-visibility data are
+    /// unaffected.
+    #[serde(default)]
+    pub requesting_agent_id: Option<String>,
     #[serde(default)]
     pub layer: Option<String>,
     /// #287: opt-in. When true, each result gets a normalized `confidence`
@@ -1036,6 +1044,17 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
     let mut entities = db
         .recall(&params)
         .map_err(|e| format!("Recall failed: {}", e))?;
+
+    // #684: visibility enforcement. Drop entities the requesting agent may not
+    // read (private → author only; fleet → same fleet / tier>=2) before any
+    // downstream processing, so hidden entities are never reconstructed,
+    // reinforced, or returned. Applied first so temporal provenance stays 1:1
+    // with the surviving set. A no-op for unscoped requesters (empty id → tier
+    // 3) and for the default `workspace`/`tenant`/'' visibility — so existing
+    // single-agent callers and data are unaffected.
+    if let Some(req) = a.requesting_agent_id.as_deref().filter(|s| !s.is_empty()) {
+        entities.retain(|e| db.can_read(req, &e.visibility, &e.agent_id));
+    }
 
     // #675/#676: re-rank the over-fetched pool by actionability and truncate to
     // the caller's limit, so action-changing memories win the top-k over vague/
@@ -3084,16 +3103,28 @@ fn default_keystone_tier_required() -> i64 {
 pub fn handle_keystone_set(db: &Database, args: Value) -> Result<String, String> {
     let a: KeystoneSetArgs = serde_json::from_value(args)
         .map_err(|e| format!("Invalid keystone_set arguments: {}", e))?;
-    // #683/#684 trust gating. `author_trust_tier` is caller-asserted until #684
-    // provides a per-agent trust registry + transport session identity; when
-    // supplied it is enforced, when omitted the write proceeds and the response
-    // sets trust_enforced=false so callers know enforcement is pending.
-    let trust_enforced = a.author_trust_tier.is_some();
-    if let Some(t) = a.author_trust_tier {
+    // #683/#684 trust gating. Prefer the AUTHORITATIVE registered tier
+    // (#684 agents registry) when the author is a known agent; fall back to the
+    // caller-asserted `author_trust_tier` otherwise. `trust_enforced` reports
+    // whether the check used a registry-backed tier (non-spoofable) vs a mere
+    // caller assertion (pending real session identity), so callers can tell
+    // which mode applied. No tier signal at all → the write proceeds unenforced.
+    let registered_tier = if a.agent_id.trim().is_empty() {
+        None
+    } else {
+        db.agent_get(&a.agent_id).ok().flatten().map(|g| g.trust_tier)
+    };
+    let (effective_tier, trust_enforced) = match registered_tier {
+        Some(t) => (Some(t), true),
+        None => (a.author_trust_tier, false),
+    };
+    if let Some(t) = effective_tier {
         if t < a.trust_tier_required {
             return Err(format!(
-                "insufficient trust tier: authoring this keystone requires tier >= {}, caller asserted {}",
-                a.trust_tier_required, t
+                "insufficient trust tier: authoring this keystone requires tier >= {}, {} has {}",
+                a.trust_tier_required,
+                if trust_enforced { "registered agent" } else { "caller asserted" },
+                t
             ));
         }
     }
@@ -3146,6 +3177,48 @@ pub fn handle_keystone_get(db: &Database, args: Value) -> Result<String, String>
         })
         .collect();
     Ok(json!({ "keystones": items, "count": items.len() }).to_string())
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AgentArgs {
+    pub agent_id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub trust_tier: Option<i64>,
+    #[serde(default)]
+    pub fleet_id: String,
+}
+
+pub fn handle_agent(db: &Database, args: Value) -> Result<String, String> {
+    let a: AgentArgs = serde_json::from_value(args)
+        .map_err(|e| format!("Invalid agent arguments: {}", e))?;
+    if a.agent_id.trim().is_empty() {
+        return Err("agent_id must not be empty".to_string());
+    }
+    // trust_tier present → upsert; absent → look up only.
+    let created = if let Some(tier) = a.trust_tier {
+        Some(
+            db.agent_upsert(&a.agent_id, &a.name, tier, &a.fleet_id)
+                .map_err(|e| format!("agent upsert failed: {}", e))?,
+        )
+    } else {
+        None
+    };
+    let agent = db
+        .agent_get(&a.agent_id)
+        .map_err(|e| format!("agent lookup failed: {}", e))?;
+    Ok(json!({
+        "found": agent.is_some(),
+        "created": created.unwrap_or(false),
+        "agent": agent.map(|g| json!({
+            "agent_id": g.agent_id,
+            "name": g.name,
+            "trust_tier": g.trust_tier,
+            "fleet_id": g.fleet_id,
+        })),
+    })
+    .to_string())
 }
 
 #[derive(Debug, Deserialize)]
@@ -6416,6 +6489,85 @@ mod tests {
             item.contains("Alice") && !item.contains("Bob"),
             "must reconstruct the point-in-time (Alice) body, got: {item}"
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn recall_enforces_visibility_by_requesting_agent() {
+        // #684: a private entity is hidden from other agents but visible to its
+        // author and to an unscoped requester; default-visibility entities are
+        // visible to everyone (non-breaking).
+        let (db, path) = temp_db();
+        db.agent_upsert("alice", "Alice", 0, "eng").unwrap();
+        db.agent_upsert("bob", "Bob", 0, "eng").unwrap();
+
+        handle_remember(
+            &db,
+            json!({"category": "notes", "key": "secret",
+                   "body_json": "{\"note\":\"quantum widget blueprint\"}",
+                   "visibility": "private", "agent_id": "alice"}),
+        )
+        .expect("private");
+        handle_remember(
+            &db,
+            json!({"category": "notes", "key": "shared",
+                   "body_json": "{\"note\":\"quantum team standup\"}",
+                   "agent_id": "alice"}),
+        )
+        .expect("shared");
+
+        let count = |args: Value| -> i64 {
+            let r = handle_recall(&db, args).expect("recall");
+            serde_json::from_str::<Value>(&r).unwrap()["total"]
+                .as_i64()
+                .unwrap()
+        };
+
+        // Bob (a different agent) sees only the default-visibility entity.
+        assert_eq!(
+            count(json!({"query": "quantum", "mode": "fts5", "requesting_agent_id": "bob"})),
+            1,
+            "bob must not see alice's private note"
+        );
+        // Alice sees both (author of the private one).
+        assert_eq!(
+            count(json!({"query": "quantum", "mode": "fts5", "requesting_agent_id": "alice"})),
+            2,
+            "alice sees her own private note"
+        );
+        // No requester identity → unscoped → sees both (existing behavior).
+        assert_eq!(
+            count(json!({"query": "quantum", "mode": "fts5"})),
+            2,
+            "unscoped recall is unchanged"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn keystone_authoring_uses_registered_trust_tier() {
+        // #684 completes #683's hook: keystone authoring is gated on the
+        // AUTHORITATIVE registered tier when the author is a known agent.
+        let (db, path) = temp_db();
+        db.agent_upsert("low", "Low", 1, "").unwrap(); // below the default required 2
+        db.agent_upsert("high", "High", 2, "").unwrap();
+
+        // Registered tier-1 agent is rejected even without asserting a tier.
+        let denied = handle_keystone_set(
+            &db,
+            json!({"content": "rule x", "agent_id": "low"}),
+        );
+        assert!(
+            denied.is_err() && denied.unwrap_err().contains("registered agent"),
+            "tier-1 registered agent must be denied by the registry"
+        );
+        // Registered tier-2 agent succeeds, and it is registry-enforced.
+        let ok = handle_keystone_set(
+            &db,
+            json!({"content": "rule x", "agent_id": "high"}),
+        )
+        .expect("tier-2 allowed");
+        assert!(ok.contains("\"trust_enforced\":true"), "registry-enforced: {ok}");
         let _ = std::fs::remove_file(&path);
     }
 

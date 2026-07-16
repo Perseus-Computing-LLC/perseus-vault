@@ -224,6 +224,22 @@ CREATE TABLE IF NOT EXISTS keystones (
 );
 CREATE INDEX IF NOT EXISTS idx_keystones_scope
     ON keystones(workspace_hash, scope, scope_id, weight);
+
+-- #684 Multi-agent scoping: the agent registry. entities/journal already carry
+-- agent_id (v1.2.0); this adds identity metadata + a trust tier (0-3) that gates
+-- sensitive ops and drives visibility enforcement on reads. tier 0 = own only,
+-- 1 = fleet, 2 = all + author keystones, 3 = admin. Unregistered agent_ids
+-- resolve to tier 0. An empty agent_id (no session identity) is treated as
+-- unscoped/admin so single-agent deployments are unaffected.
+CREATE TABLE IF NOT EXISTS agents (
+    agent_id TEXT PRIMARY KEY,
+    name TEXT NOT NULL DEFAULT '',
+    trust_tier INTEGER NOT NULL DEFAULT 0,
+    fleet_id TEXT NOT NULL DEFAULT '',
+    created_at_unix_ms INTEGER NOT NULL,
+    updated_at_unix_ms INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_agents_fleet ON agents(fleet_id);
 ";
 
 /// Current schema migration level, stamped into `PRAGMA user_version` once all
@@ -271,7 +287,10 @@ CREATE INDEX IF NOT EXISTS idx_keystones_scope
 /// idempotently and backfilled from every existing entity_history row.
 /// v21 (#683 Keystones): the `keystones` table (mandatory policy rules).
 /// Created idempotently; no backfill (new table).
-const SCHEMA_VERSION: i64 = 21;
+/// v22 (#684 Multi-agent scoping): the `agents` registry (trust_tier + fleet).
+/// Created idempotently; no backfill (new table). entities/journal already
+/// carry agent_id from v1.2.0.
+const SCHEMA_VERSION: i64 = 22;
 
 /// Initialize the v0.2.0 schema on a fresh database.
 pub fn initialize_schema(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
@@ -796,6 +815,21 @@ fn apply_migrations(conn: &Connection) -> Result<(), Box<dyn std::error::Error>>
             ON keystones(workspace_hash, scope, scope_id, weight);",
     )?;
     // ── end v21 ──────────────────────────────────────────────────────────
+
+    // ── v22 (#684 Multi-agent scoping): agent registry ───────────────────
+    // New table (base DDL has the fresh-DB create). No backfill.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS agents (
+            agent_id TEXT PRIMARY KEY,
+            name TEXT NOT NULL DEFAULT '',
+            trust_tier INTEGER NOT NULL DEFAULT 0,
+            fleet_id TEXT NOT NULL DEFAULT '',
+            created_at_unix_ms INTEGER NOT NULL,
+            updated_at_unix_ms INTEGER NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS idx_agents_fleet ON agents(fleet_id);",
+    )?;
+    // ── end v22 ──────────────────────────────────────────────────────────
 
     // Stamp the migration level so subsequent opens skip the probe block above.
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;

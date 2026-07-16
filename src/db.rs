@@ -5836,6 +5836,135 @@ impl Database {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    // ── #684 Multi-agent scoping: agent registry + trust tiers ───────────
+
+    /// An empty agent_id means "no session identity" (single-agent deployment
+    /// or a client that sent no clientInfo). Such a caller is treated as
+    /// unscoped/admin so existing behavior is preserved — enforcement only
+    /// engages once agents are actually identified and registered.
+    pub const TRUST_TIER_UNSCOPED: i64 = 3;
+
+    /// #684: register or update an agent (identity + trust tier + fleet).
+    /// Upsert by agent_id. Returns `created`.
+    pub fn agent_upsert(
+        &self,
+        agent_id: &str,
+        name: &str,
+        trust_tier: i64,
+        fleet_id: &str,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        if agent_id.trim().is_empty() {
+            return Err("agent_id must not be empty".into());
+        }
+        let tier = trust_tier.clamp(0, 3);
+        let now = now_ms();
+        let conn = self.conn()?;
+        let existed: bool = conn
+            .query_row(
+                "SELECT 1 FROM agents WHERE agent_id = ?1",
+                params![agent_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        conn.execute(
+            "INSERT INTO agents (agent_id, name, trust_tier, fleet_id, created_at_unix_ms, updated_at_unix_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5) \
+             ON CONFLICT(agent_id) DO UPDATE SET \
+               name = excluded.name, trust_tier = excluded.trust_tier, \
+               fleet_id = excluded.fleet_id, updated_at_unix_ms = excluded.updated_at_unix_ms",
+            params![agent_id, name, tier, fleet_id, now],
+        )?;
+        Ok(!existed)
+    }
+
+    /// #684: fetch a registered agent by id.
+    pub fn agent_get(
+        &self,
+        agent_id: &str,
+    ) -> Result<Option<crate::models::Agent>, Box<dyn std::error::Error>> {
+        let conn = self.conn()?;
+        let a = conn
+            .query_row(
+                "SELECT agent_id, name, trust_tier, fleet_id, created_at_unix_ms, updated_at_unix_ms \
+                 FROM agents WHERE agent_id = ?1",
+                params![agent_id],
+                |r| {
+                    Ok(crate::models::Agent {
+                        agent_id: r.get(0)?,
+                        name: r.get(1)?,
+                        trust_tier: r.get(2)?,
+                        fleet_id: r.get(3)?,
+                        created_at_unix_ms: r.get(4)?,
+                        updated_at_unix_ms: r.get(5)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(a)
+    }
+
+    /// #684: trust tier for an agent_id. Empty id → unscoped/admin (3, preserves
+    /// single-agent behavior); registered → its tier; unknown non-empty → 0.
+    pub fn agent_trust_tier(&self, agent_id: &str) -> i64 {
+        if agent_id.is_empty() {
+            return Self::TRUST_TIER_UNSCOPED;
+        }
+        self.agent_get(agent_id)
+            .ok()
+            .flatten()
+            .map(|a| a.trust_tier)
+            .unwrap_or(0)
+    }
+
+    fn agent_fleet(&self, agent_id: &str) -> Option<String> {
+        if agent_id.is_empty() {
+            return None;
+        }
+        self.agent_get(agent_id)
+            .ok()
+            .flatten()
+            .map(|a| a.fleet_id)
+            .filter(|f| !f.is_empty())
+    }
+
+    /// #684: may `requesting_agent_id` read an entity with this `visibility`
+    /// authored by `owner_agent_id`? The enforcement model:
+    ///   * `private`  → only the author, or an admin (tier 3).
+    ///   * `fleet`    → same-fleet agents, or tier >= 2, or admin.
+    ///   * `workspace` / `tenant` / '' (the default) → everyone.
+    /// An empty requester id is unscoped/admin, so single-agent deployments and
+    /// all existing `workspace`-visibility data are unaffected — scoping only
+    /// hides `private`/`fleet` entities from identified, lower-tier agents.
+    pub fn can_read(
+        &self,
+        requesting_agent_id: &str,
+        visibility: &str,
+        owner_agent_id: &str,
+    ) -> bool {
+        let tier = self.agent_trust_tier(requesting_agent_id);
+        if tier >= Self::TRUST_TIER_UNSCOPED {
+            return true; // admin / unscoped sees everything
+        }
+        match visibility {
+            "private" => requesting_agent_id == owner_agent_id,
+            "fleet" => {
+                if tier >= 2 {
+                    return true;
+                }
+                match (
+                    self.agent_fleet(requesting_agent_id),
+                    self.agent_fleet(owner_agent_id),
+                ) {
+                    (Some(rf), Some(of)) => rf == of,
+                    _ => requesting_agent_id == owner_agent_id,
+                }
+            }
+            // "workspace" (default), "tenant", "" → visible to all.
+            _ => true,
+        }
+    }
+
     /// All superseded (historical) versions of a (category, key), newest first.
     /// Each was the live fact during [recorded_at_unix_ms, invalidated_at_unix_ms);
     /// the current live version lives in `entities`, not here. Bodies are decrypted
@@ -23171,6 +23300,47 @@ mod tests {
             live.is_empty(),
             "live FTS must not match the superseded term — that is the #682 gap"
         );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn agent_registry_and_can_read_enforce_visibility() {
+        // #684: agent registry CRUD + trust-tier lookup + the can_read matrix.
+        let (db, path) = temp_db();
+
+        // Register: created on first upsert, updated on second.
+        assert!(db.agent_upsert("a1", "Alice", 0, "eng").unwrap(), "created");
+        assert!(!db.agent_upsert("a1", "Alice", 1, "eng").unwrap(), "updated in place");
+        assert_eq!(db.agent_get("a1").unwrap().unwrap().trust_tier, 1);
+
+        // Trust tiers: empty id = unscoped admin (3); unknown = 0; registered = its tier.
+        assert_eq!(db.agent_trust_tier(""), 3);
+        assert_eq!(db.agent_trust_tier("nobody"), 0);
+        assert_eq!(db.agent_trust_tier("a1"), 1);
+        // Clamp out-of-range.
+        db.agent_upsert("admin", "Root", 9, "").unwrap();
+        assert_eq!(db.agent_trust_tier("admin"), 3);
+
+        // Two fleet-mates and an outsider.
+        db.agent_upsert("a2", "Bob", 0, "eng").unwrap(); // same fleet as a1
+        db.agent_upsert("b1", "Carol", 0, "sales").unwrap(); // other fleet
+
+        // private: only the author (or admin).
+        assert!(db.can_read("a1", "private", "a1"));
+        assert!(!db.can_read("a2", "private", "a1"));
+        assert!(db.can_read("admin", "private", "a1"));
+        assert!(db.can_read("", "private", "a1"), "unscoped sees all");
+
+        // fleet: same-fleet yes, other-fleet no, tier>=2 yes.
+        assert!(db.can_read("a2", "fleet", "a1"), "same fleet");
+        assert!(!db.can_read("b1", "fleet", "a1"), "other fleet blocked");
+        db.agent_upsert("t2", "Tier2", 2, "sales").unwrap();
+        assert!(db.can_read("t2", "fleet", "a1"), "tier 2 reads all fleets");
+
+        // workspace/tenant/default: everyone.
+        for vis in ["workspace", "tenant", ""] {
+            assert!(db.can_read("b1", vis, "a1"), "default vis visible: {vis}");
+        }
         let _ = fs::remove_file(&path);
     }
 
