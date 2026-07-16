@@ -114,6 +114,10 @@ Then wire the **recall → work → capture → consolidate** loop to your clien
 session events (SessionStart/Stop hooks for Claude Code, Codex, and Cursor,
 plus a portable AGENTS.md fallback): **[docs/lifecycle-hooks.md](docs/lifecycle-hooks.md)**.
 
+Composing with a memory washer (CoalWash) and a runtime output compactor
+(Noisegate) for end-to-end context-budget control:
+**[docs/integration/context-budget-stack.md](docs/integration/context-budget-stack.md)**.
+
 ## Why Perseus Vault
 
 Perseus Vault is the **only** memory engine that is simultaneously MCP-native,
