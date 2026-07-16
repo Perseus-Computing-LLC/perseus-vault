@@ -119,6 +119,9 @@ Perseus Vault exposes 55+ MCP tools covering the full memory lifecycle:
 | Metrics | stats, health, bench, synthesize |
 | Connectors | ingest |
 
+`federate` is a local export / workspace-rename / re-import (file based, no
+network peers); the Windows-safe default path is tracked in #704.
+
 Mem0 exposes ~5 tools: add, search, get, get_all, delete.
 
 ## MCP-Native Advantage

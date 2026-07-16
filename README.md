@@ -114,6 +114,10 @@ Then wire the **recall → work → capture → consolidate** loop to your clien
 session events (SessionStart/Stop hooks for Claude Code, Codex, and Cursor,
 plus a portable AGENTS.md fallback): **[docs/lifecycle-hooks.md](docs/lifecycle-hooks.md)**.
 
+Composing with a memory washer (CoalWash) and a runtime output compactor
+(Noisegate) for end-to-end context-budget control:
+**[docs/integration/context-budget-stack.md](docs/integration/context-budget-stack.md)**.
+
 ## Why Perseus Vault
 
 Perseus Vault is the **only** memory engine that is simultaneously MCP-native,
@@ -129,7 +133,7 @@ Recall quality measured on LongMemEval's **official** harness, not a home-grown 
 | Zep | 63.8% (published) |
 | Mem0 | 49.0% (published) |
 
-`longmemeval_s` (500 questions), gpt-4o-2024-08-06 answerer + LongMemEval's official judge; competitor numbers are their published values. Perseus Vault's 73.8% is the plain mean of 3 runs; 79.0% with official CoT. [Methodology & signed results →](benchmark/longmemeval/COMPARISON.md)
+`longmemeval_s` (500 questions), gpt-4o-2024-08-06 answerer + LongMemEval's official judge; competitor numbers are their published values. Perseus Vault's 73.8% is the plain mean of 3 runs; 79.0% with official CoT. [Methodology & content-hashed (sha256) results →](benchmark/longmemeval/COMPARISON.md)
 
 ### Bi-temporal time-travel (three-axis)
 
@@ -182,17 +186,22 @@ the reference. [Methodology & dataset →](benchmark/temporal/README.md)
 
 ### Stress Test: 100K Entities
 
-Perseus Vault handles production workloads on modest hardware:
+Perseus Vault handles production workloads on modest hardware. The numbers
+below are from the committed artifact
+[`benchmark/scale/report.json`](benchmark/scale/report.json): the real release
+binary driven over MCP stdio (one persistent process per corpus size), AMD64
+16-core, Windows 11, every write durable before the next is sent.
 
-| Metric | Result |
-|---|---|
-| **100K entity insert** | 1.01s (98,732 entities/s) |
-| **FTS5 recall (10 results)** | 0.022s |
-| **Decay tick (100K entities)** | 1.317s (batched, transactional) |
-| **Memory (100K entities)** | ~85MB RSS |
-| **DB file size (100K)** | ~45MB (with FTS5 index) |
+| Metric | 10K | 100K |
+|---|---|---|
+| **Write throughput, sustained (MCP stdio)** | 479 docs/s | 40 docs/s |
+| **Hybrid recall p50** | 19.03 ms | 79.73 ms |
+| **FTS5 recall p50** | 3.14 ms | 15.67 ms |
 
-Run it yourself: `cargo test stress_100k --release -- --ignored --nocapture`
+Full percentiles, `as_of` point lookups, temporal recall, and cold-start
+numbers are in [`benchmark/scale/`](benchmark/scale/README.md).
+
+Run it yourself: `python benchmark/scale/run.py`
 
 ### Recall Accuracy at Scale: Keyword Collapses, Hybrid Holds
 
@@ -294,6 +303,7 @@ Any MCP-compatible framework works with Perseus Vault directly. See
 | `mimir_remember` | Store/update entity. Idempotent by (category, key); a content change snapshots the prior version into history. |
 | `mimir_recall` | Search with FTS5/dense/hybrid modes, filters, stemming expansion. Query contract (#562): `query=""` is match-all enumeration (the "list all" path); `"*"` and other wildcards are literal FTS5 terms, **not** globs — `"*"` matches nothing. |
 | `mimir_scan` | Deterministic paginated enumeration of a category or the whole store (#562): immutable `id ASC` keyset pages with a `next_cursor`/`has_more` contract, so export/sync/reset callers can walk every entity exactly once. Read-only — no retrieval-count/decay side-effects, no offset cap. |
+| `mimir_hygiene` | Read-only startup-memory hygiene report (#675): scores active memories by "actionability" (concrete anchors — issue keys, #refs, paths, URLs, decisions — vs vague/date-only/short) and lists the worst offenders with reasons, for archive/consolidate curation. |
 | `mimir_recall_layer` | Recall from a specific biomimetic layer (world, episodic, semantic). |
 | `mimir_recall_when` | Proactive just-in-time recall: surface entities whose `recall_when` triggers match. |
 | `mimir_get_entity` | Fetch one entity by ID with full `body_json`. |
@@ -363,14 +373,21 @@ Any MCP-compatible framework works with Perseus Vault directly. See
 | `mimir_conflicts` | Detect conflicting entities via trigram similarity; opt-in `resolve=true` invalidates the lower-certainty side into history (reversible, dry-run by default). |
 | `mimir_correct` | Structured correction capture for learning from errors. |
 | `mimir_supersede` | Mark a new fact as superseding an old one (sets the old entity to `deprecated`). |
-| `mimir_follow` | Record whether an entity was actually FOLLOWED or MISSED — follow-rate efficacy signal that feeds decay scoring. |
+| `mimir_follow` | Record whether an entity was actually FOLLOWED or MISSED — follow-rate efficacy signal that feeds both decay scoring and outcome-weighted recall ranking (#681). |
+
+### Keystones (policy rules)
+| Tool | Description |
+|---|---|
+| `mimir_keystone_set` | Author a Keystone — a mandatory policy rule that survives context compaction (#683). Scoped (tenant/fleet/agent), weight-ranked, crypto-chained on every mutation; authoring is trust-tier-gated. |
+| `mimir_keystone_get` | Fetch the merged Keystones for a scope, ordered by weight (highest first) then scope specificity — the deterministic session-start counterpart to recall. A renderer injects these ahead of all other context. |
+| `mimir_agent` | Register/update or look up an agent in the multi-agent registry (#684): identity + trust tier (0-3) + fleet. Trust tier gates sensitive ops (e.g. authoring keystones needs tier ≥ 2) and drives visibility enforcement on recall. |
 
 ### Vault & Federation
 | Tool | Description |
 |---|---|
 | `mimir_vault_export` | Export entities to .md files with YAML frontmatter. |
 | `mimir_vault_import` | Import from .md vault directory (idempotent). |
-| `mimir_federate` | Copy entities between workspaces. |
+| `mimir_federate` | Copy entities between workspaces. This is a local export / workspace-rename / re-import (file based, no network peers); the Windows-safe default path is tracked in #704. |
 | `mimir_share` | Share one entity (by category + key) into another workspace, preserving content. |
 | `mimir_workspace_list` | List all distinct entity categories. |
 

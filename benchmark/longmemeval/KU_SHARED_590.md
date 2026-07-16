@@ -63,7 +63,7 @@ Paired read (same 78 questions): 14 flipped wrong→right, 10 right→wrong, net
 vault-wrong (`6a1eabeb`, `852ce960` — the two that opened this issue) are in
 the **fixed** column. The ±10–14 churn includes abstention (`_abs`) pairs
 flipping in both directions — consistent with normal answerer variance on this
-slice (signed full-500 runs put knowledge-update anywhere in a 76.9–80.8%
+slice (content-hashed full-500 runs put knowledge-update anywhere in a 76.9–80.8%
 band across seeds) plus context-composition changes, not with a one-directional
 shape effect beyond the net gain.
 

@@ -177,6 +177,35 @@ fn default_event_type() -> String {
     "decision".to_string()
 }
 
+/// #683: a Keystone — a mandatory policy rule fetched deterministically at
+/// session start and obeyed over conflicting instructions. Merged across scope
+/// (tenant < fleet < agent) with weight-based conflict resolution.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Keystone {
+    pub id: String,
+    pub content: String,
+    pub scope: String,
+    pub scope_id: String,
+    pub weight: f64,
+    pub trust_tier_required: i64,
+    pub workspace_hash: String,
+    pub author_agent_id: String,
+    pub created_at_unix_ms: i64,
+    pub updated_at_unix_ms: i64,
+}
+
+/// #684: a registered agent — identity + a trust tier (0-3) that gates
+/// sensitive ops and drives visibility enforcement on reads.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Agent {
+    pub agent_id: String,
+    pub name: String,
+    pub trust_tier: i64,
+    pub fleet_id: String,
+    pub created_at_unix_ms: i64,
+    pub updated_at_unix_ms: i64,
+}
+
 /// A key-value state entry with optional TTL.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StateEntry {
@@ -404,6 +433,10 @@ pub struct ContextBlock {
     pub entities_injected: i64,
     /// Soft warnings: always-on cap overflow, budget truncation.
     pub warnings: Vec<String>,
+    pub injected_chars: i64,
+    pub estimated_injected_tokens: i64,
+    pub corpus_chars: i64,
+    pub estimated_corpus_tokens: i64,
 }
 
 /// Parameters for timeline queries over the journal.
@@ -718,6 +751,79 @@ pub struct Stats {
     /// #398: top-10 (category, key) pairs by stored version count —
     /// `[{category, key, versions, bytes}]` — the hot keys to cap first.
     pub top_history_keys: serde_json::Value,
+}
+
+/// #677: cheap readiness snapshot surfaced by the `health` tool and the
+/// empty-recall diagnostic, so a silent-empty result is self-explaining
+/// (unhealthy DB vs genuinely empty store vs keyword-only / no-coverage
+/// semantic posture) instead of looking like a broken MCP child. Every field
+/// is a cheap covering-index count or a config read — safe to call before a
+/// recall-heavy workflow as a heartbeat.
+#[derive(Debug, Clone, Serialize)]
+pub struct Readiness {
+    /// `SELECT 1` succeeded against the pool.
+    pub db_responds: bool,
+    /// Non-archived entity count — the set recall actually reads.
+    pub active_memories: i64,
+    /// Non-archived entities carrying a stored dense embedding.
+    pub embedded_memories: i64,
+    /// Whether a dense-embedding backend is active (false on lite builds).
+    pub embedding_enabled: bool,
+}
+
+impl Readiness {
+    /// The store can serve a non-empty recall: the DB answers and at least one
+    /// active memory exists.
+    pub fn ready(&self) -> bool {
+        self.db_responds && self.active_memories > 0
+    }
+
+    /// Coarse semantic-recall posture for dense/hybrid callers:
+    /// - `"available"`   — backend on and at least one embedded memory
+    /// - `"no_coverage"` — backend on but nothing embedded yet (falls back to keyword)
+    /// - `"disabled"`    — no dense backend (keyword-only build/config)
+    pub fn semantic_recall(&self) -> &'static str {
+        if !self.embedding_enabled {
+            "disabled"
+        } else if self.embedded_memories > 0 {
+            "available"
+        } else {
+            "no_coverage"
+        }
+    }
+
+    /// Human-readable likely-cause warnings — empty when everything is nominal.
+    /// This is what a client prints instead of chasing a false "no memories
+    /// found" debugging path when recall comes back empty.
+    pub fn warnings(&self) -> Vec<String> {
+        let mut w = Vec::new();
+        if !self.db_responds {
+            w.push(
+                "database is not responding — recall and writes will fail until the vault process/DB is healthy"
+                    .to_string(),
+            );
+            // Downstream counts are meaningless when the DB is down.
+            return w;
+        }
+        if self.active_memories == 0 {
+            w.push(
+                "store has 0 active memories — recall will return empty until memories are written"
+                    .to_string(),
+            );
+        }
+        if self.embedding_enabled && self.active_memories > 0 && self.embedded_memories == 0 {
+            w.push(
+                "no active memories carry embeddings — dense/hybrid recall will fall back to keyword; run reindex/embed to restore semantic recall"
+                    .to_string(),
+            );
+        }
+        if !self.embedding_enabled {
+            w.push(
+                "semantic (dense/hybrid) backend is disabled — recall is keyword-only".to_string(),
+            );
+        }
+        w
+    }
 }
 
 /// Graph node for entity link visualization.

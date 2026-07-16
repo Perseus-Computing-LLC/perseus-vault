@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Perseus Vault benchmarks: reproducible numbers, signed reports</title>
+<script>try{var t=localStorage.getItem('perseus-theme');if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<link rel="icon" href="/assets/perseus.svg">
+<link rel="canonical" href="https://perseus.observer/benchmarks/">
+<meta name="description" content="Reproducible agent-memory benchmarks: LongMemEval retrieval recall, bi-temporal correctness, scale and latency to 100K entities. Every number generated from a signed report with a script you can rerun.">
+<meta name="theme-color" content="#0A0A12">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Perseus">
+<meta property="og:title" content="Perseus Vault benchmarks">
+<meta property="og:description" content="Every number here has a script. Signed reports, named models, reproducible offline.">
+<meta property="og:url" content="https://perseus.observer/benchmarks/">
+<link rel="stylesheet" href="/assets/fonts.css">
+<link rel="stylesheet" href="/assets/tokens.css">
+<link rel="stylesheet" href="/assets/perseus.css">
+<style>
+main.bench{max-width:1080px;margin:0 auto;padding:32px 20px 64px}
+main.bench h1{font-size:34px;margin:18px 0 6px}
+main.bench h2{font-size:22px;margin:38px 0 8px}
+main.bench .lead,main.bench .note{color:var(--text-dim,#98a0b3);font-size:14.5px;line-height:1.55}
+main.bench .stats{display:flex;flex-wrap:wrap;gap:12px;margin:14px 0}
+main.bench .stat{background:var(--surface,#101018);border:1px solid var(--border,#23232f);border-radius:10px;padding:12px 18px;min-width:120px}
+main.bench .stat .v{font-size:24px;font-weight:700;font-family:var(--font-display,'Space Grotesk',sans-serif)}
+main.bench .stat.big .v{font-size:32px;color:var(--violet,#a78bfa)}
+main.bench .stat .l{font-size:12px;color:var(--text-dim,#98a0b3);margin-top:2px}
+main.bench .tablewrap{overflow-x:auto;margin:12px 0}
+main.bench table{border-collapse:collapse;width:100%;font-size:13.5px}
+main.bench th,main.bench td{text-align:left;padding:8px 12px;border-bottom:1px solid var(--border,#23232f);vertical-align:top}
+main.bench thead th{color:var(--text-dim,#98a0b3);font-size:12px;text-transform:uppercase;letter-spacing:.5px}
+main.bench td.us{color:var(--violet,#a78bfa);font-weight:600}
+main.bench .src{font-size:12px;color:var(--text-dim,#98a0b3);margin-top:6px}
+main.bench .src .sig{font-family:var(--font-mono,'IBM Plex Mono',monospace);opacity:.8;margin-left:6px}
+main.bench pre{background:var(--surface,#101018);border:1px solid var(--border,#23232f);border-radius:10px;padding:14px 16px;overflow-x:auto;font-size:13px}
+</style>
+<script defer src="https://stats.perseus.observer/script.js" data-website-id="74dc0a11-f2dd-4d6f-b0b7-4a550116bbe5"></script>
+</head>
+<body>
+<header class="site">
+  <div class="nav">
+    <a href="/" class="brand" aria-label="Perseus home">
+      <svg width="30" height="30" viewBox="0 0 56 56" fill="none" aria-hidden="true"><rect x="3" y="14" width="17" height="3.6" rx="1.8" fill="var(--violet)"/><rect x="3" y="21" width="17" height="3.6" rx="1.8" fill="var(--violet)" fill-opacity=".75"/><rect x="3" y="28" width="17" height="3.6" rx="1.8" fill="var(--violet)" fill-opacity=".55"/><rect x="3" y="35" width="17" height="3.6" rx="1.8" fill="var(--violet)" fill-opacity=".4"/><g stroke="var(--amber)" stroke-width="2.4" stroke-linecap="round"><line x1="22" y1="16" x2="42" y2="28"/><line x1="22" y1="23" x2="42" y2="28"/><line x1="22" y1="30" x2="42" y2="28"/><line x1="22" y1="37" x2="42" y2="28"/></g><circle cx="44" cy="28" r="4.2" fill="var(--amber)"/></svg>
+      <b>Perseus<span class="sub"> / Benchmarks</span></b>
+    </a>
+    <nav class="navlinks">
+      <a href="/perseus-vault/">Perseus Vault</a>
+      <a href="https://github.com/Perseus-Computing-LLC/perseus-vault">GitHub</a>
+    </nav>
+  </div>
+</header>
+<main class="bench">
+  <h1>Benchmarks that you can rerun</h1>
+  <p class="lead">Agent-memory vendors publish numbers; ours come with the script, the dataset,
+  the named model, and a sha256 signature over the result set. Everything below is generated
+  from committed reports in the open repo. If you cannot reproduce a number, it comes down.</p>
+  
+<section id="matrix">
+  <h2>Feature matrix</h2>
+  <p class="note">Architecture facts, not adjectives. Competitor rows come from their public repos (<a href="https://github.com/getzep/graphiti">Zep / Graphiti</a> · <a href="https://github.com/mem0ai/mem0">Mem0</a> · <a href="https://github.com/topoteretes/cognee">Cognee</a> · <a href="https://github.com/letta-ai/letta">Letta</a>); anything we could not verify is "n/a".</p>
+  <div class="tablewrap"><table><thead><tr><th></th><th>Perseus Vault</th><th>Zep / Graphiti</th><th>Mem0</th><th>Cognee</th><th>Letta</th></tr></thead><tbody><tr><th>Temporal model</th><td class="us">Full SQL:2011 bi-temporal (valid + transaction time, point-in-time recall)</td><td class="">Bi-temporal edges (Graphiti)</td><td class="">Timestamps</td><td class="">Timestamps</td><td class="">Timestamps</td></tr><tr><th>Storage / deployment</th><td class="us">Single local binary, SQLite, offline</td><td class="">Server + graph DB</td><td class="">Server or SaaS, vector DB</td><td class="">Server, graph + vector DBs</td><td class="">Server, Postgres</td></tr><tr><th>Encryption at rest</th><td class="us">AES-256-GCM built in</td><td class="">n/a</td><td class="">n/a</td><td class="">n/a</td><td class="">n/a</td></tr><tr><th>Audit trail</th><td class="us">Hash-chained journal (keyed MAC under encryption; external review pending)</td><td class="">n/a</td><td class="">n/a</td><td class="">n/a</td><td class="">n/a</td></tr><tr><th>Retrieval modes</th><td class="us">FTS5 keyword + dense vector + hybrid RRF, decay + trust weighted</td><td class="">Graph + semantic</td><td class="">Vector</td><td class="">Graph + vector</td><td class="">Vector + recall memory</td></tr><tr><th>License</th><td class="us">MIT</td><td class="">Apache-2.0 (Graphiti)</td><td class="">Apache-2.0</td><td class="">Apache-2.0</td><td class="">Apache-2.0</td></tr></tbody></table></div>
+</section>
+<section id="retrieval">
+  <h2>Retrieval recall (LongMemEval)</h2>
+  <p class="note">Session-level recall against the 500-instance LongMemEval split
+  (23,867 sessions ingested into the real binary, offline, judge-free;
+  default hybrid retrieval). mimir.exe.</p>
+  <div class="stats"><div class='stat'><div class='v'>84.6%</div><div class='l'>recall@1</div></div><div class='stat'><div class='v'>95.2%</div><div class='l'>recall@3</div></div><div class='stat'><div class='v'>97.4%</div><div class='l'>recall@5</div></div><div class='stat'><div class='v'>99.2%</div><div class='l'>recall@10</div></div><div class='stat'><div class='v'>0.903</div><div class='l'>MRR</div></div></div>
+  <div class="src">source: <a href="https://github.com/Perseus-Computing-LLC/perseus-vault/blob/main/benchmark/longmemeval/report.json">benchmark/longmemeval/report.json</a> <span class="sig" title="sha256 over the result set">sig 9babb85f54f9</span></div>
+</section>
+<section id="qa">
+  <h2>End-to-end QA vs Zep</h2>
+  <p class="note">Zep publishes <b>63.8%</b> on LongMemEval with GPT-4o (<a href="https://arxiv.org/abs/2501.13956">their paper</a>). Our end-to-end run (same 500-instance split, pinned
+  gpt-4o-2024-08-06 answerer and judge, temperature 0) is in progress; the signed
+  report and per-category breakdown will render here when it lands. Until then this
+  section shows no number, because there is no signed number to show.</p>
+</section>
+<section id="scale">
+  <h2>Scale and latency</h2>
+  <p class="note">The real binary over MCP stdio, seeded corpus, 100 queries
+  per metric. Hardware named in the report: Windows 11, 16 cores. Bi-temporal point
+  lookups stay flat from 10K to 100K entities; that column is the differentiator.</p>
+  <div class="tablewrap"><table><thead><tr><th>entities</th><th>write sustained</th>
+  <th>fts5 p50/p99</th><th>hybrid p50/p99</th><th>as_of p99</th><th>cold start</th></tr></thead>
+  <tbody><tr><th>10,000</th><td>141/s</td><td>2.3 / 6.04 ms</td><td>19.61 / 22.99 ms</td><td>0.34 ms</td><td>24.8 ms</td></tr><tr><th>100,000</th><td>7/s</td><td>16.53 / 181.66 ms</td><td>597.41 / 639.11 ms</td><td>0.32 ms</td><td>70.2 ms</td></tr></tbody></table></div>
+  <div class="src">source: <a href="https://github.com/Perseus-Computing-LLC/perseus-vault/blob/main/benchmark/scale/report.json">benchmark/scale/report.json</a> <span class="sig" title="sha256 over the result set">sig 131a60eaa6fc</span></div>
+</section>
+<section id="temporal">
+  <h2>Temporal correctness</h2>
+  <p class="note">Bi-temporal reconstruction checked scenario by scenario: what was believed at T
+  (transaction time), what was true at T (valid time), and the full cell. Deterministic, offline.</p>
+  <div class='stats'><div class='stat big'><div class='v'>92.3%</div><div class='l'>gauntlet: 12/13 checks</div></div><div class='stat'><div class='v'>9/10</div><div class='l'>valid_at</div></div><div class='stat'><div class='v'>1/1</div><div class='l'>as_of</div></div><div class='stat'><div class='v'>2/2</div><div class='l'>bitemporal</div></div></div><div class="src">source: <a href="https://github.com/Perseus-Computing-LLC/perseus-vault/blob/main/benchmark/temporal/gauntlet_report.json">benchmark/temporal/gauntlet_report.json</a> <span class="sig" title="sha256 over the result set">sig 4225997f79a8</span></div><div class='stats'><div class='stat'><div class='v'>100.0%</div><div class='l'>temporal suite: 20/20</div></div></div><div class="src">source: <a href="https://github.com/Perseus-Computing-LLC/perseus-vault/blob/main/benchmark/temporal/report.json">benchmark/temporal/report.json</a> <span class="sig" title="sha256 over the result set">sig 009c4c3e25cb</span></div>
+</section>
+<section id="reproduce">
+  <h2>Reproduce every number</h2>
+  <p class="note">Every report above is generated by a script in the repo and signed with a sha256
+  over its result set. From a clean clone:</p>
+  <pre><code>git clone https://github.com/Perseus-Computing-LLC/perseus-vault.git
+cd perseus-vault
+cargo build --release
+python benchmark/recall/run.py        # recall quality (offline)
+python benchmark/longmemeval/run.py   # LongMemEval retrieval (offline)
+python benchmark/temporal/gauntlet.py # bi-temporal gauntlet (offline)
+python benchmark/scale/run.py         # scale + latency (offline)
+python benchmark/longmemeval/qa.py    # end-to-end QA (needs an OpenAI key; prints cost first)</code></pre>
+  <p class="note">This page was generated by <a href="https://github.com/Perseus-Computing-LLC/perseus-vault/blob/main/scripts/gen_benchmark_page.py">scripts/gen_benchmark_page.py</a>
+  at commit <code>58658ac</code>. If a number here cannot be traced to a committed signed report, that is a bug; please file it.</p>
+</section>
+</main>
+<footer class="site">
+  <div class="foot-compact">
+    <div class="brand-line">
+      <svg width="26" height="26" viewBox="0 0 56 56" fill="none" aria-hidden="true"><rect x="3" y="14" width="17" height="3.6" rx="1.8" fill="var(--violet)"/><rect x="3" y="21" width="17" height="3.6" rx="1.8" fill="var(--violet)" fill-opacity=".75"/><rect x="3" y="28" width="17" height="3.6" rx="1.8" fill="var(--violet)" fill-opacity=".55"/><rect x="3" y="35" width="17" height="3.6" rx="1.8" fill="var(--violet)" fill-opacity=".4"/><g stroke="var(--amber)" stroke-width="2.4" stroke-linecap="round"><line x1="22" y1="16" x2="42" y2="28"/><line x1="22" y1="23" x2="42" y2="28"/><line x1="22" y1="30" x2="42" y2="28"/><line x1="22" y1="37" x2="42" y2="28"/></g><circle cx="44" cy="28" r="4.2" fill="var(--amber)"/></svg>
+      <span class="legal-line">Perseus Computing LLC · generated 2026-07-07 at 58658ac · perseus.observer/benchmarks</span>
+    </div>
+    <div class="sib"><a href="/">Perseus</a><a href="/perseus-vault/">Perseus Vault</a><a href="/plutus/">Plutus</a><a href="https://github.com/Perseus-Computing-LLC/perseus-vault">GitHub</a></div>
+  </div>
+</footer>
+<script src="/assets/perseus.js"></script>
+</body>
+</html>

@@ -91,6 +91,39 @@ model affordable to *serve* — it is not a way to shrink the local default.
 This keeps GPU spend gated behind a cheap, decisive quality measurement, exactly
 as the #630 plan-of-record intended.
 
+## Measured result (2026-07-15): the naive larger-embedder swap loses
+
+Ran the gating experiment at **1M** (not just 100K) — re-embedded the reused
+corpus with **Qwen3-Embedding-0.6B (fp16)** and measured recall against the
+nomic-768 baseline on the same entities / clusters / queries / shipped-default
+recall config (2× H100, 500 queries, uniform, standalone dense = the honest
+signal). Artifact: `benchmark/lambda/results/scale1m_qwen3_0.6b.json`
+(`entities_embedded=995562`, `dim=1024` — verified, not a stale-embedding no-op).
+
+| Model (1M, dense, default config) | r@1 | r@5 | r@10 | p50 | dim |
+| --- | --- | --- | --- | --- | --- |
+| nomic-embed-text (baseline) | 0.514 | **0.726** | 0.800 | 194 ms | 768 |
+| Qwen3-Embedding-0.6B fp16 (as-integrated) | 0.190 | **0.368** | 0.440 | 334 ms | 1024 |
+
+The larger, higher-MTEB model **lost decisively** as integrated — roughly half
+the dense recall and ~1.7× slower (bigger vectors → more scan + rerank cost).
+
+**Read this as an integration result, not qwen3's ceiling.** Qwen3-Embedding is
+instruction-tuned: queries need a task-instruction prefix and the model uses
+last-token pooling. The vault embeds through a generic Ollama `/api/embed` call
+that applies **neither** — so this is "Qwen3-0.6B dropped into the vault as-is,"
+which is exactly the naive swap the issue proposed, and it does not pay off.
+Reaching qwen3's MTEB-implied quality would require prefix + pooling handling the
+vault does not have.
+
+**Conclusion (closes the evaluation):** a naive larger-embedder swap is a
+regression here, so there is nothing for NVFP4 to make "affordable" — NVFP4 only
+matters once a *properly integrated* larger model first shows a quality win,
+which this does not. Combined with the local-first / Blackwell-only constraints
+above, NVFP4 embedding is **not worth pursuing for Vault now**. If revisited, the
+prerequisite is instruction-prefix + last-token embedding support (a model-serving
+feature), measured to beat nomic-768 *before* any 4-bit/Blackwell spend.
+
 ## Sources
 
 - NVFP4 format + Blackwell-native tensor cores: [Introducing NVFP4 (NVIDIA)](https://developer.nvidia.com/blog/introducing-nvfp4-for-efficient-and-accurate-low-precision-inference/), [NVFP4 training precision (NVIDIA)](https://developer.nvidia.com/blog/nvfp4-trains-with-precision-of-16-bit-and-speed-and-efficiency-of-4-bit/)

@@ -37,7 +37,7 @@ against for the general case — leave it on.
 | **1bit_sig_prefilter_rerank** | `emb_sig` | 32× | 1 | 0.514 | 0.726 | 0.800 | 194.5 ms | `scale1m_default_500.json` **(SHIPPED DEFAULT)** |
 | pure_1bit_hamming_only | `emb_sig` | 32× | 1 | 0.132 | 0.312 | 0.412 | 184.3 ms | `scale1m_pure1bit.json` (prefilter, **no rerank**) |
 
-All four rows are signed (SHA-256 in `report.json` → `provenance`); `max_scan =
+All four rows are content-hashed (SHA-256 in `report.json` → `provenance`); `max_scan =
 50000`, `persisted = 995562` for each. Note the last row: the 1-bit prefilter
 *without* the exact-cosine rerank collapses to 0.312 r@5 — the rerank, not the
 1-bit ranking, is what earns the shipped tier's 0.726 (never disable it).

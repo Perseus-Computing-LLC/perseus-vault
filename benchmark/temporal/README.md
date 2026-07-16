@@ -11,7 +11,7 @@ benchmark.
 > in history (`entity_history`) and can answer *"what did we believe at time
 > T?"* via `mimir_as_of` — while normal recall stays live-only. This harness
 > drives the **real shipped binary over MCP stdio** through fact updates and
-> verifies exactly that, with a signed, re-runnable report anyone can reproduce
+> verifies exactly that, with a content-hashed (sha256), re-runnable report anyone can reproduce
 > with **no API key, no network, no LLM**.
 
 ## Run it

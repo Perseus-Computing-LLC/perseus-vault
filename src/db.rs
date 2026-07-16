@@ -12,7 +12,7 @@ use crate::connectors::Connector;
 use crate::encryption::EncryptionManager;
 use crate::models::{
     AskParams, AskResult, AskSource, CompactReport, DecayReport, EmbedParams, Entity, GraphEdge,
-    GraphNode, IngestParams, JournalEvent, MemoryLink, PruneParams, PruneReport, PurgeReport, RecallParams,
+    GraphNode, IngestParams, JournalEvent, MemoryLink, PruneParams, PruneReport, PurgeReport, Readiness, RecallParams,
     StateEntry, Stats, TimelineParams, VaultReport,
 };
 use crate::schema;
@@ -589,6 +589,18 @@ impl Database {
         }
     }
 
+    /// Absolute path of the SQLite file this instance is bound to. Surfaced in
+    /// `health` so a "wrote here, inspected there" mismatch (#657/#671 — an MCP
+    /// server launched with a different `--db` than the file the operator
+    /// queries, e.g. `~/mimir.db`) is immediately visible instead of looking
+    /// like a silent no-op. Falls back to the configured path if it cannot be
+    /// canonicalized (e.g. the file was removed).
+    pub fn db_path(&self) -> String {
+        std::fs::canonicalize(&self.db_path)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| self.db_path.clone())
+    }
+
     /// Enable encryption by loading the AES-256-GCM key from `key_file`.
     /// Returns an error if the key file cannot be read or is invalid.
     ///
@@ -757,6 +769,46 @@ impl Database {
             |r| r.get(0),
         )
         .unwrap_or(0)
+    }
+
+    /// #677: count of non-archived entities, regardless of embedding state.
+    /// Cheap covering-index count used by the `health` readiness probe and the
+    /// empty-recall diagnostic to tell "there really are no memories" apart from
+    /// "recall came back empty but the store is populated" (a degraded/keyword
+    /// fallback or a broken client expectation). Returns 0 on any error.
+    pub fn active_entity_count(&self) -> i64 {
+        let conn = match self.conn() {
+            Ok(c) => c,
+            Err(_) => return 0,
+        };
+        conn.query_row(
+            "SELECT COUNT(*) FROM entities WHERE archived = 0",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0)
+    }
+
+    /// #677: a cheap, allocation-light readiness snapshot for the `health` tool
+    /// and empty-recall diagnostics. Distinguishes an unhealthy DB, a genuinely
+    /// empty store, and a keyword-only / no-coverage semantic posture — the
+    /// silent-empty failure modes that otherwise cost tokens on false debugging
+    /// paths (long-lived MCP child suspicion).
+    pub fn readiness(&self) -> Readiness {
+        let db_responds = self.health_check();
+        // Only pay for the counts if the DB is actually answering; otherwise the
+        // counts would be a misleading 0 layered on top of the real fault.
+        let (active_memories, embedded_memories) = if db_responds {
+            (self.active_entity_count(), self.embedding_coverage())
+        } else {
+            (0, 0)
+        };
+        Readiness {
+            db_responds,
+            active_memories,
+            embedded_memories,
+            embedding_enabled: self.embedding_enabled(),
+        }
     }
 
     /// Replace the connector list (used at startup to load configured connectors).
@@ -1831,6 +1883,41 @@ impl Database {
                 [],
             )?
         };
+        // #682: rebuild the standalone history FTS from every entity_history row
+        // in the same transaction. This is the backfill path for stores upgraded
+        // to schema v20 (the migration only creates the empty table), and the
+        // repair path if the index ever drifts. Same dual encrypted/plaintext
+        // handling as the live index above — never index ciphertext.
+        tx.execute("DELETE FROM entity_history_fts", [])?;
+        if let Some(ref enc) = self.encryption {
+            let rows: Vec<(i64, String, String, String)> = {
+                let mut stmt = tx.prepare(
+                    "SELECT rowid, category, key, body_json FROM entity_history",
+                )?;
+                let mapped = stmt.query_map([], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                })?;
+                mapped.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            let mut insert =
+                tx.prepare("INSERT INTO entity_history_fts (rowid, body_json) VALUES (?1, ?2)")?;
+            for (rowid, category, key, raw_body) in rows {
+                let plain = match Self::decrypt_body_with_aad_fallback(
+                    enc, &raw_body, &category, &key,
+                ) {
+                    crate::encryption::BodyDecrypt::Plaintext(s)
+                    | crate::encryption::BodyDecrypt::LegacyPlaintext(s) => s,
+                    crate::encryption::BodyDecrypt::AuthFailed(_) => "{}".to_string(),
+                };
+                insert.execute(params![rowid, plain])?;
+            }
+        } else {
+            tx.execute(
+                "INSERT INTO entity_history_fts (rowid, body_json)
+                 SELECT rowid, body_json FROM entity_history",
+                [],
+            )?;
+        }
         tx.commit()?;
         Ok(indexed)
     }
@@ -3583,7 +3670,7 @@ impl Database {
             // re-assert (#371) — same body, but the pre-change valid period
             // must stay reconstructable.
             if content_changed || audit_period_change {
-                Self::snapshot_live_row_to_history(&tx, &history_id, now, &id)?;
+                Self::snapshot_live_row_to_history(&tx, self.encryption.as_ref(), &history_id, now, &id)?;
             }
 
             // #382: remember must not clobber the stored link graph. Callers
@@ -4170,11 +4257,12 @@ impl Database {
                 // front — the lever for date-keyed questions (e.g. "two weeks
                 // ago") where topical recall alone under-ranks the dated session.
                 let fused = crate::db::apply_date_window(fused, &params.query);
-                // #487: usefulness term in the composite rank expression —
-                // Belief Memory's `(1.0 + usefulness())`. Applied over the
-                // fused candidate pool BEFORE the metadata filter + truncate,
-                // so a cited-and-reused memory ranked just past `limit` can
-                // still make the cut over a never-reused near-tie.
+                // #487 + #681: honest-usage terms in the composite rank
+                // expression — Belief Memory's `(1.0 + usefulness())` citation
+                // boost and the follow-rate efficacy multiplier. Applied over
+                // the fused candidate pool BEFORE the metadata filter +
+                // truncate, so a cited/followed memory ranked just past `limit`
+                // can still make the cut over a never-reused near-tie.
                 let fused = self.apply_usefulness_rank_boost(fused)?;
                 timer.stage("usefulness");
                 // #485: scope preference in the same first-phase expression —
@@ -4346,14 +4434,16 @@ impl Database {
         supersede_reorder(fused, quantum)
     }
 
-    /// #487: multiply each fused score by the usefulness weight — memories
-    /// repeatedly cited as `derived_from` sources outrank equally-relevant
-    /// never-reused ones. One primary-key IN-lookup over the candidate pool
-    /// (≤ candidate_k rows), touching only rows with a non-zero count, so the
-    /// common all-zero case is a single index probe and an unchanged order.
-    /// Read-only: ranking only, no access-state writes — hybrid recall stays
-    /// idempotent (#247). The re-sort mirrors reciprocal_rank_fusion's
-    /// deterministic tie-break (score desc, id asc).
+    /// #487 + #681: multiply each fused score by the honest-usage weights —
+    /// memories repeatedly cited as `derived_from` sources (#487 usefulness)
+    /// and memories that get FOLLOWED (#681 efficacy) outrank equally-relevant
+    /// never-reused / ignored ones; a 'dead' lesson is gently demoted. One
+    /// primary-key IN-lookup over the candidate pool (≤ candidate_k rows),
+    /// touching only rows that carry a signal, so the common no-signal case is
+    /// a single index probe and an unchanged order. Read-only: ranking only,
+    /// no access-state writes — hybrid recall stays idempotent (#247). The
+    /// re-sort mirrors reciprocal_rank_fusion's deterministic tie-break
+    /// (score desc, id asc).
     fn apply_usefulness_rank_boost(
         &self,
         mut fused: Vec<(Entity, f64)>,
@@ -4361,31 +4451,48 @@ impl Database {
         if fused.is_empty() {
             return Ok(fused);
         }
+        let outcome_on = outcome_rank_enabled();
         let conn = self.conn()?;
         let placeholders = vec!["?"; fused.len()].join(",");
+        // #487 usefulness (derived_from citations) + #681 efficacy (honest
+        // follow-rate) resolved in one primary-key IN-lookup. Only rows
+        // carrying an actual honest-usage signal are returned, so the common
+        // no-signal case stays a single index probe and an unchanged order.
         let sql = format!(
-            "SELECT id, usefulness_count FROM entities \
-             WHERE id IN ({placeholders}) AND usefulness_count > 0"
+            "SELECT id, usefulness_count, efficacy_status, follow_rate FROM entities \
+             WHERE id IN ({placeholders}) \
+               AND (usefulness_count > 0 OR efficacy_status IN ('useful','dead'))"
         );
         let mut stmt = conn.prepare(&sql)?;
         let id_params: Vec<&dyn rusqlite::ToSql> = fused
             .iter()
             .map(|(e, _)| &e.id as &dyn rusqlite::ToSql)
             .collect();
-        let mut counts: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+        let mut sig: std::collections::HashMap<String, (i64, String, f64)> =
+            std::collections::HashMap::new();
         let rows = stmt.query_map(id_params.as_slice(), |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1).unwrap_or(0),
+                r.get::<_, String>(2).unwrap_or_default(),
+                r.get::<_, f64>(3).unwrap_or(0.0),
+            ))
         })?;
         for row in rows {
-            let (id, c) = row?;
-            counts.insert(id, c);
+            let (id, c, status, rate) = row?;
+            sig.insert(id, (c, status, rate));
         }
-        if counts.is_empty() {
+        if sig.is_empty() {
             return Ok(fused);
         }
         for (entity, score) in fused.iter_mut() {
-            if let Some(&c) = counts.get(&entity.id) {
-                *score *= usefulness_weight(c);
+            if let Some((c, status, rate)) = sig.get(&entity.id) {
+                // #487 usefulness term (always on).
+                *score *= usefulness_weight(*c);
+                // #681 outcome (efficacy) term — governed by the kill-switch.
+                if outcome_on {
+                    *score *= efficacy_rank_weight(status, *rate);
+                }
             }
         }
         fused.sort_by(|a, b| {
@@ -5567,6 +5674,297 @@ impl Database {
         self.encryption.as_ref().map(|e| *e.audit_key())
     }
 
+    /// #683: author or update a Keystone (mandatory policy rule). Upsert by
+    /// (scope, scope_id, content, workspace_hash) so re-setting the same rule
+    /// updates its weight / required tier / author in place instead of
+    /// duplicating. `scope` must be one of tenant | fleet | agent. Every
+    /// mutation is appended to the cryptographic audit chain (event_type
+    /// `keystone_set`, category `keystone`). Returns `(id, created)`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn keystone_set(
+        &self,
+        content: &str,
+        scope: &str,
+        scope_id: &str,
+        weight: f64,
+        trust_tier_required: i64,
+        workspace_hash: &str,
+        author_agent_id: &str,
+    ) -> Result<(String, bool), Box<dyn std::error::Error>> {
+        if !matches!(scope, "tenant" | "fleet" | "agent") {
+            return Err(format!(
+                "invalid keystone scope '{scope}': expected 'tenant', 'fleet', or 'agent'"
+            )
+            .into());
+        }
+        if content.trim().is_empty() {
+            return Err("keystone content must not be empty".into());
+        }
+        let now = now_ms();
+        let conn = self.conn()?;
+        let existing: Option<String> = conn
+            .query_row(
+                "SELECT id FROM keystones \
+                 WHERE scope = ?1 AND scope_id = ?2 AND content = ?3 AND workspace_hash = ?4",
+                params![scope, scope_id, content, workspace_hash],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?;
+        let (id, created) = match existing {
+            Some(id) => {
+                conn.execute(
+                    "UPDATE keystones SET weight = ?1, trust_tier_required = ?2, \
+                     author_agent_id = ?3, updated_at_unix_ms = ?4 WHERE id = ?5",
+                    params![weight, trust_tier_required, author_agent_id, now, id],
+                )?;
+                (id, false)
+            }
+            None => {
+                let id = format!(
+                    "ks-{}",
+                    uuid::Uuid::new_v4().to_string().replace('-', "")[..16].to_string()
+                );
+                conn.execute(
+                    "INSERT INTO keystones \
+                     (id, content, scope, scope_id, weight, trust_tier_required, \
+                      workspace_hash, author_agent_id, created_at_unix_ms, updated_at_unix_ms) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
+                    params![
+                        id,
+                        content,
+                        scope,
+                        scope_id,
+                        weight,
+                        trust_tier_required,
+                        workspace_hash,
+                        author_agent_id,
+                        now
+                    ],
+                )?;
+                (id, true)
+            }
+        };
+        // Crypto-chained audit event, like entity mutations.
+        self.journal(&crate::models::JournalEvent {
+            id: format!(
+                "jrn-{}",
+                uuid::Uuid::new_v4().to_string().replace('-', "")[..16].to_string()
+            ),
+            event_type: "keystone_set".to_string(),
+            evaluated_json: serde_json::json!({
+                "scope": scope,
+                "scope_id": scope_id,
+                "weight": weight,
+                "trust_tier_required": trust_tier_required,
+                "created": created,
+            })
+            .to_string(),
+            acted_json: String::new(),
+            forward_json: String::new(),
+            category: "keystone".to_string(),
+            key: id.clone(),
+            entity_id: id.clone(),
+            agent_id: author_agent_id.to_string(),
+            workspace_hash: workspace_hash.to_string(),
+            created_at_unix_ms: now,
+        })?;
+        Ok((id, created))
+    }
+
+    /// #683: the merged Keystones that apply for a scope filter, ordered for
+    /// deterministic precedence: weight DESC, then scope (tenant < fleet <
+    /// agent), then id. A renderer injects these ahead of all other context.
+    /// Filters are widening: an omitted `scope`/`scope_id` matches all; a
+    /// provided `workspace_hash` includes both that workspace and global (`''`)
+    /// keystones; a provided `scope_id` includes both it and scope-wide (`''`).
+    pub fn keystone_get(
+        &self,
+        scope: Option<&str>,
+        scope_id: Option<&str>,
+        workspace_hash: Option<&str>,
+    ) -> Result<Vec<crate::models::Keystone>, Box<dyn std::error::Error>> {
+        let conn = self.conn()?;
+        let mut conds: Vec<String> = Vec::new();
+        let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        if let Some(s) = scope.filter(|s| !s.is_empty()) {
+            conds.push(format!("scope = ?{}", binds.len() + 1));
+            binds.push(Box::new(s.to_string()));
+        }
+        if let Some(sid) = scope_id.filter(|s| !s.is_empty()) {
+            conds.push(format!(
+                "(scope_id = ?{} OR scope_id = '')",
+                binds.len() + 1
+            ));
+            binds.push(Box::new(sid.to_string()));
+        }
+        if let Some(ws) = workspace_hash.filter(|w| !w.is_empty()) {
+            conds.push(format!(
+                "(workspace_hash = ?{} OR workspace_hash = '')",
+                binds.len() + 1
+            ));
+            binds.push(Box::new(ws.to_string()));
+        }
+        let where_clause = if conds.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", conds.join(" AND "))
+        };
+        let sql = format!(
+            "SELECT id, content, scope, scope_id, weight, trust_tier_required, \
+                    workspace_hash, author_agent_id, created_at_unix_ms, updated_at_unix_ms \
+             FROM keystones {where_clause} \
+             ORDER BY weight DESC, \
+               CASE scope WHEN 'tenant' THEN 0 WHEN 'fleet' THEN 1 WHEN 'agent' THEN 2 ELSE 3 END ASC, \
+               id ASC"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let bind_refs: Vec<&dyn rusqlite::ToSql> = binds.iter().map(|b| b.as_ref()).collect();
+        let rows = stmt.query_map(bind_refs.as_slice(), |r| {
+            Ok(crate::models::Keystone {
+                id: r.get(0)?,
+                content: r.get(1)?,
+                scope: r.get(2)?,
+                scope_id: r.get(3)?,
+                weight: r.get(4)?,
+                trust_tier_required: r.get(5)?,
+                workspace_hash: r.get(6)?,
+                author_agent_id: r.get(7)?,
+                created_at_unix_ms: r.get(8)?,
+                updated_at_unix_ms: r.get(9)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    // ── #684 Multi-agent scoping: agent registry + trust tiers ───────────
+
+    /// An empty agent_id means "no session identity" (single-agent deployment
+    /// or a client that sent no clientInfo). Such a caller is treated as
+    /// unscoped/admin so existing behavior is preserved — enforcement only
+    /// engages once agents are actually identified and registered.
+    pub const TRUST_TIER_UNSCOPED: i64 = 3;
+
+    /// #684: register or update an agent (identity + trust tier + fleet).
+    /// Upsert by agent_id. Returns `created`.
+    pub fn agent_upsert(
+        &self,
+        agent_id: &str,
+        name: &str,
+        trust_tier: i64,
+        fleet_id: &str,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        if agent_id.trim().is_empty() {
+            return Err("agent_id must not be empty".into());
+        }
+        let tier = trust_tier.clamp(0, 3);
+        let now = now_ms();
+        let conn = self.conn()?;
+        let existed: bool = conn
+            .query_row(
+                "SELECT 1 FROM agents WHERE agent_id = ?1",
+                params![agent_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        conn.execute(
+            "INSERT INTO agents (agent_id, name, trust_tier, fleet_id, created_at_unix_ms, updated_at_unix_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5) \
+             ON CONFLICT(agent_id) DO UPDATE SET \
+               name = excluded.name, trust_tier = excluded.trust_tier, \
+               fleet_id = excluded.fleet_id, updated_at_unix_ms = excluded.updated_at_unix_ms",
+            params![agent_id, name, tier, fleet_id, now],
+        )?;
+        Ok(!existed)
+    }
+
+    /// #684: fetch a registered agent by id.
+    pub fn agent_get(
+        &self,
+        agent_id: &str,
+    ) -> Result<Option<crate::models::Agent>, Box<dyn std::error::Error>> {
+        let conn = self.conn()?;
+        let a = conn
+            .query_row(
+                "SELECT agent_id, name, trust_tier, fleet_id, created_at_unix_ms, updated_at_unix_ms \
+                 FROM agents WHERE agent_id = ?1",
+                params![agent_id],
+                |r| {
+                    Ok(crate::models::Agent {
+                        agent_id: r.get(0)?,
+                        name: r.get(1)?,
+                        trust_tier: r.get(2)?,
+                        fleet_id: r.get(3)?,
+                        created_at_unix_ms: r.get(4)?,
+                        updated_at_unix_ms: r.get(5)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(a)
+    }
+
+    /// #684: trust tier for an agent_id. Empty id → unscoped/admin (3, preserves
+    /// single-agent behavior); registered → its tier; unknown non-empty → 0.
+    pub fn agent_trust_tier(&self, agent_id: &str) -> i64 {
+        if agent_id.is_empty() {
+            return Self::TRUST_TIER_UNSCOPED;
+        }
+        self.agent_get(agent_id)
+            .ok()
+            .flatten()
+            .map(|a| a.trust_tier)
+            .unwrap_or(0)
+    }
+
+    fn agent_fleet(&self, agent_id: &str) -> Option<String> {
+        if agent_id.is_empty() {
+            return None;
+        }
+        self.agent_get(agent_id)
+            .ok()
+            .flatten()
+            .map(|a| a.fleet_id)
+            .filter(|f| !f.is_empty())
+    }
+
+    /// #684: may `requesting_agent_id` read an entity with this `visibility`
+    /// authored by `owner_agent_id`? The enforcement model:
+    ///   * `private`  → only the author, or an admin (tier 3).
+    ///   * `fleet`    → same-fleet agents, or tier >= 2, or admin.
+    ///   * `workspace` / `tenant` / '' (the default) → everyone.
+    /// An empty requester id is unscoped/admin, so single-agent deployments and
+    /// all existing `workspace`-visibility data are unaffected — scoping only
+    /// hides `private`/`fleet` entities from identified, lower-tier agents.
+    pub fn can_read(
+        &self,
+        requesting_agent_id: &str,
+        visibility: &str,
+        owner_agent_id: &str,
+    ) -> bool {
+        let tier = self.agent_trust_tier(requesting_agent_id);
+        if tier >= Self::TRUST_TIER_UNSCOPED {
+            return true; // admin / unscoped sees everything
+        }
+        match visibility {
+            "private" => requesting_agent_id == owner_agent_id,
+            "fleet" => {
+                if tier >= 2 {
+                    return true;
+                }
+                match (
+                    self.agent_fleet(requesting_agent_id),
+                    self.agent_fleet(owner_agent_id),
+                ) {
+                    (Some(rf), Some(of)) => rf == of,
+                    _ => requesting_agent_id == owner_agent_id,
+                }
+            }
+            // "workspace" (default), "tenant", "" → visible to all.
+            _ => true,
+        }
+    }
+
     /// All superseded (historical) versions of a (category, key), newest first.
     /// Each was the live fact during [recorded_at_unix_ms, invalidated_at_unix_ms);
     /// the current live version lives in `entities`, not here. Bodies are decrypted
@@ -5829,6 +6227,82 @@ impl Database {
             .versions_recorded_by(category, key, tx_at)?
             .into_iter()
             .next())
+    }
+
+    /// #682 Temporal RAG: candidate `(category, key)` pairs whose SUPERSEDED or
+    /// retired body text matches `query`, discovered via the standalone history
+    /// FTS (`entity_history_fts`). Temporal semantic recall over the LIVE index
+    /// surfaces a fact only if its CURRENT body still matches; this finds keys
+    /// the live index missed — a fact whose matching version has since been
+    /// replaced (e.g. "CEO is Alice", now "Bob") or a key fully retired since
+    /// the instant. It returns ONLY keys: the authoritative point-in-time
+    /// reconstruction still runs through `bitemporal_at` / `as_of_version`, so
+    /// temporal semantics are identical to the point-lookup tools. Query
+    /// tokenization mirrors `fts5_bm25_search` (stopword drop, quote-escape,
+    /// prefix `OR`). Distinct keys, workspace-scoped like recall's widening
+    /// (current workspace + global `''`), most-recent transaction time first,
+    /// capped at `limit`.
+    pub fn history_matching_keys(
+        &self,
+        query: &str,
+        workspace_hash: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<(String, String)>, Box<dyn std::error::Error>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let words: Vec<&str> = query
+            .split_whitespace()
+            .filter(|w| !w.is_empty() && !is_stopword(w))
+            .collect();
+        if words.is_empty() {
+            return Ok(Vec::new());
+        }
+        let fts_query = words
+            .iter()
+            .map(|w| {
+                let escaped = w.replace('"', "\"\"");
+                if escaped.is_empty() {
+                    "\"\"".to_string()
+                } else {
+                    format!("\"{}\"*", escaped)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" OR ");
+
+        let conn = self.conn()?;
+        let scoped = matches!(workspace_hash, Some(ws) if !ws.is_empty());
+        let sql = format!(
+            "SELECT h.category, h.key, \
+                    MAX(COALESCE(h.recorded_at_unix_ms, h.created_at_unix_ms)) AS rec \
+             FROM entity_history_fts JOIN entity_history h \
+               ON h.rowid = entity_history_fts.rowid \
+             WHERE entity_history_fts MATCH ?1{} \
+             GROUP BY h.category, h.key \
+             ORDER BY rec DESC, h.category ASC, h.key ASC \
+             LIMIT ?{}",
+            if scoped {
+                " AND (h.workspace_hash = ?2 OR h.workspace_hash = '')"
+            } else {
+                ""
+            },
+            if scoped { 3 } else { 2 }
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let map_row =
+            |r: &rusqlite::Row| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?));
+        let rows: Vec<(String, String)> = if scoped {
+            stmt.query_map(
+                params![fts_query, workspace_hash.unwrap(), limit as i64],
+                map_row,
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+        } else {
+            stmt.query_map(params![fts_query, limit as i64], map_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        Ok(rows)
     }
 
     /// #472 Temporal RAG: reconstruct a recalled entity set to its point-in-time
@@ -6465,7 +6939,7 @@ impl Database {
             "hist-{}",
             uuid::Uuid::new_v4().to_string().replace('-', "")[..16].to_string()
         );
-        Self::snapshot_live_row_to_history(&tx, &history_id, now, id)?;
+        Self::snapshot_live_row_to_history(&tx, self.encryption.as_ref(), &history_id, now, id)?;
         tx.execute(
             "UPDATE entities SET status = ?1, archive_reason = ?2, last_accessed_unix_ms = ?3,
                 recorded_at_unix_ms = ?4, supersedes = ?5,
@@ -6511,6 +6985,7 @@ impl Database {
     /// of the live row.
     fn snapshot_live_row_to_history(
         conn: &rusqlite::Connection,
+        enc: Option<&EncryptionManager>,
         history_id: &str,
         invalidated_at: i64,
         id: &str,
@@ -6531,6 +7006,48 @@ impl Database {
               supersedes, ?3, created_at_unix_ms, last_accessed_unix_ms
              FROM entities WHERE id = ?3",
             params![history_id, invalidated_at, id],
+        )?;
+        // #682: index this snapshot's PLAINTEXT body into the standalone history
+        // FTS (rowid = entity_history.rowid), so point-in-time semantic recall
+        // can later surface this now-superseded version by its own text — even
+        // if the live row's text has since changed to no longer match. Mirrors
+        // reindex_fts's dual path: under encryption `body_json` is ciphertext, so
+        // decrypt (build_aad with legacy fallback) before indexing; on auth
+        // failure index an empty body rather than leak/garble ciphertext.
+        Self::index_history_row_fts(conn, enc, history_id)?;
+        Ok(())
+    }
+
+    /// #682: (re)index a single `entity_history` row's plaintext body into
+    /// `entity_history_fts` at the matching rowid. Idempotent via
+    /// `INSERT OR REPLACE`. Safe no-op if the history row is gone.
+    fn index_history_row_fts(
+        conn: &rusqlite::Connection,
+        enc: Option<&EncryptionManager>,
+        history_id: &str,
+    ) -> Result<(), rusqlite::Error> {
+        let row: Option<(i64, String, String, String)> = conn
+            .query_row(
+                "SELECT rowid, category, key, body_json FROM entity_history WHERE history_id = ?1",
+                params![history_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?;
+        let Some((rowid, category, key, raw_body)) = row else {
+            return Ok(());
+        };
+        let plain = match enc {
+            Some(enc) => match Self::decrypt_body_with_aad_fallback(enc, &raw_body, &category, &key)
+            {
+                crate::encryption::BodyDecrypt::Plaintext(s)
+                | crate::encryption::BodyDecrypt::LegacyPlaintext(s) => s,
+                crate::encryption::BodyDecrypt::AuthFailed(_) => "{}".to_string(),
+            },
+            None => raw_body,
+        };
+        conn.execute(
+            "INSERT OR REPLACE INTO entity_history_fts (rowid, body_json) VALUES (?1, ?2)",
+            params![rowid, plain],
         )?;
         Ok(())
     }
@@ -6597,7 +7114,7 @@ impl Database {
             "hist-{}",
             uuid::Uuid::new_v4().to_string().replace('-', "")[..16].to_string()
         );
-        Self::snapshot_live_row_to_history(&tx, &history_id, now, id)?;
+        Self::snapshot_live_row_to_history(&tx, self.encryption.as_ref(), &history_id, now, id)?;
         tx.execute(
             "UPDATE entities SET valid_to_unix_ms = ?1, recorded_at_unix_ms = ?2,
                 supersedes = ?3, valid_from_unix_ms = COALESCE(valid_from_unix_ms, ?4)
@@ -8432,6 +8949,16 @@ Return a JSON object with an "insights" array. Each insight has:
         let mut history_deleted = 0i64;
         let mut journal_redacted = 0i64;
         for (id, cat, key, ws) in &doomed {
+            // #682: drop the history rows' FTS entries first (by rowid), so the
+            // standalone entity_history_fts can't retain orphaned text or, worse,
+            // hand a reused rowid to a future snapshot as a false match.
+            conn.execute(
+                &format!(
+                    "DELETE FROM entity_history_fts WHERE rowid IN \
+                     (SELECT rowid FROM entity_history WHERE {HIST_MATCH})"
+                ),
+                params![id, cat, key, ws],
+            )?;
             history_deleted += conn.execute(
                 &format!("DELETE FROM entity_history WHERE {HIST_MATCH}"),
                 params![id, cat, key, ws],
@@ -8695,6 +9222,14 @@ Return a JSON object with an "insights" array. Each insight has:
                     digest =
                         history_retention_digest(&digest, &r.history_id, &body, r.rec, r.inv);
                 }
+                // #682: clear this version's history-FTS entry (by rowid)
+                // before deleting the row, so the standalone index never
+                // retains orphaned text or a reusable rowid.
+                tx.execute(
+                    "DELETE FROM entity_history_fts WHERE rowid IN \
+                     (SELECT rowid FROM entity_history WHERE history_id = ?1)",
+                    params![r.history_id],
+                )?;
                 tx.execute(
                     "DELETE FROM entity_history WHERE history_id = ?1",
                     params![r.history_id],
@@ -9406,11 +9941,12 @@ last_accessed: {}
         // Render.
         let entity_line = |entity: &crate::models::Entity, tag: &str| -> String {
             format!(
-                "- {}[{}] **{}** — {} (retrievals: {}, decay: {:.2})\n",
+                "- {}[{}] **{}** — {} (type: {}, retrievals: {}, decay: {:.2})\n",
                 tag,
                 sanitize_prompt_field(&entity.category),
                 sanitize_prompt_field(&entity.key),
                 sanitize_prompt_field(&truncate_str(&entity.body_json, 100)),
+                sanitize_prompt_field(&entity.entity_type),
                 entity.retrieval_count,
                 entity.decay_score,
             )
@@ -9483,12 +10019,34 @@ last_accessed: {}
             ));
         }
 
+        let injected_chars = ctx.chars().count() as i64;
+        let estimated_injected_tokens = injected_chars / 4;
+        let conn = self.conn()?;
+        let corpus_chars: i64 = if let Some(ref w) = ws {
+            conn.query_row(
+                "SELECT COALESCE(SUM(LENGTH(body_json)), 0) FROM entities WHERE archived = 0 AND workspace_hash = ?1",
+                rusqlite::params![w],
+                |row| row.get(0)
+            ).unwrap_or(0)
+        } else {
+            conn.query_row(
+                "SELECT COALESCE(SUM(LENGTH(body_json)), 0) FROM entities WHERE archived = 0",
+                rusqlite::params![],
+                |row| row.get(0)
+            ).unwrap_or(0)
+        };
+        let estimated_corpus_tokens = corpus_chars / 4;
+
         Ok(crate::models::ContextBlock {
             markdown: ctx,
             mode: opts.mode.as_str().to_string(),
             budget_chars: budget,
             entities_injected: injected,
             warnings,
+            injected_chars,
+            estimated_injected_tokens,
+            corpus_chars,
+            estimated_corpus_tokens,
         })
     }
 
@@ -10881,6 +11439,254 @@ fn cosine_with_query_norm(query: &[f32], q_norm: f64, b: &[f32]) -> f64 {
 /// relevance: 1 citation → ~1.07, 10 → ~1.24, cap 1.4 from ~55 citations.
 pub(crate) fn usefulness_weight(usefulness_count: i64) -> f64 {
     1.0 + ((usefulness_count.max(0) as f64).ln_1p() * 0.1).min(0.4)
+}
+
+/// #681: outcome-weighted recall — the honest follow-rate efficacy signal
+/// (`mimir_follow`) as a rank multiplier. It mirrors the "useful" arm of
+/// `decay_tick`'s efficacy composite (`1.0 + follow_rate * 0.3`) so the two
+/// honest-usage signals never drift: a lesson that gets FOLLOWED floats above
+/// an equally-relevant one that gets ignored. A 'dead' lesson (ignored despite
+/// >= FOLLOW_MIN_ATTEMPTS attempts) is demoted — but gently (0.5), not with the
+/// decay composite's near-annihilating 0.05, so ranking never fully buries an
+/// otherwise-relevant hit that may be the only match. `follow_rate` is clamped
+/// so a malformed row can't invert the sign. No-op until `efficacy_status`
+/// leaves 'unverified', so freshly-ingested corpora — and every benchmark —
+/// rank exactly as before.
+pub(crate) fn efficacy_rank_weight(efficacy_status: &str, follow_rate: f64) -> f64 {
+    match efficacy_status {
+        "useful" => 1.0 + follow_rate.clamp(0.0, 1.0) * 0.3,
+        "dead" => 0.5,
+        _ => 1.0,
+    }
+}
+
+/// #681: outcome-weighted recall is ON by default — it is mild, bounded, and a
+/// no-op on any memory without a follow/miss signal. The kill-switch mirrors
+/// the other recall-tuning env flags (accepts 0/false/off/no); it governs ONLY
+/// the new efficacy factor, never #487's usefulness term.
+pub fn outcome_rank_enabled() -> bool {
+    !matches!(
+        std::env::var("PERSEUS_VAULT_OUTCOME_RANK").as_deref(),
+        Ok("0") | Ok("false") | Ok("off") | Ok("FALSE") | Ok("no")
+    )
+}
+
+// ─── #675/#676: startup actionability scoring ───────────────────────────────
+//
+// A startup-memory block is judged by whether it CHANGES THE FIRST RETRIEVAL
+// MOVE, not just by topical relevance. In benchmarking, the high-value startup
+// facts carried concrete anchors — issue/ticket keys, #refs, named systems,
+// filing paths/URLs, escalation/decision language — while vague, date-only, or
+// very short entries cost tokens without changing the first move. These pure,
+// deterministic, offline helpers score that "actionability" so a caller can opt
+// into a startup-optimized recall order (#676) and surface low-signal entries
+// for cleanup (#675). They never run on the default recall path.
+
+/// The signal-bearing text of an entity: its key plus the human note/summary/
+/// content of its body. Cheap and allocation-light.
+fn actionability_text(e: &Entity) -> String {
+    let mut s = String::with_capacity(e.key.len() + 64);
+    s.push_str(&e.key);
+    s.push('\n');
+    let before = s.len();
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&e.body_json) {
+        for field in ["note", "summary", "content", "text", "title", "value"] {
+            if let Some(t) = v.get(field).and_then(|x| x.as_str()) {
+                s.push_str(t);
+                s.push('\n');
+            }
+        }
+    }
+    // No recognized body field matched → fall back to the raw body text so
+    // scoring still sees the content (e.g. a plain-string body_json).
+    if s.len() == before {
+        s.push_str(&e.body_json);
+    }
+    s
+}
+
+/// Whether the key is essentially just a date (`2026-07-13`, `2026/07/13`) — the
+/// canonical low-signal startup item (#675). Allows up to two stray letters
+/// (e.g. a `v` prefix) so a real titled memory that merely contains a date is
+/// not misflagged.
+fn key_is_date_only(key: &str) -> bool {
+    let key = key.trim();
+    !key.is_empty()
+        && parse_event_date_key(key).is_some()
+        && key.chars().filter(|c| c.is_ascii_alphabetic()).count() <= 2
+}
+
+/// True if the token looks like an issue/ticket key: ≥2 uppercase letters, a
+/// hyphen, then digits (e.g. `ACE-10669`, `PROJ-12`).
+fn is_issue_key(tok: &str) -> bool {
+    if let Some(dash) = tok.find('-') {
+        let (a, b) = (&tok[..dash], &tok[dash + 1..]);
+        return a.len() >= 2
+            && a.chars().all(|c| c.is_ascii_uppercase())
+            && !b.is_empty()
+            && b.chars().all(|c| c.is_ascii_digit());
+    }
+    false
+}
+
+/// True if the token is a standalone acronym/identifier: 2–6 chars, all
+/// uppercase/digits, at least one letter (e.g. `SAM`, `NSF`, `A100`).
+fn is_acronym(tok: &str) -> bool {
+    let n = tok.chars().count();
+    (2..=6).contains(&n)
+        && tok.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+        && tok.chars().any(|c| c.is_ascii_uppercase())
+}
+
+/// Count concrete-entity signals in `text`:
+/// (issue_keys, hash_refs, path_seps, urls, acronyms).
+fn count_concrete_signals(text: &str) -> (usize, usize, usize, usize, usize) {
+    let (mut issue_keys, mut hash_refs, mut paths, mut urls, mut acronyms) = (0, 0, 0, 0, 0);
+    if text.contains("http://") || text.contains("https://") {
+        urls += 1;
+    }
+    let b = text.as_bytes();
+    for i in 0..b.len() {
+        // #ref: '#' immediately followed by a digit.
+        if b[i] == b'#' && i + 1 < b.len() && b[i + 1].is_ascii_digit() {
+            hash_refs += 1;
+        }
+        // path separator flanked by alphanumerics (folder/sub, a\b).
+        if (b[i] == b'/' || b[i] == b'\\')
+            && i > 0
+            && i + 1 < b.len()
+            && b[i - 1].is_ascii_alphanumeric()
+            && b[i + 1].is_ascii_alphanumeric()
+        {
+            paths += 1;
+        }
+    }
+    for tok in text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-')) {
+        if is_issue_key(tok) {
+            issue_keys += 1;
+        }
+    }
+    for tok in text.split(|c: char| !c.is_ascii_alphanumeric()) {
+        if is_acronym(tok) {
+            acronyms += 1;
+        }
+    }
+    (issue_keys, hash_refs, paths, urls, acronyms)
+}
+
+/// Decision/escalation/anchor language — the phrasing of facts that changed the
+/// first retrieval move rather than generic background.
+fn has_action_language(lower: &str) -> bool {
+    const MARKERS: [&str; 13] = [
+        "escalat", "decision", "decided", "blocked", "deadline", "owner",
+        "root cause", "action item", "canonical", "source of truth", "incident",
+        "filed", "due date",
+    ];
+    MARKERS.iter().any(|m| lower.contains(m))
+}
+
+/// #676: startup-actionability score in [0.0, 1.0]. Centered at ~0.5 for a plain
+/// memory; boosted by concrete entities and decision language, damped for
+/// date-only titles and very short bodies.
+pub(crate) fn actionability_score(e: &Entity) -> f64 {
+    let text = actionability_text(e);
+    let trimmed = text.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    let key = e.key.trim();
+    let body_len = trimmed.len().saturating_sub(key.len());
+
+    let mut score = 0.5_f64;
+    let (issue_keys, hash_refs, paths, urls, acronyms) = count_concrete_signals(trimmed);
+    if issue_keys > 0 {
+        score += 0.22;
+    }
+    if hash_refs > 0 {
+        score += 0.12;
+    }
+    if paths > 0 {
+        score += 0.12;
+    }
+    if urls > 0 {
+        score += 0.10;
+    }
+    if acronyms >= 2 {
+        score += 0.10;
+    }
+    if has_action_language(&lower) {
+        score += 0.10;
+    }
+    if body_len >= 120 {
+        score += 0.06;
+    }
+    if body_len < 30 {
+        score -= 0.20;
+    }
+    if key_is_date_only(key) {
+        score -= 0.30;
+    }
+    score.clamp(0.0, 1.0)
+}
+
+/// Map an actionability score to a rank multiplier centered at 1.0 (neutral):
+/// 0.0 → 0.70 (damp), 0.5 → 1.0, 1.0 → 1.30 (boost). Bounded so the signal
+/// reorders near-ties without swamping the relevance signal.
+fn actionability_weight(score: f64) -> f64 {
+    0.70 + 0.60 * score
+}
+
+/// #675: the human-readable low-signal reasons for an entity, for the hygiene
+/// report. Empty when the entity is not low-signal.
+pub(crate) fn actionability_reasons(e: &Entity) -> Vec<&'static str> {
+    let text = actionability_text(e);
+    let trimmed = text.trim();
+    let key = e.key.trim();
+    let mut reasons = Vec::new();
+    if key_is_date_only(key) {
+        reasons.push("date_only_title");
+    }
+    if trimmed.len().saturating_sub(key.len()) < 30 {
+        reasons.push("short_body");
+    }
+    let (ik, hr, pa, ur, ac) = count_concrete_signals(trimmed);
+    if ik + hr + pa + ur == 0 && ac < 2 {
+        reasons.push("no_concrete_entities");
+    }
+    reasons
+}
+
+/// #676: startup-optimized re-rank. `entities` arrive in relevance order; assign
+/// an RRF-style base score by that rank, multiply by actionability weight, and
+/// re-sort so action-changing memories outrank vague/date-only near-neighbors.
+/// Deterministic tie-break (score desc, id asc). Truncates to `limit` (0 = all).
+/// Only invoked when a caller opts into startup ranking — default order is
+/// untouched.
+pub(crate) fn actionability_rerank(entities: Vec<Entity>, limit: usize) -> Vec<Entity> {
+    if entities.len() < 2 {
+        let mut e = entities;
+        if limit > 0 {
+            e.truncate(limit);
+        }
+        return e;
+    }
+    let mut scored: Vec<(f64, Entity)> = entities
+        .into_iter()
+        .enumerate()
+        .map(|(rank, e)| {
+            let base = 1.0 / (60.0 + rank as f64 + 1.0);
+            let w = actionability_weight(actionability_score(&e));
+            (base * w, e)
+        })
+        .collect();
+    scored.sort_by(|a, b| {
+        b.0.partial_cmp(&a.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.1.id.cmp(&b.1.id))
+    });
+    let mut out: Vec<Entity> = scored.into_iter().map(|(_, e)| e).collect();
+    if limit > 0 {
+        out.truncate(limit);
+    }
+    out
 }
 
 pub(crate) fn sparse_arm_weight(n_hits: usize) -> f64 {
@@ -22470,6 +23276,98 @@ mod tests {
     }
 
     #[test]
+    fn history_fts_finds_superseded_body_that_live_index_cannot() {
+        // #682: once a fact is superseded, its old body moves to entity_history
+        // and leaves the live FTS index. A query matching only that old body
+        // must still be discoverable via the history FTS (the seam that lets
+        // temporal recall surface it), even though live recall finds nothing.
+        let (db, path) = temp_db();
+        db.remember(&make_entity(
+            "e-ldr",
+            "org",
+            "leader",
+            r#"{"note":"the leader is Alice Alpha"}"#,
+        ))
+        .unwrap();
+        // Supersede with a body sharing no meaning-bearing tokens with the old.
+        db.remember(&make_entity(
+            "e-ldr2",
+            "org",
+            "leader",
+            r#"{"note":"the leader is Bob Bravo"}"#,
+        ))
+        .unwrap();
+
+        // The old, superseded body is discoverable in history…
+        let hits = db.history_matching_keys("Alpha", None, 10).unwrap();
+        assert_eq!(
+            hits,
+            vec![("org".to_string(), "leader".to_string())],
+            "superseded 'Alpha' body must be found via history FTS"
+        );
+        // …the current live body is NOT in history (never superseded)…
+        assert!(
+            db.history_matching_keys("Bravo", None, 10).unwrap().is_empty(),
+            "the live body must not appear in the history index"
+        );
+        // …and the live index genuinely cannot serve the old term (the gap).
+        let live = db
+            .recall(&RecallParams {
+                query: "Alpha".to_string(),
+                mode: crate::models::SearchMode::Fts5,
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(
+            live.is_empty(),
+            "live FTS must not match the superseded term — that is the #682 gap"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn agent_registry_and_can_read_enforce_visibility() {
+        // #684: agent registry CRUD + trust-tier lookup + the can_read matrix.
+        let (db, path) = temp_db();
+
+        // Register: created on first upsert, updated on second.
+        assert!(db.agent_upsert("a1", "Alice", 0, "eng").unwrap(), "created");
+        assert!(!db.agent_upsert("a1", "Alice", 1, "eng").unwrap(), "updated in place");
+        assert_eq!(db.agent_get("a1").unwrap().unwrap().trust_tier, 1);
+
+        // Trust tiers: empty id = unscoped admin (3); unknown = 0; registered = its tier.
+        assert_eq!(db.agent_trust_tier(""), 3);
+        assert_eq!(db.agent_trust_tier("nobody"), 0);
+        assert_eq!(db.agent_trust_tier("a1"), 1);
+        // Clamp out-of-range.
+        db.agent_upsert("admin", "Root", 9, "").unwrap();
+        assert_eq!(db.agent_trust_tier("admin"), 3);
+
+        // Two fleet-mates and an outsider.
+        db.agent_upsert("a2", "Bob", 0, "eng").unwrap(); // same fleet as a1
+        db.agent_upsert("b1", "Carol", 0, "sales").unwrap(); // other fleet
+
+        // private: only the author (or admin).
+        assert!(db.can_read("a1", "private", "a1"));
+        assert!(!db.can_read("a2", "private", "a1"));
+        assert!(db.can_read("admin", "private", "a1"));
+        assert!(db.can_read("", "private", "a1"), "unscoped sees all");
+
+        // fleet: same-fleet yes, other-fleet no, tier>=2 yes.
+        assert!(db.can_read("a2", "fleet", "a1"), "same fleet");
+        assert!(!db.can_read("b1", "fleet", "a1"), "other fleet blocked");
+        db.agent_upsert("t2", "Tier2", 2, "sales").unwrap();
+        assert!(db.can_read("t2", "fleet", "a1"), "tier 2 reads all fleets");
+
+        // workspace/tenant/default: everyone.
+        for vis in ["workspace", "tenant", ""] {
+            assert!(db.can_read("b1", vis, "a1"), "default vis visible: {vis}");
+        }
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
     fn remember_union_stored_link_wins_on_same_target() {
         // #382 review advisory: pin the union's conflict rule — when the
         // caller re-asserts a link to a target that already has a stored
@@ -22575,6 +23473,66 @@ mod tests {
         }
         // else: dead entity was auto-archived, which is an even stronger pass.
 
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn efficacy_rank_weight_matches_decay_composite_and_is_bounded() {
+        // 'useful' mirrors decay_tick's `1.0 + follow_rate * 0.3` so the two
+        // honest-usage signals never drift.
+        assert!((efficacy_rank_weight("useful", 0.9) - 1.27).abs() < 1e-9);
+        assert!((efficacy_rank_weight("useful", 0.75) - 1.225).abs() < 1e-9);
+        // 'dead' is a gentle demotion for ranking (not the decay 0.05).
+        assert!((efficacy_rank_weight("dead", 0.05) - 0.5).abs() < 1e-9);
+        // no signal yet, or unknown status -> identity (no-op).
+        assert!((efficacy_rank_weight("unverified", 0.9) - 1.0).abs() < 1e-9);
+        assert!((efficacy_rank_weight("", 0.9) - 1.0).abs() < 1e-9);
+        // malformed follow_rate can't invert the sign or overshoot.
+        assert!((efficacy_rank_weight("useful", -5.0) - 1.0).abs() < 1e-9);
+        assert!((efficacy_rank_weight("useful", 42.0) - 1.3).abs() < 1e-9);
+    }
+
+    #[test]
+    fn outcome_rank_boost_floats_useful_over_dead_at_equal_relevance() {
+        // #681: with identical fused relevance scores, a FOLLOWED memory must
+        // outrank an IGNORED ('dead') one after the honest-usage rank boost.
+        let (db, path) = temp_db();
+        db.remember(&make_entity("e-u", "convention", "useful-rule", r#"{"note":"a"}"#))
+            .unwrap();
+        db.remember(&make_entity("e-d", "convention", "dead-rule", r#"{"note":"b"}"#))
+            .unwrap();
+        db.remember(&make_entity("e-n", "convention", "neutral-rule", r#"{"note":"c"}"#))
+            .unwrap();
+        {
+            let conn = db.conn().unwrap();
+            conn.execute(
+                "UPDATE entities SET efficacy_status='useful', follow_rate=0.9 WHERE key='useful-rule'",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE entities SET efficacy_status='dead', follow_rate=0.05 WHERE key='dead-rule'",
+                [],
+            )
+            .unwrap();
+        }
+        let u = db.get_entity("convention", "useful-rule").unwrap().unwrap();
+        let d = db.get_entity("convention", "dead-rule").unwrap().unwrap();
+        let n = db.get_entity("convention", "neutral-rule").unwrap().unwrap();
+        // Equal base relevance; input order puts 'dead' first to prove the
+        // reorder is driven by the outcome signal, not by input position.
+        let fused = vec![(d.clone(), 1.0), (n.clone(), 1.0), (u.clone(), 1.0)];
+        let out = db.apply_usefulness_rank_boost(fused).unwrap();
+        let order: Vec<&str> = out.iter().map(|(e, _)| e.key.as_str()).collect();
+        assert_eq!(
+            order,
+            vec!["useful-rule", "neutral-rule", "dead-rule"],
+            "useful floats up, dead sinks; neutral holds the middle"
+        );
+        // Concrete scores: useful 1.27, neutral 1.0, dead 0.5.
+        assert!((out[0].1 - 1.27).abs() < 1e-9);
+        assert!((out[1].1 - 1.0).abs() < 1e-9);
+        assert!((out[2].1 - 0.5).abs() < 1e-9);
         let _ = fs::remove_file(&path);
     }
 

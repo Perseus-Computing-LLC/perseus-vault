@@ -10,7 +10,7 @@ deterministic (seeded corpus), no network, no API key.
 Post-optimization run — v2.19.1 main with #476 (signature-driven dedup scan),
 #507 (covering dense index), and #511 (hybrid sparse-arm hydration +
 concurrent arms) merged; AMD64 16-core, Windows 11 (full hardware + commit in
-`report.json`, sha256-signed):
+`report.json`, sha256-fingerprinted):
 
 | Metric | 10K | 100K |
 | --- | --- | --- |

@@ -229,6 +229,14 @@ pub struct RecallArgs {
     pub scope_weight: Option<f64>,
     #[serde(default)]
     pub agent_id: Option<String>,
+    /// #684: the identity of the agent making the request (distinct from
+    /// `agent_id`, which is an author FILTER). Stamped by the MCP transport from
+    /// the `initialize` handshake's clientInfo; used only for visibility
+    /// enforcement (`private`/`fleet` entities). Empty/absent → unscoped, so
+    /// single-agent callers and default `workspace`-visibility data are
+    /// unaffected.
+    #[serde(default)]
+    pub requesting_agent_id: Option<String>,
     #[serde(default)]
     pub layer: Option<String>,
     /// #287: opt-in. When true, each result gets a normalized `confidence`
@@ -264,6 +272,15 @@ pub struct RecallArgs {
     /// contains the whole queried period).
     #[serde(default, deserialize_with = "null_as_default")]
     pub valid_op: String,
+    /// #675/#676: opt-in startup-optimized ranking. When true, recall over-fetches
+    /// a candidate pool and re-ranks it by actionability — memories more likely to
+    /// change the first retrieval move (concrete entities: issue/ticket keys,
+    /// #refs, paths, URLs, named systems; decision/escalation language) outrank
+    /// vague, date-only, or very short near-neighbors — then truncates to `limit`.
+    /// Each returned item also carries an `actionability` score (0.0–1.0). Default
+    /// false: recall order is byte-identical to prior behavior.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub startup: bool,
 }
 
 pub type BatchQuery = RecallArgs;
@@ -331,9 +348,12 @@ struct TemporalHit {
 ///     reconstructs the historical world-version rather than narrowing live rows.
 ///   * `as_of` only → the version believed at transaction time `as_of`.
 /// At least one of `as_of` / `valid_at` must be Some (the caller guarantees it).
-/// Candidate generation is still over the live index, so a fact fully deleted
-/// since the instant (history-only, unindexed) will not surface — the documented
-/// v1 limitation; the dominant "reproduce a still-known fact at T" case is exact.
+/// Candidate generation here is over the live index, so this pass alone cannot
+/// surface a fact whose query-matching version has since been superseded/retired
+/// (history-only). #682 closes that: `augment_temporal_with_history` runs right
+/// after this and reconstructs the missed keys via the same engines. This
+/// function stays live-only so the fast, common "reproduce a still-known fact at
+/// T" path is untouched.
 fn temporal_resolve(
     db: &Database,
     as_of: Option<i64>,
@@ -364,6 +384,69 @@ fn temporal_resolve(
     }
     *entities = resolved;
     Ok(hits)
+}
+
+/// #682 Temporal RAG: history-inclusive candidate generation. `temporal_resolve`
+/// above can only reconstruct facts whose CURRENT body still matches the query
+/// (candidates came from the live index). A fact whose query-matching version
+/// has since been superseded/retired lives only in `entity_history`, so it never
+/// surfaced — the documented v1 limitation. This fills that gap: discover the
+/// missed keys via the history FTS and reconstruct each through the SAME
+/// point-in-time engines (`bitemporal_at` / `as_of_version`) as `temporal_resolve`,
+/// so semantics are identical. It only ever ADDS — live/relevance-ranked hits
+/// keep their positions and history-only hits are appended, and only up to the
+/// caller's `limit` (so a query that already found enough is untouched: the
+/// augmentation is a no-op whenever `entities.len() >= limit`). `hits` is kept
+/// 1:1 with `entities` so downstream provenance stamping stays aligned.
+fn augment_temporal_with_history(
+    db: &Database,
+    query: &str,
+    as_of: Option<i64>,
+    valid_at: Option<i64>,
+    workspace_hash: Option<&str>,
+    limit: usize,
+    entities: &mut Vec<crate::models::Entity>,
+    hits: &mut Vec<TemporalHit>,
+) -> Result<(), String> {
+    if limit == 0 || entities.len() >= limit {
+        return Ok(());
+    }
+    let mut seen: std::collections::HashSet<(String, String)> = entities
+        .iter()
+        .map(|e| (e.category.clone(), e.key.clone()))
+        .collect();
+    // Discover a modest pool beyond what's already surfaced; bounded.
+    let discover = limit.saturating_mul(2).clamp(1, 200);
+    let keys = db
+        .history_matching_keys(query, workspace_hash, discover)
+        .map_err(|e| format!("temporal history discovery failed: {}", e))?;
+    for (category, key) in keys {
+        if entities.len() >= limit {
+            break;
+        }
+        if !seen.insert((category.clone(), key.clone())) {
+            continue;
+        }
+        let tv = match valid_at {
+            Some(v) => db.bitemporal_at(&category, &key, as_of.unwrap_or(i64::MAX), v),
+            None => db.as_of_version(
+                &category,
+                &key,
+                as_of.expect("augment_temporal_with_history requires as_of or valid_at"),
+            ),
+        }
+        .map_err(|e| format!("temporal history resolution failed: {}", e))?;
+        if let Some(tv) = tv {
+            hits.push(TemporalHit {
+                is_live: tv.invalidated_at_unix_ms.is_none(),
+                recorded_at: tv.recorded_at_unix_ms,
+                valid_from: tv.valid_from_unix_ms,
+                valid_to: tv.valid_to_unix_ms,
+            });
+            entities.push(tv.entity);
+        }
+    }
+    Ok(())
 }
 
 /// #287: presentation-layer confidence rollup over signals Mneme already has.
@@ -793,6 +876,50 @@ pub fn handle_remember(db: &Database, args: Value) -> Result<String, String> {
     Ok(result.to_string())
 }
 
+/// #677: when a recall comes back empty, build a self-describing diagnostic so
+/// the caller can tell a genuinely empty / no-match store apart from an
+/// unhealthy DB or a degraded (keyword-only / no-coverage) semantic backend —
+/// the silent-empty failure modes that otherwise waste tokens on false
+/// debugging paths ("no memories found" when the real issue is MCP-child /
+/// backend health). Only attached when `total == 0`, so nominal responses are
+/// unchanged.
+fn empty_recall_diagnostic(db: &Database, mode: &SearchMode) -> serde_json::Value {
+    let r = db.readiness();
+    let reason = if !r.db_responds {
+        "db_unhealthy"
+    } else if r.active_memories == 0 {
+        "empty_store"
+    } else if matches!(mode, SearchMode::Dense | SearchMode::Hybrid)
+        && r.embedding_enabled
+        && r.embedded_memories == 0
+    {
+        "degraded_semantic"
+    } else {
+        "no_match"
+    };
+    let hint = match reason {
+        "db_unhealthy" => {
+            "vault DB is not responding — check the MCP child/process and the --db path (call the health tool)"
+        }
+        "empty_store" => {
+            "the store has no active memories yet — this is a true empty result, not a fault"
+        }
+        "degraded_semantic" => {
+            "no active memories carry embeddings, so this dense/hybrid query found nothing — run reindex/embed, or retry with mode=fts5"
+        }
+        _ => {
+            "the store is populated and the backend is healthy — this query simply had no matches; broaden the query or mode before assuming a fault"
+        }
+    };
+    json!({
+        "reason": reason,
+        "hint": hint,
+        "active_memories": r.active_memories,
+        "embedded_memories": r.embedded_memories,
+        "semantic_recall": r.semantic_recall(),
+    })
+}
+
 pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
     let a: RecallArgs =
         serde_json::from_value(args).map_err(|e| format!("Invalid recall arguments: {}", e))?;
@@ -865,11 +992,26 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
     let mode_for_side_effects = mode.clone();
     let reinforce_requested = a.reinforce;
 
+    // #675/#676: startup-optimized recall over-fetches a candidate pool, then
+    // re-ranks by actionability and truncates to the caller's limit below. Only
+    // when opted in (a.startup) and paging from the first page (offset 0) — so
+    // pagination semantics and the default recall path are untouched. The pool
+    // is read purely (skip_side_effects) so over-fetch doesn't reinforce rows
+    // that won't survive the truncate; survivors are reinforced afterwards.
+    let startup_rank = a.startup;
+    let requested_limit = a.limit;
+    let effective_limit = if startup_rank && a.offset == 0 {
+        requested_limit.saturating_mul(5).clamp(requested_limit, 200)
+    } else {
+        requested_limit
+    };
+    let defer_side_effects = temporal_filtering || (startup_rank && a.offset == 0);
+
     let params = RecallParams {
         query: a.query,
         category: a.category,
         entity_type: a.entity_type,
-        limit: a.limit,
+        limit: effective_limit,
         offset: a.offset,
         min_decay: a.min_decay,
         topic_path: a.topic_path,
@@ -881,7 +1023,7 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
         // "what was true at T" would make the invisible entities immortal.
         // Side-effects are applied below to the SURVIVING hits only, mirroring
         // the expansion path. Unfiltered calls keep the original behavior.
-        skip_side_effects: temporal_filtering,
+        skip_side_effects: defer_side_effects,
         mode,
         embedding: None,
         preview_cap: a.preview_cap,
@@ -903,13 +1045,46 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
         .recall(&params)
         .map_err(|e| format!("Recall failed: {}", e))?;
 
+    // #684: visibility enforcement. Drop entities the requesting agent may not
+    // read (private → author only; fleet → same fleet / tier>=2) before any
+    // downstream processing, so hidden entities are never reconstructed,
+    // reinforced, or returned. Applied first so temporal provenance stays 1:1
+    // with the surviving set. A no-op for unscoped requesters (empty id → tier
+    // 3) and for the default `workspace`/`tenant`/'' visibility — so existing
+    // single-agent callers and data are unaffected.
+    if let Some(req) = a.requesting_agent_id.as_deref().filter(|s| !s.is_empty()) {
+        entities.retain(|e| db.can_read(req, &e.visibility, &e.agent_id));
+    }
+
+    // #675/#676: re-rank the over-fetched pool by actionability and truncate to
+    // the caller's limit, so action-changing memories win the top-k over vague/
+    // date-only near-neighbors. No-op unless startup was requested.
+    if startup_rank && a.offset == 0 {
+        entities = crate::db::actionability_rerank(entities, requested_limit.max(0) as usize);
+    }
+
     // #472 Temporal RAG: an as_of (transaction) and/or valid_at (world) instant
     // reconstructs each hit's point-in-time body — valid_at alone now rebuilds
     // the historical world-version, not just a live-row narrow; as_of adds the
     // transaction axis; together = the full bi-temporal cell. The valid_from/
     // valid_to PERIOD-range filter (when no valid_at instant) stays a live narrow.
     let temporal_meta = if as_of.is_some() || valid_at.is_some() {
-        Some(temporal_resolve(db, as_of, valid_at, &mut entities)?)
+        let mut hits = temporal_resolve(db, as_of, valid_at, &mut entities)?;
+        // #682: close the documented v1 limitation — surface facts whose
+        // query-matching version has since been superseded/retired (live index
+        // never saw them). Only fills up to the caller's limit and only when
+        // the live path came up short, so it never reorders or bloats results.
+        augment_temporal_with_history(
+            db,
+            &params.query,
+            as_of,
+            valid_at,
+            params.workspace_hash.as_deref(),
+            requested_limit.max(0) as usize,
+            &mut entities,
+            &mut hits,
+        )?;
+        Some(hits)
     } else {
         valid_time_retain(db, None, valid_from, valid_to, &valid_op, &mut entities)?;
         None
@@ -917,8 +1092,10 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
 
     // #363 review: re-apply the deferred recall side-effects to the survivors,
     // under exactly the conditions the un-filtered path would have reinforced:
-    // fts5 always does; dense/hybrid only when the caller opted in.
-    if temporal_filtering
+    // fts5 always does; dense/hybrid only when the caller opted in. #675/#676:
+    // the startup path defers the same way (it over-fetched a pure-read pool),
+    // so its truncated survivors get reinforced here too.
+    if defer_side_effects
         && (mode_for_side_effects == SearchMode::Fts5 || reinforce_requested)
         && !entities.is_empty()
     {
@@ -946,10 +1123,19 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
         apply_confidence(&mut items_expanded, &entities);
     }
 
-    let result = json!({
-        "items": items_expanded,
-        "total": items_expanded.len(),
-    });
+    let result = if items_expanded.is_empty() {
+        json!({
+            "items": items_expanded,
+            "total": 0,
+            // #677: self-describing empty result — see empty_recall_diagnostic.
+            "diagnostic": empty_recall_diagnostic(db, &mode_for_side_effects),
+        })
+    } else {
+        json!({
+            "items": items_expanded,
+            "total": items_expanded.len(),
+        })
+    };
     Ok(result.to_string())
 }
 
@@ -1176,6 +1362,98 @@ where
 /// call repeatedly, feeding each page's `next_cursor` back in, until
 /// `has_more` is false — every entity in scope is returned exactly once.
 /// Read-only: no retrieval-count/decay side-effects.
+#[derive(Debug, Deserialize, Default)]
+pub struct HygieneArgs {
+    /// Restrict the scan to one category (default: all active memories).
+    #[serde(default)]
+    pub category: Option<String>,
+    /// Actionability below which a memory is flagged low-signal (default 0.35).
+    #[serde(default)]
+    pub threshold: Option<f64>,
+    /// Max memories to scan (default 1000, cap 10000).
+    #[serde(default)]
+    pub scan_limit: Option<i64>,
+    /// Max flagged rows to return, worst first (default 50, cap 1000).
+    #[serde(default)]
+    pub limit: Option<i64>,
+}
+
+/// #675: read-only hygiene report — surface likely low-signal memories (vague,
+/// date-only titles, very short bodies, no concrete entities) so a startup
+/// block can be kept dense without hand-forensics over the vault. Uses the same
+/// actionability scoring as startup recall (#676); keyset-scans active memories
+/// in pages (no recall side-effects) and returns the worst offenders with the
+/// reasons they were flagged.
+pub fn handle_hygiene(db: &Database, args: Value) -> Result<String, String> {
+    let a: HygieneArgs =
+        serde_json::from_value(args).map_err(|e| format!("Invalid hygiene arguments: {}", e))?;
+    let threshold = a.threshold.unwrap_or(0.35).clamp(0.0, 1.0);
+    let scan_cap = a.scan_limit.unwrap_or(1000).clamp(1, 10_000);
+    let report_cap = a.limit.unwrap_or(50).clamp(1, 1000) as usize;
+
+    let mut scanned = 0i64;
+    let mut flagged: Vec<(f64, serde_json::Value)> = Vec::new();
+    let mut cursor: Option<String> = None;
+    const PAGE: i64 = 500;
+    while scanned < scan_cap {
+        let want = PAGE.min(scan_cap - scanned);
+        // Over-fetch one row to learn whether another page exists (mirrors scan).
+        let batch = db
+            .scan_entities(a.category.as_deref(), None, false, cursor.as_deref(), want + 1)
+            .map_err(|e| format!("Hygiene scan failed: {}", e))?;
+        let has_more = batch.len() as i64 > want;
+        let take = if has_more { want as usize } else { batch.len() };
+        if take == 0 {
+            break;
+        }
+        cursor = batch.get(take - 1).map(|e| e.id.clone());
+        for e in batch.iter().take(take) {
+            scanned += 1;
+            let score = crate::db::actionability_score(e);
+            if score < threshold {
+                let mut reasons: Vec<String> = crate::db::actionability_reasons(e)
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect();
+                if reasons.is_empty() {
+                    reasons.push("low_actionability".to_string());
+                }
+                flagged.push((
+                    score,
+                    json!({
+                        "id": e.id,
+                        "category": e.category,
+                        "key": e.key,
+                        "actionability": (score * 1000.0).round() / 1000.0,
+                        "reasons": reasons,
+                        "retrieval_count": e.retrieval_count,
+                    }),
+                ));
+            }
+        }
+        if !has_more {
+            break;
+        }
+    }
+    // Worst (lowest actionability) first; deterministic id tiebreak.
+    flagged.sort_by(|x, y| {
+        x.0.partial_cmp(&y.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| x.1["id"].as_str().unwrap_or("").cmp(y.1["id"].as_str().unwrap_or("")))
+    });
+    let flagged_count = flagged.len();
+    let items: Vec<serde_json::Value> =
+        flagged.into_iter().take(report_cap).map(|(_, v)| v).collect();
+    Ok(json!({
+        "scanned": scanned,
+        "flagged_count": flagged_count,
+        "returned": items.len(),
+        "threshold": threshold,
+        "flagged": items,
+    })
+    .to_string())
+}
+
 pub fn handle_scan(db: &Database, args: Value) -> Result<String, String> {
     let a: ScanArgs =
         serde_json::from_value(args).map_err(|e| format!("Invalid scan arguments: {}", e))?;
@@ -2201,11 +2479,26 @@ pub fn handle_state_list(db: &Database, args: Value) -> Result<String, String> {
 }
 
 pub fn handle_health(db: &Database) -> String {
-    if db.health_check() {
-        json!({ "status": "healthy" }).to_string()
-    } else {
-        json!({ "status": "unhealthy" }).to_string()
-    }
+    // #671: include the absolute db path so a "remember succeeded but the row
+    // isn't in ~/mimir.db" mismatch (server bound to a different --db than the
+    // file being inspected) is self-diagnosing rather than looking like a
+    // silent no-op.
+    //
+    // #677: also fold in a cheap readiness snapshot so a long-lived client can
+    // gate recall-heavy workflows on it, and so an empty recall is
+    // distinguishable from a broken MCP child — is the DB down, the store
+    // genuinely empty, or is the semantic backend degraded/keyword-only?
+    let r = db.readiness();
+    json!({
+        "status": if r.db_responds { "healthy" } else { "unhealthy" },
+        "db_path": db.db_path(),
+        "ready": r.ready(),
+        "active_memories": r.active_memories,
+        "embedded_memories": r.embedded_memories,
+        "semantic_recall": r.semantic_recall(),
+        "warnings": r.warnings(),
+    })
+    .to_string()
 }
 
 pub fn handle_stats(db: &Database) -> String {
@@ -2286,6 +2579,10 @@ pub fn handle_context(db: &Database, args: Value) -> String {
                 "budget_chars": block.budget_chars,
                 "entities_injected": block.entities_injected,
                 "warnings": block.warnings,
+                "injected_chars": block.injected_chars,
+                "estimated_injected_tokens": block.estimated_injected_tokens,
+                "corpus_chars": block.corpus_chars,
+                "estimated_corpus_tokens": block.estimated_corpus_tokens,
             })
             .to_string()
         }
@@ -2773,6 +3070,161 @@ pub fn handle_follow(db: &Database, args: Value) -> Result<String, String> {
     serde_json::to_string(&report).map_err(|e| format!("Serialization failed: {}", e))
 }
 
+// ── #683 Keystones: mandatory policy rules ───────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct KeystoneSetArgs {
+    pub content: String,
+    #[serde(default = "default_keystone_scope")]
+    pub scope: String,
+    #[serde(default)]
+    pub scope_id: String,
+    #[serde(default = "default_keystone_weight")]
+    pub weight: f64,
+    #[serde(default = "default_keystone_tier_required")]
+    pub trust_tier_required: i64,
+    /// Caller-asserted authoring tier. Until #684 wires per-agent trust +
+    /// session identity, this is honor-system: when present it is enforced,
+    /// when absent authoring is allowed and the response flags it.
+    #[serde(default)]
+    pub author_trust_tier: Option<i64>,
+    #[serde(default)]
+    pub workspace_hash: String,
+    #[serde(default)]
+    pub agent_id: String,
+}
+
+fn default_keystone_scope() -> String {
+    "tenant".to_string()
+}
+fn default_keystone_weight() -> f64 {
+    1.0
+}
+fn default_keystone_tier_required() -> i64 {
+    2
+}
+
+pub fn handle_keystone_set(db: &Database, args: Value) -> Result<String, String> {
+    let a: KeystoneSetArgs = serde_json::from_value(args)
+        .map_err(|e| format!("Invalid keystone_set arguments: {}", e))?;
+    // #683/#684 trust gating. Prefer the AUTHORITATIVE registered tier
+    // (#684 agents registry) when the author is a known agent; fall back to the
+    // caller-asserted `author_trust_tier` otherwise. `trust_enforced` reports
+    // whether the check used a registry-backed tier (non-spoofable) vs a mere
+    // caller assertion (pending real session identity), so callers can tell
+    // which mode applied. No tier signal at all → the write proceeds unenforced.
+    let registered_tier = if a.agent_id.trim().is_empty() {
+        None
+    } else {
+        db.agent_get(&a.agent_id).ok().flatten().map(|g| g.trust_tier)
+    };
+    let (effective_tier, trust_enforced) = match registered_tier {
+        Some(t) => (Some(t), true),
+        None => (a.author_trust_tier, false),
+    };
+    if let Some(t) = effective_tier {
+        if t < a.trust_tier_required {
+            return Err(format!(
+                "insufficient trust tier: authoring this keystone requires tier >= {}, {} has {}",
+                a.trust_tier_required,
+                if trust_enforced { "registered agent" } else { "caller asserted" },
+                t
+            ));
+        }
+    }
+    let (id, created) = db
+        .keystone_set(
+            &a.content,
+            &a.scope,
+            &a.scope_id,
+            a.weight,
+            a.trust_tier_required,
+            &a.workspace_hash,
+            &a.agent_id,
+        )
+        .map_err(|e| format!("keystone_set failed: {}", e))?;
+    Ok(json!({ "id": id, "created": created, "trust_enforced": trust_enforced }).to_string())
+}
+
+#[derive(Debug, Deserialize)]
+pub struct KeystoneGetArgs {
+    #[serde(default)]
+    pub scope: Option<String>,
+    #[serde(default)]
+    pub scope_id: Option<String>,
+    #[serde(default)]
+    pub workspace_hash: Option<String>,
+}
+
+pub fn handle_keystone_get(db: &Database, args: Value) -> Result<String, String> {
+    let a: KeystoneGetArgs = serde_json::from_value(args)
+        .map_err(|e| format!("Invalid keystone_get arguments: {}", e))?;
+    let keystones = db
+        .keystone_get(
+            a.scope.as_deref(),
+            a.scope_id.as_deref(),
+            a.workspace_hash.as_deref(),
+        )
+        .map_err(|e| format!("keystone_get failed: {}", e))?;
+    let items: Vec<Value> = keystones
+        .iter()
+        .map(|k| {
+            json!({
+                "id": k.id,
+                "content": k.content,
+                "scope": k.scope,
+                "scope_id": k.scope_id,
+                "weight": k.weight,
+                "trust_tier_required": k.trust_tier_required,
+                "workspace_hash": k.workspace_hash,
+            })
+        })
+        .collect();
+    Ok(json!({ "keystones": items, "count": items.len() }).to_string())
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AgentArgs {
+    pub agent_id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub trust_tier: Option<i64>,
+    #[serde(default)]
+    pub fleet_id: String,
+}
+
+pub fn handle_agent(db: &Database, args: Value) -> Result<String, String> {
+    let a: AgentArgs = serde_json::from_value(args)
+        .map_err(|e| format!("Invalid agent arguments: {}", e))?;
+    if a.agent_id.trim().is_empty() {
+        return Err("agent_id must not be empty".to_string());
+    }
+    // trust_tier present → upsert; absent → look up only.
+    let created = if let Some(tier) = a.trust_tier {
+        Some(
+            db.agent_upsert(&a.agent_id, &a.name, tier, &a.fleet_id)
+                .map_err(|e| format!("agent upsert failed: {}", e))?,
+        )
+    } else {
+        None
+    };
+    let agent = db
+        .agent_get(&a.agent_id)
+        .map_err(|e| format!("agent lookup failed: {}", e))?;
+    Ok(json!({
+        "found": agent.is_some(),
+        "created": created.unwrap_or(false),
+        "agent": agent.map(|g| json!({
+            "agent_id": g.agent_id,
+            "name": g.name,
+            "trust_tier": g.trust_tier,
+            "fleet_id": g.fleet_id,
+        })),
+    })
+    .to_string())
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ConflictArgs {
     pub category: String,
@@ -3124,7 +3576,7 @@ pub fn handle_federate(db: &Database, args: Value) -> Result<String, String> {
         .map_err(|e| format!("Invalid federate arguments: {}", e))?;
 
     let vault_dir = if a.vault_dir.is_empty() {
-        "/tmp/mimir-federate".to_string()
+        std::env::temp_dir().join("mimir-federate").to_string_lossy().to_string()
     } else {
         a.vault_dir
     };
@@ -4117,6 +4569,89 @@ mod tests {
         let path_str = path.to_str().unwrap().to_string();
         let db = Database::open(&path_str).expect("open test db");
         (db, path_str)
+    }
+
+    #[test]
+    fn health_reports_status_and_db_path() {
+        // #671: health must surface the absolute db path so a "wrote here,
+        // inspected ~/mimir.db there" mismatch is self-diagnosing.
+        let (db, path) = temp_db();
+        let v: Value = serde_json::from_str(&handle_health(&db)).unwrap();
+        assert_eq!(v["status"], json!("healthy"), "{v}");
+        let reported = v["db_path"].as_str().expect("db_path present");
+        assert!(!reported.is_empty(), "db_path must be non-empty: {v}");
+        // The reported path resolves to the same file the db was opened with.
+        let want = std::fs::canonicalize(&path).unwrap();
+        assert_eq!(std::path::Path::new(reported), want.as_path(), "{v}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn health_reports_readiness_on_empty_store() {
+        // #677: an empty but healthy store must be distinguishable from a
+        // broken one — status healthy, but ready=false with a warning that
+        // names the true cause (0 active memories) rather than looking silent.
+        let (db, path) = temp_db();
+        let v: Value = serde_json::from_str(&handle_health(&db)).unwrap();
+        assert_eq!(v["status"], json!("healthy"), "{v}");
+        assert_eq!(v["ready"], json!(false), "empty store is not recall-ready: {v}");
+        assert_eq!(v["active_memories"], json!(0), "{v}");
+        let sem = v["semantic_recall"].as_str().expect("semantic_recall present");
+        assert!(
+            matches!(sem, "available" | "no_coverage" | "disabled"),
+            "unexpected semantic_recall {sem}: {v}"
+        );
+        let warnings = v["warnings"].as_array().expect("warnings present");
+        assert!(
+            warnings.iter().any(|w| w.as_str().unwrap_or("").contains("0 active memories")),
+            "empty store must warn about 0 active memories: {v}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn empty_recall_attaches_empty_store_diagnostic() {
+        // #677: recall against an empty store returns total=0 WITH a diagnostic
+        // that says "empty_store" — a true empty result, not a fault — so the
+        // caller does not chase a false "MCP child is broken" debugging path.
+        let (db, path) = temp_db();
+        let out = handle_recall(&db, json!({"query": "anything"})).unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["total"], json!(0), "{v}");
+        assert_eq!(v["diagnostic"]["reason"], json!("empty_store"), "{v}");
+        assert_eq!(v["diagnostic"]["active_memories"], json!(0), "{v}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn empty_recall_on_populated_store_reports_no_match() {
+        // #677: when the store IS populated and healthy but a query simply
+        // misses, the diagnostic must say "no_match" (not empty_store), so a
+        // genuine miss isn't mistaken for an empty/broken store. Uses fts5 so
+        // the assertion holds on lite (no-embedding) builds too.
+        let (db, path) = temp_db();
+        handle_remember(
+            &db,
+            json!({
+                "category": "insight",
+                "key": "k1",
+                "body_json": "{\"content\":\"postgres reindex after major upgrade\"}"
+            }),
+        )
+        .unwrap();
+        let out = handle_recall(
+            &db,
+            json!({"query": "zzzznonexistentqueryterm", "mode": "fts5"}),
+        )
+        .unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["total"], json!(0), "{v}");
+        assert_eq!(v["diagnostic"]["reason"], json!("no_match"), "{v}");
+        assert!(
+            v["diagnostic"]["active_memories"].as_i64().unwrap_or(0) >= 1,
+            "populated store must report >=1 active memory: {v}"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     // ─── scope as a ranking multiplier (#485) ────────────────────
@@ -5901,6 +6436,142 @@ mod tests {
             "surviving entity must still be reinforced once per recall"
         );
 
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn temporal_recall_surfaces_superseded_fact_via_history() {
+        // #682 end-to-end: a fact valid at T whose body has since been
+        // superseded must surface under a temporal recall keyed on its OWN
+        // (now-historical) text — the case plain live-index recall cannot serve.
+        let (db, path) = temp_db();
+        handle_remember(
+            &db,
+            json!({"category": "org", "key": "leader",
+                   "body_json": "{\"note\":\"the leader is Alice Alpha\"}"}),
+        )
+        .expect("v1");
+        // Distinct transaction time so Alice's [recorded, invalidated) window is
+        // non-empty (as_of below lands strictly inside it).
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        handle_remember(
+            &db,
+            json!({"category": "org", "key": "leader",
+                   "body_json": "{\"note\":\"the leader is Bob Bravo\"}"}),
+        )
+        .expect("v2 supersede");
+
+        // Plain (non-temporal) recall on the superseded term finds nothing —
+        // the live body is now "Bob Bravo".
+        let live = handle_recall(&db, json!({"query": "Alpha", "mode": "fts5"})).expect("live");
+        let lv: Value = serde_json::from_str(&live).unwrap();
+        assert_eq!(lv["total"], json!(0), "live recall must miss the old term: {live}");
+
+        // Alice's transaction window, read straight from history.
+        let (rec, inv): (i64, i64) = {
+            let conn = db.conn().unwrap();
+            conn.query_row(
+                "SELECT COALESCE(recorded_at_unix_ms, created_at_unix_ms), invalidated_at_unix_ms \
+                 FROM entity_history WHERE category='org' AND key='leader'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+        };
+        assert!(rec < inv, "sleep must yield a non-empty tx window ({rec} < {inv})");
+
+        // Temporal recall AS OF that window surfaces the superseded Alice body.
+        let r = handle_recall(
+            &db,
+            json!({"query": "Alpha", "mode": "fts5", "as_of_unix_ms": rec}),
+        )
+        .expect("temporal recall");
+        let v: Value = serde_json::from_str(&r).unwrap();
+        assert_eq!(v["total"], json!(1), "temporal recall must surface it: {r}");
+        let item = v["items"][0].to_string();
+        assert!(
+            item.contains("Alice") && !item.contains("Bob"),
+            "must reconstruct the point-in-time (Alice) body, got: {item}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn recall_enforces_visibility_by_requesting_agent() {
+        // #684: a private entity is hidden from other agents but visible to its
+        // author and to an unscoped requester; default-visibility entities are
+        // visible to everyone (non-breaking).
+        let (db, path) = temp_db();
+        db.agent_upsert("alice", "Alice", 0, "eng").unwrap();
+        db.agent_upsert("bob", "Bob", 0, "eng").unwrap();
+
+        handle_remember(
+            &db,
+            json!({"category": "notes", "key": "secret",
+                   "body_json": "{\"note\":\"quantum widget blueprint\"}",
+                   "visibility": "private", "agent_id": "alice"}),
+        )
+        .expect("private");
+        handle_remember(
+            &db,
+            json!({"category": "notes", "key": "shared",
+                   "body_json": "{\"note\":\"quantum team standup\"}",
+                   "agent_id": "alice"}),
+        )
+        .expect("shared");
+
+        let count = |args: Value| -> i64 {
+            let r = handle_recall(&db, args).expect("recall");
+            serde_json::from_str::<Value>(&r).unwrap()["total"]
+                .as_i64()
+                .unwrap()
+        };
+
+        // Bob (a different agent) sees only the default-visibility entity.
+        assert_eq!(
+            count(json!({"query": "quantum", "mode": "fts5", "requesting_agent_id": "bob"})),
+            1,
+            "bob must not see alice's private note"
+        );
+        // Alice sees both (author of the private one).
+        assert_eq!(
+            count(json!({"query": "quantum", "mode": "fts5", "requesting_agent_id": "alice"})),
+            2,
+            "alice sees her own private note"
+        );
+        // No requester identity → unscoped → sees both (existing behavior).
+        assert_eq!(
+            count(json!({"query": "quantum", "mode": "fts5"})),
+            2,
+            "unscoped recall is unchanged"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn keystone_authoring_uses_registered_trust_tier() {
+        // #684 completes #683's hook: keystone authoring is gated on the
+        // AUTHORITATIVE registered tier when the author is a known agent.
+        let (db, path) = temp_db();
+        db.agent_upsert("low", "Low", 1, "").unwrap(); // below the default required 2
+        db.agent_upsert("high", "High", 2, "").unwrap();
+
+        // Registered tier-1 agent is rejected even without asserting a tier.
+        let denied = handle_keystone_set(
+            &db,
+            json!({"content": "rule x", "agent_id": "low"}),
+        );
+        assert!(
+            denied.is_err() && denied.unwrap_err().contains("registered agent"),
+            "tier-1 registered agent must be denied by the registry"
+        );
+        // Registered tier-2 agent succeeds, and it is registry-enforced.
+        let ok = handle_keystone_set(
+            &db,
+            json!({"content": "rule x", "agent_id": "high"}),
+        )
+        .expect("tier-2 allowed");
+        assert!(ok.contains("\"trust_enforced\":true"), "registry-enforced: {ok}");
         let _ = std::fs::remove_file(&path);
     }
 

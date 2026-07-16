@@ -1,0 +1,106 @@
+{
+  "benchmark": "perseus-vault-beam",
+  "reuses": "benchmark/temporal/gauntlet.py (run_scenarios/build_report)",
+  "binary": "perseus-vault",
+  "platform": "Linux-6.18.33-Unraid-x86_64-with-glibc2.41",
+  "offline": true,
+  "tiers": [
+    {
+      "tier": "128K",
+      "token_budget": 128000,
+      "filler_entities": 1969,
+      "approx_tokens": 129461,
+      "populate_secs": 2.87,
+      "gauntlet_accuracy": 1.0,
+      "gauntlet_checks": "13/13",
+      "deterministic": true,
+      "signature_sha256": "2c1e38ab18aad935089acad0bf2ccc750a7f627d59865dcad4a5ec2daff5f077",
+      "latency": {
+        "as_of": {
+          "p50_ms": 22.08,
+          "p95_ms": 24.36,
+          "samples": 40
+        },
+        "valid_at": {
+          "p50_ms": 22.75,
+          "p95_ms": 25.61,
+          "samples": 40
+        }
+      },
+      "ok": true
+    },
+    {
+      "tier": "500K",
+      "token_budget": 500000,
+      "filler_entities": 7692,
+      "approx_tokens": 505749,
+      "populate_secs": 10.21,
+      "gauntlet_accuracy": 1.0,
+      "gauntlet_checks": "13/13",
+      "deterministic": true,
+      "signature_sha256": "2c1e38ab18aad935089acad0bf2ccc750a7f627d59865dcad4a5ec2daff5f077",
+      "latency": {
+        "as_of": {
+          "p50_ms": 21.26,
+          "p95_ms": 24.45,
+          "samples": 40
+        },
+        "valid_at": {
+          "p50_ms": 17.7,
+          "p95_ms": 24.11,
+          "samples": 40
+        }
+      },
+      "ok": true
+    },
+    {
+      "tier": "1M",
+      "token_budget": 1000000,
+      "filler_entities": 15384,
+      "approx_tokens": 1011498,
+      "populate_secs": 27.58,
+      "gauntlet_accuracy": 1.0,
+      "gauntlet_checks": "13/13",
+      "deterministic": true,
+      "signature_sha256": "2c1e38ab18aad935089acad0bf2ccc750a7f627d59865dcad4a5ec2daff5f077",
+      "latency": {
+        "as_of": {
+          "p50_ms": 23.17,
+          "p95_ms": 88.83,
+          "samples": 40
+        },
+        "valid_at": {
+          "p50_ms": 22.09,
+          "p95_ms": 23.95,
+          "samples": 40
+        }
+      },
+      "ok": true
+    },
+    {
+      "tier": "10M",
+      "token_budget": 10000000,
+      "filler_entities": 153846,
+      "approx_tokens": 10115374,
+      "populate_secs": 332.43,
+      "gauntlet_accuracy": 1.0,
+      "gauntlet_checks": "13/13",
+      "deterministic": true,
+      "signature_sha256": "2c1e38ab18aad935089acad0bf2ccc750a7f627d59865dcad4a5ec2daff5f077",
+      "latency": {
+        "as_of": {
+          "p50_ms": 23.07,
+          "p95_ms": 24.61,
+          "samples": 40
+        },
+        "valid_at": {
+          "p50_ms": 22.62,
+          "p95_ms": 25.56,
+          "samples": 40
+        }
+      },
+      "ok": true
+    }
+  ],
+  "all_ok": true
+}

@@ -1,6 +1,6 @@
 # Feature Spec: Temporal RAG — point-in-time semantic recall
 
-**Status:** proposed
+**Status:** implemented (#472 wired the temporal params + point-in-time reconstruction; #682 closed the history-inclusive candidate gap)
 **Depends on:** existing bi-temporal engine (`as_of`, `valid_at`, `bitemporal_at`, entity history), hybrid recall (FTS5 + dense + RRF)
 **Competitive driver:** Zep/Graphiti win LongMemEval on valid-time *fact lookup*; nobody offers valid-time *semantic search*.
 
@@ -39,12 +39,20 @@ Both may be combined (full bi-temporal recall). Absent → today's live view
 
 ### Semantics
 
-1. **Candidate generation** runs unchanged (FTS5 + dense over the live index)
-   but is widened to include superseded versions when a temporal filter is set.
+1. **Candidate generation.** Live FTS5 + dense run unchanged. When a temporal
+   filter is set they are *widened* to include superseded versions
+   (`augment_temporal_with_history`, #682): superseded/retired bodies leave the
+   live FTS index, so they are indexed in a dedicated standalone
+   `entity_history_fts` (schema v20). The augmentation queries that index to
+   discover the `(category,key)` pairs the live arm missed — a fact whose
+   query-matching version was later replaced (e.g. "CEO is Alice" → "Bob"), or a
+   key fully retired since the instant.
 2. **Temporal gate** (reuses `versions_recorded_by` + the `bitemporal_at`
    interval logic — the code just fixed for out-of-order arrival) filters each
    candidate entity to the single version that satisfies the requested
-   (tx, valid) instant, or drops it if none does.
+   (tx, valid) instant, or drops it if none does. History-discovered keys are
+   reconstructed through the **same** `bitemporal_at`/`as_of_version` engines, so
+   there is one source of temporal truth.
 3. **Ranking** (RRF, trust, decay, recency) runs over the gated set, scoring the
    *point-in-time body text*, not the live body.
 4. Result rows carry `recorded_at_unix_ms` / `valid_from`/`valid_to` and an
@@ -89,4 +97,29 @@ Both may be combined (full bi-temporal recall). Absent → today's live view
 
 - Not a time-series database; instants are queried, not aggregated over ranges
   (a `valid_during(start,end)` range variant is a possible follow-up).
-- No change to write path or storage schema — history already persists versions.
+
+## Implementation note (#682)
+
+The original spec assumed candidate widening needed no schema change ("history
+already persists versions"). In practice a *superseded* body leaves the live
+FTS index the moment it is replaced, so it is unreachable by keyword/dense
+search — the point-in-time reconstruction in `temporal_resolve` could only
+rebuild facts whose *current* body still matched the query. Closing the gap
+therefore required a searchable history surface:
+
+- **Schema v20:** standalone `entity_history_fts` (FTS5 over history body text).
+- **Plaintext, decrypt-aware:** mirrors `entities_fts` — under encryption the
+  stored `entity_history.body_json` is ciphertext, so it is decrypted
+  (`build_aad` with legacy fallback) before indexing; auth failure indexes an
+  empty body rather than leaking/garbling ciphertext.
+- **Maintenance:** indexed at the single history-append site
+  (`snapshot_live_row_to_history`), cleared at both history-delete sites
+  (purge/forget) to avoid orphaned text and rowid reuse, and rebuilt/backfilled
+  by `reindex_fts` (the `mimir_reindex` tool) — the one-time upgrade path.
+- **Additive & safe:** the augmentation only appends to fill the caller's limit
+  and never reorders live hits; the hot `db::recall` core is untouched, so
+  determinism (#247) and benchmark numbers are unaffected.
+
+Follow-up (not yet done): a dense/vector arm over history (today's discovery is
+keyword/FTS only), and a `benchmark/temporal/temporal_rag.py` ranked-retrieval
+harness extending the point-lookup gauntlet.

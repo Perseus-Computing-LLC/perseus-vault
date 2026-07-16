@@ -93,25 +93,12 @@ def now_ms():
     return int(time.time() * 1000)
 
 
-def main():
-    ap = argparse.ArgumentParser(description="Perseus Vault bi-temporal gauntlet")
-    ap.add_argument("--bin", default=None)
-    ap.add_argument("--dataset", default=str(HERE / "gauntlet_dataset.json"))
-    ap.add_argument("--out", default=str(HERE / "gauntlet_report.json"))
-    args = ap.parse_args()
-
-    binary = find_binary(args.bin)
-    data = json.loads(Path(args.dataset).read_text(encoding="utf-8"))
-
-    db_dir = Path(os.environ.get("TMPDIR") or os.environ.get("TEMP") or "/tmp")
-    db = str(db_dir / "pv-gauntlet.db")
-    for ext in ("", "-wal", "-shm"):
-        try:
-            os.remove(db + ext)
-        except OSError:
-            pass
-    v = Vault(binary, db)
-
+def run_scenarios(v, data):
+    """Drive every scenario's writes + checks through the vault `v` and return
+    the flat list of check results. Extracted so the BEAM at-scale harness
+    (benchmark/beam/) reuses this exact, CI-verified bi-temporal logic instead
+    of duplicating it. The vault may already hold an unrelated filler corpus —
+    scenarios are keyed by their own (category,key), so they are unaffected."""
     checks = []
 
     def record(scn, name, ok, detail=""):
@@ -170,7 +157,11 @@ def main():
                 ok = found and want in blob
                 record(scn["id"], label + f" -> {want}", ok,
                        "" if ok else f"expected '{want}', got {blob[:160]}")
+    return checks
 
+
+def build_report(checks, data, binary):
+    """Summarize checks into the signed report dict (shared with BEAM)."""
     total = len(checks)
     passed = sum(1 for c in checks if c["ok"])
     by_axis = {}
@@ -180,14 +171,12 @@ def main():
         b["total"] += 1
         b["pass"] += 1 if c["ok"] else 0
     accuracy = round(passed / total, 4) if total else 1.0
-
     sig_payload = json.dumps(
         {"dataset": data.get("name"),
          "checks": [{"s": c["scenario"], "c": c["check"], "ok": c["ok"]} for c in checks]},
         sort_keys=True)
     signature = hashlib.sha256(sig_payload.encode("utf-8")).hexdigest()
-
-    report = {
+    return {
         "benchmark": "perseus-vault-bitemporal-gauntlet",
         "dataset": data.get("name"),
         "n_scenarios": len(data["scenarios"]),
@@ -201,6 +190,34 @@ def main():
         "signature_sha256": signature,
         "results": checks,
     }
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Perseus Vault bi-temporal gauntlet")
+    ap.add_argument("--bin", default=None)
+    ap.add_argument("--dataset", default=str(HERE / "gauntlet_dataset.json"))
+    ap.add_argument("--out", default=str(HERE / "gauntlet_report.json"))
+    args = ap.parse_args()
+
+    binary = find_binary(args.bin)
+    data = json.loads(Path(args.dataset).read_text(encoding="utf-8"))
+
+    db_dir = Path(os.environ.get("TMPDIR") or os.environ.get("TEMP") or "/tmp")
+    db = str(db_dir / "pv-gauntlet.db")
+    for ext in ("", "-wal", "-shm"):
+        try:
+            os.remove(db + ext)
+        except OSError:
+            pass
+    v = Vault(binary, db)
+
+    checks = run_scenarios(v, data)
+    report = build_report(checks, data, binary)
+    total = report["checks_total"]
+    passed = report["checks_passed"]
+    by_axis = report["by_axis"]
+    accuracy = report["accuracy"]
+    signature = report["signature_sha256"]
     Path(args.out).write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
 
     print(f"Perseus Vault bi-temporal gauntlet — {data.get('name')}")

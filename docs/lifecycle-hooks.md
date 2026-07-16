@@ -296,6 +296,35 @@ Make the script executable (`chmod +x .cursor/hooks/perseus-vault-recall.sh`).
 The `stop` hook reuses the once-per-day guard because Cursor's `stop` fires
 per agent loop, not per editor session.
 
+### Rovo Dev CLI — use AGENTS.md, not a session-start hook
+
+**Rovo Dev's event hooks cannot inject startup context (yet), so do not wire
+memory-prep through a hook.** As of this writing Rovo Dev CLI hooks fire only on
+side-effect events — `on_tool_permission`, `on_complete`, `on_error` — there is
+**no session-start event**, and **hook stdout is not fed back into the
+assistant's context** (Atlassian describes hook input/output support as still
+being *explored*, not shipped —
+[event-hooks blog](https://www.atlassian.com/blog/development/streamline-rovo-dev-cli-with-event-hooks)).
+A `~/.rovo/hooks/.../session_start.sh` that prints a `<memory-prep>` block will
+run and produce correct output when invoked directly, but a fresh Rovo session
+never sees it — the hook output goes nowhere.
+
+What Rovo *does* load at startup is **`AGENTS.md`**. So for Rovo, route recall
+through the file, not a hook: render the memory-prep into `AGENTS.md` before the
+session (the same "render a file, refresh before start" pattern as Hermes'
+`.hermes.md` above), e.g.
+
+```bash
+# refresh AGENTS.md before a Rovo session (cron / watch / manual)
+perseus-vault prepare --task "$(basename "$PWD")" > .perseus-vault-recall.md
+# then include/concatenate that block into the AGENTS.md Rovo reads
+```
+
+Keep it fresh with a scheduler or file watch, exactly like the other
+render-a-file profiles. (The always-on + `recall_when` block is a snapshot at
+render time — re-render when the task changes.) Track turnkey `AGENTS.md`
+integration in perseus#790.
+
 ## Portable fallback: AGENTS.md / instructions file
 
 If your client has no lifecycle hooks (or you'd rather not configure them),

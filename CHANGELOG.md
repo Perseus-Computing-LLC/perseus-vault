@@ -6,6 +6,86 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
 ## [Unreleased]
 
 ### Added
+- **BEAM — bi-temporal correctness + determinism at scale** (#685). A new
+  harness (`benchmark/beam/`) that embeds the CI-verified bi-temporal gauntlet
+  inside a filler corpus sized to the BEAM token tiers (128K / 500K / 1M / 10M)
+  and asserts, at every tier: correctness holds (gauntlet still 13/13),
+  results are deterministic (two independent runs → identical signature), and
+  per-axis point-lookup latency stays under budget. It **reuses**
+  `gauntlet.run_scenarios` / `build_report` verbatim (one source of temporal
+  truth — the gauntlet's `main` was refactored to call the same extracted
+  functions, output unchanged), so BEAM can only ever agree with the gauntlet's
+  verdicts. Ships with a CI gate (`gate.py`), a methodology `README.md`, and a
+  binary-free `--self-test` for the corpus/token logic. Fully offline,
+  seeded/deterministic corpus. Published tier numbers come from a run on named
+  hardware (the heavy 1M/10M tiers on the benchmark fleet) — captured in a
+  signed `report.json`, never hand-written.
+- **Multi-agent scoping — trust tiers + visibility enforcement** (#684). A new
+  `agents` registry (schema v22: `agent_id`, `name`, `trust_tier` 0-3,
+  `fleet_id`) plus the `mimir_agent` tool to register/look up agents.
+  `entities`/`journal` already carried `agent_id` (v1.2.0); this adds the trust
+  tier that gates sensitive ops and **enforces the previously stored-but-unused
+  `visibility` field** on recall:
+  - `can_read()` model — `private` → author (or admin) only; `fleet` → same
+    fleet or tier ≥ 2; `workspace`/`tenant`/`''` (the default) → everyone.
+  - The MCP transport now **captures the client's identity** from the
+    `initialize` handshake (`clientInfo.name`) and stamps it onto tool calls as
+    `requesting_agent_id`, so `recall` transparently drops entities the caller
+    may not see — no explicit arg required.
+  - Keystone authoring (#683) now gates on the **authoritative registered tier**
+    when the author is a known agent, replacing pure caller-assertion
+    (`trust_enforced=true` then means registry-backed).
+  - **Non-breaking:** an empty/unknown requester is unscoped (tier 3 = admin),
+    and the default `workspace` visibility is visible to all, so single-agent
+    deployments and every existing entity/benchmark are unaffected. Scoping only
+    hides `private`/`fleet` entities from identified, lower-tier agents.
+  - Follow-ups (noted, not yet wired): enforcement on the other read surfaces
+    (`ask`/`global_recall`/`memories`), automatic author `agent_id` population
+    from the session on writes, and per-agent recall tuning.
+- **Keystones — mandatory policy rules** (#683). A new `keystones` table
+  (schema v21) plus `mimir_keystone_set` / `mimir_keystone_get` MCP tools.
+  Keystones are directives fetched deterministically at session start (unlike
+  ordinary memories, which are retrieved when relevant), merged across scope
+  (tenant < fleet < agent) with weight-based conflict resolution, and meant to
+  be obeyed over any conflicting instruction. Re-setting the same
+  (scope, scope_id, content) updates in place; every mutation is appended to
+  the cryptographic audit chain (`event_type=keystone_set`). Authoring is
+  trust-tier-gated (`trust_tier_required`, default 2) — caller-asserted via
+  `author_trust_tier` until per-agent trust + session identity land (#684), at
+  which point enforcement becomes automatic (the response's `trust_enforced`
+  flag surfaces which mode applied). The session-start `@keystone` render
+  directive that injects merged keystones ahead of all other context lives in
+  the separate Perseus orchestrator; this ships the vault-side storage, query,
+  and audit surface it renders from.
+- **Temporal RAG: history-inclusive point-in-time recall** (#682). Temporal
+  semantic recall (`as_of` / `valid_at`) could only reconstruct facts whose
+  *current* body still matched the query, because candidates came from the live
+  FTS/dense index — a fact whose query-matching version had since been
+  superseded or retired (its text now living only in `entity_history`) could
+  never surface (the documented v1 limitation). A new standalone
+  `entity_history_fts` index (schema v20) makes superseded/retired body text
+  searchable; on a temporal recall, `augment_temporal_with_history` discovers
+  the keys the live index missed and reconstructs each through the **same**
+  authoritative `bitemporal_at` / `as_of_version` engines, so temporal semantics
+  are identical to the point-lookup tools. The index stores plaintext
+  (decrypt-aware, mirroring `entities_fts`; never indexes ciphertext),
+  maintained at the history-append site and cleared at both history-delete
+  sites; pre-existing history is backfilled by `mimir_reindex`. Purely
+  additive: live/relevance-ranked hits keep their positions, history-only hits
+  are appended only to fill the caller's limit, and a query that already found
+  enough is a no-op. The hot `db::recall` core is untouched (no determinism or
+  benchmark impact).
+- **Outcome-weighted recall ranking** (#681). The honest follow-rate efficacy
+  signal (`mimir_follow`) now feeds recall ranking, not just decay: a memory
+  that gets FOLLOWED is boosted (`1.0 + follow_rate * 0.3`, mirroring the decay
+  composite so the two never drift) and a 'dead' lesson (ignored despite
+  ≥ 5 attempts) is gently demoted (×0.5 — not the decay path's near-annihilating
+  ×0.05, so ranking never fully buries an otherwise-relevant hit). Folded into
+  the existing #487 usefulness rank pass (one primary-key lookup) and applied
+  over the fused candidate pool before truncation. On by default, bounded, and
+  a strict no-op on any memory without a follow/miss signal — so freshly
+  ingested corpora and every benchmark rank exactly as before. Kill-switch:
+  `PERSEUS_VAULT_OUTCOME_RANK=0`. Determinism (#247) preserved.
 - **`mimir_scan` — deterministic paginated enumeration** (#562). First-class
   "list all / export / sync / reset" path: pages a category (or the whole store)
   by immutable `id ASC` with a keyset continuation cursor (`next_cursor` /
@@ -19,6 +99,19 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
   offset paging on pre-#562 servers. Tool count: 57 → 58.
 
 ### Documentation
+- **Claims hygiene pass** (#702): removed the unbacked 100K-entity insert-rate
+  figure from the README (no committed artifact backed it); the stress-test section
+  now quotes the committed `benchmark/scale/report.json` (479 docs/s sustained
+  MCP stdio writes at 10K, 40 docs/s durable at 100K, hybrid recall p50
+  19.03 ms / 79.73 ms). Refreshed CLAIMS-AUDIT.md: the sub-millisecond recall
+  entry is retired in favor of artifact-backed latencies, and the tool recount
+  note now says the registry has grown since the v2.13-era recount (published
+  figure stays "55+" by convention). Reworded "signed results/reports" to
+  "content-hashed (sha256)" across README/PERF/benchmark surfaces, since
+  `signature_sha256` is a self-computed content hash, not a cryptographic
+  signature (audit-chain, keyed-MAC, and release-signing docs untouched).
+  Clarified that `federate` is a local export / workspace-rename / re-import
+  with no network peers; the Windows-safe default path is tracked in #704.
 - **Recall query contract made explicit** (#562): `query=""` is the match-all /
   enumeration path; `"*"` and other wildcards are literal FTS5 terms, **not**
   globs (`"*"` matches nothing). Documented in the `recall` tool schema, README

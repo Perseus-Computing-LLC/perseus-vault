@@ -3,8 +3,9 @@
 Documents what changing embedding precision costs in retrieval quality. The
 benchmark separates two orthogonal precision axes, measures the one that ships
 today, and records the pending rows as status stubs rather than fabricated
-numbers. Every figure below is extracted verbatim from a signed 1M artifact and
-lives in the committed `report.json`; nothing here is estimated.
+numbers. Every figure below is extracted verbatim from a content-hashed
+(sha256) 1M artifact and lives in the committed `report.json`; nothing here is
+estimated.
 
 ## Two axes
 
@@ -37,7 +38,7 @@ isolates what the compressed vector actually preserves.
 
 ### Headline: more quantization gives both higher recall and lower latency
 
-Counterintuitive, and all of it measured and signed: moving *down* the ladder
+Counterintuitive, and all of it measured and sha256-fingerprinted: moving *down* the ladder
 (more aggressive index quantization) improves standalone dense recall *and*
 cuts latency monotonically. The 1-bit prefilter (0.726 r@5 @ 194.5 ms) beats
 full-precision exact cosine (0.684 r@5 @ 650.1 ms) at every k.
@@ -109,7 +110,7 @@ python benchmark/embedding-quantization/aggregate.py   # regenerate report.json
 python benchmark/embedding-quantization/gate.py        # assert the invariants
 ```
 
-`aggregate.py` reads the three signed 1M source artifacts from
+`aggregate.py` reads the three content-hashed (sha256) 1M source artifacts from
 `benchmark/lambda/results/`, extracts the `uniform` dense and hybrid rows
 verbatim, and writes `report.json`. Integrity is per-source: each artifact's
 raw-bytes SHA-256 is recorded in `report.json`'s `provenance` block (rather than

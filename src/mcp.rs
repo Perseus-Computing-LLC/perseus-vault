@@ -96,12 +96,19 @@ pub struct MCPState {
     // concurrent requests without a Mutex (which would re-serialize them now
     // that the DB pool removed the other lock). handle_request takes &MCPState.
     pub initialized: std::sync::atomic::AtomicBool,
+    // #684: agent identity captured from the `initialize` handshake's
+    // clientInfo.name. Threaded into tool calls as `requesting_agent_id` so
+    // visibility enforcement knows who is asking. Empty when the client sent no
+    // clientInfo (single-agent / legacy) → unscoped, preserving old behavior.
+    // RwLock: set once at initialize, read per tools/call across the shared &state.
+    pub session_agent_id: std::sync::RwLock<String>,
 }
 
 impl MCPState {
     pub fn new() -> Self {
         MCPState {
             initialized: std::sync::atomic::AtomicBool::new(false),
+            session_agent_id: std::sync::RwLock::new(String::new()),
         }
     }
 }
@@ -307,6 +314,27 @@ pub fn handle_request(
                 })),
                 error: None,
             };
+            // #684: capture the client's identity from the handshake so
+            // subsequent tool calls can be attributed/visibility-scoped. MCP
+            // clientInfo.name (e.g. the agent's name); sanitized to a bounded
+            // token. Absent clientInfo → stays empty → unscoped.
+            if let Some(name) = req
+                .params
+                .as_ref()
+                .and_then(|p| p.get("clientInfo"))
+                .and_then(|c| c.get("name"))
+                .and_then(|n| n.as_str())
+            {
+                let sanitized: String = name
+                    .trim()
+                    .chars()
+                    .filter(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'))
+                    .take(128)
+                    .collect();
+                if let Ok(mut slot) = state.session_agent_id.write() {
+                    *slot = sanitized;
+                }
+            }
             state.initialized.store(true, std::sync::atomic::Ordering::Relaxed);
             Some(response)
         }
@@ -338,7 +366,20 @@ pub fn handle_request(
                 None => return Some(error_response(id, -32602, "Missing tool name")),
             };
 
-            let tool_args = params.get("arguments").cloned().unwrap_or(json!({}));
+            let mut tool_args = params.get("arguments").cloned().unwrap_or(json!({}));
+
+            // #684: stamp the captured session identity so tools that enforce
+            // visibility (recall) know who is asking, without the caller having
+            // to pass it. Only when non-empty and not already supplied; unknown
+            // to tools that don't read it (serde ignores it).
+            if let Ok(sid) = state.session_agent_id.read() {
+                if !sid.is_empty() {
+                    if let Some(obj) = tool_args.as_object_mut() {
+                        obj.entry("requesting_agent_id")
+                            .or_insert_with(|| json!(*sid));
+                    }
+                }
+            }
 
             let result_text = call_tool(tool_name, db, tool_args, id.clone());
 
@@ -976,6 +1017,65 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
       "readOnlyHint": true
     },
     "title": "Scan / Enumerate Entities"
+  },
+  {
+    "name": "mimir_hygiene",
+    "description": "Read-only hygiene report: surface likely low-signal memories so a startup-memory block stays dense without manual forensics. Scores every active memory by startup 'actionability' (the same signal as recall's startup mode) — concrete anchors like issue/ticket keys, #refs, paths, URLs, named systems, and decision/escalation language score high; vague, date-only titles (e.g. '2026-07-13') and very short bodies score low — and returns the worst offenders (below `threshold`) with the reasons they were flagged. Keyset-scans in pages; never bumps retrieval counts or decay. Use it to find archive/consolidate candidates before curating startup recall.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "category": {
+          "type": "string",
+          "description": "Restrict the scan to one category, e.g. 'memories'. Omit to scan every active category."
+        },
+        "threshold": {
+          "type": "number",
+          "default": 0.35,
+          "description": "Actionability score (0.0–1.0) below which a memory is flagged low-signal. Lower = stricter (fewer flags)."
+        },
+        "scan_limit": {
+          "type": "integer",
+          "default": 1000,
+          "description": "Maximum active memories to scan (1–10000)."
+        },
+        "limit": {
+          "type": "integer",
+          "default": 50,
+          "description": "Maximum flagged rows to return, worst first (1–1000)."
+        }
+      },
+      "required": []
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "scanned": {
+          "type": "integer",
+          "description": "Number of active memories inspected."
+        },
+        "flagged_count": {
+          "type": "integer",
+          "description": "Total memories below the threshold (may exceed the returned rows)."
+        },
+        "returned": {
+          "type": "integer",
+          "description": "Number of flagged rows in this response."
+        },
+        "threshold": {
+          "type": "number",
+          "description": "The actionability threshold applied."
+        },
+        "flagged": {
+          "type": "array",
+          "items": { "type": "object" },
+          "description": "Worst-first: {id, category, key, actionability, reasons[], retrieval_count}. reasons ∈ date_only_title | short_body | no_concrete_entities | low_actionability."
+        }
+      }
+    },
+    "annotations": {
+      "readOnlyHint": true
+    },
+    "title": "Startup-Memory Hygiene Report"
   },
   {
     "name": "mimir_semantic_search",
@@ -2122,7 +2222,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
   },
   {
     "name": "mimir_health",
-    "description": "Check whether the Mneme server and its SQLite database are healthy. Returns a simple healthy/unhealthy status. Use this for health checks and monitoring, not for detailed stats (use mimir_stats).",
+    "description": "Cheap readiness probe for the vault server and its SQLite database. Returns healthy/unhealthy plus a readiness snapshot: `ready` (DB answers AND at least one active memory), `active_memories`, `embedded_memories`, `semantic_recall` (available|no_coverage|disabled), `db_path`, and `warnings[]` with likely causes. Call this before a recall-heavy workflow, or when recall unexpectedly returns empty, to tell an empty/degraded store apart from a broken MCP child. Use mimir_stats for detailed statistics.",
     "inputSchema": {
       "type": "object",
       "properties": {}
@@ -2136,7 +2236,37 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
             "healthy",
             "unhealthy"
           ],
-          "description": "Server health status"
+          "description": "Server health status (healthy iff the DB responds)"
+        },
+        "db_path": {
+          "type": "string",
+          "description": "Absolute path of the SQLite file this server is bound to (#671)"
+        },
+        "ready": {
+          "type": "boolean",
+          "description": "True when the DB responds AND the store has at least one active memory — i.e. recall can return non-empty results"
+        },
+        "active_memories": {
+          "type": "integer",
+          "description": "Count of non-archived memories (the set recall reads)"
+        },
+        "embedded_memories": {
+          "type": "integer",
+          "description": "Count of active memories carrying a dense embedding"
+        },
+        "semantic_recall": {
+          "type": "string",
+          "enum": [
+            "available",
+            "no_coverage",
+            "disabled"
+          ],
+          "description": "Dense/hybrid posture: available (backend on, coverage present), no_coverage (backend on, nothing embedded), or disabled (keyword-only build/config)"
+        },
+        "warnings": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Likely-cause messages for degraded/empty states; empty when nominal"
         }
       }
     },
@@ -4132,6 +4262,96 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
       }
     },
     "title": "Global Recall (GraphRAG)"
+  },
+  {
+    "name": "mimir_keystone_set",
+    "description": "Author a Keystone — a mandatory policy rule that survives context compaction (#683). Unlike ordinary memories (retrieved when relevant), keystones are fetched deterministically at session start via mimir_keystone_get, merged across scope, and are meant to be obeyed over any conflicting instruction (e.g. 'Every memory write MUST carry a retention class', 'Customer PII MUST NOT cross agent boundaries'). Higher weight wins on contradiction. Re-setting the same (scope, scope_id, content) updates it in place. Every mutation is appended to the cryptographic audit chain. Authoring is gated on trust tier: pass author_trust_tier (>= trust_tier_required, default 2). NOTE: until multi-agent trust tiers land (#684), author_trust_tier is caller-asserted; when omitted the write is allowed and the response flags that enforcement is pending.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "content": { "type": "string", "description": "The policy rule text. Imperative, testable directives work best." },
+        "scope": { "type": "string", "default": "tenant", "description": "Merge scope: 'tenant' (org-wide), 'fleet' (a team), or 'agent' (an individual). Narrower scopes are layered on top of broader ones at get time." },
+        "scope_id": { "type": "string", "description": "Identifier the keystone applies to within a non-tenant scope: the fleet_id ('fleet') or agent_id ('agent'). Omit/empty for tenant scope or 'all in scope'." },
+        "weight": { "type": "number", "default": 1.0, "description": "Conflict-resolution weight; on contradiction the higher-weight keystone wins. Also the merge/sort order returned by keystone_get." },
+        "trust_tier_required": { "type": "integer", "default": 2, "description": "Minimum author trust tier permitted to set/modify this keystone. Defaults to 2 (per #684's tier model: tier 2 = write keystones)." },
+        "author_trust_tier": { "type": "integer", "description": "The authoring agent's trust tier, checked against trust_tier_required. Caller-asserted until #684 wires per-agent trust + session identity." },
+        "agent_id": { "type": "string", "description": "Identity of the authoring agent, stamped on the keystone and its audit-chain event for provenance." },
+        "workspace_hash": { "type": "string", "description": "Optional workspace scope. Keystones with an empty workspace_hash are global (apply everywhere)." }
+      },
+      "required": ["content"]
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "created": { "type": "boolean", "description": "true if a new keystone was created, false if an existing one was updated" },
+        "trust_enforced": { "type": "boolean", "description": "false when author_trust_tier was omitted (enforcement pending #684)" }
+      }
+    },
+    "title": "Set Keystone"
+  },
+  {
+    "name": "mimir_keystone_get",
+    "description": "Fetch the merged Keystones (mandatory policy rules, #683) that apply at session start — the deterministic counterpart to recall. Returns rules ordered by weight (highest first, then scope tenant<fleet<agent, then id) so a renderer can inject them ahead of all other context and resolve contradictions by weight. Filter by scope/scope_id/workspace to get exactly the set an agent must obey. Read-only.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "scope": { "type": "string", "description": "Optional: restrict to a single scope ('tenant' | 'fleet' | 'agent'). Omit to merge all scopes." },
+        "scope_id": { "type": "string", "description": "Optional: with a non-tenant scope, restrict to this fleet_id/agent_id. Rules with an empty scope_id (scope-wide) are always included." },
+        "workspace_hash": { "type": "string", "description": "Optional workspace scope. Global keystones (empty workspace_hash) are always included." }
+      }
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "keystones": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": { "type": "string" },
+              "content": { "type": "string" },
+              "scope": { "type": "string" },
+              "scope_id": { "type": "string" },
+              "weight": { "type": "number" }
+            }
+          }
+        },
+        "count": { "type": "integer" }
+      }
+    },
+    "title": "Get Keystones"
+  },
+  {
+    "name": "mimir_agent",
+    "description": "Register/update or look up an agent in the multi-agent registry (#684). Agents carry a trust tier (0-3) that gates sensitive ops (e.g. authoring keystones needs tier >= 2) and drives visibility enforcement on recall: tier 0 = read own only, 1 = fleet, 2 = read all + write keystones, 3 = admin. Pass trust_tier (and optionally name/fleet_id) to upsert; omit trust_tier to just look up. entities/journal already stamp agent_id (v1.2.0); this adds the identity + tier metadata. NOTE: an empty/unknown agent has no registry row — unknown identified agents resolve to tier 0, and a caller with no session identity is unscoped.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "agent_id": { "type": "string", "description": "The agent's stable identifier (e.g. the MCP clientInfo name)." },
+        "name": { "type": "string", "description": "Human-readable name (upsert only)." },
+        "trust_tier": { "type": "integer", "description": "Trust tier 0-3. Provide to upsert; omit to look up. Clamped to [0,3]." },
+        "fleet_id": { "type": "string", "description": "Fleet/team the agent belongs to (used for 'fleet' visibility). Upsert only." }
+      },
+      "required": ["agent_id"]
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "found": { "type": "boolean" },
+        "created": { "type": "boolean", "description": "true if an upsert created a new registry row" },
+        "agent": {
+          "type": "object",
+          "properties": {
+            "agent_id": { "type": "string" },
+            "name": { "type": "string" },
+            "trust_tier": { "type": "integer" },
+            "fleet_id": { "type": "string" }
+          }
+        }
+      }
+    },
+    "title": "Agent Registry"
   }
 ]"###,
         )
@@ -4235,6 +4455,8 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
 
         "mimir_scan" => tools::handle_scan(db, args).map_err(|e| e.to_string()),
 
+        "mimir_hygiene" => tools::handle_hygiene(db, args).map_err(|e| e.to_string()),
+
         "mimir_semantic_search" => {
             tools::handle_semantic_search(db, args).map_err(|e| e.to_string())
         }
@@ -4296,6 +4518,9 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
         "mimir_traverse" => Ok(tools::handle_traverse(db, args)),
         "mimir_score" => Ok(tools::handle_score(db, args)),
         "mimir_follow" => tools::handle_follow(db, args).map_err(|e| e.to_string()),
+        "mimir_keystone_set" => tools::handle_keystone_set(db, args),
+        "mimir_keystone_get" => tools::handle_keystone_get(db, args),
+        "mimir_agent" => tools::handle_agent(db, args),
         "mimir_conflicts" => Ok(tools::handle_conflicts(db, args)),
         "mimir_consolidate" => Ok(tools::handle_consolidate(db, args)),
         "mimir_dream" => tools::handle_dream(db, args),
@@ -4677,6 +4902,102 @@ mod tests {
     }
 
     #[test]
+    fn keystone_tools_register_dispatch_order_and_gate() {
+        // #683: keystones are registered (with aliases), round-trip through
+        // call_tool, merge by weight, are updated in place on re-set, gate on
+        // trust tier, and every mutation lands on the audit chain.
+        let db_path = std::env::temp_dir()
+            .join(format!("mimir-keystones-{}.db", uuid::Uuid::new_v4()));
+        let db = Database::open(db_path.to_str().expect("temp db path")).expect("open temp db");
+
+        // Registered under canonical + both back-compat prefixes.
+        let all = advertised_names(true);
+        for expect in [
+            "mimir_keystone_set",
+            "perseus_vault_keystone_set",
+            "mneme_keystone_get",
+        ] {
+            assert!(all.contains(&expect.to_string()), "missing tool {expect}");
+        }
+
+        // Author two keystones with different weights (author tier satisfies).
+        let low = call_tool(
+            "perseus_vault_keystone_set",
+            &db,
+            json!({"content": "cite source memory IDs", "scope": "tenant",
+                   "weight": 1.0, "author_trust_tier": 2}),
+            None,
+        );
+        assert!(low.contains("\"created\":true"), "{low}");
+        // #684: caller-asserted (no registered agent) → checked but not
+        // registry-enforced. trust_enforced reflects registry backing only.
+        assert!(low.contains("\"trust_enforced\":false"), "{low}");
+        let _ = call_tool(
+            "mimir_keystone_set",
+            &db,
+            json!({"content": "PII MUST NOT cross agent boundaries", "scope": "fleet",
+                   "scope_id": "sec", "weight": 9.0, "author_trust_tier": 3}),
+            None,
+        );
+
+        // get merges both, highest weight first.
+        let got = call_tool("mimir_keystone_get", &db, json!({}), None);
+        let v: Value = serde_json::from_str(&got).unwrap();
+        assert_eq!(v["count"], json!(2), "{got}");
+        assert_eq!(v["keystones"][0]["content"], json!("PII MUST NOT cross agent boundaries"));
+        assert_eq!(v["keystones"][1]["content"], json!("cite source memory IDs"));
+
+        // Re-setting the same (scope, scope_id, content) updates in place.
+        let again = call_tool(
+            "mimir_keystone_set",
+            &db,
+            json!({"content": "cite source memory IDs", "scope": "tenant",
+                   "weight": 5.0, "author_trust_tier": 2}),
+            None,
+        );
+        assert!(again.contains("\"created\":false"), "re-set must update: {again}");
+        let got2 = call_tool("mimir_keystone_get", &db, json!({}), None);
+        let v2: Value = serde_json::from_str(&got2).unwrap();
+        assert_eq!(v2["count"], json!(2), "no duplicate row on re-set: {got2}");
+
+        // Trust gate: asserting tier below required is rejected.
+        let denied = call_tool(
+            "mimir_keystone_set",
+            &db,
+            json!({"content": "denied rule", "author_trust_tier": 1}),
+            None,
+        );
+        assert!(denied.contains("insufficient trust tier"), "{denied}");
+        // Omitting the tier is allowed but flagged as unenforced.
+        let unenforced = call_tool(
+            "mimir_keystone_set",
+            &db,
+            json!({"content": "unenforced rule", "scope": "agent", "scope_id": "a1"}),
+            None,
+        );
+        assert!(unenforced.contains("\"trust_enforced\":false"), "{unenforced}");
+
+        // Every keystone_set is crypto-chained (event_type keystone_set) and the
+        // chain still verifies.
+        let chained: i64 = db
+            .conn()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM journal WHERE event_type = 'keystone_set'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(chained, 4, "one audit event per successful set (3 create + 1 update); the trust-denied set emits none");
+        assert!(
+            crate::db::verify_audit_chain(&db).is_ok(),
+            "audit chain must verify after keystone mutations"
+        );
+
+        let _ = fs::remove_file(&db_path);
+    }
+
+    #[test]
     fn unknown_tool_error_reports_original_unnormalized_name() {
         let db_path = std::env::temp_dir()
             .join(format!("mimir-unknown-tool-{}.db", uuid::Uuid::new_v4()));
@@ -4741,6 +5062,59 @@ mod tests {
             json!(env!("CARGO_PKG_NAME")),
         );
 
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn initialize_captures_client_identity_and_scopes_recall() {
+        // #684: the initialize handshake's clientInfo.name is captured and
+        // stamped onto tool calls as requesting_agent_id, so a private entity is
+        // transparently hidden from a different client — no explicit arg needed.
+        let db_path = std::env::temp_dir()
+            .join(format!("mimir-clientinfo-{}.db", uuid::Uuid::new_v4()));
+        let db = Database::open(db_path.to_str().expect("temp db path")).expect("open temp db");
+        db.agent_upsert("alice", "Alice", 0, "eng").unwrap();
+        db.agent_upsert("bob", "Bob", 0, "eng").unwrap();
+        tools::handle_remember(
+            &db,
+            json!({"category": "notes", "key": "secret",
+                   "body_json": "{\"note\":\"quantum blueprint\"}",
+                   "visibility": "private", "agent_id": "alice"}),
+        )
+        .expect("private note");
+
+        let state = MCPState::new();
+        // Handshake as client "bob".
+        let init = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(1)),
+            method: "initialize".to_string(),
+            params: Some(json!({"clientInfo": {"name": "bob", "version": "1.0"}})),
+        };
+        handle_request(&init, &state, &db).expect("initialize");
+        assert_eq!(
+            *state.session_agent_id.read().unwrap(),
+            "bob",
+            "clientInfo.name must be captured"
+        );
+
+        // A plain recall (no requesting_agent_id arg) is transparently scoped to bob.
+        let call = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(2)),
+            method: "tools/call".to_string(),
+            params: Some(json!({
+                "name": "mimir_recall",
+                "arguments": {"query": "quantum", "mode": "fts5"}
+            })),
+        };
+        let resp = handle_request(&call, &state, &db).expect("recall response");
+        let structured = resp.result.expect("result")["structuredContent"].clone();
+        assert_eq!(
+            structured["total"],
+            json!(0),
+            "bob must not see alice's private note via the captured identity: {structured}"
+        );
         let _ = fs::remove_file(db_path);
     }
 

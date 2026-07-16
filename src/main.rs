@@ -2000,6 +2000,10 @@ fn run_prepare(
             "context_budget_chars": context_block.budget_chars,
             "context_entities_injected": context_block.entities_injected,
             "context_warnings": context_block.warnings,
+            "injected_chars": context_block.injected_chars,
+            "estimated_injected_tokens": context_block.estimated_injected_tokens,
+            "corpus_chars": context_block.corpus_chars,
+            "estimated_corpus_tokens": context_block.estimated_corpus_tokens,
         });
         println!("{}", serde_json::to_string_pretty(&result).unwrap_or_default());
         return;
