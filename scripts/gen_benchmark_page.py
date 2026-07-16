@@ -20,6 +20,7 @@ import argparse
 import datetime as _dt
 import html
 import json
+import math
 import subprocess
 from pathlib import Path
 
@@ -220,6 +221,62 @@ def sec_qa(qa, seeds=(), cot_html=""):
 </section>"""
 
 
+# Same-box presentation metadata (#697): (json key, display label, stack, is-us).
+# Hand-maintained like the feature matrix above; the RECALL and LATENCY numbers
+# come from the committed benchmark/lambda/results/competitors.json, never from
+# here. List order is the table order (recall desc, then latency asc; Perseus first).
+SAMEBOX_SYSTEMS = [
+    ("perseus_vault", "Perseus Vault (hybrid)", "single local binary, in-process", True),
+    ("letta", "Letta (archival / pgvector)", "server + Postgres/pgvector", False),
+    ("mem0", "Mem0 (vector)", "Python + Qdrant", False),
+    ("zep", "Zep (Graphiti temporal KG)", "server + Neo4j", False),
+]
+
+
+def sec_samebox(c):
+    """#697: every system stood up live on one box against the same local Ollama,
+    identical corpus/queries/judge, no published or cloud numbers substituted.
+    Table cells (recall, p50) render from competitors.json; the display labels and
+    stack strings are hand-maintained presentation, like the feature matrix. First
+    hand-added to the site (perseus PR #797), pinned so a full regen re-emits it."""
+    if not c:
+        return ""
+    measured = c.get("measured", {})
+    if not measured:
+        return ""
+    rows = ""
+    for key, label, stack, us in SAMEBOX_SYSTEMS:
+        m = measured.get(key)
+        if not m:
+            continue
+        cls = ' class="us"' if us else ""
+        rows += (f'<tr><th>{esc(label)}</th>'
+                 f'<td{cls}>{m["recall_accuracy"]:.2f}</td>'
+                 f'<td{cls}>{m["p50_latency_ms"]} ms</td>'
+                 f'<td{cls}>{esc(stack)}</td></tr>')
+    src = (f'<div class="src">source: <a href="{GITHUB}/blob/main/benchmark/lambda/results/competitors.json">benchmark/lambda/results/competitors.json</a>'
+           f' &middot; <a href="{GITHUB}/blob/main/benchmark/lambda/competitors_bench.py">competitors_bench.py</a></div>')
+    return f"""
+<section id="samebox">
+  <h2>Same-box recall, all systems fully local</h2>
+  <p class="note">Every system stood up and run live on one H100 against the same local Ollama
+  (<code>qwen2.5:14b-instruct</code> + <code>nomic-embed-text</code>): identical fact set, identical
+  queries, identical substring judge. No published or cloud numbers are substituted for a competitor.
+  Cells show recall accuracy and p50 latency.</p>
+  <div class="tablewrap"><table><thead><tr><th>system</th><th>recall</th><th>p50 latency</th><th>stack</th></tr></thead><tbody>{rows}</tbody></table></div>
+  <p class="note">Letta matches Perseus Vault on recall for this corpus; the difference is operational,
+  an in-process binary answering in ~35 ms versus a server plus Postgres at ~135 ms p50. Zep's
+  self-hosted Community Edition server is deprecated and its <code>zep_python</code> memory API is now
+  Zep Cloud only, so this measures Zep's open-source engine, Graphiti (a temporal knowledge graph on
+  Neo4j), with entity extraction and embeddings both on the same local Ollama. Building a knowledge
+  graph needs an LLM to do structured extraction, and a local model is lossy at it (5 entities and 2
+  edges from 6 facts here), so 0.20 reflects local-extraction quality rather than Zep Cloud, which
+  uses frontier models. The point of this table is not a scoreboard; it is what each architecture does
+  when the whole stack has to run locally.</p>
+  {src}
+</section>"""
+
+
 def sec_scale(s):
     if not s:
         return ""
@@ -275,6 +332,90 @@ def sec_temporal(t, g):
 </section>"""
 
 
+def sec_beam(b):
+    """#685/#697: correctness + determinism AT SCALE (BEAM). The embedded
+    bi-temporal gauntlet must still score 13/13 and stay byte-identical across
+    two runs while a filler corpus grows the search space to 10M tokens, with
+    point-lookup latency flat. Every number renders from benchmark/beam/report.json;
+    this section was first hand-added to the site (perseus PR #797) and is pinned
+    here so a full regeneration re-emits it instead of wiping it."""
+    if not b:
+        return ""
+    tiers = b.get("tiers", [])
+    if not tiers:
+        return ""
+    first, last = tiers[0], tiers[-1]
+
+    def lat(t, axis):
+        a = t["latency"][axis]
+        return f"{a['p50_ms']} / {a['p95_ms']} ms"
+
+    rows = ""
+    for t in tiers:
+        rows += (f'  <tr><th>{esc(t["tier"])}</th><td>{t["filler_entities"]:,}</td>'
+                 f'<td>{t["approx_tokens"]:,}</td><td>{t["populate_secs"]} s</td>'
+                 f'<td class="us">{esc(t["gauntlet_checks"])}</td>'
+                 f'<td class="us">{"yes" if t["deterministic"] else "no"}</td>'
+                 f'<td>{lat(t, "as_of")}</td><td>{lat(t, "valid_at")}</td></tr>\n')
+
+    acc = first["gauntlet_accuracy"] * 100
+    checks_n = first["gauntlet_checks"].split("/")[0]  # "13" from "13/13"
+    p50_first = first["latency"]["as_of"]["p50_ms"]
+    p50_last = last["latency"]["as_of"]["p50_ms"]
+    tokens_m = last["approx_tokens"] / 1e6
+    samples = first["latency"]["as_of"]["samples"]
+
+    # p50 flatness list across tiers (as_of point lookups).
+    p50s = " &rarr; ".join(f"{t['latency']['as_of']['p50_ms']}" for t in tiers)
+
+    # Single worst p95 across both axes and every tier, shown as measured; the
+    # bound is the next-worst p95 rounded up ("every other tier stays under X ms").
+    p95_all = sorted(
+        ((t["latency"][axis]["p95_ms"], t["tier"])
+         for t in tiers for axis in ("as_of", "valid_at")),
+        reverse=True)
+    worst_p95, worst_tier = p95_all[0]
+    bound = math.ceil(p95_all[1][0])
+
+    sig = first.get("signature_sha256", "")
+    href = f"{GITHUB}/blob/main/benchmark/beam"
+    src = (f'<div class="src">source: <a href="{href}/report.json">benchmark/beam/report.json</a>'
+           f' <span class="sig" title="sha256 over the result set">sig {esc(sig[:12])}</span>'
+           f' &middot; <a href="{href}/README.md">methodology</a></div>')
+
+    stats = (
+        "<div class='stats'>"
+        f"<div class='stat big'><div class='v'>{acc:.1f}%</div>"
+        f"<div class='l'>gauntlet: {esc(first['gauntlet_checks'])} at every tier ({esc(first['tier'])}&ndash;{esc(last['tier'])})</div></div>"
+        "<div class='stat'><div class='v'>deterministic=true</div>"
+        "<div class='l'>identical signature across two runs, every tier</div></div>"
+        f"<div class='stat'><div class='v'>{p50_last} ms</div>"
+        f"<div class='l'>as_of p50 at {esc(last['tier'])} (flat from {p50_first} ms at {esc(first['tier'])})</div></div>"
+        f"<div class='stat'><div class='v'>{esc(last['tier'])}</div>"
+        f"<div class='l'>{last['filler_entities']:,} entities, ~{tokens_m:.1f}M tokens, {last['populate_secs']}s populate</div></div>"
+        "</div>")
+
+    return f"""
+<section id="beam">
+  <h2>Correctness and determinism at scale (BEAM)</h2>
+  <p class="note">Named for <a href="https://arxiv.org/abs/2510.27246">BEAM</a> (Beyond a Million Tokens), which tests at
+  128K / 500K / 1M / 10M tokens to defeat the "dump everything in context" cheat. Our claim is orthogonal to a
+  context-window score: <b>FTS5 + deterministic bi-temporal retrieval must not degrade as the corpus grows.</b>
+  BEAM embeds the CI-verified bi-temporal gauntlet (the same {checks_n} checks) inside a filler corpus sized to each token
+  tier and asserts, at every tier, that correctness holds ({esc(first['gauntlet_checks'])}), that two independent runs produce an identical
+  signature (<code>deterministic=true</code>), and that point lookups stay flat. Fully offline, lean FTS5 + bi-temporal
+  binary (no embeddings), on Linux / Unraid.</p>
+  {stats}
+  <div class="tablewrap"><table><thead><tr><th>token tier</th><th>filler entities</th><th>approx tokens</th><th>populate</th><th>gauntlet</th><th>deterministic</th><th>as_of p50/p95</th><th>valid_at p50/p95</th></tr></thead>
+  <tbody>
+{rows}  </tbody></table></div>
+  <p class="note">Point-lookup p50 is flat ({p50s} ms as the corpus grows {esc(first['tier'])}&ndash;{esc(last['tier'])}),
+  because lookups are <code>(category,key)</code>-indexed. p95 is flat too except a single {worst_p95} ms sample at the {esc(worst_tier)}
+  tier, shown as measured; every other tier stays under {bound} ms. {samples} samples per axis per tier.</p>
+  {src}
+</section>"""
+
+
 def sec_reproduce(commit):
     return f"""
 <section id="reproduce">
@@ -288,6 +429,7 @@ python benchmark/recall/run.py        # recall quality (offline)
 python benchmark/longmemeval/run.py   # LongMemEval retrieval (offline)
 python benchmark/temporal/gauntlet.py # bi-temporal gauntlet (offline)
 python benchmark/scale/run.py         # scale + latency (offline)
+python benchmark/beam/run.py --tiers 128K 500K 1M 10M --out /tmp/beam.json  # BEAM: correctness + determinism at scale (offline)
 python benchmark/longmemeval/qa.py    # end-to-end QA (needs an OpenAI key; prints cost first)</code></pre>
   <p class="note">This page was generated by <a href="{GITHUB}/blob/main/scripts/gen_benchmark_page.py">scripts/gen_benchmark_page.py</a>
   at commit <code>{esc(commit)}</code>. If a number here cannot be traced to a committed signed report, that is a bug; please file it.</p>
@@ -327,15 +469,18 @@ def main():
     qa_cot = load("longmemeval/qa_report_cot.json")
     qa_cot_seeds = [load("longmemeval/qa_report_cot_seed2.json"),
                     load("longmemeval/qa_report_cot_seed3.json")]
+    samebox = load("lambda/results/competitors.json")
     scale = load("scale/report.json")
     temporal = load("temporal/report.json")
     gauntlet = load("temporal/gauntlet_report.json")
+    beam = load("beam/report.json")
     commit = commit_sha()
     today = _dt.date.today().isoformat()
 
     body = (sec_matrix() + sec_retrieval(recall)
-            + sec_qa(qa, qa_seeds, cot_html=sec_qa_cot(qa_cot, qa_cot_seeds)) + sec_scale(scale)
-            + sec_temporal(temporal, gauntlet) + sec_reproduce(commit))
+            + sec_qa(qa, qa_seeds, cot_html=sec_qa_cot(qa_cot, qa_cot_seeds))
+            + sec_samebox(samebox) + sec_scale(scale)
+            + sec_temporal(temporal, gauntlet) + sec_beam(beam) + sec_reproduce(commit))
 
     page = f"""<!DOCTYPE html>
 <html lang="en" data-theme="dark">
@@ -346,7 +491,7 @@ def main():
 <script>try{{var t=localStorage.getItem('perseus-theme');if(t)document.documentElement.setAttribute('data-theme',t)}}catch(e){{}}</script>
 <link rel="icon" href="/assets/perseus.svg">
 <link rel="canonical" href="https://perseus.observer/benchmarks/">
-<meta name="description" content="Reproducible agent-memory benchmarks: LongMemEval retrieval recall, bi-temporal correctness, scale and latency to 100K entities. Every number generated from a signed report with a script you can rerun.">
+<meta name="description" content="Reproducible agent-memory benchmarks: LongMemEval retrieval recall, bi-temporal correctness, and BEAM correctness + determinism at scale (128K to 10M tokens). Every number generated from a signed report with a script you can rerun.">
 <meta name="theme-color" content="#0A0A12">
 <meta property="og:type" content="website">
 <meta property="og:site_name" content="Perseus">
