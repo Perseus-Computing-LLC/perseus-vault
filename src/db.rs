@@ -491,6 +491,69 @@ impl Database {
         Ok((migrated, already_current, failed))
     }
 
+    /// Encrypt existing plaintext body_json records in place. Operates on
+    /// non-archived entities whose body_json is NOT already ciphertext (i.e.
+    /// it is raw JSON). Requires encryption to be loaded (`set_encryption`).
+    /// Returns (encrypted_count, skipped_count, failed_count).
+    ///
+    /// Idempotent: already-encrypted rows are detected and left untouched.
+    /// Safe to re-run. Back up the database before calling if rollback is
+    /// needed.
+    pub fn encrypt_plaintext_records(&self) -> Result<(usize, usize, usize), Box<dyn std::error::Error>> {
+        let enc = match &self.encryption {
+            Some(enc) => enc,
+            None => return Err("encryption not enabled — run set_encryption first".into()),
+        };
+        let conn = self.conn()?;
+        let rows: Vec<(i64, String, String, String)> = {
+            let mut stmt =
+                conn.prepare("SELECT rowid, category, key, body_json FROM entities WHERE archived = 0")?;
+            let mapped = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?;
+            mapped.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+
+        let (mut encrypted, mut skipped, failed) = (0usize, 0usize, 0usize);
+        for (rowid, category, key, raw_body) in rows {
+            // If the body is already ciphertext, skip.
+            match enc.decrypt_body(&raw_body, Self::build_aad(&category, &key).as_bytes()) {
+                crate::encryption::BodyDecrypt::Plaintext(_) => {
+                    // Already encrypted under current key AAD — skip.
+                    skipped += 1;
+                    continue;
+                }
+                crate::encryption::BodyDecrypt::LegacyPlaintext(_) => {
+                    // This is a plaintext body — encrypt it.
+                }
+                _ => {
+                    // AuthFailed or ciphertext under wrong AAD — skip (user should run rekey_aad first).
+                    skipped += 1;
+                    continue;
+                }
+            }
+
+            let new_cipher = enc
+                .encrypt(&raw_body, Self::build_aad(&category, &key).as_bytes())
+                .map_err(|e| {
+                    format!("encrypt_plaintext_records: encrypt failed for {}:{}: {}", category, key, e)
+                })?;
+            if Self::rekey_write_guarded(&conn, rowid, &new_cipher, &raw_body)? {
+                encrypted += 1;
+            } else {
+                // Row was rewritten between our read and write — it's now
+                // already current (written under encryption), so skip.
+                skipped += 1;
+            }
+        }
+        Ok((encrypted, skipped, failed))
+    }
+
     /// #386: rekey_aad's per-row write, guarded against a concurrent rewrite.
     /// The UPDATE only lands if the stored ciphertext still equals the one we
     /// read and re-encrypted — otherwise a `remember()` that committed in the
@@ -761,9 +824,62 @@ impl Database {
 
     /// Returns true if encryption is enabled.
     #[allow(dead_code)]
-    #[allow(dead_code)]
     pub fn encryption_enabled(&self) -> bool {
         self.encryption.is_some()
+    }
+
+    /// Describes the encryption state of the database on **disk** (independent of
+    /// whether a key is loaded in this session). Returns one of:
+    /// - `"plaintext"` — no `encryption_canary` table exists and no body_json
+    ///   values look like AES-256-GCM ciphertext (base64, ≥28 bytes).
+    /// - `"encrypted"` — the canary exists. Bodies are ciphertext.
+    /// - `"mixed-legacy"` — no canary but some body_json values are base64
+    ///   ciphertext (encryption was started with a previous key and later
+    ///   disabled, or a partial rekey). Caller should run `init --rekey`.
+    /// - `"unknown"` — database could not be opened or queried.
+    ///
+    /// Does NOT require an encryption key — reads the SQLite schema and a sample
+    /// of row bodies. Intended for `doctor` diagnostics.
+    pub fn encryption_storage_state(&self) -> String {
+        let conn = match self.conn() {
+            Ok(c) => c,
+            Err(_) => return "unknown".to_string(),
+        };
+        // Check for canary table first.
+        let has_canary: bool = conn
+            .prepare("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='encryption_canary'")
+            .and_then(|mut s| s.query_row([], |r| r.get::<_, i64>(0)))
+            .map(|c| c > 0)
+            .unwrap_or(false);
+        if has_canary {
+            return "encrypted".to_string();
+        }
+        // No canary — scan a sample of body_json for base64-looking values.
+        // Real JSON always starts with '{' (0x7b), which is not in the base64
+        // alphabet. Ciphertext in our format is always ≥28 bytes.
+        let has_ciphertext_like: bool = {
+            let mut stmt = match conn.prepare(
+                "SELECT body_json FROM entities WHERE length(body_json) >= 28 AND body_json GLOB '[A-Za-z0-9+/]*=' LIMIT 32"
+            ) {
+                Ok(s) => s,
+                Err(_) => return "unknown".to_string(),
+            };
+            let rows: Vec<String> = match stmt.query_map([], |r| r.get::<_, String>(0)) {
+                Ok(r) => r.flatten().collect(),
+                Err(_) => return "unknown".to_string(),
+            };
+            // Drop stmt before checking rows to satisfy borrow checker.
+            drop(stmt);
+            rows.iter().any(|s| {
+                s.len() >= 28 && s.as_bytes().iter().all(|&c| {
+                    c.is_ascii_alphanumeric() || c == b'+' || c == b'/' || c == b'='
+                })
+            })
+        };
+        if has_ciphertext_like {
+            return "mixed-legacy".to_string();
+        }
+        "plaintext".to_string()
     }
 
     /// #271: whether a dense-embedding backend is active. With the default

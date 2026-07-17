@@ -71,18 +71,60 @@ rotation, and backup are entirely the operator's responsibility.
 
 ### Rotation and recovery
 
-- **No automatic rotation.** There is no built-in re-encrypt/rekey command.
-  Rotating a key means decrypting with the old key and re-writing with the new
-  one (e.g. export → re-import under a new key).
-- **No recovery.** If the key is lost, encrypted `body_json` is unrecoverable.
-- On read, a failed decrypt (wrong key **or** a never-encrypted database) does
-  **not** raise an error: Mimir falls back to returning the **stored bytes
-  verbatim**. This is what lets a plaintext database be read without a key — but
-  it also means that opening an *encrypted* database with the **wrong key**
-  silently returns the raw base64 ciphertext as the "body" instead of failing
-  loudly. There is no built-in signal that distinguishes "plaintext DB" from
-  "encrypted DB, wrong key." Treat a key mismatch as an operator error to catch
-  out-of-band; do not rely on the read path to flag it.
+- **No automatic rotation.** There is no built-in scheduled rotation. Rotating a
+  key means decrypting with the old key and re-writing with the new one
+  (e.g. `perseus-vault init --rekey --key-file /path/to/new-key`, see below).
+- **Key recovery is manual.** If the key is lost, encrypted `body_json` is
+  unrecoverable — back up the key file immediately after `init` or `keygen`.
+  See [Key recovery procedure](#key-recovery-procedure) below.
+- **Wrong-key startup fails closed.** When a key is loaded, the canary is
+  verified before any read/write. If authentication fails, Vault refuses to
+  start with a fatal error — it no longer silently returns ciphertext as
+  plaintext.
+- **Keys are never stored in SQLite** or printed in diagnostics. The key file
+  is read once at startup and kept only in process memory. The `doctor` command
+  reads the canary table but never reveals the key material.
+
+### Key recovery procedure
+
+1. **Back up the key file immediately after generating it:**
+   ```bash
+   cp ~/.perseus-vault/secret.key ~/.perseus-vault/secret.key.backup-$(date +%F)
+   ```
+   Store a second copy off-site (e.g. encrypted vault, password manager).
+
+2. **Back up the database** before any rekey or migration:
+   ```bash
+   cp ~/.perseus-vault/data/perseus-vault.db ~/.perseus-vault/data/perseus-vault.db.backup-$(date +%F)
+   ```
+
+3. **Test your backup** by restoring it on a different machine:
+   ```bash
+   perseus-vault doctor --db /tmp/restored.db  # confirms encryption state
+   perseus-vault serve --db /tmp/restored.db --encryption-key /path/to/secret.key
+   ```
+
+4. **If the key is lost** and the database is encrypted:
+   - `body_json` content is **permanently unrecoverable**.
+   - Metadata (categories, keys, timestamps, FTS index) is still readable.
+   - Run `perseus-vault init --rekey` with a new key to encrypt plaintext-only
+     write targets (new writes only; existing ciphertext stays unrecoverable).
+   - Filesystem-level recovery tools (extundelete, PhotoRec) on the key file's
+     directory may help if the key was recently deleted.
+
+### Plaintext, encrypted, and mixed databases
+
+Perseus Vault categorises a database into one of three storage states,
+reported by `perseus-vault doctor` without requiring an encryption key:
+
+| State | `doctor` output | Meaning |
+|-------|----------------|---------|
+| **Plaintext** | `plaintext (not encrypted ...)` | No `encryption_canary` table; all `body_json` values are raw JSON. A key has never been provided, or was removed after creation. Safe to read without a key. |
+| **Encrypted** | `[ENCRYPTED] AES-256-GCM canary present` | The canary exists; `body_json` values are ciphertext. A key is required for reads and writes. The canary is verified on every startup — a wrong key is rejected with a fatal error. |
+| **Mixed legacy** | `[WARN] mixed — some bodies appear encrypted` | The canary is **absent** but some `body_json` values match the ciphertext format. This happens when encryption was enabled and later the canary was lost (e.g. a partial restore from backup). Run `perseus-vault init --rekey` to establish a canary and normalise the state. |
+
+The `perseus-vault init` command always produces an **encrypted** database.
+A fresh database started without a key is **plaintext**.
 
 ---
 

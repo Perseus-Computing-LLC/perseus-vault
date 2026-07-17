@@ -275,6 +275,24 @@ enum Commands {
         key_file: String,
     },
 
+    /// Initialize a database with encryption. Generates a key (if none exists),
+    /// opens or creates the database, enables encryption, and writes the
+    /// encryption canary. Combines keygen + serve setup into one safe step.
+    /// With `--rekey`, also encrypts existing plaintext bodies in place
+    /// (backup the database first). Always shows the key path and a reminder
+    /// to back it up. Keys are never stored in SQLite or printed in diagnostics.
+    Init {
+        /// SQLite database path
+        #[arg(long, default_value_t = default_db_path())]
+        db: String,
+        /// Path to write the AES-256-GCM key file (default: ~/.perseus-vault/secret.key)
+        #[arg(long, default_value_t = default_key_file())]
+        key_file: String,
+        /// Also encrypt existing plaintext body_json records in place
+        #[arg(long)]
+        rekey: bool,
+    },
+
     /// Re-encrypt every entity's AAD binding from the legacy "category:key"
     /// scheme to the collision-free length-prefixed scheme. Safe to re-run:
     /// already-migrated rows are detected and left untouched. No-op if the
@@ -581,6 +599,7 @@ impl Commands {
         match self {
             Commands::Write { db, .. }
             | Commands::Serve { db, .. }
+            | Commands::Init { db, .. }
             | Commands::RekeyAad { db, .. }
             | Commands::VerifyAuditChain { db, .. }
             | Commands::Forget { db, .. }
@@ -1025,6 +1044,28 @@ fn run_doctor(db_path: &str) {
         "not yet created (dir made on first run)"
     };
     println!("  database: {} ({})", db_path, db_status);
+
+    // #712: report encryption storage state — plaintext, encrypted, or
+    // mixed-legacy. Opens the DB read-only (no key required).
+    if dbp.exists() {
+        match db::Database::open(db_path) {
+            Ok(database) => {
+                let state = database.encryption_storage_state();
+                let state_desc = match state.as_str() {
+                    "encrypted" => "[ENCRYPTED] AES-256-GCM canary present — bodies are ciphertext",
+                    "mixed-legacy" => "[WARN] mixed — some bodies appear encrypted, no canary (run `init --rekey`)",
+                    "unknown" => "unknown (could not read schema)",
+                    _ => "plaintext (not encrypted — use `init` to enable)",
+                };
+                println!("  encryption: {}", state_desc);
+            }
+            Err(e) => {
+                println!("  encryption: unknown (could not open database: {})", e);
+            }
+        }
+    } else {
+        println!("  encryption: (no database yet — will be plaintext until a key is provided)");
+    }
 
     // #433 N4: freshness/liveness — surface a stale vault instead of silently
     // reporting "healthy" while the harvest/writer has quietly stopped. Reads
@@ -2168,6 +2209,125 @@ fn main() {
                     std::process::exit(1);
                 }
             }
+        }
+        Some(Commands::Init {
+            db: ref db_path,
+            key_file: ref key_path,
+            rekey,
+        }) => {
+            // 1. Write the key file (same logic as Keygen).
+            let expanded = if key_path.starts_with("~/") {
+                let home = std::env::var("HOME")
+                    .or_else(|_| std::env::var("USERPROFILE"))
+                    .unwrap_or_else(|_| "/root".to_string());
+                key_path.replacen("~", &home, 1)
+            } else {
+                key_path.clone()
+            };
+            if let Some(parent) = std::path::Path::new(&expanded).parent() {
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    eprintln!(
+                        "mimir: failed to create directory {}: {}",
+                        parent.display(),
+                        e
+                    );
+                    std::process::exit(1);
+                }
+            }
+            let key = crate::encryption::EncryptionManager::generate_key();
+            let write_result: std::io::Result<()> = {
+                #[cfg(unix)]
+                {
+                    use std::io::Write;
+                    use std::os::unix::fs::OpenOptionsExt;
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .create(true)
+                        .truncate(true)
+                        .mode(0o600)
+                        .open(&expanded)
+                        .and_then(|mut f| f.write_all(key.as_bytes()))
+                }
+                #[cfg(not(unix))]
+                {
+                    std::fs::write(&expanded, &key)
+                }
+            };
+            match write_result {
+                Ok(_) => {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        let _ = std::fs::set_permissions(
+                            &expanded,
+                            std::fs::Permissions::from_mode(0o600),
+                        );
+                    }
+                    #[cfg(windows)]
+                    {
+                        if !tighten_windows_key_acls(&expanded) {
+                            eprintln!(
+                                "mimir: WARNING: could not restrict ACLs on key file {}. \
+                                 Other local users may be able to read your encryption key. \
+                                 Restrict it manually: icacls \"{}\" /inheritance:r /grant:r %USERNAME%:F",
+                                expanded, expanded
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("mimir: failed to write key file {}: {}", expanded, e);
+                    std::process::exit(1);
+                }
+            }
+
+            // 2. Open/create the database and enable encryption.
+            let mut database = match db::Database::open(db_path) {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("mimir: failed to open database at {}: {}", db_path, e);
+                    std::process::exit(1);
+                }
+            };
+            if let Err(e) = database.set_encryption(&expanded) {
+                eprintln!(
+                    "mimir: encryption setup failed: {}. The key at {} exists but \
+                     the database could not be encrypted. Key files are precious: \
+                     back up {} before retrying.",
+                    e, expanded, expanded
+                );
+                std::process::exit(1);
+            }
+
+            // 3. Optionally encrypt existing plaintext records.
+            if rekey {
+                match database.encrypt_plaintext_records() {
+                    Ok((encrypted, skipped, failed)) => {
+                        println!(
+                            "encrypt: {} records encrypted, {} skipped, {} failed",
+                            encrypted, skipped, failed
+                        );
+                        if failed > 0 {
+                            eprintln!("mimir: init --rekey: some records failed — check stderr above");
+                            std::process::exit(1);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("mimir: init --rekey failed: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            }
+
+            println!(
+                "Database initialized with encryption at {}",
+                db_path
+            );
+            println!("Encryption key: {} (back this file up — it cannot be recovered)", expanded);
+            println!(
+                "Run: perseus-vault serve --db {} --encryption-key {}",
+                db_path, expanded
+            );
         }
         Some(Commands::RekeyAad {
             db: ref db_path,
