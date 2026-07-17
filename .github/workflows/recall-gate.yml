@@ -49,6 +49,6 @@ jobs:
           [ -s .model-cache/tokenizer.json ] || curl -fL --retry 5 --retry-all-errors "$base/tokenizer.json" -o .model-cache/tokenizer.json
           cp .model-cache/model_qint8_avx512_vnni.onnx .model-cache/model_quantized.onnx
       - name: Build (release, bundled embeddings)
-        run: cargo build --release
+        run: cargo build --locked --release
       - name: Recall regression gate
         run: python benchmark/recall/gate.py

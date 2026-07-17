@@ -10,7 +10,7 @@
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 [![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](https://rust-lang.org)
-[![Version](https://img.shields.io/badge/version-2.19.1-green.svg)](https://github.com/Perseus-Computing-LLC/perseus-vault/releases)
+[![Version](https://img.shields.io/badge/version-2.20.2-green.svg)](https://github.com/Perseus-Computing-LLC/perseus-vault/releases)
 [![LangGraph](https://img.shields.io/badge/integrations-LangGraph-blue)](integrations/langgraph/)
 [![CrewAI](https://img.shields.io/badge/integrations-CrewAI-orange)](integrations/crewai/)
 [![AutoGen](https://img.shields.io/badge/integrations-AutoGen-purple)](integrations/autogen/)
@@ -696,6 +696,48 @@ Perseus Vault is a **local-first MCP server** — it runs entirely on your machi
 ### Contact
 - **Email:** privacy@perseus.observer
 - **GitHub:** [Perseus-Computing-LLC/perseus-vault](https://github.com/Perseus-Computing-LLC/perseus-vault)
+
+## Release Verification
+
+Release binaries are built from tagged commits via [GitHub Actions](.github/workflows/release.yml). Every release ships:
+
+| Artifact | Description | Verification |
+|----------|-------------|-------------|
+| `perseus-vault-<target>.tar.gz` | Full build (bundled embeddings, glibc) | SHA-256 checksum in `.sha256` sidecar |
+| `perseus-vault-lite-<target>.tar.gz` | Lean build (`--no-default-features`, musl/static) | SHA-256 checksum in `.sha256` sidecar |
+| SLSA provenance attestation | Sigstore-signed build provenance | `gh attestation verify <archive> --repo Perseus-Computing-LLC/perseus-vault` |
+
+### Verify a release binary
+
+```bash
+# 1. Verify SHA-256 checksum
+sha256sum -c perseus-vault-lite-x86_64-unknown-linux-musl.tar.gz.sha256
+
+# 2. Verify SLSA build provenance (requires gh CLI + OIDC session)
+gh attestation verify perseus-vault-lite-x86_64-unknown-linux-musl.tar.gz \
+  --repo Perseus-Computing-LLC/perseus-vault
+
+# 3. Confirm the binary identity
+./perseus-vault --version
+# Should show both the release version AND the git commit hash, e.g.:
+#   perseus-vault 2.20.2 (v2.20.2-0-gabcdef1)
+
+# 4. Confirm the doctor reports the same identity
+./perseus-vault doctor --db /tmp/test.db | head -1
+#   perseus-vault doctor — v2.20.2 (v2.20.2-0-gabcdef1)
+```
+
+### Build reproducibly from source
+
+```bash
+# The exact same binary (bit-for-bit) requires matching:
+#   - Rust toolchain version (see rust-toolchain.toml)
+#   - Locked dependencies: `cargo build --locked`
+#   - Build flags: `--release` for release builds
+
+cargo build --locked --release
+./target/release/perseus-vault --version
+```
 
 ## License
 

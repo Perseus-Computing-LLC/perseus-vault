@@ -56,7 +56,7 @@ jobs:
           [ -s .model-cache/tokenizer.json ] || curl -fL --retry 5 --retry-all-errors "$base/tokenizer.json" -o .model-cache/tokenizer.json
           cp .model-cache/model_qint8_avx512_vnni.onnx .model-cache/model_quantized.onnx
       - name: Build (release, full — the dense path needs the embedding stack)
-        run: cargo build --release
+        run: cargo build --locked --release
       - name: Set up Python
         uses: actions/setup-python@v5
         with:

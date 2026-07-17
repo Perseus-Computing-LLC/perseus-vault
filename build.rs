@@ -1,6 +1,9 @@
 use std::path::Path;
 
 fn main() {
+    // #713: embed the git commit hash for build identity reporting.
+    embed_git_hash();
+
     #[cfg(feature = "grpc")]
     {
         tonic_build::configure()
@@ -21,6 +24,52 @@ fn main() {
     }
 
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-env-changed=GIT_HASH");
+    println!("cargo:rerun-if-changed=.git/HEAD");
+    // Also track the current ref so detached-HEAD builds still get the hash.
+    if let Ok(head) = std::fs::read_to_string(".git/HEAD") {
+        if let Some(ref_path) = head.strip_prefix("ref: ") {
+            let ref_path = ref_path.trim();
+            println!("cargo:rerun-if-changed=.git/{}", ref_path);
+        }
+    }
+}
+
+/// Embed the git commit hash as GIT_HASH at compile time. Falls back to
+/// "unknown" when .git is absent (e.g. source tarball builds), so the binary
+/// always reports a build identity.
+fn embed_git_hash() {
+    let hash = git_describe_hash().unwrap_or_else(|| "unknown".to_string());
+    println!("cargo:rustc-env=GIT_HASH={}", hash);
+}
+
+fn git_describe_hash() -> Option<String> {
+    // Prefer an explicit env override (docker builds, CI where .git may be shallow).
+    if let Ok(h) = std::env::var("GIT_HASH") {
+        if !h.is_empty() {
+            return Some(h);
+        }
+    }
+    // Try `git describe --always --dirty` for a human-readable identity.
+    let output = std::process::Command::new("git")
+        .args(["describe", "--always", "--dirty", "--long"])
+        .output()
+        .ok()?;
+    if output.status.success() {
+        let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !s.is_empty() {
+            return Some(s);
+        }
+    }
+    // Fallback: `git rev-parse HEAD` for just the hash.
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()?;
+    if output.status.success() {
+        return String::from_utf8_lossy(&output.stdout).trim().to_string().into();
+    }
+    None
 }
 
 #[allow(dead_code)]

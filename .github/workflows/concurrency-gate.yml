@@ -39,7 +39,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
       - name: Build (lean, release)
-        run: cargo build --release --no-default-features --tests
+        run: cargo build --locked --release --no-default-features --tests
       - name: Pool load test at 2x oversubscription (32 clients / pool 16)
         env:
           MIMIR_LOADTEST_CLIENTS: "32"
@@ -49,11 +49,11 @@ jobs:
           MIMIR_BUSY_TIMEOUT_MS: "5000"
           MIMIR_LOADTEST_MAX_WALL_SECS: "60"
         run: |
-          cargo test --release --no-default-features \
+          cargo test --locked --release --no-default-features \
             pool_load_test_http_transport -- --ignored --nocapture
       - name: Concurrency hammer tests
         run: |
-          cargo test --release --no-default-features -- \
+          cargo test --locked --release --no-default-features -- \
             concurrent_audited_writers_serialize_without_corrupting_history \
             concurrent_links_and_remembers_do_not_lose_edges \
             concurrent_follows_do_not_lose_increments \

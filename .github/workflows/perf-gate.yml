@@ -41,7 +41,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
       - name: Build (lean, release)
-        run: cargo build --release --no-default-features --tests
+        run: cargo build --locked --release --no-default-features --tests
       - name: Perf gate (100k corpus, medians of 5)
         env:
           # Corpus sizes (issue #404 scales)
@@ -62,5 +62,5 @@ jobs:
         # --test-threads=1: the latency medians must not contend with another
         # 100k seed/tick running in parallel.
         run: |
-          cargo test --release --no-default-features perf_gate_ -- \
+          cargo test --locked --release --no-default-features perf_gate_ -- \
             --ignored --nocapture --test-threads=1

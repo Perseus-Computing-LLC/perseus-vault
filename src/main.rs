@@ -28,7 +28,12 @@ use clap::{Parser, Subcommand};
 #[command(name = "perseus-vault")]
 #[command(
     about = "Perseus Vault — persistent memory for AI agents — MCP JSON-RPC stdio server (formerly Mneme/Mimir)",
-    version
+    version = concat!(
+        env!("CARGO_PKG_VERSION"),
+        " (",
+        env!("GIT_HASH"),
+        ")"
+    )
 )]
 struct Cli {
     #[command(subcommand)]
@@ -1011,7 +1016,11 @@ fn latest_write_age_days(db_path: &str) -> Option<f64> {
 }
 
 fn run_doctor(db_path: &str) {
-    println!("perseus-vault doctor — v{}", env!("CARGO_PKG_VERSION"));
+    println!(
+        "perseus-vault doctor — v{} ({})",
+        env!("CARGO_PKG_VERSION"),
+        option_env!("GIT_HASH").unwrap_or("unknown")
+    );
     match std::env::current_exe() {
         Ok(p) => println!("  binary:   {}", p.display()),
         Err(_) => println!("  binary:   (unknown)"),

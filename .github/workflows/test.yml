@@ -36,9 +36,9 @@ jobs:
           # build.rs looks for these exact names:
           cp .model-cache/model_qint8_avx512_vnni.onnx .model-cache/model_quantized.onnx
       - name: Build
-        run: cargo build --verbose
+        run: cargo build --locked --verbose
       - name: Run tests
-        run: cargo test --verbose
+        run: cargo test --locked --verbose
 
   # All-platform first-class (#237): the bundled default must also build, LINK,
   # and run on Windows MSVC. The esaxx-rs/ort static-vs-dynamic-CRT link clash was
@@ -63,9 +63,9 @@ jobs:
           [ -s .model-cache/tokenizer.json ] || curl -fL --retry 5 --retry-all-errors "$base/tokenizer.json" -o .model-cache/tokenizer.json
           cp .model-cache/model_qint8_avx512_vnni.onnx .model-cache/model_quantized.onnx
       - name: Build
-        run: cargo build --verbose
+        run: cargo build --locked --verbose
       - name: Run tests
-        run: cargo test --verbose
+        run: cargo test --locked --verbose
 
   # All-platform first-class (#237), cont'd: the bundled default must also build,
   # link, and run real inference on macOS (Apple Silicon). The `ort`
@@ -91,9 +91,9 @@ jobs:
           [ -s .model-cache/tokenizer.json ] || curl -fL --retry 5 --retry-all-errors "$base/tokenizer.json" -o .model-cache/tokenizer.json
           cp .model-cache/model_qint8_avx512_vnni.onnx .model-cache/model_quantized.onnx
       - name: Build
-        run: cargo build --verbose
+        run: cargo build --locked --verbose
       - name: Run tests
-        run: cargo test --verbose
+        run: cargo test --locked --verbose
 
   # Guard the default build on OLD glibc (#526): ubuntu-latest is 24.04
   # (glibc 2.39), so the `test` job can't catch it, but the prebuilt ONNX
@@ -136,9 +136,9 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
       - name: Build (no default features)
-        run: cargo build --no-default-features --verbose
+        run: cargo build --locked --no-default-features --verbose
       - name: Test (no default features)
-        run: cargo test --no-default-features --verbose
+        run: cargo test --locked --no-default-features --verbose
 
   # Guard the optional gRPC transport (#354): src/grpc.rs is entirely
   # feature-gated and was previously absent from every CI lane, so the whole
@@ -156,9 +156,9 @@ jobs:
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - name: Build (grpc, no embeddings)
-        run: cargo build --no-default-features --features grpc --verbose
+        run: cargo build --locked --no-default-features --features grpc --verbose
       - name: Test (grpc, no embeddings)
-        run: cargo test --no-default-features --features grpc --verbose
+        run: cargo test --locked --no-default-features --features grpc --verbose
 
   # Guard the optional multimodal document-extraction feature (#236): it pulls
   # zip + pdf-extract, so make sure it still builds and its tests pass. Built
@@ -171,6 +171,6 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
       - name: Build (multimodal, no embeddings)
-        run: cargo build --no-default-features --features multimodal --verbose
+        run: cargo build --locked --no-default-features --features multimodal --verbose
       - name: Test (multimodal, no embeddings)
-        run: cargo test --no-default-features --features multimodal multimodal --verbose
+        run: cargo test --locked --no-default-features --features multimodal multimodal --verbose
