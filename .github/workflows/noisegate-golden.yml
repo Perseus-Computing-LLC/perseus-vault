@@ -16,6 +16,7 @@ on:
       - "src/**"
       - "Cargo.toml"
       - "Cargo.lock"
+      - "build.rs"
       - "integrations/noisegate/**"
       - ".github/workflows/noisegate-golden.yml"
   pull_request:
@@ -24,8 +25,14 @@ on:
       - "src/**"
       - "Cargo.toml"
       - "Cargo.lock"
+      - "build.rs"
       - "integrations/noisegate/**"
       - ".github/workflows/noisegate-golden.yml"
+
+# This job only reads the checkout; it does not need the repository default
+# token permissions.
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
