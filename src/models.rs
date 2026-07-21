@@ -1218,3 +1218,51 @@ pub struct ConsolidateReport {
     pub observations: Vec<Observation>,
 }
 
+// ─── Memory origin + external references (#729/#728) ────────────────────────
+// Spec: docs/specs/memory-provenance-and-external-refs.md. Both contracts are
+// optional and stored inside body_json under reserved keys ("origin",
+// "external_refs") — the same metadata channel recall_when already uses, so
+// no schema migration is required and existing entities are valid unchanged.
+
+/// Canonical memory-origin values (spec §1.1).
+pub const MEMORY_KINDS: [&str; 5] = ["asserted", "extracted", "inferred", "imported", "observed"];
+
+/// Canonical external-ref relationship values (spec §2.1).
+pub const REF_RELATIONSHIPS: [&str; 5] =
+    ["about", "derived_from", "mentions", "applies_to", "supersedes"];
+
+/// How a memory came to exist. All fields optional — never guessed when
+/// unknown (spec §1.2: absent means unlabeled, not defaulted).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct OriginRecord {
+    /// asserted | extracted | inferred | imported | observed
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_kind: Option<String>,
+    /// e.g. user, capture, slack, confluence, jira, connector:<name>, agent
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_system: Option<String>,
+    /// manual | rule_based_extractor | llm_extractor | import | event_feed
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_method: Option<String>,
+    /// When the fact was true in the world, if distinct from recorded time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_at_unix_ms: Option<i64>,
+}
+
+/// A first-class pointer from a memory to an external system of record.
+/// Canonical ref_value forms per ref_type live in
+/// docs/specs/source-anchors-corrections-retention.md §1.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExternalRef {
+    /// ari | url | jira_key | confluence_page | account_id | repo |
+    /// pull_request | file | session | custom
+    pub ref_type: String,
+    pub ref_value: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_system: Option<String>,
+    /// about | derived_from | mentions | applies_to | supersedes
+    /// (default about when omitted)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relationship: Option<String>,
+}
+

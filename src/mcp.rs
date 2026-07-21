@@ -5,6 +5,7 @@ use std::sync::OnceLock;
 
 use crate::db::Database;
 use crate::tools;
+use crate::beliefs;
 
 /// The parent PID observed once at process start, before any reparenting can
 /// occur. `is_orphaned_by_ppid()` compares the live ppid against this baseline
@@ -551,6 +552,30 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
             ]
           },
           "description": "#487: the memories this write was built on (max 64). Each cited source is automatically marked useful — usefulness_count bumped, last_useful/last_accessed refreshed — so memories that actually inform later writes rank higher in recall and decay slower. Cite the entities you recalled before composing this write. Unknown citations are reported in the result, not fatal; self-citations are ignored."
+        },
+        "origin": {
+          "type": "object",
+          "properties": {
+            "memory_kind": { "type": "string", "enum": ["asserted", "extracted", "inferred", "imported", "observed"] },
+            "source_system": { "type": "string" },
+            "capture_method": { "type": "string" },
+            "observed_at_unix_ms": { "type": "integer" }
+          },
+          "description": "#729: optional memory-origin/provenance metadata (spec: docs/specs/memory-provenance-and-external-refs.md). Stored inside body_json under the reserved 'origin' key — surfaced by recall/get_entity via body expansion. All fields optional; unknown values are left absent, never guessed."
+        },
+        "external_refs": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "ref_type": { "type": "string" },
+              "ref_value": { "type": "string" },
+              "source_system": { "type": "string" },
+              "relationship": { "type": "string", "enum": ["about", "derived_from", "mentions", "applies_to", "supersedes"] }
+            },
+            "required": ["ref_type", "ref_value"]
+          },
+          "description": "#728: optional first-class pointers to external systems of record (max 32). Stored inside body_json under the reserved 'external_refs' key; filter recall with ref_type/ref_value."
         }
       },
       "required": [
@@ -714,6 +739,14 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
         "layer": {
             "type": "string",
             "description": "Filter by memory layer (world, episodic, semantic)."
+        },
+        "ref_type": {
+          "type": "string",
+          "description": "#728: post-filter hits to entities whose body external_refs carry this ref_type (exact match, e.g. 'repo', 'pull_request', 'jira_key')."
+        },
+        "ref_value": {
+          "type": "string",
+          "description": "#728: post-filter hits to entities whose body external_refs carry this ref_value. Matches exactly or as a hierarchical '/' prefix ('github:Org' matches 'github:Org/repo')."
         },
         "as_of_unix_ms": {
           "type": "integer",
@@ -1089,6 +1122,81 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
       "readOnlyHint": true
     },
     "title": "Startup-Memory Hygiene Report"
+  },
+  {
+    "name": "mimir_promote",
+    "description": "Promote a memory across the class ladder (to_category) and/or the scope ladder (to_workspace_hash) per the shared-memory promotion ladder (perseus docs/shared-memory-promotion-ladder.md §4). Creates a new entity that carries a promoted_from provenance record (source category/key/id/scope, reason, timestamp) and links the source to it with relationship='promoted_to'. The source entity is never edited or hidden — raw evidence stays reachable. Uses skip_dedup internally so the promoted copy always creates its own key even when near-identical to the source.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "from_category": {
+          "type": "string",
+          "description": "Category of the source entity to promote"
+        },
+        "from_key": {
+          "type": "string",
+          "description": "Key of the source entity to promote"
+        },
+        "to_category": {
+          "type": "string",
+          "description": "Target class/category. Omit to keep the source category."
+        },
+        "to_workspace_hash": {
+          "type": "string",
+          "description": "Target scope (workspace_hash; empty string = global). Omit to keep the source scope."
+        },
+        "to_key": {
+          "type": "string",
+          "description": "Target key. Omit to keep the source key."
+        },
+        "reason": {
+          "type": "string",
+          "description": "Why this promotion is happening (recorded in promoted_from)."
+        }
+      },
+      "required": ["from_category", "from_key"]
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "promoted": { "type": "boolean" },
+        "action": { "type": "string", "description": "'created' or 'updated' for the target entity" },
+        "from_id": { "type": "string" },
+        "to_id": { "type": "string" },
+        "to_workspace_hash": { "type": "string" }
+      }
+    },
+    "annotations": {
+      "destructiveHint": true
+    },
+    "title": "Promote Memory"
+  },
+  {
+    "name": "mimir_beliefs",
+    "description": "Derived-belief overlay (#717, spec: docs/specs/belief-overlay.md): compute the current effective belief for a topic from the live entity store, with fresh local corrections always outranking stale global beliefs regardless of semantic similarity (precedence tiers are absolute, never blended).",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "topic": {
+          "type": "string",
+          "description": "Topic or question to resolve the current effective belief for"
+        },
+        "workspace_hash": {
+          "type": "string",
+          "description": "Optional workspace scope for the local-correction tier"
+        },
+        "limit": {
+          "type": "integer",
+          "default": 10,
+          "description": "Maximum belief candidates to return"
+        }
+      },
+      "required": ["topic"]
+    },
+    "annotations": {
+      "readOnlyHint": true
+    },
+    "title": "Derived Beliefs Overlay"
   },
   {
     "name": "mimir_semantic_search",
@@ -4534,6 +4642,8 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
         "mimir_keystone_set" => tools::handle_keystone_set(db, args),
         "mimir_keystone_get" => tools::handle_keystone_get(db, args),
         "mimir_agent" => tools::handle_agent(db, args),
+        "mimir_promote" => tools::handle_promote(db, args),
+        "mimir_beliefs" => beliefs::handle_beliefs(db, args),
         "mimir_conflicts" => Ok(tools::handle_conflicts(db, args)),
         "mimir_consolidate" => Ok(tools::handle_consolidate(db, args)),
         "mimir_dream" => tools::handle_dream(db, args),
