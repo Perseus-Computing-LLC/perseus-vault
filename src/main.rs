@@ -1,6 +1,7 @@
 mod capture;
 mod communities;
 mod connectors;
+mod beliefs;
 mod db;
 mod dedup;
 mod embedding;

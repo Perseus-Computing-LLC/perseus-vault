@@ -123,6 +123,15 @@ pub struct RememberArgs {
     /// actually create its key.
     #[serde(default, deserialize_with = "null_as_default")]
     pub skip_dedup: bool,
+    /// #729: optional memory-origin/provenance metadata (spec:
+    /// docs/specs/memory-provenance-and-external-refs.md). Stored inside
+    /// body_json under the reserved "origin" key — no schema change.
+    #[serde(default)]
+    pub origin: Option<crate::models::OriginRecord>,
+    /// #728: optional first-class external entity references. Stored inside
+    /// body_json under the reserved "external_refs" key.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub external_refs: Vec<crate::models::ExternalRef>,
 }
 
 /// #487: a `derived_from` citation — either an entity id (`"mem-..."`, as
@@ -281,6 +290,15 @@ pub struct RecallArgs {
     /// false: recall order is byte-identical to prior behavior.
     #[serde(default, deserialize_with = "null_as_default")]
     pub startup: bool,
+    /// #728: optional external-ref post-filters. When set, only hits whose
+    /// body carries a matching external_refs entry survive (spec:
+    /// docs/specs/memory-provenance-and-external-refs.md §2.2). ref_type is
+    /// exact-match; ref_value additionally matches on hierarchical '/'
+    /// prefix ("github:Org" matches "github:Org/repo").
+    #[serde(default)]
+    pub ref_type: Option<String>,
+    #[serde(default)]
+    pub ref_value: Option<String>,
 }
 
 pub type BatchQuery = RecallArgs;
@@ -743,6 +761,65 @@ pub fn handle_remember(db: &Database, args: Value) -> Result<String, String> {
         serde_json::to_string(&obj).unwrap_or(a.body_json)
     };
 
+    // #729/#728: merge origin + external_refs into body_json under reserved
+    // keys (spec: docs/specs/memory-provenance-and-external-refs.md). Same
+    // metadata channel as recall_when — no schema change; recall/get_entity
+    // surface the fields via body expansion. Validate the vocabulary up
+    // front so bad values never enter the store.
+    const MAX_EXTERNAL_REFS: usize = 32;
+    if a.external_refs.len() > MAX_EXTERNAL_REFS {
+        return Err(format!(
+            "external_refs too long: {} refs (max {})",
+            a.external_refs.len(),
+            MAX_EXTERNAL_REFS
+        ));
+    }
+    if let Some(ref origin) = a.origin {
+        if let Some(ref kind) = origin.memory_kind {
+            if !crate::models::MEMORY_KINDS.contains(&kind.as_str()) {
+                return Err(format!(
+                    "Invalid origin.memory_kind '{kind}': expected one of {:?}",
+                    crate::models::MEMORY_KINDS
+                ));
+            }
+        }
+    }
+    for r in &a.external_refs {
+        if r.ref_type.trim().is_empty() || r.ref_value.trim().is_empty() {
+            return Err("external_refs entries require non-empty ref_type and ref_value".into());
+        }
+        if let Some(ref rel) = r.relationship {
+            if !crate::models::REF_RELATIONSHIPS.contains(&rel.as_str()) {
+                return Err(format!(
+                    "Invalid external_refs relationship '{rel}': expected one of {:?}",
+                    crate::models::REF_RELATIONSHIPS
+                ));
+            }
+        }
+    }
+    let body = if a.origin.is_none() && a.external_refs.is_empty() {
+        body
+    } else {
+        let mut obj: serde_json::Value =
+            serde_json::from_str(&body).unwrap_or(serde_json::json!({}));
+        if let Some(map) = obj.as_object_mut() {
+            if let Some(ref origin) = a.origin {
+                map.insert(
+                    "origin".to_string(),
+                    serde_json::to_value(origin).unwrap_or(serde_json::json!({})),
+                );
+            }
+            if !a.external_refs.is_empty() {
+                map.insert(
+                    "external_refs".to_string(),
+                    serde_json::to_value(&a.external_refs)
+                        .unwrap_or(serde_json::json!([])),
+                );
+            }
+        }
+        serde_json::to_string(&obj).unwrap_or(body)
+    };
+
     let raw_id = Uuid::new_v4().to_string().replace('-', "");
     let id = format!("mem-{}", &raw_id[..12.min(raw_id.len())]);
     let now = now_ms();
@@ -920,6 +997,30 @@ fn empty_recall_diagnostic(db: &Database, mode: &SearchMode) -> serde_json::Valu
     })
 }
 
+/// #728: does an entity's body carry an external_refs entry matching the
+/// optional (ref_type, ref_value) recall filter? ref_type is exact-match;
+/// ref_value matches exactly or as a hierarchical prefix on a '/'
+/// boundary ("github:org" matches "github:org/repo", not "github.com/org").
+fn entity_matches_ref_filter(e: &Entity, want_type: Option<&str>, want_value: Option<&str>) -> bool {
+    let body: serde_json::Value = match serde_json::from_str(&e.body_json) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let refs = match body.get("external_refs").and_then(|r| r.as_array()) {
+        Some(arr) => arr,
+        None => return false,
+    };
+    refs.iter().any(|r| {
+        let rt = r.get("ref_type").and_then(|v| v.as_str()).unwrap_or("");
+        let rv = r.get("ref_value").and_then(|v| v.as_str()).unwrap_or("");
+        let type_ok = want_type.map_or(true, |t| rt == t);
+        let value_ok = want_value.map_or(true, |v| {
+            rv == v || (rv.len() > v.len() && rv.starts_with(v) && rv[v.len()..].starts_with('/'))
+        });
+        type_ok && value_ok
+    })
+}
+
 pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
     let a: RecallArgs =
         serde_json::from_value(args).map_err(|e| format!("Invalid recall arguments: {}", e))?;
@@ -1054,6 +1155,14 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
     // single-agent callers and data are unaffected.
     if let Some(req) = a.requesting_agent_id.as_deref().filter(|s| !s.is_empty()) {
         entities.retain(|e| db.can_read(req, &e.visibility, &e.agent_id));
+    }
+
+    // #728: external-ref post-filter (spec §2.2). Applied after visibility so
+    // hidden rows are never inspected; narrows only, never re-ranks.
+    if a.ref_type.is_some() || a.ref_value.is_some() {
+        let want_type = a.ref_type.as_deref();
+        let want_value = a.ref_value.as_deref();
+        entities.retain(|e| entity_matches_ref_filter(e, want_type, want_value));
     }
 
     // #675/#676: re-rank the over-fetched pool by actionability and truncate to
@@ -1942,6 +2051,143 @@ pub fn handle_unlink(db: &Database, args: Value) -> Result<String, String> {
         "success": true,
         "from": format!("{}/{}", a.from_category, a.from_key),
         "to": a.to_id,
+    });
+    Ok(result.to_string())
+}
+
+// ─── mimir_promote handler (#832) ───────────────────────────────────────────
+// Spec: perseus docs/shared-memory-promotion-ladder.md §4. Promotes an entity
+// across the class ladder (to_category) and/or the scope ladder
+// (to_workspace_hash), preserving provenance: the new entity carries a
+// promoted_from record and a promoted_to link back to the source. The source
+// is never edited or hidden — raw evidence stays reachable.
+
+#[derive(Debug, Deserialize)]
+pub struct PromoteArgs {
+    pub from_category: String,
+    pub from_key: String,
+    /// Target class/category. Omit to keep the source category.
+    #[serde(default)]
+    pub to_category: Option<String>,
+    /// Target scope (workspace_hash; "" = global). Omit to keep the source scope.
+    #[serde(default)]
+    pub to_workspace_hash: Option<String>,
+    /// Target key. Omit to keep the source key.
+    #[serde(default)]
+    pub to_key: Option<String>,
+    #[serde(default)]
+    pub reason: String,
+}
+
+pub fn handle_promote(db: &Database, args: Value) -> Result<String, String> {
+    let a: PromoteArgs = serde_json::from_value(args)
+        .map_err(|e| format!("Invalid promote arguments: {}", e))?;
+
+    if a.to_category.is_none() && a.to_workspace_hash.is_none() && a.to_key.is_none() {
+        return Err(
+            "Nothing to promote: pass to_category, to_workspace_hash, and/or to_key".into(),
+        );
+    }
+
+    let src = db
+        .get_entity(&a.from_category, &a.from_key)
+        .map_err(|e| format!("Source entity lookup failed: {}", e))?
+        .ok_or_else(|| {
+            format!(
+                "Source entity not found: {}/{}",
+                a.from_category, a.from_key
+            )
+        })?;
+    if src.archived {
+        return Err(format!(
+            "Source entity {}/{} is archived; promotion requires a live source",
+            a.from_category, a.from_key
+        ));
+    }
+
+    let to_category = a.to_category.clone().unwrap_or_else(|| src.category.clone());
+    let to_key = a.to_key.clone().unwrap_or_else(|| src.key.clone());
+    let to_scope = a
+        .to_workspace_hash
+        .clone()
+        .unwrap_or_else(|| src.workspace_hash.clone());
+
+    if to_category == src.category && to_key == src.key && to_scope == src.workspace_hash {
+        return Err("Target is identical to source; nothing to promote".into());
+    }
+
+    // Provenance goes into the body: a promoted_from record naming the source,
+    // the reason, and the transaction time.
+    let now = now_ms();
+    let mut body: serde_json::Value =
+        serde_json::from_str(&src.body_json).unwrap_or(serde_json::json!({}));
+    if let Some(map) = body.as_object_mut() {
+        map.insert(
+            "promoted_from".to_string(),
+            json!({
+                "category": src.category,
+                "key": src.key,
+                "id": src.id,
+                "workspace_hash": src.workspace_hash,
+                "reason": a.reason,
+                "promoted_at_unix_ms": now,
+            }),
+        );
+    }
+    let body_str = serde_json::to_string(&body).unwrap_or_else(|_| src.body_json.clone());
+
+    let raw_id = Uuid::new_v4().to_string().replace('-', "");
+    let new_entity = Entity {
+        id: format!("mem-{}", &raw_id[..12.min(raw_id.len())]),
+        category: to_category.clone(),
+        key: to_key.clone(),
+        body_json: body_str,
+        status: src.status.clone(),
+        entity_type: src.entity_type.clone(),
+        tags: src.tags.clone(),
+        decay_score: src.decay_score,
+        retrieval_count: 0,
+        layer: src.layer.clone(),
+        topic_path: src.topic_path.clone(),
+        archived: false,
+        archive_reason: String::new(),
+        links: vec![],
+        verified: src.verified,
+        source: "agent".to_string(),
+        always_on: src.always_on,
+        certainty: src.certainty,
+        workspace_hash: to_scope.clone(),
+        agent_id: src.agent_id.clone(),
+        visibility: src.visibility.clone(),
+        created_at_unix_ms: now,
+        last_accessed_unix_ms: now,
+        follow_count: 0,
+        miss_count: 0,
+        follow_rate: 0.0,
+        efficacy_status: "unverified".to_string(),
+        embedding: None,
+        _parsed_body: None,
+    };
+
+    // Promotion must create its key even when content is near-identical to
+    // the source (that is the point), so skip dedup merging.
+    let (new_id, action) = db
+        .remember_skip_dedup(&new_entity)
+        .map_err(|e| format!("Promote write failed: {}", e))?;
+
+    // Evidence trail: source gains a promoted_to link to the new entity.
+    db.link(&a.from_category, &a.from_key, &new_id, "promoted_to")
+        .map_err(|e| format!("Promote link failed: {}", e))?;
+
+    let result = json!({
+        "promoted": true,
+        "action": action,
+        "from": format!("{}/{}", a.from_category, a.from_key),
+        "from_id": src.id,
+        "to": format!("{}/{}", to_category, to_key),
+        "to_id": new_id,
+        "to_workspace_hash": to_scope,
+        "reason": a.reason,
     });
     Ok(result.to_string())
 }
@@ -7490,6 +7736,216 @@ mod tests {
         assert_eq!(items[0]["key"], "key-beta");
         assert_eq!(items[1]["key"], "key-alpha");
 
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ─── #729/#728: origin + external_refs ──────────────────────────────
+
+    #[test]
+    fn remember_merges_origin_and_external_refs_into_body() {
+        let (db, path) = temp_db();
+        let out = handle_remember(
+            &db,
+            json!({
+                "category": "facts",
+                "key": "with-provenance",
+                "body_json": "{\"content\": \"gate shipped\"}",
+                "origin": {"memory_kind": "observed", "source_system": "agent"},
+                "external_refs": [
+                    {"ref_type": "pull_request",
+                     "ref_value": "github:Perseus-Computing-LLC/plutus#176"}
+                ]
+            }),
+        )
+        .unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        let id = v["id"].as_str().unwrap().to_string();
+
+        let entity = db
+            .get_entity("facts", "with-provenance")
+            .unwrap()
+            .expect("entity");
+        let body: Value = serde_json::from_str(&entity.body_json).unwrap();
+        assert_eq!(body["origin"]["memory_kind"], json!("observed"));
+        assert_eq!(body["origin"]["source_system"], json!("agent"));
+        assert_eq!(
+            body["external_refs"][0]["ref_value"],
+            json!("github:Perseus-Computing-LLC/plutus#176")
+        );
+        assert_eq!(body["content"], json!("gate shipped"));
+
+        // Recall surfaces the fields via body expansion.
+        let out = handle_recall(&db, json!({"query": "gate"})).unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        let hit = v["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|h| h["id"] == id)
+            .expect("recall hit");
+        assert_eq!(hit["origin"]["memory_kind"], json!("observed"));
+        assert_eq!(
+            hit["external_refs"][0]["ref_type"],
+            json!("pull_request")
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn remember_rejects_invalid_origin_and_ref_vocabulary() {
+        let (db, path) = temp_db();
+        let err = handle_remember(
+            &db,
+            json!({
+                "category": "facts", "key": "bad-origin",
+                "body_json": "{\"content\": \"x\"}",
+                "origin": {"memory_kind": "hallucinated"}
+            }),
+        )
+        .unwrap_err();
+        assert!(err.contains("memory_kind"), "{err}");
+
+        let err = handle_remember(
+            &db,
+            json!({
+                "category": "facts", "key": "bad-rel",
+                "body_json": "{\"content\": \"x\"}",
+                "external_refs": [{"ref_type": "repo", "ref_value": "github:o/r",
+                                   "relationship": "cousin_of"}]
+            }),
+        )
+        .unwrap_err();
+        assert!(err.contains("relationship"), "{err}");
+
+        let err = handle_remember(
+            &db,
+            json!({
+                "category": "facts", "key": "empty-ref",
+                "body_json": "{\"content\": \"x\"}",
+                "external_refs": [{"ref_type": "", "ref_value": "github:o/r"}]
+            }),
+        )
+        .unwrap_err();
+        assert!(err.contains("non-empty"), "{err}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn recall_filters_by_ref_type_and_value() {
+        let (db, path) = temp_db();
+        handle_remember(
+            &db,
+            json!({
+                "category": "facts", "key": "about-plutus",
+                "body_json": "{\"content\": \"deployment gate\"}",
+                "skip_dedup": true,
+                "external_refs": [{"ref_type": "repo",
+                                   "ref_value": "github:Perseus-Computing-LLC/plutus"}]
+            }),
+        )
+        .unwrap();
+        handle_remember(
+            &db,
+            json!({
+                "category": "facts", "key": "about-vault",
+                "body_json": "{\"content\": \"deployment gate\"}",
+                "skip_dedup": true,
+                "external_refs": [{"ref_type": "repo",
+                                   "ref_value": "github:Perseus-Computing-LLC/perseus-vault"}]
+            }),
+        )
+        .unwrap();
+
+        let out = handle_recall(
+            &db,
+            json!({"query": "deployment", "ref_type": "repo"}),
+        )
+        .unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["items"].as_array().unwrap().len(), 2, "{v}");
+
+        let out = handle_recall(
+            &db,
+            json!({"query": "deployment",
+                   "ref_value": "github:Perseus-Computing-LLC/plutus"}),
+        )
+        .unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        let items = v["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1, "{v}");
+        assert_eq!(items[0]["key"], json!("about-plutus"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ─── #832: mimir_promote ────────────────────────────────────────────
+
+    #[test]
+    fn promote_creates_provenance_linked_copy() {
+        let (db, path) = temp_db();
+        handle_remember(
+            &db,
+            json!({"category": "episodes", "key": "incident-42",
+                   "body_json": "{\"content\": \"deploy dropped webhooks\"}",
+                   "skip_dedup": true}),
+        )
+        .unwrap();
+
+        let out = handle_promote(
+            &db,
+            json!({"from_category": "episodes", "from_key": "incident-42",
+                   "to_category": "convention",
+                   "reason": "recurred three times"}),
+        )
+        .unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["promoted"], json!(true));
+        let new_id = v["to_id"].as_str().unwrap();
+
+        let promoted = db.get_entity("convention", "incident-42").unwrap().expect("copy");
+        let body: Value = serde_json::from_str(&promoted.body_json).unwrap();
+        assert_eq!(body["promoted_from"]["category"], json!("episodes"));
+        assert_eq!(body["promoted_from"]["reason"], json!("recurred three times"));
+
+        let source = db.get_entity("episodes", "incident-42").unwrap().expect("source");
+        assert!(source
+            .links
+            .iter()
+            .any(|l| l.relationship == "promoted_to" && l.target_id == new_id));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn promote_rejects_noop_and_missing_source() {
+        let (db, path) = temp_db();
+        handle_remember(
+            &db,
+            json!({"category": "episodes", "key": "e1",
+                   "body_json": "{\"content\": \"x\"}", "skip_dedup": true}),
+        )
+        .unwrap();
+
+        let err = handle_promote(
+            &db,
+            json!({"from_category": "episodes", "from_key": "e1"}),
+        )
+        .unwrap_err();
+        assert!(err.contains("Nothing to promote"), "{err}");
+
+        let err = handle_promote(
+            &db,
+            json!({"from_category": "episodes", "from_key": "e1",
+                   "to_category": "episodes"}),
+        )
+        .unwrap_err();
+        assert!(err.contains("identical"), "{err}");
+
+        let err = handle_promote(
+            &db,
+            json!({"from_category": "episodes", "from_key": "nope",
+                   "to_category": "convention"}),
+        )
+        .unwrap_err();
+        assert!(err.contains("not found"), "{err}");
         let _ = std::fs::remove_file(&path);
     }
 }
