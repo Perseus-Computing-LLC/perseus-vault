@@ -1,0 +1,70 @@
+name: Noisegate golden fixture gate
+
+# Producer-side contract for the Perseus Vault + Noisegate integration
+# (Tosko4/noisegate#41): the committed golden fixture under
+# integrations/noisegate/ must be byte-identical to what the binary built
+# from THIS checkout produces. Catches formatter/schema drift in the
+# `prepare --json` surface at PR time instead of at downstream-consumption
+# time. The prepare path is FTS5-only (no embedding inference on the render
+# path), but the gate builds the real default binary so feature-gated drift
+# can never slip past a lean build.
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "integrations/noisegate/**"
+      - ".github/workflows/noisegate-golden.yml"
+  pull_request:
+    branches: [main, master]
+    paths:
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "integrations/noisegate/**"
+      - ".github/workflows/noisegate-golden.yml"
+
+env:
+  CARGO_TERM_COLOR: always
+  # Same model-cache scheme as test.yml / recall-gate.yml: build.rs copies the
+  # bundled embedding model from here instead of hitting HuggingFace.
+  MIMIR_BUNDLED_MODEL_DIR: ${{ github.workspace }}/.model-cache
+
+jobs:
+  golden:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache embedding model
+        uses: actions/cache@v4
+        with:
+          path: .model-cache
+          key: minilm-l6-v2-qint8-v1
+      - name: Fetch embedding model (if not cached)
+        shell: bash
+        run: |
+          mkdir -p .model-cache
+          base=https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main
+          [ -s .model-cache/model_qint8_avx512_vnni.onnx ] || curl -fL --retry 5 --retry-all-errors "$base/onnx/model_qint8_avx512_vnni.onnx" -o .model-cache/model_qint8_avx512_vnni.onnx
+          [ -s .model-cache/tokenizer.json ] || curl -fL --retry 5 --retry-all-errors "$base/tokenizer.json" -o .model-cache/tokenizer.json
+          cp .model-cache/model_qint8_avx512_vnni.onnx .model-cache/model_quantized.onnx
+      - name: Build (release, from this exact checkout)
+        run: cargo build --locked --release
+      - name: Golden fixture matches checkout-built binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$(mktemp)"
+          integrations/noisegate/regen.sh > "$out"
+          if ! cmp -s "$out" integrations/noisegate/prepare_output.golden.json; then
+            echo "::error::integrations/noisegate/prepare_output.golden.json is stale."
+            echo "::error::Regenerate with: integrations/noisegate/regen.sh > integrations/noisegate/prepare_output.golden.json"
+            diff integrations/noisegate/prepare_output.golden.json "$out" || true
+            exit 1
+          fi
+          sha256sum integrations/noisegate/prepare_output.golden.json
