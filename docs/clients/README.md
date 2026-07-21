@@ -49,6 +49,11 @@ consolidate loop to session events, plus a portable AGENTS.md fallback.
 { "mcpServers": { "perseus-vault": { "command": "perseus-vault", "args": ["serve"] } } }
 ```
 
+> **macOS extension users:** if the `.mcpb` extension shows "Could not connect
+> to MCP server" immediately on macOS, the cause is the ad-hoc signed binary
+> (#732). Use the stdio config above (unaffected) or see
+> [docs/macos-signing.md](../macos-signing.md) for details and status.
+
 ### Claude Code — `.mcp.json` (project root)
 ```json
 { "mcpServers": { "perseus-vault": { "command": "perseus-vault", "args": ["serve"] } } }

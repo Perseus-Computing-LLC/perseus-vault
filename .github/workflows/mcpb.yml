@@ -57,6 +57,24 @@ jobs:
             target/aarch64-apple-darwin/release/perseus-vault
           lipo -info dist/perseus-vault
 
+      # #732: the darwin binary inside the .mcpb is the exact file Claude
+      # Desktop's extension host launches — ad-hoc signed builds are rejected
+      # there. Developer ID sign + notarize when the Apple secrets are
+      # configured (repo variable APPLE_SIGNING_ENABLED=true; setup guide in
+      # docs/macos-signing.md). Skipped silently otherwise so unsigned CI stays
+      # green until the certs land.
+      - name: Sign + notarize macOS universal binary (when configured)
+        if: matrix.name == 'darwin' && vars.APPLE_SIGNING_ENABLED == 'true'
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_NOTARY_KEY: ${{ secrets.APPLE_NOTARY_KEY }}
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER: ${{ secrets.APPLE_NOTARY_ISSUER }}
+        run: bash scripts/sign-macos.sh dist/perseus-vault
+
       # Windows: MSVC lite build. --no-default-features drops ort/tokenizers, so
       # the esaxx /MT-vs-/MD link clash does not apply and crt-static yields a
       # binary that runs without the VC++ redistributable installed.
