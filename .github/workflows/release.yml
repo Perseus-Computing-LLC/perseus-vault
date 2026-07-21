@@ -120,7 +120,44 @@ jobs:
       - name: Install Linux build deps
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
-      - name: Upload full binary
+      # ── macOS: manual build + Developer ID signing (#732) ──────────────────
+      # taiki-e's fused build+upload gives no hook to codesign the binary
+      # before it lands on the release, and ad-hoc-signed binaries are rejected
+      # by Claude Desktop's extension host on macOS. So macOS legs build with
+      # plain cargo, sign/notarize when the Apple secrets are configured
+      # (repo variable APPLE_SIGNING_ENABLED=true; see docs/macos-signing.md),
+      # and upload the tarball with gh.
+      - name: Build full binary (macOS)
+        if: runner.os == 'macOS'
+        run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Sign + notarize (macOS, when signing is configured)
+        if: runner.os == 'macOS' && vars.APPLE_SIGNING_ENABLED == 'true'
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_NOTARY_KEY: ${{ secrets.APPLE_NOTARY_KEY }}
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER: ${{ secrets.APPLE_NOTARY_ISSUER }}
+        run: bash scripts/sign-macos.sh target/${{ matrix.target }}/release/perseus-vault
+      - name: Note unsigned build (macOS, signing not configured)
+        if: runner.os == 'macOS' && vars.APPLE_SIGNING_ENABLED != 'true'
+        run: |
+          echo "::warning::APPLE_SIGNING_ENABLED is not set — shipping an ad-hoc signed macOS binary (see #732 / docs/macos-signing.md)"
+      - name: Package + upload (macOS, tag pushes)
+        if: runner.os == 'macOS' && startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd "target/${{ matrix.target }}/release"
+          asset="perseus-vault-${{ matrix.target }}.tar.gz"
+          tar -czf "$asset" perseus-vault
+          shasum -a 256 "$asset" > "$asset.sha256"
+          gh release upload "$GITHUB_REF_NAME" "$asset" "$asset.sha256" \
+            --repo "$GITHUB_REPOSITORY" --clobber
+      - name: Upload full binary (Linux/Windows)
+        if: runner.os != 'macOS'
         uses: taiki-e/upload-rust-binary-action@v1
         with:
           bin: perseus-vault
