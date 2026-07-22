@@ -66,7 +66,7 @@ pub fn is_orphaned_by_ppid() -> bool {
         // directly under PID 1 has baseline == 1 and is never treated as orphaned.
         current == 1 && baseline != 1
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(unix))]
     {
         false
     }
