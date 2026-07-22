@@ -42,17 +42,6 @@ async-stream = "0.3"
 futures = "0.3"
 libc = "0.2"
 
-[target.'cfg(windows)'.dependencies]
-# Windows parent-death detection (#751): Toolhelp snapshot for parent-PID
-# discovery + OpenProcess/GetProcessTimes liveness polling. Version pinned to
-# the 0.52 already in the transitive tree (via mio/notify) to avoid a third
-# windows-sys copy.
-windows-sys = { version = "0.52", features = [
-    "Win32_Foundation",
-    "Win32_System_Threading",
-    "Win32_System_Diagnostics_ToolHelp",
-] }
-
 # Optional: bundled embedding model (all-MiniLM-L6-v2 via ONNX Runtime)
 ort = { version = "2.0.0-rc.12", optional = true, features = ["download-binaries"] }
 # default-features=false drops tokenizers' `esaxx_fast` feature, which pulls in
@@ -80,6 +69,22 @@ tokio-stream = { version = "0.1", optional = true }
 # with `--features multimodal`. All extraction is local (no cloud, no network).
 zip = { version = "2", optional = true, default-features = false, features = ["deflate"] }
 pdf-extract = { version = "0.12", optional = true }
+
+# Target-specific deps must live AFTER every general [dependencies] entry —
+# a [target.*] table header captures everything below it into that target's
+# section. (First #751 commit put this block mid-list and silently demoted
+# ort/tokenizers/ndarray/tonic/etc. to Windows-only, breaking 9 CI lanes on
+# every non-Windows platform.)
+[target.'cfg(windows)'.dependencies]
+# Windows parent-death detection (#751): Toolhelp snapshot for parent-PID
+# discovery + OpenProcess/GetProcessTimes liveness polling. Version pinned to
+# the 0.52 already in the transitive tree (via mio/notify) to avoid a third
+# windows-sys copy.
+windows-sys = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_System_Diagnostics_ToolHelp",
+] }
 
 [features]
 # bundled-embeddings is ON by default (#237): zero-config, zero-network dense /
