@@ -117,6 +117,33 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
   globs (`"*"` matches nothing). Documented in the `recall` tool schema, README
   tool table, and docs/retrieval-modes.md, and pinned by tests.
 
+### Fixed
+- **stdio server no longer dies on quiet-but-alive hosts** (#748). The
+  orphan-leak guard (#57228) used a flat 600s idle timer as its abandonment
+  signal. On Linux that was a redundant backstop (PR_SET_PDEATHSIG + ppid
+  reparent detection already catch real orphans), but on macOS/Windows it was
+  the ONLY orphan check — so a healthy Claude Desktop session that simply went
+  >10 minutes between tool calls had its server executed, and Claude Desktop
+  never respawns a dead stdio server: the memory backend silently vanished
+  until a full app restart. The guard now detects *parent death* instead of
+  *inactivity*:
+  - `is_orphaned_by_ppid()` / `record_initial_ppid()` widened from Linux-only
+    to all Unix (`getppid()` has identical reparent-to-PID-1 semantics on
+    macOS — orphans are adopted by launchd).
+  - New background **parent-death watcher thread** polls the reparent check
+    every 5s and exits promptly when orphaned — the existing ppid poll only
+    ran per-request, so an idle orphan never noticed. On Linux this backs up
+    PR_SET_PDEATHSIG; on macOS it is the primary abandonment signal.
+  - `MIMIR_IDLE_TIMEOUT_SECS` is now **opt-in (default: off)** instead of
+    defaulting to 600s. It remains for the one topology parent-death detection
+    cannot see — a host that leaks the child's stdin write-end while staying
+    alive (the original #57228 Hermes-worker reconnect leak); such hosts
+    should set it when spawning the server. Unparseable values are ignored
+    with a warning instead of silently enabling the timer.
+  - Windows is unchanged in mechanism (stdin EOF on host death) but shares
+    the new default: no flat idle kill. OpenProcess-based parent liveness for
+    Windows is tracked as a follow-up.
+
 ## [2.20.0] - 2026-07-10
 
 ### Added

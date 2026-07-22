@@ -12,30 +12,40 @@ the Anthropic MCP Connector API, or any HTTP MCP client — it also ships a full
 | `--transport sse` | `GET /sse` + `POST /message` | Claude Desktop, MCP Connector API |
 | `--transport http` | `POST /message` only | Stateless Streamable HTTP |
 
-## stdio process lifecycle & the idle-watchdog
+## stdio process lifecycle & orphan detection
 
 Each MCP client spawns **one** `perseus-vault` stdio process per connection and
 runs all its tool calls over that persistent pipe — it does **not** spawn a
 process per tool call. A well-behaved client closes stdin when the session ends,
 the server sees EOF, and it exits, freeing its DB handle.
 
-Some long-lived clients (e.g. a Hermes worker that reconnects) can leak the
-write-end of the pipe without closing it, so the server would never see EOF and
-would block forever — accumulating one orphan per reconnect. The **idle-watchdog**
-(shipped in v2.16.0+) guards this: after `MIMIR_IDLE_TIMEOUT_SECS` of zero
-traffic the server exits on its own.
+**The server exits when its host dies — never merely because the host went
+quiet.** Abandonment is detected by parent death, not inactivity (#748):
 
-- **Default: 600s (10 min).** An active client issues a `tools/call` (or at
-  least a `ping`) well within that window, so it is never affected; an orphan
-  self-terminates and frees its handle.
-- Override with `MIMIR_IDLE_TIMEOUT_SECS=<seconds>`; set `0` to disable.
+- **Linux:** the kernel delivers SIGTERM the instant the parent dies
+  (`PR_SET_PDEATHSIG`), backed by a reparent-to-init poll.
+- **macOS / other Unix:** a background watcher polls `getppid()` every 5s and
+  exits promptly when the process is reparented to PID 1 (launchd) — i.e. the
+  spawning host is gone. This works with zero traffic, so an orphaned server
+  blocked in `recv()` still notices.
+- A quiet-but-alive host (e.g. Claude Desktop, which can go many minutes
+  between tool calls and does **not** respawn a server that exits) is left
+  running indefinitely. Idleness is not abandonment.
+
+`MIMIR_IDLE_TIMEOUT_SECS=<seconds>` remains as an **opt-in** flat idle watchdog
+(default: **off** since v2.21.0; previously 600s) for the one topology
+parent-death detection cannot see: a host that leaks the child's stdin
+write-end while *staying alive* (the Hermes-worker reconnect leak,
+NousResearch/hermes-agent#57228). Hosts with that lifecycle should set the env
+var when spawning the server. Unparseable values are ignored with a warning.
 
 > ⚠️ **Do not run an external process-count reaper** (e.g. a cron that kills the
 > oldest `perseus-vault` processes when more than N exist). These subprocesses
 > are the normal stdio transport for **live** tool calls, so a count-based reap
 > races with active operations and kills them mid-call — clients then see
 > `Unknown tool` errors and silent dispatch failures ([#450]). The built-in
-> idle-watchdog already reclaims true orphans. If you must add external cleanup,
+> parent-death watcher already reclaims true orphans. If you must add external
+> cleanup,
 > key it on **age + orphaned parent** (PPID reparented to init), never on raw
 > process count.
 
