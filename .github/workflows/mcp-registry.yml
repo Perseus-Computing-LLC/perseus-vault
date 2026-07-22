@@ -13,9 +13,17 @@ name: Publish to MCP Registry
 #      (tag push) and this workflow (release published) race each other, and
 #      the registry validates that the OCI image exists.
 
+# NOTE on triggers (#755): this workflow intentionally does NOT use
+# `release: [published]`. release.yml creates the GitHub Release as
+# github-actions[bot], and events caused by GITHUB_TOKEN never trigger
+# downstream workflows — that trigger silently never fired (registry skipped
+# v2.18–v2.20). Instead, run after the "Release binaries" workflow completes,
+# gated below to successful tag-push builds only (release.yml also runs on
+# PRs and manual dispatch, neither of which should publish).
 on:
-  release:
-    types: [published]
+  workflow_run:
+    workflows: ["Release binaries"]
+    types: [completed]
   workflow_dispatch:
 
 permissions:
@@ -24,6 +32,11 @@ permissions:
 
 jobs:
   publish:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       startsWith(github.event.workflow_run.head_branch, 'v'))
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
