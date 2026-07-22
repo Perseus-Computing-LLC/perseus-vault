@@ -22,6 +22,13 @@ use crate::beliefs;
 /// orphan guard and crash-looped.
 static INITIAL_PPID: OnceLock<i32> = OnceLock::new();
 
+/// Windows only: the parent process's creation timestamp, captured alongside
+/// INITIAL_PPID. OpenProcess-liveness alone is vulnerable to PID reuse — a
+/// dead parent's PID can be recycled by an unrelated process, which would look
+/// "alive". Comparing creation times makes the liveness check exact.
+#[cfg(windows)]
+static INITIAL_PPID_CREATE_TIME: OnceLock<u64> = OnceLock::new();
+
 /// Record the current parent PID as the baseline. Call once, as early as
 /// possible in `run_server`, before entering the request loop. Idempotent:
 /// only the first call sets the baseline.
@@ -33,9 +40,83 @@ pub fn record_initial_ppid() {
     {
         let _ = INITIAL_PPID.set(unsafe { libc::getppid() });
     }
-    #[cfg(not(unix))]
+    // Windows has no getppid(): recover the parent PID from a Toolhelp
+    // snapshot and stamp its creation time for the PID-reuse-safe liveness
+    // check (#751).
+    #[cfg(windows)]
+    {
+        let ppid = windows_parent_pid().unwrap_or(0);
+        let _ = INITIAL_PPID.set(ppid);
+        if ppid > 0 {
+            if let Some(t) = windows_process_creation_time(ppid) {
+                let _ = INITIAL_PPID_CREATE_TIME.set(t);
+            }
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = INITIAL_PPID.set(0);
+    }
+}
+
+/// Current parent PID via a Toolhelp process snapshot (Windows has no
+/// getppid). Returns None if the snapshot fails — callers treat that as
+/// "unknown" and never false-fire the orphan guard.
+#[cfg(windows)]
+fn windows_parent_pid() -> Option<i32> {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32First, Process32Next, PROCESSENTRY32,
+        TH32CS_SNAPPROCESS,
+    };
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snap == INVALID_HANDLE_VALUE {
+            return None;
+        }
+        let mut entry: PROCESSENTRY32 = std::mem::zeroed();
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32>() as u32;
+        let self_pid = std::process::id();
+        let mut found = None;
+        if Process32First(snap, &mut entry) != 0 {
+            loop {
+                if entry.th32ProcessID == self_pid {
+                    found = Some(entry.th32ParentProcessID as i32);
+                    break;
+                }
+                if Process32Next(snap, &mut entry) == 0 {
+                    break;
+                }
+            }
+        }
+        CloseHandle(snap);
+        found
+    }
+}
+
+/// Creation time of `pid` as a u64 FILETIME, or None if the process cannot be
+/// opened (i.e. it is dead or inaccessible). Doubles as the liveness probe.
+#[cfg(windows)]
+fn windows_process_creation_time(pid: i32) -> Option<u64> {
+    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
+    use windows_sys::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid as u32);
+        if h == 0 {
+            return None;
+        }
+        let mut ct: FILETIME = std::mem::zeroed();
+        let mut et: FILETIME = std::mem::zeroed();
+        let mut kt: FILETIME = std::mem::zeroed();
+        let mut ut: FILETIME = std::mem::zeroed();
+        let ok = GetProcessTimes(h, &mut ct, &mut et, &mut kt, &mut ut);
+        CloseHandle(h);
+        if ok == 0 {
+            return None;
+        }
+        Some(((ct.dwHighDateTime as u64) << 32) | ct.dwLowDateTime as u64)
     }
 }
 
@@ -46,6 +127,11 @@ pub fn record_initial_ppid() {
 /// at start AND the live ppid is now 1 (reparented to init). A process that was
 /// *born* with ppid == 1 (its launcher is the container's PID-1 init) is NOT an
 /// orphan — its baseline is 1 and stays 1, so this correctly returns `false`.
+///
+/// On Windows (#751) there is no reparenting: the check instead probes the
+/// recorded parent PID with `OpenProcess` and compares creation timestamps, so
+/// a dead parent — or a PID recycled by an unrelated process — is detected.
+/// Unknown parent (snapshot failed at startup) conservatively returns `false`.
 ///
 /// Exposed as `pub` so the orphan case can be unit-tested without needing to
 /// actually kill a parent process.
@@ -66,7 +152,29 @@ pub fn is_orphaned_by_ppid() -> bool {
         // directly under PID 1 has baseline == 1 and is never treated as orphaned.
         current == 1 && baseline != 1
     }
-    #[cfg(not(unix))]
+    // Windows (#751): no reparenting concept — instead probe the recorded
+    // parent PID with OpenProcess and compare creation times (PID-reuse safe).
+    #[cfg(windows)]
+    {
+        let baseline = *INITIAL_PPID.get_or_init(|| 0);
+        if baseline <= 0 {
+            // Parent unknown (snapshot failed at start): never false-fire.
+            return false;
+        }
+        match windows_process_creation_time(baseline) {
+            // OpenProcess/GetProcessTimes failed -> parent is gone.
+            None => true,
+            // Handle opened: alive only if it is the SAME process (creation
+            // time matches the startup stamp). A recycled PID means the
+            // original parent died.
+            Some(t) => match INITIAL_PPID_CREATE_TIME.get() {
+                Some(recorded) => t != *recorded,
+                // No stamp recorded: liveness alone is the best signal we have.
+                None => false,
+            },
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         false
     }
@@ -228,18 +336,19 @@ pub fn run_server(db: std::sync::Arc<Database>) {
         }
     }
 
-    // --- Parent-death watcher thread (all Unix; primary orphan signal, #748) ---
+    // --- Parent-death watcher thread (Unix + Windows; primary orphan signal) ---
     //
     // The per-request ppid poll in the loop below can only run WHEN TRAFFIC
     // ARRIVES — an orphaned server sitting idle in recv() would never notice
-    // its parent died. This thread polls the same reparent check on a 5s timer
+    // its parent died. This thread polls the same orphan check on a 5s timer
     // and exits promptly, so abandonment detection works with zero traffic.
     // On Linux it backs up PR_SET_PDEATHSIG (which seccomp/kernels can filter);
-    // on macOS it is the ONLY parent-death signal and is what lets the idle
-    // watchdog default to OFF: the server now dies iff its host actually died,
-    // never merely because the host went quiet (Claude Desktop neither pings
-    // nor respawns, so idleness-kills were unrecoverable for it).
-    #[cfg(unix)]
+    // on macOS it is the ONLY parent-death signal (reparent-to-launchd poll,
+    // #748); on Windows it polls OpenProcess + creation-time on the recorded
+    // parent PID (#751). It is what lets the idle watchdog default to OFF: the
+    // server dies iff its host actually died, never merely because the host
+    // went quiet (Claude Desktop neither pings nor respawns).
+    #[cfg(any(unix, windows))]
     {
         std::thread::spawn(|| loop {
             std::thread::sleep(std::time::Duration::from_secs(5));
