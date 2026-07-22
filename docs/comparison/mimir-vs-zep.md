@@ -37,6 +37,39 @@ Full artifact: [`benchmark/lambda/results/competitors.json`](../../benchmark/lam
 | **License** | MIT | Apache 2.0 |
 | **API** | MCP JSON-RPC (stdio/SSE/HTTP) | REST API |
 
+## Measured: LOCOMO head-to-head (mem0's harness)
+
+LOCOMO long-term conversational-memory benchmark, run on mem0's own harness
+([our fork](https://github.com/Perseus-Computing-LLC/memory-benchmarks) of
+`mem0ai/memory-benchmarks`). Categories 1–4, 1,540 questions, top-200
+retrieval, gpt-5 answerer + judge (OpenAI), 2026-07-22:
+
+| System | Overall | Single | Temporal | Multi | Open-domain |
+|---|---|---|---|---|---|
+| **Perseus Vault 2.20.2** (`e1e7d51`) | **87.9%** | 89.1 | 92.2 | 85.1 | 70.8 |
+| Mem0 Platform Starter (measured) | 82.2% | 85.0 | 82.9 | 78.0 | 67.7 |
+| **Zep Cloud Flex (measured)** | **33.8%** | 36.9 | **6.9** | 50.0 | 49.0 |
+
+Category 5 (adversarial, 446 questions, top-200): **Perseus Vault 63.5%**,
+Mem0 55.6%, Zep 49.8%.
+
+Zep-specific findings:
+
+- **Temporal collapse is reproducible.** Zep scores 10.6% on the temporal
+  category without timestamps and **6.9% *with*** `created_at` timestamps —
+  handing Zep the timestamp makes its temporal retrieval *worse*. Perseus
+  Vault scores 92.2% on the same questions.
+- **`graph.search` caps at 50 results.** Zep Cloud's graph search returns at
+  most 50 results regardless of the requested limit, truncating recall on
+  long conversations.
+- **Time-to-searchable:** Perseus Vault is instant (fully local single
+  binary); Zep Cloud took ~222s per session in our runs.
+
+Zep Cloud Flex is Zep's current hosted offering — this measures the
+frontier-model configuration, not the local-extraction path measured above.
+Full per-question results and configs:
+**[memory-benchmarks / LEADERBOARD.md](https://github.com/Perseus-Computing-LLC/memory-benchmarks)**
+
 ## Architecture
 
 ### Perseus Vault: One Binary
