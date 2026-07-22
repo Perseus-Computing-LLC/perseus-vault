@@ -142,7 +142,11 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
     with a warning instead of silently enabling the timer.
   - Windows is unchanged in mechanism (stdin EOF on host death) but shares
     the new default: no flat idle kill. OpenProcess-based parent liveness for
-    Windows is tracked as a follow-up.
+    Windows is tracked in #751 and landed right after: the watcher thread now
+    also runs on Windows, probing the startup-recorded parent PID via
+    `OpenProcess` + `GetProcessTimes` (creation-time compared, so PID reuse
+    cannot mask a dead parent; a failed Toolhelp snapshot conservatively
+    never fires). Adds a Windows-only `windows-sys` 0.52 dependency.
 
 ## [2.20.0] - 2026-07-10
 

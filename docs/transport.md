@@ -28,6 +28,9 @@ quiet.** Abandonment is detected by parent death, not inactivity (#748):
   exits promptly when the process is reparented to PID 1 (launchd) — i.e. the
   spawning host is gone. This works with zero traffic, so an orphaned server
   blocked in `recv()` still notices.
+- **Windows:** the same watcher polls `OpenProcess` on the parent PID recorded
+  at startup (via Toolhelp snapshot), comparing creation timestamps so a
+  recycled PID can't masquerade as a live parent (#751).
 - A quiet-but-alive host (e.g. Claude Desktop, which can go many minutes
   between tool calls and does **not** respawn a server that exits) is left
   running indefinitely. Idleness is not abandonment.
