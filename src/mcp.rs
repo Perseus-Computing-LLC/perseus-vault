@@ -26,11 +26,14 @@ static INITIAL_PPID: OnceLock<i32> = OnceLock::new();
 /// possible in `run_server`, before entering the request loop. Idempotent:
 /// only the first call sets the baseline.
 pub fn record_initial_ppid() {
-    #[cfg(target_os = "linux")]
+    // getppid() has identical reparent-to-PID-1 semantics on every Unix
+    // (Linux: init; macOS: launchd), so the baseline/orphan check is not
+    // Linux-specific — widened from cfg(linux) to cfg(unix) for #748.
+    #[cfg(unix)]
     {
         let _ = INITIAL_PPID.set(unsafe { libc::getppid() });
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(unix))]
     {
         let _ = INITIAL_PPID.set(0);
     }
@@ -48,7 +51,11 @@ pub fn record_initial_ppid() {
 /// actually kill a parent process.
 pub fn is_orphaned_by_ppid() -> bool {
     // Safety: getppid() is always safe — no undefined behaviour, no allocation.
-    #[cfg(target_os = "linux")]
+    // All Unix platforms (Linux AND macOS) reparent orphans to PID 1, so this
+    // check is the primary parent-death signal on macOS too (#748) — without
+    // it, macOS/Windows had no orphan signal at all and the flat idle timer
+    // was the only guard, killing healthy-but-quiet hosts.
+    #[cfg(unix)]
     {
         let current = unsafe { libc::getppid() };
         // Baseline should have been recorded at startup; if it wasn't (defensive),
@@ -59,7 +66,7 @@ pub fn is_orphaned_by_ppid() -> bool {
         // directly under PID 1 has baseline == 1 and is never treated as orphaned.
         current == 1 && baseline != 1
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(unix))]
     {
         false
     }
@@ -116,19 +123,33 @@ impl MCPState {
 
 /// Parse the `MIMIR_IDLE_TIMEOUT_SECS` env value into an idle-watchdog duration.
 ///
-/// - unset / unparseable  -> default 600s (Some)
-/// - "0"                  -> disabled (None)
-/// - "N"                  -> Some(N seconds)
+/// - unset / "0" / unparseable  -> disabled (None). DEFAULT IS OFF since #748:
+///   inactivity is NOT proof of abandonment — a quiet-but-alive host (Claude
+///   Desktop routinely goes many minutes between tool calls and never respawns
+///   a dead server) must never be reaped. Parent death is detected
+///   deterministically by the orphan watcher (PDEATHSIG on Linux, ppid poll
+///   everywhere else), so the flat timer is no longer the orphan guard.
+/// - "N" (N > 0)                -> Some(N seconds): OPT-IN aggressive reaping,
+///   for the one topology parent-death detection cannot see: a host that leaks
+///   the child's stdin write-end while STAYING ALIVE (the original #57228
+///   Hermes-worker reconnect leak). Hosts with that lifecycle should set this
+///   when spawning the server.
 ///
-/// Factored out of `run_server` so the orphan-leak guard (#57228) is unit-tested.
+/// Factored out of `run_server` so the watchdog policy is unit-tested.
 pub fn parse_idle_timeout(raw: Option<&str>) -> Option<std::time::Duration> {
     match raw {
         Some(v) => match v.trim().parse::<u64>() {
             Ok(0) => None,
             Ok(secs) => Some(std::time::Duration::from_secs(secs)),
-            Err(_) => Some(std::time::Duration::from_secs(600)),
+            Err(_) => {
+                eprintln!(
+                    "mimir: ignoring unparseable MIMIR_IDLE_TIMEOUT_SECS value {:?} — idle watchdog disabled",
+                    v
+                );
+                None
+            }
         },
-        None => Some(std::time::Duration::from_secs(600)),
+        None => None,
     }
 }
 
@@ -147,16 +168,19 @@ pub fn run_server(db: std::sync::Arc<Database>) {
     let mut stdout = std::io::stdout();
     let state = MCPState::new();
 
-    // Idle watchdog (fixes NousResearch/hermes-agent#57228 from the server side).
+    // Idle watchdog — OPT-IN since #748 (MIMIR_IDLE_TIMEOUT_SECS, default off).
     //
-    // A stdio MCP server that receives ZERO traffic for `idle_timeout` is, by
-    // definition, an abandoned/orphaned child: its client (a long-lived Hermes
-    // worker) reconnected and leaked the write-end of this pipe, so we will never
-    // see EOF and would otherwise block in the read forever — accumulating one
-    // orphan per reconnect until SQLite handle contention makes the vault appear
-    // "down". An ACTIVE client always issues a tools/call (or at least a ping)
-    // well within the window, so it is never affected; an orphan self-terminates
-    // and frees its DB handle. Override with MIMIR_IDLE_TIMEOUT_SECS (0 disables).
+    // The original #57228 guard treated 600s of silence as proof of orphanhood.
+    // That proxy is wrong on every platform without a real parent-death signal
+    // (macOS/Windows had none): Claude Desktop goes quiet for long stretches in
+    // normal use and — critically — never respawns a server that exits, so the
+    // timer was silently killing healthy sessions and forcing a full app
+    // restart. True orphans are now caught deterministically by parent-death
+    // detection (PR_SET_PDEATHSIG on Linux; the ppid watcher thread below on
+    // all Unix), so the flat timer remains only as an opt-in for hosts that
+    // leak a child's stdin write-end while STAYING ALIVE (the actual #57228
+    // Hermes-worker topology) — those hosts set MIMIR_IDLE_TIMEOUT_SECS when
+    // spawning. EOF on stdin (well-behaved host shutdown) exits regardless.
     let idle_timeout: Option<std::time::Duration> =
         parse_idle_timeout(std::env::var("MIMIR_IDLE_TIMEOUT_SECS").ok().as_deref());
 
@@ -202,6 +226,33 @@ pub fn run_server(db: std::sync::Arc<Database>) {
             eprintln!("mimir: parent already dead at server start — exiting (orphan-reap race guard, #547)");
             return;
         }
+    }
+
+    // --- Parent-death watcher thread (all Unix; primary orphan signal, #748) ---
+    //
+    // The per-request ppid poll in the loop below can only run WHEN TRAFFIC
+    // ARRIVES — an orphaned server sitting idle in recv() would never notice
+    // its parent died. This thread polls the same reparent check on a 5s timer
+    // and exits promptly, so abandonment detection works with zero traffic.
+    // On Linux it backs up PR_SET_PDEATHSIG (which seccomp/kernels can filter);
+    // on macOS it is the ONLY parent-death signal and is what lets the idle
+    // watchdog default to OFF: the server now dies iff its host actually died,
+    // never merely because the host went quiet (Claude Desktop neither pings
+    // nor respawns, so idleness-kills were unrecoverable for it).
+    #[cfg(unix)]
+    {
+        std::thread::spawn(|| loop {
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            if is_orphaned_by_ppid() {
+                eprintln!(
+                    "mimir: parent process died — exiting orphaned stdio server (orphan watcher, #547/#748)"
+                );
+                // process::exit from the watcher: the main loop is blocked in
+                // recv() and cannot be woken without traffic. SQLite is in WAL
+                // mode, so skipping destructor-driven pool shutdown is safe.
+                std::process::exit(0);
+            }
+        });
     }
 
     loop {
@@ -5430,24 +5481,25 @@ mod tests {
     }
 
     #[test]
-    fn idle_timeout_parsing_covers_orphan_guard_cases() {
+    fn idle_timeout_is_opt_in_since_748() {
         use std::time::Duration;
-        // Unset -> 10-minute default (guard ON).
-        assert_eq!(parse_idle_timeout(None), Some(Duration::from_secs(600)));
-        // Explicit "0" -> disabled (guard OFF, for interactive/debug use).
+        // Unset -> DISABLED (default off): inactivity is not abandonment; a
+        // quiet-but-alive host (Claude Desktop) must never be reaped. Orphans
+        // are caught by parent-death detection, not a flat timer.
+        assert_eq!(parse_idle_timeout(None), None);
+        // Explicit "0" -> disabled (same as unset).
         assert_eq!(parse_idle_timeout(Some("0")), None);
-        // Explicit value -> honored.
+        // Explicit value -> honored (opt-in aggressive reaping for hosts that
+        // leak the stdin write-end while staying alive, the #57228 topology).
         assert_eq!(parse_idle_timeout(Some("30")), Some(Duration::from_secs(30)));
         // Whitespace tolerated.
         assert_eq!(
             parse_idle_timeout(Some(" 120 ")),
             Some(Duration::from_secs(120))
         );
-        // Garbage -> safe default, never panics.
-        assert_eq!(
-            parse_idle_timeout(Some("banana")),
-            Some(Duration::from_secs(600))
-        );
+        // Garbage -> disabled (never silently re-enables the flat timer),
+        // never panics.
+        assert_eq!(parse_idle_timeout(Some("banana")), None);
     }
 
     #[test]
