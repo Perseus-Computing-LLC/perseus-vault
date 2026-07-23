@@ -1353,6 +1353,39 @@ mod tests {
     }
 
     #[test]
+    fn changed_community_rehydrates_prior_summary_as_successor_evidence() {
+        let (db, path) = temp_db();
+        plant_cluster(&db, "rehydrate", &["r1", "r2", "r3", "r4"], "provider budget incident");
+        let first_run = db.detect_communities("", "label_prop", 2).unwrap();
+        let old_id = first_run.communities[0].id.clone();
+        let old_summary = db.community_summary(&old_id, false, false).unwrap();
+
+        // New related experience changes the evidence neighborhood. A fresh
+        // summary should preserve an auditable bridge to the prior distilled
+        // context rather than merely replacing it.
+        remember(&db, "rehydrate", "r5", "provider budget incident new evidence");
+        link(&db, "rehydrate", "r4", "rehydrate", "r5");
+        link(&db, "rehydrate", "r5", "rehydrate", "r1");
+        let second_run = db.detect_communities("", "label_prop", 2).unwrap();
+        let new_id = second_run.communities[0].id.clone();
+        let new_summary = db.community_summary(&new_id, false, false).unwrap();
+        let entity = db
+            .get_entity("community_summary", &new_id)
+            .unwrap()
+            .expect("new summary entity");
+
+        assert_ne!(new_id, old_id);
+        assert!(
+            entity.links.iter().any(|link| {
+                link.relationship == "rehydrates" && link.target_id == old_summary.summary_entity_id
+            }),
+            "the new summary must retain an explicit rehydration link to the prior summary"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn detection_excludes_summary_entities_from_the_graph() {
         let (db, path) = temp_db();
         plant_cluster(&db, "p", &["p1", "p2", "p3", "p4"], "first island");
