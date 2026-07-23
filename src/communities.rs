@@ -800,9 +800,47 @@ impl Database {
         }
 
         // Materialize the summary entity with evidence_for links to members.
+        // If detection replaced a community after new members arrived, retain a
+        // directed audit edge to the archived summary whose *source evidence*
+        // overlaps this new member set. This is intentionally not a generic
+        // "latest archived summary" lookup: unrelated communities must never
+        // be cross-linked merely because they were refreshed nearby in time.
+        let prior_summary_id = {
+            let conn = self.conn()?;
+            let mut stmt = conn.prepare(
+                "SELECT id, links FROM entities \
+                 WHERE archived = 1 AND category = 'community_summary' \
+                   AND workspace_hash = ?1",
+            )?;
+            let candidates = stmt.query_map(params![workspace_hash], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?;
+            let current_members: std::collections::HashSet<&str> =
+                member_ids.iter().map(String::as_str).collect();
+            let mut best: Option<(usize, String)> = None;
+            for candidate in candidates {
+                let (candidate_id, links_json) = candidate?;
+                let overlap = serde_json::from_str::<Vec<MemoryLink>>(&links_json)
+                    .unwrap_or_default()
+                    .iter()
+                    .filter(|link| {
+                        link.relationship == "evidence_for"
+                            && current_members.contains(link.target_id.as_str())
+                    })
+                    .count();
+                // One shared member is too weak: it could be a coincidental
+                // graph bridge. Two preserve the old lesson's evidence basis.
+                if overlap >= 2
+                    && best.as_ref().map_or(true, |(score, _)| overlap > *score)
+                {
+                    best = Some((overlap, candidate_id));
+                }
+            }
+            best.map(|(_, candidate_id)| candidate_id)
+        };
         let raw_id = uuid::Uuid::new_v4().to_string().replace('-', "");
         let now = now_ms();
-        let links: Vec<MemoryLink> = member_ids
+        let mut links: Vec<MemoryLink> = member_ids
             .iter()
             .take(MAX_EVIDENCE_LINKS)
             .map(|mid| MemoryLink {
@@ -811,6 +849,13 @@ impl Database {
                 weight: 0.5,
             })
             .collect();
+        if let Some(old_summary_id) = prior_summary_id {
+            links.push(MemoryLink {
+                target_id: old_summary_id,
+                relationship: "rehydrates".to_string(),
+                weight: 1.0,
+            });
+        }
         let entity = Entity {
             id: format!("mem-{}", &raw_id[..12.min(raw_id.len())]),
             category: "community_summary".to_string(),
