@@ -1,10 +1,10 @@
-# Mimir Integration Examples
+# Perseus Vault Integration Examples
 
 ## Quickstart
 `quickstart.py` — 60-second demo: remember, recall, forget, vault export.
 
 ## CrewAI Integration
-`crewai_integration.py` — Use Mimir as persistent memory for CrewAI crews.
+`crewai_integration.py` — Use Perseus Vault as persistent memory for CrewAI crews.
 Stores conversation history and user preferences, recalls context across crew kickoffs.
 
 ## Google ADK Integration
