@@ -1,5 +1,5 @@
 name: Bug Report
-description: File a bug report to help us improve Mimir
+description: File a bug report to help us improve Perseus Vault
 title: "[Bug]: "
 labels: ["bug"]
 body:
@@ -11,7 +11,7 @@ body:
     attributes:
       label: Description
       description: A clear and concise description of what the bug is.
-      placeholder: E.g., mimir_recall returns empty results when...
+      placeholder: E.g., perseus_vault_recall returns empty results when...
     validations:
       required: true
   - type: textarea
@@ -20,7 +20,7 @@ body:
       label: Steps to Reproduce
       description: Step-by-step instructions to reproduce.
       placeholder: |
-        1. Start mimir with `mimir --db /tmp/test.db`
+        1. Start Perseus Vault with `perseus-vault --db /tmp/test.db`
         2. Store a memory via MCP
         3. Try to recall with query "..."
         4. See error / unexpected behavior
@@ -36,8 +36,8 @@ body:
   - type: input
     id: version
     attributes:
-      label: Mimir Version
-      description: Output of `mimir --version`
+      label: Perseus Vault Version
+      description: Output of `perseus-vault --version`
     validations:
       required: true
   - type: input

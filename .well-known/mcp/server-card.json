@@ -562,7 +562,7 @@
     },
     {
       "name": "mimir_health",
-      "description": "Check whether the Mimir server and its SQLite database are healthy. Returns a simple healthy/unhealthy status. Use this for health checks and monitoring, not for detailed stats (use mimir_stats).",
+      "description": "Check whether the Perseus Vault server and its SQLite database are healthy. Returns a simple healthy/unhealthy status. Use this for health checks and monitoring, not for detailed stats (use mimir_stats).",
       "inputSchema": {
         "type": "object",
         "properties": {}
