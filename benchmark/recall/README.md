@@ -1,6 +1,6 @@
-# Mimir recall-quality benchmark
+# Perseus Vault recall-quality benchmark
 
-A **reproducible, fully offline** measurement of whether Mimir retrieves the
+A **reproducible, fully offline** measurement of whether Perseus Vault retrieves the
 *right* memory — recall@k and MRR — across its three search modes. This is a
 **quality** benchmark; the latency/throughput suite lives in
 [`../run.py`](../run.py).
