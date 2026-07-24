@@ -306,6 +306,8 @@ Any MCP-compatible framework works with Perseus Vault directly. See
 > upgrade the CLI to **≥ 1.0.23** (calls canonical names, with dynamic
 > fallback), or set `PERSEUS_VAULT_TOOL_ALIASES=all` on the vault as a bridge
 > while older clients remain deployed.
+>
+> **Migration contract.** See [legacy Mimir/Mneme tool-prefix migration](docs/migration/legacy-tool-prefixes.md) for replacement mapping, process-local migration evidence, and the v3 removal gate.
 
 ### Entity CRUD
 | Tool | Description |
