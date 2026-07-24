@@ -1,17 +1,17 @@
 ---
 name: mimir-memory
-description: Self-hosted persistent memory for OpenClaw agents via Mimir MCP — 30 tools, hybrid search, AES-256 encryption, zero external dependencies
+description: Self-hosted persistent memory for OpenClaw agents via Perseus Vault MCP — 30 tools, hybrid search, AES-256 encryption, zero external dependencies
 ---
 
-# Mimir — Self-Hosted Persistent Agent Memory
+# Perseus Vault — Self-Hosted Persistent Agent Memory
 
 ## Purpose
 
-This skill connects your OpenClaw agent to Mimir, a self-hosted Rust binary that provides durable, encrypted persistent memory via stdio MCP. No cloud, no API keys, no Docker — just one binary serving 23 memory tools.
+This skill connects your OpenClaw agent to Perseus Vault, a self-hosted Rust binary that provides durable, encrypted persistent memory via stdio MCP. No cloud, no API keys, no Docker — just one binary serving 23 memory tools.
 
-**Mimir runs entirely on your machine.** No data leaves your environment. No external service sees your agent's memories. Every stored memory is AES-256-GCM encrypted at rest.
+**Perseus Vault runs entirely on your machine.** No data leaves your environment. No external service sees your agent's memories. Every stored memory is AES-256-GCM encrypted at rest.
 
-## What Mimir Does
+## What Perseus Vault Does
 
 ### Full persistent memory lifecycle
 
@@ -27,11 +27,11 @@ All stored data is AES-256-GCM encrypted. Even if someone accesses the database 
 
 ### Memory lifecycle management
 
-Mimir applies Ebbinghaus decay to memories — rarely-used facts fade and eventually archive. Your agent's context stays sharp without manual cleanup. Run a `mimir_cohere` grooming pass to auto-link related memories, promote frequently-used ones, and archive decayed ones.
+Perseus Vault applies Ebbinghaus decay to memories — rarely-used facts fade and eventually archive. Your agent's context stays sharp without manual cleanup. Run a `mimir_cohere` grooming pass to auto-link related memories, promote frequently-used ones, and archive decayed ones.
 
 ### No external dependencies
 
-Mimir is a single Rust binary (~8MB). No Docker, no PostgreSQL, no Redis, no cloud service. Drop it in, start it, connect via stdio MCP. It runs anywhere OpenClaw runs — Linux, macOS, Windows, even a Raspberry Pi.
+Perseus Vault is a single Rust binary (~8MB). No Docker, no PostgreSQL, no Redis, no cloud service. Drop it in, start it, connect via stdio MCP. It runs anywhere OpenClaw runs — Linux, macOS, Windows, even a Raspberry Pi.
 
 ## Available Tools (23 total)
 
@@ -78,7 +78,7 @@ Mimir is a single Rust binary (~8MB). No Docker, no PostgreSQL, no Redis, no clo
 
 ## Setup Instructions
 
-### Step 1 — Install Mimir
+### Step 1 — Install Perseus Vault
 
 Choose one:
 
@@ -103,7 +103,7 @@ sudo cp target/release/perseus-vault /usr/local/bin/
 curl -sSf https://raw.githubusercontent.com/Perseus-Computing-LLC/perseus-vault/main/scripts/install.sh | sh
 ```
 
-### Step 2 — Configure Mimir as an MCP server in OpenClaw
+### Step 2 — Configure Perseus Vault as an MCP server in OpenClaw
 
 Add to your OpenClaw MCP servers config:
 
@@ -147,7 +147,7 @@ MIMIR_ENCRYPTION_KEY=$(openssl rand -hex 32)
 echo "MIMIR_ENCRYPTION_KEY=$MIMIR_ENCRYPTION_KEY" >> ~/.openclaw/.env
 ```
 
-Without an encryption key, Mimir stores data unencrypted (still local).
+Without an encryption key, Perseus Vault stores data unencrypted (still local).
 
 ### Step 4 — Initialize and verify
 
@@ -155,14 +155,14 @@ Without an encryption key, Mimir stores data unencrypted (still local).
 # Create the database directory
 mkdir -p ~/.openclaw/mimir
 
-# Start Mimir once to initialize
+# Start Perseus Vault once to initialize
 perseus-vault --db ~/.openclaw/mimir/mimir.db --health
 
 # Verify it's running
 perseus-vault --db ~/.openclaw/mimir/mimir.db --stats
 ```
 
-Then start a new OpenClaw session. Your agent now has access to all 23 Mimir memory tools.
+Then start a new OpenClaw session. Your agent now has access to all 23 Perseus Vault memory tools.
 
 ### Step 5 — Web dashboard (optional)
 
@@ -174,25 +174,25 @@ perseus-vault --db ~/.openclaw/mimir/mimir.db --dashboard --port 8789
 
 ## Data Handling & Privacy
 
-Mimir is entirely self-hosted. No data leaves your machine.
+Perseus Vault is entirely self-hosted. No data leaves your machine.
 
 - **What gets stored:** Only what your agent explicitly passes to `mimir_remember` or `mimir_journal` tool calls. No automatic capture, no silent monitoring.
 - **Where it's stored:** A local SQLite database at the path you specify (`--db`). You control the file.
 - **Encryption:** AES-256-GCM at rest when an encryption key is provided. Without a key, data is stored in plaintext SQLite (still local).
 - **Who can read it:** Only processes with access to the database file and encryption key. No network access by default.
 - **Retention:** Memories decay naturally via Ebbinghaus scoring. You control decay thresholds. Nothing is deleted without your agent's action.
-- **No telemetry:** No analytics, no usage tracking, no phone-home. Mimir is a local binary.
+- **No telemetry:** No analytics, no usage tracking, no phone-home. Perseus Vault is a local binary.
 - **MIT licensed:** Fully open source. You can audit the code, fork it, embed it.
 
 ## Constraints
 
-- **No cloud sync:** Mimir is local-only by design. Use `mimir_vault_export` and git for backup/sharing.
+- **No cloud sync:** Perseus Vault is local-only by design. Use `mimir_vault_export` and git for backup/sharing.
 - **Embeddings require Ollama or compatible endpoint:** Semantic search needs `--llm-endpoint` pointing to an Ollama instance or compatible embedding API. Keyword search (FTS5) works without it.
 - **Single-writer:** Mimir uses SQLite. One process at a time. Works perfectly for a single-agent OpenClaw setup.
 
 ## Complementary Skills
 
-Pair Mimir with these ClawHub skills for a complete memory stack:
+Pair Perseus Vault with these ClawHub skills for a complete memory stack:
 
 - `memory-audit-guardian` — Weekly memory governance audit
 - `skill-from-memory` — Extract reusable skills from stored memories
@@ -200,9 +200,9 @@ Pair Mimir with these ClawHub skills for a complete memory stack:
 
 ## CI / Automation
 
-To run Mimir in CI or scheduled jobs:
+To run Perseus Vault in CI or scheduled jobs:
 ```bash
-# Start Mimir in the background
+# Start Perseus Vault in the background
 perseus-vault --db /tmp/mimir_ci.db &
 
 # Run a coherence grooming pass nightly
