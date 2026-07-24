@@ -285,13 +285,11 @@ Each adapter:
 - Has passing tests with mocked MCP transport
 
 Any MCP-compatible framework works with Perseus Vault directly. See
-[Awesome Mimir](awesome-mimir.md) for the full list.
+[MCP client and framework integrations](docs/clients/README.md) for the full list.
 
 ## 55+ MCP Tools
 
-> **Tool names & the `perseus_vault_` prefix.** The tables below use the
-> historical `mimir_*` names, but by default the server now advertises each tool
-> **once**, under its canonical `perseus_vault_*` name (e.g. `perseus_vault_remember`).
+> **Canonical product and tool names.** Perseus Vault is the product name, and new integrations should use the canonical `perseus_vault_*` tools (for example, `perseus_vault_remember`). Legacy `mimir_*` and `mneme_*` tool names remain supported for compatibility.
 > The legacy `mimir_*` and `mneme_*` names remain fully *callable* — every prefix
 > dispatches to the same handler — they are just no longer advertised in
 > `tools/list`. This keeps the advertised manifest to one name per tool instead
