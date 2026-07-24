@@ -2,7 +2,7 @@
 name = "perseus-vault"
 version = "2.21.0"
 edition = "2021"
-description = "Persistent memory engine for AI agents — MCP JSON-RPC stdio server (formerly Mneme/Mimir)"
+description = "Persistent, encrypted memory engine for AI agents — MCP JSON-RPC stdio server"
 repository = "https://github.com/Perseus-Computing-LLC/perseus-vault"
 license = "MIT"
 
