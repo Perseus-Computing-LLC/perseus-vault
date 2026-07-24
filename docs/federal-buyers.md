@@ -120,7 +120,7 @@ perseus --help
 
 # Perseus Vault — persistent memory (MCP server)
 # Download binary from https://github.com/Perseus-Computing-LLC/perseus-vault/releases
-./mimir --help
+perseus-vault --help
 ```
 
 **For procurement inquiries, security assessments, or ATO support:**
