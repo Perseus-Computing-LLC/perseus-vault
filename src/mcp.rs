@@ -2595,12 +2595,12 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
           "description": "Database file size on disk in bytes"
         },
         "oldest_unix_ms": {
-          "type": "integer",
-          "description": "Oldest entity creation timestamp"
+          "type": ["integer", "null"],
+          "description": "Oldest entity creation timestamp, or null when the database has no entities"
         },
         "newest_unix_ms": {
-          "type": "integer",
-          "description": "Newest entity creation timestamp"
+          "type": ["integer", "null"],
+          "description": "Newest entity creation timestamp, or null when the database has no entities"
         },
         "total_history_rows": {
           "type": "integer",
@@ -4896,6 +4896,22 @@ mod tests {
             .iter()
             .map(|t| t["name"].as_str().unwrap().to_string())
             .collect()
+    }
+
+    #[test]
+    fn stats_schema_allows_null_timestamps_for_an_empty_database() {
+        let stats = tool_registry_base()
+            .iter()
+            .find(|tool| tool["name"] == "mimir_stats")
+            .expect("stats tool must be registered");
+
+        for field in ["oldest_unix_ms", "newest_unix_ms"] {
+            assert_eq!(
+                stats["outputSchema"]["properties"][field]["type"],
+                json!(["integer", "null"]),
+                "{field} must accept the null value returned for an empty database"
+            );
+        }
     }
 
     #[test]
