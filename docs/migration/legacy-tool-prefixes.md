@@ -45,6 +45,8 @@ The readout is for maintained-deployment migration reviews only. It is not centr
 
 ## Future removal
 
+The current dated review is [Legacy Tool-Prefix Compatibility Review — 2026-07-25](../compatibility/legacy-prefix-review-2026-07.md) and its decision is **NO-GO**.
+
 A removal of the legacy prefixes is v3-only and will not be scheduled until all of the following are met:
 
 1. At least two stable v2 releases and 90 days of observed migration evidence.
