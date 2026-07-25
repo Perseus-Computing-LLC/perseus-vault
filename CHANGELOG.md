@@ -6,6 +6,14 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
 ## [Unreleased]
 
 ### Added
+- **Privacy-preserving legacy tool-prefix usage counters** (#764). Every valid
+  MCP `tools/call` is classified by its original `perseus_vault_`, `mimir_`,
+  `mneme_`, or other prefix before alias normalization and counted exactly once
+  in process-local atomics. The canonical `perseus_vault_alias_usage` readout
+  returns only aggregate totals and the process-start Unix timestamp; counters
+  reset on restart, are never persisted, never capture arguments or client
+  metadata, and the readout does not increment itself. v2 aliases and the
+  canonical-only default `tools/list` advertisement remain unchanged.
 - **BEAM — bi-temporal correctness + determinism at scale** (#685). A new
   harness (`benchmark/beam/`) that embeds the CI-verified bi-temporal gauntlet
   inside a filler corpus sized to the BEAM token tiers (128K / 500K / 1M / 10M)

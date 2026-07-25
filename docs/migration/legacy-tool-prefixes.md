@@ -39,7 +39,7 @@ The legacy `MIMIR_TOOL_ALIASES` environment variable is also honored. This is a 
 
 ## Migration evidence
 
-`perseus_vault_alias_usage` provides a process-local aggregate count of canonical, Mimir, Mneme, and other tool-prefix calls. It contains no tool arguments, memory content, entity identifiers, client identity, or persisted analytics; it resets on server restart.
+`perseus_vault_alias_usage` provides process-local `canonical_calls`, `mimir_calls`, `mneme_calls`, and `other_calls` totals plus `since_process_start_unix_ms`. It contains no tool arguments, memory content, entity identifiers, credentials, client identity, or persisted analytics; it resets on server restart and does not count its own canonical or legacy-alias readouts.
 
 The readout is for maintained-deployment migration reviews only. It is not centralized telemetry and must not be used to infer global adoption.
 

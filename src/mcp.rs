@@ -207,6 +207,79 @@ pub struct JsonRpcError {
     pub message: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolPrefix {
+    Canonical,
+    Mimir,
+    Mneme,
+    Other,
+}
+
+fn classify_tool_prefix(name: &str) -> ToolPrefix {
+    if name.starts_with("perseus_vault_") {
+        ToolPrefix::Canonical
+    } else if name.starts_with("mimir_") {
+        ToolPrefix::Mimir
+    } else if name.starts_with("mneme_") {
+        ToolPrefix::Mneme
+    } else {
+        ToolPrefix::Other
+    }
+}
+
+struct AliasUsageCounters {
+    canonical_calls: std::sync::atomic::AtomicU64,
+    mimir_calls: std::sync::atomic::AtomicU64,
+    mneme_calls: std::sync::atomic::AtomicU64,
+    other_calls: std::sync::atomic::AtomicU64,
+    since_process_start_unix_ms: u64,
+}
+
+impl AliasUsageCounters {
+    fn new() -> Self {
+        let since_process_start_unix_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        Self {
+            canonical_calls: std::sync::atomic::AtomicU64::new(0),
+            mimir_calls: std::sync::atomic::AtomicU64::new(0),
+            mneme_calls: std::sync::atomic::AtomicU64::new(0),
+            other_calls: std::sync::atomic::AtomicU64::new(0),
+            since_process_start_unix_ms,
+        }
+    }
+
+    fn record(&self, prefix: ToolPrefix) {
+        use std::sync::atomic::Ordering;
+        let counter = match prefix {
+            ToolPrefix::Canonical => &self.canonical_calls,
+            ToolPrefix::Mimir => &self.mimir_calls,
+            ToolPrefix::Mneme => &self.mneme_calls,
+            ToolPrefix::Other => &self.other_calls,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> Value {
+        use std::sync::atomic::Ordering;
+        json!({
+            "canonical_calls": self.canonical_calls.load(Ordering::Relaxed),
+            "mimir_calls": self.mimir_calls.load(Ordering::Relaxed),
+            "mneme_calls": self.mneme_calls.load(Ordering::Relaxed),
+            "other_calls": self.other_calls.load(Ordering::Relaxed),
+            "since_process_start_unix_ms": self.since_process_start_unix_ms,
+        })
+    }
+}
+
+fn is_alias_usage_tool(name: &str) -> bool {
+    name.strip_prefix("perseus_vault_")
+        .or_else(|| name.strip_prefix("mimir_"))
+        .or_else(|| name.strip_prefix("mneme_"))
+        == Some("alias_usage")
+}
+
 pub struct MCPState {
     // #210: AtomicBool so the HTTP/SSE transport can share &MCPState across
     // concurrent requests without a Mutex (which would re-serialize them now
@@ -218,6 +291,7 @@ pub struct MCPState {
     // clientInfo (single-agent / legacy) → unscoped, preserving old behavior.
     // RwLock: set once at initialize, read per tools/call across the shared &state.
     pub session_agent_id: std::sync::RwLock<String>,
+    alias_usage: AliasUsageCounters,
 }
 
 impl MCPState {
@@ -225,6 +299,7 @@ impl MCPState {
         MCPState {
             initialized: std::sync::atomic::AtomicBool::new(false),
             session_agent_id: std::sync::RwLock::new(String::new()),
+            alias_usage: AliasUsageCounters::new(),
         }
     }
 }
@@ -527,6 +602,14 @@ pub fn handle_request(
                 None => return Some(error_response(id, -32602, "Missing tool name")),
             };
 
+            // Count only the original call name at the tools/call boundary,
+            // before aliases are normalized. The readout itself is excluded so
+            // repeated operator checks do not perturb the evidence being read.
+            let is_alias_usage = is_alias_usage_tool(tool_name);
+            if !is_alias_usage {
+                state.alias_usage.record(classify_tool_prefix(tool_name));
+            }
+
             let mut tool_args = params.get("arguments").cloned().unwrap_or(json!({}));
 
             // #684: stamp the captured session identity so tools that enforce
@@ -555,7 +638,11 @@ pub fn handle_request(
                 .unwrap_or("");
             crate::db::set_chancery_writ_id(chancery_writ_id);
 
-            let result_text = call_tool(tool_name, db, tool_args, id.clone());
+            let result_text = if is_alias_usage {
+                state.alias_usage.snapshot().to_string()
+            } else {
+                call_tool(tool_name, db, tool_args, id.clone())
+            };
 
             // Try to parse the result as JSON for structuredContent
             let structured: Option<serde_json::Value> = serde_json::from_str(&result_text).ok();
@@ -2620,6 +2707,44 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
       "readOnlyHint": true
     },
     "title": "Get Database Statistics"
+  },
+  {
+    "name": "mimir_alias_usage",
+    "description": "Return privacy-preserving process-local counts of MCP tool calls by original prefix. Counters reset on restart, are never persisted, and exclude this readout tool itself.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {}
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "canonical_calls": {
+          "type": "integer",
+          "description": "Calls using the canonical perseus_vault_ prefix"
+        },
+        "mimir_calls": {
+          "type": "integer",
+          "description": "Calls using the legacy mimir_ prefix"
+        },
+        "mneme_calls": {
+          "type": "integer",
+          "description": "Calls using the legacy mneme_ prefix"
+        },
+        "other_calls": {
+          "type": "integer",
+          "description": "Calls whose tool name used none of the recognized prefixes"
+        },
+        "since_process_start_unix_ms": {
+          "type": "integer",
+          "description": "Unix-millisecond timestamp when this process-local counter set started"
+        }
+      },
+      "required": ["canonical_calls", "mimir_calls", "mneme_calls", "other_calls", "since_process_start_unix_ms"]
+    },
+    "annotations": {
+      "readOnlyHint": true
+    },
+    "title": "Get Legacy Prefix Usage"
   },
   {
     "name": "mimir_compact",
@@ -4912,6 +5037,78 @@ mod tests {
                 "{field} must accept the null value returned for an empty database"
             );
         }
+    }
+
+    #[test]
+    fn tool_prefix_classifier_distinguishes_all_call_names() {
+        assert_eq!(
+            classify_tool_prefix("perseus_vault_recall"),
+            ToolPrefix::Canonical
+        );
+        assert_eq!(classify_tool_prefix("mimir_recall"), ToolPrefix::Mimir);
+        assert_eq!(classify_tool_prefix("mneme_recall"), ToolPrefix::Mneme);
+        assert_eq!(classify_tool_prefix("custom_tool"), ToolPrefix::Other);
+    }
+
+    #[test]
+    fn alias_usage_counts_calls_once_without_counting_or_leaking_readouts() {
+        let db_path = std::env::temp_dir().join(format!(
+            "perseus-alias-usage-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let db = Database::open(db_path.to_str().expect("temp db path")).expect("open temp db");
+        let state = MCPState::new();
+        state
+            .initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let call = |name: &str, arguments: Value| {
+            let response = handle_request(
+                &JsonRpcRequest {
+                    jsonrpc: "2.0".to_string(),
+                    id: Some(json!(1)),
+                    method: "tools/call".to_string(),
+                    params: Some(json!({"name": name, "arguments": arguments})),
+                },
+                &state,
+                &db,
+            )
+            .expect("tools/call response");
+            response.result.expect("tools/call result")["structuredContent"].clone()
+        };
+
+        call(
+            "perseus_vault_health",
+            json!({"sentinel": "must-not-appear-in-alias-usage"}),
+        );
+        call("mimir_health", json!({}));
+        call("mneme_health", json!({}));
+        call("custom_tool", json!({}));
+
+        let first = call("perseus_vault_alias_usage", json!({}));
+        assert_eq!(first["canonical_calls"], json!(1));
+        assert_eq!(first["mimir_calls"], json!(1));
+        assert_eq!(first["mneme_calls"], json!(1));
+        assert_eq!(first["other_calls"], json!(1));
+        assert!(first["since_process_start_unix_ms"].as_u64().unwrap() > 0);
+        assert!(!first.to_string().contains("must-not-appear-in-alias-usage"));
+
+        let second = call("mimir_alias_usage", json!({}));
+        assert_eq!(
+            second, first,
+            "alias-usage readouts must not count themselves"
+        );
+
+        assert!(advertised_names(false).contains(&"perseus_vault_alias_usage".to_string()));
+        for name in [
+            "mimir_alias_usage",
+            "mneme_alias_usage",
+            "perseus_vault_alias_usage",
+        ] {
+            assert!(advertised_names(true).contains(&name.to_string()));
+        }
+
+        let _ = fs::remove_file(db_path);
     }
 
     #[test]
