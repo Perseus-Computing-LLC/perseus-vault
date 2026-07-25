@@ -3472,6 +3472,38 @@ pub fn handle_agent(db: &Database, args: Value) -> Result<String, String> {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct AuthoritySetArgs {
+    pub agent_id: String, pub workspace_hash: String, pub allowed_capabilities: Vec<String>, pub scope_anchors: Vec<String>,
+    #[serde(default)] pub approval_required_capabilities: Vec<String>, #[serde(default)] pub approver_principals: Vec<String>,
+    #[serde(default)] pub allowed_inbound_principals: Vec<String>, #[serde(default)] pub permitted_external_ref_prefixes: Vec<String>,
+    #[serde(default = "authority_default_parallel")] pub max_parallel_actions: i64, #[serde(default = "authority_default_mode")] pub mode: String,
+    #[serde(default)] pub expires_at_unix_ms: Option<i64>, #[serde(default)] pub author_agent_id: String,
+}
+fn authority_default_parallel() -> i64 { 1 }
+fn authority_default_mode() -> String { "shadow".to_string() }
+pub fn handle_authority_set(db: &Database, args: Value) -> Result<String, String> {
+    let a: AuthoritySetArgs=serde_json::from_value(args).map_err(|e|format!("Invalid authority_set arguments: {e}"))?;
+    let input=crate::models::AuthorityManifestInput { agent_id:a.agent_id, workspace_hash:a.workspace_hash, allowed_capabilities:a.allowed_capabilities, approval_required_capabilities:a.approval_required_capabilities, scope_anchors:a.scope_anchors, approver_principals:a.approver_principals, allowed_inbound_principals:a.allowed_inbound_principals, permitted_external_ref_prefixes:a.permitted_external_ref_prefixes, max_parallel_actions:a.max_parallel_actions, mode:a.mode, expires_at_unix_ms:a.expires_at_unix_ms };
+    serde_json::to_string(&db.authority_set(&input,&a.author_agent_id).map_err(|e|format!("authority_set failed: {e}"))?).map_err(|e|e.to_string())
+}
+#[derive(Debug, Deserialize)] pub struct AuthorityGetArgs { pub agent_id:String, pub workspace_hash:String, #[serde(default)] pub include_revoked:bool }
+pub fn handle_authority_get(db:&Database,args:Value)->Result<String,String>{let a:AuthorityGetArgs=serde_json::from_value(args).map_err(|e|format!("Invalid authority_get arguments: {e}"))?;serde_json::to_string(&json!({"authority":db.authority_get(&a.agent_id,&a.workspace_hash,a.include_revoked).map_err(|e|format!("authority_get failed: {e}"))?})).map_err(|e|e.to_string())}
+#[derive(Debug, Deserialize)] pub struct AuthorityRevokeArgs { pub manifest_id:String, #[serde(default)] pub actor_agent_id:String, #[serde(default)] pub reason:String }
+pub fn handle_authority_revoke(db:&Database,args:Value)->Result<String,String>{let a:AuthorityRevokeArgs=serde_json::from_value(args).map_err(|e|format!("Invalid authority_revoke arguments: {e}"))?;db.authority_revoke(&a.manifest_id,&a.actor_agent_id,&a.reason).map_err(|e|format!("authority_revoke failed: {e}"))?;Ok(json!({"revoked":true,"manifest_id":a.manifest_id}).to_string())}
+#[derive(Debug, Deserialize)] pub struct ActionIntentArgs { pub agent_id:String,pub workspace_hash:String,pub scope_anchor:String,pub external_ref:String,pub capability:String,pub action_key:String,pub intent_hash:String }
+pub fn handle_action_intent(db:&Database,args:Value)->Result<String,String>{let a:ActionIntentArgs=serde_json::from_value(args).map_err(|e|format!("Invalid action_intent arguments: {e}"))?;serde_json::to_string(&db.action_intent(&a.agent_id,&a.workspace_hash,&a.scope_anchor,&a.external_ref,&a.capability,&a.action_key,&a.intent_hash).map_err(|e|format!("action_intent failed: {e}"))?).map_err(|e|e.to_string())}
+#[derive(Debug, Deserialize)] pub struct ActionApproveArgs {pub action_id:String,pub approver_principal:String,pub decision:String}
+pub fn handle_action_approve(db:&Database,args:Value)->Result<String,String>{let a:ActionApproveArgs=serde_json::from_value(args).map_err(|e|format!("Invalid action_approve arguments: {e}"))?;serde_json::to_string(&db.action_approve(&a.action_id,&a.approver_principal,&a.decision).map_err(|e|format!("action_approve failed: {e}"))?).map_err(|e|e.to_string())}
+#[derive(Debug, Deserialize)] pub struct ActionCompleteArgs {pub action_id:String,pub actor_agent_id:String,pub outcome:String,pub outcome_hash:String}
+pub fn handle_action_complete(db:&Database,args:Value)->Result<String,String>{let a:ActionCompleteArgs=serde_json::from_value(args).map_err(|e|format!("Invalid action_complete arguments: {e}"))?;serde_json::to_string(&db.action_complete(&a.action_id,&a.actor_agent_id,&a.outcome,&a.outcome_hash).map_err(|e|format!("action_complete failed: {e}"))?).map_err(|e|e.to_string())}
+#[derive(Debug, Deserialize)] pub struct ActionReceiptGetArgs {pub action_id:String}
+pub fn handle_action_receipt_get(db:&Database,args:Value)->Result<String,String>{let a:ActionReceiptGetArgs=serde_json::from_value(args).map_err(|e|format!("Invalid action_receipt_get arguments: {e}"))?;serde_json::to_string(&json!({"receipt":db.action_receipt_get(&a.action_id).map_err(|e|format!("action_receipt_get failed: {e}"))?})).map_err(|e|e.to_string())}
+#[derive(Debug, Deserialize)] pub struct ActionLeaseArgs {pub action_id:String,pub holder_id:String,#[serde(default="authority_default_parallel")]pub ttl_seconds:i64}
+pub fn handle_action_lease_acquire(db:&Database,args:Value)->Result<String,String>{let a:ActionLeaseArgs=serde_json::from_value(args).map_err(|e|format!("Invalid action_lease_acquire arguments: {e}"))?;serde_json::to_string(&db.action_lease_acquire(&a.action_id,&a.holder_id,a.ttl_seconds).map_err(|e|format!("action_lease_acquire failed: {e}"))?).map_err(|e|e.to_string())}
+#[derive(Debug, Deserialize)] pub struct ActionLeaseReleaseArgs {pub lease_id:String,pub holder_id:String}
+pub fn handle_action_lease_release(db:&Database,args:Value)->Result<String,String>{let a:ActionLeaseReleaseArgs=serde_json::from_value(args).map_err(|e|format!("Invalid action_lease_release arguments: {e}"))?;db.action_lease_release(&a.lease_id,&a.holder_id).map_err(|e|format!("action_lease_release failed: {e}"))?;Ok(json!({"released":true,"lease_id":a.lease_id}).to_string())}
+
+#[derive(Debug, Deserialize)]
 pub struct ConflictArgs {
     pub category: String,
     #[serde(default = "default_conflict_threshold")]

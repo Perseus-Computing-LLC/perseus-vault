@@ -4633,7 +4633,17 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
       }
     },
     "title": "Agent Registry"
-  }
+  },
+  {
+    "name":"mimir_authority_set", "description":"Create a versioned authority manifest for a registered agent.", "inputSchema":{"type":"object","properties":{"agent_id":{"type":"string"},"workspace_hash":{"type":"string"},"allowed_capabilities":{"type":"array","items":{"type":"string"}},"scope_anchors":{"type":"array","items":{"type":"string"}},"approval_required_capabilities":{"type":"array","items":{"type":"string"}},"approver_principals":{"type":"array","items":{"type":"string"}},"allowed_inbound_principals":{"type":"array","items":{"type":"string"}},"permitted_external_ref_prefixes":{"type":"array","items":{"type":"string"}},"max_parallel_actions":{"type":"integer","default":1},"mode":{"type":"string","default":"shadow"},"expires_at_unix_ms":{"type":"integer"},"author_agent_id":{"type":"string"}},"required":["agent_id","workspace_hash","allowed_capabilities","scope_anchors"]}, "title":"Set Action Authority"},
+  {"name":"mimir_authority_get", "description":"Get the active authority manifest for an agent and workspace.", "inputSchema":{"type":"object","properties":{"agent_id":{"type":"string"},"workspace_hash":{"type":"string"},"include_revoked":{"type":"boolean","default":false}},"required":["agent_id","workspace_hash"]}, "title":"Get Action Authority"},
+  {"name":"mimir_authority_revoke", "description":"Revoke an authority manifest.", "inputSchema":{"type":"object","properties":{"manifest_id":{"type":"string"},"actor_agent_id":{"type":"string"},"reason":{"type":"string"}},"required":["manifest_id"]}, "title":"Revoke Action Authority"},
+  {"name":"mimir_action_intent", "description":"Record a fail-closed authorized action intent.", "inputSchema":{"type":"object","properties":{"agent_id":{"type":"string"},"workspace_hash":{"type":"string"},"scope_anchor":{"type":"string"},"external_ref":{"type":"string"},"capability":{"type":"string"},"action_key":{"type":"string"},"intent_hash":{"type":"string"}},"required":["agent_id","workspace_hash","scope_anchor","external_ref","capability","action_key","intent_hash"]}, "title":"Record Action Intent"},
+  {"name":"mimir_action_approve", "description":"Grant or deny an approval-requested action.", "inputSchema":{"type":"object","properties":{"action_id":{"type":"string"},"approver_principal":{"type":"string"},"decision":{"type":"string","enum":["granted","denied"]}},"required":["action_id","approver_principal","decision"]}, "title":"Decide Action Approval"},
+  {"name":"mimir_action_complete", "description":"Record an executed, failed, or cancelled action outcome by hash.", "inputSchema":{"type":"object","properties":{"action_id":{"type":"string"},"actor_agent_id":{"type":"string"},"outcome":{"type":"string","enum":["executed","failed","cancelled"]},"outcome_hash":{"type":"string"}},"required":["action_id","actor_agent_id","outcome","outcome_hash"]}, "title":"Complete Authorized Action"},
+  {"name":"mimir_action_receipt_get", "description":"Get durable action receipt metadata and hashes.", "inputSchema":{"type":"object","properties":{"action_id":{"type":"string"}},"required":["action_id"]}, "title":"Get Action Receipt"},
+  {"name":"mimir_action_lease_acquire", "description":"Acquire the single active lease for an action key.", "inputSchema":{"type":"object","properties":{"action_id":{"type":"string"},"holder_id":{"type":"string"},"ttl_seconds":{"type":"integer","default":1}},"required":["action_id","holder_id"]}, "title":"Acquire Action Lease"},
+  {"name":"mimir_action_lease_release", "description":"Release an action lease held by its owner.", "inputSchema":{"type":"object","properties":{"lease_id":{"type":"string"},"holder_id":{"type":"string"}},"required":["lease_id","holder_id"]}, "title":"Release Action Lease"}
 ]"###,
         )
         .expect("tools JSON must be valid")
@@ -4802,6 +4812,15 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
         "mimir_keystone_set" => tools::handle_keystone_set(db, args),
         "mimir_keystone_get" => tools::handle_keystone_get(db, args),
         "mimir_agent" => tools::handle_agent(db, args),
+        "mimir_authority_set" => tools::handle_authority_set(db, args),
+        "mimir_authority_get" => tools::handle_authority_get(db, args),
+        "mimir_authority_revoke" => tools::handle_authority_revoke(db, args),
+        "mimir_action_intent" => tools::handle_action_intent(db, args),
+        "mimir_action_approve" => tools::handle_action_approve(db, args),
+        "mimir_action_complete" => tools::handle_action_complete(db, args),
+        "mimir_action_receipt_get" => tools::handle_action_receipt_get(db, args),
+        "mimir_action_lease_acquire" => tools::handle_action_lease_acquire(db, args),
+        "mimir_action_lease_release" => tools::handle_action_lease_release(db, args),
         "mimir_promote" => tools::handle_promote(db, args),
         "mimir_beliefs" => beliefs::handle_beliefs(db, args),
         "mimir_conflicts" => Ok(tools::handle_conflicts(db, args)),

@@ -243,6 +243,62 @@ CREATE TABLE IF NOT EXISTS agents (
     updated_at_unix_ms INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_agents_fleet ON agents(fleet_id);
+
+-- #768 Authorized Action Receipts control plane. Manifests are versioned rather
+-- than mutated, and actions are append-only state records whose transitions are
+-- additionally written to the keyed journal audit chain.
+CREATE TABLE IF NOT EXISTS authority_manifests (
+    id TEXT PRIMARY KEY,
+    agent_id TEXT NOT NULL,
+    workspace_hash TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    allowed_capabilities TEXT NOT NULL DEFAULT '[]',
+    approval_required_capabilities TEXT NOT NULL DEFAULT '[]',
+    scope_anchors TEXT NOT NULL DEFAULT '[]',
+    approver_principals TEXT NOT NULL DEFAULT '[]',
+    allowed_inbound_principals TEXT NOT NULL DEFAULT '[]',
+    permitted_external_ref_prefixes TEXT NOT NULL DEFAULT '[]',
+    max_parallel_actions INTEGER NOT NULL DEFAULT 1,
+    mode TEXT NOT NULL DEFAULT 'shadow',
+    expires_at_unix_ms INTEGER,
+    revoked_at_unix_ms INTEGER,
+    created_at_unix_ms INTEGER NOT NULL,
+    UNIQUE(agent_id, workspace_hash, version)
+);
+CREATE INDEX IF NOT EXISTS idx_authority_active
+ ON authority_manifests(agent_id, workspace_hash, revoked_at_unix_ms, version DESC);
+CREATE TABLE IF NOT EXISTS authorized_actions (
+    id TEXT PRIMARY KEY,
+    manifest_id TEXT NOT NULL REFERENCES authority_manifests(id),
+    manifest_version INTEGER NOT NULL,
+    agent_id TEXT NOT NULL,
+    workspace_hash TEXT NOT NULL,
+    scope_anchor TEXT NOT NULL,
+    external_ref TEXT NOT NULL DEFAULT '',
+    capability TEXT NOT NULL,
+    action_key TEXT NOT NULL,
+    intent_hash TEXT NOT NULL,
+    outcome_hash TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL,
+    approval_required INTEGER NOT NULL DEFAULT 0,
+    approval_ref TEXT NOT NULL DEFAULT '',
+    created_at_unix_ms INTEGER NOT NULL,
+    updated_at_unix_ms INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_authorized_actions_scope
+ ON authorized_actions(workspace_hash, action_key, status);
+CREATE TABLE IF NOT EXISTS authorized_action_leases (
+    id TEXT PRIMARY KEY,
+    action_id TEXT NOT NULL REFERENCES authorized_actions(id),
+    workspace_hash TEXT NOT NULL,
+    action_key TEXT NOT NULL,
+    holder_id TEXT NOT NULL,
+    expires_at_unix_ms INTEGER NOT NULL,
+    released_at_unix_ms INTEGER,
+    created_at_unix_ms INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_authorized_action_leases_active
+ ON authorized_action_leases(workspace_hash, action_key, released_at_unix_ms, expires_at_unix_ms);
 ";
 
 /// Current schema migration level, stamped into `PRAGMA user_version` once all
@@ -299,7 +355,10 @@ CREATE INDEX IF NOT EXISTS idx_agents_fleet ON agents(fleet_id);
 /// records it so downstream audit queries can cross-reference vault journal
 /// entries against Chancery writ records. New column, backfill-free: no-op on
 /// fresh DBs; legacy rows get '' and are populated going forward.
-const SCHEMA_VERSION: i64 = 23;
+/// v24 (#768 Authorized Action Receipts): authority manifests, receipts, and
+/// action leases. Tables are created idempotently; action columns are ALTER-
+/// probed because v23 stores must retain existing receipt records.
+const SCHEMA_VERSION: i64 = 24;
 
 /// Initialize the v0.2.0 schema on a fresh database.
 pub fn initialize_schema(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
@@ -849,6 +908,38 @@ fn apply_migrations(conn: &Connection) -> Result<(), Box<dyn std::error::Error>>
     // '' (the column default) and are populated on all future journal writes.
     ensure_column(conn, "journal", "chancery_writ_id", "TEXT DEFAULT ''")?;
     // ── end v23 ──────────────────────────────────────────────────────────
+
+    // ── v24 (#768 Authorized Action Receipts) ─────────────────────────────
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS authority_manifests (
+            id TEXT PRIMARY KEY, agent_id TEXT NOT NULL, workspace_hash TEXT NOT NULL,
+            version INTEGER NOT NULL, allowed_capabilities TEXT NOT NULL DEFAULT '[]',
+            approval_required_capabilities TEXT NOT NULL DEFAULT '[]', scope_anchors TEXT NOT NULL DEFAULT '[]',
+            approver_principals TEXT NOT NULL DEFAULT '[]', allowed_inbound_principals TEXT NOT NULL DEFAULT '[]',
+            permitted_external_ref_prefixes TEXT NOT NULL DEFAULT '[]', max_parallel_actions INTEGER NOT NULL DEFAULT 1,
+            mode TEXT NOT NULL DEFAULT 'shadow', expires_at_unix_ms INTEGER, revoked_at_unix_ms INTEGER,
+            created_at_unix_ms INTEGER NOT NULL, UNIQUE(agent_id, workspace_hash, version));
+         CREATE INDEX IF NOT EXISTS idx_authority_active ON authority_manifests(agent_id, workspace_hash, revoked_at_unix_ms, version DESC);
+         CREATE TABLE IF NOT EXISTS authorized_actions (
+            id TEXT PRIMARY KEY, manifest_id TEXT NOT NULL REFERENCES authority_manifests(id), manifest_version INTEGER NOT NULL DEFAULT 0,
+            agent_id TEXT NOT NULL, workspace_hash TEXT NOT NULL, scope_anchor TEXT NOT NULL, external_ref TEXT NOT NULL DEFAULT '',
+            capability TEXT NOT NULL, action_key TEXT NOT NULL, intent_hash TEXT NOT NULL, outcome_hash TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL, approval_required INTEGER NOT NULL DEFAULT 0, approval_ref TEXT NOT NULL DEFAULT '',
+            created_at_unix_ms INTEGER NOT NULL, updated_at_unix_ms INTEGER NOT NULL);
+         CREATE INDEX IF NOT EXISTS idx_authorized_actions_scope ON authorized_actions(workspace_hash, action_key, status);
+         CREATE TABLE IF NOT EXISTS authorized_action_leases (
+            id TEXT PRIMARY KEY, action_id TEXT NOT NULL REFERENCES authorized_actions(id), workspace_hash TEXT NOT NULL,
+            action_key TEXT NOT NULL, holder_id TEXT NOT NULL, expires_at_unix_ms INTEGER NOT NULL,
+            released_at_unix_ms INTEGER, created_at_unix_ms INTEGER NOT NULL);
+         CREATE INDEX IF NOT EXISTS idx_authorized_action_leases_active ON authorized_action_leases(workspace_hash, action_key, released_at_unix_ms, expires_at_unix_ms);",
+    )?;
+    ensure_column(conn, "authority_manifests", "allowed_inbound_principals", "TEXT NOT NULL DEFAULT '[]'")?;
+    ensure_column(conn, "authority_manifests", "permitted_external_ref_prefixes", "TEXT NOT NULL DEFAULT '[]'")?;
+    ensure_column(conn, "authority_manifests", "max_parallel_actions", "INTEGER NOT NULL DEFAULT 1")?;
+    ensure_column(conn, "authorized_actions", "manifest_version", "INTEGER NOT NULL DEFAULT 0")?;
+    ensure_column(conn, "authorized_actions", "external_ref", "TEXT NOT NULL DEFAULT ''")?;
+    ensure_column(conn, "authorized_actions", "outcome_hash", "TEXT NOT NULL DEFAULT ''")?;
+    // ── end v24 ──────────────────────────────────────────────────────────
 
     // Stamp the migration level so subsequent opens skip the probe block above.
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;

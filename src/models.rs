@@ -206,6 +206,92 @@ pub struct Agent {
     pub updated_at_unix_ms: i64,
 }
 
+/// A versioned authority manifest that constrains an agent's actions inside one
+/// workspace. It carries opaque trusted-scope anchors; callers never self-authorize
+/// arbitrary workspace or repository strings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthorityManifestInput {
+    pub agent_id: String,
+    pub workspace_hash: String,
+    #[serde(default)]
+    pub allowed_capabilities: Vec<String>,
+    #[serde(default)]
+    pub approval_required_capabilities: Vec<String>,
+    #[serde(default)]
+    pub scope_anchors: Vec<String>,
+    #[serde(default)]
+    pub approver_principals: Vec<String>,
+    #[serde(default)]
+    pub allowed_inbound_principals: Vec<String>,
+    #[serde(default)]
+    pub permitted_external_ref_prefixes: Vec<String>,
+    #[serde(default = "default_max_parallel_actions")]
+    pub max_parallel_actions: i64,
+    #[serde(default = "default_authority_mode")]
+    pub mode: String,
+    #[serde(default)]
+    pub expires_at_unix_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthorityManifest {
+    pub id: String,
+    pub agent_id: String,
+    pub workspace_hash: String,
+    pub version: i64,
+    pub allowed_capabilities: Vec<String>,
+    pub approval_required_capabilities: Vec<String>,
+    pub scope_anchors: Vec<String>,
+    pub approver_principals: Vec<String>,
+    pub allowed_inbound_principals: Vec<String>,
+    pub permitted_external_ref_prefixes: Vec<String>,
+    pub max_parallel_actions: i64,
+    pub mode: String,
+    pub expires_at_unix_ms: Option<i64>,
+    pub revoked_at_unix_ms: Option<i64>,
+    pub created_at_unix_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthorizedAction {
+    pub id: String,
+    pub manifest_id: String,
+    pub manifest_version: i64,
+    pub agent_id: String,
+    pub workspace_hash: String,
+    pub scope_anchor: String,
+    pub external_ref: String,
+    pub capability: String,
+    pub action_key: String,
+    pub intent_hash: String,
+    pub outcome_hash: String,
+    pub status: String,
+    pub approval_required: bool,
+    pub approval_ref: String,
+    pub created_at_unix_ms: i64,
+    pub updated_at_unix_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActionLease {
+    pub id: String,
+    pub action_id: String,
+    pub workspace_hash: String,
+    pub action_key: String,
+    pub holder_id: String,
+    pub expires_at_unix_ms: i64,
+    pub released_at_unix_ms: Option<i64>,
+    pub created_at_unix_ms: i64,
+}
+
+fn default_max_parallel_actions() -> i64 {
+    1
+}
+
+fn default_authority_mode() -> String {
+    "shadow".to_string()
+}
+
 /// A key-value state entry with optional TTL.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StateEntry {
