@@ -362,35 +362,27 @@ const SCHEMA_VERSION: i64 = 24;
 
 /// Initialize the v0.2.0 schema on a fresh database.
 pub fn initialize_schema(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
-    // DDL is all IF NOT EXISTS, so it stays ungated: it both creates a fresh DB
-    // and back-fills newer objects (e.g. idx_entities_recall) on older ones.
-    // It also stays OUTSIDE the migration transaction below — IF NOT EXISTS is
-    // already concurrency-safe, and it keeps the FTS5 virtual-table creation
-    // out of the transaction entirely.
-    conn.execute_batch(DDL_V0_2_0)?;
-
-    // The column-add migrations each probe for the column first. `open` runs
-    // several times per process, so on a fully-migrated DB this is pure wasted
-    // work. Gate it on PRAGMA user_version: run once when behind, then stamp
-    // current and skip on every subsequent open. (#208)
-    let user_version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    if user_version >= SCHEMA_VERSION {
-        return Ok(());
-    }
-
-    // #353: PRAGMA busy_timeout serializes individual statements, not this
-    // whole check-then-migrate sequence — two *processes* opening the same
-    // pre-upgrade DB could both read a stale user_version, both enter the
-    // migration path, and the loser would die on "duplicate column name".
-    // BEGIN IMMEDIATE takes SQLite's write lock up front, acting as a
-    // cross-process mutex: the loser blocks here (subject to busy_timeout)
-    // until the winner commits, then sees the stamped version inside
-    // apply_migrations and no-ops. Bonus: the migration steps used to
-    // auto-commit individually; one transaction makes the whole migration
-    // atomic (SQLite DDL is transactional), so a crash mid-migration rolls
-    // back cleanly instead of leaving a half-migrated DB.
+    // #353: serialize the ENTIRE schema bootstrap, not only ALTER migrations.
+    // `DDL_V0_2_0` is idempotent but is still write DDL (including FTS5 virtual
+    // tables). Two fresh/pre-upgrade openers could race there before the old
+    // BEGIN IMMEDIATE below, producing SQLITE_BUSY despite the migration lock.
+    // SQLite DDL, including the virtual-table creation used here, is
+    // transactional; acquire the cross-process write mutex before any schema
+    // statement so the loser waits, then observes the winner's complete state.
     conn.execute_batch("BEGIN IMMEDIATE;")?;
-    match apply_migrations(conn) {
+    let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        conn.execute_batch(DDL_V0_2_0)?;
+
+        // `open` runs several times per process, so fully-migrated stores do
+        // no column probes after the in-transaction version check. A process
+        // that waited on the lock sees the winner's stamped version here.
+        let user_version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if user_version < SCHEMA_VERSION {
+            apply_migrations(conn)?;
+        }
+        Ok(())
+    })();
+    match result {
         Ok(()) => {
             conn.execute_batch("COMMIT;")?;
             Ok(())
