@@ -1,0 +1,81 @@
+{
+  "benchmark": "scale",
+  "issue": "#474",
+  "meta": {
+    "binary": "perseus-vault 2.21.0 (5553251)",
+    "commit": "555325185afb",
+    "hardware": {
+      "machine": "x86_64",
+      "processor": "",
+      "cpus": 8,
+      "os": "Linux 6.12.91-fly",
+      "python": "3.13.5"
+    },
+    "queries_per_metric": 100,
+    "transport": "MCP stdio, one persistent process per corpus size"
+  },
+  "runs": {
+    "100000": {
+      "entities": 100000,
+      "write": {
+        "count": 100000,
+        "elapsed_s": 3793.1,
+        "docs_per_sec": 26,
+        "first_10pct_docs_per_sec": 50,
+        "last_10pct_docs_per_sec": 14
+      },
+      "embed": {
+        "embedded": 302,
+        "elapsed_s": 16.0,
+        "embeds_per_sec": 19
+      },
+      "recall": {
+        "fts5": {
+          "p50_ms": 77.24,
+          "p95_ms": 87.09,
+          "p99_ms": 125.04,
+          "avg_ms": 74.31,
+          "n": 100
+        },
+        "dense": {
+          "p50_ms": 80.71,
+          "p95_ms": 130.89,
+          "p99_ms": 166.27,
+          "avg_ms": 83.21,
+          "n": 100
+        },
+        "hybrid": {
+          "p50_ms": 319.75,
+          "p95_ms": 378.57,
+          "p99_ms": 390.91,
+          "avg_ms": 303.48,
+          "n": 100
+        }
+      },
+      "as_of": {
+        "p50_ms": 0.2,
+        "p95_ms": 0.39,
+        "p99_ms": 44.01,
+        "avg_ms": 1.15,
+        "n": 100
+      },
+      "temporal_recall": {
+        "p50_ms": 63.26,
+        "p95_ms": 75.94,
+        "p99_ms": 80.22,
+        "avg_ms": 50.55,
+        "n": 100
+      },
+      "db": {
+        "file_bytes": 968712192,
+        "file_mb": 923.8,
+        "active_entities": 99832
+      },
+      "cold_start": {
+        "first_query_ms_min": 144.7,
+        "first_query_ms_median": 228.7
+      }
+    }
+  },
+  "signature_sha256": "4e90b0dc8b97533fda8e7559641206f0049d29d4930537d16703d4c812ed129e"
+}
