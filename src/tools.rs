@@ -248,6 +248,9 @@ pub struct RecallArgs {
     pub requesting_agent_id: Option<String>,
     #[serde(default)]
     pub layer: Option<String>,
+    /// #784: serving posture applied after authorization: personal, agent, or shared.
+    #[serde(default)]
+    pub retrieval_profile: Option<String>,
     /// #287: opt-in. When true, each result gets a normalized `confidence`
     /// (0.0–1.0) rolled up from rank, trust, and decay. Default false so
     /// existing callers and snapshot tests are unaffected; ranking is unchanged.
@@ -1131,6 +1134,15 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
     };
     let defer_side_effects = temporal_filtering || (startup_rank && a.offset == 0);
 
+    // #784: personal/agent profiles may retrieve global policy records; shared
+    // profile stays strictly workspace-scoped.
+    let profile_name = a.retrieval_profile.clone().unwrap_or_else(|| "shared".to_string());
+    let profile_workspace = if matches!(profile_name.as_str(), "personal" | "agent") {
+        None
+    } else {
+        a.workspace_hash.clone()
+    };
+
     let params = RecallParams {
         query: a.query,
         category: a.category,
@@ -1157,7 +1169,7 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
         diversity_halving: a.diversity_halving,
         diversity_per_query_share: 0.0,
         recency_half_life_secs: a.recency_half_life_secs,
-        workspace_hash: a.workspace_hash.clone(),
+        workspace_hash: profile_workspace.clone(),
         scope_weight: a.scope_weight,
         agent_id: a.agent_id.clone(),
         visibility: None,
@@ -1178,6 +1190,21 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
     // single-agent callers and data are unaffected.
     if let Some(req) = a.requesting_agent_id.as_deref().filter(|s| !s.is_empty()) {
         entities.retain(|e| db.can_read(req, &e.visibility, &e.agent_id));
+    }
+
+    // #784: profile-specific serving filter. This is additive to visibility:
+    // profile choice can only narrow results and never exposes another scope.
+    let profile_name = a.retrieval_profile.as_deref().unwrap_or("shared");
+    match profile_name {
+        "shared" => {
+            entities.retain(|e| {
+                e.category != "preference" && e.category != "personal"
+                    && a.workspace_hash.as_ref().map_or(true, |ws| ws.is_empty() || e.workspace_hash == *ws)
+            });
+        }
+        "personal" => entities.retain(|e| e.category == "preference" || e.category == "personal"),
+        "agent" => entities.retain(|e| matches!(e.category.as_str(), "convention" | "correction" | "keystone")),
+        other => return Err(format!("unknown retrieval_profile '{other}': expected personal, agent, or shared")),
     }
 
     // #728: external-ref post-filter (spec §2.2). Applied after visibility so
@@ -1267,6 +1294,7 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
         json!({
             "items": items_expanded,
             "total": items_expanded.len(),
+            "retrieval_profile": profile_name,
         })
     };
     Ok(result.to_string())
@@ -8214,6 +8242,36 @@ mod tests {
         assert_eq!(why["promotion_state"], json!("observation"));
         assert_eq!(why["support_count"], json!(1));
         assert_eq!(why["source_evidence_ids"], json!(["mem-episode"]));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn recall_profiles_partition_personal_agent_and_shared_memory() {
+        let (db, path) = temp_db();
+        for (category, key, workspace) in [
+            ("preference", "pref", ""),
+            ("convention", "rule", ""),
+            ("correction", "fix", ""),
+            ("insight", "shared", "ws-a"),
+            ("insight", "other", "ws-b"),
+        ] {
+            handle_remember(&db, json!({"category":category,"key":key,
+                "workspace_hash":workspace,"body_json":format!("{{\"content\":\"{} profile token\"}}", key),
+                "skip_dedup":true})).unwrap();
+        }
+        let ids = |profile: &str, ws: &str| -> Vec<String> {
+            let raw = handle_recall(&db, json!({"query":"profile token", "retrieval_profile":profile,
+                "workspace_hash":ws, "limit":10})).unwrap();
+            let mut keys: Vec<String> = serde_json::from_str::<Value>(&raw).unwrap()["items"].as_array().unwrap()
+                .iter().map(|x| x["key"].as_str().unwrap().to_string()).collect();
+            keys.sort();
+            keys
+        };
+        assert_eq!(ids("personal", "ws-a"), vec!["pref"]);
+        assert_eq!(ids("agent", "ws-a"), vec!["fix", "rule"]);
+        assert_eq!(ids("shared", "ws-a"), vec!["shared"]);
+        let err = handle_recall(&db, json!({"query":"profile token", "retrieval_profile":"bad"})).unwrap_err();
+        assert!(err.contains("unknown retrieval_profile"));
         let _ = std::fs::remove_file(&path);
     }
 

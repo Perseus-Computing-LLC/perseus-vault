@@ -983,6 +983,11 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
           "type": "string",
           "description": "Agent identity filter (v1.2.0). When set, only entities with a matching agent_id are returned. Omit for no agent filtering."
         },
+        "retrieval_profile": {
+          "type": "string",
+          "enum": ["personal", "agent", "shared"],
+          "description": "#784 serving posture. personal returns preference/personal classes; agent returns convention/correction/keystone classes; shared (default) returns non-personal memory in the requested workspace. Applied after visibility filtering."
+        },
         "layer": {
             "type": "string",
             "description": "Filter by memory layer (world, episodic, semantic)."
