@@ -3736,6 +3736,49 @@ fn default_certainty_margin() -> f64 {
     0.2
 }
 
+#[derive(Debug, Deserialize)]
+pub struct OperatorReviewArgs {
+    #[serde(default = "default_category")]
+    pub category: String,
+    #[serde(default = "default_conflict_limit")]
+    pub limit: i64,
+    #[serde(default)]
+    pub stale_threshold: Option<f64>,
+}
+
+fn default_category() -> String { "general".to_string() }
+
+/// #786: read-only operator queue. It composes existing conflict detection,
+/// actionability hygiene, and deprecated-state discovery without mutating facts.
+pub fn handle_operator_review(db: &Database, args: Value) -> Result<String, String> {
+    let a: OperatorReviewArgs = serde_json::from_value(args)
+        .map_err(|e| format!("Invalid operator_review arguments: {e}"))?;
+    let limit = a.limit.clamp(1, 1000);
+    let contradictions = db.detect_conflicts(&a.category, default_conflict_threshold(), limit, 0)
+        .map_err(|e| format!("Conflict review failed: {e}"))?;
+    let hygiene = handle_hygiene(db, json!({"category": a.category, "threshold": a.stale_threshold.unwrap_or(0.35), "limit":limit, "scan_limit":10000}))?;
+    let stale: Value = serde_json::from_str(&hygiene).map_err(|e| format!("Stale review decode failed: {e}"))?;
+    let mut supersession_lag = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let rows = db.scan_entities(Some(&a.category), None, false, cursor.as_deref(), 501)
+            .map_err(|e| format!("Supersession scan failed: {e}"))?;
+        if rows.is_empty() { break; }
+        let take = rows.len().min(500);
+        for entity in rows.iter().take(take) {
+            if entity.status == "deprecated" {
+                supersession_lag.push(json!({"id":entity.id,"category":entity.category,"key":entity.key,"status":entity.status,"reason":"deprecated fact requires successor review"}));
+            }
+        }
+        if rows.len() <= 500 || supersession_lag.len() >= limit as usize { break; }
+        cursor = rows.get(take - 1).map(|e| e.id.clone());
+    }
+    supersession_lag.truncate(limit as usize);
+    Ok(json!({"reviewed_at_unix_ms": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as i64, "category":a.category,
+        "contradictions":contradictions, "stale_candidates":stale["flagged"],
+        "supersession_lag":supersession_lag, "read_only":true}).to_string())
+}
+
 pub fn handle_conflicts(db: &Database, args: Value) -> String {
     let a: ConflictArgs = match serde_json::from_value(args) {
         Ok(a) => a,
@@ -8285,6 +8328,21 @@ mod tests {
         assert_eq!(why["promotion_state"], json!("observation"));
         assert_eq!(why["support_count"], json!(1));
         assert_eq!(why["source_evidence_ids"], json!(["mem-episode"]));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn operator_review_surfaces_conflicts_stale_and_supersession_candidates() {
+        let (db, path) = temp_db();
+        handle_remember(&db, json!({"category":"facts","key":"policy","body_json":"{\"content\":\"allow red\"}","certainty":0.9})).unwrap();
+        handle_remember(&db, json!({"category":"facts","key":"policy-two","body_json":"{\"content\":\"deny blue\"}","certainty":0.1})).unwrap();
+        handle_remember(&db, json!({"category":"convention","key":"vague","body_json":"{\"content\":\"ok\"}"})).unwrap();
+        let raw = handle_operator_review(&db, json!({"category":"facts", "limit":20})).unwrap();
+        let report: Value = serde_json::from_str(&raw).unwrap();
+        assert!(report["contradictions"]["conflicts"].is_array(), "{raw}");
+        assert!(report["stale_candidates"].is_array());
+        assert!(report["supersession_lag"].is_array());
+        assert!(report["reviewed_at_unix_ms"].as_i64().unwrap() > 0);
         let _ = std::fs::remove_file(&path);
     }
 
