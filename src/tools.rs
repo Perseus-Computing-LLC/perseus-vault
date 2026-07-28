@@ -1021,6 +1021,29 @@ fn entity_matches_ref_filter(e: &Entity, want_type: Option<&str>, want_value: Op
     })
 }
 
+fn apply_promotion_explanations(items: &mut [Value]) {
+    for item in items {
+        let Some(obj) = item.as_object_mut() else { continue };
+        let class = obj.get("category").and_then(Value::as_str).unwrap_or("unknown");
+        let transition = obj.get("promotion_transition");
+        let state = transition
+            .and_then(|v| v.get("to_state"))
+            .and_then(Value::as_str)
+            .unwrap_or("unpromoted");
+        let evidence: Vec<Value> = obj.get("promoted_from")
+            .and_then(|v| v.get("id"))
+            .cloned().into_iter().collect();
+        obj.insert("why_served".to_string(), json!({
+            "memory_class": class,
+            "promotion_state": state,
+            "support_count": evidence.len(),
+            "source_evidence_ids": evidence,
+            "promoted_scope": obj.get("workspace_hash").cloned().unwrap_or(Value::String(String::new())),
+            "reason": "matched the recall query"
+        }));
+    }
+}
+
 pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
     let a: RecallArgs =
         serde_json::from_value(args).map_err(|e| format!("Invalid recall arguments: {}", e))?;
@@ -1214,6 +1237,7 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
 
     let mut items_expanded: Vec<serde_json::Value> =
         entities.iter().map(|e| e.to_json_expanded()).collect();
+    apply_promotion_explanations(&mut items_expanded);
 
     // #472: stamp point-in-time provenance onto each reconstructed hit.
     if let Some(meta) = &temporal_meta {
@@ -8176,6 +8200,20 @@ mod tests {
         let items = v["items"].as_array().unwrap();
         assert_eq!(items.len(), 1, "{v}");
         assert_eq!(items[0]["key"], json!("about-plutus"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn recall_surfaces_promotion_aware_explanation() {
+        let (db, path) = temp_db();
+        handle_remember(&db, json!({"category":"observation","key":"rollout","body_json":"{\"content\":\"canary rollout reduces blast radius\",\"promoted_from\":{\"id\":\"mem-episode\"},\"promotion_transition\":{\"from_state\":\"episode\",\"to_state\":\"observation\"}}"})).unwrap();
+        let out = handle_recall(&db, json!({"query":"canary rollout"})).unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        let why = &v["items"][0]["why_served"];
+        assert_eq!(why["memory_class"], json!("observation"));
+        assert_eq!(why["promotion_state"], json!("observation"));
+        assert_eq!(why["support_count"], json!(1));
+        assert_eq!(why["source_evidence_ids"], json!(["mem-episode"]));
         let _ = std::fs::remove_file(&path);
     }
 
