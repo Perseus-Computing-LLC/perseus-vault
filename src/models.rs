@@ -944,6 +944,10 @@ pub struct AskParams {
     /// this valid-time instant (unix ms). Combine with as_of for the full cell.
     #[serde(default, deserialize_with = "crate::tools::string_or_int_opt")]
     pub valid_at_unix_ms: Option<i64>,
+    /// #783: MCP session identity stamped by the transport for visibility
+    /// enforcement on RAG sources. Never treated as an author filter.
+    #[serde(default)]
+    pub requesting_agent_id: Option<String>,
 }
 
 fn default_ask_limit() -> usize {

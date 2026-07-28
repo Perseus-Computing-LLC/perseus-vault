@@ -1007,13 +1007,13 @@ impl Database {
         self.llm_config.enabled
     }
 
-    /// RAG: recall relevant entities, assemble context, ask Ollama for a grounded answer.
-    pub fn ask(&self, params: &AskParams) -> Result<AskResult, Box<dyn std::error::Error>> {
-        if !self.llm_config.enabled {
-            return Err("LLM is not enabled. Set --llm-endpoint to enable mimir_ask.".into());
-        }
-
-        // Step 1: Recall top-k relevant entities
+    /// Recall the source set for RAG, enforcing the same session visibility
+    /// contract as mimir_recall. Kept separate so the security boundary is
+    /// testable without requiring a live LLM endpoint (#783).
+    pub fn ask_sources(
+        &self,
+        params: &AskParams,
+    ) -> Result<Vec<Entity>, Box<dyn std::error::Error>> {
         let recall_params = RecallParams {
             query: params.query.clone(),
             limit: params.top_k as i64,
@@ -1021,13 +1021,25 @@ impl Database {
             ..Default::default()
         };
         let mut entities = self.recall(&recall_params)?;
-        // #472 Temporal RAG: reconstruct the retrieved context at the requested
-        // past instant so the RAG answer is reproducible at a decision point.
+        if let Some(requester) = params.requesting_agent_id.as_deref() {
+            entities.retain(|e| self.can_read(requester, &e.visibility, &e.agent_id));
+        }
         self.resolve_temporal_versions(
             &mut entities,
             params.as_of_unix_ms,
             params.valid_at_unix_ms,
         )?;
+        Ok(entities)
+    }
+
+    /// RAG: recall relevant entities, assemble context, ask Ollama for a grounded answer.
+    pub fn ask(&self, params: &AskParams) -> Result<AskResult, Box<dyn std::error::Error>> {
+        if !self.llm_config.enabled {
+            return Err("LLM is not enabled. Set --llm-endpoint to enable mimir_ask.".into());
+        }
+
+        // Step 1: Recall top-k relevant entities through the visibility boundary.
+        let entities = self.ask_sources(params)?;
 
         if entities.is_empty() {
             return Err("No matching memories found for this question.".into());
@@ -13273,6 +13285,47 @@ mod tests {
         db.authority_revoke(&stored.id, "admin", "end test").unwrap();
         assert!(db.authority_get("agent-768", "ws-768", false).unwrap().is_none());
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn ask_sources_enforce_visibility_before_llm_prompting() {
+        let db = Database::open(":memory:").unwrap();
+        let now = now_ms();
+        for (key, owner, visibility) in [
+            ("private-plan", "alice", "private"),
+            ("shared-plan", "alice", "workspace"),
+        ] {
+            let entity = Entity {
+                id: format!("mem-{key}"),
+                category: "ask_visibility".to_string(),
+                key: key.to_string(),
+                body_json: serde_json::json!({"content": "aurora launch plan"}).to_string(),
+                status: "active".to_string(),
+                entity_type: "insight".to_string(),
+                tags: vec![], decay_score: 1.0, retrieval_count: 0,
+                layer: "working".to_string(), topic_path: String::new(), archived: false,
+                archive_reason: String::new(), links: vec![], verified: false,
+                source: "test".to_string(), always_on: false, certainty: 1.0,
+                workspace_hash: String::new(), agent_id: owner.to_string(),
+                visibility: visibility.to_string(), created_at_unix_ms: now,
+                last_accessed_unix_ms: now, follow_count: 0, miss_count: 0,
+                follow_rate: 0.0, efficacy_status: "unverified".to_string(),
+                embedding: None, _parsed_body: None,
+            };
+            db.remember_skip_dedup(&entity).unwrap();
+        }
+        let bob = db.ask_sources(&AskParams {
+            query: "aurora launch plan".to_string(), top_k: 10,
+            as_of_unix_ms: None, valid_at_unix_ms: None,
+            requesting_agent_id: Some("bob".to_string()),
+        }).unwrap();
+        assert_eq!(bob.iter().map(|e| e.key.as_str()).collect::<Vec<_>>(), vec!["shared-plan"]);
+        let alice = db.ask_sources(&AskParams {
+            query: "aurora launch plan".to_string(), top_k: 10,
+            as_of_unix_ms: None, valid_at_unix_ms: None,
+            requesting_agent_id: Some("alice".to_string()),
+        }).unwrap();
+        assert_eq!(alice.len(), 2);
     }
 
     #[test]

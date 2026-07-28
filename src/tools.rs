@@ -4628,6 +4628,10 @@ pub struct MemoriesArgs {
     pub old_path: String,
     #[serde(default)]
     pub new_path: String,
+    /// #783: MCP session identity stamped by the transport. Read commands use
+    /// it to enforce private/fleet visibility without trusting caller filters.
+    #[serde(default)]
+    pub requesting_agent_id: Option<String>,
 }
 
 /// Normalize a /memories path to an entity key. Rejects traversal and
@@ -4654,10 +4658,21 @@ fn is_memories_root(path: &str) -> bool {
     p.is_empty() || p == "/memories" || p == "memories" || p == "/"
 }
 
-fn memories_file(db: &Database, key: &str) -> Result<Option<crate::models::Entity>, String> {
+fn memories_file(
+    db: &Database,
+    key: &str,
+    requesting_agent_id: Option<&str>,
+) -> Result<Option<crate::models::Entity>, String> {
     db.get_entity(MEMORIES_CATEGORY, key)
         .map_err(|e| format!("read failed: {}", e))
-        .map(|opt| opt.filter(|e| !e.archived))
+        .map(|opt| {
+            opt.filter(|e| {
+                !e.archived
+                    && requesting_agent_id
+                        .map(|requester| db.can_read(requester, &e.visibility, &e.agent_id))
+                        .unwrap_or(true)
+            })
+        })
 }
 
 fn memories_write(
@@ -4732,8 +4747,16 @@ pub fn handle_memories(db: &Database, args: Value) -> Result<String, String> {
                 let entries = db
                     .list_entities(0, 1000, Some(MEMORIES_CATEGORY), None, None)
                     .map_err(|e| format!("list failed: {}", e))?;
-                let mut names: Vec<String> =
-                    entries.iter().map(|e| e.key.clone()).collect();
+                let mut names: Vec<String> = entries
+                    .iter()
+                    .filter(|e| {
+                        a.requesting_agent_id
+                            .as_deref()
+                            .map(|requester| db.can_read(requester, &e.visibility, &e.agent_id))
+                            .unwrap_or(true)
+                    })
+                    .map(|e| e.key.clone())
+                    .collect();
                 names.sort();
                 return Ok(json!({
                     "directory": "/memories",
@@ -4743,7 +4766,7 @@ pub fn handle_memories(db: &Database, args: Value) -> Result<String, String> {
                 .to_string());
             }
             let key = memories_key(&a.path)?;
-            let file = memories_file(db, &key)?
+            let file = memories_file(db, &key, a.requesting_agent_id.as_deref())?
                 .ok_or_else(|| format!("file not found: /memories/{}", key))?;
             // cat -n style numbering, matching the native memory tool's view.
             let numbered: String = file
@@ -4761,13 +4784,13 @@ pub fn handle_memories(db: &Database, args: Value) -> Result<String, String> {
         "create" => {
             let key = memories_key(&a.path)?;
             // Anthropic semantics: create overwrites an existing file.
-            let existing = memories_file(db, &key)?;
+            let existing = memories_file(db, &key, a.requesting_agent_id.as_deref())?;
             memories_write(db, &key, &a.file_text, existing.as_ref())?;
             Ok(json!({"path": format!("/memories/{}", key), "action": "created"}).to_string())
         }
         "str_replace" => {
             let key = memories_key(&a.path)?;
-            let file = memories_file(db, &key)?
+            let file = memories_file(db, &key, a.requesting_agent_id.as_deref())?
                 .ok_or_else(|| format!("file not found: /memories/{}", key))?;
             let occurrences = file.body_json.matches(&a.old_str).count();
             if a.old_str.is_empty() {
@@ -4788,7 +4811,7 @@ pub fn handle_memories(db: &Database, args: Value) -> Result<String, String> {
         }
         "insert" => {
             let key = memories_key(&a.path)?;
-            let file = memories_file(db, &key)?
+            let file = memories_file(db, &key, a.requesting_agent_id.as_deref())?
                 .ok_or_else(|| format!("file not found: /memories/{}", key))?;
             let mut lines: Vec<&str> = file.body_json.lines().collect();
             let at = a.insert_line.clamp(0, lines.len() as i64) as usize;
@@ -4804,6 +4827,8 @@ pub fn handle_memories(db: &Database, args: Value) -> Result<String, String> {
         }
         "delete" => {
             let key = memories_key(&a.path)?;
+            memories_file(db, &key, a.requesting_agent_id.as_deref())?
+                .ok_or_else(|| format!("file not found: /memories/{}", key))?;
             let removed = db
                 .forget(MEMORIES_CATEGORY, &key, "memories: delete command")
                 .map_err(|e| format!("delete failed: {}", e))?;
@@ -4815,9 +4840,9 @@ pub fn handle_memories(db: &Database, args: Value) -> Result<String, String> {
         "rename" => {
             let old_key = memories_key(&a.old_path)?;
             let new_key = memories_key(&a.new_path)?;
-            let file = memories_file(db, &old_key)?
+            let file = memories_file(db, &old_key, a.requesting_agent_id.as_deref())?
                 .ok_or_else(|| format!("file not found: /memories/{}", old_key))?;
-            if memories_file(db, &new_key)?.is_some() {
+            if memories_file(db, &new_key, a.requesting_agent_id.as_deref())?.is_some() {
                 return Err(format!("destination exists: /memories/{}", new_key));
             }
             memories_write(db, &new_key, &file.body_json, None)?;
@@ -4847,6 +4872,72 @@ mod tests {
         let path_str = path.to_str().unwrap().to_string();
         let db = Database::open(&path_str).expect("open test db");
         (db, path_str)
+    }
+
+    #[test]
+    fn memories_adapter_hides_private_files_from_other_agents() {
+        let (db, path) = temp_db();
+        let now = crate::db::now_ms();
+        let private = Entity {
+            id: "memf-private".to_string(),
+            category: MEMORIES_CATEGORY.to_string(),
+            key: "private.md".to_string(),
+            body_json: "private contents".to_string(),
+            status: "active".to_string(),
+            entity_type: "file".to_string(),
+            tags: vec!["memories".to_string()],
+            decay_score: 1.0,
+            retrieval_count: 0,
+            layer: "working".to_string(),
+            topic_path: String::new(),
+            archived: false,
+            archive_reason: String::new(),
+            links: vec![],
+            verified: false,
+            source: "test".to_string(),
+            always_on: false,
+            certainty: 1.0,
+            workspace_hash: String::new(),
+            agent_id: "alice".to_string(),
+            visibility: "private".to_string(),
+            created_at_unix_ms: now,
+            last_accessed_unix_ms: now,
+            follow_count: 0,
+            miss_count: 0,
+            follow_rate: 0.0,
+            efficacy_status: "unverified".to_string(),
+            embedding: None,
+            _parsed_body: None,
+        };
+        db.remember_skip_dedup(&private).unwrap();
+
+        let alice: Value = serde_json::from_str(&handle_memories(
+            &db,
+            json!({"command": "view", "path": "/memories", "requesting_agent_id": "alice"}),
+        ).unwrap()).unwrap();
+        assert_eq!(alice["files"], json!(["private.md"]), "{alice}");
+
+        let bob: Value = serde_json::from_str(&handle_memories(
+            &db,
+            json!({"command": "view", "path": "/memories", "requesting_agent_id": "bob"}),
+        ).unwrap()).unwrap();
+        assert_eq!(bob["files"], json!([]), "{bob}");
+        let err = handle_memories(
+            &db,
+            json!({"command": "view", "path": "/memories/private.md", "requesting_agent_id": "bob"}),
+        ).expect_err("private file must not be readable by another agent");
+        assert!(err.contains("file not found"), "must not disclose private existence: {err}");
+        let err = handle_memories(
+            &db,
+            json!({"command": "delete", "path": "/memories/private.md", "requesting_agent_id": "bob"}),
+        ).expect_err("private file must not be deletable by another agent");
+        assert!(err.contains("file not found"), "must not disclose private existence: {err}");
+        let alice_after: Value = serde_json::from_str(&handle_memories(
+            &db,
+            json!({"command": "view", "path": "/memories/private.md", "requesting_agent_id": "alice"}),
+        ).unwrap()).unwrap();
+        assert!(alice_after["content"].as_str().unwrap().contains("private contents"));
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
