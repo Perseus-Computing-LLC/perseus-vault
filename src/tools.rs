@@ -2901,6 +2901,49 @@ pub fn handle_health(db: &Database) -> String {
     .to_string()
 }
 
+fn default_telemetry_category() -> String { "general".to_string() }
+
+#[derive(Debug, Deserialize)]
+pub struct QualityTelemetryArgs {
+    #[serde(default = "default_telemetry_category")]
+    pub category: String,
+}
+
+/// #787: compact, machine-readable quality posture for dashboards and release gates.
+pub fn handle_quality_telemetry(db: &Database, args: Value) -> Result<String, String> {
+    let a: QualityTelemetryArgs = serde_json::from_value(args)
+        .map_err(|e| format!("Invalid quality_telemetry arguments: {e}"))?;
+    let stats = db.stats().map_err(|e| format!("Telemetry stats failed: {e}"))?;
+    let conflicts = db.detect_conflicts(&a.category, default_conflict_threshold(), 1000, 0)
+        .map_err(|e| format!("Telemetry conflict scan failed: {e}"))?;
+    let conflict_value = serde_json::to_value(&conflicts).map_err(|e| e.to_string())?;
+    let contradiction_count = conflict_value["total"].as_i64().unwrap_or_else(|| {
+        conflict_value["conflicts"].as_array().map(|v| v.len() as i64).unwrap_or(0)
+    });
+    let mut deprecated = 0i64;
+    let mut cursor: Option<String> = None;
+    loop {
+        let rows = db.scan_entities(None, None, false, cursor.as_deref(), 501)
+            .map_err(|e| format!("Telemetry scan failed: {e}"))?;
+        if rows.is_empty() { break; }
+        let take = rows.len().min(500);
+        deprecated += rows.iter().take(take).filter(|e| e.status == "deprecated").count() as i64;
+        if rows.len() <= 500 { break; }
+        cursor = rows.get(take - 1).map(|e| e.id.clone());
+    }
+    Ok(json!({
+        "active_entities": stats.active_entities,
+        "contradiction_count": contradiction_count,
+        "contradiction_rate": if stats.active_entities > 0 { contradiction_count as f64 / stats.active_entities as f64 } else { 0.0 },
+        "supersession_lag_count": deprecated,
+        "class_distribution": stats.by_category_active,
+        "layer_distribution": stats.by_layer_active,
+        "promotion_flow": {"working": stats.by_layer_active["working"], "semantic": stats.by_layer_active["semantic"], "core": stats.by_layer_active["core"]},
+        "served_tier_mix": "available via recall retrieval_profile explanations",
+        "category_scanned": a.category,
+    }).to_string())
+}
+
 pub fn handle_stats(db: &Database) -> String {
     match db.stats() {
         Ok(stats) => serde_json::to_string(&stats).unwrap_or_else(|e| {
@@ -8285,6 +8328,20 @@ mod tests {
         assert_eq!(why["promotion_state"], json!("observation"));
         assert_eq!(why["support_count"], json!(1));
         assert_eq!(why["source_evidence_ids"], json!(["mem-episode"]));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn quality_telemetry_reports_machine_readable_memory_signals() {
+        let (db, path) = temp_db();
+        handle_remember(&db, json!({"category":"facts","key":"one","body_json":"{\"content\":\"red state\"}","certainty":0.9})).unwrap();
+        handle_remember(&db, json!({"category":"facts","key":"two","body_json":"{\"content\":\"blue state\"}","certainty":0.1})).unwrap();
+        let raw = handle_quality_telemetry(&db, json!({"category":"facts"})).unwrap();
+        let report: Value = serde_json::from_str(&raw).unwrap();
+        assert!(report["active_entities"].as_i64().unwrap() >= 2, "{raw}");
+        assert!(report["contradiction_count"].as_i64().unwrap() >= 1, "{raw}");
+        assert!(report["class_distribution"].is_object(), "{raw}");
+        assert!(report["promotion_flow"].is_object(), "{raw}");
         let _ = std::fs::remove_file(&path);
     }
 

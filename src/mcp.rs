@@ -2659,6 +2659,14 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Check Health"
   },
   {
+    "name": "mimir_quality_telemetry",
+    "description": "Machine-readable memory-quality telemetry: contradiction rate, supersession lag, class/layer distribution, and promotion-flow proxy.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {"category": {"type": "string", "description": "Category for contradiction scan (default general)."}}
+    }
+  },
+  {
     "name": "mimir_stats",
     "description": "Return comprehensive database statistics: entity counts by category, type, and decay layer; journal event count; state entry count; database file size; date range of stored data; and history growth (stored version rows, bytes, and the top-10 keys by version count — #398).",
     "inputSchema": {
@@ -4962,6 +4970,7 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
         "mimir_state_list" => tools::handle_state_list(db, args).map_err(|e| e.to_string()),
 
         "mimir_health" => Ok(tools::handle_health(db)),
+        "mimir_quality_telemetry" => tools::handle_quality_telemetry(db, args),
 
         "mimir_stats" => Ok(tools::handle_stats(db)),
 
