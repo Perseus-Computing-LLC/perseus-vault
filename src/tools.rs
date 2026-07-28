@@ -3954,6 +3954,16 @@ pub fn handle_workspace_list(db: &Database) -> String {
 pub struct AutocohereArgs {
     #[serde(default)]
     pub dry_run: bool,
+    /// #780: optional raw session/transcript payload captured DURABLY before
+    /// any cohere/decay/compaction work can discard source context.
+    #[serde(default)]
+    pub capture_text: Option<String>,
+    #[serde(default)]
+    pub capture_workspace_hash: String,
+    #[serde(default)]
+    pub capture_agent_id: String,
+    #[serde(default)]
+    pub capture_max_entities: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -4007,6 +4017,31 @@ pub fn handle_autocohere(db: &Database, args: Value) -> Result<String, String> {
     let mut total_promoted = 0i64;
     let mut total_links = 0i64;
     let mut total_archived_cohere = 0i64;
+
+    // #780 ordering guarantee: a caller-supplied raw buffer is distilled and
+    // persisted before the first lifecycle step (cohere/decay/compact) that can
+    // archive or compress source context. Capture failure aborts this run rather
+    // than letting a later compaction silently proceed without the durability
+    // barrier. `dry_run` reaches capture too, so preview is side-effect free.
+    let precompact_capture = match a.capture_text.as_deref().map(str::trim) {
+        Some(text) if !text.is_empty() => {
+            let mut capture_args = json!({
+                "text": text,
+                "workspace_hash": a.capture_workspace_hash,
+                "agent_id": a.capture_agent_id,
+                "dry_run": a.dry_run,
+            });
+            if let Some(max) = a.capture_max_entities {
+                capture_args["max_entities"] = json!(max);
+            }
+            let raw = handle_capture(db, capture_args)
+                .map_err(|e| format!("Autocohere pre-compaction capture failed: {}", e))?;
+            let report: Value = serde_json::from_str(&raw)
+                .map_err(|e| format!("Autocohere pre-compaction capture report parse failed: {}", e))?;
+            json!({ "stage": "completed", "report": report })
+        }
+        _ => json!({ "stage": "skipped", "reason": "no capture_text provided" }),
+    };
 
     // Snapshot the DB size BEFORE any mutation so db_size_delta_bytes is
     // meaningful — it was previously read after all three steps had run, so
@@ -4093,6 +4128,7 @@ pub fn handle_autocohere(db: &Database, args: Value) -> Result<String, String> {
     };
 
     let result = json!({
+        "precompact_capture": precompact_capture,
         "promoted_entities": total_promoted,
         "links_created": total_links,
         "archived_entities": total_archived_cohere + compact_report.entities_archived,
@@ -5473,6 +5509,47 @@ mod tests {
             "autocohere must auto-link a clearly-linkable corpus (max_links \
              default must not be 0): {resp}"
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn autocohere_captures_before_compaction_and_preserves_fact() {
+        let (db, path) = temp_db();
+        let response = handle_autocohere(
+            &db,
+            json!({
+                "capture_text": "## Deployment decision\nUse blue-green deployment so rollback remains safe.",
+                "capture_workspace_hash": "ws-precompact"
+            }),
+        )
+        .expect("autocohere with pre-compaction capture");
+        let report: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(report["precompact_capture"]["stage"], json!("completed"), "{response}");
+        assert!(report["precompact_capture"]["report"]["captured"].as_i64().unwrap() >= 1, "{response}");
+        let captured = db
+            .get_entity("capture", "deployment-decision")
+            .unwrap()
+            .expect("captured fact must survive subsequent compaction lifecycle");
+        assert!(!captured.archived, "captured fact must remain live");
+        assert_eq!(captured.workspace_hash, "ws-precompact");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn autocohere_capture_dry_run_writes_no_fact() {
+        let (db, path) = temp_db();
+        let response = handle_autocohere(
+            &db,
+            json!({
+                "dry_run": true,
+                "capture_text": "## Preview decision\nDo not persist this preview-only deployment decision."
+            }),
+        )
+        .expect("dry-run autocohere");
+        let report: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(report["precompact_capture"]["stage"], json!("completed"));
+        assert_eq!(report["precompact_capture"]["report"]["dry_run"], json!(true));
+        assert!(db.get_entity("capture", "preview-decision").unwrap().is_none());
         let _ = std::fs::remove_file(&path);
     }
 
