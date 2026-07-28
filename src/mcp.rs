@@ -1419,6 +1419,16 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Promote Memory"
   },
   {
+    "name": "mimir_demote",
+    "description": "Demote a governed memory exactly one rung down the durable-memory ladder. Writes a provenance-preserving copy, a demoted_to link, and an append-only demotion journal event.",
+    "inputSchema": {"type":"object","properties":{
+      "from_category":{"type":"string"},"from_key":{"type":"string"},"to_category":{"type":"string"},"to_key":{"type":"string"},"reason":{"type":"string"}
+    },"required":["from_category","from_key","to_category"]},
+    "outputSchema": {"type":"object","properties":{"demoted":{"type":"boolean"},"to_id":{"type":"string"}}},
+    "annotations": {"destructiveHint": true},
+    "title": "Demote Memory"
+  },
+  {
     "name": "mimir_beliefs",
     "description": "Derived-belief overlay (#717, spec: docs/specs/belief-overlay.md): compute the current effective belief for a topic from the live entity store, with fresh local corrections always outranking stale global beliefs regardless of semantic similarity (precedence tiers are absolute, never blended).",
     "inputSchema": {
@@ -4967,6 +4977,7 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
         "mimir_action_lease_acquire" => tools::handle_action_lease_acquire(db, args),
         "mimir_action_lease_release" => tools::handle_action_lease_release(db, args),
         "mimir_promote" => tools::handle_promote(db, args),
+        "mimir_demote" => tools::handle_demote(db, args),
         "mimir_beliefs" => beliefs::handle_beliefs(db, args),
         "mimir_conflicts" => Ok(tools::handle_conflicts(db, args)),
         "mimir_consolidate" => Ok(tools::handle_consolidate(db, args)),
