@@ -3677,6 +3677,18 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Export Vault to Files"
   },
   {
+    "name": "mimir_derived_export",
+    "description": "Compile durable knowledge into a deterministic, provenance-rich Markdown surface. The export is derived and read-only; SQLite remains the source of truth.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "output_path": {"type": "string", "description": "Markdown file path to write."},
+        "workspace_hash": {"type": "string", "description": "Optional exact workspace scope."}
+      },
+      "required": ["output_path"]
+    }
+  },
+  {
     "name": "mimir_vault_import",
     "description": "Import .md files from a vault directory into the database. Reads YAML frontmatter for metadata and markdown body for content. Idempotent — re-running on the same vault won't duplicate entities. Pair with mimir_vault_export for transfer.",
     "inputSchema": {
@@ -4988,6 +5000,7 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
         "mimir_consolidate" => Ok(tools::handle_consolidate(db, args)),
         "mimir_dream" => tools::handle_dream(db, args),
         "mimir_vault_export" => Ok(tools::handle_vault_export(db, args)),
+        "mimir_derived_export" => tools::handle_derived_export(db, args),
         "mimir_vault_import" => Ok(tools::handle_vault_import(db, args)),
         "mimir_decay" => Ok(tools::handle_decay(db, args)),
         "mimir_reindex" => Ok(tools::handle_reindex(db, args)),
