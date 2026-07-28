@@ -2079,6 +2079,28 @@ pub struct PromoteArgs {
     pub reason: String,
 }
 
+fn promotion_state(category: &str) -> Option<&'static str> {
+    match category {
+        "episode" | "episodes" | "capture" => Some("episode"),
+        "observation" => Some("observation"),
+        "convention" => Some("convention"),
+        "belief" => Some("belief"),
+        "keystone" => Some("keystone"),
+        _ => None,
+    }
+}
+
+fn valid_promotion_transition(from: &str, to: &str) -> bool {
+    matches!(
+        (from, to),
+        ("episode", "observation")
+            | ("observation", "convention")
+            | ("observation", "belief")
+            | ("convention", "keystone")
+            | ("belief", "keystone")
+    )
+}
+
 pub fn handle_promote(db: &Database, args: Value) -> Result<String, String> {
     let a: PromoteArgs = serde_json::from_value(args)
         .map_err(|e| format!("Invalid promote arguments: {}", e))?;
@@ -2112,6 +2134,20 @@ pub fn handle_promote(db: &Database, args: Value) -> Result<String, String> {
         .clone()
         .unwrap_or_else(|| src.workspace_hash.clone());
 
+    // #781: categories in the durable-knowledge ladder are governed. Generic
+    // category/scope promotion remains backward-compatible, but a recognized
+    // ladder state cannot skip a rung or move backward.
+    if let (Some(from_state), Some(to_state)) =
+        (promotion_state(&src.category), promotion_state(&to_category))
+    {
+        if from_state != to_state && !valid_promotion_transition(from_state, to_state) {
+            return Err(format!(
+                "invalid promotion transition: {} ({}) -> {} ({}); allowed: episode -> observation -> convention/belief -> keystone",
+                src.category, from_state, to_category, to_state
+            ));
+        }
+    }
+
     if to_category == src.category && to_key == src.key && to_scope == src.workspace_hash {
         return Err("Target is identical to source; nothing to promote".into());
     }
@@ -2131,6 +2167,14 @@ pub fn handle_promote(db: &Database, args: Value) -> Result<String, String> {
                 "workspace_hash": src.workspace_hash,
                 "reason": a.reason,
                 "promoted_at_unix_ms": now,
+            }),
+        );
+        map.insert(
+            "promotion_transition".to_string(),
+            json!({
+                "from_state": promotion_state(&src.category),
+                "to_state": promotion_state(&to_category),
+                "at_unix_ms": now,
             }),
         );
     }
@@ -2179,6 +2223,24 @@ pub fn handle_promote(db: &Database, args: Value) -> Result<String, String> {
     db.link(&a.from_category, &a.from_key, &new_id, "promoted_to")
         .map_err(|e| format!("Promote link failed: {}", e))?;
 
+    // #781: each governed promotion is reconstructible independently of the
+    // entity body/link graph through the append-only audit timeline.
+    let event = JournalEvent {
+        id: format!("jrn-{}", &Uuid::new_v4().to_string().replace('-', "")[..12]),
+        event_type: "promotion".to_string(),
+        evaluated_json: json!({"from_state": promotion_state(&src.category), "to_state": promotion_state(&to_category)}).to_string(),
+        acted_json: json!({"from": format!("{}/{}", a.from_category, a.from_key), "to": format!("{}/{}", to_category, to_key), "reason": a.reason}).to_string(),
+        forward_json: json!({"next": "evaluate the promoted entity at the next lifecycle rung"}).to_string(),
+        category: to_category.clone(),
+        key: to_key.clone(),
+        entity_id: new_id.clone(),
+        agent_id: src.agent_id.clone(),
+        workspace_hash: to_scope.clone(),
+        created_at_unix_ms: now,
+    };
+    db.journal(&event)
+        .map_err(|e| format!("Promotion audit journal failed: {}", e))?;
+
     let result = json!({
         "promoted": true,
         "action": action,
@@ -2190,6 +2252,46 @@ pub fn handle_promote(db: &Database, args: Value) -> Result<String, String> {
         "reason": a.reason,
     });
     Ok(result.to_string())
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DemoteArgs {
+    pub from_category: String,
+    pub from_key: String,
+    pub to_category: String,
+    #[serde(default)]
+    pub to_key: Option<String>,
+    #[serde(default)]
+    pub reason: String,
+}
+
+pub fn handle_demote(db: &Database, args: Value) -> Result<String, String> {
+    let a: DemoteArgs = serde_json::from_value(args)
+        .map_err(|e| format!("Invalid demote arguments: {}", e))?;
+    let src = db.get_entity(&a.from_category, &a.from_key)
+        .map_err(|e| format!("Source entity lookup failed: {}", e))?
+        .ok_or_else(|| format!("Source entity not found: {}/{}", a.from_category, a.from_key))?;
+    let from_state = promotion_state(&src.category)
+        .ok_or_else(|| format!("Source category '{}' is not in the promotion ladder", src.category))?;
+    let to_state = promotion_state(&a.to_category)
+        .ok_or_else(|| format!("Target category '{}' is not in the promotion ladder", a.to_category))?;
+    if !valid_promotion_transition(to_state, from_state) {
+        return Err(format!("invalid demotion transition: {} -> {}; allowed reverse ladder transitions only", from_state, to_state));
+    }
+    let now = now_ms();
+    let to_key = a.to_key.clone().unwrap_or_else(|| src.key.clone());
+    let mut body: Value = serde_json::from_str(&src.body_json).unwrap_or_else(|_| json!({}));
+    if let Some(map) = body.as_object_mut() {
+        map.insert("demoted_from".into(), json!({"category":src.category,"key":src.key,"id":src.id,"reason":a.reason,"demoted_at_unix_ms":now}));
+        map.insert("promotion_transition".into(), json!({"from_state":from_state,"to_state":to_state,"at_unix_ms":now}));
+    }
+    let raw_id = Uuid::new_v4().to_string().replace('-', "");
+    let entity = Entity { id: format!("mem-{}", &raw_id[..12]), category:a.to_category.clone(), key:to_key.clone(), body_json:body.to_string(), status:src.status.clone(), entity_type:src.entity_type.clone(), tags:src.tags.clone(), decay_score:src.decay_score, retrieval_count:0, layer:src.layer.clone(), topic_path:src.topic_path.clone(), archived:false, archive_reason:String::new(), links:vec![], verified:src.verified, source:"agent".into(), always_on:src.always_on, certainty:src.certainty, workspace_hash:src.workspace_hash.clone(), agent_id:src.agent_id.clone(), visibility:src.visibility.clone(), created_at_unix_ms:now, last_accessed_unix_ms:now, follow_count:0, miss_count:0, follow_rate:0.0, efficacy_status:"unverified".into(), embedding:None, _parsed_body:None };
+    let (new_id, action) = db.remember_skip_dedup(&entity).map_err(|e| format!("Demote write failed: {}", e))?;
+    db.link(&a.from_category, &a.from_key, &new_id, "demoted_to").map_err(|e| format!("Demote link failed: {}", e))?;
+    let event = JournalEvent { id:format!("jrn-{}", &Uuid::new_v4().to_string().replace('-', "")[..12]), event_type:"demotion".into(), evaluated_json:json!({"from_state":from_state,"to_state":to_state}).to_string(), acted_json:json!({"reason":a.reason}).to_string(), forward_json:json!({"next":"re-evaluate evidence before promotion"}).to_string(), category:a.to_category.clone(), key:to_key.clone(), entity_id:new_id.clone(), agent_id:src.agent_id.clone(), workspace_hash:src.workspace_hash.clone(), created_at_unix_ms:now };
+    db.journal(&event).map_err(|e| format!("Demotion audit journal failed: {}", e))?;
+    Ok(json!({"demoted":true,"action":action,"from":format!("{}/{}",a.from_category,a.from_key),"to":format!("{}/{}",a.to_category,to_key),"to_id":new_id,"reason":a.reason}).to_string())
 }
 
 pub fn handle_journal(db: &Database, args: Value) -> Result<String, String> {
@@ -8093,7 +8195,7 @@ mod tests {
         let out = handle_promote(
             &db,
             json!({"from_category": "episodes", "from_key": "incident-42",
-                   "to_category": "convention",
+                   "to_category": "observation",
                    "reason": "recurred three times"}),
         )
         .unwrap();
@@ -8101,7 +8203,7 @@ mod tests {
         assert_eq!(v["promoted"], json!(true));
         let new_id = v["to_id"].as_str().unwrap();
 
-        let promoted = db.get_entity("convention", "incident-42").unwrap().expect("copy");
+        let promoted = db.get_entity("observation", "incident-42").unwrap().expect("copy");
         let body: Value = serde_json::from_str(&promoted.body_json).unwrap();
         assert_eq!(body["promoted_from"]["category"], json!("episodes"));
         assert_eq!(body["promoted_from"]["reason"], json!("recurred three times"));
@@ -8111,6 +8213,31 @@ mod tests {
             .links
             .iter()
             .any(|l| l.relationship == "promoted_to" && l.target_id == new_id));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn demote_creates_provenance_linked_copy_and_journal_event() {
+        let (db, path) = temp_db();
+        handle_remember(&db, json!({"category":"convention", "key":"rollout", "body_json":"{\"content\":\"canary deploy first\"}"})).unwrap();
+        let out = handle_demote(&db, json!({"from_category":"convention", "from_key":"rollout", "to_category":"observation", "reason":"not yet durable"})).unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        let demoted = db.get_entity("observation", "rollout").unwrap().expect("copy");
+        let body: Value = serde_json::from_str(&demoted.body_json).unwrap();
+        assert_eq!(body["demoted_from"]["category"], json!("convention"));
+        assert!(v["demoted"].as_bool().unwrap());
+        let events = db.timeline(&TimelineParams { event_type: Some("demotion".into()), ..Default::default() }).unwrap();
+        assert_eq!(events.len(), 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn promote_rejects_ladder_skips() {
+        let (db, path) = temp_db();
+        handle_remember(&db, json!({"category":"episodes", "key":"skip", "body_json":"{\"content\":\"repeated deploy failure\"}"})).unwrap();
+        let err = handle_promote(&db, json!({"from_category":"episodes", "from_key":"skip", "to_category":"convention"})).unwrap_err();
+        assert!(err.contains("invalid promotion transition"), "{err}");
+        assert!(db.get_entity("convention", "skip").unwrap().is_none());
         let _ = std::fs::remove_file(&path);
     }
 
