@@ -4261,7 +4261,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
   },
   {
     "name": "mimir_autocohere",
-    "description": "Run a full atomic grooming pass: cohere (promote, link, archive), then decay (recalculate Ebbinghaus decay), then compact (archive below threshold), then consolidate, then enforce the entity_history retention policy (#398 — no-op unless MIMIR_HISTORY_* env knobs are set). Returns a summary report. Use dry_run=true to preview without changes.",
+    "description": "Run a full atomic grooming pass. When capture_text is supplied, capture runs first and must succeed before cohere, decay, compact, consolidation, or retention can compress source context. Returns a summary report. Use dry_run=true to preview without writing.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -4269,12 +4269,32 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
           "type": "boolean",
           "description": "If true, preview changes without writing",
           "default": false
+        },
+        "capture_text": {
+          "type": "string",
+          "description": "Optional raw transcript/insight payload persisted before every compaction-like stage. Capture failure aborts the pass."
+        },
+        "capture_workspace_hash": {
+          "type": "string",
+          "description": "Workspace scope for pre-compaction captured facts"
+        },
+        "capture_agent_id": {
+          "type": "string",
+          "description": "Agent attribution for pre-compaction captured facts"
+        },
+        "capture_max_entities": {
+          "type": "integer",
+          "description": "Maximum durable notes extracted from capture_text (1-20)"
         }
       }
     },
     "outputSchema": {
       "type": "object",
       "properties": {
+        "precompact_capture": {
+          "type": "object",
+          "description": "Capture barrier report. stage=completed means capture persisted before all lifecycle compression stages; stage=skipped means no capture_text was supplied."
+        },
         "promoted_entities": {
           "type": "integer",
           "description": "Entities promoted during cohere"
