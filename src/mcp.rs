@@ -3709,6 +3709,19 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     }
   },
   {
+    "name": "mimir_markdown_import",
+    "description": "Import one Markdown file as explicitly non-authoritative, provenance-labeled draft evidence. Duplicate source content is idempotently detected.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "path": {"type": "string", "description": "Markdown file path to import."},
+        "workspace_hash": {"type": "string"},
+        "source_system": {"type": "string", "description": "Provenance source label; defaults to markdown."}
+      },
+      "required": ["path"]
+    }
+  },
+  {
     "name": "mimir_vault_import",
     "description": "Import .md files from a vault directory into the database. Reads YAML frontmatter for metadata and markdown body for content. Idempotent — re-running on the same vault won't duplicate entities. Pair with mimir_vault_export for transfer.",
     "inputSchema": {
@@ -5023,6 +5036,7 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
         "mimir_dream" => tools::handle_dream(db, args),
         "mimir_vault_export" => Ok(tools::handle_vault_export(db, args)),
         "mimir_derived_export" => tools::handle_derived_export(db, args),
+        "mimir_markdown_import" => tools::handle_markdown_import(db, args),
         "mimir_vault_import" => Ok(tools::handle_vault_import(db, args)),
         "mimir_decay" => Ok(tools::handle_decay(db, args)),
         "mimir_reindex" => Ok(tools::handle_reindex(db, args)),
