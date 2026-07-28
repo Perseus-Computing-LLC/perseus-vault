@@ -3377,6 +3377,18 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Record Follow/Miss Efficacy Signal"
   },
   {
+    "name": "mimir_operator_review",
+    "description": "Read-only operator review queue for contradictions, stale/low-actionability facts, and deprecated supersession lag. Does not resolve or hide findings.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "category": {"type": "string", "description": "Category to review (default general)."},
+        "limit": {"type": "integer", "minimum": 1, "maximum": 1000},
+        "stale_threshold": {"type": "number", "minimum": 0, "maximum": 1}
+      }
+    }
+  },
+  {
     "name": "mimir_conflicts",
     "description": "Detect conflicting entities in the same category — pairs with low trigram similarity in their body_json. Flags potential contradictions, duplicate-but-divergent entries, and stale-overwritten facts. Read-only by default. Opt in with resolve=true to actively invalidate the lower-certainty side of clear conflicts (superseding it into history, reversible + time-travelable via mimir_as_of); that path defaults to dry_run=true so you preview first, and never resolves pairs whose certainties are within certainty_margin.",
     "inputSchema": {
@@ -5005,6 +5017,7 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
         "mimir_promote" => tools::handle_promote(db, args),
         "mimir_demote" => tools::handle_demote(db, args),
         "mimir_beliefs" => beliefs::handle_beliefs(db, args),
+        "mimir_operator_review" => tools::handle_operator_review(db, args),
         "mimir_conflicts" => Ok(tools::handle_conflicts(db, args)),
         "mimir_consolidate" => Ok(tools::handle_consolidate(db, args)),
         "mimir_dream" => tools::handle_dream(db, args),
