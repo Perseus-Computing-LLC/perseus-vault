@@ -33,11 +33,15 @@ jobs:
           python-version: "3.12"
       - name: Build (lean)
         run: cargo build --locked --no-default-features
-      - name: Memory quality gate
+      - name: Memory quality report
         run: python benchmark/quality/run.py --out benchmark/quality/report.json
-      - name: Upload quality report
+      - name: Build blocking release scorecard
+        run: python benchmark/quality/scorecard.py benchmark/quality/report.json --out benchmark/quality/scorecard.json
+      - name: Upload quality report and scorecard
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: memory-quality-report
-          path: benchmark/quality/report.json
+          name: memory-quality-scorecard
+          path: |
+            benchmark/quality/report.json
+            benchmark/quality/scorecard.json

@@ -43,3 +43,17 @@ Each report contains:
 - `offline`
 - `binary`
 - `signature_sha256`
+
+## Release scorecard
+
+Generate the blocking release decision defined in
+[`docs/memory-quality-release-gate.md`](../../docs/memory-quality-release-gate.md):
+
+```bash
+python benchmark/quality/scorecard.py /tmp/perseus-vault-memory-quality.json \
+  --out /tmp/perseus-vault-memory-quality-scorecard.json
+```
+
+The scorecard is `release_ready` only when every required category is present,
+all checks pass, and aggregate accuracy is 1.0. CI uploads both the raw report
+and scorecard as the `memory-quality-scorecard` artifact.
