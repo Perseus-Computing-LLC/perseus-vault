@@ -3386,6 +3386,47 @@ pub fn handle_derived_export(db: &Database, args: Value) -> Result<String, Strin
     Ok(json!({"output_path": path, "exported": selected.len(), "deterministic": true}).to_string())
 }
 
+#[derive(Debug, Deserialize)]
+pub struct MarkdownImportArgs {
+    pub path: String,
+    #[serde(default)]
+    pub workspace_hash: String,
+    #[serde(default = "default_import_source_system")]
+    pub source_system: String,
+}
+fn default_import_source_system() -> String { "markdown".to_string() }
+
+/// #788: controlled one-document Markdown import. Imported material is always
+/// draft, low-certainty evidence with explicit provenance; it never masquerades
+/// as a native observation/correction.
+pub fn handle_markdown_import(db: &Database, args: Value) -> Result<String, String> {
+    let a: MarkdownImportArgs = serde_json::from_value(args)
+        .map_err(|e| format!("Invalid markdown_import arguments: {e}"))?;
+    let content = std::fs::read_to_string(&a.path)
+        .map_err(|e| format!("Cannot read Markdown source {}: {e}", a.path))?;
+    let title = content.lines().find_map(|l| l.strip_prefix("# ")).unwrap_or("Imported Markdown").trim();
+    let source_hash = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        a.path.hash(&mut h); content.hash(&mut h); format!("{:016x}", h.finish())
+    };
+    let key = format!("markdown-{}", source_hash);
+    let existing = db.recall(&crate::models::RecallParams { query: String::new(), category: Some("imported_markdown".to_string()), workspace_hash: Some(a.workspace_hash.clone()), limit: 1000, skip_side_effects: true, ..crate::models::RecallParams::default() })
+        .map_err(|e| format!("Import duplicate scan failed: {e}"))?;
+    if existing.iter().any(|e| e.key == key) {
+        return Ok(json!({"imported":0,"deduped":true,"key":key,"status":"draft"}).to_string());
+    }
+    let body = json!({"title":title,"content":content,"origin": {"memory_kind":"imported","source_system":a.source_system,"capture_method":"import"},"non_authoritative":true,"source_path":a.path});
+    let remembered = handle_remember(db, json!({
+        "category":"imported_markdown", "key":key, "body_json":body.to_string(),
+        "status":"draft", "type":"reference", "tags":["imported","markdown"],
+        "importance":0.2, "certainty":0.2, "workspace_hash":a.workspace_hash,
+        "skip_dedup":true
+    }))?;
+    let result: Value = serde_json::from_str(&remembered).map_err(|e| format!("Markdown import response decode failed: {e}"))?;
+    Ok(json!({"imported":1,"deduped":false,"id":result["id"],"key":key,"action":result["action"],"status":"draft","non_authoritative":true}).to_string())
+}
+
 pub fn handle_vault_import(db: &Database, args: Value) -> String {
     let a: VaultExportArgs = match serde_json::from_value(args) {
         Ok(a) => a,
@@ -8401,6 +8442,23 @@ mod tests {
         assert!(report["supersession_lag"].is_array());
         assert!(report["reviewed_at_unix_ms"].as_i64().unwrap() > 0);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn markdown_import_labels_content_as_non_authoritative_import_and_dedups() {
+        let (db, path) = temp_db();
+        let source = std::env::temp_dir().join(format!("import-{}.md", uuid::Uuid::new_v4()));
+        std::fs::write(&source, "# Team Policy\n\nImported procedures apply here.").unwrap();
+        let args = json!({"path":source.to_string_lossy(), "workspace_hash":"ws", "source_system":"wiki"});
+        let first: Value = serde_json::from_str(&handle_markdown_import(&db, args.clone()).unwrap()).unwrap();
+        assert_eq!(first["imported"], 1, "{first}");
+        let second: Value = serde_json::from_str(&handle_markdown_import(&db, args).unwrap()).unwrap();
+        assert_eq!(second["imported"], 0, "{second}");
+        let raw = handle_recall(&db, json!({"query":"Imported procedures", "workspace_hash":"ws"})).unwrap();
+        let item = &serde_json::from_str::<Value>(&raw).unwrap()["items"][0];
+        assert_eq!(item["origin"]["memory_kind"], "imported");
+        assert_eq!(item["status"], "draft");
+        let _ = std::fs::remove_file(&path); let _ = std::fs::remove_file(&source);
     }
 
     #[test]
