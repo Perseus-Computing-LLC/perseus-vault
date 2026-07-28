@@ -1,6 +1,6 @@
 # Operator review queue
 
-`mimir_operator_review` provides a read-only maintenance surface for operator triage:
+`perseus_vault_operator_review` provides a read-only maintenance surface for operator triage. The legacy `mimir_operator_review` alias remains callable during the v2 compatibility window.
 
 ```json
 {"category":"general","limit":50,"stale_threshold":0.35}
