@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 
 from run import evaluate_report, load_manifest, run_benchmark
+from scorecard import build_scorecard
 
 
 class QualityHarnessTests(unittest.TestCase):
@@ -53,6 +54,51 @@ class QualityHarnessTests(unittest.TestCase):
         result = evaluate_report(report)
         self.assertFalse(result["passed"])
         self.assertEqual(result["missing_categories"], ["adversarial", "shared_memory"])
+
+    def test_scorecard_marks_a_fully_passing_report_release_ready(self):
+        report = {
+            "benchmark": "perseus-vault-memory-quality",
+            "dataset": "quality-v1",
+            "passed": True,
+            "checks_passed": 8,
+            "checks_total": 8,
+            "accuracy": 1.0,
+            "missing_categories": [],
+            "cases": [
+                {"category": category, "checks": {"passed": 2, "total": 2}}
+                for category in (
+                    "long_horizon",
+                    "contradiction_supersession",
+                    "shared_memory",
+                    "adversarial",
+                )
+            ],
+        }
+        scorecard = build_scorecard(report)
+        self.assertEqual(scorecard["verdict"], "release_ready")
+        self.assertTrue(scorecard["blocking"])
+        self.assertEqual(scorecard["thresholds"]["minimum_accuracy"], 1.0)
+
+    def test_scorecard_blocks_a_regression_and_names_failed_categories(self):
+        report = {
+            "benchmark": "perseus-vault-memory-quality",
+            "dataset": "quality-v1",
+            "passed": False,
+            "checks_passed": 7,
+            "checks_total": 8,
+            "accuracy": 0.875,
+            "missing_categories": [],
+            "cases": [
+                {"category": "long_horizon", "checks": {"passed": 2, "total": 2}},
+                {"category": "contradiction_supersession", "checks": {"passed": 1, "total": 2}},
+                {"category": "shared_memory", "checks": {"passed": 2, "total": 2}},
+                {"category": "adversarial", "checks": {"passed": 2, "total": 2}},
+            ],
+        }
+        scorecard = build_scorecard(report)
+        self.assertEqual(scorecard["verdict"], "blocked")
+        self.assertEqual(scorecard["failed_categories"], ["contradiction_supersession"])
+        self.assertEqual(scorecard["override_policy"]["required_approver"], "maintainer")
 
 
 if __name__ == "__main__":
