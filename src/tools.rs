@@ -3427,6 +3427,71 @@ pub fn handle_markdown_import(db: &Database, args: Value) -> Result<String, Stri
     Ok(json!({"imported":1,"deduped":false,"id":result["id"],"key":key,"action":result["action"],"status":"draft","non_authoritative":true}).to_string())
 }
 
+#[derive(Debug, Deserialize)]
+pub struct StructuredIndexAnchorArgs {
+    pub index_type: String,
+    pub index_uri: String,
+    pub record_id: String,
+    /// `reference` preserves only an external anchor; `import` persists a
+    /// low-trust local copy with sufficient refetch metadata.
+    #[serde(default = "default_anchor_mode")]
+    pub mode: String,
+    #[serde(default)]
+    pub content: Option<String>,
+    #[serde(default)]
+    pub workspace_hash: String,
+    #[serde(default)]
+    pub source_system: String,
+    #[serde(default)]
+    pub observed_at_unix_ms: Option<i64>,
+    #[serde(default)]
+    pub revision: Option<String>,
+}
+
+fn default_anchor_mode() -> String { "reference".to_string() }
+
+/// #789: stable anchor contract for upstream structured indexes. Reference mode
+/// is deliberately non-mutating; import mode writes an explicitly imported,
+/// draft record with enough metadata for later verification/refetch.
+pub fn handle_structured_index_anchor(db: &Database, args: Value) -> Result<String, String> {
+    let a: StructuredIndexAnchorArgs = serde_json::from_value(args)
+        .map_err(|e| format!("Invalid structured_index_anchor arguments: {e}"))?;
+    if a.index_type.trim().is_empty() || a.index_uri.trim().is_empty() || a.record_id.trim().is_empty() {
+        return Err("index_type, index_uri, and record_id are required".to_string());
+    }
+    let anchor = format!("{}:{}#{}", a.index_type, a.index_uri, a.record_id);
+    let source_system = if a.source_system.is_empty() { format!("structured_index:{}", a.index_type) } else { a.source_system };
+    let metadata = json!({
+        "ref_type":"structured_index", "ref_value":anchor, "source_system":source_system,
+        "relationship":"about", "index_type":a.index_type, "index_uri":a.index_uri,
+        "record_id":a.record_id, "revision":a.revision, "observed_at_unix_ms":a.observed_at_unix_ms
+    });
+    match a.mode.as_str() {
+        "reference" => Ok(json!({"mode":"reference", "anchor":metadata, "persisted":false,
+            "refetch":"retrieve index_uri and record_id, then compare revision/observed_at_unix_ms"}).to_string()),
+        "import" => {
+            let content = a.content.filter(|v| !v.trim().is_empty())
+                .ok_or_else(|| "content is required when mode=import".to_string())?;
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            use std::hash::{Hash, Hasher};
+            anchor.hash(&mut h); content.hash(&mut h);
+            let key = format!("structured-index-{:016x}", h.finish());
+            let existing = db.recall(&crate::models::RecallParams { query: String::new(), category: Some("structured_index_fact".to_string()), workspace_hash: Some(a.workspace_hash.clone()), limit: 1000, skip_side_effects: true, ..crate::models::RecallParams::default() })
+                .map_err(|e| format!("Structured index duplicate scan failed: {e}"))?;
+            if existing.iter().any(|e| e.key == key) {
+                return Ok(json!({"mode":"import","imported":0,"deduped":true,"key":key,"anchor":metadata}).to_string());
+            }
+            let body = json!({"content":content,"origin":{"memory_kind":"imported","source_system":source_system,"capture_method":"import","observed_at_unix_ms":a.observed_at_unix_ms},"external_refs":[metadata],"non_authoritative":true,"refetch":"retrieve index_uri and record_id, then compare revision/observed_at_unix_ms"});
+            let remembered = handle_remember(db, json!({"category":"structured_index_fact","key":key,
+                "body_json":body.to_string(),"status":"draft","type":"reference","importance":0.25,
+                "certainty":0.25,"workspace_hash":a.workspace_hash,"tags":["imported","structured-index"],"skip_dedup":true}))?;
+            let result: Value = serde_json::from_str(&remembered).map_err(|e| format!("Structured index import response decode failed: {e}"))?;
+            Ok(json!({"mode":"import","imported":1,"deduped":false,"id":result["id"],"key":key,"anchor":metadata,"non_authoritative":true}).to_string())
+        }
+        other => Err(format!("unknown mode '{other}': expected reference or import")),
+    }
+}
+
 pub fn handle_vault_import(db: &Database, args: Value) -> String {
     let a: VaultExportArgs = match serde_json::from_value(args) {
         Ok(a) => a,
@@ -8441,6 +8506,27 @@ mod tests {
         assert!(report["stale_candidates"].is_array());
         assert!(report["supersession_lag"].is_array());
         assert!(report["reviewed_at_unix_ms"].as_i64().unwrap() > 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn structured_index_anchor_distinguishes_reference_from_imported_fact() {
+        let (db, path) = temp_db();
+        let reference: Value = serde_json::from_str(&handle_structured_index_anchor(&db, json!({
+            "index_type":"ide_symbol", "index_uri":"ide://repo/src/lib.rs", "record_id":"symbol:parse",
+            "mode":"reference", "workspace_hash":"ws"
+        })).unwrap()).unwrap();
+        assert_eq!(reference["mode"], "reference");
+        let imported: Value = serde_json::from_str(&handle_structured_index_anchor(&db, json!({
+            "index_type":"ide_symbol", "index_uri":"ide://repo/src/lib.rs", "record_id":"symbol:parse",
+            "mode":"import", "content":"parse converts input", "workspace_hash":"ws"
+        })).unwrap()).unwrap();
+        assert_eq!(imported["mode"], "import");
+        let raw = handle_recall(&db, json!({"query":"parse converts", "workspace_hash":"ws"})).unwrap();
+        let item = &serde_json::from_str::<Value>(&raw).unwrap()["items"][0];
+        assert_eq!(item["origin"]["memory_kind"], "imported");
+        assert_eq!(item["external_refs"][0]["ref_type"], "structured_index");
+        assert_eq!(item["external_refs"][0]["ref_value"], "ide_symbol:ide://repo/src/lib.rs#symbol:parse");
         let _ = std::fs::remove_file(&path);
     }
 

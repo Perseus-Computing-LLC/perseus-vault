@@ -3708,6 +3708,25 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     }
   },
   {
+    "name": "mimir_structured_index_anchor",
+    "description": "Represent an upstream structured-index record as a refetchable anchor, or import it explicitly as low-confidence non-authoritative draft evidence.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "index_type": {"type": "string", "description": "Structured index kind, e.g. ide_symbol or domain_fact_map."},
+        "index_uri": {"type": "string", "description": "Stable index locator for later refetch."},
+        "record_id": {"type": "string", "description": "Stable record identity inside the index."},
+        "mode": {"type": "string", "enum": ["reference", "import"], "default": "reference"},
+        "content": {"type": "string", "description": "Required only for mode=import."},
+        "workspace_hash": {"type": "string"},
+        "source_system": {"type": "string"},
+        "observed_at_unix_ms": {"type": "integer"},
+        "revision": {"type": "string", "description": "Optional upstream revision/ETag for refetch verification."}
+      },
+      "required": ["index_type", "index_uri", "record_id"]
+    }
+  },
+  {
     "name": "mimir_vault_import",
     "description": "Import .md files from a vault directory into the database. Reads YAML frontmatter for metadata and markdown body for content. Idempotent — re-running on the same vault won't duplicate entities. Pair with mimir_vault_export for transfer.",
     "inputSchema": {
@@ -5035,6 +5054,7 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
         "mimir_vault_export" => Ok(tools::handle_vault_export(db, args)),
         "mimir_derived_export" => tools::handle_derived_export(db, args),
         "mimir_markdown_import" => tools::handle_markdown_import(db, args),
+        "mimir_structured_index_anchor" => tools::handle_structured_index_anchor(db, args),
         "mimir_vault_import" => Ok(tools::handle_vault_import(db, args)),
         "mimir_decay" => Ok(tools::handle_decay(db, args)),
         "mimir_reindex" => Ok(tools::handle_reindex(db, args)),
