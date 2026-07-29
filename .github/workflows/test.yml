@@ -6,6 +6,10 @@ on:
   pull_request:
     branches: [main, master]
 
+concurrency:
+  group: test-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   # build.rs copies the bundled embedding model from here instead of hitting
@@ -13,12 +17,28 @@ env:
   MIMIR_BUNDLED_MODEL_DIR: ${{ github.workspace }}/.model-cache
 
 jobs:
+  static-quality:
+    name: format and Clippy (lean)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      # The existing codebase has broad historical rustfmt/Clippy debt. Gate
+      # correctness lints now without letting style-only baseline debt turn a
+      # test infrastructure PR into an unrelated mass reformat.
+      - name: Lint lean production target for correctness
+        run: cargo clippy --locked --no-default-features -- -D clippy::correctness
+
   # Default build = bundled-embeddings (#237): this exercises the headline
   # zero-config dense-search path, including real inference in the embedding test.
   test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
       - name: Cache embedding model
@@ -47,6 +67,7 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
       - name: Cache embedding model
@@ -75,6 +96,7 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
       - name: Cache embedding model
@@ -107,6 +129,7 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
       - name: Cache embedding model
@@ -133,6 +156,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
       - name: Build (no default features)
@@ -151,6 +175,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
       - name: Install protoc
@@ -168,6 +193,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
       - name: Build (multimodal, no embeddings)

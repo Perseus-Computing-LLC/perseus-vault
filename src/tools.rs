@@ -5291,12 +5291,10 @@ pub fn handle_memories(db: &Database, args: Value) -> Result<String, String> {
 mod tests {
     use super::*;
 
-    fn temp_db() -> (Database, String) {
-        let dir = std::env::temp_dir();
-        let path = dir.join(format!("mimir-test-tools-{}.db", Uuid::new_v4()));
-        let path_str = path.to_str().unwrap().to_string();
-        let db = Database::open(&path_str).expect("open test db");
-        (db, path_str)
+    fn temp_db() -> (crate::db::TestDatabase, String) {
+        let db = crate::db::TestDatabase::new("mimir-test-tools");
+        let path = db.path().to_string();
+        (db, path)
     }
 
     #[test]
