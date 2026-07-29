@@ -1115,12 +1115,10 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn temp_db() -> (Database, String) {
-        let dir = std::env::temp_dir();
-        let path = dir.join(format!("mimir-test-communities-{}.db", uuid::Uuid::new_v4()));
-        let path_str = path.to_str().unwrap().to_string();
-        let db = Database::open(&path_str).expect("open test db");
-        (db, path_str)
+    fn temp_db() -> (crate::db::TestDatabase, String) {
+        let db = crate::db::TestDatabase::new("mimir-test-communities");
+        let path = db.path().to_string();
+        (db, path)
     }
 
     /// Store a test entity, bypassing near-duplicate dedup: planted-cluster

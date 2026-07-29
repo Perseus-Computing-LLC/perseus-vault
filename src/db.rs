@@ -593,6 +593,13 @@ impl Database {
 
     /// Open a database at `path`, initializing the v0.2.0 schema if needed.
     pub fn open(path: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        // Unit tests create hundreds of isolated temporary databases. DELETE
+        // journaling avoids WAL/SHM sidecars for every direct test open while
+        // production keeps its concurrent WAL configuration.
+        Self::open_inner(path, cfg!(test))
+    }
+
+    fn open_inner(path: &str, test_mode: bool) -> Result<Self, Box<dyn std::error::Error>> {
         // #210: a connection pool lets concurrent HTTP/SSE requests read in
         // parallel under WAL instead of serializing on one Mutex<Connection>
         // (rusqlite Connection is !Sync). The PRAGMAs must be applied to EVERY
@@ -631,9 +638,10 @@ impl Database {
             .and_then(|v| v.parse().ok())
             .filter(|&n| n > 0)
             .unwrap_or(30_000);
+        let journal_mode = if test_mode { "DELETE" } else { "WAL" };
         let manager = SqliteConnectionManager::file(path).with_init(move |c| {
             c.execute_batch(&format!(
-                "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=1000; \
+                "PRAGMA journal_mode={journal_mode}; PRAGMA wal_autocheckpoint=1000; \
                  PRAGMA foreign_keys=ON; PRAGMA busy_timeout={busy_timeout_ms}; \
                  PRAGMA synchronous=NORMAL; PRAGMA cache_size=-8000; \
                  PRAGMA mmap_size=268435456; PRAGMA temp_store=MEMORY;",
@@ -13155,17 +13163,92 @@ fn entity_from_row(
     })
 }
 
+/// Owns a temporary SQLite database and clears SQLite sidecars on test exit.
+/// The main file remains available for tests that deliberately reopen it after
+/// dropping the fixture; WAL/SHM are the high-volume artifacts that accumulate
+/// across repeated suite runs.
+#[cfg(test)]
+pub(crate) struct TestDatabase {
+    db: Option<Database>,
+    path: String,
+}
+
+#[cfg(test)]
+impl TestDatabase {
+    pub(crate) fn new(prefix: &str) -> Self {
+        let path = std::env::temp_dir()
+            .join(format!("{prefix}-{}.db", uuid::Uuid::new_v4()))
+            .to_string_lossy()
+            .into_owned();
+        // This fixture deliberately uses WAL so Drop's sidecar cleanup stays
+        // covered even though ordinary unit-test opens use DELETE journaling.
+        let db = Database::open_inner(&path, false).expect("open test database");
+        Self { db: Some(db), path }
+    }
+
+    pub(crate) fn path(&self) -> &str {
+        &self.path
+    }
+
+}
+
+#[cfg(test)]
+impl std::ops::Deref for TestDatabase {
+    type Target = Database;
+
+    fn deref(&self) -> &Self::Target {
+        self.db.as_ref().expect("test database present")
+    }
+}
+
+#[cfg(test)]
+impl std::ops::DerefMut for TestDatabase {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.db.as_mut().expect("test database present")
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestDatabase {
+    fn drop(&mut self) {
+        // Drop the pool before unlinking SQLite's WAL sidecars.
+        drop(self.db.take());
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let _ = std::fs::remove_file(format!("{}{}", self.path, suffix));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
 
-    fn temp_db() -> (Database, String) {
-        let dir = std::env::temp_dir();
-        let path = dir.join(format!("mimir-test-db-{}.db", uuid::Uuid::new_v4()));
-        let path_str = path.to_str().unwrap().to_string();
-        let db = Database::open(&path_str).expect("open test db");
-        (db, path_str)
+    fn temp_db() -> (TestDatabase, String) {
+        let db = TestDatabase::new("mimir-test-db");
+        let path = db.path().to_string();
+        (db, path)
+    }
+
+    #[test]
+    fn test_database_fixture_removes_sqlite_sidecars_on_drop() {
+        let path = {
+            let db = TestDatabase::new("mimir-test-cleanup");
+            let path = db.path().to_string();
+            db.remember_skip_dedup(&make_entity(
+                "fixture-cleanup", "test", "fixture", "{\"content\":\"fixture cleanup\"}",
+            ))
+            .expect("seed fixture");
+            path
+        };
+        for suffix in ["-wal", "-shm"] {
+            assert!(
+                !std::path::Path::new(&(path.clone() + suffix)).exists(),
+                "fixture left SQLite sidecar {}",
+                path.clone() + suffix
+            );
+        }
+        let _ = std::fs::remove_file(path);
     }
 
     /// #393: auto-embed is asynchronous — tests that assert on embeddings (or
@@ -22377,6 +22460,8 @@ mod tests {
         }
         drop(db); // close the temp_db connection so the second connection can open fresh
 
+        // This is a production concurrency contract. The normal test fixture
+        // uses DELETE journaling for hygiene, so reopen explicitly with WAL.
         // Barrier: both threads start together after setup.
         let barrier = Arc::new(Barrier::new(2));
         let reader_failures = Arc::new(std::sync::atomic::AtomicU32::new(0));
@@ -22386,7 +22471,7 @@ mod tests {
         let writer_barrier = Arc::clone(&barrier);
         let wf = Arc::clone(&writer_failures);
         let writer = thread::spawn(move || {
-            let wdb = crate::db::Database::open(&writer_path).expect("writer db open");
+            let wdb = crate::db::Database::open_inner(&writer_path, false).expect("writer db open");
             writer_barrier.wait();
             for i in 0..500 {
                 let body = format!(r#"{{"content":"writer entity {}"}}"#, i);
@@ -22415,7 +22500,7 @@ mod tests {
         let reader_barrier = Arc::clone(&barrier);
         let rf = Arc::clone(&reader_failures);
         let reader = thread::spawn(move || {
-            let rdb = crate::db::Database::open(&reader_path).expect("reader db open");
+            let rdb = crate::db::Database::open_inner(&reader_path, false).expect("reader db open");
             reader_barrier.wait();
             for _ in 0..100 {
                 match rdb.fts5_search(&crate::models::RecallParams {
@@ -22912,7 +22997,7 @@ mod tests {
     fn db_with_fake_embed_endpoint(
         delay: std::time::Duration,
         queue_cap: Option<usize>,
-    ) -> (Database, String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    ) -> (TestDatabase, String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
         let (mut db, path) = temp_db();
         if let Some(cap) = queue_cap {
             db.set_embed_queue_cap(cap);
