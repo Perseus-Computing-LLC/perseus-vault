@@ -8479,6 +8479,34 @@ mod tests {
     }
 
     #[test]
+    fn cross_product_served_memory_fixture_is_canonical_hash_only_and_provenance_consistent() {
+        let fixture: Value = serde_json::from_str(include_str!("../tests/fixtures/cross_product_served_memory_contract.json")).unwrap();
+        assert_eq!(fixture["producer_tool"], json!("perseus_vault_recall"));
+        assert!(fixture["producer_tool"].as_str().unwrap().starts_with("perseus_vault_"));
+
+        let item = &fixture["items"][0];
+        let why = &item["why_served"];
+        assert_eq!(why["memory_class"], item["category"]);
+        assert_eq!(why["promotion_state"], item["promotion_transition"]["to_state"]);
+        assert!(why["source_evidence_ids"].as_array().unwrap().contains(&item["promoted_from"]["id"]));
+        assert_eq!(why["promoted_scope"], item["workspace_hash"]);
+
+        let binding = &item["action_receipt_binding"];
+        for field in ["action_id", "authority_manifest_ref", "approval_ref", "outcome_hash"] {
+            assert!(binding[field].is_string() && !binding[field].as_str().unwrap().is_empty(), "missing {field}");
+        }
+        let outcome_hash = binding["outcome_hash"].as_str().unwrap();
+        assert_eq!(outcome_hash.len(), 64);
+        assert!(outcome_hash.bytes().all(|byte| byte.is_ascii_hexdigit()));
+
+        let raw = fixture.to_string();
+        for forbidden in ["content", "body_json", "secret", "prompt"] {
+            assert!(!raw.contains(&format!("\"{forbidden}\"")), "fixture leaks {forbidden}");
+        }
+        assert!(include_str!("../docs/cross-product-acceptance-contract.md").contains("perseus_vault_recall"));
+    }
+
+    #[test]
     fn quality_telemetry_reports_machine_readable_memory_signals() {
         let (db, path) = temp_db();
         handle_remember(&db, json!({"category":"facts","key":"one","body_json":"{\"content\":\"red state\"}","certainty":0.9})).unwrap();
