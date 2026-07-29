@@ -24,11 +24,23 @@ on:
   pull_request:
     paths:
       - ".github/workflows/release.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "manifest.json"
+      - "scripts/check-release-metadata.py"
 
 permissions:
   contents: write # upload assets onto the release for the pushed tag
 
 jobs:
+  release-metadata:
+    name: release metadata
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify Cargo and MCP bundle versions agree
+        run: python3 scripts/check-release-metadata.py
+
   # Create the GitHub Release object ONCE, up front (#483). On a tag push the
   # lite/full matrix legs each call taiki-e/upload-rust-binary-action, which
   # create-or-uploads to the release; run in parallel they race to CREATE it and
@@ -38,6 +50,7 @@ jobs:
   # so lite/full (which `needs` this) still run and dry-build there.
   create-release:
     name: create release
+    needs: release-metadata
     runs-on: ubuntu-latest
     steps:
       - name: Create release if missing (tag pushes only)
