@@ -5110,7 +5110,7 @@ mod tests {
     fn stats_schema_allows_null_timestamps_for_an_empty_database() {
         let stats = tool_registry_base()
             .iter()
-            .find(|tool| tool["name"] == "mimir_stats")
+            .find(|tool| tool["name"] == "perseus_vault_stats")
             .expect("stats tool must be registered");
 
         for field in ["oldest_unix_ms", "newest_unix_ms"] {
