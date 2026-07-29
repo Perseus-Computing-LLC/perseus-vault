@@ -1,6 +1,6 @@
 # Derived knowledge surface export
 
-`mimir_derived_export` creates a human-readable Markdown projection of durable knowledge while keeping SQLite as the only source of truth.
+`perseus_vault_derived_export` creates a human-readable Markdown projection of durable knowledge while keeping SQLite as the only source of truth. The legacy `mimir_derived_export` alias remains callable during the v2 compatibility window.
 
 ```json
 {"output_path":"/tmp/derived-knowledge.md","workspace_hash":"optional-workspace"}

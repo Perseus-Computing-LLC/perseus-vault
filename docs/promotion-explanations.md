@@ -1,6 +1,6 @@
 # Promotion-aware recall explanations
 
-`mimir_recall` / `perseus_vault_recall` returns a `why_served` object on every recalled item. It is explanatory metadata only: it does not alter ranking, visibility filtering, temporal reconstruction, or reinforcement.
+`perseus_vault_recall` returns a `why_served` object on every recalled item. The legacy `mimir_recall` alias remains callable during the v2 compatibility window. This metadata does not alter ranking, visibility filtering, temporal reconstruction, or reinforcement.
 
 | Field | Meaning |
 |---|---|

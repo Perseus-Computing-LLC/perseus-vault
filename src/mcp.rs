@@ -676,40 +676,26 @@ pub fn handle_request(
     }
 }
 
-/// Given a `mimir_*` tool definition from the static registry, return a clone
-/// advertised under the equivalent `mneme_*` name (Mneme rename, transition
-/// release — both names dispatch to the same handler via `call_tool`).
-/// Returns `None` for entries that, unexpectedly, aren't named `mimir_*`.
-fn mneme_alias_tool(tool: &serde_json::Value) -> Option<serde_json::Value> {
+/// Clone a canonical `perseus_vault_*` tool under one retained legacy prefix.
+/// Legacy aliases remain callable during the v2 observation window; only the
+/// canonical public registry and documentation lead with Perseus Vault.
+fn legacy_alias_tool(tool: &serde_json::Value, prefix: &str) -> Option<serde_json::Value> {
     let name = tool.get("name")?.as_str()?;
-    let suffix = name.strip_prefix("mimir_")?;
+    let suffix = name.strip_prefix("perseus_vault_")?;
     let mut alias = tool.clone();
-    alias["name"] = serde_json::Value::String(format!("mneme_{}", suffix));
+    alias["name"] = serde_json::Value::String(format!("{}_{}", prefix, suffix));
     Some(alias)
 }
 
-/// Given a `mimir_*` tool definition from the static registry, return a clone
-/// advertised under the equivalent `perseus_vault_*` name (Perseus Vault
-/// rename, transition release — all three names dispatch to the same handler
-/// via `call_tool`). Returns `None` for entries that aren't named `mimir_*`.
-fn perseus_vault_alias_tool(tool: &serde_json::Value) -> Option<serde_json::Value> {
-    let name = tool.get("name")?.as_str()?;
-    let suffix = name.strip_prefix("mimir_")?;
-    let mut alias = tool.clone();
-    alias["name"] = serde_json::Value::String(format!("perseus_vault_{}", suffix));
-    Some(alias)
-}
-
-/// Parse-once cache of the canonical tool registry. Every tool is declared
-/// under its original `mimir_*` name; rename-transition aliases (`mneme_*`,
-/// `perseus_vault_*`) are synthesized on top of this at advertise time by
-/// `build_tools_array`. The registry is a compile-time constant, parsed exactly
-/// once per process instead of re-parsing ~3.5k lines of JSON on every
-/// tools/list request (perf review #208).
+/// Parse-once cache of the canonical Perseus Vault tool registry. The embedded
+/// literal keeps legacy names only as an implementation migration detail; names
+/// and descriptions are canonicalized before any public registry is built.
+/// `mimir_*` and `mneme_*` are synthesized solely as retained compatibility
+/// aliases at advertise time by `build_tools_array`.
 fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     static BASE: OnceLock<Vec<serde_json::Value>> = OnceLock::new();
     BASE.get_or_init(|| {
-        serde_json::from_str::<serde_json::Value>(
+        let mut registry = serde_json::from_str::<serde_json::Value>(
         r###"[
   {
     "name": "mimir_remember",
@@ -4851,10 +4837,23 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
   {"name":"mimir_action_lease_release", "description":"Release an action lease held by its owner.", "inputSchema":{"type":"object","properties":{"lease_id":{"type":"string"},"holder_id":{"type":"string"}},"required":["lease_id","holder_id"]}, "title":"Release Action Lease"}
 ]"###,
         )
-        .expect("tools JSON must be valid")
-        .as_array()
-        .expect("tools registry must be a JSON array")
-        .clone()
+        .expect("tools JSON must be valid");
+        let tools = registry
+            .as_array_mut()
+            .expect("tools registry must be a JSON array");
+        for tool in tools.iter_mut() {
+            if let Some(name) = tool.get("name").and_then(|v| v.as_str()) {
+                if let Some(suffix) = name.strip_prefix("mimir_") {
+                    tool["name"] = serde_json::Value::String(format!("perseus_vault_{}", suffix));
+                }
+            }
+            if let Some(description) = tool.get("description").and_then(|v| v.as_str()) {
+                tool["description"] = serde_json::Value::String(
+                    description.replace("mimir_", "perseus_vault_").replace("Mimir", "Perseus Vault"),
+                );
+            }
+        }
+        tools.clone()
     })
 }
 
@@ -4887,18 +4886,17 @@ fn build_tools_array(base_array: &[serde_json::Value], advertise_all: bool) -> s
     let mut aliased: Vec<serde_json::Value> =
         Vec::with_capacity(base_array.len() * if advertise_all { 3 } else { 1 });
     for tool in base_array {
+        // The base registry is canonical Perseus Vault names. Legacy names are
+        // present only when a caller explicitly opts into the compatibility
+        // manifest during the v2 observation window.
+        aliased.push(tool.clone());
         if advertise_all {
-            aliased.push(tool.clone());
-            if let Some(mneme_alias) = mneme_alias_tool(tool) {
+            if let Some(mimir_alias) = legacy_alias_tool(tool, "mimir") {
+                aliased.push(mimir_alias);
+            }
+            if let Some(mneme_alias) = legacy_alias_tool(tool, "mneme") {
                 aliased.push(mneme_alias);
             }
-            if let Some(vault_alias) = perseus_vault_alias_tool(tool) {
-                aliased.push(vault_alias);
-            }
-        } else {
-            // Canonical-only: advertise the perseus_vault_* name. A tool that
-            // (unexpectedly) isn't mimir_*-prefixed passes through unchanged.
-            aliased.push(perseus_vault_alias_tool(tool).unwrap_or_else(|| tool.clone()));
         }
     }
     serde_json::Value::Array(aliased)
@@ -5112,7 +5110,7 @@ mod tests {
     fn stats_schema_allows_null_timestamps_for_an_empty_database() {
         let stats = tool_registry_base()
             .iter()
-            .find(|tool| tool["name"] == "mimir_stats")
+            .find(|tool| tool["name"] == "perseus_vault_stats")
             .expect("stats tool must be registered");
 
         for field in ["oldest_unix_ms", "newest_unix_ms"] {
