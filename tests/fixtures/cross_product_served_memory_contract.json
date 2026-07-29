@@ -1,0 +1,45 @@
+{
+  "contract_version": "2026-07-29",
+  "producer_tool": "perseus_vault_recall",
+  "items": [
+    {
+      "id": "mem-observation",
+      "category": "observation",
+      "key": "canary-rollout",
+      "workspace_hash": "github:Perseus-Computing-LLC/perseus",
+      "origin": {
+        "memory_kind": "observed",
+        "source_system": "acceptance-fixture"
+      },
+      "external_refs": [
+        {
+          "ref_type": "repo",
+          "ref_value": "github:Perseus-Computing-LLC/perseus",
+          "relationship": "about"
+        }
+      ],
+      "promoted_from": {
+        "id": "mem-episode",
+        "category": "episodes"
+      },
+      "promotion_transition": {
+        "from_state": "episode",
+        "to_state": "observation"
+      },
+      "why_served": {
+        "memory_class": "observation",
+        "promotion_state": "observation",
+        "support_count": 1,
+        "source_evidence_ids": ["mem-episode"],
+        "promoted_scope": "github:Perseus-Computing-LLC/perseus",
+        "reason": "matched the recall query"
+      },
+      "action_receipt_binding": {
+        "action_id": "act-acceptance-001",
+        "authority_manifest_ref": "auth-acceptance@1",
+        "approval_ref": "apr-acceptance-001",
+        "outcome_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    }
+  ]
+}
