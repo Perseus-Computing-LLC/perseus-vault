@@ -12,10 +12,12 @@ type PooledConn = r2d2::PooledConnection<SqliteConnectionManager>;
 use crate::connectors::Connector;
 use crate::encryption::EncryptionManager;
 use crate::models::{
-    ActionLease, AskParams, AskResult, AskSource, AuthorityManifest, AuthorityManifestInput,
-    AuthorizedAction, CompactReport, DecayReport, EmbedParams, Entity, GraphEdge,
-    GraphNode, IngestParams, JournalEvent, MemoryLink, PruneParams, PruneReport, PurgeReport, Readiness, RecallParams,
-    StateEntry, Stats, TimelineParams, VaultReport,
+    ActionLease, ArtifactAnchor, ArtifactBinding, ArtifactManifest, ArtifactManifestBinding,
+    ArtifactRepresentation, ArtifactRetrievalCapabilities, ArtifactStructure, ArtifactWhyServed,
+    AskParams, AskResult, AskSource, AuthorityManifest, AuthorityManifestInput,
+    AuthorizedAction, CompactReport, DecayReport, EmbedParams, Entity, ExternalRef, GraphEdge,
+    GraphNode, IngestParams, JournalEvent, MemoryLink, OriginRecord, PruneParams, PruneReport,
+    PurgeReport, Readiness, RecallParams, StateEntry, Stats, TimelineParams, VaultReport,
 };
 use crate::schema;
 
@@ -7652,6 +7654,372 @@ impl Database {
         id: &str,
     ) -> Result<Option<Entity>, Box<dyn std::error::Error>> {
         self.get_entity_by_id(id)
+    }
+
+    fn artifact_store_aad(sha256: &str) -> Vec<u8> {
+        let mut aad = b"perseus-vault/artifact/v1\0".to_vec();
+        aad.extend_from_slice(sha256.as_bytes());
+        aad
+    }
+
+    fn artifact_binding_id(
+        sha256: &str,
+        mime_type: &str,
+        workspace_hash: &str,
+        agent_id: &str,
+        visibility: &str,
+        origin_json: &str,
+        external_refs_json: &str,
+        retention_policy: &str,
+        representation_kind: &str,
+        derived_from_sha256: &str,
+        derivation_kind: &str,
+        derivation_version: &str,
+    ) -> String {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        for field in [
+            sha256,
+            mime_type,
+            workspace_hash,
+            agent_id,
+            visibility,
+            origin_json,
+            external_refs_json,
+            retention_policy,
+            representation_kind,
+            derived_from_sha256,
+            derivation_kind,
+            derivation_version,
+        ] {
+            h.update((field.len() as u64).to_le_bytes());
+            h.update(field.as_bytes());
+        }
+        format!("artbind-{:x}", h.finalize())
+    }
+
+    fn encode_artifact_content(
+        &self,
+        sha256: &str,
+        bytes: &[u8],
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let b64 = {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD.encode(bytes)
+        };
+        if let Some(enc) = self.encryption.as_ref() {
+            enc.encrypt(&b64, &Self::artifact_store_aad(sha256))
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e).into())
+        } else {
+            Ok(b64)
+        }
+    }
+
+    fn decode_artifact_content(
+        &self,
+        sha256: &str,
+        stored: &str,
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        let raw_b64 = if let Some(enc) = self.encryption.as_ref() {
+            match enc.decrypt_body(stored, &Self::artifact_store_aad(sha256)) {
+                crate::encryption::BodyDecrypt::Plaintext(s)
+                | crate::encryption::BodyDecrypt::LegacyPlaintext(s) => s,
+                crate::encryption::BodyDecrypt::AuthFailed(e) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        format!("artifact authentication failed: {e}"),
+                    )
+                    .into())
+                }
+            }
+        } else {
+            stored.to_string()
+        };
+        let bytes = {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD
+                .decode(raw_b64)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?
+        };
+        Ok(bytes)
+    }
+
+    fn artifact_binding_from_row(
+        row: &rusqlite::Row<'_>,
+    ) -> Result<ArtifactBinding, rusqlite::Error> {
+        let origin_json: String = row.get(6)?;
+        let external_refs_json: String = row.get(7)?;
+        let retention_policy: String = row.get(8)?;
+        let representation_kind: String = row.get(9)?;
+        let derived_from_sha256: String = row.get(10)?;
+        let derivation_kind: String = row.get(11)?;
+        let derivation_version: String = row.get(12)?;
+        Ok(ArtifactBinding {
+            binding_id: row.get(0)?,
+            sha256: row.get(1)?,
+            mime_type: row.get(2)?,
+            workspace_hash: row.get(3)?,
+            agent_id: row.get(4)?,
+            visibility: row.get(5)?,
+            origin: serde_json::from_str(&origin_json).ok().filter(|v: &OriginRecord| {
+                v.memory_kind.is_some()
+                    || v.source_system.is_some()
+                    || v.capture_method.is_some()
+                    || v.observed_at_unix_ms.is_some()
+            }),
+            external_refs: serde_json::from_str(&external_refs_json).unwrap_or_default(),
+            retention_policy: (!retention_policy.is_empty()).then_some(retention_policy),
+            representation: ArtifactRepresentation {
+                kind: representation_kind,
+                derived_from_sha256: (!derived_from_sha256.is_empty())
+                    .then_some(derived_from_sha256),
+                derivation_kind: (!derivation_kind.is_empty()).then_some(derivation_kind),
+                derivation_version: (!derivation_version.is_empty()).then_some(derivation_version),
+            },
+            created_at_unix_ms: row.get(13)?,
+        })
+    }
+
+    fn visible_artifact_bindings(
+        &self,
+        sha256: &str,
+        workspace_hash: Option<&str>,
+        requesting_agent_id: Option<&str>,
+    ) -> Result<Vec<ArtifactBinding>, Box<dyn std::error::Error>> {
+        let scope = workspace_hash.unwrap_or("");
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT binding_id, sha256, mime_type, workspace_hash, agent_id, visibility,
+                    origin_json, external_refs_json, retention_policy,
+                    representation_kind, derived_from_sha256, derivation_kind,
+                    derivation_version, created_at_unix_ms
+             FROM artifact_bindings
+             WHERE sha256 = ?1 AND workspace_hash = ?2
+             ORDER BY created_at_unix_ms ASC, binding_id ASC",
+        )?;
+        let rows = stmt.query_map(params![sha256, scope], Self::artifact_binding_from_row)?;
+        let mut bindings = Vec::new();
+        for row in rows {
+            let binding = row?;
+            if requesting_agent_id
+                .filter(|s| !s.is_empty())
+                .map(|requester| self.can_read(requester, &binding.visibility, &binding.agent_id))
+                .unwrap_or(true)
+            {
+                bindings.push(binding);
+            }
+        }
+        Ok(bindings)
+    }
+
+    pub fn artifact_register(
+        &self,
+        bytes: &[u8],
+        mime_type: &str,
+        workspace_hash: &str,
+        agent_id: &str,
+        visibility: &str,
+        origin: Option<OriginRecord>,
+        external_refs: Vec<ExternalRef>,
+        retention_policy: Option<String>,
+        representation: ArtifactRepresentation,
+    ) -> Result<(String, bool, bool), Box<dyn std::error::Error>> {
+        use sha2::{Digest, Sha256};
+        let sha256 = format!("{:x}", Sha256::digest(bytes));
+        let origin_json = serde_json::to_string(&origin)?;
+        let external_refs_json = serde_json::to_string(&external_refs)?;
+        let retention_policy_value = retention_policy.unwrap_or_default();
+        let binding_id = Self::artifact_binding_id(
+            &sha256,
+            mime_type,
+            workspace_hash,
+            agent_id,
+            visibility,
+            &origin_json,
+            &external_refs_json,
+            &retention_policy_value,
+            &representation.kind,
+            representation.derived_from_sha256.as_deref().unwrap_or(""),
+            representation.derivation_kind.as_deref().unwrap_or(""),
+            representation.derivation_version.as_deref().unwrap_or(""),
+        );
+        let now = now_ms();
+        let conn = self.conn()?;
+
+        let existing: Option<String> = conn
+            .query_row(
+                "SELECT content_b64 FROM artifacts WHERE sha256 = ?1",
+                params![sha256.clone()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let artifact_created = if let Some(stored) = existing {
+            let prior = self.decode_artifact_content(&sha256, &stored)?;
+            if prior != bytes {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("artifact hash collision or corrupted stored bytes for {sha256}"),
+                )
+                .into());
+            }
+            false
+        } else {
+            let encoded = self.encode_artifact_content(&sha256, bytes)?;
+            conn.execute(
+                "INSERT INTO artifacts (sha256, content_b64, byte_length, created_at_unix_ms)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![sha256.clone(), encoded, bytes.len() as i64, now],
+            )?;
+            true
+        };
+
+        let binding_created = conn.execute(
+            "INSERT OR IGNORE INTO artifact_bindings
+             (binding_id, sha256, mime_type, workspace_hash, agent_id, visibility,
+              origin_json, external_refs_json, retention_policy, representation_kind,
+              derived_from_sha256, derivation_kind, derivation_version, created_at_unix_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            params![
+                binding_id,
+                sha256.clone(),
+                mime_type,
+                workspace_hash,
+                agent_id,
+                visibility,
+                origin_json,
+                external_refs_json,
+                retention_policy_value,
+                representation.kind,
+                representation.derived_from_sha256.unwrap_or_default(),
+                representation.derivation_kind.unwrap_or_default(),
+                representation.derivation_version.unwrap_or_default(),
+                now,
+            ],
+        )? > 0;
+
+        Ok((sha256, artifact_created, binding_created))
+    }
+
+    pub fn artifact_resolve_visible(
+        &self,
+        sha256: &str,
+        workspace_hash: Option<&str>,
+        requesting_agent_id: Option<&str>,
+    ) -> Result<(Vec<u8>, Vec<ArtifactBinding>), Box<dyn std::error::Error>> {
+        let bindings = self.visible_artifact_bindings(sha256, workspace_hash, requesting_agent_id)?;
+        if bindings.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "artifact not found in the requested scope or not visible to the requester",
+            )
+            .into());
+        }
+        let conn = self.conn()?;
+        let (stored, stored_len): (String, i64) = conn.query_row(
+            "SELECT content_b64, byte_length FROM artifacts WHERE sha256 = ?1",
+            params![sha256],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        let bytes = self.decode_artifact_content(sha256, &stored)?;
+        if bytes.len() as i64 != stored_len {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("artifact byte-length mismatch for {sha256}"),
+            )
+            .into());
+        }
+        Ok((bytes, bindings))
+    }
+
+    pub fn artifact_manifest(
+        &self,
+        sha256: &str,
+        workspace_hash: Option<&str>,
+        requesting_agent_id: Option<&str>,
+    ) -> Result<ArtifactManifest, Box<dyn std::error::Error>> {
+        let (bytes, bindings) = self.artifact_resolve_visible(sha256, workspace_hash, requesting_agent_id)?;
+        let utf8_text = std::str::from_utf8(&bytes).ok();
+        let structure = ArtifactStructure {
+            utf8_text: utf8_text.is_some(),
+            line_count: utf8_text.map(|s| s.lines().count() as i64),
+            trailing_newline: utf8_text.map(|s| s.ends_with('\n')),
+        };
+        let mut signals = Vec::new();
+        if bytes.is_empty() {
+            signals.push("empty".to_string());
+        }
+        if structure.utf8_text {
+            signals.push("utf8_text".to_string());
+            if let Some(lines) = structure.line_count {
+                signals.push(format!("line_count:{lines}"));
+            }
+            if structure.trailing_newline == Some(true) {
+                signals.push("trailing_newline".to_string());
+            }
+        } else {
+            signals.push("binary_or_non_utf8".to_string());
+        }
+        let visible_binding_count = bindings.len() as i64;
+        let bindings = bindings
+            .into_iter()
+            .map(|binding| ArtifactManifestBinding {
+                binding_id: binding.binding_id,
+                mime_type: binding.mime_type,
+                workspace_hash: binding.workspace_hash.clone(),
+                agent_id: binding.agent_id.clone(),
+                visibility: binding.visibility.clone(),
+                origin: binding.origin,
+                external_refs: binding.external_refs.clone(),
+                retention_policy: binding.retention_policy,
+                representation: binding.representation,
+                created_at_unix_ms: binding.created_at_unix_ms,
+                why_served: ArtifactWhyServed {
+                    reason: "artifact binding visible in the requested scope".to_string(),
+                    workspace_hash: binding.workspace_hash,
+                    visibility: binding.visibility,
+                    anchors: binding.external_refs,
+                },
+            })
+            .collect();
+        Ok(ArtifactManifest {
+            sha256: sha256.to_string(),
+            byte_length: bytes.len() as i64,
+            structure,
+            significant_signals: signals,
+            available_retrievals: ArtifactRetrievalCapabilities {
+                byte_range: true,
+                line_range: utf8_text.is_some(),
+                verify_value: true,
+            },
+            visible_binding_count,
+            bindings,
+        })
+    }
+
+    pub fn artifact_anchor(
+        &self,
+        sha256: &str,
+        bytes: &[u8],
+        byte_start: usize,
+        byte_end: usize,
+    ) -> ArtifactAnchor {
+        let line_start = std::str::from_utf8(bytes)
+            .ok()
+            .map(|_| 1 + bytes[..byte_start].iter().filter(|&&b| b == b'\n').count() as i64);
+        let line_end = std::str::from_utf8(bytes).ok().map(|_| {
+            let inclusive_end = byte_end.saturating_sub(1).min(bytes.len().saturating_sub(1));
+            1 + bytes[..inclusive_end]
+                .iter()
+                .filter(|&&b| b == b'\n')
+                .count() as i64
+        });
+        ArtifactAnchor {
+            sha256: sha256.to_string(),
+            byte_start: byte_start as i64,
+            byte_end: byte_end as i64,
+            line_start,
+            line_end,
+        }
     }
 
     /// List entities with pagination and optional filters.

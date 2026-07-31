@@ -299,6 +299,36 @@ CREATE TABLE IF NOT EXISTS authorized_action_leases (
 );
 CREATE INDEX IF NOT EXISTS idx_authorized_action_leases_active
  ON authorized_action_leases(workspace_hash, action_key, released_at_unix_ms, expires_at_unix_ms);
+
+-- #811 Immutable artifacts: content-addressed bytes live once in `artifacts`,
+-- while scope/provenance/representation metadata lives in `artifact_bindings` so
+-- the same bytes can be visible in multiple workspaces without leaking access.
+CREATE TABLE IF NOT EXISTS artifacts (
+    sha256 TEXT PRIMARY KEY,
+    content_b64 TEXT NOT NULL,
+    byte_length INTEGER NOT NULL,
+    created_at_unix_ms INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS artifact_bindings (
+    binding_id TEXT PRIMARY KEY,
+    sha256 TEXT NOT NULL REFERENCES artifacts(sha256),
+    mime_type TEXT NOT NULL DEFAULT 'application/octet-stream',
+    workspace_hash TEXT NOT NULL DEFAULT '',
+    agent_id TEXT NOT NULL DEFAULT '',
+    visibility TEXT NOT NULL DEFAULT 'workspace',
+    origin_json TEXT NOT NULL DEFAULT '{}',
+    external_refs_json TEXT NOT NULL DEFAULT '[]',
+    retention_policy TEXT NOT NULL DEFAULT '',
+    representation_kind TEXT NOT NULL DEFAULT 'original',
+    derived_from_sha256 TEXT NOT NULL DEFAULT '',
+    derivation_kind TEXT NOT NULL DEFAULT '',
+    derivation_version TEXT NOT NULL DEFAULT '',
+    created_at_unix_ms INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_artifact_bindings_scope
+ ON artifact_bindings(sha256, workspace_hash, visibility, created_at_unix_ms DESC);
+CREATE INDEX IF NOT EXISTS idx_artifact_bindings_derived_from
+ ON artifact_bindings(derived_from_sha256);
 ";
 
 /// Current schema migration level, stamped into `PRAGMA user_version` once all
@@ -358,7 +388,9 @@ CREATE INDEX IF NOT EXISTS idx_authorized_action_leases_active
 /// v24 (#768 Authorized Action Receipts): authority manifests, receipts, and
 /// action leases. Tables are created idempotently; action columns are ALTER-
 /// probed because v23 stores must retain existing receipt records.
-const SCHEMA_VERSION: i64 = 24;
+/// v25 (#811 Immutable artifacts): shared content-addressed `artifacts` bytes
+/// plus scope/provenance/representation `artifact_bindings`.
+const SCHEMA_VERSION: i64 = 25;
 
 /// Initialize the v0.2.0 schema on a fresh database.
 pub fn initialize_schema(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
@@ -932,6 +964,37 @@ fn apply_migrations(conn: &Connection) -> Result<(), Box<dyn std::error::Error>>
     ensure_column(conn, "authorized_actions", "external_ref", "TEXT NOT NULL DEFAULT ''")?;
     ensure_column(conn, "authorized_actions", "outcome_hash", "TEXT NOT NULL DEFAULT ''")?;
     // ── end v24 ──────────────────────────────────────────────────────────
+
+    // ── v25 (#811 Immutable artifacts) ───────────────────────────────────
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS artifacts (
+            sha256 TEXT PRIMARY KEY,
+            content_b64 TEXT NOT NULL,
+            byte_length INTEGER NOT NULL,
+            created_at_unix_ms INTEGER NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS artifact_bindings (
+            binding_id TEXT PRIMARY KEY,
+            sha256 TEXT NOT NULL REFERENCES artifacts(sha256),
+            mime_type TEXT NOT NULL DEFAULT 'application/octet-stream',
+            workspace_hash TEXT NOT NULL DEFAULT '',
+            agent_id TEXT NOT NULL DEFAULT '',
+            visibility TEXT NOT NULL DEFAULT 'workspace',
+            origin_json TEXT NOT NULL DEFAULT '{}',
+            external_refs_json TEXT NOT NULL DEFAULT '[]',
+            retention_policy TEXT NOT NULL DEFAULT '',
+            representation_kind TEXT NOT NULL DEFAULT 'original',
+            derived_from_sha256 TEXT NOT NULL DEFAULT '',
+            derivation_kind TEXT NOT NULL DEFAULT '',
+            derivation_version TEXT NOT NULL DEFAULT '',
+            created_at_unix_ms INTEGER NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS idx_artifact_bindings_scope
+           ON artifact_bindings(sha256, workspace_hash, visibility, created_at_unix_ms DESC);
+         CREATE INDEX IF NOT EXISTS idx_artifact_bindings_derived_from
+           ON artifact_bindings(derived_from_sha256);",
+    )?;
+    // ── end v25 ──────────────────────────────────────────────────────────
 
     // Stamp the migration level so subsequent opens skip the probe block above.
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -2110,6 +2173,33 @@ mod tests {
         assert_eq!(stats.by_category_active["decision"], 2);
         assert!(stats.by_category_active.get("insight").is_none());
 
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn fresh_db_has_artifact_tables_and_indexes() {
+        let (conn, path) = temp_db();
+        initialize_schema(&conn).expect("init schema");
+        for table in ["artifacts", "artifact_bindings"] {
+            let exists: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    params![table],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(exists, 1, "missing table {table}");
+        }
+        for index in ["idx_artifact_bindings_scope", "idx_artifact_bindings_derived_from"] {
+            let exists: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name=?1",
+                    params![index],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(exists, 1, "missing index {index}");
+        }
         let _ = std::fs::remove_file(&path);
     }
 }
