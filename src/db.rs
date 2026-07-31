@@ -1,5 +1,6 @@
 use rusqlite::params;
 use rusqlite::OptionalExtension;
+use serde_json::json;
 use r2d2_sqlite::SqliteConnectionManager;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -11,7 +12,8 @@ type PooledConn = r2d2::PooledConnection<SqliteConnectionManager>;
 use crate::connectors::Connector;
 use crate::encryption::EncryptionManager;
 use crate::models::{
-    AskParams, AskResult, AskSource, CompactReport, DecayReport, EmbedParams, Entity, GraphEdge,
+    ActionLease, AskParams, AskResult, AskSource, AuthorityManifest, AuthorityManifestInput,
+    AuthorizedAction, CompactReport, DecayReport, EmbedParams, Entity, GraphEdge,
     GraphNode, IngestParams, JournalEvent, MemoryLink, PruneParams, PruneReport, PurgeReport, Readiness, RecallParams,
     StateEntry, Stats, TimelineParams, VaultReport,
 };
@@ -591,6 +593,13 @@ impl Database {
 
     /// Open a database at `path`, initializing the v0.2.0 schema if needed.
     pub fn open(path: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        // Unit tests create hundreds of isolated temporary databases. DELETE
+        // journaling avoids WAL/SHM sidecars for every direct test open while
+        // production keeps its concurrent WAL configuration.
+        Self::open_inner(path, cfg!(test))
+    }
+
+    fn open_inner(path: &str, test_mode: bool) -> Result<Self, Box<dyn std::error::Error>> {
         // #210: a connection pool lets concurrent HTTP/SSE requests read in
         // parallel under WAL instead of serializing on one Mutex<Connection>
         // (rusqlite Connection is !Sync). The PRAGMAs must be applied to EVERY
@@ -629,9 +638,10 @@ impl Database {
             .and_then(|v| v.parse().ok())
             .filter(|&n| n > 0)
             .unwrap_or(30_000);
+        let journal_mode = if test_mode { "DELETE" } else { "WAL" };
         let manager = SqliteConnectionManager::file(path).with_init(move |c| {
             c.execute_batch(&format!(
-                "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=1000; \
+                "PRAGMA journal_mode={journal_mode}; PRAGMA wal_autocheckpoint=1000; \
                  PRAGMA foreign_keys=ON; PRAGMA busy_timeout={busy_timeout_ms}; \
                  PRAGMA synchronous=NORMAL; PRAGMA cache_size=-8000; \
                  PRAGMA mmap_size=268435456; PRAGMA temp_store=MEMORY;",
@@ -1005,13 +1015,13 @@ impl Database {
         self.llm_config.enabled
     }
 
-    /// RAG: recall relevant entities, assemble context, ask Ollama for a grounded answer.
-    pub fn ask(&self, params: &AskParams) -> Result<AskResult, Box<dyn std::error::Error>> {
-        if !self.llm_config.enabled {
-            return Err("LLM is not enabled. Set --llm-endpoint to enable mimir_ask.".into());
-        }
-
-        // Step 1: Recall top-k relevant entities
+    /// Recall the source set for RAG, enforcing the same session visibility
+    /// contract as mimir_recall. Kept separate so the security boundary is
+    /// testable without requiring a live LLM endpoint (#783).
+    pub fn ask_sources(
+        &self,
+        params: &AskParams,
+    ) -> Result<Vec<Entity>, Box<dyn std::error::Error>> {
         let recall_params = RecallParams {
             query: params.query.clone(),
             limit: params.top_k as i64,
@@ -1019,13 +1029,25 @@ impl Database {
             ..Default::default()
         };
         let mut entities = self.recall(&recall_params)?;
-        // #472 Temporal RAG: reconstruct the retrieved context at the requested
-        // past instant so the RAG answer is reproducible at a decision point.
+        if let Some(requester) = params.requesting_agent_id.as_deref() {
+            entities.retain(|e| self.can_read(requester, &e.visibility, &e.agent_id));
+        }
         self.resolve_temporal_versions(
             &mut entities,
             params.as_of_unix_ms,
             params.valid_at_unix_ms,
         )?;
+        Ok(entities)
+    }
+
+    /// RAG: recall relevant entities, assemble context, ask Ollama for a grounded answer.
+    pub fn ask(&self, params: &AskParams) -> Result<AskResult, Box<dyn std::error::Error>> {
+        if !self.llm_config.enabled {
+            return Err("LLM is not enabled. Set --llm-endpoint to enable mimir_ask.".into());
+        }
+
+        // Step 1: Recall top-k relevant entities through the visibility boundary.
+        let entities = self.ask_sources(params)?;
 
         if entities.is_empty() {
             return Err("No matching memories found for this question.".into());
@@ -6696,6 +6718,186 @@ impl Database {
         }
         Ok(items)
     }
+
+    /// #768: write a new version of an agent authority manifest. The current
+    /// manifest is the highest non-revoked version for its agent/workspace.
+    pub fn authority_set(
+        &self,
+        input: &AuthorityManifestInput,
+        author_agent_id: &str,
+    ) -> Result<AuthorityManifest, Box<dyn std::error::Error>> {
+        if input.agent_id.trim().is_empty() || input.workspace_hash.trim().is_empty() {
+            return Err("authority manifest requires agent_id and workspace_hash".into());
+        }
+        if !matches!(input.mode.as_str(), "shadow" | "enforce") {
+            return Err("authority manifest mode must be shadow or enforce".into());
+        }
+        if input.allowed_capabilities.is_empty() || input.scope_anchors.is_empty() {
+            return Err("authority manifest requires capabilities and trusted scope anchors".into());
+        }
+        if self.agent_get(&input.agent_id)?.is_none() {
+            return Err("authority manifest agent_id must be registered".into());
+        }
+        if input.max_parallel_actions < 1 {
+            return Err("authority manifest max_parallel_actions must be at least 1".into());
+        }
+        let now = now_ms();
+        let conn = self.conn()?;
+        let version: i64 = conn.query_row(
+            "SELECT COALESCE(MAX(version), 0) + 1 FROM authority_manifests \
+             WHERE agent_id = ?1 AND workspace_hash = ?2",
+            params![input.agent_id, input.workspace_hash],
+            |r| r.get(0),
+        )?;
+        let id = format!("auth-{}", uuid::Uuid::new_v4().simple());
+        let allowed = serde_json::to_string(&input.allowed_capabilities)?;
+        let approvals = serde_json::to_string(&input.approval_required_capabilities)?;
+        let anchors = serde_json::to_string(&input.scope_anchors)?;
+        let approvers = serde_json::to_string(&input.approver_principals)?;
+        let inbound = serde_json::to_string(&input.allowed_inbound_principals)?;
+        let prefixes = serde_json::to_string(&input.permitted_external_ref_prefixes)?;
+        conn.execute(
+            "INSERT INTO authority_manifests
+             (id, agent_id, workspace_hash, version, allowed_capabilities,
+              approval_required_capabilities, scope_anchors, approver_principals,
+              allowed_inbound_principals, permitted_external_ref_prefixes, max_parallel_actions,
+              mode, expires_at_unix_ms, revoked_at_unix_ms, created_at_unix_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, NULL, ?14)",
+            params![id, input.agent_id, input.workspace_hash, version, allowed,
+                    approvals, anchors, approvers, inbound, prefixes, input.max_parallel_actions,
+                    input.mode, input.expires_at_unix_ms, now],
+        )?;
+        let manifest = AuthorityManifest {
+            id,
+            agent_id: input.agent_id.clone(),
+            workspace_hash: input.workspace_hash.clone(),
+            version,
+            allowed_capabilities: input.allowed_capabilities.clone(),
+            approval_required_capabilities: input.approval_required_capabilities.clone(),
+            scope_anchors: input.scope_anchors.clone(),
+            approver_principals: input.approver_principals.clone(),
+            allowed_inbound_principals: input.allowed_inbound_principals.clone(),
+            permitted_external_ref_prefixes: input.permitted_external_ref_prefixes.clone(),
+            max_parallel_actions: input.max_parallel_actions,
+            mode: input.mode.clone(),
+            expires_at_unix_ms: input.expires_at_unix_ms,
+            revoked_at_unix_ms: None,
+            created_at_unix_ms: now,
+        };
+        drop(conn);
+        self.journal(&JournalEvent {
+            id: format!("jrn-{}", uuid::Uuid::new_v4().simple()),
+            event_type: "authority_set".to_string(),
+            evaluated_json: "{}".to_string(),
+            acted_json: serde_json::to_string(&manifest)?,
+            forward_json: "{}".to_string(),
+            category: "authority".to_string(),
+            key: manifest.id.clone(),
+            entity_id: String::new(),
+            agent_id: author_agent_id.to_string(),
+            workspace_hash: manifest.workspace_hash.clone(),
+            created_at_unix_ms: now,
+        })?;
+        Ok(manifest)
+    }
+
+    fn authority_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<AuthorityManifest> {
+        Ok(AuthorityManifest {
+            id: r.get(0)?, agent_id: r.get(1)?, workspace_hash: r.get(2)?, version: r.get(3)?,
+            allowed_capabilities: serde_json::from_str(&r.get::<_, String>(4)?).unwrap_or_default(),
+            approval_required_capabilities: serde_json::from_str(&r.get::<_, String>(5)?).unwrap_or_default(),
+            scope_anchors: serde_json::from_str(&r.get::<_, String>(6)?).unwrap_or_default(),
+            approver_principals: serde_json::from_str(&r.get::<_, String>(7)?).unwrap_or_default(),
+            allowed_inbound_principals: serde_json::from_str(&r.get::<_, String>(8)?).unwrap_or_default(),
+            permitted_external_ref_prefixes: serde_json::from_str(&r.get::<_, String>(9)?).unwrap_or_default(),
+            max_parallel_actions: r.get(10)?, mode: r.get(11)?, expires_at_unix_ms: r.get(12)?,
+            revoked_at_unix_ms: r.get(13)?, created_at_unix_ms: r.get(14)?,
+        })
+    }
+
+    fn action_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<AuthorizedAction> {
+        Ok(AuthorizedAction {
+            id: r.get(0)?, manifest_id: r.get(1)?, manifest_version: r.get(2)?, agent_id: r.get(3)?,
+            workspace_hash: r.get(4)?, scope_anchor: r.get(5)?, external_ref: r.get(6)?, capability: r.get(7)?,
+            action_key: r.get(8)?, intent_hash: r.get(9)?, outcome_hash: r.get(10)?, status: r.get(11)?,
+            approval_required: r.get::<_, i64>(12)? != 0, approval_ref: r.get(13)?,
+            created_at_unix_ms: r.get(14)?, updated_at_unix_ms: r.get(15)?,
+        })
+    }
+
+    fn action_select_sql() -> &'static str {
+        "SELECT id, manifest_id, manifest_version, agent_id, workspace_hash, scope_anchor, external_ref, capability, action_key, intent_hash, outcome_hash, status, approval_required, approval_ref, created_at_unix_ms, updated_at_unix_ms FROM authorized_actions"
+    }
+
+    fn active_authority(&self, agent_id: &str, workspace_hash: &str) -> Result<AuthorityManifest, Box<dyn std::error::Error>> {
+        self.authority_get(agent_id, workspace_hash, false)?.ok_or_else(|| "no active authority manifest for agent/workspace".into())
+    }
+
+    pub fn authority_get(&self, agent_id: &str, workspace_hash: &str, include_revoked: bool) -> Result<Option<AuthorityManifest>, Box<dyn std::error::Error>> {
+        let now = now_ms();
+        let conn = self.conn()?;
+        let sql = if include_revoked {
+            "SELECT id, agent_id, workspace_hash, version, allowed_capabilities, approval_required_capabilities, scope_anchors, approver_principals, allowed_inbound_principals, permitted_external_ref_prefixes, max_parallel_actions, mode, expires_at_unix_ms, revoked_at_unix_ms, created_at_unix_ms FROM authority_manifests WHERE agent_id=?1 AND workspace_hash=?2 ORDER BY version DESC LIMIT 1"
+        } else {
+            "SELECT id, agent_id, workspace_hash, version, allowed_capabilities, approval_required_capabilities, scope_anchors, approver_principals, allowed_inbound_principals, permitted_external_ref_prefixes, max_parallel_actions, mode, expires_at_unix_ms, revoked_at_unix_ms, created_at_unix_ms FROM authority_manifests WHERE agent_id=?1 AND workspace_hash=?2 AND revoked_at_unix_ms IS NULL AND (expires_at_unix_ms IS NULL OR expires_at_unix_ms>?3) ORDER BY version DESC LIMIT 1"
+        };
+        let result = if include_revoked { conn.query_row(sql, params![agent_id, workspace_hash], Self::authority_from_row).optional()? } else { conn.query_row(sql, params![agent_id, workspace_hash, now], Self::authority_from_row).optional()? };
+        Ok(result)
+    }
+
+    pub fn authority_revoke(&self, manifest_id: &str, actor: &str, reason: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let now = now_ms(); let conn = self.conn()?;
+        let manifest = conn.query_row("SELECT id, agent_id, workspace_hash, version, allowed_capabilities, approval_required_capabilities, scope_anchors, approver_principals, allowed_inbound_principals, permitted_external_ref_prefixes, max_parallel_actions, mode, expires_at_unix_ms, revoked_at_unix_ms, created_at_unix_ms FROM authority_manifests WHERE id=?1", params![manifest_id], Self::authority_from_row)?;
+        if manifest.revoked_at_unix_ms.is_some() { return Err("authority manifest is already revoked".into()); }
+        conn.execute("UPDATE authority_manifests SET revoked_at_unix_ms=?1 WHERE id=?2", params![now, manifest_id])?; drop(conn);
+        self.journal(&JournalEvent { id: format!("jrn-{}", uuid::Uuid::new_v4().simple()), event_type:"authority_revoked".to_string(), evaluated_json:json!({"reason":reason}).to_string(), acted_json:serde_json::to_string(&manifest)?, forward_json:"{}".to_string(), category:"authority".to_string(), key:manifest_id.to_string(), entity_id:String::new(), agent_id:actor.to_string(), workspace_hash:manifest.workspace_hash, created_at_unix_ms:now })?;
+        Ok(())
+    }
+
+    pub fn action_intent(&self, agent_id:&str, workspace_hash:&str, scope_anchor:&str, external_ref:&str, capability:&str, action_key:&str, intent_hash:&str) -> Result<AuthorizedAction, Box<dyn std::error::Error>> {
+        let manifest = self.active_authority(agent_id, workspace_hash)?;
+        if !manifest.allowed_capabilities.iter().any(|v| v == capability) { return Err("capability is not permitted by authority manifest".into()); }
+        if !manifest.scope_anchors.iter().any(|v| v == scope_anchor) { return Err("trusted scope anchor is not permitted by authority manifest".into()); }
+        if !manifest.permitted_external_ref_prefixes.iter().any(|v| external_ref == v || external_ref.starts_with(&(v.clone()+"/"))) { return Err("external reference is not permitted by authority manifest".into()); }
+        if intent_hash.len()!=64 || !intent_hash.bytes().all(|b| b.is_ascii_hexdigit()) { return Err("intent_hash must be a SHA-256 hex digest".into()); }
+        let approval_required=manifest.approval_required_capabilities.iter().any(|v|v==capability); let now=now_ms();
+        let action=AuthorizedAction { id:format!("act-{}",uuid::Uuid::new_v4().simple()), manifest_id:manifest.id.clone(), manifest_version:manifest.version, agent_id:agent_id.to_string(), workspace_hash:workspace_hash.to_string(), scope_anchor:scope_anchor.to_string(), external_ref:external_ref.to_string(), capability:capability.to_string(), action_key:action_key.to_string(), intent_hash:intent_hash.to_ascii_lowercase(), outcome_hash:String::new(), status:if approval_required{"approval_requested"}else{"intent"}.to_string(), approval_required, approval_ref:String::new(), created_at_unix_ms:now, updated_at_unix_ms:now };
+        let conn=self.conn()?; conn.execute("INSERT INTO authorized_actions (id,manifest_id,manifest_version,agent_id,workspace_hash,scope_anchor,external_ref,capability,action_key,intent_hash,outcome_hash,status,approval_required,approval_ref,created_at_unix_ms,updated_at_unix_ms) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?15)", params![action.id,action.manifest_id,action.manifest_version,action.agent_id,action.workspace_hash,action.scope_anchor,action.external_ref,action.capability,action.action_key,action.intent_hash,action.outcome_hash,action.status,action.approval_required as i64,action.approval_ref,now])?; drop(conn);
+        self.journal(&JournalEvent {id:format!("jrn-{}",uuid::Uuid::new_v4().simple()),event_type:"action_intent".to_string(),evaluated_json:serde_json::to_string(&manifest)?,acted_json:serde_json::to_string(&action)?,forward_json:"{}".to_string(),category:"authorized_action".to_string(),key:action.id.clone(),entity_id:String::new(),agent_id:agent_id.to_string(),workspace_hash:workspace_hash.to_string(),created_at_unix_ms:now})?; Ok(action)
+    }
+
+    pub fn action_receipt_get(&self, action_id:&str) -> Result<Option<AuthorizedAction>, Box<dyn std::error::Error>> { let conn=self.conn()?; Ok(conn.query_row(&format!("{} WHERE id=?1",Self::action_select_sql()),params![action_id],Self::action_from_row).optional()?) }
+
+    pub fn action_approve(&self, action_id:&str, approver:&str, decision:&str) -> Result<AuthorizedAction, Box<dyn std::error::Error>> {
+        if !matches!(decision,"granted"|"denied") { return Err("approval decision must be granted or denied".into()); }
+        let mut action=self.action_receipt_get(action_id)?.ok_or("authorized action not found")?;
+        if action.status!="approval_requested" { return Err("action is not awaiting approval".into()); }
+        let conn=self.conn()?; let manifest=conn.query_row("SELECT id, agent_id, workspace_hash, version, allowed_capabilities, approval_required_capabilities, scope_anchors, approver_principals, allowed_inbound_principals, permitted_external_ref_prefixes, max_parallel_actions, mode, expires_at_unix_ms, revoked_at_unix_ms, created_at_unix_ms FROM authority_manifests WHERE id=?1",params![action.manifest_id],Self::authority_from_row)?;
+        if !manifest.approver_principals.iter().any(|p|p==approver) || !manifest.allowed_inbound_principals.iter().any(|p|p==approver) { return Err("approver is not allowed by authority manifest".into()); }
+        let now=now_ms(); action.status=format!("approval_{decision}"); action.approval_ref=format!("apr-{}",uuid::Uuid::new_v4().simple()); action.updated_at_unix_ms=now; conn.execute("UPDATE authorized_actions SET status=?1,approval_ref=?2,updated_at_unix_ms=?3 WHERE id=?4",params![action.status,action.approval_ref,now,action.id])?; drop(conn);
+        self.journal(&JournalEvent{id:format!("jrn-{}",uuid::Uuid::new_v4().simple()),event_type:action.status.clone(),evaluated_json:json!({"approver_principal":approver,"manifest_version":action.manifest_version}).to_string(),acted_json:serde_json::to_string(&action)?,forward_json:"{}".to_string(),category:"authorized_action".to_string(),key:action.id.clone(),entity_id:String::new(),agent_id:action.agent_id.clone(),workspace_hash:action.workspace_hash.clone(),created_at_unix_ms:now})?; Ok(action)
+    }
+
+    pub fn action_complete(&self, action_id:&str, actor:&str, outcome:&str, outcome_hash:&str) -> Result<AuthorizedAction, Box<dyn std::error::Error>> {
+        if !matches!(outcome,"executed"|"failed"|"cancelled") { return Err("action outcome must be executed, failed, or cancelled".into()); }
+        if outcome_hash.len()!=64 || !outcome_hash.bytes().all(|b|b.is_ascii_hexdigit()) { return Err("outcome_hash must be a SHA-256 hex digest".into()); }
+        let mut action=self.action_receipt_get(action_id)?.ok_or("authorized action not found")?;
+        if action.approval_required && action.status!="approval_granted" { return Err("approval-required action lacks granted approval".into()); }
+        if !action.approval_required && action.status!="intent" { return Err("action is not in a completable state".into()); }
+        let now=now_ms(); action.status=format!("action_{outcome}"); action.outcome_hash=outcome_hash.to_ascii_lowercase(); action.updated_at_unix_ms=now; let conn=self.conn()?; conn.execute("UPDATE authorized_actions SET status=?1,outcome_hash=?2,updated_at_unix_ms=?3 WHERE id=?4",params![action.status,action.outcome_hash,now,action.id])?; drop(conn);
+        self.journal(&JournalEvent{id:format!("jrn-{}",uuid::Uuid::new_v4().simple()),event_type:action.status.clone(),evaluated_json:json!({"actor":actor,"manifest_version":action.manifest_version}).to_string(),acted_json:serde_json::to_string(&action)?,forward_json:"{}".to_string(),category:"authorized_action".to_string(),key:action.id.clone(),entity_id:String::new(),agent_id:actor.to_string(),workspace_hash:action.workspace_hash.clone(),created_at_unix_ms:now})?; Ok(action)
+    }
+
+    pub fn action_lease_acquire(&self, action_id:&str, holder:&str, ttl_seconds:i64) -> Result<ActionLease, Box<dyn std::error::Error>> {
+        if holder.trim().is_empty() || ttl_seconds<1 { return Err("lease requires holder_id and positive ttl_seconds".into()); }
+        let action=self.action_receipt_get(action_id)?.ok_or("authorized action not found")?; let now=now_ms(); let expires=now+ttl_seconds.saturating_mul(1000); let conn=self.conn()?; let tx=conn.unchecked_transaction()?;
+        tx.execute("UPDATE authorized_action_leases SET released_at_unix_ms=?1 WHERE workspace_hash=?2 AND action_key=?3 AND released_at_unix_ms IS NULL AND expires_at_unix_ms<=?1",params![now,action.workspace_hash,action.action_key])?;
+        let busy:Option<String>=tx.query_row("SELECT id FROM authorized_action_leases WHERE workspace_hash=?1 AND action_key=?2 AND released_at_unix_ms IS NULL AND expires_at_unix_ms>?3 LIMIT 1",params![action.workspace_hash,action.action_key,now],|r|r.get(0)).optional()?;
+        if busy.is_some() { return Err("an active lease already exists for workspace/action key".into()); }
+        let lease=ActionLease{id:format!("lease-{}",uuid::Uuid::new_v4().simple()),action_id:action.id,workspace_hash:action.workspace_hash,action_key:action.action_key,holder_id:holder.to_string(),expires_at_unix_ms:expires,released_at_unix_ms:None,created_at_unix_ms:now}; tx.execute("INSERT INTO authorized_action_leases (id,action_id,workspace_hash,action_key,holder_id,expires_at_unix_ms,released_at_unix_ms,created_at_unix_ms) VALUES (?1,?2,?3,?4,?5,?6,NULL,?7)",params![lease.id,lease.action_id,lease.workspace_hash,lease.action_key,lease.holder_id,lease.expires_at_unix_ms,lease.created_at_unix_ms])?; tx.commit()?; Ok(lease)
+    }
+
+    pub fn action_lease_release(&self, lease_id:&str, holder:&str) -> Result<(), Box<dyn std::error::Error>> { let now=now_ms(); let conn=self.conn()?; let changed=conn.execute("UPDATE authorized_action_leases SET released_at_unix_ms=?1 WHERE id=?2 AND holder_id=?3 AND released_at_unix_ms IS NULL",params![now,lease_id,holder])?; if changed!=1 { return Err("lease not found, already released, or holder mismatch".into()); } Ok(()) }
 
     // ─── State ───────────────────────────────────────────────────
 
@@ -12961,17 +13163,92 @@ fn entity_from_row(
     })
 }
 
+/// Owns a temporary SQLite database and clears SQLite sidecars on test exit.
+/// The main file remains available for tests that deliberately reopen it after
+/// dropping the fixture; WAL/SHM are the high-volume artifacts that accumulate
+/// across repeated suite runs.
+#[cfg(test)]
+pub(crate) struct TestDatabase {
+    db: Option<Database>,
+    path: String,
+}
+
+#[cfg(test)]
+impl TestDatabase {
+    pub(crate) fn new(prefix: &str) -> Self {
+        let path = std::env::temp_dir()
+            .join(format!("{prefix}-{}.db", uuid::Uuid::new_v4()))
+            .to_string_lossy()
+            .into_owned();
+        // This fixture deliberately uses WAL so Drop's sidecar cleanup stays
+        // covered even though ordinary unit-test opens use DELETE journaling.
+        let db = Database::open_inner(&path, false).expect("open test database");
+        Self { db: Some(db), path }
+    }
+
+    pub(crate) fn path(&self) -> &str {
+        &self.path
+    }
+
+}
+
+#[cfg(test)]
+impl std::ops::Deref for TestDatabase {
+    type Target = Database;
+
+    fn deref(&self) -> &Self::Target {
+        self.db.as_ref().expect("test database present")
+    }
+}
+
+#[cfg(test)]
+impl std::ops::DerefMut for TestDatabase {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.db.as_mut().expect("test database present")
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestDatabase {
+    fn drop(&mut self) {
+        // Drop the pool before unlinking SQLite's WAL sidecars.
+        drop(self.db.take());
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let _ = std::fs::remove_file(format!("{}{}", self.path, suffix));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
 
-    fn temp_db() -> (Database, String) {
-        let dir = std::env::temp_dir();
-        let path = dir.join(format!("mimir-test-db-{}.db", uuid::Uuid::new_v4()));
-        let path_str = path.to_str().unwrap().to_string();
-        let db = Database::open(&path_str).expect("open test db");
-        (db, path_str)
+    fn temp_db() -> (TestDatabase, String) {
+        let db = TestDatabase::new("mimir-test-db");
+        let path = db.path().to_string();
+        (db, path)
+    }
+
+    #[test]
+    fn test_database_fixture_removes_sqlite_sidecars_on_drop() {
+        let path = {
+            let db = TestDatabase::new("mimir-test-cleanup");
+            let path = db.path().to_string();
+            db.remember_skip_dedup(&make_entity(
+                "fixture-cleanup", "test", "fixture", "{\"content\":\"fixture cleanup\"}",
+            ))
+            .expect("seed fixture");
+            path
+        };
+        for suffix in ["-wal", "-shm"] {
+            assert!(
+                !std::path::Path::new(&(path.clone() + suffix)).exists(),
+                "fixture left SQLite sidecar {}",
+                path.clone() + suffix
+            );
+        }
+        let _ = std::fs::remove_file(path);
     }
 
     /// #393: auto-embed is asynchronous — tests that assert on embeddings (or
@@ -13015,6 +13292,123 @@ mod tests {
             embedding: None,
             _parsed_body: None,
         }
+    }
+
+    #[test]
+    fn authority_manifest_is_versioned_and_records_auditable_lifecycle() {
+        let (db, path) = temp_db();
+        db.agent_upsert("hermes-prod", "Hermes Production", 3, "perseus")
+            .unwrap();
+        let manifest = crate::models::AuthorityManifestInput {
+            agent_id: "hermes-prod".to_string(),
+            workspace_hash: "workspace-42".to_string(),
+            allowed_capabilities: vec!["read".to_string(), "git_push".to_string()],
+            approval_required_capabilities: vec!["git_push".to_string()],
+            scope_anchors: vec!["github:Perseus-Computing-LLC/perseus-vault".to_string()],
+            approver_principals: vec!["github:tcconnally".to_string()],
+            allowed_inbound_principals: vec!["github:tcconnally".to_string()],
+            permitted_external_ref_prefixes: vec!["github:Perseus-Computing-LLC/perseus-vault".to_string()],
+            max_parallel_actions: 1,
+            mode: "shadow".to_string(),
+            expires_at_unix_ms: None,
+        };
+        let stored = db.authority_set(&manifest, "hermes-admin").unwrap();
+        assert_eq!(stored.version, 1);
+        assert_eq!(stored.mode, "shadow");
+
+        let intent = db
+            .action_intent(
+                "hermes-prod",
+                "workspace-42",
+                "github:Perseus-Computing-LLC/perseus-vault",
+                "github:Perseus-Computing-LLC/perseus-vault",
+                "git_push",
+                "action-42",
+                "a".repeat(64).as_str(),
+            )
+            .unwrap();
+        assert_eq!(intent.status, "approval_requested");
+        assert!(intent.approval_required);
+
+        let approval = db
+            .action_approve(&intent.id, "github:tcconnally", "granted")
+            .unwrap();
+        assert_eq!(approval.status, "approval_granted");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn authorized_action_receipt_contract_covers_pinned_authority_lifecycle_and_lease() {
+        let (db, path) = temp_db();
+        db.agent_upsert("agent-768", "Agent 768", 2, "perseus").unwrap();
+        let manifest = crate::models::AuthorityManifestInput {
+            agent_id: "agent-768".to_string(), workspace_hash: "ws-768".to_string(),
+            allowed_capabilities: vec!["git_push".to_string()],
+            approval_required_capabilities: vec!["git_push".to_string()],
+            scope_anchors: vec!["github:Perseus-Computing-LLC/perseus-vault".to_string()],
+            approver_principals: vec!["github:tcconnally".to_string()],
+            allowed_inbound_principals: vec!["github:tcconnally".to_string()],
+            permitted_external_ref_prefixes: vec!["github:Perseus-Computing-LLC/perseus-vault".to_string()],
+            max_parallel_actions: 1, mode: "enforce".to_string(), expires_at_unix_ms: None,
+        };
+        let stored = db.authority_set(&manifest, "admin").unwrap();
+        let action = db.action_intent("agent-768", "ws-768", "github:Perseus-Computing-LLC/perseus-vault", "github:Perseus-Computing-LLC/perseus-vault/pull/768", "git_push", "push-768", &"a".repeat(64)).unwrap();
+        assert_eq!(action.manifest_version, stored.version);
+        assert_eq!(action.status, "approval_requested");
+        assert!(db.action_complete(&action.id, "agent-768", "executed", &"b".repeat(64)).is_err());
+        let approved = db.action_approve(&action.id, "github:tcconnally", "granted").unwrap();
+        assert_eq!(approved.status, "approval_granted");
+        let done = db.action_complete(&action.id, "agent-768", "executed", &"b".repeat(64)).unwrap();
+        assert_eq!(done.status, "action_executed");
+        assert_eq!(db.action_receipt_get(&action.id).unwrap().unwrap().id, action.id);
+        let lease = db.action_lease_acquire(&action.id, "holder-a", 60).unwrap();
+        assert!(db.action_lease_acquire(&action.id, "holder-b", 60).is_err());
+        assert!(db.action_lease_release(&lease.id, "holder-b").is_err());
+        db.action_lease_release(&lease.id, "holder-a").unwrap();
+        db.authority_revoke(&stored.id, "admin", "end test").unwrap();
+        assert!(db.authority_get("agent-768", "ws-768", false).unwrap().is_none());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn ask_sources_enforce_visibility_before_llm_prompting() {
+        let db = Database::open(":memory:").unwrap();
+        let now = now_ms();
+        for (key, owner, visibility) in [
+            ("private-plan", "alice", "private"),
+            ("shared-plan", "alice", "workspace"),
+        ] {
+            let entity = Entity {
+                id: format!("mem-{key}"),
+                category: "ask_visibility".to_string(),
+                key: key.to_string(),
+                body_json: serde_json::json!({"content": "aurora launch plan"}).to_string(),
+                status: "active".to_string(),
+                entity_type: "insight".to_string(),
+                tags: vec![], decay_score: 1.0, retrieval_count: 0,
+                layer: "working".to_string(), topic_path: String::new(), archived: false,
+                archive_reason: String::new(), links: vec![], verified: false,
+                source: "test".to_string(), always_on: false, certainty: 1.0,
+                workspace_hash: String::new(), agent_id: owner.to_string(),
+                visibility: visibility.to_string(), created_at_unix_ms: now,
+                last_accessed_unix_ms: now, follow_count: 0, miss_count: 0,
+                follow_rate: 0.0, efficacy_status: "unverified".to_string(),
+                embedding: None, _parsed_body: None,
+            };
+            db.remember_skip_dedup(&entity).unwrap();
+        }
+        let bob = db.ask_sources(&AskParams {
+            query: "aurora launch plan".to_string(), top_k: 10,
+            as_of_unix_ms: None, valid_at_unix_ms: None,
+            requesting_agent_id: Some("bob".to_string()),
+        }).unwrap();
+        assert_eq!(bob.iter().map(|e| e.key.as_str()).collect::<Vec<_>>(), vec!["shared-plan"]);
+        let alice = db.ask_sources(&AskParams {
+            query: "aurora launch plan".to_string(), top_k: 10,
+            as_of_unix_ms: None, valid_at_unix_ms: None,
+            requesting_agent_id: Some("alice".to_string()),
+        }).unwrap();
+        assert_eq!(alice.len(), 2);
     }
 
     #[test]
@@ -22066,6 +22460,8 @@ mod tests {
         }
         drop(db); // close the temp_db connection so the second connection can open fresh
 
+        // This is a production concurrency contract. The normal test fixture
+        // uses DELETE journaling for hygiene, so reopen explicitly with WAL.
         // Barrier: both threads start together after setup.
         let barrier = Arc::new(Barrier::new(2));
         let reader_failures = Arc::new(std::sync::atomic::AtomicU32::new(0));
@@ -22075,7 +22471,7 @@ mod tests {
         let writer_barrier = Arc::clone(&barrier);
         let wf = Arc::clone(&writer_failures);
         let writer = thread::spawn(move || {
-            let wdb = crate::db::Database::open(&writer_path).expect("writer db open");
+            let wdb = crate::db::Database::open_inner(&writer_path, false).expect("writer db open");
             writer_barrier.wait();
             for i in 0..500 {
                 let body = format!(r#"{{"content":"writer entity {}"}}"#, i);
@@ -22104,7 +22500,7 @@ mod tests {
         let reader_barrier = Arc::clone(&barrier);
         let rf = Arc::clone(&reader_failures);
         let reader = thread::spawn(move || {
-            let rdb = crate::db::Database::open(&reader_path).expect("reader db open");
+            let rdb = crate::db::Database::open_inner(&reader_path, false).expect("reader db open");
             reader_barrier.wait();
             for _ in 0..100 {
                 match rdb.fts5_search(&crate::models::RecallParams {
@@ -22601,7 +22997,7 @@ mod tests {
     fn db_with_fake_embed_endpoint(
         delay: std::time::Duration,
         queue_cap: Option<usize>,
-    ) -> (Database, String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    ) -> (TestDatabase, String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
         let (mut db, path) = temp_db();
         if let Some(cap) = queue_cap {
             db.set_embed_queue_cap(cap);

@@ -207,6 +207,79 @@ pub struct JsonRpcError {
     pub message: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolPrefix {
+    Canonical,
+    Mimir,
+    Mneme,
+    Other,
+}
+
+fn classify_tool_prefix(name: &str) -> ToolPrefix {
+    if name.starts_with("perseus_vault_") {
+        ToolPrefix::Canonical
+    } else if name.starts_with("mimir_") {
+        ToolPrefix::Mimir
+    } else if name.starts_with("mneme_") {
+        ToolPrefix::Mneme
+    } else {
+        ToolPrefix::Other
+    }
+}
+
+struct AliasUsageCounters {
+    canonical_calls: std::sync::atomic::AtomicU64,
+    mimir_calls: std::sync::atomic::AtomicU64,
+    mneme_calls: std::sync::atomic::AtomicU64,
+    other_calls: std::sync::atomic::AtomicU64,
+    since_process_start_unix_ms: u64,
+}
+
+impl AliasUsageCounters {
+    fn new() -> Self {
+        let since_process_start_unix_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        Self {
+            canonical_calls: std::sync::atomic::AtomicU64::new(0),
+            mimir_calls: std::sync::atomic::AtomicU64::new(0),
+            mneme_calls: std::sync::atomic::AtomicU64::new(0),
+            other_calls: std::sync::atomic::AtomicU64::new(0),
+            since_process_start_unix_ms,
+        }
+    }
+
+    fn record(&self, prefix: ToolPrefix) {
+        use std::sync::atomic::Ordering;
+        let counter = match prefix {
+            ToolPrefix::Canonical => &self.canonical_calls,
+            ToolPrefix::Mimir => &self.mimir_calls,
+            ToolPrefix::Mneme => &self.mneme_calls,
+            ToolPrefix::Other => &self.other_calls,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> Value {
+        use std::sync::atomic::Ordering;
+        json!({
+            "canonical_calls": self.canonical_calls.load(Ordering::Relaxed),
+            "mimir_calls": self.mimir_calls.load(Ordering::Relaxed),
+            "mneme_calls": self.mneme_calls.load(Ordering::Relaxed),
+            "other_calls": self.other_calls.load(Ordering::Relaxed),
+            "since_process_start_unix_ms": self.since_process_start_unix_ms,
+        })
+    }
+}
+
+fn is_alias_usage_tool(name: &str) -> bool {
+    name.strip_prefix("perseus_vault_")
+        .or_else(|| name.strip_prefix("mimir_"))
+        .or_else(|| name.strip_prefix("mneme_"))
+        == Some("alias_usage")
+}
+
 pub struct MCPState {
     // #210: AtomicBool so the HTTP/SSE transport can share &MCPState across
     // concurrent requests without a Mutex (which would re-serialize them now
@@ -218,6 +291,7 @@ pub struct MCPState {
     // clientInfo (single-agent / legacy) → unscoped, preserving old behavior.
     // RwLock: set once at initialize, read per tools/call across the shared &state.
     pub session_agent_id: std::sync::RwLock<String>,
+    alias_usage: AliasUsageCounters,
 }
 
 impl MCPState {
@@ -225,6 +299,7 @@ impl MCPState {
         MCPState {
             initialized: std::sync::atomic::AtomicBool::new(false),
             session_agent_id: std::sync::RwLock::new(String::new()),
+            alias_usage: AliasUsageCounters::new(),
         }
     }
 }
@@ -527,6 +602,14 @@ pub fn handle_request(
                 None => return Some(error_response(id, -32602, "Missing tool name")),
             };
 
+            // Count only the original call name at the tools/call boundary,
+            // before aliases are normalized. The readout itself is excluded so
+            // repeated operator checks do not perturb the evidence being read.
+            let is_alias_usage = is_alias_usage_tool(tool_name);
+            if !is_alias_usage {
+                state.alias_usage.record(classify_tool_prefix(tool_name));
+            }
+
             let mut tool_args = params.get("arguments").cloned().unwrap_or(json!({}));
 
             // #684: stamp the captured session identity so tools that enforce
@@ -555,7 +638,11 @@ pub fn handle_request(
                 .unwrap_or("");
             crate::db::set_chancery_writ_id(chancery_writ_id);
 
-            let result_text = call_tool(tool_name, db, tool_args, id.clone());
+            let result_text = if is_alias_usage {
+                state.alias_usage.snapshot().to_string()
+            } else {
+                call_tool(tool_name, db, tool_args, id.clone())
+            };
 
             // Try to parse the result as JSON for structuredContent
             let structured: Option<serde_json::Value> = serde_json::from_str(&result_text).ok();
@@ -589,40 +676,26 @@ pub fn handle_request(
     }
 }
 
-/// Given a `mimir_*` tool definition from the static registry, return a clone
-/// advertised under the equivalent `mneme_*` name (Mneme rename, transition
-/// release — both names dispatch to the same handler via `call_tool`).
-/// Returns `None` for entries that, unexpectedly, aren't named `mimir_*`.
-fn mneme_alias_tool(tool: &serde_json::Value) -> Option<serde_json::Value> {
+/// Clone a canonical `perseus_vault_*` tool under one retained legacy prefix.
+/// Legacy aliases remain callable during the v2 observation window; only the
+/// canonical public registry and documentation lead with Perseus Vault.
+fn legacy_alias_tool(tool: &serde_json::Value, prefix: &str) -> Option<serde_json::Value> {
     let name = tool.get("name")?.as_str()?;
-    let suffix = name.strip_prefix("mimir_")?;
+    let suffix = name.strip_prefix("perseus_vault_")?;
     let mut alias = tool.clone();
-    alias["name"] = serde_json::Value::String(format!("mneme_{}", suffix));
+    alias["name"] = serde_json::Value::String(format!("{}_{}", prefix, suffix));
     Some(alias)
 }
 
-/// Given a `mimir_*` tool definition from the static registry, return a clone
-/// advertised under the equivalent `perseus_vault_*` name (Perseus Vault
-/// rename, transition release — all three names dispatch to the same handler
-/// via `call_tool`). Returns `None` for entries that aren't named `mimir_*`.
-fn perseus_vault_alias_tool(tool: &serde_json::Value) -> Option<serde_json::Value> {
-    let name = tool.get("name")?.as_str()?;
-    let suffix = name.strip_prefix("mimir_")?;
-    let mut alias = tool.clone();
-    alias["name"] = serde_json::Value::String(format!("perseus_vault_{}", suffix));
-    Some(alias)
-}
-
-/// Parse-once cache of the canonical tool registry. Every tool is declared
-/// under its original `mimir_*` name; rename-transition aliases (`mneme_*`,
-/// `perseus_vault_*`) are synthesized on top of this at advertise time by
-/// `build_tools_array`. The registry is a compile-time constant, parsed exactly
-/// once per process instead of re-parsing ~3.5k lines of JSON on every
-/// tools/list request (perf review #208).
+/// Parse-once cache of the canonical Perseus Vault tool registry. The embedded
+/// literal keeps legacy names only as an implementation migration detail; names
+/// and descriptions are canonicalized before any public registry is built.
+/// `mimir_*` and `mneme_*` are synthesized solely as retained compatibility
+/// aliases at advertise time by `build_tools_array`.
 fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     static BASE: OnceLock<Vec<serde_json::Value>> = OnceLock::new();
     BASE.get_or_init(|| {
-        serde_json::from_str::<serde_json::Value>(
+        let mut registry = serde_json::from_str::<serde_json::Value>(
         r###"[
   {
     "name": "mimir_remember",
@@ -895,6 +968,11 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
         "agent_id": {
           "type": "string",
           "description": "Agent identity filter (v1.2.0). When set, only entities with a matching agent_id are returned. Omit for no agent filtering."
+        },
+        "retrieval_profile": {
+          "type": "string",
+          "enum": ["personal", "agent", "shared"],
+          "description": "#784 serving posture. personal returns preference/personal classes; agent returns convention/correction/keystone classes; shared (default) returns non-personal memory in the requested workspace. Applied after visibility filtering."
         },
         "layer": {
             "type": "string",
@@ -1330,6 +1408,16 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
       "destructiveHint": true
     },
     "title": "Promote Memory"
+  },
+  {
+    "name": "mimir_demote",
+    "description": "Demote a governed memory exactly one rung down the durable-memory ladder. Writes a provenance-preserving copy, a demoted_to link, and an append-only demotion journal event.",
+    "inputSchema": {"type":"object","properties":{
+      "from_category":{"type":"string"},"from_key":{"type":"string"},"to_category":{"type":"string"},"to_key":{"type":"string"},"reason":{"type":"string"}
+    },"required":["from_category","from_key","to_category"]},
+    "outputSchema": {"type":"object","properties":{"demoted":{"type":"boolean"},"to_id":{"type":"string"}}},
+    "annotations": {"destructiveHint": true},
+    "title": "Demote Memory"
   },
   {
     "name": "mimir_beliefs",
@@ -2557,6 +2645,14 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Check Health"
   },
   {
+    "name": "mimir_quality_telemetry",
+    "description": "Machine-readable memory-quality telemetry: contradiction rate, supersession lag, class/layer distribution, and promotion-flow proxy.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {"category": {"type": "string", "description": "Category for contradiction scan (default general)."}}
+    }
+  },
+  {
     "name": "mimir_stats",
     "description": "Return comprehensive database statistics: entity counts by category, type, and decay layer; journal event count; state entry count; database file size; date range of stored data; and history growth (stored version rows, bytes, and the top-10 keys by version count — #398).",
     "inputSchema": {
@@ -2595,12 +2691,12 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
           "description": "Database file size on disk in bytes"
         },
         "oldest_unix_ms": {
-          "type": "integer",
-          "description": "Oldest entity creation timestamp"
+          "type": ["integer", "null"],
+          "description": "Oldest entity creation timestamp, or null when the database has no entities"
         },
         "newest_unix_ms": {
-          "type": "integer",
-          "description": "Newest entity creation timestamp"
+          "type": ["integer", "null"],
+          "description": "Newest entity creation timestamp, or null when the database has no entities"
         },
         "total_history_rows": {
           "type": "integer",
@@ -2620,6 +2716,44 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
       "readOnlyHint": true
     },
     "title": "Get Database Statistics"
+  },
+  {
+    "name": "mimir_alias_usage",
+    "description": "Return privacy-preserving process-local counts of MCP tool calls by original prefix. Counters reset on restart, are never persisted, and exclude this readout tool itself.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {}
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "canonical_calls": {
+          "type": "integer",
+          "description": "Calls using the canonical perseus_vault_ prefix"
+        },
+        "mimir_calls": {
+          "type": "integer",
+          "description": "Calls using the legacy mimir_ prefix"
+        },
+        "mneme_calls": {
+          "type": "integer",
+          "description": "Calls using the legacy mneme_ prefix"
+        },
+        "other_calls": {
+          "type": "integer",
+          "description": "Calls whose tool name used none of the recognized prefixes"
+        },
+        "since_process_start_unix_ms": {
+          "type": "integer",
+          "description": "Unix-millisecond timestamp when this process-local counter set started"
+        }
+      },
+      "required": ["canonical_calls", "mimir_calls", "mneme_calls", "other_calls", "since_process_start_unix_ms"]
+    },
+    "annotations": {
+      "readOnlyHint": true
+    },
+    "title": "Get Legacy Prefix Usage"
   },
   {
     "name": "mimir_compact",
@@ -3229,6 +3363,18 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Record Follow/Miss Efficacy Signal"
   },
   {
+    "name": "mimir_operator_review",
+    "description": "Read-only operator review queue for contradictions, stale/low-actionability facts, and deprecated supersession lag. Does not resolve or hide findings.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "category": {"type": "string", "description": "Category to review (default general)."},
+        "limit": {"type": "integer", "minimum": 1, "maximum": 1000},
+        "stale_threshold": {"type": "number", "minimum": 0, "maximum": 1}
+      }
+    }
+  },
+  {
     "name": "mimir_conflicts",
     "description": "Detect conflicting entities in the same category — pairs with low trigram similarity in their body_json. Flags potential contradictions, duplicate-but-divergent entries, and stale-overwritten facts. Read-only by default. Opt in with resolve=true to actively invalidate the lower-certainty side of clear conflicts (superseding it into history, reversible + time-travelable via mimir_as_of); that path defaults to dry_run=true so you preview first, and never resolves pairs whose certainties are within certainty_margin.",
     "inputSchema": {
@@ -3535,6 +3681,50 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
       "destructiveHint": true
     },
     "title": "Export Vault to Files"
+  },
+  {
+    "name": "mimir_derived_export",
+    "description": "Compile durable knowledge into a deterministic, provenance-rich Markdown surface. The export is derived and read-only; SQLite remains the source of truth.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "output_path": {"type": "string", "description": "Markdown file path to write."},
+        "workspace_hash": {"type": "string", "description": "Optional exact workspace scope."}
+      },
+      "required": ["output_path"]
+    }
+  },
+  {
+    "name": "mimir_markdown_import",
+    "description": "Import one Markdown file as explicitly non-authoritative, provenance-labeled draft evidence. Duplicate source content is idempotently detected.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "path": {"type": "string", "description": "Markdown file path to import."},
+        "workspace_hash": {"type": "string"},
+        "source_system": {"type": "string", "description": "Provenance source label; defaults to markdown."}
+      },
+      "required": ["path"]
+    }
+  },
+  {
+    "name": "mimir_structured_index_anchor",
+    "description": "Represent an upstream structured-index record as a refetchable anchor, or import it explicitly as low-confidence non-authoritative draft evidence.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "index_type": {"type": "string", "description": "Structured index kind, e.g. ide_symbol or domain_fact_map."},
+        "index_uri": {"type": "string", "description": "Stable index locator for later refetch."},
+        "record_id": {"type": "string", "description": "Stable record identity inside the index."},
+        "mode": {"type": "string", "enum": ["reference", "import"], "default": "reference"},
+        "content": {"type": "string", "description": "Required only for mode=import."},
+        "workspace_hash": {"type": "string"},
+        "source_system": {"type": "string"},
+        "observed_at_unix_ms": {"type": "integer"},
+        "revision": {"type": "string", "description": "Optional upstream revision/ETag for refetch verification."}
+      },
+      "required": ["index_type", "index_uri", "record_id"]
+    }
   },
   {
     "name": "mimir_vault_import",
@@ -4136,7 +4326,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
   },
   {
     "name": "mimir_autocohere",
-    "description": "Run a full atomic grooming pass: cohere (promote, link, archive), then decay (recalculate Ebbinghaus decay), then compact (archive below threshold), then consolidate, then enforce the entity_history retention policy (#398 — no-op unless MIMIR_HISTORY_* env knobs are set). Returns a summary report. Use dry_run=true to preview without changes.",
+    "description": "Run a full atomic grooming pass. When capture_text is supplied, capture runs first and must succeed before cohere, decay, compact, consolidation, or retention can compress source context. Returns a summary report. Use dry_run=true to preview without writing.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -4144,12 +4334,32 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
           "type": "boolean",
           "description": "If true, preview changes without writing",
           "default": false
+        },
+        "capture_text": {
+          "type": "string",
+          "description": "Optional raw transcript/insight payload persisted before every compaction-like stage. Capture failure aborts the pass."
+        },
+        "capture_workspace_hash": {
+          "type": "string",
+          "description": "Workspace scope for pre-compaction captured facts"
+        },
+        "capture_agent_id": {
+          "type": "string",
+          "description": "Agent attribution for pre-compaction captured facts"
+        },
+        "capture_max_entities": {
+          "type": "integer",
+          "description": "Maximum durable notes extracted from capture_text (1-20)"
         }
       }
     },
     "outputSchema": {
       "type": "object",
       "properties": {
+        "precompact_capture": {
+          "type": "object",
+          "description": "Capture barrier report. stage=completed means capture persisted before all lifecycle compression stages; stage=skipped means no capture_text was supplied."
+        },
         "promoted_entities": {
           "type": "integer",
           "description": "Entities promoted during cohere"
@@ -4633,13 +4843,36 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
       }
     },
     "title": "Agent Registry"
-  }
+  },
+  {
+    "name":"mimir_authority_set", "description":"Create a versioned authority manifest for a registered agent.", "inputSchema":{"type":"object","properties":{"agent_id":{"type":"string"},"workspace_hash":{"type":"string"},"allowed_capabilities":{"type":"array","items":{"type":"string"}},"scope_anchors":{"type":"array","items":{"type":"string"}},"approval_required_capabilities":{"type":"array","items":{"type":"string"}},"approver_principals":{"type":"array","items":{"type":"string"}},"allowed_inbound_principals":{"type":"array","items":{"type":"string"}},"permitted_external_ref_prefixes":{"type":"array","items":{"type":"string"}},"max_parallel_actions":{"type":"integer","default":1},"mode":{"type":"string","default":"shadow"},"expires_at_unix_ms":{"type":"integer"},"author_agent_id":{"type":"string"}},"required":["agent_id","workspace_hash","allowed_capabilities","scope_anchors"]}, "title":"Set Action Authority"},
+  {"name":"mimir_authority_get", "description":"Get the active authority manifest for an agent and workspace.", "inputSchema":{"type":"object","properties":{"agent_id":{"type":"string"},"workspace_hash":{"type":"string"},"include_revoked":{"type":"boolean","default":false}},"required":["agent_id","workspace_hash"]}, "title":"Get Action Authority"},
+  {"name":"mimir_authority_revoke", "description":"Revoke an authority manifest.", "inputSchema":{"type":"object","properties":{"manifest_id":{"type":"string"},"actor_agent_id":{"type":"string"},"reason":{"type":"string"}},"required":["manifest_id"]}, "title":"Revoke Action Authority"},
+  {"name":"mimir_action_intent", "description":"Record a fail-closed authorized action intent.", "inputSchema":{"type":"object","properties":{"agent_id":{"type":"string"},"workspace_hash":{"type":"string"},"scope_anchor":{"type":"string"},"external_ref":{"type":"string"},"capability":{"type":"string"},"action_key":{"type":"string"},"intent_hash":{"type":"string"}},"required":["agent_id","workspace_hash","scope_anchor","external_ref","capability","action_key","intent_hash"]}, "title":"Record Action Intent"},
+  {"name":"mimir_action_approve", "description":"Grant or deny an approval-requested action.", "inputSchema":{"type":"object","properties":{"action_id":{"type":"string"},"approver_principal":{"type":"string"},"decision":{"type":"string","enum":["granted","denied"]}},"required":["action_id","approver_principal","decision"]}, "title":"Decide Action Approval"},
+  {"name":"mimir_action_complete", "description":"Record an executed, failed, or cancelled action outcome by hash.", "inputSchema":{"type":"object","properties":{"action_id":{"type":"string"},"actor_agent_id":{"type":"string"},"outcome":{"type":"string","enum":["executed","failed","cancelled"]},"outcome_hash":{"type":"string"}},"required":["action_id","actor_agent_id","outcome","outcome_hash"]}, "title":"Complete Authorized Action"},
+  {"name":"mimir_action_receipt_get", "description":"Get durable action receipt metadata and hashes.", "inputSchema":{"type":"object","properties":{"action_id":{"type":"string"}},"required":["action_id"]}, "title":"Get Action Receipt"},
+  {"name":"mimir_action_lease_acquire", "description":"Acquire the single active lease for an action key.", "inputSchema":{"type":"object","properties":{"action_id":{"type":"string"},"holder_id":{"type":"string"},"ttl_seconds":{"type":"integer","default":1}},"required":["action_id","holder_id"]}, "title":"Acquire Action Lease"},
+  {"name":"mimir_action_lease_release", "description":"Release an action lease held by its owner.", "inputSchema":{"type":"object","properties":{"lease_id":{"type":"string"},"holder_id":{"type":"string"}},"required":["lease_id","holder_id"]}, "title":"Release Action Lease"}
 ]"###,
         )
-        .expect("tools JSON must be valid")
-        .as_array()
-        .expect("tools registry must be a JSON array")
-        .clone()
+        .expect("tools JSON must be valid");
+        let tools = registry
+            .as_array_mut()
+            .expect("tools registry must be a JSON array");
+        for tool in tools.iter_mut() {
+            if let Some(name) = tool.get("name").and_then(|v| v.as_str()) {
+                if let Some(suffix) = name.strip_prefix("mimir_") {
+                    tool["name"] = serde_json::Value::String(format!("perseus_vault_{}", suffix));
+                }
+            }
+            if let Some(description) = tool.get("description").and_then(|v| v.as_str()) {
+                tool["description"] = serde_json::Value::String(
+                    description.replace("mimir_", "perseus_vault_").replace("Mimir", "Perseus Vault"),
+                );
+            }
+        }
+        tools.clone()
     })
 }
 
@@ -4672,18 +4905,17 @@ fn build_tools_array(base_array: &[serde_json::Value], advertise_all: bool) -> s
     let mut aliased: Vec<serde_json::Value> =
         Vec::with_capacity(base_array.len() * if advertise_all { 3 } else { 1 });
     for tool in base_array {
+        // The base registry is canonical Perseus Vault names. Legacy names are
+        // present only when a caller explicitly opts into the compatibility
+        // manifest during the v2 observation window.
+        aliased.push(tool.clone());
         if advertise_all {
-            aliased.push(tool.clone());
-            if let Some(mneme_alias) = mneme_alias_tool(tool) {
+            if let Some(mimir_alias) = legacy_alias_tool(tool, "mimir") {
+                aliased.push(mimir_alias);
+            }
+            if let Some(mneme_alias) = legacy_alias_tool(tool, "mneme") {
                 aliased.push(mneme_alias);
             }
-            if let Some(vault_alias) = perseus_vault_alias_tool(tool) {
-                aliased.push(vault_alias);
-            }
-        } else {
-            // Canonical-only: advertise the perseus_vault_* name. A tool that
-            // (unexpectedly) isn't mimir_*-prefixed passes through unchanged.
-            aliased.push(perseus_vault_alias_tool(tool).unwrap_or_else(|| tool.clone()));
         }
     }
     serde_json::Value::Array(aliased)
@@ -4780,6 +5012,7 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
         "mimir_state_list" => tools::handle_state_list(db, args).map_err(|e| e.to_string()),
 
         "mimir_health" => Ok(tools::handle_health(db)),
+        "mimir_quality_telemetry" => tools::handle_quality_telemetry(db, args),
 
         "mimir_stats" => Ok(tools::handle_stats(db)),
 
@@ -4802,12 +5035,26 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
         "mimir_keystone_set" => tools::handle_keystone_set(db, args),
         "mimir_keystone_get" => tools::handle_keystone_get(db, args),
         "mimir_agent" => tools::handle_agent(db, args),
+        "mimir_authority_set" => tools::handle_authority_set(db, args),
+        "mimir_authority_get" => tools::handle_authority_get(db, args),
+        "mimir_authority_revoke" => tools::handle_authority_revoke(db, args),
+        "mimir_action_intent" => tools::handle_action_intent(db, args),
+        "mimir_action_approve" => tools::handle_action_approve(db, args),
+        "mimir_action_complete" => tools::handle_action_complete(db, args),
+        "mimir_action_receipt_get" => tools::handle_action_receipt_get(db, args),
+        "mimir_action_lease_acquire" => tools::handle_action_lease_acquire(db, args),
+        "mimir_action_lease_release" => tools::handle_action_lease_release(db, args),
         "mimir_promote" => tools::handle_promote(db, args),
+        "mimir_demote" => tools::handle_demote(db, args),
         "mimir_beliefs" => beliefs::handle_beliefs(db, args),
+        "mimir_operator_review" => tools::handle_operator_review(db, args),
         "mimir_conflicts" => Ok(tools::handle_conflicts(db, args)),
         "mimir_consolidate" => Ok(tools::handle_consolidate(db, args)),
         "mimir_dream" => tools::handle_dream(db, args),
         "mimir_vault_export" => Ok(tools::handle_vault_export(db, args)),
+        "mimir_derived_export" => tools::handle_derived_export(db, args),
+        "mimir_markdown_import" => tools::handle_markdown_import(db, args),
+        "mimir_structured_index_anchor" => tools::handle_structured_index_anchor(db, args),
         "mimir_vault_import" => Ok(tools::handle_vault_import(db, args)),
         "mimir_decay" => Ok(tools::handle_decay(db, args)),
         "mimir_reindex" => Ok(tools::handle_reindex(db, args)),
@@ -4877,6 +5124,94 @@ mod tests {
             .iter()
             .map(|t| t["name"].as_str().unwrap().to_string())
             .collect()
+    }
+
+    #[test]
+    fn stats_schema_allows_null_timestamps_for_an_empty_database() {
+        let stats = tool_registry_base()
+            .iter()
+            .find(|tool| tool["name"] == "perseus_vault_stats")
+            .expect("stats tool must be registered");
+
+        for field in ["oldest_unix_ms", "newest_unix_ms"] {
+            assert_eq!(
+                stats["outputSchema"]["properties"][field]["type"],
+                json!(["integer", "null"]),
+                "{field} must accept the null value returned for an empty database"
+            );
+        }
+    }
+
+    #[test]
+    fn tool_prefix_classifier_distinguishes_all_call_names() {
+        assert_eq!(
+            classify_tool_prefix("perseus_vault_recall"),
+            ToolPrefix::Canonical
+        );
+        assert_eq!(classify_tool_prefix("mimir_recall"), ToolPrefix::Mimir);
+        assert_eq!(classify_tool_prefix("mneme_recall"), ToolPrefix::Mneme);
+        assert_eq!(classify_tool_prefix("custom_tool"), ToolPrefix::Other);
+    }
+
+    #[test]
+    fn alias_usage_counts_calls_once_without_counting_or_leaking_readouts() {
+        let db_path = std::env::temp_dir().join(format!(
+            "perseus-alias-usage-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let db = Database::open(db_path.to_str().expect("temp db path")).expect("open temp db");
+        let state = MCPState::new();
+        state
+            .initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let call = |name: &str, arguments: Value| {
+            let response = handle_request(
+                &JsonRpcRequest {
+                    jsonrpc: "2.0".to_string(),
+                    id: Some(json!(1)),
+                    method: "tools/call".to_string(),
+                    params: Some(json!({"name": name, "arguments": arguments})),
+                },
+                &state,
+                &db,
+            )
+            .expect("tools/call response");
+            response.result.expect("tools/call result")["structuredContent"].clone()
+        };
+
+        call(
+            "perseus_vault_health",
+            json!({"sentinel": "must-not-appear-in-alias-usage"}),
+        );
+        call("mimir_health", json!({}));
+        call("mneme_health", json!({}));
+        call("custom_tool", json!({}));
+
+        let first = call("perseus_vault_alias_usage", json!({}));
+        assert_eq!(first["canonical_calls"], json!(1));
+        assert_eq!(first["mimir_calls"], json!(1));
+        assert_eq!(first["mneme_calls"], json!(1));
+        assert_eq!(first["other_calls"], json!(1));
+        assert!(first["since_process_start_unix_ms"].as_u64().unwrap() > 0);
+        assert!(!first.to_string().contains("must-not-appear-in-alias-usage"));
+
+        let second = call("mimir_alias_usage", json!({}));
+        assert_eq!(
+            second, first,
+            "alias-usage readouts must not count themselves"
+        );
+
+        assert!(advertised_names(false).contains(&"perseus_vault_alias_usage".to_string()));
+        for name in [
+            "mimir_alias_usage",
+            "mneme_alias_usage",
+            "perseus_vault_alias_usage",
+        ] {
+            assert!(advertised_names(true).contains(&name.to_string()));
+        }
+
+        let _ = fs::remove_file(db_path);
     }
 
     #[test]

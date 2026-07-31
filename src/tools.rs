@@ -248,6 +248,9 @@ pub struct RecallArgs {
     pub requesting_agent_id: Option<String>,
     #[serde(default)]
     pub layer: Option<String>,
+    /// #784: serving posture applied after authorization: personal, agent, or shared.
+    #[serde(default)]
+    pub retrieval_profile: Option<String>,
     /// #287: opt-in. When true, each result gets a normalized `confidence`
     /// (0.0–1.0) rolled up from rank, trust, and decay. Default false so
     /// existing callers and snapshot tests are unaffected; ranking is unchanged.
@@ -1021,6 +1024,29 @@ fn entity_matches_ref_filter(e: &Entity, want_type: Option<&str>, want_value: Op
     })
 }
 
+fn apply_promotion_explanations(items: &mut [Value]) {
+    for item in items {
+        let Some(obj) = item.as_object_mut() else { continue };
+        let class = obj.get("category").and_then(Value::as_str).unwrap_or("unknown");
+        let transition = obj.get("promotion_transition");
+        let state = transition
+            .and_then(|v| v.get("to_state"))
+            .and_then(Value::as_str)
+            .unwrap_or("unpromoted");
+        let evidence: Vec<Value> = obj.get("promoted_from")
+            .and_then(|v| v.get("id"))
+            .cloned().into_iter().collect();
+        obj.insert("why_served".to_string(), json!({
+            "memory_class": class,
+            "promotion_state": state,
+            "support_count": evidence.len(),
+            "source_evidence_ids": evidence,
+            "promoted_scope": obj.get("workspace_hash").cloned().unwrap_or(Value::String(String::new())),
+            "reason": "matched the recall query"
+        }));
+    }
+}
+
 pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
     let a: RecallArgs =
         serde_json::from_value(args).map_err(|e| format!("Invalid recall arguments: {}", e))?;
@@ -1108,6 +1134,15 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
     };
     let defer_side_effects = temporal_filtering || (startup_rank && a.offset == 0);
 
+    // #784: personal/agent profiles may retrieve global policy records; shared
+    // profile stays strictly workspace-scoped.
+    let profile_name = a.retrieval_profile.clone().unwrap_or_else(|| "shared".to_string());
+    let profile_workspace = if matches!(profile_name.as_str(), "personal" | "agent") {
+        None
+    } else {
+        a.workspace_hash.clone()
+    };
+
     let params = RecallParams {
         query: a.query,
         category: a.category,
@@ -1134,7 +1169,7 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
         diversity_halving: a.diversity_halving,
         diversity_per_query_share: 0.0,
         recency_half_life_secs: a.recency_half_life_secs,
-        workspace_hash: a.workspace_hash.clone(),
+        workspace_hash: profile_workspace.clone(),
         scope_weight: a.scope_weight,
         agent_id: a.agent_id.clone(),
         visibility: None,
@@ -1155,6 +1190,21 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
     // single-agent callers and data are unaffected.
     if let Some(req) = a.requesting_agent_id.as_deref().filter(|s| !s.is_empty()) {
         entities.retain(|e| db.can_read(req, &e.visibility, &e.agent_id));
+    }
+
+    // #784: profile-specific serving filter. This is additive to visibility:
+    // profile choice can only narrow results and never exposes another scope.
+    let profile_name = a.retrieval_profile.as_deref().unwrap_or("shared");
+    match profile_name {
+        "shared" => {
+            entities.retain(|e| {
+                e.category != "preference" && e.category != "personal"
+                    && a.workspace_hash.as_ref().map_or(true, |ws| ws.is_empty() || e.workspace_hash == *ws)
+            });
+        }
+        "personal" => entities.retain(|e| e.category == "preference" || e.category == "personal"),
+        "agent" => entities.retain(|e| matches!(e.category.as_str(), "convention" | "correction" | "keystone")),
+        other => return Err(format!("unknown retrieval_profile '{other}': expected personal, agent, or shared")),
     }
 
     // #728: external-ref post-filter (spec §2.2). Applied after visibility so
@@ -1214,6 +1264,7 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
 
     let mut items_expanded: Vec<serde_json::Value> =
         entities.iter().map(|e| e.to_json_expanded()).collect();
+    apply_promotion_explanations(&mut items_expanded);
 
     // #472: stamp point-in-time provenance onto each reconstructed hit.
     if let Some(meta) = &temporal_meta {
@@ -1243,6 +1294,7 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
         json!({
             "items": items_expanded,
             "total": items_expanded.len(),
+            "retrieval_profile": profile_name,
         })
     };
     Ok(result.to_string())
@@ -2079,6 +2131,28 @@ pub struct PromoteArgs {
     pub reason: String,
 }
 
+fn promotion_state(category: &str) -> Option<&'static str> {
+    match category {
+        "episode" | "episodes" | "capture" => Some("episode"),
+        "observation" => Some("observation"),
+        "convention" => Some("convention"),
+        "belief" => Some("belief"),
+        "keystone" => Some("keystone"),
+        _ => None,
+    }
+}
+
+fn valid_promotion_transition(from: &str, to: &str) -> bool {
+    matches!(
+        (from, to),
+        ("episode", "observation")
+            | ("observation", "convention")
+            | ("observation", "belief")
+            | ("convention", "keystone")
+            | ("belief", "keystone")
+    )
+}
+
 pub fn handle_promote(db: &Database, args: Value) -> Result<String, String> {
     let a: PromoteArgs = serde_json::from_value(args)
         .map_err(|e| format!("Invalid promote arguments: {}", e))?;
@@ -2112,6 +2186,20 @@ pub fn handle_promote(db: &Database, args: Value) -> Result<String, String> {
         .clone()
         .unwrap_or_else(|| src.workspace_hash.clone());
 
+    // #781: categories in the durable-knowledge ladder are governed. Generic
+    // category/scope promotion remains backward-compatible, but a recognized
+    // ladder state cannot skip a rung or move backward.
+    if let (Some(from_state), Some(to_state)) =
+        (promotion_state(&src.category), promotion_state(&to_category))
+    {
+        if from_state != to_state && !valid_promotion_transition(from_state, to_state) {
+            return Err(format!(
+                "invalid promotion transition: {} ({}) -> {} ({}); allowed: episode -> observation -> convention/belief -> keystone",
+                src.category, from_state, to_category, to_state
+            ));
+        }
+    }
+
     if to_category == src.category && to_key == src.key && to_scope == src.workspace_hash {
         return Err("Target is identical to source; nothing to promote".into());
     }
@@ -2131,6 +2219,14 @@ pub fn handle_promote(db: &Database, args: Value) -> Result<String, String> {
                 "workspace_hash": src.workspace_hash,
                 "reason": a.reason,
                 "promoted_at_unix_ms": now,
+            }),
+        );
+        map.insert(
+            "promotion_transition".to_string(),
+            json!({
+                "from_state": promotion_state(&src.category),
+                "to_state": promotion_state(&to_category),
+                "at_unix_ms": now,
             }),
         );
     }
@@ -2179,6 +2275,24 @@ pub fn handle_promote(db: &Database, args: Value) -> Result<String, String> {
     db.link(&a.from_category, &a.from_key, &new_id, "promoted_to")
         .map_err(|e| format!("Promote link failed: {}", e))?;
 
+    // #781: each governed promotion is reconstructible independently of the
+    // entity body/link graph through the append-only audit timeline.
+    let event = JournalEvent {
+        id: format!("jrn-{}", &Uuid::new_v4().to_string().replace('-', "")[..12]),
+        event_type: "promotion".to_string(),
+        evaluated_json: json!({"from_state": promotion_state(&src.category), "to_state": promotion_state(&to_category)}).to_string(),
+        acted_json: json!({"from": format!("{}/{}", a.from_category, a.from_key), "to": format!("{}/{}", to_category, to_key), "reason": a.reason}).to_string(),
+        forward_json: json!({"next": "evaluate the promoted entity at the next lifecycle rung"}).to_string(),
+        category: to_category.clone(),
+        key: to_key.clone(),
+        entity_id: new_id.clone(),
+        agent_id: src.agent_id.clone(),
+        workspace_hash: to_scope.clone(),
+        created_at_unix_ms: now,
+    };
+    db.journal(&event)
+        .map_err(|e| format!("Promotion audit journal failed: {}", e))?;
+
     let result = json!({
         "promoted": true,
         "action": action,
@@ -2190,6 +2304,46 @@ pub fn handle_promote(db: &Database, args: Value) -> Result<String, String> {
         "reason": a.reason,
     });
     Ok(result.to_string())
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DemoteArgs {
+    pub from_category: String,
+    pub from_key: String,
+    pub to_category: String,
+    #[serde(default)]
+    pub to_key: Option<String>,
+    #[serde(default)]
+    pub reason: String,
+}
+
+pub fn handle_demote(db: &Database, args: Value) -> Result<String, String> {
+    let a: DemoteArgs = serde_json::from_value(args)
+        .map_err(|e| format!("Invalid demote arguments: {}", e))?;
+    let src = db.get_entity(&a.from_category, &a.from_key)
+        .map_err(|e| format!("Source entity lookup failed: {}", e))?
+        .ok_or_else(|| format!("Source entity not found: {}/{}", a.from_category, a.from_key))?;
+    let from_state = promotion_state(&src.category)
+        .ok_or_else(|| format!("Source category '{}' is not in the promotion ladder", src.category))?;
+    let to_state = promotion_state(&a.to_category)
+        .ok_or_else(|| format!("Target category '{}' is not in the promotion ladder", a.to_category))?;
+    if !valid_promotion_transition(to_state, from_state) {
+        return Err(format!("invalid demotion transition: {} -> {}; allowed reverse ladder transitions only", from_state, to_state));
+    }
+    let now = now_ms();
+    let to_key = a.to_key.clone().unwrap_or_else(|| src.key.clone());
+    let mut body: Value = serde_json::from_str(&src.body_json).unwrap_or_else(|_| json!({}));
+    if let Some(map) = body.as_object_mut() {
+        map.insert("demoted_from".into(), json!({"category":src.category,"key":src.key,"id":src.id,"reason":a.reason,"demoted_at_unix_ms":now}));
+        map.insert("promotion_transition".into(), json!({"from_state":from_state,"to_state":to_state,"at_unix_ms":now}));
+    }
+    let raw_id = Uuid::new_v4().to_string().replace('-', "");
+    let entity = Entity { id: format!("mem-{}", &raw_id[..12]), category:a.to_category.clone(), key:to_key.clone(), body_json:body.to_string(), status:src.status.clone(), entity_type:src.entity_type.clone(), tags:src.tags.clone(), decay_score:src.decay_score, retrieval_count:0, layer:src.layer.clone(), topic_path:src.topic_path.clone(), archived:false, archive_reason:String::new(), links:vec![], verified:src.verified, source:"agent".into(), always_on:src.always_on, certainty:src.certainty, workspace_hash:src.workspace_hash.clone(), agent_id:src.agent_id.clone(), visibility:src.visibility.clone(), created_at_unix_ms:now, last_accessed_unix_ms:now, follow_count:0, miss_count:0, follow_rate:0.0, efficacy_status:"unverified".into(), embedding:None, _parsed_body:None };
+    let (new_id, action) = db.remember_skip_dedup(&entity).map_err(|e| format!("Demote write failed: {}", e))?;
+    db.link(&a.from_category, &a.from_key, &new_id, "demoted_to").map_err(|e| format!("Demote link failed: {}", e))?;
+    let event = JournalEvent { id:format!("jrn-{}", &Uuid::new_v4().to_string().replace('-', "")[..12]), event_type:"demotion".into(), evaluated_json:json!({"from_state":from_state,"to_state":to_state}).to_string(), acted_json:json!({"reason":a.reason}).to_string(), forward_json:json!({"next":"re-evaluate evidence before promotion"}).to_string(), category:a.to_category.clone(), key:to_key.clone(), entity_id:new_id.clone(), agent_id:src.agent_id.clone(), workspace_hash:src.workspace_hash.clone(), created_at_unix_ms:now };
+    db.journal(&event).map_err(|e| format!("Demotion audit journal failed: {}", e))?;
+    Ok(json!({"demoted":true,"action":action,"from":format!("{}/{}",a.from_category,a.from_key),"to":format!("{}/{}",a.to_category,to_key),"to_id":new_id,"reason":a.reason}).to_string())
 }
 
 pub fn handle_journal(db: &Database, args: Value) -> Result<String, String> {
@@ -2747,6 +2901,49 @@ pub fn handle_health(db: &Database) -> String {
     .to_string()
 }
 
+fn default_telemetry_category() -> String { "general".to_string() }
+
+#[derive(Debug, Deserialize)]
+pub struct QualityTelemetryArgs {
+    #[serde(default = "default_telemetry_category")]
+    pub category: String,
+}
+
+/// #787: compact, machine-readable quality posture for dashboards and release gates.
+pub fn handle_quality_telemetry(db: &Database, args: Value) -> Result<String, String> {
+    let a: QualityTelemetryArgs = serde_json::from_value(args)
+        .map_err(|e| format!("Invalid quality_telemetry arguments: {e}"))?;
+    let stats = db.stats().map_err(|e| format!("Telemetry stats failed: {e}"))?;
+    let conflicts = db.detect_conflicts(&a.category, default_conflict_threshold(), 1000, 0)
+        .map_err(|e| format!("Telemetry conflict scan failed: {e}"))?;
+    let conflict_value = serde_json::to_value(&conflicts).map_err(|e| e.to_string())?;
+    let contradiction_count = conflict_value["total"].as_i64().unwrap_or_else(|| {
+        conflict_value["conflicts"].as_array().map(|v| v.len() as i64).unwrap_or(0)
+    });
+    let mut deprecated = 0i64;
+    let mut cursor: Option<String> = None;
+    loop {
+        let rows = db.scan_entities(None, None, false, cursor.as_deref(), 501)
+            .map_err(|e| format!("Telemetry scan failed: {e}"))?;
+        if rows.is_empty() { break; }
+        let take = rows.len().min(500);
+        deprecated += rows.iter().take(take).filter(|e| e.status == "deprecated").count() as i64;
+        if rows.len() <= 500 { break; }
+        cursor = rows.get(take - 1).map(|e| e.id.clone());
+    }
+    Ok(json!({
+        "active_entities": stats.active_entities,
+        "contradiction_count": contradiction_count,
+        "contradiction_rate": if stats.active_entities > 0 { contradiction_count as f64 / stats.active_entities as f64 } else { 0.0 },
+        "supersession_lag_count": deprecated,
+        "class_distribution": stats.by_category_active,
+        "layer_distribution": stats.by_layer_active,
+        "promotion_flow": {"working": stats.by_layer_active["working"], "semantic": stats.by_layer_active["semantic"], "core": stats.by_layer_active["core"]},
+        "served_tier_mix": "available via recall retrieval_profile explanations",
+        "category_scanned": a.category,
+    }).to_string())
+}
+
 pub fn handle_stats(db: &Database) -> String {
     match db.stats() {
         Ok(stats) => serde_json::to_string(&stats).unwrap_or_else(|e| {
@@ -3146,6 +3343,155 @@ pub fn handle_vault_export(db: &Database, args: Value) -> String {
     }
 }
 
+#[derive(Debug, Deserialize)]
+pub struct DerivedExportArgs {
+    pub output_path: String,
+    #[serde(default)]
+    pub workspace_hash: Option<String>,
+}
+
+pub fn handle_derived_export(db: &Database, args: Value) -> Result<String, String> {
+    let a: DerivedExportArgs = serde_json::from_value(args)
+        .map_err(|e| format!("Invalid derived_export arguments: {e}"))?;
+    let entities = db.recall(&crate::models::RecallParams {
+        query: String::new(),
+        limit: 1000,
+        include_archived: false,
+        workspace_hash: a.workspace_hash.clone(),
+        skip_side_effects: true,
+        ..crate::models::RecallParams::default()
+    }).map_err(|e| format!("Derived export recall failed: {e}"))?;
+    let mut selected: Vec<_> = entities.into_iter().filter(|e| matches!(
+        e.category.as_str(), "convention" | "belief" | "keystone" | "correction" | "insight"
+    )).collect();
+    selected.sort_by(|a, b| a.category.cmp(&b.category).then(a.key.cmp(&b.key)).then(a.id.cmp(&b.id)));
+    let labels = [("belief", "Beliefs"), ("convention", "Conventions"), ("correction", "Corrections"),
+        ("insight", "Insights"), ("keystone", "Scoped Operating Rules")];
+    let mut markdown = String::from("# Derived Knowledge Surface\n\n<!-- generated by perseus-vault; do not edit: source of truth is SQLite -->\n\n");
+    for (category, label) in labels {
+        let items: Vec<_> = selected.iter().filter(|e| e.category == category).collect();
+        if items.is_empty() { continue; }
+        markdown.push_str(&format!("## {label}\n\n"));
+        for entity in items {
+            let expanded = entity.to_json_expanded();
+            let content = expanded.get("summary").or_else(|| expanded.get("content")).or_else(|| expanded.get("text"))
+                .and_then(Value::as_str).unwrap_or(&entity.body_json);
+            markdown.push_str(&format!("### {}\n\n{}\n\n<!-- provenance: category={} key={} id={} workspace={} -->\n\n",
+                entity.key, content, entity.category, entity.key, entity.id, entity.workspace_hash));
+        }
+    }
+    let path = std::path::PathBuf::from(&a.output_path);
+    if let Some(parent) = path.parent() { std::fs::create_dir_all(parent).map_err(|e| format!("Cannot create export directory: {e}"))?; }
+    std::fs::write(&path, markdown.as_bytes()).map_err(|e| format!("Cannot write derived export: {e}"))?;
+    Ok(json!({"output_path": path, "exported": selected.len(), "deterministic": true}).to_string())
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MarkdownImportArgs {
+    pub path: String,
+    #[serde(default)]
+    pub workspace_hash: String,
+    #[serde(default = "default_import_source_system")]
+    pub source_system: String,
+}
+fn default_import_source_system() -> String { "markdown".to_string() }
+
+/// #788: controlled one-document Markdown import. Imported material is always
+/// draft, low-certainty evidence with explicit provenance; it never masquerades
+/// as a native observation/correction.
+pub fn handle_markdown_import(db: &Database, args: Value) -> Result<String, String> {
+    let a: MarkdownImportArgs = serde_json::from_value(args)
+        .map_err(|e| format!("Invalid markdown_import arguments: {e}"))?;
+    let content = std::fs::read_to_string(&a.path)
+        .map_err(|e| format!("Cannot read Markdown source {}: {e}", a.path))?;
+    let title = content.lines().find_map(|l| l.strip_prefix("# ")).unwrap_or("Imported Markdown").trim();
+    let source_hash = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        a.path.hash(&mut h); content.hash(&mut h); format!("{:016x}", h.finish())
+    };
+    let key = format!("markdown-{}", source_hash);
+    let existing = db.recall(&crate::models::RecallParams { query: String::new(), category: Some("imported_markdown".to_string()), workspace_hash: Some(a.workspace_hash.clone()), limit: 1000, skip_side_effects: true, ..crate::models::RecallParams::default() })
+        .map_err(|e| format!("Import duplicate scan failed: {e}"))?;
+    if existing.iter().any(|e| e.key == key) {
+        return Ok(json!({"imported":0,"deduped":true,"key":key,"status":"draft"}).to_string());
+    }
+    let body = json!({"title":title,"content":content,"origin": {"memory_kind":"imported","source_system":a.source_system,"capture_method":"import"},"non_authoritative":true,"source_path":a.path});
+    let remembered = handle_remember(db, json!({
+        "category":"imported_markdown", "key":key, "body_json":body.to_string(),
+        "status":"draft", "type":"reference", "tags":["imported","markdown"],
+        "importance":0.2, "certainty":0.2, "workspace_hash":a.workspace_hash,
+        "skip_dedup":true
+    }))?;
+    let result: Value = serde_json::from_str(&remembered).map_err(|e| format!("Markdown import response decode failed: {e}"))?;
+    Ok(json!({"imported":1,"deduped":false,"id":result["id"],"key":key,"action":result["action"],"status":"draft","non_authoritative":true}).to_string())
+}
+
+#[derive(Debug, Deserialize)]
+pub struct StructuredIndexAnchorArgs {
+    pub index_type: String,
+    pub index_uri: String,
+    pub record_id: String,
+    /// `reference` preserves only an external anchor; `import` persists a
+    /// low-trust local copy with sufficient refetch metadata.
+    #[serde(default = "default_anchor_mode")]
+    pub mode: String,
+    #[serde(default)]
+    pub content: Option<String>,
+    #[serde(default)]
+    pub workspace_hash: String,
+    #[serde(default)]
+    pub source_system: String,
+    #[serde(default)]
+    pub observed_at_unix_ms: Option<i64>,
+    #[serde(default)]
+    pub revision: Option<String>,
+}
+
+fn default_anchor_mode() -> String { "reference".to_string() }
+
+/// #789: stable anchor contract for upstream structured indexes. Reference mode
+/// is deliberately non-mutating; import mode writes an explicitly imported,
+/// draft record with enough metadata for later verification/refetch.
+pub fn handle_structured_index_anchor(db: &Database, args: Value) -> Result<String, String> {
+    let a: StructuredIndexAnchorArgs = serde_json::from_value(args)
+        .map_err(|e| format!("Invalid structured_index_anchor arguments: {e}"))?;
+    if a.index_type.trim().is_empty() || a.index_uri.trim().is_empty() || a.record_id.trim().is_empty() {
+        return Err("index_type, index_uri, and record_id are required".to_string());
+    }
+    let anchor = format!("{}:{}#{}", a.index_type, a.index_uri, a.record_id);
+    let source_system = if a.source_system.is_empty() { format!("structured_index:{}", a.index_type) } else { a.source_system };
+    let metadata = json!({
+        "ref_type":"structured_index", "ref_value":anchor, "source_system":source_system,
+        "relationship":"about", "index_type":a.index_type, "index_uri":a.index_uri,
+        "record_id":a.record_id, "revision":a.revision, "observed_at_unix_ms":a.observed_at_unix_ms
+    });
+    match a.mode.as_str() {
+        "reference" => Ok(json!({"mode":"reference", "anchor":metadata, "persisted":false,
+            "refetch":"retrieve index_uri and record_id, then compare revision/observed_at_unix_ms"}).to_string()),
+        "import" => {
+            let content = a.content.filter(|v| !v.trim().is_empty())
+                .ok_or_else(|| "content is required when mode=import".to_string())?;
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            use std::hash::{Hash, Hasher};
+            anchor.hash(&mut h); content.hash(&mut h);
+            let key = format!("structured-index-{:016x}", h.finish());
+            let existing = db.recall(&crate::models::RecallParams { query: String::new(), category: Some("structured_index_fact".to_string()), workspace_hash: Some(a.workspace_hash.clone()), limit: 1000, skip_side_effects: true, ..crate::models::RecallParams::default() })
+                .map_err(|e| format!("Structured index duplicate scan failed: {e}"))?;
+            if existing.iter().any(|e| e.key == key) {
+                return Ok(json!({"mode":"import","imported":0,"deduped":true,"key":key,"anchor":metadata}).to_string());
+            }
+            let body = json!({"content":content,"origin":{"memory_kind":"imported","source_system":source_system,"capture_method":"import","observed_at_unix_ms":a.observed_at_unix_ms},"external_refs":[metadata],"non_authoritative":true,"refetch":"retrieve index_uri and record_id, then compare revision/observed_at_unix_ms"});
+            let remembered = handle_remember(db, json!({"category":"structured_index_fact","key":key,
+                "body_json":body.to_string(),"status":"draft","type":"reference","importance":0.25,
+                "certainty":0.25,"workspace_hash":a.workspace_hash,"tags":["imported","structured-index"],"skip_dedup":true}))?;
+            let result: Value = serde_json::from_str(&remembered).map_err(|e| format!("Structured index import response decode failed: {e}"))?;
+            Ok(json!({"mode":"import","imported":1,"deduped":false,"id":result["id"],"key":key,"anchor":metadata,"non_authoritative":true}).to_string())
+        }
+        other => Err(format!("unknown mode '{other}': expected reference or import")),
+    }
+}
+
 pub fn handle_vault_import(db: &Database, args: Value) -> String {
     let a: VaultExportArgs = match serde_json::from_value(args) {
         Ok(a) => a,
@@ -3472,6 +3818,38 @@ pub fn handle_agent(db: &Database, args: Value) -> Result<String, String> {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct AuthoritySetArgs {
+    pub agent_id: String, pub workspace_hash: String, pub allowed_capabilities: Vec<String>, pub scope_anchors: Vec<String>,
+    #[serde(default)] pub approval_required_capabilities: Vec<String>, #[serde(default)] pub approver_principals: Vec<String>,
+    #[serde(default)] pub allowed_inbound_principals: Vec<String>, #[serde(default)] pub permitted_external_ref_prefixes: Vec<String>,
+    #[serde(default = "authority_default_parallel")] pub max_parallel_actions: i64, #[serde(default = "authority_default_mode")] pub mode: String,
+    #[serde(default)] pub expires_at_unix_ms: Option<i64>, #[serde(default)] pub author_agent_id: String,
+}
+fn authority_default_parallel() -> i64 { 1 }
+fn authority_default_mode() -> String { "shadow".to_string() }
+pub fn handle_authority_set(db: &Database, args: Value) -> Result<String, String> {
+    let a: AuthoritySetArgs=serde_json::from_value(args).map_err(|e|format!("Invalid authority_set arguments: {e}"))?;
+    let input=crate::models::AuthorityManifestInput { agent_id:a.agent_id, workspace_hash:a.workspace_hash, allowed_capabilities:a.allowed_capabilities, approval_required_capabilities:a.approval_required_capabilities, scope_anchors:a.scope_anchors, approver_principals:a.approver_principals, allowed_inbound_principals:a.allowed_inbound_principals, permitted_external_ref_prefixes:a.permitted_external_ref_prefixes, max_parallel_actions:a.max_parallel_actions, mode:a.mode, expires_at_unix_ms:a.expires_at_unix_ms };
+    serde_json::to_string(&db.authority_set(&input,&a.author_agent_id).map_err(|e|format!("authority_set failed: {e}"))?).map_err(|e|e.to_string())
+}
+#[derive(Debug, Deserialize)] pub struct AuthorityGetArgs { pub agent_id:String, pub workspace_hash:String, #[serde(default)] pub include_revoked:bool }
+pub fn handle_authority_get(db:&Database,args:Value)->Result<String,String>{let a:AuthorityGetArgs=serde_json::from_value(args).map_err(|e|format!("Invalid authority_get arguments: {e}"))?;serde_json::to_string(&json!({"authority":db.authority_get(&a.agent_id,&a.workspace_hash,a.include_revoked).map_err(|e|format!("authority_get failed: {e}"))?})).map_err(|e|e.to_string())}
+#[derive(Debug, Deserialize)] pub struct AuthorityRevokeArgs { pub manifest_id:String, #[serde(default)] pub actor_agent_id:String, #[serde(default)] pub reason:String }
+pub fn handle_authority_revoke(db:&Database,args:Value)->Result<String,String>{let a:AuthorityRevokeArgs=serde_json::from_value(args).map_err(|e|format!("Invalid authority_revoke arguments: {e}"))?;db.authority_revoke(&a.manifest_id,&a.actor_agent_id,&a.reason).map_err(|e|format!("authority_revoke failed: {e}"))?;Ok(json!({"revoked":true,"manifest_id":a.manifest_id}).to_string())}
+#[derive(Debug, Deserialize)] pub struct ActionIntentArgs { pub agent_id:String,pub workspace_hash:String,pub scope_anchor:String,pub external_ref:String,pub capability:String,pub action_key:String,pub intent_hash:String }
+pub fn handle_action_intent(db:&Database,args:Value)->Result<String,String>{let a:ActionIntentArgs=serde_json::from_value(args).map_err(|e|format!("Invalid action_intent arguments: {e}"))?;serde_json::to_string(&db.action_intent(&a.agent_id,&a.workspace_hash,&a.scope_anchor,&a.external_ref,&a.capability,&a.action_key,&a.intent_hash).map_err(|e|format!("action_intent failed: {e}"))?).map_err(|e|e.to_string())}
+#[derive(Debug, Deserialize)] pub struct ActionApproveArgs {pub action_id:String,pub approver_principal:String,pub decision:String}
+pub fn handle_action_approve(db:&Database,args:Value)->Result<String,String>{let a:ActionApproveArgs=serde_json::from_value(args).map_err(|e|format!("Invalid action_approve arguments: {e}"))?;serde_json::to_string(&db.action_approve(&a.action_id,&a.approver_principal,&a.decision).map_err(|e|format!("action_approve failed: {e}"))?).map_err(|e|e.to_string())}
+#[derive(Debug, Deserialize)] pub struct ActionCompleteArgs {pub action_id:String,pub actor_agent_id:String,pub outcome:String,pub outcome_hash:String}
+pub fn handle_action_complete(db:&Database,args:Value)->Result<String,String>{let a:ActionCompleteArgs=serde_json::from_value(args).map_err(|e|format!("Invalid action_complete arguments: {e}"))?;serde_json::to_string(&db.action_complete(&a.action_id,&a.actor_agent_id,&a.outcome,&a.outcome_hash).map_err(|e|format!("action_complete failed: {e}"))?).map_err(|e|e.to_string())}
+#[derive(Debug, Deserialize)] pub struct ActionReceiptGetArgs {pub action_id:String}
+pub fn handle_action_receipt_get(db:&Database,args:Value)->Result<String,String>{let a:ActionReceiptGetArgs=serde_json::from_value(args).map_err(|e|format!("Invalid action_receipt_get arguments: {e}"))?;serde_json::to_string(&json!({"receipt":db.action_receipt_get(&a.action_id).map_err(|e|format!("action_receipt_get failed: {e}"))?})).map_err(|e|e.to_string())}
+#[derive(Debug, Deserialize)] pub struct ActionLeaseArgs {pub action_id:String,pub holder_id:String,#[serde(default="authority_default_parallel")]pub ttl_seconds:i64}
+pub fn handle_action_lease_acquire(db:&Database,args:Value)->Result<String,String>{let a:ActionLeaseArgs=serde_json::from_value(args).map_err(|e|format!("Invalid action_lease_acquire arguments: {e}"))?;serde_json::to_string(&db.action_lease_acquire(&a.action_id,&a.holder_id,a.ttl_seconds).map_err(|e|format!("action_lease_acquire failed: {e}"))?).map_err(|e|e.to_string())}
+#[derive(Debug, Deserialize)] pub struct ActionLeaseReleaseArgs {pub lease_id:String,pub holder_id:String}
+pub fn handle_action_lease_release(db:&Database,args:Value)->Result<String,String>{let a:ActionLeaseReleaseArgs=serde_json::from_value(args).map_err(|e|format!("Invalid action_lease_release arguments: {e}"))?;db.action_lease_release(&a.lease_id,&a.holder_id).map_err(|e|format!("action_lease_release failed: {e}"))?;Ok(json!({"released":true,"lease_id":a.lease_id}).to_string())}
+
+#[derive(Debug, Deserialize)]
 pub struct ConflictArgs {
     pub category: String,
     #[serde(default = "default_conflict_threshold")]
@@ -3505,6 +3883,49 @@ fn default_true() -> bool {
 }
 fn default_certainty_margin() -> f64 {
     0.2
+}
+
+#[derive(Debug, Deserialize)]
+pub struct OperatorReviewArgs {
+    #[serde(default = "default_category")]
+    pub category: String,
+    #[serde(default = "default_conflict_limit")]
+    pub limit: i64,
+    #[serde(default)]
+    pub stale_threshold: Option<f64>,
+}
+
+fn default_category() -> String { "general".to_string() }
+
+/// #786: read-only operator queue. It composes existing conflict detection,
+/// actionability hygiene, and deprecated-state discovery without mutating facts.
+pub fn handle_operator_review(db: &Database, args: Value) -> Result<String, String> {
+    let a: OperatorReviewArgs = serde_json::from_value(args)
+        .map_err(|e| format!("Invalid operator_review arguments: {e}"))?;
+    let limit = a.limit.clamp(1, 1000);
+    let contradictions = db.detect_conflicts(&a.category, default_conflict_threshold(), limit, 0)
+        .map_err(|e| format!("Conflict review failed: {e}"))?;
+    let hygiene = handle_hygiene(db, json!({"category": a.category, "threshold": a.stale_threshold.unwrap_or(0.35), "limit":limit, "scan_limit":10000}))?;
+    let stale: Value = serde_json::from_str(&hygiene).map_err(|e| format!("Stale review decode failed: {e}"))?;
+    let mut supersession_lag = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let rows = db.scan_entities(Some(&a.category), None, false, cursor.as_deref(), 501)
+            .map_err(|e| format!("Supersession scan failed: {e}"))?;
+        if rows.is_empty() { break; }
+        let take = rows.len().min(500);
+        for entity in rows.iter().take(take) {
+            if entity.status == "deprecated" {
+                supersession_lag.push(json!({"id":entity.id,"category":entity.category,"key":entity.key,"status":entity.status,"reason":"deprecated fact requires successor review"}));
+            }
+        }
+        if rows.len() <= 500 || supersession_lag.len() >= limit as usize { break; }
+        cursor = rows.get(take - 1).map(|e| e.id.clone());
+    }
+    supersession_lag.truncate(limit as usize);
+    Ok(json!({"reviewed_at_unix_ms": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as i64, "category":a.category,
+        "contradictions":contradictions, "stale_candidates":stale["flagged"],
+        "supersession_lag":supersession_lag, "read_only":true}).to_string())
 }
 
 pub fn handle_conflicts(db: &Database, args: Value) -> String {
@@ -3922,6 +4343,16 @@ pub fn handle_workspace_list(db: &Database) -> String {
 pub struct AutocohereArgs {
     #[serde(default)]
     pub dry_run: bool,
+    /// #780: optional raw session/transcript payload captured DURABLY before
+    /// any cohere/decay/compaction work can discard source context.
+    #[serde(default)]
+    pub capture_text: Option<String>,
+    #[serde(default)]
+    pub capture_workspace_hash: String,
+    #[serde(default)]
+    pub capture_agent_id: String,
+    #[serde(default)]
+    pub capture_max_entities: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3975,6 +4406,31 @@ pub fn handle_autocohere(db: &Database, args: Value) -> Result<String, String> {
     let mut total_promoted = 0i64;
     let mut total_links = 0i64;
     let mut total_archived_cohere = 0i64;
+
+    // #780 ordering guarantee: a caller-supplied raw buffer is distilled and
+    // persisted before the first lifecycle step (cohere/decay/compact) that can
+    // archive or compress source context. Capture failure aborts this run rather
+    // than letting a later compaction silently proceed without the durability
+    // barrier. `dry_run` reaches capture too, so preview is side-effect free.
+    let precompact_capture = match a.capture_text.as_deref().map(str::trim) {
+        Some(text) if !text.is_empty() => {
+            let mut capture_args = json!({
+                "text": text,
+                "workspace_hash": a.capture_workspace_hash,
+                "agent_id": a.capture_agent_id,
+                "dry_run": a.dry_run,
+            });
+            if let Some(max) = a.capture_max_entities {
+                capture_args["max_entities"] = json!(max);
+            }
+            let raw = handle_capture(db, capture_args)
+                .map_err(|e| format!("Autocohere pre-compaction capture failed: {}", e))?;
+            let report: Value = serde_json::from_str(&raw)
+                .map_err(|e| format!("Autocohere pre-compaction capture report parse failed: {}", e))?;
+            json!({ "stage": "completed", "report": report })
+        }
+        _ => json!({ "stage": "skipped", "reason": "no capture_text provided" }),
+    };
 
     // Snapshot the DB size BEFORE any mutation so db_size_delta_bytes is
     // meaningful — it was previously read after all three steps had run, so
@@ -4061,6 +4517,7 @@ pub fn handle_autocohere(db: &Database, args: Value) -> Result<String, String> {
     };
 
     let result = json!({
+        "precompact_capture": precompact_capture,
         "promoted_entities": total_promoted,
         "links_created": total_links,
         "archived_entities": total_archived_cohere + compact_report.entities_archived,
@@ -4596,6 +5053,10 @@ pub struct MemoriesArgs {
     pub old_path: String,
     #[serde(default)]
     pub new_path: String,
+    /// #783: MCP session identity stamped by the transport. Read commands use
+    /// it to enforce private/fleet visibility without trusting caller filters.
+    #[serde(default)]
+    pub requesting_agent_id: Option<String>,
 }
 
 /// Normalize a /memories path to an entity key. Rejects traversal and
@@ -4622,10 +5083,21 @@ fn is_memories_root(path: &str) -> bool {
     p.is_empty() || p == "/memories" || p == "memories" || p == "/"
 }
 
-fn memories_file(db: &Database, key: &str) -> Result<Option<crate::models::Entity>, String> {
+fn memories_file(
+    db: &Database,
+    key: &str,
+    requesting_agent_id: Option<&str>,
+) -> Result<Option<crate::models::Entity>, String> {
     db.get_entity(MEMORIES_CATEGORY, key)
         .map_err(|e| format!("read failed: {}", e))
-        .map(|opt| opt.filter(|e| !e.archived))
+        .map(|opt| {
+            opt.filter(|e| {
+                !e.archived
+                    && requesting_agent_id
+                        .map(|requester| db.can_read(requester, &e.visibility, &e.agent_id))
+                        .unwrap_or(true)
+            })
+        })
 }
 
 fn memories_write(
@@ -4700,8 +5172,16 @@ pub fn handle_memories(db: &Database, args: Value) -> Result<String, String> {
                 let entries = db
                     .list_entities(0, 1000, Some(MEMORIES_CATEGORY), None, None)
                     .map_err(|e| format!("list failed: {}", e))?;
-                let mut names: Vec<String> =
-                    entries.iter().map(|e| e.key.clone()).collect();
+                let mut names: Vec<String> = entries
+                    .iter()
+                    .filter(|e| {
+                        a.requesting_agent_id
+                            .as_deref()
+                            .map(|requester| db.can_read(requester, &e.visibility, &e.agent_id))
+                            .unwrap_or(true)
+                    })
+                    .map(|e| e.key.clone())
+                    .collect();
                 names.sort();
                 return Ok(json!({
                     "directory": "/memories",
@@ -4711,7 +5191,7 @@ pub fn handle_memories(db: &Database, args: Value) -> Result<String, String> {
                 .to_string());
             }
             let key = memories_key(&a.path)?;
-            let file = memories_file(db, &key)?
+            let file = memories_file(db, &key, a.requesting_agent_id.as_deref())?
                 .ok_or_else(|| format!("file not found: /memories/{}", key))?;
             // cat -n style numbering, matching the native memory tool's view.
             let numbered: String = file
@@ -4729,13 +5209,13 @@ pub fn handle_memories(db: &Database, args: Value) -> Result<String, String> {
         "create" => {
             let key = memories_key(&a.path)?;
             // Anthropic semantics: create overwrites an existing file.
-            let existing = memories_file(db, &key)?;
+            let existing = memories_file(db, &key, a.requesting_agent_id.as_deref())?;
             memories_write(db, &key, &a.file_text, existing.as_ref())?;
             Ok(json!({"path": format!("/memories/{}", key), "action": "created"}).to_string())
         }
         "str_replace" => {
             let key = memories_key(&a.path)?;
-            let file = memories_file(db, &key)?
+            let file = memories_file(db, &key, a.requesting_agent_id.as_deref())?
                 .ok_or_else(|| format!("file not found: /memories/{}", key))?;
             let occurrences = file.body_json.matches(&a.old_str).count();
             if a.old_str.is_empty() {
@@ -4756,7 +5236,7 @@ pub fn handle_memories(db: &Database, args: Value) -> Result<String, String> {
         }
         "insert" => {
             let key = memories_key(&a.path)?;
-            let file = memories_file(db, &key)?
+            let file = memories_file(db, &key, a.requesting_agent_id.as_deref())?
                 .ok_or_else(|| format!("file not found: /memories/{}", key))?;
             let mut lines: Vec<&str> = file.body_json.lines().collect();
             let at = a.insert_line.clamp(0, lines.len() as i64) as usize;
@@ -4772,6 +5252,8 @@ pub fn handle_memories(db: &Database, args: Value) -> Result<String, String> {
         }
         "delete" => {
             let key = memories_key(&a.path)?;
+            memories_file(db, &key, a.requesting_agent_id.as_deref())?
+                .ok_or_else(|| format!("file not found: /memories/{}", key))?;
             let removed = db
                 .forget(MEMORIES_CATEGORY, &key, "memories: delete command")
                 .map_err(|e| format!("delete failed: {}", e))?;
@@ -4783,9 +5265,9 @@ pub fn handle_memories(db: &Database, args: Value) -> Result<String, String> {
         "rename" => {
             let old_key = memories_key(&a.old_path)?;
             let new_key = memories_key(&a.new_path)?;
-            let file = memories_file(db, &old_key)?
+            let file = memories_file(db, &old_key, a.requesting_agent_id.as_deref())?
                 .ok_or_else(|| format!("file not found: /memories/{}", old_key))?;
-            if memories_file(db, &new_key)?.is_some() {
+            if memories_file(db, &new_key, a.requesting_agent_id.as_deref())?.is_some() {
                 return Err(format!("destination exists: /memories/{}", new_key));
             }
             memories_write(db, &new_key, &file.body_json, None)?;
@@ -4809,12 +5291,76 @@ pub fn handle_memories(db: &Database, args: Value) -> Result<String, String> {
 mod tests {
     use super::*;
 
-    fn temp_db() -> (Database, String) {
-        let dir = std::env::temp_dir();
-        let path = dir.join(format!("mimir-test-tools-{}.db", Uuid::new_v4()));
-        let path_str = path.to_str().unwrap().to_string();
-        let db = Database::open(&path_str).expect("open test db");
-        (db, path_str)
+    fn temp_db() -> (crate::db::TestDatabase, String) {
+        let db = crate::db::TestDatabase::new("mimir-test-tools");
+        let path = db.path().to_string();
+        (db, path)
+    }
+
+    #[test]
+    fn memories_adapter_hides_private_files_from_other_agents() {
+        let (db, path) = temp_db();
+        let now = crate::db::now_ms();
+        let private = Entity {
+            id: "memf-private".to_string(),
+            category: MEMORIES_CATEGORY.to_string(),
+            key: "private.md".to_string(),
+            body_json: "private contents".to_string(),
+            status: "active".to_string(),
+            entity_type: "file".to_string(),
+            tags: vec!["memories".to_string()],
+            decay_score: 1.0,
+            retrieval_count: 0,
+            layer: "working".to_string(),
+            topic_path: String::new(),
+            archived: false,
+            archive_reason: String::new(),
+            links: vec![],
+            verified: false,
+            source: "test".to_string(),
+            always_on: false,
+            certainty: 1.0,
+            workspace_hash: String::new(),
+            agent_id: "alice".to_string(),
+            visibility: "private".to_string(),
+            created_at_unix_ms: now,
+            last_accessed_unix_ms: now,
+            follow_count: 0,
+            miss_count: 0,
+            follow_rate: 0.0,
+            efficacy_status: "unverified".to_string(),
+            embedding: None,
+            _parsed_body: None,
+        };
+        db.remember_skip_dedup(&private).unwrap();
+
+        let alice: Value = serde_json::from_str(&handle_memories(
+            &db,
+            json!({"command": "view", "path": "/memories", "requesting_agent_id": "alice"}),
+        ).unwrap()).unwrap();
+        assert_eq!(alice["files"], json!(["private.md"]), "{alice}");
+
+        let bob: Value = serde_json::from_str(&handle_memories(
+            &db,
+            json!({"command": "view", "path": "/memories", "requesting_agent_id": "bob"}),
+        ).unwrap()).unwrap();
+        assert_eq!(bob["files"], json!([]), "{bob}");
+        let err = handle_memories(
+            &db,
+            json!({"command": "view", "path": "/memories/private.md", "requesting_agent_id": "bob"}),
+        ).expect_err("private file must not be readable by another agent");
+        assert!(err.contains("file not found"), "must not disclose private existence: {err}");
+        let err = handle_memories(
+            &db,
+            json!({"command": "delete", "path": "/memories/private.md", "requesting_agent_id": "bob"}),
+        ).expect_err("private file must not be deletable by another agent");
+        assert!(err.contains("file not found"), "must not disclose private existence: {err}");
+        let alice_after: Value = serde_json::from_str(&handle_memories(
+            &db,
+            json!({"command": "view", "path": "/memories/private.md", "requesting_agent_id": "alice"}),
+        ).unwrap()).unwrap();
+        assert!(alice_after["content"].as_str().unwrap().contains("private contents"));
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -5350,6 +5896,47 @@ mod tests {
             "autocohere must auto-link a clearly-linkable corpus (max_links \
              default must not be 0): {resp}"
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn autocohere_captures_before_compaction_and_preserves_fact() {
+        let (db, path) = temp_db();
+        let response = handle_autocohere(
+            &db,
+            json!({
+                "capture_text": "## Deployment decision\nUse blue-green deployment so rollback remains safe.",
+                "capture_workspace_hash": "ws-precompact"
+            }),
+        )
+        .expect("autocohere with pre-compaction capture");
+        let report: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(report["precompact_capture"]["stage"], json!("completed"), "{response}");
+        assert!(report["precompact_capture"]["report"]["captured"].as_i64().unwrap() >= 1, "{response}");
+        let captured = db
+            .get_entity("capture", "deployment-decision")
+            .unwrap()
+            .expect("captured fact must survive subsequent compaction lifecycle");
+        assert!(!captured.archived, "captured fact must remain live");
+        assert_eq!(captured.workspace_hash, "ws-precompact");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn autocohere_capture_dry_run_writes_no_fact() {
+        let (db, path) = temp_db();
+        let response = handle_autocohere(
+            &db,
+            json!({
+                "dry_run": true,
+                "capture_text": "## Preview decision\nDo not persist this preview-only deployment decision."
+            }),
+        )
+        .expect("dry-run autocohere");
+        let report: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(report["precompact_capture"]["stage"], json!("completed"));
+        assert_eq!(report["precompact_capture"]["report"]["dry_run"], json!(true));
+        assert!(db.get_entity("capture", "preview-decision").unwrap().is_none());
         let _ = std::fs::remove_file(&path);
     }
 
@@ -7877,6 +8464,162 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    #[test]
+    fn recall_surfaces_promotion_aware_explanation() {
+        let (db, path) = temp_db();
+        handle_remember(&db, json!({"category":"observation","key":"rollout","body_json":"{\"content\":\"canary rollout reduces blast radius\",\"promoted_from\":{\"id\":\"mem-episode\"},\"promotion_transition\":{\"from_state\":\"episode\",\"to_state\":\"observation\"}}"})).unwrap();
+        let out = handle_recall(&db, json!({"query":"canary rollout"})).unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        let why = &v["items"][0]["why_served"];
+        assert_eq!(why["memory_class"], json!("observation"));
+        assert_eq!(why["promotion_state"], json!("observation"));
+        assert_eq!(why["support_count"], json!(1));
+        assert_eq!(why["source_evidence_ids"], json!(["mem-episode"]));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn cross_product_served_memory_fixture_is_canonical_hash_only_and_provenance_consistent() {
+        let fixture: Value = serde_json::from_str(include_str!("../tests/fixtures/cross_product_served_memory_contract.json")).unwrap();
+        assert_eq!(fixture["producer_tool"], json!("perseus_vault_recall"));
+        assert!(fixture["producer_tool"].as_str().unwrap().starts_with("perseus_vault_"));
+
+        let item = &fixture["items"][0];
+        let why = &item["why_served"];
+        assert_eq!(why["memory_class"], item["category"]);
+        assert_eq!(why["promotion_state"], item["promotion_transition"]["to_state"]);
+        assert!(why["source_evidence_ids"].as_array().unwrap().contains(&item["promoted_from"]["id"]));
+        assert_eq!(why["promoted_scope"], item["workspace_hash"]);
+
+        let binding = &item["action_receipt_binding"];
+        for field in ["action_id", "authority_manifest_ref", "approval_ref", "outcome_hash"] {
+            assert!(binding[field].is_string() && !binding[field].as_str().unwrap().is_empty(), "missing {field}");
+        }
+        let outcome_hash = binding["outcome_hash"].as_str().unwrap();
+        assert_eq!(outcome_hash.len(), 64);
+        assert!(outcome_hash.bytes().all(|byte| byte.is_ascii_hexdigit()));
+
+        let raw = fixture.to_string();
+        for forbidden in ["content", "body_json", "secret", "prompt"] {
+            assert!(!raw.contains(&format!("\"{forbidden}\"")), "fixture leaks {forbidden}");
+        }
+        assert!(include_str!("../docs/cross-product-acceptance-contract.md").contains("perseus_vault_recall"));
+    }
+
+    #[test]
+    fn quality_telemetry_reports_machine_readable_memory_signals() {
+        let (db, path) = temp_db();
+        handle_remember(&db, json!({"category":"facts","key":"one","body_json":"{\"content\":\"red state\"}","certainty":0.9})).unwrap();
+        handle_remember(&db, json!({"category":"facts","key":"two","body_json":"{\"content\":\"blue state\"}","certainty":0.1})).unwrap();
+        let raw = handle_quality_telemetry(&db, json!({"category":"facts"})).unwrap();
+        let report: Value = serde_json::from_str(&raw).unwrap();
+        assert!(report["active_entities"].as_i64().unwrap() >= 2, "{raw}");
+        assert!(report["contradiction_count"].as_i64().unwrap() >= 1, "{raw}");
+        assert!(report["class_distribution"].is_object(), "{raw}");
+        assert!(report["promotion_flow"].is_object(), "{raw}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn operator_review_surfaces_conflicts_stale_and_supersession_candidates() {
+        let (db, path) = temp_db();
+        handle_remember(&db, json!({"category":"facts","key":"policy","body_json":"{\"content\":\"allow red\"}","certainty":0.9})).unwrap();
+        handle_remember(&db, json!({"category":"facts","key":"policy-two","body_json":"{\"content\":\"deny blue\"}","certainty":0.1})).unwrap();
+        handle_remember(&db, json!({"category":"convention","key":"vague","body_json":"{\"content\":\"ok\"}"})).unwrap();
+        let raw = handle_operator_review(&db, json!({"category":"facts", "limit":20})).unwrap();
+        let report: Value = serde_json::from_str(&raw).unwrap();
+        assert!(report["contradictions"]["conflicts"].is_array(), "{raw}");
+        assert!(report["stale_candidates"].is_array());
+        assert!(report["supersession_lag"].is_array());
+        assert!(report["reviewed_at_unix_ms"].as_i64().unwrap() > 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn structured_index_anchor_distinguishes_reference_from_imported_fact() {
+        let (db, path) = temp_db();
+        let reference: Value = serde_json::from_str(&handle_structured_index_anchor(&db, json!({
+            "index_type":"ide_symbol", "index_uri":"ide://repo/src/lib.rs", "record_id":"symbol:parse",
+            "mode":"reference", "workspace_hash":"ws"
+        })).unwrap()).unwrap();
+        assert_eq!(reference["mode"], "reference");
+        let imported: Value = serde_json::from_str(&handle_structured_index_anchor(&db, json!({
+            "index_type":"ide_symbol", "index_uri":"ide://repo/src/lib.rs", "record_id":"symbol:parse",
+            "mode":"import", "content":"parse converts input", "workspace_hash":"ws"
+        })).unwrap()).unwrap();
+        assert_eq!(imported["mode"], "import");
+        let raw = handle_recall(&db, json!({"query":"parse converts", "workspace_hash":"ws"})).unwrap();
+        let item = &serde_json::from_str::<Value>(&raw).unwrap()["items"][0];
+        assert_eq!(item["origin"]["memory_kind"], "imported");
+        assert_eq!(item["external_refs"][0]["ref_type"], "structured_index");
+        assert_eq!(item["external_refs"][0]["ref_value"], "ide_symbol:ide://repo/src/lib.rs#symbol:parse");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn markdown_import_labels_content_as_non_authoritative_import_and_dedups() {
+        let (db, path) = temp_db();
+        let source = std::env::temp_dir().join(format!("import-{}.md", uuid::Uuid::new_v4()));
+        std::fs::write(&source, "# Team Policy\n\nImported procedures apply here.").unwrap();
+        let args = json!({"path":source.to_string_lossy(), "workspace_hash":"ws", "source_system":"wiki"});
+        let first: Value = serde_json::from_str(&handle_markdown_import(&db, args.clone()).unwrap()).unwrap();
+        assert_eq!(first["imported"], 1, "{first}");
+        let second: Value = serde_json::from_str(&handle_markdown_import(&db, args).unwrap()).unwrap();
+        assert_eq!(second["imported"], 0, "{second}");
+        let raw = handle_recall(&db, json!({"query":"Imported procedures", "workspace_hash":"ws"})).unwrap();
+        let item = &serde_json::from_str::<Value>(&raw).unwrap()["items"][0];
+        assert_eq!(item["origin"]["memory_kind"], "imported");
+        assert_eq!(item["status"], "draft");
+        let _ = std::fs::remove_file(&path); let _ = std::fs::remove_file(&source);
+    }
+
+    #[test]
+    fn derived_export_writes_stable_provenance_markdown() {
+        let (db, path) = temp_db();
+        handle_remember(&db, json!({"category":"convention","key":"format","body_json":"{\"content\":\"Use stable markdown\"}"})).unwrap();
+        let output = std::env::temp_dir().join(format!("derived-{}.md", uuid::Uuid::new_v4()));
+        let response = handle_derived_export(&db, json!({"output_path":output.to_string_lossy()})).unwrap();
+        let result: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(result["exported"], 1);
+        let markdown = std::fs::read_to_string(&output).unwrap();
+        assert!(markdown.contains("# Derived Knowledge Surface"));
+        assert!(markdown.contains("## Conventions"));
+        assert!(markdown.contains("Use stable markdown"));
+        assert!(markdown.contains("provenance: category=convention key=format"));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&output);
+    }
+
+    #[test]
+    fn recall_profiles_partition_personal_agent_and_shared_memory() {
+        let (db, path) = temp_db();
+        for (category, key, workspace) in [
+            ("preference", "pref", ""),
+            ("convention", "rule", ""),
+            ("correction", "fix", ""),
+            ("insight", "shared", "ws-a"),
+            ("insight", "other", "ws-b"),
+        ] {
+            handle_remember(&db, json!({"category":category,"key":key,
+                "workspace_hash":workspace,"body_json":format!("{{\"content\":\"{} profile token\"}}", key),
+                "skip_dedup":true})).unwrap();
+        }
+        let ids = |profile: &str, ws: &str| -> Vec<String> {
+            let raw = handle_recall(&db, json!({"query":"profile token", "retrieval_profile":profile,
+                "workspace_hash":ws, "limit":10})).unwrap();
+            let mut keys: Vec<String> = serde_json::from_str::<Value>(&raw).unwrap()["items"].as_array().unwrap()
+                .iter().map(|x| x["key"].as_str().unwrap().to_string()).collect();
+            keys.sort();
+            keys
+        };
+        assert_eq!(ids("personal", "ws-a"), vec!["pref"]);
+        assert_eq!(ids("agent", "ws-a"), vec!["fix", "rule"]);
+        assert_eq!(ids("shared", "ws-a"), vec!["shared"]);
+        let err = handle_recall(&db, json!({"query":"profile token", "retrieval_profile":"bad"})).unwrap_err();
+        assert!(err.contains("unknown retrieval_profile"));
+        let _ = std::fs::remove_file(&path);
+    }
+
     // ─── #832: mimir_promote ────────────────────────────────────────────
 
     #[test]
@@ -7893,7 +8636,7 @@ mod tests {
         let out = handle_promote(
             &db,
             json!({"from_category": "episodes", "from_key": "incident-42",
-                   "to_category": "convention",
+                   "to_category": "observation",
                    "reason": "recurred three times"}),
         )
         .unwrap();
@@ -7901,7 +8644,7 @@ mod tests {
         assert_eq!(v["promoted"], json!(true));
         let new_id = v["to_id"].as_str().unwrap();
 
-        let promoted = db.get_entity("convention", "incident-42").unwrap().expect("copy");
+        let promoted = db.get_entity("observation", "incident-42").unwrap().expect("copy");
         let body: Value = serde_json::from_str(&promoted.body_json).unwrap();
         assert_eq!(body["promoted_from"]["category"], json!("episodes"));
         assert_eq!(body["promoted_from"]["reason"], json!("recurred three times"));
@@ -7911,6 +8654,31 @@ mod tests {
             .links
             .iter()
             .any(|l| l.relationship == "promoted_to" && l.target_id == new_id));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn demote_creates_provenance_linked_copy_and_journal_event() {
+        let (db, path) = temp_db();
+        handle_remember(&db, json!({"category":"convention", "key":"rollout", "body_json":"{\"content\":\"canary deploy first\"}"})).unwrap();
+        let out = handle_demote(&db, json!({"from_category":"convention", "from_key":"rollout", "to_category":"observation", "reason":"not yet durable"})).unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        let demoted = db.get_entity("observation", "rollout").unwrap().expect("copy");
+        let body: Value = serde_json::from_str(&demoted.body_json).unwrap();
+        assert_eq!(body["demoted_from"]["category"], json!("convention"));
+        assert!(v["demoted"].as_bool().unwrap());
+        let events = db.timeline(&TimelineParams { event_type: Some("demotion".into()), ..Default::default() }).unwrap();
+        assert_eq!(events.len(), 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn promote_rejects_ladder_skips() {
+        let (db, path) = temp_db();
+        handle_remember(&db, json!({"category":"episodes", "key":"skip", "body_json":"{\"content\":\"repeated deploy failure\"}"})).unwrap();
+        let err = handle_promote(&db, json!({"from_category":"episodes", "from_key":"skip", "to_category":"convention"})).unwrap_err();
+        assert!(err.contains("invalid promotion transition"), "{err}");
+        assert!(db.get_entity("convention", "skip").unwrap().is_none());
         let _ = std::fs::remove_file(&path);
     }
 

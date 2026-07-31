@@ -1,0 +1,31 @@
+{
+  "name": "perseus-vault-memory-quality-v1",
+  "description": "Offline quality-contract manifest for long-horizon, contradiction/supersession, shared-memory, and adversarial memory behavior.",
+  "version": 1,
+  "cases": [
+    {
+      "id": "long-horizon-basic",
+      "category": "long_horizon",
+      "description": "Retrieve a durable fact after intervening memories and updates.",
+      "checks": ["answer_found", "answer_is_current"]
+    },
+    {
+      "id": "contradiction-supersession-basic",
+      "category": "contradiction_supersession",
+      "description": "Prefer the current fact while retaining superseded evidence for audit.",
+      "checks": ["current_wins", "history_retained"]
+    },
+    {
+      "id": "shared-memory-scope-basic",
+      "category": "shared_memory",
+      "description": "Respect workspace visibility while serving eligible global knowledge.",
+      "checks": ["eligible_memory_served", "ineligible_memory_hidden"]
+    },
+    {
+      "id": "adversarial-contamination-basic",
+      "category": "adversarial",
+      "description": "Do not let a misleading or contaminated memory displace verified truth.",
+      "checks": ["verified_truth_wins", "contamination_does_not_win"]
+    }
+  ]
+}

@@ -306,6 +306,12 @@ Any MCP-compatible framework works with Perseus Vault directly. See
 > upgrade the CLI to **≥ 1.0.23** (calls canonical names, with dynamic
 > fallback), or set `PERSEUS_VAULT_TOOL_ALIASES=all` on the vault as a bridge
 > while older clients remain deployed.
+>
+> **Migration contract.** See [legacy Mimir/Mneme tool-prefix migration](docs/migration/legacy-tool-prefixes.md) for replacement mapping, process-local migration evidence, and the v3 removal gate.
+> Operators can call `perseus_vault_alias_usage` to read process-local totals for
+> canonical, Mimir, Mneme, and unrecognized prefixes. The counters reset on
+> restart, never persist call data, and never include tool arguments, entity
+> identifiers, credentials, client metadata, or the readout call itself.
 
 ### Entity CRUD
 | Tool | Description |

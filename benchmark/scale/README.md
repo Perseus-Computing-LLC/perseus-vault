@@ -40,6 +40,43 @@ Headlines:
   inside the FTS index and the two arms run concurrently. Attribution
   tables in PERF.md.
 
+## v2.21.0 Cloud Linux validation (non-canonical)
+
+Fresh v2.21.0 artifacts are committed alongside the canonical baseline:
+
+- [`report-v2.21.0-linux-8vcpu-10k.json`](report-v2.21.0-linux-8vcpu-10k.json)
+- [`report-v2.21.0-linux-8vcpu-100k.json`](report-v2.21.0-linux-8vcpu-100k.json)
+
+They were produced on a hosted **8-vCPU Linux container** (`Linux 6.12.91-fly`),
+not the AMD64 16-core Windows 11 baseline host above. Treat them as operational
+validation evidence, **not** as a version-to-version performance comparison.
+
+| Metric | 10K | 100K |
+| --- | --- | --- |
+| Write throughput, sustained | 45/s | 26/s |
+| Write throughput, first→last 10% | 66/s → 46/s | 50/s → 14/s |
+| fts5 recall p50 / p99 | 5.3 / 117.0 ms | 77.2 / 125.0 ms |
+| dense recall p50 / p99 | 40.7 / 45.6 ms | 80.7 / 166.3 ms |
+| hybrid recall p50 / p99 | 41.6 / 64.0 ms | 319.8 / 390.9 ms |
+| `as_of` point lookup p50 / p99 | 0.16 / 0.35 ms | 0.20 / 44.0 ms |
+| temporal recall p50 / p99 | 5.0 / 8.4 ms | 63.3 / 80.2 ms |
+| Cold start (median) | 23.8 ms | 228.7 ms |
+| DB on disk | 92.2 MB | 923.8 MB |
+
+Caveats recorded with the artifacts:
+
+- The canonical gate budgets are calibrated to the Windows baseline host. On
+  this shared Linux container, the 10K artifact fails write and fts5-tail
+  budgets, while the 100K artifact fails the fts5/dense/hybrid/`as_of`/temporal
+  tail budgets. That is a host/provenance mismatch, not evidence of a v2.21
+  regression without a same-hardware A/B run.
+- Embedding coverage differed materially between environments (302 embedded
+  rows at 100K here versus 8,115 in the canonical baseline), so dense and
+  hybrid rows are not comparable even before hardware differences.
+- Tail outliers (for example `as_of` p99 at 100K) are consistent with a noisy
+  shared container. Public claims remain pinned to `report.json` until a
+  controlled same-host rerun supersedes it.
+
 ## Running
 
 ```bash

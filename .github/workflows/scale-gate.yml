@@ -26,7 +26,7 @@ on:
     inputs:
       size:
         description: "Corpus size to gate (10000 or 100000)"
-        default: "100000"
+        default: "10000"
 
 env:
   CARGO_TERM_COLOR: always

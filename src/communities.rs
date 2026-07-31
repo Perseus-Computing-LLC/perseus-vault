@@ -432,6 +432,10 @@ pub struct GlobalRecallParams {
     /// answer when the LLM is disabled or errors.
     #[serde(default)]
     pub use_llm: bool,
+    /// #783: MCP session identity stamped by the transport for visibility
+    /// enforcement before summaries or member bodies enter the result.
+    #[serde(default)]
+    pub requesting_agent_id: Option<String>,
 }
 
 fn default_top_communities() -> usize {
@@ -932,6 +936,22 @@ impl Database {
             self.detect_communities(&params.workspace_hash, "label_prop", 2)?;
             rows = self.load_communities(&params.workspace_hash)?;
         }
+        // #783: community summaries are derived from member bodies and can leak
+        // private vocabulary even when member hydration is later filtered. Drop
+        // communities with no readable member BEFORE scoring/rendering summaries.
+        if let Some(requester) = params.requesting_agent_id.as_deref() {
+            let mut visible_rows = Vec::with_capacity(rows.len());
+            for row in rows {
+                let members = self.entities_by_ids(&row.member_ids)?;
+                if members
+                    .iter()
+                    .any(|e| self.can_read(requester, &e.visibility, &e.agent_id))
+                {
+                    visible_rows.push(row);
+                }
+            }
+            rows = visible_rows;
+        }
         let considered = rows.len();
 
         // Breadth: score the query against community summaries.
@@ -971,6 +991,13 @@ impl Database {
             per_community_members.push(
                 ranked
                     .into_iter()
+                    .filter(|(_, e)| {
+                        params
+                            .requesting_agent_id
+                            .as_deref()
+                            .map(|requester| self.can_read(requester, &e.visibility, &e.agent_id))
+                            .unwrap_or(true)
+                    })
                     .map(|(s, e)| GlobalRecallMember {
                         id: e.id.clone(),
                         category: e.category.clone(),
@@ -1088,12 +1115,10 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn temp_db() -> (Database, String) {
-        let dir = std::env::temp_dir();
-        let path = dir.join(format!("mimir-test-communities-{}.db", uuid::Uuid::new_v4()));
-        let path_str = path.to_str().unwrap().to_string();
-        let db = Database::open(&path_str).expect("open test db");
-        (db, path_str)
+    fn temp_db() -> (crate::db::TestDatabase, String) {
+        let db = crate::db::TestDatabase::new("mimir-test-communities");
+        let path = db.path().to_string();
+        (db, path)
     }
 
     /// Store a test entity, bypassing near-duplicate dedup: planted-cluster
@@ -1478,6 +1503,7 @@ mod tests {
                 limit: 6,
                 auto_detect: true,
                 use_llm: false,
+                requesting_agent_id: None,
             })
             .expect("global recall");
 
@@ -1506,6 +1532,7 @@ mod tests {
                 limit: 6,
                 auto_detect: true,
                 use_llm: false,
+                requesting_agent_id: None,
             })
             .unwrap();
         assert_eq!(
@@ -1515,6 +1542,41 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn global_recall_hides_private_members_from_other_agents() {
+        let (db, path) = temp_db();
+        plant_cluster(&db, "private_topic", &["p1", "p2", "p3", "p4"], "classified aurora plan");
+        for key in ["p1", "p2", "p3", "p4"] {
+            let mut entity = db.get_entity("private_topic", key).unwrap().unwrap();
+            entity.agent_id = "alice".to_string();
+            entity.visibility = "private".to_string();
+            db.remember(&entity).unwrap();
+        }
+        db.detect_communities("", "label_prop", 2).unwrap();
+        let bob = db.global_recall(&GlobalRecallParams {
+            query: "classified aurora plan".to_string(),
+            workspace_hash: String::new(),
+            top_communities: 3,
+            limit: 10,
+            auto_detect: false,
+            use_llm: false,
+            requesting_agent_id: Some("bob".to_string()),
+        }).unwrap();
+        assert!(bob.communities.iter().all(|c| c.members.is_empty()), "{bob:?}");
+        assert!(!bob.answer.contains("private_topic/"), "{}", bob.answer);
+        let alice = db.global_recall(&GlobalRecallParams {
+            query: "classified aurora plan".to_string(),
+            workspace_hash: String::new(),
+            top_communities: 3,
+            limit: 10,
+            auto_detect: false,
+            use_llm: false,
+            requesting_agent_id: Some("alice".to_string()),
+        }).unwrap();
+        assert!(alice.communities.iter().any(|c| !c.members.is_empty()), "{alice:?}");
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -1530,6 +1592,7 @@ mod tests {
                 limit: 5,
                 auto_detect: true,
                 use_llm: false,
+                requesting_agent_id: None,
             })
             .expect("global recall");
         assert_eq!(result.communities_considered, 1);
@@ -1545,6 +1608,7 @@ mod tests {
                 limit: 5,
                 auto_detect: false,
                 use_llm: false,
+                requesting_agent_id: None,
             })
             .is_err());
 

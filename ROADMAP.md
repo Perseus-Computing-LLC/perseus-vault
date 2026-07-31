@@ -1,4 +1,4 @@
-# Mimir Roadmap
+# Perseus Vault Roadmap
 
 ## What Mimir Is
 
@@ -106,6 +106,20 @@ The genuinely-unshipped pieces of the "Mimir as infrastructure" goal:
 - **Scale:** 100K+ entity stress tests with documented recall latency budgets.
 - **Federation maturation:** sync health/observability (lag, conflict rate, entity drift) for `mimir_federate`.
 
+## Next+1 — Memory quality, serving, and shared knowledge
+
+**Theme:** prove memory quality, preserve provenance, and make durable knowledge serveable without turning Markdown into the source of truth.
+
+This phase turns Vault's memory model into an explicitly measured, operator-reviewable serving system. The emphasis is not "more memory features" in the abstract. The emphasis is discipline: benchmarked quality, explicit lifecycle transitions, governed sharing, and human-readable derived surfaces generated from the durable store.
+
+- **Benchmark rigor.** Add repeatable memory-quality gates modeled on long-horizon, adversarial, and shared-memory tasks. Publish scorecards for retrieval quality, contradiction handling, stale-memory demotion, and downstream task lift.
+- **Pre-compaction capture.** Make the capture-before-compaction/summary path explicit so important facts are persisted before any compression step can discard them.
+- **Promotion pipeline.** Formalize `episode -> observation -> convention/belief -> keystone` transitions with thresholds, provenance conservation, and journaled promotion/demotion.
+- **Shared-memory governance.** Complete visibility enforcement across all read surfaces, add retrieval profiles per agent/tier, and make cross-scope promotion explainable.
+- **Derived knowledge surfaces.** Generate human-readable, provenance-rich Markdown/wiki artifacts from durable memory as a derived surface for review, sharing, and synthesis, not as the authoritative store.
+- **Memory quality observability.** Surface contradiction rate, stale-hit rate, supersession lag, promotion counts, and served-tier explanations as first-class health signals.
+- **Interop bridges.** Support controlled Markdown import/export and external structured-index anchors where they improve reviewability or interoperability without replacing the structured store.
+
 ## Later — Gated & cross-product
 
 - **Managed "Mimir Cloud":** a hosted/multi-region option — only after the platform hardening above.
@@ -122,7 +136,8 @@ Ideas we like and may pursue. Listed to capture intent, **not** to promise deliv
 - Causal memory graphs — entities linked by causation, traversable in both directions
 - Multi-modal memory — image/audio/code entities with cross-modal recall
 - Production CRDT sync across WAN with conflict resolution
-- An open, versioned "Mimir-compatible" memory standard + compliance suite
+- An open, versioned "Perseus Vault-compatible" memory standard + compliance suite
+- Open memory benchmark pack and compliance suite for memory systems, with Vault semantics for provenance, time, correction, and supersession
 
 ---
 

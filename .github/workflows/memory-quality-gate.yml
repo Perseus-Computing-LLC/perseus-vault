@@ -1,0 +1,47 @@
+name: Memory quality gate
+
+# #778: first-class memory-quality scenarios against the real Vault binary.
+# Unlike latency benchmarks, this answers whether memory behavior is correct:
+# durable recall, supersession, visibility, and adversarial demotion all must pass.
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - "src/**"
+      - "benchmark/quality/**"
+      - ".github/workflows/memory-quality-gate.yml"
+  pull_request:
+    branches: [main, master]
+    paths:
+      - "src/**"
+      - "benchmark/quality/**"
+      - ".github/workflows/memory-quality-gate.yml"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  memory-quality-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build (lean)
+        run: cargo build --locked --no-default-features
+      - name: Memory quality report
+        run: python benchmark/quality/run.py --out benchmark/quality/report.json
+      - name: Build blocking release scorecard
+        run: python benchmark/quality/scorecard.py benchmark/quality/report.json --out benchmark/quality/scorecard.json
+      - name: Upload quality report and scorecard
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: memory-quality-scorecard
+          path: |
+            benchmark/quality/report.json
+            benchmark/quality/scorecard.json

@@ -243,6 +243,62 @@ CREATE TABLE IF NOT EXISTS agents (
     updated_at_unix_ms INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_agents_fleet ON agents(fleet_id);
+
+-- #768 Authorized Action Receipts control plane. Manifests are versioned rather
+-- than mutated, and actions are append-only state records whose transitions are
+-- additionally written to the keyed journal audit chain.
+CREATE TABLE IF NOT EXISTS authority_manifests (
+    id TEXT PRIMARY KEY,
+    agent_id TEXT NOT NULL,
+    workspace_hash TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    allowed_capabilities TEXT NOT NULL DEFAULT '[]',
+    approval_required_capabilities TEXT NOT NULL DEFAULT '[]',
+    scope_anchors TEXT NOT NULL DEFAULT '[]',
+    approver_principals TEXT NOT NULL DEFAULT '[]',
+    allowed_inbound_principals TEXT NOT NULL DEFAULT '[]',
+    permitted_external_ref_prefixes TEXT NOT NULL DEFAULT '[]',
+    max_parallel_actions INTEGER NOT NULL DEFAULT 1,
+    mode TEXT NOT NULL DEFAULT 'shadow',
+    expires_at_unix_ms INTEGER,
+    revoked_at_unix_ms INTEGER,
+    created_at_unix_ms INTEGER NOT NULL,
+    UNIQUE(agent_id, workspace_hash, version)
+);
+CREATE INDEX IF NOT EXISTS idx_authority_active
+ ON authority_manifests(agent_id, workspace_hash, revoked_at_unix_ms, version DESC);
+CREATE TABLE IF NOT EXISTS authorized_actions (
+    id TEXT PRIMARY KEY,
+    manifest_id TEXT NOT NULL REFERENCES authority_manifests(id),
+    manifest_version INTEGER NOT NULL,
+    agent_id TEXT NOT NULL,
+    workspace_hash TEXT NOT NULL,
+    scope_anchor TEXT NOT NULL,
+    external_ref TEXT NOT NULL DEFAULT '',
+    capability TEXT NOT NULL,
+    action_key TEXT NOT NULL,
+    intent_hash TEXT NOT NULL,
+    outcome_hash TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL,
+    approval_required INTEGER NOT NULL DEFAULT 0,
+    approval_ref TEXT NOT NULL DEFAULT '',
+    created_at_unix_ms INTEGER NOT NULL,
+    updated_at_unix_ms INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_authorized_actions_scope
+ ON authorized_actions(workspace_hash, action_key, status);
+CREATE TABLE IF NOT EXISTS authorized_action_leases (
+    id TEXT PRIMARY KEY,
+    action_id TEXT NOT NULL REFERENCES authorized_actions(id),
+    workspace_hash TEXT NOT NULL,
+    action_key TEXT NOT NULL,
+    holder_id TEXT NOT NULL,
+    expires_at_unix_ms INTEGER NOT NULL,
+    released_at_unix_ms INTEGER,
+    created_at_unix_ms INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_authorized_action_leases_active
+ ON authorized_action_leases(workspace_hash, action_key, released_at_unix_ms, expires_at_unix_ms);
 ";
 
 /// Current schema migration level, stamped into `PRAGMA user_version` once all
@@ -299,39 +355,34 @@ CREATE INDEX IF NOT EXISTS idx_agents_fleet ON agents(fleet_id);
 /// records it so downstream audit queries can cross-reference vault journal
 /// entries against Chancery writ records. New column, backfill-free: no-op on
 /// fresh DBs; legacy rows get '' and are populated going forward.
-const SCHEMA_VERSION: i64 = 23;
+/// v24 (#768 Authorized Action Receipts): authority manifests, receipts, and
+/// action leases. Tables are created idempotently; action columns are ALTER-
+/// probed because v23 stores must retain existing receipt records.
+const SCHEMA_VERSION: i64 = 24;
 
 /// Initialize the v0.2.0 schema on a fresh database.
 pub fn initialize_schema(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
-    // DDL is all IF NOT EXISTS, so it stays ungated: it both creates a fresh DB
-    // and back-fills newer objects (e.g. idx_entities_recall) on older ones.
-    // It also stays OUTSIDE the migration transaction below — IF NOT EXISTS is
-    // already concurrency-safe, and it keeps the FTS5 virtual-table creation
-    // out of the transaction entirely.
-    conn.execute_batch(DDL_V0_2_0)?;
-
-    // The column-add migrations each probe for the column first. `open` runs
-    // several times per process, so on a fully-migrated DB this is pure wasted
-    // work. Gate it on PRAGMA user_version: run once when behind, then stamp
-    // current and skip on every subsequent open. (#208)
-    let user_version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    if user_version >= SCHEMA_VERSION {
-        return Ok(());
-    }
-
-    // #353: PRAGMA busy_timeout serializes individual statements, not this
-    // whole check-then-migrate sequence — two *processes* opening the same
-    // pre-upgrade DB could both read a stale user_version, both enter the
-    // migration path, and the loser would die on "duplicate column name".
-    // BEGIN IMMEDIATE takes SQLite's write lock up front, acting as a
-    // cross-process mutex: the loser blocks here (subject to busy_timeout)
-    // until the winner commits, then sees the stamped version inside
-    // apply_migrations and no-ops. Bonus: the migration steps used to
-    // auto-commit individually; one transaction makes the whole migration
-    // atomic (SQLite DDL is transactional), so a crash mid-migration rolls
-    // back cleanly instead of leaving a half-migrated DB.
+    // #353: serialize the ENTIRE schema bootstrap, not only ALTER migrations.
+    // `DDL_V0_2_0` is idempotent but is still write DDL (including FTS5 virtual
+    // tables). Two fresh/pre-upgrade openers could race there before the old
+    // BEGIN IMMEDIATE below, producing SQLITE_BUSY despite the migration lock.
+    // SQLite DDL, including the virtual-table creation used here, is
+    // transactional; acquire the cross-process write mutex before any schema
+    // statement so the loser waits, then observes the winner's complete state.
     conn.execute_batch("BEGIN IMMEDIATE;")?;
-    match apply_migrations(conn) {
+    let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        conn.execute_batch(DDL_V0_2_0)?;
+
+        // `open` runs several times per process, so fully-migrated stores do
+        // no column probes after the in-transaction version check. A process
+        // that waited on the lock sees the winner's stamped version here.
+        let user_version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if user_version < SCHEMA_VERSION {
+            apply_migrations(conn)?;
+        }
+        Ok(())
+    })();
+    match result {
         Ok(()) => {
             conn.execute_batch("COMMIT;")?;
             Ok(())
@@ -849,6 +900,38 @@ fn apply_migrations(conn: &Connection) -> Result<(), Box<dyn std::error::Error>>
     // '' (the column default) and are populated on all future journal writes.
     ensure_column(conn, "journal", "chancery_writ_id", "TEXT DEFAULT ''")?;
     // ── end v23 ──────────────────────────────────────────────────────────
+
+    // ── v24 (#768 Authorized Action Receipts) ─────────────────────────────
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS authority_manifests (
+            id TEXT PRIMARY KEY, agent_id TEXT NOT NULL, workspace_hash TEXT NOT NULL,
+            version INTEGER NOT NULL, allowed_capabilities TEXT NOT NULL DEFAULT '[]',
+            approval_required_capabilities TEXT NOT NULL DEFAULT '[]', scope_anchors TEXT NOT NULL DEFAULT '[]',
+            approver_principals TEXT NOT NULL DEFAULT '[]', allowed_inbound_principals TEXT NOT NULL DEFAULT '[]',
+            permitted_external_ref_prefixes TEXT NOT NULL DEFAULT '[]', max_parallel_actions INTEGER NOT NULL DEFAULT 1,
+            mode TEXT NOT NULL DEFAULT 'shadow', expires_at_unix_ms INTEGER, revoked_at_unix_ms INTEGER,
+            created_at_unix_ms INTEGER NOT NULL, UNIQUE(agent_id, workspace_hash, version));
+         CREATE INDEX IF NOT EXISTS idx_authority_active ON authority_manifests(agent_id, workspace_hash, revoked_at_unix_ms, version DESC);
+         CREATE TABLE IF NOT EXISTS authorized_actions (
+            id TEXT PRIMARY KEY, manifest_id TEXT NOT NULL REFERENCES authority_manifests(id), manifest_version INTEGER NOT NULL DEFAULT 0,
+            agent_id TEXT NOT NULL, workspace_hash TEXT NOT NULL, scope_anchor TEXT NOT NULL, external_ref TEXT NOT NULL DEFAULT '',
+            capability TEXT NOT NULL, action_key TEXT NOT NULL, intent_hash TEXT NOT NULL, outcome_hash TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL, approval_required INTEGER NOT NULL DEFAULT 0, approval_ref TEXT NOT NULL DEFAULT '',
+            created_at_unix_ms INTEGER NOT NULL, updated_at_unix_ms INTEGER NOT NULL);
+         CREATE INDEX IF NOT EXISTS idx_authorized_actions_scope ON authorized_actions(workspace_hash, action_key, status);
+         CREATE TABLE IF NOT EXISTS authorized_action_leases (
+            id TEXT PRIMARY KEY, action_id TEXT NOT NULL REFERENCES authorized_actions(id), workspace_hash TEXT NOT NULL,
+            action_key TEXT NOT NULL, holder_id TEXT NOT NULL, expires_at_unix_ms INTEGER NOT NULL,
+            released_at_unix_ms INTEGER, created_at_unix_ms INTEGER NOT NULL);
+         CREATE INDEX IF NOT EXISTS idx_authorized_action_leases_active ON authorized_action_leases(workspace_hash, action_key, released_at_unix_ms, expires_at_unix_ms);",
+    )?;
+    ensure_column(conn, "authority_manifests", "allowed_inbound_principals", "TEXT NOT NULL DEFAULT '[]'")?;
+    ensure_column(conn, "authority_manifests", "permitted_external_ref_prefixes", "TEXT NOT NULL DEFAULT '[]'")?;
+    ensure_column(conn, "authority_manifests", "max_parallel_actions", "INTEGER NOT NULL DEFAULT 1")?;
+    ensure_column(conn, "authorized_actions", "manifest_version", "INTEGER NOT NULL DEFAULT 0")?;
+    ensure_column(conn, "authorized_actions", "external_ref", "TEXT NOT NULL DEFAULT ''")?;
+    ensure_column(conn, "authorized_actions", "outcome_hash", "TEXT NOT NULL DEFAULT ''")?;
+    // ── end v24 ──────────────────────────────────────────────────────────
 
     // Stamp the migration level so subsequent opens skip the probe block above.
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
