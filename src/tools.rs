@@ -3,9 +3,11 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::db::{now_ms, Database};
+use crate::log_digest;
 use crate::models::{
-    AskParams, EmbedParams, Entity, IngestParams, JournalEvent, PruneParams, RecallParams,
-    SearchMode, StateEntry, TimelineParams,
+    ArtifactRepresentation, Entity, ExternalRef, JournalEvent, OriginRecord, SearchMode,
+    StateEntry, TimelineParams,
+    AskParams, EmbedParams, IngestParams, PruneParams, RecallParams,
 };
 
 // ─── Deserialization structs ────────────────────────────────────
@@ -182,6 +184,16 @@ null_as_named_default!(null_as_default_entity_type, String, default_entity_type)
 null_as_named_default!(null_as_default_importance, f64, default_importance);
 null_as_named_default!(null_as_default_certainty, f64, default_certainty);
 null_as_named_default!(null_as_default_visibility, String, default_visibility);
+null_as_named_default!(
+    null_as_default_artifact_candidate_encoding,
+    String,
+    default_artifact_candidate_encoding
+);
+null_as_named_default!(
+    null_as_default_artifact_max_matches,
+    i64,
+    default_artifact_max_matches
+);
 
 #[derive(Debug, Deserialize)]
 pub struct RecallArgs {
@@ -4097,6 +4109,93 @@ pub struct IngestFileArgs {
     pub tags: Vec<String>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct ArtifactRegisterArgs {
+    pub path: String,
+    #[serde(default)]
+    pub mime_type: Option<String>,
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub workspace_hash: String,
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub agent_id: String,
+    #[serde(
+        default = "default_visibility",
+        deserialize_with = "null_as_default_visibility"
+    )]
+    pub visibility: String,
+    #[serde(default)]
+    pub origin: Option<OriginRecord>,
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub external_refs: Vec<ExternalRef>,
+    #[serde(default)]
+    pub retention_policy: Option<String>,
+    #[serde(default)]
+    pub representation: ArtifactRepresentation,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ArtifactManifestArgs {
+    pub sha256: String,
+    #[serde(default)]
+    pub workspace_hash: Option<String>,
+    #[serde(default)]
+    pub requesting_agent_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ArtifactExcerptArgs {
+    pub sha256: String,
+    #[serde(default)]
+    pub workspace_hash: Option<String>,
+    #[serde(default)]
+    pub requesting_agent_id: Option<String>,
+    #[serde(default)]
+    pub byte_start: Option<i64>,
+    #[serde(default)]
+    pub byte_end: Option<i64>,
+    #[serde(default)]
+    pub line_start: Option<i64>,
+    #[serde(default)]
+    pub line_end: Option<i64>,
+}
+
+fn default_artifact_candidate_encoding() -> String {
+    "utf8".to_string()
+}
+
+fn default_artifact_max_matches() -> i64 {
+    5
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ArtifactDigestArgs {
+    pub sha256: String,
+    #[serde(default)]
+    pub workspace_hash: Option<String>,
+    #[serde(default)]
+    pub requesting_agent_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ArtifactVerifyArgs {
+    pub sha256: String,
+    #[serde(default)]
+    pub workspace_hash: Option<String>,
+    #[serde(default)]
+    pub requesting_agent_id: Option<String>,
+    pub candidate: String,
+    #[serde(
+        default = "default_artifact_candidate_encoding",
+        deserialize_with = "null_as_default_artifact_candidate_encoding"
+    )]
+    pub encoding: String,
+    #[serde(
+        default = "default_artifact_max_matches",
+        deserialize_with = "null_as_default_artifact_max_matches"
+    )]
+    pub max_matches: i64,
+}
+
 /// Ingest a document file into memory by extracting its text **locally** (#236).
 /// Plaintext/markdown work in any build; DOCX/PDF need `--features multimodal`.
 /// The extracted text is stored as a normal entity (category default "document",
@@ -4161,6 +4260,485 @@ pub fn handle_ingest_file(db: &Database, args: Value) -> Result<String, String> 
         "category": entity.category,
         "key": entity.key,
         "chars": char_count,
+    })
+    .to_string())
+}
+
+const MAX_ARTIFACT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_ARTIFACT_EXTERNAL_REFS: usize = 32;
+const MAX_ARTIFACT_EXCERPT_BYTES: usize = 8 * 1024;
+const MAX_ARTIFACT_EXCERPT_LINES: usize = 200;
+const MAX_ARTIFACT_VERIFY_BYTES: usize = 4 * 1024;
+const MAX_ARTIFACT_VERIFY_MATCHES: i64 = 20;
+
+fn is_sha256_hex(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn guess_artifact_mime_type(path: &std::path::Path) -> String {
+    match path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("txt") | Some("log") | Some("md") => "text/plain".to_string(),
+        Some("json") | Some("jsonl") => "application/json".to_string(),
+        Some("csv") => "text/csv".to_string(),
+        Some("yaml") | Some("yml") => "application/yaml".to_string(),
+        Some("html") | Some("htm") => "text/html".to_string(),
+        Some("xml") => "application/xml".to_string(),
+        Some("pdf") => "application/pdf".to_string(),
+        Some("gz") => "application/gzip".to_string(),
+        Some("zip") => "application/zip".to_string(),
+        _ => "application/octet-stream".to_string(),
+    }
+}
+
+fn canonicalize_external_refs(mut refs: Vec<ExternalRef>) -> Vec<ExternalRef> {
+    refs.sort_by(|a, b| {
+        (
+            a.ref_type.as_str(),
+            a.ref_value.as_str(),
+            a.source_system.as_deref().unwrap_or(""),
+            a.relationship.as_deref().unwrap_or("about"),
+        )
+            .cmp(&(
+                b.ref_type.as_str(),
+                b.ref_value.as_str(),
+                b.source_system.as_deref().unwrap_or(""),
+                b.relationship.as_deref().unwrap_or("about"),
+            ))
+    });
+    refs.dedup_by(|a, b| {
+        a.ref_type == b.ref_type
+            && a.ref_value == b.ref_value
+            && a.source_system == b.source_system
+            && a.relationship.as_deref().unwrap_or("about")
+                == b.relationship.as_deref().unwrap_or("about")
+    });
+    refs
+}
+
+fn artifact_why_served(binding: &crate::models::ArtifactBinding, reason: &str) -> Value {
+    json!({
+        "reason": reason,
+        "workspace_hash": binding.workspace_hash,
+        "visibility": binding.visibility,
+        "anchors": binding.external_refs,
+    })
+}
+
+fn artifact_line_bounds(bytes: &[u8]) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    for (i, b) in bytes.iter().enumerate() {
+        if *b == b'\n' {
+            out.push((start, i + 1));
+            start = i + 1;
+        }
+    }
+    if start < bytes.len() {
+        out.push((start, bytes.len()));
+    }
+    out
+}
+
+fn find_exact_matches(haystack: &[u8], needle: &[u8], max_matches: usize) -> Vec<(usize, usize)> {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i + needle.len() <= haystack.len() && out.len() < max_matches {
+        if &haystack[i..i + needle.len()] == needle {
+            out.push((i, i + needle.len()));
+            i += needle.len().max(1);
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+pub fn handle_artifact_register(db: &Database, args: Value) -> Result<String, String> {
+    let a: ArtifactRegisterArgs = serde_json::from_value(args)
+        .map_err(|e| format!("Invalid artifact_register arguments: {}", e))?;
+    let path = std::path::Path::new(&a.path);
+    let meta = std::fs::metadata(path).map_err(|e| format!("stat {}: {}", path.display(), e))?;
+    if !meta.is_file() {
+        return Err(format!("artifact path must be a regular file: {}", path.display()));
+    }
+    if meta.len() as usize > MAX_ARTIFACT_BYTES {
+        return Err(format!(
+            "artifact too large: {} bytes (max {})",
+            meta.len(),
+            MAX_ARTIFACT_BYTES
+        ));
+    }
+    let mime_type = a
+        .mime_type
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| guess_artifact_mime_type(path));
+    if matches!(mime_type.as_str(), "application/gzip" | "application/zip") {
+        return Err(
+            "compressed artifacts are not supported in the exact-byte first slice; register the original bytes uncompressed"
+                .to_string(),
+        );
+    }
+    if !matches!(
+        a.visibility.as_str(),
+        "private" | "fleet" | "workspace" | "tenant" | "public" | ""
+    ) {
+        return Err(format!(
+            "invalid visibility '{}': expected private, fleet, workspace, tenant, or public",
+            a.visibility
+        ));
+    }
+    if let Some(ref origin) = a.origin {
+        if let Some(ref kind) = origin.memory_kind {
+            if !crate::models::MEMORY_KINDS.contains(&kind.as_str()) {
+                return Err(format!(
+                    "invalid origin.memory_kind '{kind}': expected one of {:?}",
+                    crate::models::MEMORY_KINDS
+                ));
+            }
+        }
+    }
+    if a.external_refs.len() > MAX_ARTIFACT_EXTERNAL_REFS {
+        return Err(format!(
+            "external_refs too long: {} refs (max {})",
+            a.external_refs.len(),
+            MAX_ARTIFACT_EXTERNAL_REFS
+        ));
+    }
+    for r in &a.external_refs {
+        if r.ref_type.trim().is_empty() || r.ref_value.trim().is_empty() {
+            return Err("external_refs entries require non-empty ref_type and ref_value".into());
+        }
+        if let Some(ref rel) = r.relationship {
+            if !crate::models::REF_RELATIONSHIPS.contains(&rel.as_str()) {
+                return Err(format!(
+                    "invalid external_refs relationship '{rel}': expected one of {:?}",
+                    crate::models::REF_RELATIONSHIPS
+                ));
+            }
+        }
+    }
+    let retention_policy = a.retention_policy.and_then(|s| {
+        let t = s.trim().to_string();
+        (!t.is_empty()).then_some(t)
+    });
+    if let Some(ref policy) = retention_policy {
+        if !crate::models::RETENTION_POLICIES.contains(&policy.as_str()) {
+            return Err(format!(
+                "invalid retention_policy '{policy}': expected one of {:?}",
+                crate::models::RETENTION_POLICIES
+            ));
+        }
+    }
+    let mut representation = a.representation;
+    if representation.kind.trim().is_empty() {
+        representation.kind = "original".to_string();
+    }
+    if !crate::models::ARTIFACT_REPRESENTATION_KINDS.contains(&representation.kind.as_str()) {
+        return Err(format!(
+            "invalid representation.kind '{}': expected one of {:?}",
+            representation.kind,
+            crate::models::ARTIFACT_REPRESENTATION_KINDS
+        ));
+    }
+    match representation.kind.as_str() {
+        "original" => {
+            if representation.derived_from_sha256.is_some()
+                || representation.derivation_kind.is_some()
+                || representation.derivation_version.is_some()
+            {
+                return Err(
+                    "original artifacts must not carry derived_from_sha256 or derivation metadata"
+                        .to_string(),
+                );
+            }
+        }
+        "derived" => {
+            let Some(ref parent) = representation.derived_from_sha256 else {
+                return Err("derived artifacts require representation.derived_from_sha256".to_string());
+            };
+            if !is_sha256_hex(parent) {
+                return Err(format!(
+                    "representation.derived_from_sha256 must be a full 64-hex SHA-256, got '{parent}'"
+                ));
+            }
+        }
+        _ => unreachable!(),
+    }
+
+    let bytes = std::fs::read(path).map_err(|e| format!("read {}: {}", path.display(), e))?;
+    let (sha256, artifact_created, binding_created) = db
+        .artifact_register(
+            &bytes,
+            &mime_type,
+            &a.workspace_hash,
+            &a.agent_id,
+            &a.visibility,
+            a.origin,
+            canonicalize_external_refs(a.external_refs),
+            retention_policy,
+            representation,
+        )
+        .map_err(|e| format!("artifact register failed: {}", e))?;
+    let manifest = db
+        .artifact_manifest(&sha256, Some(a.workspace_hash.as_str()), None)
+        .map_err(|e| format!("artifact manifest failed: {}", e))?;
+    Ok(json!({
+        "sha256": sha256,
+        "artifact_action": if artifact_created { "created" } else { "existing" },
+        "binding_action": if binding_created { "created" } else { "existing" },
+        "manifest": manifest,
+    })
+    .to_string())
+}
+
+pub fn handle_artifact_manifest(db: &Database, args: Value) -> Result<String, String> {
+    let a: ArtifactManifestArgs = serde_json::from_value(args)
+        .map_err(|e| format!("Invalid artifact_manifest arguments: {}", e))?;
+    if !is_sha256_hex(&a.sha256) {
+        return Err(format!(
+            "sha256 must be a full 64-hex SHA-256, got '{}'",
+            a.sha256
+        ));
+    }
+    let manifest = db
+        .artifact_manifest(
+            &a.sha256,
+            a.workspace_hash.as_deref(),
+            a.requesting_agent_id.as_deref(),
+        )
+        .map_err(|e| format!("artifact manifest failed: {}", e))?;
+    serde_json::to_string(&manifest).map_err(|e| format!("Serialization failed: {}", e))
+}
+
+pub fn handle_artifact_excerpt(db: &Database, args: Value) -> Result<String, String> {
+    let a: ArtifactExcerptArgs = serde_json::from_value(args)
+        .map_err(|e| format!("Invalid artifact_excerpt arguments: {}", e))?;
+    if !is_sha256_hex(&a.sha256) {
+        return Err(format!(
+            "sha256 must be a full 64-hex SHA-256, got '{}'",
+            a.sha256
+        ));
+    }
+    let byte_mode = a.byte_start.is_some() || a.byte_end.is_some();
+    let line_mode = a.line_start.is_some() || a.line_end.is_some();
+    if byte_mode == line_mode {
+        return Err(
+            "artifact_excerpt requires exactly one range kind: either byte_start/byte_end or line_start/line_end"
+                .to_string(),
+        );
+    }
+    let (bytes, bindings) = db
+        .artifact_resolve_visible(
+            &a.sha256,
+            a.workspace_hash.as_deref(),
+            a.requesting_agent_id.as_deref(),
+        )
+        .map_err(|e| format!("artifact excerpt failed: {}", e))?;
+    let binding = bindings
+        .first()
+        .ok_or_else(|| "artifact excerpt resolved no visible binding".to_string())?;
+
+    let (range_kind, start, end) = if byte_mode {
+        let start = a.byte_start.ok_or_else(|| "byte_start is required".to_string())?;
+        let end = a.byte_end.ok_or_else(|| "byte_end is required".to_string())?;
+        if start < 0 || end < 0 || end <= start {
+            return Err("byte ranges are half-open [start,end) and require 0 <= start < end".to_string());
+        }
+        let (start, end) = (start as usize, end as usize);
+        if end > bytes.len() {
+            return Err(format!("byte_end {} exceeds artifact length {}", end, bytes.len()));
+        }
+        if end - start > MAX_ARTIFACT_EXCERPT_BYTES {
+            return Err(format!(
+                "byte excerpt too large: {} bytes (max {})",
+                end - start,
+                MAX_ARTIFACT_EXCERPT_BYTES
+            ));
+        }
+        ("bytes", start, end)
+    } else {
+        let start_line = a.line_start.ok_or_else(|| "line_start is required".to_string())?;
+        let end_line = a.line_end.ok_or_else(|| "line_end is required".to_string())?;
+        if start_line <= 0 || end_line < start_line {
+            return Err("line ranges are 1-indexed and inclusive: require 1 <= line_start <= line_end".to_string());
+        }
+        let bounds = artifact_line_bounds(&bytes);
+        if bounds.is_empty() && start_line == 1 && end_line == 1 {
+            return Err("artifact has no lines to retrieve".to_string());
+        }
+        let total_lines = bounds.len() as i64;
+        if end_line > total_lines {
+            return Err(format!("line_end {} exceeds artifact line count {}", end_line, total_lines));
+        }
+        if (end_line - start_line + 1) as usize > MAX_ARTIFACT_EXCERPT_LINES {
+            return Err(format!(
+                "line excerpt too large: {} lines (max {})",
+                end_line - start_line + 1,
+                MAX_ARTIFACT_EXCERPT_LINES
+            ));
+        }
+        let start = bounds[start_line as usize - 1].0;
+        let end = bounds[end_line as usize - 1].1;
+        if end - start > MAX_ARTIFACT_EXCERPT_BYTES {
+            return Err(format!(
+                "line excerpt expands to {} bytes (max {})",
+                end - start,
+                MAX_ARTIFACT_EXCERPT_BYTES
+            ));
+        }
+        ("lines", start, end)
+    };
+    let slice = &bytes[start..end];
+    let anchor = db.artifact_anchor(&a.sha256, &bytes, start, end);
+    let content_b64 = {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.encode(slice)
+    };
+    let content_utf8 = std::str::from_utf8(slice).ok().map(str::to_string);
+    Ok(json!({
+        "sha256": a.sha256,
+        "range": {
+            "kind": range_kind,
+            "start": start,
+            "end": end,
+        },
+        "content_b64": content_b64,
+        "content_utf8": content_utf8,
+        "anchors": [anchor],
+        "why_served": artifact_why_served(binding, "exact artifact excerpt requested"),
+    })
+    .to_string())
+}
+
+pub fn handle_artifact_log_digest(db: &Database, args: Value) -> Result<String, String> {
+    let a: ArtifactDigestArgs = serde_json::from_value(args)
+        .map_err(|e| format!("Invalid artifact_log_digest arguments: {}", e))?;
+    if !is_sha256_hex(&a.sha256) {
+        return Err(format!("sha256 must be a full 64-hex SHA-256, got '{}'", a.sha256));
+    }
+    // Resolve bytes only through the original artifact contract, which applies
+    // workspace + visibility filtering before any aggregate count/template is built.
+    let (bytes, bindings) = db
+        .artifact_resolve_visible(
+            &a.sha256,
+            a.workspace_hash.as_deref(),
+            a.requesting_agent_id.as_deref(),
+        )
+        .map_err(|e| format!("artifact log digest failed: {}", e))?;
+    let binding = bindings
+        .first()
+        .ok_or_else(|| "artifact log digest resolved no visible binding".to_string())?;
+    let digest = log_digest::digest(&a.sha256, &bytes, |start, end| {
+        db.artifact_anchor(&a.sha256, &bytes, start, end)
+    })?;
+    let digest_bytes = serde_json::to_vec(&digest)
+        .map_err(|e| format!("digest serialization failed: {}", e))?;
+    // The navigation view is itself versioned derivative data. It never replaces
+    // the source artifact and inherits only an already-visible binding's scope.
+    let (derived_sha256, _artifact_created, _binding_created) = db
+        .artifact_register(
+            &digest_bytes,
+            "application/vnd.perseus-vault.evidence-log-digest+json",
+            &binding.workspace_hash,
+            &binding.agent_id,
+            &binding.visibility,
+            binding.origin.clone(),
+            binding.external_refs.clone(),
+            binding.retention_policy.clone(),
+            ArtifactRepresentation {
+                kind: "derived".to_string(),
+                derived_from_sha256: Some(a.sha256.clone()),
+                derivation_kind: Some("evidence_log_digest".to_string()),
+                derivation_version: Some(log_digest::DIGEST_VERSION.to_string()),
+            },
+        )
+        .map_err(|e| format!("digest derivative registration failed: {}", e))?;
+    serde_json::to_string(&json!({
+        "digest": digest,
+        "derived_artifact_sha256": derived_sha256,
+        "representation": {
+            "kind": "derived",
+            "derived_from_sha256": a.sha256,
+            "derivation_kind": "evidence_log_digest",
+            "derivation_version": log_digest::DIGEST_VERSION,
+        }
+    }))
+    .map_err(|e| format!("Serialization failed: {}", e))
+}
+
+pub fn handle_artifact_verify_value(db: &Database, args: Value) -> Result<String, String> {
+    let a: ArtifactVerifyArgs = serde_json::from_value(args)
+        .map_err(|e| format!("Invalid artifact_verify_value arguments: {}", e))?;
+    if !is_sha256_hex(&a.sha256) {
+        return Err(format!(
+            "sha256 must be a full 64-hex SHA-256, got '{}'",
+            a.sha256
+        ));
+    }
+    if a.max_matches <= 0 || a.max_matches > MAX_ARTIFACT_VERIFY_MATCHES {
+        return Err(format!(
+            "max_matches must be between 1 and {}",
+            MAX_ARTIFACT_VERIFY_MATCHES
+        ));
+    }
+    let needle = match a.encoding.as_str() {
+        "utf8" => a.candidate.into_bytes(),
+        "base64" => {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD
+                .decode(a.candidate)
+                .map_err(|e| format!("candidate base64 decode failed: {}", e))?
+        }
+        other => {
+            return Err(format!(
+                "encoding must be 'utf8' or 'base64', got '{}'",
+                other
+            ))
+        }
+    };
+    if needle.is_empty() {
+        return Err("candidate must not be empty".to_string());
+    }
+    if needle.len() > MAX_ARTIFACT_VERIFY_BYTES {
+        return Err(format!(
+            "candidate too large: {} bytes (max {})",
+            needle.len(),
+            MAX_ARTIFACT_VERIFY_BYTES
+        ));
+    }
+    let (bytes, bindings) = db
+        .artifact_resolve_visible(
+            &a.sha256,
+            a.workspace_hash.as_deref(),
+            a.requesting_agent_id.as_deref(),
+        )
+        .map_err(|e| format!("artifact verify failed: {}", e))?;
+    let binding = bindings
+        .first()
+        .ok_or_else(|| "artifact verify resolved no visible binding".to_string())?;
+    let all_matches = find_exact_matches(&bytes, &needle, a.max_matches as usize + 1);
+    let truncated = all_matches.len() > a.max_matches as usize;
+    let matches: Vec<_> = all_matches
+        .into_iter()
+        .take(a.max_matches as usize)
+        .map(|(start, end)| db.artifact_anchor(&a.sha256, &bytes, start, end))
+        .collect();
+    Ok(json!({
+        "sha256": a.sha256,
+        "candidate_encoding": a.encoding,
+        "candidate_byte_length": needle.len(),
+        "match_count": matches.len(),
+        "truncated": truncated,
+        "matches": matches,
+        "why_served": artifact_why_served(binding, "candidate verified against original artifact bytes"),
     })
     .to_string())
 }
@@ -8715,6 +9293,268 @@ mod tests {
         .unwrap_err();
         assert!(err.contains("not found"), "{err}");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn artifact_register_manifest_excerpt_and_verify_round_trip() {
+        let (db, path) = temp_db();
+        let source = std::env::temp_dir().join(format!("artifact-{}.log", uuid::Uuid::new_v4()));
+        std::fs::write(&source, "alpha\nbeta\ngamma\n").unwrap();
+
+        let registered: Value = serde_json::from_str(
+            &handle_artifact_register(
+                &db,
+                json!({
+                    "path": source.to_string_lossy(),
+                    "workspace_hash": "ws-art",
+                    "external_refs": [{"ref_type":"file","ref_value":source.to_string_lossy()}]
+                }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let sha = registered["sha256"].as_str().unwrap();
+        assert_eq!(registered["artifact_action"], json!("created"));
+        assert_eq!(registered["binding_action"], json!("created"));
+        assert_eq!(registered["manifest"]["structure"]["utf8_text"], json!(true));
+        assert_eq!(registered["manifest"]["visible_binding_count"], json!(1));
+
+        let excerpt: Value = serde_json::from_str(
+            &handle_artifact_excerpt(
+                &db,
+                json!({"sha256": sha, "workspace_hash": "ws-art", "line_start": 2, "line_end": 3}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(excerpt["content_utf8"], json!("beta\ngamma\n"));
+        assert_eq!(excerpt["anchors"][0]["line_start"], json!(2));
+        assert_eq!(excerpt["anchors"][0]["line_end"], json!(3));
+
+        let verified: Value = serde_json::from_str(
+            &handle_artifact_verify_value(
+                &db,
+                json!({"sha256": sha, "workspace_hash": "ws-art", "candidate": "beta\ngamma\n"}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(verified["match_count"], json!(1));
+        assert_eq!(verified["matches"][0]["line_start"], json!(2));
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&source);
+    }
+
+    #[test]
+    fn artifact_log_digest_is_derived_navigation_with_exact_source_anchors() {
+        let (db, path) = temp_db();
+        let source = std::env::temp_dir().join(format!("digest-{}.log", uuid::Uuid::new_v4()));
+        std::fs::write(
+            &source,
+            "CI job=100 passed\nCI job=101 passed\nERROR deploy timeout id=22\nCI job=102 passed\n",
+        )
+        .unwrap();
+        let registered: Value = serde_json::from_str(
+            &handle_artifact_register(
+                &db,
+                json!({"path": source.to_string_lossy(), "workspace_hash": "ws-digest"}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let source_sha = registered["sha256"].as_str().unwrap();
+        let first = handle_artifact_log_digest(
+            &db,
+            json!({"sha256": source_sha, "workspace_hash": "ws-digest"}),
+        )
+        .unwrap();
+        let second = handle_artifact_log_digest(
+            &db,
+            json!({"sha256": source_sha, "workspace_hash": "ws-digest"}),
+        )
+        .unwrap();
+        let a: Value = serde_json::from_str(&first).unwrap();
+        let b: Value = serde_json::from_str(&second).unwrap();
+        assert_eq!(a, b, "same input + config must be byte-stable in content");
+        assert_eq!(a["digest"]["protected_line_count"], json!(1));
+        assert_eq!(a["digest"]["protected_lines"][0][0], json!("ERROR deploy timeout id=22"));
+        assert_eq!(a["digest"]["sections"][0]["count"], json!(3));
+        assert_eq!(a["representation"]["kind"], json!("derived"));
+        assert_eq!(a["representation"]["derived_from_sha256"], json!(source_sha));
+        assert_ne!(a["derived_artifact_sha256"], json!(source_sha));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&source);
+    }
+
+    #[test]
+    fn artifact_register_dedupes_same_bytes_but_keeps_scope_isolation() {
+        let (db, path) = temp_db();
+        let source = std::env::temp_dir().join(format!("artifact-{}.txt", uuid::Uuid::new_v4()));
+        std::fs::write(&source, "same bytes").unwrap();
+
+        let first: Value = serde_json::from_str(
+            &handle_artifact_register(
+                &db,
+                json!({"path": source.to_string_lossy(), "workspace_hash": "ws-a"}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let second: Value = serde_json::from_str(
+            &handle_artifact_register(
+                &db,
+                json!({"path": source.to_string_lossy(), "workspace_hash": "ws-a"}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let third: Value = serde_json::from_str(
+            &handle_artifact_register(
+                &db,
+                json!({"path": source.to_string_lossy(), "workspace_hash": "ws-b"}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(first["sha256"], second["sha256"]);
+        assert_eq!(first["sha256"], third["sha256"]);
+        assert_eq!(second["artifact_action"], json!("existing"));
+        assert_eq!(second["binding_action"], json!("existing"));
+        assert_eq!(third["artifact_action"], json!("existing"));
+        assert_eq!(third["binding_action"], json!("created"));
+
+        let ws_a: Value = serde_json::from_str(
+            &handle_artifact_manifest(
+                &db,
+                json!({"sha256": first["sha256"], "workspace_hash": "ws-a"}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let ws_b: Value = serde_json::from_str(
+            &handle_artifact_manifest(
+                &db,
+                json!({"sha256": first["sha256"], "workspace_hash": "ws-b"}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(ws_a["bindings"][0]["workspace_hash"], json!("ws-a"));
+        assert_eq!(ws_b["bindings"][0]["workspace_hash"], json!("ws-b"));
+        let err = handle_artifact_manifest(&db, json!({"sha256": first["sha256"]})).unwrap_err();
+        assert!(err.contains("not found"), "{err}");
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&source);
+    }
+
+    #[test]
+    fn artifact_manifest_and_excerpt_enforce_visibility_before_serving() {
+        let (db, path) = temp_db();
+        let source = std::env::temp_dir().join(format!("artifact-private-{}.txt", uuid::Uuid::new_v4()));
+        std::fs::write(&source, "secret line\n").unwrap();
+
+        let registered: Value = serde_json::from_str(
+            &handle_artifact_register(
+                &db,
+                json!({
+                    "path": source.to_string_lossy(),
+                    "workspace_hash": "ws-private",
+                    "agent_id": "alice",
+                    "visibility": "private"
+                }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let sha = registered["sha256"].as_str().unwrap();
+
+        let err = handle_artifact_manifest(
+            &db,
+            json!({"sha256": sha, "workspace_hash": "ws-private", "requesting_agent_id": "bob"}),
+        )
+        .unwrap_err();
+        assert!(err.contains("not found"), "{err}");
+
+        let allowed: Value = serde_json::from_str(
+            &handle_artifact_excerpt(
+                &db,
+                json!({
+                    "sha256": sha,
+                    "workspace_hash": "ws-private",
+                    "requesting_agent_id": "alice",
+                    "byte_start": 0,
+                    "byte_end": 6
+                }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(allowed["content_utf8"], json!("secret"));
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&source);
+    }
+
+    #[test]
+    fn artifact_register_rejects_compressed_inputs_and_short_parent_hashes() {
+        let (db, path) = temp_db();
+        let source = std::env::temp_dir().join(format!("artifact-{}.gz", uuid::Uuid::new_v4()));
+        std::fs::write(&source, b"pretend gzip").unwrap();
+        let err = handle_artifact_register(
+            &db,
+            json!({"path": source.to_string_lossy()}),
+        )
+        .unwrap_err();
+        assert!(err.contains("uncompressed"), "{err}");
+
+        let plain = std::env::temp_dir().join(format!("artifact-{}.txt", uuid::Uuid::new_v4()));
+        std::fs::write(&plain, b"derived body").unwrap();
+        let err = handle_artifact_register(
+            &db,
+            json!({
+                "path": plain.to_string_lossy(),
+                "representation": {"kind":"derived", "derived_from_sha256":"abc123"}
+            }),
+        )
+        .unwrap_err();
+        assert!(err.contains("full 64-hex"), "{err}");
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&source);
+        let _ = std::fs::remove_file(&plain);
+    }
+
+    #[test]
+    fn artifact_register_detects_hash_collision_or_corrupted_stored_bytes() {
+        let (db, path) = temp_db();
+        let source = std::env::temp_dir().join(format!("artifact-collision-{}.txt", uuid::Uuid::new_v4()));
+        std::fs::write(&source, b"true bytes").unwrap();
+        use base64::Engine as _;
+        let good_sha = {
+            use sha2::{Digest, Sha256};
+            format!("{:x}", Sha256::digest(b"true bytes"))
+        };
+        let bad_b64 = base64::engine::general_purpose::STANDARD.encode(b"other bytes");
+        let conn = db.conn().unwrap();
+        conn.execute(
+            "INSERT INTO artifacts (sha256, content_b64, byte_length, created_at_unix_ms)
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![good_sha, bad_b64, 10i64, crate::db::now_ms()],
+        )
+        .unwrap();
+        drop(conn);
+
+        let err = handle_artifact_register(
+            &db,
+            json!({"path": source.to_string_lossy(), "workspace_hash": "ws-collision"}),
+        )
+        .unwrap_err();
+        assert!(err.contains("collision") || err.contains("corrupted"), "{err}");
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&source);
     }
 }
 

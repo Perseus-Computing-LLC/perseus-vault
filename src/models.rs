@@ -1356,3 +1356,115 @@ pub struct ExternalRef {
     pub relationship: Option<String>,
 }
 
+/// Canonical retention-policy vocabulary from
+/// docs/specs/source-anchors-corrections-retention.md §3.
+pub const RETENTION_POLICIES: [&str; 5] = [
+    "keep_forever",
+    "decay_unless_reinforced",
+    "archive_when_superseded",
+    "retain_no_autoserve",
+    "erase_on",
+];
+
+/// Artifact representation semantics (#811). Original bytes are always preserved;
+/// derived representations point back to their immutable source artifact.
+pub const ARTIFACT_REPRESENTATION_KINDS: [&str; 2] = ["original", "derived"];
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ArtifactRepresentation {
+    /// original | derived
+    #[serde(default = "default_artifact_representation_kind")]
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub derived_from_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub derivation_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub derivation_version: Option<String>,
+}
+
+fn default_artifact_representation_kind() -> String {
+    "original".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArtifactBinding {
+    pub binding_id: String,
+    pub sha256: String,
+    pub mime_type: String,
+    pub workspace_hash: String,
+    pub agent_id: String,
+    pub visibility: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<OriginRecord>,
+    #[serde(default)]
+    pub external_refs: Vec<ExternalRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention_policy: Option<String>,
+    pub representation: ArtifactRepresentation,
+    pub created_at_unix_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ArtifactWhyServed {
+    pub reason: String,
+    pub workspace_hash: String,
+    pub visibility: String,
+    pub anchors: Vec<ExternalRef>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ArtifactManifestBinding {
+    pub binding_id: String,
+    pub mime_type: String,
+    pub workspace_hash: String,
+    pub agent_id: String,
+    pub visibility: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin: Option<OriginRecord>,
+    pub external_refs: Vec<ExternalRef>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retention_policy: Option<String>,
+    pub representation: ArtifactRepresentation,
+    pub created_at_unix_ms: i64,
+    pub why_served: ArtifactWhyServed,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ArtifactStructure {
+    pub utf8_text: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line_count: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trailing_newline: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ArtifactRetrievalCapabilities {
+    pub byte_range: bool,
+    pub line_range: bool,
+    pub verify_value: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ArtifactManifest {
+    pub sha256: String,
+    pub byte_length: i64,
+    pub structure: ArtifactStructure,
+    pub significant_signals: Vec<String>,
+    pub available_retrievals: ArtifactRetrievalCapabilities,
+    pub visible_binding_count: i64,
+    pub bindings: Vec<ArtifactManifestBinding>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ArtifactAnchor {
+    pub sha256: String,
+    pub byte_start: i64,
+    pub byte_end: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line_start: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line_end: Option<i64>,
+}
+

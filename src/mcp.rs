@@ -2036,6 +2036,150 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Ingest Document File"
   },
   {
+    "name": "mimir_artifact_register",
+    "description": "Register an immutable artifact by reading a local file, hashing its exact bytes with full SHA-256, and storing a scope-bound metadata binding plus the preserved original bytes. Returns the compact deterministic manifest by default. This first slice accepts only uncompressed source bytes so retrieval anchors stay exact to the original artifact.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "path": { "type": "string", "description": "Local file path to register" },
+        "mime_type": { "type": "string", "description": "Optional MIME type override; otherwise inferred from the file extension" },
+        "workspace_hash": { "type": "string", "default": "", "description": "Workspace scope for the metadata binding. Omit/empty = global." },
+        "agent_id": { "type": "string", "default": "", "description": "Owning agent id for visibility checks." },
+        "visibility": { "type": "string", "default": "workspace", "description": "private | fleet | workspace | tenant | public" },
+        "origin": { "type": "object", "description": "Optional origin/provenance metadata using the existing memory-origin contract." },
+        "external_refs": { "type": "array", "items": { "type": "object" }, "description": "Optional external source anchors; pointers only, never access grants." },
+        "retention_policy": { "type": "string", "description": "Optional retention policy from the existing vocabulary." },
+        "representation": { "type": "object", "description": "original or derived representation metadata; derived artifacts must point at a full parent SHA-256." }
+      },
+      "required": ["path"]
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "sha256": { "type": "string" },
+        "artifact_action": { "type": "string" },
+        "binding_action": { "type": "string" },
+        "manifest": { "type": "object" }
+      }
+    },
+    "annotations": {
+      "destructiveHint": true
+    },
+    "title": "Register Immutable Artifact"
+  },
+  {
+    "name": "mimir_artifact_manifest",
+    "description": "Serve the compact deterministic manifest for one artifact identity after scope + visibility filtering. When workspace_hash is omitted, only global bindings are considered — an artifact hash alone is a pointer, not an access grant.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "sha256": { "type": "string", "description": "Full 64-hex SHA-256 content identity" },
+        "workspace_hash": { "type": "string", "description": "Exact workspace scope to read; omit for global-only." },
+        "requesting_agent_id": { "type": "string", "description": "Optional requesting agent id for visibility filtering." }
+      },
+      "required": ["sha256"]
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "sha256": { "type": "string" },
+        "byte_length": { "type": "integer" },
+        "structure": { "type": "object" },
+        "significant_signals": { "type": "array", "items": { "type": "string" } },
+        "available_retrievals": { "type": "object" },
+        "visible_binding_count": { "type": "integer" },
+        "bindings": { "type": "array", "items": { "type": "object" } }
+      }
+    },
+    "title": "Serve Artifact Manifest"
+  },
+  {
+    "name": "mimir_artifact_excerpt",
+    "description": "Retrieve an exact bounded excerpt from the preserved original artifact bytes by either a half-open byte range [start,end) or an inclusive 1-indexed line range. Returns exact source anchors plus base64 bytes, and UTF-8 text when the slice decodes cleanly.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "sha256": { "type": "string", "description": "Full 64-hex SHA-256 content identity" },
+        "workspace_hash": { "type": "string", "description": "Exact workspace scope to read; omit for global-only." },
+        "requesting_agent_id": { "type": "string", "description": "Optional requesting agent id for visibility filtering." },
+        "byte_start": { "type": "integer", "description": "Byte-range start offset (inclusive)" },
+        "byte_end": { "type": "integer", "description": "Byte-range end offset (exclusive)" },
+        "line_start": { "type": "integer", "description": "Line-range start (1-indexed, inclusive)" },
+        "line_end": { "type": "integer", "description": "Line-range end (1-indexed, inclusive)" }
+      },
+      "required": ["sha256"]
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "sha256": { "type": "string" },
+        "range": { "type": "object" },
+        "content_b64": { "type": "string" },
+        "content_utf8": { "type": ["string", "null"] },
+        "anchors": { "type": "array", "items": { "type": "object" } },
+        "why_served": { "type": "object" }
+      }
+    },
+    "title": "Retrieve Exact Artifact Excerpt"
+  },
+  {
+    "name": "mimir_artifact_log_digest",
+    "description": "Build a deterministic, evidence-preserving navigation digest over a visible UTF-8 log artifact. Repeated non-protected templates are collapsed with exact counts and first/last source anchors. Lines containing error, warn, exception, fatal, panic, denied, refused, timeout, assertion, or traceback remain verbatim. This is never an LLM summary or replacement for original bytes.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "sha256": { "type": "string", "description": "Full 64-hex SHA-256 content identity" },
+        "workspace_hash": { "type": "string", "description": "Exact workspace scope to read; omit for global-only." },
+        "requesting_agent_id": { "type": "string", "description": "Optional requesting agent id for visibility filtering." }
+      },
+      "required": ["sha256"]
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "format": { "type": "string" },
+        "source_sha256": { "type": "string" },
+        "config_version": { "type": "string" },
+        "input_line_count": { "type": "integer" },
+        "omitted_line_count": { "type": "integer" },
+        "protected_line_count": { "type": "integer" },
+        "sections": { "type": "array", "items": { "type": "object" } },
+        "protected_lines": { "type": "array", "items": { "type": "array" } },
+        "retrieval": { "type": "string" }
+      }
+    },
+    "title": "Build Deterministic Evidence-Preserving Log Digest"
+  },
+  {
+    "name": "mimir_artifact_verify_value",
+    "description": "Verify that a candidate value occurs verbatim in the preserved original artifact bytes, with bounded exact-match search only (no regex). Returns exact source anchors for each match found.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "sha256": { "type": "string", "description": "Full 64-hex SHA-256 content identity" },
+        "workspace_hash": { "type": "string", "description": "Exact workspace scope to read; omit for global-only." },
+        "requesting_agent_id": { "type": "string", "description": "Optional requesting agent id for visibility filtering." },
+        "candidate": { "type": "string", "description": "Candidate value to verify: UTF-8 text by default, or base64 when encoding='base64'." },
+        "encoding": { "type": "string", "default": "utf8", "description": "utf8 | base64" },
+        "max_matches": { "type": "integer", "default": 5, "description": "Maximum exact-match anchors to return (bounded)." }
+      },
+      "required": ["sha256", "candidate"]
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "sha256": { "type": "string" },
+        "candidate_encoding": { "type": "string" },
+        "candidate_byte_length": { "type": "integer" },
+        "match_count": { "type": "integer" },
+        "truncated": { "type": "boolean" },
+        "matches": { "type": "array", "items": { "type": "object" } },
+        "why_served": { "type": "object" }
+      }
+    },
+    "title": "Verify Candidate Against Original Artifact Bytes"
+  },
+  {
     "name": "mimir_embed",
     "description": "Generate and store dense vector embeddings for entities via Ollama /api/embed. Supports single entity (category+key) or batch mode (batch_category). Requires --llm-endpoint to be set.",
     "inputSchema": {
@@ -4987,6 +5131,22 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
 
         "mimir_ingest_file" => tools::handle_ingest_file(db, args).map_err(|e| e.to_string()),
 
+        "mimir_artifact_register" => {
+            tools::handle_artifact_register(db, args).map_err(|e| e.to_string())
+        }
+        "mimir_artifact_manifest" => {
+            tools::handle_artifact_manifest(db, args).map_err(|e| e.to_string())
+        }
+        "mimir_artifact_excerpt" => {
+            tools::handle_artifact_excerpt(db, args).map_err(|e| e.to_string())
+        }
+        "mimir_artifact_log_digest" => {
+            tools::handle_artifact_log_digest(db, args).map_err(|e| e.to_string())
+        }
+        "mimir_artifact_verify_value" => {
+            tools::handle_artifact_verify_value(db, args).map_err(|e| e.to_string())
+        }
+
         "mimir_embed" => tools::handle_embed(db, args).map_err(|e| e.to_string()),
 
         "mimir_prune" => tools::handle_prune(db, args).map_err(|e| e.to_string()),
@@ -5922,6 +6082,46 @@ mod tests {
         assert_eq!(keys(&all).len(), 2, "no filter should return both");
 
         let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn artifact_tools_advertise_canonical_names_and_dispatch_aliases() {
+        let names = advertised_names(false);
+        for name in [
+            "perseus_vault_artifact_register",
+            "perseus_vault_artifact_manifest",
+            "perseus_vault_artifact_excerpt",
+            "perseus_vault_artifact_log_digest",
+            "perseus_vault_artifact_verify_value",
+        ] {
+            assert!(names.contains(&name.to_string()), "canonical list must advertise {name}");
+        }
+
+        let db_path = std::env::temp_dir().join(format!("mimir-artifact-tools-{}.db", uuid::Uuid::new_v4()));
+        let db = Database::open(db_path.to_str().expect("temp db path")).expect("open temp db");
+        let source = std::env::temp_dir().join(format!("artifact-mcp-{}.txt", uuid::Uuid::new_v4()));
+        std::fs::write(&source, "artifact via MCP\n").unwrap();
+
+        let registered = call_tool(
+            "perseus_vault_artifact_register",
+            &db,
+            json!({"path": source.to_string_lossy(), "workspace_hash": "ws-mcp"}),
+            None,
+        );
+        let rv: Value = serde_json::from_str(&registered).unwrap();
+        let sha = rv["sha256"].as_str().unwrap();
+
+        let manifest = call_tool(
+            "mneme_artifact_manifest",
+            &db,
+            json!({"sha256": sha, "workspace_hash": "ws-mcp"}),
+            None,
+        );
+        let mv: Value = serde_json::from_str(&manifest).unwrap();
+        assert_eq!(mv["sha256"], json!(sha));
+
+        let _ = fs::remove_file(db_path);
+        let _ = std::fs::remove_file(source);
     }
 
     #[test]
