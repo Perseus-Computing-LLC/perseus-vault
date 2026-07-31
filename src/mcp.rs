@@ -2123,6 +2123,34 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Retrieve Exact Artifact Excerpt"
   },
   {
+    "name": "mimir_artifact_log_digest",
+    "description": "Build a deterministic, evidence-preserving navigation digest over a visible UTF-8 log artifact. Repeated non-protected templates are collapsed with exact counts and first/last source anchors. Lines containing error, warn, exception, fatal, panic, denied, refused, timeout, assertion, or traceback remain verbatim. This is never an LLM summary or replacement for original bytes.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "sha256": { "type": "string", "description": "Full 64-hex SHA-256 content identity" },
+        "workspace_hash": { "type": "string", "description": "Exact workspace scope to read; omit for global-only." },
+        "requesting_agent_id": { "type": "string", "description": "Optional requesting agent id for visibility filtering." }
+      },
+      "required": ["sha256"]
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "format": { "type": "string" },
+        "source_sha256": { "type": "string" },
+        "config_version": { "type": "string" },
+        "input_line_count": { "type": "integer" },
+        "omitted_line_count": { "type": "integer" },
+        "protected_line_count": { "type": "integer" },
+        "sections": { "type": "array", "items": { "type": "object" } },
+        "protected_lines": { "type": "array", "items": { "type": "array" } },
+        "retrieval": { "type": "string" }
+      }
+    },
+    "title": "Build Deterministic Evidence-Preserving Log Digest"
+  },
+  {
     "name": "mimir_artifact_verify_value",
     "description": "Verify that a candidate value occurs verbatim in the preserved original artifact bytes, with bounded exact-match search only (no regex). Returns exact source anchors for each match found.",
     "inputSchema": {
@@ -5112,6 +5140,9 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
         "mimir_artifact_excerpt" => {
             tools::handle_artifact_excerpt(db, args).map_err(|e| e.to_string())
         }
+        "mimir_artifact_log_digest" => {
+            tools::handle_artifact_log_digest(db, args).map_err(|e| e.to_string())
+        }
         "mimir_artifact_verify_value" => {
             tools::handle_artifact_verify_value(db, args).map_err(|e| e.to_string())
         }
@@ -6060,6 +6091,7 @@ mod tests {
             "perseus_vault_artifact_register",
             "perseus_vault_artifact_manifest",
             "perseus_vault_artifact_excerpt",
+            "perseus_vault_artifact_log_digest",
             "perseus_vault_artifact_verify_value",
         ] {
             assert!(names.contains(&name.to_string()), "canonical list must advertise {name}");

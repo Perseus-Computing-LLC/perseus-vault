@@ -3,6 +3,7 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::db::{now_ms, Database};
+use crate::log_digest;
 use crate::models::{
     ArtifactRepresentation, Entity, ExternalRef, JournalEvent, OriginRecord, SearchMode,
     StateEntry, TimelineParams,
@@ -4167,6 +4168,15 @@ fn default_artifact_max_matches() -> i64 {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct ArtifactDigestArgs {
+    pub sha256: String,
+    #[serde(default)]
+    pub workspace_hash: Option<String>,
+    #[serde(default)]
+    pub requesting_agent_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct ArtifactVerifyArgs {
     pub sha256: String,
     #[serde(default)]
@@ -4606,6 +4616,62 @@ pub fn handle_artifact_excerpt(db: &Database, args: Value) -> Result<String, Str
         "why_served": artifact_why_served(binding, "exact artifact excerpt requested"),
     })
     .to_string())
+}
+
+pub fn handle_artifact_log_digest(db: &Database, args: Value) -> Result<String, String> {
+    let a: ArtifactDigestArgs = serde_json::from_value(args)
+        .map_err(|e| format!("Invalid artifact_log_digest arguments: {}", e))?;
+    if !is_sha256_hex(&a.sha256) {
+        return Err(format!("sha256 must be a full 64-hex SHA-256, got '{}'", a.sha256));
+    }
+    // Resolve bytes only through the original artifact contract, which applies
+    // workspace + visibility filtering before any aggregate count/template is built.
+    let (bytes, bindings) = db
+        .artifact_resolve_visible(
+            &a.sha256,
+            a.workspace_hash.as_deref(),
+            a.requesting_agent_id.as_deref(),
+        )
+        .map_err(|e| format!("artifact log digest failed: {}", e))?;
+    let binding = bindings
+        .first()
+        .ok_or_else(|| "artifact log digest resolved no visible binding".to_string())?;
+    let digest = log_digest::digest(&a.sha256, &bytes, |start, end| {
+        db.artifact_anchor(&a.sha256, &bytes, start, end)
+    })?;
+    let digest_bytes = serde_json::to_vec(&digest)
+        .map_err(|e| format!("digest serialization failed: {}", e))?;
+    // The navigation view is itself versioned derivative data. It never replaces
+    // the source artifact and inherits only an already-visible binding's scope.
+    let (derived_sha256, _artifact_created, _binding_created) = db
+        .artifact_register(
+            &digest_bytes,
+            "application/vnd.perseus-vault.evidence-log-digest+json",
+            &binding.workspace_hash,
+            &binding.agent_id,
+            &binding.visibility,
+            binding.origin.clone(),
+            binding.external_refs.clone(),
+            binding.retention_policy.clone(),
+            ArtifactRepresentation {
+                kind: "derived".to_string(),
+                derived_from_sha256: Some(a.sha256.clone()),
+                derivation_kind: Some("evidence_log_digest".to_string()),
+                derivation_version: Some(log_digest::DIGEST_VERSION.to_string()),
+            },
+        )
+        .map_err(|e| format!("digest derivative registration failed: {}", e))?;
+    serde_json::to_string(&json!({
+        "digest": digest,
+        "derived_artifact_sha256": derived_sha256,
+        "representation": {
+            "kind": "derived",
+            "derived_from_sha256": a.sha256,
+            "derivation_kind": "evidence_log_digest",
+            "derivation_version": log_digest::DIGEST_VERSION,
+        }
+    }))
+    .map_err(|e| format!("Serialization failed: {}", e))
 }
 
 pub fn handle_artifact_verify_value(db: &Database, args: Value) -> Result<String, String> {
@@ -9276,6 +9342,47 @@ mod tests {
         assert_eq!(verified["match_count"], json!(1));
         assert_eq!(verified["matches"][0]["line_start"], json!(2));
 
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&source);
+    }
+
+    #[test]
+    fn artifact_log_digest_is_derived_navigation_with_exact_source_anchors() {
+        let (db, path) = temp_db();
+        let source = std::env::temp_dir().join(format!("digest-{}.log", uuid::Uuid::new_v4()));
+        std::fs::write(
+            &source,
+            "CI job=100 passed\nCI job=101 passed\nERROR deploy timeout id=22\nCI job=102 passed\n",
+        )
+        .unwrap();
+        let registered: Value = serde_json::from_str(
+            &handle_artifact_register(
+                &db,
+                json!({"path": source.to_string_lossy(), "workspace_hash": "ws-digest"}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let source_sha = registered["sha256"].as_str().unwrap();
+        let first = handle_artifact_log_digest(
+            &db,
+            json!({"sha256": source_sha, "workspace_hash": "ws-digest"}),
+        )
+        .unwrap();
+        let second = handle_artifact_log_digest(
+            &db,
+            json!({"sha256": source_sha, "workspace_hash": "ws-digest"}),
+        )
+        .unwrap();
+        let a: Value = serde_json::from_str(&first).unwrap();
+        let b: Value = serde_json::from_str(&second).unwrap();
+        assert_eq!(a, b, "same input + config must be byte-stable in content");
+        assert_eq!(a["digest"]["protected_line_count"], json!(1));
+        assert_eq!(a["digest"]["protected_lines"][0][0], json!("ERROR deploy timeout id=22"));
+        assert_eq!(a["digest"]["sections"][0]["count"], json!(3));
+        assert_eq!(a["representation"]["kind"], json!("derived"));
+        assert_eq!(a["representation"]["derived_from_sha256"], json!(source_sha));
+        assert_ne!(a["derived_artifact_sha256"], json!(source_sha));
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&source);
     }

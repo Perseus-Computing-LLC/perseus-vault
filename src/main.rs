@@ -13,6 +13,7 @@ mod extraction;
 #[cfg(all(feature = "bundled-embeddings", target_os = "linux", target_env = "gnu"))]
 mod glibc_compat;
 mod httplimit;
+mod log_digest;
 mod mcp;
 mod models;
 mod multimodal;
