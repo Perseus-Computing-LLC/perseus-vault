@@ -89,6 +89,70 @@ the heavy lifting: keep it on (it is, by default). `gate.py` locks this in
 
 Still pending (model-weight axis): the FP16/BF16 row and NVFP4 — #629.
 
+## v2.22.0 — release-validation baseline (2026-07-31)
+
+**Scope.** Fresh internal release validation after the v2.22.0 deployment. Every
+result below is a measured run, pinned to `perseus-vault 2.22.0` revision
+`a9524e9`; scale runs use Lambda H100 hardware and LongMemEval is a
+retrieval-only measurement. These rows do **not** replace the separately
+validated public LongMemEval official-CoT QA result.
+
+### Exact 10K 2×H100 comparison
+
+10,000 entities; 1,250 clusters × 8; 2,500 queries; Lambda `gpu_2x_h100_sxm5`.
+
+| Metric | Prior canonical | v2.22 | Delta |
+| --- | ---: | ---: | ---: |
+| hybrid recall@1 | 0.900 | 0.897 | -0.003 |
+| hybrid recall@5 | 1.000 | 0.999 | -0.001 |
+| hybrid recall@10 | 1.000 | 1.000 | 0.000 |
+| hybrid p50 @1 | 39.6 ms | 36.2 ms | -3.4 ms |
+| hybrid p50 @5 | 39.8 ms | 36.8 ms | -3.0 ms |
+| hybrid p50 @10 | 40.6 ms | 38.0 ms | -2.6 ms |
+
+**Result:** no material retrieval regression; modest latency improvement.
+
+### Exact 100K 1×H100 comparison
+
+100,000 entities; 1,000 clusters × 100; 2,000 queries; Lambda
+`gpu_1x_h100_sxm5`; local `nomic-embed-text` endpoint.
+
+| Metric | Prior canonical | v2.22 | Delta |
+| --- | ---: | ---: | ---: |
+| hybrid recall@1 | 0.785 | 0.878 | +0.093 |
+| hybrid recall@5 | 1.000 | 1.000 | 0.000 |
+| hybrid recall@10 | 1.000 | 1.000 | 0.000 |
+| hybrid p50 @1 | 94.7 ms | 52.9 ms | -41.8 ms |
+| hybrid p50 @5 | 93.1 ms | 53.0 ms | -40.1 ms |
+| hybrid p50 @10 | 95.6 ms | 53.9 ms | -41.7 ms |
+| dense recall@1 | 0.680 | 0.711 | +0.031 |
+| dense recall@5 | 0.859 | 0.875 | +0.016 |
+| dense recall@10 | 0.899 | 0.910 | +0.011 |
+
+v2.22 seed throughput was 202.4 entities/s; embedding throughput was 47.0
+entities/s, with 99,526 stored vectors. This clears the R2 acceptance targets:
+hybrid recall@5 = 1.0 and hybrid p50 <100 ms at 100K.
+
+### Shared-memory, live serving, and LongMemEval retrieval
+
+- **Shared-memory scale:** 16 isolated concurrent MCP agents: shared retrieval
+  1.000, private-memory isolation 1.000, recall p95 9.236 ms against a 250 ms
+  budget — **PASS**. This is a single-host isolation/concurrency result, not a
+  multi-node claim.
+- **Live flywheel:** after deployment of the full bundled-embedding v2.22 image,
+  the combined live run verdict was **PROMOTE**: lifecycle 10/10, AAR 7/7,
+  Cycle 3 8/8, Cycle 4 5/5, adversarial 14/14, chaos 7/7, and
+  context-to-receipt 6/6.
+- **LongMemEval `_s`, retrieval-only:** 500 questions / 23,867 sessions; explicit
+  bundled-ONNX embedding population before query. Auto and hybrid both measured
+  recall@1 **84.6%**, recall@5 **97.4%**, recall@10 **99.2%**, MRR **0.903**;
+  dense was 76.8% / 93.2% / 97.2% / 0.842 and FTS5 was 4.2% / 23.4% /
+  42.2% / 0.126. This is not a QA-accuracy claim.
+
+Artifacts: `benchmark-runs/v2.22-release-validation-2026-07-31.md` in the
+release evidence archive; the live flywheel artifact is
+`/opt/data/benchmark-runs/v222-live-flywheel-20260730T234705Z/`.
+
 ## #530 — GPU contention + agent economics: recall unaffected at 100% accelerator load
 
 Not an optimization — a measured property of the architecture, recorded here
