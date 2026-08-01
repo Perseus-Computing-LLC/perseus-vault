@@ -231,6 +231,8 @@ pub struct AuthorityManifestInput {
     pub mode: String,
     #[serde(default)]
     pub expires_at_unix_ms: Option<i64>,
+    #[serde(default)]
+    pub capability_constraints_json: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -250,6 +252,8 @@ pub struct AuthorityManifest {
     pub expires_at_unix_ms: Option<i64>,
     pub revoked_at_unix_ms: Option<i64>,
     pub created_at_unix_ms: i64,
+    #[serde(default)]
+    pub capability_constraints_json: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -270,6 +274,10 @@ pub struct AuthorizedAction {
     pub approval_ref: String,
     pub created_at_unix_ms: i64,
     pub updated_at_unix_ms: i64,
+    #[serde(default)]
+    pub resource_constraints_json: String,
+    #[serde(default)]
+    pub resource_constraints_hash: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
