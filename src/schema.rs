@@ -942,7 +942,8 @@ fn apply_migrations(conn: &Connection) -> Result<(), Box<dyn std::error::Error>>
             approver_principals TEXT NOT NULL DEFAULT '[]', allowed_inbound_principals TEXT NOT NULL DEFAULT '[]',
             permitted_external_ref_prefixes TEXT NOT NULL DEFAULT '[]', max_parallel_actions INTEGER NOT NULL DEFAULT 1,
             mode TEXT NOT NULL DEFAULT 'shadow', expires_at_unix_ms INTEGER, revoked_at_unix_ms INTEGER,
-            created_at_unix_ms INTEGER NOT NULL, UNIQUE(agent_id, workspace_hash, version));
+            created_at_unix_ms INTEGER NOT NULL,
+            UNIQUE(agent_id, workspace_hash, version));
          CREATE INDEX IF NOT EXISTS idx_authority_active ON authority_manifests(agent_id, workspace_hash, revoked_at_unix_ms, version DESC);
          CREATE TABLE IF NOT EXISTS authorized_actions (
             id TEXT PRIMARY KEY, manifest_id TEXT NOT NULL REFERENCES authority_manifests(id), manifest_version INTEGER NOT NULL DEFAULT 0,
@@ -963,6 +964,11 @@ fn apply_migrations(conn: &Connection) -> Result<(), Box<dyn std::error::Error>>
     ensure_column(conn, "authorized_actions", "manifest_version", "INTEGER NOT NULL DEFAULT 0")?;
     ensure_column(conn, "authorized_actions", "external_ref", "TEXT NOT NULL DEFAULT ''")?;
     ensure_column(conn, "authorized_actions", "outcome_hash", "TEXT NOT NULL DEFAULT ''")?;
+    ensure_column(conn, "authority_manifests", "capability_constraints_json", "TEXT NOT NULL DEFAULT '{}'")?;
+    ensure_column(conn, "authorized_actions", "resource_constraints_json", "TEXT NOT NULL DEFAULT '{}'")?;
+    ensure_column(conn, "authorized_actions", "resource_constraints_hash", "TEXT NOT NULL DEFAULT ''")?;
+    // #10 resource constraints are hash-only lifecycle metadata. Legacy rows
+    // remain readable with NULL/empty defaults; opted-in actions populate them.
     // ── end v24 ──────────────────────────────────────────────────────────
 
     // ── v25 (#811 Immutable artifacts) ───────────────────────────────────

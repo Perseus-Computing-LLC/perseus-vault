@@ -2,6 +2,7 @@ use rusqlite::params;
 use rusqlite::OptionalExtension;
 use serde_json::json;
 use r2d2_sqlite::SqliteConnectionManager;
+use sha2::{Digest, Sha256};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// A connection checked out from the pool. Derefs to `rusqlite::Connection`, so
@@ -20,6 +21,64 @@ use crate::models::{
     PurgeReport, Readiness, RecallParams, StateEntry, Stats, TimelineParams, VaultReport,
 };
 use crate::schema;
+
+fn canonical_constraint_json(raw: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let value: serde_json::Value = serde_json::from_str(raw)?;
+    let object = value.as_object().ok_or("resource constraints must be a JSON object")?;
+    let forbidden = ["raw_arguments", "credentials", "prompt", "card_number", "token", "secret"];
+    if object.keys().any(|key| forbidden.contains(&key.as_str())) {
+        return Err("raw resource constraint fields are not permitted".into());
+    }
+    let mut keys = object.keys().cloned().collect::<Vec<_>>();
+    keys.sort();
+    let mut sorted = serde_json::Map::new();
+    for key in keys {
+        sorted.insert(key.clone(), object[&key].clone());
+    }
+    Ok(serde_json::to_string(&sorted)?)
+}
+
+fn resource_constraints_permit(
+    manifest_json: &str,
+    capability: &str,
+    proposed_json: &str,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let manifest: serde_json::Value = serde_json::from_str(manifest_json)?;
+    let proposed: serde_json::Value = serde_json::from_str(proposed_json)?;
+    let Some(bound) = manifest.get(capability) else {
+        return Ok(true);
+    };
+    let Some(bound) = bound.as_object() else {
+        return Err("capability constraint must be a JSON object".into());
+    };
+    let Some(proposed) = proposed.as_object() else {
+        return Err("resource constraints must be a JSON object".into());
+    };
+    for key in ["resource_ref", "environment", "destination", "merchant_ref", "currency"] {
+        if let Some(expected) = bound.get(key) {
+            if proposed.get(key) != Some(expected) {
+                return Ok(false);
+            }
+        }
+    }
+    if let Some(max_amount) = bound.get("amount_minor").and_then(|value| value.as_i64()) {
+        if proposed.get("amount_minor").and_then(|value| value.as_i64()).map_or(true, |amount| amount > max_amount) {
+            return Ok(false);
+        }
+    }
+    if let Some(max_expiry) = bound.get("expires_at").and_then(|value| value.as_str()) {
+        if proposed.get("expires_at").and_then(|value| value.as_str()).map_or(true, |expiry| expiry > max_expiry) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn constraint_hash(canonical: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(canonical.as_bytes());
+    format!("{:x}", digest.finalize())
+}
 
 // Thread-local holding the chancery writ ID for the current MCP request.
 // When Chancery wraps an MCP server, it stamps `_meta.chancery/lease` on every
@@ -6758,16 +6817,18 @@ impl Database {
         let approvers = serde_json::to_string(&input.approver_principals)?;
         let inbound = serde_json::to_string(&input.allowed_inbound_principals)?;
         let prefixes = serde_json::to_string(&input.permitted_external_ref_prefixes)?;
+        let capability_constraints = canonical_constraint_json(&input.capability_constraints_json)?;
         conn.execute(
             "INSERT INTO authority_manifests
              (id, agent_id, workspace_hash, version, allowed_capabilities,
               approval_required_capabilities, scope_anchors, approver_principals,
               allowed_inbound_principals, permitted_external_ref_prefixes, max_parallel_actions,
-              mode, expires_at_unix_ms, revoked_at_unix_ms, created_at_unix_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, NULL, ?14)",
+              mode, expires_at_unix_ms, revoked_at_unix_ms, created_at_unix_ms,
+              capability_constraints_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, NULL, ?14, ?15)",
             params![id, input.agent_id, input.workspace_hash, version, allowed,
                     approvals, anchors, approvers, inbound, prefixes, input.max_parallel_actions,
-                    input.mode, input.expires_at_unix_ms, now],
+                    input.mode, input.expires_at_unix_ms, now, capability_constraints],
         )?;
         let manifest = AuthorityManifest {
             id,
@@ -6785,6 +6846,7 @@ impl Database {
             expires_at_unix_ms: input.expires_at_unix_ms,
             revoked_at_unix_ms: None,
             created_at_unix_ms: now,
+            capability_constraints_json: capability_constraints.clone(),
         };
         drop(conn);
         self.journal(&JournalEvent {
@@ -6814,6 +6876,7 @@ impl Database {
             permitted_external_ref_prefixes: serde_json::from_str(&r.get::<_, String>(9)?).unwrap_or_default(),
             max_parallel_actions: r.get(10)?, mode: r.get(11)?, expires_at_unix_ms: r.get(12)?,
             revoked_at_unix_ms: r.get(13)?, created_at_unix_ms: r.get(14)?,
+            capability_constraints_json: r.get(15).unwrap_or_else(|_| "{}".to_string()),
         })
     }
 
@@ -6824,11 +6887,13 @@ impl Database {
             action_key: r.get(8)?, intent_hash: r.get(9)?, outcome_hash: r.get(10)?, status: r.get(11)?,
             approval_required: r.get::<_, i64>(12)? != 0, approval_ref: r.get(13)?,
             created_at_unix_ms: r.get(14)?, updated_at_unix_ms: r.get(15)?,
+            resource_constraints_json: r.get(16).unwrap_or_else(|_| "{}".to_string()),
+            resource_constraints_hash: r.get(17).unwrap_or_default(),
         })
     }
 
     fn action_select_sql() -> &'static str {
-        "SELECT id, manifest_id, manifest_version, agent_id, workspace_hash, scope_anchor, external_ref, capability, action_key, intent_hash, outcome_hash, status, approval_required, approval_ref, created_at_unix_ms, updated_at_unix_ms FROM authorized_actions"
+        "SELECT id, manifest_id, manifest_version, agent_id, workspace_hash, scope_anchor, external_ref, capability, action_key, intent_hash, outcome_hash, status, approval_required, approval_ref, created_at_unix_ms, updated_at_unix_ms, resource_constraints_json, resource_constraints_hash FROM authorized_actions"
     }
 
     fn active_authority(&self, agent_id: &str, workspace_hash: &str) -> Result<AuthorityManifest, Box<dyn std::error::Error>> {
@@ -6839,9 +6904,9 @@ impl Database {
         let now = now_ms();
         let conn = self.conn()?;
         let sql = if include_revoked {
-            "SELECT id, agent_id, workspace_hash, version, allowed_capabilities, approval_required_capabilities, scope_anchors, approver_principals, allowed_inbound_principals, permitted_external_ref_prefixes, max_parallel_actions, mode, expires_at_unix_ms, revoked_at_unix_ms, created_at_unix_ms FROM authority_manifests WHERE agent_id=?1 AND workspace_hash=?2 ORDER BY version DESC LIMIT 1"
+            "SELECT id, agent_id, workspace_hash, version, allowed_capabilities, approval_required_capabilities, scope_anchors, approver_principals, allowed_inbound_principals, permitted_external_ref_prefixes, max_parallel_actions, mode, expires_at_unix_ms, revoked_at_unix_ms, created_at_unix_ms, capability_constraints_json FROM authority_manifests WHERE agent_id=?1 AND workspace_hash=?2 ORDER BY version DESC LIMIT 1"
         } else {
-            "SELECT id, agent_id, workspace_hash, version, allowed_capabilities, approval_required_capabilities, scope_anchors, approver_principals, allowed_inbound_principals, permitted_external_ref_prefixes, max_parallel_actions, mode, expires_at_unix_ms, revoked_at_unix_ms, created_at_unix_ms FROM authority_manifests WHERE agent_id=?1 AND workspace_hash=?2 AND revoked_at_unix_ms IS NULL AND (expires_at_unix_ms IS NULL OR expires_at_unix_ms>?3) ORDER BY version DESC LIMIT 1"
+            "SELECT id, agent_id, workspace_hash, version, allowed_capabilities, approval_required_capabilities, scope_anchors, approver_principals, allowed_inbound_principals, permitted_external_ref_prefixes, max_parallel_actions, mode, expires_at_unix_ms, revoked_at_unix_ms, created_at_unix_ms, capability_constraints_json FROM authority_manifests WHERE agent_id=?1 AND workspace_hash=?2 AND revoked_at_unix_ms IS NULL AND (expires_at_unix_ms IS NULL OR expires_at_unix_ms>?3) ORDER BY version DESC LIMIT 1"
         };
         let result = if include_revoked { conn.query_row(sql, params![agent_id, workspace_hash], Self::authority_from_row).optional()? } else { conn.query_row(sql, params![agent_id, workspace_hash, now], Self::authority_from_row).optional()? };
         Ok(result)
@@ -6849,22 +6914,42 @@ impl Database {
 
     pub fn authority_revoke(&self, manifest_id: &str, actor: &str, reason: &str) -> Result<(), Box<dyn std::error::Error>> {
         let now = now_ms(); let conn = self.conn()?;
-        let manifest = conn.query_row("SELECT id, agent_id, workspace_hash, version, allowed_capabilities, approval_required_capabilities, scope_anchors, approver_principals, allowed_inbound_principals, permitted_external_ref_prefixes, max_parallel_actions, mode, expires_at_unix_ms, revoked_at_unix_ms, created_at_unix_ms FROM authority_manifests WHERE id=?1", params![manifest_id], Self::authority_from_row)?;
+        let manifest = conn.query_row("SELECT id, agent_id, workspace_hash, version, allowed_capabilities, approval_required_capabilities, scope_anchors, approver_principals, allowed_inbound_principals, permitted_external_ref_prefixes, max_parallel_actions, mode, expires_at_unix_ms, revoked_at_unix_ms, created_at_unix_ms, capability_constraints_json FROM authority_manifests WHERE id=?1", params![manifest_id], Self::authority_from_row)?;
         if manifest.revoked_at_unix_ms.is_some() { return Err("authority manifest is already revoked".into()); }
         conn.execute("UPDATE authority_manifests SET revoked_at_unix_ms=?1 WHERE id=?2", params![now, manifest_id])?; drop(conn);
         self.journal(&JournalEvent { id: format!("jrn-{}", uuid::Uuid::new_v4().simple()), event_type:"authority_revoked".to_string(), evaluated_json:json!({"reason":reason}).to_string(), acted_json:serde_json::to_string(&manifest)?, forward_json:"{}".to_string(), category:"authority".to_string(), key:manifest_id.to_string(), entity_id:String::new(), agent_id:actor.to_string(), workspace_hash:manifest.workspace_hash, created_at_unix_ms:now })?;
         Ok(())
     }
 
-    pub fn action_intent(&self, agent_id:&str, workspace_hash:&str, scope_anchor:&str, external_ref:&str, capability:&str, action_key:&str, intent_hash:&str) -> Result<AuthorizedAction, Box<dyn std::error::Error>> {
+    pub fn action_intent(&self, agent_id:&str, workspace_hash:&str, scope_anchor:&str, external_ref:&str, capability:&str, action_key:&str, intent_hash:&str, resource_constraints_json: Option<&str>) -> Result<AuthorizedAction, Box<dyn std::error::Error>> {
         let manifest = self.active_authority(agent_id, workspace_hash)?;
         if !manifest.allowed_capabilities.iter().any(|v| v == capability) { return Err("capability is not permitted by authority manifest".into()); }
         if !manifest.scope_anchors.iter().any(|v| v == scope_anchor) { return Err("trusted scope anchor is not permitted by authority manifest".into()); }
         if !manifest.permitted_external_ref_prefixes.iter().any(|v| external_ref == v || external_ref.starts_with(&(v.clone()+"/"))) { return Err("external reference is not permitted by authority manifest".into()); }
         if intent_hash.len()!=64 || !intent_hash.bytes().all(|b| b.is_ascii_hexdigit()) { return Err("intent_hash must be a SHA-256 hex digest".into()); }
+        let resource_constraints_json = canonical_constraint_json(resource_constraints_json.unwrap_or("{}"))?;
+        if !resource_constraints_permit(&manifest.capability_constraints_json, capability, &resource_constraints_json)? {
+            return Err("RESOURCE_CONSTRAINT_MISMATCH".into());
+        }
+        let resource_constraints_hash = constraint_hash(&resource_constraints_json);
         let approval_required=manifest.approval_required_capabilities.iter().any(|v|v==capability); let now=now_ms();
-        let action=AuthorizedAction { id:format!("act-{}",uuid::Uuid::new_v4().simple()), manifest_id:manifest.id.clone(), manifest_version:manifest.version, agent_id:agent_id.to_string(), workspace_hash:workspace_hash.to_string(), scope_anchor:scope_anchor.to_string(), external_ref:external_ref.to_string(), capability:capability.to_string(), action_key:action_key.to_string(), intent_hash:intent_hash.to_ascii_lowercase(), outcome_hash:String::new(), status:if approval_required{"approval_requested"}else{"intent"}.to_string(), approval_required, approval_ref:String::new(), created_at_unix_ms:now, updated_at_unix_ms:now };
-        let conn=self.conn()?; conn.execute("INSERT INTO authorized_actions (id,manifest_id,manifest_version,agent_id,workspace_hash,scope_anchor,external_ref,capability,action_key,intent_hash,outcome_hash,status,approval_required,approval_ref,created_at_unix_ms,updated_at_unix_ms) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?15)", params![action.id,action.manifest_id,action.manifest_version,action.agent_id,action.workspace_hash,action.scope_anchor,action.external_ref,action.capability,action.action_key,action.intent_hash,action.outcome_hash,action.status,action.approval_required as i64,action.approval_ref,now])?; drop(conn);
+        let action=AuthorizedAction { id:format!("act-{}",uuid::Uuid::new_v4().simple()), manifest_id:manifest.id.clone(), manifest_version:manifest.version, agent_id:agent_id.to_string(), workspace_hash:workspace_hash.to_string(), scope_anchor:scope_anchor.to_string(), external_ref:external_ref.to_string(), capability:capability.to_string(), action_key:action_key.to_string(), intent_hash:intent_hash.to_ascii_lowercase(), outcome_hash:String::new(), status:if approval_required{"approval_requested"}else{"intent"}.to_string(), approval_required, approval_ref:String::new(), created_at_unix_ms:now, updated_at_unix_ms:now, resource_constraints_json, resource_constraints_hash };
+        let conn=self.conn()?;
+        conn.execute(
+            "INSERT INTO authorized_actions
+             (id,manifest_id,manifest_version,agent_id,workspace_hash,scope_anchor,
+              external_ref,capability,action_key,intent_hash,outcome_hash,status,
+              approval_required,approval_ref,created_at_unix_ms,updated_at_unix_ms,
+              resource_constraints_json,resource_constraints_hash)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?15,?16,?17)",
+            params![action.id,action.manifest_id,action.manifest_version,action.agent_id,
+                    action.workspace_hash,action.scope_anchor,action.external_ref,
+                    action.capability,action.action_key,action.intent_hash,
+                    action.outcome_hash,action.status,action.approval_required as i64,
+                    action.approval_ref,now,action.resource_constraints_json,
+                    action.resource_constraints_hash],
+        )?;
+        drop(conn);
         self.journal(&JournalEvent {id:format!("jrn-{}",uuid::Uuid::new_v4().simple()),event_type:"action_intent".to_string(),evaluated_json:serde_json::to_string(&manifest)?,acted_json:serde_json::to_string(&action)?,forward_json:"{}".to_string(),category:"authorized_action".to_string(),key:action.id.clone(),entity_id:String::new(),agent_id:agent_id.to_string(),workspace_hash:workspace_hash.to_string(),created_at_unix_ms:now})?; Ok(action)
     }
 
@@ -6874,7 +6959,7 @@ impl Database {
         if !matches!(decision,"granted"|"denied") { return Err("approval decision must be granted or denied".into()); }
         let mut action=self.action_receipt_get(action_id)?.ok_or("authorized action not found")?;
         if action.status!="approval_requested" { return Err("action is not awaiting approval".into()); }
-        let conn=self.conn()?; let manifest=conn.query_row("SELECT id, agent_id, workspace_hash, version, allowed_capabilities, approval_required_capabilities, scope_anchors, approver_principals, allowed_inbound_principals, permitted_external_ref_prefixes, max_parallel_actions, mode, expires_at_unix_ms, revoked_at_unix_ms, created_at_unix_ms FROM authority_manifests WHERE id=?1",params![action.manifest_id],Self::authority_from_row)?;
+        let conn=self.conn()?; let manifest=conn.query_row("SELECT id, agent_id, workspace_hash, version, allowed_capabilities, approval_required_capabilities, scope_anchors, approver_principals, allowed_inbound_principals, permitted_external_ref_prefixes, max_parallel_actions, mode, expires_at_unix_ms, revoked_at_unix_ms, created_at_unix_ms, capability_constraints_json FROM authority_manifests WHERE id=?1",params![action.manifest_id],Self::authority_from_row)?;
         if !manifest.approver_principals.iter().any(|p|p==approver) || !manifest.allowed_inbound_principals.iter().any(|p|p==approver) { return Err("approver is not allowed by authority manifest".into()); }
         let now=now_ms(); action.status=format!("approval_{decision}"); action.approval_ref=format!("apr-{}",uuid::Uuid::new_v4().simple()); action.updated_at_unix_ms=now; conn.execute("UPDATE authorized_actions SET status=?1,approval_ref=?2,updated_at_unix_ms=?3 WHERE id=?4",params![action.status,action.approval_ref,now,action.id])?; drop(conn);
         self.journal(&JournalEvent{id:format!("jrn-{}",uuid::Uuid::new_v4().simple()),event_type:action.status.clone(),evaluated_json:json!({"approver_principal":approver,"manifest_version":action.manifest_version}).to_string(),acted_json:serde_json::to_string(&action)?,forward_json:"{}".to_string(),category:"authorized_action".to_string(),key:action.id.clone(),entity_id:String::new(),agent_id:action.agent_id.clone(),workspace_hash:action.workspace_hash.clone(),created_at_unix_ms:now})?; Ok(action)
@@ -13679,6 +13764,7 @@ mod tests {
             max_parallel_actions: 1,
             mode: "shadow".to_string(),
             expires_at_unix_ms: None,
+            capability_constraints_json: "{}".to_string(),
         };
         let stored = db.authority_set(&manifest, "hermes-admin").unwrap();
         assert_eq!(stored.version, 1);
@@ -13693,6 +13779,7 @@ mod tests {
                 "git_push",
                 "action-42",
                 "a".repeat(64).as_str(),
+                Some("{}"),
             )
             .unwrap();
         assert_eq!(intent.status, "approval_requested");
@@ -13717,10 +13804,10 @@ mod tests {
             approver_principals: vec!["github:tcconnally".to_string()],
             allowed_inbound_principals: vec!["github:tcconnally".to_string()],
             permitted_external_ref_prefixes: vec!["github:Perseus-Computing-LLC/perseus-vault".to_string()],
-            max_parallel_actions: 1, mode: "enforce".to_string(), expires_at_unix_ms: None,
+            max_parallel_actions: 1, mode: "enforce".to_string(), expires_at_unix_ms: None, capability_constraints_json: "{}".to_string(),
         };
         let stored = db.authority_set(&manifest, "admin").unwrap();
-        let action = db.action_intent("agent-768", "ws-768", "github:Perseus-Computing-LLC/perseus-vault", "github:Perseus-Computing-LLC/perseus-vault/pull/768", "git_push", "push-768", &"a".repeat(64)).unwrap();
+        let action = db.action_intent("agent-768", "ws-768", "github:Perseus-Computing-LLC/perseus-vault", "github:Perseus-Computing-LLC/perseus-vault/pull/768", "git_push", "push-768", &"a".repeat(64), Some("{}")).unwrap();
         assert_eq!(action.manifest_version, stored.version);
         assert_eq!(action.status, "approval_requested");
         assert!(db.action_complete(&action.id, "agent-768", "executed", &"b".repeat(64)).is_err());
