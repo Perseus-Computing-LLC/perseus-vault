@@ -1347,6 +1347,33 @@ pub struct OriginRecord {
     pub observed_at_unix_ms: Option<i64>,
 }
 
+/// Write-time evidence retention modes. The mode is required inside every
+/// evidence envelope so an absent value has an explicit audit meaning.
+pub const EVIDENCE_CAPTURE_MODES: [&str; 6] = [
+    "snapshot",
+    "hash_only",
+    "pointer_only",
+    "not_requested",
+    "capture_failed",
+    "legacy_unknown",
+];
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvidenceEnvelope {
+    pub capture_mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_value: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_system: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_ref: Option<String>,
+    pub captured_at_unix_ms: i64,
+    #[serde(default)]
+    pub replayable: bool,
+}
+
 /// A first-class pointer from a memory to an external system of record.
 /// Canonical ref_value forms per ref_type live in
 /// docs/specs/source-anchors-corrections-retention.md §1.

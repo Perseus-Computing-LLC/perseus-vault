@@ -698,7 +698,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
         let mut registry = serde_json::from_str::<serde_json::Value>(
         r###"[
   {
-    "name": "mimir_remember",
+    "name": "perseus_vault_remember",
     "description": "Store or update an entity by (category, key). Idempotent — call as often as you want, same key returns an update. NEAR-DUPLICATE MERGING (#531): a NEW key whose body is >=70% trigram-similar to an existing entity in the same category+workspace does NOT create a new entity — the write is folded into the existing one (result: action='deduped', deduped=true, merged_into=<id>). Right for conversational memory; wrong for bulk ingest of templated records, which are similar by construction and will silently collapse to a handful of rows. For bulk ingest pass skip_dedup=true (or use mimir_ingest_file), and check the returned action. Prefer recall_when triggers (retrieve when relevant) over always_on=true (inject unconditionally): the recall-first mimir_context hard-caps the always-on set and warns when it overflows, so reserve always_on for genuinely identity-critical facts. Optional certainty (0.0-1.0) is used by mimir_conflicts for typed-entity conflict detection. Pass derived_from (ids or {category,key} pairs of the memories you recalled) to auto-mark those sources useful — cited memories rank higher and decay slower. Use this for saving facts, decisions, architecture notes, and conventions. When encryption is enabled, body_json is encrypted at rest with AES-256-GCM.",
     "inputSchema": {
       "type": "object",
@@ -809,6 +809,20 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
             "required": ["ref_type", "ref_value"]
           },
           "description": "#728: optional first-class pointers to external systems of record (max 32). Stored inside body_json under the reserved 'external_refs' key; filter recall with ref_type/ref_value."
+        },
+        "evidence": {
+          "type": "object",
+          "description": "Write-time audit envelope. capture_mode distinguishes snapshot, hash_only, pointer_only, not_requested, capture_failed, and legacy_unknown; a missing value is never interpreted implicitly.",
+          "properties": {
+            "capture_mode": { "type": "string", "enum": ["snapshot", "hash_only", "pointer_only", "not_requested", "capture_failed", "legacy_unknown"] },
+            "resolved_value": { "description": "Resolved source value retained at write time when capture_mode=snapshot" },
+            "content_sha256": { "type": "string", "description": "64-hex SHA-256 of the resolved value or source bytes" },
+            "source_system": { "type": "string" },
+            "source_ref": { "type": "string" },
+            "captured_at_unix_ms": { "type": "integer" },
+            "replayable": { "type": "boolean" }
+          },
+          "required": ["capture_mode", "captured_at_unix_ms", "replayable"]
         }
       },
       "required": [
