@@ -134,6 +134,10 @@ pub struct RememberArgs {
     /// body_json under the reserved "external_refs" key.
     #[serde(default, deserialize_with = "null_as_default")]
     pub external_refs: Vec<crate::models::ExternalRef>,
+    /// Write-time audit metadata. Omitted envelopes remain distinguishable as
+    /// legacy records rather than being inferred from a missing value.
+    #[serde(default)]
+    pub evidence: Option<crate::models::EvidenceEnvelope>,
 }
 
 /// #487: a `derived_from` citation — either an entity id (`"mem-..."`, as
@@ -812,7 +816,33 @@ pub fn handle_remember(db: &Database, args: Value) -> Result<String, String> {
             }
         }
     }
-    let body = if a.origin.is_none() && a.external_refs.is_empty() {
+    if let Some(ref evidence) = a.evidence {
+        if !crate::models::EVIDENCE_CAPTURE_MODES.contains(&evidence.capture_mode.as_str()) {
+            return Err(format!(
+                "Invalid evidence.capture_mode '{}': expected one of {:?}",
+                evidence.capture_mode,
+                crate::models::EVIDENCE_CAPTURE_MODES
+            ));
+        }
+        match evidence.capture_mode.as_str() {
+            "snapshot" if evidence.resolved_value.is_none() => {
+                return Err("evidence.capture_mode=snapshot requires resolved_value".into())
+            }
+            "hash_only" if evidence.content_sha256.is_none() => {
+                return Err("evidence.capture_mode=hash_only requires content_sha256".into())
+            }
+            "capture_failed" if evidence.resolved_value.is_some() => {
+                return Err("evidence.capture_mode=capture_failed cannot carry resolved_value".into())
+            }
+            _ => {}
+        }
+        if let Some(ref hash) = evidence.content_sha256 {
+            if hash.len() != 64 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Err("evidence.content_sha256 must be a 64-hex SHA-256 digest".into());
+            }
+        }
+    }
+    let body = if a.origin.is_none() && a.external_refs.is_empty() && a.evidence.is_none() {
         body
     } else {
         let mut obj: serde_json::Value =
@@ -829,6 +859,12 @@ pub fn handle_remember(db: &Database, args: Value) -> Result<String, String> {
                     "external_refs".to_string(),
                     serde_json::to_value(&a.external_refs)
                         .unwrap_or(serde_json::json!([])),
+                );
+            }
+            if let Some(ref evidence) = a.evidence {
+                map.insert(
+                    "evidence".to_string(),
+                    serde_json::to_value(evidence).unwrap_or(serde_json::json!({})),
                 );
             }
         }
@@ -9555,6 +9591,45 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&source);
+    }
+
+    #[test]
+    fn remember_evidence_modes_are_explicit_and_validated() {
+        let (db, path) = temp_db();
+        let base = json!({
+            "category": "decision",
+            "key": "evidence-contract",
+            "body_json": "{\"content\":\"port is 3001\"}",
+            "evidence": {
+                "capture_mode": "snapshot",
+                "resolved_value": {"port": 3001},
+                "captured_at_unix_ms": 100,
+                "replayable": true
+            }
+        });
+        let response = handle_remember(&db, base).expect("snapshot evidence should write");
+        let id = serde_json::from_str::<Value>(&response).unwrap()["id"].clone();
+        let entity = db.get_entity_by_id_public(id.as_str().unwrap()).unwrap().unwrap();
+        let body: Value = serde_json::from_str(&entity.body_json).unwrap();
+        assert_eq!(body["evidence"]["capture_mode"], "snapshot");
+        assert_eq!(body["evidence"]["resolved_value"]["port"], 3001);
+
+        let err = handle_remember(&db, json!({
+            "category": "decision",
+            "key": "missing-snapshot",
+            "body_json": "{}",
+            "evidence": {"capture_mode": "snapshot", "captured_at_unix_ms": 100, "replayable": false}
+        })).unwrap_err();
+        assert!(err.contains("requires resolved_value"), "{err}");
+
+        let err = handle_remember(&db, json!({
+            "category": "decision",
+            "key": "missing-hash",
+            "body_json": "{}",
+            "evidence": {"capture_mode": "hash_only", "captured_at_unix_ms": 100, "replayable": false}
+        })).unwrap_err();
+        assert!(err.contains("requires content_sha256"), "{err}");
+        let _ = std::fs::remove_file(path);
     }
 }
 
