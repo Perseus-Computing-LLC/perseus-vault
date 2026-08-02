@@ -894,6 +894,24 @@ fn normalize_default_db(cli: &mut Cli) {
     }
 }
 
+/// Warn when serving an already-encrypted database with NO key loaded.
+///
+/// `serve` only reads the key from an explicit `--encryption-key`; it never
+/// falls back to `default_key_file()`. Starting without the flag against an
+/// encrypted vault does not fail — it silently appends PLAINTEXT bodies next to
+/// the existing ciphertext, so the database ends up half-encrypted with no
+/// signal to the operator. The canary exists to catch a *wrong* key; this
+/// covers the *missing* key.
+fn warn_plaintext_writes_to_encrypted_db(database: &db::Database) {
+    if database.encryption_storage_state() == "encrypted" {
+        eprintln!(
+            "mimir: WARNING — this database is encrypted but no --encryption-key was given. \
+             New memories will be written as PLAINTEXT alongside the existing ciphertext. \
+             Pass --encryption-key <file> (see `perseus-vault init --help`)."
+        );
+    }
+}
+
 fn default_key_file() -> String {
     let home = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
@@ -2849,6 +2867,8 @@ fn main() {
                 }
                 eprintln!("mimir: encryption enabled (key: {})", key_file);
                 warn_key_acls_on_windows(key_file);
+            } else {
+                warn_plaintext_writes_to_encrypted_db(&database);
             }
 
             // Configure LLM for mimir_ask if endpoint is provided
@@ -3024,6 +3044,8 @@ fn main() {
                 }
                 eprintln!("mimir: encryption enabled (key: {})", key_file);
                 warn_key_acls_on_windows(key_file);
+            } else {
+                warn_plaintext_writes_to_encrypted_db(&database);
             }
 
             if let Some(ref endpoint) = cli.llm_endpoint {
