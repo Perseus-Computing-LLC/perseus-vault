@@ -3154,6 +3154,11 @@ pub struct CaptureArgs {
     /// `consume` to have anything to prune; ignored otherwise.
     #[serde(default)]
     pub source_file: Option<String>,
+    /// Optional write-time evidence envelope for the captured source. When
+    /// absent, captured notes are explicitly marked legacy_unknown by the
+    /// persistence boundary rather than treated as a reproducible snapshot.
+    #[serde(default)]
+    pub evidence: Option<crate::models::EvidenceEnvelope>,
 }
 
 fn default_capture_max() -> i64 {
@@ -3201,6 +3206,18 @@ pub fn handle_capture(db: &Database, args: Value) -> Result<String, String> {
         );
     }
     let max_notes = a.max_entities.clamp(1, crate::capture::MAX_CAPTURE_NOTES as i64) as usize;
+
+    if let Some(ref evidence) = a.evidence {
+        if !crate::models::EVIDENCE_CAPTURE_MODES.contains(&evidence.capture_mode.as_str()) {
+            return Err(format!("Invalid evidence.capture_mode '{}': expected one of {:?}", evidence.capture_mode, crate::models::EVIDENCE_CAPTURE_MODES));
+        }
+        if evidence.capture_mode == "snapshot" && evidence.resolved_value.is_none() {
+            return Err("evidence.capture_mode=snapshot requires resolved_value".into());
+        }
+        if evidence.capture_mode == "hash_only" && evidence.content_sha256.is_none() {
+            return Err("evidence.capture_mode=hash_only requires content_sha256".into());
+        }
+    }
 
     // Distiller selection: rule-based is the floor; the LLM path degrades to
     // it on any failure so a capture invocation never comes back empty-handed
@@ -3250,7 +3267,17 @@ pub fn handle_capture(db: &Database, args: Value) -> Result<String, String> {
         let now = now_ms();
         let raw_id = Uuid::new_v4().to_string().replace('-', "");
         let id = format!("mem-{}", &raw_id[..12.min(raw_id.len())]);
-        let body = json!({ "content": note.content, "summary": note.summary }).to_string();
+        let mut body_value = json!({ "content": note.content, "summary": note.summary });
+        body_value["evidence"] = serde_json::to_value(a.evidence.as_ref().unwrap_or(&crate::models::EvidenceEnvelope {
+            capture_mode: "legacy_unknown".to_string(),
+            resolved_value: None,
+            content_sha256: None,
+            source_system: Some("perseus_vault_capture".to_string()),
+            source_ref: a.source_file.clone(),
+            captured_at_unix_ms: now,
+            replayable: false,
+        })).unwrap_or(json!({"capture_mode":"legacy_unknown","replayable":false}));
+        let body = body_value.to_string();
         let entity = Entity {
             id,
             category: "capture".to_string(),
@@ -5515,6 +5542,8 @@ pub struct CorrectArgs {
     pub valid_from_unix_ms: Option<i64>,
     #[serde(default)]
     pub valid_to_unix_ms: Option<i64>,
+    #[serde(default)]
+    pub evidence: Option<crate::models::EvidenceEnvelope>,
 }
 
 
@@ -5543,6 +5572,7 @@ pub fn handle_correct(db: &Database, args: Value) -> Result<String, String> {
         visibility: a.visibility,
         valid_from_unix_ms: a.valid_from_unix_ms,
         valid_to_unix_ms: a.valid_to_unix_ms,
+        evidence: a.evidence,
     };
 
     let result = db.correct(&params)
@@ -5562,6 +5592,8 @@ pub struct SynthesizeArgs {
     pub tags: Vec<String>,
     #[serde(default)]
     pub visibility: String,
+    #[serde(default)]
+    pub evidence: Option<crate::models::EvidenceEnvelope>,
 }
 
 pub fn handle_synthesize(db: &Database, args: Value) -> Result<String, String> {
@@ -5573,6 +5605,7 @@ pub fn handle_synthesize(db: &Database, args: Value) -> Result<String, String> {
         session_id: a.session_id,
         tags: a.tags,
         visibility: a.visibility,
+        evidence: a.evidence,
     };
 
     let result = db.synthesize(&params)
@@ -6213,7 +6246,35 @@ mod tests {
         assert_eq!(ent.layer, "buffer");
         assert_eq!(ent.workspace_hash, "ws-cap");
         assert!(ent.body_json.contains("schema version"), "{}", ent.body_json);
+        let captured_body: Value = serde_json::from_str(&ent.body_json).unwrap();
+        assert_eq!(captured_body["evidence"]["capture_mode"], "legacy_unknown");
 
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn capture_accepts_explicit_hash_only_evidence() {
+        let (db, path) = temp_db();
+        let digest = "a".repeat(64);
+        let raw = handle_capture(
+            &db,
+            json!({
+                "text": "We decided to retain a digest instead of the source snapshot.",
+                "evidence": {
+                    "capture_mode": "hash_only",
+                    "content_sha256": digest,
+                    "captured_at_unix_ms": 100,
+                    "replayable": false
+                }
+            }),
+        ).expect("capture with hash-only evidence");
+        let report: Value = serde_json::from_str(&raw).unwrap();
+        let key = report["notes"][0]["key"].as_str().unwrap();
+        let entity = db.get_entity("capture", key).unwrap().unwrap();
+        let body: Value = serde_json::from_str(&entity.body_json).unwrap();
+        assert_eq!(body["evidence"]["capture_mode"], "hash_only");
+        assert_eq!(body["evidence"]["replayable"], false);
+        assert!(body["evidence"].get("resolved_value").is_none());
         let _ = std::fs::remove_file(&path);
     }
 

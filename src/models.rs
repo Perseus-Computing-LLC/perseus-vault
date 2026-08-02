@@ -1071,6 +1071,8 @@ pub struct CorrectParams {
     pub valid_from_unix_ms: Option<i64>,
     #[serde(default)]
     pub valid_to_unix_ms: Option<i64>,
+    #[serde(default)]
+    pub evidence: Option<EvidenceEnvelope>,
 }
 
 /// Result from mimir_correct.
@@ -1094,6 +1096,8 @@ pub struct SynthesizeParams {
     pub tags: Vec<String>,
     #[serde(default)]
     pub visibility: String,
+    #[serde(default)]
+    pub evidence: Option<EvidenceEnvelope>,
 }
 
 /// A single synthesized lesson from session content.
