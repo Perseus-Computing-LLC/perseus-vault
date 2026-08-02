@@ -917,7 +917,7 @@ impl Database {
     /// whether a key is loaded in this session). Returns one of:
     /// - `"plaintext"` — no `encryption_canary` table exists and no body_json
     ///   values look like AES-256-GCM ciphertext (base64, ≥28 bytes).
-    /// - `"encrypted"` — the canary exists. Bodies are ciphertext.
+    /// - `"encrypted"` — the canary ROW (id=1) exists. Bodies are ciphertext.
     /// - `"mixed-legacy"` — no canary but some body_json values are base64
     ///   ciphertext (encryption was started with a previous key and later
     ///   disabled, or a partial rekey). Caller should run `init --rekey`.
@@ -930,9 +930,17 @@ impl Database {
             Ok(c) => c,
             Err(_) => return "unknown".to_string(),
         };
-        // Check for canary table first.
+        // Check for a canary ROW first. The table itself is created
+        // unconditionally by the schema (`CREATE TABLE IF NOT EXISTS
+        // encryption_canary`, schema.rs), so its mere existence says nothing
+        // about encryption — testing for it reported every database, including
+        // a freshly created plaintext one, as "encrypted". Only `set_encryption`
+        // ever writes the id=1 row, so the row is the real signal.
+        // A missing table makes `prepare` fail, which falls through to the
+        // ciphertext heuristic below — the documented "plaintext" /
+        // "mixed-legacy" path.
         let has_canary: bool = conn
-            .prepare("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='encryption_canary'")
+            .prepare("SELECT COUNT(*) FROM encryption_canary")
             .and_then(|mut s| s.query_row([], |r| r.get::<_, i64>(0)))
             .map(|c| c > 0)
             .unwrap_or(false);
@@ -17500,6 +17508,46 @@ mod tests {
         f.write_all(key.as_bytes()).unwrap();
         drop(f);
         (path.to_str().unwrap().to_string(), key)
+    }
+
+    /// Regression: `encryption_storage_state()` used to test for the EXISTENCE
+    /// of the `encryption_canary` table. The schema creates that table
+    /// unconditionally, so every database — including a brand-new plaintext one
+    /// — was reported as "encrypted", and `doctor` printed
+    /// "[ENCRYPTED] AES-256-GCM canary present — bodies are ciphertext"
+    /// over a database whose bodies were readable with plain `sqlite3`.
+    #[test]
+    fn storage_state_is_plaintext_until_a_canary_row_exists() {
+        let (mut db, path) = temp_db();
+
+        // Fresh DB: canary TABLE exists (schema), canary ROW does not.
+        let table_exists: i64 = db
+            .conn()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='encryption_canary'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(table_exists, 1, "schema always creates the canary table");
+
+        db.remember(&make_entity("s-1", "note", "s-1", r#"{"x":1}"#))
+            .unwrap();
+        assert_eq!(
+            db.encryption_storage_state(),
+            "plaintext",
+            "an unencrypted database must not report itself as encrypted"
+        );
+
+        // Enabling encryption writes the canary row — only then "encrypted".
+        let (key_path, _) = temp_key_file();
+        db.set_encryption(&key_path).unwrap();
+        assert_eq!(db.encryption_storage_state(), "encrypted");
+
+        let _ = std::fs::remove_file(&key_path);
+        drop(db);
+        let _ = fs::remove_file(&path);
     }
 
     #[test]
