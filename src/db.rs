@@ -11091,7 +11091,7 @@ last_accessed: {}
             // chunk gives every waiter a per-cycle chance to acquire, making
             // starvation probabilistically negligible at the default 5000ms
             // timeout. Costs 2ms of wall per 1000 rows (~0.2s @100k).
-            std::thread::sleep(std::time::Duration::from_millis(2));
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
         Ok((eligible, chunks))
     }
@@ -11463,8 +11463,6 @@ last_accessed: {}
         let (decay_eligible, _decay_chunks) = Self::cohere_decay_chunked(&conn)?;
         decayed = decay_eligible;
 
-        let tx = Self::audited_write_tx(&conn)?;
-
         // 3. Link: auto-link entities sharing a category. The JOIN already
         // proves both rows exist and carries e1.id + e1.links, so we build the
         // new link lists in memory and flush one UPDATE per source entity —
@@ -11485,8 +11483,14 @@ last_accessed: {}
         let candidate_budget = max_links.saturating_mul(50).clamp(0, 5000);
         let mut pending: std::collections::HashMap<String, Vec<MemoryLink>> =
             std::collections::HashMap::new();
+        let mut candidate_links: i64 = 0;
         {
-            let mut stmt = tx.prepare(
+            // Candidate discovery is read-only and must stay outside the
+            // writer transaction. On a large category, SQLite may scan a
+            // substantial self-join before producing the bounded LIMIT set;
+            // doing that after BEGIN IMMEDIATE would hold the writer lock for
+            // the entire scan and starve concurrent remembers.
+            let mut stmt = conn.prepare(
                 "SELECT e1.id, e1.links, e2.id as e2_id, e1.body_json, e2.body_json
                  FROM entities e1
                  JOIN entities e2 ON e1.category = e2.category AND e1.id < e2.id
@@ -11543,21 +11547,48 @@ last_accessed: {}
                         relationship: "auto-related".to_string(),
                         weight: sim,
                     });
-                    linked += 1;
-                    if linked >= max_links {
+                    candidate_links += 1;
+                    if candidate_links >= max_links {
                         break 'link;
                     }
                 }
             }
         }
 
+        // Re-enter the writer transaction only for the bounded read-modify-
+        // write and archive phase. Re-read each source's current links under
+        // the lock so a concurrent link/unlink that happened during candidate
+        // discovery is merged rather than overwritten.
+        let tx = Self::audited_write_tx(&conn)?;
         let link_ts = now_ms();
-        for (id, links) in &pending {
-            let new_links = serde_json::to_string(links)?;
-            tx.execute(
-                "UPDATE entities SET links = ?1, last_accessed_unix_ms = ?2 WHERE id = ?3",
-                params![new_links, link_ts, id],
-            )?;
+        for (id, proposed_links) in &pending {
+            let Some(current_links_json) = tx
+                .query_row(
+                    "SELECT links FROM entities WHERE id = ?1 AND archived = 0",
+                    params![id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+            else {
+                continue;
+            };
+            let mut links: Vec<MemoryLink> =
+                serde_json::from_str(&current_links_json).unwrap_or_default();
+            let mut added = false;
+            for proposed in proposed_links {
+                if !links.iter().any(|existing| existing.target_id == proposed.target_id) {
+                    links.push(proposed.clone());
+                    linked += 1;
+                    added = true;
+                }
+            }
+            if added {
+                let new_links = serde_json::to_string(&links)?;
+                tx.execute(
+                    "UPDATE entities SET links = ?1, last_accessed_unix_ms = ?2 WHERE id = ?3",
+                    params![new_links, link_ts, id],
+                )?;
+            }
         }
 
         // 4. Archive: entities below decay threshold. Exempt verified facts to
@@ -14625,17 +14656,17 @@ mod tests {
     /// — so no writer with a ~250ms budget could EVER acquire inside it.
     /// Post-fix the longest hold is one 1000-row decay chunk or the
     /// candidate_budget-bounded link/archive tx (~60ms worst at this scale,
-    /// debug, same box), and the 2ms inter-chunk yield guarantees an
+    /// debug, same box), and the inter-chunk yield gives a waiting writer an
     /// acquisition window after each chunk. Both sides scale with machine
     /// speed, so the ~10x pre/post hold ratio — not absolute timing — is
     /// what the 250ms budget sits inside.
     ///
     /// The writer polls with a fine-grained 1ms busy handler rather than
     /// PRAGMA busy_timeout: SQLite's default busy handler sleeps up to 100ms
-    /// between retries, which measures retry-schedule luck against the 2ms
-    /// windows instead of the property under test (no single hold may exceed
-    /// the wait budget). Field writers keep the default 5000ms timeout,
-    /// which the bounded holds now clear at any store size.
+    /// between retries, which would measure retry-schedule luck rather than
+    /// the property under test (no single hold may exceed the wait budget).
+    /// Field writers keep the default 5000ms timeout, which the bounded holds
+    /// now clear at any store size.
     #[test]
     fn concurrent_writer_not_starved_during_cohere() {
         use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -23603,7 +23634,7 @@ mod tests {
                 std::time::Instant::now() < deadline,
                 "fake embed server never saw request #{n}"
             );
-            std::thread::sleep(std::time::Duration::from_millis(2));
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
 

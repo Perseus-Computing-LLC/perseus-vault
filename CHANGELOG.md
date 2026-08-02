@@ -5,15 +5,16 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
 
 ## [Unreleased]
 
+### Fixed
+- **Encryption diagnostics and key propagation.** `doctor` now reports a
+  database as encrypted only when the authoritative `encryption_canary` row
+  (`id=1`) exists; the schema table alone is not evidence of encryption.
+  Server and write-capable CLI paths resolve the existing default key file
+  (`~/.perseus-vault/secret.key`, with legacy `~/.mimir/secret.key` fallback),
+  warn before plaintext writes to an encrypted vault when no key is available,
+  and generated client configurations carry the resolved key path.
+
 ### Added
-- **Privacy-preserving legacy tool-prefix usage counters** (#764). Every valid
-  MCP `tools/call` is classified by its original `perseus_vault_`, `mimir_`,
-  `mneme_`, or other prefix before alias normalization and counted exactly once
-  in process-local atomics. The canonical `perseus_vault_alias_usage` readout
-  returns only aggregate totals and the process-start Unix timestamp; counters
-  reset on restart, are never persisted, never capture arguments or client
-  metadata, and the readout does not increment itself. v2 aliases and the
-  canonical-only default `tools/list` advertisement remain unchanged.
 - **BEAM — bi-temporal correctness + determinism at scale** (#685). A new
   harness (`benchmark/beam/`) that embeds the CI-verified bi-temporal gauntlet
   inside a filler corpus sized to the BEAM token tiers (128K / 500K / 1M / 10M)
@@ -113,8 +114,8 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
   MCP stdio writes at 10K, 40 docs/s durable at 100K, hybrid recall p50
   19.03 ms / 79.73 ms). Refreshed CLAIMS-AUDIT.md: the sub-millisecond recall
   entry is retired in favor of artifact-backed latencies, and the tool recount
-  note now says the registry has grown since the v2.13-era recount (published
-  figure stays "55+" by convention). Reworded "signed results/reports" to
+  note now says the registry has grown since the v2.13-era recount (the current
+  published figure is 65 canonical tools). Reworded "signed results/reports" to
   "content-hashed (sha256)" across README/PERF/benchmark surfaces, since
   `signature_sha256` is a self-computed content hash, not a cryptographic
   signature (audit-chain, keyed-MAC, and release-signing docs untouched).

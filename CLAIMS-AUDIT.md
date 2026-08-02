@@ -1,6 +1,6 @@
 # Claims Audit — Perseus Vault (formerly Mimir/Mneme)
 
-**Date:** 2026-07-16 (refreshed) · **Audited:** README.md vs code and committed benchmark artifacts on `main`
+**Date:** 2026-08-01 (refreshed) · **Audited:** README.md vs code and committed benchmark artifacts on `main`
 
 ## Audit note 2026-07-16 (#702)
 
@@ -16,20 +16,19 @@
 - Clarified that `federate` is a local export / workspace-rename / re-import
   (file based, no network peers); the Windows-safe default path is tracked
   in #704.
-- Tool-count note refreshed: the registry has grown since the v2.13-era
-  recount; the published figure stays "55+" by convention.
+- Tool-count note refreshed: the current registry contains 65 unique canonical
+  tool names. Compatibility aliases are callable but excluded from the count.
 
 ## Findings
 
-### LOW — no material gaps found
+### LOW — no material gaps found (encryption caveat tracked below)
 
 Claims verified against `src/`:
 
-- **55+ MCP tools**: published as "55+" per naming convention. ✓ The registry
-  has grown since the v2.13-era recount of 57 distinct base tool names in
-  `src/mcp.rs` (each exposed under 3 aliases
-  `perseus_vault_*`/`mimir_*`/`mneme_*`); the published figure remains "55+"
-  by convention, and the recount command below remains the source of truth.
+- **65 canonical MCP tools**: ✓ The current registry contains 65 distinct base
+  tool names in `src/mcp.rs`, each exposed under the canonical
+  `perseus_vault_*` prefix. The legacy `mimir_*` and `mneme_*` aliases remain
+  callable but are not counted separately.
 
   Verify the count against source (this is the authoritative command — re-run
   it and update README/manifest.json/glama.json whenever a tool is added):
@@ -41,6 +40,12 @@ Claims verified against `src/`:
 - **MCP-native** — full JSON-RPC stdio server (`initialize`, `tools/list`, `tools/call`). ✓
 - **SQLite + FTS5** — schema builds FTS5 tables; recall uses FTS5 queries. ✓
 - **AES-256-GCM encrypted** — encryption at rest for entity bodies. ✓
+- **Encryption is optional and must be enabled explicitly** — the default
+  install is plaintext until `init`/`set_encryption` establishes the encrypted
+  canary row. `doctor` reports the on-disk state from that row; it must not be
+  read as proof that every default install is encrypted. `serve` warns when an
+  encrypted vault is opened without a key, and the standard key path is used
+  automatically when present. See `docs/ENCRYPTION.md`.
 - **Fully local / zero-dependency** — no network runtime deps in `Cargo.toml`. ✓
 - **Sub-millisecond recall**: RETIRED 2026-07-16. No committed artifact
   supports it, and the old justification (bundled offline embeddings) said
