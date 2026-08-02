@@ -170,6 +170,10 @@ enum Commands {
         /// Workspace hash (optional)
         #[arg(long)]
         workspace_hash: Option<String>,
+        /// Path to AES-256-GCM encryption key file; falls back to the standard
+        /// key path when one exists.
+        #[arg(long)]
+        encryption_key: Option<String>,
     },
 
     /// Start the MCP JSON-RPC stdio server
@@ -178,7 +182,8 @@ enum Commands {
         #[arg(long, default_value_t = default_db_path())]
         db: String,
 
-        /// Path to AES-256-GCM encryption key file (base64-encoded, 32 bytes)
+        /// Path to AES-256-GCM encryption key file (base64-encoded, 32 bytes).
+        /// When omitted, an existing standard key file is detected automatically.
         #[arg(long)]
         encryption_key: Option<String>,
 
@@ -335,6 +340,10 @@ enum Commands {
         /// Reason recorded in archive_reason
         #[arg(long, default_value_t = String::from("forgotten via CLI"))]
         reason: String,
+        /// Path to AES-256-GCM encryption key file; falls back to the standard
+        /// key path when one exists.
+        #[arg(long)]
+        encryption_key: Option<String>,
     },
 
     /// Bulk-archive entities by category, decay threshold, or age
@@ -357,6 +366,10 @@ enum Commands {
         /// Preview what would be archived without changing anything
         #[arg(long)]
         dry_run: bool,
+        /// Path to AES-256-GCM encryption key file; falls back to the standard
+        /// key path when one exists.
+        #[arg(long)]
+        encryption_key: Option<String>,
     },
 
     /// Recalculate decay scores and auto-archive fully decayed entities
@@ -364,6 +377,10 @@ enum Commands {
         /// SQLite database path
         #[arg(long, default_value_t = default_db_path())]
         db: String,
+        /// Path to AES-256-GCM encryption key file; falls back to the standard
+        /// key path when one exists.
+        #[arg(long)]
+        encryption_key: Option<String>,
     },
 
     /// Run the full unattended hygiene pass once and exit: cohere → decay →
@@ -375,6 +392,10 @@ enum Commands {
         /// SQLite database path
         #[arg(long, default_value_t = default_db_path())]
         db: String,
+        /// Path to AES-256-GCM encryption key file; falls back to the standard
+        /// key path when one exists.
+        #[arg(long)]
+        encryption_key: Option<String>,
         /// Preview the combined report without changing anything
         #[arg(long)]
         dry_run: bool,
@@ -388,6 +409,10 @@ enum Commands {
         /// SQLite database path
         #[arg(long, default_value_t = default_db_path())]
         db: String,
+        /// Path to AES-256-GCM encryption key file; falls back to the standard
+        /// key path when one exists.
+        #[arg(long)]
+        encryption_key: Option<String>,
     },
 
     /// Print database statistics as JSON
@@ -417,6 +442,10 @@ enum Commands {
         /// Optional workspace hash to scope the export
         #[arg(long)]
         workspace_hash: Option<String>,
+        /// Path to AES-256-GCM encryption key file; falls back to the standard
+        /// key path when one exists.
+        #[arg(long)]
+        encryption_key: Option<String>,
     },
 
     /// Import .md files from a vault directory into the database
@@ -427,6 +456,10 @@ enum Commands {
         /// Source directory containing .md files
         #[arg(long, default_value_t = String::from("~/.mimir/vault"))]
         vault_dir: String,
+        /// Path to AES-256-GCM encryption key file; falls back to the standard
+        /// key path when one exists.
+        #[arg(long)]
+        encryption_key: Option<String>,
     },
 
     /// Sync your Mneme memory into an Obsidian (or Logseq/Notion) vault as
@@ -454,6 +487,10 @@ enum Commands {
         /// Preview what would be deleted without changing anything
         #[arg(long)]
         dry_run: bool,
+        /// Path to AES-256-GCM encryption key file; falls back to the standard
+        /// key path when one exists.
+        #[arg(long)]
+        encryption_key: Option<String>,
     },
 
     /// Validate the local install + config and report MCP client compatibility (#272).
@@ -486,6 +523,10 @@ enum Commands {
         /// database — one brain across projects and clients.
         #[arg(long, default_value_t = default_db_path())]
         db: String,
+        /// Optional AES-256-GCM key file to include in generated client configs.
+        /// When omitted, an existing default key file is detected automatically.
+        #[arg(long)]
+        encryption_key: Option<String>,
         /// Also register session lifecycle hooks per docs/lifecycle-hooks.md
         /// (SessionStart recall, SessionEnd/Stop hygiene) for clients that
         /// support them: claude-code, codex, cursor
@@ -541,6 +582,10 @@ enum Commands {
         /// of the recall-first, relevance-gated default (#356/#366).
         #[arg(long)]
         legacy_context: bool,
+        /// Path to AES-256-GCM encryption key file; falls back to the standard
+        /// key path when one exists.
+        #[arg(long)]
+        encryption_key: Option<String>,
     },
 
     /// #520: opt-in in-session memory capture. Distill a transcript /
@@ -894,6 +939,24 @@ fn normalize_default_db(cli: &mut Cli) {
     }
 }
 
+/// Warn when serving an already-encrypted database with NO key loaded.
+///
+/// `serve` only reads the key from an explicit `--encryption-key`; it never
+/// falls back to `default_key_file()`. Starting without the flag against an
+/// encrypted vault does not fail — it silently appends PLAINTEXT bodies next to
+/// the existing ciphertext, so the database ends up half-encrypted with no
+/// signal to the operator. The canary exists to catch a *wrong* key; this
+/// covers the *missing* key.
+fn warn_plaintext_writes_to_encrypted_db(database: &db::Database) {
+    if should_warn_plaintext_writes_to_encrypted_db(&database.encryption_storage_state(), false) {
+        eprintln!(
+            "mimir: WARNING — this database is encrypted but no --encryption-key was given. \
+             New memories will be written as PLAINTEXT alongside the existing ciphertext. \
+             Pass --encryption-key <file> (see `perseus-vault init --help`)."
+        );
+    }
+}
+
 fn default_key_file() -> String {
     let home = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
@@ -912,13 +975,44 @@ fn default_key_file() -> String {
     }
 }
 
-/// Best-effort tighten of a key file's ACLs on Windows, which has no umask/0600
-/// equivalent applied at creation (the `#[cfg(unix)]` 0600 path in `Keygen` does
-/// not exist there). Strips inherited ACEs and grants only the current user full
-/// control via `icacls`, so the encryption key is not readable by other local
-/// accounts. Returns false if the file could not be restricted (icacls missing,
-/// USERNAME unset, or a non-zero exit) so the caller can warn.
-#[cfg(windows)]
+/// Resolve an explicitly supplied key, or use the standard key path when it
+/// exists. The boolean is passed by callers that already checked the path so
+/// this helper remains deterministic and unit-testable.
+fn select_encryption_key(
+    explicit: Option<&str>,
+    default_path: &str,
+    default_exists: bool,
+) -> Option<String> {
+    explicit
+        .map(str::to_string)
+        .or_else(|| default_exists.then(|| default_path.to_string()))
+}
+
+/// Build the argv fragment used by generated MCP client configurations.
+fn serve_config_args(db_path: &str, encryption_key: Option<&str>) -> Vec<String> {
+    let mut args = vec!["serve".to_string(), "--db".to_string(), db_path.to_string()];
+    if let Some(key) = encryption_key {
+        args.extend(["--encryption-key".to_string(), key.to_string()]);
+    }
+    args
+}
+
+fn configured_encryption_key(explicit: Option<&str>) -> Option<String> {
+    let default = default_key_file();
+    select_encryption_key(explicit, &default, std::path::Path::new(&default).is_file())
+}
+
+/// Return whether startup should warn about plaintext writes. An explicit or
+/// successfully resolved key suppresses the warning; only a canary-backed
+/// encrypted database with no key loaded is dangerous here.
+fn should_warn_plaintext_writes_to_encrypted_db(state: &str, key_loaded: bool) -> bool {
+    state == "encrypted" && !key_loaded
+}
+
+/// Warn when a server is opened without a key against an already-encrypted
+/// database. The database intentionally permits mixed operation for backwards
+/// compatibility, but new writes would otherwise be plaintext with no signal.
+
 fn tighten_windows_key_acls(path: &str) -> bool {
     let Ok(user) = std::env::var("USERNAME") else {
         return false;
@@ -1179,6 +1273,8 @@ struct ConnectCtx {
     bin: String,
     /// Absolute DB path: the shared memory root every client points at.
     db_path: String,
+    /// Optional default encryption key path to include in generated server configs.
+    encryption_key: Option<String>,
     hooks: bool,
     rules: bool,
     dry_run: bool,
@@ -1357,6 +1453,7 @@ fn merge_mcp_json(
     zed_style: bool,
     bin: &str,
     db_path: &str,
+    encryption_key: Option<&str>,
 ) -> Result<String, String> {
     let mut root: serde_json::Value = if existing.trim().is_empty() {
         serde_json::json!({})
@@ -1367,10 +1464,11 @@ fn merge_mcp_json(
     if !root.is_object() {
         return Err("top level is not a JSON object; refusing to merge".to_string());
     }
+    let args = serve_config_args(db_path, encryption_key);
     let entry = if zed_style {
-        serde_json::json!({ "command": { "path": bin, "args": ["serve", "--db", db_path] } })
+        serde_json::json!({ "command": { "path": bin, "args": args } })
     } else {
-        serde_json::json!({ "command": bin, "args": ["serve", "--db", db_path] })
+        serde_json::json!({ "command": bin, "args": args })
     };
     let obj = root.as_object_mut().unwrap();
     let servers = obj
@@ -1389,7 +1487,12 @@ fn merge_mcp_json(
 
 /// Merge the server registration into Hermes' YAML config (mcp_servers map),
 /// preserving unknown keys.
-fn merge_hermes_yaml(existing: &str, bin: &str, db_path: &str) -> Result<String, String> {
+fn merge_hermes_yaml(
+    existing: &str,
+    bin: &str,
+    db_path: &str,
+    encryption_key: Option<&str>,
+) -> Result<String, String> {
     let mut root: serde_yaml::Value = if existing.trim().is_empty() {
         serde_yaml::Value::Mapping(serde_yaml::Mapping::new())
     } else {
@@ -1409,7 +1512,7 @@ fn merge_hermes_yaml(existing: &str, bin: &str, db_path: &str) -> Result<String,
     }
     let entry = serde_yaml::to_value(serde_json::json!({
         "command": bin,
-        "args": ["serve", "--db", db_path]
+        "args": serve_config_args(db_path, encryption_key)
     }))
     .unwrap();
     let servers = servers.as_mapping_mut().unwrap();
@@ -1438,15 +1541,25 @@ fn splice_out_toml_stanza(existing: &str, header: &str) -> String {
 /// `[mcp_servers.perseus-vault]` table without a TOML parser dependency —
 /// which also preserves the rest of the file byte-for-byte, comments
 /// included. Pre-rename `[mcp_servers.mimir]`/`.mneme` stanzas are removed.
-fn merge_codex_toml(existing: &str, bin: &str, db_path: &str) -> String {
+fn merge_codex_toml(
+    existing: &str,
+    bin: &str,
+    db_path: &str,
+    encryption_key: Option<&str>,
+) -> String {
     let existing = splice_out_toml_stanza(existing, "[mcp_servers.mimir]");
     let existing = splice_out_toml_stanza(&existing, "[mcp_servers.mneme]");
     let header = "[mcp_servers.perseus-vault]";
+    let args_toml = serve_config_args(db_path, encryption_key)
+        .iter()
+        .map(|arg| format!("\"{}\"", arg.replace('\\', "\\\\").replace('"', "\\\"")))
+        .collect::<Vec<_>>()
+        .join(", ");
     let stanza = format!(
-        "{}\ncommand = \"{}\"\nargs = [\"serve\", \"--db\", \"{}\"]\n",
+        "{}\ncommand = \"{}\"\nargs = [{}]\n",
         header,
         bin.replace('\\', "\\\\"),
-        db_path.replace('\\', "\\\\")
+        args_toml
     );
     if let Some(start) = existing.find(header) {
         let after = &existing[start + header.len()..];
@@ -1560,18 +1673,25 @@ fn append_rules_block(existing: &str) -> Option<String> {
 /// the absolute binary and DB paths, so it embeds both (explicitly sanctioned
 /// by the contract doc). Paths are forward-slashed so the strings survive
 /// POSIX-shell quoting on every platform.
-fn hook_commands(bin: &str, db_path: &str) -> (String, String) {
+fn hook_commands(
+    bin: &str,
+    db_path: &str,
+    encryption_key: Option<&str>,
+) -> (String, String) {
     let b = bin.replace('\\', "/");
     let d = db_path.replace('\\', "/");
+    let key_arg = encryption_key
+        .map(|key| format!(" --encryption-key \"{}\"", key.replace('"', "\\\"")))
+        .unwrap_or_default();
     let prepare = format!(
-        "\"{}\" prepare --task \"$(basename \\\"$PWD\\\")\" --db \"{}\"",
-        b, d
+        "\"{}\" prepare --task \"$(basename \\\"$PWD\\\")\" --db \"{}\"{}",
+        b, d, key_arg
     );
     // Once-per-day stamp guard, verbatim from the contract doc — used where
     // the client's stop event fires per turn/loop rather than per session.
     let guarded_maintain = format!(
-        "sh -c 'STAMP=\"$HOME/.perseus-vault/.maintain-$(date +%F)\"; [ -f \"$STAMP\" ] || {{ \"{}\" maintain --db \"{}\" && mkdir -p \"$HOME/.perseus-vault\" && touch \"$STAMP\"; }}'",
-        b, d
+        "sh -c 'STAMP=\"$HOME/.perseus-vault/.maintain-$(date +%F)\"; [ -f \"$STAMP\" ] || {{ \"{}\" maintain --db \"{}\"{} && mkdir -p \"$HOME/.perseus-vault\" && touch \"$STAMP\"; }}'",
+        b, d, key_arg
     );
     (prepare, guarded_maintain)
 }
@@ -1579,13 +1699,12 @@ fn hook_commands(bin: &str, db_path: &str) -> (String, String) {
 /// Claude Code hooks (.claude/settings.json): SessionStart (matcher
 /// startup|resume — stdout becomes context) + SessionEnd hygiene. NOT `Stop`,
 /// which fires per turn. Exactly the docs/lifecycle-hooks.md contract.
-fn claude_code_hook_specs(bin: &str, db_path: &str) -> Vec<HookSpec> {
-    let (prepare, _) = hook_commands(bin, db_path);
-    let maintain = format!(
-        "\"{}\" maintain --db \"{}\"",
-        bin.replace('\\', "/"),
-        db_path.replace('\\', "/")
-    );
+fn claude_code_hook_specs(
+    bin: &str,
+    db_path: &str,
+    encryption_key: Option<&str>,
+) -> Vec<HookSpec> {
+    let (prepare, maintain) = hook_commands(bin, db_path, encryption_key);
     vec![
         HookSpec {
             event: "SessionStart",
@@ -1618,8 +1737,12 @@ fn claude_code_hook_specs(bin: &str, db_path: &str) -> Vec<HookSpec> {
 /// Codex hooks (~/.codex/hooks.json, Claude-Code-compatible schema): Codex
 /// has no SessionEnd, so hygiene rides `Stop` behind the once-per-day stamp
 /// guard from the contract doc.
-fn codex_hook_specs(bin: &str, db_path: &str) -> Vec<HookSpec> {
-    let (prepare, guarded_maintain) = hook_commands(bin, db_path);
+fn codex_hook_specs(
+    bin: &str,
+    db_path: &str,
+    encryption_key: Option<&str>,
+) -> Vec<HookSpec> {
+    let (prepare, guarded_maintain) = hook_commands(bin, db_path, encryption_key);
     vec![
         HookSpec {
             event: "SessionStart",
@@ -1650,8 +1773,12 @@ fn codex_hook_specs(bin: &str, db_path: &str) -> Vec<HookSpec> {
 /// Cursor hooks (.cursor/hooks.json v1): sessionStart must inject context as
 /// JSON `additional_context` (not plain stdout), so it runs a wrapper script;
 /// `stop` fires per agent loop and reuses the once-per-day guard.
-fn cursor_hook_specs(bin: &str, db_path: &str) -> Vec<HookSpec> {
-    let (_, guarded_maintain) = hook_commands(bin, db_path);
+fn cursor_hook_specs(
+    bin: &str,
+    db_path: &str,
+    encryption_key: Option<&str>,
+) -> Vec<HookSpec> {
+    let (_, guarded_maintain) = hook_commands(bin, db_path, encryption_key);
     vec![
         HookSpec {
             event: "sessionStart",
@@ -1668,17 +1795,25 @@ fn cursor_hook_specs(bin: &str, db_path: &str) -> Vec<HookSpec> {
 
 /// The Cursor sessionStart wrapper script (verbatim from the contract doc,
 /// with the absolute binary/db paths substituted).
-fn cursor_recall_script(bin: &str, db_path: &str) -> String {
+fn cursor_recall_script(
+    bin: &str,
+    db_path: &str,
+    encryption_key: Option<&str>,
+) -> String {
+    let key_arg = encryption_key
+        .map(|key| format!(" --encryption-key \"{}\"", key.replace('"', "\\\"")))
+        .unwrap_or_default();
     format!(
         r#"#!/usr/bin/env bash
 # Installed by `perseus-vault connect --hooks` (docs/lifecycle-hooks.md).
 # Read hook input (unused here, but consume stdin), emit additional_context.
 cat > /dev/null
-CTX="$("{}" prepare --task "$(basename "$PWD")" --db "{}" 2>/dev/null)"
+CTX="$("{}" prepare --task "$(basename "$PWD")" --db "{}"{} 2>/dev/null)"
 jq -n --arg ctx "$CTX" '{{ "additional_context": $ctx }}'
 "#,
         bin.replace('\\', "/"),
-        db_path.replace('\\', "/")
+        db_path.replace('\\', "/"),
+        key_arg
     )
 }
 
@@ -1725,6 +1860,9 @@ fn connect_one(ctx: &ConnectCtx, client: &str) -> Result<usize, String> {
     println!("\nperseus-vault connect — client: {}", client);
     println!("  binary: {}", ctx.bin);
     println!("  db:     {}  (shared memory root)", ctx.db_path);
+    if let Some(key) = ctx.encryption_key.as_deref() {
+        eprintln!("  encryption key: {}", key);
+    }
 
     let mut changed = 0usize;
 
@@ -1734,13 +1872,37 @@ fn connect_one(ctx: &ConnectCtx, client: &str) -> Result<usize, String> {
             let existing = std::fs::read_to_string(&path).unwrap_or_default();
             let merged = match kind {
                 "json_mcpServers" => {
-                    merge_mcp_json(&existing, "mcpServers", false, &ctx.bin, &ctx.db_path)
+                    merge_mcp_json(
+                        &existing,
+                        "mcpServers",
+                        false,
+                        &ctx.bin,
+                        &ctx.db_path,
+                        ctx.encryption_key.as_deref(),
+                    )
                 }
                 "json_contextServers" => {
-                    merge_mcp_json(&existing, "context_servers", true, &ctx.bin, &ctx.db_path)
+                    merge_mcp_json(
+                        &existing,
+                        "context_servers",
+                        true,
+                        &ctx.bin,
+                        &ctx.db_path,
+                        ctx.encryption_key.as_deref(),
+                    )
                 }
-                "yaml_hermes" => merge_hermes_yaml(&existing, &ctx.bin, &ctx.db_path),
-                "toml_codex" => Ok(merge_codex_toml(&existing, &ctx.bin, &ctx.db_path)),
+                "yaml_hermes" => merge_hermes_yaml(
+                    &existing,
+                    &ctx.bin,
+                    &ctx.db_path,
+                    ctx.encryption_key.as_deref(),
+                ),
+                "toml_codex" => Ok(merge_codex_toml(
+                    &existing,
+                    &ctx.bin,
+                    &ctx.db_path,
+                    ctx.encryption_key.as_deref(),
+                )),
                 _ => unreachable!(),
             }
             .map_err(|e| format!("{}: {}", path.display(), e))?;
@@ -1752,7 +1914,10 @@ fn connect_one(ctx: &ConnectCtx, client: &str) -> Result<usize, String> {
             println!("  [mcp]   generic client — add this to your MCP config by hand:");
             let snippet = serde_json::json!({
                 "mcpServers": {
-                    "perseus-vault": { "command": ctx.bin, "args": ["serve", "--db", ctx.db_path] }
+                    "perseus-vault": {
+                        "command": ctx.bin,
+                        "args": serve_config_args(&ctx.db_path, ctx.encryption_key.as_deref())
+                    }
                 }
             });
             for line in serde_json::to_string_pretty(&snippet).unwrap().lines() {
@@ -1766,17 +1931,17 @@ fn connect_one(ctx: &ConnectCtx, client: &str) -> Result<usize, String> {
         let hook_plan: Option<(std::path::PathBuf, Vec<HookSpec>, bool)> = match client {
             "claude-code" => Some((
                 proj.join(".claude/settings.json"),
-                claude_code_hook_specs(&ctx.bin, &ctx.db_path),
+                claude_code_hook_specs(&ctx.bin, &ctx.db_path, ctx.encryption_key.as_deref()),
                 false,
             )),
             "codex" => Some((
                 home.join(".codex/hooks.json"),
-                codex_hook_specs(&ctx.bin, &ctx.db_path),
+                codex_hook_specs(&ctx.bin, &ctx.db_path, ctx.encryption_key.as_deref()),
                 false,
             )),
             "cursor" => Some((
                 proj.join(".cursor/hooks.json"),
-                cursor_hook_specs(&ctx.bin, &ctx.db_path),
+                cursor_hook_specs(&ctx.bin, &ctx.db_path, ctx.encryption_key.as_deref()),
                 true,
             )),
             _ => None,
@@ -1787,7 +1952,11 @@ fn connect_one(ctx: &ConnectCtx, client: &str) -> Result<usize, String> {
                     // The sessionStart hook shells out to a wrapper script
                     // (Cursor needs JSON additional_context, not stdout).
                     let script_path = proj.join(".cursor/hooks/perseus-vault-recall.sh");
-                    let script = cursor_recall_script(&ctx.bin, &ctx.db_path);
+                    let script = cursor_recall_script(
+                        &ctx.bin,
+                        &ctx.db_path,
+                        ctx.encryption_key.as_deref(),
+                    );
                     let outcome = plan_write(&script_path, &script, ctx.dry_run, "[hooks]")?;
                     if outcome != WriteOutcome::Unchanged {
                         changed += 1;
@@ -1852,6 +2021,7 @@ fn run_connect(
     client: Option<&str>,
     all_detected: bool,
     db_path: &str,
+    encryption_key: Option<&str>,
     hooks: bool,
     rules: bool,
     dry_run: bool,
@@ -1910,6 +2080,7 @@ fn run_connect(
         project_dir,
         bin,
         db_path: absolutize(db_path),
+        encryption_key: configured_encryption_key(encryption_key),
         hooks,
         rules,
         dry_run,
@@ -2380,8 +2551,18 @@ fn main() {
             ref category,
             ref key,
             ref reason,
+            ref encryption_key,
         }) => {
-            let database = open_db_or_exit(db_path);
+            let mut database = open_db_or_exit(db_path);
+            let encryption_key = configured_encryption_key(encryption_key.as_deref());
+            if let Some(ref key_file) = encryption_key {
+                if let Err(e) = database.set_encryption(key_file) {
+                    eprintln!("mimir: encryption setup failed: {}", e);
+                    std::process::exit(1);
+                }
+            } else {
+                warn_plaintext_writes_to_encrypted_db(&database);
+            }
             match database.forget(category, key, reason) {
                 Ok(true) => println!("Archived {}/{}", category, key),
                 Ok(false) => {
@@ -2401,8 +2582,18 @@ fn main() {
             older_than_days,
             limit,
             dry_run,
+            ref encryption_key,
         }) => {
-            let database = open_db_or_exit(db_path);
+            let mut database = open_db_or_exit(db_path);
+            let encryption_key = configured_encryption_key(encryption_key.as_deref());
+            if let Some(ref key_file) = encryption_key {
+                if let Err(e) = database.set_encryption(key_file) {
+                    eprintln!("mimir: encryption setup failed: {}", e);
+                    std::process::exit(1);
+                }
+            } else {
+                warn_plaintext_writes_to_encrypted_db(&database);
+            }
             let params = models::PruneParams {
                 category: category.clone(),
                 min_decay,
@@ -2419,8 +2610,20 @@ fn main() {
                 }
             }
         }
-        Some(Commands::Decay { db: ref db_path }) => {
-            let database = open_db_or_exit(db_path);
+        Some(Commands::Decay {
+            db: ref db_path,
+            ref encryption_key,
+        }) => {
+            let mut database = open_db_or_exit(db_path);
+            let encryption_key = configured_encryption_key(encryption_key.as_deref());
+            if let Some(ref key_file) = encryption_key {
+                if let Err(e) = database.set_encryption(key_file) {
+                    eprintln!("mimir: encryption setup failed: {}", e);
+                    std::process::exit(1);
+                }
+            } else {
+                warn_plaintext_writes_to_encrypted_db(&database);
+            }
             match database.decay_tick() {
                 Ok(report) => print_json(&report),
                 Err(e) => {
@@ -2431,10 +2634,20 @@ fn main() {
         }
         Some(Commands::Maintain {
             db: ref db_path,
+            ref encryption_key,
             dry_run,
             vacuum,
         }) => {
-            let database = open_db_or_exit(db_path);
+            let mut database = open_db_or_exit(db_path);
+            let encryption_key = configured_encryption_key(encryption_key.as_deref());
+            if let Some(ref key_file) = encryption_key {
+                if let Err(e) = database.set_encryption(key_file) {
+                    eprintln!("mimir: encryption setup failed: {}", e);
+                    std::process::exit(1);
+                }
+            } else {
+                warn_plaintext_writes_to_encrypted_db(&database);
+            }
             match tools::run_maintenance_pass(&database, dry_run, vacuum) {
                 Ok(report) => print_json(&report),
                 Err(e) => {
@@ -2443,8 +2656,20 @@ fn main() {
                 }
             }
         }
-        Some(Commands::Reindex { db: ref db_path }) => {
-            let database = open_db_or_exit(db_path);
+        Some(Commands::Reindex {
+            db: ref db_path,
+            ref encryption_key,
+        }) => {
+            let mut database = open_db_or_exit(db_path);
+            let encryption_key = configured_encryption_key(encryption_key.as_deref());
+            if let Some(ref key_file) = encryption_key {
+                if let Err(e) = database.set_encryption(key_file) {
+                    eprintln!("mimir: encryption setup failed: {}", e);
+                    std::process::exit(1);
+                }
+            } else {
+                warn_plaintext_writes_to_encrypted_db(&database);
+            }
             match database.reindex_fts() {
                 Ok(n) => println!("Reindexed {} entities into FTS5", n),
                 Err(e) => {
@@ -2470,11 +2695,20 @@ fn main() {
             ref client,
             all_detected,
             db: ref db_path,
+            ref encryption_key,
             hooks,
             rules,
             dry_run,
         }) => {
-            run_connect(client.as_deref(), all_detected, db_path, hooks, rules, dry_run);
+            run_connect(
+                client.as_deref(),
+                all_detected,
+                db_path,
+                encryption_key.as_deref(),
+                hooks,
+                rules,
+                dry_run,
+            );
         }
         Some(Commands::Prepare {
             db: ref db_path,
@@ -2486,8 +2720,18 @@ fn main() {
             max_context_chars,
             ref model,
             legacy_context,
+            ref encryption_key,
         }) => {
-            let database = open_db_or_exit(db_path);
+            let mut database = open_db_or_exit(db_path);
+            let encryption_key = configured_encryption_key(encryption_key.as_deref());
+            if let Some(ref key_file) = encryption_key {
+                if let Err(e) = database.set_encryption(key_file) {
+                    eprintln!("mimir: encryption setup failed: {}", e);
+                    std::process::exit(1);
+                }
+            } else {
+                warn_plaintext_writes_to_encrypted_db(&database);
+            }
             run_prepare(
                 &database,
                 task,
@@ -2546,11 +2790,14 @@ fn main() {
             };
 
             let mut database = open_db_or_exit(db_path);
+            let encryption_key = configured_encryption_key(encryption_key.as_deref());
             if let Some(ref key_file) = encryption_key {
                 if let Err(e) = database.set_encryption(key_file) {
                     eprintln!("perseus-vault: capture: encryption setup failed: {}", e);
                     std::process::exit(1);
                 }
+            } else {
+                warn_plaintext_writes_to_encrypted_db(&database);
             }
             // --llm needs an endpoint; without one, handle_capture degrades
             // gracefully to the rule-based distiller (and says so).
@@ -2594,8 +2841,18 @@ fn main() {
             ref visibility,
             ref agent_id,
             ref workspace_hash,
+            ref encryption_key,
         }) => {
-            let database = open_db_or_exit(db_path);
+            let mut database = open_db_or_exit(db_path);
+            let encryption_key = configured_encryption_key(encryption_key.as_deref());
+            if let Some(ref key_file) = encryption_key {
+                if let Err(e) = database.set_encryption(key_file) {
+                    eprintln!("mimir: encryption setup failed: {}", e);
+                    std::process::exit(1);
+                }
+            } else {
+                warn_plaintext_writes_to_encrypted_db(&database);
+            }
             let parsed_body: serde_json::Value = match serde_json::from_str(body) {
                 Ok(b) => b,
                 Err(e) => {
@@ -2663,8 +2920,18 @@ fn main() {
             db: ref db_path,
             ref vault_dir,
             ref workspace_hash,
+            ref encryption_key,
         }) => {
-            let database = open_db_or_exit(db_path);
+            let mut database = open_db_or_exit(db_path);
+            let encryption_key = configured_encryption_key(encryption_key.as_deref());
+            if let Some(ref key_file) = encryption_key {
+                if let Err(e) = database.set_encryption(key_file) {
+                    eprintln!("mimir: encryption setup failed: {}", e);
+                    std::process::exit(1);
+                }
+            } else {
+                warn_plaintext_writes_to_encrypted_db(&database);
+            }
             let dir = if vault_dir.starts_with("~/") {
                 let home = std::env::var("HOME")
                     .or_else(|_| std::env::var("USERPROFILE"))
@@ -2684,8 +2951,18 @@ fn main() {
         Some(Commands::VaultImport {
             db: ref db_path,
             ref vault_dir,
+            ref encryption_key,
         }) => {
-            let database = open_db_or_exit(db_path);
+            let mut database = open_db_or_exit(db_path);
+            let encryption_key = configured_encryption_key(encryption_key.as_deref());
+            if let Some(ref key_file) = encryption_key {
+                if let Err(e) = database.set_encryption(key_file) {
+                    eprintln!("mimir: encryption setup failed: {}", e);
+                    std::process::exit(1);
+                }
+            } else {
+                warn_plaintext_writes_to_encrypted_db(&database);
+            }
             let dir = if vault_dir.starts_with("~/") {
                 let home = std::env::var("HOME")
                     .or_else(|_| std::env::var("USERPROFILE"))
@@ -2708,7 +2985,16 @@ fn main() {
             watch,
         }) => {
             let db_path = db.clone().unwrap_or_else(default_db_path);
-            let database = open_db_or_exit(&db_path);
+            let mut database = open_db_or_exit(&db_path);
+            let encryption_key = configured_encryption_key(None);
+            if let Some(ref key_file) = encryption_key {
+                if let Err(e) = database.set_encryption(key_file) {
+                    eprintln!("mimir: encryption setup failed: {}", e);
+                    std::process::exit(1);
+                }
+            } else {
+                warn_plaintext_writes_to_encrypted_db(&database);
+            }
             let dir = if vault_path.starts_with("~/") {
                 let home = std::env::var("HOME")
                     .or_else(|_| std::env::var("USERPROFILE"))
@@ -2767,8 +3053,18 @@ fn main() {
         Some(Commands::Purge {
             db: ref db_path,
             dry_run,
+            ref encryption_key,
         }) => {
-            let database = open_db_or_exit(db_path);
+            let mut database = open_db_or_exit(db_path);
+            let encryption_key = configured_encryption_key(encryption_key.as_deref());
+            if let Some(ref key_file) = encryption_key {
+                if let Err(e) = database.set_encryption(key_file) {
+                    eprintln!("mimir: encryption setup failed: {}", e);
+                    std::process::exit(1);
+                }
+            } else {
+                warn_plaintext_writes_to_encrypted_db(&database);
+            }
             match database.purge(dry_run) {
                 Ok(report) => print_json(&report),
                 Err(e) => {
@@ -2842,6 +3138,7 @@ fn main() {
                     std::process::exit(1);
                 }
             };
+            let encryption_key = configured_encryption_key(encryption_key.as_deref());
             if let Some(ref key_file) = encryption_key {
                 if let Err(e) = database.set_encryption(key_file) {
                     eprintln!("mimir: encryption setup failed: {}", e);
@@ -2849,6 +3146,8 @@ fn main() {
                 }
                 eprintln!("mimir: encryption enabled (key: {})", key_file);
                 warn_key_acls_on_windows(key_file);
+            } else {
+                warn_plaintext_writes_to_encrypted_db(&database);
             }
 
             // Configure LLM for mimir_ask if endpoint is provided
@@ -3017,13 +3316,16 @@ fn main() {
                     std::process::exit(1);
                 }
             };
-            if let Some(ref key_file) = cli.encryption_key {
+            let encryption_key = configured_encryption_key(cli.encryption_key.as_deref());
+            if let Some(ref key_file) = encryption_key {
                 if let Err(e) = database.set_encryption(key_file) {
                     eprintln!("mimir: encryption setup failed: {}", e);
                     std::process::exit(1);
                 }
                 eprintln!("mimir: encryption enabled (key: {})", key_file);
                 warn_key_acls_on_windows(key_file);
+            } else {
+                warn_plaintext_writes_to_encrypted_db(&database);
             }
 
             if let Some(ref endpoint) = cli.llm_endpoint {
@@ -3636,11 +3938,9 @@ mod tests {
         // no dry-run, no vacuum unless asked.
         let cli = Cli::parse_from(["mimir", "maintain", "--db", "/tmp/maintain.db"]);
         match cli.command {
-            Some(Commands::Maintain {
-                db,
+            Some(Commands::Maintain {db,
                 dry_run,
-                vacuum,
-            }) => {
+                vacuum, .. }) => {
                 assert_eq!(db, "/tmp/maintain.db");
                 assert!(!dry_run);
                 assert!(!vacuum);
@@ -3691,19 +3991,134 @@ mod tests {
     }
 
     #[test]
+    fn warns_only_for_encrypted_storage_without_an_explicit_key() {
+        assert!(should_warn_plaintext_writes_to_encrypted_db("encrypted", false));
+        assert!(!should_warn_plaintext_writes_to_encrypted_db("encrypted", true));
+        assert!(!should_warn_plaintext_writes_to_encrypted_db("plaintext", false));
+        assert!(!should_warn_plaintext_writes_to_encrypted_db("mixed-legacy", false));
+        assert!(!should_warn_plaintext_writes_to_encrypted_db("unknown", false));
+    }
+
+    #[test]
+    fn selects_explicit_key_or_existing_default_key() {
+        assert_eq!(
+            select_encryption_key(Some("/explicit.key"), "/missing.key", false),
+            Some("/explicit.key".to_string())
+        );
+        assert_eq!(
+            select_encryption_key(None, "/home/tester/.perseus-vault/secret.key", true),
+            Some("/home/tester/.perseus-vault/secret.key".to_string())
+        );
+        assert_eq!(select_encryption_key(None, "/missing.key", false), None);
+    }
+
+    #[test]
+    fn generated_server_args_include_encryption_key_when_present() {
+        assert_eq!(
+            serve_config_args("/tmp/vault.db", Some("/tmp/secret.key")),
+            vec![
+                "serve",
+                "--db",
+                "/tmp/vault.db",
+                "--encryption-key",
+                "/tmp/secret.key"
+            ]
+        );
+        assert_eq!(
+            serve_config_args("/tmp/vault.db", None),
+            vec!["serve", "--db", "/tmp/vault.db"]
+        );
+    }
+
+    #[test]
+    fn generated_hooks_keep_encryption_key_inside_each_command() {
+        let specs = claude_code_hook_specs(
+            "/opt/perseus-vault",
+            "/tmp/vault.db",
+            Some("/tmp/secret.key"),
+        );
+        let rendered = specs
+            .iter()
+            .map(|spec| spec.entry.to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(rendered.contains("prepare --task"));
+        assert!(rendered.contains("--encryption-key \\\"/tmp/secret.key\\\""));
+    }
+
+    #[test]
+    fn generated_vault_commands_accept_encryption_key_flags() {
+        let cli = Cli::parse_from([
+            "mimir",
+            "vault-export",
+            "--db",
+            "/tmp/vault.db",
+            "--vault-dir",
+            "/tmp/export",
+            "--encryption-key",
+            "/tmp/secret.key",
+        ]);
+        match cli.command {
+            Some(Commands::VaultExport { encryption_key, .. }) => {
+                assert_eq!(encryption_key.as_deref(), Some("/tmp/secret.key"));
+            }
+            _ => panic!("expected vault-export subcommand"),
+        }
+
+        let cli = Cli::parse_from([
+            "mimir",
+            "vault-import",
+            "--db",
+            "/tmp/vault.db",
+            "--vault-dir",
+            "/tmp/export",
+            "--encryption-key",
+            "/tmp/secret.key",
+        ]);
+        match cli.command {
+            Some(Commands::VaultImport { encryption_key, .. }) => {
+                assert_eq!(encryption_key.as_deref(), Some("/tmp/secret.key"));
+            }
+            _ => panic!("expected vault-import subcommand"),
+        }
+    }
+
+    #[test]
+    fn parses_write_with_encryption_key() {
+        let cli = Cli::parse_from([
+            "mimir",
+            "write",
+            "--db",
+            "/tmp/vault.db",
+            "--category",
+            "note",
+            "--key",
+            "k1",
+            "--body",
+            "{}",
+            "--encryption-key",
+            "/tmp/secret.key",
+        ]);
+        match cli.command {
+            Some(Commands::Write { encryption_key, .. }) => {
+                assert_eq!(encryption_key.as_deref(), Some("/tmp/secret.key"));
+            }
+            _ => panic!("expected write subcommand"),
+        }
+    }
+
+    #[test]
     fn parses_connect_with_client_and_db() {
         let cli = Cli::parse_from([
             "mimir", "connect", "--client", "claude-code", "--db", "/tmp/connect.db",
         ]);
         match cli.command {
-            Some(Commands::Connect {
-                client,
+            Some(Commands::Connect {client,
                 db,
                 dry_run,
                 hooks,
                 rules,
-                all_detected,
-            }) => {
+                all_detected, .. }) => {
                 assert_eq!(client.as_deref(), Some("claude-code"));
                 assert_eq!(db, "/tmp/connect.db");
                 assert!(!dry_run && !hooks && !rules && !all_detected);
@@ -3764,8 +4179,7 @@ mod tests {
             "3",
         ]);
         match cli.command {
-            Some(Commands::Prepare {
-                db,
+            Some(Commands::Prepare {db,
                 task,
                 recall_when_limit,
                 context_limit,
@@ -3773,8 +4187,7 @@ mod tests {
                 json,
                 max_context_chars,
                 model,
-                legacy_context,
-            }) => {
+                legacy_context, .. }) => {
                 assert_eq!(db, "/tmp/prep.db");
                 assert_eq!(task, "deploying the service");
                 assert_eq!(recall_when_limit, 5);
@@ -3948,6 +4361,7 @@ mod tests {
             project_dir: project,
             bin: "/opt/perseus-vault".to_string(),
             db_path: "/tmp/shared-brain.db".to_string(),
+            encryption_key: None,
             hooks,
             rules,
             dry_run,
@@ -4200,7 +4614,7 @@ mod tests {
                 ]
             }
         }"#;
-        let specs = claude_code_hook_specs("/opt/perseus-vault", "/tmp/db.db");
+        let specs = claude_code_hook_specs("/opt/perseus-vault", "/tmp/db.db", None);
         let merged = merge_lifecycle_hooks_json(existing, &specs, false)
             .unwrap()
             .expect("first merge must change the doc");
@@ -4220,7 +4634,7 @@ mod tests {
 
     #[test]
     fn merge_lifecycle_hooks_rejects_invalid_json() {
-        let specs = claude_code_hook_specs("/opt/perseus-vault", "/tmp/db.db");
+        let specs = claude_code_hook_specs("/opt/perseus-vault", "/tmp/db.db", None);
         assert!(merge_lifecycle_hooks_json("{not json", &specs, false).is_err());
         assert!(merge_lifecycle_hooks_json("[1,2,3]", &specs, false).is_err());
     }
@@ -4306,7 +4720,7 @@ mod tests {
             "/tmp/new.db",
         ]);
         match cli.command {
-            Some(Commands::Migrate { from, to }) => {
+            Some(Commands::Migrate {from, to, .. }) => {
                 assert_eq!(from, "/tmp/old.db");
                 assert_eq!(to, "/tmp/new.db");
             }
@@ -4320,11 +4734,9 @@ mod tests {
         // watch off by default.
         let cli = Cli::parse_from(["mimir", "obsidian-sync", "/tmp/vault"]);
         match cli.command {
-            Some(Commands::ObsidianSync {
-                vault_path,
+            Some(Commands::ObsidianSync {vault_path,
                 db,
-                watch,
-            }) => {
+                watch, .. }) => {
                 assert_eq!(vault_path, "/tmp/vault");
                 assert_eq!(db, None);
                 assert!(!watch);
@@ -4344,11 +4756,9 @@ mod tests {
             "--watch",
         ]);
         match cli.command {
-            Some(Commands::ObsidianSync {
-                vault_path,
+            Some(Commands::ObsidianSync {vault_path,
                 db,
-                watch,
-            }) => {
+                watch, .. }) => {
                 assert_eq!(vault_path, "/tmp/vault");
                 assert_eq!(db.as_deref(), Some("/tmp/m.db"));
                 assert!(watch);

@@ -14,13 +14,15 @@
 [![LangGraph](https://img.shields.io/badge/integrations-LangGraph-blue)](integrations/langgraph/)
 [![CrewAI](https://img.shields.io/badge/integrations-CrewAI-orange)](integrations/crewai/)
 [![AutoGen](https://img.shields.io/badge/integrations-AutoGen-purple)](integrations/autogen/)
-[![MCP Tools](https://img.shields.io/badge/MCP%20tools-55%2B-brightgreen)]()
+[![MCP Tools](https://img.shields.io/badge/MCP%20tools-65%20canonical-brightgreen)]()
 [![Listed on mcpservers.org](https://img.shields.io/badge/listed-mcpservers.org-blue)](https://mcpservers.org/servers/perseus-computing-llc/perseus-vault)
 
 Give your agents memory that survives the session, so they stop re-deriving what they
 already learned and stop repeating past mistakes. Hybrid recall (BM25 + dense + RRF),
-bi-temporal history, and **AES-256-GCM** at rest, exposed as **55+ MCP tools** that work
-with any host. **73.8% on LongMemEval's official harness** (vs Zep 63.8%, Mem0 49.0%).
+bi-temporal history, and **AES-256-GCM** at rest, exposed as **65 canonical MCP tools**
+that work with any host. Legacy `mimir_*` and `mneme_*` aliases remain callable but are
+not counted separately. **73.8% on LongMemEval's official harness** (vs Zep 63.8%, Mem0
+49.0%).
 **One binary. One file. No Docker. No Postgres. No cloud.** Local-first, air-gap ready, MIT.
 
 ## One-Line Install
@@ -34,6 +36,13 @@ That's it. Perseus Vault is installed to `~/.local/bin/perseus-vault`. Start it:
 ```bash
 perseus-vault serve --db ~/.mimir/data/perseus-vault.db
 ```
+
+> **Encryption is opt-in.** A stock install writes plaintext bodies until you
+> initialize encryption. Run `perseus-vault init --db ~/.mimir/data/perseus-vault.db`
+> to create the AES-256-GCM key and canary. Once `~/.perseus-vault/secret.key`
+> (or the legacy `~/.mimir/secret.key`) exists, `serve` and generated client
+> configurations use it automatically; `doctor` reports the actual on-disk
+> state rather than assuming the database is encrypted.
 
 > **macOS note (Apple Silicon).** A freshly built or copied binary is
 > SIGKILLed on first run (`Killed: 9`, no other output) by the OS binary
@@ -181,7 +190,7 @@ the reference. [Methodology & dataset →](benchmark/temporal/README.md)
 |---|---|---|---|---|
 | **Deployment** | Single binary | Cloud + self-host | Docker/Postgres | Docker/Neo4j |
 | **Dependencies** | None (SQLite embedded) | Python + vector DB | Postgres + Python | Neo4j + Go (Graphiti) |
-| **MCP-Native** | ✅ 55+ tools | ❌ Not MCP-native | ❌ Not MCP-native | ❌ Not MCP-native |
+| **MCP-Native** | ✅ 65 canonical tools | ❌ Not MCP-native | ❌ Not MCP-native | ❌ Not MCP-native |
 | **Offline/Local** | ✅ Fully local | Cloud-dependent | Docker needed | Docker needed |
 | **Encryption** | AES-256-GCM ✅ | ❌ | ❌ | ❌ |
 | **Hybrid Search** | BM25 + Dense + RRF | Vector only | Vector only | Vector + Graph |
@@ -189,7 +198,7 @@ the reference. [Methodology & dataset →](benchmark/temporal/README.md)
 | **Entity Graph** | Link + Traverse | ❌ | ❌ | ✅ |
 | **Journal Audit Trail** | ✅ Immutable | ❌ | ❌ | ❌ |
 | **State Management** | ✅ Key-value + TTL | ❌ | ❌ | ❌ |
-| **MCP Tools** | 55+ | 5 | 8 | 0 |
+| **MCP Tools** | 65 canonical | 5 | 8 | 0 |
 | **License** | MIT | Apache 2.0 | Apache 2.0 | Apache 2.0 |
 
 [Full comparison: Perseus Vault vs Mem0 →](docs/comparison/mimir-vs-mem0.md)
@@ -287,9 +296,10 @@ Each adapter:
 Any MCP-compatible framework works with Perseus Vault directly. See
 [MCP client and framework integrations](docs/clients/README.md) for the full list.
 
-## 55+ MCP Tools
+## 65 Canonical MCP Tools
 
 > **Canonical product and tool names.** Perseus Vault is the product name, and new integrations should use the canonical `perseus_vault_*` tools (for example, `perseus_vault_remember`). Legacy `mimir_*` and `mneme_*` tool names remain supported for compatibility.
+> The count is the number of unique canonical tools in the source registry. Compatibility aliases are callable but are not counted separately.
 > The legacy `mimir_*` and `mneme_*` names remain fully *callable* — every prefix
 > dispatches to the same handler — they are just no longer advertised in
 > `tools/list`. This keeps the advertised manifest to one name per tool instead
@@ -306,12 +316,6 @@ Any MCP-compatible framework works with Perseus Vault directly. See
 > upgrade the CLI to **≥ 1.0.23** (calls canonical names, with dynamic
 > fallback), or set `PERSEUS_VAULT_TOOL_ALIASES=all` on the vault as a bridge
 > while older clients remain deployed.
->
-> **Migration contract.** See [legacy Mimir/Mneme tool-prefix migration](docs/migration/legacy-tool-prefixes.md) for replacement mapping, process-local migration evidence, and the v3 removal gate.
-> Operators can call `perseus_vault_alias_usage` to read process-local totals for
-> canonical, Mimir, Mneme, and unrecognized prefixes. The counters reset on
-> restart, never persist call data, and never include tool arguments, entity
-> identifiers, credentials, client metadata, or the readout call itself.
 
 ### Entity CRUD
 | Tool | Description |

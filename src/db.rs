@@ -917,7 +917,7 @@ impl Database {
     /// whether a key is loaded in this session). Returns one of:
     /// - `"plaintext"` — no `encryption_canary` table exists and no body_json
     ///   values look like AES-256-GCM ciphertext (base64, ≥28 bytes).
-    /// - `"encrypted"` — the canary exists. Bodies are ciphertext.
+    /// - `"encrypted"` — the canary ROW (id=1) exists. Bodies are ciphertext.
     /// - `"mixed-legacy"` — no canary but some body_json values are base64
     ///   ciphertext (encryption was started with a previous key and later
     ///   disabled, or a partial rekey). Caller should run `init --rekey`.
@@ -930,9 +930,17 @@ impl Database {
             Ok(c) => c,
             Err(_) => return "unknown".to_string(),
         };
-        // Check for canary table first.
+        // Check for a canary ROW first. The table itself is created
+        // unconditionally by the schema (`CREATE TABLE IF NOT EXISTS
+        // encryption_canary`, schema.rs), so its mere existence says nothing
+        // about encryption — testing for it reported every database, including
+        // a freshly created plaintext one, as "encrypted". Only `set_encryption`
+        // ever writes the id=1 row, so the row is the real signal.
+        // A missing table makes `prepare` fail, which falls through to the
+        // ciphertext heuristic below — the documented "plaintext" /
+        // "mixed-legacy" path.
         let has_canary: bool = conn
-            .prepare("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='encryption_canary'")
+            .prepare("SELECT COUNT(*) FROM encryption_canary")
             .and_then(|mut s| s.query_row([], |r| r.get::<_, i64>(0)))
             .map(|c| c > 0)
             .unwrap_or(false);
@@ -11083,7 +11091,7 @@ last_accessed: {}
             // chunk gives every waiter a per-cycle chance to acquire, making
             // starvation probabilistically negligible at the default 5000ms
             // timeout. Costs 2ms of wall per 1000 rows (~0.2s @100k).
-            std::thread::sleep(std::time::Duration::from_millis(2));
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
         Ok((eligible, chunks))
     }
@@ -11455,8 +11463,6 @@ last_accessed: {}
         let (decay_eligible, _decay_chunks) = Self::cohere_decay_chunked(&conn)?;
         decayed = decay_eligible;
 
-        let tx = Self::audited_write_tx(&conn)?;
-
         // 3. Link: auto-link entities sharing a category. The JOIN already
         // proves both rows exist and carries e1.id + e1.links, so we build the
         // new link lists in memory and flush one UPDATE per source entity —
@@ -11477,8 +11483,14 @@ last_accessed: {}
         let candidate_budget = max_links.saturating_mul(50).clamp(0, 5000);
         let mut pending: std::collections::HashMap<String, Vec<MemoryLink>> =
             std::collections::HashMap::new();
+        let mut candidate_links: i64 = 0;
         {
-            let mut stmt = tx.prepare(
+            // Candidate discovery is read-only and must stay outside the
+            // writer transaction. On a large category, SQLite may scan a
+            // substantial self-join before producing the bounded LIMIT set;
+            // doing that after BEGIN IMMEDIATE would hold the writer lock for
+            // the entire scan and starve concurrent remembers.
+            let mut stmt = conn.prepare(
                 "SELECT e1.id, e1.links, e2.id as e2_id, e1.body_json, e2.body_json
                  FROM entities e1
                  JOIN entities e2 ON e1.category = e2.category AND e1.id < e2.id
@@ -11535,21 +11547,48 @@ last_accessed: {}
                         relationship: "auto-related".to_string(),
                         weight: sim,
                     });
-                    linked += 1;
-                    if linked >= max_links {
+                    candidate_links += 1;
+                    if candidate_links >= max_links {
                         break 'link;
                     }
                 }
             }
         }
 
+        // Re-enter the writer transaction only for the bounded read-modify-
+        // write and archive phase. Re-read each source's current links under
+        // the lock so a concurrent link/unlink that happened during candidate
+        // discovery is merged rather than overwritten.
+        let tx = Self::audited_write_tx(&conn)?;
         let link_ts = now_ms();
-        for (id, links) in &pending {
-            let new_links = serde_json::to_string(links)?;
-            tx.execute(
-                "UPDATE entities SET links = ?1, last_accessed_unix_ms = ?2 WHERE id = ?3",
-                params![new_links, link_ts, id],
-            )?;
+        for (id, proposed_links) in &pending {
+            let Some(current_links_json) = tx
+                .query_row(
+                    "SELECT links FROM entities WHERE id = ?1 AND archived = 0",
+                    params![id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+            else {
+                continue;
+            };
+            let mut links: Vec<MemoryLink> =
+                serde_json::from_str(&current_links_json).unwrap_or_default();
+            let mut added = false;
+            for proposed in proposed_links {
+                if !links.iter().any(|existing| existing.target_id == proposed.target_id) {
+                    links.push(proposed.clone());
+                    linked += 1;
+                    added = true;
+                }
+            }
+            if added {
+                let new_links = serde_json::to_string(&links)?;
+                tx.execute(
+                    "UPDATE entities SET links = ?1, last_accessed_unix_ms = ?2 WHERE id = ?3",
+                    params![new_links, link_ts, id],
+                )?;
+            }
         }
 
         // 4. Archive: entities below decay threshold. Exempt verified facts to
@@ -14617,17 +14656,17 @@ mod tests {
     /// — so no writer with a ~250ms budget could EVER acquire inside it.
     /// Post-fix the longest hold is one 1000-row decay chunk or the
     /// candidate_budget-bounded link/archive tx (~60ms worst at this scale,
-    /// debug, same box), and the 2ms inter-chunk yield guarantees an
+    /// debug, same box), and the inter-chunk yield gives a waiting writer an
     /// acquisition window after each chunk. Both sides scale with machine
     /// speed, so the ~10x pre/post hold ratio — not absolute timing — is
     /// what the 250ms budget sits inside.
     ///
     /// The writer polls with a fine-grained 1ms busy handler rather than
     /// PRAGMA busy_timeout: SQLite's default busy handler sleeps up to 100ms
-    /// between retries, which measures retry-schedule luck against the 2ms
-    /// windows instead of the property under test (no single hold may exceed
-    /// the wait budget). Field writers keep the default 5000ms timeout,
-    /// which the bounded holds now clear at any store size.
+    /// between retries, which would measure retry-schedule luck rather than
+    /// the property under test (no single hold may exceed the wait budget).
+    /// Field writers keep the default 5000ms timeout, which the bounded holds
+    /// now clear at any store size.
     #[test]
     fn concurrent_writer_not_starved_during_cohere() {
         use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -17500,6 +17539,46 @@ mod tests {
         f.write_all(key.as_bytes()).unwrap();
         drop(f);
         (path.to_str().unwrap().to_string(), key)
+    }
+
+    /// Regression: `encryption_storage_state()` used to test for the EXISTENCE
+    /// of the `encryption_canary` table. The schema creates that table
+    /// unconditionally, so every database — including a brand-new plaintext one
+    /// — was reported as "encrypted", and `doctor` printed
+    /// "[ENCRYPTED] AES-256-GCM canary present — bodies are ciphertext"
+    /// over a database whose bodies were readable with plain `sqlite3`.
+    #[test]
+    fn storage_state_is_plaintext_until_a_canary_row_exists() {
+        let (mut db, path) = temp_db();
+
+        // Fresh DB: canary TABLE exists (schema), canary ROW does not.
+        let table_exists: i64 = db
+            .conn()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='encryption_canary'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(table_exists, 1, "schema always creates the canary table");
+
+        db.remember(&make_entity("s-1", "note", "s-1", r#"{"x":1}"#))
+            .unwrap();
+        assert_eq!(
+            db.encryption_storage_state(),
+            "plaintext",
+            "an unencrypted database must not report itself as encrypted"
+        );
+
+        // Enabling encryption writes the canary row — only then "encrypted".
+        let (key_path, _) = temp_key_file();
+        db.set_encryption(&key_path).unwrap();
+        assert_eq!(db.encryption_storage_state(), "encrypted");
+
+        let _ = std::fs::remove_file(&key_path);
+        drop(db);
+        let _ = fs::remove_file(&path);
     }
 
     #[test]
@@ -23555,7 +23634,7 @@ mod tests {
                 std::time::Instant::now() < deadline,
                 "fake embed server never saw request #{n}"
             );
-            std::thread::sleep(std::time::Duration::from_millis(2));
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
 
