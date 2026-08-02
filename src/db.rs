@@ -20,6 +20,20 @@ use crate::models::{
     GraphNode, IngestParams, JournalEvent, MemoryLink, OriginRecord, PruneParams, PruneReport,
     PurgeReport, Readiness, RecallParams, StateEntry, Stats, TimelineParams, VaultReport,
 };
+
+fn with_legacy_evidence(body_json: String, captured_at_unix_ms: i64, source_system: &str) -> String {
+    let mut body = serde_json::from_str::<serde_json::Value>(&body_json)
+        .unwrap_or_else(|_| serde_json::json!({"content": body_json}));
+    if let Some(map) = body.as_object_mut() {
+        map.entry("evidence").or_insert_with(|| serde_json::json!({
+            "capture_mode": "legacy_unknown",
+            "source_system": source_system,
+            "captured_at_unix_ms": captured_at_unix_ms,
+            "replayable": false
+        }));
+    }
+    body.to_string()
+}
 use crate::schema;
 
 fn canonical_constraint_json(raw: &str) -> Result<String, Box<dyn std::error::Error>> {
@@ -1277,7 +1291,7 @@ impl Database {
                             },
                             category: doc.category,
                             key: doc.key,
-                            body_json: doc.body_json,
+                            body_json: with_legacy_evidence(doc.body_json, now, &format!("connector:{}", name)),
                             status: "active".to_string(),
                             entity_type: "insight".to_string(),
                             tags: doc.tags,
@@ -11626,6 +11640,14 @@ last_accessed: {}
         };
         // #363: corrections often describe when the corrected fact was actually
         // true in the world — pass the caller's valid-time period through.
+        let mut entity = entity;
+        if let Some(evidence) = &params.evidence {
+            let mut body: serde_json::Value = serde_json::from_str(&entity.body_json)?;
+            body["evidence"] = serde_json::to_value(evidence)?;
+            entity.body_json = body.to_string();
+        } else {
+            entity.body_json = with_legacy_evidence(entity.body_json, now, "perseus_vault_correct");
+        }
         self.remember_with_validity(&entity, params.valid_from_unix_ms, params.valid_to_unix_ms)?;
 
         // Also create a journal entry
@@ -11735,7 +11757,7 @@ If no clear lessons found, return: {{"lessons": []}}"#,
         for lesson in &lessons {
             let id = format!("syn-{}", uuid::Uuid::new_v4().to_string().replace('-', "")[..12].to_string());
             let key = format!("{}-{}", lesson.lesson_type, &id[4..16]);
-            let body = serde_json::json!({
+            let mut body = serde_json::json!({
                 "lesson_type": lesson.lesson_type,
                 "summary": lesson.summary,
                 "evidence": lesson.evidence,
@@ -11743,6 +11765,15 @@ If no clear lessons found, return: {{"lessons": []}}"#,
                 "session_id": params.session_id,
                 "source": "mimir_synthesize",
             });
+            body["evidence"] = serde_json::to_value(params.evidence.as_ref().unwrap_or(&crate::models::EvidenceEnvelope {
+                capture_mode: "legacy_unknown".to_string(),
+                resolved_value: None,
+                content_sha256: None,
+                source_system: Some("perseus_vault_synthesize".to_string()),
+                source_ref: Some(params.session_id.clone()),
+                captured_at_unix_ms: now,
+                replayable: false,
+            }))?;
             
             let entity = crate::models::Entity {
                 id: id.clone(),

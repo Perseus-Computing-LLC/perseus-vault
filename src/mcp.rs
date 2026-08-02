@@ -812,7 +812,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
         },
         "evidence": {
           "type": "object",
-          "description": "Write-time audit envelope. capture_mode distinguishes snapshot, hash_only, pointer_only, not_requested, capture_failed, and legacy_unknown; a missing value is never interpreted implicitly.",
+          "description": "Write-time audit envelope for captures and decisions. capture_mode distinguishes snapshot, hash_only, pointer_only, not_requested, capture_failed, and legacy_unknown; a missing value is never interpreted implicitly.",
           "properties": {
             "capture_mode": { "type": "string", "enum": ["snapshot", "hash_only", "pointer_only", "not_requested", "capture_failed", "legacy_unknown"] },
             "resolved_value": { "description": "Resolved source value retained at write time when capture_mode=snapshot" },
@@ -3280,6 +3280,20 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
         "source_file": {
           "type": "string",
           "description": "#563: path to the file the payload came from. Required for consume to have anything to prune; ignored when consume is false."
+        },
+        "evidence": {
+          "type": "object",
+          "description": "Write-time evidence envelope for captured notes. Omit only for legacy_unknown compatibility.",
+          "properties": {
+            "capture_mode": { "type": "string", "enum": ["snapshot", "hash_only", "pointer_only", "not_requested", "capture_failed", "legacy_unknown"] },
+            "resolved_value": { "description": "Resolved source value retained at capture time" },
+            "content_sha256": { "type": "string" },
+            "source_system": { "type": "string" },
+            "source_ref": { "type": "string" },
+            "captured_at_unix_ms": { "type": "integer" },
+            "replayable": { "type": "boolean" }
+          },
+          "required": ["capture_mode", "captured_at_unix_ms", "replayable"]
         }
       },
       "required": [
