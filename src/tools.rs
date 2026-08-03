@@ -138,6 +138,11 @@ pub struct RememberArgs {
     /// legacy records rather than being inferred from a missing value.
     #[serde(default)]
     pub evidence: Option<crate::models::EvidenceEnvelope>,
+    /// #821: optional hash-only trust admission evidence. Suppressed/abstained
+    /// writes return without durable memory; quarantined/escalated records are
+    /// retained as explicitly non-authoritative history.
+    #[serde(default)]
+    pub admission: Option<crate::trust_admission::AdmissionRequest>,
 }
 
 /// #487: a `derived_from` citation — either an entity id (`"mem-..."`, as
@@ -842,7 +847,26 @@ pub fn handle_remember(db: &Database, args: Value) -> Result<String, String> {
             }
         }
     }
-    let body = if a.origin.is_none() && a.external_refs.is_empty() && a.evidence.is_none() {
+    let admission_evidence = if let Some(ref request) = a.admission {
+        let decision = crate::trust_admission::evaluate(request)
+            .map_err(|e| format!("admission gate failed: {e}"))?;
+        if matches!(decision.outcome.as_str(), "suppressed" | "abstained") {
+            return Ok(json!({
+                "ok": false,
+                "remembered": false,
+                "admission": decision,
+            })
+            .to_string());
+        }
+        Some(decision)
+    } else {
+        None
+    };
+    let body = if a.origin.is_none()
+        && a.external_refs.is_empty()
+        && a.evidence.is_none()
+        && admission_evidence.is_none()
+    {
         body
     } else {
         let mut obj: serde_json::Value =
@@ -867,6 +891,12 @@ pub fn handle_remember(db: &Database, args: Value) -> Result<String, String> {
                     serde_json::to_value(evidence).unwrap_or(serde_json::json!({})),
                 );
             }
+            if let Some(ref admission) = admission_evidence {
+                map.insert(
+                    "admission".to_string(),
+                    serde_json::to_value(admission).unwrap_or(serde_json::json!({})),
+                );
+            }
         }
         serde_json::to_string(&obj).unwrap_or(body)
     };
@@ -881,13 +911,16 @@ pub fn handle_remember(db: &Database, args: Value) -> Result<String, String> {
         "semantic" => "working".to_string(),
         _ => l,
     }).unwrap_or_else(|| "buffer".to_string());
+    let quarantined = admission_evidence
+        .as_ref()
+        .is_some_and(|admission| admission.outcome != "admitted");
 
     let entity = Entity {
         id,
         category: a.category,
         key: a.key,
         body_json: body,
-        status: a.status,
+        status: if quarantined { "quarantined".to_string() } else { a.status },
         entity_type: a.entity_type,
         tags: a.tags,
         decay_score: a.importance,
@@ -899,7 +932,7 @@ pub fn handle_remember(db: &Database, args: Value) -> Result<String, String> {
         links: vec![],
         verified: false,
         source: "agent".to_string(),
-        always_on: a.always_on,
+        always_on: if quarantined { false } else { a.always_on },
         certainty: a.certainty,
         workspace_hash: a.workspace_hash.clone(),
         agent_id: a.agent_id.clone(),
@@ -1000,6 +1033,9 @@ pub fn handle_remember(db: &Database, args: Value) -> Result<String, String> {
     }
     if let Some(dr) = derived_report {
         result["derived_from"] = dr;
+    }
+    if let Some(admission) = admission_evidence {
+        result["admission"] = serde_json::to_value(admission).unwrap_or(serde_json::json!({}));
     }
     Ok(result.to_string())
 }
@@ -9691,6 +9727,74 @@ mod tests {
             "evidence": {"capture_mode": "hash_only", "captured_at_unix_ms": 100, "replayable": false}
         })).unwrap_err();
         assert!(err.contains("requires content_sha256"), "{err}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn remember_admission_quarantines_untrusted_content_at_write_boundary() {
+        let (db, path) = temp_db();
+        let response = handle_remember(
+            &db,
+            json!({
+                "category": "security",
+                "key": "poisoned-record",
+                "body_json": "{\"note\":\"untrusted source\"}",
+                "always_on": true,
+                "admission": {
+                    "record_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "source_identity": "email-42",
+                    "authorization_scope": "workspace-a",
+                    "ingestion_channel": "connector-email",
+                    "workspace_hash": "workspace-a",
+                    "source_trust": "untrusted",
+                    "valid_from_unix_ms": 100,
+                    "recorded_at_unix_ms": 110,
+                    "task_relevance_bps": 9000,
+                    "instruction_bearing": true
+                }
+            }),
+        )
+        .expect("quarantine should retain non-authoritative evidence");
+        let value: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(value["admission"]["outcome"], "quarantined");
+        let entity = db
+            .get_entity("security", "poisoned-record")
+            .unwrap()
+            .expect("quarantined record should be retained");
+        assert_eq!(entity.status, "quarantined");
+        assert!(!entity.always_on);
+        let body: Value = serde_json::from_str(&entity.body_json).unwrap();
+        assert_eq!(body["admission"]["authoritative"], false);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn remember_admission_suppression_does_not_write_memory() {
+        let (db, path) = temp_db();
+        let response = handle_remember(
+            &db,
+            json!({
+                "category": "security",
+                "key": "irrelevant-record",
+                "body_json": "{\"note\":\"not relevant\"}",
+                "admission": {
+                    "record_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "source_identity": "web-17",
+                    "authorization_scope": "workspace-a",
+                    "ingestion_channel": "web-import",
+                    "workspace_hash": "workspace-a",
+                    "source_trust": "trusted",
+                    "valid_from_unix_ms": 100,
+                    "recorded_at_unix_ms": 110,
+                    "task_relevance_bps": 100
+                }
+            }),
+        )
+        .expect("suppression is a structured non-write");
+        let value: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(value["ok"], false);
+        assert_eq!(value["remembered"], false);
+        assert!(db.get_entity("security", "irrelevant-record").unwrap().is_none());
         let _ = std::fs::remove_file(path);
     }
 }

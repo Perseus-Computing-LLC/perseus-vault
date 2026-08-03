@@ -18,6 +18,7 @@ mod mcp;
 mod models;
 mod multimodal;
 mod schema;
+mod trust_admission;
 mod tools;
 mod transport;
 mod grpc;
