@@ -1,0 +1,66 @@
+{
+  "contract_version": "perseus-vault-integration-conformance/v1",
+  "vault_schema_version": "2.22.x",
+  "purpose": "Reusable synthetic contract for adapter behavior; no credentials or raw memory bodies.",
+  "cases": [
+    {
+      "id": "remember_idempotent",
+      "operation": "remember",
+      "expected": [
+        "same logical key does not create duplicate active entities",
+        "correction or supersession remains inspectable"
+      ]
+    },
+    {
+      "id": "workspace_isolation",
+      "operation": "recall",
+      "expected": [
+        "workspace A cannot recall workspace B memory",
+        "empty result is distinct from backend failure"
+      ]
+    },
+    {
+      "id": "empty_recall",
+      "operation": "recall",
+      "expected": [
+        "empty recall is a valid response",
+        "adapter does not manufacture context"
+      ]
+    },
+    {
+      "id": "timeout_or_backend_error",
+      "operation": "health",
+      "expected": [
+        "timeout or unavailable backend is observable",
+        "failure is not reported as a successful empty recall"
+      ]
+    },
+    {
+      "id": "forget_preserves_history",
+      "operation": "forget",
+      "expected": [
+        "forget/revocation changes active visibility",
+        "historical state remains auditable"
+      ]
+    },
+    {
+      "id": "provenance_projection",
+      "operation": "recall",
+      "expected": [
+        "source class and workspace scope are hash-bindable",
+        "raw memory bodies are excluded from conformance reports"
+      ]
+    }
+  ],
+  "report_requirements": {
+    "required_fields": [
+      "contract_version",
+      "adapter",
+      "adapter_version",
+      "vault_version",
+      "results"
+    ],
+    "result_fields": ["case_id", "status", "evidence_digest"],
+    "statuses": ["pass", "fail", "degraded", "skip"]
+  }
+}
