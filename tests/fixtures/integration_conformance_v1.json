@@ -6,6 +6,7 @@
     {
       "id": "remember_idempotent",
       "operation": "remember",
+      "request": {"category": "decision", "key": "repeatable-key", "workspace_hash": "hash-a", "payload_digest": "sha256"},
       "expected": [
         "same logical key does not create duplicate active entities",
         "correction or supersession remains inspectable"
@@ -14,6 +15,7 @@
     {
       "id": "workspace_isolation",
       "operation": "recall",
+      "request": {"workspace_a": "hash-a", "workspace_b": "hash-b", "query_digest": "sha256"},
       "expected": [
         "workspace A cannot recall workspace B memory",
         "empty result is distinct from backend failure"
@@ -22,6 +24,7 @@
     {
       "id": "empty_recall",
       "operation": "recall",
+      "request": {"workspace_hash": "empty-scope", "query": "unseen topic"},
       "expected": [
         "empty recall is a valid response",
         "adapter does not manufacture context"
@@ -30,6 +33,7 @@
     {
       "id": "timeout_or_backend_error",
       "operation": "health",
+      "request": {"timeout_seconds": 1, "failure_policy": "observable_error"},
       "expected": [
         "timeout or unavailable backend is observable",
         "failure is not reported as a successful empty recall"
@@ -38,6 +42,7 @@
     {
       "id": "forget_preserves_history",
       "operation": "forget",
+      "request": {"category": "decision", "key": "repeatable-key", "workspace_hash": "hash-a"},
       "expected": [
         "forget/revocation changes active visibility",
         "historical state remains auditable"
@@ -46,9 +51,20 @@
     {
       "id": "provenance_projection",
       "operation": "recall",
+      "request": {"workspace_hash": "hash-a", "source_class": "asserted", "report_mode": "hash-only"},
       "expected": [
         "source class and workspace scope are hash-bindable",
         "raw memory bodies are excluded from conformance reports"
+      ]
+    },
+    {
+      "id": "outcome_state_semantics",
+      "operation": "context",
+      "request": {"mode": "on_demand", "workspace_hash": "hash-a"},
+      "expected": [
+        "complete is reserved for a successful bounded context result",
+        "degraded records an explicit compatibility policy",
+        "abstain prevents injection when compilation fails"
       ]
     }
   ],

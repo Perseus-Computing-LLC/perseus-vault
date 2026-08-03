@@ -38,15 +38,8 @@ def test_report_requires_sanitized_case_results():
         "adapter_version": "0.1.0",
         "vault_version": "2.22.0",
         "results": [
-            {"case_id": case_id, "status": "pass", "evidence_digest": "a" * 64}
-            for case_id in (
-                "remember_idempotent",
-                "workspace_isolation",
-                "empty_recall",
-                "timeout_or_backend_error",
-                "forget_preserves_history",
-                "provenance_projection",
-            )
+            {"case_id": case["id"], "status": "pass", "evidence_digest": "a" * 64}
+            for case in json.loads(FIXTURE.read_text())["cases"]
         ],
     }
     assert validate_report(report)["adapter"] == "example"

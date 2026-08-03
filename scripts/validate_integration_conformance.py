@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import re
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -18,12 +19,13 @@ REQUIRED_CASES = frozenset(
         "timeout_or_backend_error",
         "forget_preserves_history",
         "provenance_projection",
+        "outcome_state_semantics",
     }
 )
 STATUSES = frozenset({"pass", "fail", "degraded", "skip"})
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _FORBIDDEN_KEYS = frozenset(
-    {"prompt", "body", "raw", "content", "secret", "api_key", "token", "password"}
+    {"prompt", "body", "raw", "content", "secret", "apikey", "token", "password"}
 )
 
 
@@ -41,8 +43,11 @@ def _validate_sanitized(value: Any, path: str = "report") -> None:
     if isinstance(value, dict):
         for key, child in value.items():
             _require(isinstance(key, str), f"{path} keys must be strings")
+            normalized = re.sub(r"[^a-z0-9]", "", key.lower())
             _require(
-                key.lower() not in _FORBIDDEN_KEYS,
+                normalized not in _FORBIDDEN_KEYS
+                and not normalized.startswith(("raw", "body", "content"))
+                and not any(marker in normalized for marker in ("apikey", "secret", "token", "password")),
                 f"{path}.{key} contains raw or secret material",
             )
             _validate_sanitized(child, f"{path}.{key}")
@@ -61,6 +66,9 @@ def validate_contract_fixture(fixture: dict[str, Any]) -> dict[str, Any]:
     _require(isinstance(report_requirements.get("required_fields"), list), "report_requirements.required_fields must be a list")
     _require(isinstance(report_requirements.get("result_fields"), list), "report_requirements.result_fields must be a list")
     _require(isinstance(report_requirements.get("statuses"), list), "report_requirements.statuses must be a list")
+    _require(all(isinstance(item, str) and item for item in report_requirements["required_fields"]), "required_fields must contain strings")
+    _require(all(isinstance(item, str) and item for item in report_requirements["result_fields"]), "result_fields must contain strings")
+    _require(set(report_requirements["statuses"]) == STATUSES, "statuses must match the contract status vocabulary")
     cases = fixture.get("cases")
     _require(isinstance(cases, list), "cases must be a list")
     ids = []
@@ -73,12 +81,19 @@ def validate_contract_fixture(fixture: dict[str, Any]) -> dict[str, Any]:
         expected = case.get("expected")
         _require(isinstance(expected, list) and expected, f"case {case_id} needs expected assertions")
         _require(all(isinstance(assertion, str) and assertion for assertion in expected), f"case {case_id} expected assertions must be strings")
+        if "request" in case:
+            _require(isinstance(case["request"], dict), f"case {case_id} request must be an object")
     _require(len(ids) == len(set(ids)), "case ids must be unique")
     _require(REQUIRED_CASES.issubset(ids), "fixture is missing a required conformance case")
+    _validate_sanitized(fixture, "fixture")
     return fixture
 
 
-def validate_report(report: dict[str, Any]) -> dict[str, Any]:
+def validate_report(
+    report: dict[str, Any],
+    *,
+    required_cases: frozenset[str] = REQUIRED_CASES,
+) -> dict[str, Any]:
     _require(isinstance(report, dict), "report must be an object")
     _require(report.get("contract_version") == CONTRACT_VERSION, "unsupported contract_version")
     for field in ("adapter", "adapter_version", "vault_version"):
@@ -91,14 +106,14 @@ def validate_report(report: dict[str, Any]) -> dict[str, Any]:
         case_id = result.get("case_id")
         _require(isinstance(case_id, str) and case_id, "result case_id must be a non-empty string")
         _require(case_id not in case_ids, "result case_id must be unique")
-        _require(case_id in REQUIRED_CASES, f"unknown case_id: {case_id}")
+        _require(case_id in required_cases, f"unknown case_id: {case_id}")
         case_ids.append(case_id)
         status = result.get("status")
         _require(isinstance(status, str) and status in STATUSES, f"invalid status for {case_id}")
         _check_digest(result.get("evidence_digest"), "evidence_digest")
         if status != "pass":
             _require(isinstance(result.get("explanation"), str) and result["explanation"], f"non-pass result {case_id} needs an explanation")
-    _require(set(case_ids) == REQUIRED_CASES, "report must include all required cases exactly once")
+    _require(set(case_ids) == required_cases, "report must include all required cases exactly once")
     _validate_sanitized(report)
     return report
 
@@ -108,9 +123,15 @@ def main() -> int:
     parser.add_argument("--fixture", type=Path, required=True)
     parser.add_argument("--report", type=Path)
     args = parser.parse_args()
-    validate_contract_fixture(json.loads(args.fixture.read_text()))
-    if args.report:
-        validate_report(json.loads(args.report.read_text()))
+    try:
+        fixture = json.loads(args.fixture.read_text())
+        validate_contract_fixture(fixture)
+        if args.report:
+            required_cases = frozenset(case["id"] for case in fixture["cases"])
+            validate_report(json.loads(args.report.read_text()), required_cases=required_cases)
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        print(f"validation failed: {exc}", file=sys.stderr)
+        return 2
     print(f"validated {CONTRACT_VERSION}")
     return 0
 
