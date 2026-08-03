@@ -110,17 +110,21 @@ Wiring it into this contract:
   hygiene pass immediately gets a chance to merge/promote them):
 
   ```json
-  "SessionEnd": [
-    { "matcher": "*",
-      "hooks": [
-        { "type": "command",
-          "command": "cat \"$CLAUDE_TRANSCRIPT_PATH\" | perseus-vault capture",
-          "timeout": 60 },
-        { "type": "command",
-          "command": "perseus-vault maintain",
-          "timeout": 120 }
-      ] }
-  ]
+  {
+    "hooks": {
+      "SessionEnd": [
+        { "matcher": "*",
+          "hooks": [
+            { "type": "command",
+              "command": "cat \"$CLAUDE_TRANSCRIPT_PATH\" | perseus-vault capture",
+              "timeout": 60 },
+            { "type": "command",
+              "command": "perseus-vault maintain",
+              "timeout": 120 }
+          ] }
+      ]
+    }
+  }
   ```
 
   Preview with `--dry-run` first to see what your transcripts distill into.
@@ -134,7 +138,8 @@ Hooks and instructions files hard-code tool names, so those names are a
 contract:
 
 - Every tool is dispatchable under **three interchangeable prefixes**:
-  `perseus_vault_*` (canonical), plus `mimir_*` and `mneme_*` (legacy aliases
+  `perseus_vault_*` (canonical), plus the two existing legacy aliases
+  `mimir_*` and `mneme_*`
   from earlier product names). The default `tools/list` advertises only the
   canonical `perseus_vault_*` set to avoid tripling the schema payload; operators
   can opt into advertising all aliases with `PERSEUS_VAULT_TOOL_ALIASES=all`.
