@@ -12,6 +12,25 @@ vault; each one just removes a "remember to call the tool" burden from the
 agent. All commands run against your local SQLite database — no network, no
 cloud, no telemetry.
 
+## Two planes: active context and durable memory
+
+A lifecycle hook operates at the boundary between the host's active working
+context and the server's durable-memory plane. `prepare` and
+`perseus_vault_context` render a bounded, rolling snapshot for the current task;
+that snapshot belongs to the host and is not durable merely because it was
+injected. A durable record exists only after an explicit write or capture
+operation succeeds. This is the server-owned lifecycle: the Vault server owns
+the database, retention, decay, history, archive, purge, and derived-record
+state; hooks only request those operations.
+
+Refresh the working snapshot when the task changes rather than assuming that a
+previous SessionStart block remains correct. If the server or hook is
+unavailable, continue without injected memory, mark the session degraded, and
+do not claim that a failed capture or write was persisted. Do not silently
+switch to another database. These are non-disruptive safeguards: memory
+failure should not prevent ordinary host work, while durability claims remain
+honest.
+
 ```
 SessionStart ──▶ recall (seed context)
      │
@@ -37,7 +56,9 @@ Notes on the mapping:
   recall-first `context` block and prints a single `<memory-prep>…</memory-prep>`
   markdown block on stdout — local SQLite queries only, no LLM calls, typically
   10–50 ms. Print it into the session and the model starts with memory already
-  in context. `--json` emits structured output for programmatic hooks.
+  in context. `prepare` is read-only: the block is a rolling snapshot, so rerun
+  it when the task changes and do not treat the host's prompt or the rendered
+  block as durable memory. `--json` emits structured output for programmatic hooks.
   - *Workspace resolution (optional):* pass `--workspace <hash>` to `prepare`
     (or `workspace_hash` on the MCP tools) to scope injection to one project's
     memories. Single-workspace vaults can ignore this entirely.
@@ -112,15 +133,17 @@ optional LLM path): [docs/capture.md](capture.md).
 Hooks and instructions files hard-code tool names, so those names are a
 contract:
 
-- Every tool is exposed under **three interchangeable prefixes**:
+- Every tool is dispatchable under **three interchangeable prefixes**:
   `perseus_vault_*` (canonical), plus `mimir_*` and `mneme_*` (legacy aliases
-  from earlier product names). The server advertises all three in
-  `tools/list`, and `tools/call` normalizes any of the three prefixes to the
-  same handler (see `src/mcp.rs`).
+  from earlier product names). The default `tools/list` advertises only the
+  canonical `perseus_vault_*` set to avoid tripling the schema payload; operators
+  can opt into advertising all aliases with `PERSEUS_VAULT_TOOL_ALIASES=all`.
+  `tools/call` normalizes any of the three prefixes to the same handler (see
+  `src/mcp.rs`).
 - **Write new hooks against `perseus_vault_*`.** Existing hooks written
-  against `mimir_*` or `mneme_*` keep working: all three prefixes are
-  supported for the lifetime of the v2 series and will not be removed in a
-  minor or patch release. New tools always ship under all three prefixes.
+  against `mimir_*` or `mneme_*` keep working because dispatch aliases remain
+  supported for the lifetime of the v2 series. New tools are canonical by
+  default; the opt-in alias advertisement mode is the compatibility bridge.
 - CLI verbs referenced by this contract (`prepare`, `write`, `capture`,
   `maintain`, `stats`) follow the same policy: stable for the v2 series; any
   future rename would keep the old verb as an alias through a deprecation

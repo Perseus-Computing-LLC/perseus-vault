@@ -19,6 +19,46 @@ remember ──▶ active (buffer) ──▶ working ──▶ core        promo
                                  deleted (permanent)
 ```
 
+## Memory model: explicit durability and active working context
+
+The diagram describes **explicit durable memory** in the Vault database. A
+prompt, transcript, or context block held by an MCP host is **implicit working
+context**: it is active only for the host's current task/session, is owned by
+the host, and is not persisted just because the server returned it. Durable
+memory enters the database through an explicit write or capture operation and
+then follows the server-owned lifecycle above.
+
+`perseus-vault prepare` and `perseus_vault_context` are read paths that assemble
+a bounded active working context from durable records. The result is a rolling
+snapshot: refresh it when the task changes, and do not assume that a client
+will retain, replay, or re-inject it after a restart. Recall-first context is
+budgeted (1500 characters by default, 6000 for large-window hosts, or an
+explicit `max_context_chars`); `always_on` is capped at five entities. A
+successful context read is not a durable write and does not turn the host's
+full prompt into memory.
+
+### Server-owned lifecycle and bounded retention
+
+The Vault server is the authority for the SQLite file, entity state, history,
+journal, decay, archive, purge, and derived-record provenance. Clients and
+lifecycle hooks only request these operations; they must not implement a
+second retention policy or silently select another database when the server is
+unavailable.
+
+Keep these bounds separate:
+
+- **Working context is bounded by the serving budget.** Use the default
+  recall-first budgets or pass `max_context_chars`; use `recall_when` for
+  targeted refreshes instead of growing an unconditional context block.
+- **Current entities may be archived by decay, not hard-deleted.** Hard deletion
+  is an explicit `purge` after archival. This is the default safety boundary.
+- **History and journal retention is append-only by default.** The history age,
+  per-key version, byte-budget, and tombstone controls are opt-in and run only
+  from documented maintenance paths; they do not silently evict on every write.
+- **Capture and lifecycle automation are opt-in.** A hook or scheduled
+  maintenance pass may be bounded and dry-run first; no client should infer
+  that a session was captured without an explicit successful result.
+
 Nothing is ever deleted automatically. Automatic forgetting stops at
 **archived**, which is reversible; only an explicit `purge` deletes rows.
 (One opt-in exception: superseded *versions* in `entity_history` can be
@@ -136,6 +176,16 @@ Deletion is explicit and two-step:
   - **`mimir_vault_export` files** — exported Markdown/JSON on disk is a point-in-
     time copy outside the database and is never touched by `purge`; delete the
     export artifacts out-of-band.
+  - **Derived knowledge projections** — `perseus_vault_derived_export` output is
+    regenerable Markdown, not a source of truth. Delete the output and any
+    copies made by a client, editor, sync job, or backup process separately.
+  - **Active working context and host artifacts** — text already injected into
+    a prompt, transcript, client log, cache, or model-side trace is outside the
+    database purge boundary. Remove those copies through the owning host or
+    retention system when erasure requires it.
+  - **Operator backups** — database, key, and export backups are independent
+    copies. Keep their retention and access controls separate, and do not call
+    erasure complete while a retained copy can still disclose the erased body.
 
 ## Version history retention (#398)
 
@@ -279,3 +329,45 @@ semantically therefore decays as if unused — unless you opt in:
 
 `skip_side_effects` always wins over `reinforce`: a caller that asked for a
 pure read never mutates.
+
+## Rolling refresh for changing sources
+
+The [incremental extraction refresh spec](specs/incremental-extraction-refresh.md)
+defines refresh as an explicit, bounded reconciliation, not a hidden background
+writer:
+
+1. Compare the new source hash with the stored hash. An unchanged source is a
+   no-op.
+2. For a changed source, refresh only entities whose provenance reaches the
+   changed artifact (or changed section when section anchors exist).
+3. Keep unchanged facts, supersede changed facts with new versions, and
+   invalidate facts that disappeared from the source. Do not rewrite history in
+   place.
+4. Mark higher-level derived observations with `stale_evidence` when their
+   evidence intersects the refresh set, then re-derive them lazily during a
+   later consolidation pass rather than on every source save.
+
+After a successful refresh, re-run `perseus-vault prepare` for the next task if
+that task's active working context depends on the changed source. A previously
+rendered context block is a snapshot and is not retroactively updated; a
+refresh failure must not be reported as a successful durable update.
+
+## Non-disruptive degraded operation
+
+Memory is an aid to a host task, not a reason to stop the task unexpectedly:
+
+- If the server is unavailable, a hook times out, or no context is returned,
+  continue without injected memory and mark the session as degraded. Do not
+  fabricate remembered facts or silently fall back to another database.
+- If an explicit durable write or capture fails, report the failure and do not
+  claim persistence. Retry only after the server is healthy, using the same
+  stable key or an explicit idempotent capture policy.
+- Maintenance, consolidation, refresh, and export failures should leave the
+  last known durable state intact. Use their dry-run modes before a bounded
+  pass, and keep them out of the critical request path where possible.
+- An encryption warning is not a harmless degraded mode: when `doctor` reports
+  an encrypted database, provide the matching key before writes. Do not accept
+  mixed plaintext/ciphertext operation merely because the server can continue.
+
+These rules preserve ordinary client work while keeping durability, retention,
+and erasure claims honest.

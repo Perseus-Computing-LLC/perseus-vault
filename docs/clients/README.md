@@ -30,6 +30,29 @@ for the session lifecycle hook contract — copy-paste SessionStart/Stop hook
 snippets for Claude Code, Codex, and Cursor that wire the recall → capture →
 consolidate loop to session events, plus a portable AGENTS.md fallback.
 
+## Working context versus durable memory
+
+A client session has an active working context (the current prompt, transcript,
+and any `prepare`/`perseus_vault_context` block) and a separate durable-memory
+plane owned by the Vault server. Context is a bounded, rolling snapshot; refresh
+it when the task changes, and do not assume that returning it persists the
+host's prompt. Only an explicit `perseus_vault_remember`,
+`perseus_vault_capture`, or equivalent write/capture result establishes
+durability. Hooks are optional orchestration around the server-owned lifecycle,
+not a second store.
+
+If the server, a hook, or a refresh operation is unavailable, the client should
+continue in degraded mode without injected memory, surface the failure, and
+never claim that an unsuccessful write was saved or silently choose another
+DB. See [retention, refresh, and erasure boundaries](../retention.md).
+
+## Upgrade and migration
+
+For a source-built upgrade, explicit database selection, encryption/doctor
+checks, client-config dry runs and backups, restart, MCP smoke testing, and
+rollback, follow the [upgrade and migration playbook](../migration/upgrade-playbook.md).
+It deliberately does not assume a generic automatic database migration.
+
 | Client | Status | Config file | Notes |
 |---|---|---|---|
 | Claude Desktop | ✅ Works | `claude_desktop_config.json` | Most common host |
