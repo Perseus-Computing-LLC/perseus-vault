@@ -161,6 +161,10 @@ Composing with a memory washer (CoalWash) and a runtime output compactor
 (Noisegate) for end-to-end context-budget control:
 **[docs/integration/context-budget-stack.md](docs/integration/context-budget-stack.md)**.
 
+Auditing what the Vault remembers, from where, and under which authority:
+**[docs/evidence-chain-guidance.md](docs/evidence-chain-guidance.md)** — evidence chains,
+write-time provenance tags, and continuous attestation for durable memory.
+
 ## Why Perseus Vault
 
 Perseus Vault is the **only** memory engine that is simultaneously MCP-native,
