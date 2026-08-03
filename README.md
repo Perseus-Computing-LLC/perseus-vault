@@ -129,9 +129,11 @@ explicit `max_context_chars`); the `always_on` set is capped at five. See
 Lifecycle hooks and client installers are optional orchestration. They request
 server-owned recall, capture, maintenance, and refresh work; they do not become
 a second store or change retention policy. If the server or a hook is
-unavailable, continue the task without injected memory, surface the degraded
-state, and never claim that a failed explicit write was persisted or silently
-switch to a different database. For upgrade/recovery steps, use the
+unavailable, continue the task without injected memory and surface the degraded
+state. A host integration may have an explicitly configured local fallback, but
+that fallback must be labeled local-only and must not be presented as durable
+Vault recall; a failed explicit write must never be reported as persisted. For
+upgrade/recovery steps, use the
 [upgrade and migration playbook](docs/migration/upgrade-playbook.md).
 
 ## Works With Every MCP Client

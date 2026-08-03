@@ -42,8 +42,9 @@ full prompt into memory.
 The Vault server is the authority for the SQLite file, entity state, history,
 journal, decay, archive, purge, and derived-record provenance. Clients and
 lifecycle hooks only request these operations; they must not implement a
-second retention policy or silently select another database when the server is
-unavailable.
+second retention policy. A host integration may explicitly configure a local
+fallback when the server is unavailable, but it must surface that degraded,
+local-only result and must not represent it as durable Vault recall.
 
 Keep these bounds separate:
 
@@ -357,8 +358,10 @@ refresh failure must not be reported as a successful durable update.
 Memory is an aid to a host task, not a reason to stop the task unexpectedly:
 
 - If the server is unavailable, a hook times out, or no context is returned,
-  continue without injected memory and mark the session as degraded. Do not
-  fabricate remembered facts or silently fall back to another database.
+  continue without injected memory and mark the session as degraded. An
+  explicitly configured host fallback may provide local-only context, but it
+  must be labeled as such; do not fabricate remembered facts or represent
+  local context as durable Vault recall.
 - If an explicit durable write or capture fails, report the failure and do not
   claim persistence. Retry only after the server is healthy, using the same
   stable key or an explicit idempotent capture policy.
