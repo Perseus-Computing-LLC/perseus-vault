@@ -102,6 +102,38 @@ echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"mimir_reme
 echo '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"mimir_recall","arguments":{"query":"Hello"}}}' | perseus-vault serve --db memory.db
 ```
 
+## Memory model and operational boundaries
+
+Perseus Vault keeps three planes distinct:
+
+- **Implicit working context** is the host's current prompt, transcript, and any
+  context block a client chooses to inject. It is ephemeral and host-owned; it
+  is not persisted merely because Vault returned it.
+- **Explicit durable memory** is written by an explicit
+  `perseus_vault_remember`, `perseus_vault_capture`, `write`, or `capture`
+  operation. The Vault server owns the SQLite record, history, journal, decay,
+  archive, and purge lifecycle.
+- **Derived projections** include consolidated or synthesized records and
+  exported Markdown. They carry provenance, but they are not a replacement for
+  the durable source records and may need separate cleanup.
+
+`perseus-vault prepare` and `perseus_vault_context` read durable records to
+produce a bounded, task-relevant **active working context**. This is a rolling
+snapshot, not a background write or a promise that the client will retain it:
+refresh it when the task changes, and do not treat prompt text as durable memory
+unless an explicit capture/write operation succeeds. Recall-first output is
+budgeted (1500 characters by default, 6000 for large-window hosts, or an
+explicit `max_context_chars`); the `always_on` set is capped at five. See
+[retention and context semantics](docs/retention.md).
+
+Lifecycle hooks and client installers are optional orchestration. They request
+server-owned recall, capture, maintenance, and refresh work; they do not become
+a second store or change retention policy. If the server or a hook is
+unavailable, continue the task without injected memory, surface the degraded
+state, and never claim that a failed explicit write was persisted or silently
+switch to a different database. For upgrade/recovery steps, use the
+[upgrade and migration playbook](docs/migration/upgrade-playbook.md).
+
 ## Works With Every MCP Client
 
 Perseus Vault is a standard MCP **stdio** server — the same `perseus-vault serve` command works
