@@ -5025,7 +5025,8 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
   {"name":"mimir_action_complete", "description":"Record an executed, failed, or cancelled action outcome by hash.", "inputSchema":{"type":"object","properties":{"action_id":{"type":"string"},"actor_agent_id":{"type":"string"},"outcome":{"type":"string","enum":["executed","failed","cancelled"]},"outcome_hash":{"type":"string"}},"required":["action_id","actor_agent_id","outcome","outcome_hash"]}, "title":"Complete Authorized Action"},
   {"name":"mimir_action_receipt_get", "description":"Get durable action receipt metadata and hashes.", "inputSchema":{"type":"object","properties":{"action_id":{"type":"string"}},"required":["action_id"]}, "title":"Get Action Receipt"},
   {"name":"mimir_action_lease_acquire", "description":"Acquire the single active lease for an action key.", "inputSchema":{"type":"object","properties":{"action_id":{"type":"string"},"holder_id":{"type":"string"},"ttl_seconds":{"type":"integer","default":1}},"required":["action_id","holder_id"]}, "title":"Acquire Action Lease"},
-  {"name":"mimir_action_lease_release", "description":"Release an action lease held by its owner.", "inputSchema":{"type":"object","properties":{"lease_id":{"type":"string"},"holder_id":{"type":"string"}},"required":["lease_id","holder_id"]}, "title":"Release Action Lease"}
+  {"name":"mimir_action_lease_release", "description":"Release an action lease held by its owner.", "inputSchema":{"type":"object","properties":{"lease_id":{"type":"string"},"holder_id":{"type":"string"}},"required":["lease_id","holder_id"]}, "title":"Release Action Lease"},
+  {"name":"mimir_stage_trace_validate", "description":"Validate a versioned hash-only runtime stage trace and optionally compare replay semantics. Raw prompts, memory bodies, credentials, and tool payloads are not accepted.", "inputSchema":{"type":"object","properties":{"trace":{"type":"object","description":"perseus-vault-stage-trace/v1 structured trace"},"replay_of":{"type":"object","description":"Optional second trace to compare by replay fingerprint"}},"required":["trace"]}, "title":"Validate Runtime Stage Trace"}
 ]"###,
         )
         .expect("tools JSON must be valid");
@@ -5232,6 +5233,33 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
         "mimir_action_receipt_get" => tools::handle_action_receipt_get(db, args),
         "mimir_action_lease_acquire" => tools::handle_action_lease_acquire(db, args),
         "mimir_action_lease_release" => tools::handle_action_lease_release(db, args),
+        "mimir_stage_trace_validate" => (|| -> Result<String, String> {
+            let trace_value = args
+                .get("trace")
+                .cloned()
+                .ok_or_else(|| "stage_trace_validate requires trace".to_string())?;
+            let trace: crate::stage_trace::StageTrace = serde_json::from_value(trace_value)
+                .map_err(|e| format!("invalid stage trace: {e}"))?;
+            trace.validate()?;
+            let replay_fingerprint = trace.replay_fingerprint()?;
+            let replay_match = if let Some(replay_value) = args.get("replay_of").cloned() {
+                let replay: crate::stage_trace::StageTrace =
+                    serde_json::from_value(replay_value)
+                        .map_err(|e| format!("invalid replay trace: {e}"))?;
+                Some(crate::stage_trace::StageTrace::validate_replay(&trace, &replay).is_ok())
+            } else {
+                None
+            };
+            serde_json::to_string(&json!({
+                "valid": true,
+                "trace_digest": trace.digest()?,
+                "replay_fingerprint": replay_fingerprint,
+                "replay_match": replay_match,
+                "schema_version": crate::stage_trace::STAGE_TRACE_SCHEMA_VERSION,
+                "stage_count": trace.stages.len(),
+            }))
+            .map_err(|e| e.to_string())
+        })(),
         "mimir_promote" => tools::handle_promote(db, args),
         "mimir_demote" => tools::handle_demote(db, args),
         "mimir_beliefs" => beliefs::handle_beliefs(db, args),
@@ -5801,6 +5829,30 @@ mod tests {
         );
 
         let _ = fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn stage_trace_tool_validates_hash_only_replay_contract() {
+        let db_path = std::env::temp_dir()
+            .join(format!("perseus-stage-trace-{}.db", uuid::Uuid::new_v4()));
+        let db = Database::open(db_path.to_str().expect("temp db path")).expect("open temp db");
+        let trace = crate::stage_trace::StageTrace::new("trace-mcp", "workspace-a")
+            .seal()
+            .expect("empty trace is a valid fixture");
+        let response = call_tool(
+            "perseus_vault_stage_trace_validate",
+            &db,
+            json!({
+                "trace": serde_json::to_value(&trace).unwrap(),
+                "replay_of": serde_json::to_value(&trace).unwrap()
+            }),
+            None,
+        );
+        let value: Value = serde_json::from_str(&response).expect("structured response");
+        assert_eq!(value["valid"], true, "{response}");
+        assert_eq!(value["replay_match"], true, "{response}");
+        assert!(advertised_names(false).contains(&"perseus_vault_stage_trace_validate".to_string()));
+        let _ = fs::remove_file(db_path);
     }
 
     #[test]
