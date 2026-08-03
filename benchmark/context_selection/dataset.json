@@ -1,0 +1,103 @@
+{
+  "schema_version": "perseus-vault-context-selection/v1",
+  "corpus_id": "issue-820-fixture-v1",
+  "split": "deterministic-acceptance",
+  "items": [
+    {
+      "entity_id": "deploy-current",
+      "source_ids": ["ops-log-2026-01", "ticket-42"],
+      "body": "The webhook deployment is healthy after the queue timeout fix.",
+      "workspace_hash": "workspace-a",
+      "valid_from_unix_ms": 1704067200000,
+      "valid_to_unix_ms": null,
+      "certainty": 0.95,
+      "provenance_class": "fact_derived",
+      "authoritative": true,
+      "superseded": false,
+      "position": 0
+    },
+    {
+      "entity_id": "deploy-stale",
+      "source_ids": ["ops-log-2025-12"],
+      "body": "The webhook deployment was degraded before the queue timeout fix.",
+      "workspace_hash": "workspace-a",
+      "valid_from_unix_ms": 1672531200000,
+      "valid_to_unix_ms": 1704067200000,
+      "certainty": 0.98,
+      "provenance_class": "fact_extracted",
+      "authoritative": true,
+      "superseded": true,
+      "position": 1
+    },
+    {
+      "entity_id": "deploy-contradiction",
+      "source_ids": [],
+      "body": "The webhook deployment is broken and should be rolled back.",
+      "workspace_hash": "workspace-a",
+      "valid_from_unix_ms": 1704067200000,
+      "valid_to_unix_ms": null,
+      "certainty": 0.55,
+      "provenance_class": "inference_agent",
+      "authoritative": false,
+      "superseded": false,
+      "position": 2
+    },
+    {
+      "entity_id": "deploy-other-workspace",
+      "source_ids": ["other-team-log"],
+      "body": "The webhook deployment is healthy in another workspace.",
+      "workspace_hash": "workspace-b",
+      "valid_from_unix_ms": 1704067200000,
+      "valid_to_unix_ms": null,
+      "certainty": 0.99,
+      "provenance_class": "fact_derived",
+      "authoritative": true,
+      "superseded": false,
+      "position": 3
+    },
+    {
+      "entity_id": "budget-current",
+      "source_ids": ["finance-ledger-1"],
+      "body": "Workspace A budget is 120 credits for the current quarter.",
+      "workspace_hash": "workspace-a",
+      "valid_from_unix_ms": 1704067200000,
+      "valid_to_unix_ms": null,
+      "certainty": 0.92,
+      "provenance_class": "fact_extracted",
+      "authoritative": true,
+      "superseded": false,
+      "position": 4
+    },
+    {
+      "entity_id": "budget-other-workspace",
+      "source_ids": ["other-finance-ledger"],
+      "body": "Workspace B budget is 900 credits for the current quarter.",
+      "workspace_hash": "workspace-b",
+      "valid_from_unix_ms": 1704067200000,
+      "valid_to_unix_ms": null,
+      "certainty": 0.99,
+      "provenance_class": "fact_extracted",
+      "authoritative": true,
+      "superseded": false,
+      "position": 5
+    }
+  ],
+  "questions": [
+    {
+      "question_id": "q-deploy-current",
+      "query": "What is the current webhook deployment status after the queue timeout fix?",
+      "workspace_hash": "workspace-a",
+      "valid_at_unix_ms": 1735689600000,
+      "expected_source_ids": ["ops-log-2026-01", "ticket-42"],
+      "positions": ["front", "middle", "tail"]
+    },
+    {
+      "question_id": "q-budget-boundary",
+      "query": "What is the current budget for this workspace?",
+      "workspace_hash": "workspace-a",
+      "valid_at_unix_ms": 1735689600000,
+      "expected_source_ids": ["finance-ledger-1"],
+      "positions": ["front", "middle", "tail"]
+    }
+  ]
+}
