@@ -18,7 +18,7 @@ mod mcp;
 mod models;
 mod multimodal;
 mod schema;
-mod stage_trace;
+pub(crate) mod stage_trace;
 mod tools;
 mod transport;
 mod grpc;
