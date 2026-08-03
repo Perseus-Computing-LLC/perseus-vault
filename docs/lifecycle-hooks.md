@@ -25,11 +25,12 @@ state; hooks only request those operations.
 
 Refresh the working snapshot when the task changes rather than assuming that a
 previous SessionStart block remains correct. If the server or hook is
-unavailable, continue without injected memory, mark the session degraded, and
-do not claim that a failed capture or write was persisted. Do not silently
-switch to another database. These are non-disruptive safeguards: memory
-failure should not prevent ordinary host work, while durability claims remain
-honest.
+unavailable, continue without injected memory and mark the session degraded.
+Some host integrations may have an explicitly configured local fallback; when
+they do, the host must label the result local-only and must not present it as
+durable Vault recall. In every case, do not claim that a failed capture or write
+was persisted. These are non-disruptive safeguards: memory failure should not
+prevent ordinary host work, while durability claims remain honest.
 
 ```
 SessionStart ──▶ recall (seed context)
