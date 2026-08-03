@@ -19,6 +19,7 @@ mod models;
 mod multimodal;
 mod schema;
 pub(crate) mod stage_trace;
+mod trust_admission;
 mod tools;
 mod transport;
 mod grpc;
