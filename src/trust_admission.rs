@@ -1,0 +1,293 @@
+//! Hash-only trust admission and poisoning acceptance gates (#821).
+//!
+//! This is deliberately a policy evaluator over metadata and digests. Raw
+//! prompts, documents, email bodies, tool output, and secrets never enter the
+//! durable decision evidence represented here.
+
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+pub const ADMISSION_SCHEMA_VERSION: &str = "perseus-vault-memory-admission/v1";
+
+const OUTCOMES: [&str; 6] = [
+    "admitted",
+    "quarantined",
+    "suppressed",
+    "escalated",
+    "abstained",
+    "revoked",
+];
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AdmissionRequest {
+    pub record_digest: String,
+    pub source_identity: String,
+    pub authorization_scope: String,
+    pub ingestion_channel: String,
+    pub workspace_hash: String,
+    pub source_trust: String,
+    pub valid_from_unix_ms: i64,
+    pub recorded_at_unix_ms: i64,
+    pub task_relevance_bps: u16,
+    #[serde(default)]
+    pub instruction_bearing: bool,
+    #[serde(default)]
+    pub contradicts_authoritative: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AdmissionEvidence {
+    pub schema_version: String,
+    pub outcome: String,
+    pub reason_codes: Vec<String>,
+    pub record_digest: String,
+    pub source_identity: String,
+    pub authorization_scope: String,
+    pub ingestion_channel: String,
+    pub workspace_hash: String,
+    pub authoritative: bool,
+    pub durable: bool,
+    pub decision_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revocation_digest: Option<String>,
+}
+
+impl AdmissionEvidence {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema_version != ADMISSION_SCHEMA_VERSION {
+            return Err(format!("unsupported schema_version: {}", self.schema_version));
+        }
+        if !OUTCOMES.contains(&self.outcome.as_str()) {
+            return Err(format!("unsupported outcome: {}", self.outcome));
+        }
+        for (label, value) in [
+            ("record_digest", self.record_digest.as_str()),
+            ("decision_digest", self.decision_digest.as_str()),
+        ] {
+            validate_sha256(label, value)?;
+        }
+        for (label, value) in [
+            ("source_identity", self.source_identity.as_str()),
+            ("authorization_scope", self.authorization_scope.as_str()),
+            ("ingestion_channel", self.ingestion_channel.as_str()),
+            ("workspace_hash", self.workspace_hash.as_str()),
+        ] {
+            validate_identifier(label, value)?;
+        }
+        if self.reason_codes.is_empty() || self.reason_codes.len() > 16 {
+            return Err("reason_codes must contain between 1 and 16 entries".to_string());
+        }
+        for reason in &self.reason_codes {
+            validate_identifier("reason_code", reason)?;
+        }
+        if let Some(digest) = &self.revocation_digest {
+            validate_sha256("revocation_digest", digest)?;
+        }
+        if self.authoritative && (!self.durable || self.outcome != "admitted") {
+            return Err("only durable admitted evidence may be authoritative".to_string());
+        }
+        if matches!(self.outcome.as_str(), "quarantined" | "suppressed" | "escalated" | "abstained" | "revoked")
+            && self.authoritative
+        {
+            return Err("non-admitted evidence cannot be authoritative".to_string());
+        }
+        Ok(())
+    }
+
+    pub fn can_activate(&self, query_workspace: &str, query_relevance_bps: u16) -> bool {
+        self.outcome == "admitted"
+            && self.authoritative
+            && self.durable
+            && self.workspace_hash == query_workspace
+            && query_relevance_bps >= 5000
+    }
+
+    pub fn revoke(&mut self, actor_digest: &str, reason: &str) -> Result<(), String> {
+        validate_sha256("actor_digest", actor_digest)?;
+        validate_identifier("revocation_reason", reason)?;
+        let material = (
+            &self.schema_version,
+            &self.decision_digest,
+            actor_digest,
+            reason,
+            "revoked",
+        );
+        self.revocation_digest = Some(canonical_digest(&material)?);
+        self.outcome = "revoked".to_string();
+        self.authoritative = false;
+        self.durable = true;
+        self.reason_codes.push("operator_revoked".to_string());
+        self.decision_digest = canonical_digest(self)?;
+        self.validate()
+    }
+}
+
+pub fn evaluate(request: &AdmissionRequest) -> Result<AdmissionEvidence, String> {
+    validate_request(request)?;
+    let (outcome, reasons, authoritative, durable) = if request.authorization_scope != request.workspace_hash {
+        ("abstained", vec!["workspace_scope_mismatch"], false, false)
+    } else if request.task_relevance_bps < 5000 {
+        ("suppressed", vec!["task_irrelevant"], false, false)
+    } else if request.instruction_bearing && request.source_trust == "untrusted" {
+        ("quarantined", vec!["untrusted_instruction_bearing"], false, true)
+    } else if request.contradicts_authoritative {
+        ("escalated", vec!["contradicts_authoritative_record"], false, true)
+    } else if request.source_trust == "untrusted" {
+        ("quarantined", vec!["untrusted_source"], false, true)
+    } else if request.source_trust == "authoritative" {
+        ("admitted", vec!["authorized_authoritative_source"], true, true)
+    } else {
+        ("admitted", vec!["trusted_source"], false, true)
+    };
+    let mut evidence = AdmissionEvidence {
+        schema_version: ADMISSION_SCHEMA_VERSION.to_string(),
+        outcome: outcome.to_string(),
+        reason_codes: reasons.into_iter().map(str::to_string).collect(),
+        record_digest: request.record_digest.clone(),
+        source_identity: request.source_identity.clone(),
+        authorization_scope: request.authorization_scope.clone(),
+        ingestion_channel: request.ingestion_channel.clone(),
+        workspace_hash: request.workspace_hash.clone(),
+        authoritative,
+        durable,
+        decision_digest: String::new(),
+        revocation_digest: None,
+    };
+    evidence.decision_digest = canonical_digest(&evidence)?;
+    evidence.validate()?;
+    Ok(evidence)
+}
+
+fn validate_request(request: &AdmissionRequest) -> Result<(), String> {
+    validate_sha256("record_digest", &request.record_digest)?;
+    for (label, value) in [
+        ("source_identity", request.source_identity.as_str()),
+        ("authorization_scope", request.authorization_scope.as_str()),
+        ("ingestion_channel", request.ingestion_channel.as_str()),
+        ("workspace_hash", request.workspace_hash.as_str()),
+        ("source_trust", request.source_trust.as_str()),
+    ] {
+        validate_identifier(label, value)?;
+    }
+    if !["untrusted", "trusted", "authoritative"].contains(&request.source_trust.as_str()) {
+        return Err(format!("unsupported source_trust: {}", request.source_trust));
+    }
+    if request.valid_from_unix_ms < 0 || request.recorded_at_unix_ms < request.valid_from_unix_ms {
+        return Err("invalid valid/recorded time interval".to_string());
+    }
+    if request.task_relevance_bps > 10_000 {
+        return Err("task_relevance_bps must be between 0 and 10000".to_string());
+    }
+    Ok(())
+}
+
+fn canonical_digest<T: Serialize>(value: &T) -> Result<String, String> {
+    let bytes = serde_json::to_vec(value).map_err(|e| format!("admission serialization failed: {e}"))?;
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn validate_sha256(label: &str, value: &str) -> Result<(), String> {
+    if value.len() != 64
+        || !value.bytes().all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(format!("{label} must be a lowercase SHA-256 value"));
+    }
+    Ok(())
+}
+
+fn validate_identifier(label: &str, value: &str) -> Result<(), String> {
+    if value.is_empty() || value.len() > 256 || value.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return Err(format!("{label} must be a bounded non-whitespace identifier"));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn digest(seed: &str) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(seed.as_bytes());
+        format!("{:x}", hasher.finalize())
+    }
+
+    fn request(trust: &str) -> AdmissionRequest {
+        AdmissionRequest {
+            record_digest: digest("record"),
+            source_identity: "email-42".to_string(),
+            authorization_scope: "workspace-a".to_string(),
+            ingestion_channel: "connector-email".to_string(),
+            workspace_hash: "workspace-a".to_string(),
+            source_trust: trust.to_string(),
+            valid_from_unix_ms: 100,
+            recorded_at_unix_ms: 110,
+            task_relevance_bps: 9000,
+            instruction_bearing: false,
+            contradicts_authoritative: false,
+        }
+    }
+
+    #[test]
+    fn untrusted_instruction_is_quarantined_and_cannot_activate_later() {
+        let mut input = request("untrusted");
+        input.instruction_bearing = true;
+        let evidence = evaluate(&input).unwrap();
+        assert_eq!(evidence.outcome, "quarantined");
+        assert!(!evidence.authoritative);
+        assert!(!evidence.can_activate("workspace-a", 9000));
+    }
+
+    #[test]
+    fn trusted_authoritative_source_is_admitted_only_in_scope() {
+        let evidence = evaluate(&request("authoritative")).unwrap();
+        assert!(evidence.authoritative);
+        assert!(evidence.durable);
+        assert!(evidence.can_activate("workspace-a", 9000));
+        assert!(!evidence.can_activate("workspace-b", 9000));
+        assert!(!evidence.can_activate("workspace-a", 4999));
+    }
+
+    #[test]
+    fn contradiction_escalates_without_deleting_history() {
+        let mut input = request("trusted");
+        input.contradicts_authoritative = true;
+        let evidence = evaluate(&input).unwrap();
+        assert_eq!(evidence.outcome, "escalated");
+        assert!(evidence.durable);
+        assert!(!evidence.authoritative);
+    }
+
+    #[test]
+    fn missing_scope_abstains_fail_closed() {
+        let mut input = request("authoritative");
+        input.authorization_scope = "workspace-b".to_string();
+        let evidence = evaluate(&input).unwrap();
+        assert_eq!(evidence.outcome, "abstained");
+        assert!(!evidence.durable);
+        assert!(!evidence.authoritative);
+    }
+
+    #[test]
+    fn revocation_is_hash_only_and_preserves_record_identity() {
+        let mut evidence = evaluate(&request("authoritative")).unwrap();
+        let original = evidence.record_digest.clone();
+        evidence.revoke(&digest("operator"), "poisoning_confirmed").unwrap();
+        assert_eq!(evidence.outcome, "revoked");
+        assert_eq!(evidence.record_digest, original);
+        assert!(evidence.revocation_digest.is_some());
+        assert!(!evidence.can_activate("workspace-a", 9000));
+        assert!(evidence.validate().is_ok());
+    }
+
+    #[test]
+    fn raw_payload_fields_are_not_part_of_evidence_shape() {
+        let evidence = evaluate(&request("trusted")).unwrap();
+        let encoded = serde_json::to_string(&evidence).unwrap();
+        assert!(!encoded.contains("body"));
+        assert!(!encoded.contains("prompt"));
+        assert!(!encoded.contains("secret"));
+    }
+}
