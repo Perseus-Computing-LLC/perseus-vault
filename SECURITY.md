@@ -54,8 +54,13 @@ Mimir is a **local-first MCP server** that stores AI agent memory. It processes:
 
 ### Encryption
 
-Mimir supports **opt-in AES-256-GCM encryption at rest** for entity bodies. It
-is **off by default**. See the full [Encryption Specification](./docs/ENCRYPTION.md)
+Perseus Vault supports **AES-256-GCM encryption at rest** for entity bodies. It
+is **enabled by default for fresh installations**: the first write to a new
+database generates an owner-only standard key (`~/.perseus-vault/secret.key`)
+and establishes the encrypted canary. Existing plaintext databases fail closed
+with an actionable `init --rekey` migration path (or an explicit
+`PERSEUS_VAULT_ALLOW_PLAINTEXT=1` opt-out). See the full
+[Encryption Specification](./docs/ENCRYPTION.md)
 and [Threat Model](./docs/THREAT-MODEL.md) for precise guarantees and limits.
 
 | Property | Detail |
@@ -68,11 +73,18 @@ and [Threat Model](./docs/THREAT-MODEL.md) for precise guarantees and limits.
 | Encrypted in transit | ⚠️ MCP stdio is local-only; secure the optional HTTP/SSE transport with TLS yourself |
 | Key management | Operator responsibility — keys never leave the machine; no escrow, no recovery |
 
-**Enable encryption:**
+**Encryption is on by default for fresh installs** — the standard key is
+auto-generated at `~/.perseus-vault/secret.key` (0o600 on Unix) on first write.
+Explicit key management:
+
 ```bash
-mimir keygen                                  # writes ~/.mimir/secret.key (0o600 on Unix)
-mimir --encryption-key ~/.mimir/secret.key    # start with encryption on
+perseus-vault keygen                              # optional; fresh installs auto-create the standard key
+perseus-vault --encryption-key ~/.perseus-vault/secret.key   # explicit key path
 ```
+
+Existing plaintext databases fail closed with an `init --rekey` migration path
+(or explicit `PERSEUS_VAULT_ALLOW_PLAINTEXT=1`); `doctor` reports the actual
+on-disk state.
 
 > ⚠️ **Body encryption does not make the database file opaque.** For keyword
 > search to work, the FTS5 index (`entities_fts`) stores the body in **plaintext**,

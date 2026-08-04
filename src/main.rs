@@ -1004,6 +1004,119 @@ fn configured_encryption_key(explicit: Option<&str>) -> Option<String> {
     select_encryption_key(explicit, &default, std::path::Path::new(&default).is_file())
 }
 
+/// Create the standard key for a fresh default database. Explicit database
+/// paths and existing databases keep their current migration semantics: a key
+/// is never silently created for a user-selected legacy store.
+fn ensure_default_encryption_key(explicit_key: Option<&str>) -> Result<Option<String>, String> {
+    if let Some(explicit) = explicit_key {
+        return Ok(Some(explicit.to_string()));
+    }
+    let key_path = default_key_file();
+    if std::path::Path::new(&key_path).is_file() {
+        return Ok(Some(key_path));
+    }
+    let path = std::path::Path::new(&key_path);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("cannot create encryption-key directory {}: {e}", parent.display()))?;
+    }
+    let key = crate::encryption::EncryptionManager::generate_key();
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .and_then(|mut file| file.write_all(key.as_bytes()))
+            .map_err(|e| format!("cannot create default encryption key {}: {e}", path.display()))?;
+    }
+    #[cfg(not(unix))]
+    std::fs::write(path, key.as_bytes())
+        .map_err(|e| format!("cannot create default encryption key {}: {e}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("cannot restrict default encryption key {}: {e}", path.display()))?;
+    }
+    eprintln!("perseus-vault: generated default encryption key at {} — back it up", path.display());
+    Ok(Some(key_path))
+}
+
+/// Configure encryption for a command/server that can write. Fresh empty
+/// stores are encrypted automatically. Existing plaintext stores require the
+/// explicit `PERSEUS_VAULT_ALLOW_PLAINTEXT=1` escape hatch until the operator
+/// runs `init --rekey`; encrypted stores always require their key.
+fn configured_encryption_key_for_database(
+    database: &mut db::Database,
+    explicit_key: Option<&str>,
+) -> Option<String> {
+    let requested = configured_encryption_key(explicit_key);
+    if let Some(ref key_file) = requested {
+        if let Err(e) = database.set_encryption(key_file) {
+            eprintln!("perseus-vault: encryption setup failed: {e}");
+            std::process::exit(1);
+        }
+        return requested;
+    }
+
+    let state = database.encryption_storage_state();
+    if state == "encrypted" || state == "mixed-legacy" {
+        eprintln!(
+            "perseus-vault: refusing to open {state} database without an encryption key; \
+             provide --encryption-key or restore the standard key file"
+        );
+        std::process::exit(1);
+    }
+
+    let entity_count = database
+        .stats()
+        .map(|stats| stats.total_entities)
+        .unwrap_or(1);
+    if entity_count == 0 {
+        if std::env::var("PERSEUS_VAULT_ALLOW_PLAINTEXT").ok().as_deref() == Some("1") {
+            eprintln!(
+                "perseus-vault: WARNING — PERSEUS_VAULT_ALLOW_PLAINTEXT=1 disables default encryption"
+            );
+            return None;
+        }
+        let key_file = match ensure_default_encryption_key(None) {
+            Ok(Some(path)) => path,
+            Ok(None) => unreachable!("default key generation returns Some unless opt-out is set"),
+            Err(e) => {
+                eprintln!("perseus-vault: encryption setup failed: {e}");
+                std::process::exit(1);
+            }
+        };
+        if let Err(e) = database.set_encryption(&key_file) {
+            eprintln!("perseus-vault: encryption setup failed: {e}");
+            std::process::exit(1);
+        }
+        eprintln!(
+            "perseus-vault: encryption enabled by default (key: {key_file}); back up this key"
+        );
+        return Some(key_file);
+    }
+
+    if std::env::var("PERSEUS_VAULT_ALLOW_PLAINTEXT").ok().as_deref() == Some("1") {
+        eprintln!(
+            "perseus-vault: WARNING — existing plaintext database; \
+             PERSEUS_VAULT_ALLOW_PLAINTEXT=1 permits plaintext writes. Run `init --rekey`."
+        );
+        None
+    } else {
+        eprintln!(
+            "perseus-vault: refusing plaintext writes to an existing unencrypted database; \
+             run `perseus-vault init --rekey --db <path>` or explicitly set \
+             PERSEUS_VAULT_ALLOW_PLAINTEXT=1"
+        );
+        std::process::exit(1);
+    }
+}
+
 /// Return whether startup should warn about plaintext writes. An explicit or
 /// successfully resolved key suppresses the warning; only a canary-backed
 /// encrypted database with no key loaded is dangerous here.
@@ -2305,7 +2418,27 @@ fn render_prepare_block(recall_when_hits: &[crate::models::Entity], context_md: 
     out
 }
 
+/// Windows' default main-thread stack is 1 MiB, and clap's full command-tree
+/// construction in an unoptimized (debug) build can exceed it — `--help`
+/// alone overflowed on the Windows CI runner (observed via the
+/// subprocess-based encryption bootstrap tests, #850). Run the real
+/// entrypoint on a thread with an explicit large stack so the binary works
+/// identically on every platform and build profile. `process::exit` calls
+/// inside the body still terminate the process as before.
 fn main() {
+    let stack_size = 8 * 1024 * 1024;
+    let thread = std::thread::Builder::new()
+        .name("perseus-vault-main".into())
+        .stack_size(stack_size)
+        .spawn(run)
+        .expect("failed to spawn the main thread");
+    std::process::exit(match thread.join() {
+        Ok(()) => 0,
+        Err(_) => 1,
+    });
+}
+
+fn run() {
     let mut cli = Cli::parse();
     apply_top_level_db(&mut cli); // #313: `mimir --db PATH serve` must honor --db
     normalize_default_db(&mut cli); // #421/#424: resolve implicit default DB + warn
@@ -2386,7 +2519,10 @@ fn main() {
                         }
                     }
                     println!("Key written to {}", expanded);
-                    println!("Use --encryption-key {} to enable encryption", expanded);
+                    println!(
+                        "Encryption is enabled by default for fresh installs; pass --encryption-key {} to pin this key explicitly",
+                        expanded
+                    );
                 }
                 Err(e) => {
                     eprintln!("mimir: failed to write key file {}: {}", expanded, e);
@@ -2556,7 +2692,7 @@ fn main() {
             ref encryption_key,
         }) => {
             let mut database = open_db_or_exit(db_path);
-            let encryption_key = configured_encryption_key(encryption_key.as_deref());
+            let encryption_key = configured_encryption_key_for_database(&mut database, encryption_key.as_deref());
             if let Some(ref key_file) = encryption_key {
                 if let Err(e) = database.set_encryption(key_file) {
                     eprintln!("mimir: encryption setup failed: {}", e);
@@ -2587,7 +2723,7 @@ fn main() {
             ref encryption_key,
         }) => {
             let mut database = open_db_or_exit(db_path);
-            let encryption_key = configured_encryption_key(encryption_key.as_deref());
+            let encryption_key = configured_encryption_key_for_database(&mut database, encryption_key.as_deref());
             if let Some(ref key_file) = encryption_key {
                 if let Err(e) = database.set_encryption(key_file) {
                     eprintln!("mimir: encryption setup failed: {}", e);
@@ -2617,7 +2753,7 @@ fn main() {
             ref encryption_key,
         }) => {
             let mut database = open_db_or_exit(db_path);
-            let encryption_key = configured_encryption_key(encryption_key.as_deref());
+            let encryption_key = configured_encryption_key_for_database(&mut database, encryption_key.as_deref());
             if let Some(ref key_file) = encryption_key {
                 if let Err(e) = database.set_encryption(key_file) {
                     eprintln!("mimir: encryption setup failed: {}", e);
@@ -2641,7 +2777,7 @@ fn main() {
             vacuum,
         }) => {
             let mut database = open_db_or_exit(db_path);
-            let encryption_key = configured_encryption_key(encryption_key.as_deref());
+            let encryption_key = configured_encryption_key_for_database(&mut database, encryption_key.as_deref());
             if let Some(ref key_file) = encryption_key {
                 if let Err(e) = database.set_encryption(key_file) {
                     eprintln!("mimir: encryption setup failed: {}", e);
@@ -2663,7 +2799,7 @@ fn main() {
             ref encryption_key,
         }) => {
             let mut database = open_db_or_exit(db_path);
-            let encryption_key = configured_encryption_key(encryption_key.as_deref());
+            let encryption_key = configured_encryption_key_for_database(&mut database, encryption_key.as_deref());
             if let Some(ref key_file) = encryption_key {
                 if let Err(e) = database.set_encryption(key_file) {
                     eprintln!("mimir: encryption setup failed: {}", e);
@@ -2725,7 +2861,7 @@ fn main() {
             ref encryption_key,
         }) => {
             let mut database = open_db_or_exit(db_path);
-            let encryption_key = configured_encryption_key(encryption_key.as_deref());
+            let encryption_key = configured_encryption_key_for_database(&mut database, encryption_key.as_deref());
             if let Some(ref key_file) = encryption_key {
                 if let Err(e) = database.set_encryption(key_file) {
                     eprintln!("mimir: encryption setup failed: {}", e);
@@ -2792,7 +2928,7 @@ fn main() {
             };
 
             let mut database = open_db_or_exit(db_path);
-            let encryption_key = configured_encryption_key(encryption_key.as_deref());
+            let encryption_key = configured_encryption_key_for_database(&mut database, encryption_key.as_deref());
             if let Some(ref key_file) = encryption_key {
                 if let Err(e) = database.set_encryption(key_file) {
                     eprintln!("perseus-vault: capture: encryption setup failed: {}", e);
@@ -2846,7 +2982,7 @@ fn main() {
             ref encryption_key,
         }) => {
             let mut database = open_db_or_exit(db_path);
-            let encryption_key = configured_encryption_key(encryption_key.as_deref());
+            let encryption_key = configured_encryption_key_for_database(&mut database, encryption_key.as_deref());
             if let Some(ref key_file) = encryption_key {
                 if let Err(e) = database.set_encryption(key_file) {
                     eprintln!("mimir: encryption setup failed: {}", e);
@@ -2925,7 +3061,7 @@ fn main() {
             ref encryption_key,
         }) => {
             let mut database = open_db_or_exit(db_path);
-            let encryption_key = configured_encryption_key(encryption_key.as_deref());
+            let encryption_key = configured_encryption_key_for_database(&mut database, encryption_key.as_deref());
             if let Some(ref key_file) = encryption_key {
                 if let Err(e) = database.set_encryption(key_file) {
                     eprintln!("mimir: encryption setup failed: {}", e);
@@ -2956,7 +3092,7 @@ fn main() {
             ref encryption_key,
         }) => {
             let mut database = open_db_or_exit(db_path);
-            let encryption_key = configured_encryption_key(encryption_key.as_deref());
+            let encryption_key = configured_encryption_key_for_database(&mut database, encryption_key.as_deref());
             if let Some(ref key_file) = encryption_key {
                 if let Err(e) = database.set_encryption(key_file) {
                     eprintln!("mimir: encryption setup failed: {}", e);
@@ -2988,7 +3124,7 @@ fn main() {
         }) => {
             let db_path = db.clone().unwrap_or_else(default_db_path);
             let mut database = open_db_or_exit(&db_path);
-            let encryption_key = configured_encryption_key(None);
+            let encryption_key = configured_encryption_key_for_database(&mut database, None);
             if let Some(ref key_file) = encryption_key {
                 if let Err(e) = database.set_encryption(key_file) {
                     eprintln!("mimir: encryption setup failed: {}", e);
@@ -3058,7 +3194,7 @@ fn main() {
             ref encryption_key,
         }) => {
             let mut database = open_db_or_exit(db_path);
-            let encryption_key = configured_encryption_key(encryption_key.as_deref());
+            let encryption_key = configured_encryption_key_for_database(&mut database, encryption_key.as_deref());
             if let Some(ref key_file) = encryption_key {
                 if let Err(e) = database.set_encryption(key_file) {
                     eprintln!("mimir: encryption setup failed: {}", e);
@@ -3140,16 +3276,13 @@ fn main() {
                     std::process::exit(1);
                 }
             };
-            let encryption_key = configured_encryption_key(encryption_key.as_deref());
+            let encryption_key = configured_encryption_key_for_database(
+                &mut database,
+                encryption_key.as_deref(),
+            );
             if let Some(ref key_file) = encryption_key {
-                if let Err(e) = database.set_encryption(key_file) {
-                    eprintln!("mimir: encryption setup failed: {}", e);
-                    std::process::exit(1);
-                }
                 eprintln!("mimir: encryption enabled (key: {})", key_file);
                 warn_key_acls_on_windows(key_file);
-            } else {
-                warn_plaintext_writes_to_encrypted_db(&database);
             }
 
             // Configure LLM for mimir_ask if endpoint is provided
@@ -3318,16 +3451,13 @@ fn main() {
                     std::process::exit(1);
                 }
             };
-            let encryption_key = configured_encryption_key(cli.encryption_key.as_deref());
+            let encryption_key = configured_encryption_key_for_database(
+                &mut database,
+                cli.encryption_key.as_deref(),
+            );
             if let Some(ref key_file) = encryption_key {
-                if let Err(e) = database.set_encryption(key_file) {
-                    eprintln!("mimir: encryption setup failed: {}", e);
-                    std::process::exit(1);
-                }
                 eprintln!("mimir: encryption enabled (key: {})", key_file);
                 warn_key_acls_on_windows(key_file);
-            } else {
-                warn_plaintext_writes_to_encrypted_db(&database);
             }
 
             if let Some(ref endpoint) = cli.llm_endpoint {

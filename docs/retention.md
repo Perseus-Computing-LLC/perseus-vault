@@ -188,6 +188,59 @@ Deletion is explicit and two-step:
     copies. Keep their retention and access controls separate, and do not call
     erasure complete while a retained copy can still disclose the erased body.
 
+## Rejected-value tombstones (#849)
+
+`forget`, supersession, archival, and purge operate on *records*. A later
+extractor, connector, `ingest_file`, capture pass, or background consolidation
+can therefore re-introduce semantically equivalent content under a **new**
+entity key after a human or policy judged the earlier value wrong. Perseus
+Vault closes that laundering window with scoped **rejected-value tombstones**
+(negative memory):
+
+- **Shape.** A tombstone is `(workspace_hash, subject, predicate,
+  value_sha256, reason, evidence_ref, author_agent_id, created_at_unix_ms,
+  expires_at_unix_ms)`. Matching is deliberately **digest-only** and
+  subject-independent within a scope: the normalized value's SHA-256 is
+  compared, so re-ingesting the same value under a different key is still
+  blocked. The raw rejected value is **never stored** — only its digest — so
+  rejection records cannot leak the content they suppress.
+- **Canonicalization.** Values are canonicalized before hashing: JSON bodies
+  are re-serialized compactly, all whitespace runs collapse to a single space,
+  and the result is lowercased. Structurally different JSON formatting,
+  case variants, and whitespace variants of a rejected value therefore match;
+  genuinely different values do not.
+- **Scope.** A tombstone with a named `workspace_hash` blocks only that
+  workspace; an empty `workspace_hash` is global. One workspace's rejection
+  never poisons another.
+- **Gate.** Every durable write path — `remember` (including
+  `remember_skip_dedup` and validity-override variants), `correct`, imports,
+  connectors, `ingest_file`, capture/extraction, promotion, and background
+  writers (`cohere`, `consolidate`, `dream`) — consults the tombstone at the
+  shared persistence seam (`remember_impl`) before committing. A blocked write
+  returns a stable `rejected` outcome and is recorded in the journal as
+  `rejected_write`.
+- **Trusted override.** Re-remembering with `allow_rejected=true` is a
+  deliberate, audited override: the write proceeds, a `rejected_write_override`
+  journal entry records it, and the tombstone stays in place so ordinary
+  future writes remain blocked. `mimir_correct` records a scoped tombstone for
+  the rejected `wrong_approach` *before* writing its correction, then uses the
+  override path so the correction itself is never mis-blocked.
+- **Expiry and reactivation.** Tombstones carry an optional
+  `expires_at_unix_ms`. Expired tombstones are ignored by the gate and removed
+  lazily on lookup, so a domain where truth can legitimately change (e.g. a
+  preference that is later genuinely superseded) can set a bounded rejection
+  horizon. Without an expiry, the rejection is permanent until deleted.
+- **Privacy and deletion.** Tombstones store no raw value (digest only) and
+  are subject to the same journaling and audit rules as other records. Deleting
+  a tombstone row (via maintenance or an explicit `DELETE` on the table)
+  reactivates the value; there is no separate "purge" flow for tombstones
+  because they hold no content to erase.
+
+This is distinct from history-compaction tombstones, which record that old
+history was compacted, and from record-level supersession, which replaces one
+active version with another. A rejected-value tombstone is the only mechanism
+that makes a *value* un-promotable across identities.
+
 ## Version history retention (#398)
 
 Every content overwrite of a `(category, key)` snapshots the prior version

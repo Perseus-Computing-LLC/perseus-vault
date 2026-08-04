@@ -1076,6 +1076,12 @@ pub struct CorrectParams {
     pub valid_to_unix_ms: Option<i64>,
     #[serde(default)]
     pub evidence: Option<EvidenceEnvelope>,
+    /// Workspace scope for the rejection tombstone. Empty means global.
+    #[serde(default)]
+    pub workspace_hash: String,
+    /// Agent that authored the correction (stamped on the tombstone).
+    #[serde(default)]
+    pub agent_id: String,
 }
 
 /// Result from mimir_correct.

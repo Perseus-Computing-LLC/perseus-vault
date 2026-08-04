@@ -85,7 +85,7 @@ local-first deployment, not as a multi-tenant network service.
 
 | Threat | Mitigation | Residual risk |
 |---|---|---|
-| Disk/backup theft reads memory **content** (A2) | Opt-in AES-256-GCM on `body_json` | **The FTS5 index stores plaintext** (see [ENCRYPTION.md §3](./ENCRYPTION.md)); metadata is plaintext. Body encryption alone does **not** make the file opaque — layer OS disk encryption. |
+| Disk/backup theft reads memory **content** (A2) | AES-256-GCM on `body_json`, enabled by default for fresh installs | **The FTS5 index stores plaintext** (see [ENCRYPTION.md §3](./ENCRYPTION.md)); metadata is plaintext. Body encryption alone does **not** make the file opaque — layer OS disk encryption. |
 | Disk/backup theft reads **metadata** (A2) | — | Not mitigated by app-layer encryption: category/key/tags/workspace/timestamps are plaintext by design (needed for indexing/routing). Use full-disk encryption. |
 | Co-tenant reads the DB or key file (A1) | Unix: `keygen` sets key file `0o600` | **Windows: key file gets default ACLs — not tightened by Mimir.** Operator must restrict the DB file and key file ACLs. |
 | Key recovered from process memory (A6) | — | Out of scope; a static key is held in process for the session. No `zeroize` of key material today. |
@@ -155,7 +155,7 @@ local-first deployment, not as a multi-tenant network service.
 
 ## 7. Hardening checklist (operator)
 
-- [ ] Enable body encryption: `mimir keygen` then `mimir --encryption-key ~/.mimir/secret.key`.
+- [ ] Confirm encryption is active on fresh installs: `perseus-vault doctor --db <path>` reports `[ENCRYPTED]` (default posture; back up `~/.perseus-vault/secret.key`).
 - [ ] Enable OS full-disk/filesystem encryption (LUKS / FileVault / BitLocker) — this is what protects metadata and the FTS index.
 - [ ] Restrict the DB file and key file permissions/ACLs (mandatory on Windows).
 - [ ] Keep the HTTP/SSE transport off, or front it with auth + TLS bound to localhost.
