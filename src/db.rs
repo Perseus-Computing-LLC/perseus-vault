@@ -68,7 +68,11 @@ fn resource_constraints_permit(
     let Some(proposed) = proposed.as_object() else {
         return Err("resource constraints must be a JSON object".into());
     };
-    for key in ["resource_ref", "environment", "destination", "merchant_ref", "currency"] {
+    // #836 argv-level policy: `tool` pins the tool identity and
+    // `argv_canonical` pins the canonicalized policy-relevant argument fields
+    // (exact match, fail closed). Only canonicalized fields are compared —
+    // canonical_constraint_json forbids raw_arguments/credentials/secret keys.
+    for key in ["resource_ref", "environment", "destination", "merchant_ref", "currency", "tool", "argv_canonical"] {
         if let Some(expected) = bound.get(key) {
             if proposed.get(key) != Some(expected) {
                 return Ok(false);
@@ -6951,7 +6955,32 @@ impl Database {
         if intent_hash.len()!=64 || !intent_hash.bytes().all(|b| b.is_ascii_hexdigit()) { return Err("intent_hash must be a SHA-256 hex digest".into()); }
         let resource_constraints_json = canonical_constraint_json(resource_constraints_json.unwrap_or("{}"))?;
         if !resource_constraints_permit(&manifest.capability_constraints_json, capability, &resource_constraints_json)? {
-            return Err("RESOURCE_CONSTRAINT_MISMATCH".into());
+            // #836 null-effect-on-deny + argv-level policy: a policy denial
+            // (including a tool-argument escalation) records an explicit
+            // `denied` receipt and grants nothing. Only canonicalized,
+            // policy-relevant fields are stored (canonical_constraint_json
+            // forbids raw_arguments/credentials/prompt/secret keys); the
+            // outcome hash is the constraint hash of the canonical form.
+            let now=now_ms();
+            let action=AuthorizedAction { id:format!("act-{}",uuid::Uuid::new_v4().simple()), manifest_id:manifest.id.clone(), manifest_version:manifest.version, agent_id:agent_id.to_string(), workspace_hash:workspace_hash.to_string(), scope_anchor:scope_anchor.to_string(), external_ref:external_ref.to_string(), capability:capability.to_string(), action_key:action_key.to_string(), intent_hash:intent_hash.to_ascii_lowercase(), outcome_hash:constraint_hash(&resource_constraints_json), status:"denied".to_string(), approval_required:false, approval_ref:String::new(), created_at_unix_ms:now, updated_at_unix_ms:now, resource_constraints_json:resource_constraints_json.clone(), resource_constraints_hash:constraint_hash(&resource_constraints_json) };
+            let conn=self.conn()?;
+            conn.execute(
+                "INSERT INTO authorized_actions
+                 (id,manifest_id,manifest_version,agent_id,workspace_hash,scope_anchor,
+                  external_ref,capability,action_key,intent_hash,outcome_hash,status,
+                  approval_required,approval_ref,created_at_unix_ms,updated_at_unix_ms,
+                  resource_constraints_json,resource_constraints_hash)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?15,?16,?17)",
+                params![action.id,action.manifest_id,action.manifest_version,action.agent_id,
+                        action.workspace_hash,action.scope_anchor,action.external_ref,
+                        action.capability,action.action_key,action.intent_hash,
+                        action.outcome_hash,action.status,action.approval_required as i64,
+                        action.approval_ref,now,action.resource_constraints_json,
+                        action.resource_constraints_hash],
+            )?;
+            drop(conn);
+            self.journal(&JournalEvent {id:format!("jrn-{}",uuid::Uuid::new_v4().simple()),event_type:"action_denied".to_string(),evaluated_json:json!({"deny_reason":"policy_mismatch","capability":capability}).to_string(),acted_json:serde_json::to_string(&action)?,forward_json:"{}".to_string(),category:"authorized_action".to_string(),key:action.id.clone(),entity_id:String::new(),agent_id:agent_id.to_string(),workspace_hash:workspace_hash.to_string(),created_at_unix_ms:now})?;
+            return Ok(action);
         }
         let resource_constraints_hash = constraint_hash(&resource_constraints_json);
         let approval_required=manifest.approval_required_capabilities.iter().any(|v|v==capability); let now=now_ms();
@@ -6988,18 +7017,30 @@ impl Database {
     }
 
     pub fn action_complete(&self, action_id:&str, actor:&str, outcome:&str, outcome_hash:&str) -> Result<AuthorizedAction, Box<dyn std::error::Error>> {
-        if !matches!(outcome,"executed"|"failed"|"cancelled") { return Err("action outcome must be executed, failed, or cancelled".into()); }
+        if !matches!(outcome,"executed"|"failed"|"cancelled"|"denied") { return Err("action outcome must be executed, failed, cancelled, or denied".into()); }
         if outcome_hash.len()!=64 || !outcome_hash.bytes().all(|b|b.is_ascii_hexdigit()) { return Err("outcome_hash must be a SHA-256 hex digest".into()); }
         let mut action=self.action_receipt_get(action_id)?.ok_or("authorized action not found")?;
-        if action.approval_required && action.status!="approval_granted" { return Err("approval-required action lacks granted approval".into()); }
-        if !action.approval_required && action.status!="intent" { return Err("action is not in a completable state".into()); }
+        // #836 null-effect-on-deny: a denied approval may only complete as
+        // `denied`; an executed/failed/cancelled completion is impossible.
+        if action.approval_required {
+            if outcome=="denied" {
+                if action.status!="approval_denied" { return Err("denied outcome requires an approval_denied action".into()); }
+            } else if action.status!="approval_granted" { return Err("approval-required action lacks granted approval".into()); }
+        } else if action.status!="intent" { return Err("action is not in a completable state".into()); }
         let now=now_ms(); action.status=format!("action_{outcome}"); action.outcome_hash=outcome_hash.to_ascii_lowercase(); action.updated_at_unix_ms=now; let conn=self.conn()?; conn.execute("UPDATE authorized_actions SET status=?1,outcome_hash=?2,updated_at_unix_ms=?3 WHERE id=?4",params![action.status,action.outcome_hash,now,action.id])?; drop(conn);
         self.journal(&JournalEvent{id:format!("jrn-{}",uuid::Uuid::new_v4().simple()),event_type:action.status.clone(),evaluated_json:json!({"actor":actor,"manifest_version":action.manifest_version}).to_string(),acted_json:serde_json::to_string(&action)?,forward_json:"{}".to_string(),category:"authorized_action".to_string(),key:action.id.clone(),entity_id:String::new(),agent_id:actor.to_string(),workspace_hash:action.workspace_hash.clone(),created_at_unix_ms:now})?; Ok(action)
     }
 
     pub fn action_lease_acquire(&self, action_id:&str, holder:&str, ttl_seconds:i64) -> Result<ActionLease, Box<dyn std::error::Error>> {
         if holder.trim().is_empty() || ttl_seconds<1 { return Err("lease requires holder_id and positive ttl_seconds".into()); }
-        let action=self.action_receipt_get(action_id)?.ok_or("authorized action not found")?; let now=now_ms(); let expires=now+ttl_seconds.saturating_mul(1000); let conn=self.conn()?; let tx=conn.unchecked_transaction()?;
+        let action=self.action_receipt_get(action_id)?.ok_or("authorized action not found")?;
+        // #836 null-effect-on-deny: a denied action can never be leased, so no
+        // execution path can start from a denial. Completed/executed actions
+        // remain leasable (receipt-history semantics unchanged).
+        if action.status=="denied" || action.status.starts_with("approval_denied") || action.status.starts_with("action_denied") {
+            return Err("cannot lease a denied action".into());
+        }
+        let now=now_ms(); let expires=now+ttl_seconds.saturating_mul(1000); let conn=self.conn()?; let tx=conn.unchecked_transaction()?;
         tx.execute("UPDATE authorized_action_leases SET released_at_unix_ms=?1 WHERE workspace_hash=?2 AND action_key=?3 AND released_at_unix_ms IS NULL AND expires_at_unix_ms<=?1",params![now,action.workspace_hash,action.action_key])?;
         let busy:Option<String>=tx.query_row("SELECT id FROM authorized_action_leases WHERE workspace_hash=?1 AND action_key=?2 AND released_at_unix_ms IS NULL AND expires_at_unix_ms>?3 LIMIT 1",params![action.workspace_hash,action.action_key,now],|r|r.get(0)).optional()?;
         if busy.is_some() { return Err("an active lease already exists for workspace/action key".into()); }
@@ -7007,6 +7048,22 @@ impl Database {
     }
 
     pub fn action_lease_release(&self, lease_id:&str, holder:&str) -> Result<(), Box<dyn std::error::Error>> { let now=now_ms(); let conn=self.conn()?; let changed=conn.execute("UPDATE authorized_action_leases SET released_at_unix_ms=?1 WHERE id=?2 AND holder_id=?3 AND released_at_unix_ms IS NULL",params![now,lease_id,holder])?; if changed!=1 { return Err("lease not found, already released, or holder mismatch".into()); } Ok(()) }
+
+    /// #836 timeout-on-pending-approval resolves to deny. An action awaiting
+    /// approval whose window (`approval_timeout_ms` from intent creation) has
+    /// elapsed is transitioned to `approval_denied` with a `timeout:` approval
+    /// ref; the caller then completes it as `denied`. Timeout defaults to deny
+    /// — a pending approval never silently becomes executable.
+    pub fn action_resolve_timeout(&self, action_id:&str, approval_timeout_ms:i64) -> Result<AuthorizedAction, Box<dyn std::error::Error>> {
+        if approval_timeout_ms<0 { return Err("approval_timeout_ms must be non-negative".into()); }
+        let mut action=self.action_receipt_get(action_id)?.ok_or("authorized action not found")?;
+        if action.status!="approval_requested" { return Err("action is not awaiting approval".into()); }
+        let now=now_ms();
+        if now - action.created_at_unix_ms < approval_timeout_ms { return Err("approval window has not yet expired".into()); }
+        action.status="approval_denied".to_string(); action.approval_ref=format!("timeout:{}",approval_timeout_ms); action.updated_at_unix_ms=now;
+        let conn=self.conn()?; conn.execute("UPDATE authorized_actions SET status=?1,approval_ref=?2,updated_at_unix_ms=?3 WHERE id=?4",params![action.status,action.approval_ref,now,action.id])?; drop(conn);
+        self.journal(&JournalEvent{id:format!("jrn-{}",uuid::Uuid::new_v4().simple()),event_type:"approval_denied".to_string(),evaluated_json:json!({"reason":"approval_timeout","approval_timeout_ms":approval_timeout_ms}).to_string(),acted_json:serde_json::to_string(&action)?,forward_json:"{}".to_string(),category:"authorized_action".to_string(),key:action.id.clone(),entity_id:String::new(),agent_id:action.agent_id.clone(),workspace_hash:action.workspace_hash.clone(),created_at_unix_ms:now})?; Ok(action)
+    }
 
     // ─── State ───────────────────────────────────────────────────
 
@@ -13892,6 +13949,122 @@ mod tests {
         db.action_lease_release(&lease.id, "holder-a").unwrap();
         db.authority_revoke(&stored.id, "admin", "end test").unwrap();
         assert!(db.authority_get("agent-768", "ws-768", false).unwrap().is_none());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn argv_policy_rejects_escalation_and_allows_benign() {
+        // #836 flywheel security scenario: tool-argument escalation. The same
+        // tool with a different argv is different risk; the policy pins the
+        // canonicalized policy-relevant argv fields, so an escalation argv is
+        // denied while a benign argv passes. No raw argv bodies or secrets
+        // appear anywhere in durable evidence (canonical_constraint_json
+        // forbids raw_arguments/credentials/prompt/secret keys).
+        let (db, path) = temp_db();
+        db.agent_upsert("agent-836", "Agent 836", 2, "perseus").unwrap();
+        let manifest = crate::models::AuthorityManifestInput {
+            agent_id: "agent-836".to_string(), workspace_hash: "ws-836".to_string(),
+            allowed_capabilities: vec!["tool.run".to_string()],
+            approval_required_capabilities: vec![],
+            scope_anchors: vec!["github:Perseus-Computing-LLC/perseus-vault".to_string()],
+            approver_principals: vec![],
+            allowed_inbound_principals: vec!["perseus.observer".to_string()],
+            permitted_external_ref_prefixes: vec!["github:Perseus-Computing-LLC".to_string()],
+            max_parallel_actions: 1, mode: "enforce".to_string(), expires_at_unix_ms: None,
+            capability_constraints_json: "{\"tool.run\":{\"tool\":\"git\",\"argv_canonical\":{\"action\":\"push\",\"remote\":\"github.com/Perseus-Computing-LLC/ledger.git\"}}}".to_string(),
+        };
+        db.authority_set(&manifest, "admin").unwrap();
+
+        // Benign argv: allowed, completes normally.
+        let benign = db.action_intent("agent-836", "ws-836", "github:Perseus-Computing-LLC/perseus-vault", "github:Perseus-Computing-LLC/ledger", "tool.run", "run-1", &"a".repeat(64),
+            Some("{\"tool\":\"git\",\"argv_canonical\":{\"action\":\"push\",\"remote\":\"github.com/Perseus-Computing-LLC/ledger.git\"}}")).unwrap();
+        assert_eq!(benign.status, "intent");
+
+        // Escalation argv (exfiltration remote): explicit denied receipt, no
+        // capability granted.
+        let escalation = db.action_intent("agent-836", "ws-836", "github:Perseus-Computing-LLC/perseus-vault", "github:Perseus-Computing-LLC/ledger", "tool.run", "run-2", &"b".repeat(64),
+            Some("{\"tool\":\"git\",\"argv_canonical\":{\"action\":\"push\",\"remote\":\"evil.example.com/exfil.git\"}}")).unwrap();
+        assert_eq!(escalation.status, "denied");
+        assert_eq!(escalation.outcome_hash.len(), 64, "denied receipt carries a real outcome hash");
+
+        // Null effect on deny: no lease, no executed completion, no side effect.
+        assert!(db.action_lease_acquire(&escalation.id, "holder-a", 60).is_err());
+        assert!(db.action_complete(&escalation.id, "agent-836", "executed", &"c".repeat(64)).is_err());
+
+        // The denied receipt is durable and readable.
+        let receipt = db.action_receipt_get(&escalation.id).unwrap().unwrap();
+        assert_eq!(receipt.status, "denied");
+        assert!(receipt.resource_constraints_json.contains("argv_canonical"));
+        assert!(!receipt.resource_constraints_json.contains("raw_arguments"));
+
+        let done = db.action_complete(&benign.id, "agent-836", "executed", &"c".repeat(64)).unwrap();
+        assert_eq!(done.status, "action_executed");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn denied_approval_produces_denied_receipt_with_no_side_effect() {
+        // #836 null-effect-on-deny via the approval path: a denied approval
+        // can only complete as `denied`; executed/failed/cancelled completion
+        // and leasing are impossible, so no process/request can follow.
+        let (db, path) = temp_db();
+        db.agent_upsert("agent-836b", "Agent 836B", 2, "perseus").unwrap();
+        let manifest = crate::models::AuthorityManifestInput {
+            agent_id: "agent-836b".to_string(), workspace_hash: "ws-836b".to_string(),
+            allowed_capabilities: vec!["tool.run".to_string()],
+            approval_required_capabilities: vec!["tool.run".to_string()],
+            scope_anchors: vec!["github:Perseus-Computing-LLC/perseus-vault".to_string()],
+            approver_principals: vec!["github:tcconnally".to_string()],
+            allowed_inbound_principals: vec!["github:tcconnally".to_string()],
+            permitted_external_ref_prefixes: vec!["github:Perseus-Computing-LLC".to_string()],
+            max_parallel_actions: 1, mode: "enforce".to_string(), expires_at_unix_ms: None,
+            capability_constraints_json: "{}".to_string(),
+        };
+        db.authority_set(&manifest, "admin").unwrap();
+        let action = db.action_intent("agent-836b", "ws-836b", "github:Perseus-Computing-LLC/perseus-vault", "github:Perseus-Computing-LLC/ledger", "tool.run", "run-1", &"a".repeat(64), Some("{}")).unwrap();
+        assert_eq!(action.status, "approval_requested");
+        let denied = db.action_approve(&action.id, "github:tcconnally", "denied").unwrap();
+        assert_eq!(denied.status, "approval_denied");
+        // Null effect: cannot execute, cannot lease.
+        assert!(db.action_complete(&action.id, "agent-836b", "executed", &"c".repeat(64)).is_err());
+        assert!(db.action_lease_acquire(&action.id, "holder-a", 60).is_err());
+        // The only terminal is a `denied` receipt.
+        let receipt = db.action_complete(&action.id, "agent-836b", "denied", &"c".repeat(64)).unwrap();
+        assert_eq!(receipt.status, "action_denied");
+        assert_eq!(db.action_receipt_get(&action.id).unwrap().unwrap().outcome_hash, "c".repeat(64));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn timeout_on_pending_approval_resolves_to_deny() {
+        // #836: a pending approval past its window resolves to deny (timeout
+        // defaults to deny), never to silent execution.
+        let (db, path) = temp_db();
+        db.agent_upsert("agent-836c", "Agent 836C", 2, "perseus").unwrap();
+        let manifest = crate::models::AuthorityManifestInput {
+            agent_id: "agent-836c".to_string(), workspace_hash: "ws-836c".to_string(),
+            allowed_capabilities: vec!["tool.run".to_string()],
+            approval_required_capabilities: vec!["tool.run".to_string()],
+            scope_anchors: vec!["github:Perseus-Computing-LLC/perseus-vault".to_string()],
+            approver_principals: vec!["github:tcconnally".to_string()],
+            allowed_inbound_principals: vec!["github:tcconnally".to_string()],
+            permitted_external_ref_prefixes: vec!["github:Perseus-Computing-LLC".to_string()],
+            max_parallel_actions: 1, mode: "enforce".to_string(), expires_at_unix_ms: None,
+            capability_constraints_json: "{}".to_string(),
+        };
+        db.authority_set(&manifest, "admin").unwrap();
+        let action = db.action_intent("agent-836c", "ws-836c", "github:Perseus-Computing-LLC/perseus-vault", "github:Perseus-Computing-LLC/ledger", "tool.run", "run-1", &"a".repeat(64), Some("{}")).unwrap();
+        assert_eq!(action.status, "approval_requested");
+        // Before the window elapses, timeout resolution refuses.
+        assert!(db.action_resolve_timeout(&action.id, 86_400_000).is_err());
+        // Once the window has elapsed (0 ms), timeout resolves to deny.
+        let resolved = db.action_resolve_timeout(&action.id, 0).unwrap();
+        assert_eq!(resolved.status, "approval_denied");
+        assert!(resolved.approval_ref.starts_with("timeout:"), "timeout ref: {}", resolved.approval_ref);
+        // Timeout-denied completes only as denied.
+        assert!(db.action_complete(&action.id, "agent-836c", "executed", &"c".repeat(64)).is_err());
+        let receipt = db.action_complete(&action.id, "agent-836c", "denied", &"c".repeat(64)).unwrap();
+        assert_eq!(receipt.status, "action_denied");
         let _ = std::fs::remove_file(&path);
     }
 
