@@ -16,7 +16,7 @@
 - Clarified that `federate` is a local export / workspace-rename / re-import
   (file based, no network peers); the Windows-safe default path is tracked
   in #704.
-- Tool-count note refreshed: the current registry contains 65 unique canonical
+- Tool-count note refreshed: the current registry contains 89 unique canonical
   tool names. Compatibility aliases are callable but excluded from the count.
 
 ## Findings
@@ -25,27 +25,26 @@
 
 Claims verified against `src/`:
 
-- **65 canonical MCP tools**: ✓ The current registry contains 65 distinct base
+- **89 canonical MCP tools**: ✓ The current registry contains 89 distinct base
   tool names in `src/mcp.rs`, each exposed under the canonical
   `perseus_vault_*` prefix. The legacy `mimir_*` and `mneme_*` aliases remain
   callable but are not counted separately.
 
-  Verify the count against source (this is the authoritative command — re-run
-  it and update README/manifest.json/glama.json whenever a tool is added):
+  Verify the count against source and current-facing metadata (this parser is
+  formatting-insensitive and runs in CI):
 
   ```bash
-  grep -o '"name": "mimir_[a-z_]*"' src/mcp.rs | sort -u | wc -l
+  python3 scripts/registry_metadata_check.py
   ```
 
 - **MCP-native** — full JSON-RPC stdio server (`initialize`, `tools/list`, `tools/call`). ✓
 - **SQLite + FTS5** — schema builds FTS5 tables; recall uses FTS5 queries. ✓
 - **AES-256-GCM encrypted** — encryption at rest for entity bodies. ✓
-- **Encryption is optional and must be enabled explicitly** — the default
-  install is plaintext until `init`/`set_encryption` establishes the encrypted
-  canary row. `doctor` reports the on-disk state from that row; it must not be
-  read as proof that every default install is encrypted. `serve` warns when an
-  encrypted vault is opened without a key, and the standard key path is used
-  automatically when present. See `docs/ENCRYPTION.md`.
+- **Encryption is enabled by default for fresh default installs** — the first
+  default startup creates the standard owner-only key and encrypted canary.
+  Existing plaintext databases remain readable for explicit migration with
+  `init --rekey`; `doctor` reports the actual on-disk state. See
+  `docs/ENCRYPTION.md`.
 - **Fully local / zero-dependency** — no network runtime deps in `Cargo.toml`. ✓
 - **Sub-millisecond recall**: RETIRED 2026-07-16. No committed artifact
   supports it, and the old justification (bundled offline embeddings) said
@@ -62,5 +61,5 @@ Claims verified against `src/`:
   mimir_follow, #345 mimir_memories). Post-v2.13.0: 53 (#365
   mimir_communities, mimir_community_summary, mimir_global_recall; #364
   mimir_dream). 55 (#363 mimir_valid_at, mimir_bitemporal). 56 (#521
-  mimir_check_failure_pattern). Now **57** (#520 mimir_capture).
+  mimir_check_failure_pattern). Now **89** (registry-derived; #520 mimir_capture and subsequent tools).
   Earlier figures kept as historical record only.

@@ -9,7 +9,7 @@
 | **Deployment** | Single binary (~8MB) | Docker (multiple services) |
 | **Dependencies** | Zero (SQLite bundled) | Neo4j + Go runtime (Graphiti) |
 | **Self-hosted server** | ✅ (the binary is the server) | ⚠️ Community Edition deprecated — memory API is Zep Cloud-only |
-| **MCP Tools** | 55+ | 0 (not MCP-native) |
+| **MCP Tools** | 89 canonical | 0 (not MCP-native) |
 | **Memory Model** | Structured entities + journal + state | Conversation history + temporal knowledge graph |
 | **Search** | FTS5 + Dense + RRF hybrid | Vector + Graph |
 | **Offline** | ✅ Fully local | ❌ Docker + Neo4j needed |
@@ -134,9 +134,9 @@ Zep is built around conversation history:
 Zep excels at conversation-heavy use cases. Perseus Vault excels at structured
 knowledge management across any agent workflow.
 
-## MCP Tools: 55+ vs 0
+## MCP Tools: 89 canonical vs 0
 
-This is the biggest gap. Perseus Vault has 55+ MCP tools. Zep has zero — it's not
+This is the biggest gap. Perseus Vault has 89 canonical MCP tools. Zep has zero — it's not
 an MCP server at all. To use Zep with MCP hosts, you need to write a bridge.
 
 Perseus Vault's tools cover:
@@ -174,7 +174,7 @@ Perseus Vault's tools cover:
 **Perseus Vault's strengths vs Zep:**
 - Zero infrastructure (single binary vs Docker + PostgreSQL)
 - MCP-native (no wrapper needed)
-- 55+ tools vs 0 MCP tools
+- 89 canonical tools vs 0 MCP tools
 - Encryption at rest
 - Full entity lifecycle
 - Single-file database (easy backup/restore)

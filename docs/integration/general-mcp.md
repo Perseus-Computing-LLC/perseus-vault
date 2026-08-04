@@ -80,10 +80,12 @@ mcp_servers:
 }
 ```
 
-## Tools (55 total)
+## Tools (89 canonical)
 
-A representative selection is shown below; run `perseus-vault --version` and your
-client's tool list to see all 55.
+Perseus Vault exposes **89 canonical MCP tools** under the `perseus_vault_*`
+prefix (legacy `mimir_*` / `mneme_*` aliases remain callable). A representative
+selection is shown below; run `perseus-vault --version` and your client's tool
+list to see all of them.
 
 | Category | Tools |
 |---|---|
@@ -100,15 +102,23 @@ client's tool list to see all 55.
 
 ## Encryption
 
-Perseus Vault supports AES-256-GCM encryption at rest for `body_json`. Opt-in:
+Perseus Vault supports AES-256-GCM encryption at rest for `body_json` and it is
+**enabled by default for fresh installs** — the first write generates
+`~/.perseus-vault/secret.key` and establishes the encrypted canary. Explicit
+`--encryption-key` paths remain supported:
 
 ```bash
-# Generate key
-perseus-vault keygen --key-file ~/.mimir/secret.key
+# Explicit key (optional; a standard key is auto-generated for fresh installs)
+perseus-vault keygen --key-file ~/.perseus-vault/secret.key
 
 # Use with any client (add --encryption-key to args)
-/usr/local/bin/perseus-vault --db ~/.mimir/data/perseus-vault.db --encryption-key ~/.mimir/secret.key
+/usr/local/bin/perseus-vault --db ~/.mimir/data/perseus-vault.db --encryption-key ~/.perseus-vault/secret.key
 ```
+
+Existing plaintext databases fail closed with an actionable `init --rekey`
+migration path unless `PERSEUS_VAULT_ALLOW_PLAINTEXT=1` is set explicitly.
+Note: encryption covers `body_json`; the FTS5 index and metadata stay
+plaintext by design (see [docs/ENCRYPTION.md](../ENCRYPTION.md)).
 
 ## Docker
 

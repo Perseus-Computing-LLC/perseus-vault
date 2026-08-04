@@ -181,10 +181,13 @@ search, graph visualization, and journal events.
 
 ### Encryption at rest
 
-Generate a key and use it:
+Encryption is **enabled by default for fresh installs** — the first write
+auto-generates `~/.perseus-vault/secret.key` (owner-only on Unix) and
+establishes the encrypted canary; no setup step is required. An explicit key
+remains supported:
 
 ```bash
-perseus-vault keygen --key-file ~/.mimir/secret.key
+perseus-vault keygen --key-file ~/.perseus-vault/secret.key
 ```
 
 Then in `.mcp.json`:
@@ -196,7 +199,7 @@ Then in `.mcp.json`:
       "command": "perseus-vault",
       "args": [
         "--db", "/home/YOU/.mimir/data/perseus-vault.db",
-        "--encryption-key", "/home/YOU/.mimir/secret.key"
+        "--encryption-key", "/home/YOU/.perseus-vault/secret.key"
       ]
     }
   }
@@ -204,4 +207,5 @@ Then in `.mcp.json`:
 ```
 
 The `body_json` column of entities is now AES-256-GCM encrypted. FTS5 indexes
-remain plaintext for search.
+remain plaintext for search, and existing plaintext databases fail closed with
+an `init --rekey` migration path (or explicit `PERSEUS_VAULT_ALLOW_PLAINTEXT=1`).

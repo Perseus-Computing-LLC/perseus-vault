@@ -21,6 +21,8 @@ name: Publish to MCP Registry
 # gated below to successful tag-push builds only (release.yml also runs on
 # PRs and manual dispatch, neither of which should publish).
 on:
+  pull_request:
+  push:
   workflow_run:
     workflows: ["Release binaries"]
     types: [completed]
@@ -31,6 +33,15 @@ permissions:
   id-token: write
 
 jobs:
+  verify-registry:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify MCP registry metadata
+        run: cargo test --no-default-features 'mcp::tests::registry_and_advertised_manifest_are_unique_and_in_sync' -- --exact
+      - name: Verify count-bearing public surfaces match the registry
+        run: python3 scripts/registry_metadata_check.py
+
   publish:
     if: >-
       github.event_name == 'workflow_dispatch' ||

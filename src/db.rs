@@ -5,6 +5,31 @@ use r2d2_sqlite::SqliteConnectionManager;
 use sha2::{Digest, Sha256};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Deterministic canonicalization for rejected-value matching (#849):
+/// 1. If the value is valid JSON, re-serialize it compactly with serde_json so
+///    that structural whitespace/formatting cannot launder a rejected value.
+/// 2. Collapse all whitespace runs to single spaces.
+/// 3. Lowercase (ASCII-equivalent case folding for the common case).
+/// The rejected value itself is never stored — only the SHA-256 of this
+/// canonical form — so raw rejected content cannot leak into the store.
+fn normalize_rejected_value(value: &str) -> String {
+    let canonical = match serde_json::from_str::<serde_json::Value>(value) {
+        Ok(v) => v.to_string(),
+        Err(_) => value.to_string(),
+    };
+    canonical
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+fn rejected_value_digest(value: &str) -> String {
+    let normalized = normalize_rejected_value(value);
+    format!("{:x}", Sha256::digest(normalized.as_bytes()))
+}
+
+
 /// A connection checked out from the pool. Derefs to `rusqlite::Connection`, so
 /// every existing `conn.prepare/execute/query_row/...` call works unchanged once
 /// a method binds `let conn = self.conn()?;`. (#210)
@@ -3641,7 +3666,7 @@ impl Database {
         &self,
         entity: &Entity,
     ) -> Result<(String, String), Box<dyn std::error::Error>> {
-        self.remember_impl(entity, false, None, None)
+        self.remember_impl(entity, false, None, None, false)
     }
 
     /// Like `remember`, but never merges the write into a near-duplicate.
@@ -3652,7 +3677,7 @@ impl Database {
         &self,
         entity: &Entity,
     ) -> Result<(String, String), Box<dyn std::error::Error>> {
-        self.remember_impl(entity, true, None, None)
+        self.remember_impl(entity, true, None, None, false)
     }
 
     /// `remember` with an explicit application-time (valid-time) period (#363,
@@ -3668,7 +3693,7 @@ impl Database {
         valid_from: Option<i64>,
         valid_to: Option<i64>,
     ) -> Result<(String, String), Box<dyn std::error::Error>> {
-        self.remember_impl(entity, false, valid_from, valid_to)
+        self.remember_impl(entity, false, valid_from, valid_to, false)
     }
 
     /// `remember_with_validity` with caller-controlled dedup (#531): the MCP
@@ -3681,8 +3706,98 @@ impl Database {
         skip_dedup: bool,
         valid_from: Option<i64>,
         valid_to: Option<i64>,
+        allow_rejected: bool,
     ) -> Result<(String, String), Box<dyn std::error::Error>> {
-        self.remember_impl(entity, skip_dedup, valid_from, valid_to)
+        self.remember_impl(entity, skip_dedup, valid_from, valid_to, allow_rejected)
+    }
+
+    /// Trusted-override write used by correction capture (#849): the
+    /// correction itself quotes the rejected value, so the tombstone gate must
+    /// not fire on it. The tombstone is recorded BEFORE the write, and the
+    /// whole flow is journaled, so the override is audited end-to-end.
+    fn remember_with_validity_override(
+        &self,
+        entity: &Entity,
+        valid_from: Option<i64>,
+        valid_to: Option<i64>,
+    ) -> Result<(String, String), Box<dyn std::error::Error>> {
+        self.remember_impl(entity, false, valid_from, valid_to, true)
+    }
+
+    /// Record a scoped negative-memory tombstone. Matching is deliberately
+    /// digest-only: the normalized rejected value never needs to be stored.
+    pub fn reject_value(
+        &self,
+        workspace_hash: &str,
+        subject: &str,
+        predicate: &str,
+        value: &str,
+        reason: &str,
+        evidence_ref: &str,
+        author_agent_id: &str,
+        expires_at_unix_ms: Option<i64>,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let id = format!("rej-{}", uuid::Uuid::new_v4().simple());
+        let digest = rejected_value_digest(value);
+        let conn = self.conn()?;
+        conn.execute(
+            "INSERT INTO rejected_value_tombstones
+             (id, workspace_hash, subject, predicate, value_sha256, reason,
+              evidence_ref, author_agent_id, created_at_unix_ms, expires_at_unix_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             ON CONFLICT(workspace_hash, subject, predicate, value_sha256)
+             DO UPDATE SET reason=excluded.reason, evidence_ref=excluded.evidence_ref,
+                author_agent_id=excluded.author_agent_id,
+                expires_at_unix_ms=excluded.expires_at_unix_ms",
+            params![
+                id,
+                workspace_hash,
+                subject,
+                predicate,
+                digest,
+                reason,
+                evidence_ref,
+                author_agent_id,
+                now_ms(),
+                expires_at_unix_ms,
+            ],
+        )?;
+        Ok(id)
+    }
+
+    /// Return true when a value is rejected in the requested scope or by a
+    /// global tombstone. Expired tombstones are ignored and removed lazily.
+    ///
+    /// The `subject` parameter is intentionally not part of the match: matching
+    /// is digest-only within the scope so a rejected value cannot be laundered
+    /// back in under a new subject/key. It is accepted for API symmetry with
+    /// `reject_value` (which stores it for audit).
+    pub fn is_value_rejected(
+        &self,
+        workspace_hash: &str,
+        _subject: &str,
+        predicate: &str,
+        value: &str,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        let digest = rejected_value_digest(value);
+        let now = now_ms();
+        let conn = self.conn()?;
+        conn.execute(
+            "DELETE FROM rejected_value_tombstones
+             WHERE expires_at_unix_ms IS NOT NULL AND expires_at_unix_ms <= ?1",
+            params![now],
+        )?;
+        let hit: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM rejected_value_tombstones
+                 WHERE workspace_hash IN ('', ?1)
+                   AND predicate = ?2 AND value_sha256 = ?3
+                 LIMIT 1",
+                params![workspace_hash, predicate, digest],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(hit.is_some())
     }
 
     fn remember_impl(
@@ -3691,7 +3806,76 @@ impl Database {
         skip_dedup: bool,
         valid_from: Option<i64>,
         valid_to: Option<i64>,
+        allow_rejected: bool,
     ) -> Result<(String, String), Box<dyn std::error::Error>> {
+        // #849: scoped rejected-value tombstones are enforced on every
+        // remember-path write (agent remember, capture, ingest, connectors,
+        // derived writers) so a corrected/deleted value cannot be laundered
+        // back in under a new key. A deliberate trusted override passes
+        // allow_rejected=true and is journaled below for audit.
+        if !allow_rejected && self.is_value_rejected(&entity.workspace_hash, &entity.key, &entity.category, &entity.body_json)?
+        {
+            let digest = rejected_value_digest(&entity.body_json);
+            let journal_id = format!("jrn-{}", uuid::Uuid::new_v4().simple());
+            let event = crate::models::JournalEvent {
+                id: journal_id.clone(),
+                event_type: "rejected_write".to_string(),
+                evaluated_json: serde_json::to_string(&serde_json::json!({
+                    "subject": entity.key,
+                    "predicate": entity.category,
+                    "value_sha256": digest,
+                }))?,
+                acted_json: "{\"stored\":false,\"reason\":\"rejected-value tombstone\"}".to_string(),
+                forward_json: "{\"override\":\"re-remember with allow_rejected=true\"}".to_string(),
+                category: entity.category.clone(),
+                key: entity.key.clone(),
+                entity_id: entity.id.clone(),
+                agent_id: entity.agent_id.clone(),
+                workspace_hash: entity.workspace_hash.clone(),
+                created_at_unix_ms: now_ms(),
+            };
+            self.journal(&event)?;
+            return Err(format!(
+                "write rejected: a tombstone marks this value as rejected \
+                 (subject={}, predicate={}, value_sha256={}); re-remember with \
+                 allow_rejected=true only if this is a deliberate trusted override",
+                entity.key, entity.category, digest
+            )
+            .into());
+        }
+        // #849: a deliberate trusted override that actually collides with a
+        // live tombstone must still be audited — the write goes through, but
+        // an explicit override journal entry records who did it and when.
+        if allow_rejected
+            && self.is_value_rejected(
+                &entity.workspace_hash,
+                &entity.key,
+                &entity.category,
+                &entity.body_json,
+            )?
+        {
+            let digest = rejected_value_digest(&entity.body_json);
+            let journal_id = format!("jrn-{}", uuid::Uuid::new_v4().simple());
+            let event = crate::models::JournalEvent {
+                id: journal_id.clone(),
+                event_type: "rejected_write_override".to_string(),
+                evaluated_json: serde_json::to_string(&serde_json::json!({
+                    "subject": entity.key,
+                    "predicate": entity.category,
+                    "value_sha256": digest,
+                    "override": true,
+                }))?,
+                acted_json: "{\"stored\":true,\"reason\":\"deliberate trusted override\"}".to_string(),
+                forward_json: "{\"note\":\"tombstone left in place; future non-override writes stay blocked\"}".to_string(),
+                category: entity.category.clone(),
+                key: entity.key.clone(),
+                entity_id: entity.id.clone(),
+                agent_id: entity.agent_id.clone(),
+                workspace_hash: entity.workspace_hash.clone(),
+                created_at_unix_ms: now_ms(),
+            };
+            self.journal(&event)?;
+        }
         let conn = self.conn()?;
         let tags_json = serde_json::to_string(&entity.tags)?;
         let links_json = serde_json::to_string(&entity.links)?;
@@ -11722,7 +11906,7 @@ last_accessed: {}
             source: "mimir_correct".to_string(),
             always_on: false,
             certainty: 1.0,
-            workspace_hash: String::new(),
+            workspace_hash: params.workspace_hash.clone(),
             agent_id: String::new(),
             visibility: params.visibility.clone(),
             follow_count: 0,
@@ -11744,7 +11928,23 @@ last_accessed: {}
         } else {
             entity.body_json = with_legacy_evidence(entity.body_json, now, "perseus_vault_correct");
         }
-        self.remember_with_validity(&entity, params.valid_from_unix_ms, params.valid_to_unix_ms)?;
+        // #849: a correction is a deliberate, audited rejection of the wrong
+        // approach. Record the scoped tombstone FIRST so no future writer can
+        // re-ingest the rejected value under a new key, then write the
+        // correction entity with the trusted-override flag (the correction's
+        // own body quotes the rejected value, so the gate must not fire on it).
+        let ws = params.workspace_hash.clone();
+        self.reject_value(
+            &ws,
+            &format!("correction-{}", &id[4..16]),
+            &category,
+            &params.wrong_approach,
+            "user correction supersedes this value",
+            &format!("entity:{id}"),
+            &params.agent_id,
+            None,
+        )?;
+        self.remember_with_validity_override(&entity, params.valid_from_unix_ms, params.valid_to_unix_ms)?;
 
         // Also create a journal entry
         let journal_id = format!("jrn-{}", uuid::Uuid::new_v4().to_string().replace('-', "")[..12].to_string());
@@ -17872,6 +18072,173 @@ mod tests {
         assert!(db3.set_encryption(&key_b).is_err());
         let _ = std::fs::remove_file(&key_a);
         let _ = std::fs::remove_file(&key_b);
+        let _ = fs::remove_file(&path);
+    }
+
+    // #849: scoped rejected-value tombstones — db-level contract tests.
+    #[test]
+    fn rejected_value_tombstone_blocks_same_value_under_any_key_in_scope() {
+        let (db, path) = temp_db();
+        let body = r#"{"note":"db-level rejected body"}"#;
+        db.reject_value(
+            "ws-a",
+            "subject-x",
+            "convention",
+            body,
+            "user correction",
+            "",
+            "test-agent",
+            None,
+        )
+        .unwrap();
+
+        // Same (subject, predicate, value) in ws-a: blocked.
+        let mut ent = make_entity("k1", "convention", "k1", body);
+        ent.workspace_hash = "ws-a".to_string();
+        let same = db.remember(&ent);
+        assert!(same.is_err(), "same-key re-ingestion must be rejected");
+        assert!(
+            same.err().unwrap().to_string().contains("tombstone"),
+            "error must name the tombstone"
+        );
+
+        // Different key, same value (laundering): still blocked.
+        let mut ent2 = make_entity("k2", "convention", "k2", body);
+        ent2.workspace_hash = "ws-a".to_string();
+        let laundered = db.remember(&ent2);
+        assert!(
+            laundered.is_err(),
+            "laundered write under a new key must be rejected"
+        );
+
+        // Different value, same key in ws-a: allowed.
+        let mut ent3 = make_entity("k2", "convention", "k2", r#"{"note":"other"}"#);
+        ent3.workspace_hash = "ws-a".to_string();
+        let distinct = db.remember(&ent3);
+        assert!(distinct.is_ok(), "distinct value must write: {distinct:?}");
+
+        // Different predicate: allowed (the tombstone is scoped by predicate).
+        let mut ent4 = make_entity("k3", "preference", "k3", body);
+        ent4.workspace_hash = "ws-a".to_string();
+        let other_pred = db.remember(&ent4);
+        assert!(other_pred.is_ok(), "other-predicate value must write: {other_pred:?}");
+
+        // Trusted override writes through and leaves the tombstone in place.
+        let mut ent5 = make_entity("k4", "convention", "k4", body);
+        ent5.workspace_hash = "ws-a".to_string();
+        let over = db.remember_with_options(&ent5, false, None, None, true);
+        assert!(over.is_ok(), "trusted override must write: {over:?}");
+        assert!(
+            db.is_value_rejected("ws-a", "k4", "convention", body).unwrap(),
+            "tombstone must survive the override"
+        );
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn rejected_value_tombstone_scopes_isolate_workspaces() {
+        let (db, path) = temp_db();
+        let body = r#"{"note":"workspace-scoped rejection"}"#;
+        db.reject_value(
+            "ws-a",
+            "s",
+            "convention",
+            body,
+            "rejected in ws-a only",
+            "",
+            "test-agent",
+            None,
+        )
+        .unwrap();
+
+        // Same value in a different workspace is not poisoned.
+        let mut ent = make_entity("b1", "convention", "b1", body);
+        ent.workspace_hash = "ws-b".to_string();
+        let other = db.remember(&ent);
+        assert!(other.is_ok(), "ws-b must not be poisoned: {other:?}");
+
+        // Same value in ws-a is blocked.
+        let mut ent_a = make_entity("a1", "convention", "a1", body);
+        ent_a.workspace_hash = "ws-a".to_string();
+        let same = db.remember(&ent_a);
+        assert!(same.is_err(), "ws-a must stay blocked: {same:?}");
+
+        // A global tombstone (empty workspace) blocks every workspace.
+        db.reject_value("", "g", "convention", body, "global", "", "test-agent", None)
+            .unwrap();
+        let mut ent_c = make_entity("c1", "convention", "c1", body);
+        ent_c.workspace_hash = "ws-c".to_string();
+        let global = db.remember(&ent_c);
+        assert!(global.is_err(), "global tombstone must block ws-c: {global:?}");
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn rejected_value_tombstone_normalization_and_expiry() {
+        let (db, path) = temp_db();
+        db.reject_value(
+            "ws-a",
+            "s",
+            "convention",
+            r#"{"note": "ALWAYS  Use  X"}"#,
+            "reject",
+            "",
+            "test-agent",
+            None,
+        )
+        .unwrap();
+
+        // Case/whitespace/JSON-formatting variants of the value are equivalent.
+        for (i, variant) in [
+            r#"{"note": "always use x"}"#,
+            "{ \"note\": \"always use x\" }",
+            r#"{"note":  "ALWAYS USE X"}"#,
+        ]
+        .iter()
+        .enumerate()
+        {
+            let mut ent = make_entity(&format!("v{i}"), "convention", &format!("v{i}"), variant);
+            ent.workspace_hash = "ws-a".to_string();
+            let r = db.remember(&ent);
+            assert!(
+                r.is_err(),
+                "normalized-equivalent variant must be blocked: {variant}"
+            );
+        }
+
+        // An expired tombstone is ignored (and lazily removed).
+        let now = now_ms();
+        db.reject_value(
+            "ws-a",
+            "s2",
+            "convention",
+            r#"{"note":"expiring value"}"#,
+            "reject with horizon",
+            "",
+            "test-agent",
+            Some(now - 1000),
+        )
+        .unwrap();
+        let mut ent_e = make_entity("e", "convention", "e", r#"{"note":"expiring value"}"#);
+        ent_e.workspace_hash = "ws-a".to_string();
+        let after_expiry = db.remember(&ent_e);
+        assert!(after_expiry.is_ok(), "expired tombstone must not block: {after_expiry:?}");
+
+        // The expired row is lazily purged on the next lookup.
+        db.is_value_rejected("ws-a", "e", "convention", "x").unwrap();
+        let remaining: i64 = db
+            .conn()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM rejected_value_tombstones WHERE subject='s2'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining, 0, "expired tombstone must be lazily removed");
+
         let _ = fs::remove_file(&path);
     }
 
