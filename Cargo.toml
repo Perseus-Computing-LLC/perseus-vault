@@ -69,6 +69,7 @@ tokio-stream = { version = "0.1", optional = true }
 # with `--features multimodal`. All extraction is local (no cloud, no network).
 zip = { version = "2", optional = true, default-features = false, features = ["deflate"] }
 pdf-extract = { version = "0.12", optional = true }
+ed25519-dalek = { version = "2", features = ["std"] }
 
 # Target-specific deps must live AFTER every general [dependencies] entry —
 # a [target.*] table header captures everything below it into that target's
