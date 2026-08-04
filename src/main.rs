@@ -2418,7 +2418,27 @@ fn render_prepare_block(recall_when_hits: &[crate::models::Entity], context_md: 
     out
 }
 
+/// Windows' default main-thread stack is 1 MiB, and clap's full command-tree
+/// construction in an unoptimized (debug) build can exceed it — `--help`
+/// alone overflowed on the Windows CI runner (observed via the
+/// subprocess-based encryption bootstrap tests, #850). Run the real
+/// entrypoint on a thread with an explicit large stack so the binary works
+/// identically on every platform and build profile. `process::exit` calls
+/// inside the body still terminate the process as before.
 fn main() {
+    let stack_size = 8 * 1024 * 1024;
+    let thread = std::thread::Builder::new()
+        .name("perseus-vault-main".into())
+        .stack_size(stack_size)
+        .spawn(run)
+        .expect("failed to spawn the main thread");
+    std::process::exit(match thread.join() {
+        Ok(()) => 0,
+        Err(_) => 1,
+    });
+}
+
+fn run() {
     let mut cli = Cli::parse();
     apply_top_level_db(&mut cli); // #313: `mimir --db PATH serve` must honor --db
     normalize_default_db(&mut cli); // #421/#424: resolve implicit default DB + warn
