@@ -29,6 +29,14 @@ Artifacts split into two layers.
 
 No truncated hashes are durable keys.
 
+The SHA-256 is **byte identity only** (see "What a digest does and does not
+prove" in `evidence-chain-guidance.md`): it proves the preserved bytes are the
+preserved bytes. It says nothing about logical content, validity, authority,
+or freshness — those come from binding state (visibility, retention,
+supersession, authority manifests), never from the digest. Digest-valid but
+superseded or archived artifacts are still byte-identical and must be presented
+as superseded/archived, never as current.
+
 ### 1.2 Scope/provenance bindings
 
 `artifact_bindings` stores visibility-safe metadata that can vary by scope even when bytes are identical:

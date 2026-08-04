@@ -800,6 +800,9 @@ pub struct CohereReport {
 /// Cheap, deterministic content digest of the recall-visible entity set (#256).
 /// Used as a cache key for resolved `@memory` outputs: stable while DB state is
 /// unchanged, changes iff that state changes.
+/// Digest semantics (#835): byte identity only — a matching digest proves the
+/// set is the set; it says nothing about validity, authority, or freshness,
+/// which come from entity state, never the digest.
 #[derive(Debug, Clone, Serialize)]
 pub struct StateDigest {
     /// 16-hex-char FNV-1a digest over (id, body_json) of non-archived entities.
