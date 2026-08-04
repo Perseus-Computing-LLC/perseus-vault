@@ -303,6 +303,9 @@ CREATE INDEX IF NOT EXISTS idx_authorized_action_leases_active
 -- #811 Immutable artifacts: content-addressed bytes live once in `artifacts`,
 -- while scope/provenance/representation metadata lives in `artifact_bindings` so
 -- the same bytes can be visible in multiple workspaces without leaking access.
+-- Digest semantics (#835): sha256 is byte identity only — it proves the bytes
+-- are the bytes; it says nothing about logical content, validity, authority,
+-- or freshness, which come from binding/entity state, never the digest.
 CREATE TABLE IF NOT EXISTS artifacts (
     sha256 TEXT PRIMARY KEY,
     content_b64 TEXT NOT NULL,
@@ -972,6 +975,8 @@ fn apply_migrations(conn: &Connection) -> Result<(), Box<dyn std::error::Error>>
     // ── end v24 ──────────────────────────────────────────────────────────
 
     // ── v25 (#811 Immutable artifacts) ───────────────────────────────────
+    // Digest semantics (#835): sha256 is byte identity only — it proves the
+    // bytes are the bytes; validity/authority/freshness come from binding state.
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS artifacts (
             sha256 TEXT PRIMARY KEY,
