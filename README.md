@@ -14,12 +14,12 @@
 [![LangGraph](https://img.shields.io/badge/integrations-LangGraph-blue)](integrations/langgraph/)
 [![CrewAI](https://img.shields.io/badge/integrations-CrewAI-orange)](integrations/crewai/)
 [![AutoGen](https://img.shields.io/badge/integrations-AutoGen-purple)](integrations/autogen/)
-[![MCP Tools](https://img.shields.io/badge/MCP%20tools-65%20canonical-brightgreen)]()
+[![MCP Tools](https://img.shields.io/badge/MCP%20tools-89%20canonical-brightgreen)]()
 [![Listed on mcpservers.org](https://img.shields.io/badge/listed-mcpservers.org-blue)](https://mcpservers.org/servers/perseus-computing-llc/perseus-vault)
 
 Give your agents memory that survives the session, so they stop re-deriving what they
 already learned and stop repeating past mistakes. Hybrid recall (BM25 + dense + RRF),
-bi-temporal history, and **AES-256-GCM** at rest, exposed as **65 canonical MCP tools**
+bi-temporal history, and **AES-256-GCM** at rest, exposed as **89 canonical MCP tools**
 that work with any host. Legacy `mimir_*` and `mneme_*` aliases remain callable but are
 not counted separately. **73.8% on LongMemEval's official harness** (vs Zep 63.8%, Mem0
 49.0%).
@@ -37,12 +37,12 @@ That's it. Perseus Vault is installed to `~/.local/bin/perseus-vault`. Start it:
 perseus-vault serve --db ~/.mimir/data/perseus-vault.db
 ```
 
-> **Encryption is opt-in.** A stock install writes plaintext bodies until you
-> initialize encryption. Run `perseus-vault init --db ~/.mimir/data/perseus-vault.db`
-> to create the AES-256-GCM key and canary. Once `~/.perseus-vault/secret.key`
-> (or the legacy `~/.mimir/secret.key`) exists, `serve` and generated client
-> configurations use it automatically; `doctor` reports the actual on-disk
-> state rather than assuming the database is encrypted.
+> **Encryption is enabled automatically for the default installation.** The first
+> run creates `~/.perseus-vault/secret.key` with owner-only permissions and an
+> encrypted database canary. Back up that key: it cannot be recovered. Explicit
+> `--encryption-key` paths remain supported, and existing plaintext databases are
+> preserved for migration with `perseus-vault init --rekey`. Use `doctor` to
+> inspect the actual on-disk state.
 
 > **macOS note (Apple Silicon).** A freshly built or copied binary is
 > SIGKILLed on first run (`Killed: 9`, no other output) by the OS binary
@@ -228,7 +228,7 @@ the reference. [Methodology & dataset →](benchmark/temporal/README.md)
 |---|---|---|---|---|
 | **Deployment** | Single binary | Cloud + self-host | Docker/Postgres | Docker/Neo4j |
 | **Dependencies** | None (SQLite embedded) | Python + vector DB | Postgres + Python | Neo4j + Go (Graphiti) |
-| **MCP-Native** | ✅ 65 canonical tools | ❌ Not MCP-native | ❌ Not MCP-native | ❌ Not MCP-native |
+| **MCP-Native** | ✅ 89 canonical tools | ❌ Not MCP-native | ❌ Not MCP-native | ❌ Not MCP-native |
 | **Offline/Local** | ✅ Fully local | Cloud-dependent | Docker needed | Docker needed |
 | **Encryption** | AES-256-GCM ✅ | ❌ | ❌ | ❌ |
 | **Hybrid Search** | BM25 + Dense + RRF | Vector only | Vector only | Vector + Graph |
@@ -236,7 +236,7 @@ the reference. [Methodology & dataset →](benchmark/temporal/README.md)
 | **Entity Graph** | Link + Traverse | ❌ | ❌ | ✅ |
 | **Journal Audit Trail** | ✅ Immutable | ❌ | ❌ | ❌ |
 | **State Management** | ✅ Key-value + TTL | ❌ | ❌ | ❌ |
-| **MCP Tools** | 65 canonical | 5 | 8 | 0 |
+| **MCP Tools** | 89 canonical | 5 | 8 | 0 |
 | **License** | MIT | Apache 2.0 | Apache 2.0 | Apache 2.0 |
 
 [Full comparison: Perseus Vault vs Mem0 →](docs/comparison/mimir-vs-mem0.md)
@@ -673,8 +673,9 @@ perseus-vault prepare --task "..." --legacy-context            # old dump, opt-i
 
 ### Encryption
 - **AES-256-GCM** transparent encryption for entity `body_json`
-- Opt-in via `--encryption-key` flag
-- `perseus-vault keygen` subcommand for key generation
+- **Enabled by default for fresh installs** — the standard key is auto-generated at `~/.perseus-vault/secret.key` on first write
+- `--encryption-key` flag for explicit keys; `perseus-vault keygen` for custom key generation
+- Existing plaintext databases fail closed with an `init --rekey` migration path (or explicit `PERSEUS_VAULT_ALLOW_PLAINTEXT=1`)
 - FTS5 index stays plaintext for search
 
 ### Web Dashboard
@@ -719,7 +720,7 @@ Perseus Vault is built for government deployment from the ground up.
 | **License** | MIT — no copyleft, no GPL/AGPL |
 | **SBOM** | [Published](./docs/SBOM.md) — NTIA minimum elements |
 | **Air-gapped** | Fully offline — no telemetry, no API calls, no network by default |
-| **Encryption at rest** | AES-256-GCM, transparent, opt-in |
+| **Encryption at rest** | AES-256-GCM on bodies, enabled by default for fresh installs |
 | **Audit trail** | Immutable journal with chain-of-custody |
 | **Supply chain** | SLSA attestation in progress |
 

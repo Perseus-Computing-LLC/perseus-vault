@@ -303,6 +303,9 @@ CREATE INDEX IF NOT EXISTS idx_authorized_action_leases_active
 -- #811 Immutable artifacts: content-addressed bytes live once in `artifacts`,
 -- while scope/provenance/representation metadata lives in `artifact_bindings` so
 -- the same bytes can be visible in multiple workspaces without leaking access.
+-- Digest semantics (#835): sha256 is byte identity only — it proves the bytes
+-- are the bytes; it says nothing about logical content, validity, authority,
+-- or freshness, which come from binding/entity state, never the digest.
 CREATE TABLE IF NOT EXISTS artifacts (
     sha256 TEXT PRIMARY KEY,
     content_b64 TEXT NOT NULL,
@@ -390,7 +393,7 @@ CREATE INDEX IF NOT EXISTS idx_artifact_bindings_derived_from
 /// probed because v23 stores must retain existing receipt records.
 /// v25 (#811 Immutable artifacts): shared content-addressed `artifacts` bytes
 /// plus scope/provenance/representation `artifact_bindings`.
-const SCHEMA_VERSION: i64 = 25;
+const SCHEMA_VERSION: i64 = 26;
 
 /// Initialize the v0.2.0 schema on a fresh database.
 pub fn initialize_schema(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
@@ -972,6 +975,8 @@ fn apply_migrations(conn: &Connection) -> Result<(), Box<dyn std::error::Error>>
     // ── end v24 ──────────────────────────────────────────────────────────
 
     // ── v25 (#811 Immutable artifacts) ───────────────────────────────────
+    // Digest semantics (#835): sha256 is byte identity only — it proves the
+    // bytes are the bytes; validity/authority/freshness come from binding state.
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS artifacts (
             sha256 TEXT PRIMARY KEY,
@@ -1001,6 +1006,27 @@ fn apply_migrations(conn: &Connection) -> Result<(), Box<dyn std::error::Error>>
            ON artifact_bindings(derived_from_sha256);",
     )?;
     // ── end v25 ──────────────────────────────────────────────────────────
+
+    // ── v26 (#849 rejected-value tombstones) ─────────────────────────────
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS rejected_value_tombstones (
+            id TEXT PRIMARY KEY,
+            workspace_hash TEXT NOT NULL DEFAULT '',
+            subject TEXT NOT NULL,
+            predicate TEXT NOT NULL,
+            value_sha256 TEXT NOT NULL,
+            reason TEXT NOT NULL DEFAULT '',
+            evidence_ref TEXT NOT NULL DEFAULT '',
+            author_agent_id TEXT NOT NULL DEFAULT '',
+            created_at_unix_ms INTEGER NOT NULL,
+            expires_at_unix_ms INTEGER
+         );
+         CREATE UNIQUE INDEX IF NOT EXISTS idx_rejected_tombstones_identity
+           ON rejected_value_tombstones(workspace_hash, subject, predicate, value_sha256);
+         CREATE INDEX IF NOT EXISTS idx_rejected_tombstones_scope
+           ON rejected_value_tombstones(workspace_hash, expires_at_unix_ms);",
+    )?;
+    // ── end v26 ──────────────────────────────────────────────────────────
 
     // Stamp the migration level so subsequent opens skip the probe block above.
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -2205,6 +2231,35 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(exists, 1, "missing index {index}");
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn fresh_db_has_rejected_value_tombstone_table_and_indexes() {
+        // v26 (#849): digest-only scoped rejection tombstones.
+        let (conn, path) = temp_db();
+        initialize_schema(&conn).expect("init schema");
+        let exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='rejected_value_tombstones'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(exists, 1, "missing rejected_value_tombstones table");
+        for index in [
+            "idx_rejected_tombstones_identity",
+            "idx_rejected_tombstones_scope",
+        ] {
+            let idx: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name=?1",
+                    params![index],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(idx, 1, "missing index {index}");
         }
         let _ = std::fs::remove_file(&path);
     }

@@ -800,6 +800,9 @@ pub struct CohereReport {
 /// Cheap, deterministic content digest of the recall-visible entity set (#256).
 /// Used as a cache key for resolved `@memory` outputs: stable while DB state is
 /// unchanged, changes iff that state changes.
+/// Digest semantics (#835): byte identity only — a matching digest proves the
+/// set is the set; it says nothing about validity, authority, or freshness,
+/// which come from entity state, never the digest.
 #[derive(Debug, Clone, Serialize)]
 pub struct StateDigest {
     /// 16-hex-char FNV-1a digest over (id, body_json) of non-archived entities.
@@ -1073,6 +1076,12 @@ pub struct CorrectParams {
     pub valid_to_unix_ms: Option<i64>,
     #[serde(default)]
     pub evidence: Option<EvidenceEnvelope>,
+    /// Workspace scope for the rejection tombstone. Empty means global.
+    #[serde(default)]
+    pub workspace_hash: String,
+    /// Agent that authored the correction (stamped on the tombstone).
+    #[serde(default)]
+    pub agent_id: String,
 }
 
 /// Result from mimir_correct.

@@ -765,6 +765,11 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
           "default": false,
           "description": "Opt out of near-duplicate merging for this write (#531). Set true for bulk/API ingest of templated records so every acknowledged write actually creates its key; leave false for conversational memory."
         },
+        "allow_rejected": {
+          "type": "boolean",
+          "default": false,
+          "description": "#849: deliberate trusted override of a rejected-value tombstone. Journaled as an audited override; never set automatically."
+        },
         "derived_from": {
           "type": "array",
           "items": {
@@ -4316,6 +4321,16 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
         "valid_to_unix_ms": {
           "type": "integer",
           "description": "Application-time period end (#363, exclusive). Omit for 'still true'."
+        },
+        "workspace_hash": {
+          "type": "string",
+          "default": "",
+          "description": "Workspace scope for the rejection tombstone (#849). Empty means global."
+        },
+        "agent_id": {
+          "type": "string",
+          "default": "",
+          "description": "Agent that authored the correction (stamped on the tombstone)."
         }
       },
       "required": [
@@ -5023,11 +5038,13 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
   {"name":"mimir_authority_set_signed", "description":"Load a signed, distributable policy/authority profile (Ed25519 sigstore-style attestation); verification failure grants no authority (fail closed) and the verification result lands in the ledger journal.", "inputSchema":{"type":"object","properties":{"profile_json":{"type":"string"},"trusted_public_key_b64":{"type":"string"},"author_agent_id":{"type":"string"}},"required":["profile_json","trusted_public_key_b64","author_agent_id"]}, "title":"Load Signed Authority Profile"},
   {"name":"mimir_action_intent", "description":"Record a fail-closed authorized action intent.", "inputSchema":{"type":"object","properties":{"agent_id":{"type":"string"},"workspace_hash":{"type":"string"},"scope_anchor":{"type":"string"},"external_ref":{"type":"string"},"capability":{"type":"string"},"action_key":{"type":"string"},"intent_hash":{"type":"string"},"resource_constraints_json":{"type":"string","default":"{}"}},"required":["agent_id","workspace_hash","scope_anchor","external_ref","capability","action_key","intent_hash"]}, "title":"Record Action Intent"},
   {"name":"mimir_action_approve", "description":"Grant or deny an approval-requested action.", "inputSchema":{"type":"object","properties":{"action_id":{"type":"string"},"approver_principal":{"type":"string"},"decision":{"type":"string","enum":["granted","denied"]}},"required":["action_id","approver_principal","decision"]}, "title":"Decide Action Approval"},
-  {"name":"mimir_action_complete", "description":"Record an executed, failed, or cancelled action outcome by hash.", "inputSchema":{"type":"object","properties":{"action_id":{"type":"string"},"actor_agent_id":{"type":"string"},"outcome":{"type":"string","enum":["executed","failed","cancelled"]},"outcome_hash":{"type":"string"}},"required":["action_id","actor_agent_id","outcome","outcome_hash"]}, "title":"Complete Authorized Action"},
+  {"name":"mimir_action_complete", "description":"Record an executed, failed, cancelled, or denied action outcome by hash.", "inputSchema":{"type":"object","properties":{"action_id":{"type":"string"},"actor_agent_id":{"type":"string"},"outcome":{"type":"string","enum":["executed","failed","cancelled","denied"]},"outcome_hash":{"type":"string"}},"required":["action_id","actor_agent_id","outcome","outcome_hash"]}, "title":"Complete Authorized Action"},
+  {"name":"mimir_action_resolve_timeout", "description":"Resolve a pending approval to deny once its window has expired (timeout defaults to deny).", "inputSchema":{"type":"object","properties":{"action_id":{"type":"string"},"approval_timeout_ms":{"type":"integer"}},"required":["action_id","approval_timeout_ms"]}, "title":"Resolve Approval Timeout"},
   {"name":"mimir_action_receipt_get", "description":"Get durable action receipt metadata and hashes.", "inputSchema":{"type":"object","properties":{"action_id":{"type":"string"}},"required":["action_id"]}, "title":"Get Action Receipt"},
   {"name":"mimir_action_lease_acquire", "description":"Acquire the single active lease for an action key.", "inputSchema":{"type":"object","properties":{"action_id":{"type":"string"},"holder_id":{"type":"string"},"ttl_seconds":{"type":"integer","default":1}},"required":["action_id","holder_id"]}, "title":"Acquire Action Lease"},
   {"name":"mimir_action_lease_release", "description":"Release an action lease held by its owner.", "inputSchema":{"type":"object","properties":{"lease_id":{"type":"string"},"holder_id":{"type":"string"}},"required":["lease_id","holder_id"]}, "title":"Release Action Lease"},
-  {"name":"mimir_stage_trace_validate", "description":"Validate a versioned hash-only runtime stage trace and optionally compare replay semantics. Raw prompts, memory bodies, credentials, and tool payloads are not accepted.", "inputSchema":{"type":"object","properties":{"trace":{"type":"object","description":"perseus-vault-stage-trace/v1 structured trace"},"replay_of":{"type":"object","description":"Optional second trace to compare by replay fingerprint"}},"required":["trace"]}, "title":"Validate Runtime Stage Trace"}
+  {"name":"mimir_stage_trace_validate", "description":"Validate a versioned hash-only runtime stage trace and optionally compare replay semantics. Raw prompts, memory bodies, credentials, and tool payloads are not accepted.", "inputSchema":{"type":"object","properties":{"trace":{"type":"object","description":"perseus-vault-stage-trace/v1 structured trace"},"replay_of":{"type":"object","description":"Optional second trace to compare by replay fingerprint"}},"required":["trace"]}, "title":"Validate Runtime Stage Trace"},
+  {"name":"mimir_reject_value", "description":"Record a scoped digest-only rejected-value tombstone. Equivalent values remain rejected across new entity keys and writer paths until the tombstone expires or is explicitly superseded.", "inputSchema":{"type":"object","properties":{"workspace_hash":{"type":"string","description":"Workspace scope; empty means global."},"subject":{"type":"string"},"predicate":{"type":"string"},"value":{"type":"string","description":"Normalized only for matching; the value is not stored."},"reason":{"type":"string"},"evidence_ref":{"type":"string"},"author_agent_id":{"type":"string"},"expires_at_unix_ms":{"type":"integer"}},"required":["workspace_hash","subject","predicate","value"]}, "title":"Reject Value"}
 ]"###,
         )
         .expect("tools JSON must be valid");
@@ -5134,6 +5151,8 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
     let handler_result: Result<String, String> = match name {
         "mimir_remember" => tools::handle_remember(db, args).map_err(|e| e.to_string()),
 
+        "mimir_reject_value" => tools::handle_reject_value(db, args).map_err(|e| e.to_string()),
+
         "mimir_recall" => tools::handle_recall(db, args).map_err(|e| e.to_string()),
 
         "mimir_recall_batch" => tools::handle_recall_batch(db, args).map_err(|e| e.to_string()),
@@ -5232,6 +5251,7 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
         "mimir_action_intent" => tools::handle_action_intent(db, args),
         "mimir_action_approve" => tools::handle_action_approve(db, args),
         "mimir_action_complete" => tools::handle_action_complete(db, args),
+        "mimir_action_resolve_timeout" => tools::handle_action_resolve_timeout(db, args),
         "mimir_action_receipt_get" => tools::handle_action_receipt_get(db, args),
         "mimir_action_lease_acquire" => tools::handle_action_lease_acquire(db, args),
         "mimir_action_lease_release" => tools::handle_action_lease_release(db, args),
@@ -5342,6 +5362,49 @@ mod tests {
             .iter()
             .map(|t| t["name"].as_str().unwrap().to_string())
             .collect()
+    }
+
+    #[test]
+    fn registry_and_advertised_manifest_are_unique_and_in_sync() {
+        let base = tool_registry_base();
+        let registry_names: Vec<&str> = base
+            .iter()
+            .map(|tool| tool["name"].as_str().expect("registry tool name"))
+            .collect();
+        let registry_set: std::collections::HashSet<&str> =
+            registry_names.iter().copied().collect();
+        assert_eq!(
+            registry_set.len(),
+            registry_names.len(),
+            "registry names must be unique"
+        );
+        assert_eq!(
+            registry_names.len(),
+            89,
+            "update public metadata when adding a tool"
+        );
+
+        let canonical = advertised_names(false);
+        let canonical_set: std::collections::HashSet<&str> =
+            canonical.iter().map(String::as_str).collect();
+        assert_eq!(canonical.len(), registry_names.len());
+        assert_eq!(
+            canonical_set.len(),
+            canonical.len(),
+            "canonical names must be unique"
+        );
+        assert!(canonical
+            .iter()
+            .all(|name| name.starts_with("perseus_vault_")));
+
+        let all = advertised_names(true);
+        let all_set: std::collections::HashSet<&str> = all.iter().map(String::as_str).collect();
+        assert_eq!(all.len(), canonical.len() * 3);
+        assert_eq!(
+            all_set.len(),
+            all.len(),
+            "compatibility names must be unique"
+        );
     }
 
     #[test]
@@ -5854,6 +5917,163 @@ mod tests {
         assert_eq!(value["valid"], true, "{response}");
         assert_eq!(value["replay_match"], true, "{response}");
         assert!(advertised_names(false).contains(&"perseus_vault_stage_trace_validate".to_string()));
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn rejected_value_tombstones_block_laundering_and_support_audited_override() {
+        let db_path = std::env::temp_dir()
+            .join(format!("mimir-rejected-value-{}.db", uuid::Uuid::new_v4()));
+        let db = Database::open(db_path.to_str().expect("temp db path")).expect("open temp db");
+
+        // Reject the value explicitly with the new tool. The value is the
+        // canonical body string the writer would store (digest matching is
+        // case/whitespace-insensitive, so any equivalent spelling matches).
+        let reject = call_tool(
+            "mimir_reject_value",
+            &db,
+            json!({
+                "workspace_hash": "ws-a",
+                "subject": "never-use-x",
+                "predicate": "convention",
+                "value": "{\"note\": \"Always use X for everything\"}",
+                "reason": "user correction",
+                "author_agent_id": "test-agent"
+            }),
+            None,
+        );
+        assert!(reject.contains("\"rejected\":true"), "reject must succeed: {reject}");
+
+        // A normal remember with the same body is blocked, even under a
+        // brand-new key and different (subject, predicate) spelling: that is
+        // the laundering prevention (the gate matches on value digest within
+        // the workspace scope).
+        let blocked = call_tool(
+            "perseus_vault_remember",
+            &db,
+            json!({
+                "category": "convention",
+                "key": "totally-different-key",
+                "workspace_hash": "ws-a",
+                "body_json": "{\"note\": \"Always use X for everything\"}"
+            }),
+            None,
+        );
+        assert!(blocked.contains("rejected"), "laundered write must be blocked: {blocked}");
+
+        // Case/whitespace variants of the rejected value are equivalent.
+        let blocked_variant = call_tool(
+            "perseus_vault_remember",
+            &db,
+            json!({
+                "category": "convention",
+                "key": "another-key",
+                "workspace_hash": "ws-a",
+                "body_json": "{ \"note\":  \"always  use x  for everything\" }"
+            }),
+            None,
+        );
+        assert!(
+            blocked_variant.contains("rejected"),
+            "equivalent value variant must be blocked: {blocked_variant}"
+        );
+
+        // A different value for the same key is NOT blocked.
+        let fine = call_tool(
+            "perseus_vault_remember",
+            &db,
+            json!({
+                "category": "convention",
+                "key": "totally-different-key",
+                "workspace_hash": "ws-a",
+                "body_json": "{\"note\": \"Use Y instead\"}"
+            }),
+            None,
+        );
+        assert!(fine.contains("\"action\":\"created\""), "unrejected value must write: {fine}");
+
+        // Scope isolation: the same value re-ingested in a DIFFERENT workspace
+        // is not poisoned by the ws-a tombstone.
+        let other_ws = call_tool(
+            "perseus_vault_remember",
+            &db,
+            json!({
+                "category": "convention",
+                "key": "ws-b-key",
+                "workspace_hash": "ws-b",
+                "body_json": "{\"note\": \"Always use X for everything\"}"
+            }),
+            None,
+        );
+        assert!(
+            other_ws.contains("\"action\":\"created\""),
+            "different workspace must not be poisoned: {other_ws}"
+        );
+
+        // The deliberate override writes through and is journaled.
+        let override_ok = call_tool(
+            "perseus_vault_remember",
+            &db,
+            json!({
+                "category": "convention",
+                "key": "never-use-x",
+                "workspace_hash": "ws-a",
+                "body_json": "{\"note\": \"Always use X for everything\"}",
+                "allow_rejected": true
+            }),
+            None,
+        );
+        assert!(override_ok.contains("\"action\":\"created\""), "override must write: {override_ok}");
+
+        let rejected_events: i64 = {
+            let conn = db.conn().expect("db connection");
+            conn.query_row(
+                "SELECT COUNT(*) FROM journal WHERE event_type = 'rejected_write'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0)
+        };
+        assert!(rejected_events >= 1, "rejected write must be journaled");
+
+        let override_events: i64 = {
+            let conn = db.conn().expect("db connection");
+            conn.query_row(
+                "SELECT COUNT(*) FROM journal WHERE event_type = 'rejected_write_override'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0)
+        };
+        assert!(
+            override_events >= 1,
+            "trusted override must be journaled for audit"
+        );
+
+        // Correcting a wrong approach records a tombstone and the correction
+        // itself still writes.
+        let corrected = call_tool(
+            "mimir_correct",
+            &db,
+            json!({
+                "workspace_hash": "ws-a",
+                "wrong_approach": "Used X everywhere",
+                "user_correction": "Prefer Y",
+                "task_context": "choose strategy",
+                "agent_id": "test-agent"
+            }),
+            None,
+        );
+        assert!(corrected.contains("entity_id"), "correction must write: {corrected}");
+        let corr_val: Value = serde_json::from_str(&corrected).expect("correction response JSON");
+        let corr_id = corr_val["entity_id"].as_str().expect("entity_id").to_string();
+        let corr_key = format!("correction-{}", &corr_id[4..16]);
+        assert!(
+            db.is_value_rejected("ws-a", &corr_key, "correction", "Used X everywhere")
+                .unwrap(),
+            "correction must leave a scoped tombstone on its own key"
+        );
+
         let _ = fs::remove_file(db_path);
     }
 

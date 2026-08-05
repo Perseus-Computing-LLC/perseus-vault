@@ -72,7 +72,30 @@ supersession/refinement edges). The event tuple binds predecessor state, input, 
 policy/version, actor, time, and delegation. This makes the memory lifecycle
 independently auditable rather than relying on in-process state.
 
-## 6. What this document does *not* claim
+## 6. What a digest does and does not prove
+
+A digest proves **byte identity only**: a valid digest says the bytes are the
+bytes — nothing more, nothing less. It says nothing about logical content,
+validity, authority, or freshness. Those are separate facts carried by entity
+state — supersession links, validity windows, authority manifests, visibility,
+and retention — and they must never be inferred from the digest itself. This
+boundary is the same discipline the broader ecosystem documents explicitly: a
+BLAKE3 root is "authoritative for byte integrity only — it says nothing about
+logical content", and projection/ABI surfaces that are contracts, not content
+identities, get no root hash. Perseus Vault applies the same rule: artifact
+`sha256` keys, evidence-log digests, and state digests certify that the bytes
+served are the bytes recorded; they certify nothing about whether the content
+is currently true, authorized, or fresh.
+
+**Negative case.** Digest-valid but superseded or archived content is still
+byte-identical, so its digest verifies — and it must still be presented as
+superseded/archived, never as current. A verifier that stops at "digest valid"
+has proved identity, not present-tense truth. The corollary is that recall and
+receipt paths must surface entity state (supersession, validity, authority)
+alongside any digest, and must not add root hashes to projection surfaces that
+are stable contracts rather than content identities.
+
+## 7. What this document does *not* claim
 
 - Provenance tags make poisoning *detectable and attributable*; they are not a
   content-level safety guarantee. Detection requires verification at recall time plus

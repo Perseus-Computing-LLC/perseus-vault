@@ -5,6 +5,31 @@ use r2d2_sqlite::SqliteConnectionManager;
 use sha2::{Digest, Sha256};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Deterministic canonicalization for rejected-value matching (#849):
+/// 1. If the value is valid JSON, re-serialize it compactly with serde_json so
+///    that structural whitespace/formatting cannot launder a rejected value.
+/// 2. Collapse all whitespace runs to single spaces.
+/// 3. Lowercase (ASCII-equivalent case folding for the common case).
+/// The rejected value itself is never stored — only the SHA-256 of this
+/// canonical form — so raw rejected content cannot leak into the store.
+fn normalize_rejected_value(value: &str) -> String {
+    let canonical = match serde_json::from_str::<serde_json::Value>(value) {
+        Ok(v) => v.to_string(),
+        Err(_) => value.to_string(),
+    };
+    canonical
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+fn rejected_value_digest(value: &str) -> String {
+    let normalized = normalize_rejected_value(value);
+    format!("{:x}", Sha256::digest(normalized.as_bytes()))
+}
+
+
 /// A connection checked out from the pool. Derefs to `rusqlite::Connection`, so
 /// every existing `conn.prepare/execute/query_row/...` call works unchanged once
 /// a method binds `let conn = self.conn()?;`. (#210)
@@ -68,7 +93,11 @@ fn resource_constraints_permit(
     let Some(proposed) = proposed.as_object() else {
         return Err("resource constraints must be a JSON object".into());
     };
-    for key in ["resource_ref", "environment", "destination", "merchant_ref", "currency"] {
+    // #836 argv-level policy: `tool` pins the tool identity and
+    // `argv_canonical` pins the canonicalized policy-relevant argument fields
+    // (exact match, fail closed). Only canonicalized fields are compared —
+    // canonical_constraint_json forbids raw_arguments/credentials/secret keys.
+    for key in ["resource_ref", "environment", "destination", "merchant_ref", "currency", "tool", "argv_canonical"] {
         if let Some(expected) = bound.get(key) {
             if proposed.get(key) != Some(expected) {
                 return Ok(false);
@@ -3637,7 +3666,7 @@ impl Database {
         &self,
         entity: &Entity,
     ) -> Result<(String, String), Box<dyn std::error::Error>> {
-        self.remember_impl(entity, false, None, None)
+        self.remember_impl(entity, false, None, None, false)
     }
 
     /// Like `remember`, but never merges the write into a near-duplicate.
@@ -3648,7 +3677,7 @@ impl Database {
         &self,
         entity: &Entity,
     ) -> Result<(String, String), Box<dyn std::error::Error>> {
-        self.remember_impl(entity, true, None, None)
+        self.remember_impl(entity, true, None, None, false)
     }
 
     /// `remember` with an explicit application-time (valid-time) period (#363,
@@ -3664,7 +3693,7 @@ impl Database {
         valid_from: Option<i64>,
         valid_to: Option<i64>,
     ) -> Result<(String, String), Box<dyn std::error::Error>> {
-        self.remember_impl(entity, false, valid_from, valid_to)
+        self.remember_impl(entity, false, valid_from, valid_to, false)
     }
 
     /// `remember_with_validity` with caller-controlled dedup (#531): the MCP
@@ -3677,8 +3706,98 @@ impl Database {
         skip_dedup: bool,
         valid_from: Option<i64>,
         valid_to: Option<i64>,
+        allow_rejected: bool,
     ) -> Result<(String, String), Box<dyn std::error::Error>> {
-        self.remember_impl(entity, skip_dedup, valid_from, valid_to)
+        self.remember_impl(entity, skip_dedup, valid_from, valid_to, allow_rejected)
+    }
+
+    /// Trusted-override write used by correction capture (#849): the
+    /// correction itself quotes the rejected value, so the tombstone gate must
+    /// not fire on it. The tombstone is recorded BEFORE the write, and the
+    /// whole flow is journaled, so the override is audited end-to-end.
+    fn remember_with_validity_override(
+        &self,
+        entity: &Entity,
+        valid_from: Option<i64>,
+        valid_to: Option<i64>,
+    ) -> Result<(String, String), Box<dyn std::error::Error>> {
+        self.remember_impl(entity, false, valid_from, valid_to, true)
+    }
+
+    /// Record a scoped negative-memory tombstone. Matching is deliberately
+    /// digest-only: the normalized rejected value never needs to be stored.
+    pub fn reject_value(
+        &self,
+        workspace_hash: &str,
+        subject: &str,
+        predicate: &str,
+        value: &str,
+        reason: &str,
+        evidence_ref: &str,
+        author_agent_id: &str,
+        expires_at_unix_ms: Option<i64>,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let id = format!("rej-{}", uuid::Uuid::new_v4().simple());
+        let digest = rejected_value_digest(value);
+        let conn = self.conn()?;
+        conn.execute(
+            "INSERT INTO rejected_value_tombstones
+             (id, workspace_hash, subject, predicate, value_sha256, reason,
+              evidence_ref, author_agent_id, created_at_unix_ms, expires_at_unix_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             ON CONFLICT(workspace_hash, subject, predicate, value_sha256)
+             DO UPDATE SET reason=excluded.reason, evidence_ref=excluded.evidence_ref,
+                author_agent_id=excluded.author_agent_id,
+                expires_at_unix_ms=excluded.expires_at_unix_ms",
+            params![
+                id,
+                workspace_hash,
+                subject,
+                predicate,
+                digest,
+                reason,
+                evidence_ref,
+                author_agent_id,
+                now_ms(),
+                expires_at_unix_ms,
+            ],
+        )?;
+        Ok(id)
+    }
+
+    /// Return true when a value is rejected in the requested scope or by a
+    /// global tombstone. Expired tombstones are ignored and removed lazily.
+    ///
+    /// The `subject` parameter is intentionally not part of the match: matching
+    /// is digest-only within the scope so a rejected value cannot be laundered
+    /// back in under a new subject/key. It is accepted for API symmetry with
+    /// `reject_value` (which stores it for audit).
+    pub fn is_value_rejected(
+        &self,
+        workspace_hash: &str,
+        _subject: &str,
+        predicate: &str,
+        value: &str,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        let digest = rejected_value_digest(value);
+        let now = now_ms();
+        let conn = self.conn()?;
+        conn.execute(
+            "DELETE FROM rejected_value_tombstones
+             WHERE expires_at_unix_ms IS NOT NULL AND expires_at_unix_ms <= ?1",
+            params![now],
+        )?;
+        let hit: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM rejected_value_tombstones
+                 WHERE workspace_hash IN ('', ?1)
+                   AND predicate = ?2 AND value_sha256 = ?3
+                 LIMIT 1",
+                params![workspace_hash, predicate, digest],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(hit.is_some())
     }
 
     fn remember_impl(
@@ -3687,7 +3806,76 @@ impl Database {
         skip_dedup: bool,
         valid_from: Option<i64>,
         valid_to: Option<i64>,
+        allow_rejected: bool,
     ) -> Result<(String, String), Box<dyn std::error::Error>> {
+        // #849: scoped rejected-value tombstones are enforced on every
+        // remember-path write (agent remember, capture, ingest, connectors,
+        // derived writers) so a corrected/deleted value cannot be laundered
+        // back in under a new key. A deliberate trusted override passes
+        // allow_rejected=true and is journaled below for audit.
+        if !allow_rejected && self.is_value_rejected(&entity.workspace_hash, &entity.key, &entity.category, &entity.body_json)?
+        {
+            let digest = rejected_value_digest(&entity.body_json);
+            let journal_id = format!("jrn-{}", uuid::Uuid::new_v4().simple());
+            let event = crate::models::JournalEvent {
+                id: journal_id.clone(),
+                event_type: "rejected_write".to_string(),
+                evaluated_json: serde_json::to_string(&serde_json::json!({
+                    "subject": entity.key,
+                    "predicate": entity.category,
+                    "value_sha256": digest,
+                }))?,
+                acted_json: "{\"stored\":false,\"reason\":\"rejected-value tombstone\"}".to_string(),
+                forward_json: "{\"override\":\"re-remember with allow_rejected=true\"}".to_string(),
+                category: entity.category.clone(),
+                key: entity.key.clone(),
+                entity_id: entity.id.clone(),
+                agent_id: entity.agent_id.clone(),
+                workspace_hash: entity.workspace_hash.clone(),
+                created_at_unix_ms: now_ms(),
+            };
+            self.journal(&event)?;
+            return Err(format!(
+                "write rejected: a tombstone marks this value as rejected \
+                 (subject={}, predicate={}, value_sha256={}); re-remember with \
+                 allow_rejected=true only if this is a deliberate trusted override",
+                entity.key, entity.category, digest
+            )
+            .into());
+        }
+        // #849: a deliberate trusted override that actually collides with a
+        // live tombstone must still be audited — the write goes through, but
+        // an explicit override journal entry records who did it and when.
+        if allow_rejected
+            && self.is_value_rejected(
+                &entity.workspace_hash,
+                &entity.key,
+                &entity.category,
+                &entity.body_json,
+            )?
+        {
+            let digest = rejected_value_digest(&entity.body_json);
+            let journal_id = format!("jrn-{}", uuid::Uuid::new_v4().simple());
+            let event = crate::models::JournalEvent {
+                id: journal_id.clone(),
+                event_type: "rejected_write_override".to_string(),
+                evaluated_json: serde_json::to_string(&serde_json::json!({
+                    "subject": entity.key,
+                    "predicate": entity.category,
+                    "value_sha256": digest,
+                    "override": true,
+                }))?,
+                acted_json: "{\"stored\":true,\"reason\":\"deliberate trusted override\"}".to_string(),
+                forward_json: "{\"note\":\"tombstone left in place; future non-override writes stay blocked\"}".to_string(),
+                category: entity.category.clone(),
+                key: entity.key.clone(),
+                entity_id: entity.id.clone(),
+                agent_id: entity.agent_id.clone(),
+                workspace_hash: entity.workspace_hash.clone(),
+                created_at_unix_ms: now_ms(),
+            };
+            self.journal(&event)?;
+        }
         let conn = self.conn()?;
         let tags_json = serde_json::to_string(&entity.tags)?;
         let links_json = serde_json::to_string(&entity.links)?;
@@ -6992,7 +7180,32 @@ impl Database {
         if intent_hash.len()!=64 || !intent_hash.bytes().all(|b| b.is_ascii_hexdigit()) { return Err("intent_hash must be a SHA-256 hex digest".into()); }
         let resource_constraints_json = canonical_constraint_json(resource_constraints_json.unwrap_or("{}"))?;
         if !resource_constraints_permit(&manifest.capability_constraints_json, capability, &resource_constraints_json)? {
-            return Err("RESOURCE_CONSTRAINT_MISMATCH".into());
+            // #836 null-effect-on-deny + argv-level policy: a policy denial
+            // (including a tool-argument escalation) records an explicit
+            // `denied` receipt and grants nothing. Only canonicalized,
+            // policy-relevant fields are stored (canonical_constraint_json
+            // forbids raw_arguments/credentials/prompt/secret keys); the
+            // outcome hash is the constraint hash of the canonical form.
+            let now=now_ms();
+            let action=AuthorizedAction { id:format!("act-{}",uuid::Uuid::new_v4().simple()), manifest_id:manifest.id.clone(), manifest_version:manifest.version, agent_id:agent_id.to_string(), workspace_hash:workspace_hash.to_string(), scope_anchor:scope_anchor.to_string(), external_ref:external_ref.to_string(), capability:capability.to_string(), action_key:action_key.to_string(), intent_hash:intent_hash.to_ascii_lowercase(), outcome_hash:constraint_hash(&resource_constraints_json), status:"denied".to_string(), approval_required:false, approval_ref:String::new(), created_at_unix_ms:now, updated_at_unix_ms:now, resource_constraints_json:resource_constraints_json.clone(), resource_constraints_hash:constraint_hash(&resource_constraints_json) };
+            let conn=self.conn()?;
+            conn.execute(
+                "INSERT INTO authorized_actions
+                 (id,manifest_id,manifest_version,agent_id,workspace_hash,scope_anchor,
+                  external_ref,capability,action_key,intent_hash,outcome_hash,status,
+                  approval_required,approval_ref,created_at_unix_ms,updated_at_unix_ms,
+                  resource_constraints_json,resource_constraints_hash)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?15,?16,?17)",
+                params![action.id,action.manifest_id,action.manifest_version,action.agent_id,
+                        action.workspace_hash,action.scope_anchor,action.external_ref,
+                        action.capability,action.action_key,action.intent_hash,
+                        action.outcome_hash,action.status,action.approval_required as i64,
+                        action.approval_ref,now,action.resource_constraints_json,
+                        action.resource_constraints_hash],
+            )?;
+            drop(conn);
+            self.journal(&JournalEvent {id:format!("jrn-{}",uuid::Uuid::new_v4().simple()),event_type:"action_denied".to_string(),evaluated_json:json!({"deny_reason":"policy_mismatch","capability":capability}).to_string(),acted_json:serde_json::to_string(&action)?,forward_json:"{}".to_string(),category:"authorized_action".to_string(),key:action.id.clone(),entity_id:String::new(),agent_id:agent_id.to_string(),workspace_hash:workspace_hash.to_string(),created_at_unix_ms:now})?;
+            return Ok(action);
         }
         let resource_constraints_hash = constraint_hash(&resource_constraints_json);
         let approval_required=manifest.approval_required_capabilities.iter().any(|v|v==capability); let now=now_ms();
@@ -7029,18 +7242,30 @@ impl Database {
     }
 
     pub fn action_complete(&self, action_id:&str, actor:&str, outcome:&str, outcome_hash:&str) -> Result<AuthorizedAction, Box<dyn std::error::Error>> {
-        if !matches!(outcome,"executed"|"failed"|"cancelled") { return Err("action outcome must be executed, failed, or cancelled".into()); }
+        if !matches!(outcome,"executed"|"failed"|"cancelled"|"denied") { return Err("action outcome must be executed, failed, cancelled, or denied".into()); }
         if outcome_hash.len()!=64 || !outcome_hash.bytes().all(|b|b.is_ascii_hexdigit()) { return Err("outcome_hash must be a SHA-256 hex digest".into()); }
         let mut action=self.action_receipt_get(action_id)?.ok_or("authorized action not found")?;
-        if action.approval_required && action.status!="approval_granted" { return Err("approval-required action lacks granted approval".into()); }
-        if !action.approval_required && action.status!="intent" { return Err("action is not in a completable state".into()); }
+        // #836 null-effect-on-deny: a denied approval may only complete as
+        // `denied`; an executed/failed/cancelled completion is impossible.
+        if action.approval_required {
+            if outcome=="denied" {
+                if action.status!="approval_denied" { return Err("denied outcome requires an approval_denied action".into()); }
+            } else if action.status!="approval_granted" { return Err("approval-required action lacks granted approval".into()); }
+        } else if action.status!="intent" { return Err("action is not in a completable state".into()); }
         let now=now_ms(); action.status=format!("action_{outcome}"); action.outcome_hash=outcome_hash.to_ascii_lowercase(); action.updated_at_unix_ms=now; let conn=self.conn()?; conn.execute("UPDATE authorized_actions SET status=?1,outcome_hash=?2,updated_at_unix_ms=?3 WHERE id=?4",params![action.status,action.outcome_hash,now,action.id])?; drop(conn);
         self.journal(&JournalEvent{id:format!("jrn-{}",uuid::Uuid::new_v4().simple()),event_type:action.status.clone(),evaluated_json:json!({"actor":actor,"manifest_version":action.manifest_version}).to_string(),acted_json:serde_json::to_string(&action)?,forward_json:"{}".to_string(),category:"authorized_action".to_string(),key:action.id.clone(),entity_id:String::new(),agent_id:actor.to_string(),workspace_hash:action.workspace_hash.clone(),created_at_unix_ms:now})?; Ok(action)
     }
 
     pub fn action_lease_acquire(&self, action_id:&str, holder:&str, ttl_seconds:i64) -> Result<ActionLease, Box<dyn std::error::Error>> {
         if holder.trim().is_empty() || ttl_seconds<1 { return Err("lease requires holder_id and positive ttl_seconds".into()); }
-        let action=self.action_receipt_get(action_id)?.ok_or("authorized action not found")?; let now=now_ms(); let expires=now+ttl_seconds.saturating_mul(1000); let conn=self.conn()?; let tx=conn.unchecked_transaction()?;
+        let action=self.action_receipt_get(action_id)?.ok_or("authorized action not found")?;
+        // #836 null-effect-on-deny: a denied action can never be leased, so no
+        // execution path can start from a denial. Completed/executed actions
+        // remain leasable (receipt-history semantics unchanged).
+        if action.status=="denied" || action.status.starts_with("approval_denied") || action.status.starts_with("action_denied") {
+            return Err("cannot lease a denied action".into());
+        }
+        let now=now_ms(); let expires=now+ttl_seconds.saturating_mul(1000); let conn=self.conn()?; let tx=conn.unchecked_transaction()?;
         tx.execute("UPDATE authorized_action_leases SET released_at_unix_ms=?1 WHERE workspace_hash=?2 AND action_key=?3 AND released_at_unix_ms IS NULL AND expires_at_unix_ms<=?1",params![now,action.workspace_hash,action.action_key])?;
         let busy:Option<String>=tx.query_row("SELECT id FROM authorized_action_leases WHERE workspace_hash=?1 AND action_key=?2 AND released_at_unix_ms IS NULL AND expires_at_unix_ms>?3 LIMIT 1",params![action.workspace_hash,action.action_key,now],|r|r.get(0)).optional()?;
         if busy.is_some() { return Err("an active lease already exists for workspace/action key".into()); }
@@ -7048,6 +7273,22 @@ impl Database {
     }
 
     pub fn action_lease_release(&self, lease_id:&str, holder:&str) -> Result<(), Box<dyn std::error::Error>> { let now=now_ms(); let conn=self.conn()?; let changed=conn.execute("UPDATE authorized_action_leases SET released_at_unix_ms=?1 WHERE id=?2 AND holder_id=?3 AND released_at_unix_ms IS NULL",params![now,lease_id,holder])?; if changed!=1 { return Err("lease not found, already released, or holder mismatch".into()); } Ok(()) }
+
+    /// #836 timeout-on-pending-approval resolves to deny. An action awaiting
+    /// approval whose window (`approval_timeout_ms` from intent creation) has
+    /// elapsed is transitioned to `approval_denied` with a `timeout:` approval
+    /// ref; the caller then completes it as `denied`. Timeout defaults to deny
+    /// — a pending approval never silently becomes executable.
+    pub fn action_resolve_timeout(&self, action_id:&str, approval_timeout_ms:i64) -> Result<AuthorizedAction, Box<dyn std::error::Error>> {
+        if approval_timeout_ms<0 { return Err("approval_timeout_ms must be non-negative".into()); }
+        let mut action=self.action_receipt_get(action_id)?.ok_or("authorized action not found")?;
+        if action.status!="approval_requested" { return Err("action is not awaiting approval".into()); }
+        let now=now_ms();
+        if now - action.created_at_unix_ms < approval_timeout_ms { return Err("approval window has not yet expired".into()); }
+        action.status="approval_denied".to_string(); action.approval_ref=format!("timeout:{}",approval_timeout_ms); action.updated_at_unix_ms=now;
+        let conn=self.conn()?; conn.execute("UPDATE authorized_actions SET status=?1,approval_ref=?2,updated_at_unix_ms=?3 WHERE id=?4",params![action.status,action.approval_ref,now,action.id])?; drop(conn);
+        self.journal(&JournalEvent{id:format!("jrn-{}",uuid::Uuid::new_v4().simple()),event_type:"approval_denied".to_string(),evaluated_json:json!({"reason":"approval_timeout","approval_timeout_ms":approval_timeout_ms}).to_string(),acted_json:serde_json::to_string(&action)?,forward_json:"{}".to_string(),category:"authorized_action".to_string(),key:action.id.clone(),entity_id:String::new(),agent_id:action.agent_id.clone(),workspace_hash:action.workspace_hash.clone(),created_at_unix_ms:now})?; Ok(action)
+    }
 
     // ─── State ───────────────────────────────────────────────────
 
@@ -11706,7 +11947,7 @@ last_accessed: {}
             source: "mimir_correct".to_string(),
             always_on: false,
             certainty: 1.0,
-            workspace_hash: String::new(),
+            workspace_hash: params.workspace_hash.clone(),
             agent_id: String::new(),
             visibility: params.visibility.clone(),
             follow_count: 0,
@@ -11728,7 +11969,23 @@ last_accessed: {}
         } else {
             entity.body_json = with_legacy_evidence(entity.body_json, now, "perseus_vault_correct");
         }
-        self.remember_with_validity(&entity, params.valid_from_unix_ms, params.valid_to_unix_ms)?;
+        // #849: a correction is a deliberate, audited rejection of the wrong
+        // approach. Record the scoped tombstone FIRST so no future writer can
+        // re-ingest the rejected value under a new key, then write the
+        // correction entity with the trusted-override flag (the correction's
+        // own body quotes the rejected value, so the gate must not fire on it).
+        let ws = params.workspace_hash.clone();
+        self.reject_value(
+            &ws,
+            &format!("correction-{}", &id[4..16]),
+            &category,
+            &params.wrong_approach,
+            "user correction supersedes this value",
+            &format!("entity:{id}"),
+            &params.agent_id,
+            None,
+        )?;
+        self.remember_with_validity_override(&entity, params.valid_from_unix_ms, params.valid_to_unix_ms)?;
 
         // Also create a journal entry
         let journal_id = format!("jrn-{}", uuid::Uuid::new_v4().to_string().replace('-', "")[..12].to_string());
@@ -13990,6 +14247,121 @@ mod tests {
         assert!(db.authority_set_signed(
             "{\"schema\":\"perseus-policy-profile/v1\",\"payload\":{}}",
             &trusted, "hermes-admin").is_err());
+    }
+
+    #[test]
+    fn argv_policy_rejects_escalation_and_allows_benign() {
+        // #836 flywheel security scenario: tool-argument escalation. The same
+        // tool with a different argv is different risk; the policy pins the
+        // canonicalized policy-relevant argv fields, so an escalation argv is
+        // denied while a benign argv passes. No raw argv bodies or secrets
+        // appear anywhere in durable evidence (canonical_constraint_json
+        // forbids raw_arguments/credentials/prompt/secret keys).
+        let (db, path) = temp_db();
+        db.agent_upsert("agent-836", "Agent 836", 2, "perseus").unwrap();
+        let manifest = crate::models::AuthorityManifestInput {
+            agent_id: "agent-836".to_string(), workspace_hash: "ws-836".to_string(),
+            allowed_capabilities: vec!["tool.run".to_string()],
+            approval_required_capabilities: vec![],
+            scope_anchors: vec!["github:Perseus-Computing-LLC/perseus-vault".to_string()],
+            approver_principals: vec![],
+            allowed_inbound_principals: vec!["perseus.observer".to_string()],
+            permitted_external_ref_prefixes: vec!["github:Perseus-Computing-LLC".to_string()],
+            max_parallel_actions: 1, mode: "enforce".to_string(), expires_at_unix_ms: None,
+            capability_constraints_json: "{\"tool.run\":{\"tool\":\"git\",\"argv_canonical\":{\"action\":\"push\",\"remote\":\"github.com/Perseus-Computing-LLC/ledger.git\"}}}".to_string(),
+        };
+        db.authority_set(&manifest, "admin").unwrap();
+
+        // Benign argv: allowed, completes normally.
+        let benign = db.action_intent("agent-836", "ws-836", "github:Perseus-Computing-LLC/perseus-vault", "github:Perseus-Computing-LLC/ledger", "tool.run", "run-1", &"a".repeat(64),
+            Some("{\"tool\":\"git\",\"argv_canonical\":{\"action\":\"push\",\"remote\":\"github.com/Perseus-Computing-LLC/ledger.git\"}}")).unwrap();
+        assert_eq!(benign.status, "intent");
+
+        // Escalation argv (exfiltration remote): explicit denied receipt, no
+        // capability granted.
+        let escalation = db.action_intent("agent-836", "ws-836", "github:Perseus-Computing-LLC/perseus-vault", "github:Perseus-Computing-LLC/ledger", "tool.run", "run-2", &"b".repeat(64),
+            Some("{\"tool\":\"git\",\"argv_canonical\":{\"action\":\"push\",\"remote\":\"evil.example.com/exfil.git\"}}")).unwrap();
+        assert_eq!(escalation.status, "denied");
+        assert_eq!(escalation.outcome_hash.len(), 64, "denied receipt carries a real outcome hash");
+
+        // Null effect on deny: no lease, no executed completion, no side effect.
+        assert!(db.action_lease_acquire(&escalation.id, "holder-a", 60).is_err());
+        assert!(db.action_complete(&escalation.id, "agent-836", "executed", &"c".repeat(64)).is_err());
+
+        // The denied receipt is durable and readable.
+        let receipt = db.action_receipt_get(&escalation.id).unwrap().unwrap();
+        assert_eq!(receipt.status, "denied");
+        assert!(receipt.resource_constraints_json.contains("argv_canonical"));
+        assert!(!receipt.resource_constraints_json.contains("raw_arguments"));
+
+        let done = db.action_complete(&benign.id, "agent-836", "executed", &"c".repeat(64)).unwrap();
+        assert_eq!(done.status, "action_executed");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn denied_approval_produces_denied_receipt_with_no_side_effect() {
+        // #836 null-effect-on-deny via the approval path: a denied approval
+        // can only complete as `denied`; executed/failed/cancelled completion
+        // and leasing are impossible, so no process/request can follow.
+        let (db, path) = temp_db();
+        db.agent_upsert("agent-836b", "Agent 836B", 2, "perseus").unwrap();
+        let manifest = crate::models::AuthorityManifestInput {
+            agent_id: "agent-836b".to_string(), workspace_hash: "ws-836b".to_string(),
+            allowed_capabilities: vec!["tool.run".to_string()],
+            approval_required_capabilities: vec!["tool.run".to_string()],
+            scope_anchors: vec!["github:Perseus-Computing-LLC/perseus-vault".to_string()],
+            approver_principals: vec!["github:tcconnally".to_string()],
+            allowed_inbound_principals: vec!["github:tcconnally".to_string()],
+            permitted_external_ref_prefixes: vec!["github:Perseus-Computing-LLC".to_string()],
+            max_parallel_actions: 1, mode: "enforce".to_string(), expires_at_unix_ms: None,
+            capability_constraints_json: "{}".to_string(),
+        };
+        db.authority_set(&manifest, "admin").unwrap();
+        let action = db.action_intent("agent-836b", "ws-836b", "github:Perseus-Computing-LLC/perseus-vault", "github:Perseus-Computing-LLC/ledger", "tool.run", "run-1", &"a".repeat(64), Some("{}")).unwrap();
+        assert_eq!(action.status, "approval_requested");
+        let denied = db.action_approve(&action.id, "github:tcconnally", "denied").unwrap();
+        assert_eq!(denied.status, "approval_denied");
+        // Null effect: cannot execute, cannot lease.
+        assert!(db.action_complete(&action.id, "agent-836b", "executed", &"c".repeat(64)).is_err());
+        assert!(db.action_lease_acquire(&action.id, "holder-a", 60).is_err());
+        // The only terminal is a `denied` receipt.
+        let receipt = db.action_complete(&action.id, "agent-836b", "denied", &"c".repeat(64)).unwrap();
+        assert_eq!(receipt.status, "action_denied");
+        assert_eq!(db.action_receipt_get(&action.id).unwrap().unwrap().outcome_hash, "c".repeat(64));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn timeout_on_pending_approval_resolves_to_deny() {
+        // #836: a pending approval past its window resolves to deny (timeout
+        // defaults to deny), never to silent execution.
+        let (db, path) = temp_db();
+        db.agent_upsert("agent-836c", "Agent 836C", 2, "perseus").unwrap();
+        let manifest = crate::models::AuthorityManifestInput {
+            agent_id: "agent-836c".to_string(), workspace_hash: "ws-836c".to_string(),
+            allowed_capabilities: vec!["tool.run".to_string()],
+            approval_required_capabilities: vec!["tool.run".to_string()],
+            scope_anchors: vec!["github:Perseus-Computing-LLC/perseus-vault".to_string()],
+            approver_principals: vec!["github:tcconnally".to_string()],
+            allowed_inbound_principals: vec!["github:tcconnally".to_string()],
+            permitted_external_ref_prefixes: vec!["github:Perseus-Computing-LLC".to_string()],
+            max_parallel_actions: 1, mode: "enforce".to_string(), expires_at_unix_ms: None,
+            capability_constraints_json: "{}".to_string(),
+        };
+        db.authority_set(&manifest, "admin").unwrap();
+        let action = db.action_intent("agent-836c", "ws-836c", "github:Perseus-Computing-LLC/perseus-vault", "github:Perseus-Computing-LLC/ledger", "tool.run", "run-1", &"a".repeat(64), Some("{}")).unwrap();
+        assert_eq!(action.status, "approval_requested");
+        // Before the window elapses, timeout resolution refuses.
+        assert!(db.action_resolve_timeout(&action.id, 86_400_000).is_err());
+        // Once the window has elapsed (0 ms), timeout resolves to deny.
+        let resolved = db.action_resolve_timeout(&action.id, 0).unwrap();
+        assert_eq!(resolved.status, "approval_denied");
+        assert!(resolved.approval_ref.starts_with("timeout:"), "timeout ref: {}", resolved.approval_ref);
+        // Timeout-denied completes only as denied.
+        assert!(db.action_complete(&action.id, "agent-836c", "executed", &"c".repeat(64)).is_err());
+        let receipt = db.action_complete(&action.id, "agent-836c", "denied", &"c".repeat(64)).unwrap();
+        assert_eq!(receipt.status, "action_denied");
         let _ = std::fs::remove_file(&path);
     }
 
@@ -17797,6 +18169,173 @@ mod tests {
         assert!(db3.set_encryption(&key_b).is_err());
         let _ = std::fs::remove_file(&key_a);
         let _ = std::fs::remove_file(&key_b);
+        let _ = fs::remove_file(&path);
+    }
+
+    // #849: scoped rejected-value tombstones — db-level contract tests.
+    #[test]
+    fn rejected_value_tombstone_blocks_same_value_under_any_key_in_scope() {
+        let (db, path) = temp_db();
+        let body = r#"{"note":"db-level rejected body"}"#;
+        db.reject_value(
+            "ws-a",
+            "subject-x",
+            "convention",
+            body,
+            "user correction",
+            "",
+            "test-agent",
+            None,
+        )
+        .unwrap();
+
+        // Same (subject, predicate, value) in ws-a: blocked.
+        let mut ent = make_entity("k1", "convention", "k1", body);
+        ent.workspace_hash = "ws-a".to_string();
+        let same = db.remember(&ent);
+        assert!(same.is_err(), "same-key re-ingestion must be rejected");
+        assert!(
+            same.err().unwrap().to_string().contains("tombstone"),
+            "error must name the tombstone"
+        );
+
+        // Different key, same value (laundering): still blocked.
+        let mut ent2 = make_entity("k2", "convention", "k2", body);
+        ent2.workspace_hash = "ws-a".to_string();
+        let laundered = db.remember(&ent2);
+        assert!(
+            laundered.is_err(),
+            "laundered write under a new key must be rejected"
+        );
+
+        // Different value, same key in ws-a: allowed.
+        let mut ent3 = make_entity("k2", "convention", "k2", r#"{"note":"other"}"#);
+        ent3.workspace_hash = "ws-a".to_string();
+        let distinct = db.remember(&ent3);
+        assert!(distinct.is_ok(), "distinct value must write: {distinct:?}");
+
+        // Different predicate: allowed (the tombstone is scoped by predicate).
+        let mut ent4 = make_entity("k3", "preference", "k3", body);
+        ent4.workspace_hash = "ws-a".to_string();
+        let other_pred = db.remember(&ent4);
+        assert!(other_pred.is_ok(), "other-predicate value must write: {other_pred:?}");
+
+        // Trusted override writes through and leaves the tombstone in place.
+        let mut ent5 = make_entity("k4", "convention", "k4", body);
+        ent5.workspace_hash = "ws-a".to_string();
+        let over = db.remember_with_options(&ent5, false, None, None, true);
+        assert!(over.is_ok(), "trusted override must write: {over:?}");
+        assert!(
+            db.is_value_rejected("ws-a", "k4", "convention", body).unwrap(),
+            "tombstone must survive the override"
+        );
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn rejected_value_tombstone_scopes_isolate_workspaces() {
+        let (db, path) = temp_db();
+        let body = r#"{"note":"workspace-scoped rejection"}"#;
+        db.reject_value(
+            "ws-a",
+            "s",
+            "convention",
+            body,
+            "rejected in ws-a only",
+            "",
+            "test-agent",
+            None,
+        )
+        .unwrap();
+
+        // Same value in a different workspace is not poisoned.
+        let mut ent = make_entity("b1", "convention", "b1", body);
+        ent.workspace_hash = "ws-b".to_string();
+        let other = db.remember(&ent);
+        assert!(other.is_ok(), "ws-b must not be poisoned: {other:?}");
+
+        // Same value in ws-a is blocked.
+        let mut ent_a = make_entity("a1", "convention", "a1", body);
+        ent_a.workspace_hash = "ws-a".to_string();
+        let same = db.remember(&ent_a);
+        assert!(same.is_err(), "ws-a must stay blocked: {same:?}");
+
+        // A global tombstone (empty workspace) blocks every workspace.
+        db.reject_value("", "g", "convention", body, "global", "", "test-agent", None)
+            .unwrap();
+        let mut ent_c = make_entity("c1", "convention", "c1", body);
+        ent_c.workspace_hash = "ws-c".to_string();
+        let global = db.remember(&ent_c);
+        assert!(global.is_err(), "global tombstone must block ws-c: {global:?}");
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn rejected_value_tombstone_normalization_and_expiry() {
+        let (db, path) = temp_db();
+        db.reject_value(
+            "ws-a",
+            "s",
+            "convention",
+            r#"{"note": "ALWAYS  Use  X"}"#,
+            "reject",
+            "",
+            "test-agent",
+            None,
+        )
+        .unwrap();
+
+        // Case/whitespace/JSON-formatting variants of the value are equivalent.
+        for (i, variant) in [
+            r#"{"note": "always use x"}"#,
+            "{ \"note\": \"always use x\" }",
+            r#"{"note":  "ALWAYS USE X"}"#,
+        ]
+        .iter()
+        .enumerate()
+        {
+            let mut ent = make_entity(&format!("v{i}"), "convention", &format!("v{i}"), variant);
+            ent.workspace_hash = "ws-a".to_string();
+            let r = db.remember(&ent);
+            assert!(
+                r.is_err(),
+                "normalized-equivalent variant must be blocked: {variant}"
+            );
+        }
+
+        // An expired tombstone is ignored (and lazily removed).
+        let now = now_ms();
+        db.reject_value(
+            "ws-a",
+            "s2",
+            "convention",
+            r#"{"note":"expiring value"}"#,
+            "reject with horizon",
+            "",
+            "test-agent",
+            Some(now - 1000),
+        )
+        .unwrap();
+        let mut ent_e = make_entity("e", "convention", "e", r#"{"note":"expiring value"}"#);
+        ent_e.workspace_hash = "ws-a".to_string();
+        let after_expiry = db.remember(&ent_e);
+        assert!(after_expiry.is_ok(), "expired tombstone must not block: {after_expiry:?}");
+
+        // The expired row is lazily purged on the next lookup.
+        db.is_value_rejected("ws-a", "e", "convention", "x").unwrap();
+        let remaining: i64 = db
+            .conn()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM rejected_value_tombstones WHERE subject='s2'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining, 0, "expired tombstone must be lazily removed");
+
         let _ = fs::remove_file(&path);
     }
 

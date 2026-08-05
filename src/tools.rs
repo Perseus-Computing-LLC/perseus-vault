@@ -143,6 +143,10 @@ pub struct RememberArgs {
     /// retained as explicitly non-authoritative history.
     #[serde(default)]
     pub admission: Option<crate::trust_admission::AdmissionRequest>,
+    /// #849: deliberate trusted override of a rejected-value tombstone.
+    /// Journaled as an audited override; never set automatically.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub allow_rejected: bool,
 }
 
 /// #487: a `derived_from` citation — either an entity id (`"mem-..."`, as
@@ -957,7 +961,13 @@ pub fn handle_remember(db: &Database, args: Value) -> Result<String, String> {
     }
 
     let (eid, action) = db
-        .remember_with_options(&entity, a.skip_dedup, a.valid_from_unix_ms, a.valid_to_unix_ms)
+        .remember_with_options(
+            &entity,
+            a.skip_dedup,
+            a.valid_from_unix_ms,
+            a.valid_to_unix_ms,
+            a.allow_rejected,
+        )
         .map_err(|e| format!("Remember failed: {}", e))?;
 
     // #487: auto-reinforce the cited sources. Runs AFTER the write succeeded
@@ -3351,7 +3361,7 @@ pub fn handle_capture(db: &Database, args: Value) -> Result<String, String> {
         } else {
             // Anti-flood: dedup deliberately stays ON (never skip_dedup here)
             // — near-dup merging IS the capture flood control (#520).
-            db.remember_with_options(&entity, false, None, None)
+            db.remember_with_options(&entity, false, None, None, false)
                 .map_err(|e| format!("Capture write failed for key '{}': {}", note.key, e))?
         };
         if action == "created" {
@@ -3956,6 +3966,8 @@ pub fn handle_action_intent(db:&Database,args:Value)->Result<String,String>{let 
 pub fn handle_action_approve(db:&Database,args:Value)->Result<String,String>{let a:ActionApproveArgs=serde_json::from_value(args).map_err(|e|format!("Invalid action_approve arguments: {e}"))?;serde_json::to_string(&db.action_approve(&a.action_id,&a.approver_principal,&a.decision).map_err(|e|format!("action_approve failed: {e}"))?).map_err(|e|e.to_string())}
 #[derive(Debug, Deserialize)] pub struct ActionCompleteArgs {pub action_id:String,pub actor_agent_id:String,pub outcome:String,pub outcome_hash:String}
 pub fn handle_action_complete(db:&Database,args:Value)->Result<String,String>{let a:ActionCompleteArgs=serde_json::from_value(args).map_err(|e|format!("Invalid action_complete arguments: {e}"))?;serde_json::to_string(&db.action_complete(&a.action_id,&a.actor_agent_id,&a.outcome,&a.outcome_hash).map_err(|e|format!("action_complete failed: {e}"))?).map_err(|e|e.to_string())}
+#[derive(Debug, Deserialize)] pub struct ActionResolveTimeoutArgs {pub action_id:String,pub approval_timeout_ms:i64}
+pub fn handle_action_resolve_timeout(db:&Database,args:Value)->Result<String,String>{let a:ActionResolveTimeoutArgs=serde_json::from_value(args).map_err(|e|format!("Invalid action_resolve_timeout arguments: {e}"))?;serde_json::to_string(&db.action_resolve_timeout(&a.action_id,a.approval_timeout_ms).map_err(|e|format!("action_resolve_timeout failed: {e}"))?).map_err(|e|e.to_string())}
 #[derive(Debug, Deserialize)] pub struct ActionReceiptGetArgs {pub action_id:String}
 pub fn handle_action_receipt_get(db:&Database,args:Value)->Result<String,String>{let a:ActionReceiptGetArgs=serde_json::from_value(args).map_err(|e|format!("Invalid action_receipt_get arguments: {e}"))?;serde_json::to_string(&json!({"receipt":db.action_receipt_get(&a.action_id).map_err(|e|format!("action_receipt_get failed: {e}"))?})).map_err(|e|e.to_string())}
 #[derive(Debug, Deserialize)] pub struct ActionLeaseArgs {pub action_id:String,pub holder_id:String,#[serde(default="authority_default_parallel")]pub ttl_seconds:i64}
@@ -5582,8 +5594,50 @@ pub struct CorrectArgs {
     pub valid_to_unix_ms: Option<i64>,
     #[serde(default)]
     pub evidence: Option<crate::models::EvidenceEnvelope>,
+    #[serde(default)]
+    pub workspace_hash: String,
+    #[serde(default)]
+    pub agent_id: String,
 }
 
+
+#[derive(Debug, Deserialize)]
+pub struct RejectValueArgs {
+    pub workspace_hash: String,
+    pub subject: String,
+    pub predicate: String,
+    pub value: String,
+    #[serde(default)]
+    pub reason: String,
+    #[serde(default)]
+    pub evidence_ref: String,
+    #[serde(default)]
+    pub author_agent_id: String,
+    #[serde(default)]
+    pub expires_at_unix_ms: Option<i64>,
+}
+
+pub fn handle_reject_value(db: &Database, args: Value) -> Result<String, String> {
+    let a: RejectValueArgs = serde_json::from_value(args)
+        .map_err(|e| format!("Invalid reject_value arguments: {e}"))?;
+    if a.subject.trim().is_empty() || a.predicate.trim().is_empty() || a.value.trim().is_empty() {
+        return Err("workspace_hash, subject, predicate, and value are required".to_string());
+    }
+    let id = db
+        .reject_value(
+            &a.workspace_hash,
+            &a.subject,
+            &a.predicate,
+            &a.value,
+            &a.reason,
+            &a.evidence_ref,
+            &a.author_agent_id,
+            a.expires_at_unix_ms,
+        )
+        .map_err(|e| format!("Reject value failed: {e}"))?;
+    serde_json::to_string(&serde_json::json!({"ok": true, "rejected": true, "id": id}))
+        .map_err(|e| format!("Serialization failed: {e}"))
+}
 
 pub fn handle_correct(db: &Database, args: Value) -> Result<String, String> {
     let a: CorrectArgs = serde_json::from_value(args)
@@ -5611,6 +5665,8 @@ pub fn handle_correct(db: &Database, args: Value) -> Result<String, String> {
         valid_from_unix_ms: a.valid_from_unix_ms,
         valid_to_unix_ms: a.valid_to_unix_ms,
         evidence: a.evidence,
+        workspace_hash: a.workspace_hash,
+        agent_id: a.agent_id,
     };
 
     let result = db.correct(&params)

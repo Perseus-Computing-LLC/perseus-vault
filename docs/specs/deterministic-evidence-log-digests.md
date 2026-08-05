@@ -26,6 +26,18 @@ source bytes.
    retrieval instruction for exact source bytes.
 6. Same source bytes and config version produce byte-identical digest content.
 
+## What the digest does and does not prove
+
+The digest is **byte identity only** (see "What a digest does and does not
+prove" in `evidence-chain-guidance.md`). A valid digest proves the served bytes
+are the recorded bytes; it proves nothing about logical content, validity,
+authority, or freshness — those are separate facts carried by entity state
+(supersession, validity windows, authority manifests), never by the digest.
+Negative case: digest-valid but superseded/archived source bytes verify
+byte-identically and must still be presented as superseded/archived, never as
+current. Projection/ABI surfaces that are contracts, not content identities,
+carry no root hash.
+
 ## Derived-artifact semantics
 
 Every generated digest is registered as a derived artifact:
