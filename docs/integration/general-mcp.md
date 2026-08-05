@@ -80,9 +80,9 @@ mcp_servers:
 }
 ```
 
-## Tools (89 canonical)
+## Tools (90 canonical)
 
-Perseus Vault exposes **89 canonical MCP tools** under the `perseus_vault_*`
+Perseus Vault exposes **90 canonical MCP tools** under the `perseus_vault_*`
 prefix (legacy `mimir_*` / `mneme_*` aliases remain callable). A representative
 selection is shown below; run `perseus-vault --version` and your client's tool
 list to see all of them.

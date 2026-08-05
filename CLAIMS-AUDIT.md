@@ -16,7 +16,7 @@
 - Clarified that `federate` is a local export / workspace-rename / re-import
   (file based, no network peers); the Windows-safe default path is tracked
   in #704.
-- Tool-count note refreshed: the current registry contains 89 unique canonical
+- Tool-count note refreshed: the current registry contains 90 unique canonical
   tool names. Compatibility aliases are callable but excluded from the count.
 
 ## Findings
@@ -25,7 +25,7 @@
 
 Claims verified against `src/`:
 
-- **89 canonical MCP tools**: ✓ The current registry contains 89 distinct base
+- **90 canonical MCP tools**: ✓ The current registry contains 90 distinct base
   tool names in `src/mcp.rs`, each exposed under the canonical
   `perseus_vault_*` prefix. The legacy `mimir_*` and `mneme_*` aliases remain
   callable but are not counted separately.
@@ -61,5 +61,5 @@ Claims verified against `src/`:
   mimir_follow, #345 mimir_memories). Post-v2.13.0: 53 (#365
   mimir_communities, mimir_community_summary, mimir_global_recall; #364
   mimir_dream). 55 (#363 mimir_valid_at, mimir_bitemporal). 56 (#521
-  mimir_check_failure_pattern). Now **89** (registry-derived; #520 mimir_capture and subsequent tools).
+  mimir_check_failure_pattern). Now **90** (registry-derived; #520 mimir_capture and subsequent tools).
   Earlier figures kept as historical record only.

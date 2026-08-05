@@ -5380,7 +5380,7 @@ mod tests {
         );
         assert_eq!(
             registry_names.len(),
-            89,
+            90,
             "update public metadata when adding a tool"
         );
 

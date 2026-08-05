@@ -12,7 +12,7 @@
 //! universal security claim from one attestation scheme, and not a key
 //! management system.
 
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, PUBLIC_KEY_LENGTH};
+use ed25519_dalek::{Signature, Signer, SigningKey, PUBLIC_KEY_LENGTH};
 use serde_json::Value;
 
 /// Profile schema version this verifier accepts.

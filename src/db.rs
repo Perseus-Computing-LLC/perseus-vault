@@ -14247,6 +14247,7 @@ mod tests {
         assert!(db.authority_set_signed(
             "{\"schema\":\"perseus-policy-profile/v1\",\"payload\":{}}",
             &trusted, "hermes-admin").is_err());
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
