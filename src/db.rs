@@ -7110,6 +7110,47 @@ impl Database {
         self.authority_get(agent_id, workspace_hash, false)?.ok_or_else(|| "no active authority manifest for agent/workspace".into())
     }
 
+    /// #837: load a signed, distributable policy/authority profile. The
+    /// profile is verified (Ed25519, sigstore-style content attestation)
+    /// against a trusted public key BEFORE the manifest takes effect;
+    /// verification failure = no authority (fail closed). The verification
+    /// result — signer fingerprint, payload digest, outcome — is recorded in
+    /// the ledger journal (event_type `profile_load`).
+    pub fn authority_set_signed(
+        &self,
+        profile_json: &str,
+        trusted_public_key_b64: &str,
+        author_agent_id: &str,
+    ) -> Result<AuthorityManifest, Box<dyn std::error::Error>> {
+        let verification =
+            crate::signed_profile::verify_profile(profile_json, trusted_public_key_b64)
+                .map_err(|e| format!("SIGNED_PROFILE_REJECTED: {e}"))?;
+        let profile: serde_json::Value = serde_json::from_str(profile_json)?;
+        let input: AuthorityManifestInput = serde_json::from_value(profile["payload"].clone())
+            .map_err(|e| format!("profile payload is not a valid authority manifest: {e}"))?;
+        let manifest = self.authority_set(&input, author_agent_id)?;
+        let now = now_ms();
+        self.journal(&JournalEvent {
+            id: format!("jrn-{}", uuid::Uuid::new_v4().simple()),
+            event_type: "profile_load".to_string(),
+            evaluated_json: json!({
+                "profile_schema": crate::signed_profile::PROFILE_SCHEMA,
+                "signer_fingerprint": verification.signer_fingerprint,
+                "payload_digest": verification.payload_digest,
+                "outcome": "verified",
+            }).to_string(),
+            acted_json: serde_json::to_string(&manifest)?,
+            forward_json: "{}".to_string(),
+            category: "authority_profile".to_string(),
+            key: manifest.id.clone(),
+            entity_id: String::new(),
+            agent_id: author_agent_id.to_string(),
+            workspace_hash: input.workspace_hash.clone(),
+            created_at_unix_ms: now,
+        })?;
+        Ok(manifest)
+    }
+
     pub fn authority_get(&self, agent_id: &str, workspace_hash: &str, include_revoked: bool) -> Result<Option<AuthorityManifest>, Box<dyn std::error::Error>> {
         let now = now_ms();
         let conn = self.conn()?;
@@ -14149,6 +14190,63 @@ mod tests {
         db.action_lease_release(&lease.id, "holder-a").unwrap();
         db.authority_revoke(&stored.id, "admin", "end test").unwrap();
         assert!(db.authority_get("agent-768", "ws-768", false).unwrap().is_none());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn signed_profile_loads_and_takes_effect_but_tampered_is_rejected() {
+        // #837: a signed, distributable policy/authority profile loads and
+        // takes effect; a tampered, wrong-key, or unsigned profile is
+        // rejected with no authority granted (fail closed); the verification
+        // result lands in the ledger journal.
+        use base64::Engine as _;
+        use crate::signed_profile;
+        let (db, path) = temp_db();
+        db.agent_upsert("agent-837", "Agent 837", 2, "perseus").unwrap();
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let trusted = base64::engine::general_purpose::STANDARD
+            .encode(signing.verifying_key().to_bytes());
+        let payload = serde_json::json!({
+            "agent_id": "agent-837", "workspace_hash": "ws-837",
+            "allowed_capabilities": ["tool.run"],
+            "approval_required_capabilities": [],
+            "scope_anchors": ["github:Perseus-Computing-LLC/perseus-vault"],
+            "approver_principals": [], "allowed_inbound_principals": ["perseus.observer"],
+            "permitted_external_ref_prefixes": ["github:Perseus-Computing-LLC"],
+            "max_parallel_actions": 1, "mode": "enforce",
+            "expires_at_unix_ms": serde_json::Value::Null,
+            "capability_constraints_json": "{}"
+        });
+        let profile = signed_profile::sign_profile(signing.as_bytes(), &payload).unwrap();
+
+        // Signed profile loads and takes effect.
+        let manifest = db.authority_set_signed(&profile.to_string(), &trusted, "hermes-admin").unwrap();
+        assert_eq!(manifest.version, 1);
+        let got = db.authority_get("agent-837", "ws-837", false).unwrap().unwrap();
+        assert_eq!(got.id, manifest.id);
+        assert!(got.allowed_capabilities.contains(&"tool.run".to_string()));
+
+        // Verification result (identity, digest, outcome) lands in the ledger.
+        let recent = db.get_recent_journal(20).unwrap();
+        assert!(recent.iter().any(|e| e.event_type == "profile_load"
+            && e.category == "authority_profile"
+            && e.evaluated_json.contains("signer_fingerprint")
+            && e.evaluated_json.contains("payload_digest")),
+            "profile_load journal entry missing: {recent:?}");
+
+        // Tampered profile: rejected, no authority granted (fail closed).
+        let mut tampered = profile.clone();
+        tampered["payload"]["allowed_capabilities"] = serde_json::json!(["rm_rf"]);
+        assert!(db.authority_set_signed(&tampered.to_string(), &trusted, "hermes-admin").is_err());
+
+        // Wrong trusted key: rejected.
+        let other_trusted = base64::engine::general_purpose::STANDARD.encode([9u8; 32]);
+        assert!(db.authority_set_signed(&profile.to_string(), &other_trusted, "hermes-admin").is_err());
+
+        // Unsigned/garbage profile: rejected.
+        assert!(db.authority_set_signed(
+            "{\"schema\":\"perseus-policy-profile/v1\",\"payload\":{}}",
+            &trusted, "hermes-admin").is_err());
         let _ = std::fs::remove_file(&path);
     }
 

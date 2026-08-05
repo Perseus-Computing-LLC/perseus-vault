@@ -18,6 +18,7 @@ mod mcp;
 mod models;
 mod multimodal;
 mod schema;
+mod signed_profile;
 pub(crate) mod stage_trace;
 mod trust_admission;
 mod tools;
