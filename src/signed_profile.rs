@@ -18,30 +18,27 @@ use serde_json::Value;
 /// Profile schema version this verifier accepts.
 pub const PROFILE_SCHEMA: &str = "perseus-policy-profile/v1";
 
-/// Canonical bytes of a JSON value: sorted keys, no insignificant
-/// whitespace. The signature binds these exact bytes, so a tampered field —
-/// or a re-ordered one — breaks verification.
+/// Canonical bytes of a JSON value: recursively sorted object keys, standard
+/// JSON escaping, and no insignificant whitespace. Key reordering therefore
+/// produces the same bytes, while every distinct JSON value has distinct
+/// canonical bytes for the supported serde_json value model.
 pub fn canonical_json_bytes(value: &Value) -> Vec<u8> {
-    canonical_value(value).as_bytes().to_vec()
+    serde_json::to_vec(&canonical_value(value)).expect("serde_json Value serialization cannot fail")
 }
 
-fn canonical_value(value: &Value) -> String {
+fn canonical_value(value: &Value) -> Value {
     match value {
         Value::Object(map) => {
             let mut keys: Vec<&String> = map.keys().collect();
             keys.sort();
-            let body: Vec<String> = keys
-                .iter()
-                .map(|k| format!("{k}:{}", canonical_value(&map[*k])))
-                .collect();
-            format!("{{{}}}", body.join(","))
+            let mut sorted = serde_json::Map::with_capacity(map.len());
+            for key in keys {
+                sorted.insert(key.clone(), canonical_value(&map[key]));
+            }
+            Value::Object(sorted)
         }
-        Value::Array(items) => {
-            let body: Vec<String> =
-                items.iter().map(canonical_value).collect();
-            format!("[{}]", body.join(","))
-        }
-        other => other.to_string(),
+        Value::Array(items) => Value::Array(items.iter().map(canonical_value).collect()),
+        other => other.clone(),
     }
 }
 
@@ -162,6 +159,18 @@ mod tests {
 
     fn test_key() -> SigningKey {
         SigningKey::from_bytes(&[7u8; 32])
+    }
+
+    #[test]
+    fn canonical_json_is_valid_and_injective_for_object_keys() {
+        let original: Value = serde_json::from_str(r#"{"a":"x","b":"y"}"#).unwrap();
+        let reordered: Value = serde_json::from_str(r#"{"b":"y","a":"x"}"#).unwrap();
+        let colliding_shape: Value = serde_json::from_str(r#"{"a:\"x\",b":"y"}"#).unwrap();
+
+        let original_bytes = canonical_json_bytes(&original);
+        assert!(serde_json::from_slice::<Value>(&original_bytes).is_ok());
+        assert_eq!(original_bytes, canonical_json_bytes(&reordered));
+        assert_ne!(original_bytes, canonical_json_bytes(&colliding_shape));
     }
 
     #[test]

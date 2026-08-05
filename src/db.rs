@@ -6015,6 +6015,17 @@ impl Database {
     /// Append a journal event.
     pub fn journal(&self, event: &JournalEvent) -> Result<(), Box<dyn std::error::Error>> {
         let conn = self.conn()?;
+        self.journal_with_conn(&conn, event)
+    }
+
+    /// Append a journal event using an existing connection or transaction.
+    /// Callers that need an atomic mutation plus its audit record can keep both
+    /// writes inside one SQLite transaction.
+    fn journal_with_conn(
+        &self,
+        conn: &rusqlite::Connection,
+        event: &JournalEvent,
+    ) -> Result<(), Box<dyn std::error::Error>> {
 
         // #417: stamp the workspace of the referenced entity so purge can scope
         // journal redaction per-workspace. Prefer an explicit value on the
@@ -6990,12 +7001,13 @@ impl Database {
         Ok(items)
     }
 
-    /// #768: write a new version of an agent authority manifest. The current
-    /// manifest is the highest non-revoked version for its agent/workspace.
-    pub fn authority_set(
+    /// Build and insert a new authority manifest using the supplied connection.
+    /// The caller owns the transaction boundary and is responsible for writing
+    /// the corresponding journal event before committing.
+    fn authority_set_with_conn(
         &self,
+        conn: &rusqlite::Connection,
         input: &AuthorityManifestInput,
-        author_agent_id: &str,
     ) -> Result<AuthorityManifest, Box<dyn std::error::Error>> {
         if input.agent_id.trim().is_empty() || input.workspace_hash.trim().is_empty() {
             return Err("authority manifest requires agent_id and workspace_hash".into());
@@ -7006,14 +7018,20 @@ impl Database {
         if input.allowed_capabilities.is_empty() || input.scope_anchors.is_empty() {
             return Err("authority manifest requires capabilities and trusted scope anchors".into());
         }
-        if self.agent_get(&input.agent_id)?.is_none() {
+        let registered: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM agents WHERE agent_id = ?1",
+                params![input.agent_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if registered.is_none() {
             return Err("authority manifest agent_id must be registered".into());
         }
         if input.max_parallel_actions < 1 {
             return Err("authority manifest max_parallel_actions must be at least 1".into());
         }
         let now = now_ms();
-        let conn = self.conn()?;
         let version: i64 = conn.query_row(
             "SELECT COALESCE(MAX(version), 0) + 1 FROM authority_manifests \
              WHERE agent_id = ?1 AND workspace_hash = ?2",
@@ -7040,7 +7058,7 @@ impl Database {
                     approvals, anchors, approvers, inbound, prefixes, input.max_parallel_actions,
                     input.mode, input.expires_at_unix_ms, now, capability_constraints],
         )?;
-        let manifest = AuthorityManifest {
+        Ok(AuthorityManifest {
             id,
             agent_id: input.agent_id.clone(),
             workspace_hash: input.workspace_hash.clone(),
@@ -7056,22 +7074,42 @@ impl Database {
             expires_at_unix_ms: input.expires_at_unix_ms,
             revoked_at_unix_ms: None,
             created_at_unix_ms: now,
-            capability_constraints_json: capability_constraints.clone(),
-        };
-        drop(conn);
-        self.journal(&JournalEvent {
+            capability_constraints_json: capability_constraints,
+        })
+    }
+
+    fn authority_set_event(
+        manifest: &AuthorityManifest,
+        author_agent_id: &str,
+    ) -> Result<JournalEvent, Box<dyn std::error::Error>> {
+        Ok(JournalEvent {
             id: format!("jrn-{}", uuid::Uuid::new_v4().simple()),
             event_type: "authority_set".to_string(),
             evaluated_json: "{}".to_string(),
-            acted_json: serde_json::to_string(&manifest)?,
+            acted_json: serde_json::to_string(manifest)?,
             forward_json: "{}".to_string(),
             category: "authority".to_string(),
             key: manifest.id.clone(),
             entity_id: String::new(),
             agent_id: author_agent_id.to_string(),
             workspace_hash: manifest.workspace_hash.clone(),
-            created_at_unix_ms: now,
-        })?;
+            created_at_unix_ms: manifest.created_at_unix_ms,
+        })
+    }
+
+    /// #768: write a new version of an agent authority manifest. The current
+    /// manifest is the highest non-revoked version for its agent/workspace.
+    pub fn authority_set(
+        &self,
+        input: &AuthorityManifestInput,
+        author_agent_id: &str,
+    ) -> Result<AuthorityManifest, Box<dyn std::error::Error>> {
+        let conn = self.conn()?;
+        let tx = conn.unchecked_transaction()?;
+        let manifest = self.authority_set_with_conn(&tx, input)?;
+        let event = Self::authority_set_event(&manifest, author_agent_id)?;
+        self.journal_with_conn(&tx, &event)?;
+        tx.commit()?;
         Ok(manifest)
     }
 
@@ -7128,9 +7166,13 @@ impl Database {
         let profile: serde_json::Value = serde_json::from_str(profile_json)?;
         let input: AuthorityManifestInput = serde_json::from_value(profile["payload"].clone())
             .map_err(|e| format!("profile payload is not a valid authority manifest: {e}"))?;
-        let manifest = self.authority_set(&input, author_agent_id)?;
+        let conn = self.conn()?;
+        let tx = conn.unchecked_transaction()?;
+        let manifest = self.authority_set_with_conn(&tx, &input)?;
+        let authority_event = Self::authority_set_event(&manifest, author_agent_id)?;
+        self.journal_with_conn(&tx, &authority_event)?;
         let now = now_ms();
-        self.journal(&JournalEvent {
+        self.journal_with_conn(&tx, &JournalEvent {
             id: format!("jrn-{}", uuid::Uuid::new_v4().simple()),
             event_type: "profile_load".to_string(),
             evaluated_json: json!({
@@ -7148,6 +7190,7 @@ impl Database {
             workspace_hash: input.workspace_hash.clone(),
             created_at_unix_ms: now,
         })?;
+        tx.commit()?;
         Ok(manifest)
     }
 
@@ -14247,6 +14290,46 @@ mod tests {
         assert!(db.authority_set_signed(
             "{\"schema\":\"perseus-policy-profile/v1\",\"payload\":{}}",
             &trusted, "hermes-admin").is_err());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn signed_profile_rolls_back_authority_when_profile_journal_fails() {
+        // The authority row and its profile_load audit event must commit as one
+        // transaction. A journal failure must not leave an active manifest
+        // without its signed-load evidence.
+        use base64::Engine as _;
+        use crate::signed_profile;
+        let (db, path) = temp_db();
+        db.agent_upsert("agent-837-atomic", "Agent 837 Atomic", 2, "perseus").unwrap();
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]);
+        let trusted = base64::engine::general_purpose::STANDARD
+            .encode(signing.verifying_key().to_bytes());
+        let payload = serde_json::json!({
+            "agent_id": "agent-837-atomic", "workspace_hash": "ws-837-atomic",
+            "allowed_capabilities": ["tool.run"],
+            "approval_required_capabilities": [], "scope_anchors": ["scope:837"],
+            "approver_principals": [], "allowed_inbound_principals": [],
+            "permitted_external_ref_prefixes": ["ref:837"], "max_parallel_actions": 1,
+            "mode": "enforce", "expires_at_unix_ms": serde_json::Value::Null,
+            "capability_constraints_json": "{}"
+        });
+        let profile = signed_profile::sign_profile(signing.as_bytes(), &payload).unwrap();
+        let conn = db.conn().unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_signed_profile_journal
+             BEFORE INSERT ON journal
+             WHEN NEW.event_type = 'profile_load'
+             BEGIN SELECT RAISE(ABORT, 'forced profile journal failure'); END;",
+        )
+        .unwrap();
+        drop(conn);
+
+        assert!(db.authority_set_signed(&profile.to_string(), &trusted, "hermes-admin").is_err());
+        assert!(db
+            .authority_get("agent-837-atomic", "ws-837-atomic", false)
+            .unwrap()
+            .is_none());
         let _ = std::fs::remove_file(&path);
     }
 

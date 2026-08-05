@@ -40,9 +40,9 @@ and verified against that key on load.
 }
 ```
 
-Canonicalization is sorted-key JSON with no insignificant whitespace
-(`signed_profile::canonical_json_bytes`), so a tampered or re-ordered field
-breaks verification.
+Canonicalization is recursively sorted-key JSON with standard JSON escaping and
+no insignificant whitespace (`signed_profile::canonical_json_bytes`). Reordering
+object keys does not change the signed bytes; changing a value or key does.
 
 ## Load semantics
 
