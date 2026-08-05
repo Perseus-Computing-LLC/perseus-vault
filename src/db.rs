@@ -14204,6 +14204,45 @@ mod tests {
     }
 
     #[test]
+    fn authority_set_rolls_back_manifest_when_authority_journal_fails() {
+        // Ordinary authority_set must preserve the same atomic manifest-plus-
+        // journal invariant as signed profile loading.
+        let (db, path) = temp_db();
+        db.agent_upsert("agent-authority-atomic", "Atomic Authority", 2, "perseus")
+            .unwrap();
+        let manifest = crate::models::AuthorityManifestInput {
+            agent_id: "agent-authority-atomic".to_string(),
+            workspace_hash: "ws-authority-atomic".to_string(),
+            allowed_capabilities: vec!["tool.run".to_string()],
+            approval_required_capabilities: vec![],
+            scope_anchors: vec!["scope:authority-atomic".to_string()],
+            approver_principals: vec![],
+            allowed_inbound_principals: vec![],
+            permitted_external_ref_prefixes: vec!["ref:authority-atomic".to_string()],
+            max_parallel_actions: 1,
+            mode: "enforce".to_string(),
+            expires_at_unix_ms: None,
+            capability_constraints_json: "{}".to_string(),
+        };
+        let conn = db.conn().unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_authority_set_journal
+             BEFORE INSERT ON journal
+             WHEN NEW.event_type = 'authority_set'
+             BEGIN SELECT RAISE(ABORT, 'forced authority journal failure'); END;",
+        )
+        .unwrap();
+        drop(conn);
+
+        assert!(db.authority_set(&manifest, "hermes-admin").is_err());
+        assert!(db
+            .authority_get("agent-authority-atomic", "ws-authority-atomic", false)
+            .unwrap()
+            .is_none());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn authorized_action_receipt_contract_covers_pinned_authority_lifecycle_and_lease() {
         let (db, path) = temp_db();
         db.agent_upsert("agent-768", "Agent 768", 2, "perseus").unwrap();
