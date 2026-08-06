@@ -239,3 +239,8 @@ A mature internal evaluation suite should measure at least these categories:
 
 The benchmark literature reinforces that memory systems should be judged as end-to-end reasoning and action substrates, not just search layers. The best next step is not one more retrieval metric. It is a small internal evaluation harness that spans retrieval, validity, compaction, mutation, and action grounding.
 
+## Follow-up implementation issues
+
+- Perseus: #923 and #924
+- Perseus Vault: #859 and #860
+- Ledger: #219 and #220
