@@ -64,6 +64,13 @@ pub struct Entity {
     /// 'unverified' | 'useful' | 'dead' — set once enough attempts accrue.
     #[serde(default = "default_efficacy_status")]
     pub efficacy_status: String,
+    /// Epistemic trust axis (#880), orthogonal to lifecycle `status`:
+    /// 'candidate' | 'verified' | 'corroborated' | 'rejected' |
+    /// 'defensively_recalled'. Default 'candidate' — a record may be useful
+    /// without being established fact; verified/corroborated require
+    /// admission evidence or operator promotion.
+    #[serde(default = "default_epistemic_state")]
+    pub epistemic_state: String,
     #[serde(skip)]
     #[allow(dead_code)]
     pub embedding: Option<Vec<f32>>,
@@ -118,6 +125,21 @@ fn default_certainty() -> f64 {
 fn default_efficacy_status() -> String {
     "unverified".to_string()
 }
+
+/// Epistemic trust axis default (#880): useful-but-unverified until admission
+/// evidence or operator promotion proves the claim.
+pub fn default_epistemic_state() -> String {
+    "candidate".to_string()
+}
+
+/// The canonical epistemic state vocabulary (#880).
+pub const EPISTEMIC_STATES: [&str; 5] = [
+    "candidate",
+    "verified",
+    "corroborated",
+    "rejected",
+    "defensively_recalled",
+];
 
 /// Default recall trust weight. Non-zero so verified sources are preferred
 /// over unverified AI drafts everywhere by default; kept low so it acts as a
@@ -371,6 +393,13 @@ pub struct RecallParams {
     /// Agent identity filter (v1.2.0). When Some, only entities with a
     /// matching agent_id are returned. None = no agent filtering.
     pub agent_id: Option<String>,
+    /// Epistemic trust-axis filter (#880). When Some, only entities whose
+    /// epistemic_state matches are returned (e.g. "candidate" to surface
+    /// useful-but-unverified records, "verified"/"corroborated" to restrict
+    /// to established fact). None = no trust filtering. Applied on the FTS,
+    /// dense, and hybrid paths alike so the semantic arms cannot leak
+    /// cross-trust results.
+    pub epistemic_state: Option<String>,
     /// Visibility filter (v1.2.0). When Some, only entities with matching
     /// visibility are returned. None = no visibility filter.
     // Reserved: the recall query does not yet apply this filter and the MCP
@@ -397,6 +426,99 @@ pub enum SearchMode {
     Fts5,
     Dense,
     Hybrid,
+}
+
+/// #864/#873/#887: explicit recall outcome. Every recall/projection path
+/// reports HOW it went, so an empty result is never mistaken for a healthy
+/// "no match" and a degraded semantic backend is never mistaken for an
+/// empty store. `status` is the high-signal summary:
+///   - `fresh`        — backend healthy, results (possibly zero) served
+///   - `partial`      — some arms served; others degraded/skipped (e.g.
+///                      hybrid with keyword arm dropped)
+///   - `timeout`      — a caller-supplied deadline elapsed before the
+///                      result set was complete
+///   - `unavailable`  — a required backend (embedding provider, DB) is
+///                      down; the empty result is a FAULT, not a fact
+///   - `empty`        — genuinely no matching evidence in a healthy store
+///   - `stale`        — the store is healthy but its derived index is
+///                      behind (pending embed jobs / low coverage), so
+///                      semantic recall may be incomplete
+/// `abstained` is the #887 no-evidence signal: when true, the caller MUST
+/// NOT treat the absence of hits as a "best guess" answer — there is
+/// simply no evidence, and the `reason` says why.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum RecallStatus {
+    #[default]
+    Fresh,
+    Partial,
+    Timeout,
+    Unavailable,
+    Empty,
+    Stale,
+}
+
+impl RecallStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RecallStatus::Fresh => "fresh",
+            RecallStatus::Partial => "partial",
+            RecallStatus::Timeout => "timeout",
+            RecallStatus::Unavailable => "unavailable",
+            RecallStatus::Empty => "empty",
+            RecallStatus::Stale => "stale",
+        }
+    }
+}
+
+/// #873: embedding/vector backend health snapshot attached to every recall
+/// outcome, so dense/hybrid callers can tell "no evidence" from "the
+/// semantic backend is not serving".
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct EmbeddingBackendHealth {
+    /// Whether a dense-embedding backend is configured/enabled at all.
+    pub enabled: bool,
+    /// Whether an embedding could actually be produced for the query
+    /// (backend reachable, dimension compatible). False on lite builds and
+    /// when the provider errored.
+    pub query_embedding_available: bool,
+    /// Active (non-archived) entities carrying a stored embedding.
+    pub embedded_memories: i64,
+    /// Active entities total — coverage = embedded/active.
+    pub active_memories: i64,
+    /// Enqueued-but-unfinished background embed jobs (#864 observability).
+    pub pending_embed_jobs: u64,
+}
+
+impl EmbeddingBackendHealth {
+    /// Coverage fraction 0.0-1.0; 0 when there are no active memories.
+    pub fn coverage(&self) -> f64 {
+        if self.active_memories <= 0 {
+            0.0
+        } else {
+            (self.embedded_memories as f64 / self.active_memories as f64).min(1.0)
+        }
+    }
+}
+
+/// #864: the full recall outcome — status, backend health, abstention, and
+/// why. Serialized onto recall/ask responses as `outcome`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct RecallOutcome {
+    pub status: RecallStatus,
+    pub abstained: bool,
+    /// Machine-readable reason (e.g. "no_match", "db_unhealthy",
+    /// "embedding_unavailable", "deadline_elapsed", "partial_arms").
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reason: String,
+    /// Caller-supplied deadline exceeded (bounded recall, #864).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub deadline_elapsed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend_health: Option<EmbeddingBackendHealth>,
+}
+
+fn is_false(v: &bool) -> bool {
+    !*v
 }
 
 /// Configuration for FTS5 query expansion using stemming variants.
@@ -451,6 +573,7 @@ impl Default for RecallParams {
             workspace_hash: None,
             scope_weight: None,
             agent_id: None,
+            epistemic_state: None,
             visibility: None,
             layer: None,
             reinforce: false,

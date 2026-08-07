@@ -114,6 +114,7 @@ pub mod grpc {
                     miss_count: 0,
                     follow_rate: 0.0,
                     efficacy_status: "unverified".to_string(),
+                    epistemic_state: crate::models::default_epistemic_state(),
                     embedding: None,
                     _parsed_body: None,
                 };
@@ -148,6 +149,7 @@ pub mod grpc {
                     workspace_hash: r.workspace_hash,
                     scope_weight: None,
                     agent_id: r.agent_id,
+                    epistemic_state: None,
                     visibility: r.visibility,
                     layer: None,
                     reinforce: false,
@@ -627,6 +629,7 @@ pub mod grpc {
                 miss_count: 0,
                 follow_rate: 0.0,
                 efficacy_status: "unverified".to_string(),
+                epistemic_state: crate::models::default_epistemic_state(),
                 embedding: None,
                 _parsed_body: None,
             };

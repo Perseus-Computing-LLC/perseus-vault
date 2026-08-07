@@ -894,6 +894,7 @@ impl Database {
             miss_count: 0,
             follow_rate: 0.0,
             efficacy_status: "unverified".to_string(),
+            epistemic_state: crate::models::default_epistemic_state(),
             embedding: None,
             _parsed_body: None,
         };
@@ -1143,7 +1144,7 @@ mod tests {
             archive_reason: String::new(),
             links: vec![],
             verified: false,
-            source: "agent".to_string(),
+            source: "community-derived".to_string(),
             always_on: false,
             certainty: 0.5,
             workspace_hash: ws.to_string(),
@@ -1155,6 +1156,7 @@ mod tests {
             miss_count: 0,
             follow_rate: 0.0,
             efficacy_status: "unverified".to_string(),
+            epistemic_state: crate::models::default_epistemic_state(),
             embedding: None,
             _parsed_body: None,
         };

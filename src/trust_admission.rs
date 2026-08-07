@@ -9,8 +9,9 @@ use sha2::{Digest, Sha256};
 
 pub const ADMISSION_SCHEMA_VERSION: &str = "perseus-vault-memory-admission/v1";
 
-const OUTCOMES: [&str; 6] = [
+const OUTCOMES: [&str; 7] = [
     "admitted",
+    "proposed",
     "quarantined",
     "suppressed",
     "escalated",
@@ -33,6 +34,17 @@ pub struct AdmissionRequest {
     pub instruction_bearing: bool,
     #[serde(default)]
     pub contradicts_authoritative: bool,
+    /// Optional immutable source event needed before an authoritative claim
+    /// can become durable authority. Missing validation keeps the record as a
+    /// reviewable proposal rather than silently treating the claim as fact.
+    #[serde(default)]
+    pub source_event_id: Option<String>,
+    #[serde(default)]
+    pub actor_kind: Option<String>,
+    #[serde(default)]
+    pub actor_identity: Option<String>,
+    #[serde(default)]
+    pub validated: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -50,6 +62,12 @@ pub struct AdmissionEvidence {
     pub decision_digest: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revocation_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_event_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor_identity: Option<String>,
 }
 
 impl AdmissionEvidence {
@@ -86,12 +104,34 @@ impl AdmissionEvidence {
         if self.authoritative && (!self.durable || self.outcome != "admitted") {
             return Err("only durable admitted evidence may be authoritative".to_string());
         }
+        let mut unsigned = self.clone();
+        unsigned.decision_digest.clear();
+        let expected = canonical_digest(&unsigned)?;
+        if self.decision_digest != expected {
+            return Err("decision_digest does not match admission evidence".to_string());
+        }
+        if self.outcome == "proposed" && self.authoritative {
+            return Err("proposed evidence cannot be authoritative".to_string());
+        }
         if matches!(self.outcome.as_str(), "quarantined" | "suppressed" | "escalated" | "abstained" | "revoked")
             && self.authoritative
         {
             return Err("non-admitted evidence cannot be authoritative".to_string());
         }
         Ok(())
+    }
+
+    pub fn downgrade_to_proposed(&mut self, reason: &str) -> Result<(), String> {
+        validate_identifier("downgrade_reason", reason)?;
+        self.outcome = "proposed".to_string();
+        self.authoritative = false;
+        self.durable = true;
+        self.reason_codes.push(reason.to_string());
+        self.reason_codes.sort();
+        self.reason_codes.dedup();
+        self.decision_digest.clear();
+        self.decision_digest = canonical_digest(self)?;
+        self.validate()
     }
 
     pub fn can_activate(&self, query_workspace: &str, query_relevance_bps: u16) -> bool {
@@ -117,6 +157,7 @@ impl AdmissionEvidence {
         self.authoritative = false;
         self.durable = true;
         self.reason_codes.push("operator_revoked".to_string());
+        self.decision_digest.clear();
         self.decision_digest = canonical_digest(self)?;
         self.validate()
     }
@@ -132,12 +173,16 @@ pub fn evaluate(request: &AdmissionRequest) -> Result<AdmissionEvidence, String>
         ("quarantined", vec!["untrusted_instruction_bearing"], false, true)
     } else if request.contradicts_authoritative {
         ("escalated", vec!["contradicts_authoritative_record"], false, true)
+    } else if request.source_trust == "authoritative"
+        && (!request.validated || request.source_event_id.is_none())
+    {
+        ("proposed", vec!["source_validation_required"], false, true)
     } else if request.source_trust == "untrusted" {
         ("quarantined", vec!["untrusted_source"], false, true)
     } else if request.source_trust == "authoritative" {
         ("admitted", vec!["authorized_authoritative_source"], true, true)
     } else {
-        ("admitted", vec!["trusted_source"], false, true)
+        ("proposed", vec!["trusted_source_requires_authority"], false, true)
     };
     let mut evidence = AdmissionEvidence {
         schema_version: ADMISSION_SCHEMA_VERSION.to_string(),
@@ -152,6 +197,9 @@ pub fn evaluate(request: &AdmissionRequest) -> Result<AdmissionEvidence, String>
         durable,
         decision_digest: String::new(),
         revocation_digest: None,
+        source_event_id: request.source_event_id.clone(),
+        actor_kind: request.actor_kind.clone(),
+        actor_identity: request.actor_identity.clone(),
     };
     evidence.decision_digest = canonical_digest(&evidence)?;
     evidence.validate()?;
@@ -172,6 +220,15 @@ fn validate_request(request: &AdmissionRequest) -> Result<(), String> {
     if !["untrusted", "trusted", "authoritative"].contains(&request.source_trust.as_str()) {
         return Err(format!("unsupported source_trust: {}", request.source_trust));
     }
+    for (label, value) in [
+        ("source_event_id", request.source_event_id.as_deref()),
+        ("actor_kind", request.actor_kind.as_deref()),
+        ("actor_identity", request.actor_identity.as_deref()),
+    ] {
+        if let Some(value) = value {
+            validate_identifier(label, value)?;
+        }
+    }
     if request.valid_from_unix_ms < 0 || request.recorded_at_unix_ms < request.valid_from_unix_ms {
         return Err("invalid valid/recorded time interval".to_string());
     }
@@ -179,6 +236,12 @@ fn validate_request(request: &AdmissionRequest) -> Result<(), String> {
         return Err("task_relevance_bps must be between 0 and 10000".to_string());
     }
     Ok(())
+}
+
+pub fn digest_text(value: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(value.as_bytes());
+    format!("{:x}", hasher.finalize())
 }
 
 fn canonical_digest<T: Serialize>(value: &T) -> Result<String, String> {
@@ -227,6 +290,10 @@ mod tests {
             task_relevance_bps: 9000,
             instruction_bearing: false,
             contradicts_authoritative: false,
+            source_event_id: (trust == "authoritative").then(|| "event-42".to_string()),
+            actor_kind: Some("connector".to_string()),
+            actor_identity: Some("email-42".to_string()),
+            validated: trust == "authoritative",
         }
     }
 
@@ -280,6 +347,13 @@ mod tests {
         assert!(evidence.revocation_digest.is_some());
         assert!(!evidence.can_activate("workspace-a", 9000));
         assert!(evidence.validate().is_ok());
+    }
+
+    #[test]
+    fn decision_digest_rejects_post_issue_evidence_mutation() {
+        let mut evidence = evaluate(&request("trusted")).unwrap();
+        evidence.reason_codes.push("forged_reason".to_string());
+        assert!(evidence.validate().is_err());
     }
 
     #[test]

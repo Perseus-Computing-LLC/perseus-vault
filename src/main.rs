@@ -3037,11 +3037,21 @@ fn run() {
                 miss_count: 0,
                 follow_rate: 0.0,
                 efficacy_status: "unverified".to_string(),
+                epistemic_state: crate::models::default_epistemic_state(),
                 embedding: None,
                 _parsed_body: None,
             };
 
-            match database.remember(&entity) {
+            // Operator CLI writes are authoritative: the human at the
+            // terminal is the same trust class that sets authority
+            // manifests, so their explicit writes land VERIFIED (active,
+            // always_on honored) rather than being demoted to reviewable
+            // candidates by the admission gate (#863/#880). The fail-closed
+            // proposal path still applies to agent-facing MCP writes, which
+            // must carry an admission envelope to activate. This is what
+            // keeps operator seeding/scripting workflows (and the Noisegate
+            // golden fixture) producing active memory.
+            match database.remember_verified_with_options(&entity, false, None, None, false) {
                 Ok((id, action)) => {
                     print_json(&serde_json::json!({ "ok": true, "id": id, "action": action }));
                 }
