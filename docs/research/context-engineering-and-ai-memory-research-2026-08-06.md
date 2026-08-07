@@ -21,15 +21,17 @@ The research does not suggest a pivot away from the current architecture. It sug
 ## Sources reviewed
 
 ### Official / primary protocol and platform sources
-1. **Model Context Protocol**: a standardized protocol for tools, resources, and structured interaction between AI clients and external systems.
-2. **Atlassian context-engineering and Rovo MCP materials** reviewed earlier in this session.
+1. [Model Context Protocol specification](https://modelcontextprotocol.io/specification/latest): standardized protocol for tools, resources, and structured interaction between AI applications and
+   external systems.
+2. [Atlassian Rovo MCP Server announcement](https://www.atlassian.com/blog/announcements/atlassian-rovo-mcp-ga) and [Rovo MCP overview](https://www.atlassian.com/platform/rovo-mcp),
+   reviewed as the primary Atlassian context-engineering/Rovo materials.
 
 ### Research sources on agent memory
-3. **Is Agent Memory a Database? Rethinking Data Foundations for Long-Term AI Agent Memory**
-4. **AgeMem: A Unified Framework Integrating Long-Term and Short-Term Memory Management in LLM Agents**
-5. **MemMachine: A Ground-Truth-Preserving Memory System for Personalized AI Agents**
-6. **RaMem: Contextual Reinstatement for Long-term Agentic Memory**
-7. **Memento: Teaching LLMs to Manage Their Own Context**
+3. [Is Agent Memory a Database? Rethinking Data Foundations for Long-Term AI Agent Memory](https://arxiv.org/abs/2605.26252)
+4. [Agentic Memory: Learning Unified Long-Term and Short-Term Memory Management for Large Language Model Agents (AgeMem)](https://arxiv.org/abs/2601.01885)
+5. [MemMachine: A Ground-Truth-Preserving Memory System for Personalized AI Agents](https://arxiv.org/abs/2604.04853)
+6. [RaMem: Contextual Reinstatement for Long-term Agentic Memory](https://arxiv.org/abs/2606.22844)
+7. [MEMENTO: Teaching LLMs to Manage Their Own Context](https://arxiv.org/abs/2604.09852)
 
 ## Major findings
 
@@ -45,7 +47,8 @@ The strongest trend is a move from prompt accumulation to **structured context p
 This reinforces the case for Perseus to evolve from a context assembler into a **context compiler with optimization passes**.
 
 ### 2. Compaction is a first-class capability
-Memento is especially important because it frames context management as controlled compaction, not just retrieval. Compact intermediate artifacts can preserve what future reasoning needs while materially reducing context cost.
+Memento is especially important because it frames context management as controlled compaction, not just retrieval. Compact intermediate artifacts can preserve what future reasoning needs while materially
+reducing context cost.
 
 This suggests a product pattern of distinct artifact tiers:
 
@@ -75,7 +78,8 @@ This strengthens the case for:
 - derivation links from summaries back to original evidence
 
 ### 5. Retrieval should be validity-aware, not just semantically similar
-RaMem’s framing is especially useful here. The best memory systems do not merely retrieve similar content. They retrieve memories that are valid for the current question, time frame, entity scope, and workflow.
+RaMem’s framing is especially useful here. The best memory systems do not merely retrieve similar content. They retrieve memories that are valid for the current question, time frame, entity scope,
+and workflow.
 
 Useful retrieval factors include:
 
@@ -92,7 +96,8 @@ AgeMem argues for integrating short-term and long-term memory decisions into one
 This suggests making the promotion and relegation path across Perseus and Vault much more explicit and measurable.
 
 ### 7. Protocolized interfaces matter
-The MCP specification matters because it provides a stable, typed interface for tools, resources, and structured interaction. That supports the move away from brittle bespoke integrations and toward predictable agent behavior.
+The MCP specification matters because it provides a stable, typed interface for tools, resources, and structured interaction. That supports the move away from brittle bespoke integrations and toward
+predictable agent behavior.
 
 ## Implications by repo
 
@@ -188,13 +193,12 @@ Recent benchmarks increasingly measure different aspects of memory quality:
 
 ### Important benchmark families
 
-- **StructMemEval** evaluates whether an agent can organize long-term memory, not just retrieve a fact.
-- **MemGround** focuses on long-term memory under rich interactive scenarios and tests temporal association and reasoning over accumulated evidence.
-- **PM-Bench** focuses on prospective memory and delayed obligations.
-- **MemoryAgentBench** evaluates accurate retrieval, test-time learning, long-range understanding, and selective forgetting in incremental multi-turn settings.
-- **MemoryArena** benchmarks interdependent multi-session agentic tasks where memory must guide later action.
-- **Mem2ActBench** tests whether long-term memory actually grounds tool-parameter selection in interrupted task histories.
-- **Recent context-collapse evaluations** suggest hierarchical memory can outperform repeated summarization in long-horizon settings.
+- [StructMemEval](https://arxiv.org/abs/2602.11243) evaluates whether an agent can organize long-term memory, not just retrieve a fact.
+- [MemGround](https://arxiv.org/html/2604.14158v1) focuses on long-term memory under rich interactive scenarios and tests temporal association and reasoning over accumulated evidence.
+- [PM-Bench](https://arxiv.org/abs/2607.12385) focuses on prospective memory and delayed obligations.
+- [MemoryAgentBench](https://arxiv.org/abs/2507.05257) evaluates accurate retrieval, test-time learning, long-range understanding, and selective forgetting in incremental multi-turn settings.
+- [MemoryArena](https://arxiv.org/abs/2602.16313) benchmarks interdependent multi-session agentic tasks where memory must guide later action.
+- [Mem2ActBench](https://arxiv.org/abs/2601.19935) tests whether long-term memory actually grounds tool-parameter selection in interrupted task histories.
 
 ### Evaluation implications for Perseus, Vault, and Ledger
 
@@ -237,10 +241,11 @@ A mature internal evaluation suite should measure at least these categories:
 
 ### Bottom line
 
-The benchmark literature reinforces that memory systems should be judged as end-to-end reasoning and action substrates, not just search layers. The best next step is not one more retrieval metric. It is a small internal evaluation harness that spans retrieval, validity, compaction, mutation, and action grounding.
+The benchmark literature reinforces that memory systems should be judged as end-to-end reasoning and action substrates, not just search layers. The best next step is not one more retrieval metric. It is
+a small internal evaluation harness that spans retrieval, validity, compaction, mutation, and action grounding.
 
 ## Follow-up implementation issues
 
-- Perseus: #923 and #924
-- Perseus Vault: #859 and #860
-- Ledger: #219 and #220
+- Perseus: [#923](https://github.com/Perseus-Computing-LLC/perseus/issues/923) and [#924](https://github.com/Perseus-Computing-LLC/perseus/issues/924)
+- Perseus Vault: [#859](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/859) and [#860](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/860)
+- Ledger: [#219](https://github.com/Perseus-Computing-LLC/ledger/issues/219) and [#220](https://github.com/Perseus-Computing-LLC/ledger/issues/220)
