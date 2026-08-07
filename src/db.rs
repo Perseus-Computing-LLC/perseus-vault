@@ -90,9 +90,10 @@ use crate::models::{
     ActionLease, ArtifactAnchor, ArtifactBinding, ArtifactManifest, ArtifactManifestBinding,
     ArtifactRepresentation, ArtifactRetrievalCapabilities, ArtifactStructure, ArtifactWhyServed,
     AskParams, AskResult, AskSource, AuthorityManifest, AuthorityManifestInput,
-    AuthorizedAction, CompactReport, DecayReport, EmbedParams, Entity, ExternalRef, GraphEdge,
-    GraphNode, IngestParams, JournalEvent, MemoryLink, OriginRecord, PruneParams, PruneReport,
-    PurgeReport, Readiness, RecallParams, StateEntry, Stats, TimelineParams, VaultReport,
+    AuthorizedAction, CompactReport, DecayReport, EmbedParams, EmbeddingBackendHealth, Entity,
+    ExternalRef, GraphEdge, GraphNode, IngestParams, JournalEvent, MemoryLink, OriginRecord,
+    PruneParams, PruneReport, PurgeReport, Readiness, RecallOutcome, RecallParams, RecallStatus,
+    SearchMode, StateEntry, Stats, TimelineParams, VaultReport,
 };
 
 fn with_legacy_evidence(body_json: String, captured_at_unix_ms: i64, source_system: &str) -> String {
@@ -1692,6 +1693,158 @@ impl Database {
             };
         }
         true
+    }
+
+    /// #864: enqueued-but-unfinished background embed jobs. Lets recall/health
+    /// report that the store is still catching up on derived embeddings
+    /// (observable partial writes) instead of silently serving a
+    /// semantic backend that is mid-backfill. 0 when no worker was ever
+    /// spawned (nothing to do).
+    pub fn pending_embed_jobs(&self) -> u64 {
+        let Some(worker) = self.embed_worker.get() else {
+            return 0;
+        };
+        match worker.pending.0.lock() {
+            Ok(g) => *g,
+            Err(_) => u64::MAX, // poisoned: report as "unknown/busy"
+        }
+    }
+
+    /// #864/#873/#887: build the explicit recall outcome for a completed
+    /// recall. Inputs are what the recall path actually experienced: the
+    /// mode requested, whether the query embedding was produced, whether
+    /// the embedding backend is enabled, the number of hits returned, and
+    /// any fatal error. This is the single place that turns those signals
+    /// into the `RecallOutcome` contract, so recall/ask/batch all report
+    /// identically and no empty result can masquerade as healthy recall.
+    pub fn recall_outcome(
+        &self,
+        mode: &SearchMode,
+        query_embedding_available: bool,
+        hits: usize,
+        fatal_error: Option<&str>,
+    ) -> RecallOutcome {
+        let r = self.readiness();
+        let pending = self.pending_embed_jobs();
+        let health = EmbeddingBackendHealth {
+            enabled: self.embedding_enabled(),
+            query_embedding_available,
+            embedded_memories: r.embedded_memories,
+            active_memories: r.active_memories,
+            pending_embed_jobs: pending,
+        };
+
+        // A fatal error (DB down, embedding provider error, SQL failure) is
+        // UNAVAILABLE — never a silent empty.
+        if let Some(err) = fatal_error {
+            return RecallOutcome {
+                status: RecallStatus::Unavailable,
+                abstained: true,
+                reason: if !r.db_responds {
+                    "db_unhealthy".to_string()
+                } else {
+                    format!("recall_error:{err}")
+                },
+                deadline_elapsed: false,
+                backend_health: Some(health),
+            };
+        }
+
+        // A semantic (dense/hybrid) query whose embedding could not be
+        // produced has NO semantic arm at all: an empty result here is a
+        // fault, not a fact — unless the caller explicitly requested dense
+        // and the store has zero embeddings (the only honest semantic answer
+        // is "nothing is embedded yet", which the stale status covers).
+        if matches!(mode, SearchMode::Dense | SearchMode::Hybrid)
+            && !query_embedding_available
+            && health.embedded_memories == 0
+        {
+            // Dense over an unembedded store is a stale/degraded posture, not
+            // an empty fact: the store may well contain the answer, just not
+            // in vector form yet.
+            return RecallOutcome {
+                status: if health.enabled {
+                    RecallStatus::Stale
+                } else {
+                    RecallStatus::Unavailable
+                },
+                abstained: true,
+                reason: "semantic_backend_not_serving".to_string(),
+                deadline_elapsed: false,
+                backend_health: Some(health),
+            };
+        }
+
+        if hits > 0 {
+            // Results were served. If the semantic backend was requested but
+            // couldn't produce a query embedding yet still returned hits (the
+            // FTS/keyword arm served), that is PARTIAL, not fresh.
+            let semantic_served = match mode {
+                SearchMode::Fts5 => true,
+                SearchMode::Dense | SearchMode::Hybrid => query_embedding_available,
+            };
+            let degraded = !semantic_served
+                || (pending > 0 && matches!(mode, SearchMode::Dense | SearchMode::Hybrid));
+            return RecallOutcome {
+                status: if degraded {
+                    RecallStatus::Partial
+                } else {
+                    RecallStatus::Fresh
+                },
+                abstained: false,
+                reason: if degraded {
+                    if !semantic_served {
+                        "partial_arms".to_string()
+                    } else {
+                        "pending_embeds".to_string()
+                    }
+                } else {
+                    String::new()
+                },
+                deadline_elapsed: false,
+                backend_health: Some(health),
+            };
+        }
+
+        // Zero hits in a healthy store: genuine no-evidence → abstain.
+        // The store may still be mid-backfill (stale beats empty so callers
+        // don't conclude "no such memory" while embeds are pending).
+        let backend_behind = pending > 0
+            || (matches!(mode, SearchMode::Dense | SearchMode::Hybrid)
+                && health.embedded_memories < health.active_memories);
+        RecallOutcome {
+            status: if backend_behind {
+                RecallStatus::Stale
+            } else {
+                RecallStatus::Empty
+            },
+            abstained: true,
+            reason: if !r.db_responds {
+                "db_unhealthy".to_string()
+            } else if r.active_memories == 0 {
+                "empty_store".to_string()
+            } else if backend_behind {
+                "index_behind".to_string()
+            } else {
+                "no_match".to_string()
+            },
+            deadline_elapsed: false,
+            backend_health: Some(health),
+        }
+    }
+
+    /// #864: apply a caller-supplied recall deadline. If elapsed, downgrade a
+    /// Fresh/Partial outcome to Timeout (bounded recall) — the caller knows
+    /// the result set may be incomplete rather than assuming it is final.
+    pub fn apply_recall_deadline(mut outcome: RecallOutcome, deadline_elapsed: bool) -> RecallOutcome {
+        if deadline_elapsed && matches!(outcome.status, RecallStatus::Fresh | RecallStatus::Partial) {
+            outcome.status = RecallStatus::Timeout;
+            if outcome.reason.is_empty() {
+                outcome.reason = "deadline_elapsed".to_string();
+            }
+            outcome.deadline_elapsed = true;
+        }
+        outcome
     }
 
     /// #393 test seam: shrink the auto-embed queue bound to exercise the
@@ -14547,6 +14700,100 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(both.contains(&"cand-1".to_string()));
         assert!(both.contains(&"ver-1".to_string()));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn recall_outcome_empty_store_abstains_with_reason() {
+        // #864/#887: an empty store yields Empty + abstained, never a
+        // best-guess or a silent healthy empty.
+        let (db, path) = temp_db();
+        let outcome = db.recall_outcome(&crate::models::SearchMode::Fts5, true, 0, None);
+        assert_eq!(outcome.status, crate::models::RecallStatus::Empty);
+        assert!(outcome.abstained);
+        assert_eq!(outcome.reason, "empty_store");
+        assert!(outcome.backend_health.is_some());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn recall_outcome_fatal_error_is_unavailable_not_empty() {
+        // #873/#864: a fatal error must surface as unavailable — an empty
+        // result caused by a dead backend is a fault, never a fact.
+        let (db, path) = temp_db();
+        let outcome = db.recall_outcome(&crate::models::SearchMode::Fts5, true, 0, Some("embedding backend down"));
+        assert_eq!(outcome.status, crate::models::RecallStatus::Unavailable);
+        assert!(outcome.abstained);
+        assert!(outcome.reason.starts_with("recall_error:"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn recall_outcome_semantic_backend_down_is_not_serving() {
+        // #873: dense recall with no query embedding and no stored vectors is
+        // never a silent "no match" — it is Unavailable when no backend is
+        // configured (lite build) or Stale when the backend exists but the
+        // store is unembedded. Either way: abstained, never fresh/empty.
+        let (db, path) = temp_db();
+        let outcome = db.recall_outcome(&crate::models::SearchMode::Dense, false, 0, None);
+        assert!(
+            matches!(
+                outcome.status,
+                crate::models::RecallStatus::Unavailable | crate::models::RecallStatus::Stale
+            ),
+            "dense without a serving backend must be unavailable/stale, got {:?}",
+            outcome.status
+        );
+        assert!(outcome.abstained);
+        assert_eq!(outcome.reason, "semantic_backend_not_serving");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn recall_outcome_healthy_hits_are_fresh() {
+        // #864: nominal recall with results and a working backend is fresh,
+        // not abstained, and carries backend health.
+        let (db, path) = temp_db();
+        let entity = make_entity("fresh-1", "decision", "fresh-1", r#"{\"content\":\"x\"}"#);
+        db.remember(&entity).unwrap();
+        let outcome = db.recall_outcome(&crate::models::SearchMode::Fts5, true, 1, None);
+        assert_eq!(outcome.status, crate::models::RecallStatus::Fresh);
+        assert!(!outcome.abstained);
+        let health = outcome.backend_health.unwrap();
+        assert_eq!(health.active_memories, 1);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn recall_outcome_deadline_downgrades_to_timeout() {
+        // #864: an elapsed caller deadline downgrades fresh/partial to
+        // timeout so the caller knows the set may be incomplete.
+        let (db, path) = temp_db();
+        let fresh = db.recall_outcome(&crate::models::SearchMode::Fts5, true, 2, None);
+        let timed = Database::apply_recall_deadline(fresh, true);
+        assert_eq!(timed.status, crate::models::RecallStatus::Timeout);
+        assert!(timed.deadline_elapsed);
+        assert_eq!(timed.reason, "deadline_elapsed");
+        // No deadline elapsed → unchanged.
+        let again = db.recall_outcome(&crate::models::SearchMode::Fts5, true, 2, None);
+        let still_fresh = Database::apply_recall_deadline(again, false);
+        assert_eq!(still_fresh.status, crate::models::RecallStatus::Fresh);
+        assert!(!still_fresh.deadline_elapsed);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn recall_outcome_mcp_surface_reports_degraded_semantic() {
+        // #873 end-to-end: dense recall over a populated-but-unembedded store
+        // reports stale/abstained (index behind) rather than an empty fact —
+        // the "zero/empty retrieval masquerading as healthy recall" failure.
+        let (db, path) = temp_db();
+        let entity = make_entity("unembedded-1", "decision", "unembedded-1", r#"{\"content\":\"needs vector\"}"#);
+        db.remember(&entity).unwrap();
+        let outcome = db.recall_outcome(&crate::models::SearchMode::Dense, true, 0, None);
+        assert_eq!(outcome.status, crate::models::RecallStatus::Stale);
+        assert!(outcome.abstained);
+        assert_eq!(outcome.reason, "index_behind");
         let _ = std::fs::remove_file(path);
     }
 

@@ -1048,6 +1048,15 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
           "type": "string",
           "description": "#728: post-filter hits to entities whose body external_refs carry this ref_value. Matches exactly or as a hierarchical '/' prefix ('github:Org' matches 'github:Org/repo')."
         },
+        "deadline_ms": {
+          "type": "integer",
+          "description": "#864: bounded recall. When set, the recall is timed; if it exceeds this many ms the response outcome.status is 'timeout' so callers know the result set may be incomplete. Results are still returned in full."
+        },
+        "include_outcome": {
+          "type": "boolean",
+          "default": false,
+          "description": "#864/#873/#887: always attach the explicit 'outcome' block (status, backend health, abstention, reason). By default it is attached only when recall was degraded/partial/timeout/empty/unavailable/stale, so nominal responses stay byte-identical."
+        },
         "as_of_unix_ms": {
           "type": "integer",
           "description": "#472 Temporal RAG: transaction-time instant (unix ms). Reconstruct semantic recall AS BELIEVED at this past instant — each hit's body is the version that was live at as_of_unix_ms; corrections recorded later do not leak in. Combine with valid_at for the full bi-temporal cell. Hits are stamped with is_live_version / recorded_at_unix_ms / valid_from_unix_ms / valid_to_unix_ms. Omit for today's live view. (v1: candidate generation is over the live index, so a fact fully deleted since that instant will not surface.)"

@@ -428,6 +428,99 @@ pub enum SearchMode {
     Hybrid,
 }
 
+/// #864/#873/#887: explicit recall outcome. Every recall/projection path
+/// reports HOW it went, so an empty result is never mistaken for a healthy
+/// "no match" and a degraded semantic backend is never mistaken for an
+/// empty store. `status` is the high-signal summary:
+///   - `fresh`        — backend healthy, results (possibly zero) served
+///   - `partial`      — some arms served; others degraded/skipped (e.g.
+///                      hybrid with keyword arm dropped)
+///   - `timeout`      — a caller-supplied deadline elapsed before the
+///                      result set was complete
+///   - `unavailable`  — a required backend (embedding provider, DB) is
+///                      down; the empty result is a FAULT, not a fact
+///   - `empty`        — genuinely no matching evidence in a healthy store
+///   - `stale`        — the store is healthy but its derived index is
+///                      behind (pending embed jobs / low coverage), so
+///                      semantic recall may be incomplete
+/// `abstained` is the #887 no-evidence signal: when true, the caller MUST
+/// NOT treat the absence of hits as a "best guess" answer — there is
+/// simply no evidence, and the `reason` says why.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum RecallStatus {
+    #[default]
+    Fresh,
+    Partial,
+    Timeout,
+    Unavailable,
+    Empty,
+    Stale,
+}
+
+impl RecallStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RecallStatus::Fresh => "fresh",
+            RecallStatus::Partial => "partial",
+            RecallStatus::Timeout => "timeout",
+            RecallStatus::Unavailable => "unavailable",
+            RecallStatus::Empty => "empty",
+            RecallStatus::Stale => "stale",
+        }
+    }
+}
+
+/// #873: embedding/vector backend health snapshot attached to every recall
+/// outcome, so dense/hybrid callers can tell "no evidence" from "the
+/// semantic backend is not serving".
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct EmbeddingBackendHealth {
+    /// Whether a dense-embedding backend is configured/enabled at all.
+    pub enabled: bool,
+    /// Whether an embedding could actually be produced for the query
+    /// (backend reachable, dimension compatible). False on lite builds and
+    /// when the provider errored.
+    pub query_embedding_available: bool,
+    /// Active (non-archived) entities carrying a stored embedding.
+    pub embedded_memories: i64,
+    /// Active entities total — coverage = embedded/active.
+    pub active_memories: i64,
+    /// Enqueued-but-unfinished background embed jobs (#864 observability).
+    pub pending_embed_jobs: u64,
+}
+
+impl EmbeddingBackendHealth {
+    /// Coverage fraction 0.0-1.0; 0 when there are no active memories.
+    pub fn coverage(&self) -> f64 {
+        if self.active_memories <= 0 {
+            0.0
+        } else {
+            (self.embedded_memories as f64 / self.active_memories as f64).min(1.0)
+        }
+    }
+}
+
+/// #864: the full recall outcome — status, backend health, abstention, and
+/// why. Serialized onto recall/ask responses as `outcome`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct RecallOutcome {
+    pub status: RecallStatus,
+    pub abstained: bool,
+    /// Machine-readable reason (e.g. "no_match", "db_unhealthy",
+    /// "embedding_unavailable", "deadline_elapsed", "partial_arms").
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reason: String,
+    /// Caller-supplied deadline exceeded (bounded recall, #864).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub deadline_elapsed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend_health: Option<EmbeddingBackendHealth>,
+}
+
+fn is_false(v: &bool) -> bool {
+    !*v
+}
+
 /// Configuration for FTS5 query expansion using stemming variants.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct QueryExpansionConfig {

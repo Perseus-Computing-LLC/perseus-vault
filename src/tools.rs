@@ -347,6 +347,19 @@ pub struct RecallArgs {
     pub ref_type: Option<String>,
     #[serde(default)]
     pub ref_value: Option<String>,
+    /// #864: bounded recall. When set, the recall is timed; if it exceeds
+    /// this many milliseconds the outcome status is `timeout` so callers
+    /// know the result set may be incomplete. Results are still returned
+    /// (bounded, not dropped).
+    #[serde(default, deserialize_with = "string_or_int_opt")]
+    pub deadline_ms: Option<i64>,
+    /// #864/#873/#887: attach the explicit recall `outcome` block (status,
+    /// backend health, abstention) even when recall was nominal. By default
+    /// the outcome is attached only when it has something to say
+    /// (degraded/partial/timeout/empty/unavailable/stale) so healthy
+    /// responses stay byte-identical; set true to always include it.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub include_outcome: bool,
 }
 
 pub type BatchQuery = RecallArgs;
@@ -1428,9 +1441,30 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
         reinforce: a.reinforce,
     };
 
+    // #864: bounded recall — time the query when the caller set a deadline.
+    // The result set is still returned in full (bounded, not dropped); the
+    // outcome reports `timeout` so callers know it may be incomplete.
+    let deadline_ms = a.deadline_ms.filter(|ms| *ms > 0);
+    let started = std::time::Instant::now();
+
     let mut entities = db
         .recall(&params)
         .map_err(|e| format!("Recall failed: {}", e))?;
+
+    let elapsed_ms = started.elapsed().as_millis() as i64;
+    let deadline_elapsed = deadline_ms.is_some_and(|ms| elapsed_ms >= ms);
+
+    // #864/#873/#887: explicit outcome. For dense/hybrid with a non-empty
+    // query, recall succeeding implies the query embedding was produced
+    // (a missing/dead backend errors out instead of silently degrading); an
+    // empty query falls through to the FTS path inside recall. FTS is always
+    // "semantically available" (it has no separate backend).
+    let query_embedding_available = match mode_for_side_effects {
+        SearchMode::Dense | SearchMode::Hybrid => !params.query.trim().is_empty(),
+        SearchMode::Fts5 => true,
+    };
+    let outcome = db.recall_outcome(&mode_for_side_effects, query_embedding_available, entities.len(), None);
+    let outcome = Database::apply_recall_deadline(outcome, deadline_elapsed);
 
     // #684: visibility enforcement. Drop entities the requesting agent may not
     // read (private → author only; fleet → same fleet / tier>=2) before any
@@ -1534,7 +1568,13 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
         apply_confidence(&mut items_expanded, &entities);
     }
 
-    let result = if items_expanded.is_empty() {
+    // #864/#873/#887: attach the explicit outcome when it has something to
+    // say (degraded/partial/timeout/unavailable/empty/stale) or the caller
+    // opted into always seeing it. Nominal fresh recalls stay byte-identical.
+    let outcome_value = serde_json::to_value(&outcome).unwrap_or(serde_json::json!({}));
+    let include_outcome = a.include_outcome || outcome.status != crate::models::RecallStatus::Fresh;
+
+    let mut result = if items_expanded.is_empty() {
         json!({
             "items": items_expanded,
             "total": 0,
@@ -1548,6 +1588,11 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
             "retrieval_profile": profile_name,
         })
     };
+    if include_outcome {
+        if let Some(obj) = result.as_object_mut() {
+            obj.insert("outcome".to_string(), outcome_value);
+        }
+    }
     Ok(result.to_string())
 }
 
