@@ -64,6 +64,13 @@ pub struct Entity {
     /// 'unverified' | 'useful' | 'dead' — set once enough attempts accrue.
     #[serde(default = "default_efficacy_status")]
     pub efficacy_status: String,
+    /// Epistemic trust axis (#880), orthogonal to lifecycle `status`:
+    /// 'candidate' | 'verified' | 'corroborated' | 'rejected' |
+    /// 'defensively_recalled'. Default 'candidate' — a record may be useful
+    /// without being established fact; verified/corroborated require
+    /// admission evidence or operator promotion.
+    #[serde(default = "default_epistemic_state")]
+    pub epistemic_state: String,
     #[serde(skip)]
     #[allow(dead_code)]
     pub embedding: Option<Vec<f32>>,
@@ -118,6 +125,21 @@ fn default_certainty() -> f64 {
 fn default_efficacy_status() -> String {
     "unverified".to_string()
 }
+
+/// Epistemic trust axis default (#880): useful-but-unverified until admission
+/// evidence or operator promotion proves the claim.
+pub fn default_epistemic_state() -> String {
+    "candidate".to_string()
+}
+
+/// The canonical epistemic state vocabulary (#880).
+pub const EPISTEMIC_STATES: [&str; 5] = [
+    "candidate",
+    "verified",
+    "corroborated",
+    "rejected",
+    "defensively_recalled",
+];
 
 /// Default recall trust weight. Non-zero so verified sources are preferred
 /// over unverified AI drafts everywhere by default; kept low so it acts as a
@@ -371,6 +393,13 @@ pub struct RecallParams {
     /// Agent identity filter (v1.2.0). When Some, only entities with a
     /// matching agent_id are returned. None = no agent filtering.
     pub agent_id: Option<String>,
+    /// Epistemic trust-axis filter (#880). When Some, only entities whose
+    /// epistemic_state matches are returned (e.g. "candidate" to surface
+    /// useful-but-unverified records, "verified"/"corroborated" to restrict
+    /// to established fact). None = no trust filtering. Applied on the FTS,
+    /// dense, and hybrid paths alike so the semantic arms cannot leak
+    /// cross-trust results.
+    pub epistemic_state: Option<String>,
     /// Visibility filter (v1.2.0). When Some, only entities with matching
     /// visibility are returned. None = no visibility filter.
     // Reserved: the recall query does not yet apply this filter and the MCP
@@ -451,6 +480,7 @@ impl Default for RecallParams {
             workspace_hash: None,
             scope_weight: None,
             agent_id: None,
+            epistemic_state: None,
             visibility: None,
             layer: None,
             reinforce: false,

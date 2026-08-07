@@ -752,6 +752,32 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
           "default": "",
           "description": "Agent identity (v1.2.0). Tracks which agent wrote this entity. Used for agent attribution and context filtering."
         },
+        "actor_kind": {
+          "type": "string",
+          "default": "assistant",
+          "description": "Actor basis for the write (for example assistant, user, connector, or system). Missing admission stays reviewable."
+        },
+        "admission": {
+          "type": "object",
+          "description": "Hash-only admission envelope. Authoritative admission requires a validated source_event_id and matching workspace; missing or unverified evidence is stored as proposed/requires_review.",
+          "properties": {
+            "record_digest": {"type": "string"},
+            "source_identity": {"type": "string"},
+            "authorization_scope": {"type": "string"},
+            "ingestion_channel": {"type": "string"},
+            "workspace_hash": {"type": "string"},
+            "source_trust": {"type": "string", "enum": ["untrusted", "trusted", "authoritative"]},
+            "source_event_id": {"type": "string"},
+            "actor_kind": {"type": "string"},
+            "actor_identity": {"type": "string"},
+            "validated": {"type": "boolean"},
+            "valid_from_unix_ms": {"type": "integer"},
+            "recorded_at_unix_ms": {"type": "integer"},
+            "task_relevance_bps": {"type": "integer"},
+            "instruction_bearing": {"type": "boolean"},
+            "contradicts_authoritative": {"type": "boolean"}
+          }
+        },
         "valid_from_unix_ms": {
           "type": "integer",
           "description": "Application-time period start (#363): when the fact became TRUE IN THE WORLD, independent of when it was recorded. Set in the past for retroactive facts ('this was true last week, we just learned it') without rewriting transaction history. Default: transaction time (now). Query with mimir_valid_at / mimir_bitemporal / recall's valid_at filter."
@@ -858,6 +884,18 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
         "derived_from": {
           "type": "object",
           "description": "Present when derived_from citations were passed: {reinforced: n, not_found: [labels]}"
+        },
+        "proposed": {
+          "type": "boolean",
+          "description": "True when the write lacks authoritative admission and must remain reviewable."
+        },
+        "requires_review": {
+          "type": "boolean",
+          "description": "Whether the stored write must be reviewed before promotion or authoritative use."
+        },
+        "provenance": {
+          "type": "object",
+          "description": "Hash-only admission/provenance state; raw prompts, bodies, credentials, and tool arguments are excluded."
         }
       }
     },
@@ -987,6 +1025,11 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
         "agent_id": {
           "type": "string",
           "description": "Agent identity filter (v1.2.0). When set, only entities with a matching agent_id are returned. Omit for no agent filtering."
+        },
+        "epistemic_state": {
+          "type": "string",
+          "enum": ["candidate", "verified", "corroborated", "rejected", "defensively_recalled"],
+          "description": "#880: epistemic trust-axis filter. When set, only entities in the requested trust state are returned — 'candidate' surfaces useful-but-unverified records, 'verified'/'corroborated' restrict to established fact, 'rejected' shows reviewed-and-refused records. Omit for no trust filtering (default)."
         },
         "retrieval_profile": {
           "type": "string",

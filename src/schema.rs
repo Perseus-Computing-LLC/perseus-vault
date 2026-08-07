@@ -62,6 +62,17 @@ CREATE TABLE IF NOT EXISTS entities (
     follow_rate REAL DEFAULT 0.0,        -- follow_count / (follow_count + miss_count), 0.0 if no attempts
     efficacy_status TEXT DEFAULT 'unverified',  -- 'unverified' | 'useful' | 'dead'
 
+    -- Epistemic trust axis (#880 — orthogonal to the lifecycle `status` axis).
+    -- status says where the record sits in its life (active/proposed/
+    -- quarantined/superseded/…); epistemic_state says how much it may be
+    -- TRUSTED as fact: 'candidate' (useful but unverified), 'verified'
+    -- (authoritative admission or operator promotion), 'corroborated'
+    -- (multiple independent evidence refs), 'rejected' (reviewed and refused),
+    -- 'defensively_recalled' (served despite low trust, explicitly framed as
+    -- untrusted). Default 'candidate': a fresh write is useful-but-unverified
+    -- until admission or promotion proves it.
+    epistemic_state TEXT DEFAULT 'candidate',
+
     -- Usefulness tracking (#487 — Belief-Memory-inspired derived_from
     -- reinforcement). Unlike retrieval_count (how often a memory was merely
     -- recalled), usefulness_count only increments when a later remember()
@@ -393,7 +404,12 @@ CREATE INDEX IF NOT EXISTS idx_artifact_bindings_derived_from
 /// probed because v23 stores must retain existing receipt records.
 /// v25 (#811 Immutable artifacts): shared content-addressed `artifacts` bytes
 /// plus scope/provenance/representation `artifact_bindings`.
-const SCHEMA_VERSION: i64 = 26;
+/// v27 (#880 epistemic states): `epistemic_state` trust axis on entities —
+/// 'candidate' | 'verified' | 'corroborated' | 'rejected' |
+/// 'defensively_recalled', orthogonal to the lifecycle `status` column.
+/// Backfill-free: existing rows default to 'candidate' (useful but unverified),
+/// which is the safe reading for any legacy record lacking admission evidence.
+const SCHEMA_VERSION: i64 = 27;
 
 /// Initialize the v0.2.0 schema on a fresh database.
 pub fn initialize_schema(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
@@ -1028,6 +1044,13 @@ fn apply_migrations(conn: &Connection) -> Result<(), Box<dyn std::error::Error>>
     )?;
     // ── end v26 ──────────────────────────────────────────────────────────
 
+    // ── v27 (#880 epistemic states) ───────────────────────────────────────
+    // Trust axis on entities, orthogonal to lifecycle `status`. Default
+    // 'candidate' is the fail-closed reading for legacy rows lacking
+    // admission evidence; writers set verified/corroborated explicitly.
+    ensure_column(conn, "entities", "epistemic_state", "TEXT DEFAULT 'candidate'")?;
+    // ── end v27 ──────────────────────────────────────────────────────────
+
     // Stamp the migration level so subsequent opens skip the probe block above.
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
 
@@ -1504,6 +1527,62 @@ mod tests {
             err.to_string().contains("duplicate column name"),
             "SQLite duplicate-column error text changed: {err}"
         );
+    }
+
+    #[test]
+    fn v27_migration_adds_epistemic_state_defaulting_to_candidate() {
+        // #880: a v26-era store (full column set minus epistemic_state) must
+        // gain the trust axis on migration, and pre-existing rows must read
+        // as 'candidate' — the fail-closed reading for records written before
+        // admission evidence existed.
+        let (conn, _path) = temp_db();
+        initialize_schema(&conn).expect("fresh init");
+        // Simulate a v26 store: drop the v27 column, stamp the old version.
+        conn.execute_batch("ALTER TABLE entities DROP COLUMN epistemic_state;")
+            .unwrap();
+        conn.pragma_update(None, "user_version", 26i64).unwrap();
+        assert!(
+            conn.prepare("SELECT epistemic_state FROM entities LIMIT 1").is_err(),
+            "precondition: v26 store lacks epistemic_state"
+        );
+        // A legacy row written before the axis existed.
+        conn.execute(
+            "INSERT INTO entities (id, category, key, body_json, created_at_unix_ms, last_accessed_unix_ms)
+             VALUES ('legacy', 'insight', 'k', '{}', 0, 0)",
+            [],
+        )
+        .unwrap();
+
+        // Migrate.
+        initialize_schema(&conn).expect("migrate v26 -> v27");
+
+        let v: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, 27, "migration must stamp v27");
+        let state: String = conn
+            .query_row(
+                "SELECT epistemic_state FROM entities WHERE id = 'legacy'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "candidate", "legacy rows default to candidate");
+        // Fresh writes on the migrated store still land with the column.
+        conn.execute(
+            "INSERT INTO entities (id, category, key, body_json, created_at_unix_ms, last_accessed_unix_ms)
+             VALUES ('fresh', 'insight', 'k2', '{}', 0, 0)",
+            [],
+        )
+        .unwrap();
+        let fresh: String = conn
+            .query_row(
+                "SELECT epistemic_state FROM entities WHERE id = 'fresh'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(fresh, "candidate");
     }
 
     #[test]

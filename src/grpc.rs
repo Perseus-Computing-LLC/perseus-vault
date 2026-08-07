@@ -114,6 +114,7 @@ pub mod grpc {
                     miss_count: 0,
                     follow_rate: 0.0,
                     efficacy_status: "unverified".to_string(),
+                    epistemic_state: crate::models::default_epistemic_state(),
                     embedding: None,
                     _parsed_body: None,
                 };
@@ -627,6 +628,7 @@ pub mod grpc {
                 miss_count: 0,
                 follow_rate: 0.0,
                 efficacy_status: "unverified".to_string(),
+                epistemic_state: crate::models::default_epistemic_state(),
                 embedding: None,
                 _parsed_body: None,
             };

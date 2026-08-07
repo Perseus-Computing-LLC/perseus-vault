@@ -14,7 +14,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// canonical form — so raw rejected content cannot leak into the store.
 fn normalize_rejected_value(value: &str) -> String {
     let canonical = match serde_json::from_str::<serde_json::Value>(value) {
-        Ok(v) => v.to_string(),
+        Ok(mut v) => {
+            // Admission/provenance is hash-only write metadata added by the
+            // durable-write boundary. It must not change the semantic value
+            // digest used by rejected-value tombstones (#849/#863).
+            if let Some(object) = v.as_object_mut() {
+                object.remove("provenance");
+                object.remove("admission");
+            }
+            v.to_string()
+        }
         Err(_) => value.to_string(),
     };
     canonical
@@ -29,6 +38,46 @@ fn rejected_value_digest(value: &str) -> String {
     format!("{:x}", Sha256::digest(normalized.as_bytes()))
 }
 
+/// Ensure every durable entity written through the database has an explicit,
+/// hash-only provenance state. Public tool handlers may supply a richer
+/// admission envelope; direct CLI/import/connector/derived writers reach this
+/// boundary without one and are marked reviewable rather than silently active.
+fn ensure_durable_write_provenance(entity: &Entity, verified_admission: bool) -> Entity {
+    if verified_admission {
+        // Authoritative admission is the strongest trust signal the write
+        // path can carry; mark the record verified (or keep an explicit
+        // operator-set corroborated state) rather than leaving it a candidate.
+        let mut admitted = entity.clone();
+        if !crate::models::EPISTEMIC_STATES.contains(&admitted.epistemic_state.as_str()) {
+            admitted.epistemic_state = "candidate".to_string();
+        }
+        if admitted.epistemic_state == "candidate" {
+            admitted.epistemic_state = "verified".to_string();
+        }
+        return admitted;
+    }
+    #[cfg(test)]
+    if entity.source == "test" {
+        return entity.clone();
+    }
+    // Keep the semantic body byte-for-byte stable for encryption, embeddings,
+    // file adapters, and deduplication. Database callers do not get to elevate
+    // a write by choosing a source label or by placing an admission-shaped JSON
+    // object in the body; activation requires the verified admission path.
+    let mut enriched = entity.clone();
+    if enriched.status == "active" {
+        enriched.status = "proposed".to_string();
+        enriched.always_on = false;
+    }
+    // Trust axis stays fail-closed: an unverified write is a candidate even
+    // when a caller attempted to label it verified/corroborated — only the
+    // verified admission path may set the trust axis (or an explicit
+    // operator/audit transition after review).
+    if enriched.epistemic_state != "rejected" && enriched.epistemic_state != "defensively_recalled" {
+        enriched.epistemic_state = "candidate".to_string();
+    }
+    enriched
+}
 
 /// A connection checked out from the pool. Derefs to `rusqlite::Connection`, so
 /// every existing `conn.prepare/execute/query_row/...` call works unchanged once
@@ -1367,6 +1416,7 @@ impl Database {
                             miss_count: 0,
                             follow_rate: 0.0,
                             efficacy_status: "unverified".to_string(),
+                            epistemic_state: crate::models::default_epistemic_state(),
                             embedding: None,
                             _parsed_body: None,
                         };
@@ -2847,7 +2897,8 @@ impl Database {
                     archived, archive_reason, links, verified, source,
                     created_at_unix_ms, last_accessed_unix_ms, NULL as embedding,
                     always_on, certainty, workspace_hash, agent_id, visibility,
-                    follow_count, miss_count, follow_rate, efficacy_status
+                    follow_count, miss_count, follow_rate, efficacy_status,
+                    epistemic_state
              FROM entities WHERE id IN ({})",
             placeholders
         );
@@ -3823,6 +3874,31 @@ impl Database {
         valid_to: Option<i64>,
         allow_rejected: bool,
     ) -> Result<(String, String), Box<dyn std::error::Error>> {
+        self.remember_impl_with_admission(entity, skip_dedup, valid_from, valid_to, allow_rejected, false)
+    }
+
+    pub(crate) fn remember_verified_with_options(
+        &self,
+        entity: &Entity,
+        skip_dedup: bool,
+        valid_from: Option<i64>,
+        valid_to: Option<i64>,
+        allow_rejected: bool,
+    ) -> Result<(String, String), Box<dyn std::error::Error>> {
+        self.remember_impl_with_admission(entity, skip_dedup, valid_from, valid_to, allow_rejected, true)
+    }
+
+    fn remember_impl_with_admission(
+        &self,
+        entity: &Entity,
+        skip_dedup: bool,
+        valid_from: Option<i64>,
+        valid_to: Option<i64>,
+        allow_rejected: bool,
+        verified_admission: bool,
+    ) -> Result<(String, String), Box<dyn std::error::Error>> {
+        let enriched_entity = ensure_durable_write_provenance(entity, verified_admission);
+        let entity = &enriched_entity;
         // #849: scoped rejected-value tombstones are enforced on every
         // remember-path write (agent remember, capture, ingest, connectors,
         // derived writers) so a corrected/deleted value cannot be laundered
@@ -4152,6 +4228,7 @@ impl Database {
                     archived = ?8, archive_reason = ?9, links = ?10,
                     verified = ?11, source = ?12, last_accessed_unix_ms = ?13,
                     always_on = ?14, certainty = ?15, workspace_hash = ?16, agent_id = ?17, visibility = ?18,
+                    epistemic_state = ?22,
                     valid_from_unix_ms = COALESCE(?20, valid_from_unix_ms),
                     valid_to_unix_ms = COALESCE(?21, valid_to_unix_ms),
                     retrieval_count = retrieval_count + 1
@@ -4182,6 +4259,18 @@ impl Database {
                     // change the stamp UPDATE below re-sets them unconditionally.
                     valid_from,
                     valid_to,
+                    // Epistemic trust axis (#880): a re-assert carries the
+                    // normalized trust state (candidate unless verified
+                    // admission proved it). ensure_durable_write_provenance
+                    // already canonicalized; guard against a caller that
+                    // bypassed it.
+                    if crate::models::EPISTEMIC_STATES
+                        .contains(&entity.epistemic_state.as_str())
+                    {
+                        entity.epistemic_state.clone()
+                    } else {
+                        crate::models::default_epistemic_state()
+                    },
                 ],
             )?;
 
@@ -4324,11 +4413,11 @@ impl Database {
                   archived, archive_reason, links, verified, source,
                   always_on, certainty, created_at_unix_ms, last_accessed_unix_ms,
                   workspace_hash, agent_id, visibility, recorded_at_unix_ms,
-                  valid_from_unix_ms, valid_to_unix_ms)
+                  valid_from_unix_ms, valid_to_unix_ms, epistemic_state)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7,
                          ?8, ?9, ?10, ?11,
                          ?12, ?13, ?14, ?15, ?16,
-                         ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)",
+                         ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)",
                 params![
                     id,
                     entity.category,
@@ -4359,6 +4448,15 @@ impl Database {
                     // "true in the world from when we recorded it, still true".
                     valid_from.unwrap_or(entity.created_at_unix_ms),
                     valid_to,
+                    // Epistemic trust axis (#880). Always a canonical value:
+                    // ensure_durable_write_provenance normalized it upstream.
+                    if crate::models::EPISTEMIC_STATES
+                        .contains(&entity.epistemic_state.as_str())
+                    {
+                        entity.epistemic_state.clone()
+                    } else {
+                        crate::models::default_epistemic_state()
+                    },
                 ],
             )?;
 
@@ -4466,6 +4564,11 @@ impl Database {
         }
         if let Some(ref aid) = params.agent_id {
             entities.retain(|e| e.agent_id == *aid);
+        }
+        if let Some(ref es) = params.epistemic_state {
+            if !es.is_empty() {
+                entities.retain(|e| e.epistemic_state == *es);
+            }
         }
     }
 
@@ -5179,6 +5282,16 @@ impl Database {
             param_values.push(Box::new(aid.clone()));
         }
 
+        // Filter by epistemic trust axis (#880). When set, only entities in
+        // the requested trust state are visible. Column exists on every
+        // v27+ store; migrated stores default legacy rows to 'candidate'.
+        if let Some(ref es) = params.epistemic_state {
+            if !es.is_empty() {
+                conditions.push(format!("epistemic_state = ?{}", param_values.len() + 1));
+                param_values.push(Box::new(es.clone()));
+            }
+        }
+
         // Filter by biomimetic memory layer (#269/#272): core/buffer/working.
         // Aliases (world/episodic/semantic) are normalized to canonical layers
         // by the tools layer before reaching here.
@@ -5201,7 +5314,8 @@ impl Database {
                     archived, archive_reason, links, verified, source,
                     created_at_unix_ms, last_accessed_unix_ms, NULL as embedding,
                     always_on, certainty, workspace_hash, agent_id, visibility,
-                    follow_count, miss_count, follow_rate, efficacy_status
+                    follow_count, miss_count, follow_rate, efficacy_status,
+                    epistemic_state
              FROM entities",
         );
 
@@ -5547,14 +5661,17 @@ impl Database {
         let limit_idx = param_values.len() + 1;
         param_values.push(Box::new(safe_limit as i64));
 
-        // bm25(entities_fts) is the trailing column (index 24); the leading 24
-        // columns match `entity_from_row`'s expected layout exactly.
+        // bm25(entities_fts) is the trailing column (index 29); the leading 29
+        // columns match `entity_from_row`'s expected layout exactly
+        // (epistemic_state at 28, #880).
         let sql = format!(
             "SELECT e.id, e.category, e.key, e.body_json, e.status, e.type, e.tags,
                     e.decay_score, e.retrieval_count, e.layer, e.topic_path,
                     e.archived, e.archive_reason, e.links, e.verified, e.source,
                     e.created_at_unix_ms, e.last_accessed_unix_ms, NULL as embedding,
                     e.always_on, e.certainty, e.workspace_hash, e.agent_id, e.visibility,
+                    e.follow_count, e.miss_count, e.follow_rate, e.efficacy_status,
+                    e.epistemic_state,
                     bm25(entities_fts) AS rank
              FROM entities_fts
              JOIN entities e ON e.rowid = entities_fts.rowid
@@ -5570,7 +5687,7 @@ impl Database {
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(param_refs.as_slice(), |row| {
             let entity = entity_from_row(row, enc)?;
-            let bm25: f64 = row.get(24)?;
+            let bm25: f64 = row.get(29)?;
             // Flip sign so higher = more relevant (BM25 is more-negative-is-better).
             Ok((entity, -bm25))
         })?;
@@ -5661,14 +5778,17 @@ impl Database {
             for (rowid, _) in chunk {
                 param_values.push(Box::new(*rowid));
             }
-            // e.rowid is the trailing column (index 24); the leading 24
-            // columns match `entity_from_row`'s expected layout exactly.
+            // e.rowid is the trailing column (index 29); the leading 29
+            // columns match `entity_from_row`'s expected layout exactly
+            // (epistemic_state at 28, #880).
             let sql = format!(
                 "SELECT e.id, e.category, e.key, e.body_json, e.status, e.type, e.tags,
                         e.decay_score, e.retrieval_count, e.layer, e.topic_path,
                         e.archived, e.archive_reason, e.links, e.verified, e.source,
                         e.created_at_unix_ms, e.last_accessed_unix_ms, NULL as embedding,
                         e.always_on, e.certainty, e.workspace_hash, e.agent_id, e.visibility,
+                        e.follow_count, e.miss_count, e.follow_rate, e.efficacy_status,
+                        e.epistemic_state,
                         e.rowid
                  FROM entities e
                  WHERE {conditions} AND e.rowid IN ({placeholders})",
@@ -5679,7 +5799,7 @@ impl Database {
                 param_values.iter().map(|p| p.as_ref()).collect();
             let rows = stmt.query_map(param_refs.as_slice(), |row| {
                 let entity = entity_from_row(row, enc)?;
-                let rowid: i64 = row.get(24)?;
+                let rowid: i64 = row.get(29)?;
                 Ok((rowid, entity))
             })?;
             let mut by_rowid: std::collections::HashMap<i64, Entity> =
@@ -5853,7 +5973,8 @@ impl Database {
                     archived, archive_reason, links, verified, source,
                     created_at_unix_ms, last_accessed_unix_ms, NULL as embedding,
                     always_on, certainty, workspace_hash, agent_id, visibility,
-                    follow_count, miss_count, follow_rate, efficacy_status
+                    follow_count, miss_count, follow_rate, efficacy_status,
+                    epistemic_state
              FROM entities WHERE category = ?1 AND key = ?2
              ORDER BY workspace_hash ASC, id ASC LIMIT 1",
         )?;
@@ -6060,7 +6181,7 @@ impl Database {
             String::new()
         };
 
-        // Audit chain: commit to the full payload, then MAC the link over
+        // Audit chain: commit to the journal payload, then MAC the link over
         // (prev, id, created_at, workspace, commitment). Keyed (HMAC) when
         // encryption is enabled, else unkeyed SHA-256. See
         // docs/audit-chain-keyed-mac-design.md.
@@ -6452,6 +6573,9 @@ impl Database {
             |r| r.get(0),
         )?;
         // Column order matches entity_from_row (incl. NULL embedding at index 18).
+        // entity_history snapshots predate the follow/efficacy/epistemic columns
+        // and do not carry them; entity_from_row reads those slots as
+        // out-of-range and hydrates defaults, which is correct for history rows.
         let mut stmt = conn.prepare(
             "SELECT id, category, key, body_json, status, type, tags, decay_score,
                     retrieval_count, layer, topic_path, archived, archive_reason, links,
@@ -6497,7 +6621,8 @@ impl Database {
              retrieval_count, layer, topic_path, archived, archive_reason, links, verified, \
              source, created_at_unix_ms, last_accessed_unix_ms, NULL as embedding, always_on, \
              certainty, workspace_hash, agent_id, visibility, \
-             0 as follow_count, 0 as miss_count, 0.0 as follow_rate, 'unverified' as efficacy_status";
+             0 as follow_count, 0 as miss_count, 0.0 as follow_rate, 'unverified' as efficacy_status, \
+             'candidate' as epistemic_state";
 
         // A superseded version answers iff it was live across T:
         // recorded_at <= T < invalidated_at. (recorded_at may be NULL on a row
@@ -6556,6 +6681,7 @@ impl Database {
              source, created_at_unix_ms, last_accessed_unix_ms, NULL as embedding, always_on, \
              certainty, workspace_hash, agent_id, visibility, \
              0 as follow_count, 0 as miss_count, 0.0 as follow_rate, 'unverified' as efficacy_status, \
+             'candidate' as epistemic_state, \
              valid_from_unix_ms, valid_to_unix_ms, \
              COALESCE(recorded_at_unix_ms, created_at_unix_ms) as rec, \
              invalidated_at_unix_ms";
@@ -6572,10 +6698,12 @@ impl Database {
             let entity = entity_from_row(r, enc)?;
             Ok(TemporalVersion {
                 entity,
-                valid_from_unix_ms: r.get::<_, Option<i64>>(28)?,
-                valid_to_unix_ms: r.get::<_, Option<i64>>(29)?,
-                recorded_at_unix_ms: r.get::<_, i64>(30)?,
-                invalidated_at_unix_ms: r.get::<_, Option<i64>>(31)?,
+                // Index 28 is the epistemic_state trust axis (#880); the
+                // temporal columns sit AFTER it (29-32).
+                valid_from_unix_ms: r.get::<_, Option<i64>>(29)?,
+                valid_to_unix_ms: r.get::<_, Option<i64>>(30)?,
+                recorded_at_unix_ms: r.get::<_, i64>(31)?,
+                invalidated_at_unix_ms: r.get::<_, Option<i64>>(32)?,
             })
         })?;
         let mut out = Vec::new();
@@ -7305,6 +7433,9 @@ impl Database {
         if !matches!(outcome,"executed"|"failed"|"cancelled"|"denied") { return Err("action outcome must be executed, failed, cancelled, or denied".into()); }
         if outcome_hash.len()!=64 || !outcome_hash.bytes().all(|b|b.is_ascii_hexdigit()) { return Err("outcome_hash must be a SHA-256 hex digest".into()); }
         let mut action=self.action_receipt_get(action_id)?.ok_or("authorized action not found")?;
+        if actor != action.agent_id {
+            return Err("action completion actor does not match the authorized action owner".into());
+        }
         // #836 null-effect-on-deny: a denied approval may only complete as
         // `denied`; an executed/failed/cancelled completion is impossible.
         if action.approval_required {
@@ -8084,7 +8215,8 @@ impl Database {
                     archived, archive_reason, links, verified, source,
                     created_at_unix_ms, last_accessed_unix_ms, NULL as embedding,
                     always_on, certainty, workspace_hash, agent_id, visibility,
-                    follow_count, miss_count, follow_rate, efficacy_status
+                    follow_count, miss_count, follow_rate, efficacy_status,
+                    epistemic_state
              FROM entities WHERE id = ?1",
         )?;
         let mut rows = stmt.query_map(params![id], |row| {
@@ -8493,7 +8625,8 @@ impl Database {
                     archived, archive_reason, links, verified, source,
                     created_at_unix_ms, last_accessed_unix_ms, NULL as embedding,
                     always_on, certainty, workspace_hash, agent_id, visibility,
-                    follow_count, miss_count, follow_rate, efficacy_status
+                    follow_count, miss_count, follow_rate, efficacy_status,
+                    epistemic_state
              FROM entities WHERE archived = 0",
         );
         let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
@@ -8608,7 +8741,8 @@ impl Database {
                     archived, archive_reason, links, verified, source,
                     created_at_unix_ms, last_accessed_unix_ms, NULL as embedding,
                     always_on, certainty, workspace_hash, agent_id, visibility,
-                    follow_count, miss_count, follow_rate, efficacy_status
+                    follow_count, miss_count, follow_rate, efficacy_status,
+                    epistemic_state
              FROM entities WHERE 1=1",
         );
         let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
@@ -9310,6 +9444,7 @@ impl Database {
                     miss_count: 0,
                     follow_rate: 0.0,
                     efficacy_status: "unverified".to_string(),
+                    epistemic_state: crate::models::default_epistemic_state(),
                     embedding: None,
                     _parsed_body: None,
                     created_at_unix_ms: now,
@@ -9669,6 +9804,7 @@ impl Database {
                             miss_count: 0,
                             follow_rate: 0.0,
                             efficacy_status: "unverified".to_string(),
+                            epistemic_state: crate::models::default_epistemic_state(),
                             embedding: None,
                             _parsed_body: None,
                             created_at_unix_ms: now,
@@ -10931,6 +11067,7 @@ last_accessed: {}
                 miss_count: 0,
                 follow_rate: 0.0,
                 efficacy_status: "unverified".to_string(),
+                epistemic_state: crate::models::default_epistemic_state(),
                 embedding: None,
                 _parsed_body: None,
             };
@@ -11334,7 +11471,8 @@ last_accessed: {}
                     archived, archive_reason, links, verified, source,
                     created_at_unix_ms, last_accessed_unix_ms, NULL as embedding,
                     always_on, certainty, workspace_hash, agent_id, visibility,
-                    follow_count, miss_count, follow_rate, efficacy_status
+                    follow_count, miss_count, follow_rate, efficacy_status,
+                    epistemic_state
              FROM entities
              WHERE archived = 0
                AND rowid IN (SELECT rowid FROM entities_fts WHERE entities_fts MATCH ?1)
@@ -11724,6 +11862,7 @@ last_accessed: {}
                 miss_count: 0,
                 follow_rate: 0.0,
                 efficacy_status: "unverified".to_string(),
+                epistemic_state: crate::models::default_epistemic_state(),
                 embedding: None,
                 _parsed_body: None,
                 created_at_unix_ms: now,
@@ -12020,13 +12159,14 @@ last_accessed: {}
         let category = if params.category.is_empty() { "correction".to_string() } else { params.category.clone() };
         let key = format!("correction-{}", &id[4..16]);
         
+        let lesson = format!("When {}: do NOT {}. Instead: {}",
+            params.task_context, params.wrong_approach, params.user_correction);
         let body = serde_json::json!({
-            "wrong_approach": params.wrong_approach,
-            "user_correction": params.user_correction,
-            "task_context": params.task_context,
+            "wrong_approach_sha256": crate::trust_admission::digest_text(&params.wrong_approach),
+            "user_correction_sha256": crate::trust_admission::digest_text(&params.user_correction),
+            "task_context_sha256": crate::trust_admission::digest_text(&params.task_context),
             "session_id": params.session_id,
-            "lesson": format!("When {}: do NOT {}. Instead: {}", 
-                params.task_context, params.wrong_approach, params.user_correction),
+            "lesson_sha256": crate::trust_admission::digest_text(&lesson),
         });
         
         let entity = crate::models::Entity {
@@ -12049,12 +12189,13 @@ last_accessed: {}
             always_on: false,
             certainty: 1.0,
             workspace_hash: params.workspace_hash.clone(),
-            agent_id: String::new(),
+            agent_id: params.agent_id.clone(),
             visibility: params.visibility.clone(),
             follow_count: 0,
             miss_count: 0,
             follow_rate: 0.0,
             efficacy_status: "unverified".to_string(),
+            epistemic_state: crate::models::default_epistemic_state(),
             embedding: None,
             _parsed_body: None,
             created_at_unix_ms: now,
@@ -12093,15 +12234,28 @@ last_accessed: {}
         let event = crate::models::JournalEvent {
             id: journal_id.clone(),
             event_type: "correction".to_string(),
-            evaluated_json: serde_json::to_string(&serde_json::json!({"wrong_approach": params.wrong_approach}))?,
-            acted_json: serde_json::to_string(&serde_json::json!({"user_correction": params.user_correction}))?,
-            forward_json: serde_json::to_string(&serde_json::json!({"lesson_learned": true, "task_context": params.task_context}))?,
+            evaluated_json: serde_json::json!({
+                "redacted": true,
+                "field": "wrong_approach",
+                "sha256": crate::trust_admission::digest_text(&params.wrong_approach),
+            }).to_string(),
+            acted_json: serde_json::json!({
+                "redacted": true,
+                "field": "user_correction",
+                "sha256": crate::trust_admission::digest_text(&params.user_correction),
+            }).to_string(),
+            forward_json: serde_json::json!({
+                "redacted": true,
+                "field": "task_context",
+                "sha256": crate::trust_admission::digest_text(&params.task_context),
+                "lesson_learned": true,
+            }).to_string(),
             category: category.clone(),
             key: key.clone(),
             entity_id: id.clone(),
-            agent_id: String::new(),
-            // Derived from the referenced entity by journal(); left empty here.
-            workspace_hash: String::new(),
+            agent_id: params.agent_id.clone(),
+            // Preserve the correction author's scope and actor attribution.
+            workspace_hash: params.workspace_hash.clone(),
             created_at_unix_ms: now,
         };
         self.journal(&event)?;
@@ -12239,6 +12393,7 @@ If no clear lessons found, return: {{"lessons": []}}"#,
                 miss_count: 0,
                 follow_rate: 0.0,
                 efficacy_status: "unverified".to_string(),
+                epistemic_state: "candidate".to_string(),
                 embedding: None,
                 _parsed_body: None,
                 created_at_unix_ms: now,
@@ -12317,6 +12472,7 @@ If no clear lessons found, return: {{"lessons": []}}"#,
             miss_count: 0,
             follow_rate: 0.0,
             efficacy_status: "unverified".to_string(),
+            epistemic_state: "candidate".to_string(),
             embedding: None, _parsed_body: None, created_at_unix_ms: now,
             last_accessed_unix_ms: now,
         };
@@ -13657,7 +13813,8 @@ impl Database {
                         archived, archive_reason, links, verified, source,
                         created_at_unix_ms, last_accessed_unix_ms, NULL as embedding,
                         always_on, certainty, workspace_hash, agent_id, visibility,
-                        follow_count, miss_count, follow_rate, efficacy_status
+                        follow_count, miss_count, follow_rate, efficacy_status,
+                    epistemic_state
                  FROM entities WHERE archived = 0 AND id IN ({})",
                 placeholders
             );
@@ -13711,7 +13868,8 @@ impl Database {
                         archived, archive_reason, links, verified, source,
                         created_at_unix_ms, last_accessed_unix_ms, NULL as embedding,
                         always_on, certainty, workspace_hash, agent_id, visibility,
-                        follow_count, miss_count, follow_rate, efficacy_status
+                        follow_count, miss_count, follow_rate, efficacy_status,
+                    epistemic_state
                  FROM entities WHERE archived = 0 AND id IN ({})",
                 placeholders
             );
@@ -14080,6 +14238,10 @@ fn entity_from_row(
             .get::<_, Option<String>>(27)
             .unwrap_or(None)
             .unwrap_or_else(|| "unverified".to_string()),
+        epistemic_state: row
+            .get::<_, Option<String>>(28)
+            .unwrap_or(None)
+            .unwrap_or_else(crate::models::default_epistemic_state),
         embedding: None,
         _parsed_body: parsed_body,
     })
@@ -14211,9 +14373,181 @@ mod tests {
             miss_count: 0,
             follow_rate: 0.0,
             efficacy_status: "unverified".to_string(),
+            epistemic_state: crate::models::default_epistemic_state(),
             embedding: None,
             _parsed_body: None,
         }
+    }
+
+    #[test]
+    fn direct_remember_adds_hash_only_reviewable_provenance() {
+        let (db, path) = temp_db();
+        let mut entity = make_entity(
+            "direct-provenance",
+            "decision",
+            "direct-provenance",
+            r#"{\"content\":\"direct writer body\"}"#,
+        );
+        entity.source = "cli-write".to_string();
+        db.remember(&entity).expect("direct writer should persist");
+        let stored = db
+            .get_entity("decision", "direct-provenance")
+            .unwrap()
+            .expect("stored entity");
+        assert_eq!(stored.status, "proposed");
+        assert_eq!(stored.source, "cli-write");
+        assert!(stored.agent_id.is_empty());
+        assert!(stored.workspace_hash.is_empty());
+        assert_eq!(stored.body_json, r#"{\"content\":\"direct writer body\"}"#);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn unverified_write_cannot_claim_a_verified_trust_state() {
+        // #880: the trust axis is fail-closed on the write path — a caller
+        // that labels its own write 'verified' without authoritative
+        // admission must be stored as 'candidate'. Only the verified
+        // admission path (remember_verified_with_options) or an explicit
+        // operator/audit transition may set verified/corroborated.
+        let (db, path) = temp_db();
+        let mut entity = make_entity(
+            "forged-trust",
+            "decision",
+            "forged-trust",
+            r#"{\"content\":\"claim\"}"#,
+        );
+        // Non-test source so the real provenance gate runs (test-source
+        // writes bypass the boundary by design).
+        entity.source = "cli-write".to_string();
+        entity.epistemic_state = "verified".to_string();
+        db.remember(&entity).expect("write persists");
+        let stored = db
+            .get_entity("decision", "forged-trust")
+            .unwrap()
+            .expect("stored entity");
+        assert_eq!(stored.epistemic_state, "candidate");
+        assert_eq!(stored.status, "proposed");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn verified_admission_write_lands_verified_on_the_trust_axis() {
+        // #880: the same body admitted with a verified authoritative source
+        // event lands 'verified' (not candidate), and an explicit operator
+        // corroborated label is preserved.
+        let (db, path) = temp_db();
+        let mut entity = make_entity(
+            "admitted-trust",
+            "decision",
+            "admitted-trust",
+            r#"{\"content\":\"observed fact\"}"#,
+        );
+        entity.agent_id = "user-1".to_string();
+        entity.workspace_hash = "ws-trust".to_string();
+        let (_, _) = db
+            .remember_verified_with_options(&entity, true, None, None, false)
+            .expect("verified admission write");
+        let stored = db
+            .get_entity("decision", "admitted-trust")
+            .unwrap()
+            .expect("stored entity");
+        assert_eq!(stored.epistemic_state, "verified");
+
+        // Operator-labeled corroborated survives the verified path unchanged.
+        let mut corroborated = make_entity(
+            "corroborated-trust",
+            "decision",
+            "corroborated-trust",
+            r#"{\"content\":\"multi-source fact\"}"#,
+        );
+        corroborated.agent_id = "user-1".to_string();
+        corroborated.workspace_hash = "ws-trust".to_string();
+        corroborated.epistemic_state = "corroborated".to_string();
+        db.remember_verified_with_options(&corroborated, true, None, None, false)
+            .expect("verified admission write");
+        let stored2 = db
+            .get_entity("decision", "corroborated-trust")
+            .unwrap()
+            .expect("stored entity");
+        assert_eq!(stored2.epistemic_state, "corroborated");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn recall_filters_by_epistemic_state_on_all_paths() {
+        // #880: epistemic_state filter isolates trust tiers. Candidates are
+        // invisible to a verified-only query and vice versa, on the FTS and
+        // dense paths alike.
+        let (db, path) = temp_db();
+        let mut candidate = make_entity(
+            "cand-1",
+            "decision",
+            "cand-1",
+            r#"{\"content\":\"epistemic candidate claim\"}"#,
+        );
+        candidate.workspace_hash = "ws-epi".to_string();
+        db.remember(&candidate).expect("candidate write");
+
+        let mut verified = make_entity(
+            "ver-1",
+            "decision",
+            "ver-1",
+            r#"{\"content\":\"epistemic verified claim\"}"#,
+        );
+        verified.agent_id = "user-1".to_string();
+        verified.workspace_hash = "ws-epi".to_string();
+        db.remember_verified_with_options(&verified, true, None, None, false)
+            .expect("verified write");
+
+        let recall = |es: &str, mode: crate::models::SearchMode| {
+            db.recall(&RecallParams {
+                query: "epistemic".to_string(),
+                limit: 50,
+                skip_side_effects: true,
+                workspace_hash: Some("ws-epi".to_string()),
+                epistemic_state: Some(es.to_string()),
+                mode,
+                ..RecallParams::default()
+            })
+            .unwrap()
+            .into_iter()
+            .map(|e| e.key)
+            .collect::<Vec<_>>()
+        };
+
+        // FTS path.
+        let candidates = recall("candidate", crate::models::SearchMode::Fts5);
+        assert!(candidates.contains(&"cand-1".to_string()));
+        assert!(!candidates.contains(&"ver-1".to_string()));
+        let verified_only = recall("verified", crate::models::SearchMode::Fts5);
+        assert!(verified_only.contains(&"ver-1".to_string()));
+        assert!(!verified_only.contains(&"cand-1".to_string()));
+
+        // Dense path (only when an embedding backend is available; the
+        // filter itself is shared retain_metadata_filters code that the FTS
+        // arm already exercises, so lean/no-backend builds stay green).
+        if db.embedding_enabled() {
+            let dense_candidates = recall("candidate", crate::models::SearchMode::Dense);
+            assert!(dense_candidates.contains(&"cand-1".to_string()));
+            assert!(!dense_candidates.contains(&"ver-1".to_string()));
+        }
+
+        // No filter → both tiers visible (default behavior unchanged).
+        let both = db
+            .recall(&RecallParams {
+                query: "epistemic".to_string(),
+                limit: 50,
+                skip_side_effects: true,
+                workspace_hash: Some("ws-epi".to_string()),
+                ..RecallParams::default()
+            })
+            .unwrap()
+            .into_iter()
+            .map(|e| e.key)
+            .collect::<Vec<_>>();
+        assert!(both.contains(&"cand-1".to_string()));
+        assert!(both.contains(&"ver-1".to_string()));
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -14490,6 +14824,7 @@ mod tests {
                 visibility: visibility.to_string(), created_at_unix_ms: now,
                 last_accessed_unix_ms: now, follow_count: 0, miss_count: 0,
                 follow_rate: 0.0, efficacy_status: "unverified".to_string(),
+                epistemic_state: "candidate".to_string(),
                 embedding: None, _parsed_body: None,
             };
             db.remember_skip_dedup(&entity).unwrap();
@@ -23409,6 +23744,7 @@ mod tests {
                 workspace_hash: None,
                 scope_weight: None,
             agent_id: None,
+            epistemic_state: None,
             visibility: None,
             layer: None,
             reinforce: false,
@@ -23882,6 +24218,7 @@ mod tests {
                     workspace_hash: None,
                     scope_weight: None,
                     agent_id: None,
+                    epistemic_state: None,
                     visibility: None,
                     layer: None,
                     reinforce: false,
@@ -23947,6 +24284,7 @@ mod tests {
             workspace_hash: ws,
             scope_weight: None,
             agent_id: None,
+            epistemic_state: None,
             visibility: None,
             layer: None,
             reinforce: false,
@@ -23994,6 +24332,7 @@ mod tests {
             diversity_per_query_share: 0.0, recency_half_life_secs: None, workspace_hash: None,
             scope_weight: None,
             agent_id: None,
+            epistemic_state: None,
             visibility: None,
             layer: None,
             reinforce: false,
@@ -26402,6 +26741,47 @@ mod tests {
         cfg.embedding_model_name = Some("nomic-embed-text".to_string());
         let resolved = cfg.embedding_model_name.as_deref().unwrap_or(&cfg.model);
         assert_eq!(resolved, "nomic-embed-text");
+    }
+
+    #[test]
+    fn action_completion_rejects_a_forged_actor_before_mutation() {
+        let (db, path) = temp_db();
+        db.agent_upsert("action-owner", "Action owner", 2, "fleet").unwrap();
+        let manifest = crate::models::AuthorityManifestInput {
+            agent_id: "action-owner".to_string(),
+            workspace_hash: "ws-action".to_string(),
+            allowed_capabilities: vec!["memory.write".to_string()],
+            approval_required_capabilities: vec![],
+            scope_anchors: vec!["vault:ws-action".to_string()],
+            approver_principals: vec![],
+            allowed_inbound_principals: vec![],
+            permitted_external_ref_prefixes: vec!["vault:ws-action".to_string()],
+            max_parallel_actions: 1,
+            mode: "enforce".to_string(),
+            expires_at_unix_ms: None,
+            capability_constraints_json: "{}".to_string(),
+        };
+        db.authority_set(&manifest, "admin").unwrap();
+        let action = db
+            .action_intent(
+                "action-owner",
+                "ws-action",
+                "vault:ws-action",
+                "vault:ws-action/item-1",
+                "memory.write",
+                "write-1",
+                &"a".repeat(64),
+                Some("{}"),
+            )
+            .unwrap();
+        let err = db
+            .action_complete(&action.id, "forged-actor", "executed", &"b".repeat(64))
+            .expect_err("a caller cannot claim another actor's action");
+        assert!(err.to_string().contains("actor") || err.to_string().contains("owner"), "{err}");
+        let unchanged = db.action_receipt_get(&action.id).unwrap().unwrap();
+        assert_eq!(unchanged.status, "intent");
+        assert!(unchanged.outcome_hash.is_empty());
+        let _ = std::fs::remove_file(path);
     }
 }
 

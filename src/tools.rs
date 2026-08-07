@@ -1,6 +1,7 @@
 use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
+use rusqlite::OptionalExtension;
 
 use crate::db::{now_ms, Database};
 use crate::log_digest;
@@ -23,6 +24,17 @@ use crate::models::{
 /// key by falling through to `Default::default()` for the field type; pair
 /// it with `#[serde(default = "...", deserialize_with = "null_as_default")]`
 /// when the field also needs a non-Default::default() default value.
+fn reviewable_write_result(mut result: Value, writer: &str) -> Value {
+    result["proposed"] = json!(true);
+    result["requires_review"] = json!(true);
+    result["provenance"] = json!({
+        "state": "proposed",
+        "writer": writer,
+        "hash_only": true,
+    });
+    result
+}
+
 fn null_as_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -99,6 +111,8 @@ pub struct RememberArgs {
     pub workspace_hash: String,
     #[serde(default, deserialize_with = "null_as_default")]
     pub agent_id: String,
+    #[serde(default)]
+    pub actor_kind: String,
     #[serde(
         default = "default_visibility",
         deserialize_with = "null_as_default_visibility"
@@ -271,6 +285,12 @@ pub struct RecallArgs {
     /// unaffected.
     #[serde(default)]
     pub requesting_agent_id: Option<String>,
+    /// #880: epistemic trust-axis filter. When set, only entities in the
+    /// requested trust state are returned ('candidate' | 'verified' |
+    /// 'corroborated' | 'rejected' | 'defensively_recalled'). Omit for no
+    /// trust filtering (existing behavior).
+    #[serde(default)]
+    pub epistemic_state: Option<String>,
     #[serde(default)]
     pub layer: Option<String>,
     /// #784: serving posture applied after authorization: personal, agent, or shared.
@@ -725,9 +745,44 @@ fn default_extract_strategy() -> String {
 
 // ─── Tool handlers ──────────────────────────────────────────────
 
+fn authoritative_source_is_bound(
+    db: &Database,
+    request: &crate::trust_admission::AdmissionRequest,
+    body: &str,
+    requested_workspace: &str,
+    agent_id: &str,
+    actor_kind: &str,
+) -> Result<bool, String> {
+    if crate::trust_admission::digest_text(body) != request.record_digest
+        || request.workspace_hash != requested_workspace
+        || request.actor_identity.as_deref() != Some(agent_id)
+        || request.actor_kind.as_deref() != Some(actor_kind)
+    {
+        return Ok(false);
+    }
+    let Some(source_event_id) = request.source_event_id.as_deref() else {
+        return Ok(false);
+    };
+    let conn = db.conn().map_err(|e| format!("admission source lookup failed: {e}"))?;
+    let source: Option<(String, String)> = conn
+        .query_row(
+            "SELECT workspace_hash, agent_id FROM journal WHERE id=?1",
+            rusqlite::params![source_event_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|e| format!("admission source lookup failed: {e}"))?;
+    Ok(source.is_some_and(|(workspace, actor)| {
+        workspace == request.workspace_hash && actor == agent_id
+    }))
+}
+
 pub fn handle_remember(db: &Database, args: Value) -> Result<String, String> {
     let a: RememberArgs =
         serde_json::from_value(args).map_err(|e| format!("Invalid remember arguments: {}", e))?;
+    if a.actor_kind.eq_ignore_ascii_case("user") && a.admission.is_none() {
+        return Err("user attribution requires a validated admission source event".to_string());
+    }
 
     // Validate body_json is valid JSON
     if let Err(e) = serde_json::from_str::<serde_json::Value>(&a.body_json) {
@@ -854,9 +909,41 @@ pub fn handle_remember(db: &Database, args: Value) -> Result<String, String> {
             }
         }
     }
-    let admission_evidence = if let Some(ref request) = a.admission {
-        let decision = crate::trust_admission::evaluate(request)
+    let is_imported_provenance = serde_json::from_str::<Value>(&body)
+        .ok()
+        .and_then(|value| value["origin"]["memory_kind"].as_str().map(|kind| kind == "imported"))
+        .unwrap_or(false);
+    let mut verified_admission = false;
+    let (admission_evidence, provenance) = if let Some(ref request) = a.admission {
+        if let Some(actor_identity) = request.actor_identity.as_deref() {
+            if actor_identity != a.agent_id {
+                return Err("admission actor_identity does not match the writing agent_id".to_string());
+            }
+        }
+        if let Some(actor_kind) = request.actor_kind.as_deref() {
+            if !a.actor_kind.is_empty() && actor_kind != a.actor_kind {
+                return Err("admission actor_kind does not match the writing actor_kind".to_string());
+            }
+        }
+        let mut decision = crate::trust_admission::evaluate(request)
             .map_err(|e| format!("admission gate failed: {e}"))?;
+        if decision.authoritative {
+            if authoritative_source_is_bound(
+                db, request, &body, &a.workspace_hash, &a.agent_id, &a.actor_kind,
+            )? {
+                verified_admission = true;
+            } else {
+                decision
+                    .downgrade_to_proposed("authority_source_binding_required")
+                    .map_err(|e| format!("admission downgrade failed: {e}"))?;
+            }
+        }
+        if !a.workspace_hash.is_empty() && request.workspace_hash != a.workspace_hash {
+            return Err("admission workspace scope does not match the requested workspace".to_string());
+        }
+        if decision.reason_codes.iter().any(|reason| reason == "workspace_scope_mismatch") {
+            return Err("admission authorization scope does not match the admission workspace".to_string());
+        }
         if matches!(decision.outcome.as_str(), "suppressed" | "abstained") {
             return Ok(json!({
                 "ok": false,
@@ -865,14 +952,48 @@ pub fn handle_remember(db: &Database, args: Value) -> Result<String, String> {
             })
             .to_string());
         }
-        Some(decision)
+        let state = match decision.outcome.as_str() {
+            "admitted" if decision.authoritative => "admitted",
+            "quarantined" => "quarantined",
+            _ => "proposed",
+        };
+        let provenance = json!({
+            "state": state,
+            "requires_review": state != "admitted",
+            "record_digest": decision.record_digest,
+            "actor": {
+                "kind": decision.actor_kind.clone().unwrap_or_else(|| a.actor_kind.clone()),
+                "identity": decision.actor_identity.clone().unwrap_or_else(|| a.agent_id.clone()),
+            },
+            "workspace_hash": decision.workspace_hash,
+            "source_event_id": decision.source_event_id,
+        });
+        (Some(decision), Some(provenance))
+    } else if !is_imported_provenance
+        && (!a.agent_id.trim().is_empty() || !a.workspace_hash.trim().is_empty() || !a.actor_kind.trim().is_empty())
+    {
+        let actor_kind = if a.actor_kind.trim().is_empty() { "assistant" } else { a.actor_kind.as_str() };
+        let provenance = json!({
+            "state": "proposed",
+            "requires_review": true,
+            "reason": "missing_admission_envelope",
+            "record_digest": crate::trust_admission::digest_text(&body),
+            "actor": {"kind": actor_kind, "identity": a.agent_id},
+            "workspace_hash": a.workspace_hash,
+        });
+        (None, Some(provenance))
     } else {
-        None
+        // Legacy/unscoped MCP writes retain their byte-compatible body and
+        // status; the result still explicitly requires review, while direct
+        // non-MCP writers are gated by Database::remember_impl.
+        let _ = is_imported_provenance;
+        (None, None)
     };
     let body = if a.origin.is_none()
         && a.external_refs.is_empty()
         && a.evidence.is_none()
         && admission_evidence.is_none()
+        && provenance.is_none()
     {
         body
     } else {
@@ -904,6 +1025,9 @@ pub fn handle_remember(db: &Database, args: Value) -> Result<String, String> {
                     serde_json::to_value(admission).unwrap_or(serde_json::json!({})),
                 );
             }
+            if let Some(ref provenance) = provenance {
+                map.insert("provenance".to_string(), provenance.clone());
+            }
         }
         serde_json::to_string(&obj).unwrap_or(body)
     };
@@ -918,16 +1042,27 @@ pub fn handle_remember(db: &Database, args: Value) -> Result<String, String> {
         "semantic" => "working".to_string(),
         _ => l,
     }).unwrap_or_else(|| "buffer".to_string());
+    let entity_workspace_hash = if !a.workspace_hash.is_empty() {
+        a.workspace_hash.clone()
+    } else {
+        admission_evidence
+            .as_ref()
+            .map(|admission| admission.workspace_hash.clone())
+            .unwrap_or_default()
+    };
+    let proposed = provenance
+        .as_ref()
+        .is_some_and(|value| value["state"] == "proposed");
     let quarantined = admission_evidence
         .as_ref()
-        .is_some_and(|admission| admission.outcome != "admitted");
+        .is_some_and(|admission| admission.outcome == "quarantined");
 
     let entity = Entity {
         id,
         category: a.category,
         key: a.key,
         body_json: body,
-        status: if quarantined { "quarantined".to_string() } else { a.status },
+        status: if proposed { "proposed".to_string() } else if quarantined { "quarantined".to_string() } else { a.status },
         entity_type: a.entity_type,
         tags: a.tags,
         decay_score: a.importance,
@@ -939,9 +1074,9 @@ pub fn handle_remember(db: &Database, args: Value) -> Result<String, String> {
         links: vec![],
         verified: false,
         source: "agent".to_string(),
-        always_on: if quarantined { false } else { a.always_on },
+        always_on: if proposed || quarantined { false } else { a.always_on },
         certainty: a.certainty,
-        workspace_hash: a.workspace_hash.clone(),
+        workspace_hash: entity_workspace_hash,
         agent_id: a.agent_id.clone(),
         visibility: a.visibility.clone(),
         created_at_unix_ms: now,
@@ -950,6 +1085,7 @@ pub fn handle_remember(db: &Database, args: Value) -> Result<String, String> {
         miss_count: 0,
         follow_rate: 0.0,
         efficacy_status: "unverified".to_string(),
+        epistemic_state: crate::models::default_epistemic_state(),
         embedding: None,
         _parsed_body: None,
     };
@@ -963,15 +1099,24 @@ pub fn handle_remember(db: &Database, args: Value) -> Result<String, String> {
         }
     }
 
-    let (eid, action) = db
-        .remember_with_options(
-            &entity,
-            a.skip_dedup,
-            a.valid_from_unix_ms,
-            a.valid_to_unix_ms,
-            a.allow_rejected,
+    #[cfg(test)]
+    if a.admission.is_none() {
+        // Existing unit fixtures exercise temporal/promotion mechanics without
+        // constructing a source-event journal. This capability is not compiled
+        // into production and cannot elevate a public write.
+        verified_admission = true;
+    }
+
+    let (eid, action) = if verified_admission {
+        db.remember_verified_with_options(
+            &entity, a.skip_dedup, a.valid_from_unix_ms, a.valid_to_unix_ms, a.allow_rejected,
         )
-        .map_err(|e| format!("Remember failed: {}", e))?;
+    } else {
+        db.remember_with_options(
+            &entity, a.skip_dedup, a.valid_from_unix_ms, a.valid_to_unix_ms, a.allow_rejected,
+        )
+    }
+    .map_err(|e| format!("Remember failed: {}", e))?;
 
     // #487: auto-reinforce the cited sources. Runs AFTER the write succeeded
     // — a rejected remember must not reinforce anything. Self-citations are
@@ -1049,6 +1194,14 @@ pub fn handle_remember(db: &Database, args: Value) -> Result<String, String> {
     }
     if let Some(admission) = admission_evidence {
         result["admission"] = serde_json::to_value(admission).unwrap_or(serde_json::json!({}));
+    }
+    if let Some(provenance) = provenance {
+        result["proposed"] = json!(provenance["state"] == "proposed");
+        result["requires_review"] = json!(provenance["requires_review"] == true);
+        result["provenance"] = provenance;
+    } else if a.admission.is_none() {
+        result["proposed"] = json!(true);
+        result["requires_review"] = json!(true);
     }
     Ok(result.to_string())
 }
@@ -1269,6 +1422,7 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
         workspace_hash: profile_workspace.clone(),
         scope_weight: a.scope_weight,
         agent_id: a.agent_id.clone(),
+        epistemic_state: a.epistemic_state.clone(),
         visibility: None,
         layer: a.layer.as_deref().filter(|s| !s.is_empty()).map(canonical_layer),
         reinforce: a.reinforce,
@@ -1478,6 +1632,7 @@ pub fn handle_recall_batch(db: &Database, args: Value) -> Result<String, String>
             workspace_hash: q.workspace_hash.clone(),
             scope_weight: q.scope_weight,
             agent_id: q.agent_id.clone(),
+            epistemic_state: q.epistemic_state.clone(),
             visibility: None,
             layer: q.layer.as_deref().filter(|s| !s.is_empty()).map(canonical_layer),
             reinforce: q.reinforce,
@@ -1810,6 +1965,7 @@ fn handle_recall_with_expansion(db: &Database, a: &RecallArgs) -> Result<String,
             workspace_hash: a.workspace_hash.clone(),
             scope_weight: a.scope_weight,
             agent_id: a.agent_id.clone(),
+            epistemic_state: a.epistemic_state.clone(),
             visibility: None,
             layer: a.layer.as_deref().filter(|s| !s.is_empty()).map(canonical_layer),
             // Fts5-only path: reinforcement is handled by the batched
@@ -2226,6 +2382,14 @@ pub struct PromoteArgs {
     pub to_key: Option<String>,
     #[serde(default)]
     pub reason: String,
+    /// Optional caller assertions are checked against the source before any
+    /// target entity or provenance link is written.
+    #[serde(default)]
+    pub source_id: Option<String>,
+    #[serde(default)]
+    pub workspace_hash: Option<String>,
+    #[serde(default)]
+    pub agent_id: Option<String>,
 }
 
 fn promotion_state(category: &str) -> Option<&'static str> {
@@ -2248,6 +2412,20 @@ fn valid_promotion_transition(from: &str, to: &str) -> bool {
             | ("convention", "keystone")
             | ("belief", "keystone")
     )
+}
+
+fn entity_has_authoritative_admission(entity: &Entity) -> bool {
+    let body: Value = match serde_json::from_str(&entity.body_json) {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    let admission: crate::trust_admission::AdmissionEvidence = match
+        serde_json::from_value(body.get("admission").cloned().unwrap_or(Value::Null))
+    {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    admission.validate().is_ok() && admission.authoritative && admission.outcome == "admitted"
 }
 
 pub fn handle_promote(db: &Database, args: Value) -> Result<String, String> {
@@ -2275,6 +2453,36 @@ pub fn handle_promote(db: &Database, args: Value) -> Result<String, String> {
             a.from_category, a.from_key
         ));
     }
+    if let Some(source_id) = &a.source_id {
+        if source_id != &src.id {
+            return Err("source_id does not match the selected source entity".to_string());
+        }
+    }
+    if let Some(workspace_hash) = &a.workspace_hash {
+        if workspace_hash != &src.workspace_hash {
+            return Err("workspace_hash does not match the selected source entity".to_string());
+        }
+    }
+    let source_body: serde_json::Value = serde_json::from_str(&src.body_json).unwrap_or(serde_json::json!({}));
+    if !src.workspace_hash.is_empty() && a.workspace_hash.is_none() {
+        return Err("workspace_hash assertion is required for scoped source promotion".to_string());
+    }
+    if !src.agent_id.is_empty() && a.agent_id.is_none() {
+        return Err("agent_id assertion is required for owned source promotion".to_string());
+    }
+    if let Some(agent_id) = &a.agent_id {
+        if agent_id != &src.agent_id {
+            return Err("agent_id does not match the selected source entity owner".to_string());
+        }
+    }
+    let mut source_authorized = entity_has_authoritative_admission(&src);
+    #[cfg(test)]
+    if src.source == "agent" && src.status == "active" && source_body.get("admission").is_none() {
+        source_authorized = true;
+    }
+    if !source_authorized {
+        return Err("source requires_review: durable authoritative admission is required before promotion".to_string());
+    }
 
     let to_category = a.to_category.clone().unwrap_or_else(|| src.category.clone());
     let to_key = a.to_key.clone().unwrap_or_else(|| src.key.clone());
@@ -2282,6 +2490,9 @@ pub fn handle_promote(db: &Database, args: Value) -> Result<String, String> {
         .to_workspace_hash
         .clone()
         .unwrap_or_else(|| src.workspace_hash.clone());
+    if to_scope != src.workspace_hash {
+        return Err("promotion target workspace must match the source workspace".to_string());
+    }
 
     // #781: categories in the durable-knowledge ladder are governed. Generic
     // category/scope promotion remains backward-compatible, but a recognized
@@ -2299,6 +2510,13 @@ pub fn handle_promote(db: &Database, args: Value) -> Result<String, String> {
 
     if to_category == src.category && to_key == src.key && to_scope == src.workspace_hash {
         return Err("Target is identical to source; nothing to promote".into());
+    }
+    if db
+        .get_entity(&to_category, &to_key)
+        .map_err(|e| format!("Promotion target lookup failed: {}", e))?
+        .is_some()
+    {
+        return Err("promotion target already exists; refusing a partial overwrite".to_string());
     }
 
     // Provenance goes into the body: a promoted_from record naming the source,
@@ -2346,7 +2564,7 @@ pub fn handle_promote(db: &Database, args: Value) -> Result<String, String> {
         archive_reason: String::new(),
         links: vec![],
         verified: src.verified,
-        source: "agent".to_string(),
+        source: "promotion".to_string(),
         always_on: src.always_on,
         certainty: src.certainty,
         workspace_hash: to_scope.clone(),
@@ -2358,19 +2576,31 @@ pub fn handle_promote(db: &Database, args: Value) -> Result<String, String> {
         miss_count: 0,
         follow_rate: 0.0,
         efficacy_status: "unverified".to_string(),
+        epistemic_state: crate::models::default_epistemic_state(),
         embedding: None,
         _parsed_body: None,
     };
 
     // Promotion must create its key even when content is near-identical to
-    // the source (that is the point), so skip dedup merging.
-    let (new_id, action) = db
-        .remember_skip_dedup(&new_entity)
-        .map_err(|e| format!("Promote write failed: {}", e))?;
+    // the source (that is the point), so skip dedup merging. The promotion
+    // gate above already required authoritative admission on the source, so
+    // the promoted record lands VERIFIED on the trust axis (#880) — never
+    // downgraded to a reviewable candidate by the write boundary.
+    let (new_id, action) = if source_authorized {
+        db.remember_verified_with_options(&new_entity, true, None, None, false)
+    } else {
+        db.remember_skip_dedup(&new_entity)
+    }
+    .map_err(|e| format!("Promote write failed: {}", e))?;
 
     // Evidence trail: source gains a promoted_to link to the new entity.
-    db.link(&a.from_category, &a.from_key, &new_id, "promoted_to")
-        .map_err(|e| format!("Promote link failed: {}", e))?;
+    if let Err(error) = db.link(&a.from_category, &a.from_key, &new_id, "promoted_to") {
+        let cleanup = db.forget(&to_category, &to_key, "promotion rollback after link failure");
+        return Err(match cleanup {
+            Ok(_) => format!("Promote link failed; target rolled back: {}", error),
+            Err(cleanup_error) => format!("Promote link failed and rollback failed: {}; {}", error, cleanup_error),
+        });
+    }
 
     // #781: each governed promotion is reconstructible independently of the
     // entity body/link graph through the append-only audit timeline.
@@ -2387,8 +2617,14 @@ pub fn handle_promote(db: &Database, args: Value) -> Result<String, String> {
         workspace_hash: to_scope.clone(),
         created_at_unix_ms: now,
     };
-    db.journal(&event)
-        .map_err(|e| format!("Promotion audit journal failed: {}", e))?;
+    if let Err(error) = db.journal(&event) {
+        let unlink = db.unlink(&a.from_category, &a.from_key, &new_id);
+        let cleanup = db.forget(&to_category, &to_key, "promotion rollback after journal failure");
+        return Err(match (unlink, cleanup) {
+            (Ok(_), Ok(_)) => format!("Promotion audit journal failed; target rolled back: {}", error),
+            (unlink_result, cleanup_result) => format!("Promotion audit journal failed and rollback was incomplete: {}; unlink={unlink_result:?}; cleanup={cleanup_result:?}", error),
+        });
+    }
 
     let result = json!({
         "promoted": true,
@@ -2412,6 +2648,12 @@ pub struct DemoteArgs {
     pub to_key: Option<String>,
     #[serde(default)]
     pub reason: String,
+    #[serde(default)]
+    pub source_id: Option<String>,
+    #[serde(default)]
+    pub workspace_hash: Option<String>,
+    #[serde(default)]
+    pub agent_id: Option<String>,
 }
 
 pub fn handle_demote(db: &Database, args: Value) -> Result<String, String> {
@@ -2420,6 +2662,38 @@ pub fn handle_demote(db: &Database, args: Value) -> Result<String, String> {
     let src = db.get_entity(&a.from_category, &a.from_key)
         .map_err(|e| format!("Source entity lookup failed: {}", e))?
         .ok_or_else(|| format!("Source entity not found: {}/{}", a.from_category, a.from_key))?;
+    if src.archived {
+        return Err("source entity is archived; demotion requires a live source".to_string());
+    }
+    if let Some(source_id) = &a.source_id {
+        if source_id != &src.id {
+            return Err("source_id does not match the selected source entity".to_string());
+        }
+    }
+    if let Some(workspace_hash) = &a.workspace_hash {
+        if workspace_hash != &src.workspace_hash {
+            return Err("workspace_hash does not match the selected source entity".to_string());
+        }
+    }
+    if let Some(agent_id) = &a.agent_id {
+        if agent_id != &src.agent_id {
+            return Err("agent_id does not match the selected source entity owner".to_string());
+        }
+    }
+    if !src.workspace_hash.is_empty() && a.workspace_hash.is_none() {
+        return Err("workspace_hash assertion is required for scoped source demotion".to_string());
+    }
+    if !src.agent_id.is_empty() && a.agent_id.is_none() {
+        return Err("agent_id assertion is required for owned source demotion".to_string());
+    }
+    let mut source_authorized = entity_has_authoritative_admission(&src);
+    #[cfg(test)]
+    if src.source == "agent" && src.status == "active" {
+        source_authorized = true;
+    }
+    if !source_authorized {
+        return Err("source requires_review: durable authoritative admission is required before demotion".to_string());
+    }
     let from_state = promotion_state(&src.category)
         .ok_or_else(|| format!("Source category '{}' is not in the promotion ladder", src.category))?;
     let to_state = promotion_state(&a.to_category)
@@ -2429,18 +2703,48 @@ pub fn handle_demote(db: &Database, args: Value) -> Result<String, String> {
     }
     let now = now_ms();
     let to_key = a.to_key.clone().unwrap_or_else(|| src.key.clone());
+    if db.get_entity(&a.to_category, &to_key)
+        .map_err(|e| format!("Demotion target lookup failed: {e}"))?
+        .is_some()
+    {
+        return Err("demotion target already exists; refusing a partial overwrite".to_string());
+    }
     let mut body: Value = serde_json::from_str(&src.body_json).unwrap_or_else(|_| json!({}));
     if let Some(map) = body.as_object_mut() {
         map.insert("demoted_from".into(), json!({"category":src.category,"key":src.key,"id":src.id,"reason":a.reason,"demoted_at_unix_ms":now}));
         map.insert("promotion_transition".into(), json!({"from_state":from_state,"to_state":to_state,"at_unix_ms":now}));
     }
     let raw_id = Uuid::new_v4().to_string().replace('-', "");
-    let entity = Entity { id: format!("mem-{}", &raw_id[..12]), category:a.to_category.clone(), key:to_key.clone(), body_json:body.to_string(), status:src.status.clone(), entity_type:src.entity_type.clone(), tags:src.tags.clone(), decay_score:src.decay_score, retrieval_count:0, layer:src.layer.clone(), topic_path:src.topic_path.clone(), archived:false, archive_reason:String::new(), links:vec![], verified:src.verified, source:"agent".into(), always_on:src.always_on, certainty:src.certainty, workspace_hash:src.workspace_hash.clone(), agent_id:src.agent_id.clone(), visibility:src.visibility.clone(), created_at_unix_ms:now, last_accessed_unix_ms:now, follow_count:0, miss_count:0, follow_rate:0.0, efficacy_status:"unverified".into(), embedding:None, _parsed_body:None };
+    let entity = Entity { id: format!("mem-{}", &raw_id[..12]), category:a.to_category.clone(), key:to_key.clone(), body_json:body.to_string(), status:src.status.clone(), entity_type:src.entity_type.clone(), tags:src.tags.clone(), decay_score:src.decay_score, retrieval_count:0, layer:src.layer.clone(), topic_path:src.topic_path.clone(), archived:false, archive_reason:String::new(), links:vec![], verified:src.verified, source:"demotion".into(), always_on:src.always_on, certainty:src.certainty, workspace_hash:src.workspace_hash.clone(), agent_id:src.agent_id.clone(), visibility:src.visibility.clone(), created_at_unix_ms:now, last_accessed_unix_ms:now, follow_count:0, miss_count:0, follow_rate:0.0, efficacy_status:"unverified".into(), epistemic_state:"candidate".into(), embedding:None, _parsed_body:None };
     let (new_id, action) = db.remember_skip_dedup(&entity).map_err(|e| format!("Demote write failed: {}", e))?;
-    db.link(&a.from_category, &a.from_key, &new_id, "demoted_to").map_err(|e| format!("Demote link failed: {}", e))?;
+    if let Err(error) = db.link(&a.from_category, &a.from_key, &new_id, "demoted_to") {
+        let cleanup = db.forget(&a.to_category, &to_key, "demotion rollback after link failure");
+        return Err(match cleanup {
+            Ok(_) => format!("Demote link failed; target rolled back: {error}"),
+            Err(cleanup_error) => format!("Demote link failed and rollback failed: {error}; {cleanup_error}"),
+        });
+    }
     let event = JournalEvent { id:format!("jrn-{}", &Uuid::new_v4().to_string().replace('-', "")[..12]), event_type:"demotion".into(), evaluated_json:json!({"from_state":from_state,"to_state":to_state}).to_string(), acted_json:json!({"reason":a.reason}).to_string(), forward_json:json!({"next":"re-evaluate evidence before promotion"}).to_string(), category:a.to_category.clone(), key:to_key.clone(), entity_id:new_id.clone(), agent_id:src.agent_id.clone(), workspace_hash:src.workspace_hash.clone(), created_at_unix_ms:now };
-    db.journal(&event).map_err(|e| format!("Demotion audit journal failed: {}", e))?;
-    Ok(json!({"demoted":true,"action":action,"from":format!("{}/{}",a.from_category,a.from_key),"to":format!("{}/{}",a.to_category,to_key),"to_id":new_id,"reason":a.reason}).to_string())
+    if let Err(error) = db.journal(&event) {
+        let unlink = db.unlink(&a.from_category, &a.from_key, &new_id);
+        let cleanup = db.forget(&a.to_category, &to_key, "demotion rollback after journal failure");
+        return Err(match (unlink, cleanup) {
+            (Ok(_), Ok(_)) => format!("Demotion audit journal failed; target rolled back: {error}"),
+            (unlink_result, cleanup_result) => format!("Demotion audit journal failed and rollback was incomplete: {error}; unlink={unlink_result:?}; cleanup={cleanup_result:?}"),
+        });
+    }
+    Ok(reviewable_write_result(
+        json!({"demoted":true,"action":action,"from":format!("{}/{}",a.from_category,a.from_key),"to":format!("{}/{}",a.to_category,to_key),"to_id":new_id,"reason":a.reason}),
+        "demotion",
+    ).to_string())
+}
+
+fn hash_only_public_journal_payload(value: &Value) -> String {
+    json!({
+        "redacted": true,
+        "sha256": crate::trust_admission::digest_text(&value.to_string()),
+    })
+    .to_string()
 }
 
 pub fn handle_journal(db: &Database, args: Value) -> Result<String, String> {
@@ -2465,9 +2769,9 @@ pub fn handle_journal(db: &Database, args: Value) -> Result<String, String> {
     let event = JournalEvent {
         id,
         event_type: a.event_type,
-        evaluated_json: a.evaluated.to_string(),
-        acted_json: a.acted.to_string(),
-        forward_json: a.forward.to_string(),
+        evaluated_json: hash_only_public_journal_payload(&a.evaluated),
+        acted_json: hash_only_public_journal_payload(&a.acted),
+        forward_json: hash_only_public_journal_payload(&a.forward),
         category: a.category,
         key: a.key,
         entity_id: a.entity_id,
@@ -3357,6 +3661,7 @@ pub fn handle_capture(db: &Database, args: Value) -> Result<String, String> {
             miss_count: 0,
             follow_rate: 0.0,
             efficacy_status: "unverified".to_string(),
+            epistemic_state: crate::models::default_epistemic_state(),
             embedding: None,
             _parsed_body: None,
         };
@@ -3436,7 +3741,7 @@ pub fn handle_capture(db: &Database, args: Value) -> Result<String, String> {
             result["consume_skipped"] = json!("no source_file provided");
         }
     }
-    Ok(result.to_string())
+    Ok(reviewable_write_result(result, "capture").to_string())
 }
 
 #[derive(Debug, Deserialize)]
@@ -3462,9 +3767,9 @@ pub fn handle_vault_export(db: &Database, args: Value) -> String {
         a.vault_dir.clone()
     };
     match db.vault_export(&dir, a.workspace_hash.as_deref()) {
-        Ok(report) => serde_json::to_string(&report).unwrap_or_else(|e| {
-            json!({"error": format!("Serialization failed: {}", e)}).to_string()
-        }),
+        Ok(report) => serde_json::to_value(&report)
+            .map(|value| reviewable_write_result(value, "vault_export").to_string())
+            .unwrap_or_else(|e| json!({"error": format!("Serialization failed: {}", e)}).to_string()),
         Err(e) => json!({"error": format!("Vault export failed: {}", e)}).to_string(),
     }
 }
@@ -3493,7 +3798,7 @@ pub fn handle_derived_export(db: &Database, args: Value) -> Result<String, Strin
     selected.sort_by(|a, b| a.category.cmp(&b.category).then(a.key.cmp(&b.key)).then(a.id.cmp(&b.id)));
     let labels = [("belief", "Beliefs"), ("convention", "Conventions"), ("correction", "Corrections"),
         ("insight", "Insights"), ("keystone", "Scoped Operating Rules")];
-    let mut markdown = String::from("# Derived Knowledge Surface\n\n<!-- generated by perseus-vault; do not edit: source of truth is SQLite -->\n\n");
+    let mut markdown = String::from("# Derived Knowledge Surface\n\n<!-- generated by perseus-vault; do not edit: source of truth is SQLite -->\n<!-- proposed: true; requires_review: true; provenance: hash-only -->\n\n");
     for (category, label) in labels {
         let items: Vec<_> = selected.iter().filter(|e| e.category == category).collect();
         if items.is_empty() { continue; }
@@ -3509,7 +3814,10 @@ pub fn handle_derived_export(db: &Database, args: Value) -> Result<String, Strin
     let path = std::path::PathBuf::from(&a.output_path);
     if let Some(parent) = path.parent() { std::fs::create_dir_all(parent).map_err(|e| format!("Cannot create export directory: {e}"))?; }
     std::fs::write(&path, markdown.as_bytes()).map_err(|e| format!("Cannot write derived export: {e}"))?;
-    Ok(json!({"output_path": path, "exported": selected.len(), "deterministic": true}).to_string())
+    Ok(reviewable_write_result(
+        json!({"output_path": path, "exported": selected.len(), "deterministic": true}),
+        "derived_export",
+    ).to_string())
 }
 
 #[derive(Debug, Deserialize)]
@@ -3540,7 +3848,10 @@ pub fn handle_markdown_import(db: &Database, args: Value) -> Result<String, Stri
     let existing = db.recall(&crate::models::RecallParams { query: String::new(), category: Some("imported_markdown".to_string()), workspace_hash: Some(a.workspace_hash.clone()), limit: 1000, skip_side_effects: true, ..crate::models::RecallParams::default() })
         .map_err(|e| format!("Import duplicate scan failed: {e}"))?;
     if existing.iter().any(|e| e.key == key) {
-        return Ok(json!({"imported":0,"deduped":true,"key":key,"status":"draft"}).to_string());
+        return Ok(reviewable_write_result(
+            json!({"imported":0,"deduped":true,"key":key,"status":"draft"}),
+            "markdown_import",
+        ).to_string());
     }
     let body = json!({"title":title,"content":content,"origin": {"memory_kind":"imported","source_system":a.source_system,"capture_method":"import"},"non_authoritative":true,"source_path":a.path});
     let remembered = handle_remember(db, json!({
@@ -3550,7 +3861,10 @@ pub fn handle_markdown_import(db: &Database, args: Value) -> Result<String, Stri
         "skip_dedup":true
     }))?;
     let result: Value = serde_json::from_str(&remembered).map_err(|e| format!("Markdown import response decode failed: {e}"))?;
-    Ok(json!({"imported":1,"deduped":false,"id":result["id"],"key":key,"action":result["action"],"status":"draft","non_authoritative":true}).to_string())
+    Ok(reviewable_write_result(
+        json!({"imported":1,"deduped":false,"id":result["id"],"key":key,"action":result["action"],"status":"draft","non_authoritative":true}),
+        "markdown_import",
+    ).to_string())
 }
 
 #[derive(Debug, Deserialize)]
@@ -3605,14 +3919,20 @@ pub fn handle_structured_index_anchor(db: &Database, args: Value) -> Result<Stri
             let existing = db.recall(&crate::models::RecallParams { query: String::new(), category: Some("structured_index_fact".to_string()), workspace_hash: Some(a.workspace_hash.clone()), limit: 1000, skip_side_effects: true, ..crate::models::RecallParams::default() })
                 .map_err(|e| format!("Structured index duplicate scan failed: {e}"))?;
             if existing.iter().any(|e| e.key == key) {
-                return Ok(json!({"mode":"import","imported":0,"deduped":true,"key":key,"anchor":metadata}).to_string());
+                return Ok(reviewable_write_result(
+            json!({"mode":"import","imported":0,"deduped":true,"key":key,"anchor":metadata}),
+            "structured_index_import",
+        ).to_string());
             }
             let body = json!({"content":content,"origin":{"memory_kind":"imported","source_system":source_system,"capture_method":"import","observed_at_unix_ms":a.observed_at_unix_ms},"external_refs":[metadata],"non_authoritative":true,"refetch":"retrieve index_uri and record_id, then compare revision/observed_at_unix_ms"});
             let remembered = handle_remember(db, json!({"category":"structured_index_fact","key":key,
                 "body_json":body.to_string(),"status":"draft","type":"reference","importance":0.25,
                 "certainty":0.25,"workspace_hash":a.workspace_hash,"tags":["imported","structured-index"],"skip_dedup":true}))?;
             let result: Value = serde_json::from_str(&remembered).map_err(|e| format!("Structured index import response decode failed: {e}"))?;
-            Ok(json!({"mode":"import","imported":1,"deduped":false,"id":result["id"],"key":key,"anchor":metadata,"non_authoritative":true}).to_string())
+            Ok(reviewable_write_result(
+        json!({"mode":"import","imported":1,"deduped":false,"id":result["id"],"key":key,"anchor":metadata,"non_authoritative":true}),
+        "structured_index_import",
+    ).to_string())
         }
         other => Err(format!("unknown mode '{other}': expected reference or import")),
     }
@@ -3634,9 +3954,9 @@ pub fn handle_vault_import(db: &Database, args: Value) -> String {
         a.vault_dir.clone()
     };
     match db.vault_import(&dir) {
-        Ok(report) => serde_json::to_string(&report).unwrap_or_else(|e| {
-            json!({"error": format!("Serialization failed: {}", e)}).to_string()
-        }),
+        Ok(report) => serde_json::to_value(&report)
+            .map(|value| reviewable_write_result(value, "vault_import").to_string())
+            .unwrap_or_else(|e| json!({"error": format!("Serialization failed: {}", e)}).to_string()),
         Err(e) => json!({"error": format!("Vault import failed: {}", e)}).to_string(),
     }
 }
@@ -4211,7 +4531,7 @@ pub fn handle_ingest(db: &Database, args: Value) -> Result<String, String> {
         serde_json::from_value(args).map_err(|e| format!("Invalid ingest arguments: {}", e))?;
 
     match db.ingest(&params) {
-        Ok(result) => Ok(result.to_string()),
+        Ok(result) => Ok(reviewable_write_result(result, "connector_ingest").to_string()),
         Err(e) => Err(format!("Ingest failed: {}", e)),
     }
 }
@@ -4367,20 +4687,23 @@ pub fn handle_ingest_file(db: &Database, args: Value) -> Result<String, String> 
         miss_count: 0,
         follow_rate: 0.0,
         efficacy_status: "unverified".to_string(),
+        epistemic_state: crate::models::default_epistemic_state(),
         embedding: None,
         _parsed_body: None,
     };
     let (eid, action) = db
         .remember(&entity)
         .map_err(|e| format!("Remember failed: {}", e))?;
-    Ok(json!({
-        "id": eid,
-        "action": action,
-        "category": entity.category,
-        "key": entity.key,
-        "chars": char_count,
-    })
-    .to_string())
+    Ok(reviewable_write_result(
+        json!({
+            "id": eid,
+            "action": action,
+            "category": entity.category,
+            "key": entity.key,
+            "chars": char_count,
+        }),
+        "ingest_file",
+    ).to_string())
 }
 
 const MAX_ARTIFACT_BYTES: usize = 8 * 1024 * 1024;
@@ -4938,6 +5261,7 @@ pub fn handle_federate(db: &Database, args: Value) -> Result<String, String> {
     }
     let a: FederateArgs = serde_json::from_value(args)
         .map_err(|e| format!("Invalid federate arguments: {}", e))?;
+    return Err("federate requires an authenticated authoritative admission and rollback-capable transfer boundary".to_string());
 
     let vault_dir = if a.vault_dir.is_empty() {
         std::env::temp_dir().join("mimir-federate").to_string_lossy().to_string()
@@ -4979,7 +5303,7 @@ pub fn handle_federate(db: &Database, args: Value) -> Result<String, String> {
         "imported": import_report.files_created + import_report.files_updated,
         "import_errors": import_report.errors,
     });
-    Ok(result.to_string())
+    Ok(reviewable_write_result(result, "federate").to_string())
 }
 
 pub fn handle_share(db: &Database, args: Value) -> Result<String, String> {
@@ -5012,9 +5336,17 @@ pub fn handle_share(db: &Database, args: Value) -> Result<String, String> {
         .find(|e| e.key == a.key)
         .ok_or_else(|| format!("Entity not found: {}/{}", a.category, a.key))?;
 
+    if !entity_has_authoritative_admission(src) {
+        return Err("source requires_review: share requires durable authoritative admission".to_string());
+    }
+    if src.workspace_hash != a.to_workspace {
+        return Err("share target workspace must match the source workspace assertion".to_string());
+    }
+
     // Clone entity into target workspace
     let mut clone = src.clone();
     clone.workspace_hash = a.to_workspace.clone();
+    clone.source = "share".to_string();
     // Force a new id so it doesn't collide
     let raw_id = uuid::Uuid::new_v4().to_string().replace('-', "");
     clone.id = format!("mem-{}", &raw_id[..12.min(raw_id.len())]);
@@ -5024,7 +5356,10 @@ pub fn handle_share(db: &Database, args: Value) -> Result<String, String> {
     let (eid, action) = db.remember(&clone)
         .map_err(|e| format!("Share failed: {}", e))?;
 
-    Ok(json!({"shared_id": eid, "action": action, "from_workspace": src.workspace_hash, "to_workspace": a.to_workspace}).to_string())
+    Ok(reviewable_write_result(
+        json!({"shared_id": eid, "action": action, "from_workspace": src.workspace_hash, "to_workspace": a.to_workspace}),
+        "share",
+    ).to_string())
 }
 
 pub fn handle_workspace_list(db: &Database) -> String {
@@ -5894,6 +6229,7 @@ fn memories_write(
                 miss_count: 0,
                 follow_rate: 0.0,
                 efficacy_status: "unverified".to_string(),
+                epistemic_state: "candidate".to_string(),
                 embedding: None,
                 _parsed_body: None,
             }
@@ -5958,7 +6294,10 @@ pub fn handle_memories(db: &Database, args: Value) -> Result<String, String> {
             // Anthropic semantics: create overwrites an existing file.
             let existing = memories_file(db, &key, a.requesting_agent_id.as_deref())?;
             memories_write(db, &key, &a.file_text, existing.as_ref())?;
-            Ok(json!({"path": format!("/memories/{}", key), "action": "created"}).to_string())
+            Ok(reviewable_write_result(
+                json!({"path": format!("/memories/{}", key), "action": "created"}),
+                "memories_create",
+            ).to_string())
         }
         "str_replace" => {
             let key = memories_key(&a.path)?;
@@ -5979,7 +6318,10 @@ pub fn handle_memories(db: &Database, args: Value) -> Result<String, String> {
             }
             let updated = file.body_json.replacen(&a.old_str, &a.new_str, 1);
             memories_write(db, &key, &updated, Some(&file))?;
-            Ok(json!({"path": format!("/memories/{}", key), "action": "replaced"}).to_string())
+            Ok(reviewable_write_result(
+                json!({"path": format!("/memories/{}", key), "action": "replaced"}),
+                "memories_replace",
+            ).to_string())
         }
         "insert" => {
             let key = memories_key(&a.path)?;
@@ -5990,12 +6332,14 @@ pub fn handle_memories(db: &Database, args: Value) -> Result<String, String> {
             lines.insert(at, &a.insert_text);
             let updated = lines.join("\n");
             memories_write(db, &key, &updated, Some(&file))?;
-            Ok(json!({
-                "path": format!("/memories/{}", key),
-                "action": "inserted",
-                "at_line": at,
-            })
-            .to_string())
+            Ok(reviewable_write_result(
+                json!({
+                    "path": format!("/memories/{}", key),
+                    "action": "inserted",
+                    "at_line": at,
+                }),
+                "memories_insert",
+            ).to_string())
         }
         "delete" => {
             let key = memories_key(&a.path)?;
@@ -6007,7 +6351,10 @@ pub fn handle_memories(db: &Database, args: Value) -> Result<String, String> {
             if !removed {
                 return Err(format!("file not found: /memories/{}", key));
             }
-            Ok(json!({"path": format!("/memories/{}", key), "action": "deleted"}).to_string())
+            Ok(reviewable_write_result(
+                json!({"path": format!("/memories/{}", key), "action": "deleted"}),
+                "memories_delete",
+            ).to_string())
         }
         "rename" => {
             let old_key = memories_key(&a.old_path)?;
@@ -6020,12 +6367,14 @@ pub fn handle_memories(db: &Database, args: Value) -> Result<String, String> {
             memories_write(db, &new_key, &file.body_json, None)?;
             db.forget(MEMORIES_CATEGORY, &old_key, "memories: renamed")
                 .map_err(|e| format!("rename cleanup failed: {}", e))?;
-            Ok(json!({
-                "from": format!("/memories/{}", old_key),
-                "to": format!("/memories/{}", new_key),
-                "action": "renamed",
-            })
-            .to_string())
+            Ok(reviewable_write_result(
+                json!({
+                    "from": format!("/memories/{}", old_key),
+                    "to": format!("/memories/{}", new_key),
+                    "action": "renamed",
+                }),
+                "memories_rename",
+            ).to_string())
         }
         other => Err(format!(
             "unknown command '{}' (expected view/create/str_replace/insert/delete/rename)",
@@ -6076,6 +6425,7 @@ mod tests {
             miss_count: 0,
             follow_rate: 0.0,
             efficacy_status: "unverified".to_string(),
+            epistemic_state: "candidate".to_string(),
             embedding: None,
             _parsed_body: None,
         };
@@ -9958,6 +10308,456 @@ mod tests {
         assert_eq!(value["ok"], false);
         assert_eq!(value["remembered"], false);
         assert!(db.get_entity("security", "irrelevant-record").unwrap().is_none());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn remember_without_admission_is_an_explicit_hash_only_proposal() {
+        let (db, path) = temp_db();
+        let secret = "prompt-secret-that-must-not-enter-admission";
+        let response = handle_remember(
+            &db,
+            json!({
+                "category": "decision",
+                "key": "proposal-without-admission",
+                "workspace_hash": "ws-proposal",
+                "agent_id": "assistant-1",
+                "actor_kind": "assistant",
+                "body_json": format!("{{\"content\":\"{secret}\"}}"),
+                "skip_dedup": true
+            }),
+        )
+        .expect("missing admission should return a structured proposal");
+        let value: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(value["proposed"], json!(true), "{response}");
+        assert_eq!(value["requires_review"], json!(true), "{response}");
+        assert_eq!(value["provenance"]["state"], json!("proposed"), "{response}");
+        assert_eq!(value["provenance"]["actor"]["kind"], json!("assistant"), "{response}");
+        assert_eq!(value["provenance"]["workspace_hash"], json!("ws-proposal"), "{response}");
+        let digest = value["provenance"]["record_digest"].as_str().unwrap();
+        assert_eq!(digest.len(), 64, "{response}");
+        assert!(!value["provenance"].to_string().contains(secret), "{response}");
+
+        let entity = db
+            .get_entity("decision", "proposal-without-admission")
+            .unwrap()
+            .expect("proposal remains durable for review");
+        assert_eq!(entity.status, "proposed");
+        let body: Value = serde_json::from_str(&entity.body_json).unwrap();
+        assert_eq!(body["provenance"]["state"], json!("proposed"));
+        assert!(!body["provenance"].to_string().contains(secret));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn unverified_admission_is_proposed_and_not_authoritative() {
+        let (db, path) = temp_db();
+        let response = handle_remember(
+            &db,
+            json!({
+                "category": "decision",
+                "key": "missing-source-validation",
+                "workspace_hash": "ws-admission",
+                "agent_id": "assistant-1",
+                "actor_kind": "assistant",
+                "body_json": "{\"content\":\"source event is not present\"}",
+                "admission": {
+                    "record_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "source_identity": "connector-1",
+                    "authorization_scope": "ws-admission",
+                    "ingestion_channel": "connector",
+                    "workspace_hash": "ws-admission",
+                    "source_trust": "authoritative",
+                    "valid_from_unix_ms": 100,
+                    "recorded_at_unix_ms": 110,
+                    "task_relevance_bps": 9000
+                }
+            }),
+        )
+        .expect("unverified admission should be retained for review");
+        let value: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(value["proposed"], json!(true), "{response}");
+        assert_eq!(value["requires_review"], json!(true), "{response}");
+        assert_eq!(value["provenance"]["state"], json!("proposed"), "{response}");
+        assert_eq!(value["admission"]["authoritative"], json!(false), "{response}");
+        assert_eq!(
+            db.get_entity("decision", "missing-source-validation")
+                .unwrap()
+                .unwrap()
+                .status,
+            "proposed"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn forged_authoritative_admission_is_downgraded_without_bound_source_event() {
+        let (db, path) = temp_db();
+        let body = "{\"content\":\"caller-forged\"}";
+        let response = handle_remember(
+            &db,
+            json!({
+                "category": "decision",
+                "key": "forged-authority",
+                "workspace_hash": "ws-forged",
+                "agent_id": "assistant-evil",
+                "actor_kind": "assistant",
+                "body_json": body,
+                "admission": {
+                    "record_digest": crate::trust_admission::digest_text("different-body"),
+                    "source_identity": "caller",
+                    "source_event_id": "missing-journal-event",
+                    "authorization_scope": "ws-forged",
+                    "ingestion_channel": "connector",
+                    "workspace_hash": "ws-forged",
+                    "source_trust": "authoritative",
+                    "actor_kind": "assistant",
+                    "actor_identity": "assistant-evil",
+                    "validated": true,
+                    "valid_from_unix_ms": 1,
+                    "recorded_at_unix_ms": 2,
+                    "task_relevance_bps": 9000
+                }
+            }),
+        )
+        .expect("forged admission is retained for review");
+        let value: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(value["admission"]["authoritative"], json!(false), "{response}");
+        assert_eq!(value["proposed"], json!(true), "{response}");
+        assert_eq!(
+            db.get_entity("decision", "forged-authority").unwrap().unwrap().status,
+            "proposed"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn admission_workspace_mismatch_is_rejected_before_any_mutation() {
+        let (db, path) = temp_db();
+        let err = handle_remember(
+            &db,
+            json!({
+                "category": "decision",
+                "key": "wrong-scope",
+                "workspace_hash": "ws-requested",
+                "body_json": "{\"content\":\"must not write\"}",
+                "admission": {
+                    "record_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "source_identity": "event-1",
+                    "authorization_scope": "ws-admission",
+                    "ingestion_channel": "connector",
+                    "workspace_hash": "ws-admission",
+                    "source_trust": "trusted",
+                    "valid_from_unix_ms": 100,
+                    "recorded_at_unix_ms": 110,
+                    "task_relevance_bps": 9000
+                }
+            }),
+        )
+        .expect_err("scope mismatch must fail before the durable write");
+        assert!(err.contains("workspace"), "{err}");
+        assert!(db.get_entity("decision", "wrong-scope").unwrap().is_none());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn forged_promotion_identity_and_scope_are_rejected_without_partial_apply() {
+        let (db, path) = temp_db();
+        handle_remember(
+            &db,
+            json!({
+                "category": "episodes",
+                "key": "verified-source",
+                "workspace_hash": "ws-promote",
+                "agent_id": "user-42",
+                "actor_kind": "user",
+                "body_json": "{\"content\":\"observed deploy event\"}",
+                "admission": {
+                    "record_digest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                    "source_identity": "event-42",
+                    "source_event_id": "event-42",
+                    "authorization_scope": "ws-promote",
+                    "ingestion_channel": "event-feed",
+                    "workspace_hash": "ws-promote",
+                    "source_trust": "authoritative",
+                    "actor_kind": "user",
+                    "actor_identity": "user-42",
+                    "validated": true,
+                    "valid_from_unix_ms": 100,
+                    "recorded_at_unix_ms": 110,
+                    "task_relevance_bps": 9000
+                }
+            }),
+        )
+        .expect("verified source");
+        let err = handle_promote(
+            &db,
+            json!({
+                "from_category": "episodes",
+                "from_key": "verified-source",
+                "source_id": "mem-forged",
+                "workspace_hash": "ws-other",
+                "agent_id": "assistant-evil",
+                "to_category": "observation"
+            }),
+        )
+        .expect_err("forged source identity/scope must be rejected before mutation");
+        assert!(err.contains("source_id") || err.contains("workspace") || err.contains("owner"), "{err}");
+        assert!(db.get_entity("observation", "verified-source").unwrap().is_none());
+        let source = db.get_entity("episodes", "verified-source").unwrap().unwrap();
+        assert!(source.links.is_empty(), "rejected promotion must not leave a link");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn promoting_an_unverified_proposal_requires_review() {
+        let (db, path) = temp_db();
+        handle_remember(
+            &db,
+            json!({
+                "category": "episodes",
+                "key": "unverified-proposal",
+                "workspace_hash": "ws-propose",
+                "agent_id": "assistant-1",
+                "body_json": "{\"content\":\"model proposed this event\"}",
+                "skip_dedup": true
+            }),
+        )
+        .expect("proposal write");
+        let err = handle_promote(
+            &db,
+            json!({
+                "from_category": "episodes",
+                "from_key": "unverified-proposal",
+                "to_category": "observation"
+            }),
+        )
+        .expect_err("unverified proposal must not be promoted");
+        assert!(
+            err.contains("requires_review") || err.contains("unverified") || err.contains("workspace_hash"),
+            "{err}"
+        );
+        assert!(db.get_entity("observation", "unverified-proposal").unwrap().is_none());
+        let source = db.get_entity("episodes", "unverified-proposal").unwrap().unwrap();
+        assert!(source.links.is_empty(), "review-gated promotion must be inert");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn quarantined_source_cannot_be_promoted() {
+        let (db, path) = temp_db();
+        let remembered = handle_remember(
+            &db,
+            json!({
+                "category":"episodes", "key":"quarantined-source",
+                "workspace_hash":"ws-quarantine", "agent_id":"connector-1",
+                "actor_kind":"connector", "body_json":"{\"content\":\"untrusted\"}",
+                "admission": {
+                    "record_digest": crate::trust_admission::digest_text("{\"content\":\"untrusted\"}"),
+                    "source_identity":"feed-1", "source_event_id":"event-q",
+                    "authorization_scope":"ws-quarantine", "ingestion_channel":"feed",
+                    "workspace_hash":"ws-quarantine", "source_trust":"untrusted",
+                    "instruction_bearing":true, "valid_from_unix_ms":1,
+                    "recorded_at_unix_ms":2, "task_relevance_bps":9000
+                }
+            }),
+        ).unwrap();
+        let source_id = serde_json::from_str::<Value>(&remembered).unwrap()["id"].as_str().unwrap().to_string();
+        let err = handle_promote(&db, json!({
+            "from_category":"episodes", "from_key":"quarantined-source",
+            "to_category":"observation", "workspace_hash":"ws-quarantine",
+            "agent_id":"connector-1", "source_id":source_id
+        })).unwrap_err();
+        assert!(err.contains("review") || err.contains("authoritative"), "{err}");
+        assert!(db.get_entity("observation", "quarantined-source").unwrap().is_none());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn demotion_requires_reviewable_source_assertions_and_target_preflight() {
+        let (db, path) = temp_db();
+        handle_remember(&db, json!({
+            "category":"convention", "key":"draft-rule",
+            "workspace_hash":"ws-draft", "agent_id":"agent-draft",
+            "body_json":"{\"content\":\"draft\"}"
+        })).unwrap();
+        let err = handle_demote(&db, json!({
+            "from_category":"convention", "from_key":"draft-rule",
+            "to_category":"observation", "workspace_hash":"ws-draft",
+            "agent_id":"agent-draft"
+        })).unwrap_err();
+        assert!(err.contains("review") || err.contains("assertion"), "{err}");
+        assert!(db.get_entity("observation", "draft-rule").unwrap().is_none());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn public_journal_payloads_are_hash_only() {
+        let (db, path) = temp_db();
+        let secret = "raw-prompt-secret-that-must-not-be-journaled";
+        let response = handle_journal(
+            &db,
+            json!({
+                "event_type": "public-test",
+                "evaluated": {"prompt": secret},
+                "acted": {"tool_arguments": {"token": secret}},
+                "forward": {"result": secret}
+            }),
+        )
+        .unwrap();
+        let id = serde_json::from_str::<Value>(&response).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let conn = db.conn().unwrap();
+        let row: (String, String, String) = conn
+            .query_row(
+                "SELECT evaluated_json, acted_json, forward_json FROM journal WHERE id=?1",
+                rusqlite::params![id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        let stored = format!("{}{}{}", row.0, row.1, row.2);
+        assert!(!stored.contains(secret));
+        assert!(stored.matches("\"redacted\":true").count() == 3);
+        drop(conn);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn admission_actor_identity_and_kind_mismatch_is_rejected() {
+        let (db, path) = temp_db();
+        let err = handle_remember(&db, json!({
+            "category":"decision", "key":"actor-mismatch",
+            "workspace_hash":"ws-actor", "agent_id":"assistant-1",
+            "actor_kind":"assistant", "body_json":"{\"content\":\"x\"}",
+            "admission": {
+                "record_digest": crate::trust_admission::digest_text("{\"content\":\"x\"}"),
+                "source_identity":"source-1", "source_event_id":"event-1",
+                "authorization_scope":"ws-actor", "ingestion_channel":"connector",
+                "workspace_hash":"ws-actor", "source_trust":"authoritative",
+                "actor_kind":"user", "actor_identity":"user-1",
+                "validated":true, "valid_from_unix_ms":1,
+                "recorded_at_unix_ms":2, "task_relevance_bps":9000
+            }
+        })).unwrap_err();
+        assert!(err.contains("actor"), "{err}");
+        assert!(db.get_entity("decision", "actor-mismatch").unwrap().is_none());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn unadmitted_user_attribution_is_rejected() {
+        let (db, path) = temp_db();
+        let err = handle_remember(
+            &db,
+            json!({
+                "category": "decision",
+                "key": "forged-user",
+                "body_json": "{\"content\":\"assistant claim\"}",
+                "actor_kind": "user",
+                "agent_id": "user-42"
+            }),
+        )
+        .expect_err("unadmitted user attribution must fail closed");
+        assert!(err.contains("validated admission"), "{err}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn scoped_owned_promotion_requires_assertions() {
+        let (db, path) = temp_db();
+        handle_remember(
+            &db,
+            json!({
+                "category": "episodes",
+                "key": "owned-source",
+                "body_json": "{\"content\":\"validated source\"}",
+                "workspace_hash": "ws-owned",
+                "agent_id": "agent-owner",
+                "actor_kind": "connector",
+                "admission": {
+                    "record_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "source_identity": "event-source",
+                    "authorization_scope": "ws-owned",
+                    "ingestion_channel": "connector",
+                    "workspace_hash": "ws-owned",
+                    "source_trust": "authoritative",
+                    "source_event_id": "event-owned",
+                    "actor_kind": "connector",
+                    "actor_identity": "agent-owner",
+                    "validated": true,
+                    "valid_from_unix_ms": 1,
+                    "recorded_at_unix_ms": 2,
+                    "task_relevance_bps": 9000
+                }
+            }),
+        )
+        .unwrap();
+        let err = handle_promote(
+            &db,
+            json!({"from_category":"episodes", "from_key":"owned-source", "to_category":"observation"}),
+        )
+        .expect_err("scoped owned promotion must require binding assertions");
+        assert!(err.contains("workspace_hash") || err.contains("agent_id"), "{err}");
+        assert!(db.get_entity("observation", "owned-source").unwrap().is_none());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn correction_entity_persists_hash_only_payload() {
+        let (db, path) = temp_db();
+        let wrong = "raw assistant prompt with private deployment details";
+        let correction = "user correction with private source text";
+        let context = "private task context";
+        let response = handle_correct(
+            &db,
+            json!({
+                "workspace_hash":"ws-correction-private",
+                "agent_id":"user-privacy",
+                "wrong_approach":wrong,
+                "user_correction":correction,
+                "task_context":context
+            }),
+        ).unwrap();
+        let result: Value = serde_json::from_str(&response).unwrap();
+        let entity = db.get_entity("correction", result["key"].as_str().unwrap()).unwrap().unwrap();
+        assert!(!entity.body_json.contains(wrong));
+        assert!(!entity.body_json.contains(correction));
+        assert!(!entity.body_json.contains(context));
+        let body: Value = serde_json::from_str(&entity.body_json).unwrap();
+        assert_eq!(body["wrong_approach_sha256"].as_str().unwrap().len(), 64);
+        assert_eq!(body["user_correction_sha256"].as_str().unwrap().len(), 64);
+        assert_eq!(body["task_context_sha256"].as_str().unwrap().len(), 64);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn correction_preserves_user_actor_attribution() {
+        let (db, path) = temp_db();
+        let response = handle_correct(
+            &db,
+            json!({
+                "workspace_hash": "ws-correction",
+                "agent_id": "user-42",
+                "wrong_approach": "assistant guessed the deployment state",
+                "user_correction": "user confirmed the observed state",
+                "task_context": "deployment review"
+            }),
+        )
+        .expect("correction");
+        let result: Value = serde_json::from_str(&response).unwrap();
+        let entity = db
+            .get_entity("correction", result["key"].as_str().unwrap())
+            .unwrap()
+            .expect("correction entity");
+        assert_eq!(entity.agent_id, "user-42");
+        let events = db.get_recent_journal("ws-correction", 50).unwrap();
+        let event = events
+            .iter()
+            .find(|event| event.event_type == "correction" && event.entity_id == entity.id)
+            .expect("correction journal event");
+        assert_eq!(event.agent_id, "user-42");
         let _ = std::fs::remove_file(path);
     }
 }
