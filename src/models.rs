@@ -535,6 +535,10 @@ pub struct ContextBlock {
 
 /// Parameters for timeline queries over the journal.
 pub struct TimelineParams {
+    /// `None` is reserved for internal/admin callers. Public readers must
+    /// provide `Some(workspace_hash)`, with `Some("")` selecting only the
+    /// explicit global partition.
+    pub workspace_hash: Option<String>,
     pub from_ms: Option<i64>,
     pub to_ms: Option<i64>,
     pub event_type: Option<String>,
@@ -547,6 +551,7 @@ pub struct TimelineParams {
 impl Default for TimelineParams {
     fn default() -> Self {
         Self {
+            workspace_hash: None,
             from_ms: None,
             to_ms: None,
             event_type: None,

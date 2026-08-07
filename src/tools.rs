@@ -611,6 +611,9 @@ fn default_event_type() -> String {
 
 #[derive(Debug, Deserialize)]
 pub struct TimelineArgs {
+    /// Required workspace scope for public timeline reads. An empty value is
+    /// an explicit request for the global partition; omission is rejected.
+    pub workspace_hash: String,
     #[serde(default)]
     pub from_ms: Option<i64>,
     #[serde(default)]
@@ -2489,6 +2492,7 @@ pub fn handle_timeline(db: &Database, args: Value) -> Result<String, String> {
         serde_json::from_value(args).map_err(|e| format!("Invalid timeline arguments: {}", e))?;
 
     let params = TimelineParams {
+        workspace_hash: Some(a.workspace_hash),
         from_ms: a.from_ms,
         to_ms: a.to_ms,
         event_type: a.event_type,
@@ -2515,7 +2519,7 @@ pub fn handle_timeline(db: &Database, args: Value) -> Result<String, String> {
 pub struct CheckFailurePatternArgs {
     /// The command line or approach description the agent is about to (re)try.
     pub action: String,
-    #[serde(default, deserialize_with = "null_as_default")]
+    /// Required public scope. An empty string explicitly selects the global partition.
     pub workspace_hash: String,
     #[serde(
         default = "default_failure_pattern_limit",
@@ -2709,11 +2713,10 @@ pub fn handle_check_failure_pattern(db: &Database, args: Value) -> Result<String
         );
     }
     let limit = a.limit.clamp(1, 50);
-    let ws: Option<String> = if a.workspace_hash.is_empty() {
-        None
-    } else {
-        Some(a.workspace_hash.clone())
-    };
+    // Keep `Some("")` distinct from `None`: public callers must choose an
+    // explicit workspace or the explicit global partition; only internal/admin
+    // callers may pass `None` directly to the database helper.
+    let ws = Some(a.workspace_hash.clone());
 
     let action_lc = action.to_lowercase();
     let action_tris = crate::dedup::packed_trigrams(&action_lc);
@@ -2726,7 +2729,7 @@ pub fn handle_check_failure_pattern(db: &Database, args: Value) -> Result<String
     // ── Journal arm: error events + failure-marked acted/forward payloads ──
     const JOURNAL_SCAN_CAP: i64 = 1000;
     let events = db
-        .failure_journal_candidates(ws.as_deref(), JOURNAL_SCAN_CAP)
+        .failure_journal_candidates(&a.workspace_hash, JOURNAL_SCAN_CAP)
         .map_err(|e| format!("check_failure_pattern journal query failed: {}", e))?;
     for ev in &events {
         let hay = format!(
@@ -2771,6 +2774,7 @@ pub fn handle_check_failure_pattern(db: &Database, args: Value) -> Result<String
             json!({
                 "source": "journal",
                 "ref": ev.id,
+                "workspace_hash": ev.workspace_hash,
                 "when": ev.created_at_unix_ms,
                 "what_failed": what_failed,
                 "cause": cause,
@@ -2839,6 +2843,7 @@ pub fn handle_check_failure_pattern(db: &Database, args: Value) -> Result<String
                 "source": "entity",
                 "ref": format!("{}/{}", e.category, e.key),
                 "id": e.id,
+                "workspace_hash": e.workspace_hash,
                 "when": e.created_at_unix_ms,
                 "what_failed": what_failed,
                 "cause": cause,
@@ -6106,6 +6111,57 @@ mod tests {
     }
 
     #[test]
+    fn timeline_requires_workspace_and_isolates_rows() {
+        let (db, path) = temp_db();
+        for (id, workspace, timestamp) in [
+            ("timeline-global", "", 3_i64),
+            ("timeline-alpha", "alpha", 2_i64),
+            ("timeline-beta", "beta", 1_i64),
+        ] {
+            db.journal(&JournalEvent {
+                id: id.to_string(),
+                event_type: "decision".to_string(),
+                evaluated_json: "{}".to_string(),
+                acted_json: "{}".to_string(),
+                forward_json: "{}".to_string(),
+                category: "test".to_string(),
+                key: id.to_string(),
+                entity_id: String::new(),
+                agent_id: String::new(),
+                workspace_hash: workspace.to_string(),
+                created_at_unix_ms: timestamp,
+            })
+            .unwrap();
+        }
+
+        let scoped: Value = serde_json::from_str(
+            &handle_timeline(&db, json!({"workspace_hash": "alpha"})).unwrap(),
+        )
+        .unwrap();
+        let items = scoped["items"].as_array().unwrap();
+        assert_eq!(items.len(), 2, "timeline must include global and exclude other workspaces: {scoped}");
+        assert_eq!(items[0]["id"], "timeline-global");
+        assert_eq!(items[0]["workspace_hash"], "");
+        assert_eq!(items[1]["id"], "timeline-alpha");
+        assert_eq!(items[1]["workspace_hash"], "alpha");
+
+        let limited: Value = serde_json::from_str(
+            &handle_timeline(&db, json!({"workspace_hash": "alpha", "limit": 1})).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(limited["items"].as_array().unwrap().len(), 1);
+        assert_eq!(limited["items"][0]["id"], "timeline-global");
+
+        let recent = db.get_recent_journal("alpha", 2).unwrap();
+        assert_eq!(recent.iter().map(|event| event.id.as_str()).collect::<Vec<_>>(),
+            vec!["timeline-global", "timeline-alpha"]);
+
+        let missing = handle_timeline(&db, json!({}));
+        assert!(missing.is_err(), "timeline must reject omitted workspace scope");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn health_reports_status_and_db_path() {
         // #671: health must surface the absolute db path so a "wrote here,
         // inspected ~/mimir.db there" mismatch is self-diagnosing.
@@ -8381,6 +8437,48 @@ mod tests {
     }
 
     #[test]
+    fn check_failure_pattern_requires_explicit_workspace_scope() {
+        let (db, path) = temp_db();
+        seed_failure_event(
+            &db,
+            "jrn-fp-scope-alpha",
+            r#"{"command": "cargo build", "error": "alpha failure"}"#,
+            "{}",
+            "alpha",
+            now_ms(),
+        );
+        seed_failure_event(
+            &db,
+            "jrn-fp-scope-beta",
+            r#"{"command": "cargo build", "error": "beta failure"}"#,
+            "{}",
+            "beta",
+            now_ms(),
+        );
+
+        let err = handle_check_failure_pattern(&db, json!({"action": "cargo build"}))
+            .expect_err("omitted workspace_hash must fail closed");
+        assert!(err.contains("workspace_hash"), "{err}");
+
+        let r = handle_check_failure_pattern(
+            &db,
+            json!({"action": "cargo build", "workspace_hash": "alpha"}),
+        )
+        .expect("explicit workspace scope");
+        let v: Value = serde_json::from_str(&r).unwrap();
+        let refs: Vec<&str> = v["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["ref"].as_str().unwrap())
+            .collect();
+        assert!(refs.contains(&"jrn-fp-scope-alpha"), "{r}");
+        assert!(!refs.contains(&"jrn-fp-scope-beta"), "{r}");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn check_failure_pattern_matches_journal_and_entity_failures() {
         let (db, path) = temp_db();
 
@@ -8405,13 +8503,14 @@ mod tests {
         // Retry of the failed command → journal match, deja_vu, warning.
         let r = handle_check_failure_pattern(
             &db,
-            json!({"action": "cargo build --no-default-features"}),
+            json!({"action": "cargo build --no-default-features", "workspace_hash": ""}),
         )
         .expect("check journal arm");
         let v: Value = serde_json::from_str(&r).unwrap();
         assert_eq!(v["deja_vu"], json!(true), "{r}");
         assert_eq!(v["matches"][0]["source"], json!("journal"), "{r}");
         assert_eq!(v["matches"][0]["ref"], json!("jrn-fp-1"), "{r}");
+        assert_eq!(v["matches"][0]["workspace_hash"], json!(""), "{r}");
         assert!(
             v["matches"][0]["what_failed"].as_str().unwrap().contains("cargo build"),
             "{r}"
@@ -8429,7 +8528,7 @@ mod tests {
         assert!(!warning.contains('\n'), "warning must be one line: {warning}");
 
         // Retry of the remembered pitfall → entity match with cause/resolution.
-        let r = handle_check_failure_pattern(&db, json!({"action": "npm publish"}))
+        let r = handle_check_failure_pattern(&db, json!({"action": "npm publish", "workspace_hash": ""}))
             .expect("check entity arm");
         let v: Value = serde_json::from_str(&r).unwrap();
         assert_eq!(v["deja_vu"], json!(true), "{r}");
@@ -8463,7 +8562,7 @@ mod tests {
         )
         .expect("non-failure entity");
 
-        let r = handle_check_failure_pattern(&db, json!({"action": "git push origin main"}))
+        let r = handle_check_failure_pattern(&db, json!({"action": "git push origin main", "workspace_hash": ""}))
             .expect("check empty state");
         let v: Value = serde_json::from_str(&r).unwrap();
         assert_eq!(v["deja_vu"], json!(false), "{r}");
@@ -8500,7 +8599,7 @@ mod tests {
             now,
         );
 
-        let r = handle_check_failure_pattern(&db, json!({"action": "docker compose up vault"}))
+        let r = handle_check_failure_pattern(&db, json!({"action": "docker compose up vault", "workspace_hash": ""}))
             .expect("check ranking");
         let v: Value = serde_json::from_str(&r).unwrap();
         assert_eq!(v["deja_vu"], json!(true), "{r}");
@@ -8516,7 +8615,7 @@ mod tests {
         // limit clamps the result set (and a junk limit is clamped, not fatal).
         let r = handle_check_failure_pattern(
             &db,
-            json!({"action": "docker compose up vault", "limit": 1}),
+            json!({"action": "docker compose up vault", "workspace_hash": "", "limit": 1}),
         )
         .expect("limit=1");
         let v: Value = serde_json::from_str(&r).unwrap();
@@ -8607,7 +8706,7 @@ mod tests {
         for _ in 0..3 {
             let r = handle_check_failure_pattern(
                 &db,
-                json!({"action": "running the concurrent_writer test"}),
+                json!({"action": "running the concurrent_writer test", "workspace_hash": ""}),
             )
             .expect("check");
             let v: Value = serde_json::from_str(&r).unwrap();
@@ -8627,13 +8726,13 @@ mod tests {
     fn check_failure_pattern_bounds_inputs() {
         let (db, path) = temp_db();
 
-        let err = handle_check_failure_pattern(&db, json!({"action": "   "}))
+        let err = handle_check_failure_pattern(&db, json!({"action": "   ", "workspace_hash": ""}))
             .expect_err("blank action must be rejected");
         assert!(err.contains("action is required"), "{err}");
 
         let err = handle_check_failure_pattern(
             &db,
-            json!({"action": "x".repeat(16 * 1024 + 1)}),
+            json!({"action": "x".repeat(16 * 1024 + 1), "workspace_hash": ""}),
         )
         .expect_err("oversized action must be rejected (#433 pattern)");
         assert!(err.contains("action too long"), "{err}");
@@ -8646,7 +8745,7 @@ mod tests {
         assert!(err.contains("workspace_hash too long"), "{err}");
 
         // Explicit null limit falls back to the default instead of erroring (#330).
-        let r = handle_check_failure_pattern(&db, json!({"action": "ls -la", "limit": null}))
+        let r = handle_check_failure_pattern(&db, json!({"action": "ls -la", "workspace_hash": "", "limit": null}))
             .expect("null limit uses the default");
         let v: Value = serde_json::from_str(&r).unwrap();
         assert_eq!(v["deja_vu"], json!(false), "{r}");
@@ -9437,7 +9536,13 @@ mod tests {
         let body: Value = serde_json::from_str(&demoted.body_json).unwrap();
         assert_eq!(body["demoted_from"]["category"], json!("convention"));
         assert!(v["demoted"].as_bool().unwrap());
-        let events = db.timeline(&TimelineParams { event_type: Some("demotion".into()), ..Default::default() }).unwrap();
+        let events = db
+            .timeline(&TimelineParams {
+                workspace_hash: Some(String::new()),
+                event_type: Some("demotion".into()),
+                ..Default::default()
+            })
+            .unwrap();
         assert_eq!(events.len(), 1);
         let _ = std::fs::remove_file(&path);
     }

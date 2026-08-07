@@ -272,7 +272,8 @@ async function search() {
 }
 
 async function loadTimeline() {
-  const data = await api('/api/journal?limit=100');
+  const workspace = new URLSearchParams(window.location.search).get('workspace') || '';
+  const data = await api(`/api/journal?workspace=${encodeURIComponent(workspace)}&limit=100`);
   const tbody = document.querySelector('#timeline-table tbody');
   tbody.innerHTML = '';
   (data.items || []).forEach(e => {
