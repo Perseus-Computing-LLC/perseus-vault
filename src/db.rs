@@ -14721,6 +14721,11 @@ mod tests {
         // filter itself is shared retain_metadata_filters code that the FTS
         // arm already exercises, so lean/no-backend builds stay green).
         if db.embedding_enabled() {
+            // Auto-embed is deferred to the background worker (#393); flush
+            // so the fixture entities actually carry vectors before the
+            // dense arm runs (avoids a cross-platform race where the worker
+            // hasn't landed the embeddings yet).
+            flush_embeds(&db);
             let dense_candidates = recall("candidate", crate::models::SearchMode::Dense);
             assert!(dense_candidates.contains(&"cand-1".to_string()));
             assert!(!dense_candidates.contains(&"ver-1".to_string()));

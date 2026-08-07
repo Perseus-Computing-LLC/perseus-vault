@@ -149,6 +149,7 @@ pub mod grpc {
                     workspace_hash: r.workspace_hash,
                     scope_weight: None,
                     agent_id: r.agent_id,
+                    epistemic_state: None,
                     visibility: r.visibility,
                     layer: None,
                     reinforce: false,
