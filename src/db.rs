@@ -313,6 +313,21 @@ fn rate_limited_log(site: &'static str, msg: &str) {
     }
 }
 
+/// Capability required by the in-process administrative journal reader.
+///
+/// The constructor is private to this module, so a public transport cannot
+/// manufacture an all-workspace read by omitting a workspace argument. A future
+/// administrative boundary must mint this capability only after its own auth
+/// check.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct JournalAdminAuthorization(());
+
+impl JournalAdminAuthorization {
+    fn new() -> Self {
+        Self(())
+    }
+}
+
 pub struct Database {
     pool: r2d2::Pool<SqliteConnectionManager>,
     db_path: String,
@@ -6815,14 +6830,46 @@ impl Database {
         Ok(map)
     }
 
-    /// Query journal events with time-range and filter parameters.
-    pub fn timeline(
+    /// Query journal events with an explicit workspace scope.
+    pub(crate) fn timeline(
+        &self,
+        params: &TimelineParams,
+    ) -> Result<Vec<JournalEvent>, Box<dyn std::error::Error>> {
+        if params.workspace_hash.is_none() {
+            return Err("timeline requires an explicit workspace scope".into());
+        }
+        self.timeline_with_scope(params)
+    }
+
+    /// Query journal events across every workspace with an explicit admin
+    /// capability. Public transports never mint this capability.
+    pub(crate) fn timeline_admin(
+        &self,
+        _authorization: JournalAdminAuthorization,
+        params: &TimelineParams,
+    ) -> Result<Vec<JournalEvent>, Box<dyn std::error::Error>> {
+        self.timeline_with_scope(params)
+    }
+
+    fn timeline_with_scope(
         &self,
         params: &TimelineParams,
     ) -> Result<Vec<JournalEvent>, Box<dyn std::error::Error>> {
         let conn = self.conn()?;
         let mut conditions: Vec<String> = Vec::new();
         let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+
+        if let Some(ref workspace_hash) = params.workspace_hash {
+            if workspace_hash.is_empty() {
+                conditions.push(format!("workspace_hash = ?{}", param_values.len() + 1));
+            } else {
+                conditions.push(format!(
+                    "(workspace_hash = ?{} OR workspace_hash = '')",
+                    param_values.len() + 1
+                ));
+            }
+            param_values.push(Box::new(workspace_hash.clone()));
+        }
 
         if let Some(from) = params.from_ms {
             conditions.push(format!("created_at_unix_ms >= ?{}", param_values.len() + 1));
@@ -6857,7 +6904,8 @@ impl Database {
 
         let mut sql = String::from(
             "SELECT id, event_type, evaluated_json, acted_json, forward_json,
-                    category, key, entity_id, agent_id, created_at_unix_ms
+                    category, key, entity_id, agent_id, workspace_hash,
+                    created_at_unix_ms
              FROM journal",
         );
 
@@ -6893,9 +6941,8 @@ impl Database {
                 key: row.get(6)?,
                 entity_id: row.get(7)?,
                 agent_id: row.get::<_, Option<String>>(8).unwrap_or(None).unwrap_or_default(),
-                // Not selected by this listing query; purge-scoping metadata only.
-                workspace_hash: String::new(),
-                created_at_unix_ms: row.get(9)?,
+                workspace_hash: row.get::<_, Option<String>>(9).unwrap_or(None).unwrap_or_default(),
+                created_at_unix_ms: row.get(10)?,
             })
         })?;
 
@@ -6906,20 +6953,31 @@ impl Database {
         Ok(items)
     }
 
-    /// #521: journal-side candidate query for the failure-pattern / deja-vu
-    /// guard (`mimir_check_failure_pattern`). Returns the most recent journal
-    /// events that RECORD A FAILURE — `event_type = 'error'`, or a payload
-    /// that mentions one of [`FAILURE_MARKERS`] — most recent first, capped
-    /// at `scan_cap`. Relevance scoring against the caller's action happens
-    /// in the tool handler; this only narrows the scan to failure records.
-    ///
-    /// Workspace scoping mirrors recall's #485 widened filter: with a
-    /// non-empty `workspace_hash`, only events stamped with that workspace
-    /// (plus global/unscoped '' events) are returned — other workspaces'
-    /// events never leak (#417 scoping). `None` = no workspace filtering.
+    /// #521: workspace-scoped journal-side candidate query for the
+    /// failure-pattern / deja-vu guard. The public in-process method always
+    /// receives an explicit workspace; `None` is available only through the
+    /// admin-capability method below.
     ///
     /// Pure read: no reinforcement, no decay side effects.
-    pub fn failure_journal_candidates(
+    pub(crate) fn failure_journal_candidates(
+        &self,
+        workspace_hash: &str,
+        scan_cap: i64,
+    ) -> Result<Vec<JournalEvent>, Box<dyn std::error::Error>> {
+        self.failure_journal_candidates_with_scope(Some(workspace_hash), scan_cap)
+    }
+
+    /// #521: all-workspace candidate query for an explicitly authorized
+    /// internal/admin caller.
+    pub(crate) fn failure_journal_candidates_admin(
+        &self,
+        _authorization: JournalAdminAuthorization,
+        scan_cap: i64,
+    ) -> Result<Vec<JournalEvent>, Box<dyn std::error::Error>> {
+        self.failure_journal_candidates_with_scope(None, scan_cap)
+    }
+
+    fn failure_journal_candidates_with_scope(
         &self,
         workspace_hash: Option<&str>,
         scan_cap: i64,
@@ -6947,7 +7005,9 @@ impl Database {
 
         let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
         if let Some(ws) = workspace_hash {
-            if !ws.is_empty() {
+            if ws.is_empty() {
+                sql.push_str(" AND workspace_hash = ''");
+            } else {
                 sql.push_str(&format!(
                     " AND workspace_hash IN (?{}, '')",
                     param_values.len() + 1
@@ -8595,24 +8655,37 @@ impl Database {
         Ok(items)
     }
 
-    /// Get recent journal events.
-    ///
-    /// NOTE: as of #417 the `journal` table has a `workspace_hash` column
-    /// (stamped at write time) that `purge` uses to scope redaction. This
-    /// listing query does not yet expose or filter by it — journal events from
-    /// every workspace are still visible here. Adding a workspace filter to the
-    /// read path is a separate, additive change.
-    pub fn get_recent_journal(
+    fn get_recent_journal_with_scope(
         &self,
+        workspace_hash: Option<&str>,
         limit: i64,
     ) -> Result<Vec<JournalEvent>, Box<dyn std::error::Error>> {
         let conn = self.conn()?;
-        let mut stmt = conn.prepare(
+        let mut sql = String::from(
             "SELECT id, event_type, evaluated_json, acted_json, forward_json,
-                    category, key, entity_id, agent_id, created_at_unix_ms
-             FROM journal ORDER BY created_at_unix_ms DESC LIMIT ?1",
-        )?;
-        let rows = stmt.query_map(params![limit], |row| {
+                    category, key, entity_id, agent_id, workspace_hash,
+                    created_at_unix_ms
+             FROM journal",
+        );
+        let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        if let Some(workspace_hash) = workspace_hash {
+            if workspace_hash.is_empty() {
+                sql.push_str(" WHERE workspace_hash = ?1");
+            } else {
+                sql.push_str(" WHERE (workspace_hash = ?1 OR workspace_hash = '')");
+            }
+            param_values.push(Box::new(workspace_hash.to_string()));
+        }
+        sql.push_str(&format!(
+            " ORDER BY created_at_unix_ms DESC LIMIT ?{}",
+            param_values.len() + 1
+        ));
+        param_values.push(Box::new(limit));
+
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            param_values.iter().map(|p| p.as_ref()).collect();
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(param_refs.as_slice(), |row| {
             Ok(JournalEvent {
                 id: row.get(0)?,
                 event_type: row.get(1)?,
@@ -8623,9 +8696,8 @@ impl Database {
                 key: row.get::<_, String>(6).unwrap_or_default(),
                 entity_id: row.get::<_, String>(7).unwrap_or_default(),
                 agent_id: row.get::<_, Option<String>>(8).unwrap_or(None).unwrap_or_default(),
-                // Not selected by this listing query; purge-scoping metadata only.
-                workspace_hash: String::new(),
-                created_at_unix_ms: row.get(9)?,
+                workspace_hash: row.get::<_, Option<String>>(9).unwrap_or(None).unwrap_or_default(),
+                created_at_unix_ms: row.get(10)?,
             })
         })?;
         let mut items = Vec::new();
@@ -8633,6 +8705,35 @@ impl Database {
             items.push(row?);
         }
         Ok(items)
+    }
+
+    /// Get recent journal events for one workspace plus the global partition.
+    ///
+    /// An empty `workspace_hash` is an explicit request for the global
+    /// workspace partition. There is deliberately no omitted-scope/default
+    /// overload: callers that need only the global partition pass an empty
+    /// string, while callers that need every workspace must use the separate
+    /// admin-authorized method below.
+    pub fn get_recent_journal(
+        &self,
+        workspace_hash: &str,
+        limit: i64,
+    ) -> Result<Vec<JournalEvent>, Box<dyn std::error::Error>> {
+        self.get_recent_journal_with_scope(Some(workspace_hash), limit)
+    }
+
+    /// Get recent journal events across every workspace.
+    ///
+    /// This operation requires an explicit in-process authorization capability;
+    /// no public transport currently mints one. A future administrative
+    /// boundary must perform its own authentication/authorization check before
+    /// constructing the capability.
+    pub(crate) fn get_recent_journal_admin(
+        &self,
+        _authorization: JournalAdminAuthorization,
+        limit: i64,
+    ) -> Result<Vec<JournalEvent>, Box<dyn std::error::Error>> {
+        self.get_recent_journal_with_scope(None, limit)
     }
 
     /// Build an entity link graph: nodes + edges for visualization.
@@ -14227,7 +14328,7 @@ mod tests {
         assert!(got.allowed_capabilities.contains(&"tool.run".to_string()));
 
         // Verification result (identity, digest, outcome) lands in the ledger.
-        let recent = db.get_recent_journal(20).unwrap();
+        let recent = db.get_recent_journal("ws-837", 20).unwrap();
         assert!(recent.iter().any(|e| e.event_type == "profile_load"
             && e.category == "authority_profile"
             && e.evaluated_json.contains("signer_fingerprint")
@@ -19872,11 +19973,54 @@ mod tests {
         db.journal(&event).unwrap();
 
         let timeline = TimelineParams::default();
-        let events = db.timeline(&timeline).unwrap();
+        assert!(
+            db.timeline(&timeline).is_err(),
+            "unscoped timeline requires the admin capability"
+        );
+        let events = db
+            .timeline_admin(JournalAdminAuthorization::new(), &timeline)
+            .unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_type, "decision");
         assert!(events[0].acted_json.contains("pg"));
 
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn recent_journal_scopes_rows_and_requires_explicit_admin_capability() {
+        let (db, path) = temp_db();
+        let make_event = |id: &str, workspace: &str, timestamp: i64| JournalEvent {
+            id: id.to_string(),
+            event_type: "decision".to_string(),
+            evaluated_json: "{}".to_string(),
+            acted_json: "{}".to_string(),
+            forward_json: "{}".to_string(),
+            category: "test".to_string(),
+            key: id.to_string(),
+            entity_id: String::new(),
+            agent_id: String::new(),
+            workspace_hash: workspace.to_string(),
+            created_at_unix_ms: timestamp,
+        };
+        db.journal(&make_event("jrn-alpha", "alpha", 2)).unwrap();
+        db.journal(&make_event("jrn-beta", "beta", 1)).unwrap();
+
+        let alpha = db.get_recent_journal("alpha", 20).unwrap();
+        assert_eq!(alpha.len(), 1);
+        assert_eq!(alpha[0].id, "jrn-alpha");
+        assert_eq!(alpha[0].workspace_hash, "alpha");
+
+        let all = db
+            .get_recent_journal_admin(JournalAdminAuthorization::new(), 20)
+            .unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(
+            all.iter()
+                .map(|event| event.workspace_hash.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha", "beta"]
+        );
         let _ = fs::remove_file(&path);
     }
 
@@ -19932,19 +20076,29 @@ mod tests {
         .unwrap();
 
         // Unscoped: all failure records, most recent first, no success rows.
-        let got = db.failure_journal_candidates(None, 100).unwrap();
+        let got = db
+            .failure_journal_candidates_admin(JournalAdminAuthorization::new(), 100)
+            .unwrap();
         let ids: Vec<&str> = got.iter().map(|e| e.id.as_str()).collect();
         assert_eq!(ids, vec!["jrn-other-ws", "jrn-marked", "jrn-err"], "{ids:?}");
         // workspace_hash round-trips (timeline() drops it; this query must not).
         assert_eq!(got[0].workspace_hash, "ws-other");
 
         // Workspace-scoped: own + global rows only; other workspaces never leak.
-        let got = db.failure_journal_candidates(Some("ws-mine"), 100).unwrap();
+        let got = db.failure_journal_candidates("ws-mine", 100).unwrap();
+        let ids: Vec<&str> = got.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, vec!["jrn-marked", "jrn-err"], "{ids:?}");
+
+        // Explicit global scope returns only global rows; it is distinct from
+        // `None`, which is reserved for internal/admin all-workspace scans.
+        let got = db.failure_journal_candidates("", 100).unwrap();
         let ids: Vec<&str> = got.iter().map(|e| e.id.as_str()).collect();
         assert_eq!(ids, vec!["jrn-marked", "jrn-err"], "{ids:?}");
 
         // scan_cap bounds the scan (newest kept).
-        let got = db.failure_journal_candidates(None, 1).unwrap();
+        let got = db
+            .failure_journal_candidates_admin(JournalAdminAuthorization::new(), 1)
+            .unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].id, "jrn-other-ws");
 
@@ -23920,7 +24074,12 @@ mod tests {
         };
         db.journal(&event).unwrap();
 
-        let events = db.timeline(&crate::models::TimelineParams::default()).unwrap();
+        let events = db
+            .timeline_admin(
+                JournalAdminAuthorization::new(),
+                &crate::models::TimelineParams::default(),
+            )
+            .unwrap();
         assert!(!events.is_empty());
         let found = events.iter().find(|e| e.id == "jrn-agent-1").unwrap();
         assert_eq!(found.agent_id, "security-bot");

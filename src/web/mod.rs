@@ -150,12 +150,12 @@ struct SearchParams {
 
 #[derive(Debug, Deserialize)]
 struct JournalParams {
+    /// Required workspace scope. An empty value explicitly selects the global
+    /// workspace partition; omitting the parameter is rejected by Axum rather
+    /// than widening the query to every workspace.
+    workspace: String,
     #[serde(default = "default_page_limit")]
     limit: i64,
-    // NOTE: intentionally no `workspace` field here yet — the
-    // `journal` table has no workspace_hash column, so there is nothing to
-    // scope by. See the doc comment on `Database::get_recent_journal` for
-    // why this needs a schema migration rather than a query-param fix.
 }
 
 #[derive(Debug, Deserialize)]
@@ -313,12 +313,13 @@ async fn journal(
     State(state): State<WebState>,
     Query(params): Query<JournalParams>,
 ) -> Result<Json<Value>, StatusCode> {
-    // #413: /api/journal had the same unbounded-`?limit=` hole as
-    // /api/entities and /api/search — `get_recent_journal` passes the value
-    // straight into SQL `LIMIT`. Clamp it identically.
+    // #413: /api/journal keeps the same bounded limit as the other list
+    // endpoints, but unlike those endpoints it requires an explicit workspace
+    // so an omitted query can never become a cross-workspace dump.
     let limit = params.limit.clamp(1, MAX_API_LIMIT);
+    let workspace = params.workspace;
     let events = blocking_db(state.db.clone(), move |db| {
-        db.get_recent_journal(limit)
+        db.get_recent_journal(&workspace, limit)
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
     })
     .await?;
@@ -939,7 +940,7 @@ mod tests {
             .unwrap();
         }
         let router = build_router(db_arc, None);
-        for uri in ["/api/search?q=quasar&limit=999999", "/api/journal?limit=999999"] {
+        for uri in ["/api/search?q=quasar&limit=999999", "/api/journal?workspace=&limit=999999"] {
             let resp = router
                 .clone()
                 .oneshot(HttpRequest::builder().uri(uri).body(Body::empty()).unwrap())
@@ -953,6 +954,67 @@ mod tests {
                 v["limit"]
             );
         }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn journal_endpoint_requires_workspace_and_isolates_rows() {
+        let (db_arc, path) = temp_db();
+        {
+            let db = &db_arc;
+            for (id, workspace, timestamp) in [
+                ("jrn-alpha", "alpha", 2_i64),
+                ("jrn-beta", "beta", 1_i64),
+            ] {
+                db.journal(&crate::models::JournalEvent {
+                    id: id.to_string(),
+                    event_type: "decision".to_string(),
+                    evaluated_json: "{}".to_string(),
+                    acted_json: "{}".to_string(),
+                    forward_json: "{}".to_string(),
+                    category: "test".to_string(),
+                    key: id.to_string(),
+                    entity_id: String::new(),
+                    agent_id: String::new(),
+                    workspace_hash: workspace.to_string(),
+                    created_at_unix_ms: timestamp,
+                })
+                .unwrap();
+            }
+        }
+
+        let router = build_router(db_arc, None);
+        let scoped = router
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/api/journal?workspace=alpha")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(scoped.status(), StatusCode::OK);
+        let scoped_json = body_json(scoped).await;
+        let items = scoped_json["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1, "journal must exclude other workspaces");
+        assert_eq!(items[0]["id"], "jrn-alpha");
+        assert_eq!(items[0]["workspace_hash"], "alpha");
+
+        let missing_scope = router
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/api/journal")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            missing_scope.status(),
+            StatusCode::BAD_REQUEST,
+            "journal must fail closed when workspace scope is omitted"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -1086,7 +1148,7 @@ mod tests {
             "/api/entities",
             "/api/search?q=zephyr",
             "/api/stats",
-            "/api/journal",
+            "/api/journal?workspace=",
             "/api/graph",
             "/api/entities?limit=1",
             "/api/graph?limit=10",
@@ -1149,7 +1211,7 @@ mod tests {
     async fn stats_and_journal_endpoints_respond_ok() {
         let (db, path) = temp_db();
         let router = build_router(db, None);
-        for uri in ["/api/stats", "/api/journal"] {
+        for uri in ["/api/stats", "/api/journal?workspace="] {
             let resp = router
                 .clone()
                 .oneshot(

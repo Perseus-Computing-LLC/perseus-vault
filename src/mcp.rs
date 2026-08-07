@@ -2454,6 +2454,11 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
           "type": "string",
           "default": "",
           "description": "Agent identity (v1.2.0). Records which agent created this journal event."
+        },
+        "workspace_hash": {
+          "type": "string",
+          "default": "",
+          "description": "Explicit workspace attribution for the journal event; empty string denotes the global partition."
         }
       },
       "required": []
@@ -2482,7 +2487,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
   },
   {
     "name": "mimir_check_failure_pattern",
-    "description": "Deja-vu guard (#521): call BEFORE retrying a failed command or committing to an approach. Checks the action against previously recorded failures in both the journal (error events and failure-marked acted/forward payloads) and the entity store (failure/pitfall/root-cause memories), ranked by similarity, recency, and trust. Returns matching prior failures with the recorded cause and resolution, a deja_vu flag, and a one-line warning when the action was already tried and failed. Read-only: never bumps retrieval counts or decay. Record failures via mimir_journal (event_type 'error') or mimir_remember so the guard can find them.",
+    "description": "Deja-vu guard (#521): call BEFORE retrying a failed command or committing to an approach. Checks the action against workspace-scoped prior failures in both the journal (error events and failure-marked acted/forward payloads) and the entity store (failure/pitfall/root-cause memories), ranked by similarity, recency, and trust. Returns matching prior failures with the recorded cause and resolution, a deja_vu flag, and a one-line warning when the action was already tried and failed. Read-only: never bumps retrieval counts or decay. Record failures via mimir_journal (event_type 'error') or mimir_remember so the guard can find them.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -2492,7 +2497,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
         },
         "workspace_hash": {
           "type": "string",
-          "description": "Workspace scope filter. When set, only failures recorded in this workspace (plus global, unscoped ones) are matched; other workspaces' failures never leak. Omit for no workspace filtering."
+          "description": "Required workspace scope. Use an empty string only for the explicit global partition; other workspaces are never searched."
         },
         "limit": {
           "type": "integer",
@@ -2501,7 +2506,8 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
         }
       },
       "required": [
-        "action"
+        "action",
+        "workspace_hash"
       ]
     },
     "outputSchema": {
@@ -2510,9 +2516,15 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
         "matches": {
           "type": "array",
           "items": {
-            "type": "object"
+            "type": "object",
+            "properties": {
+              "workspace_hash": {
+                "type": "string",
+                "description": "Stored workspace scope of the matched failure; empty means the global partition."
+              }
+            }
           },
-          "description": "Prior failures matching the action, best first. Each: {source: 'journal'|'entity', ref, when (unix ms), what_failed, cause, resolution, score}"
+          "description": "Prior failures matching the action, best first. Each includes source, ref, workspace_hash, when (unix ms), what_failed, cause, resolution, and score."
         },
         "deja_vu": {
           "type": "boolean",
@@ -2535,10 +2547,14 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
   },
   {
     "name": "mimir_timeline",
-    "description": "Query journal events by time range with optional filters for event type, category, or entity. Use this to reconstruct the decision history and understand what happened when.",
+    "description": "Query workspace-scoped journal events by time range with optional filters for event type, category, or entity. Use this to reconstruct the decision history and understand what happened when.",
     "inputSchema": {
       "type": "object",
       "properties": {
+        "workspace_hash": {
+          "type": "string",
+          "description": "Required workspace scope. Use an empty string only for the explicit global partition."
+        },
         "from_ms": {
           "type": "integer",
           "description": "Start time boundary in unix milliseconds"
@@ -2570,7 +2586,9 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
           "description": "Number of events to skip for pagination"
         }
       },
-      "required": []
+      "required": [
+        "workspace_hash"
+      ]
     },
     "outputSchema": {
       "type": "object",
@@ -2578,7 +2596,19 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
         "items": {
           "type": "array",
           "items": {
-            "type": "object"
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "event_type": {
+                "type": "string"
+              },
+              "workspace_hash": {
+                "type": "string",
+                "description": "Stored workspace attribution; empty string denotes the global partition."
+              }
+            }
           },
           "description": "Journal events matching the query"
         },
@@ -5408,6 +5438,39 @@ mod tests {
     }
 
     #[test]
+    fn journal_scope_attribution_is_advertised_in_canonical_and_alias_schemas() {
+        let canonical = build_tools_array(tool_registry_base(), false);
+        for name in ["perseus_vault_journal", "perseus_vault_timeline"] {
+            let tool = canonical
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .unwrap_or_else(|| panic!("missing {name}"));
+            if name.ends_with("journal") {
+                assert_eq!(tool["inputSchema"]["properties"]["workspace_hash"]["type"], "string");
+            } else {
+                assert_eq!(
+                    tool["outputSchema"]["properties"]["items"]["items"]["properties"]["workspace_hash"]["type"],
+                    "string"
+                );
+            }
+        }
+
+        let aliases = build_tools_array(tool_registry_base(), true);
+        for name in ["mimir_journal", "mneme_journal", "mimir_timeline", "mneme_timeline"] {
+            assert!(
+                aliases
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|tool| tool["name"] == name),
+                "missing alias {name}"
+            );
+        }
+    }
+
+    #[test]
     fn stats_schema_allows_null_timestamps_for_an_empty_database() {
         let stats = tool_registry_base()
             .iter()
@@ -5592,7 +5655,7 @@ mod tests {
         let r = call_tool(
             "perseus_vault_check_failure_pattern",
             &db,
-            json!({"action": "cargo build --release"}),
+            json!({"action": "cargo build --release", "workspace_hash": ""}),
             None,
         );
         let v: Value = serde_json::from_str(&r).unwrap();
