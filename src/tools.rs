@@ -111,6 +111,12 @@ pub struct RememberArgs {
     pub workspace_hash: String,
     #[serde(default, deserialize_with = "null_as_default")]
     pub agent_id: String,
+    /// #865: the identity of the agent making the request (distinct from
+    /// `agent_id`, the write's author attribution). Stamped by the MCP
+    /// transport from the `initialize` handshake; used for granular
+    /// read/propose/commit authority enforcement when a manifest exists.
+    #[serde(default)]
+    pub requesting_agent_id: String,
     #[serde(default)]
     pub actor_kind: String,
     #[serde(
@@ -797,6 +803,22 @@ pub fn handle_remember(db: &Database, args: Value) -> Result<String, String> {
         return Err("user attribution requires a validated admission source event".to_string());
     }
 
+    // #865: granular authority — a manifest's presence splits write authority
+    // into propose (reviewable candidates) vs commit (verified records). The
+    // caller's actual capability must match the write's ambition BEFORE any
+    // mutation. Fail-open when no manifest exists (legacy single-agent vault).
+    if let Err(e) = db.require_memory_capability(
+        &a.requesting_agent_id,
+        &a.workspace_hash,
+        if a.admission.is_some() {
+            "memory.commit"
+        } else {
+            "memory.propose"
+        },
+    ) {
+        return Err(format!("write denied: {e}"));
+    }
+
     // Validate body_json is valid JSON
     if let Err(e) = serde_json::from_str::<serde_json::Value>(&a.body_json) {
         return Err(format!("body_json is not valid JSON: {}", e));
@@ -1314,6 +1336,16 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
     let a: RecallArgs =
         serde_json::from_value(args).map_err(|e| format!("Invalid recall arguments: {}", e))?;
 
+    // #865: granular authority — a manifest's presence requires memory.read
+    // for retrieval. Fail-open when no manifest exists (legacy vault).
+    if let Err(e) = db.require_memory_capability(
+        a.requesting_agent_id.as_deref().unwrap_or(""),
+        a.workspace_hash.as_deref().unwrap_or(""),
+        "memory.read",
+    ) {
+        return Err(format!("recall denied: {e}"));
+    }
+
     // #363 review: valid_op is a closed SQL:2011 enum — reject unknown strings
     // instead of silently treating them as 'overlaps'. Validated up front so
     // the expansion path is covered too. "" is the serde default (= overlaps).
@@ -1550,6 +1582,26 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
     let mut items_expanded: Vec<serde_json::Value> =
         entities.iter().map(|e| e.to_json_expanded()).collect();
     apply_promotion_explanations(&mut items_expanded);
+
+    // #865: retrieved memory is UNTRUSTED DATA. Every hit whose epistemic
+    // trust axis is not established fact (candidate/rejected/
+    // defensively_recalled — anything below verified/corroborated) is
+    // explicitly typed as such in the response, so a consuming agent never
+    // mistakes a recalled draft for an authoritative claim. The entity's
+    // epistemic_state field is authoritative; this flag is the serving-layer
+    // framing on top of it.
+    for (item, entity) in items_expanded.iter_mut().zip(entities.iter()) {
+        if let Some(obj) = item.as_object_mut() {
+            let trusted = matches!(entity.epistemic_state.as_str(), "verified" | "corroborated");
+            obj.insert("untrusted".to_string(), json!(!trusted));
+            if !trusted {
+                obj.insert(
+                    "untrusted_reason".to_string(),
+                    json!(format!("epistemic_state:{}", entity.epistemic_state)),
+                );
+            }
+        }
+    }
 
     // #472: stamp point-in-time provenance onto each reconstructed hit.
     if let Some(meta) = &temporal_meta {

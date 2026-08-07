@@ -7451,6 +7451,47 @@ impl Database {
         self.authority_get(agent_id, workspace_hash, false)?.ok_or_else(|| "no active authority manifest for agent/workspace".into())
     }
 
+    /// #865: granular memory capability check (fail-open). `memory.read` /
+    /// `memory.propose` / `memory.commit` split the coarse write authority:
+    /// propose may write reviewable candidates, commit may write verified
+    /// (admission-proven) records, read may retrieve. Enforcement applies
+    /// ONLY when an active authority manifest exists for the requesting
+    /// agent + workspace — a single-agent vault with no policy configured
+    /// stays fully open (backward compatible), and a manifest's presence
+    /// activates the split. `Ok(true)` = permitted, `Ok(false)` = no
+    /// manifest (open), `Err` = manifest present but capability denied.
+    pub fn require_memory_capability(
+        &self,
+        requesting_agent_id: &str,
+        workspace_hash: &str,
+        capability: &str,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        // Unscoped/legacy callers (no handshake identity) are outside the
+        // manifest regime entirely — fail open, exactly like visibility.
+        if requesting_agent_id.trim().is_empty() {
+            return Ok(false);
+        }
+        let manifest = match self.authority_get(requesting_agent_id, workspace_hash, false)? {
+            Some(m) => m,
+            None => return Ok(false), // no policy configured → open
+        };
+        if manifest.expires_at_unix_ms.is_some_and(|t| t < now_ms()) {
+            return Err("authority manifest has expired".into());
+        }
+        if manifest.revoked_at_unix_ms.is_some() {
+            return Err("authority manifest is revoked".into());
+        }
+        if !manifest.allowed_capabilities.iter().any(|c| c == capability) {
+            return Err(format!(
+                "agent {requesting_agent_id} lacks required capability {capability} \
+                 (manifest allows: {})",
+                manifest.allowed_capabilities.join(", ")
+            )
+            .into());
+        }
+        Ok(true)
+    }
+
     /// #837: load a signed, distributable policy/authority profile. The
     /// profile is verified (Ed25519, sigstore-style content attestation)
     /// against a trusted public key BEFORE the manifest takes effect;
@@ -14794,6 +14835,184 @@ mod tests {
         assert_eq!(outcome.status, crate::models::RecallStatus::Stale);
         assert!(outcome.abstained);
         assert_eq!(outcome.reason, "index_behind");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn memory_capability_split_denies_commit_without_manifest_permission() {
+        // #865: a manifest's presence activates the read/propose/commit
+        // split. An agent with only memory.propose may write candidates but
+        // is DENIED a commit (admission-bearing) write; an agent without
+        // memory.read is denied recall.
+        let (db, path) = temp_db();
+        db.agent_upsert("propose-only", "Propose Only", 2, "fleet").unwrap();
+        let manifest = crate::models::AuthorityManifestInput {
+            agent_id: "propose-only".to_string(),
+            workspace_hash: "ws-sec".to_string(),
+            allowed_capabilities: vec!["memory.propose".to_string()],
+            approval_required_capabilities: vec![],
+            scope_anchors: vec!["vault:ws-sec".to_string()],
+            approver_principals: vec![],
+            allowed_inbound_principals: vec![],
+            permitted_external_ref_prefixes: vec!["vault:ws-sec".to_string()],
+            max_parallel_actions: 1,
+            mode: "enforce".to_string(),
+            expires_at_unix_ms: None,
+            capability_constraints_json: "{}".to_string(),
+        };
+        db.authority_set(&manifest, "admin").unwrap();
+
+        // Propose (no admission) is allowed.
+        assert!(db
+            .require_memory_capability("propose-only", "ws-sec", "memory.propose")
+            .unwrap());
+        // Commit is denied by the manifest.
+        let err = db
+            .require_memory_capability("propose-only", "ws-sec", "memory.commit")
+            .unwrap_err();
+        assert!(err.to_string().contains("memory.commit"), "{err}");
+        // Read is denied too.
+        let err2 = db
+            .require_memory_capability("propose-only", "ws-sec", "memory.read")
+            .unwrap_err();
+        assert!(err2.to_string().contains("memory.read"), "{err2}");
+        // Fail-open: no manifest → Ok(false), no error (legacy vault).
+        assert!(!db
+            .require_memory_capability("ghost-agent", "ws-sec", "memory.commit")
+            .unwrap());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn remember_denies_commit_write_without_commit_capability() {
+        // #865 end-to-end: an agent with only propose permission cannot
+        // perform a commit (admission-bearing) remember — the tool boundary
+        // rejects BEFORE any mutation.
+        let (db, path) = temp_db();
+        db.agent_upsert("propose-only", "Propose Only", 2, "fleet").unwrap();
+        let manifest = crate::models::AuthorityManifestInput {
+            agent_id: "propose-only".to_string(),
+            workspace_hash: "ws-sec".to_string(),
+            allowed_capabilities: vec!["memory.propose".to_string()],
+            approval_required_capabilities: vec![],
+            scope_anchors: vec!["vault:ws-sec".to_string()],
+            approver_principals: vec![],
+            allowed_inbound_principals: vec![],
+            permitted_external_ref_prefixes: vec!["vault:ws-sec".to_string()],
+            max_parallel_actions: 1,
+            mode: "enforce".to_string(),
+            expires_at_unix_ms: None,
+            capability_constraints_json: "{}".to_string(),
+        };
+        db.authority_set(&manifest, "admin").unwrap();
+
+        let err = crate::tools::handle_remember(
+            &db,
+            json!({
+                "category": "decision",
+                "key": "commit-attempt",
+                "workspace_hash": "ws-sec",
+                "requesting_agent_id": "propose-only",
+                "agent_id": "propose-only",
+                "actor_kind": "assistant",
+                "body_json": "{\"content\":\"x\"}",
+                "admission": {
+                    "record_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "source_identity": "src-1",
+                    "authorization_scope": "ws-sec",
+                    "ingestion_channel": "connector",
+                    "workspace_hash": "ws-sec",
+                    "source_trust": "authoritative",
+                    "valid_from_unix_ms": 1,
+                    "recorded_at_unix_ms": 2,
+                    "task_relevance_bps": 9000
+                }
+            }),
+        )
+        .unwrap_err();
+        assert!(err.contains("write denied") && err.contains("memory.commit"), "{err}");
+        assert!(db.get_entity("decision", "commit-attempt").unwrap().is_none());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn recall_denies_read_without_read_capability() {
+        // #865: retrieval is a distinct authority — an agent manifest
+        // without memory.read is denied recall even though it can propose.
+        let (db, path) = temp_db();
+        db.agent_upsert("write-only", "Write Only", 2, "fleet").unwrap();
+        let manifest = crate::models::AuthorityManifestInput {
+            agent_id: "write-only".to_string(),
+            workspace_hash: "ws-sec".to_string(),
+            allowed_capabilities: vec!["memory.propose".to_string(), "memory.commit".to_string()],
+            approval_required_capabilities: vec![],
+            scope_anchors: vec!["vault:ws-sec".to_string()],
+            approver_principals: vec![],
+            allowed_inbound_principals: vec![],
+            permitted_external_ref_prefixes: vec!["vault:ws-sec".to_string()],
+            max_parallel_actions: 1,
+            mode: "enforce".to_string(),
+            expires_at_unix_ms: None,
+            capability_constraints_json: "{}".to_string(),
+        };
+        db.authority_set(&manifest, "admin").unwrap();
+
+        let err = crate::tools::handle_recall(
+            &db,
+            json!({
+                "query": "anything",
+                "workspace_hash": "ws-sec",
+                "requesting_agent_id": "write-only",
+                "limit": 5,
+            }),
+        )
+        .unwrap_err();
+        assert!(err.contains("recall denied") && err.contains("memory.read"), "{err}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn recall_marks_unverified_hits_as_untrusted_data() {
+        // #865: retrieved memory is untrusted data — candidate/rejected/
+        // defensively_recalled hits are explicitly typed untrusted in the
+        // response, verified/corroborated hits are not.
+        let (db, path) = temp_db();
+        // Candidate (unverified) write.
+        let mut cand = make_entity("untrusted-cand", "decision", "untrusted-cand", r#"{\"content\":\"draft claim\"}"#);
+        cand.workspace_hash = "ws-t".to_string();
+        db.remember(&cand).unwrap();
+        // Verified write.
+        let mut ver = make_entity("trusted-ver", "decision", "trusted-ver", r#"{\"content\":\"proven fact\"}"#);
+        ver.agent_id = "user-1".to_string();
+        ver.workspace_hash = "ws-t".to_string();
+        db.remember_verified_with_options(&ver, true, None, None, false).unwrap();
+
+        let response = crate::tools::handle_recall(
+            &db,
+            json!({
+                "query": "claim fact",
+                "workspace_hash": "ws-t",
+                "limit": 20,
+            }),
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        let items = value["items"].as_array().unwrap();
+        let cand_item = items
+            .iter()
+            .find(|i| i["key"] == "untrusted-cand")
+            .expect("candidate hit present");
+        assert_eq!(cand_item["untrusted"], json!(true));
+        assert_eq!(
+            cand_item["untrusted_reason"],
+            json!("epistemic_state:candidate")
+        );
+        let ver_item = items
+            .iter()
+            .find(|i| i["key"] == "trusted-ver")
+            .expect("verified hit present");
+        assert_eq!(ver_item["untrusted"], json!(false));
+        assert!(ver_item.get("untrusted_reason").is_none());
         let _ = std::fs::remove_file(path);
     }
 
