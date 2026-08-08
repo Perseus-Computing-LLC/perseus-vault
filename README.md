@@ -14,12 +14,12 @@
 [![LangGraph](https://img.shields.io/badge/integrations-LangGraph-blue)](integrations/langgraph/)
 [![CrewAI](https://img.shields.io/badge/integrations-CrewAI-orange)](integrations/crewai/)
 [![AutoGen](https://img.shields.io/badge/integrations-AutoGen-purple)](integrations/autogen/)
-[![MCP Tools](https://img.shields.io/badge/MCP%20tools-91%20canonical-brightgreen)]()
+[![MCP Tools](https://img.shields.io/badge/MCP%20tools-92%20canonical-brightgreen)]()
 [![Listed on mcpservers.org](https://img.shields.io/badge/listed-mcpservers.org-blue)](https://mcpservers.org/servers/perseus-computing-llc/perseus-vault)
 
 Give your agents memory that survives the session, so they stop re-deriving what they
 already learned and stop repeating past mistakes. Hybrid recall (BM25 + dense + RRF),
-bi-temporal history, and **AES-256-GCM** at rest, exposed as **91 canonical MCP tools**
+bi-temporal history, and **AES-256-GCM** at rest, exposed as **92 canonical MCP tools**
 that work with any host. Legacy `mimir_*` and `mneme_*` aliases remain callable but are
 not counted separately. **73.8% on LongMemEval's official harness** (vs Zep 63.8%, Mem0
 49.0%).
@@ -228,7 +228,7 @@ the reference. [Methodology & dataset →](benchmark/temporal/README.md)
 |---|---|---|---|---|
 | **Deployment** | Single binary | Cloud + self-host | Docker/Postgres | Docker/Neo4j |
 | **Dependencies** | None (SQLite embedded) | Python + vector DB | Postgres + Python | Neo4j + Go (Graphiti) |
-| **MCP-Native** | ✅ 91 canonical tools | ❌ Not MCP-native | ❌ Not MCP-native | ❌ Not MCP-native |
+| **MCP-Native** | ✅ 92 canonical tools | ❌ Not MCP-native | ❌ Not MCP-native | ❌ Not MCP-native |
 | **Offline/Local** | ✅ Fully local | Cloud-dependent | Docker needed | Docker needed |
 | **Encryption** | AES-256-GCM ✅ | ❌ | ❌ | ❌ |
 | **Hybrid Search** | BM25 + Dense + RRF | Vector only | Vector only | Vector + Graph |
@@ -236,7 +236,7 @@ the reference. [Methodology & dataset →](benchmark/temporal/README.md)
 | **Entity Graph** | Link + Traverse | ❌ | ❌ | ✅ |
 | **Journal Audit Trail** | ✅ Immutable | ❌ | ❌ | ❌ |
 | **State Management** | ✅ Key-value + TTL | ❌ | ❌ | ❌ |
-| **MCP Tools** | 91 canonical | 5 | 8 | 0 |
+| **MCP Tools** | 92 canonical | 5 | 8 | 0 |
 | **License** | MIT | Apache 2.0 | Apache 2.0 | Apache 2.0 |
 
 [Full comparison: Perseus Vault vs Mem0 →](docs/comparison/mimir-vs-mem0.md)
