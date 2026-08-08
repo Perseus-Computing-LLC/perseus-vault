@@ -2605,9 +2605,17 @@ impl Database {
         })?;
         let mut candidates = Vec::new();
         for row in rows {
-            let (entity, embedding) = row?;
-            if embedding.len() == query_vec.len() {
-                candidates.push((entity, embedding));
+            match row {
+                Ok((entity, embedding)) => {
+                    if embedding.len() == query_vec.len() {
+                        candidates.push((entity, embedding));
+                    }
+                }
+                Err(e) => {
+                    #[cfg(test)]
+                    eprintln!("[dense-sup-diag] candidate row error: {e}");
+                    return Err(e.into());
+                }
             }
         }
         drop(stmt);
@@ -2622,6 +2630,66 @@ impl Database {
                     .collect::<Vec<_>>(),
                 max_scan
             );
+            for (entity, embedding) in &candidates {
+                eprintln!(
+                    "[dense-sup-diag] candidate row id={} key={} emb_len={} query_dim={} match={}",
+                    entity.id,
+                    entity.key,
+                    embedding.len(),
+                    query_vec.len(),
+                    embedding.len() == query_vec.len()
+                );
+            }
+            // Precise row-level probe on the same pooled connection: where do
+            // candidates go missing (rows gone / archived / embedding NULL /
+            // signature NULL / dim mismatch)?
+            let counts = conn.query_row(
+                "SELECT
+                   (SELECT COUNT(*) FROM entities) AS total,
+                   (SELECT COUNT(*) FROM entities WHERE archived = 0) AS a0,
+                   (SELECT COUNT(*) FROM entities WHERE embedding IS NOT NULL) AS emb,
+                   (SELECT COUNT(*) FROM entities WHERE archived = 0 AND embedding IS NOT NULL) AS a0e,
+                   (SELECT COUNT(*) FROM entities WHERE archived = 0 AND emb_sig IS NOT NULL) AS a0s",
+                [],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, i64>(3)?,
+                        r.get::<_, i64>(4)?,
+                    ))
+                },
+            )?;
+            eprintln!(
+                "[dense-sup-diag] counts total={} archived0={} embedded={} a0_embedded={} a0_signed={}",
+                counts.0, counts.1, counts.2, counts.3, counts.4
+            );
+            let mut probe = conn.prepare(
+                "SELECT id, key, category, archived, length(embedding), length(emb_sig), workspace_hash \
+                 FROM entities ORDER BY id",
+            )?;
+            let prows = probe.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, Option<i64>>(4)?,
+                    r.get::<_, Option<i64>>(5)?,
+                    r.get::<_, String>(6)?,
+                ))
+            })?;
+            for pr in prows {
+                match pr {
+                    Ok((id, key, cat, arch, elen, slen, ws)) => eprintln!(
+                        "[dense-sup-diag] row id={} key={} category={} workspace={} archived={} emb_len={:?} sig_len={:?}",
+                        id, key, cat, ws, arch, elen, slen
+                    ),
+                    Err(e) => eprintln!("[dense-sup-diag] probe row error: {e}"),
+                }
+            }
+            drop(probe);
         }
         // Materialize the primary rows before opening either governance
         // connection. On Windows, keeping the dense scan's pooled primary
