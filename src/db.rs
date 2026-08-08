@@ -5375,6 +5375,49 @@ impl Database {
         }
     }
 
+    /// Deterministic dense/hybrid recall: synchronously embed any
+    /// non-archived entity that still lacks a derived embedding (the
+    /// background auto-embed worker may not have reached it yet),
+    /// bounded by `cap`. Ranking then reads a fully-embedded candidate
+    /// set instead of a snapshot that the async worker can mutate
+    /// between two identical calls (quality `replay-frozen-recall`).
+    /// Best-effort: per-entity embed failures are ignored — the row
+    /// simply stays out of dense ranking and the RecallOutcome contract
+    /// still reports Partial/Unavailable accordingly.
+    fn settle_dense_candidates(&self, cap: usize) -> Result<(), Box<dyn std::error::Error>> {
+        if !self.embedding_enabled() {
+            return Ok(());
+        }
+        let missing: Vec<(String, String, String)> = {
+            let conn = self.conn()?;
+            let mut stmt = conn.prepare(
+                "SELECT id, category, key FROM entities \
+                 WHERE archived = 0 AND embedding IS NULL LIMIT ?1",
+            )?;
+            let rows = stmt.query_map([cap as i64], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        // #397 discipline: embed_entity's single mode draws and returns its
+        // own pooled connections sequentially, so no connection is held
+        // across an embed call. Batch fields are ignored in single mode.
+        for (_, category, key) in missing {
+            let _ = self.embed_entity(&crate::models::EmbedParams {
+                text: None,
+                category: Some(category),
+                key: Some(key),
+                batch_category: None,
+                batch_limit: 100,
+            });
+        }
+        Ok(())
+    }
+
     pub fn recall(&self, params: &RecallParams) -> Result<Vec<Entity>, Box<dyn std::error::Error>> {
         Ok(self.recall_with_completeness(params)?.0)
     }
@@ -5412,6 +5455,17 @@ impl Database {
             timer.stage("embed");
 
             if let Some(query_vec) = query_vec {
+                // Deterministic dense/hybrid recall: the background auto-embed
+                // worker can land derived embeddings between two identical
+                // calls and shift dense rankings, breaking replay determinism
+                // (observed by the quality `replay-frozen-recall` case). First
+                // settle any candidates that still lack embeddings (bounded
+                // synchronous embed), then drain the auto-embed queue
+                // (bounded), so ranking is a deterministic function of the
+                // settled store; the RecallOutcome contract still reports
+                // Partial when jobs remain after the bounds.
+                let _ = self.settle_dense_candidates(128);
+                let _ = self.embed_queue_flush(std::time::Duration::from_millis(250));
                 if params.mode == crate::models::SearchMode::Dense {
                     // Clamp negative limits to 0 before the usize cast (a negative
                     // i64 would wrap to a huge usize).
@@ -6256,10 +6310,16 @@ impl Database {
             sql.push_str(&conditions.join(" AND "));
         }
 
-        // Rank by retrieval count + recency, with a stable total-order tie-break.
-        sql.push_str(
-            " ORDER BY retrieval_count DESC, last_accessed_unix_ms DESC, id ASC",
-        );
+        // Rank by retrieval count, with a stable total-order tie-break.
+        // `last_accessed_unix_ms` is deliberately NOT a ranking key: recall
+        // side-effects refresh it to the same `now` for every survivor, so
+        // adjacent identical recalls would reorder pairs whose distinct
+        // access times collapse into a tie (quality `replay-frozen-recall`).
+        // The refresh itself is kept — it drives the decay clock — but the
+        // ranking must be a pure function of recall-immutable state, and
+        // `retrieval_count` bumps are uniform (+1 per survivor), which
+        // preserves relative order run-to-run.
+        sql.push_str(" ORDER BY retrieval_count DESC, id ASC");
         // Governance is applied after materialization; do not let SQL LIMIT/OFFSET
         // consume slots before suppressed rows are removed.
         sql.push_str(" LIMIT -1");
@@ -9805,9 +9865,9 @@ impl Database {
 
     /// #562: deterministic keyset enumeration — the first-class "list every
     /// entity in a category" path that recall's empty-query mode cannot be:
-    /// recall orders by `retrieval_count DESC, last_accessed_unix_ms DESC`,
-    /// and BOTH keys mutate on every reinforcing recall, so offset pagination
-    /// over that ordering can skip or repeat rows between pages (and its
+    /// recall orders by `retrieval_count DESC, id ASC`, and the primary key
+    /// mutates on every reinforcing recall, so offset pagination over that
+    /// ordering can skip or repeat rows between pages (and its
     /// offset is capped at 10,000). This scan orders by immutable `id ASC`
     /// and resumes from a cursor (`id > after_id`), so every row that exists
     /// for the duration of the scan is returned exactly once, no matter how
@@ -27839,17 +27899,35 @@ mod tests {
             .join(format!("mimir-no-model-{}", uuid::Uuid::new_v4()))
             .join("model.onnx");
         db.set_embedding_model(missing.to_str().unwrap());
-        // A port with nothing listening: bind then drop to reserve-and-refuse.
-        let dead_port = {
-            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            l.local_addr().unwrap().port()
+        // A live endpoint that REJECTS every request (HTTP 500). Deterministic:
+        // a bare dead port can collide with another test's ephemeral mock
+        // server in the same process (ephemeral port reuse) and accidentally
+        // serve embeddings — the flake seen on the grpc build.
+        let rejecting_port = {
+            use std::io::{Read, Write};
+            let listener =
+                std::net::TcpListener::bind("127.0.0.1:0").expect("bind rejecting embed server");
+            let port = listener.local_addr().unwrap().port();
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(mut s) = stream else { break };
+                    std::thread::spawn(move || {
+                        let mut buf = [0u8; 1024];
+                        let _ = s.read(&mut buf);
+                        let resp = b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                        let _ = s.write_all(resp);
+                        let _ = s.flush();
+                    });
+                }
+            });
+            port
         };
         db.set_llm(
             true,
-            &format!("http://127.0.0.1:{dead_port}/api/generate"),
+            &format!("http://127.0.0.1:{rejecting_port}/api/generate"),
             "fake-embed",
             None,
-            Some(&format!("http://127.0.0.1:{dead_port}/api/embed")),
+            Some(&format!("http://127.0.0.1:{rejecting_port}/api/embed")),
             None,
         );
         let total = 30;
