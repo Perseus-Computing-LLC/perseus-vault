@@ -1,0 +1,23 @@
+{
+  "name": "perseus-vault-deletion-durability-v1",
+  "version": 1,
+  "policies": ["logical_forget", "permanent_purge"],
+  "cases": [
+    {
+      "id": "logical-forget",
+      "policy": "logical_forget",
+      "category": "benchmark_deletion_logical",
+      "key": "canary-logical",
+      "canary": "quality-deletion-logical-9f2c7d4a",
+      "twin": "quality-deletion-twin-4b8e1c6f"
+    },
+    {
+      "id": "permanent-purge",
+      "policy": "permanent_purge",
+      "category": "benchmark_deletion_purge",
+      "key": "canary-purge",
+      "canary": "quality-deletion-purge-7c1a5e9b",
+      "twin": "quality-deletion-twin-2d6f8a4c"
+    }
+  ]
+}

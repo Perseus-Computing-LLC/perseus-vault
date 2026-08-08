@@ -1,0 +1,66 @@
+{
+  "name": "perseus-vault-correction-durability-v1",
+  "version": 1,
+  "cases": [
+    {
+      "id": "replacement",
+      "shape": "replacement",
+      "category": "benchmark_correction_replacement",
+      "key": "address",
+      "original": {"note": "quality-correction-berlin", "valid_from_unix_ms": 1000},
+      "updated": {"note": "quality-correction-lisbon", "valid_from_unix_ms": 2000},
+      "current_query": "quality correction lisbon",
+      "history_query": "quality correction berlin",
+      "expected_current": "quality-correction-lisbon",
+      "expected_history": "quality-correction-berlin"
+    },
+    {
+      "id": "polarity-flip",
+      "shape": "polarity_flip",
+      "category": "benchmark_correction_polarity",
+      "key": "coriander",
+      "original": {"note": "quality-correction-loves-coriander", "valid_from_unix_ms": 1000},
+      "updated": {"note": "quality-correction-dislikes-coriander", "valid_from_unix_ms": 2000},
+      "current_query": "quality correction dislikes coriander",
+      "history_query": "quality correction loves coriander",
+      "expected_current": "quality-correction-dislikes-coriander",
+      "expected_history": "quality-correction-loves-coriander"
+    },
+    {
+      "id": "retraction",
+      "shape": "retraction",
+      "category": "benchmark_correction_retraction",
+      "key": "sister",
+      "original": {"note": "quality-correction-has-sister-doctor", "valid_from_unix_ms": 1000},
+      "updated": {"note": "quality-correction-no-sister-retraction", "valid_from_unix_ms": 2000},
+      "current_query": "quality correction no sister retraction",
+      "history_query": "quality correction has sister doctor",
+      "expected_current": "quality-correction-no-sister-retraction",
+      "expected_history": "quality-correction-has-sister-doctor"
+    },
+    {
+      "id": "partial-supersession",
+      "shape": "partial_supersession",
+      "category": "benchmark_correction_partial",
+      "key": "employment",
+      "original": {"note": "quality-correction-engineer-acme", "role": "engineer", "employer": "acme", "valid_from_unix_ms": 1000},
+      "updated": {"note": "quality-correction-manager-acme", "role": "manager", "employer": "acme", "valid_from_unix_ms": 2000},
+      "current_query": "quality correction manager acme",
+      "history_query": "quality correction engineer acme",
+      "expected_current": "quality-correction-manager-acme",
+      "expected_history": "quality-correction-engineer-acme"
+    },
+    {
+      "id": "bounded-validity",
+      "shape": "bounded_validity",
+      "category": "benchmark_correction_bounded",
+      "key": "diet",
+      "original": {"note": "quality-correction-vegetarian", "valid_from_unix_ms": 1000, "valid_to_unix_ms": 3000},
+      "updated": {"note": "quality-correction-stopped-vegetarian", "valid_from_unix_ms": 3000},
+      "current_query": "quality correction stopped vegetarian",
+      "history_query": "quality correction vegetarian",
+      "expected_current": "quality-correction-stopped-vegetarian",
+      "expected_history": "quality-correction-vegetarian"
+    }
+  ]
+}

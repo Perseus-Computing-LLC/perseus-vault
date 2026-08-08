@@ -1,0 +1,77 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://perseus.observer/schemas/perseus-vault-benchmark-control-profile-v1.json",
+  "title": "Perseus Vault benchmark control profile",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "benchmark_id",
+    "suite_version",
+    "case_manifest_sha256",
+    "harness_commit",
+    "binary_sha256",
+    "dataset",
+    "execution",
+    "retrieval",
+    "baselines"
+  ],
+  "properties": {
+    "schema_version": {"const": "perseus-vault-benchmark-control-profile/v1"},
+    "benchmark_id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{2,127}$"},
+    "suite_version": {"type": "string", "pattern": "^v[0-9]+$"},
+    "case_manifest_sha256": {"$ref": "#/$defs/sha256"},
+    "harness_commit": {"type": "string", "minLength": 1},
+    "binary_sha256": {"$ref": "#/$defs/sha256"},
+    "dataset": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version", "sha256"],
+      "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "version": {"type": "string", "minLength": 1},
+        "sha256": {"$ref": "#/$defs/sha256"},
+        "split": {"type": "string"},
+        "license": {"type": "string"},
+        "acquisition": {"type": "string"}
+      }
+    },
+    "execution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["offline", "network_calls", "seed_policy"],
+      "properties": {
+        "offline": {"type": "boolean"},
+        "network_calls": {"type": "integer", "minimum": 0},
+        "seed_policy": {"type": "string", "minLength": 1},
+        "platform": {"type": "string"},
+        "hardware": {"type": "string"},
+        "provider_class": {"type": "string"}
+      }
+    },
+    "retrieval": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["modes", "k", "context_budget"],
+      "properties": {
+        "modes": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+        "k": {"type": "integer", "minimum": 1},
+        "context_budget": {"type": "integer", "minimum": 0},
+        "answerer_model": {"type": "string"},
+        "judge_model": {"type": "string"},
+        "temperature": {"type": "number", "minimum": 0},
+        "max_tokens": {"type": "integer", "minimum": 1}
+      }
+    },
+    "baselines": {
+      "type": "array",
+      "items": {"enum": ["no_memory", "full_context", "file_notes", "vault", "oracle", "placebo_drop", "inert_memory"]},
+      "minItems": 1,
+      "uniqueItems": true
+    },
+    "notes": {"type": "string"}
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}

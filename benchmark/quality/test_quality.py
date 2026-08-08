@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from benchmark.package.common.artifacts import result_signature
 from run import (
     build_metric_rates,
     case_result,
@@ -98,7 +99,33 @@ class QualityHarnessTests(unittest.TestCase):
             self.assertNotIn(forbidden, encoded)
         self.assertNotIn("id_sha256", encoded)
         self.assertNotIn("mem-random", encoded)
-        self.assertEqual(evidence["nested"]["key"], "safe-key")
+        self.assertNotIn("nested", encoded)
+
+    def test_case_result_rejects_evidence_with_no_public_fields(self):
+        with self.assertRaises(ValueError):
+            case_result(
+                {"id": "case", "category": "quality", "checks": ["ok"]},
+                {"ok": True},
+                {"query": "private query sentinel", "body": "private body sentinel"},
+            )
+
+    def test_case_result_rejects_mixed_forbidden_evidence(self):
+        with self.assertRaises(ValueError):
+            case_result(
+                {"id": "case", "category": "quality", "checks": ["ok"]},
+                {"ok": True},
+                {"count": 1, "query": "private-query-sentinel"},
+            )
+
+    def test_case_result_hashes_failure_class_evidence(self):
+        result = case_result(
+            {"id": "case", "category": "quality", "checks": ["ok"]},
+            {"ok": False},
+            {"failure_class": "MCPError"},
+            status="failed",
+            failure_class="MCPError",
+        )
+        self.assertRegex(result["evidence"]["failure_class"], r"^[0-9a-f]{64}$")
 
     def test_public_evidence_drops_credentials_timestamps_and_unknown_keys(self):
         evidence = sanitize_evidence(
@@ -154,7 +181,7 @@ class QualityHarnessTests(unittest.TestCase):
         result = case_result(
             {"id": "partial", "category": "mutation", "metric": "mutation", "checks": ["ok", "missing"]},
             {"ok": True},
-            {},
+            {"complete": True},
         )
         self.assertEqual(result["status"], "failed")
         self.assertEqual(result["checks"], {"passed": 1, "total": 2})
@@ -181,6 +208,16 @@ class QualityHarnessTests(unittest.TestCase):
         self.assertEqual(metrics["validity"]["rate"], 1.0)
         self.assertEqual(metrics["compaction_projection"]["status"], "unavailable")
         self.assertEqual(metrics["compaction_projection"]["reason"], "tool not advertised")
+
+    def test_metric_aggregation_emits_reason_without_zero_denominator_measurement(self):
+        metrics = compute_metrics(
+            [{
+                "status": "failed",
+                "checks": {"passed": 0, "total": 0},
+                "metric": {"name": "recall_outcome", "status": "failed", "reason": "mcp_error"},
+            }]
+        )
+        self.assertEqual(metrics["recall_outcome"], {"status": "failed", "reason": "mcp_error"})
 
     def test_signature_payload_omits_nondeterministic_and_private_evidence(self):
         first = report_signature_payload(
@@ -239,11 +276,25 @@ class QualityHarnessTests(unittest.TestCase):
             self.skipTest(str(exc))
         out = Path(tempfile.mkdtemp()) / "report.json"
         report = run_benchmark(Path(__file__).with_name("manifest.json"), None, out)
-        self.assertEqual(report["dataset"], "perseus-vault-memory-quality-v0")
-        self.assertEqual(report["checks_total"], 29)
-        self.assertEqual(len(report["cases"]), 24)
+        self.assertEqual(report["dataset"], "perseus-vault-memory-quality-v1")
+        self.assertEqual(report["checks_total"], 41)
+        self.assertEqual(len(report["cases"]), 30)
         self.assertTrue(all(case["evidence"] for case in report["cases"]))
         self.assertTrue(report["passed"])
+
+    def test_scorecard_rejects_resigned_manifest_case_substitution(self):
+        try:
+            find_binary(None)
+        except FileNotFoundError as exc:
+            self.skipTest(str(exc))
+        out = Path(tempfile.mkdtemp()) / "report.json"
+        report = run_benchmark(Path(__file__).with_name("manifest.json"), None, out)
+        forged = json.loads(json.dumps(report))
+        forged["cases"][0]["id"] = "forged-case-id"
+        forged["result_signature_sha256"] = result_signature(forged)
+        scorecard = build_scorecard(forged)
+        self.assertEqual(scorecard["verdict"], "blocked")
+        self.assertEqual(scorecard["reason"], "incomplete_case_contract")
 
     def test_evaluate_report_rejects_missing_or_failed_checks(self):
         report = {
@@ -290,9 +341,9 @@ class QualityHarnessTests(unittest.TestCase):
             ],
         }
         scorecard = build_scorecard(report)
-        self.assertEqual(scorecard["verdict"], "release_ready")
+        self.assertEqual(scorecard["verdict"], "blocked")
         self.assertTrue(scorecard["blocking"])
-        self.assertEqual(scorecard["thresholds"]["minimum_accuracy"], 1.0)
+        self.assertEqual(scorecard["reason"], "incomplete_publication_envelope")
 
     def test_scorecard_blocks_a_regression_and_names_failed_categories(self):
         report = {
@@ -312,8 +363,7 @@ class QualityHarnessTests(unittest.TestCase):
         }
         scorecard = build_scorecard(report)
         self.assertEqual(scorecard["verdict"], "blocked")
-        self.assertEqual(scorecard["failed_categories"], ["contradiction_supersession"])
-        self.assertEqual(scorecard["override_policy"]["required_approver"], "maintainer")
+        self.assertEqual(scorecard["reason"], "incomplete_publication_envelope")
     def test_scorecard_blocks_explicit_unavailable_capability(self):
         report = {
             "benchmark": "perseus-vault-memory-quality",
@@ -338,9 +388,7 @@ class QualityHarnessTests(unittest.TestCase):
         }
         scorecard = build_scorecard(report)
         self.assertEqual(scorecard["verdict"], "blocked")
-        self.assertEqual(scorecard["unavailable_categories"], ["compaction_projection"])
-        self.assertEqual(scorecard["unavailable_cases"], ["compaction-archive"])
-        self.assertEqual(scorecard["metrics"]["compaction_projection"]["status"], "unavailable")
+        self.assertEqual(scorecard["reason"], "incomplete_publication_envelope")
     def test_scorecard_blocks_unavailable_capability_without_category_failure(self):
         report = {
             "benchmark": "perseus-vault-memory-quality",
@@ -368,7 +416,7 @@ class QualityHarnessTests(unittest.TestCase):
         }
         scorecard = build_scorecard(report)
         self.assertEqual(scorecard["verdict"], "blocked")
-        self.assertEqual(scorecard["unavailable_capabilities"], ["context"])
+        self.assertEqual(scorecard["reason"], "incomplete_publication_envelope")
 
     def test_scorecard_requires_finite_exact_accuracy_and_consistent_counts(self):
         for accuracy, passed, total in ((1.1, 1, 1), (float("inf"), 1, 1), (1.0, 2, 1)):
@@ -461,7 +509,7 @@ class QualityHarnessTests(unittest.TestCase):
             "cases": v0_cases,
         }
         self.assertEqual(build_scorecard(short_v0)["verdict"], "blocked")
-        self.assertFalse(build_scorecard(short_v0)["case_count_valid"])
+        self.assertEqual(build_scorecard(short_v0)["reason"], "incomplete_publication_envelope")
         legacy_cases = [
             {"category": category, "status": "passed", "checks": {"passed": 1, "total": 1}}
             for category in ("long_horizon", "contradiction_supersession", "shared_memory", "adversarial")
@@ -484,7 +532,7 @@ class QualityHarnessTests(unittest.TestCase):
         }
         scorecard = build_scorecard(inconsistent)
         self.assertEqual(scorecard["verdict"], "blocked")
-        self.assertEqual(scorecard["invalid_cases"], ["long_horizon"])
+        self.assertEqual(scorecard["reason"], "incomplete_publication_envelope")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,71 @@
+{
+  "schema_version": "perseus-vault-benchmark-claims/v1",
+  "policy": {
+    "composite_score": false,
+    "publication_requires": [
+      "control_profile",
+      "dataset_and_manifest_digest",
+      "binary_digest",
+      "harness_commit",
+      "complete_denominators",
+      "semantic_result_signature",
+      "negative_claims",
+      "independent_review"
+    ]
+  },
+  "claims": [
+    {
+      "id": "quality-v1-contract",
+      "suite": "quality",
+      "status": "supported",
+      "evidence": "real_binary_41_of_41",
+      "scope": "deterministic local contract gate"
+    },
+    {
+      "id": "correction-v1-durability",
+      "suite": "correction",
+      "status": "supported",
+      "evidence": "real_binary_35_of_35",
+      "scope": "five correction shapes and local reindex/coherence/reentry paths"
+    },
+    {
+      "id": "deletion-v1-local-durability",
+      "suite": "deletion",
+      "status": "supported",
+      "evidence": "real_binary_18_of_18",
+      "scope": "logical forget and permanent purge local vertical slice"
+    },
+    {
+      "id": "freshness-v1-healthy-path",
+      "suite": "freshness",
+      "status": "supported",
+      "evidence": "real_binary_19_of_19",
+      "scope": "healthy FTS readability, outcome, deadline, and restart probes"
+    },
+    {
+      "id": "economics-overlay",
+      "suite": "economics",
+      "status": "review",
+      "evidence": "focused_unit_tests_only",
+      "scope": "helpers are not yet integrated into canonical scale/BEAM reports"
+    },
+    {
+      "id": "provider-failure-stress",
+      "suite": "freshness",
+      "status": "not_measured",
+      "negative_claim": "No provider-failure coverage is claimed by the healthy-path run."
+    },
+    {
+      "id": "deletion-external-propagation",
+      "suite": "deletion",
+      "status": "not_measured",
+      "negative_claim": "No backup/restore, federation, share-copy, vector-cache, or external propagation coverage is claimed by the local vertical slice."
+    },
+    {
+      "id": "downstream-agent-utility",
+      "suite": "agent_tasks",
+      "status": "not_measured",
+      "negative_claim": "No downstream task-completion claim is made by retrieval or contract suites."
+    }
+  ]
+}
