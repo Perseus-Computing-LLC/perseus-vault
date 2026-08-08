@@ -104,18 +104,20 @@ _REPORT_KEYS = {
     "run_fingerprint_sha256", "status", "capabilities", "cases", "metrics",
     "not_measured", "excluded", "negative_claim_ids", "public_evidence", "raw_inputs_captured",
     "network_calls", "result_signature_sha256", "claim_ids", "binary_sha256",
-    "dataset_sha256", "harness_commit", "benchmark", "dataset", "harness_version",
+    "dataset_sha256", "harness_commit", "claims_sha256", "benchmark", "dataset", "harness_version",
     "required_categories", "metric_rates", "offline", "binary", "passed",
     "checks_passed", "checks_total", "accuracy", "signature_sha256",
 }
 _CASE_KEYS = {"id", "category", "status", "checks", "evidence", "failure_class"}
 _METRIC_KEYS = {"status", "numerator", "denominator", "rate", "p50_ms", "p95_ms", "p99_ms", "value", "reason"}
 _PUBLIC_LABEL_FORBIDDEN = ("private", "query", "token", "credential", "password", "secret", "body")
+_PUBLIC_IDENTIFIER_EXCEPTIONS = set()
 
 
 def _is_public_identifier(value: Any) -> bool:
-    return isinstance(value, str) and bool(_SAFE_ID_RE.fullmatch(value)) and not any(
-        token in value.lower() for token in _PUBLIC_LABEL_FORBIDDEN
+    return isinstance(value, str) and bool(_SAFE_ID_RE.fullmatch(value)) and (
+        value in _PUBLIC_IDENTIFIER_EXCEPTIONS
+        or not any(token in value.lower() for token in _PUBLIC_LABEL_FORBIDDEN)
     )
 
 
@@ -176,11 +178,36 @@ def _validate_safe_evidence(evidence: Any, path: str = "evidence") -> None:
                 raise ValueError(f"{field_path} must be a bounded identifier")
 
 
+def _validate_public_metric_rates(metric_rates: Any) -> None:
+    if not isinstance(metric_rates, dict):
+        raise ValueError("metric_rates must be an object")
+    for name, metric in metric_rates.items():
+        if not _is_public_identifier(name) or not isinstance(metric, dict):
+            raise ValueError("metric_rates must contain bounded names and objects")
+        if set(metric) - {"status", "rate"}:
+            raise ValueError(f"metric_rates {name} contains unknown fields")
+        status = metric.get("status")
+        if status not in {"available", "partial", "unavailable", "not_measured", "failed"}:
+            raise ValueError(f"metric_rates {name} has invalid status")
+        if "rate" in metric:
+            rate = metric["rate"]
+            if isinstance(rate, bool) or not isinstance(rate, (int, float)) or not math.isfinite(float(rate)) or not 0 <= rate <= 1:
+                raise ValueError(f"metric_rates {name} has invalid rate")
+        if status in {"unavailable", "partial", "not_measured"} and metric.get("rate") is not None:
+            raise ValueError(f"metric_rates {name} has a rate for non-measured status")
+        if status == "available" and ("rate" not in metric or metric.get("rate") is None):
+            raise ValueError(f"metric_rates {name} lacks a measured rate")
+        if status == "failed" and metric.get("rate") is not None:
+            # A failed metric may retain its observed rate for diagnosis; the
+            # scorecard still blocks it based on status.
+            pass
+
+
 def _validate_status_map(capabilities: Any) -> None:
     if not isinstance(capabilities, dict) or not capabilities:
         raise ValueError("capabilities must be a non-empty object")
     allowed = {"available", "partial", "unavailable", "not_measured", "failed"}
-    allowed_state_keys = {"status", "reason", "required_tools", "missing_tools"}
+    allowed_state_keys = {"status", "reason", "required_tools", "missing_tools", "details", "count"}
     for name, state in capabilities.items():
         if not _is_public_identifier(name):
             raise ValueError("capability names must be bounded identifiers")
@@ -194,8 +221,21 @@ def _validate_status_map(capabilities: Any) -> None:
                 or any(not _is_public_identifier(tool) for tool in state[key])
             ):
                 raise ValueError(f"capability {name}.{key} contains unsafe tool names")
+        if "count" in state and (
+            not isinstance(state["count"], int)
+            or isinstance(state["count"], bool)
+            or state["count"] < 0
+        ):
+            raise ValueError(f"capability {name}.count must be a non-negative integer")
+        if "details" in state and not isinstance(state["details"], dict):
+            raise ValueError(f"capability {name}.details must be an object")
+        if "details" in state:
+            if state["details"]:
+                raise ValueError(f"capability {name}.details must be empty in public reports")
         if state.get("status") in {"partial", "unavailable", "not_measured", "failed"} and not isinstance(state.get("reason"), str):
             raise ValueError(f"capability {name} requires a reason")
+        if state.get("reason") is not None and not isinstance(state["reason"], str):
+            raise ValueError(f"capability {name} has a non-string reason")
         if state.get("reason") is not None and not _is_public_identifier(state["reason"]):
             raise ValueError(f"capability {name} has an unsafe reason")
         missing_tools = set(state.get("missing_tools", []))
@@ -241,6 +281,9 @@ def validate_report(report: dict[str, Any]) -> None:
         "binary_sha256",
         "dataset_sha256",
         "harness_commit",
+        "claims_sha256",
+        "claim_ids",
+        "negative_claim_ids",
     }
     missing = sorted(required - set(report))
     if missing:
@@ -251,11 +294,33 @@ def validate_report(report: dict[str, Any]) -> None:
         raise ValueError("benchmark_id must be a bounded identifier")
     if not _is_public_identifier(report["suite_version"]):
         raise ValueError("suite_version must be a bounded identifier")
-    for key in ("control_profile_sha256", "run_fingerprint_sha256", "result_signature_sha256", "binary_sha256", "dataset_sha256"):
+    for key in ("control_profile_sha256", "run_fingerprint_sha256", "result_signature_sha256", "binary_sha256", "dataset_sha256", "claims_sha256"):
         if not _is_sha256(report[key]):
             raise ValueError(f"{key} must be a lowercase SHA-256 digest")
-    if not isinstance(report["harness_commit"], str) or not re.fullmatch(r"[0-9a-f]{40}|unknown", report["harness_commit"]):
+    if not isinstance(report["harness_commit"], str) or not re.fullmatch(r"[0-9a-f]{40}", report["harness_commit"]):
         raise ValueError("harness_commit must be a bounded identifier")
+    expected_claims = sha256_text(stable_json({
+        "claim_ids": sorted(report.get("claim_ids", [])),
+        "negative_claim_ids": sorted(report.get("negative_claim_ids", [])),
+    }))
+    if "claim_ids" not in report or "negative_claim_ids" not in report:
+        raise ValueError("claim arrays are required")
+    if report["claims_sha256"] != expected_claims:
+        raise ValueError("claims_sha256 does not match claim IDs")
+    for claim_field in ("claim_ids", "negative_claim_ids"):
+        values = report[claim_field]
+        if not isinstance(values, list) or len(values) != len(set(values)):
+            raise ValueError(f"{claim_field} must be a duplicate-free array")
+    if set(report["claim_ids"]) & set(report["negative_claim_ids"]):
+        raise ValueError("claim_ids and negative_claim_ids must be disjoint")
+    if report["run_fingerprint_sha256"] != run_fingerprint(
+        binary_sha256=report["binary_sha256"],
+        control_profile_sha256=report["control_profile_sha256"],
+        dataset_sha256=report["dataset_sha256"],
+        harness_commit=report["harness_commit"],
+        claims_sha256=report["claims_sha256"],
+    ):
+        raise ValueError("run_fingerprint_sha256 does not match bound metadata")
     for optional_key in ("benchmark", "dataset", "harness_version", "binary"):
         if optional_key in report and not _is_public_identifier(report[optional_key]):
             raise ValueError(f"{optional_key} must be a public identifier")
@@ -266,6 +331,8 @@ def validate_report(report: dict[str, Any]) -> None:
         raise ValueError("required_categories must contain public identifiers")
     if "metric_rates" in report and not isinstance(report["metric_rates"], dict):
         raise ValueError("metric_rates must be an object")
+    if "metric_rates" in report:
+        _validate_public_metric_rates(report["metric_rates"])
     if "offline" in report and not isinstance(report["offline"], bool):
         raise ValueError("offline must be boolean")
     if "passed" in report and not isinstance(report["passed"], bool):
@@ -317,7 +384,7 @@ def validate_report(report: dict[str, Any]) -> None:
                 raise ValueError(f"case missing required field: {key}")
         case_id = case["id"]
         if not _is_public_identifier(case_id) or case_id in case_ids:
-            raise ValueError("case IDs must be unique bounded identifiers")
+            raise ValueError(f"case IDs must be unique bounded identifiers: {case_id!r}")
         case_ids.add(case_id)
         if not _is_public_identifier(case["category"]):
             raise ValueError(f"case {case_id} has an unsafe category")
@@ -495,17 +562,41 @@ def result_signature(report: dict[str, Any]) -> str:
         "schema_version": report.get("schema_version"),
         "benchmark_id": report.get("benchmark_id"),
         "suite_version": report.get("suite_version"),
+        "benchmark": report.get("benchmark"),
+        "dataset": report.get("dataset"),
+        "harness_version": report.get("harness_version"),
+        "suite_version": report.get("suite_version"),
         "status": report.get("status"),
         "capabilities": report.get("capabilities", {}),
         "cases": cases,
         "metrics": metrics,
         "not_measured": sorted(report.get("not_measured", [])),
         "excluded": sorted(report.get("excluded", [])),
+        "claim_ids": sorted(report.get("claim_ids", [])),
+        "negative_claim_ids": sorted(report.get("negative_claim_ids", [])),
+        "claims_sha256": report.get("claims_sha256"),
+        "failure_classes": sorted((case.get("failure_class") for case in report.get("cases", []) if case.get("failure_class"))),
+        "passed": report.get("passed"),
+        "checks_passed": report.get("checks_passed"),
+        "checks_total": report.get("checks_total"),
+        "accuracy": report.get("accuracy"),
+        "required_categories": sorted(report.get("required_categories", [])),
+        "metric_rates": report.get("metric_rates", {}),
+        "signature_sha256": report.get("signature_sha256"),
+        "control_profile_sha256": report.get("control_profile_sha256"),
+        "run_fingerprint_sha256": report.get("run_fingerprint_sha256"),
+        "binary_sha256": report.get("binary_sha256"),
+        "dataset_sha256": report.get("dataset_sha256"),
+        "harness_commit": report.get("harness_commit"),
+        "network_calls": report.get("network_calls"),
+        "offline": report.get("offline"),
+        "public_evidence": report.get("public_evidence"),
+        "raw_inputs_captured": report.get("raw_inputs_captured"),
     }
     return sha256_text(stable_json(payload))
 
 
-def run_fingerprint(*, binary_sha256: str, control_profile_sha256: str, dataset_sha256: str, harness_commit: str) -> str:
+def run_fingerprint(*, binary_sha256: str, control_profile_sha256: str, dataset_sha256: str, harness_commit: str, claims_sha256: str | None = None) -> str:
     return sha256_text(
         stable_json(
             {
@@ -513,6 +604,7 @@ def run_fingerprint(*, binary_sha256: str, control_profile_sha256: str, dataset_
                 "control_profile_sha256": control_profile_sha256,
                 "dataset_sha256": dataset_sha256,
                 "harness_commit": harness_commit,
+                **({"claims_sha256": claims_sha256} if claims_sha256 is not None else {}),
             }
         )
     )

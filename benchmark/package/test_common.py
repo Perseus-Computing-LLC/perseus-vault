@@ -10,6 +10,7 @@ from benchmark.package.common.artifacts import (
     result_signature,
     run_fingerprint,
     sha256_file,
+    sha256_text,
     stable_json,
     validate_report,
     write_report,
@@ -127,10 +128,13 @@ class CommonArtifactTests(unittest.TestCase):
             "benchmark_id": "smoke",
             "suite_version": "v1",
             "control_profile_sha256": "a" * 64,
-            "run_fingerprint_sha256": "b" * 64,
+            "run_fingerprint_sha256": run_fingerprint(binary_sha256="c" * 64, control_profile_sha256="a" * 64, dataset_sha256="d" * 64, harness_commit="a" * 40, claims_sha256=sha256_text(stable_json({"claim_ids": [], "negative_claim_ids": []}))),
             "binary_sha256": "c" * 64,
             "dataset_sha256": "d" * 64,
             "harness_commit": "a" * 40,
+            "claim_ids": [],
+            "negative_claim_ids": [],
+            "claims_sha256": sha256_text(stable_json({"claim_ids": [], "negative_claim_ids": []})),
             "status": "passed",
             "capabilities": {"mcp": {"status": "available"}},
             "cases": [
@@ -195,6 +199,43 @@ class CommonArtifactTests(unittest.TestCase):
             with self.subTest(key=key), self.assertRaises(ValueError):
                 validate_report(report)
 
+    def test_validate_report_rejects_private_identifier_tokens(self):
+        report = self._valid_report()
+        report["cases"][0]["id"] = "private-query-token"
+        with self.assertRaises(ValueError):
+            validate_report(report)
+        report = self._valid_report()
+        report["cases"][0]["id"] = "scope-invalid-recall-external"
+        report["result_signature_sha256"] = result_signature(report)
+        validate_report(report)
+        report = self._valid_report()
+        report["cases"][0]["category"] = "private-query-token"
+        with self.assertRaises(ValueError):
+            validate_report(report)
+        report = self._valid_report()
+        report["benchmark_id"] = "private-query-token"
+        with self.assertRaises(ValueError):
+            validate_report(report)
+
+    def test_validate_report_rejects_available_metric_rate_without_measurement(self):
+        report = self._valid_report()
+        report["metric_rates"] = {"suite": {"status": "available"}}
+        with self.assertRaises(ValueError):
+            validate_report(report)
+
+    def test_validate_report_rejects_non_boolean_case_checks(self):
+        report = self._valid_report()
+        report["cases"][0]["checks"]["ok"] = 1
+        with self.assertRaises(ValueError):
+            validate_report(report)
+
+    def test_validate_report_binds_claims_to_run_fingerprint(self):
+        report = self._valid_report()
+        report["claim_ids"] = ["claim-a"]
+        report["claims_sha256"] = "f" * 64
+        with self.assertRaises(ValueError):
+            validate_report(report)
+
     def test_validate_report_rejects_missing_tools_on_available_capability(self):
         report = self._valid_report()
         report["capabilities"]["mcp"] = {
@@ -236,9 +277,51 @@ class CommonArtifactTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_report(report)
 
+    def test_validate_report_rejects_forged_run_fingerprint(self):
+        report = self._valid_report()
+        report["run_fingerprint_sha256"] = "f" * 64
+        with self.assertRaises(ValueError):
+            validate_report(report)
+
     def test_run_fingerprint_binds_binary_profile_dataset_and_commit(self):
         args = dict(binary_sha256="a" * 64, control_profile_sha256="b" * 64, dataset_sha256="c" * 64, harness_commit="a" * 40)
         self.assertNotEqual(run_fingerprint(**args), run_fingerprint(**{**args, "harness_commit": "b" * 40}))
+        self.assertNotEqual(run_fingerprint(**args), run_fingerprint(**{**args, "claims_sha256": "d" * 64}))
+
+    def test_validate_report_rejects_unknown_harness_commit(self):
+        report = self._valid_report()
+        report["harness_commit"] = "unknown"
+        with self.assertRaises(ValueError):
+            validate_report(report)
+
+    def test_validate_report_requires_explicit_claim_arrays(self):
+        report = self._valid_report()
+        del report["claim_ids"]
+        with self.assertRaises(ValueError):
+            validate_report(report)
+        report = self._valid_report()
+        del report["negative_claim_ids"]
+        with self.assertRaises(ValueError):
+            validate_report(report)
+
+    def test_result_signature_binds_report_identity(self):
+        report = self._valid_report()
+        changed = dict(report)
+        changed["dataset"] = "other-dataset"
+        changed["harness_version"] = "other-harness"
+        self.assertNotEqual(result_signature(report), result_signature(changed))
+        changed["suite_version"] = "v2"
+        self.assertNotEqual(result_signature(report), result_signature(changed))
+
+    def test_validate_report_rejects_overlapping_claim_arrays(self):
+        report = self._valid_report()
+        report["claim_ids"] = ["same-claim"]
+        report["negative_claim_ids"] = ["same-claim"]
+        report["claims_sha256"] = sha256_text(stable_json({"claim_ids": ["same-claim"], "negative_claim_ids": ["same-claim"]}))
+        report["run_fingerprint_sha256"] = run_fingerprint(binary_sha256=report["binary_sha256"], control_profile_sha256=report["control_profile_sha256"], dataset_sha256=report["dataset_sha256"], harness_commit=report["harness_commit"], claims_sha256=report["claims_sha256"])
+        report["result_signature_sha256"] = result_signature(report)
+        with self.assertRaises(ValueError):
+            validate_report(report)
 
     def test_sha256_file_is_real_content_hash(self):
         with tempfile.TemporaryDirectory() as directory:

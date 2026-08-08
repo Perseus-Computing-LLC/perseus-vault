@@ -394,6 +394,15 @@ pub struct Database {
     embed_queue_cap: usize,
     /// #619: opt-in resident sig cache for the dense arm (see `SigCache`).
     sig_cache: std::sync::Mutex<Option<SigCache>>,
+    /// #882: decoupled governance overlay — a SEPARATE SQLite file
+    /// (`{db_path}.governance.db`) holding digest-keyed permanent erasure
+    /// mandates. It lives outside the primary store's lifecycle on purpose:
+    /// rolling the primary DB back (restore, revert, replay) can resurrect
+    /// rows AND wipe in-DB tombstones, but the overlay file is untouched, so
+    /// the read-layer interceptor keeps suppressing. Lazily opened under a
+    /// mutex (rusqlite::Connection is !Send/!Sync, so it cannot live in a
+    /// OnceLock inside the shared Database).
+    governance_overlay: std::sync::Mutex<Option<rusqlite::Connection>>,
 }
 
 /// #619: bumped by every in-place emb_sig write; one of the sig cache's two
@@ -837,6 +846,7 @@ impl Database {
             embed_worker: std::sync::OnceLock::new(),
             embed_queue_cap: EMBED_QUEUE_CAP,
             sig_cache: std::sync::Mutex::new(None),
+            governance_overlay: std::sync::Mutex::new(None),
         })
     }
 
@@ -3067,13 +3077,16 @@ impl Database {
             let e = e?;
             by_id.insert(e.id.clone(), e);
         }
-        // Emit in the score order computed above; skip any id that vanished
-        // between the scan and the hydrate (deleted concurrently).
+        // Release the primary statement before opening the read-only sidecar.
+        drop(hstmt);
+        // Emit in score order and apply governance before the caller can rank or
+        // truncate the candidates. Suppressed rows must not occupy top-k slots.
         let result: Vec<(Entity, f64)> = scored_ids
             .into_iter()
             .filter_map(|(id, sim)| by_id.remove(&id).map(|e| (e, sim)))
             .collect();
-        Ok(result)
+        let visible = self.filter_suppressed_scored_with_conn(&conn, result)?;
+        Ok(visible)
     }
 
     // ─── Decay & Layer Progression ──────────────────────────────────
@@ -3981,6 +3994,14 @@ impl Database {
                 expires_at_unix_ms,
             ],
         )?;
+        drop(conn);
+        // #882: permanent refusals are mirrored into the DECOUPLED overlay
+        // so the mandate survives primary-DB reversion. Expiring tombstones
+        // remain lifecycle-scoped to the primary table: mirroring one into
+        // the permanent overlay would violate its expiry contract.
+        if expires_at_unix_ms.is_none() {
+            self.assert_erasure(value, predicate, reason, workspace_hash)?;
+        }
         Ok(id)
     }
 
@@ -4001,6 +4022,9 @@ impl Database {
         let digest = rejected_value_digest(value);
         let now = now_ms();
         let conn = self.conn()?;
+        // Expiry cleanup is part of the tombstone lifecycle write/read
+        // contract. It does not touch the governance sidecar or ordinary
+        // entity reads; it only removes expired primary tombstones.
         conn.execute(
             "DELETE FROM rejected_value_tombstones
              WHERE expires_at_unix_ms IS NOT NULL AND expires_at_unix_ms <= ?1",
@@ -4018,6 +4042,361 @@ impl Database {
             .optional()?;
         Ok(hit.is_some())
     }
+
+    // ─── #882: decoupled governance overlay ─────────────────────────────
+    //
+    // A SEPARATE SQLite file (`{db_path}.governance.db`) holds permanent
+    // erasure mandates keyed by value digest. It is deliberately decoupled
+    // from the primary store's lifecycle: rolling the primary DB back
+    // (restore/revert/replay) can resurrect rows AND wipe in-DB tombstones,
+    // but this file is untouched, so the read-layer interceptor keeps
+    // suppressing. The write gate consults it too (continuous assertion),
+    // so a resurrected store cannot be re-poisoned with a suppressed value.
+
+    /// Lazy-open (or return) the decoupled governance overlay connection.
+    /// The file lives next to the primary DB as `{db_path}.governance.db`.
+    /// A short-lived guard is held only while the connection is used; the
+    /// connection itself is cached for the Database's lifetime.
+    fn governance_conn(
+        &self,
+        create: bool,
+    ) -> Result<std::sync::MutexGuard<'_, Option<rusqlite::Connection>>, Box<dyn std::error::Error>> {
+        let mut guard = self
+            .governance_overlay
+            .lock()
+            .map_err(|_| "governance overlay mutex poisoned".to_string())?;
+        if guard.is_none() {
+            let overlay_path = format!("{}.governance.db", self.db_path);
+            // Read paths must not create sidecar state for an ordinary vault.
+            // Once a mandate has been authored, the file exists and is opened
+            // read-only-by-convention through this connection.
+            if create || std::path::Path::new(&overlay_path).exists() {
+                let overlay = if create {
+                    rusqlite::Connection::open(&overlay_path)?
+                } else {
+                    rusqlite::Connection::open_with_flags(
+                        &overlay_path,
+                        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                    )?
+                };
+                // `journal_mode=WAL` and schema creation can mutate the
+                // sidecar. Only mandate authorship may perform that setup;
+                // ordinary reads open it read-only and remain observational.
+                if create {
+                    overlay.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
+                    let has_table: bool = overlay.query_row(
+                        "SELECT EXISTS(
+                             SELECT 1 FROM sqlite_master
+                             WHERE type = 'table' AND name = 'erasure_mandates'
+                         )",
+                        [],
+                        |row| row.get(0),
+                    )?;
+                    if has_table {
+                        let mut columns = overlay.prepare("PRAGMA table_info(erasure_mandates)")?;
+                        let names: Vec<String> = columns
+                            .query_map([], |row| row.get::<_, String>(1))?
+                            .collect::<Result<Vec<_>, _>>()?;
+                        drop(columns);
+                        // Older sidecars used (workspace_hash, value_sha256)
+                        // and had no predicate column. Rebuild them only on a
+                        // mandate-authoring write; read paths never migrate.
+                        if !names.iter().any(|name| name == "predicate") {
+                            overlay.execute_batch(
+                                "ALTER TABLE erasure_mandates RENAME TO erasure_mandates_legacy;
+                                 CREATE TABLE erasure_mandates (
+                                   value_sha256       TEXT NOT NULL,
+                                   predicate         TEXT NOT NULL DEFAULT '',
+                                   reason             TEXT NOT NULL DEFAULT '',
+                                   workspace_hash     TEXT NOT NULL DEFAULT '',
+                                   created_at_unix_ms INTEGER NOT NULL,
+                                   PRIMARY KEY (workspace_hash, predicate, value_sha256)
+                                 );
+                                 INSERT INTO erasure_mandates
+                                   (value_sha256, predicate, reason, workspace_hash, created_at_unix_ms)
+                                 SELECT value_sha256, '', reason, workspace_hash, created_at_unix_ms
+                                   FROM erasure_mandates_legacy;
+                                 DROP TABLE erasure_mandates_legacy;",
+                            )?;
+                        }
+                    } else {
+                        overlay.execute_batch(
+                            "CREATE TABLE erasure_mandates (
+                               value_sha256       TEXT NOT NULL,
+                               predicate         TEXT NOT NULL DEFAULT '',
+                               reason             TEXT NOT NULL DEFAULT '',
+                               workspace_hash     TEXT NOT NULL DEFAULT '',
+                               created_at_unix_ms INTEGER NOT NULL,
+                               PRIMARY KEY (workspace_hash, predicate, value_sha256)
+                             );",
+                        )?;
+                    }
+                }
+                *guard = Some(overlay);
+            }
+        }
+        Ok(guard)
+    }
+
+    /// #882: assert a permanent erasure mandate for a value in the
+    /// decoupled overlay. Idempotent; survives primary-DB reversion because
+    /// it lives in a separate file. `reject_value` and `correct` mirror
+    /// their tombstones here so every refusal becomes a permanent mandate.
+    pub fn assert_erasure(
+        &self,
+        value: &str,
+        predicate: &str,
+        reason: &str,
+        workspace_hash: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let digest = rejected_value_digest(value);
+        let guard = self.governance_conn(true)?;
+        let conn = guard.as_ref().expect("overlay initialized above");
+        conn.execute(
+            "INSERT INTO erasure_mandates
+             (value_sha256, predicate, reason, workspace_hash, created_at_unix_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(workspace_hash, predicate, value_sha256)
+             DO UPDATE SET reason=excluded.reason",
+            params![digest, predicate, reason, workspace_hash, now_ms()],
+        )?;
+        Ok(())
+    }
+
+    fn governance_read_conn(
+        &self,
+    ) -> Result<Option<rusqlite::Connection>, Box<dyn std::error::Error>> {
+        let overlay_path = format!("{}.governance.db", self.db_path);
+        if !std::path::Path::new(&overlay_path).exists() {
+            return Ok(None);
+        }
+        Ok(Some(rusqlite::Connection::open_with_flags(
+            &overlay_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?))
+    }
+
+    fn governance_schema_is_compatible(
+        conn: &rusqlite::Connection,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        let mut stmt = conn.prepare("PRAGMA table_info(erasure_mandates)")?;
+        let columns: std::collections::HashSet<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .collect();
+        Ok([
+            "value_sha256",
+            "predicate",
+            "reason",
+            "workspace_hash",
+            "created_at_unix_ms",
+        ]
+        .into_iter()
+        .all(|name| columns.contains(name)))
+    }
+
+    fn governance_read_conn_compatible(
+        &self,
+    ) -> Result<Option<rusqlite::Connection>, Box<dyn std::error::Error>> {
+        let Some(conn) = self.governance_read_conn()? else {
+            return Ok(None);
+        };
+        let has_table: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='erasure_mandates')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_table || !Self::governance_schema_is_compatible(&conn)? {
+            return Ok(None);
+        }
+        Ok(Some(conn))
+    }
+
+    fn filter_suppressed_with_conn(
+        &self,
+        conn: &rusqlite::Connection,
+        entities: Vec<Entity>,
+    ) -> Result<Vec<Entity>, Box<dyn std::error::Error>> {
+        if entities.is_empty() {
+            return Ok(entities);
+        }
+        let overlay = self.governance_read_conn_compatible()?;
+        let now = now_ms();
+        let mut kept = Vec::with_capacity(entities.len());
+        for entity in entities {
+            let erased = overlay
+                .as_ref()
+                .map(|sidecar| {
+                    self.is_value_erased_with_conn(
+                        sidecar,
+                        &entity.workspace_hash,
+                        &entity.category,
+                        &entity.body_json,
+                    )
+                })
+                .transpose()?
+                .unwrap_or(false);
+            if erased || !self.primary_entity_suppressed_with_conn(conn, &entity, now)? {
+                if !erased {
+                    kept.push(entity);
+                }
+            }
+        }
+        Ok(kept)
+    }
+
+    fn primary_entity_suppressed_with_conn(
+        &self,
+        conn: &rusqlite::Connection,
+        entity: &Entity,
+        now: i64,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        let digest = rejected_value_digest(&entity.body_json);
+        let hit: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM rejected_value_tombstones
+                 WHERE workspace_hash IN ('', ?1)
+                   AND predicate = ?2
+                   AND value_sha256 = ?3
+                   AND (expires_at_unix_ms IS NULL OR expires_at_unix_ms > ?4)
+                 LIMIT 1",
+                params![entity.workspace_hash, entity.category, digest, now],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(hit.is_some())
+    }
+
+    fn is_value_erased_with_conn(
+        &self,
+        conn: &rusqlite::Connection,
+        workspace_hash: &str,
+        predicate: &str,
+        value: &str,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        let digest = rejected_value_digest(value);
+        let hit: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM erasure_mandates
+                 WHERE workspace_hash IN ('', ?1)
+                   AND predicate IN ('', ?2)
+                   AND value_sha256 = ?3
+                 LIMIT 1",
+                params![workspace_hash, predicate, digest],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(hit.is_some())
+    }
+
+    /// #882: is this value suppressed by the DECOUPLED overlay (permanent
+    /// mandate)? Consulted FIRST by both the read interceptor and the write
+    /// gate — it is the assertion that survives primary-DB rollback.
+    pub fn is_value_erased(
+        &self,
+        workspace_hash: &str,
+        predicate: &str,
+        value: &str,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        let Some(conn) = self.governance_read_conn_compatible()? else {
+            return Ok(false);
+        };
+        self.is_value_erased_with_conn(&conn, workspace_hash, predicate, value)
+    }
+
+    /// #882: full suppression check — decoupled overlay OR in-DB tombstone.
+    /// Used by the write gate (continuous assertion) and by the read
+    /// interceptor's single-value path.
+    pub fn is_value_suppressed(
+        &self,
+        workspace_hash: &str,
+        predicate: &str,
+        value: &str,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        Ok(self.is_value_erased(workspace_hash, predicate, value)?
+            || self.is_value_rejected(workspace_hash, "", predicate, value)?)
+    }
+
+    /// #882: read-layer governance interceptor. Given retrieved entities
+    /// (any read path — recall, scan, get_entity, temporal), drop every
+    /// entity whose body digest carries an erasure mandate in the overlay
+    /// OR an in-DB tombstone. This is the permanent assertion standing
+    /// between suppressed data and every consumer.
+    pub fn filter_suppressed(
+        &self,
+        entities: Vec<Entity>,
+    ) -> Result<Vec<Entity>, Box<dyn std::error::Error>> {
+        if entities.is_empty() {
+            return Ok(entities);
+        }
+        let conn = self.conn()?;
+        let kept = self.filter_suppressed_with_conn(&conn, entities)?;
+        drop(conn);
+        Ok(kept)
+    }
+
+    /// Read-only suppression check for an already-materialized entity. The
+    /// caller owns the primary connection so this helper never performs a
+    /// nested pool checkout. Sidecar lookup is still independent and
+    /// workspace/predicate scoped.
+    fn entity_suppressed_with_conn(
+        &self,
+        conn: &rusqlite::Connection,
+        entity: &Entity,
+        now: i64,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        let overlay = self.governance_read_conn_compatible()?;
+        if overlay
+            .as_ref()
+            .map(|sidecar| {
+                self.is_value_erased_with_conn(
+                    sidecar,
+                    &entity.workspace_hash,
+                    &entity.category,
+                    &entity.body_json,
+                )
+            })
+            .transpose()?
+            .unwrap_or(false)
+        {
+            return Ok(true);
+        }
+        self.primary_entity_suppressed_with_conn(conn, entity, now)
+    }
+
+    /// #882: like `filter_suppressed` but for scored candidates (bm25 /
+    /// dense-arm `(Entity, f64)` pairs) — drops suppressed entities while
+    /// preserving the surviving scores.
+    pub(crate) fn filter_suppressed_scored(
+        &self,
+        scored: Vec<(Entity, f64)>,
+    ) -> Result<Vec<(Entity, f64)>, Box<dyn std::error::Error>> {
+        if scored.is_empty() {
+            return Ok(scored);
+        }
+        let conn = self.conn()?;
+        let kept = self.filter_suppressed_scored_with_conn(&conn, scored)?;
+        drop(conn);
+        Ok(kept)
+    }
+
+    fn filter_suppressed_scored_with_conn(
+        &self,
+        conn: &rusqlite::Connection,
+        scored: Vec<(Entity, f64)>,
+    ) -> Result<Vec<(Entity, f64)>, Box<dyn std::error::Error>> {
+        let now = now_ms();
+        let mut kept = Vec::with_capacity(scored.len());
+        for (entity, score) in scored {
+            if !self.entity_suppressed_with_conn(conn, &entity, now)? {
+                kept.push((entity, score));
+            }
+        }
+        Ok(kept)
+    }
+
+
 
     fn remember_impl(
         &self,
@@ -4052,12 +4431,15 @@ impl Database {
     ) -> Result<(String, String), Box<dyn std::error::Error>> {
         let enriched_entity = ensure_durable_write_provenance(entity, verified_admission);
         let entity = &enriched_entity;
-        // #849: scoped rejected-value tombstones are enforced on every
+        // #849/#882: scoped rejected-value tombstones are enforced on every
         // remember-path write (agent remember, capture, ingest, connectors,
         // derived writers) so a corrected/deleted value cannot be laundered
-        // back in under a new key. A deliberate trusted override passes
-        // allow_rejected=true and is journaled below for audit.
-        if !allow_rejected && self.is_value_rejected(&entity.workspace_hash, &entity.key, &entity.category, &entity.body_json)?
+        // back in under a new key. The check consults BOTH the in-DB
+        // tombstone table and the decoupled governance overlay (#882), so a
+        // resurrected primary store (rollback/revert) still cannot be
+        // re-poisoned with a value under permanent erasure. A deliberate
+        // trusted override passes allow_rejected=true and is journaled below.
+        if !allow_rejected && self.is_value_suppressed(&entity.workspace_hash, &entity.category, &entity.body_json)?
         {
             let digest = rejected_value_digest(&entity.body_json);
             let journal_id = format!("jrn-{}", uuid::Uuid::new_v4().simple());
@@ -4761,6 +5143,10 @@ impl Database {
                         limit.saturating_mul(5).clamp(1, 1000).max(limit.min(1000));
                     let dense_results = self.dense_search(query_vec, candidate_k)?;
                     timer.stage("dense");
+                    // #882: remove governed candidates before ranking/truncation
+                    // and optional reinforcement; suppressed rows must not
+                    // consume a page slot or receive read-side effects.
+                    let dense_results = self.filter_suppressed_scored(dense_results)?;
                     // #485: apply the scope preference while similarity scores
                     // are still attached, before they're dropped below.
                     let dense_results = Self::apply_scope_rank_weight(dense_results, params);
@@ -4771,8 +5157,9 @@ impl Database {
                     self.reinforce_if_requested(params, &out)?;
                     timer.stage("filter");
                     timer.finish("dense");
-                    return Ok(out);
-                }
+                    // #882: governance interceptor on the dense arm.
+                    return Ok(self.filter_suppressed(out)?);
+                    }
 
                 // Hybrid: fuse the dense vectors with a read-only, BM25-ranked,
                 // stopword-filtered keyword arm. The keyword arm is fused at a
@@ -4828,8 +5215,8 @@ impl Database {
                             });
                         (dense_res, sparse_res, dense_ms, sparse_ms)
                     });
-                let dense_scored = dense_res?;
-                let sparse_scored = sparse_res?;
+                let dense_scored = self.filter_suppressed_scored(dense_res?)?;
+                let sparse_scored = self.filter_suppressed_scored(sparse_res?)?;
                 timer.stage("arms");
                 timer.record("dense", dense_ms);
                 timer.record("sparse", sparse_ms);
@@ -4855,7 +5242,7 @@ impl Database {
                         graph_seeds.push(e.clone());
                     }
                 }
-                let graph_scored = self.graph_expand(&graph_seeds, candidate_k)?;
+                let graph_scored = self.filter_suppressed_scored(self.graph_expand(&graph_seeds, candidate_k)?)?;
                 timer.stage("graph");
                 let graph_weight = crate::db::graph_arm_weight(graph_scored.len());
 
@@ -4933,10 +5320,15 @@ impl Database {
                                 .generate_embedding_with_fallback(sub)
                                 .ok()
                                 .and_then(|emb| self.dense_search(&emb, candidate_k).ok())
+                                .and_then(|scored| self.filter_suppressed_scored(scored).ok())
                                 .unwrap_or_default();
                             let mut sp = wide.clone();
                             sp.query = sub.clone();
-                            let s = self.fts5_bm25_search(&sp).unwrap_or_default();
+                            let s = self
+                                .fts5_bm25_search(&sp)
+                                .ok()
+                                .and_then(|scored| self.filter_suppressed_scored(scored).ok())
+                                .unwrap_or_default();
                             let sub_fused = crate::db::reciprocal_rank_fusion(
                                 &d,
                                 &s,
@@ -4991,7 +5383,8 @@ impl Database {
                 self.reinforce_if_requested(params, &out)?;
                 timer.stage("filter");
                 timer.finish("hybrid");
-                return Ok(out);
+                // #882: governance interceptor on the hybrid arm.
+                return Ok(self.filter_suppressed(out)?);
             }
             // Empty query: nothing to embed, fall through to FTS5
         }
@@ -5007,7 +5400,11 @@ impl Database {
             results.sort_by_key(|e| e.workspace_hash.is_empty());
         }
         timer.finish("fts5");
-        Ok(results)
+        // #882: read-layer governance interceptor — drop any retrieved
+        // entity under a permanent erasure mandate (decoupled overlay) or an
+        // in-DB tombstone. Runs on the recall funnel, which recall_batch,
+        // context_block, ask, and the grpc surface all feed through.
+        Ok(self.filter_suppressed(results)?)
     }
 
     pub fn recall_batch(
@@ -5552,8 +5949,19 @@ impl Database {
         fts_drive_max: usize,
     ) -> Result<Vec<Entity>, Box<dyn std::error::Error>> {
         let conn = self.conn()?;
+        // #882: sidecar suppression is outside the FTS schema, so fetch the
+        // bounded maximum and apply governance before local pagination. A
+        // suppressed hit must not consume the caller's limit/offset slots.
+        let mut search_params = params.clone();
+        search_params.offset = 0;
+        if params.limit > 0 {
+            search_params.limit = params
+                .limit
+                .saturating_add(params.offset.max(0))
+                .clamp(0, 11_000);
+        }
         let (sql, param_values) =
-            match Self::build_fts5_search_sql(&conn, params, fts_drive_max)? {
+            match Self::build_fts5_search_sql(&conn, &search_params, fts_drive_max)? {
                 Some(built) => built,
                 // FTS terms present but nothing matched: result is empty by
                 // construction, with no side effects to apply (no hits).
@@ -5566,16 +5974,18 @@ impl Database {
         let mut stmt = conn.prepare(&sql)?;
         let enc = self.encryption.as_ref();
         let rows = stmt.query_map(param_refs.as_slice(), |row| entity_from_row(row, enc))?;
-
-        let mut items = Vec::with_capacity(params.limit.max(0) as usize);
-        // #207: collect matched ids and apply retrieval-count/recency/decay/layer
-        // side-effects in one batched UPDATE after the loop, instead of one
-        // write per returned row on this read-mostly hot path.
-        let mut hit_ids: Vec<String> = Vec::with_capacity(params.limit.max(0) as usize);
+        let mut raw_items = Vec::with_capacity(search_params.limit.max(0) as usize);
         for row in rows {
-            let mut entity = row?;
-            if !params.skip_side_effects {
-                hit_ids.push(entity.id.clone());
+            raw_items.push(row?);
+        }
+        drop(stmt);
+
+        let mut items = Vec::with_capacity(search_params.limit.max(0) as usize);
+        // #882: governance is applied before ranking/truncation. A suppressed
+        // row must not consume a page slot or receive read-side effects.
+        for mut entity in raw_items {
+            if self.entity_suppressed_with_conn(&conn, &entity, now_ms())? {
+                continue;
             }
 
             // #103: Apply preview cap with drill-down footer (BrainDB-inspired)
@@ -5594,15 +6004,6 @@ impl Database {
                 }
             }
             items.push(entity);
-        }
-
-        // #207: one batched side-effect write for all matched rows. Errors are
-        // ignored here exactly as the previous per-row write was — a failed bump
-        // must never fail the read. #397: applied on the connection this search
-        // already holds — a nested self.conn() here held TWO pooled connections
-        // per recall and collapsed the pool under load.
-        if !hit_ids.is_empty() {
-            let _ = Self::apply_recall_side_effects_with_conn(&conn, &hit_ids);
         }
 
         // #106: Content witness signal (additive boost, never penalizes)
@@ -5666,6 +6067,20 @@ impl Database {
             );
         }
 
+        let start = params.offset.clamp(0, 10000) as usize;
+        let end = start.saturating_add(params.limit.clamp(0, 1000) as usize).min(items.len());
+        if start >= items.len() {
+            items.clear();
+        } else {
+            items = items[start..end].to_vec();
+        }
+        // Preserve the historical FTS reinforcement contract, but only after
+        // governance and pagination have selected visible rows. The query
+        // statement was materialized and dropped above before this write.
+        if !params.skip_side_effects && !items.is_empty() {
+            let ids: Vec<String> = items.iter().map(|e| e.id.clone()).collect();
+            let _ = Self::apply_recall_side_effects_with_conn(&conn, &ids);
+        }
         Ok(items)
     }
 
@@ -5775,7 +6190,7 @@ impl Database {
         const BM25_FIRST_FETCH_MIN: usize = 128;
         const BM25_MAX_FETCH: usize = 4096;
         let mut fetch = safe_limit
-            .saturating_mul(3)
+            .saturating_mul(4)
             .clamp(BM25_FIRST_FETCH_MIN, BM25_MAX_FETCH);
         loop {
             let mut stmt = conn.prepare(
@@ -5795,8 +6210,10 @@ impl Database {
             }
             let exhausted = ranked.len() < fetch;
             drop(stmt);
-            let out = self.bm25_hydrate_filtered(&conn, &ranked, params, safe_limit)?;
-            if out.len() == safe_limit || exhausted {
+            let mut out = self.bm25_hydrate_filtered(&conn, &ranked, params, fetch)?;
+            out = self.filter_suppressed_scored_with_conn(&conn, out)?;
+            if out.len() >= safe_limit || exhausted {
+                out.truncate(safe_limit);
                 return Ok(out);
             }
             if fetch >= BM25_MAX_FETCH {
@@ -5849,6 +6266,13 @@ impl Database {
         for r in rows {
             out.push(r?);
         }
+        drop(stmt);
+        // #882: governance interceptor on the bm25 candidate arm — drop
+        // suppressed entities while preserving surviving scores. The current
+        // BM25 connection is still live, so use it directly rather than
+        // checking out a second pooled connection.
+        let mut out = self.filter_suppressed_scored_with_conn(&conn, out)?;
+        out.truncate(safe_limit);
         Ok(out)
     }
 
@@ -5903,7 +6327,10 @@ impl Database {
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| a.0.cmp(&b.0))
         });
-        self.bm25_hydrate_filtered(conn, &ranked, params, safe_limit)
+        let out = self.bm25_hydrate_filtered(conn, &ranked, params, scan_cap)?;
+        let mut out = self.filter_suppressed_scored_with_conn(conn, out)?;
+        out.truncate(safe_limit);
+        Ok(out)
     }
 
     /// #511 phase 2: hydrate a bm25-ranked rowid pool and apply the sparse
@@ -6137,12 +6564,25 @@ impl Database {
         // first, then the lexicographically-first workspace — not whichever
         // row SQLite happened to visit.
 
-        let mut rows = stmt.query_map(params![category, key], |row| {
-            entity_from_row(row, self.encryption.as_ref())
-        })?;
+        let entity = {
+            let mut rows = stmt.query_map(params![category, key], |row| {
+                entity_from_row(row, self.encryption.as_ref())
+            })?;
+            match rows.next() {
+                Some(row) => Some(row?),
+                None => None,
+            }
+        };
+        drop(stmt);
+        drop(conn);
 
-        if let Some(row) = rows.next() {
-            Ok(Some(row?))
+        if let Some(entity) = entity {
+            // #882: governance interceptor — a permanently erased entity is
+            // unreachable even by direct key lookup. The primary statement
+            // and pooled connection are released before the sidecar/legacy
+            // tombstone checks to avoid nested pool draws and SQLite locks.
+            let mut kept = self.filter_suppressed(vec![entity])?;
+            Ok(kept.pop())
         } else {
             Ok(None)
         }
@@ -6729,26 +7169,50 @@ impl Database {
         // entity_history snapshots predate the follow/efficacy/epistemic columns
         // and do not carry them; entity_from_row reads those slots as
         // out-of-range and hydrates defaults, which is correct for history rows.
-        let mut stmt = conn.prepare(
-            "SELECT id, category, key, body_json, status, type, tags, decay_score,
-                    retrieval_count, layer, topic_path, archived, archive_reason, links,
-                    verified, source, created_at_unix_ms, last_accessed_unix_ms,
-                    NULL as embedding, always_on, certainty, workspace_hash, agent_id,
-                    visibility
-             FROM entity_history
-             WHERE category = ?1 AND key = ?2
-             ORDER BY invalidated_at_unix_ms DESC, recorded_at_unix_ms DESC
-             LIMIT ?3 OFFSET ?4",
-        )?;
-        let enc = self.encryption.as_ref();
-        let rows = stmt.query_map(params![category, key, limit, offset.max(0)], |r| {
-            entity_from_row(r, enc)
-        })?;
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r?);
+        // #882: materialize the full ordered history before applying
+        // suppression so hidden rows cannot consume SQL OFFSET/LIMIT slots.
+        // `total` remains the full underlying trail for pagination metadata.
+        let all = {
+            let mut stmt = conn.prepare(
+                "SELECT id, category, key, body_json, status, type, tags, decay_score,
+                        retrieval_count, layer, topic_path, archived, archive_reason, links,
+                        verified, source, created_at_unix_ms, last_accessed_unix_ms,
+                        NULL as embedding, always_on, certainty, workspace_hash, agent_id,
+                        visibility
+                 FROM entity_history
+                 WHERE category = ?1 AND key = ?2
+                 ORDER BY invalidated_at_unix_ms DESC, recorded_at_unix_ms DESC",
+            )?;
+            let enc = self.encryption.as_ref();
+            let rows = stmt.query_map(params![category, key], |r| {
+                entity_from_row(r, enc)
+            })?;
+            let mut all = Vec::new();
+            for r in rows {
+                all.push(r?);
+            }
+            all
+        };
+        let now = now_ms();
+        let mut visible = Vec::with_capacity(all.len());
+        for entity in all {
+            if !self.entity_suppressed_with_conn(&conn, &entity, now)? {
+                visible.push(entity);
+            }
         }
-        Ok((out, total))
+        drop(conn);
+        let start = offset.max(0) as usize;
+        let end = if limit < 0 {
+            visible.len()
+        } else {
+            start.saturating_add(limit as usize).min(visible.len())
+        };
+        let page = if start >= visible.len() {
+            Vec::new()
+        } else {
+            visible[start..end].to_vec()
+        };
+        Ok((page, total))
     }
 
     /// The version of (category, key) that was the live fact at transaction time
@@ -6788,14 +7252,19 @@ impl Database {
                AND invalidated_at_unix_ms > ?3
              ORDER BY invalidated_at_unix_ms ASC LIMIT 1"
         );
-        {
+        let historical = {
             let mut stmt = conn.prepare(&hist_sql)?;
             let mut rows = stmt.query_map(params![category, key, as_of_unix_ms], |r| {
                 entity_from_row(r, enc)
             })?;
-            if let Some(r) = rows.next() {
-                return Ok(Some(r?));
+            match rows.next() {
+                Some(r) => Some(r?),
+                None => None,
             }
+        };
+        if let Some(entity) = historical {
+            drop(conn);
+            return Ok(self.filter_suppressed(vec![entity])?.into_iter().next());
         }
 
         // Otherwise the current live row answers iff it had been recorded by T.
@@ -6805,14 +7274,22 @@ impl Database {
                AND COALESCE(recorded_at_unix_ms, created_at_unix_ms) <= ?3
              LIMIT 1"
         );
-        let mut stmt = conn.prepare(&live_sql)?;
-        let mut rows = stmt.query_map(params![category, key, as_of_unix_ms], |r| {
-            entity_from_row(r, enc)
-        })?;
-        match rows.next() {
-            Some(r) => Ok(Some(r?)),
-            None => Ok(None),
-        }
+        let live = {
+            let mut stmt = conn.prepare(&live_sql)?;
+            let mut rows = stmt.query_map(params![category, key, as_of_unix_ms], |r| {
+                entity_from_row(r, enc)
+            })?;
+            match rows.next() {
+                Some(r) => Some(r?),
+                None => None,
+            }
+        };
+        drop(conn);
+        let visible = match live {
+            Some(entity) => self.filter_suppressed(vec![entity])?,
+            None => Vec::new(),
+        };
+        Ok(visible.into_iter().next())
     }
 
     /// Fetch every version (live + superseded) of (category, key) that had been
@@ -6863,7 +7340,19 @@ impl Database {
         for r in rows {
             out.push(r?);
         }
-        Ok(out)
+        // The primary connection must be released before the governance
+        // interceptor is called: the interceptor owns its own read connection
+        // and temporal callers are exercised with a one-connection pool.
+        drop(stmt);
+        drop(conn);
+        let mut kept = Vec::with_capacity(out.len());
+        for version in out {
+            if self.filter_suppressed(vec![version.entity.clone()])?.is_empty() {
+                continue;
+            }
+            kept.push(version);
+        }
+        Ok(kept)
     }
 
     /// The full 2-axis bi-temporal query (#363, SQL:2011 SYSTEM_TIME +
@@ -7016,28 +7505,46 @@ impl Database {
              WHERE entity_history_fts MATCH ?1{} \
              GROUP BY h.category, h.key \
              ORDER BY rec DESC, h.category ASC, h.key ASC \
-             LIMIT ?{}",
+             LIMIT -1",
             if scoped {
                 " AND (h.workspace_hash = ?2 OR h.workspace_hash = '')"
             } else {
                 ""
-            },
-            if scoped { 3 } else { 2 }
+            }
         );
         let mut stmt = conn.prepare(&sql)?;
         let map_row =
             |r: &rusqlite::Row| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?));
         let rows: Vec<(String, String)> = if scoped {
-            stmt.query_map(
-                params![fts_query, workspace_hash.unwrap(), limit as i64],
-                map_row,
-            )?
-            .collect::<rusqlite::Result<Vec<_>>>()?
+            stmt.query_map(params![fts_query, workspace_hash.unwrap()], map_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?
         } else {
-            stmt.query_map(params![fts_query, limit as i64], map_row)?
+            stmt.query_map(params![fts_query], map_row)?
                 .collect::<rusqlite::Result<Vec<_>>>()?
         };
-        Ok(rows)
+        // History FTS can identify a key whose matching version is no longer
+        // live. Keep the candidate-key surface conservative: if every
+        // matching historical version is governed, do not disclose the key.
+        let mut visible = Vec::with_capacity(rows.len());
+        drop(stmt);
+        drop(conn);
+        for (category, key) in rows {
+            let versions = self.versions_recorded_by(&category, &key, i64::MAX)?;
+            let mut has_visible = false;
+            for version in &versions {
+                if !self.filter_suppressed(vec![version.entity.clone()])?.is_empty() {
+                    has_visible = true;
+                    break;
+                }
+            }
+            if has_visible {
+                visible.push((category, key));
+                if visible.len() >= limit {
+                    break;
+                }
+            }
+        }
+        Ok(visible)
     }
 
     /// #472 Temporal RAG: reconstruct a recalled entity set to its point-in-time
@@ -7875,20 +8382,17 @@ impl Database {
         max_depth: i64,
         max_nodes: i64,
     ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-        let conn = self.conn()?;
+        // Resolve the root before borrowing a connection; get_entity performs
+        // the governance check and releases its pooled connection itself.
         let root = self
             .get_entity(category, key)?
             .ok_or_else(|| format!("entity not found: {}/{}", category, key))?;
+        let conn = self.conn()?;
 
-        // Get root links
-        let links_json: String = conn
-            .query_row(
-                "SELECT links FROM entities WHERE id = ?1",
-                params![root.id],
-                |r| r.get(0),
-            )
-            .unwrap_or_else(|_| "[]".to_string());
-        let root_links: Vec<MemoryLink> = serde_json::from_str(&links_json).unwrap_or_default();
+        let root_links_json = serde_json::to_string(&root.links).unwrap_or_else(|_| "[]".to_string());
+        let root_links: Vec<MemoryLink> = serde_json::from_str(&root_links_json).unwrap_or_default();
+
+        // Get root links from the already-authorized root entity.
         let root_links_json: Vec<serde_json::Value> = root_links
             .iter()
             .map(|l| serde_json::json!({"target_id": l.target_id, "relationship": l.relationship}))
@@ -7935,8 +8439,23 @@ impl Database {
         max_nodes: i64,
         current_depth: i64,
     ) {
+        // Traversal remains best-effort for its historical API; query errors
+        // are represented as an omitted/dangling link rather than propagated.
+        let _ = self._traverse_links_inner(conn, entity_id, traversed, visited, max_depth, max_nodes, current_depth);
+    }
+
+    fn _traverse_links_inner(
+        &self,
+        conn: &rusqlite::Connection,
+        entity_id: &str,
+        traversed: &mut Vec<serde_json::Value>,
+        visited: &mut std::collections::HashSet<String>,
+        max_depth: i64,
+        max_nodes: i64,
+        current_depth: i64,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         if current_depth >= max_depth || traversed.len() as i64 >= max_nodes {
-            return;
+            return Ok(());
         }
 
         let links_json: String = conn
@@ -7954,9 +8473,29 @@ impl Database {
                 continue;
             }
 
-            match self.get_entity_by_id(&link.target_id) {
-                Ok(Some(entity)) => {
-                    visited.insert(link.target_id.clone());
+            // Read the child from the connection already owned by this
+            // traversal, then apply the governance decision to the
+            // materialized row without a nested primary checkout.
+            let child: Option<Entity> = conn
+                .query_row(
+                    "SELECT id, category, key, body_json, status, type, tags,
+                            decay_score, retrieval_count, layer, topic_path,
+                            archived, archive_reason, links, verified, source,
+                            created_at_unix_ms, last_accessed_unix_ms, NULL as embedding,
+                            always_on, certainty, workspace_hash, agent_id, visibility,
+                            follow_count, miss_count, follow_rate, efficacy_status,
+                            epistemic_state
+                     FROM entities WHERE id = ?1",
+                    params![link.target_id],
+                    |row| entity_from_row(row, self.encryption.as_ref()),
+                )
+                .optional()?;
+            let child = match child {
+                Some(entity) if !self.entity_suppressed_with_conn(conn, &entity, now_ms())? => entity,
+                _ => continue,
+            };
+            let entity = child;
+            visited.insert(link.target_id.clone());
 
                     // Get this entity's outgoing links
                     let child_links_json: String = conn
@@ -7984,27 +8523,17 @@ impl Database {
 
                     traversed.push(node.clone());
 
-                    self._traverse_links(
-                        conn,
-                        &entity.id,
-                        traversed,
-                        visited,
-                        max_depth,
-                        max_nodes,
-                        current_depth + 1,
-                    );
-                }
-                Ok(None) => {
-                    // Dangling link — target entity no longer exists
-                }
-                Err(e) => {
-                    eprintln!(
-                        "mimir: traverse error reading entity {}: {}",
-                        link.target_id, e
-                    );
-                }
-            }
+            self._traverse_links_inner(
+                conn,
+                &entity.id,
+                traversed,
+                visited,
+                max_depth,
+                max_nodes,
+                current_depth + 1,
+            )?;
         }
+        Ok(())
     }
 
     /// Update an entity's status (e.g., to "deprecated").
@@ -8413,11 +8942,20 @@ impl Database {
                     epistemic_state
              FROM entities WHERE id = ?1",
         )?;
-        let mut rows = stmt.query_map(params![id], |row| {
-            entity_from_row(row, self.encryption.as_ref())
-        })?;
-        if let Some(row) = rows.next() {
-            Ok(Some(row?))
+        let entity = {
+            let mut rows = stmt.query_map(params![id], |row| {
+                entity_from_row(row, self.encryption.as_ref())
+            })?;
+            match rows.next() {
+                Some(row) => Some(row?),
+                None => None,
+            }
+        };
+        drop(stmt);
+        drop(conn);
+        if let Some(entity) = entity {
+            let mut kept = self.filter_suppressed(vec![entity])?;
+            Ok(kept.pop())
         } else {
             Ok(None)
         }
@@ -8813,6 +9351,11 @@ impl Database {
         workspace_hash: Option<&str>,
     ) -> Result<Vec<Entity>, Box<dyn std::error::Error>> {
         let conn = self.conn()?;
+        // #882: sidecar mandates are not represented in the primary SQL
+        // predicate, so materialize the complete filtered set before applying
+        // offset/limit. Otherwise suppressed rows consume page slots.
+        let requested_offset = offset.max(0) as usize;
+        let requested_limit = limit.max(0) as usize;
         let mut sql = String::from(
             "SELECT id, category, key, body_json, status, type, tags,
                     decay_score, retrieval_count, layer, topic_path,
@@ -8846,25 +9389,29 @@ impl Database {
         }
 
         sql.push_str(" ORDER BY last_accessed_unix_ms DESC");
-        sql.push_str(&format!(
-            " LIMIT ?{} OFFSET ?{}",
-            params.len() + 1,
-            params.len() + 2
-        ));
-        params.push(Box::new(limit));
-        params.push(Box::new(offset));
 
-        let mut stmt = conn.prepare(&sql)?;
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            params.iter().map(|p| p.as_ref()).collect();
-        let enc = self.encryption.as_ref();
-        let rows = stmt.query_map(param_refs.as_slice(), |row| entity_from_row(row, enc))?;
-
-        let mut items = Vec::new();
-        for row in rows {
-            items.push(row?);
-        }
-        Ok(items)
+        let items = {
+            let mut stmt = conn.prepare(&sql)?;
+            let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                params.iter().map(|p| p.as_ref()).collect();
+            let enc = self.encryption.as_ref();
+            let rows = stmt.query_map(param_refs.as_slice(), |row| entity_from_row(row, enc))?;
+            let mut items = Vec::new();
+            for row in rows {
+                items.push(row?);
+            }
+            items
+        };
+        drop(conn);
+        let visible = self.filter_suppressed(items)?;
+        let end = requested_offset
+            .saturating_add(requested_limit)
+            .min(visible.len());
+        Ok(if requested_offset >= visible.len() {
+            Vec::new()
+        } else {
+            visible[requested_offset..end].to_vec()
+        })
     }
 
     /// Count entities matching the same filters as `list_entities`, with no
@@ -8876,10 +9423,21 @@ impl Database {
         layer: Option<&str>,
         workspace_hash: Option<&str>,
     ) -> Result<i64, Box<dyn std::error::Error>> {
+        // #882: materialize the complete primary match set and apply the same
+        // governance interceptor as list/scan. A SQL COUNT cannot see the
+        // decoupled sidecar, so returning it would disclose hidden rows.
         let conn = self.conn()?;
-        let mut sql = String::from("SELECT COUNT(*) FROM entities WHERE archived = 0");
+        let mut sql = String::from(
+            "SELECT id, category, key, body_json, status, type, tags,
+                    decay_score, retrieval_count, layer, topic_path,
+                    archived, archive_reason, links, verified, source,
+                    created_at_unix_ms, last_accessed_unix_ms, NULL as embedding,
+                    always_on, certainty, workspace_hash, agent_id, visibility,
+                    follow_count, miss_count, follow_rate, efficacy_status,
+                    epistemic_state
+             FROM entities WHERE archived = 0",
+        );
         let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-
         if let Some(cat) = category {
             if !cat.is_empty() {
                 sql.push_str(&format!(" AND category = ?{}", params.len() + 1));
@@ -8892,16 +9450,24 @@ impl Database {
                 params.push(Box::new(l.to_string()));
             }
         }
-        // #408: same strict Some("") = global-only semantics as list_entities.
         if let Some(ws) = workspace_hash {
             sql.push_str(&format!(" AND workspace_hash = ?{}", params.len() + 1));
             params.push(Box::new(ws.to_string()));
         }
-
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            params.iter().map(|p| p.as_ref()).collect();
-        let count: i64 = conn.query_row(&sql, param_refs.as_slice(), |r| r.get(0))?;
-        Ok(count)
+        let items = {
+            let mut stmt = conn.prepare(&sql)?;
+            let refs: Vec<&dyn rusqlite::types::ToSql> =
+                params.iter().map(|p| p.as_ref()).collect();
+            let enc = self.encryption.as_ref();
+            let rows = stmt.query_map(refs.as_slice(), |row| entity_from_row(row, enc))?;
+            let mut items = Vec::new();
+            for row in rows {
+                items.push(row?);
+            }
+            items
+        };
+        drop(conn);
+        Ok(self.filter_suppressed(items)?.len() as i64)
     }
 
     /// #562: deterministic keyset enumeration — the first-class "list every
@@ -8962,25 +9528,27 @@ impl Database {
         }
 
         sql.push_str(" ORDER BY id ASC");
-        // 1001, not 1000: the tools layer fetches page_limit + 1 (max 1000+1)
-        // as a has-more sentinel; clamping the sentinel away would report the
-        // final full page of a max-size scan as the last one even when more
-        // rows exist.
-        let safe_limit = limit.clamp(1, 1001);
-        sql.push_str(&format!(" LIMIT ?{}", params.len() + 1));
-        params.push(Box::new(safe_limit));
+        // Suppression is outside the primary schema. Materialize the complete
+        // keyset suffix, filter it, then apply the page/sentinel limit. A SQL
+        // LIMIT before governance would let hidden rows consume visible slots.
+        let requested_limit = limit.clamp(1, 1001);
 
-        let mut stmt = conn.prepare(&sql)?;
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            params.iter().map(|p| p.as_ref()).collect();
-        let enc = self.encryption.as_ref();
-        let rows = stmt.query_map(param_refs.as_slice(), |row| entity_from_row(row, enc))?;
-
-        let mut items = Vec::new();
-        for row in rows {
-            items.push(row?);
-        }
-        Ok(items)
+        let items = {
+            let mut stmt = conn.prepare(&sql)?;
+            let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                params.iter().map(|p| p.as_ref()).collect();
+            let enc = self.encryption.as_ref();
+            let rows = stmt.query_map(param_refs.as_slice(), |row| entity_from_row(row, enc))?;
+            let mut items = Vec::new();
+            for row in rows {
+                items.push(row?);
+            }
+            items
+        };
+        drop(conn);
+        let mut visible = self.filter_suppressed(items)?;
+        visible.truncate(requested_limit as usize);
+        Ok(visible)
     }
 
     fn get_recent_journal_with_scope(
@@ -9091,26 +9659,17 @@ impl Database {
         let offset = offset.max(0);
         // #408: any Some — including Some("") — is a strict scope.
         let scoped = workspace_hash.is_some();
-        let (count_sql, sql) = if scoped {
-            (
-                "SELECT COUNT(*) FROM entities WHERE archived = 0 AND workspace_hash = ?1",
-                "SELECT id, category, key, links FROM entities
-                 WHERE archived = 0 AND workspace_hash = ?1
-                 ORDER BY created_at_unix_ms DESC, id ASC LIMIT ?2 OFFSET ?3",
-            )
+        let sql = if scoped {
+            "SELECT id, category, key, links FROM entities
+             WHERE archived = 0 AND workspace_hash = ?1
+             ORDER BY created_at_unix_ms DESC, id ASC"
         } else {
-            (
-                "SELECT COUNT(*) FROM entities WHERE archived = 0",
-                "SELECT id, category, key, links FROM entities
-                 WHERE archived = 0
-                 ORDER BY created_at_unix_ms DESC, id ASC LIMIT ?1 OFFSET ?2",
-            )
+            "SELECT id, category, key, links FROM entities
+             WHERE archived = 0
+             ORDER BY created_at_unix_ms DESC, id ASC"
         };
-        let total_nodes: i64 = if scoped {
-            conn.query_row(count_sql, params![workspace_hash.unwrap()], |r| r.get(0))?
-        } else {
-            conn.query_row(count_sql, [], |r| r.get(0))?
-        };
+        // The public graph total is the visible governed set, not the primary
+        // row count. Materialize and filter below, then derive total_nodes.
         let mut stmt = conn.prepare(sql)?;
         let map_row = |row: &rusqlite::Row| {
             let id: String = row.get(0)?;
@@ -9121,18 +9680,39 @@ impl Database {
             Ok((id, category, key, links))
         };
         let rows: Vec<(String, String, String, Vec<MemoryLink>)> = if scoped {
-            stmt.query_map(params![workspace_hash.unwrap(), limit, offset], map_row)?
+            stmt.query_map(params![workspace_hash.unwrap()], map_row)?
                 .collect::<rusqlite::Result<Vec<_>>>()?
         } else {
-            stmt.query_map(params![limit, offset], map_row)?
+            stmt.query_map([], map_row)?
                 .collect::<rusqlite::Result<Vec<_>>>()?
         };
 
+        drop(stmt);
+        drop(conn);
+        let mut visible_rows = Vec::with_capacity(rows.len());
+        for (id, category, key, _links) in rows {
+            if let Some(entity) = self.get_entity_by_id_public(&id)? {
+                visible_rows.push((entity, category, key));
+            }
+        }
+        let total_nodes = visible_rows.len() as i64;
+        let start = offset as usize;
+        let end = if limit < 0 {
+            visible_rows.len()
+        } else {
+            start.saturating_add(limit as usize).min(visible_rows.len())
+        };
+        let page_rows: &[(Entity, String, String)] = if start >= visible_rows.len() {
+            &[]
+        } else {
+            &visible_rows[start..end]
+        };
         let mut nodes = Vec::new();
         let mut edges = Vec::new();
         let mut seen_ids = std::collections::HashSet::new();
 
-        for (id, category, key, links) in &rows {
+        for (entity, category, key) in page_rows {
+            let id = &entity.id;
             if seen_ids.insert(id.clone()) {
                 nodes.push(GraphNode {
                     id: id.clone(),
@@ -9140,7 +9720,7 @@ impl Database {
                     category: category.clone(),
                 });
             }
-            for link in links {
+            for link in &entity.links {
                 edges.push(GraphEdge {
                     from: id.clone(),
                     to: link.target_id.clone(),
@@ -11693,7 +12273,9 @@ last_accessed: {}
                 }
             }
         }
-        Ok(items)
+        drop(stmt);
+        drop(conn);
+        self.filter_suppressed(items)
     }
 
     /// True if any of `lc_words` (already lowercased) is a substring of any
@@ -14494,6 +15076,10 @@ impl Drop for TestDatabase {
         for suffix in ["-wal", "-shm", "-journal"] {
             let _ = std::fs::remove_file(format!("{}{}", self.path, suffix));
         }
+        let _ = std::fs::remove_file(format!("{}.governance.db", self.path));
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let _ = std::fs::remove_file(format!("{}.governance.db{}", self.path, suffix));
+        }
     }
 }
 
@@ -15027,6 +15613,204 @@ mod tests {
         assert_eq!(ver_item["untrusted"], json!(false));
         assert!(ver_item.get("untrusted_reason").is_none());
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn prewrite_gate_rejects_known_bad_candidate_with_specific_error_and_no_storage() {
+        // #881: a known-rejected candidate is blocked deterministically on
+        // the write path — BEFORE any storage is allocated — and the error
+        // is specific enough to act on (names the tombstone + digest).
+        let (db, path) = temp_db();
+        db.reject_value("ws-a", "subject-x", "convention", r#"{\"content\":\"bad-value\"}"#, "review", "ev-1", "agent-1", None)
+            .unwrap();
+        let mut entity = make_entity("launder-1", "convention", "launder-1", r#"{\"content\":\"bad-value\"}"#);
+        entity.workspace_hash = "ws-a".to_string();
+        let err = db.remember(&entity).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("write rejected"), "{msg}");
+        assert!(msg.contains("tombstone"), "{msg}");
+        assert!(msg.contains("value_sha256"), "{msg}");
+        // No storage allocated: the entity must not exist and the count must
+        // be unchanged (the gate fired before the INSERT).
+        assert!(db.get_entity("convention", "launder-1").unwrap().is_none());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn reject_value_mirrors_into_decoupled_overlay() {
+        // #882: every refusal becomes a permanent erasure mandate in the
+        // decoupled overlay file (separate from the primary DB), so it
+        // survives primary-DB reversion.
+        let (db, path) = temp_db();
+        db.reject_value("ws-a", "s", "convention", r#"{\"content\":\"erase-me\"}"#, "gdpr", "ev-1", "agent-1", None)
+            .unwrap();
+        assert!(db.is_value_erased("ws-a", "convention", r#"{\"content\":\"erase-me\"}"#).unwrap());
+        // Overlay file exists next to the primary DB.
+        let overlay_path = format!("{path}.governance.db");
+        assert!(std::path::Path::new(&overlay_path).exists(), "overlay sidecar must exist");
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(&overlay_path);
+    }
+
+    #[test]
+    fn read_layer_interceptor_blocks_suppressed_entities() {
+        // #882: suppressed data is unreachable through recall AND direct
+        // key lookup (get_entity) even though the row still exists in the
+        // primary store.
+        let (db, path) = temp_db();
+        db.remember_skip_dedup(&make_entity("sup-1", "convention", "sup-1", r#"{\"content\":\"suppress this value\"}"#))
+            .unwrap();
+        // Baseline: recall finds it.
+        let hits = db
+            .recall(&crate::models::RecallParams {
+                query: "suppress this value".to_string(),
+                category: None,
+                entity_type: None,
+                limit: 10,
+                offset: 0,
+                min_decay: 0.0,
+                topic_path: None,
+                include_archived: false,
+                skip_side_effects: true,
+                mode: crate::models::SearchMode::Fts5,
+                embedding: None,
+                preview_cap: None,
+                always_on: None,
+                content_weight: 1.0,
+                trust_weight: 0.0,
+                diversity_halving: 0.0,
+                diversity_per_query_share: 0.0,
+                recency_half_life_secs: None,
+                workspace_hash: None,
+                scope_weight: None,
+                agent_id: None,
+                epistemic_state: None,
+                visibility: None,
+                layer: None,
+                reinforce: false,
+            })
+            .unwrap();
+        assert!(hits.iter().any(|e| e.key == "sup-1"));
+        // Reject the value (mirrors into overlay + in-DB tombstone).
+        db.reject_value("", "s", "convention", r#"{\"content\":\"suppress this value\"}"#, "test", "ev", "agent-1", None)
+            .unwrap();
+        // Recall now excludes it.
+        let hits2 = db
+            .recall(&crate::models::RecallParams {
+                query: "suppress this value".to_string(),
+                category: None,
+                entity_type: None,
+                limit: 10,
+                offset: 0,
+                min_decay: 0.0,
+                topic_path: None,
+                include_archived: false,
+                skip_side_effects: true,
+                mode: crate::models::SearchMode::Fts5,
+                embedding: None,
+                preview_cap: None,
+                always_on: None,
+                content_weight: 1.0,
+                trust_weight: 0.0,
+                diversity_halving: 0.0,
+                diversity_per_query_share: 0.0,
+                recency_half_life_secs: None,
+                workspace_hash: None,
+                scope_weight: None,
+                agent_id: None,
+                epistemic_state: None,
+                visibility: None,
+                layer: None,
+                reinforce: false,
+            })
+            .unwrap();
+        assert!(!hits2.iter().any(|e| e.key == "sup-1"));
+        // Direct lookup is blocked too.
+        assert!(db.get_entity("convention", "sup-1").unwrap().is_none());
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{path}.governance.db"));
+    }
+
+    #[test]
+    fn overlay_survives_primary_db_reversion() {
+        // #882 acceptance benchmark: suppressed data stays unreachable even
+        // if the UNDERLYING DATABASE STATE IS REVERTED — simulated here by
+        // wiping the in-DB tombstone table and re-inserting the entity
+        // (the classic rollback-to-before-the-refusal shape). The decoupled
+        // overlay still asserts, so the read interceptor keeps suppressing.
+        let (db, path) = temp_db();
+        db.remember_skip_dedup(&make_entity("revert-1", "convention", "revert-1", r#"{\"content\":\"must stay gone\"}"#))
+            .unwrap();
+        // Refuse → in-DB tombstone + decoupled overlay mandate.
+        db.reject_value("", "s", "convention", r#"{\"content\":\"must stay gone\"}"#, "test", "ev", "agent-1", None)
+            .unwrap();
+        // SIMULATED REVERSION: drop the in-DB tombstone rows (the rollback
+        // restores the store to a state before the refusal) and make sure
+        // the entity row itself is still there (the rollback resurrects it).
+        let conn = db.conn().unwrap();
+        conn.execute("DELETE FROM rejected_value_tombstones", []).unwrap();
+        drop(conn);
+        // The primary store now looks like it never knew about the refusal.
+        assert!(db
+            .is_value_rejected("", "", "convention", r#"{\"content\":\"must stay gone\"}"#)
+            .unwrap() == false);
+        // But the DECOUPLED overlay still asserts.
+        assert!(db.is_value_erased("", "convention", r#"{\"content\":\"must stay gone\"}"#).unwrap());
+        // And the read interceptor still suppresses on every surface.
+        let hits = db
+            .recall(&crate::models::RecallParams {
+                query: "must stay gone".to_string(),
+                category: None,
+                entity_type: None,
+                limit: 10,
+                offset: 0,
+                min_decay: 0.0,
+                topic_path: None,
+                include_archived: false,
+                skip_side_effects: true,
+                mode: crate::models::SearchMode::Fts5,
+                embedding: None,
+                preview_cap: None,
+                always_on: None,
+                content_weight: 1.0,
+                trust_weight: 0.0,
+                diversity_halving: 0.0,
+                diversity_per_query_share: 0.0,
+                recency_half_life_secs: None,
+                workspace_hash: None,
+                scope_weight: None,
+                agent_id: None,
+                epistemic_state: None,
+                visibility: None,
+                layer: None,
+                reinforce: false,
+            })
+            .unwrap();
+        assert!(!hits.iter().any(|e| e.key == "revert-1"), "reverted store must still suppress");
+        assert!(db.get_entity("convention", "revert-1").unwrap().is_none());
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{path}.governance.db"));
+    }
+
+    #[test]
+    fn write_gate_consults_overlay_after_reversion() {
+        // #882: the continuous assertion — after a primary-DB reversion wipes
+        // in-DB tombstones, the write gate STILL blocks re-ingesting the
+        // suppressed value because the decoupled overlay still asserts.
+        let (db, path) = temp_db();
+        db.reject_value("", "s", "convention", r#"{\"content\":\"poison-value\"}"#, "test", "ev", "agent-1", None)
+            .unwrap();
+        // Simulate reversion: wipe in-DB tombstones.
+        let conn = db.conn().unwrap();
+        conn.execute("DELETE FROM rejected_value_tombstones", []).unwrap();
+        drop(conn);
+        // A NEW write of the same value must be blocked by the overlay.
+        let entity = make_entity("poison-2", "convention", "poison-2", r#"{\"content\":\"poison-value\"}"#);
+        let err = db.remember(&entity).unwrap_err();
+        assert!(err.to_string().contains("write rejected"), "{err}");
+        assert!(db.get_entity("convention", "poison-2").unwrap().is_none());
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{path}.governance.db"));
     }
 
     #[test]
@@ -15711,6 +16495,7 @@ mod tests {
             embed_worker: std::sync::OnceLock::new(),
             embed_queue_cap: EMBED_QUEUE_CAP,
             sig_cache: std::sync::Mutex::new(None),
+            governance_overlay: std::sync::Mutex::new(None),
         };
 
         db.remember_skip_dedup(&make_entity(

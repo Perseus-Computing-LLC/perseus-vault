@@ -1969,8 +1969,8 @@ pub fn handle_scan(db: &Database, args: Value) -> Result<String, String> {
         serde_json::from_value(args).map_err(|e| format!("Invalid scan arguments: {}", e))?;
 
     let limit = a.limit.clamp(1, 1000);
-    // Fetch one extra row to learn whether another page exists without a
-    // second COUNT query; the sentinel row is not returned.
+    // The DB scan over-fetches and filters governed rows before returning;
+    // request the page-plus-sentinel directly so this boundary remains exact.
     let mut entities = db
         .scan_entities(
             a.category.as_deref(),

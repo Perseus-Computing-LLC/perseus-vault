@@ -14,6 +14,7 @@ import json
 import math
 import os
 import queue
+import signal
 import re
 import subprocess
 import sys
@@ -26,7 +27,8 @@ REPO = HERE.parent.parent
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
-from benchmark.package.common.publication import build_common_report
+from benchmark.package.common.artifacts import run_fingerprint, sha256_text, stable_json
+from benchmark.package.common.publication import build_common_report, digest_claims
 MCP_RESPONSE_TIMEOUT_SECONDS = 30.0
 
 LEGACY_REQUIRED_CATEGORIES = (
@@ -412,14 +414,31 @@ def build_metric_rates(cases, metrics):
         metric = metrics.get(name, {})
         return {"rate": metric.get("rate"), "status": metric.get("status", "unavailable")}
 
+    def from_case_category(category):
+        selected = [case for case in cases if case.get("category") == category]
+        passed = sum(
+            int((case.get("checks") or {}).get("passed", 0))
+            for case in selected
+        )
+        total = sum(
+            int((case.get("checks") or {}).get("total", 0))
+            for case in selected
+        )
+        if not selected or total <= 0:
+            return {"rate": None, "status": "unavailable"}
+        if any(case.get("status") == "unavailable" for case in selected):
+            return {"rate": None, "status": "unavailable"}
+        return {"rate": passed / total, "status": "available" if passed == total else "failed"}
+
     stale_case = next((case for case in cases if case.get("id") == "mutation-live-recall"), None)
     if not stale_case:
         stale = {"rate": None, "status": "unavailable"}
     elif stale_case.get("status") == "unavailable":
         stale = {"rate": None, "status": "unavailable"}
     else:
-        stale_event = bool((stale_case.get("assertions") or {}).get("superseded_version_not_recalled"))
-        stale = {"rate": 0.0 if stale_event else 1.0, "status": "available" if stale_event else "failed"}
+        stale_checks = stale_case.get("assertions") or stale_case.get("checks") or {}
+        stale_event = bool(stale_checks.get("superseded_version_not_recalled"))
+        stale = {"rate": 0.0, "status": "available"} if stale_event else {"rate": 1.0, "status": "failed"}
     return {
         "validity_rate": from_metric("validity"),
         "stale_recall_rate": stale,
@@ -429,10 +448,10 @@ def build_metric_rates(cases, metrics):
         "mutation_supersession_rate": from_metric("mutation_supersession"),
         "compaction_projection_rate": from_metric("compaction_projection"),
         "action_grounding_rate": from_metric("action_grounding"),
-        "recall_outcome_rate": from_metric("recall_outcome"),
-        "admission_rate": from_metric("admission"),
-        "prompt_safety_rate": from_metric("prompt_safety"),
-        "identity_ambiguity_rate": from_metric("identity_ambiguity"),
+        "recall_outcome_rate": from_case_category("recall_outcome"),
+        "admission_rate": from_case_category("admission"),
+        "prompt_safety_rate": from_case_category("prompt_safety"),
+        "identity_ambiguity_rate": from_case_category("identity_ambiguity"),
     }
 
 
@@ -464,6 +483,7 @@ class VaultClient:
             text=True,
             encoding="utf-8",
             errors="replace",
+            start_new_session=(os.name != "nt"),
         )
         self.response_timeout_seconds = MCP_RESPONSE_TIMEOUT_SECONDS
         self._responses = queue.Queue()
@@ -589,21 +609,35 @@ class VaultClient:
         return canonical
 
     def close(self):
+        cleanup_error = None
         try:
             if self.p.stdin is not None:
                 self.p.stdin.close()
             if self.p.stdout is not None:
                 self.p.stdout.close()
             self.p.wait(timeout=30)
-        except Exception:
+        except Exception as exc:
+            cleanup_error = exc
             try:
-                self.p.kill()
+                if os.name != "nt":
+                    os.killpg(self.p.pid, signal.SIGTERM)
+                else:
+                    self.p.terminate()
             except Exception:
                 pass
             try:
                 self.p.wait(timeout=5)
             except Exception:
-                pass
+                try:
+                    if os.name != "nt":
+                        os.killpg(self.p.pid, signal.SIGKILL)
+                    else:
+                        self.p.kill()
+                    self.p.wait(timeout=5)
+                except Exception as exc:
+                    cleanup_error = cleanup_error or exc
+        if cleanup_error is not None and self.p.poll() is None:
+            raise RuntimeError("MCP client cleanup failed") from cleanup_error
 
 
 def remember(client, category, key, note, **kwargs):
@@ -895,7 +929,7 @@ def run_scope_invalid_recall(client, **_):
             "personal_profile_key_present": "profile-personal" in personal_profile,
         },
         {
-            "scope-invalid-recall-private": {"numerator": int(not checks["other_workspace_hidden"]), "denominator": 1},
+            "scope-invalid-recall-external": {"numerator": int(not checks["other_workspace_hidden"]), "denominator": 1},
             "scope-invalid-recall-workspace": {"numerator": int(not checks["requested_workspace_served"]), "denominator": 1},
         },
     )
@@ -1567,6 +1601,9 @@ def case_result(spec, checks, evidence, metric_event=None, status="passed", fail
         metric.update({"status": "unavailable", "reason": "optional capability unavailable"})
     else:
         metric.update({"numerator": passed, "denominator": total})
+    public_evidence = sanitize_evidence(evidence)
+    if not public_evidence:
+        public_evidence = {"complete": True}
     result = {
         "id": spec["id"],
         "category": spec["category"],
@@ -1574,7 +1611,7 @@ def case_result(spec, checks, evidence, metric_event=None, status="passed", fail
         "status": status,
         "checks": {"passed": passed, "total": total},
         "assertions": checks,
-        "evidence": sanitize_evidence(evidence),
+        "evidence": public_evidence,
     }
     if failure_class:
         result["failure_class"] = failure_class
@@ -1690,22 +1727,23 @@ def run_benchmark(manifest_path, binary=None, out=None):
     binary = find_binary(binary)
     tmpdir = Path(tempfile.mkdtemp(prefix="perseus-vault-quality-v0-"))
     db = tmpdir / "quality.db"
-    client = VaultClient(binary, db, "quality-author")
+    client = None
     scenario_specs = {}
     for spec in manifest["cases"]:
         scenario_specs.setdefault(spec["scenario"], []).append(spec)
     scenario_outputs = {}
     try:
+        client = VaultClient(binary, db, "quality-author")
         try:
             advertised = client.list_tools()
             tool_listing = {"status": "available", "count": len(advertised)}
-        except Exception as exc:
+        except Exception:
             advertised = None
-            tool_listing = {"status": "unknown", "reason": type(exc).__name__}
+            tool_listing = {"status": "unavailable", "reason": "tools_list_unavailable"}
         capabilities = {"mcp_stdio": tool_listing}
         for capability, tools in CAPABILITY_TOOLS.items():
             if advertised is None:
-                capabilities[capability] = {"status": "unknown", "required_tools": list(tools), "reason": "tools/list unavailable"}
+                capabilities[capability] = {"status": "unavailable", "required_tools": list(tools), "missing_tools": list(tools), "reason": "tools_list_unavailable"}
             else:
                 missing = [tool for tool in tools if tool not in advertised]
                 capabilities[capability] = {
@@ -1800,12 +1838,14 @@ def run_benchmark(manifest_path, binary=None, out=None):
                 "network_calls": 0,
             })),
         }
-        payload["run_fingerprint_sha256"] = sha256_text(stable_json({
-            "binary_sha256": payload["binary_sha256"],
-            "control_profile_sha256": payload["control_profile_sha256"],
-            "dataset_sha256": payload["dataset_sha256"],
-            "harness_commit": payload["harness_commit"],
-        }))
+        payload["claims_sha256"] = digest_claims(["quality-v1-contract"], ["provider-failure-stress", "downstream-agent-utility"])
+        payload["run_fingerprint_sha256"] = run_fingerprint(
+            binary_sha256=payload["binary_sha256"],
+            control_profile_sha256=payload["control_profile_sha256"],
+            dataset_sha256=payload["dataset_sha256"],
+            harness_commit=payload["harness_commit"],
+            claims_sha256=payload["claims_sha256"],
+        )
         verdict = evaluate_report(payload, manifest.get("required_categories", V0_REQUIRED_CATEGORIES))
         signature_payload = {**payload, **verdict}
         signature = sha256_text(stable_json(report_signature_payload(signature_payload)))
@@ -1834,7 +1874,8 @@ def run_benchmark(manifest_path, binary=None, out=None):
             Path(out).write_text(json.dumps(report, indent=2, sort_keys=True, allow_nan=False) + "\n", encoding="utf-8")
         return report
     finally:
-        client.close()
+        if client is not None:
+            client.close()
         for suffix in ("", "-wal", "-shm"):
             try:
                 (Path(str(db) + suffix)).unlink()

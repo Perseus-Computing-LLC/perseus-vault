@@ -13,7 +13,7 @@ from .artifacts import (
     write_json,
     write_report,
 )
-from .publication import build_common_report, digest_manifest, normalize_cases, write_common_report
+from .publication import build_common_report, digest_claims, digest_manifest, normalize_cases, normalize_metric_rates, write_common_report
 
 __all__ = [
     "control_profile_digest",
@@ -28,7 +28,9 @@ __all__ = [
     "write_json",
     "write_report",
     "build_common_report",
+    "digest_claims",
     "digest_manifest",
     "normalize_cases",
+    "normalize_metric_rates",
     "write_common_report",
 ]

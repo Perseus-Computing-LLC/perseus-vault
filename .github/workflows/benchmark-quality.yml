@@ -32,13 +32,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
       - name: Build lean release binary
         run: cargo build --locked --release --no-default-features
       - name: Run benchmark package tests
         run: |
           python3 -m unittest discover -s benchmark/package -p 'test_*.py' -v
+          python3 -m unittest discover -s benchmark -p 'run_smoke_test.py' -v
           python3 -m unittest discover -s benchmark/correction -p 'test_*.py' -v
           python3 -m unittest discover -s benchmark/freshness -p 'test_*.py' -v
           python3 -m unittest discover -s benchmark/economics -p 'test_*.py' -v
@@ -46,6 +47,8 @@ jobs:
         run: python3 benchmark/claim_register.py
       - name: Run deterministic local portfolio
         run: python3 benchmark/run_smoke.py --bin target/release/perseus-vault --out /tmp/perseus-vault-benchmark-smoke-summary.json
+      - name: Validate quality release scorecard
+        run: python3 benchmark/quality/scorecard.py /tmp/perseus-quality-smoke.json --out /tmp/perseus-quality-scorecard.json
       - name: Run deletion suite
         run: python3 benchmark/deletion/run.py --bin target/release/perseus-vault --out /tmp/perseus-vault-deletion-report.json
       - name: Run existing quality tests
@@ -55,8 +58,30 @@ jobs:
           mkdir -p benchmark-artifacts
           cp /tmp/perseus-vault-benchmark-smoke-summary.json benchmark-artifacts/
           cp /tmp/perseus-vault-deletion-report.json benchmark-artifacts/
+          cp /tmp/perseus-quality-scorecard.json benchmark-artifacts/
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          forbidden = ("token", "credential", "password", "secret", "prompt", "query", "body", "stderr_tail", "stdout_tail")
+          def walk(value, path):
+              if isinstance(value, float) and not __import__('math').isfinite(value):
+                  raise SystemExit(f"non-finite artifact value: {path}")
+              if isinstance(value, dict):
+                  for key, child in value.items():
+                      lowered = str(key).lower()
+                      if any(marker in lowered for marker in forbidden):
+                          raise SystemExit(f"forbidden artifact key: {path}.{key}")
+                      walk(child, f"{path}.{key}")
+              elif isinstance(value, list):
+                  for index, child in enumerate(value):
+                      walk(child, f"{path}[{index}]")
+              elif isinstance(value, str) and any(marker in value.lower() for marker in forbidden):
+                  raise SystemExit(f"forbidden artifact marker: {path}")
+          for artifact in Path("benchmark-artifacts").glob("*.json"):
+              walk(json.loads(artifact.read_text()), str(artifact))
+          PY
       - name: Upload sanitized benchmark summaries
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: perseus-vault-benchmark-summaries
           path: benchmark-artifacts/

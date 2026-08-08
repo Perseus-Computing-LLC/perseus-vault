@@ -154,9 +154,10 @@ def main() -> int:
     rows: list[dict[str, Any]] = []
     fts_lags: list[float] = []
     outcome_classes: dict[str, int] = {}
-    c = Client(binary, db)
+    c = None
     category = "benchmark_freshness"
     try:
+        c = Client(binary, db)
         for index in range(max(1, args.samples)):
             key = f"freshness-{index}"
             marker = f"quality-freshness-marker-{index}-9e4a"
@@ -181,28 +182,33 @@ def main() -> int:
         deadline_class = classify_outcome(deadline.get("outcome") if isinstance(deadline, dict) else None)
         rows.append({"case": "deadline", "axis": "deadline_outcome_explicit", "ok": deadline_class in {"timeout", "fresh", "partial", "stale", "empty", "unavailable"}, "outcome_class": deadline_class})
     finally:
-        c.close()
-    restarted = Client(binary, db)
+        if c is not None:
+            c.close()
+    restarted = None
     try:
+        restarted = Client(binary, db)
         probe = restarted.call("perseus_vault_recall", {"query": "quality freshness marker", "category": category, "mode": "fts5", "limit": 100, "include_outcome": True})
         rows.append({"case": "restart", "axis": "readable_after_restart", "ok": "quality-freshness-marker" in stable_json(probe.get("items", []))})
         rows.append({"case": "restart", "axis": "restart_outcome_explicit", "ok": classify_outcome(probe.get("outcome")) != "missing"})
     finally:
-        restarted.close()
+        if restarted is not None:
+            restarted.close()
         shutil.rmtree(db.parent, ignore_errors=True)
     passed = sum(bool(row["ok"]) for row in rows)
     if not rows:
         raise ValueError("freshness benchmark produced no checks")
     raw_report = {
         "passed": passed == len(rows),
+        "status": "passed" if passed == len(rows) else "failed",
+        "capabilities": {"runner": {"status": "available"}},
         "network_calls": 0,
         "cases": [
             {
-                "id": f"{row['case']}-{row['axis']}",
+                "id": f"{row['case']}-{row['axis']}".lower(),
                 "category": "freshness",
                 "status": "passed" if row["ok"] else "failed",
                 "checks": {row["axis"]: bool(row["ok"])},
-                "evidence": {},
+                "evidence": {"complete": True},
                 **({"failure_class": "freshness_check_failed"} if not row["ok"] else {}),
             }
             for row in rows

@@ -16,6 +16,7 @@ class SmokeSummaryTests(unittest.TestCase):
             output = Path(directory) / "summary.json"
             output.write_text(json.dumps({
                 "benchmark": "perseus-vault-local-smoke",
+                "status": "failed",
                 "runs": [{
                     "returncode": 0,
                     "summary": {
@@ -34,11 +35,23 @@ class SmokeSummaryTests(unittest.TestCase):
         result = {"returncode": None, "timeout": True, "summary": {"passed": False}}
         self.assertFalse(run_smoke.run_passed(result))
 
+    def test_missing_report_is_blocking(self):
+        result = {"returncode": 0, "summary": {"parse_error": True}}
+        self.assertFalse(run_smoke.run_passed(result))
+
+    def test_nonzero_child_cannot_be_overridden_by_passing_report(self):
+        result = {"returncode": 1, "summary": {"passed": True, "status": "passed"}}
+        self.assertFalse(run_smoke.run_passed(result))
+
+    def test_empty_top_level_run_set_is_blocking(self):
+        self.assertFalse(run_smoke.aggregate_passed([]))
+
     def test_nested_passing_report_is_accepted(self):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "summary.json"
             output.write_text(json.dumps({
                 "benchmark": "perseus-vault-local-smoke",
+                "status": "passed",
                 "runs": [{
                     "returncode": 0,
                     "summary": {
@@ -53,6 +66,13 @@ class SmokeSummaryTests(unittest.TestCase):
             }))
             result = {"returncode": 0, "summary": json.loads(output.read_text())}
             self.assertTrue(run_smoke.run_passed(result))
+
+    def test_leaf_passing_projection_without_report_is_blocked(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "report.json"
+            output.write_text(json.dumps({"passed": True, "status": "passed"}))
+            result = {"returncode": 0, "report": str(output), "summary": {"passed": True, "status": "passed"}}
+            self.assertFalse(run_smoke.run_passed(result))
 
 
 if __name__ == "__main__":

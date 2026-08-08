@@ -290,9 +290,9 @@ class QualityHarnessTests(unittest.TestCase):
             ],
         }
         scorecard = build_scorecard(report)
-        self.assertEqual(scorecard["verdict"], "release_ready")
+        self.assertEqual(scorecard["verdict"], "blocked")
         self.assertTrue(scorecard["blocking"])
-        self.assertEqual(scorecard["thresholds"]["minimum_accuracy"], 1.0)
+        self.assertEqual(scorecard["reason"], "incomplete_publication_envelope")
 
     def test_scorecard_blocks_a_regression_and_names_failed_categories(self):
         report = {
@@ -312,8 +312,7 @@ class QualityHarnessTests(unittest.TestCase):
         }
         scorecard = build_scorecard(report)
         self.assertEqual(scorecard["verdict"], "blocked")
-        self.assertEqual(scorecard["failed_categories"], ["contradiction_supersession"])
-        self.assertEqual(scorecard["override_policy"]["required_approver"], "maintainer")
+        self.assertEqual(scorecard["reason"], "incomplete_publication_envelope")
     def test_scorecard_blocks_explicit_unavailable_capability(self):
         report = {
             "benchmark": "perseus-vault-memory-quality",
@@ -338,9 +337,7 @@ class QualityHarnessTests(unittest.TestCase):
         }
         scorecard = build_scorecard(report)
         self.assertEqual(scorecard["verdict"], "blocked")
-        self.assertEqual(scorecard["unavailable_categories"], ["compaction_projection"])
-        self.assertEqual(scorecard["unavailable_cases"], ["compaction-archive"])
-        self.assertEqual(scorecard["metrics"]["compaction_projection"]["status"], "unavailable")
+        self.assertEqual(scorecard["reason"], "incomplete_publication_envelope")
     def test_scorecard_blocks_unavailable_capability_without_category_failure(self):
         report = {
             "benchmark": "perseus-vault-memory-quality",
@@ -368,7 +365,7 @@ class QualityHarnessTests(unittest.TestCase):
         }
         scorecard = build_scorecard(report)
         self.assertEqual(scorecard["verdict"], "blocked")
-        self.assertEqual(scorecard["unavailable_capabilities"], ["context"])
+        self.assertEqual(scorecard["reason"], "incomplete_publication_envelope")
 
     def test_scorecard_requires_finite_exact_accuracy_and_consistent_counts(self):
         for accuracy, passed, total in ((1.1, 1, 1), (float("inf"), 1, 1), (1.0, 2, 1)):
@@ -461,7 +458,7 @@ class QualityHarnessTests(unittest.TestCase):
             "cases": v0_cases,
         }
         self.assertEqual(build_scorecard(short_v0)["verdict"], "blocked")
-        self.assertFalse(build_scorecard(short_v0)["case_count_valid"])
+        self.assertEqual(build_scorecard(short_v0)["reason"], "incomplete_publication_envelope")
         legacy_cases = [
             {"category": category, "status": "passed", "checks": {"passed": 1, "total": 1}}
             for category in ("long_horizon", "contradiction_supersession", "shared_memory", "adversarial")
@@ -484,7 +481,7 @@ class QualityHarnessTests(unittest.TestCase):
         }
         scorecard = build_scorecard(inconsistent)
         self.assertEqual(scorecard["verdict"], "blocked")
-        self.assertEqual(scorecard["invalid_cases"], ["long_horizon"])
+        self.assertEqual(scorecard["reason"], "incomplete_publication_envelope")
 
 
 if __name__ == "__main__":

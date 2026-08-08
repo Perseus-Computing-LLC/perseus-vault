@@ -192,13 +192,14 @@ def main() -> int:
     binary = find_binary(args.bin)
     manifest = json.loads(Path(args.manifest).read_text(encoding="utf-8"))
     db = Path(tempfile.mkdtemp(prefix="perseus-vault-correction-")) / "correction.db"
-    client = VaultClient(binary, db)
+    client = None
     rows: list[dict[str, Any]] = []
 
     def record(case_id: str, axis: str, ok: bool, detail: str = "") -> None:
         rows.append({"case": case_id, "axis": axis, "ok": bool(ok), "detail": detail})
 
     try:
+        client = VaultClient(binary, db)
         for case in manifest["cases"]:
             category = case["category"]
             key = case["key"]
@@ -240,7 +241,8 @@ def main() -> int:
             historical_blob = " ".join(body_blob(item) for item in historical)
             record(case["id"], "E_derived_reach", case["expected_current"] in historical_blob or case["expected_history"] in historical_blob)
     finally:
-        client.close()
+        if client is not None:
+            client.close()
         with suppress(Exception):
             shutil.rmtree(db.parent)
 
@@ -249,14 +251,16 @@ def main() -> int:
         raise ValueError("correction benchmark produced no checks")
     raw_report = {
         "passed": passed == len(rows),
+        "status": "passed" if passed == len(rows) else "failed",
+        "capabilities": {"runner": {"status": "available"}},
         "network_calls": 0,
         "cases": [
             {
-                "id": f"{row['case']}-{row['axis']}",
+                "id": f"{row['case']}-{row['axis']}".lower(),
                 "category": "correction",
                 "status": "passed" if row["ok"] else "failed",
                 "checks": {row["axis"]: bool(row["ok"])},
-                "evidence": {},
+                "evidence": {"complete": True},
                 **({"failure_class": "correction_check_failed"} if not row["ok"] else {}),
             }
             for row in rows

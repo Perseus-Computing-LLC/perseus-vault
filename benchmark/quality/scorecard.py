@@ -8,6 +8,24 @@ import sys
 from pathlib import Path
 
 from run import LEGACY_REQUIRED_CATEGORIES, V0_REQUIRED_CATEGORIES, V1_REQUIRED_CATEGORIES
+from benchmark.package.common.artifacts import validate_report
+
+
+# Unit-level scorecard tests exercise the scoring logic with compact legacy
+# fixtures. Full publication reports are validated by the runner boundary.
+_SCORECARD_FIXTURE_KEYS = {"cases", "passed", "checks_passed", "checks_total", "accuracy"}
+
+
+def _is_publishable_report(report):
+    return all(key in report for key in (
+        "schema_version", "benchmark_id", "suite_version", "control_profile_sha256",
+        "run_fingerprint_sha256", "result_signature_sha256", "binary_sha256",
+        "dataset_sha256", "harness_commit", "claims_sha256", "public_evidence",
+        "raw_inputs_captured", "capabilities", "cases", "metrics", "not_measured", "excluded",
+        "claim_ids", "negative_claim_ids", "benchmark", "dataset", "harness_version",
+        "passed", "checks_passed", "checks_total", "accuracy", "required_categories",
+        "metric_rates", "signature_sha256",
+    ))
 
 MINIMUM_ACCURACY = 1.0
 REQUIRED_APPROVER = "maintainer"
@@ -99,14 +117,28 @@ def _required_categories(report):
 
 
 def build_scorecard(report):
+    if not _is_publishable_report(report):
+        return {"scorecard_version": "perseus-vault-memory-quality-scorecard/v2", "verdict": "blocked", "blocking": True, "reason": "incomplete_publication_envelope"}
+    try:
+        validate_report(report)
+    except (TypeError, ValueError, KeyError, OverflowError):
+        return {"scorecard_version": "perseus-vault-memory-quality-scorecard/v2", "verdict": "blocked", "blocking": True, "reason": "report_validation_failed"}
+    if report.get("harness_version") == "perseus-vault-memory-quality/v1":
+        required_case_fields = {"id", "category", "status", "checks", "evidence"}
+        if any(not required_case_fields.issubset(case) for case in report.get("cases", [])):
+            return {"scorecard_version": "perseus-vault-memory-quality-scorecard/v2", "verdict": "blocked", "blocking": True, "reason": "incomplete_case_contract"}
     failed_categories = set()
     invalid_cases = []
     observed_passed = 0
     observed_total = 0
     for case in report.get("cases", []):
         checks = case.get("checks", {}) or {}
-        case_passed = _strict_count(checks.get("passed"))
-        case_total = _strict_count(checks.get("total"))
+        if "passed" not in checks and "total" not in checks:
+            case_total = len(checks)
+            case_passed = sum(1 for value in checks.values() if value is True)
+        else:
+            case_passed = _strict_count(checks.get("passed"))
+            case_total = _strict_count(checks.get("total"))
         case_id = case.get("id") or case.get("category") or "<unknown>"
         status = case.get("status", "passed")
         if status == "unavailable" and case_passed == 0 and case_total == 0:
@@ -175,7 +207,7 @@ def build_scorecard(report):
             elif name == "stale_recall_rate" and numeric_rate != 0.0:
                 invalid_metrics.add(name)
     numeric_accuracy = _strict_number(report.get("accuracy"))
-    accuracy = numeric_accuracy if numeric_accuracy is not None else float("nan")
+    accuracy = numeric_accuracy
     checks_passed = _strict_count(report.get("checks_passed"))
     checks_total = _strict_count(report.get("checks_total"))
     counts_match_cases = (
@@ -191,7 +223,7 @@ def build_scorecard(report):
         and checks_total > 0
         and checks_passed == checks_total
     )
-    exact_accuracy = math.isfinite(accuracy) and accuracy == MINIMUM_ACCURACY
+    exact_accuracy = accuracy is not None and math.isfinite(accuracy) and accuracy == MINIMUM_ACCURACY
     case_count = len(report.get("cases", []))
     case_count_valid = 20 <= case_count <= 40 if _is_v1_report(report) else (20 <= case_count <= 30 if _is_v0_report(report) else case_count == 4)
     release_ready = (
@@ -256,7 +288,7 @@ def build_scorecard(report):
                 "record the override in release notes",
             ],
         },
-        "source_report_signature": report.get("signature_sha256"),
+        "source_report_signature": report.get("result_signature_sha256"),
     }
 
 
@@ -268,8 +300,8 @@ def main():
     report = json.loads(Path(args.report).read_text(encoding="utf-8"))
     scorecard = build_scorecard(report)
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
-    Path(args.out).write_text(json.dumps(scorecard, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    print(json.dumps(scorecard, indent=2, sort_keys=True))
+    Path(args.out).write_text(json.dumps(scorecard, indent=2, sort_keys=True, allow_nan=False) + "\n", encoding="utf-8")
+    print(json.dumps(scorecard, indent=2, sort_keys=True, allow_nan=False))
     return 0 if scorecard["verdict"] == "release_ready" else 1
 
 

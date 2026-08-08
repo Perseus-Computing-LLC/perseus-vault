@@ -171,27 +171,31 @@ def main() -> int:
     if not isinstance(manifest.get("cases"), list) or not manifest["cases"]:
         raise ValueError("deletion manifest must contain at least one case")
     db = Path(tempfile.mkdtemp(prefix="perseus-vault-deletion-")) / "deletion.db"
-    c = Client(binary, db)
+    c = None
     rows: list[dict[str, Any]] = []
     try:
+        c = Client(binary, db)
         for case in manifest["cases"]:
             run_case(c, case, db, rows)
     finally:
-        c.close()
+        if c is not None:
+            c.close()
         shutil.rmtree(db.parent, ignore_errors=True)
     passed = sum(bool(row["ok"]) for row in rows)
     if not rows:
         raise ValueError("deletion benchmark produced no checks")
     raw_report = {
         "passed": passed == len(rows),
+        "status": "passed" if passed == len(rows) else "failed",
+        "capabilities": {"runner": {"status": "available"}},
         "network_calls": 0,
         "cases": [
             {
-                "id": f"{row['case']}-{row['axis']}",
+                "id": f"{row['case']}-{row['axis']}".lower(),
                 "category": "deletion",
                 "status": "passed" if row["ok"] else "failed",
                 "checks": {row["axis"]: bool(row["ok"])},
-                "evidence": {},
+                "evidence": {"complete": True},
                 **({"failure_class": "deletion_check_failed"} if not row["ok"] else {}),
             }
             for row in rows

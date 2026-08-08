@@ -21,12 +21,15 @@
     "result_signature_sha256",
     "binary_sha256",
     "dataset_sha256",
-    "harness_commit"
+    "harness_commit",
+    "claims_sha256",
+    "claim_ids",
+    "negative_claim_ids"
   ],
   "properties": {
     "schema_version": {"const": "perseus-vault-benchmark-report/v1"},
     "benchmark_id": {"$ref": "#/$defs/identifier"},
-    "suite_version": {"type": "string", "pattern": "^v[0-9]+$"},
+    "suite_version": {"$ref": "#/$defs/publicIdentifier"},
     "control_profile_sha256": {"$ref": "#/$defs/sha256"},
     "run_fingerprint_sha256": {"$ref": "#/$defs/sha256"},
     "status": {"enum": ["passed", "failed", "blocked", "partial"]},
@@ -41,13 +44,14 @@
     "result_signature_sha256": {"$ref": "#/$defs/sha256"},
     "binary_sha256": {"$ref": "#/$defs/sha256"},
     "dataset_sha256": {"$ref": "#/$defs/sha256"},
-    "harness_commit": {"type": "string", "pattern": "^(unknown|[0-9a-f]{40})$"},
+    "harness_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "claims_sha256": {"$ref": "#/$defs/sha256"},
     "benchmark": {"$ref": "#/$defs/publicIdentifier"},
     "dataset": {"$ref": "#/$defs/publicIdentifier"},
     "harness_version": {"$ref": "#/$defs/publicIdentifier"},
     "binary": {"$ref": "#/$defs/publicIdentifier"},
     "required_categories": {"type": "array", "items": {"$ref": "#/$defs/publicIdentifier"}},
-    "metric_rates": {"type": "object"},
+    "metric_rates": {"type": "object", "additionalProperties": {"type": "object", "additionalProperties": false, "required": ["status"], "properties": {"status": {"enum": ["available", "partial", "unavailable", "not_measured", "failed"]}, "rate": {"type": "number", "minimum": 0, "maximum": 1}}}},
     "offline": {"type": "boolean"},
     "passed": {"type": "boolean"},
     "checks_passed": {"type": "integer", "minimum": 0},
@@ -70,7 +74,9 @@
           "status": {"enum": ["available", "partial", "unavailable", "not_measured", "failed"]},
           "reason": {"$ref": "#/$defs/publicIdentifier"},
           "required_tools": {"type": "array", "items": {"$ref": "#/$defs/identifier"}},
-          "missing_tools": {"type": "array", "items": {"$ref": "#/$defs/identifier"}}
+          "missing_tools": {"type": "array", "items": {"$ref": "#/$defs/identifier"}},
+          "details": {"type": "object", "additionalProperties": false},
+          "count": {"type": "integer", "minimum": 0}
         },
         "allOf": [
           {"if": {"properties": {"status": {"enum": ["partial", "unavailable", "not_measured", "failed"]}}, "required": ["status"]}, "then": {"required": ["reason"]}},
