@@ -500,6 +500,44 @@ impl EmbeddingBackendHealth {
     }
 }
 
+/// #856: how complete the returned top-k is, relative to the scoped
+/// population the caller asked for.
+///
+/// - `Exact` — the ranking was computed over the complete (embedded) scoped
+///   population: the dense scan was exhausted (or the sig cache covered every
+///   row), or the FTS path ranked the full match set.
+/// - `Bounded` — the candidate pool was capped by the scan bound, but the
+///   requested `limit` in-scope hits were still found (the top-k may miss
+///   deeper in-scope rows, but nothing the caller asked for was lost).
+/// - `Partial` — the pool was capped AND fewer than `limit` in-scope hits
+///   were found: the returned set is an INCOMPLETE top-k; more in-scope
+///   results may exist beyond the pool.
+/// - `Abstain` — no evidence / backend unavailable; there is nothing to be
+///   complete about (#887 abstention semantics).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum Completeness {
+    #[default]
+    Exact,
+    Bounded,
+    Partial,
+    Abstain,
+}
+
+/// #856: the effective candidate scope behind a recall's completeness label.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct CandidateScope {
+    /// Embedded rows actually examined by the dense arm this call.
+    pub scanned: i64,
+    /// Total embedded (non-archived) rows when known; `None` when the scan
+    /// was bounded and the true population is beyond the pool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedded_population: Option<i64>,
+    /// The pool bound that applied (dense scan ceiling / candidate pool);
+    /// `None` when the scan was exhausted (no bound bit).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool_bound: Option<i64>,
+}
+
 /// #864: the full recall outcome — status, backend health, abstention, and
 /// why. Serialized onto recall/ask responses as `outcome`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -515,6 +553,22 @@ pub struct RecallOutcome {
     pub deadline_elapsed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend_health: Option<EmbeddingBackendHealth>,
+    /// #856: top-k completeness (exact/bounded/partial/abstain) and the
+    /// effective candidate scope. `None` when the caller did not request the
+    /// outcome or the path does not produce one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completeness: Option<Completeness>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_scope: Option<CandidateScope>,
+}
+
+/// #856: completeness metadata returned alongside a recall (dense/hybrid
+/// paths) so callers can tell "exact top-k" from "bounded/partial".
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct RecallCompleteness {
+    pub completeness: Completeness,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<CandidateScope>,
 }
 
 fn is_false(v: &bool) -> bool {
