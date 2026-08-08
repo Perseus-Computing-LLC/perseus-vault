@@ -386,12 +386,12 @@ def compute_metrics(cases):
         name = metric["name"]
         entry = aggregate.setdefault(
             name,
-            {"numerator": 0, "denominator": 0, "unavailable": [], "failed": 0},
+            {"numerator": 0, "denominator": 0, "unavailable": [], "failed": 0, "failed_reasons": []},
         )
         status = metric.get("status") or case.get("status", "passed")
         if status == "unavailable":
             reason = metric.get("reason", "optional capability unavailable")
-            entry["unavailable"].append(reason)
+            entry["unavailable"].append(str(reason))
             continue
         denominator = int(metric.get("denominator", 0))
         numerator = int(metric.get("numerator", 0))
@@ -399,21 +399,30 @@ def compute_metrics(cases):
         entry["denominator"] += max(0, denominator)
         if status == "failed":
             entry["failed"] += 1
+            entry["failed_reasons"].append(str(metric.get("reason", "metric_execution_failed")))
 
     result = {}
     for name, entry in sorted(aggregate.items()):
         unavailable = entry["unavailable"]
         denominator = entry["denominator"]
-        metric = {
-            "numerator": entry["numerator"],
-            "denominator": denominator,
-            "rate": round(entry["numerator"] / denominator, 4) if denominator else None,
-            "status": "unavailable" if unavailable and not denominator else (
-                "partial" if unavailable else ("failed" if entry["failed"] else "available")
-            ),
-        }
         if unavailable:
-            metric["reason"] = "; ".join(sorted(set(unavailable)))
+            status = "unavailable" if not denominator else "partial"
+        elif entry["failed"]:
+            status = "failed"
+        elif denominator:
+            status = "available"
+        else:
+            status = "unavailable"
+        metric = {"status": status}
+        if denominator:
+            metric.update({
+                "numerator": entry["numerator"],
+                "denominator": denominator,
+                "rate": round(entry["numerator"] / denominator, 4),
+            })
+        if status != "available":
+            reasons = unavailable or entry["failed_reasons"] or ["no_executed_denominator"]
+            metric["reason"] = "; ".join(sorted(set(reasons)))
         result[name] = metric
     return result
 

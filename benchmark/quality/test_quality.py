@@ -209,6 +209,16 @@ class QualityHarnessTests(unittest.TestCase):
         self.assertEqual(metrics["compaction_projection"]["status"], "unavailable")
         self.assertEqual(metrics["compaction_projection"]["reason"], "tool not advertised")
 
+    def test_metric_aggregation_emits_reason_without_zero_denominator_measurement(self):
+        metrics = compute_metrics(
+            [{
+                "status": "failed",
+                "checks": {"passed": 0, "total": 0},
+                "metric": {"name": "recall_outcome", "status": "failed", "reason": "mcp_error"},
+            }]
+        )
+        self.assertEqual(metrics["recall_outcome"], {"status": "failed", "reason": "mcp_error"})
+
     def test_signature_payload_omits_nondeterministic_and_private_evidence(self):
         first = report_signature_payload(
             {
