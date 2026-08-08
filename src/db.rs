@@ -4338,6 +4338,11 @@ impl Database {
             params![digest, predicate, reason, workspace_hash, now_ms()],
         )?;
         drop(guard);
+        // Close the cached read-write connection so it cannot hold a file
+        // lock that conflicts with the read-only connections opened by
+        // governance_read_conn (material on Windows where SQLite uses
+        // mandatory file locking rather than advisory POSIX locks).
+        *self.governance_overlay.lock().unwrap() = None;
         self.invalidate_suppression_cache();
         Ok(())
     }
