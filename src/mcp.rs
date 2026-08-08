@@ -614,13 +614,14 @@ pub fn handle_request(
 
             // #684: stamp the captured session identity so tools that enforce
             // visibility (recall) know who is asking, without the caller having
-            // to pass it. Only when non-empty and not already supplied; unknown
-            // to tools that don't read it (serde ignores it).
+            // to pass it. #855: the transport-captured host identity is
+            // AUTHORITATIVE — a caller-supplied `requesting_agent_id`
+            // (model-forged or empty) is overwritten, never trusted, so no
+            // model can claim another agent's identity.
             if let Ok(sid) = state.session_agent_id.read() {
                 if !sid.is_empty() {
                     if let Some(obj) = tool_args.as_object_mut() {
-                        obj.entry("requesting_agent_id")
-                            .or_insert_with(|| json!(*sid));
+                        obj.insert("requesting_agent_id".to_string(), json!(*sid));
                     }
                 }
             }
@@ -6380,6 +6381,51 @@ mod tests {
             structured["total"],
             json!(0),
             "bob must not see alice's private note via the captured identity: {structured}"
+        );
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn transport_host_identity_overrides_forged_requesting_agent_id() {
+        // #855 review: even when the caller forges a requesting_agent_id
+        // (or passes an empty one), the transport overwrites it with the
+        // captured clientInfo.name — a model cannot claim another identity.
+        let db_path = std::env::temp_dir()
+            .join(format!("mimir-forged-id-{}.db", uuid::Uuid::new_v4()));
+        let db = Database::open(db_path.to_str().expect("temp db path")).expect("open temp db");
+
+        let state = MCPState::new();
+        let init = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(1)),
+            method: "initialize".to_string(),
+            params: Some(json!({"clientInfo": {"name": "host-bob", "version": "1.0"}})),
+        };
+        handle_request(&init, &state, &db).expect("initialize");
+
+        // Forge: the model claims to be "mallory" in both author and host
+        // fields. The transport must replace requesting_agent_id with host-bob.
+        let call = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(2)),
+            method: "tools/call".to_string(),
+            params: Some(json!({
+                "name": "mimir_correct",
+                "arguments": {
+                    "wrong_approach": "assistant guessed the state",
+                    "user_correction": "user corrected",
+                    "task_context": "review",
+                    "agent_id": "mallory",
+                    "requesting_agent_id": "mallory"
+                }
+            })),
+        };
+        let resp = handle_request(&call, &state, &db).expect("correct response");
+        let structured = resp.result.expect("result")["structuredContent"].clone();
+        assert_eq!(
+            structured["agent_id"],
+            json!("host-bob"),
+            "host identity must override the forged id: {structured}"
         );
         let _ = fs::remove_file(db_path);
     }

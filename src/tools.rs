@@ -4546,8 +4546,8 @@ pub fn handle_dream(db: &Database, args: Value) -> Result<String, String> {
         let categories: Vec<String> = match a.params.category {
             Some(ref c) => vec![c.clone()],
             None => db
-                .workspace_list_categories()
-                .map_err(|e| format!("Dream fallback (categories) failed: {}", e))?
+                .workspace_list_categories_scoped(a.params.workspace_hash.as_deref())
+                .map_err(|e| format!("Dream fallback (categories) failed: {e}"))?
                 .into_iter()
                 .filter(|c| {
                     c != "insight" && c != "observation" && c != "synthesis" && c != "memories"
@@ -10991,6 +10991,63 @@ mod tests {
             .expect("correction journal event");
         assert_eq!(event.agent_id, "");
         assert_eq!(event.workspace_hash, "");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn dream_fallback_consolidate_is_scoped() {
+        // #854 review: the no-LLM fallback (fallback_consolidate) must carry
+        // the same workspace scope into the mechanical consolidate pass —
+        // scoped fallback never merges across workspaces.
+        let (db, path) = temp_db();
+        let ins = |id: &str, ws: &str| {
+            db.conn()
+                .unwrap()
+                .execute(
+                    "INSERT INTO entities (id, category, key, body_json, status, type, tags, \
+                     decay_score, retrieval_count, layer, topic_path, archived, archive_reason, \
+                     links, verified, source, certainty, workspace_hash, created_at_unix_ms, \
+                     last_accessed_unix_ms) \
+                     VALUES (?1, 'episodes', ?1, '{\"note\":\"user ran database migrations \
+                     before restarting the api service\"}', 'active', 'insight', '[]', 1.0, 0, \
+                     'working', '', 0, '', '[]', 0, 'agent', 0.5, ?2, 0, 0)",
+                    rusqlite::params![id, ws],
+                )
+                .unwrap();
+        };
+        ins("fb-1", "ws-fb");
+        ins("fb-2", "ws-fb");
+        ins("fb-3", "ws-other");
+
+        let response = handle_dream(
+            &db,
+            json!({
+                "category": "episodes",
+                "fallback_consolidate": true,
+                "workspace_hash": "ws-fb",
+                "dry_run": false
+            }),
+        )
+        .expect("dream fallback");
+        let v: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(v["fallback"], json!("consolidate"));
+        assert_eq!(
+            v["entities_examined"], json!(2),
+            "scoped fallback must only examine ws-fb: {v}"
+        );
+        assert_eq!(v["observations_created"], json!(1));
+
+        // The derived observation inherits the scope.
+        let obs_ws: String = db
+            .conn()
+            .unwrap()
+            .query_row(
+                "SELECT workspace_hash FROM entities WHERE category='observation' LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(obs_ws, "ws-fb", "fallback observation must inherit the scope");
         let _ = std::fs::remove_file(path);
     }
 }

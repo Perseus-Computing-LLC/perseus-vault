@@ -10196,11 +10196,13 @@ impl Database {
     }
 
     /// #854: authorize a deliberate cross-workspace (global) maintenance run.
-    /// Anonymous/unscoped callers (no host identity) fail open, exactly like
-    /// the rest of the authority regime; identity-carrying callers must hold
-    /// capability `memory.maintenance.global` in the SYSTEM scope — a
-    /// manifest with `workspace_hash = "*"` (the system/global scope sentinel,
-    /// since manifests require a non-empty workspace) — or the run is denied.
+    /// Anonymous/unscoped callers (no host identity) fail open — there is no
+    /// identity to hold accountable, matching the authority regime's
+    /// pre-manifest behavior. Identity-carrying callers FAIL CLOSED: global
+    /// cross-workspace maintenance requires an authority manifest granting
+    /// `memory.maintenance.global` in the SYSTEM scope — a manifest with
+    /// `workspace_hash = "*"` (the sentinel, since manifests require a
+    /// non-empty workspace). Missing manifest or missing capability = denied.
     fn authorize_global_maintenance(
         &self,
         requesting_agent_id: &str,
@@ -10208,8 +10210,14 @@ impl Database {
         if requesting_agent_id.trim().is_empty() {
             return Ok(());
         }
-        self.require_memory_capability(requesting_agent_id, "*", "memory.maintenance.global")
-            .map(|_| ())
+        match self.require_memory_capability(requesting_agent_id, "*", "memory.maintenance.global")? {
+            true => Ok(()),
+            false => Err(
+                "global maintenance denied: no authority manifest grants \
+                 memory.maintenance.global for this agent in the system scope ('*')"
+                    .into(),
+            ),
+        }
     }
 
     /// Merge overlapping/duplicative entities within a category into durable,
@@ -24218,6 +24226,25 @@ mod tests {
         ins("w1-b", "billing-b", "ws-one");
         ins("w2-a", "billing-c", "ws-two");
 
+        // The global run is AUTHORIZED: sweeper holds memory.maintenance.global
+        // in the system scope ('*').
+        db.agent_upsert("sweeper", "Sweeper", 2, "fleet").unwrap();
+        let manifest = crate::models::AuthorityManifestInput {
+            agent_id: "sweeper".to_string(),
+            workspace_hash: "*".to_string(), // system/global scope sentinel
+            allowed_capabilities: vec!["memory.maintenance.global".to_string()],
+            approval_required_capabilities: vec![],
+            scope_anchors: vec!["vault:*".to_string()],
+            approver_principals: vec![],
+            allowed_inbound_principals: vec![],
+            permitted_external_ref_prefixes: vec!["vault:*".to_string()],
+            max_parallel_actions: 1,
+            mode: "enforce".to_string(),
+            expires_at_unix_ms: None,
+            capability_constraints_json: "{}".to_string(),
+        };
+        db.authority_set(&manifest, "admin").unwrap();
+
         let report = db
             .consolidate(&crate::models::ConsolidateParams {
                 category: "facts".to_string(),
@@ -24259,6 +24286,54 @@ mod tests {
                 && e.category == "consolidate"),
             "global run must produce a maintenance_global_run audit event"
         );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn consolidate_global_mode_denied_without_manifest() {
+        // #854 review: identity-carrying callers FAIL CLOSED — an agent with
+        // NO authority manifest at all cannot run global maintenance, even
+        // though it could run scoped maintenance.
+        let (db, path) = temp_db();
+        db.agent_upsert("ghost", "Ghost", 2, "fleet").unwrap();
+
+        let err = db
+            .consolidate(&crate::models::ConsolidateParams {
+                category: "facts".to_string(),
+                similarity_threshold: 0.6,
+                limit: 50,
+                offset: 0,
+                dry_run: true,
+                cold_first: false,
+                archive_sources: false,
+                workspace_hash: None,
+                global: true,
+                requesting_agent_id: "ghost".to_string(),
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("global maintenance denied")
+                && err.contains("memory.maintenance.global"),
+            "missing manifest must deny global mode, got: {err}"
+        );
+
+        // Scoped runs remain available to the same identity.
+        let ok = db
+            .consolidate(&crate::models::ConsolidateParams {
+                category: "facts".to_string(),
+                similarity_threshold: 0.6,
+                limit: 50,
+                offset: 0,
+                dry_run: true,
+                cold_first: false,
+                archive_sources: false,
+                workspace_hash: Some(String::new()),
+                global: false,
+                requesting_agent_id: "ghost".to_string(),
+            })
+            .is_ok();
+        assert!(ok, "scoped runs must not require a manifest");
         let _ = fs::remove_file(&path);
     }
 
