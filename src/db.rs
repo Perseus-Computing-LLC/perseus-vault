@@ -15917,6 +15917,169 @@ mod tests {
         let _ = std::fs::remove_file(format!("{path}.governance.db"));
     }
 
+    // ── #882 regression: hidden-before-visible at limit/cap = 1 ──
+
+    /// Dense search: a suppressed entity that would rank first by cosine
+    /// must not consume the top-k cap; the next-ranked visible entity must
+    /// fill the slot instead of the result being silently truncated.
+    #[test]
+    fn dense_suppression_hidden_before_visible_at_limit_1() {
+        let (db, path) = temp_db();
+        // Create entities through the normal write path so all schema columns
+        // (workspace_hash, emb_sig, etc.) are properly populated.
+        db.remember_skip_dedup(&make_entity("d-best", "insight", "best",
+            r#"{"content":"best-match"}"#)).unwrap();
+        db.remember_skip_dedup(&make_entity("d-second", "insight", "second",
+            r#"{"content":"second-best"}"#)).unwrap();
+        // Store embeddings: best is closest to [1,0,0], second at ~0.707.
+        db.store_embedding("d-best", &[1.0, 0.0, 0.0]).unwrap();
+        db.store_embedding("d-second", &[0.7, 0.7, 0.0]).unwrap();
+        // Baseline: best ranks first at limit=1.
+        let baseline = db.dense_search(&[1.0, 0.0, 0.0], 1).unwrap();
+        assert_eq!(baseline.len(), 1);
+        assert_eq!(baseline[0].0.key, "best");
+        // Suppress "best" — the governed dense path must now return "second".
+        db.reject_value("", "s", "insight",
+            r#"{"content":"best-match"}"#, "test", "ev", "agent-1", None).unwrap();
+        let governed = db.dense_search(&[1.0, 0.0, 0.0], 1).unwrap();
+        assert_eq!(
+            governed.len(), 1,
+            "governed dense at limit=1 must return the visible runner-up, not zero"
+        );
+        assert_eq!(governed[0].0.key, "second");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{path}.governance.db"));
+    }
+
+    /// BM25: a suppressed entity that would rank first must not consume the
+    /// page slot; the next-ranked visible entity must be returned instead.
+    #[test]
+    fn bm25_suppression_hidden_before_visible_at_limit_1() {
+        let (db, path) = temp_db();
+        db.remember_skip_dedup(&make_entity("bm-a", "insight", "alpha",
+            r#"{"content":"unique-alpha-term"}"#)).unwrap();
+        db.remember_skip_dedup(&make_entity("bm-b", "insight", "beta",
+            r#"{"content":"unique-beta-term"}"#)).unwrap();
+        // Baseline: both visible in FTS mode.
+        let hits = db.recall(&crate::models::RecallParams {
+            query: "unique-alpha-term OR unique-beta-term".to_string(),
+            limit: 1, offset: 0, mode: crate::models::SearchMode::Fts5,
+            skip_side_effects: true,
+            ..Default::default()
+        }).unwrap();
+        assert_eq!(hits.len(), 1);
+        // Suppress the first-ranked entity (alpha). The governed path must
+        // return beta instead — not zero or alpha.
+        db.reject_value("", "s", "insight",
+            r#"{"content":"unique-alpha-term"}"#, "test", "ev", "agent-1", None).unwrap();
+        let governed = db.recall(&crate::models::RecallParams {
+            query: "unique-alpha-term OR unique-beta-term".to_string(),
+            limit: 1, offset: 0, mode: crate::models::SearchMode::Fts5,
+            skip_side_effects: true,
+            ..Default::default()
+        }).unwrap();
+        assert!(!governed.is_empty(), "governed BM25 at limit=1 must not return empty");
+        assert!(
+            governed.iter().all(|e| e.key != "alpha"),
+            "suppressed entity must not appear"
+        );
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{path}.governance.db"));
+    }
+
+    /// Graph expansion: a suppressed linked entity must not appear as a
+    /// neighbor, even when it is the only linked entity (expanding from a
+    /// visible root must return zero neighbors, not the suppressed one).
+    #[test]
+    fn graph_expansion_suppression_hides_linked_targets() {
+        let (db, path) = temp_db();
+        // Root entity with a link to the suppressed target.
+        let mut root = make_entity("g-root", "insight", "root",
+            r#"{"content":"root node"}"#);
+        root.links = vec![crate::models::MemoryLink {
+            target_id: "g-hidden".to_string(),
+            relationship: "references".to_string(),
+            weight: 0.5,
+        }];
+        db.remember_skip_dedup(&root).unwrap();
+        // Target entity — will be suppressed.
+        db.remember_skip_dedup(&make_entity("g-hidden", "insight", "hidden",
+            r#"{"content":"suppressed neighbor"}"#)).unwrap();
+        // Baseline: expansion finds the neighbor.
+        let baseline = db.graph_expand(&[root.clone()], 5).unwrap();
+        assert!(baseline.iter().any(|(e, _)| e.key == "hidden"));
+        // Suppress the target.
+        db.reject_value("", "s", "insight",
+            r#"{"content":"suppressed neighbor"}"#, "test", "ev", "agent-1", None).unwrap();
+        // Governed expansion must exclude the suppressed neighbor.
+        let governed = db.graph_expand(&[root], 5).unwrap();
+        assert!(
+            !governed.iter().any(|(e, _)| e.key == "hidden"),
+            "suppressed linked entity must not appear in graph expansion"
+        );
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{path}.governance.db"));
+    }
+
+    /// History pagination: a suppressed historical version must not consume
+    /// page slots or inflate the visible total.
+    #[test]
+    fn history_pagination_suppression_hides_versions_and_reports_visible_total() {
+        let (db, path) = temp_db();
+        // Write the entity once.
+        db.remember_skip_dedup(&make_entity("h-1", "convention", "hist-key",
+            r#"{"content":"version-one"}"#)).unwrap();
+        // Update it to create a historical version.
+        let mut v2 = make_entity("h-1", "convention", "hist-key",
+            r#"{"content":"version-two"}"#);
+        v2.body_json = r#"{"content":"version-two"}"#.to_string();
+        db.remember_skip_dedup(&v2).unwrap();
+        // Baseline: two versions in history (one superseded, one live).
+        let (hist, total) = db.history_versions_page("convention", "hist-key", -1, 0).unwrap();
+        assert_eq!(total, 1, "one superseded historical version (live is in entities)");
+        assert_eq!(hist.len(), 1);
+        // Suppress the superseded version's value.
+        db.reject_value("", "s", "convention",
+            r#"{"content":"version-one"}"#, "test", "ev", "agent-1", None).unwrap();
+        // Governed history must now report zero visible versions.
+        let (governed, visible_total) = db.history_versions_page("convention", "hist-key", -1, 0).unwrap();
+        assert_eq!(visible_total, 0, "suppressed version must not inflate visible total");
+        assert!(governed.is_empty(), "suppressed version must not occupy a page slot");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{path}.governance.db"));
+    }
+
+    /// recall_when: a suppressed FTS trigger-match must not consume the
+    /// candidate cap, allowing the next visible match to fill the slot.
+    #[test]
+    fn recall_when_suppression_hidden_before_visible_at_limit_1() {
+        let (db, path) = temp_db();
+        let mut a = make_entity("rw-a", "insight", "trigger-a",
+            r#"{"content":"alpha entry","recall_when":["alpha trigger keyword"]}"#);
+        a.always_on = true;
+        db.remember_skip_dedup(&a).unwrap();
+        let mut b = make_entity("rw-b", "insight", "trigger-b",
+            r#"{"content":"beta entry","recall_when":["beta trigger keyword"]}"#);
+        b.always_on = true;
+        db.remember_skip_dedup(&b).unwrap();
+        // Baseline: both triggers match "trigger".
+        let base = db.recall_when("trigger", 10, None).unwrap();
+        assert_eq!(base.len(), 2);
+        // Suppress "trigger-a".
+        db.reject_value("", "s", "insight",
+            r#"{"content":"alpha entry","recall_when":["alpha trigger keyword"]}"#,
+            "test", "ev", "agent-1", None).unwrap();
+        // Governed recall_when at limit=1 must return "trigger-b", not zero.
+        let governed = db.recall_when("trigger", 1, None).unwrap();
+        assert_eq!(
+            governed.len(), 1,
+            "recall_when at limit=1 must return the visible match, not zero"
+        );
+        assert_eq!(governed[0].key, "trigger-b");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{path}.governance.db"));
+    }
+
     #[test]
     fn authority_manifest_is_versioned_and_records_auditable_lifecycle() {
         let (db, path) = temp_db();
