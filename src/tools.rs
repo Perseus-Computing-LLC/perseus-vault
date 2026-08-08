@@ -1479,8 +1479,8 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
     let deadline_ms = a.deadline_ms.filter(|ms| *ms > 0);
     let started = std::time::Instant::now();
 
-    let mut entities = db
-        .recall(&params)
+    let (mut entities, recall_completeness) = db
+        .recall_with_completeness(&params)
         .map_err(|e| format!("Recall failed: {}", e))?;
 
     let elapsed_ms = started.elapsed().as_millis() as i64;
@@ -1497,6 +1497,20 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
     };
     let outcome = db.recall_outcome(&mode_for_side_effects, query_embedding_available, entities.len(), None);
     let outcome = Database::apply_recall_deadline(outcome, deadline_elapsed);
+    // #856: the recall path's pool dynamics are authoritative over the
+    // standalone estimate; abstention (no evidence / backend unavailable)
+    // wins over everything.
+    let outcome = {
+        let mut o = outcome;
+        if o.abstained {
+            o.completeness = Some(crate::models::Completeness::Abstain);
+            o.candidate_scope = None;
+        } else {
+            o.completeness = Some(recall_completeness.completeness);
+            o.candidate_scope = recall_completeness.scope;
+        }
+        o
+    };
 
     // #684: visibility enforcement. Drop entities the requesting agent may not
     // read (private → author only; fleet → same fleet / tier>=2) before any
