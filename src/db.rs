@@ -8533,8 +8533,15 @@ impl Database {
         input: &AuthorityManifestInput,
         author_agent_id: &str,
     ) -> Result<AuthorityManifest, Box<dyn std::error::Error>> {
-        if input.agent_id.trim().is_empty() || input.workspace_hash.trim().is_empty() {
-            return Err("authority manifest requires agent_id and workspace_hash".into());
+        if input.agent_id.trim().is_empty() {
+            return Err("authority manifest requires a non-empty agent_id".into());
+        }
+        if input.workspace_hash.trim().is_empty() {
+            // The authority regime is per-workspace by design: a manifest must
+            // name the exact workspace it governs. Empty ("global") scope is
+            // valid for memory entities but NOT for authority manifests, so
+            // fail loudly with the reason instead of a generic shape error.
+            return Err("authority manifest requires a non-empty workspace_hash (authority is per-workspace; empty/global scope is not valid for manifests)".into());
         }
         if !matches!(input.mode.as_str(), "shadow" | "enforce") {
             return Err("authority manifest mode must be shadow or enforce".into());
@@ -8751,9 +8758,18 @@ impl Database {
 
     pub fn action_intent(&self, agent_id:&str, workspace_hash:&str, scope_anchor:&str, external_ref:&str, capability:&str, action_key:&str, intent_hash:&str, resource_constraints_json: Option<&str>) -> Result<AuthorizedAction, Box<dyn std::error::Error>> {
         let manifest = self.active_authority(agent_id, workspace_hash)?;
-        if !manifest.allowed_capabilities.iter().any(|v| v == capability) { return Err("capability is not permitted by authority manifest".into()); }
-        if !manifest.scope_anchors.iter().any(|v| v == scope_anchor) { return Err("trusted scope anchor is not permitted by authority manifest".into()); }
-        if !manifest.permitted_external_ref_prefixes.iter().any(|v| external_ref == v || external_ref.starts_with(&(v.clone()+"/"))) { return Err("external reference is not permitted by authority manifest".into()); }
+        if !manifest.allowed_capabilities.iter().any(|v| v == capability) {
+            return Err(format!("capability {capability:?} is not permitted by authority manifest (allowed capabilities: {})", manifest.allowed_capabilities.join(", ")).into());
+        }
+        if !manifest.scope_anchors.iter().any(|v| v == scope_anchor) {
+            // Scope anchors are exact-match identifiers, not prefixes: the
+            // intent must name one of the trusted anchors verbatim so a
+            // manifest can never be satisfied by a lookalike anchor.
+            return Err(format!("scope anchor {scope_anchor:?} is not permitted by authority manifest (anchors match exactly; allowed: {})", manifest.scope_anchors.join(", ")).into());
+        }
+        if !manifest.permitted_external_ref_prefixes.iter().any(|v| external_ref == v || external_ref.starts_with(&(v.clone()+"/"))) {
+            return Err(format!("external reference {external_ref:?} is not permitted by authority manifest (permitted prefixes: {})", manifest.permitted_external_ref_prefixes.join(", ")).into());
+        }
         if intent_hash.len()!=64 || !intent_hash.bytes().all(|b| b.is_ascii_hexdigit()) { return Err("intent_hash must be a SHA-256 hex digest".into()); }
         let resource_constraints_json = canonical_constraint_json(resource_constraints_json.unwrap_or("{}"))?;
         if !resource_constraints_permit(&manifest.capability_constraints_json, capability, &resource_constraints_json)? {
@@ -17282,6 +17298,114 @@ mod tests {
             .action_approve(&intent.id, "github:tcconnally", "granted")
             .unwrap();
         assert_eq!(approval.status, "approval_granted");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn authority_intent_rejections_are_self_explanatory() {
+        let (db, path) = temp_db();
+        db.agent_upsert("agent-aar-msg", "AAR Messages", 3, "perseus")
+            .unwrap();
+        let manifest = crate::models::AuthorityManifestInput {
+            agent_id: "agent-aar-msg".to_string(),
+            workspace_hash: "ws-aar-msg".to_string(),
+            allowed_capabilities: vec!["git_push".to_string(), "issue_closure".to_string()],
+            approval_required_capabilities: vec![],
+            scope_anchors: vec!["Perseus-Computing-LLC/perseus".to_string()],
+            approver_principals: vec![],
+            allowed_inbound_principals: vec![],
+            permitted_external_ref_prefixes: vec![
+                "https://github.com/Perseus-Computing-LLC/perseus".to_string(),
+            ],
+            max_parallel_actions: 1,
+            mode: "enforce".to_string(),
+            expires_at_unix_ms: None,
+            capability_constraints_json: "{}".to_string(),
+        };
+        let _ = db.authority_set(&manifest, "admin").unwrap();
+
+        // Capability denial names the capability and lists the allowed set.
+        let err = db
+            .action_intent(
+                "agent-aar-msg", "ws-aar-msg",
+                "Perseus-Computing-LLC/perseus",
+                "https://github.com/Perseus-Computing-LLC/perseus",
+                "deploy", "act-1", &"a".repeat(64), Some("{}"),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("deploy"), "denial should name the capability: {err}");
+        assert!(err.contains("git_push"), "denial should list allowed capabilities: {err}");
+
+        // Anchor denial names the offending anchor, states exact-match
+        // semantics, and lists the allowed anchors.
+        let err = db
+            .action_intent(
+                "agent-aar-msg", "ws-aar-msg",
+                "Perseus-Computing-LLC/perseus branch feat/x",  // lookalike anchor
+                "https://github.com/Perseus-Computing-LLC/perseus",
+                "git_push", "act-2", &"a".repeat(64), Some("{}"),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("branch feat/x"), "denial should name the anchor: {err}");
+        assert!(err.contains("exactly"), "denial should state exact-match semantics: {err}");
+        assert!(err.contains("Perseus-Computing-LLC/perseus"), "denial should list allowed anchors: {err}");
+
+        // External-ref denial names the reference and lists the prefixes.
+        let err = db
+            .action_intent(
+                "agent-aar-msg", "ws-aar-msg",
+                "Perseus-Computing-LLC/perseus",
+                "https://github.com/Other-Org/other",
+                "git_push", "act-3", &"a".repeat(64), Some("{}"),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Other-Org"), "denial should name the reference: {err}");
+        assert!(err.contains("https://github.com/Perseus-Computing-LLC/perseus"), "denial should list permitted prefixes: {err}");
+
+        // Exact anchor + permitted prefix passes without approval required.
+        let ok = db
+            .action_intent(
+                "agent-aar-msg", "ws-aar-msg",
+                "Perseus-Computing-LLC/perseus",
+                "https://github.com/Perseus-Computing-LLC/perseus/pull/931",
+                "git_push", "act-4", &"a".repeat(64), Some("{}"),
+            )
+            .unwrap();
+        assert_eq!(ok.status, "intent");
+        assert!(!ok.approval_required);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn authority_set_validation_names_the_missing_field() {
+        let (db, path) = temp_db();
+        db.agent_upsert("agent-aar-set", "AAR Set", 3, "perseus")
+            .unwrap();
+        let mut base = crate::models::AuthorityManifestInput {
+            agent_id: "agent-aar-set".to_string(),
+            workspace_hash: "ws-aar-set".to_string(),
+            allowed_capabilities: vec!["git_push".to_string()],
+            approval_required_capabilities: vec![],
+            scope_anchors: vec!["anchor".to_string()],
+            approver_principals: vec![],
+            allowed_inbound_principals: vec![],
+            permitted_external_ref_prefixes: vec!["https://example.com".to_string()],
+            max_parallel_actions: 1,
+            mode: "enforce".to_string(),
+            expires_at_unix_ms: None,
+            capability_constraints_json: "{}".to_string(),
+        };
+        base.agent_id = "   ".to_string();
+        let err = db.authority_set(&base, "admin").unwrap_err().to_string();
+        assert!(err.contains("agent_id"), "should name agent_id: {err}");
+        base.agent_id = "agent-aar-set".to_string();
+        base.workspace_hash = "".to_string();
+        let err = db.authority_set(&base, "admin").unwrap_err().to_string();
+        assert!(err.contains("workspace_hash"), "should name workspace_hash: {err}");
+        assert!(err.contains("per-workspace"), "should explain the per-workspace regime: {err}");
         let _ = std::fs::remove_file(&path);
     }
 
