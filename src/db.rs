@@ -2605,92 +2605,12 @@ impl Database {
         })?;
         let mut candidates = Vec::new();
         for row in rows {
-            match row {
-                Ok((entity, embedding)) => {
-                    if embedding.len() == query_vec.len() {
-                        candidates.push((entity, embedding));
-                    }
-                }
-                Err(e) => {
-                    #[cfg(test)]
-                    eprintln!("[dense-sup-diag] candidate row error: {e}");
-                    return Err(e.into());
-                }
+            let (entity, embedding) = row?;
+            if embedding.len() == query_vec.len() {
+                candidates.push((entity, embedding));
             }
         }
         drop(stmt);
-        #[cfg(test)]
-        if candidates.len() <= 8 {
-            eprintln!(
-                "[dense-sup-diag] governed candidates={} keys={:?} max_scan={}",
-                candidates.len(),
-                candidates
-                    .iter()
-                    .map(|(entity, _)| entity.key.as_str())
-                    .collect::<Vec<_>>(),
-                max_scan
-            );
-            for (entity, embedding) in &candidates {
-                eprintln!(
-                    "[dense-sup-diag] candidate row id={} key={} emb_len={} query_dim={} match={}",
-                    entity.id,
-                    entity.key,
-                    embedding.len(),
-                    query_vec.len(),
-                    embedding.len() == query_vec.len()
-                );
-            }
-            // Precise row-level probe on the same pooled connection: where do
-            // candidates go missing (rows gone / archived / embedding NULL /
-            // signature NULL / dim mismatch)?
-            let counts = conn.query_row(
-                "SELECT
-                   (SELECT COUNT(*) FROM entities) AS total,
-                   (SELECT COUNT(*) FROM entities WHERE archived = 0) AS a0,
-                   (SELECT COUNT(*) FROM entities WHERE embedding IS NOT NULL) AS emb,
-                   (SELECT COUNT(*) FROM entities WHERE archived = 0 AND embedding IS NOT NULL) AS a0e,
-                   (SELECT COUNT(*) FROM entities WHERE archived = 0 AND emb_sig IS NOT NULL) AS a0s",
-                [],
-                |r| {
-                    Ok((
-                        r.get::<_, i64>(0)?,
-                        r.get::<_, i64>(1)?,
-                        r.get::<_, i64>(2)?,
-                        r.get::<_, i64>(3)?,
-                        r.get::<_, i64>(4)?,
-                    ))
-                },
-            )?;
-            eprintln!(
-                "[dense-sup-diag] counts total={} archived0={} embedded={} a0_embedded={} a0_signed={}",
-                counts.0, counts.1, counts.2, counts.3, counts.4
-            );
-            let mut probe = conn.prepare(
-                "SELECT id, key, category, archived, length(embedding), length(emb_sig), workspace_hash \
-                 FROM entities ORDER BY id",
-            )?;
-            let prows = probe.query_map([], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                    r.get::<_, i64>(3)?,
-                    r.get::<_, Option<i64>>(4)?,
-                    r.get::<_, Option<i64>>(5)?,
-                    r.get::<_, String>(6)?,
-                ))
-            })?;
-            for pr in prows {
-                match pr {
-                    Ok((id, key, cat, arch, elen, slen, ws)) => eprintln!(
-                        "[dense-sup-diag] row id={} key={} category={} workspace={} archived={} emb_len={:?} sig_len={:?}",
-                        id, key, cat, ws, arch, elen, slen
-                    ),
-                    Err(e) => eprintln!("[dense-sup-diag] probe row error: {e}"),
-                }
-            }
-            drop(probe);
-        }
         // Materialize the primary rows before opening either governance
         // connection. On Windows, keeping the dense scan's pooled primary
         // connection live while the suppression interceptor checks the
@@ -2701,14 +2621,6 @@ impl Database {
         drop(conn);
         let entities: Vec<Entity> = candidates.iter().map(|(entity, _)| entity.clone()).collect();
         let visible = self.filter_suppressed(entities)?;
-        #[cfg(test)]
-        if visible.len() <= 8 {
-            eprintln!(
-                "[dense-sup-diag] governed visible={} keys={:?}",
-                visible.len(),
-                visible.iter().map(|entity| entity.key.as_str()).collect::<Vec<_>>()
-            );
-        }
         let visible_ids: std::collections::HashSet<String> =
             visible.into_iter().map(|entity| entity.id).collect();
         let query_norm = query_vec
@@ -4527,8 +4439,6 @@ impl Database {
         let overlay = self.governance_read_conn_compatible()?;
         let now = now_ms();
         let mut kept = Vec::with_capacity(entities.len());
-        #[cfg(test)]
-        let dense_diag = entities.len() <= 8;
         for entity in entities {
             let erased = overlay
                 .as_ref()
@@ -4543,17 +4453,6 @@ impl Database {
                 .transpose()?
                 .unwrap_or(false);
             let primary_suppressed = self.primary_entity_suppressed_with_conn(&conn, &entity, now)?;
-            #[cfg(test)]
-            if dense_diag {
-                eprintln!(
-                    "[dense-sup-diag] filter key={} id={} workspace={} erased={} primary_suppressed={}",
-                    entity.key,
-                    entity.id,
-                    entity.workspace_hash,
-                    erased,
-                    primary_suppressed
-                );
-            }
             if !erased && !primary_suppressed {
                 kept.push(entity);
             }
@@ -16062,7 +15961,14 @@ mod tests {
     /// fill the slot instead of the result being silently truncated.
     #[test]
     fn dense_suppression_hidden_before_visible_at_limit_1() {
-        let (db, path) = temp_db();
+        let (mut db, path) = temp_db();
+        // This test writes hand-crafted 3-dim fixture embeddings and asserts
+        // on their exact ranks. The default build bundles a real 384-dim
+        // embedding model, and the normal write path auto-embeds in the
+        // background; that worker would overwrite the fixture vectors
+        // mid-test (the Windows CI race this test used to hit), so disable
+        // auto-embedding for this instance.
+        db.embedding_config.enabled = false;
         // Create entities through the normal write path so all schema columns
         // (workspace_hash, emb_sig, etc.) are properly populated.
         db.remember_skip_dedup(&make_entity("d-best", "insight", "best",
@@ -16077,13 +15983,11 @@ mod tests {
         assert_eq!(baseline.len(), 1);
         assert_eq!(baseline[0].0.key, "best");
         // Suppress "best" — the governed dense path must now return "second".
-        let rej_id = db.reject_value("", "s", "insight",
+        let _ = db.reject_value("", "s", "insight",
             r#"{"content":"best-match"}"#, "test", "ev", "agent-1", None).unwrap();
-        eprintln!("[dense-sup-diag] reject_value id={rej_id}");
-        // Diagnostic: verify the tombstone is visible before the governed search.
+        // Verify the tombstone is visible before the governed search.
         let is_rej = db.is_value_rejected("", "s", "insight",
             r#"{"content":"best-match"}"#).unwrap_or(false);
-        eprintln!("[dense-sup-diag] is_value_rejected(best-match)={is_rej}");
         assert!(is_rej, "tombstone must be visible after reject_value");
         let governed = db.dense_search(&[1.0, 0.0, 0.0], 1).unwrap();
         assert_eq!(
