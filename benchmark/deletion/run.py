@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import subprocess
+import signal
 import sys
 import tempfile
 import shutil
@@ -43,13 +44,21 @@ def find_binary(explicit: str | None) -> str:
 
 class Client:
     def __init__(self, binary: str, db: Path):
-        self.p = subprocess.Popen([binary, "--db", str(db)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
-        self.responses: queue.Queue[object] = queue.Queue()
-        threading.Thread(target=self._reader_loop, daemon=True).start()
-        self.i = 0
-        self.send({"jsonrpc": "2.0", "id": self.next_id(), "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "deletion-benchmark", "version": "1"}}})
-        self.read()
-        self.send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        self.p = subprocess.Popen([binary, "--db", str(db)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, start_new_session=(os.name != "nt"))
+        try:
+            self.responses: queue.Queue[object] = queue.Queue()
+            self._reader = threading.Thread(target=self._reader_loop, daemon=True)
+            self._reader.start()
+            self.i = 0
+            self.send({"jsonrpc": "2.0", "id": self.next_id(), "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "deletion-benchmark", "version": "1"}}})
+            self.read()
+            self.send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        except BaseException:
+            try:
+                self.close()
+            except Exception:
+                pass
+            raise
 
     def next_id(self) -> int:
         self.i += 1
@@ -94,13 +103,35 @@ class Client:
         return self.read()
 
     def close(self) -> None:
+        cleanup_error = None
         try:
             if self.p.stdin is not None:
                 self.p.stdin.close()
             self.p.wait(timeout=30)
-        except Exception:
-            self.p.kill()
-            self.p.wait(timeout=5)
+        except Exception as exc:
+            cleanup_error = exc
+            try:
+                if os.name != "nt":
+                    os.killpg(self.p.pid, signal.SIGTERM)
+                else:
+                    self.p.terminate()
+                self.p.wait(timeout=5)
+            except Exception:
+                try:
+                    if os.name != "nt":
+                        os.killpg(self.p.pid, signal.SIGKILL)
+                    else:
+                        self.p.kill()
+                    self.p.wait(timeout=5)
+                except Exception as kill_exc:
+                    cleanup_error = cleanup_error or kill_exc
+        reader = getattr(self, "_reader", None)
+        if reader is not None:
+            reader.join(timeout=5)
+            if reader.is_alive():
+                raise RuntimeError("deletion reader thread did not stop")
+        if cleanup_error is not None and self.p.poll() is None:
+            raise RuntimeError("deletion client cleanup failed") from cleanup_error
 
 
 def remember(c: Client, category: str, key: str, marker: str) -> None:
@@ -178,9 +209,18 @@ def main() -> int:
         for case in manifest["cases"]:
             run_case(c, case, db, rows)
     finally:
+        cleanup_errors = []
         if c is not None:
-            c.close()
-        shutil.rmtree(db.parent, ignore_errors=True)
+            try:
+                c.close()
+            except BaseException as exc:
+                cleanup_errors.append(exc)
+        try:
+            shutil.rmtree(db.parent)
+        except BaseException as exc:
+            cleanup_errors.append(exc)
+        if cleanup_errors:
+            raise RuntimeError("deletion benchmark cleanup failed") from cleanup_errors[0]
     passed = sum(bool(row["ok"]) for row in rows)
     if not rows:
         raise ValueError("deletion benchmark produced no checks")

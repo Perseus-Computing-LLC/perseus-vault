@@ -42,7 +42,7 @@ class PublicationTests(unittest.TestCase):
                 raw_report={
                     "passed": True,
                     "capabilities": {"runner": {"status": "available"}},
-                    "cases": [{"id": "case", "category": "suite", "status": "passed", "checks": {"ok": True}, "evidence": {"query": "private", "target_key": "secret", "count": 1}}],
+                    "cases": [{"id": "case", "category": "suite", "status": "passed", "checks": {"ok": True}, "evidence": {"target_key": "secret", "count": 1}}],
                     "metrics": {"suite": {"status": "available", "numerator": 1, "denominator": 1, "rate": 1.0}},
                 },
                 binary=binary,
@@ -54,6 +54,28 @@ class PublicationTests(unittest.TestCase):
             )
             self.assertNotIn("query", report["cases"][0]["evidence"])
             self.assertNotIn("target_key", report["cases"][0]["evidence"])
+
+    def test_common_envelope_rejects_forbidden_evidence_keys(self):
+        with tempfile.TemporaryDirectory() as directory:
+            binary = Path(directory) / "binary"
+            binary.write_bytes(b"benchmark-binary")
+            with self.assertRaises(ValueError):
+                build_common_report(
+                    suite_id="suite",
+                    suite_version="v1",
+                    raw_report={
+                        "passed": True,
+                        "capabilities": {"runner": {"status": "available"}},
+                        "cases": [{"id": "case", "category": "suite", "status": "passed", "checks": {"ok": True}, "evidence": {"count": 1, "query": "private-query-sentinel"}}],
+                        "metrics": {"suite": {"status": "available", "numerator": 1, "denominator": 1, "rate": 1.0}},
+                    },
+                    binary=binary,
+                    manifest={"name": "fixture", "version": 1},
+                    profile={"suite": "v1"},
+                    repo_root=Path(os.environ.get("PERSEUS_TEST_REPO", str(Path(__file__).resolve().parents[2]))),
+                    claim_ids=[],
+                    negative_claim_ids=[],
+                )
 
     def test_common_envelope_redacts_private_labels(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -101,6 +123,56 @@ class PublicationTests(unittest.TestCase):
             )
             self.assertEqual(report["status"], "partial")
 
+    def test_common_envelope_rejects_unregistered_claim_ids(self):
+        with tempfile.TemporaryDirectory() as directory:
+            binary = Path(directory) / "binary"
+            binary.write_bytes(b"benchmark-binary")
+            with self.assertRaises(ValueError):
+                build_common_report(
+                    suite_id="suite",
+                    suite_version="v1",
+                    raw_report={
+                        "passed": True,
+                        "capabilities": {"runner": {"status": "available"}},
+                        "cases": [{"id": "case", "category": "suite", "status": "passed", "checks": {"ok": True}, "evidence": {"count": 1}}],
+                        "metrics": {"suite": {"status": "available", "numerator": 1, "denominator": 1}},
+                    },
+                    binary=binary,
+                    manifest={"suite": "fixture"},
+                    profile={"suite": "v1"},
+                    repo_root=Path(os.environ.get("PERSEUS_TEST_REPO", str(Path(__file__).resolve().parents[2]))),
+                    claim_ids=["forged-claim-id"],
+                    negative_claim_ids=[],
+                )
+
+    def test_common_envelope_rejects_evidence_with_no_public_fields(self):
+        with tempfile.TemporaryDirectory() as directory:
+            binary = Path(directory) / "binary"
+            binary.write_bytes(b"benchmark-binary")
+            with self.assertRaises(ValueError):
+                build_common_report(
+                    suite_id="suite",
+                    suite_version="v1",
+                    raw_report={
+                        "passed": True,
+                        "capabilities": {"runner": {"status": "available"}},
+                        "cases": [{
+                            "id": "case",
+                            "category": "suite",
+                            "status": "passed",
+                            "checks": {"ok": True},
+                            "evidence": {"query": "private", "body": "secret"},
+                        }],
+                        "metrics": {"suite": {"status": "available", "numerator": 1, "denominator": 1}},
+                    },
+                    binary=binary,
+                    manifest={"suite": "fixture"},
+                    profile={"suite": "v1"},
+                    repo_root=Path(os.environ.get("PERSEUS_TEST_REPO", str(Path(__file__).resolve().parents[2]))),
+                    claim_ids=[],
+                    negative_claim_ids=[],
+                )
+
     def test_common_envelope_rejects_private_identifier_tokens(self):
         with tempfile.TemporaryDirectory() as directory:
             binary = Path(directory) / "binary"
@@ -134,7 +206,7 @@ class PublicationTests(unittest.TestCase):
                     "passed": True,
                     "capabilities": {"runner": {"status": "available"}},
                     "cases": [{"id": "case", "checks": {"ok": True}, "category": "safe-category", "evidence": {"count": 1}}],
-                    "metrics": {"suite": {"numerator": 1, "denominator": 1}},
+                    "metrics": {"suite": {"status": "available", "numerator": 1, "denominator": 1}},
                 },
                 binary=binary,
                 manifest={"name": "fixture", "version": 1},
@@ -156,7 +228,7 @@ class PublicationTests(unittest.TestCase):
                     raw_report={
                         "cases": [{"id": "case", "checks": {"ok": True}}],
                         "capabilities": {"runner": {"status": "available"}},
-                        "metrics": {"suite": {"numerator": 1, "denominator": 1}},
+                        "metrics": {"suite": {"status": "available", "numerator": 1, "denominator": 1}},
                         "metric_rates": {"suite": {"status": "available", "nested": {"secret": "x"}}},
                     },
                     binary=binary,

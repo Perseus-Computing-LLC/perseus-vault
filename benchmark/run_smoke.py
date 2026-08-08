@@ -8,9 +8,15 @@ import json
 import os
 import subprocess
 import signal
+import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from benchmark.package.common.artifacts import validate_report
+
 
 
 def run(command: list[str], output: Path) -> dict:
@@ -90,34 +96,62 @@ def run(command: list[str], output: Path) -> dict:
 
 
 def run_passed(result: dict) -> bool:
-    summary = result.get("summary", {})
-    if result.get("returncode") != 0:
+    if not isinstance(result, dict) or result.get("returncode") != 0:
         return False
-    if summary.get("passed") is not True or summary.get("status") != "passed" or summary.get("verdict") == "blocked":
-        return False
-    if "runs" in summary:
-        nested = summary.get("runs")
-        if not isinstance(nested, list) or not nested:
-            return False
-        return all(
-            isinstance(item, dict)
-            and isinstance(item.get("summary"), dict)
-            and item.get("returncode") == 0
-            and item["summary"].get("passed") is True
-            and item["summary"].get("status") == "passed"
-            for item in nested
-        )
     report_path = result.get("report")
     if not isinstance(report_path, str):
         return False
     try:
         report = json.loads(Path(report_path).read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        if not isinstance(report, dict):
+            return False
+        validate_report(report)
+    except (OSError, json.JSONDecodeError, TypeError, ValueError, KeyError, OverflowError):
         return False
-    required = {"schema_version", "benchmark_id", "suite_version", "cases", "metrics", "result_signature_sha256", "claims_sha256"}
-    if not isinstance(report, dict) or not required.issubset(report):
+    if report.get("passed") is not True or report.get("status") != "passed":
         return False
+    nested = report.get("runs")
+    if nested is not None:
+        if not isinstance(nested, list) or not nested:
+            return False
+        for child in nested:
+            if not isinstance(child, dict) or not isinstance(child.get("report"), str):
+                return False
+            if not run_passed({"returncode": child.get("returncode"), "report": child["report"]}):
+                return False
     return True
+
+
+def _public_summary(summary: dict) -> dict:
+    if not isinstance(summary, dict):
+        return {}
+    allowed = {"passed", "checks_passed", "checks_total", "accuracy", "verdict", "status"}
+    result = {key: summary[key] for key in allowed if key in summary}
+    nested = summary.get("runs")
+    if nested is not None:
+        if not isinstance(nested, list):
+            raise ValueError("nested smoke summary must be a list")
+        result["runs"] = [
+            {
+                "returncode": item.get("returncode"),
+                "summary": _public_summary(item.get("summary", {})),
+            }
+            for item in nested
+            if isinstance(item, dict)
+        ]
+        if len(result["runs"]) != len(nested):
+            raise ValueError("nested smoke summary contains a non-object")
+    return result
+
+
+def _public_run(result: dict) -> dict:
+    public = {
+        key: result[key]
+        for key in ("returncode", "timeout", "stdout_sha256", "stderr_sha256")
+        if key in result
+    }
+    public["summary"] = _public_summary(result.get("summary", {}))
+    return public
 
 
 def aggregate_passed(results: list[dict]) -> bool:
@@ -141,7 +175,7 @@ def main() -> int:
     summary = {
         "benchmark": "perseus-vault-local-smoke",
         "status": "passed" if aggregate_passed(runs) else "failed",
-        "runs": runs,
+        "runs": [_public_run(run_result) for run_result in runs],
         "passed": aggregate_passed(runs),
     }
     Path(args.out).write_text(json.dumps(summary, indent=2, sort_keys=True, allow_nan=False) + "\n")

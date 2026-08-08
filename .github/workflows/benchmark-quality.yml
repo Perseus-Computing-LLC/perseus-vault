@@ -43,6 +43,8 @@ jobs:
           python3 -m unittest discover -s benchmark/correction -p 'test_*.py' -v
           python3 -m unittest discover -s benchmark/freshness -p 'test_*.py' -v
           python3 -m unittest discover -s benchmark/economics -p 'test_*.py' -v
+          python3 -m unittest discover -s benchmark/context_selection -p 'test_*.py' -v
+          python3 -m unittest discover -s benchmark/shared_scale -p 'test_*.py' -v
       - name: Validate claim register
         run: python3 benchmark/claim_register.py
       - name: Run deterministic local portfolio
@@ -61,24 +63,83 @@ jobs:
           cp /tmp/perseus-quality-scorecard.json benchmark-artifacts/
           python3 - <<'PY'
           import json
+          import math
           from pathlib import Path
-          forbidden = ("token", "credential", "password", "secret", "prompt", "query", "body", "stderr_tail", "stdout_tail")
+          from benchmark.package.common.artifacts import _CASE_KEYS, _METRIC_KEYS, _REPORT_KEYS, validate_report
+
+          forbidden_keys = {"token", "credential", "password", "secret", "prompt", "query", "body", "api_key", "authorization", "stderr_tail", "stdout_tail"}
+          filesystem_keys = {"command", "report", "path", "output", "binary_path", "dataset_path"}
+          forbidden_values = {"token", "credential", "password", "secret", "authorization", "bearer"}
+          smoke_keys = {"benchmark", "status", "runs", "passed"}
+          smoke_run_keys = {"returncode", "timeout", "stdout_sha256", "stderr_sha256", "summary"}
+          smoke_summary_keys = {"passed", "checks_passed", "checks_total", "accuracy", "verdict", "status", "runs"}
+          scorecard_keys = {
+              "scorecard_version", "benchmark", "dataset", "harness_version", "verdict", "blocking", "reason",
+              "checks_passed", "checks_total", "accuracy", "failed_categories", "invalid_cases", "missing_categories",
+              "unavailable_categories", "unavailable_cases", "unavailable_capabilities", "unavailable_metrics",
+              "partial_metrics", "failed_metrics", "invalid_metrics", "case_count", "case_count_valid", "metrics",
+              "metric_rates", "thresholds", "override_policy", "source_report_signature",
+          }
+
           def walk(value, path):
-              if isinstance(value, float) and not __import__('math').isfinite(value):
+              if isinstance(value, bool):
+                  return
+              if isinstance(value, int) and value.bit_length() > 333:
+                  raise SystemExit(f"oversized artifact integer: {path}")
+              if isinstance(value, float) and not math.isfinite(value):
                   raise SystemExit(f"non-finite artifact value: {path}")
               if isinstance(value, dict):
                   for key, child in value.items():
                       lowered = str(key).lower()
-                      if any(marker in lowered for marker in forbidden):
+                      if lowered in forbidden_keys or lowered.endswith(("_token", "_credential", "_password", "_secret")):
                           raise SystemExit(f"forbidden artifact key: {path}.{key}")
+                      if lowered in filesystem_keys:
+                          raise SystemExit(f"filesystem/process field in artifact: {path}.{key}")
                       walk(child, f"{path}.{key}")
               elif isinstance(value, list):
                   for index, child in enumerate(value):
                       walk(child, f"{path}[{index}]")
-              elif isinstance(value, str) and any(marker in value.lower() for marker in forbidden):
+              elif isinstance(value, str) and value.lower() in forbidden_values:
                   raise SystemExit(f"forbidden artifact marker: {path}")
+
+          def check_common(data, path):
+              if not isinstance(data, dict) or not set(data).issubset(_REPORT_KEYS):
+                  raise SystemExit(f"unknown common-report field: {path}")
+              validate_report(data)
+              for index, case in enumerate(data.get("cases", [])):
+                  if not set(case).issubset(_CASE_KEYS):
+                      raise SystemExit(f"unknown case field: {path}.cases[{index}]")
+              for name, metric in data.get("metrics", {}).items():
+                  if not set(metric).issubset(_METRIC_KEYS):
+                      raise SystemExit(f"unknown metric field: {path}.metrics.{name}")
+
+          def check_smoke(data, path):
+              if not isinstance(data, dict) or set(data) != smoke_keys or not isinstance(data.get("runs"), list):
+                  raise SystemExit(f"invalid smoke envelope: {path}")
+              for index, run in enumerate(data["runs"]):
+                  if not isinstance(run, dict) or not set(run).issubset(smoke_run_keys):
+                      raise SystemExit(f"invalid smoke run: {path}.runs[{index}]")
+                  summary = run.get("summary")
+                  if not isinstance(summary, dict) or not set(summary).issubset(smoke_summary_keys):
+                      raise SystemExit(f"invalid smoke summary: {path}.runs[{index}]")
+
+          def check_scorecard(data, path):
+              if not isinstance(data, dict) or not set(data).issubset(scorecard_keys):
+                  raise SystemExit(f"invalid scorecard envelope: {path}")
+              if data.get("verdict") not in {"release_ready", "blocked"}:
+                  raise SystemExit(f"invalid scorecard verdict: {path}")
+
           for artifact in Path("benchmark-artifacts").glob("*.json"):
-              walk(json.loads(artifact.read_text()), str(artifact))
+              data = json.loads(artifact.read_text(encoding="utf-8"))
+              if artifact.name == "perseus-vault-benchmark-smoke-summary.json":
+                  check_smoke(data, str(artifact))
+              elif artifact.name == "perseus-quality-scorecard.json":
+                  check_scorecard(data, str(artifact))
+              elif artifact.name == "perseus-vault-deletion-report.json":
+                  check_common(data, str(artifact))
+              else:
+                  raise SystemExit(f"unexpected artifact: {artifact.name}")
+              walk(data, str(artifact))
           PY
       - name: Upload sanitized benchmark summaries
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02

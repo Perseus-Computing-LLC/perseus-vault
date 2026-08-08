@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from benchmark.package.common.artifacts import result_signature
 from run import (
     build_metric_rates,
     case_result,
@@ -100,6 +101,32 @@ class QualityHarnessTests(unittest.TestCase):
         self.assertNotIn("mem-random", encoded)
         self.assertNotIn("nested", encoded)
 
+    def test_case_result_rejects_evidence_with_no_public_fields(self):
+        with self.assertRaises(ValueError):
+            case_result(
+                {"id": "case", "category": "quality", "checks": ["ok"]},
+                {"ok": True},
+                {"query": "private query sentinel", "body": "private body sentinel"},
+            )
+
+    def test_case_result_rejects_mixed_forbidden_evidence(self):
+        with self.assertRaises(ValueError):
+            case_result(
+                {"id": "case", "category": "quality", "checks": ["ok"]},
+                {"ok": True},
+                {"count": 1, "query": "private-query-sentinel"},
+            )
+
+    def test_case_result_hashes_failure_class_evidence(self):
+        result = case_result(
+            {"id": "case", "category": "quality", "checks": ["ok"]},
+            {"ok": False},
+            {"failure_class": "MCPError"},
+            status="failed",
+            failure_class="MCPError",
+        )
+        self.assertRegex(result["evidence"]["failure_class"], r"^[0-9a-f]{64}$")
+
     def test_public_evidence_drops_credentials_timestamps_and_unknown_keys(self):
         evidence = sanitize_evidence(
             {
@@ -154,7 +181,7 @@ class QualityHarnessTests(unittest.TestCase):
         result = case_result(
             {"id": "partial", "category": "mutation", "metric": "mutation", "checks": ["ok", "missing"]},
             {"ok": True},
-            {},
+            {"complete": True},
         )
         self.assertEqual(result["status"], "failed")
         self.assertEqual(result["checks"], {"passed": 1, "total": 2})
@@ -244,6 +271,20 @@ class QualityHarnessTests(unittest.TestCase):
         self.assertEqual(len(report["cases"]), 30)
         self.assertTrue(all(case["evidence"] for case in report["cases"]))
         self.assertTrue(report["passed"])
+
+    def test_scorecard_rejects_resigned_manifest_case_substitution(self):
+        try:
+            find_binary(None)
+        except FileNotFoundError as exc:
+            self.skipTest(str(exc))
+        out = Path(tempfile.mkdtemp()) / "report.json"
+        report = run_benchmark(Path(__file__).with_name("manifest.json"), None, out)
+        forged = json.loads(json.dumps(report))
+        forged["cases"][0]["id"] = "forged-case-id"
+        forged["result_signature_sha256"] = result_signature(forged)
+        scorecard = build_scorecard(forged)
+        self.assertEqual(scorecard["verdict"], "blocked")
+        self.assertEqual(scorecard["reason"], "incomplete_case_contract")
 
     def test_evaluate_report_rejects_missing_or_failed_checks(self):
         report = {

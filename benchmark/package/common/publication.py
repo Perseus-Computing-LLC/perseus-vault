@@ -9,7 +9,7 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from .artifacts import finalize_report, sha256_file, sha256_text, stable_json, write_report
+from .artifacts import finalize_report, sha256_file, sha256_text, stable_json, validate_claim_arrays, write_report
 
 
 def git_commit(root: str | Path) -> str:
@@ -32,15 +32,27 @@ def digest_manifest(manifest: Any) -> str:
     return sha256_text(stable_json(manifest))
 
 
-def digest_claims(claim_ids: list[str] | None, negative_claim_ids: list[str] | None) -> str:
-    if not isinstance(claim_ids, list) or not isinstance(negative_claim_ids, list):
-        raise ValueError("claim arrays must be explicit lists")
-    if any(not isinstance(item, str) for item in claim_ids + negative_claim_ids):
-        raise ValueError("claim arrays must contain strings")
-    if len(claim_ids) != len(set(claim_ids)) or len(negative_claim_ids) != len(set(negative_claim_ids)):
-        raise ValueError("claim arrays must be duplicate-free")
-    if set(claim_ids) & set(negative_claim_ids):
-        raise ValueError("claim arrays must be disjoint")
+def _registered_claim_ids() -> set[str]:
+    path = Path(__file__).resolve().parents[2] / "claim_register.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("claim register unavailable") from exc
+    claims = data.get("claims")
+    if not isinstance(claims, list):
+        raise ValueError("claim register is malformed")
+    registered = {
+        item["id"]
+        for item in claims
+        if isinstance(item, dict) and isinstance(item.get("id"), str)
+    }
+    if not registered:
+        raise ValueError("claim register is empty")
+    return registered
+
+
+def digest_claims(claim_ids: list[str], negative_claim_ids: list[str]) -> str:
+    validate_claim_arrays(claim_ids, negative_claim_ids)
     return sha256_text(stable_json({
         "claim_ids": sorted(claim_ids),
         "negative_claim_ids": sorted(negative_claim_ids),
@@ -71,7 +83,7 @@ def safe_numeric(value: Any, *, integer: bool = False) -> Any:
     if isinstance(value, bool):
         return None
     if integer:
-        return value if isinstance(value, int) and value >= 0 else None
+        return value if isinstance(value, int) and value >= 0 and value.bit_length() <= 333 else None
     return value if isinstance(value, (int, float)) and math.isfinite(float(value)) else None
 
 
@@ -86,11 +98,28 @@ def _safe_evidence(raw: Any) -> dict[str, Any]:
         "other_workspace_key_present", "receipt_present", "lease_released",
         "entities_archived", "entities_examined", "budget_chars", "injected_chars",
         "total_chars", "frozen_key_count", "on_demand_entities", "always_inject_entities",
+        "always_inject_budget", "always_inject_injected_chars", "always_inject_total_chars",
+        "on_demand_budget", "on_demand_injected_chars", "on_demand_total_chars",
+        "history_total", "scoped_key_count", "ranked_key_count", "seed_count",
+        "core_field_count", "core_field_total", "current_row_count", "authority_version",
+        "external_ref_count", "provenance_field_count",
+        "author_key_present", "other_key_present", "current_key_present",
+        "superseded_evidence_present", "inside_found", "outside_found",
+        "shared_profile_personal_key_present", "personal_profile_key_present",
+        "live_key_present", "prior_version_content_present", "other_workspace_visible",
+        "origin_present", "empty_abstained", "pending_health_present",
+        "proposed_requires_review", "untrusted_authoritative", "hostile_marker_visible",
+        "selected_a", "selected_b",
+        "frozen_digest", "intent_hash", "outcome_hash", "temporal_digest",
+        "empty_status", "pending_status", "proposed_outcome", "untrusted_outcome",
+        "evidence_mode", "digest", "evidence_hash",
     }
     result: dict[str, Any] = {}
     forbidden = ("private", "query", "token", "credential", "password", "secret", "prompt", "body")
     for key, value in raw.items():
         lowered = str(key).lower()
+        if any(marker in lowered for marker in forbidden):
+            raise ValueError(f"evidence field {key} is forbidden")
         if lowered not in allowed or lowered in {"query", "token", "credential", "private_key"}:
             continue
         if isinstance(value, float) and not math.isfinite(value):
@@ -105,12 +134,16 @@ def _safe_evidence(raw: Any) -> dict[str, Any]:
             numeric = safe_numeric(value)
             if numeric is not None:
                 result[str(key)] = numeric
-        elif isinstance(value, str) and lowered in {"status", "reason", "category", "capability", "mode", "scope", "failure_class"}:
-            label = public_label(value, "redacted_label", field=lowered)
+        elif isinstance(value, str) and lowered in {"digest", "evidence_hash", "frozen_digest", "intent_hash", "outcome_hash", "temporal_digest"}:
+            if not re.fullmatch(r"[0-9a-f]{64}", value):
+                raise ValueError(f"evidence field {key} must be a lowercase SHA-256 digest")
+            result[str(key)] = value
+        elif isinstance(value, str) and lowered in {"status", "reason", "category", "capability", "mode", "scope", "failure_class", "empty_status", "pending_status", "proposed_outcome", "untrusted_outcome", "evidence_mode"}:
+            label = public_label(value, "redacted_label", field=lowered if lowered in {"status", "mode"} else "reason")
             if label != "redacted_label":
                 result[str(key)] = label
     if not result:
-        return {"complete": True}
+        raise ValueError("evidence contains no public fields")
     return result
 
 
@@ -223,15 +256,13 @@ def normalize_capabilities(raw: Any) -> dict[str, dict[str, Any]]:
         if "details" in state:
             if not isinstance(state["details"], dict):
                 raise ValueError(f"capability {key}.details must be an object")
+            if state["details"]:
+                raise ValueError(f"capability {key}.details must be empty in public reports")
             allowed["details"] = {}
         if "count" in state:
             if not isinstance(state["count"], int) or isinstance(state["count"], bool) or state["count"] < 0:
                 raise ValueError(f"capability {key}.count must be a non-negative integer")
             allowed["count"] = state["count"]
-        if "details" in state:
-            if not isinstance(state["details"], dict):
-                raise ValueError(f"capability {key}.details must be an object")
-            allowed["details"] = {}
         if status != "available":
             reason = state.get("reason")
             if not isinstance(reason, str) or not reason:
@@ -253,7 +284,9 @@ def normalize_metrics(raw_metrics: Any, cases: list[dict[str, Any]]) -> dict[str
         for name, raw in raw_metrics.items():
             if not isinstance(raw, dict):
                 raise ValueError(f"metric {name} must be an object")
-            status = raw.get("status", "available")
+            status = raw.get("status")
+            if status is None:
+                raise ValueError(f"metric {name} is missing a status")
             if status not in {"available", "partial", "unavailable", "not_measured", "failed"}:
                 raise ValueError(f"metric {name} has an invalid status")
             if set(raw) - {"status", "numerator", "denominator", "rate", "p50_ms", "p95_ms", "p99_ms", "value", "reason"}:
@@ -264,7 +297,12 @@ def normalize_metrics(raw_metrics: Any, cases: list[dict[str, Any]]) -> dict[str
                 denominator = safe_numeric(raw["denominator"], integer=True)
                 if numerator is None or denominator is None or denominator == 0 or numerator > denominator:
                     raise ValueError(f"metric {name} contains invalid numerator/denominator")
-                metric.update({"numerator": numerator, "denominator": denominator, "rate": numerator / denominator})
+                computed_rate = numerator / denominator
+                if "rate" in raw:
+                    supplied_rate = safe_numeric(raw["rate"])
+                    if supplied_rate is None or abs(float(supplied_rate) - computed_rate) > 0.00005:
+                        raise ValueError(f"metric {name} rate does not match numerator/denominator")
+                metric.update({"numerator": numerator, "denominator": denominator, "rate": computed_rate})
             elif all(key in raw for key in ("p50_ms", "p95_ms", "p99_ms")):
                 values = {key: safe_numeric(raw[key]) for key in ("p50_ms", "p95_ms", "p99_ms")}
                 if any(value is None or value < 0 for value in values.values()):
@@ -307,6 +345,8 @@ def normalize_metric_rates(raw: Any) -> dict[str, dict[str, Any]]:
         if status == "available" and "rate" not in metric:
             raise ValueError(f"metric_rates {name} lacks a measured rate")
         rate = metric.get("rate")
+        if "rate" in metric and rate is None:
+            raise ValueError(f"metric_rates {name} has an explicit null rate")
         if rate is not None and (isinstance(rate, bool) or not isinstance(rate, (int, float)) or not math.isfinite(float(rate)) or not 0 <= rate <= 1):
             raise ValueError(f"metric_rates {name} has invalid rate")
         if status in {"unavailable", "partial", "not_measured"} and rate is not None:

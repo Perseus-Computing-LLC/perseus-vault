@@ -46,7 +46,7 @@ class SmokeSummaryTests(unittest.TestCase):
     def test_empty_top_level_run_set_is_blocking(self):
         self.assertFalse(run_smoke.aggregate_passed([]))
 
-    def test_nested_passing_report_is_accepted(self):
+    def test_nested_passing_projection_without_child_report_is_blocked(self):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "summary.json"
             output.write_text(json.dumps({
@@ -65,7 +65,7 @@ class SmokeSummaryTests(unittest.TestCase):
                 "passed": True,
             }))
             result = {"returncode": 0, "summary": json.loads(output.read_text())}
-            self.assertTrue(run_smoke.run_passed(result))
+            self.assertFalse(run_smoke.run_passed(result))
 
     def test_leaf_passing_projection_without_report_is_blocked(self):
         with tempfile.TemporaryDirectory() as directory:

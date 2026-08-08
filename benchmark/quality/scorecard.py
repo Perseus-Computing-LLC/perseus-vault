@@ -47,6 +47,32 @@ V1_REQUIRED_METRIC_RATES = {
 }
 
 
+def _quality_manifest_contract(report) -> bool:
+    try:
+        manifest = json.loads(Path(__file__).with_name("manifest.json").read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return False
+    expected_cases = {
+        item.get("id"): {
+            "category": item.get("category"),
+            "checks": set(item.get("checks", [])),
+        }
+        for item in manifest.get("cases", [])
+        if isinstance(item, dict) and isinstance(item.get("id"), str)
+    }
+    actual_cases = report.get("cases", [])
+    if set(case.get("id") for case in actual_cases) != set(expected_cases):
+        return False
+    for case in actual_cases:
+        expected = expected_cases.get(case.get("id"))
+        if expected is None or case.get("category") != expected["category"] or set((case.get("checks") or {})) != expected["checks"]:
+            return False
+    if set(report.get("required_categories", [])) != set(manifest.get("required_categories", [])):
+        return False
+    metric_names = set(manifest.get("metrics", []))
+    return set(report.get("metrics", {})) == metric_names
+
+
 def _unavailable_categories(report):
     categories = set(report.get("unavailable_categories", []))
     cases = set(report.get("unavailable_cases", []))
@@ -117,12 +143,24 @@ def _required_categories(report):
 
 
 def build_scorecard(report):
+    if not isinstance(report, dict):
+        return {"scorecard_version": "perseus-vault-memory-quality-scorecard/v2", "verdict": "blocked", "blocking": True, "reason": "malformed_report"}
     if not _is_publishable_report(report):
         return {"scorecard_version": "perseus-vault-memory-quality-scorecard/v2", "verdict": "blocked", "blocking": True, "reason": "incomplete_publication_envelope"}
     try:
         validate_report(report)
     except (TypeError, ValueError, KeyError, OverflowError):
         return {"scorecard_version": "perseus-vault-memory-quality-scorecard/v2", "verdict": "blocked", "blocking": True, "reason": "report_validation_failed"}
+    if (
+        report.get("benchmark_id") != "perseus-vault-memory-quality"
+        or report.get("benchmark") != "perseus-vault-memory-quality"
+        or report.get("dataset") != "perseus-vault-memory-quality-v1"
+        or report.get("harness_version") != "perseus-vault-memory-quality/v1"
+        or report.get("suite_version") != "v1"
+    ):
+        return {"scorecard_version": "perseus-vault-memory-quality-scorecard/v2", "verdict": "blocked", "blocking": True, "reason": "untrusted_benchmark_identity"}
+    if not _quality_manifest_contract(report):
+        return {"scorecard_version": "perseus-vault-memory-quality-scorecard/v2", "verdict": "blocked", "blocking": True, "reason": "incomplete_case_contract"}
     if report.get("harness_version") == "perseus-vault-memory-quality/v1":
         required_case_fields = {"id", "category", "status", "checks", "evidence"}
         if any(not required_case_fields.issubset(case) for case in report.get("cases", [])):
@@ -297,7 +335,10 @@ def main():
     parser.add_argument("report")
     parser.add_argument("--out", required=True)
     args = parser.parse_args()
-    report = json.loads(Path(args.report).read_text(encoding="utf-8"))
+    try:
+        report = json.loads(Path(args.report).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeError):
+        report = None
     scorecard = build_scorecard(report)
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     Path(args.out).write_text(json.dumps(scorecard, indent=2, sort_keys=True, allow_nan=False) + "\n", encoding="utf-8")

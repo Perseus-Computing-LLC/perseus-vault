@@ -18,8 +18,8 @@ import tempfile
 import time
 import shutil
 import queue
+import signal
 import threading
-from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
@@ -74,25 +74,33 @@ class VaultClient:
             stderr=subprocess.DEVNULL,
             text=True,
             encoding="utf-8",
+            start_new_session=(os.name != "nt"),
         )
-        self._reader = threading.Thread(target=self._reader_loop, daemon=True)
-        self._responses: queue.Queue[object] = queue.Queue()
-        self._reader.start()
-        self.request_id = 0
-        self._send(
-            {
-                "jsonrpc": "2.0",
-                "id": self._next_id(),
-                "method": "initialize",
-                "params": {
-                    "protocolVersion": "2025-06-18",
-                    "capabilities": {},
-                    "clientInfo": {"name": "correction-benchmark", "version": "1"},
-                },
-            }
-        )
-        self._read()
-        self._send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        try:
+            self._reader = threading.Thread(target=self._reader_loop, daemon=True)
+            self._responses: queue.Queue[object] = queue.Queue()
+            self._reader.start()
+            self.request_id = 0
+            self._send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": self._next_id(),
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-06-18",
+                        "capabilities": {},
+                        "clientInfo": {"name": "correction-benchmark", "version": "1"},
+                    },
+                }
+            )
+            self._read()
+            self._send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        except BaseException:
+            try:
+                self.close()
+            except Exception:
+                pass
+            raise
 
     def _next_id(self) -> int:
         self.request_id += 1
@@ -150,13 +158,35 @@ class VaultClient:
         return self._read()
 
     def close(self) -> None:
+        cleanup_error = None
         try:
             if self.process.stdin is not None:
                 self.process.stdin.close()
             self.process.wait(timeout=30)
-        except Exception:
-            self.process.kill()
-            self.process.wait(timeout=5)
+        except Exception as exc:
+            cleanup_error = exc
+            try:
+                if os.name != "nt":
+                    os.killpg(self.process.pid, signal.SIGTERM)
+                else:
+                    self.process.terminate()
+                self.process.wait(timeout=5)
+            except Exception:
+                try:
+                    if os.name != "nt":
+                        os.killpg(self.process.pid, signal.SIGKILL)
+                    else:
+                        self.process.kill()
+                    self.process.wait(timeout=5)
+                except Exception as kill_exc:
+                    cleanup_error = cleanup_error or kill_exc
+        reader = getattr(self, "_reader", None)
+        if reader is not None:
+            reader.join(timeout=5)
+            if reader.is_alive():
+                raise RuntimeError("correction reader thread did not stop")
+        if cleanup_error is not None and self.process.poll() is None:
+            raise RuntimeError("correction client cleanup failed") from cleanup_error
 
 
 def remember(client: VaultClient, category: str, key: str, body: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
@@ -241,10 +271,18 @@ def main() -> int:
             historical_blob = " ".join(body_blob(item) for item in historical)
             record(case["id"], "E_derived_reach", case["expected_current"] in historical_blob or case["expected_history"] in historical_blob)
     finally:
+        cleanup_errors = []
         if client is not None:
-            client.close()
-        with suppress(Exception):
+            try:
+                client.close()
+            except BaseException as exc:
+                cleanup_errors.append(exc)
+        try:
             shutil.rmtree(db.parent)
+        except BaseException as exc:
+            cleanup_errors.append(exc)
+        if cleanup_errors:
+            raise RuntimeError("correction benchmark cleanup failed") from cleanup_errors[0]
 
     passed = sum(row["ok"] for row in rows)
     if not rows:

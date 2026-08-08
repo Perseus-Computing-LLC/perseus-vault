@@ -323,6 +323,16 @@ class CommonArtifactTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_report(report)
 
+    def test_validate_report_rejects_registered_negative_claim_as_positive(self):
+        report = self._valid_report()
+        report["claim_ids"] = ["provider-failure-stress"]
+        report["negative_claim_ids"] = []
+        report["claims_sha256"] = sha256_text(stable_json({"claim_ids": report["claim_ids"], "negative_claim_ids": []}))
+        report["run_fingerprint_sha256"] = run_fingerprint(binary_sha256=report["binary_sha256"], control_profile_sha256=report["control_profile_sha256"], dataset_sha256=report["dataset_sha256"], harness_commit=report["harness_commit"], claims_sha256=report["claims_sha256"])
+        report["result_signature_sha256"] = result_signature(report)
+        with self.assertRaises(ValueError):
+            validate_report(report)
+
     def test_sha256_file_is_real_content_hash(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "fixture.txt"

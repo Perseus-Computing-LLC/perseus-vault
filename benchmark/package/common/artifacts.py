@@ -56,8 +56,50 @@ _SAFE_EVIDENCE_KEYS = {
     "frozen_key_count",
     "on_demand_entities",
     "always_inject_entities",
-}
-_SAFE_BOOLEAN_EVIDENCE_KEYS = {
+    "always_inject_budget",
+    "always_inject_injected_chars",
+    "always_inject_total_chars",
+    "on_demand_budget",
+    "on_demand_injected_chars",
+    "on_demand_total_chars",
+    "history_total",
+    "scoped_key_count",
+    "seed_count",
+    "core_field_count",
+    "core_field_total",
+    "current_row_count",
+    "authority_version",
+    "external_ref_count",
+    "provenance_field_count",
+    "author_key_present",
+    "other_key_present",
+    "current_key_present",
+    "superseded_evidence_present",
+    "inside_found",
+    "outside_found",
+    "shared_profile_personal_key_present",
+    "personal_profile_key_present",
+    "live_key_present",
+    "prior_version_content_present",
+    "other_workspace_visible",
+    "origin_present",
+    "empty_abstained",
+    "pending_health_present",
+    "proposed_requires_review",
+    "untrusted_authoritative",
+    "hostile_marker_visible",
+    "selected_a",
+    "selected_b",
+    "frozen_digest",
+    "intent_hash",
+    "outcome_hash",
+    "temporal_digest",
+    "empty_status",
+    "pending_status",
+    "proposed_outcome",
+    "untrusted_outcome",
+    "evidence_mode",
+
     "available",
     "complete",
     "found",
@@ -71,6 +113,18 @@ _SAFE_BOOLEAN_EVIDENCE_KEYS = {
     "lease_released",
     "raw_inputs_captured",
     "stage_trace_checked",
+}
+_SAFE_BOOLEAN_EVIDENCE_KEYS = {
+    "available", "complete", "found", "matched", "present",
+    "target_key_present", "truth_key_present", "contamination_key_present",
+    "other_workspace_key_present", "receipt_present", "lease_released",
+    "raw_inputs_captured", "stage_trace_checked", "author_key_present",
+    "other_key_present", "current_key_present", "superseded_evidence_present",
+    "inside_found", "outside_found", "shared_profile_personal_key_present",
+    "personal_profile_key_present", "live_key_present", "prior_version_content_present",
+    "other_workspace_visible", "origin_present", "empty_abstained", "pending_health_present",
+    "proposed_requires_review", "untrusted_authoritative", "hostile_marker_visible",
+    "selected_a", "selected_b",
 }
 _SAFE_INTEGER_EVIDENCE_KEYS = {
     "count",
@@ -87,8 +141,25 @@ _SAFE_INTEGER_EVIDENCE_KEYS = {
     "frozen_key_count",
     "on_demand_entities",
     "always_inject_entities",
+    "always_inject_budget",
+    "always_inject_injected_chars",
+    "always_inject_total_chars",
+    "on_demand_budget",
+    "on_demand_injected_chars",
+    "on_demand_total_chars",
+    "history_total",
+    "scoped_key_count",
+    "seed_count",
+    "core_field_count",
+    "core_field_total",
+    "current_row_count",
+    "authority_version",
+    "external_ref_count",
+    "provenance_field_count",
 }
-_SAFE_DIGEST_EVIDENCE_KEYS = {"digest", "evidence_hash"}
+_SAFE_DIGEST_EVIDENCE_KEYS = {
+    "digest", "evidence_hash", "frozen_digest", "intent_hash", "outcome_hash", "temporal_digest"
+}
 _SAFE_IDENTIFIER_EVIDENCE_KEYS = {
     "capability",
     "category",
@@ -98,6 +169,11 @@ _SAFE_IDENTIFIER_EVIDENCE_KEYS = {
     "reason",
     "scope",
     "status",
+    "empty_status",
+    "pending_status",
+    "proposed_outcome",
+    "untrusted_outcome",
+    "evidence_mode",
 }
 _REPORT_KEYS = {
     "schema_version", "benchmark_id", "suite_version", "control_profile_sha256",
@@ -112,6 +188,49 @@ _CASE_KEYS = {"id", "category", "status", "checks", "evidence", "failure_class"}
 _METRIC_KEYS = {"status", "numerator", "denominator", "rate", "p50_ms", "p95_ms", "p99_ms", "value", "reason"}
 _PUBLIC_LABEL_FORBIDDEN = ("private", "query", "token", "credential", "password", "secret", "body")
 _PUBLIC_IDENTIFIER_EXCEPTIONS = set()
+_MAX_PUBLIC_INTEGER_BITS = 333
+
+
+def _load_claim_registry() -> dict[str, dict[str, Any]]:
+    path = Path(__file__).resolve().parents[2] / "claim_register.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("claim register unavailable") from exc
+    claims = payload.get("claims")
+    if not isinstance(claims, list):
+        raise ValueError("claim register is malformed")
+    registry = {
+        item["id"]: item
+        for item in claims
+        if isinstance(item, dict) and isinstance(item.get("id"), str)
+    }
+    if not registry:
+        raise ValueError("claim register is empty")
+    return registry
+
+
+def validate_claim_arrays(claim_ids: Any, negative_claim_ids: Any) -> None:
+    if not isinstance(claim_ids, list) or not isinstance(negative_claim_ids, list):
+        raise ValueError("claim arrays must be explicit lists")
+    if any(not isinstance(item, str) for item in claim_ids + negative_claim_ids):
+        raise ValueError("claim arrays must contain strings")
+    if len(claim_ids) != len(set(claim_ids)) or len(negative_claim_ids) != len(set(negative_claim_ids)):
+        raise ValueError("claim arrays must be duplicate-free")
+    if set(claim_ids) & set(negative_claim_ids):
+        raise ValueError("claim arrays must be disjoint")
+    registry = _load_claim_registry()
+    unknown = (set(claim_ids) | set(negative_claim_ids)) - set(registry)
+    if unknown:
+        raise ValueError("claim arrays contain unregistered claim IDs")
+    for claim_id in claim_ids:
+        claim = registry[claim_id]
+        if claim.get("status") == "not_measured" or "negative_claim" in claim:
+            raise ValueError(f"not-measured claim cannot be positive: {claim_id}")
+    for claim_id in negative_claim_ids:
+        claim = registry[claim_id]
+        if claim.get("status") != "not_measured" or not isinstance(claim.get("negative_claim"), str):
+            raise ValueError(f"claim is not registered as a negative claim: {claim_id}")
 
 
 def _is_public_identifier(value: Any) -> bool:
@@ -138,6 +257,8 @@ def _is_sha256(value: Any) -> bool:
 
 
 def _validate_finite_tree(value: Any, path: str = "value") -> None:
+    if isinstance(value, int) and not isinstance(value, bool) and value.bit_length() > _MAX_PUBLIC_INTEGER_BITS:
+        raise ValueError(f"{path} contains an oversized integer")
     if isinstance(value, float) and not math.isfinite(value):
         raise ValueError(f"{path} contains a non-finite number")
     if isinstance(value, dict):
@@ -299,20 +420,15 @@ def validate_report(report: dict[str, Any]) -> None:
             raise ValueError(f"{key} must be a lowercase SHA-256 digest")
     if not isinstance(report["harness_commit"], str) or not re.fullmatch(r"[0-9a-f]{40}", report["harness_commit"]):
         raise ValueError("harness_commit must be a bounded identifier")
-    expected_claims = sha256_text(stable_json({
-        "claim_ids": sorted(report.get("claim_ids", [])),
-        "negative_claim_ids": sorted(report.get("negative_claim_ids", [])),
-    }))
     if "claim_ids" not in report or "negative_claim_ids" not in report:
         raise ValueError("claim arrays are required")
+    validate_claim_arrays(report["claim_ids"], report["negative_claim_ids"])
+    expected_claims = sha256_text(stable_json({
+        "claim_ids": sorted(report["claim_ids"]),
+        "negative_claim_ids": sorted(report["negative_claim_ids"]),
+    }))
     if report["claims_sha256"] != expected_claims:
         raise ValueError("claims_sha256 does not match claim IDs")
-    for claim_field in ("claim_ids", "negative_claim_ids"):
-        values = report[claim_field]
-        if not isinstance(values, list) or len(values) != len(set(values)):
-            raise ValueError(f"{claim_field} must be a duplicate-free array")
-    if set(report["claim_ids"]) & set(report["negative_claim_ids"]):
-        raise ValueError("claim_ids and negative_claim_ids must be disjoint")
     if report["run_fingerprint_sha256"] != run_fingerprint(
         binary_sha256=report["binary_sha256"],
         control_profile_sha256=report["control_profile_sha256"],

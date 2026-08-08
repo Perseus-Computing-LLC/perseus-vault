@@ -14,6 +14,7 @@ import json
 import math
 import os
 import queue
+import shutil
 import signal
 import re
 import subprocess
@@ -119,6 +120,7 @@ NONDETERMINISTIC_EVIDENCE_KEYS = {
 }
 SAFE_EVIDENCE_KEYS = {
     "available",
+    "complete",
     "category",
     "capability",
     "check",
@@ -265,7 +267,7 @@ def sha256_file(path):
     return digest.hexdigest()
 
 
-def sanitize_evidence(value, *, _key=None):
+def sanitize_evidence(value, *, _key=None, strict=False):
     """Return only deterministic, hash-only public evidence.
 
     Every scalar string is either rejected/dropped or reduced to a bounded
@@ -279,17 +281,23 @@ def sanitize_evidence(value, *, _key=None):
         for raw_key, raw_value in value.items():
             lowered = str(raw_key).lower()
             if evidence_key_forbidden(lowered) or lowered == "id" or lowered.endswith("_id") or lowered.endswith("_ids"):
+                if strict:
+                    raise ValueError(f"forbidden evidence field: {raw_key}")
                 continue
-            if lowered not in SAFE_EVIDENCE_KEYS or lowered in {"key", "keys", "target_key", "scope_anchor", "tool", "workspace_hash", "profiles_compared", "nested"}:
+            if lowered in {"key", "keys", "target_key", "scope_anchor", "tool", "workspace_hash", "profiles_compared", "nested", "modes_compared"}:
                 continue
-            clean = sanitize_evidence(raw_value, _key=lowered)
+            if lowered not in SAFE_EVIDENCE_KEYS:
+                if strict:
+                    raise ValueError(f"unknown evidence field: {raw_key}")
+                continue
+            clean = sanitize_evidence(raw_value, _key=lowered, strict=strict)
             if clean is not _DROP and clean not in ({}, []):
                 result[str(raw_key)] = clean
         return result
     if isinstance(value, list):
         result = []
         for item in value:
-            clean = sanitize_evidence(item, _key=_key)
+            clean = sanitize_evidence(item, _key=_key, strict=strict)
             if clean is not _DROP:
                 result.append(clean)
         return result
@@ -300,8 +308,12 @@ def sanitize_evidence(value, *, _key=None):
     if isinstance(value, float):
         return value if _key in SAFE_EVIDENCE_KEYS else _DROP
     if isinstance(value, str):
-        if _key in {"digest", "evidence_hash"} and re.fullmatch(r"[0-9a-f]{64}", value):
+        if _key in {"digest", "evidence_hash", "frozen_digest", "intent_hash", "outcome_hash", "temporal_digest"} and re.fullmatch(r"[0-9a-f]{64}", value):
             return value
+        if _key == "status" and value in {"available", "partial", "unavailable", "not_measured", "failed", "passed", "blocked"}:
+            return value
+        if _key in {"category", "capability", "failure_class", "reason", "scope", "mode", "tool", "check", "evidence_mode"}:
+            return sha256_text(value)
         return _DROP
     return _DROP
 
@@ -401,7 +413,6 @@ def compute_metrics(cases):
             ),
         }
         if unavailable:
-            metric["unavailable_cases"] = len(unavailable)
             metric["reason"] = "; ".join(sorted(set(unavailable)))
         result[name] = metric
     return result
@@ -485,26 +496,33 @@ class VaultClient:
             errors="replace",
             start_new_session=(os.name != "nt"),
         )
-        self.response_timeout_seconds = MCP_RESPONSE_TIMEOUT_SECONDS
-        self._responses = queue.Queue()
-        self._reader = threading.Thread(target=self._reader_loop, daemon=True)
-        self._reader.start()
-        self._id = 0
-        self._tools = None
-        self._send(
-            {
-                "jsonrpc": "2.0",
-                "id": self._next(),
-                "method": "initialize",
-                "params": {
-                    "protocolVersion": "2025-06-18",
-                    "capabilities": {},
-                    "clientInfo": {"name": client_name, "version": "quality-v0"},
-                },
-            }
-        )
-        self._read()
-        self._send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        try:
+            self.response_timeout_seconds = MCP_RESPONSE_TIMEOUT_SECONDS
+            self._responses = queue.Queue()
+            self._reader = threading.Thread(target=self._reader_loop, daemon=True)
+            self._reader.start()
+            self._id = 0
+            self._tools = None
+            self._send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": self._next(),
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-06-18",
+                        "capabilities": {},
+                        "clientInfo": {"name": client_name, "version": "quality-v0"},
+                    },
+                }
+            )
+            self._read()
+            self._send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        except BaseException:
+            try:
+                self.close()
+            except Exception:
+                pass
+            raise
 
     def _next(self):
         self._id += 1
@@ -636,6 +654,11 @@ class VaultClient:
                     self.p.wait(timeout=5)
                 except Exception as exc:
                     cleanup_error = cleanup_error or exc
+        reader = getattr(self, "_reader", None)
+        if reader is not None:
+            reader.join(timeout=5)
+            if reader.is_alive():
+                raise RuntimeError("quality reader thread did not stop")
         if cleanup_error is not None and self.p.poll() is None:
             raise RuntimeError("MCP client cleanup failed") from cleanup_error
 
@@ -1586,7 +1609,15 @@ SCENARIO_RUNNERS = {
 
 
 def case_result(spec, checks, evidence, metric_event=None, status="passed", failure_class=None):
-    checks = {name: bool(checks.get(name, False)) for name in spec.get("checks", [])}
+    if not isinstance(checks, dict):
+        raise ValueError(f"case {spec['id']} checks must be an object")
+    source_checks = checks
+    checks = {}
+    for name in spec.get("checks", []):
+        value = source_checks.get(name, False)
+        if not isinstance(value, bool):
+            raise ValueError(f"case {spec['id']} check {name} is not boolean")
+        checks[name] = value
     passed = sum(1 for value in checks.values() if value)
     total = len(checks)
     if status == "unavailable":
@@ -1601,9 +1632,9 @@ def case_result(spec, checks, evidence, metric_event=None, status="passed", fail
         metric.update({"status": "unavailable", "reason": "optional capability unavailable"})
     else:
         metric.update({"numerator": passed, "denominator": total})
-    public_evidence = sanitize_evidence(evidence)
+    public_evidence = sanitize_evidence(evidence, strict=True)
     if not public_evidence:
-        public_evidence = {"complete": True}
+        raise ValueError(f"case {spec['id']} evidence contains no public fields")
     result = {
         "id": spec["id"],
         "category": spec["category"],
@@ -1874,23 +1905,18 @@ def run_benchmark(manifest_path, binary=None, out=None):
             Path(out).write_text(json.dumps(report, indent=2, sort_keys=True, allow_nan=False) + "\n", encoding="utf-8")
         return report
     finally:
+        cleanup_errors = []
         if client is not None:
-            client.close()
-        for suffix in ("", "-wal", "-shm"):
             try:
-                (Path(str(db) + suffix)).unlink()
-            except OSError:
-                pass
-        for child in tmpdir.iterdir():
-            if child.is_file():
-                try:
-                    child.unlink()
-                except OSError:
-                    pass
+                client.close()
+            except BaseException as exc:
+                cleanup_errors.append(exc)
         try:
-            tmpdir.rmdir()
-        except OSError:
-            pass
+            shutil.rmtree(tmpdir)
+        except BaseException as exc:
+            cleanup_errors.append(exc)
+        if cleanup_errors:
+            raise RuntimeError("quality benchmark cleanup failed") from cleanup_errors[0]
 
 
 def main():
