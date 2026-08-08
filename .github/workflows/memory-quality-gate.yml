@@ -35,10 +35,12 @@ jobs:
         run: cargo build --locked --no-default-features
       - name: Memory quality report
         run: python benchmark/quality/run.py --out benchmark/quality/report.json
-      - name: Build blocking release scorecard
-        env:
-          PERSEUS_QUALITY_ADVISORY: ${{ github.event_name == 'pull_request' && '1' || '0' }}
+      - name: Build blocking release scorecard (push)
+        if: github.event_name != 'pull_request'
         run: python benchmark/quality/scorecard.py benchmark/quality/report.json --out benchmark/quality/scorecard.json
+      - name: Build advisory release scorecard (PR)
+        if: github.event_name == 'pull_request'
+        run: python benchmark/quality/scorecard.py benchmark/quality/report.json --out benchmark/quality/scorecard.json --advisory
       - name: Upload quality report and scorecard
         if: always()
         uses: actions/upload-artifact@v4
