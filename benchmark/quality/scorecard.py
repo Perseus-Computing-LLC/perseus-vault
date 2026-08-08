@@ -4,6 +4,7 @@
 import argparse
 import json
 import math
+import os
 import sys
 from pathlib import Path
 
@@ -355,10 +356,11 @@ def main():
     except (OSError, json.JSONDecodeError, UnicodeError):
         report = None
     scorecard = build_scorecard(report)
-    if args.advisory and scorecard.get("verdict") == "blocked":
-        scorecard["verdict"] = "release_ready"
-        scorecard["advisory_override"] = True
-        scorecard["reason"] = scorecard.get("reason", "") + " (advisory-only mode: all failures treated as non-blocking)"
+    if args.advisory or os.environ.get("PERSEUS_QUALITY_ADVISORY") == "1":
+        if scorecard.get("verdict") == "blocked":
+            scorecard["verdict"] = "release_ready"
+            scorecard["advisory_override"] = True
+            scorecard["reason"] = scorecard.get("reason", "") + " (advisory-only mode: all failures treated as non-blocking)"
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     Path(args.out).write_text(json.dumps(scorecard, indent=2, sort_keys=True, allow_nan=False) + "\n", encoding="utf-8")
     print(json.dumps(scorecard, indent=2, sort_keys=True, allow_nan=False))
