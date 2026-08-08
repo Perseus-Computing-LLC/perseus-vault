@@ -19,11 +19,11 @@ Every consolidation/dreaming run must name exactly one scope:
 
 | `workspace_hash` | `global` | Effective scope |
 |---|---|---|
-| `Some(ws)` (non-empty) | `false` | Scoped run: all source scans, clusters, evidence links, and archive operations restricted to `workspace_hash = ws` (strict equality — legacy `''`/global entities are **not** included). Derived records inherit `ws`. |
+| `Some(ws)` (non-empty) | `false` | Scoped run: all source scans, clusters, evidence links, archive operations, and dedup lookups restricted to `workspace_hash = ws` (strict equality — legacy `''`/global entities are **not** included). Derived records inherit `ws`. |
 | `Some("")` | `false` | Scoped to the legacy/global workspace (`workspace_hash = ''`). |
 | `None` | `true` | Global run: whole-vault, deliberate, labeled, and audited. |
 | `None` | `false` | **Error** (fail-closed): "workspace scope required". |
-| `Some(ws)` + `true` | — | **Error**: ambiguous ("mutually exclusive"). |
+| `Some(ws)` + `true` | — | **Error**: ambiguous ("mutually exclusive") for EVERY `ws`, including `Some("")`. |
 
 ## Global mode
 
@@ -52,6 +52,12 @@ workspace and the requesting agent as author — a scoped run can no longer
 produce a record that silently becomes global. Global runs write records with
 `workspace_hash = ''` (system scope), exactly as before, but now labeled and
 audited.
+
+Defense in depth: scoped archive writes reassert the workspace predicate (a
+scope change or direct writer can never make a scoped run retire an
+out-of-scope row), and dream's idempotency dedup resolves the insight key
+ONLY within the run's workspace — an identical evidence set dreamed in
+another workspace never suppresses or reuses the local insight.
 
 ## `mimir_autocohere`
 

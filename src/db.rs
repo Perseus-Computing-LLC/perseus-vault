@@ -6765,6 +6765,37 @@ impl Database {
         }
     }
 
+    /// #854 review: workspace-scoped variant of `resolve_entity_id`. Dream's
+    /// dedup lookup uses this so a scoped run can never reuse an insight that
+    /// belongs to another workspace (or the legacy global scope). `None`
+    /// preserves the historical unscoped semantics (lexicographic pick).
+    fn resolve_entity_id_scoped(
+        conn: &rusqlite::Connection,
+        category: &str,
+        key: &str,
+        workspace_hash: Option<&str>,
+    ) -> rusqlite::Result<Option<String>> {
+        let result = match workspace_hash {
+            Some(ws) => conn.query_row(
+                "SELECT id FROM entities WHERE category = ?1 AND key = ?2 \
+                 AND workspace_hash = ?3 LIMIT 1",
+                params![category, key, ws],
+                |r| r.get(0),
+            ),
+            None => conn.query_row(
+                "SELECT id FROM entities WHERE category = ?1 AND key = ?2 \
+                 ORDER BY workspace_hash ASC, id ASC LIMIT 1",
+                params![category, key],
+                |r| r.get(0),
+            ),
+        };
+        match result {
+            Ok(id) => Ok(Some(id)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Create a link from one entity to another.
     pub fn link(
         &self,
@@ -10182,11 +10213,14 @@ impl Database {
         global: bool,
     ) -> Result<(Option<String>, bool), Box<dyn std::error::Error>> {
         match (workspace_hash, global) {
-            (Some(ws), true) if !ws.trim().is_empty() => Err(
+            // #854 review: `Some(_)` and `global=true` are mutually exclusive
+            // for EVERY workspace value — including Some("") (the legacy/
+            // global workspace), which must not silently mean whole-vault.
+            (Some(_), true) => Err(
                 "workspace_hash and global=true are mutually exclusive: pick one scope".into(),
             ),
             (Some(ws), false) => Ok((Some(ws.to_string()), false)),
-            (_, true) => Ok((None, true)),
+            (None, true) => Ok((None, true)),
             (None, false) => Err(
                 "workspace scope required: pass workspace_hash (scoped run) or \
                  global=true (explicit cross-workspace run)"
@@ -10460,15 +10494,27 @@ impl Database {
                         if verified || importance > 0.0 {
                             continue;
                         }
-                        let affected = tx.execute(
-                            "UPDATE entities SET archived = 1, archive_reason = ?1,
-                             last_accessed_unix_ms = ?2 WHERE id = ?3 AND archived = 0",
-                            params![
-                                format!("consolidated into {}", entity_id),
-                                now,
-                                id
-                            ],
-                        )?;
+                        // #854 review: archive reasserts the run's workspace so
+                        // a scope change (or direct writer) can never make a
+                        // scoped run retire a row outside its scope.
+                        let affected = match scope_ws.as_deref() {
+                            Some(ws) => tx.execute(
+                                "UPDATE entities SET archived = 1, archive_reason = ?1,
+                                 last_accessed_unix_ms = ?2 WHERE id = ?3 AND archived = 0
+                                 AND workspace_hash = ?4",
+                                params![
+                                    format!("consolidated into {}", entity_id),
+                                    now,
+                                    id,
+                                    ws
+                                ],
+                            )?,
+                            None => tx.execute(
+                                "UPDATE entities SET archived = 1, archive_reason = ?1,
+                                 last_accessed_unix_ms = ?2 WHERE id = ?3 AND archived = 0",
+                                params![format!("consolidated into {}", entity_id), now, id],
+                            )?,
+                        };
                         if affected > 0 {
                             sources_archived += 1;
                             let _ = tx.execute(
@@ -10801,7 +10847,12 @@ impl Database {
                     // #394: dedup needs only the id — resolve it on the
                     // connection this loop already holds instead of drawing a
                     // second pooled connection per cluster (#387 shape).
-                    if let Some(existing_id) = Self::resolve_entity_id(&conn, "insight", &key)? {
+                    // #854 review: scoped runs dedup ONLY within their own
+                    // workspace — an insight in another workspace (or the
+                    // legacy global scope) is never reused.
+                    if let Some(existing_id) =
+                        Self::resolve_entity_id_scoped(&conn, "insight", &key, scope_ws.as_deref())?
+                    {
                         report.insights_deduped += 1;
                         report.insights.push(crate::models::DreamInsight {
                             entity_id: existing_id,
@@ -10893,15 +10944,27 @@ impl Database {
                                 if !source_ids.contains(&m.0) || m.4 || m.5 > 0.0 {
                                     continue;
                                 }
-                                let affected = tx.execute(
-                                    "UPDATE entities SET archived = 1, archive_reason = ?1,
-                                     last_accessed_unix_ms = ?2 WHERE id = ?3 AND archived = 0",
-                                    params![
-                                        format!("dreamed into {}", entity_id),
-                                        now,
-                                        m.0
-                                    ],
-                                )?;
+                                // #854 review: archive reasserts the run's
+                                // workspace — a scoped dream never retires a
+                                // row outside its scope.
+                                let affected = match scope_ws.as_deref() {
+                                    Some(ws) => tx.execute(
+                                        "UPDATE entities SET archived = 1, archive_reason = ?1,
+                                         last_accessed_unix_ms = ?2 WHERE id = ?3 AND archived = 0
+                                         AND workspace_hash = ?4",
+                                        params![
+                                            format!("dreamed into {}", entity_id),
+                                            now,
+                                            m.0,
+                                            ws
+                                        ],
+                                    )?,
+                                    None => tx.execute(
+                                        "UPDATE entities SET archived = 1, archive_reason = ?1,
+                                         last_accessed_unix_ms = ?2 WHERE id = ?3 AND archived = 0",
+                                        params![format!("dreamed into {}", entity_id), now, m.0],
+                                    )?,
+                                };
                                 if affected > 0 {
                                     report.sources_archived += 1;
                                     let _ = tx.execute(
@@ -24114,6 +24177,22 @@ mod tests {
         };
         let err2 = db.consolidate(&amb).unwrap_err().to_string();
         assert!(err2.contains("mutually exclusive"), "{err2}");
+        // Some("") + global=true is equally ambiguous: the legacy/global
+        // workspace selector must never silently mean whole-vault.
+        let amb2 = crate::models::ConsolidateParams {
+            category: "facts".to_string(),
+            similarity_threshold: 0.6,
+            limit: 50,
+            offset: 0,
+            dry_run: true,
+            cold_first: false,
+            archive_sources: false,
+            workspace_hash: Some(String::new()),
+            global: true,
+            requesting_agent_id: String::new(),
+        };
+        let err3 = db.consolidate(&amb2).unwrap_err().to_string();
+        assert!(err3.contains("mutually exclusive"), "{err3}");
         let _ = fs::remove_file(&path);
     }
 
@@ -24201,6 +24280,56 @@ mod tests {
             .unwrap();
         assert_eq!(report2.entities_examined, 1);
         assert_eq!(report2.observations_created, 0);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn consolidate_scoped_archive_never_touches_other_workspaces() {
+        // #854 review: archive operations reassert the run's workspace — a
+        // scoped run with archive_sources retires only in-scope rows.
+        let (db, path) = temp_db();
+        let ins = |id: &str, ws: &str| {
+            db.conn()
+                .unwrap()
+                .execute(
+                    "INSERT INTO entities (id, category, key, body_json, status, type, tags, \
+                     decay_score, retrieval_count, layer, topic_path, archived, archive_reason, \
+                     links, verified, source, certainty, workspace_hash, created_at_unix_ms, \
+                     last_accessed_unix_ms) \
+                     VALUES (?1, 'lore', ?1, '{\"note\":\"the gateway service handles \
+                     authentication and rate limiting\"}', 'active', 'insight', '[]', 1.0, 0, \
+                     'working', '', 0, '', '[]', 0, 'agent', 0.5, ?2, 0, 0)",
+                    params![id, ws],
+                )
+                .unwrap();
+        };
+        ins("ar-1", "ws-one");
+        ins("ar-2", "ws-one");
+        ins("ar-3", "ws-two");
+
+        let report = db
+            .consolidate(&crate::models::ConsolidateParams {
+                category: "lore".to_string(),
+                similarity_threshold: 0.6,
+                limit: 50,
+                offset: 0,
+                dry_run: false,
+                cold_first: false,
+                archive_sources: true,
+                workspace_hash: Some("ws-one".to_string()),
+                global: false,
+                requesting_agent_id: String::new(),
+            })
+            .unwrap();
+        assert_eq!(report.observations_created, 1);
+        assert_eq!(report.sources_archived, 2, "both ws-one sources retire");
+
+        let w2 = db.get_entity("lore", "ar-3").unwrap().unwrap();
+        assert!(
+            !w2.archived,
+            "ws-two entity must stay live: scoped archive never crosses workspaces"
+        );
+        assert_eq!(w2.workspace_hash, "ws-two");
         let _ = fs::remove_file(&path);
     }
 
@@ -24471,6 +24600,95 @@ mod tests {
             .find(|e| e.event_type == "dream")
             .expect("dream journal event");
         assert!(ev.evaluated_json.contains("scoped:ws-one"), "{}", ev.evaluated_json);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn dream_dedup_is_workspace_scoped() {
+        // #854 review: dedup looks up the insight key ONLY inside the run's
+        // workspace — an identical evidence set dreamed in ws-one must not
+        // suppress (or reuse) a ws-two insight and vice versa.
+        let (db, path) = temp_db();
+        let ins = |id: &str, ws: &str| {
+            db.conn()
+                .unwrap()
+                .execute(
+                    "INSERT INTO entities (id, category, key, body_json, status, type, tags, \
+                     decay_score, retrieval_count, layer, topic_path, archived, archive_reason, \
+                     links, verified, source, certainty, workspace_hash, created_at_unix_ms, \
+                     last_accessed_unix_ms) \
+                     VALUES (?1, 'episodes', ?1, '{\"note\":\"user ran database migrations \
+                     before restarting the api service\"}', 'active', 'insight', '[]', 1.0, 0, \
+                     'working', '', 0, '', '[]', 0, 'agent', 0.5, ?2, 0, 0)",
+                    params![id, ws],
+                )
+                .unwrap();
+        };
+        ins("dp-1", "ws-one");
+        ins("dp-2", "ws-one");
+        ins("dp-3", "ws-two");
+        ins("dp-4", "ws-two");
+
+        let stub = |_prompt: &str| -> Result<String, String> {
+            Ok(r#"{"insights":[{"insight_type":"pattern","summary":"migrations run before restarts","confidence":0.9,"supported_by":[0,1]}]}"#.to_string())
+        };
+        let scoped = |ws: &str| crate::models::DreamParams {
+            category: Some("episodes".to_string()),
+            topic_path: None,
+            similarity_threshold: 0.3,
+            max_entities: 100,
+            max_clusters: 5,
+            min_cluster_size: 2,
+            dry_run: false,
+            cold_first: true,
+            archive_sources: false,
+            workspace_hash: Some(ws.to_string()),
+            global: false,
+            requesting_agent_id: String::new(),
+        };
+
+        let r1 = db.dream_with_llm(&scoped("ws-one"), &stub).unwrap();
+        assert_eq!(r1.insights_written, 1);
+        let first = &r1.insights[0];
+        assert!(
+            first.source_ids.contains(&"dp-1".to_string()),
+            "ws-one dream must use ws-one sources, got {:?}",
+            first.source_ids
+        );
+
+        // Identical evidence set in ws-two: same key, but the ws-two run must
+        // NOT dedup against ws-one's insight — it writes its own.
+        let r2 = db.dream_with_llm(&scoped("ws-two"), &stub).unwrap();
+        assert_eq!(r2.insights_written, 1, "ws-two must write its own insight");
+        assert_eq!(r2.insights_deduped, 0);
+        let second = &r2.insights[0];
+        assert_ne!(first.entity_id, second.entity_id);
+        assert!(
+            second.source_ids.contains(&"dp-3".to_string()),
+            "ws-two dream must use ws-two sources, got {:?}",
+            second.source_ids
+        );
+
+        // Both insights exist, each in its own workspace (queried by id —
+        // get_entity is deterministic-unscoped and would pick one row for a
+        // shared key).
+        let ws_of = |entity_id: &str| -> String {
+            db.conn()
+                .unwrap()
+                .query_row(
+                    "SELECT workspace_hash FROM entities WHERE id = ?1",
+                    [entity_id],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(ws_of(&first.entity_id), "ws-one");
+        assert_eq!(ws_of(&second.entity_id), "ws-two");
+
+        // Re-dreaming ws-one dedups WITHIN ws-one only.
+        let r3 = db.dream_with_llm(&scoped("ws-one"), &stub).unwrap();
+        assert_eq!(r3.insights_written, 0);
+        assert_eq!(r3.insights_deduped, 1);
         let _ = fs::remove_file(&path);
     }
 
