@@ -15977,17 +15977,7 @@ mod tests {
         let is_rej = db.is_value_rejected("", "s", "insight",
             r#"{"content":"best-match"}"#).unwrap_or(false);
         eprintln!("[dense-sup-diag] is_value_rejected(best-match)={is_rej}");
-        let is_rej2 = db.is_value_rejected("", "s", "insight",
-            r#"{"content":"second-best"}"#).unwrap_or(false);
-        eprintln!("[dense-sup-diag] is_value_rejected(second-best)={is_rej2}");
-        // Check what filter_suppressed does with the two entities directly.
-        let e1 = db.get_entity("insight", "best").unwrap().unwrap();
-        let e2 = db.get_entity("insight", "second").unwrap().unwrap();
-        let filtered = db.filter_suppressed(vec![e1.clone(), e2.clone()]).unwrap_or_default();
-        eprintln!("[dense-sup-diag] filter_suppressed([best,second]).len()={}", filtered.len());
-        for e in &filtered {
-            eprintln!("[dense-sup-diag]   kept: key={}", e.key);
-        }
+        assert!(is_rej, "tombstone must be visible after reject_value");
         let governed = db.dense_search(&[1.0, 0.0, 0.0], 1).unwrap();
         assert_eq!(
             governed.len(), 1,
