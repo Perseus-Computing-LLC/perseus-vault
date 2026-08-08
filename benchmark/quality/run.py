@@ -604,6 +604,38 @@ class VaultClient:
         )
         return self._decode(self._read())
 
+    def call_allow_error(self, name, arguments=None):
+        """Like call(), but returns the raw tool payload when the tool
+        responds with isError instead of raising — lets scenarios assert the
+        clear-error contract (#898: no silent empty results)."""
+        self._send(
+            {
+                "jsonrpc": "2.0",
+                "id": self._next(),
+                "method": "tools/call",
+                "params": {"name": name, "arguments": arguments or {}},
+            }
+        )
+        response = self._read()
+        if "error" in response:
+            return {
+                "isError": True,
+                "content": [{"type": "text", "text": json.dumps(response["error"])}],
+            }
+        result = response.get("result", {})
+        if isinstance(result, dict) and "structuredContent" in result:
+            return result["structuredContent"]
+        if isinstance(result, dict) and "content" in result:
+            content = result.get("content") or []
+            if content and isinstance(content[0], dict):
+                text = content[0].get("text")
+                if text is not None:
+                    try:
+                        return json.loads(text)
+                    except (TypeError, json.JSONDecodeError):
+                        return result
+        return result
+
     def list_tools(self):
         self._send({"jsonrpc": "2.0", "id": self._next(), "method": "tools/list", "params": {}})
         result = self._decode(self._read())
@@ -1408,7 +1440,7 @@ def run_recall_outcome(client, **_):
         "pending-marker",
         "quality-fixture-pending-semantic-marker",
     )
-    pending = client.call(
+    pending = client.call_allow_error(
         "perseus_vault_recall",
         {
             "query": "quality fixture pending semantic marker",
@@ -1418,28 +1450,50 @@ def run_recall_outcome(client, **_):
             "include_outcome": True,
         },
     )
+    # #898: the lean build (--no-default-features) has no embedding backend,
+    # so a hybrid recall must fail with a CLEAR error naming the backend —
+    # never a silent empty (#864/#890). The full build returns the outcome
+    # payload. Assert the build-appropriate contract.
+    backend_unavailable = isinstance(pending, dict) and pending.get("isError") is True
     pending_outcome = pending.get("outcome") if isinstance(pending, dict) else None
-    empty_status = isinstance(empty_outcome, dict) and empty_outcome.get("status") in {"Empty", "Stale", "Unavailable", "empty", "stale", "unavailable"}
+    empty_status = isinstance(empty_outcome, dict) and empty_outcome.get("status") in {
+        "Empty", "Stale", "Unavailable", "empty", "stale", "unavailable",
+    }
     empty_abstains = isinstance(empty_outcome, dict) and empty_outcome.get("abstained") is True
-    pending_status = isinstance(pending_outcome, dict) and pending_outcome.get("status") in {"Fresh", "Partial", "Stale", "Timeout", "fresh", "partial", "stale", "timeout"}
-    pending_health = isinstance(pending_outcome, dict) and isinstance(pending_outcome.get("backend_health"), dict)
+    if backend_unavailable:
+        pending_explicit = "embedding backend" in json.dumps(pending).lower()
+        pending_not_silent = True  # an explicit error is not a silent empty
+        pending_status_value = "unavailable"
+        pending_health = False
+    else:
+        pending_explicit = isinstance(pending_outcome, dict) and pending_outcome.get("status") in {
+            "Fresh", "Partial", "Stale", "Timeout", "fresh", "partial", "stale", "timeout",
+        }
+        pending_health = (
+            isinstance(pending_outcome, dict)
+            and isinstance(pending_outcome.get("backend_health"), dict)
+        )
+        pending_not_silent = pending_outcome is not None
+        pending_status_value = (
+            pending_outcome.get("status") if isinstance(pending_outcome, dict) else "missing"
+        )
     checks = {
         "empty_status_explicit": empty_status,
         "empty_abstains": empty_abstains,
-        "pending_status_explicit": pending_status,
-        "pending_health_present": pending_health,
+        "pending_outcome_explicit": pending_explicit,
+        "pending_not_silent": pending_not_silent,
     }
     return output(
         checks,
         {
             "empty_status": empty_outcome.get("status") if isinstance(empty_outcome, dict) else "missing",
             "empty_abstained": empty_abstains,
-            "pending_status": pending_outcome.get("status") if isinstance(pending_outcome, dict) else "missing",
+            "pending_status": pending_status_value,
             "pending_health_present": pending_health,
         },
         {
             "recall-outcome-empty-abstains": {"numerator": int(empty_status and empty_abstains), "denominator": 1},
-            "recall-outcome-pending-is-stale": {"numerator": int(pending_status and pending_health), "denominator": 1},
+            "recall-outcome-pending-is-stale": {"numerator": int(pending_explicit and pending_not_silent), "denominator": 1},
         },
     )
 

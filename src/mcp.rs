@@ -7,7 +7,6 @@ use crate::db::Database;
 use crate::tools;
 use crate::beliefs;
 use crate::claim_card;
-use crate::live_update;
 
 /// The parent PID observed once at process start, before any reparenting can
 /// occur. `is_orphaned_by_ppid()` compares the live ppid against this baseline
