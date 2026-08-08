@@ -1732,7 +1732,47 @@ impl Database {
     /// any fatal error. This is the single place that turns those signals
     /// into the `RecallOutcome` contract, so recall/ask/batch all report
     /// identically and no empty result can masquerade as healthy recall.
+    /// #856: best-effort top-k completeness for the standalone outcome view.
+    /// The recall path itself (`recall_with_completeness`) reports the exact
+    /// pool dynamics; this estimate is derived from the scan bound vs the
+    /// embedded population and is conservative (never overclaims exactness).
+    fn estimate_completeness(mode: &SearchMode, outcome: &RecallOutcome) -> crate::models::Completeness {
+        if outcome.abstained {
+            return crate::models::Completeness::Abstain;
+        }
+        match mode {
+            SearchMode::Fts5 => crate::models::Completeness::Exact,
+            SearchMode::Dense | SearchMode::Hybrid => {
+                let population = outcome
+                    .backend_health
+                    .as_ref()
+                    .map(|h| h.embedded_memories)
+                    .unwrap_or(0);
+                let bound = Self::dense_max_scan_from_env();
+                if bound == i64::MAX as usize || population <= bound as i64 {
+                    crate::models::Completeness::Exact
+                } else {
+                    crate::models::Completeness::Bounded
+                }
+            }
+        }
+    }
+
     pub fn recall_outcome(
+        &self,
+        mode: &SearchMode,
+        query_embedding_available: bool,
+        hits: usize,
+        fatal_error: Option<&str>,
+    ) -> RecallOutcome {
+        let mut outcome = self.recall_outcome_inner(mode, query_embedding_available, hits, fatal_error);
+        // #856: attach the completeness estimate (exact/bounded/partial/
+        // abstain) derived from the scan bound vs the embedded population.
+        outcome.completeness = Some(Self::estimate_completeness(mode, &outcome));
+        outcome
+    }
+
+    fn recall_outcome_inner(
         &self,
         mode: &SearchMode,
         query_embedding_available: bool,
@@ -1762,6 +1802,8 @@ impl Database {
                 },
                 deadline_elapsed: false,
                 backend_health: Some(health),
+                completeness: None,
+                candidate_scope: None,
             };
         }
 
@@ -1787,6 +1829,8 @@ impl Database {
                 reason: "semantic_backend_not_serving".to_string(),
                 deadline_elapsed: false,
                 backend_health: Some(health),
+                completeness: None,
+                candidate_scope: None,
             };
         }
 
@@ -1818,6 +1862,8 @@ impl Database {
                 },
                 deadline_elapsed: false,
                 backend_health: Some(health),
+                completeness: None,
+                candidate_scope: None,
             };
         }
 
@@ -1845,6 +1891,8 @@ impl Database {
             },
             deadline_elapsed: false,
             backend_health: Some(health),
+            completeness: None,
+            candidate_scope: None,
         }
     }
 
@@ -2439,6 +2487,19 @@ impl Database {
         self.dense_search_governed(query_vec, limit)
     }
 
+    /// #856: shared env knob — the dense scan ceiling. `unset` → 50,000,
+    /// `0` → unbounded (i64::MAX), else N. Mirrors the documented #619 dial.
+    pub fn dense_max_scan_from_env() -> usize {
+        match std::env::var("MIMIR_DENSE_MAX_SCAN")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+        {
+            Some(0) => i64::MAX as usize, // 0 = unbounded (SQLite LIMIT is i64)
+            Some(n) => n,
+            None => 50_000,
+        }
+    }
+
     fn dense_search_governed(
         &self,
         query_vec: &[f32],
@@ -2457,14 +2518,7 @@ impl Database {
         //                once embedded rows exceed N)
         //   0          → unbounded exact scan (full recall at any corpus
         //                size; latency grows linearly with the corpus)
-        let max_scan: usize = match std::env::var("MIMIR_DENSE_MAX_SCAN")
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-        {
-            Some(0) => i64::MAX as usize, // 0 = unbounded (SQLite LIMIT is i64)
-            Some(n) => n,
-            None => 50_000,
-        };
+        let max_scan: usize = Self::dense_max_scan_from_env();
         // #619: resident sig cache — full-corpus prefilter coverage instead
         // of the first `max_scan` rows (see `SigCache`). Default is AUTO:
         // the cache engages exactly when the corpus outgrows `max_scan` —
@@ -5322,6 +5376,19 @@ impl Database {
     }
 
     pub fn recall(&self, params: &RecallParams) -> Result<Vec<Entity>, Box<dyn std::error::Error>> {
+        Ok(self.recall_with_completeness(params)?.0)
+    }
+
+    /// #856: recall plus top-k completeness metadata. Dense/hybrid paths
+    /// report `exact` (scan exhausted — full embedded population examined),
+    /// `bounded` (pool capped but `limit` in-scope hits still found), or
+    /// `partial` (pool capped AND short — an incomplete top-k), plus the
+    /// effective candidate scope. FTS is always exact (the index ranks the
+    /// full match set). The caller's `limit` is still honored exactly.
+    pub fn recall_with_completeness(
+        &self,
+        params: &RecallParams,
+    ) -> Result<(Vec<Entity>, crate::models::RecallCompleteness), Box<dyn std::error::Error>> {
         // #511: stage-level attribution, opt-in via MIMIR_RECALL_TIMING=1.
         // No-op (single cached-bool check per stage) when disabled.
         let mut timer = RecallTimer::start();
@@ -5347,33 +5414,71 @@ impl Database {
             if let Some(query_vec) = query_vec {
                 if params.mode == crate::models::SearchMode::Dense {
                     // Clamp negative limits to 0 before the usize cast (a negative
-                    // i64 would wrap to a huge usize). Over-fetch a candidate pool,
-                    // apply the same metadata predicates the FTS SQL enforces
-                    // (dense_search only filters archived/embedding), then truncate
-                    // to `limit`. Without the post-filter a Dense recall silently
-                    // ignores category/type/topic_path/workspace/etc. (#467).
+                    // i64 would wrap to a huge usize).
                     let limit = params.limit.max(0) as usize;
-                    let candidate_k =
-                        limit.saturating_mul(5).clamp(1, 1000).max(limit.min(1000));
-                    let dense_results = self.dense_search_governed(query_vec, candidate_k)?;
+                    // #856: adaptive over-fetch. Start at the historical pool
+                    // (limit*5, capped 1000), then double until `limit`
+                    // in-scope hits are found, the scan is known exhausted
+                    // (returned < pool — every embedded row was examined), or
+                    // the pool ceiling is reached. Completeness labels the
+                    // result: exact / bounded / partial.
+                    let mut pool = limit.saturating_mul(5).clamp(1, 1000).max(limit.min(1000));
+                    const POOL_CEILING: usize = 4096;
+                    let mut out: Vec<Entity> = Vec::new();
+                    let mut dense_returned: usize = 0;
+                    let mut attempts = 0;
+                    loop {
+                        let dense_results = self.dense_search_governed(query_vec, pool)?;
+                        let dense_results = self.filter_suppressed_scored(dense_results)?;
+                        let dense_results = Self::apply_scope_rank_weight(dense_results, params);
+                        dense_returned = dense_results.len();
+                        let mut cand: Vec<Entity> =
+                            dense_results.into_iter().map(|(e, _)| e).collect();
+                        Self::retain_layer(&mut cand, params);
+                        Self::retain_metadata_filters(&mut cand, params);
+                        out = cand;
+                        attempts += 1;
+                        if out.len() >= limit
+                            || dense_returned < pool
+                            || pool >= POOL_CEILING
+                            || attempts >= 12
+                        {
+                            break;
+                        }
+                        pool = (pool.saturating_mul(2)).min(POOL_CEILING);
+                    }
                     timer.stage("dense");
-                    // #882: remove governed candidates before ranking/truncation
-                    // and optional reinforcement; suppressed rows must not
-                    // consume a page slot or receive read-side effects.
-                    let dense_results = self.filter_suppressed_scored(dense_results)?;
-                    // #485: apply the scope preference while similarity scores
-                    // are still attached, before they're dropped below.
-                    let dense_results = Self::apply_scope_rank_weight(dense_results, params);
-                    let mut out: Vec<Entity> = dense_results.into_iter().map(|(e, _)| e).collect();
-                    Self::retain_layer(&mut out, params);
-                    Self::retain_metadata_filters(&mut out, params);
+                    let exhausted = dense_returned < pool;
+                    let completeness = if exhausted {
+                        crate::models::Completeness::Exact
+                    } else if out.len() >= limit {
+                        crate::models::Completeness::Bounded
+                    } else {
+                        crate::models::Completeness::Partial
+                    };
+                    let scope = crate::models::CandidateScope {
+                        scanned: dense_returned as i64,
+                        embedded_population: if exhausted {
+                            Some(dense_returned as i64)
+                        } else {
+                            None
+                        },
+                        pool_bound: if exhausted { None } else { Some(pool as i64) },
+                    };
                     out.truncate(limit);
                     self.reinforce_if_requested(params, &out)?;
                     timer.stage("filter");
                     timer.finish("dense");
                     // #882: governance interceptor on the dense arm.
-                    return Ok(self.filter_suppressed(out)?);
-                    }
+                    let out = self.filter_suppressed(out)?;
+                    return Ok((
+                        out,
+                        crate::models::RecallCompleteness {
+                            completeness,
+                            scope: Some(scope),
+                        },
+                    ));
+                }
 
                 // Hybrid: fuse the dense vectors with a read-only, BM25-ranked,
                 // stopword-filtered keyword arm. The keyword arm is fused at a
@@ -5391,7 +5496,16 @@ impl Database {
                 // hybrid recalls are idempotent (#247). Larger candidate sets plus
                 // the id tie-break keep the result byte-stable run-to-run.
                 let limit = params.limit.max(0) as usize;
-                let candidate_k = limit.saturating_mul(5).clamp(1, 1000).max(limit.min(1000));
+                // #856: adaptive over-fetch (same driver as the dense arm):
+                // the pool doubles until `limit` in-scope hits are found, the
+                // dense scan is known exhausted, or the ceiling is reached.
+                let mut pool = limit.saturating_mul(5).clamp(1, 1000).max(limit.min(1000));
+                const POOL_CEILING: usize = 4096;
+                let mut out: Vec<Entity> = Vec::new();
+                let mut dense_returned: usize = 0;
+                let mut attempts = 0;
+                'hybrid_pool: loop {
+                let candidate_k = pool;
                 let mut wide = params.clone();
                 wide.limit = candidate_k as i64;
                 // #511: the two arms are independent, read-only queries on
@@ -5429,6 +5543,7 @@ impl Database {
                             });
                         (dense_res, sparse_res, dense_ms, sparse_ms)
                     });
+                dense_returned = dense_res.as_ref().map(|v| v.len()).unwrap_or(0);
                 let dense_scored = self.filter_suppressed_scored(dense_res?)?;
                 let sparse_scored = self.filter_suppressed_scored(sparse_res?)?;
                 timer.stage("arms");
@@ -5585,20 +5700,55 @@ impl Database {
                 // has the final say on order (nothing re-sorts after it).
                 let fused = Self::apply_supersede_recency(fused);
                 timer.stage("supersede");
-                let mut out: Vec<Entity> = fused.into_iter().map(|(e, _)| e).collect();
-                Self::retain_layer(&mut out, params);
+                let mut cand: Vec<Entity> = fused.into_iter().map(|(e, _)| e).collect();
+                Self::retain_layer(&mut cand, params);
                 // Apply the same metadata predicates as fts5_search: the dense
                 // and graph arms rank without them, so an unfiltered fuse leaks
                 // cross-category/type/workspace hits (#467). The arms were
                 // over-fetched to candidate_k, so truncating here still fills
                 // `limit` whenever enough in-scope hits exist.
-                Self::retain_metadata_filters(&mut out, params);
+                Self::retain_metadata_filters(&mut cand, params);
+                out = cand;
+                attempts += 1;
+                if out.len() >= limit
+                    || dense_returned < pool
+                    || pool >= POOL_CEILING
+                    || attempts >= 12
+                {
+                    break 'hybrid_pool;
+                }
+                pool = (pool.saturating_mul(2)).min(POOL_CEILING);
+                }
                 out.truncate(limit);
                 self.reinforce_if_requested(params, &out)?;
                 timer.stage("filter");
                 timer.finish("hybrid");
                 // #882: governance interceptor on the hybrid arm.
-                return Ok(self.filter_suppressed(out)?);
+                let out = self.filter_suppressed(out)?;
+                let exhausted = dense_returned < pool;
+                let completeness = if exhausted {
+                    crate::models::Completeness::Exact
+                } else if out.len() >= limit {
+                    crate::models::Completeness::Bounded
+                } else {
+                    crate::models::Completeness::Partial
+                };
+                let scope = crate::models::CandidateScope {
+                    scanned: dense_returned as i64,
+                    embedded_population: if exhausted {
+                        Some(dense_returned as i64)
+                    } else {
+                        None
+                    },
+                    pool_bound: if exhausted { None } else { Some(pool as i64) },
+                };
+                return Ok((
+                    out,
+                    crate::models::RecallCompleteness {
+                        completeness,
+                        scope: Some(scope),
+                    },
+                ));
             }
             // Empty query: nothing to embed, fall through to FTS5
         }
@@ -5618,7 +5768,16 @@ impl Database {
         // entity under a permanent erasure mandate (decoupled overlay) or an
         // in-DB tombstone. Runs on the recall funnel, which recall_batch,
         // context_block, ask, and the grpc surface all feed through.
-        Ok(self.filter_suppressed(results)?)
+        let results = self.filter_suppressed(results)?;
+        // #856: FTS ranks the full match set — the top-k is exact by
+        // construction; no candidate pool is involved.
+        Ok((
+            results,
+            crate::models::RecallCompleteness {
+                completeness: crate::models::Completeness::Exact,
+                scope: None,
+            },
+        ))
     }
 
     pub fn recall_batch(
@@ -20928,11 +21087,215 @@ mod tests {
         let _ = fs::remove_file(&path);
     }
 
+    // #856: the bounded dense pool must not silently drop in-scope results —
+    // the recall path adaptively over-fetches until `limit` in-scope hits are
+    // found, the scan is known exhausted, or the pool ceiling is reached, and
+    // reports exact/bounded/partial completeness + the candidate scope.
+    fn seed_deep_scope_corpus(db: &Database, fillers_drown_hits: bool) -> (Vec<f32>, String) {
+        // Direction-based similarity (cosine is scale-invariant, so scalar
+        // magnitudes can't control rank). all-ones vectors score cos=1.0 vs
+        // the query; half-positive vectors score cos=0.707.
+        //   fillers_drown_hits=true  → 300 fillers (1.0) above 2 hits (0.707)
+        //   fillers_drown_hits=false → 2 hits (1.0) above 300 fillers (0.707)
+        let dim = 16usize;
+        let blob = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|f| f.to_le_bytes()).collect() };
+        let all_ones: Vec<f32> = vec![1.0; dim];
+        let half_pos: Vec<f32> = (0..dim)
+            .map(|d| if d < dim / 2 { 1.0 } else { 0.0 })
+            .collect();
+        let (filler_v, hit_v) = if fillers_drown_hits {
+            (all_ones.clone(), half_pos.clone())
+        } else {
+            (half_pos.clone(), all_ones.clone())
+        };
+        let conn = db.conn().unwrap();
+        let tx = conn.unchecked_transaction().unwrap();
+        {
+            let mut stmt = tx
+                .prepare(
+                    "INSERT INTO entities (id, category, key, body_json, type, status,
+                        retrieval_count, last_accessed_unix_ms, created_at_unix_ms,
+                        decay_score, layer, embedding, workspace_hash, archived)
+                     VALUES (?1, 'insight', ?2, ?3, 'insight', 'active', 0, 0, 0,
+                             1.0, 'working', ?4, ?5, 0)",
+                )
+                .unwrap();
+            for i in 1..=300u32 {
+                stmt.execute(params![
+                    format!("filler-{:05}", i),
+                    format!("filler-key-{:05}", i),
+                    format!("{{\"k\":\"filler-key-{:05}\"}}", i),
+                    blob(&filler_v),
+                    "ws-other"
+                ])
+                .unwrap();
+            }
+            for (id, key) in [("hit-1", "hit-key-1"), ("hit-2", "hit-key-2")] {
+                stmt.execute(params![
+                    id,
+                    key,
+                    format!("{{\"k\":\"{key}\"}}"),
+                    blob(&hit_v),
+                    "ws-target"
+                ])
+                .unwrap();
+            }
+        }
+        tx.commit().unwrap();
+        (vec![1.0f32; dim], "hit-key-1".to_string())
+    }
+
+    #[test]
+    fn dense_recall_adaptive_overfetch_finds_deep_scoped_hits() {
+        // 300 closer fillers in ws-other drown the ws-target hits inside the
+        // historical pool (limit*5 = 5). Adaptive over-fetch must expand the
+        // pool until the scan is exhausted (302 rows < pool) and the in-scope
+        // hits surface — with completeness=exact and the true population.
+        let (db, path) = temp_db();
+        let (query, hit_key) = seed_deep_scope_corpus(&db, true);
+
+        let (results, rc) = db
+            .recall_with_completeness(&RecallParams {
+                query: "deep hit".to_string(),
+                embedding: Some(query),
+                mode: crate::models::SearchMode::Dense,
+                limit: 1,
+                workspace_hash: Some("ws-target".to_string()),
+                skip_side_effects: true,
+                ..RecallParams::default()
+            })
+            .unwrap();
+
+        assert!(
+            results.iter().any(|e| e.key == hit_key),
+            "adaptive over-fetch must recover in-scope hits beyond the historical pool, got {:?}",
+            results.iter().map(|e| e.key.clone()).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            rc.completeness,
+            crate::models::Completeness::Exact,
+            "scan exhausted at 302 embedded rows → exact"
+        );
+        let scope = rc.scope.expect("candidate scope reported");
+        assert_eq!(scope.scanned, 302, "all embedded rows examined");
+        assert_eq!(scope.embedded_population, Some(302));
+        assert_eq!(scope.pool_bound, None, "no bound bit when exhausted");
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn dense_recall_bounded_completeness_when_pool_fills() {
+        // In-scope hits rank at the TOP (fillers less similar): the first pass
+        // fills `limit` but the scan is NOT exhausted — completeness=bounded,
+        // pool bound and scanned count reported honestly.
+        let (db, path) = temp_db();
+        let (query, hit_key) = seed_deep_scope_corpus(&db, false);
+
+        let (results, rc) = db
+            .recall_with_completeness(&RecallParams {
+                query: "top hit".to_string(),
+                embedding: Some(query),
+                mode: crate::models::SearchMode::Dense,
+                limit: 1,
+                workspace_hash: Some("ws-target".to_string()),
+                skip_side_effects: true,
+                ..RecallParams::default()
+            })
+            .unwrap();
+
+        assert!(
+            results.iter().any(|e| e.key == hit_key),
+            "top-ranked in-scope hit must be returned"
+        );
+        assert_eq!(rc.completeness, crate::models::Completeness::Bounded);
+        let scope = rc.scope.expect("candidate scope reported");
+        assert_eq!(scope.scanned, 5, "one pass at the historical pool");
+        assert_eq!(scope.pool_bound, Some(5));
+        assert_eq!(scope.embedded_population, None, "population beyond the pool is unknown");
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn hybrid_recall_reports_completeness_and_finds_deep_hits() {
+        // Same deep corpus through the hybrid fusion (sparse arm finds
+        // nothing: the query text matches no body/key; the dense arm governs).
+        let (db, path) = temp_db();
+        let (query, hit_key) = seed_deep_scope_corpus(&db, true);
+
+        let (results, rc) = db
+            .recall_with_completeness(&RecallParams {
+                query: "deep hit".to_string(),
+                embedding: Some(query),
+                mode: crate::models::SearchMode::Hybrid,
+                limit: 1,
+                workspace_hash: Some("ws-target".to_string()),
+                skip_side_effects: true,
+                ..RecallParams::default()
+            })
+            .unwrap();
+
+        assert!(
+            results.iter().any(|e| e.key == hit_key),
+            "hybrid adaptive over-fetch must recover deep in-scope hits, got {:?}",
+            results.iter().map(|e| e.key.clone()).collect::<Vec<_>>()
+        );
+        assert_eq!(rc.completeness, crate::models::Completeness::Exact);
+        assert_eq!(rc.scope.as_ref().map(|s| s.scanned), Some(302));
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn fts_recall_completeness_is_exact() {
+        let (db, path) = temp_db();
+        db.remember(&make_entity("f1", "notes", "f1", r#"{"d":"alpha bravo charlie"}"#))
+            .unwrap();
+
+        let (results, rc) = db
+            .recall_with_completeness(&RecallParams {
+                query: "alpha".to_string(),
+                limit: 5,
+                mode: crate::models::SearchMode::Fts5,
+                skip_side_effects: true,
+                ..RecallParams::default()
+            })
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(rc.completeness, crate::models::Completeness::Exact);
+        assert!(rc.scope.is_none(), "FTS has no candidate pool");
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn recall_outcome_completeness_estimate_matches_scan_bound() {
+        // #856 standalone outcome view: small embedded population under the
+        // default 50k scan bound → exact; abstained outcomes → abstain.
+        let (db, path) = temp_db();
+        let mut e = make_entity("e1", "notes", "e1", r#"{"d":"hello world"}"#);
+        e.workspace_hash = "ws-o".to_string();
+        db.remember(&e).unwrap();
+
+        let outcome = db.recall_outcome(&crate::models::SearchMode::Dense, true, 1, None);
+        assert_eq!(
+            outcome.completeness,
+            Some(crate::models::Completeness::Exact),
+            "1 embedded row < 50k default scan bound → exact"
+        );
+        let abstain = db.recall_outcome(&crate::models::SearchMode::Dense, false, 0, Some("boom"));
+        assert_eq!(abstain.completeness, Some(crate::models::Completeness::Abstain));
+
+        let _ = fs::remove_file(&path);
+    }
+
     // #254 (determinism): recall ordering must be a stable total order so that
     // @memory resolution over a frozen DB is byte-identical run-to-run. Entities
     // that tie on (retrieval_count, last_accessed_unix_ms) must fall back to a
     // deterministic `id ASC` tie-break, and skip_side_effects must suppress the
     // access-state mutations that would otherwise perturb the sort keys.
+
     #[test]
     fn recall_is_deterministic_on_frozen_db_with_ties() {
         let (db, path) = temp_db();
