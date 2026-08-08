@@ -6,6 +6,7 @@ use std::sync::OnceLock;
 use crate::db::Database;
 use crate::tools;
 use crate::beliefs;
+use crate::claim_card;
 
 /// The parent PID observed once at process start, before any reparenting can
 /// occur. `is_orphaned_by_ppid()` compares the live ppid against this baseline
@@ -1517,6 +1518,42 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
       "readOnlyHint": true
     },
     "title": "Derived Beliefs Overlay"
+  },
+  {
+    "name": "mimir_claim_card",
+    "description": "Evidence-backed claim card (#852, spec: docs/specs/claim-cards.md): a deterministic, versioned projection of one entity's claim, provenance class (source_human/fact_extracted/fact_derived/inference_agent), valid vs recorded time, confidence/support, supersession/contradiction/stale state, evidence references, a sanitized agent_projection hash-bound to the selected evidence and policy, and machine-readable reason codes (serveable / archived / scope_mismatch / revoked_access + flags). Read-only view over existing entities and links — never a second source of truth.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "entity_id": {
+          "type": "string",
+          "description": "ID of the entity to project as a claim card"
+        },
+        "workspace_hash": {
+          "type": "string",
+          "description": "Caller's workspace scope for visibility enforcement (workspace-scoped entities mismatch → withheld with scope_mismatch)"
+        },
+        "agent_id": {
+          "type": "string",
+          "description": "Caller identity for visibility enforcement (private/fleet entities require the author's agent_id → else revoked_access)"
+        },
+        "include_evidence": {
+          "type": "boolean",
+          "default": true,
+          "description": "Include evidence references (metadata only; raw bodies never cross)"
+        },
+        "include_agent_projection": {
+          "type": "boolean",
+          "default": true,
+          "description": "Include the sanitized agent_projection block"
+        }
+      },
+      "required": ["entity_id"]
+    },
+    "annotations": {
+      "readOnlyHint": true
+    },
+    "title": "Evidence-Backed Claim Card"
   },
   {
     "name": "mimir_semantic_search",
@@ -5485,6 +5522,7 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
         "mimir_promote" => tools::handle_promote(db, args),
         "mimir_demote" => tools::handle_demote(db, args),
         "mimir_beliefs" => beliefs::handle_beliefs(db, args),
+        "mimir_claim_card" => claim_card::handle_claim_card(db, args),
         "mimir_operator_review" => tools::handle_operator_review(db, args),
         "mimir_conflicts" => Ok(tools::handle_conflicts(db, args)),
         "mimir_consolidate" => Ok(tools::handle_consolidate(db, args)),
@@ -5580,7 +5618,7 @@ mod tests {
         );
         assert_eq!(
             registry_names.len(),
-            90,
+            91,
             "update public metadata when adding a tool"
         );
 

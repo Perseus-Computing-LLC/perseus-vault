@@ -1,7 +1,8 @@
+mod beliefs;
 mod capture;
+mod claim_card;
 mod communities;
 mod connectors;
-mod beliefs;
 mod db;
 mod dedup;
 mod embedding;
