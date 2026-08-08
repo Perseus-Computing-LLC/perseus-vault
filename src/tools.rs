@@ -4546,8 +4546,8 @@ pub fn handle_dream(db: &Database, args: Value) -> Result<String, String> {
         let categories: Vec<String> = match a.params.category {
             Some(ref c) => vec![c.clone()],
             None => db
-                .workspace_list_categories()
-                .map_err(|e| format!("Dream fallback (categories) failed: {}", e))?
+                .workspace_list_categories_scoped(a.params.workspace_hash.as_deref())
+                .map_err(|e| format!("Dream fallback (categories) failed: {e}"))?
                 .into_iter()
                 .filter(|c| {
                     c != "insight" && c != "observation" && c != "synthesis" && c != "memories"
@@ -4567,6 +4567,9 @@ pub fn handle_dream(db: &Database, args: Value) -> Result<String, String> {
                     dry_run: a.params.dry_run,
                     cold_first: true,
                     archive_sources: a.params.archive_sources,
+                    workspace_hash: a.params.workspace_hash.clone(),
+                    global: a.params.global,
+                    requesting_agent_id: a.params.requesting_agent_id.clone(),
                 })
                 .map_err(|e| format!("Dream fallback (consolidate {}) failed: {}", cat, e))?;
             observations_created += report.observations_created;
@@ -5482,6 +5485,22 @@ pub struct AutocohereArgs {
     pub capture_agent_id: String,
     #[serde(default)]
     pub capture_max_entities: Option<i64>,
+    /// #854: workspace scope for the consolidation step. `Some(ws)` scopes
+    /// the consolidate pass (and its derived observations) to that workspace;
+    /// `None` keeps the whole-vault default (the other grooming steps —
+    /// cohere/decay/compact — are whole-vault by design). Set `global: true`
+    /// to make the whole-vault consolidation explicit and capability-gated.
+    #[serde(default)]
+    pub workspace_hash: Option<String>,
+    /// #854: explicit cross-workspace consolidation mode. When `workspace_hash`
+    /// is also set the run is rejected as ambiguous. Callers with a host
+    /// identity need capability `memory.maintenance.global` for global runs.
+    #[serde(default)]
+    pub global: bool,
+    /// Host identity stamped by the MCP transport (clientInfo.name); used for
+    /// global-mode authorization and consolidation author attribution.
+    #[serde(default)]
+    pub requesting_agent_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -5624,6 +5643,12 @@ pub fn handle_autocohere(db: &Database, args: Value) -> Result<String, String> {
                 dry_run: a.dry_run,
                 cold_first: true,
                 archive_sources: true,
+                workspace_hash: a.workspace_hash.clone(),
+                // #854: no scope named → whole-vault pass (historical
+                // autocohere behavior); an explicit workspace scopes only the
+                // consolidation step.
+                global: a.global || a.workspace_hash.is_none(),
+                requesting_agent_id: a.requesting_agent_id.clone(),
             })
             .map_err(|e| format!("Autocohere step (consolidate {}) failed: {}", cat, e))?;
         observations_created += report.observations_created;
@@ -6035,6 +6060,12 @@ pub struct CorrectArgs {
     pub workspace_hash: String,
     #[serde(default)]
     pub agent_id: String,
+    /// #855: host identity stamped by the MCP transport (clientInfo.name),
+    /// distinct from the model-supplied `agent_id` author attribution. When
+    /// present (non-empty), it is authoritative: a model cannot override the
+    /// host's identity on the correction entity, journal event, or tombstone.
+    #[serde(default)]
+    pub requesting_agent_id: String,
 }
 
 
@@ -6091,6 +6122,16 @@ pub fn handle_correct(db: &Database, args: Value) -> Result<String, String> {
         }
     }
 
+    // #855: host identity (transport-stamped requesting_agent_id) is
+    // authoritative over any model-supplied author attribution — a model
+    // cannot claim to be the user. Without a host identity (non-MCP callers),
+    // the supplied agent_id is used as before.
+    let author_agent_id = if a.requesting_agent_id.trim().is_empty() {
+        a.agent_id
+    } else {
+        a.requesting_agent_id
+    };
+
     let params = crate::models::CorrectParams {
         wrong_approach: a.wrong_approach,
         user_correction: a.user_correction,
@@ -6103,7 +6144,7 @@ pub fn handle_correct(db: &Database, args: Value) -> Result<String, String> {
         valid_to_unix_ms: a.valid_to_unix_ms,
         evidence: a.evidence,
         workspace_hash: a.workspace_hash,
-        agent_id: a.agent_id,
+        agent_id: author_agent_id,
     };
 
     let result = db.correct(&params)
@@ -10855,6 +10896,158 @@ mod tests {
             .find(|event| event.event_type == "correction" && event.entity_id == entity.id)
             .expect("correction journal event");
         assert_eq!(event.agent_id, "user-42");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn correction_host_identity_overrides_model_agent_id() {
+        // #855: when the MCP transport stamps a host identity, it is
+        // authoritative — a model-supplied agent_id cannot override it on the
+        // entity, the journal event, or the result.
+        let (db, path) = temp_db();
+        let response = handle_correct(
+            &db,
+            json!({
+                "workspace_hash": "ws-host",
+                "agent_id": "model-claimed-user",
+                "requesting_agent_id": "host-claude-desktop",
+                "wrong_approach": "assistant guessed the deployment state",
+                "user_correction": "user confirmed the observed state",
+                "task_context": "deployment review"
+            }),
+        )
+        .expect("correction");
+        let result: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(result["agent_id"], json!("host-claude-desktop"));
+        assert_eq!(result["workspace_hash"], json!("ws-host"));
+
+        let entity = db
+            .get_entity("correction", result["key"].as_str().unwrap())
+            .unwrap()
+            .expect("correction entity");
+        assert_eq!(
+            entity.agent_id, "host-claude-desktop",
+            "host identity must win over the model-supplied author"
+        );
+        assert_eq!(entity.workspace_hash, "ws-host");
+
+        let events = db.get_recent_journal("ws-host", 50).unwrap();
+        let event = events
+            .iter()
+            .find(|event| event.event_type == "correction" && event.entity_id == entity.id)
+            .expect("correction journal event");
+        assert_eq!(event.agent_id, "host-claude-desktop");
+        assert_eq!(event.workspace_hash, "ws-host");
+
+        // The rejected-value tombstone carries the same host attribution.
+        let authors: Vec<String> = db
+            .conn()
+            .unwrap()
+            .prepare(
+                "SELECT author_agent_id FROM rejected_value_tombstones \
+                 WHERE workspace_hash = ?1",
+            )
+            .unwrap()
+            .query_map(rusqlite::params!["ws-host"], |r| r.get::<_, String>(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert!(
+            authors.iter().any(|a| a == "host-claude-desktop"),
+            "tombstone must record the host identity, got {authors:?}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn correction_empty_attribution_records_legacy_empties() {
+        // #855: no agent/workspace supplied (non-MCP caller) → the correction
+        // entity, journal event, and result all carry empty attribution —
+        // legacy behavior preserved, nothing invented.
+        let (db, path) = temp_db();
+        let response = handle_correct(
+            &db,
+            json!({
+                "wrong_approach": "assistant guessed the deployment state",
+                "user_correction": "user confirmed the observed state",
+                "task_context": "deployment review"
+            }),
+        )
+        .expect("correction");
+        let result: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(result["agent_id"], json!(""));
+        assert_eq!(result["workspace_hash"], json!(""));
+
+        let entity = db
+            .get_entity("correction", result["key"].as_str().unwrap())
+            .unwrap()
+            .expect("correction entity");
+        assert_eq!(entity.agent_id, "");
+        assert_eq!(entity.workspace_hash, "");
+        let events = db.get_recent_journal("", 50).unwrap();
+        let event = events
+            .iter()
+            .find(|event| event.event_type == "correction" && event.entity_id == entity.id)
+            .expect("correction journal event");
+        assert_eq!(event.agent_id, "");
+        assert_eq!(event.workspace_hash, "");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn dream_fallback_consolidate_is_scoped() {
+        // #854 review: the no-LLM fallback (fallback_consolidate) must carry
+        // the same workspace scope into the mechanical consolidate pass —
+        // scoped fallback never merges across workspaces.
+        let (db, path) = temp_db();
+        let ins = |id: &str, ws: &str| {
+            db.conn()
+                .unwrap()
+                .execute(
+                    "INSERT INTO entities (id, category, key, body_json, status, type, tags, \
+                     decay_score, retrieval_count, layer, topic_path, archived, archive_reason, \
+                     links, verified, source, certainty, workspace_hash, created_at_unix_ms, \
+                     last_accessed_unix_ms) \
+                     VALUES (?1, 'episodes', ?1, '{\"note\":\"user ran database migrations \
+                     before restarting the api service\"}', 'active', 'insight', '[]', 1.0, 0, \
+                     'working', '', 0, '', '[]', 0, 'agent', 0.5, ?2, 0, 0)",
+                    rusqlite::params![id, ws],
+                )
+                .unwrap();
+        };
+        ins("fb-1", "ws-fb");
+        ins("fb-2", "ws-fb");
+        ins("fb-3", "ws-other");
+
+        let response = handle_dream(
+            &db,
+            json!({
+                "category": "episodes",
+                "fallback_consolidate": true,
+                "workspace_hash": "ws-fb",
+                "dry_run": false
+            }),
+        )
+        .expect("dream fallback");
+        let v: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(v["fallback"], json!("consolidate"));
+        assert_eq!(
+            v["entities_examined"], json!(2),
+            "scoped fallback must only examine ws-fb: {v}"
+        );
+        assert_eq!(v["observations_created"], json!(1));
+
+        // The derived observation inherits the scope.
+        let obs_ws: String = db
+            .conn()
+            .unwrap()
+            .query_row(
+                "SELECT workspace_hash FROM entities WHERE category='observation' LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(obs_ws, "ws-fb", "fallback observation must inherit the scope");
         let _ = std::fs::remove_file(path);
     }
 }

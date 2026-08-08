@@ -1220,6 +1220,13 @@ pub struct CorrectResult {
     pub category: String,
     pub key: String,
     pub created_at_unix_ms: i64,
+    /// #855: the agent attribution persisted on the correction entity and its
+    /// journal event (host identity when the transport stamped one, else the
+    /// caller-supplied author). Empty when neither was provided.
+    pub agent_id: String,
+    /// #855: the workspace scope persisted on the correction entity and its
+    /// journal event. Empty = global/legacy.
+    pub workspace_hash: String,
 }
 
 /// Parameters for the mimir_synthesize tool — LLM-driven session synthesis.
@@ -1308,6 +1315,25 @@ pub struct ConsolidateParams {
     /// never archived — same exemption policy as decay. Default false.
     #[serde(default)]
     pub archive_sources: bool,
+    /// #854: workspace scope for this run. `Some(ws)` restricts every source
+    /// scan, cluster, evidence link, and archive operation to that workspace,
+    /// and derived observations inherit the scope (never silently global).
+    /// Requires `global` to be false. Neither `workspace_hash` nor `global`
+    /// is an error (fail-closed: ordinary maintenance runs must name a scope).
+    #[serde(default)]
+    pub workspace_hash: Option<String>,
+    /// #854: explicit cross-workspace mode for deliberate whole-vault
+    /// consolidation. Authorization-gated when the caller carries a host
+    /// identity (`requesting_agent_id`): the agent must hold capability
+    /// `memory.maintenance.global` in the system scope, or the run is
+    /// denied. Mutually exclusive with `workspace_hash`.
+    #[serde(default)]
+    pub global: bool,
+    /// Host identity stamped by the MCP transport (clientInfo.name). Used for
+    /// global-mode authorization and stamped on derived records as author
+    /// attribution. Never trusted from the model when a host identity exists.
+    #[serde(default)]
+    pub requesting_agent_id: String,
 }
 
 fn default_consolidate_threshold() -> f64 {
@@ -1360,6 +1386,25 @@ pub struct DreamParams {
     /// exemption policy as decay and consolidate). Default false.
     #[serde(default)]
     pub archive_sources: bool,
+    /// #854: workspace scope for this run. `Some(ws)` restricts every source
+    /// scan, cluster, and evidence lookup to that workspace, and derived
+    /// insights inherit the scope (never silently global). Requires `global`
+    /// to be false. Neither `workspace_hash` nor `global` is an error
+    /// (fail-closed: ordinary maintenance runs must name a scope).
+    #[serde(default)]
+    pub workspace_hash: Option<String>,
+    /// #854: explicit cross-workspace mode for deliberate whole-vault
+    /// dreaming. Authorization-gated when the caller carries a host identity
+    /// (`requesting_agent_id`): the agent must hold capability
+    /// `memory.maintenance.global` in the system scope, or the run is
+    /// denied. Mutually exclusive with `workspace_hash`.
+    #[serde(default)]
+    pub global: bool,
+    /// Host identity stamped by the MCP transport (clientInfo.name). Used for
+    /// global-mode authorization and stamped on derived records as author
+    /// attribution. Never trusted from the model when a host identity exists.
+    #[serde(default)]
+    pub requesting_agent_id: String,
 }
 
 fn default_dream_threshold() -> f64 {
@@ -1425,6 +1470,10 @@ pub struct DreamReport {
     pub sources_archived: i64,
     pub dry_run: bool,
     pub insights: Vec<DreamInsight>,
+    /// #854: effective scope of this run. `Some(ws)` = scoped to that
+    /// workspace; `None` with `global=true` = deliberate whole-vault run.
+    pub workspace_hash: Option<String>,
+    pub global: bool,
 }
 
 /// One evidence-tracked observation formed by merging 2+ overlapping entities.
@@ -1455,6 +1504,10 @@ pub struct ConsolidateReport {
     pub sources_archived: i64,
     pub dry_run: bool,
     pub observations: Vec<Observation>,
+    /// #854: effective scope of this run. `Some(ws)` = scoped to that
+    /// workspace; `None` with `global=true` = deliberate whole-vault run.
+    pub workspace_hash: Option<String>,
+    pub global: bool,
 }
 
 // ─── Memory origin + external references (#729/#728) ────────────────────────

@@ -10173,6 +10173,53 @@ impl Database {
         }))
     }
 
+    /// #854: resolve the effective scope for a maintenance run. Returns
+    /// `(workspace, global)` and fails closed when the caller selected
+    /// neither an explicit workspace nor global mode. `global=true` together
+    /// with a non-empty `workspace_hash` is ambiguous and rejected.
+    fn resolve_maintenance_scope(
+        workspace_hash: Option<&str>,
+        global: bool,
+    ) -> Result<(Option<String>, bool), Box<dyn std::error::Error>> {
+        match (workspace_hash, global) {
+            (Some(ws), true) if !ws.trim().is_empty() => Err(
+                "workspace_hash and global=true are mutually exclusive: pick one scope".into(),
+            ),
+            (Some(ws), false) => Ok((Some(ws.to_string()), false)),
+            (_, true) => Ok((None, true)),
+            (None, false) => Err(
+                "workspace scope required: pass workspace_hash (scoped run) or \
+                 global=true (explicit cross-workspace run)"
+                    .into(),
+            ),
+        }
+    }
+
+    /// #854: authorize a deliberate cross-workspace (global) maintenance run.
+    /// Anonymous/unscoped callers (no host identity) fail open — there is no
+    /// identity to hold accountable, matching the authority regime's
+    /// pre-manifest behavior. Identity-carrying callers FAIL CLOSED: global
+    /// cross-workspace maintenance requires an authority manifest granting
+    /// `memory.maintenance.global` in the SYSTEM scope — a manifest with
+    /// `workspace_hash = "*"` (the sentinel, since manifests require a
+    /// non-empty workspace). Missing manifest or missing capability = denied.
+    fn authorize_global_maintenance(
+        &self,
+        requesting_agent_id: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if requesting_agent_id.trim().is_empty() {
+            return Ok(());
+        }
+        match self.require_memory_capability(requesting_agent_id, "*", "memory.maintenance.global")? {
+            true => Ok(()),
+            false => Err(
+                "global maintenance denied: no authority manifest grants \
+                 memory.maintenance.global for this agent in the system scope ('*')"
+                    .into(),
+            ),
+        }
+    }
+
     /// Merge overlapping/duplicative entities within a category into durable,
     /// evidence-tracked "observations" (#steal-2, competitive research:
     /// Hindsight's Observation layer). Where `detect_conflicts` flags pairs
@@ -10201,20 +10248,46 @@ impl Database {
         &self,
         params: &crate::models::ConsolidateParams,
     ) -> Result<crate::models::ConsolidateReport, Box<dyn std::error::Error>> {
+        // #854: ordinary runs require an explicit workspace; global mode is
+        // deliberate and authorization-gated.
+        let (scope_ws, global) = Self::resolve_maintenance_scope(
+            params.workspace_hash.as_deref(),
+            params.global,
+        )?;
+        if global {
+            self.authorize_global_maintenance(&params.requesting_agent_id)?;
+        }
         let conn = self.conn()?;
         // cold_first scans the entities decay is about to claim (ASC = coldest
         // first) — "local dreaming" compresses fading memories into durable
         // observations instead of losing them one by one. Default (DESC)
         // preserves the original recent-window behavior.
         let order = if params.cold_first { "ASC" } else { "DESC" };
-        let mut stmt = conn.prepare(&format!(
-            "SELECT id, key, body_json, certainty, verified, importance
-             FROM entities WHERE category = ?1 AND archived = 0
-             ORDER BY last_accessed_unix_ms {}, id ASC LIMIT {} OFFSET ?2",
-            order,
-            Self::CONFLICT_SCAN_WINDOW
-        ))?;
-        let rows = stmt.query_map(params![params.category, params.offset], |r| {
+        let (sql, scan_ws): (String, Option<&str>) = match &scope_ws {
+            Some(ws) => (
+                format!(
+                    "SELECT id, key, body_json, certainty, verified, importance
+                     FROM entities WHERE category = ?1 AND archived = 0
+                     AND workspace_hash = ?2
+                     ORDER BY last_accessed_unix_ms {}, id ASC LIMIT {} OFFSET ?3",
+                    order,
+                    Self::CONFLICT_SCAN_WINDOW
+                ),
+                Some(ws),
+            ),
+            None => (
+                format!(
+                    "SELECT id, key, body_json, certainty, verified, importance
+                     FROM entities WHERE category = ?1 AND archived = 0
+                     ORDER BY last_accessed_unix_ms {}, id ASC LIMIT {} OFFSET ?2",
+                    order,
+                    Self::CONFLICT_SCAN_WINDOW
+                ),
+                None,
+            ),
+        };
+        let mut stmt = conn.prepare(&sql)?;
+        let map_row = |r: &rusqlite::Row| -> rusqlite::Result<(String, String, String, f64, bool, f64)> {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
@@ -10223,7 +10296,11 @@ impl Database {
                 r.get::<_, bool>(4).unwrap_or(false),
                 r.get::<_, Option<f64>>(5).unwrap_or(None).unwrap_or(0.0),
             ))
-        })?;
+        };
+        let rows = match scan_ws {
+            Some(ws) => stmt.query_map(params![params.category, ws, params.offset], map_row)?,
+            None => stmt.query_map(params![params.category, params.offset], map_row)?,
+        };
         let entities: Vec<(String, String, String, f64, bool, f64)> =
             rows.filter_map(|r| r.ok()).collect();
         drop(stmt);
@@ -10354,8 +10431,8 @@ impl Database {
                     source: "mimir_consolidate".to_string(),
                     always_on: false,
                     certainty: avg_certainty,
-                    workspace_hash: String::new(),
-                    agent_id: String::new(),
+                    workspace_hash: scope_ws.clone().unwrap_or_default(),
+                    agent_id: params.requesting_agent_id.clone(),
                     visibility: "workspace".to_string(),
                     follow_count: 0,
                     miss_count: 0,
@@ -10408,6 +10485,33 @@ impl Database {
             observations.push(observation);
         }
 
+        // #854: a deliberate cross-workspace run is an audit event — label it
+        // with the requesting agent so global maintenance is reviewable.
+        if global && !params.dry_run {
+            let jid = format!("jrn-{}", uuid::Uuid::new_v4().simple());
+            self.journal(&crate::models::JournalEvent {
+                id: jid,
+                event_type: "maintenance_global_run".to_string(),
+                evaluated_json: serde_json::json!({
+                    "tool": "consolidate",
+                    "scope": "global",
+                })
+                .to_string(),
+                acted_json: serde_json::json!({
+                    "observations_created": observations.len(),
+                    "sources_archived": sources_archived,
+                })
+                .to_string(),
+                forward_json: "{}".to_string(),
+                category: "consolidate".to_string(),
+                key: String::new(),
+                entity_id: String::new(),
+                agent_id: params.requesting_agent_id.clone(),
+                workspace_hash: String::new(),
+                created_at_unix_ms: now,
+            })?;
+        }
+
         Ok(crate::models::ConsolidateReport {
             category: params.category.clone(),
             entities_examined: n as i64,
@@ -10416,6 +10520,8 @@ impl Database {
             sources_archived,
             dry_run: params.dry_run,
             observations,
+            workspace_hash: scope_ws,
+            global,
         })
     }
 
@@ -10476,10 +10582,20 @@ impl Database {
             .into());
         }
 
+        // #854: ordinary runs require an explicit workspace; global mode is
+        // deliberate and authorization-gated.
+        let (scope_ws, global) = Self::resolve_maintenance_scope(
+            params.workspace_hash.as_deref(),
+            params.global,
+        )?;
+        if global {
+            self.authorize_global_maintenance(&params.requesting_agent_id)?;
+        }
+
         let categories: Vec<String> = match params.category {
             Some(ref c) => vec![c.clone()],
             None => self
-                .workspace_list_categories()?
+                .workspace_list_categories_scoped(scope_ws.as_deref())?
                 .into_iter()
                 .filter(|c| !Self::DREAM_SKIP_CATEGORIES.contains(&c.as_str()))
                 .collect(),
@@ -10500,6 +10616,8 @@ impl Database {
             sources_archived: 0,
             dry_run: params.dry_run,
             insights: Vec::new(),
+            workspace_hash: scope_ws.clone(),
+            global,
         };
         let now = now_ms();
 
@@ -10511,17 +10629,52 @@ impl Database {
             report.categories_scanned.push(category.clone());
 
             // (id, key, body_json, certainty, verified, importance)
-            let topic_filter = if params.topic_path.is_some() {
-                "AND topic_path LIKE ?2 || '%'"
-            } else {
-                ""
+            // #854: when scoped, the scan carries a strict workspace
+            // predicate so no cross-workspace fact can enter a cluster.
+            let (sql, binds): (String, Vec<&str>) = match (
+                scope_ws.as_deref(),
+                params.topic_path.as_deref(),
+            ) {
+                (Some(ws), Some(tp)) => (
+                    format!(
+                        "SELECT id, key, body_json, certainty, verified, importance
+                         FROM entities WHERE category = ?1 AND archived = 0
+                         AND topic_path LIKE ?2 || '%' AND workspace_hash = ?3
+                         ORDER BY last_accessed_unix_ms {}, id ASC LIMIT {}",
+                        order, remaining_entities
+                    ),
+                    vec![&category, tp, ws],
+                ),
+                (Some(ws), None) => (
+                    format!(
+                        "SELECT id, key, body_json, certainty, verified, importance
+                         FROM entities WHERE category = ?1 AND archived = 0
+                         AND workspace_hash = ?2
+                         ORDER BY last_accessed_unix_ms {}, id ASC LIMIT {}",
+                        order, remaining_entities
+                    ),
+                    vec![&category, ws],
+                ),
+                (None, Some(tp)) => (
+                    format!(
+                        "SELECT id, key, body_json, certainty, verified, importance
+                         FROM entities WHERE category = ?1 AND archived = 0
+                         AND topic_path LIKE ?2 || '%'
+                         ORDER BY last_accessed_unix_ms {}, id ASC LIMIT {}",
+                        order, remaining_entities
+                    ),
+                    vec![&category, tp],
+                ),
+                (None, None) => (
+                    format!(
+                        "SELECT id, key, body_json, certainty, verified, importance
+                         FROM entities WHERE category = ?1 AND archived = 0
+                         ORDER BY last_accessed_unix_ms {}, id ASC LIMIT {}",
+                        order, remaining_entities
+                    ),
+                    vec![&category],
+                ),
             };
-            let sql = format!(
-                "SELECT id, key, body_json, certainty, verified, importance
-                 FROM entities WHERE category = ?1 AND archived = 0 {}
-                 ORDER BY last_accessed_unix_ms {}, id ASC LIMIT {}",
-                topic_filter, order, remaining_entities
-            );
             let mut stmt = conn.prepare(&sql)?;
             let map_row = |r: &rusqlite::Row| -> rusqlite::Result<(String, String, String, f64, bool, f64)> {
                 Ok((
@@ -10533,16 +10686,14 @@ impl Database {
                     r.get::<_, Option<f64>>(5).unwrap_or(None).unwrap_or(0.0),
                 ))
             };
-            let entities: Vec<(String, String, String, f64, bool, f64)> =
-                if let Some(ref tp) = params.topic_path {
-                    stmt.query_map(params![category, tp], map_row)?
-                        .filter_map(|r| r.ok())
-                        .collect()
-                } else {
-                    stmt.query_map(params![category], map_row)?
-                        .filter_map(|r| r.ok())
-                        .collect()
+            let entities: Vec<(String, String, String, f64, bool, f64)> = {
+                let it = match binds.len() {
+                    3 => stmt.query_map(rusqlite::params![binds[0], binds[1], binds[2]], map_row)?,
+                    2 => stmt.query_map(rusqlite::params![binds[0], binds[1]], map_row)?,
+                    _ => stmt.query_map(rusqlite::params![binds[0]], map_row)?,
                 };
+                it.filter_map(|r| r.ok()).collect()
+            };
             drop(stmt);
 
             // Decrypt bodies when encryption is on — the LLM reflects over
@@ -10714,8 +10865,8 @@ impl Database {
                             source: "mimir_dream".to_string(),
                             always_on: false,
                             certainty,
-                            workspace_hash: String::new(),
-                            agent_id: String::new(),
+                            workspace_hash: scope_ws.clone().unwrap_or_default(),
+                            agent_id: params.requesting_agent_id.clone(),
                             visibility: "workspace".to_string(),
                             follow_count: 0,
                             miss_count: 0,
@@ -10796,6 +10947,8 @@ impl Database {
                     "categories_scanned": report.categories_scanned,
                     "entities_examined": report.entities_examined,
                     "clusters_dreamed": report.clusters_dreamed,
+                    // #854: scope labeling — "scoped:<ws>" or "global".
+                    "scope": report.workspace_hash.clone().map(|ws| format!("scoped:{ws}")).unwrap_or_else(|| "global".to_string()),
                 }))?,
                 acted_json: serde_json::to_string(&serde_json::json!({
                     "insights_written": report.insights_written,
@@ -10809,8 +10962,10 @@ impl Database {
                 category: "insight".to_string(),
                 key: "dream-run".to_string(),
                 entity_id: String::new(),
-                agent_id: String::new(),
-                workspace_hash: String::new(), // workspace-agnostic system event
+                agent_id: params.requesting_agent_id.clone(),
+                // #854: scoped runs carry their workspace; global runs are
+                // system-scoped events labeled "global" in evaluated_json.
+                workspace_hash: report.workspace_hash.clone().unwrap_or_default(),
                 created_at_unix_ms: now,
             };
             self.journal(&event)?;
@@ -12312,11 +12467,35 @@ last_accessed: {}
 
     /// List all distinct categories in the entities table.
     pub fn workspace_list_categories(&self) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+        self.workspace_list_categories_scoped(None)
+    }
+
+    /// #854: category listing restricted to one workspace. `Some(ws)` lists
+    /// only categories with live entities in that workspace (strict match —
+    /// legacy `''`/global entities are only visible to unscoped listings);
+    /// `None` lists across all workspaces (global view).
+    pub fn workspace_list_categories_scoped(
+        &self,
+        workspace_hash: Option<&str>,
+    ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
         let conn = self.conn()?;
-        let mut stmt = conn.prepare(
-            "SELECT DISTINCT category FROM entities WHERE archived = 0 ORDER BY category",
-        )?;
-        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let (sql, param): (&str, Option<&str>) = match workspace_hash {
+            Some(ws) => (
+                "SELECT DISTINCT category FROM entities WHERE archived = 0 \
+                 AND workspace_hash = ?1 ORDER BY category",
+                Some(ws),
+            ),
+            None => (
+                "SELECT DISTINCT category FROM entities WHERE archived = 0 ORDER BY category",
+                None,
+            ),
+        };
+        let mut stmt = conn.prepare(sql)?;
+        let get_category = |r: &rusqlite::Row| -> rusqlite::Result<String> { r.get(0) };
+        let rows = match param {
+            Some(ws) => stmt.query_map(params![ws], get_category)?,
+            None => stmt.query_map([], get_category)?,
+        };
         let mut cats = Vec::new();
         for row in rows {
             cats.push(row?);
@@ -13182,6 +13361,8 @@ last_accessed: {}
             category,
             key,
             created_at_unix_ms: now,
+            agent_id: params.agent_id.clone(),
+            workspace_hash: params.workspace_hash.clone(),
         })
     }
 
@@ -23611,6 +23792,9 @@ mod tests {
             dry_run: false,
             cold_first: false,
             archive_sources: false,
+            workspace_hash: Some(String::new()),
+            global: false,
+            requesting_agent_id: String::new(),
         };
         let report = db.consolidate(&params).unwrap();
 
@@ -23698,6 +23882,9 @@ mod tests {
             dry_run: true,
             cold_first: false,
             archive_sources: false,
+            workspace_hash: Some(String::new()),
+            global: false,
+            requesting_agent_id: String::new(),
         };
         let report = db.consolidate(&params).unwrap();
         assert_eq!(report.observations_created, 1);
@@ -23735,6 +23922,9 @@ mod tests {
             dry_run: false,
             cold_first: false,
             archive_sources: false,
+            workspace_hash: Some(String::new()),
+            global: false,
+            requesting_agent_id: String::new(),
         };
         let report = db.consolidate(&params).unwrap();
         assert_eq!(
@@ -23789,6 +23979,9 @@ mod tests {
                 dry_run: false,
                 cold_first: true,
                 archive_sources: true,
+                workspace_hash: Some(String::new()),
+                global: false,
+                requesting_agent_id: String::new(),
             })
             .unwrap();
         assert_eq!(report.observations_created, 1);
@@ -23875,6 +24068,9 @@ mod tests {
                 dry_run: true,
                 cold_first: true,
                 archive_sources: false,
+                workspace_hash: Some(String::new()),
+                global: false,
+                requesting_agent_id: String::new(),
             })
             .unwrap();
         assert_eq!(report.observations_created, 1);
@@ -23885,6 +24081,396 @@ mod tests {
             obs.source_ids
         );
 
+        let _ = fs::remove_file(&path);
+    }
+
+    // ─── #854 workspace-scoped maintenance ────────────────────────────
+
+    #[test]
+    fn consolidate_requires_workspace_scope_or_global() {
+        let (db, path) = temp_db();
+        let params = crate::models::ConsolidateParams {
+            category: "facts".to_string(),
+            similarity_threshold: 0.6,
+            limit: 50,
+            offset: 0,
+            dry_run: true,
+            cold_first: false,
+            archive_sources: false,
+            workspace_hash: None,
+            global: false,
+            requesting_agent_id: String::new(),
+        };
+        let err = db.consolidate(&params).unwrap_err().to_string();
+        assert!(
+            err.contains("workspace scope required"),
+            "fail-closed scope error expected, got: {err}"
+        );
+        // Ambiguous scope (workspace + global) is rejected too.
+        let amb = crate::models::ConsolidateParams {
+            workspace_hash: Some("ws-a".to_string()),
+            global: true,
+            ..params
+        };
+        let err2 = db.consolidate(&amb).unwrap_err().to_string();
+        assert!(err2.contains("mutually exclusive"), "{err2}");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn consolidate_never_merges_across_workspaces() {
+        let (db, path) = temp_db();
+        // Direct SQL insert: remember()'s near-duplicate dedup would collapse
+        // the intentionally-identical fixtures.
+        let ins = |id: &str, key: &str, ws: &str| {
+            db.conn()
+                .unwrap()
+                .execute(
+                    "INSERT INTO entities (id, category, key, body_json, status, type, tags, \
+                     decay_score, retrieval_count, layer, topic_path, archived, archive_reason, \
+                     links, verified, source, certainty, workspace_hash, created_at_unix_ms, \
+                     last_accessed_unix_ms) \
+                     VALUES (?1, 'facts', ?2, '{\"note\":\"the shared billing service handles \
+                     invoicing and payments\"}', 'active', 'insight', '[]', 1.0, 0, 'working', \
+                     '', 0, '', '[]', 0, 'agent', 0.5, ?3, 0, 0)",
+                    params![id, key, ws],
+                )
+                .unwrap();
+        };
+        ins("w1-a", "billing-a", "ws-one");
+        ins("w1-b", "billing-b", "ws-one");
+        ins("w2-a", "billing-c", "ws-two");
+
+        let report = db
+            .consolidate(&crate::models::ConsolidateParams {
+                category: "facts".to_string(),
+                similarity_threshold: 0.6,
+                limit: 50,
+                offset: 0,
+                dry_run: false,
+                cold_first: false,
+                archive_sources: false,
+                workspace_hash: Some("ws-one".to_string()),
+                global: false,
+                requesting_agent_id: String::new(),
+            })
+            .unwrap();
+
+        assert_eq!(report.entities_examined, 2, "scoped scan must only see ws-one");
+        assert_eq!(report.observations_created, 1);
+        assert_eq!(report.workspace_hash.as_deref(), Some("ws-one"));
+        assert!(!report.global);
+        let obs = &report.observations[0];
+        assert!(
+            obs.source_ids.contains(&"w1-a".to_string())
+                && obs.source_ids.contains(&"w1-b".to_string()),
+            "evidence must be ws-one only, got {:?}",
+            obs.source_ids
+        );
+        assert!(
+            !obs.source_ids.contains(&"w2-a".to_string()),
+            "cross-workspace evidence must never leak into a scoped run"
+        );
+
+        // The derived observation inherits the workspace scope.
+        let stored = db
+            .get_entity("observation", &obs.key)
+            .unwrap()
+            .expect("observation persisted");
+        assert_eq!(stored.workspace_hash, "ws-one");
+
+        // ws-two's entity is untouched and not part of any evidence set.
+        let w2 = db.get_entity("facts", "billing-c").unwrap().unwrap();
+        assert!(!w2.archived);
+        assert_eq!(w2.workspace_hash, "ws-two");
+
+        // A scoped run for ws-two sees only its own singleton.
+        let report2 = db
+            .consolidate(&crate::models::ConsolidateParams {
+                category: "facts".to_string(),
+                similarity_threshold: 0.6,
+                limit: 50,
+                offset: 0,
+                dry_run: false,
+                cold_first: false,
+                archive_sources: false,
+                workspace_hash: Some("ws-two".to_string()),
+                global: false,
+                requesting_agent_id: String::new(),
+            })
+            .unwrap();
+        assert_eq!(report2.entities_examined, 1);
+        assert_eq!(report2.observations_created, 0);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn consolidate_global_mode_crosses_workspaces_and_audits() {
+        let (db, path) = temp_db();
+        let ins = |id: &str, key: &str, ws: &str| {
+            db.conn()
+                .unwrap()
+                .execute(
+                    "INSERT INTO entities (id, category, key, body_json, status, type, tags, \
+                     decay_score, retrieval_count, layer, topic_path, archived, archive_reason, \
+                     links, verified, source, certainty, workspace_hash, created_at_unix_ms, \
+                     last_accessed_unix_ms) \
+                     VALUES (?1, 'facts', ?2, '{\"note\":\"the shared billing service handles \
+                     invoicing and payments\"}', 'active', 'insight', '[]', 1.0, 0, 'working', \
+                     '', 0, '', '[]', 0, 'agent', 0.5, ?3, 0, 0)",
+                    params![id, key, ws],
+                )
+                .unwrap();
+        };
+        ins("w1-a", "billing-a", "ws-one");
+        ins("w1-b", "billing-b", "ws-one");
+        ins("w2-a", "billing-c", "ws-two");
+
+        // The global run is AUTHORIZED: sweeper holds memory.maintenance.global
+        // in the system scope ('*').
+        db.agent_upsert("sweeper", "Sweeper", 2, "fleet").unwrap();
+        let manifest = crate::models::AuthorityManifestInput {
+            agent_id: "sweeper".to_string(),
+            workspace_hash: "*".to_string(), // system/global scope sentinel
+            allowed_capabilities: vec!["memory.maintenance.global".to_string()],
+            approval_required_capabilities: vec![],
+            scope_anchors: vec!["vault:*".to_string()],
+            approver_principals: vec![],
+            allowed_inbound_principals: vec![],
+            permitted_external_ref_prefixes: vec!["vault:*".to_string()],
+            max_parallel_actions: 1,
+            mode: "enforce".to_string(),
+            expires_at_unix_ms: None,
+            capability_constraints_json: "{}".to_string(),
+        };
+        db.authority_set(&manifest, "admin").unwrap();
+
+        let report = db
+            .consolidate(&crate::models::ConsolidateParams {
+                category: "facts".to_string(),
+                similarity_threshold: 0.6,
+                limit: 50,
+                offset: 0,
+                dry_run: false,
+                cold_first: false,
+                archive_sources: false,
+                workspace_hash: None,
+                global: true,
+                requesting_agent_id: "sweeper".to_string(),
+            })
+            .unwrap();
+
+        assert!(report.global);
+        assert_eq!(report.workspace_hash, None);
+        assert_eq!(report.entities_examined, 3);
+        assert_eq!(report.observations_created, 1);
+        let obs = &report.observations[0];
+        assert!(
+            obs.source_ids.contains(&"w1-a".to_string())
+                && obs.source_ids.contains(&"w2-a".to_string()),
+            "global mode may cluster facts from multiple workspaces, got {:?}",
+            obs.source_ids
+        );
+        // Global derived records are system-scoped (''), not silently bound.
+        let stored = db
+            .get_entity("observation", &obs.key)
+            .unwrap()
+            .expect("observation persisted");
+        assert_eq!(stored.workspace_hash, "");
+
+        // The global run is an audited event labeled with the requester.
+        let events = db.get_recent_journal("", 100).unwrap();
+        assert!(
+            events.iter().any(|e| e.event_type == "maintenance_global_run"
+                && e.agent_id == "sweeper"
+                && e.category == "consolidate"),
+            "global run must produce a maintenance_global_run audit event"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn consolidate_global_mode_denied_without_manifest() {
+        // #854 review: identity-carrying callers FAIL CLOSED — an agent with
+        // NO authority manifest at all cannot run global maintenance, even
+        // though it could run scoped maintenance.
+        let (db, path) = temp_db();
+        db.agent_upsert("ghost", "Ghost", 2, "fleet").unwrap();
+
+        let err = db
+            .consolidate(&crate::models::ConsolidateParams {
+                category: "facts".to_string(),
+                similarity_threshold: 0.6,
+                limit: 50,
+                offset: 0,
+                dry_run: true,
+                cold_first: false,
+                archive_sources: false,
+                workspace_hash: None,
+                global: true,
+                requesting_agent_id: "ghost".to_string(),
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("global maintenance denied")
+                && err.contains("memory.maintenance.global"),
+            "missing manifest must deny global mode, got: {err}"
+        );
+
+        // Scoped runs remain available to the same identity.
+        let ok = db
+            .consolidate(&crate::models::ConsolidateParams {
+                category: "facts".to_string(),
+                similarity_threshold: 0.6,
+                limit: 50,
+                offset: 0,
+                dry_run: true,
+                cold_first: false,
+                archive_sources: false,
+                workspace_hash: Some(String::new()),
+                global: false,
+                requesting_agent_id: "ghost".to_string(),
+            })
+            .is_ok();
+        assert!(ok, "scoped runs must not require a manifest");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn consolidate_global_mode_denied_without_capability() {
+        let (db, path) = temp_db();
+        db.agent_upsert("maintainer", "Maintainer", 2, "fleet").unwrap();
+        let manifest = crate::models::AuthorityManifestInput {
+            agent_id: "maintainer".to_string(),
+            workspace_hash: "*".to_string(), // system/global scope sentinel
+            allowed_capabilities: vec!["memory.read".to_string()],
+            approval_required_capabilities: vec![],
+            scope_anchors: vec!["vault:*".to_string()],
+            approver_principals: vec![],
+            allowed_inbound_principals: vec![],
+            permitted_external_ref_prefixes: vec!["vault:*".to_string()],
+            max_parallel_actions: 1,
+            mode: "enforce".to_string(),
+            expires_at_unix_ms: None,
+            capability_constraints_json: "{}".to_string(),
+        };
+        db.authority_set(&manifest, "admin").unwrap();
+
+        let err = db
+            .consolidate(&crate::models::ConsolidateParams {
+                category: "facts".to_string(),
+                similarity_threshold: 0.6,
+                limit: 50,
+                offset: 0,
+                dry_run: true,
+                cold_first: false,
+                archive_sources: false,
+                workspace_hash: None,
+                global: true,
+                requesting_agent_id: "maintainer".to_string(),
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("memory.maintenance.global"),
+            "global mode must be capability-gated, got: {err}"
+        );
+
+        // The same identity may still run a scoped pass.
+        let ok = db
+            .consolidate(&crate::models::ConsolidateParams {
+                category: "facts".to_string(),
+                similarity_threshold: 0.6,
+                limit: 50,
+                offset: 0,
+                dry_run: true,
+                cold_first: false,
+                archive_sources: false,
+                workspace_hash: Some(String::new()),
+                global: false,
+                requesting_agent_id: "maintainer".to_string(),
+            })
+            .is_ok();
+        assert!(ok, "scoped runs must not require the global capability");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn dream_scoped_restricts_scan_and_inherits_workspace() {
+        let (db, path) = temp_db();
+        let ins = |id: &str, ws: &str| {
+            db.conn()
+                .unwrap()
+                .execute(
+                    "INSERT INTO entities (id, category, key, body_json, status, type, tags, \
+                     decay_score, retrieval_count, layer, topic_path, archived, archive_reason, \
+                     links, verified, source, certainty, workspace_hash, created_at_unix_ms, \
+                     last_accessed_unix_ms) \
+                     VALUES (?1, 'episodes', ?1, '{\"note\":\"user ran database migrations \
+                     before restarting the api service\"}', 'active', 'insight', '[]', 1.0, 0, \
+                     'working', '', 0, '', '[]', 0, 'agent', 0.5, ?2, 0, 0)",
+                    params![id, ws],
+                )
+                .unwrap();
+        };
+        ins("sc-ep-1", "ws-one");
+        ins("sc-ep-2", "ws-one");
+        ins("sc-ep-3", "ws-two");
+        ins("sc-ep-4", "ws-two");
+
+        let params = crate::models::DreamParams {
+            category: Some("episodes".to_string()),
+            topic_path: None,
+            similarity_threshold: 0.3,
+            max_entities: 100,
+            max_clusters: 5,
+            min_cluster_size: 2,
+            dry_run: false,
+            cold_first: true,
+            archive_sources: false,
+            workspace_hash: Some("ws-one".to_string()),
+            global: false,
+            requesting_agent_id: String::new(),
+        };
+        let stub = |_prompt: &str| -> Result<String, String> {
+            Ok(r#"{"insights":[{"insight_type":"pattern","summary":"migrations run before restarts","confidence":0.9,"supported_by":[0,1]}]}"#.to_string())
+        };
+        let report = db.dream_with_llm(&params, &stub).unwrap();
+
+        assert_eq!(report.workspace_hash.as_deref(), Some("ws-one"));
+        assert!(!report.global);
+        assert_eq!(
+            report.entities_examined, 2,
+            "scoped dream must only examine ws-one entities"
+        );
+        assert_eq!(report.insights_written, 1);
+        let ins = &report.insights[0];
+        assert!(
+            ins.source_ids.contains(&"sc-ep-1".to_string())
+                && ins.source_ids.contains(&"sc-ep-2".to_string()),
+            "insight evidence must be ws-one only, got {:?}",
+            ins.source_ids
+        );
+        assert!(
+            !ins.source_ids.contains(&"sc-ep-3".to_string()),
+            "ws-two sources must never enter a ws-one dream"
+        );
+
+        // The derived insight inherits the workspace scope.
+        let stored = db
+            .get_entity("insight", &ins.key)
+            .unwrap()
+            .expect("insight persisted");
+        assert_eq!(stored.workspace_hash, "ws-one");
+
+        // The dream journal event carries the scope and attribution.
+        let events = db.get_recent_journal("ws-one", 50).unwrap();
+        let ev = events
+            .iter()
+            .find(|e| e.event_type == "dream")
+            .expect("dream journal event");
+        assert!(ev.evaluated_json.contains("scoped:ws-one"), "{}", ev.evaluated_json);
         let _ = fs::remove_file(&path);
     }
 
@@ -23903,6 +24489,9 @@ mod tests {
             dry_run: false,
             cold_first: true,
             archive_sources: false,
+            workspace_hash: Some(String::new()),
+            global: false,
+            requesting_agent_id: String::new(),
         }
     }
 
