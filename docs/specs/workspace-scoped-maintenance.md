@@ -29,12 +29,15 @@ Every consolidation/dreaming run must name exactly one scope:
 
 Global mode is an explicit, reviewable operation:
 
-- **Authorization**: callers carrying a host identity (`requesting_agent_id`,
-  stamped by the MCP transport from `clientInfo.name`) must hold capability
-  `memory.maintenance.global` in the **system scope** — an authority manifest
-  with `workspace_hash = "*"` (the system/global-scope sentinel; manifests
-  require a non-empty workspace). Anonymous callers (no host identity) fail
-  open, consistent with the rest of the authority regime.
+- **Authorization**: identity-carrying callers (`requesting_agent_id`, stamped
+  by the MCP transport from `clientInfo.name` and overwriting any forged
+  value) FAIL CLOSED: they must hold capability `memory.maintenance.global`
+  in the **system scope** — an authority manifest with
+  `workspace_hash = "*"` (the system/global-scope sentinel; manifests
+  require a non-empty workspace). Missing manifest or missing capability =
+  denied. Anonymous callers (no host identity) fail open — there is no
+  identity to hold accountable, matching the authority regime's pre-manifest
+  behavior.
 - **Labeling**: reports expose `workspace_hash: null` + `global: true`; MCP
   output schemas carry both fields.
 - **Audit**: real (non-dry-run) global consolidate runs journal a
@@ -70,6 +73,13 @@ and are out of scope for this contract.
   present with the requester.
 - `consolidate_global_mode_denied_without_capability` — manifest without
   `memory.maintenance.global` denies the global run; scoped runs still work.
+- `consolidate_global_mode_denied_without_manifest` — identity-carrying
+  caller with no manifest at all is denied global mode (fail-closed).
+- `transport_host_identity_overrides_forged_requesting_agent_id` — an MCP
+  caller-supplied (forged) `requesting_agent_id` is overwritten by the
+  captured `clientInfo.name`; the correction attributes the host.
+- `dream_fallback_consolidate_is_scoped` — the no-LLM fallback carries the
+  workspace scope into the mechanical pass.
 - `dream_scoped_restricts_scan_and_inherits_workspace` — scoped dream
   examines only the scoped workspace, insight evidence stays in-scope,
   insight and journal event carry the scope.
