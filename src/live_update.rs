@@ -299,7 +299,11 @@ mod tests {
     fn rename_replace_is_detected() {
         let p = tmp_file("rename-target.txt", "old image");
         let id = BinaryIdentity::capture(&p).expect("capture");
-        let replacement = tmp_file("rename-source.txt", "new image");
+        // Different length on purpose: on Windows dev/ino are 0, so detection
+        // must not hinge on a sub-ms mtime delta (rename preserves the source
+        // mtime, which was written only moments after capture — that made this
+        // test flaky on Windows runners).
+        let replacement = tmp_file("rename-source.txt", "new image with a longer body");
         std::thread::sleep(Duration::from_millis(20));
         fs::rename(&replacement, &p).unwrap();
         assert!(id.replaced(), "rename-replace (new inode) must be detected");

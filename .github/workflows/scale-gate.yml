@@ -36,12 +36,11 @@ env:
 
 jobs:
   scale-gate:
-    # 8-core: the committed reference baselines (benchmark/scale/report-v2.21.0-*)
-    # were measured on 8-vCPU hardware, and budgets carry ~3x headroom over
-    # them. GitHub provides larger runners free for public repositories; the
-    # default 2-vCPU runner measures 30x+ over the same budgets and made the
-    # gate permanently red (#898).
-    runs-on: ubuntu-8core
+    # Default 2-vCPU runner: ubuntu-8core labels do NOT provision on this
+    # repository (queued runs sat without a runner for 1h+ — #898). Budgets in
+    # benchmark/scale/gate.py are calibrated to this runner (measured p99s x3
+    # headroom; see the 2026-08-08 recalibration in #898 / #900).
+    runs-on: ubuntu-latest
     timeout-minutes: 350
     steps:
       - uses: actions/checkout@v4
