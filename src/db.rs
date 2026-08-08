@@ -2611,6 +2611,18 @@ impl Database {
             }
         }
         drop(stmt);
+        #[cfg(test)]
+        if candidates.len() <= 8 {
+            eprintln!(
+                "[dense-sup-diag] governed candidates={} keys={:?} max_scan={}",
+                candidates.len(),
+                candidates
+                    .iter()
+                    .map(|(entity, _)| entity.key.as_str())
+                    .collect::<Vec<_>>(),
+                max_scan
+            );
+        }
         // Materialize the primary rows before opening either governance
         // connection. On Windows, keeping the dense scan's pooled primary
         // connection live while the suppression interceptor checks the
@@ -2621,6 +2633,14 @@ impl Database {
         drop(conn);
         let entities: Vec<Entity> = candidates.iter().map(|(entity, _)| entity.clone()).collect();
         let visible = self.filter_suppressed(entities)?;
+        #[cfg(test)]
+        if visible.len() <= 8 {
+            eprintln!(
+                "[dense-sup-diag] governed visible={} keys={:?}",
+                visible.len(),
+                visible.iter().map(|entity| entity.key.as_str()).collect::<Vec<_>>()
+            );
+        }
         let visible_ids: std::collections::HashSet<String> =
             visible.into_iter().map(|entity| entity.id).collect();
         let query_norm = query_vec
@@ -4439,6 +4459,8 @@ impl Database {
         let overlay = self.governance_read_conn_compatible()?;
         let now = now_ms();
         let mut kept = Vec::with_capacity(entities.len());
+        #[cfg(test)]
+        let dense_diag = entities.len() <= 8;
         for entity in entities {
             let erased = overlay
                 .as_ref()
@@ -4452,10 +4474,20 @@ impl Database {
                 })
                 .transpose()?
                 .unwrap_or(false);
-            if erased || !self.primary_entity_suppressed_with_conn(conn, &entity, now)? {
-                if !erased {
-                    kept.push(entity);
-                }
+            let primary_suppressed = self.primary_entity_suppressed_with_conn(&conn, &entity, now)?;
+            #[cfg(test)]
+            if dense_diag {
+                eprintln!(
+                    "[dense-sup-diag] filter key={} id={} workspace={} erased={} primary_suppressed={}",
+                    entity.key,
+                    entity.id,
+                    entity.workspace_hash,
+                    erased,
+                    primary_suppressed
+                );
+            }
+            if !erased && !primary_suppressed {
+                kept.push(entity);
             }
         }
         Ok(kept)

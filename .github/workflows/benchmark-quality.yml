@@ -87,7 +87,7 @@ jobs:
               "checks_passed", "checks_total", "accuracy", "failed_categories", "invalid_cases", "missing_categories",
               "unavailable_categories", "unavailable_cases", "unavailable_capabilities", "unavailable_metrics",
               "partial_metrics", "failed_metrics", "invalid_metrics", "case_count", "case_count_valid", "metrics",
-              "metric_rates", "thresholds", "override_policy", "source_report_signature",
+              "metric_rates", "thresholds", "override_policy", "source_report_signature", "advisory_override",
           }
 
           def walk(value, path):
