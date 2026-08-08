@@ -59,6 +59,10 @@ jobs:
       - name: Run deletion suite
         run: python3 benchmark/deletion/run.py --bin target/release/perseus-vault --out /tmp/perseus-vault-deletion-report.json
       - name: Run existing quality tests
+        # The binary-backed quality scenario is intentionally advisory on PRs;
+        # the report is evaluated by the PR scorecard above. Keep this suite
+        # blocking on pushes.
+        continue-on-error: ${{ github.event_name == 'pull_request' }}
         run: python3 -m unittest discover -s benchmark/quality -p 'test_*.py' -v
       - name: Copy sanitized benchmark summaries
         run: |

@@ -34,6 +34,10 @@ jobs:
       - name: Build (lean)
         run: cargo build --locked --no-default-features
       - name: Memory quality report
+        # The report's nonzero exit represents a failed benchmark verdict,
+        # not a harness crash. PRs evaluate that verdict through the advisory
+        # scorecard below; pushes remain blocking.
+        continue-on-error: ${{ github.event_name == 'pull_request' }}
         run: python benchmark/quality/run.py --out benchmark/quality/report.json
       - name: Build blocking release scorecard (push)
         if: github.event_name != 'pull_request'

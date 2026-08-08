@@ -2611,9 +2611,16 @@ impl Database {
             }
         }
         drop(stmt);
-        let entities: Vec<Entity> = candidates.iter().map(|(entity, _)| entity.clone()).collect();
-        let visible = self.filter_suppressed_with_conn(&conn, entities)?;
+        // Materialize the primary rows before opening either governance
+        // connection. On Windows, keeping the dense scan's pooled primary
+        // connection live while the suppression interceptor checks the
+        // sidecar can make the read path observe an empty governed set.
+        // Release it first, matching the recall/BM25 path's connection
+        // ownership boundary; the interceptor obtains its own short-lived
+        // primary connection and sidecar read connection.
         drop(conn);
+        let entities: Vec<Entity> = candidates.iter().map(|(entity, _)| entity.clone()).collect();
+        let visible = self.filter_suppressed(entities)?;
         let visible_ids: std::collections::HashSet<String> =
             visible.into_iter().map(|entity| entity.id).collect();
         let query_norm = query_vec
