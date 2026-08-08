@@ -5628,7 +5628,7 @@ pub fn handle_autocohere(db: &Database, args: Value) -> Result<String, String> {
     let mut observations_created = 0i64;
     let mut consolidate_sources_archived = 0i64;
     let categories = db
-        .workspace_list_categories()
+        .workspace_list_categories_scoped(a.workspace_hash.as_deref())
         .map_err(|e| format!("Autocohere step (consolidate: categories) failed: {}", e))?;
     for cat in categories {
         if cat == "observation" || cat == "memories" {

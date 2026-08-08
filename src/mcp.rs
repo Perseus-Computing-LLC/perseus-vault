@@ -3789,8 +3789,8 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
           "type": "boolean"
         },
         "workspace_hash": {
-          "type": "string",
-          "description": "#854 effective scope: the workspace this run operated in"
+          "type": ["string", "null"],
+          "description": "#854 effective scope: the workspace this run operated in (null when global=true)"
         },
         "global": {
           "type": "boolean",
@@ -3918,8 +3918,8 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
           "type": "boolean"
         },
         "workspace_hash": {
-          "type": "string",
-          "description": "#854 effective scope: the workspace this run operated in"
+          "type": ["string", "null"],
+          "description": "#854 effective scope: the workspace this run operated in (null when global=true)"
         },
         "global": {
           "type": "boolean",
@@ -3931,6 +3931,18 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
             "type": "object"
           },
           "description": "The insights written (or previewed), each with entity_id, key, summary, insight_type, confidence, source_ids, category, contradiction, deduped"
+        },
+        "fallback": {
+          "type": "string",
+          "description": "Present only when fallback_consolidate ran (no LLM endpoint): always \"consolidate\". The report then has this union shape — categories_scanned, entities_examined, observations_created, sources_archived, dry_run — instead of the LLM dream counters."
+        },
+        "note": {
+          "type": "string",
+          "description": "Fallback-only explanation of why the mechanical pass ran"
+        },
+        "observations_created": {
+          "type": "integer",
+          "description": "Fallback-only: observations created by the mechanical consolidate pass"
         }
       }
     },
@@ -4419,6 +4431,20 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
           "type": "string",
           "description": "What task was being attempted when the correction occurred"
         },
+        "evidence": {
+          "type": "object",
+          "description": "Write-time audit envelope for the correction's source evidence. capture_mode distinguishes snapshot, hash_only, pointer_only, not_requested, capture_failed, and legacy_unknown; a missing value is never interpreted implicitly.",
+          "properties": {
+            "capture_mode": { "type": "string", "enum": ["snapshot", "hash_only", "pointer_only", "not_requested", "capture_failed", "legacy_unknown"] },
+            "resolved_value": { "description": "Resolved source value retained at write time when capture_mode=snapshot" },
+            "content_sha256": { "type": "string", "description": "64-hex SHA-256 of the resolved value or source bytes" },
+            "source_system": { "type": "string" },
+            "source_ref": { "type": "string" },
+            "captured_at_unix_ms": { "type": "integer" },
+            "replayable": { "type": "boolean" }
+          },
+          "required": ["capture_mode", "captured_at_unix_ms", "replayable"]
+        },
         "session_id": {
           "type": "string",
           "default": "",
@@ -4736,6 +4762,26 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
         "db_size_delta_bytes": {
           "type": "integer",
           "description": "Change in SQLite file size in bytes"
+        },
+        "decay_auto_archived": {
+          "type": "integer",
+          "description": "Entities decay auto-archived during this pass (#490; 0 under dry_run)"
+        },
+        "observations_created": {
+          "type": "integer",
+          "description": "Observations created by the consolidation step"
+        },
+        "consolidate_sources_archived": {
+          "type": "integer",
+          "description": "Sources archived by the consolidation step (verified/importance-floored exempt)"
+        },
+        "workspace_hash": {
+          "type": ["string", "null"],
+          "description": "#854 effective consolidation scope: the workspace the consolidate step operated in (null = whole-vault pass)"
+        },
+        "global": {
+          "type": "boolean",
+          "description": "#854 true when the consolidation step deliberately crossed all workspaces"
         },
         "dry_run": {
           "type": "boolean"
