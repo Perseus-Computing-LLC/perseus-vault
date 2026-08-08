@@ -7,7 +7,7 @@ import math
 import sys
 from pathlib import Path
 
-from run import LEGACY_REQUIRED_CATEGORIES, V0_REQUIRED_CATEGORIES
+from run import LEGACY_REQUIRED_CATEGORIES, V0_REQUIRED_CATEGORIES, V1_REQUIRED_CATEGORIES
 
 MINIMUM_ACCURACY = 1.0
 REQUIRED_APPROVER = "maintainer"
@@ -20,6 +20,12 @@ REQUIRED_METRIC_RATES = {
     "mutation_supersession_rate",
     "compaction_projection_rate",
     "action_grounding_rate",
+}
+V1_REQUIRED_METRIC_RATES = {
+    "recall_outcome_rate",
+    "admission_rate",
+    "prompt_safety_rate",
+    "identity_ambiguity_rate",
 }
 
 
@@ -69,11 +75,20 @@ def _is_v0_report(report):
     )
 
 
+def _is_v1_report(report):
+    categories = {case.get("category") for case in report.get("cases", [])}
+    return report.get("harness_version") == "perseus-vault-memory-quality/v1" or bool(
+        categories.intersection(set(V1_REQUIRED_CATEGORIES) - set(V0_REQUIRED_CATEGORIES))
+    )
+
+
 def _required_categories(report):
     """Select the contract from report identity, not self-declared omissions."""
     categories = {case.get("category") for case in report.get("cases", [])}
     dataset = report.get("dataset")
     harness_version = report.get("harness_version", "")
+    if _is_v1_report(report):
+        return set(V1_REQUIRED_CATEGORIES)
     if (
         dataset == "perseus-vault-memory-quality-v0"
         or harness_version == "perseus-vault-memory-quality/v0"
@@ -134,7 +149,8 @@ def build_scorecard(report):
         if isinstance(metric, dict) and metric.get("status") == "failed"
     )
     invalid_metrics = set()
-    for name in REQUIRED_METRIC_RATES:
+    required_metric_rates = REQUIRED_METRIC_RATES | (V1_REQUIRED_METRIC_RATES if _is_v1_report(report) else set())
+    for name in required_metric_rates:
         metric = metric_rates.get(name)
         if not isinstance(metric, dict):
             unavailable_metrics.add(name)
@@ -172,7 +188,7 @@ def build_scorecard(report):
     )
     exact_accuracy = math.isfinite(accuracy) and accuracy == MINIMUM_ACCURACY
     case_count = len(report.get("cases", []))
-    case_count_valid = 20 <= case_count <= 30 if _is_v0_report(report) else case_count == 4
+    case_count_valid = 20 <= case_count <= 40 if _is_v1_report(report) else (20 <= case_count <= 30 if _is_v0_report(report) else case_count == 4)
     release_ready = (
         report.get("passed") is True
         and exact_accuracy
@@ -222,7 +238,7 @@ def build_scorecard(report):
             "exact_accuracy": True,
             "consistent_check_counts": True,
             "counts_match_cases": True,
-            "case_count_20_to_30_for_v0": True,
+            "case_count_20_to_40_for_v1": True,
         },
         "override_policy": {
             "allowed": True,

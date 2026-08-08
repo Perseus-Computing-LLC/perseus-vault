@@ -240,8 +240,8 @@ class QualityHarnessTests(unittest.TestCase):
         out = Path(tempfile.mkdtemp()) / "report.json"
         report = run_benchmark(Path(__file__).with_name("manifest.json"), None, out)
         self.assertEqual(report["dataset"], "perseus-vault-memory-quality-v0")
-        self.assertEqual(report["checks_total"], 29)
-        self.assertEqual(len(report["cases"]), 24)
+        self.assertEqual(report["checks_total"], 41)
+        self.assertEqual(len(report["cases"]), 30)
         self.assertTrue(all(case["evidence"] for case in report["cases"]))
         self.assertTrue(report["passed"])
 

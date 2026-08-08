@@ -1,0 +1,63 @@
+name: Benchmark Quality Gate
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - 'benchmark/**'
+      - 'src/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/benchmark-quality.yml'
+  pull_request:
+    branches: [main, master]
+    paths:
+      - 'benchmark/**'
+      - 'src/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/benchmark-quality.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: benchmark-quality-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  deterministic-harness:
+    name: Deterministic benchmark harnesses
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build lean release binary
+        run: cargo build --locked --release --no-default-features
+      - name: Run benchmark package tests
+        run: |
+          python3 -m unittest discover -s benchmark/package -p 'test_*.py' -v
+          python3 -m unittest discover -s benchmark/correction -p 'test_*.py' -v
+          python3 -m unittest discover -s benchmark/freshness -p 'test_*.py' -v
+          python3 -m unittest discover -s benchmark/economics -p 'test_*.py' -v
+      - name: Validate claim register
+        run: python3 benchmark/claim_register.py
+      - name: Run deterministic local portfolio
+        run: python3 benchmark/run_smoke.py --bin target/release/perseus-vault --out /tmp/perseus-vault-benchmark-smoke-summary.json
+      - name: Run deletion suite
+        run: python3 benchmark/deletion/run.py --bin target/release/perseus-vault --out /tmp/perseus-vault-deletion-report.json
+      - name: Run existing quality tests
+        run: python3 -m unittest discover -s benchmark/quality -p 'test_*.py' -v
+      - name: Copy sanitized benchmark summaries
+        run: |
+          mkdir -p benchmark-artifacts
+          cp /tmp/perseus-vault-benchmark-smoke-summary.json benchmark-artifacts/
+          cp /tmp/perseus-vault-deletion-report.json benchmark-artifacts/
+      - name: Upload sanitized benchmark summaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: perseus-vault-benchmark-summaries
+          path: benchmark-artifacts/
+          if-no-files-found: error
+          retention-days: 14

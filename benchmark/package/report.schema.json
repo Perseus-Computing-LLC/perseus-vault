@@ -1,0 +1,162 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://perseus.observer/schemas/perseus-vault-benchmark-report-v1.json",
+  "title": "Perseus Vault benchmark report",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "benchmark_id",
+    "suite_version",
+    "control_profile_sha256",
+    "run_fingerprint_sha256",
+    "status",
+    "capabilities",
+    "cases",
+    "metrics",
+    "not_measured",
+    "excluded",
+    "public_evidence",
+    "raw_inputs_captured",
+    "result_signature_sha256"
+  ],
+  "properties": {
+    "schema_version": {"const": "perseus-vault-benchmark-report/v1"},
+    "benchmark_id": {"$ref": "#/$defs/identifier"},
+    "suite_version": {"type": "string", "pattern": "^v[0-9]+$"},
+    "control_profile_sha256": {"$ref": "#/$defs/sha256"},
+    "run_fingerprint_sha256": {"$ref": "#/$defs/sha256"},
+    "status": {"enum": ["passed", "failed", "blocked", "partial"]},
+    "capabilities": {"$ref": "#/$defs/statusMap"},
+    "cases": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/case"}},
+    "metrics": {"type": "object", "minProperties": 1, "additionalProperties": {"$ref": "#/$defs/metric"}},
+    "not_measured": {"type": "array", "items": {"$ref": "#/$defs/identifier"}},
+    "excluded": {"type": "array", "items": {"$ref": "#/$defs/identifier"}},
+    "public_evidence": {"const": "hash-only"},
+    "raw_inputs_captured": {"const": false},
+    "network_calls": {"type": "integer", "minimum": 0},
+    "result_signature_sha256": {"$ref": "#/$defs/sha256"},
+    "claim_ids": {"type": "array", "items": {"$ref": "#/$defs/identifier"}}
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "statusMap": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["status"],
+        "properties": {
+          "status": {"enum": ["available", "partial", "unavailable", "not_measured", "failed"]},
+          "reason": {"$ref": "#/$defs/publicIdentifier"},
+          "required_tools": {"type": "array", "items": {"$ref": "#/$defs/identifier"}},
+          "missing_tools": {"type": "array", "items": {"$ref": "#/$defs/identifier"}}
+        },
+        "allOf": [
+          {"if": {"properties": {"status": {"enum": ["partial", "unavailable", "not_measured", "failed"]}}, "required": ["status"]}, "then": {"required": ["reason"]}},
+          {"if": {"properties": {"status": {"const": "available"}}, "required": ["status"]}, "then": {"anyOf": [{"not": {"required": ["missing_tools"]}}, {"properties": {"missing_tools": {"maxItems": 0}}}]}}
+        ]
+      }
+    },
+    "case": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "category", "status", "checks", "evidence"],
+      "properties": {
+        "id": {"$ref": "#/$defs/identifier"},
+        "category": {"$ref": "#/$defs/identifier"},
+        "status": {"enum": ["passed", "failed", "blocked", "unavailable", "not_measured"]},
+        "checks": {"type": "object", "minProperties": 1, "additionalProperties": {"type": "boolean"}},
+        "evidence": {"$ref": "#/$defs/evidence"},
+        "failure_class": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$"}
+      }
+    },
+    "metric": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status"],
+      "properties": {
+        "status": {"enum": ["available", "partial", "unavailable", "not_measured", "failed"]},
+        "numerator": {"type": "integer", "minimum": 0},
+        "denominator": {"type": "integer", "minimum": 1},
+        "rate": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+        "p50_ms": {"type": ["number", "null"], "minimum": 0},
+        "p95_ms": {"type": ["number", "null"], "minimum": 0},
+        "p99_ms": {"type": ["number", "null"], "minimum": 0},
+        "value": {"type": ["number", "null"], "minimum": 0},
+        "reason": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$"}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"status": {"const": "available"}}, "required": ["status"]},
+          "then": {"anyOf": [
+            {"required": ["numerator", "denominator", "rate"]},
+            {"required": ["p50_ms", "p95_ms", "p99_ms"]},
+            {"required": ["value"]}
+          ]}
+        },
+        {
+          "if": {"properties": {"status": {"enum": ["partial", "unavailable", "not_measured", "failed"]}}, "required": ["status"]},
+          "then": {"required": ["reason"]}
+        }
+      ]
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "available": {"type": "boolean"},
+        "complete": {"type": "boolean"},
+        "found": {"type": "boolean"},
+        "matched": {"type": "boolean"},
+        "target_key_present": {"type": "boolean"},
+        "truth_key_present": {"type": "boolean"},
+        "contamination_key_present": {"type": "boolean"},
+        "other_workspace_key_present": {"type": "boolean"},
+        "receipt_present": {"type": "boolean"},
+        "lease_released": {"type": "boolean"},
+        "raw_inputs_captured": {"const": false},
+        "stage_trace_checked": {"type": "boolean"},
+        "count": {"type": "integer", "minimum": 0},
+        "denominator": {"type": "integer", "minimum": 0},
+        "numerator": {"type": "integer", "minimum": 0},
+        "rank": {"type": "integer", "minimum": 0},
+        "ranked_key_count": {"type": "integer", "minimum": 0},
+        "total": {"type": "integer", "minimum": 0},
+        "entities_archived": {"type": "integer", "minimum": 0},
+        "entities_examined": {"type": "integer", "minimum": 0},
+        "budget_chars": {"type": "integer", "minimum": 0},
+        "injected_chars": {"type": "integer", "minimum": 0},
+        "total_chars": {"type": "integer", "minimum": 0},
+        "frozen_key_count": {"type": "integer", "minimum": 0},
+        "on_demand_entities": {"type": "integer", "minimum": 0},
+        "always_inject_entities": {"type": "integer", "minimum": 0},
+        "rate": {"type": "number", "minimum": 0, "maximum": 1},
+        "digest": {"$ref": "#/$defs/sha256"},
+        "evidence_hash": {"$ref": "#/$defs/sha256"},
+        "profiles_compared": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$"}
+        },
+        "capability": {"$ref": "#/$defs/identifier"},
+        "category": {"$ref": "#/$defs/identifier"},
+        "check": {"$ref": "#/$defs/identifier"},
+        "failure_class": {"$ref": "#/$defs/identifier"},
+        "mode": {"$ref": "#/$defs/identifier"},
+        "reason": {"$ref": "#/$defs/publicIdentifier"},
+        "scope": {"$ref": "#/$defs/identifier"},
+        "status": {"$ref": "#/$defs/identifier"}
+      }
+    },
+    "identifier": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$"
+    },
+    "publicIdentifier": {
+      "type": "string",
+      "pattern": "^(?!.*private)(?!.*query)(?!.*token)(?!.*credential)[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$"
+    }
+  }
+}

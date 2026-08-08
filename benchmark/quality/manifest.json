@@ -1,8 +1,8 @@
 {
   "name": "perseus-vault-memory-quality-v0",
-  "description": "Bounded offline quality-contract manifest for retrieval, temporal validity, scope validity, provenance, replay, mutation/supersession, compaction/projection, and action grounding.",
-  "version": 2,
-  "case_count": {"min": 20, "max": 30},
+  "description": "Bounded offline quality-contract manifest for retrieval, temporal validity, scope validity, provenance, replay, mutation/supersession, compaction/projection, action grounding, recall outcomes, admission, poisoning, and identity ambiguity.",
+  "version": 3,
+  "case_count": {"min": 20, "max": 40},
   "required_categories": [
     "long_horizon",
     "contradiction_supersession",
@@ -14,7 +14,11 @@
     "replay",
     "mutation",
     "compaction_projection",
-    "action_grounding"
+    "action_grounding",
+    "recall_outcome",
+    "admission",
+    "prompt_safety",
+    "identity_ambiguity"
   ],
   "metrics": [
     "validity",
@@ -23,210 +27,42 @@
     "replay_fidelity",
     "mutation_supersession",
     "compaction_projection",
-    "action_grounding"
+    "action_grounding",
+    "recall_outcome",
+    "admission",
+    "prompt_safety",
+    "identity_ambiguity"
   ],
   "cases": [
-    {
-      "id": "long-horizon-basic",
-      "category": "long_horizon",
-      "metric": "validity",
-      "scenario": "long_horizon",
-      "description": "Retrieve a durable fact after intervening memories and updates.",
-      "checks": ["answer_found", "answer_is_current"]
-    },
-    {
-      "id": "contradiction-supersession-basic",
-      "category": "contradiction_supersession",
-      "metric": "mutation_supersession",
-      "scenario": "contradiction_supersession",
-      "description": "Prefer the current fact while retaining superseded evidence for audit.",
-      "checks": ["current_wins", "history_retained"]
-    },
-    {
-      "id": "shared-memory-scope-basic",
-      "category": "shared_memory",
-      "metric": "scope_invalid_recall",
-      "scenario": "shared_memory",
-      "description": "Respect workspace visibility while serving eligible global knowledge.",
-      "checks": ["eligible_memory_served", "ineligible_memory_hidden"]
-    },
-    {
-      "id": "adversarial-contamination-basic",
-      "category": "adversarial",
-      "metric": "validity",
-      "scenario": "adversarial",
-      "description": "Do not let a misleading or contaminated memory displace verified truth.",
-      "checks": ["verified_truth_wins", "contamination_does_not_win"]
-    },
-    {
-      "id": "validity-valid-at-current",
-      "category": "validity",
-      "metric": "validity",
-      "scenario": "validity",
-      "description": "A fixed application-time fact is returned at an instant inside its validity interval.",
-      "checks": ["valid_interval_hit", "validity_provenance_present"]
-    },
-    {
-      "id": "validity-valid-at-gap",
-      "category": "validity",
-      "metric": "validity",
-      "scenario": "validity",
-      "description": "An instant outside a fixed application-time interval is not treated as valid.",
-      "checks": ["valid_interval_gap_empty"]
-    },
-    {
-      "id": "scope-invalid-recall-private",
-      "category": "scope_validity",
-      "metric": "scope_invalid_recall",
-      "scenario": "scope_invalid_recall",
-      "description": "A memory in another workspace is excluded from a strictly scoped recall.",
-      "checks": ["other_workspace_hidden"]
-    },
-    {
-      "id": "scope-invalid-recall-workspace",
-      "category": "scope_validity",
-      "metric": "scope_invalid_recall",
-      "scenario": "scope_invalid_recall",
-      "description": "A memory in the requested workspace remains eligible while the distractor is excluded.",
-      "checks": ["requested_workspace_served"]
-    },
-    {
-      "id": "provenance-core-fields",
-      "category": "provenance",
-      "metric": "provenance",
-      "scenario": "provenance",
-      "description": "Recall exposes stable identity, scope, attribution, and temporal provenance fields.",
-      "checks": ["core_provenance_complete"]
-    },
-    {
-      "id": "provenance-origin-refs",
-      "category": "provenance",
-      "metric": "provenance",
-      "scenario": "provenance",
-      "description": "Origin and external reference metadata survive a write and recall projection.",
-      "checks": ["origin_and_reference_complete"]
-    },
-    {
-      "id": "provenance-evidence-hash",
-      "category": "provenance",
-      "metric": "provenance",
-      "scenario": "provenance",
-      "description": "Hash-only evidence metadata is accepted and returned without publishing raw content.",
-      "checks": ["evidence_hash_complete"]
-    },
-    {
-      "id": "replay-frozen-recall",
-      "category": "replay",
-      "metric": "replay_fidelity",
-      "scenario": "replay",
-      "description": "Repeated read-only recall over the same seeded state has the same key order and digest.",
-      "checks": ["frozen_recall_replays"]
-    },
-    {
-      "id": "replay-temporal-recall",
-      "category": "replay",
-      "metric": "replay_fidelity",
-      "scenario": "replay",
-      "description": "A temporal query repeated at the same fixed instant returns the same version identity and validity metadata.",
-      "checks": ["temporal_recall_replays"]
-    },
-    {
-      "id": "replay-stage-fingerprint",
-      "category": "replay",
-      "metric": "replay_fidelity",
-      "scenario": "replay",
-      "capability": "stage_trace_validate",
-      "optional": true,
-      "description": "The optional runtime stage-trace validator agrees with a replay of the same hash-only trace.",
-      "checks": ["stage_trace_replay_matches"]
-    },
-    {
-      "id": "mutation-idempotent-update",
-      "category": "mutation",
-      "metric": "mutation_supersession",
-      "scenario": "mutation",
-      "description": "Updating one logical key creates one current row rather than duplicate active rows.",
-      "checks": ["single_current_key"]
-    },
-    {
-      "id": "mutation-history-retained",
-      "category": "mutation",
-      "metric": "mutation_supersession",
-      "scenario": "mutation",
-      "description": "A mutation retains a prior version in the history trail.",
-      "checks": ["prior_version_retained"]
-    },
-    {
-      "id": "mutation-live-recall",
-      "category": "mutation",
-      "metric": "mutation_supersession",
-      "scenario": "mutation",
-      "description": "Live recall does not resurface a superseded version.",
-      "checks": ["superseded_version_not_recalled"]
-    },
-    {
-      "id": "compaction-archive",
-      "category": "compaction_projection",
-      "metric": "compaction_projection",
-      "scenario": "compaction",
-      "capability": "compact",
-      "optional": true,
-      "description": "The optional compaction tool explicitly archives a low-decay fixture or reports unavailable.",
-      "checks": ["low_decay_compacted"]
-    },
-    {
-      "id": "projection-context-budget",
-      "category": "compaction_projection",
-      "metric": "compaction_projection",
-      "scenario": "projection",
-      "capability": "context",
-      "description": "The context projection reports a bounded budget and injected entity count.",
-      "checks": ["projection_budget_bounded"]
-    },
-    {
-      "id": "projection-scope",
-      "category": "compaction_projection",
-      "metric": "compaction_projection",
-      "scenario": "projection",
-      "capability": "context",
-      "description": "The context projection does not include another workspace's fixture.",
-      "checks": ["projection_scope_respected"]
-    },
-    {
-      "id": "action-authority",
-      "category": "action_grounding",
-      "metric": "action_grounding",
-      "scenario": "action_grounding",
-      "capability": "action_control_plane",
-      "description": "An action intent is admitted only under a matching registered authority and scope anchor.",
-      "checks": ["authority_scope_matches"]
-    },
-    {
-      "id": "action-receipt",
-      "category": "action_grounding",
-      "metric": "action_grounding",
-      "scenario": "action_grounding",
-      "capability": "action_control_plane",
-      "description": "An executed action has a durable receipt with intent and outcome hashes.",
-      "checks": ["receipt_hashes_complete"]
-    },
-    {
-      "id": "action-grounding-ref",
-      "category": "action_grounding",
-      "metric": "action_grounding",
-      "scenario": "action_grounding",
-      "capability": "action_control_plane",
-      "description": "The action external reference and workspace match the grounded memory anchor.",
-      "checks": ["action_reference_grounded"]
-    },
-    {
-      "id": "action-lease",
-      "category": "action_grounding",
-      "metric": "action_grounding",
-      "scenario": "action_grounding",
-      "capability": "action_control_plane",
-      "description": "A matching action lease can be acquired and released by its holder.",
-      "checks": ["lease_lifecycle_complete"]
-    }
+    {"id": "long-horizon-basic", "category": "long_horizon", "metric": "validity", "scenario": "long_horizon", "description": "Retrieve a durable fact after intervening memories and updates.", "checks": ["answer_found", "answer_is_current"]},
+    {"id": "contradiction-supersession-basic", "category": "contradiction_supersession", "metric": "mutation_supersession", "scenario": "contradiction_supersession", "description": "Prefer the current fact while retaining superseded evidence for audit.", "checks": ["current_wins", "history_retained"]},
+    {"id": "shared-memory-scope-basic", "category": "shared_memory", "metric": "scope_invalid_recall", "scenario": "shared_memory", "description": "Respect workspace visibility while serving eligible global knowledge.", "checks": ["eligible_memory_served", "ineligible_memory_hidden"]},
+    {"id": "adversarial-contamination-basic", "category": "adversarial", "metric": "validity", "scenario": "adversarial", "description": "Do not let a misleading or contaminated memory displace verified truth.", "checks": ["verified_truth_wins", "contamination_does_not_win"]},
+    {"id": "validity-valid-at-current", "category": "validity", "metric": "validity", "scenario": "validity", "description": "A fixed application-time fact is returned at an instant inside its validity interval.", "checks": ["valid_interval_hit", "validity_provenance_present"]},
+    {"id": "validity-valid-at-gap", "category": "validity", "metric": "validity", "scenario": "validity", "description": "An instant outside a fixed application-time interval is not treated as valid.", "checks": ["valid_interval_gap_empty"]},
+    {"id": "scope-invalid-recall-private", "category": "scope_validity", "metric": "scope_invalid_recall", "scenario": "scope_invalid_recall", "description": "A memory in another workspace is excluded from a strictly scoped recall.", "checks": ["other_workspace_hidden"]},
+    {"id": "scope-invalid-recall-workspace", "category": "scope_validity", "metric": "scope_invalid_recall", "scenario": "scope_invalid_recall", "description": "A memory in the requested workspace remains eligible while the distractor is excluded.", "checks": ["requested_workspace_served"]},
+    {"id": "provenance-core-fields", "category": "provenance", "metric": "provenance", "scenario": "provenance", "description": "Recall exposes stable identity, scope, attribution, and temporal provenance fields.", "checks": ["core_provenance_complete"]},
+    {"id": "provenance-origin-refs", "category": "provenance", "metric": "provenance", "scenario": "provenance", "description": "Origin and external reference metadata survive a write and recall projection.", "checks": ["origin_and_reference_complete"]},
+    {"id": "provenance-evidence-hash", "category": "provenance", "metric": "provenance", "scenario": "provenance", "description": "Hash-only evidence metadata is accepted and returned without publishing raw content.", "checks": ["evidence_hash_complete"]},
+    {"id": "replay-frozen-recall", "category": "replay", "metric": "replay_fidelity", "scenario": "replay", "description": "Repeated read-only recall over the same seeded state has the same key order and digest.", "checks": ["frozen_recall_replays"]},
+    {"id": "replay-temporal-recall", "category": "replay", "metric": "replay_fidelity", "scenario": "replay", "description": "A temporal query repeated at the same fixed instant returns the same version identity and validity metadata.", "checks": ["temporal_recall_replays"]},
+    {"id": "replay-stage-fingerprint", "category": "replay", "metric": "replay_fidelity", "scenario": "replay", "capability": "stage_trace_validate", "optional": true, "description": "The optional runtime stage-trace validator agrees with a replay of the same hash-only trace.", "checks": ["stage_trace_replay_matches"]},
+    {"id": "mutation-idempotent-update", "category": "mutation", "metric": "mutation_supersession", "scenario": "mutation", "description": "Updating one logical key creates one current row rather than duplicate active rows.", "checks": ["single_current_key"]},
+    {"id": "mutation-history-retained", "category": "mutation", "metric": "mutation_supersession", "scenario": "mutation", "description": "A mutation retains a prior version in the history trail.", "checks": ["prior_version_retained"]},
+    {"id": "mutation-live-recall", "category": "mutation", "metric": "mutation_supersession", "scenario": "mutation", "description": "Live recall does not resurface a superseded version.", "checks": ["superseded_version_not_recalled"]},
+    {"id": "compaction-archive", "category": "compaction_projection", "metric": "compaction_projection", "scenario": "compaction", "capability": "compact", "optional": true, "description": "The optional compaction tool explicitly archives a low-decay fixture or reports unavailable.", "checks": ["low_decay_compacted"]},
+    {"id": "projection-context-budget", "category": "compaction_projection", "metric": "compaction_projection", "scenario": "projection", "capability": "context", "description": "The context projection reports a bounded budget and injected entity count.", "checks": ["projection_budget_bounded"]},
+    {"id": "projection-scope", "category": "compaction_projection", "metric": "compaction_projection", "scenario": "projection", "capability": "context", "description": "The context projection does not include another workspace's fixture.", "checks": ["projection_scope_respected"]},
+    {"id": "action-authority", "category": "action_grounding", "metric": "action_grounding", "scenario": "action_grounding", "capability": "action_control_plane", "description": "An action intent is admitted only under a matching registered authority and scope anchor.", "checks": ["authority_scope_matches"]},
+    {"id": "action-receipt", "category": "action_grounding", "metric": "action_grounding", "scenario": "action_grounding", "capability": "action_control_plane", "description": "An executed action has a durable receipt with intent and outcome hashes.", "checks": ["receipt_hashes_complete"]},
+    {"id": "action-grounding-ref", "category": "action_grounding", "metric": "action_grounding", "scenario": "action_grounding", "capability": "action_control_plane", "description": "The action external reference and workspace match the grounded memory anchor.", "checks": ["action_reference_grounded"]},
+    {"id": "action-lease", "category": "action_grounding", "metric": "action_grounding", "scenario": "action_grounding", "capability": "action_control_plane", "description": "A matching action lease can be acquired and released by its holder.", "checks": ["lease_lifecycle_complete"]},
+    {"id": "recall-outcome-empty-abstains", "category": "recall_outcome", "metric": "recall_outcome", "scenario": "recall_outcome", "description": "An empty healthy query is explicit no-evidence and abstains rather than silently pretending success.", "checks": ["empty_status_explicit", "empty_abstains"]},
+    {"id": "recall-outcome-pending-is-stale", "category": "recall_outcome", "metric": "recall_outcome", "scenario": "recall_outcome", "description": "A semantic query while embeddings are pending reports degraded freshness and backend health.", "checks": ["pending_status_explicit", "pending_health_present"]},
+    {"id": "admission-untrusted-instruction", "category": "admission", "metric": "admission", "scenario": "admission", "description": "An untrusted instruction-bearing memory is quarantined and cannot be authoritative.", "checks": ["quarantined", "not_authoritative"]},
+    {"id": "admission-authoritative-needs-source", "category": "admission", "metric": "admission", "scenario": "admission", "description": "An authoritative claim without a bound source event remains proposed/reviewable.", "checks": ["proposed", "requires_review"]},
+    {"id": "prompt-safety-hostile-memory", "category": "prompt_safety", "metric": "prompt_safety", "scenario": "prompt_safety", "capability": "context", "description": "Hostile memory text is not emitted as an executable prompt instruction.", "checks": ["hostile_marker_not_executable", "context_remains_bounded"]},
+    {"id": "identity-ambiguity-abstains", "category": "identity_ambiguity", "metric": "identity_ambiguity", "scenario": "identity_ambiguity", "description": "Ambiguous identity evidence does not cross scopes or produce an unqualified selection.", "checks": ["ambiguous_not_selected", "ambiguous_scope_safe"]}
   ]
 }

@@ -5,7 +5,7 @@ for [issue #862](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/8
 It remains the same manifest-driven MCP stdio harness; there is no parallel
 benchmark runner.
 
-The v0 manifest contains **24 deterministic cases and 29 checks**. Synthetic fixtures use stable category/key/token commitments, while the report
+The current v1 manifest contains **30 deterministic cases and 41 checks**. Synthetic fixtures use stable category/key/token commitments, while the report
 retains only booleans, counters, scope/key labels, and SHA-256 digests. Prompts,
 memory bodies, tool arguments, credentials, timestamps, random identifiers, and
 raw MCP payloads are not written to public artifacts. Evidence uses an explicit
@@ -82,7 +82,8 @@ MCP request.
 The report includes:
 
 - `benchmark`, `dataset`, `harness_version`, and `required_categories`
-- exactly 24 manifest-driven `cases[]`, each with `id`, `category`, `metric`,
+- v1 additions: recall outcome, admission, prompt safety, and identity ambiguity cases; v1 metric rates are required by the scorecard
+- exactly 30 manifest-driven `cases[]` in v1, each with `id`, `category`, `metric`,
   `status`, `checks`, sanitized `assertions`, and sanitized `evidence`
 - grouped `metrics` and flat `metric_rates`
 - `capabilities`, `offline: true`, `network_calls: 0`,
