@@ -2431,6 +2431,14 @@ impl Database {
         query_vec: &[f32],
         limit: usize,
     ) -> Result<Vec<(Entity, f64)>, Box<dyn std::error::Error>> {
+        self.dense_search_governed(query_vec, limit)
+    }
+
+    fn dense_search_governed(
+        &self,
+        query_vec: &[f32],
+        limit: usize,
+    ) -> Result<Vec<(Entity, f64)>, Box<dyn std::error::Error>> {
         // ── #619 interim: explicit exact-vs-bounded dial for the dense arm ──
         //
         // There is no ANN path yet, so this arm is a brute-force scan bounded
@@ -2488,7 +2496,132 @@ impl Database {
             // measure the pure 1-bit (Hamming-only) recall row. Default ON.
             rerank: tri("MIMIR_DENSE_SIG_RERANK"),
         };
-        self.dense_search_with_opts(query_vec, limit, max_scan, opts)
+        if self.governance_may_suppress()? {
+            let scan_limit = if opts.use_sig_cache == Some(true) {
+                usize::MAX
+            } else {
+                max_scan
+            };
+            return self.dense_search_governed_scan(query_vec, limit, scan_limit);
+        }
+        self.dense_search_with_opts_raw(query_vec, limit, max_scan, opts)
+    }
+
+    fn governance_may_suppress(&self) -> Result<bool, Box<dyn std::error::Error>> {
+        let conn = self.conn()?;
+        let primary: bool = conn.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM rejected_value_tombstones
+                 WHERE expires_at_unix_ms IS NULL OR expires_at_unix_ms > ?1
+             )",
+            params![now_ms()],
+            |row| row.get(0),
+        )?;
+        drop(conn);
+        if primary {
+            return Ok(true);
+        }
+        let Some(sidecar) = self.governance_read_conn_compatible()? else {
+            return Ok(false);
+        };
+        Ok(sidecar.query_row(
+            "SELECT EXISTS(SELECT 1 FROM erasure_mandates)",
+            [],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Exact governed dense scan used whenever suppression state exists. The
+    /// approximate signature/cache path remains available for an ungoverned
+    /// store, but it is never allowed to discard candidates before governance.
+    fn dense_search_governed_scan(
+        &self,
+        query_vec: &[f32],
+        limit: usize,
+        max_scan: usize,
+    ) -> Result<Vec<(Entity, f64)>, Box<dyn std::error::Error>> {
+        if limit == 0 || max_scan == 0 {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn()?;
+        let sql = if max_scan == usize::MAX {
+            "SELECT id, category, key, body_json, status, type, tags,
+                    decay_score, retrieval_count, layer, topic_path,
+                    archived, archive_reason, links, verified, source,
+                    created_at_unix_ms, last_accessed_unix_ms, NULL as embedding,
+                    always_on, certainty, workspace_hash, agent_id, visibility,
+                    follow_count, miss_count, follow_rate, efficacy_status,
+                    epistemic_state, embedding
+             FROM entities
+             WHERE archived = 0 AND embedding IS NOT NULL"
+                .to_string()
+        } else {
+            format!(
+                "SELECT id, category, key, body_json, status, type, tags,
+                        decay_score, retrieval_count, layer, topic_path,
+                        archived, archive_reason, links, verified, source,
+                        created_at_unix_ms, last_accessed_unix_ms, NULL as embedding,
+                        always_on, certainty, workspace_hash, agent_id, visibility,
+                        follow_count, miss_count, follow_rate, efficacy_status,
+                        epistemic_state, embedding
+                 FROM entities
+                 WHERE archived = 0 AND embedding IS NOT NULL
+                 LIMIT {}",
+                max_scan
+            )
+        };
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map([], |row| {
+            let entity = entity_from_row(row, self.encryption.as_ref())?;
+            let blob: Vec<u8> = row.get(29)?;
+            let embedding: Vec<f32> = blob
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect();
+            Ok((entity, embedding))
+        })?;
+        let mut candidates = Vec::new();
+        for row in rows {
+            let (entity, embedding) = row?;
+            if embedding.len() == query_vec.len() {
+                candidates.push((entity, embedding));
+            }
+        }
+        drop(stmt);
+        let entities: Vec<Entity> = candidates.iter().map(|(entity, _)| entity.clone()).collect();
+        let visible = self.filter_suppressed_with_conn(&conn, entities)?;
+        drop(conn);
+        let visible_ids: std::collections::HashSet<String> =
+            visible.into_iter().map(|entity| entity.id).collect();
+        let query_norm = query_vec
+            .iter()
+            .map(|value| (*value as f64) * (*value as f64))
+            .sum::<f64>()
+            .sqrt();
+        let mut scored = Vec::new();
+        for (entity, embedding) in candidates {
+            if !visible_ids.contains(&entity.id) || query_norm <= 0.0 {
+                continue;
+            }
+            let mut dot = 0.0;
+            let mut norm = 0.0;
+            for (query, value) in query_vec.iter().zip(embedding.iter()) {
+                dot += (*query as f64) * (*value as f64);
+                norm += (*value as f64) * (*value as f64);
+            }
+            let denominator = query_norm * norm.sqrt();
+            let score = if denominator > 0.0 { dot / denominator } else { 0.0 };
+            scored.push((entity, score));
+        }
+        scored.sort_by(|left, right| {
+            right
+                .1
+                .partial_cmp(&left.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| left.0.id.cmp(&right.0.id))
+        });
+        scored.truncate(limit);
+        Ok(scored)
     }
 
     /// The `dense_search` implementation with the scan ceiling as an explicit
@@ -2502,7 +2635,10 @@ impl Database {
         limit: usize,
         max_scan: usize,
     ) -> Result<Vec<(Entity, f64)>, Box<dyn std::error::Error>> {
-        self.dense_search_with_opts(
+        if self.governance_may_suppress()? {
+            return self.dense_search_governed_scan(query_vec, limit, max_scan);
+        }
+        self.dense_search_with_opts_raw(
             query_vec,
             limit,
             max_scan,
@@ -2516,6 +2652,19 @@ impl Database {
     /// resolve to defaults: `use_sig_cache` → AUTO (engage when the corpus
     /// outgrows `max_scan`), `sig4_resident` → off, `sig4_refine` → off.
     pub fn dense_search_with_opts(
+        &self,
+        query_vec: &[f32],
+        limit: usize,
+        max_scan: usize,
+        opts: DenseOpts,
+    ) -> Result<Vec<(Entity, f64)>, Box<dyn std::error::Error>> {
+        if self.governance_may_suppress()? {
+            return self.dense_search_governed_scan(query_vec, limit, max_scan);
+        }
+        self.dense_search_with_opts_raw(query_vec, limit, max_scan, opts)
+    }
+
+    fn dense_search_with_opts_raw(
         &self,
         query_vec: &[f32],
         limit: usize,
@@ -3045,6 +3194,9 @@ impl Database {
         }
         } // end else (non-pure-1-bit cosine rerank)
         scored_ids.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        // Governance (#882): the governed path uses dense_search_governed_scan
+        // (which does its own suppression + truncation). This raw path serves
+        // the ungoverned store and must still respect `limit`.
         scored_ids.truncate(limit);
         if scored_ids.is_empty() {
             return Ok(Vec::new());
@@ -4034,7 +4186,8 @@ impl Database {
             .query_row(
                 "SELECT 1 FROM rejected_value_tombstones
                  WHERE workspace_hash IN ('', ?1)
-                   AND predicate = ?2 AND value_sha256 = ?3
+                   AND (predicate = '' OR predicate = ?2)
+                   AND value_sha256 = ?3
                  LIMIT 1",
                 params![workspace_hash, predicate, digest],
                 |row| row.get(0),
@@ -4180,20 +4333,44 @@ impl Database {
         conn: &rusqlite::Connection,
     ) -> Result<bool, Box<dyn std::error::Error>> {
         let mut stmt = conn.prepare("PRAGMA table_info(erasure_mandates)")?;
-        let columns: std::collections::HashSet<String> = stmt
-            .query_map([], |row| row.get::<_, String>(1))?
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
+        let mut columns = std::collections::HashMap::<String, (String, bool, i64)>::new();
+        for row in stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(5)?,
+            ))
+        })? {
+            let (name, ty, not_null, pk) = row?;
+            columns.insert(name, (ty, not_null != 0, pk));
+        }
+        let required = [
+            ("value_sha256", "TEXT", true),
+            ("predicate", "TEXT", true),
+            ("reason", "TEXT", true),
+            ("workspace_hash", "TEXT", true),
+            ("created_at_unix_ms", "INTEGER", true),
+        ];
+        if !required.iter().all(|(name, ty, not_null)| {
+            columns
+                .get(*name)
+                .map(|(actual, nn, _)| actual.eq_ignore_ascii_case(ty) && *nn == *not_null)
+                .unwrap_or(false)
+        }) {
+            return Ok(false);
+        }
+        let mut pk: Vec<(i64, String)> = columns
+            .iter()
+            .filter(|(_, (_, _, order))| *order > 0)
+            .map(|(name, (_, _, order))| (*order, name.clone()))
             .collect();
-        Ok([
-            "value_sha256",
-            "predicate",
-            "reason",
+        pk.sort_by_key(|(order, _)| *order);
+        Ok(pk.iter().map(|(_, name)| name.as_str()).eq([
             "workspace_hash",
-            "created_at_unix_ms",
-        ]
-        .into_iter()
-        .all(|name| columns.contains(name)))
+            "predicate",
+            "value_sha256",
+        ]))
     }
 
     fn governance_read_conn_compatible(
@@ -4208,7 +4385,7 @@ impl Database {
             |row| row.get(0),
         )?;
         if !has_table || !Self::governance_schema_is_compatible(&conn)? {
-            return Ok(None);
+            return Err("governance sidecar exists but has an incompatible schema".into());
         }
         Ok(Some(conn))
     }
@@ -4257,7 +4434,7 @@ impl Database {
             .query_row(
                 "SELECT 1 FROM rejected_value_tombstones
                  WHERE workspace_hash IN ('', ?1)
-                   AND predicate = ?2
+                   AND (predicate = '' OR predicate = ?2)
                    AND value_sha256 = ?3
                    AND (expires_at_unix_ms IS NULL OR expires_at_unix_ms > ?4)
                  LIMIT 1",
@@ -5141,7 +5318,7 @@ impl Database {
                     let limit = params.limit.max(0) as usize;
                     let candidate_k =
                         limit.saturating_mul(5).clamp(1, 1000).max(limit.min(1000));
-                    let dense_results = self.dense_search(query_vec, candidate_k)?;
+                    let dense_results = self.dense_search_governed(query_vec, candidate_k)?;
                     timer.stage("dense");
                     // #882: remove governed candidates before ranking/truncation
                     // and optional reinforcement; suppressed rows must not
@@ -5205,7 +5382,7 @@ impl Database {
                         });
                         let t0 = arm_clock(timing_on);
                         let dense_res = self
-                            .dense_search(query_vec, candidate_k)
+                            .dense_search_governed(query_vec, candidate_k)
                             .map_err(|e| e.to_string());
                         let dense_ms = arm_ms(t0);
                         let (sparse_res, sparse_ms) = sparse_handle
@@ -5319,7 +5496,7 @@ impl Database {
                             let d = self
                                 .generate_embedding_with_fallback(sub)
                                 .ok()
-                                .and_then(|emb| self.dense_search(&emb, candidate_k).ok())
+                                .and_then(|emb| self.dense_search_governed(&emb, candidate_k).ok())
                                 .and_then(|scored| self.filter_suppressed_scored(scored).ok())
                                 .unwrap_or_default();
                             let mut sp = wide.clone();
@@ -5884,29 +6061,12 @@ impl Database {
         }
 
         // Rank by retrieval count + recency, with a stable total-order tie-break.
-        //
-        // #254 (determinism): retrieval_count and last_accessed_unix_ms both
-        // MUTATE on every non-side-effect-skipping recall, so without a stable
-        // final key two entities that tie on both columns could swap order
-        // run-to-run. Appending `id ASC` makes the ordering a total order that
-        // depends only on stored identity once the leading keys tie. Combined
-        // with `skip_side_effects = true` (which suppresses the retrieval-count
-        // and last-accessed bumps), recall over a frozen DB is byte-identical
-        // across runs — the property Perseus's @memory reproducibility claim
-        // relies on.
         sql.push_str(
             " ORDER BY retrieval_count DESC, last_accessed_unix_ms DESC, id ASC",
         );
-
-        let safe_limit = params.limit.clamp(0, 1000);
-        sql.push_str(&format!(" LIMIT ?{}", param_values.len() + 1));
-        param_values.push(Box::new(safe_limit));
-
-        if params.offset > 0 {
-            let safe_offset = params.offset.clamp(0, 10000);
-            sql.push_str(&format!(" OFFSET ?{}", param_values.len() + 1));
-            param_values.push(Box::new(safe_offset));
-        }
+        // Governance is applied after materialization; do not let SQL LIMIT/OFFSET
+        // consume slots before suppressed rows are removed.
+        sql.push_str(" LIMIT -1");
 
         Ok(Some((sql, param_values)))
     }
@@ -5980,7 +6140,7 @@ impl Database {
         }
         drop(stmt);
 
-        let mut items = Vec::with_capacity(search_params.limit.max(0) as usize);
+        let mut items = Vec::with_capacity(raw_items.len());
         // #882: governance is applied before ranking/truncation. A suppressed
         // row must not consume a page slot or receive read-side effects.
         for mut entity in raw_items {
@@ -6178,100 +6338,27 @@ impl Database {
         // rowid + bm25() only, entirely inside the FTS index (entities is
         // never touched); phase 2 hydrates and metadata-filters just the
         // fetched pool. Filters live in `bm25_metadata_conditions`, shared
-        // with the fallback so the two plans cannot drift.
-        //
-        // Exactness: bm25 rank does not depend on the join, and the pool is
-        // consumed in (rank, rowid) order with the same predicates applied, so
-        // the result equals the fallback's whenever the pool covers the top
-        // `safe_limit` filtered hits. If filters eat the whole pool (kept <
-        // safe_limit with matches left over), retry once at MAX_FETCH, then
-        // fall back to the exact single-query plan — worst case is bounded and
-        // the answer is never silently truncated.
-        const BM25_FIRST_FETCH_MIN: usize = 128;
-        const BM25_MAX_FETCH: usize = 4096;
-        let mut fetch = safe_limit
-            .saturating_mul(4)
-            .clamp(BM25_FIRST_FETCH_MIN, BM25_MAX_FETCH);
-        loop {
-            let mut stmt = conn.prepare(
-                "SELECT rowid, bm25(entities_fts) AS rank FROM entities_fts \
-                 WHERE entities_fts MATCH ?1 ORDER BY rank ASC, rowid ASC LIMIT ?2",
-            )?;
-            let rows = stmt.query_map(
-                rusqlite::params![fts_query, fetch as i64],
-                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?)),
-            )?;
-            let mut ranked: Vec<(i64, f64)> = Vec::with_capacity(fetch.min(1024));
-            for r in rows {
-                ranked.push(r?);
-            }
-            if ranked.is_empty() {
-                return Ok(Vec::new());
-            }
-            let exhausted = ranked.len() < fetch;
-            drop(stmt);
-            let mut out = self.bm25_hydrate_filtered(&conn, &ranked, params, fetch)?;
-            out = self.filter_suppressed_scored_with_conn(&conn, out)?;
-            if out.len() >= safe_limit || exhausted {
-                out.truncate(safe_limit);
-                return Ok(out);
-            }
-            if fetch >= BM25_MAX_FETCH {
-                break; // pathologically selective filters: exact fallback below
-            }
-            fetch = BM25_MAX_FETCH;
-        }
-
-        // ── Fallback: the pre-#511 single-query plan (exact, join-per-match) ──
-        let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-        // ?1 is always the FTS MATCH expression.
-        param_values.push(Box::new(fts_query));
-        let conditions = Self::bm25_metadata_conditions(params, &mut param_values);
-
-        let limit_idx = param_values.len() + 1;
-        param_values.push(Box::new(safe_limit as i64));
-
-        // bm25(entities_fts) is the trailing column (index 29); the leading 29
-        // columns match `entity_from_row`'s expected layout exactly
-        // (epistemic_state at 28, #880).
-        let sql = format!(
-            "SELECT e.id, e.category, e.key, e.body_json, e.status, e.type, e.tags,
-                    e.decay_score, e.retrieval_count, e.layer, e.topic_path,
-                    e.archived, e.archive_reason, e.links, e.verified, e.source,
-                    e.created_at_unix_ms, e.last_accessed_unix_ms, NULL as embedding,
-                    e.always_on, e.certainty, e.workspace_hash, e.agent_id, e.visibility,
-                    e.follow_count, e.miss_count, e.follow_rate, e.efficacy_status,
-                    e.epistemic_state,
-                    bm25(entities_fts) AS rank
-             FROM entities_fts
-             JOIN entities e ON e.rowid = entities_fts.rowid
-             WHERE entities_fts MATCH ?1 AND {conditions}
-             ORDER BY rank ASC
-             LIMIT ?{limit_idx}",
-            conditions = conditions.join(" AND "),
-        );
-
-        let enc = self.encryption.as_ref();
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            param_values.iter().map(|p| p.as_ref()).collect();
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(param_refs.as_slice(), |row| {
-            let entity = entity_from_row(row, enc)?;
-            let bm25: f64 = row.get(29)?;
-            // Flip sign so higher = more relevant (BM25 is more-negative-is-better).
-            Ok((entity, -bm25))
-        })?;
-
-        let mut out = Vec::new();
+        // Governance (#882): materialize the complete FTS match set without an
+        // SQL LIMIT so suppression happens before any candidate cap. Hydrate,
+        // metadata-filter, suppress, and truncate in order.
+        let mut stmt = conn.prepare(
+            "SELECT rowid, bm25(entities_fts) AS rank FROM entities_fts \
+             WHERE entities_fts MATCH ?1 ORDER BY rank ASC, rowid ASC LIMIT -1",
+        )?;
+        let rows = stmt.query_map(
+            rusqlite::params![fts_query],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?)),
+        )?;
+        let mut ranked: Vec<(i64, f64)> = Vec::new();
         for r in rows {
-            out.push(r?);
+            ranked.push(r?);
+        }
+        if ranked.is_empty() {
+            return Ok(Vec::new());
         }
         drop(stmt);
-        // #882: governance interceptor on the bm25 candidate arm — drop
-        // suppressed entities while preserving surviving scores. The current
-        // BM25 connection is still live, so use it directly rather than
-        // checking out a second pooled connection.
-        let mut out = self.filter_suppressed_scored_with_conn(&conn, out)?;
+        let mut out = self.bm25_hydrate_filtered(&conn, &ranked, params, ranked.len())?;
+        out = self.filter_suppressed_scored_with_conn(&conn, out)?;
         out.truncate(safe_limit);
         Ok(out)
     }
@@ -6327,7 +6414,7 @@ impl Database {
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| a.0.cmp(&b.0))
         });
-        let out = self.bm25_hydrate_filtered(conn, &ranked, params, scan_cap)?;
+        let out = self.bm25_hydrate_filtered(conn, &ranked, params, ranked.len())?;
         let mut out = self.filter_suppressed_scored_with_conn(conn, out)?;
         out.truncate(safe_limit);
         Ok(out)
@@ -6343,11 +6430,11 @@ impl Database {
         conn: &rusqlite::Connection,
         ranked: &[(i64, f64)],
         params: &RecallParams,
-        safe_limit: usize,
+        _safe_limit: usize,
     ) -> Result<Vec<(Entity, f64)>, Box<dyn std::error::Error>> {
         let enc = self.encryption.as_ref();
-        let mut out: Vec<(Entity, f64)> = Vec::with_capacity(safe_limit.min(ranked.len()));
-        'chunks: for chunk in ranked.chunks(500) {
+        let mut out: Vec<(Entity, f64)> = Vec::with_capacity(ranked.len());
+        for chunk in ranked.chunks(500) {
             let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
             let conditions = Self::bm25_metadata_conditions(params, &mut param_values);
             let base = param_values.len();
@@ -6393,9 +6480,6 @@ impl Database {
                     // Flip sign so higher = more relevant (BM25 is
                     // more-negative-is-better).
                     out.push((e, -rank));
-                    if out.len() == safe_limit {
-                        break 'chunks;
-                    }
                 }
             }
         }
@@ -7160,7 +7244,9 @@ impl Database {
         offset: i64,
     ) -> Result<(Vec<crate::models::Entity>, i64), Box<dyn std::error::Error>> {
         let conn = self.conn()?;
-        let total: i64 = conn.query_row(
+        // The public total is the visible trail size; returning the raw count
+        // would disclose how many suppressed historical versions exist.
+        let raw_total: i64 = conn.query_row(
             "SELECT COUNT(*) FROM entity_history WHERE category = ?1 AND key = ?2",
             params![category, key],
             |r| r.get(0),
@@ -7212,7 +7298,8 @@ impl Database {
         } else {
             visible[start..end].to_vec()
         };
-        Ok((page, total))
+        let _ = raw_total;
+        Ok((page, visible.len() as i64))
     }
 
     /// The version of (category, key) that was the live fact at transaction time
@@ -7597,22 +7684,41 @@ impl Database {
             .collect::<Vec<_>>()
             .join(",");
         let sql = format!(
-            "SELECT id, COALESCE(valid_from_unix_ms, recorded_at_unix_ms, created_at_unix_ms), \
-                    valid_to_unix_ms \
+            "SELECT id, category, key, body_json, status, type, tags,
+                    decay_score, retrieval_count, layer, topic_path,
+                    archived, archive_reason, links, verified, source,
+                    created_at_unix_ms, last_accessed_unix_ms, NULL as embedding,
+                    always_on, certainty, workspace_hash, agent_id, visibility,
+                    follow_count, miss_count, follow_rate, efficacy_status,
+                    epistemic_state,
+                    COALESCE(valid_from_unix_ms, recorded_at_unix_ms, created_at_unix_ms),
+                    valid_to_unix_ms
              FROM entities WHERE id IN ({placeholders})"
         );
         let mut stmt = conn.prepare(&sql)?;
         let param_refs: Vec<&dyn rusqlite::types::ToSql> =
             ids.iter().map(|s| s as &dyn rusqlite::types::ToSql).collect();
         let rows = stmt.query_map(param_refs.as_slice(), |r| {
+            let entity = entity_from_row(r, self.encryption.as_ref())?;
             Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, i64>(1)?,
-                r.get::<_, Option<i64>>(2)?,
+                entity,
+                r.get::<_, i64>(29)?,
+                r.get::<_, Option<i64>>(30)?,
             ))
         })?;
+        let mut candidates: Vec<(Entity, i64, Option<i64>)> = Vec::new();
         for r in rows {
-            let (id, from, to) = r?;
+            candidates.push(r?);
+        }
+        drop(stmt);
+        drop(conn);
+        let mut visible = Vec::new();
+        for (entity, from, to) in candidates {
+            if !self.filter_suppressed(vec![entity.clone()])?.is_empty() {
+                visible.push((entity.id, from, to));
+            }
+        }
+        for (id, from, to) in visible {
             map.insert(id, (from, to));
         }
         Ok(map)
@@ -12227,15 +12333,13 @@ last_accessed: {}
         }
 
         let safe_limit = limit.clamp(0, 100);
-        // Scan a multiple of the requested limit since some FTS candidates won't
-        // pass the recall_when confirmation; bounded so this stays cheap.
-        let scan_cap = (safe_limit * 5).clamp(50, 500);
-
+        // Materialize the complete ordered match set before governance. A
+        // bounded SQL candidate cap can let suppressed triggers consume slots.
         let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> =
-            vec![Box::new(fts_query), Box::new(scan_cap)];
+            vec![Box::new(fts_query)];
         let ws_clause = if let Some(ws) = workspace_hash {
             param_values.push(Box::new(ws.to_string()));
-            "AND workspace_hash = ?3"
+            "AND workspace_hash = ?2"
         } else {
             ""
         };
@@ -12252,7 +12356,7 @@ last_accessed: {}
                AND rowid IN (SELECT rowid FROM entities_fts WHERE entities_fts MATCH ?1)
                {}
              ORDER BY decay_score DESC, retrieval_count DESC
-             LIMIT ?2",
+             LIMIT -1",
             ws_clause
         );
         let param_refs: Vec<&dyn rusqlite::types::ToSql> =
@@ -12263,19 +12367,18 @@ last_accessed: {}
         let rows =
             stmt.query_map(param_refs.as_slice(), |row| entity_from_row(row, enc))?;
 
-        let mut items = Vec::new();
+        let mut candidates = Vec::new();
         for row in rows {
             let entity = row?;
             if Self::matches_recall_when(&entity.body_json, &lc_words) {
-                items.push(entity);
-                if items.len() as i64 >= safe_limit {
-                    break;
-                }
+                candidates.push(entity);
             }
         }
         drop(stmt);
         drop(conn);
-        self.filter_suppressed(items)
+        let mut visible = self.filter_suppressed(candidates)?;
+        visible.truncate(safe_limit as usize);
+        Ok(visible)
     }
 
     /// True if any of `lc_words` (already lowercased) is a substring of any
@@ -14578,7 +14681,7 @@ impl Database {
         let conn = self.conn()?;
         let enc = self.encryption.as_ref();
         let mut out = Vec::new();
-        'chunks: for chunk in ordered_ids.chunks(500) {
+        for chunk in ordered_ids.chunks(500) {
             let placeholders = (1..=chunk.len())
                 .map(|i| format!("?{}", i))
                 .collect::<Vec<_>>()
@@ -14610,13 +14713,13 @@ impl Database {
             for id in chunk {
                 if let Some(e) = by_id.remove(id) {
                     out.push((e, 1.0));
-                    if out.len() >= max_neighbors {
-                        break 'chunks;
-                    }
                 }
             }
         }
-        Ok(out)
+        drop(conn);
+        let mut visible = self.filter_suppressed_scored(out)?;
+        visible.truncate(max_neighbors);
+        Ok(visible)
     }
 
     /// Hydrate non-archived entities by id, preserving the order of `ids`.
@@ -14668,7 +14771,8 @@ impl Database {
                 }
             }
         }
-        Ok(out)
+        drop(conn);
+        self.filter_suppressed(out)
     }
 
     /// Minimal completion call against the configured LLM endpoint (Ollama
