@@ -3403,6 +3403,10 @@ pub fn handle_health(db: &Database) -> String {
     // distinguishable from a broken MCP child — is the DB down, the store
     // genuinely empty, or is the semantic backend degraded/keyword-only?
     let r = db.readiness();
+    // #858: binary staleness — replaced on disk since this process started.
+    // Lets a long-lived client distinguish "stale server" from "empty store"
+    // and gives it the reconnect path (perseus_vault_handoff_restart).
+    let live = crate::live_update::running_identity();
     json!({
         "status": if r.db_responds { "healthy" } else { "unhealthy" },
         "db_path": db.db_path(),
@@ -3411,6 +3415,9 @@ pub fn handle_health(db: &Database) -> String {
         "embedded_memories": r.embedded_memories,
         "semantic_recall": r.semantic_recall(),
         "warnings": r.warnings(),
+        "binary_stale": crate::live_update::running_stale(),
+        "binary_path": live.map(|i| i.path.display().to_string()).unwrap_or_default(),
+        "pid": std::process::id(),
     })
     .to_string()
 }

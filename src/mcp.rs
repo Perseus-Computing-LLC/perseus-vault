@@ -7,6 +7,7 @@ use crate::db::Database;
 use crate::tools;
 use crate::beliefs;
 use crate::claim_card;
+use crate::live_update;
 
 /// The parent PID observed once at process start, before any reparenting can
 /// occur. `is_orphaned_by_ppid()` compares the live ppid against this baseline
@@ -137,6 +138,12 @@ fn windows_process_creation_time(pid: i32) -> Option<u64> {
 /// Exposed as `pub` so the orphan case can be unit-tested without needing to
 /// actually kill a parent process.
 pub fn is_orphaned_by_ppid() -> bool {
+    // #858: a handoff child is deliberately reparented when the spawning
+    // server exits — the handoff protocol is its liveness proof, and stdin
+    // EOF remains the real client-death signal.
+    if crate::live_update::handoff_child() {
+        return false;
+    }
     // Safety: getppid() is always safe — no undefined behaviour, no allocation.
     // All Unix platforms (Linux AND macOS) reparent orphans to PID 1, so this
     // check is the primary parent-death signal on macOS too (#748) — without
@@ -401,14 +408,16 @@ pub fn run_server(db: std::sync::Arc<Database>) {
     // under a PID-1 container entrypoint is NOT treated as orphaned.
     #[cfg(target_os = "linux")]
     {
-        unsafe {
-            // PR_SET_PDEATHSIG = 1; SIGTERM = 15.  Using the raw constants
-            // avoids pulling in the full `nix` crate just for this call.
-            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM, 0, 0, 0);
-        }
-        if is_orphaned_by_ppid() {
-            eprintln!("mimir: parent already dead at server start — exiting (orphan-reap race guard, #547)");
-            return;
+        if !crate::live_update::handoff_child() {
+            unsafe {
+                // PR_SET_PDEATHSIG = 1; SIGTERM = 15.  Using the raw constants
+                // avoids pulling in the full `nix` crate just for this call.
+                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM, 0, 0, 0);
+            }
+            if is_orphaned_by_ppid() {
+                eprintln!("mimir: parent already dead at server start — exiting (orphan-reap race guard, #547)");
+                return;
+            }
         }
     }
 
@@ -508,6 +517,20 @@ pub fn run_server(db: std::sync::Arc<Database>) {
             });
             let _ = writeln!(stdout, "{}", resp_str);
             let _ = stdout.flush();
+
+            // #858: fd-preserving live-update handoff. The response above is
+            // flushed FIRST so the client receives the report before the
+            // process image switches; the child inherits the same stdin/stdout
+            // pipes, so the MCP session continues uninterrupted.
+            if crate::live_update::handoff_pending() {
+                if let Err(e) = crate::live_update::perform_handoff() {
+                    eprintln!("mimir: handoff spawn failed: {e}");
+                }
+                // Exit regardless: on success the child owns the session; on
+                // failure the client sees EOF and can restart cleanly (the
+                // stale gate keeps serving loud errors until then).
+                std::process::exit(0);
+            }
         }
     }
 }
@@ -2919,6 +2942,18 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
           "type": "array",
           "items": { "type": "string" },
           "description": "Likely-cause messages for degraded/empty states; empty when nominal"
+        },
+        "binary_stale": {
+          "type": "boolean",
+          "description": "True when the running binary was replaced on disk since this process started (#858): results come from a stale image — call perseus_vault_handoff_restart or restart the session"
+        },
+        "binary_path": {
+          "type": "string",
+          "description": "Absolute path of the running binary (empty when undeterminable)"
+        },
+        "pid": {
+          "type": "integer",
+          "description": "PID of the running server process"
         }
       }
     },
@@ -2926,6 +2961,23 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
       "readOnlyHint": true
     },
     "title": "Check Health"
+  },
+  {
+    "name": "mimir_handoff_restart",
+    "description": "Live-update / reconnect for long-lived stdio sessions (#858). When the perseus-vault binary was rebuilt or replaced on disk mid-session, the running process image is stale: every other tool refuses loudly (isError) until the session is restarted — or this tool hot-swaps the process on the SAME stdio connection. States: binary unchanged -> no_handoff_needed (identity report); stale + dry_run -> dry_run (what would happen); stale without confirm -> confirm_required; stale + confirm:true -> the replacement binary is spawned on this session's stdio and the old process exits immediately after this response — the MCP session continues uninterrupted in the new process image. Do not pipeline requests during the handoff.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "dry_run": {
+          "type": "boolean",
+          "description": "Report what would happen without performing the handoff (default false)"
+        },
+        "confirm": {
+          "type": "boolean",
+          "description": "Required to actually perform the hot-swap when the binary is stale (default false)"
+        }
+      }
+    }
   },
   {
     "name": "mimir_quality_telemetry",
@@ -5385,6 +5437,22 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
         .map(|suffix| format!("mimir_{}", suffix));
     let name: &str = owned_name.as_deref().unwrap_or(name);
 
+    // #858: fail loud when the running binary was replaced on disk — never
+    // silently serve results from a stale process image. The handoff tool and
+    // health stay callable (health reports the staleness in its payload).
+    if let Some(stale_msg) = crate::live_update::stale_error_message(name) {
+        return serde_json::to_string(&json!({
+            "content": [{"type": "text", "text": stale_msg}],
+            "isError": true
+        }))
+        .unwrap_or_else(|_| {
+            format!(
+                r#"{{"content":[{{"type":"text","text":"{}"}}],"isError":true}}"#,
+                stale_msg
+            )
+        });
+    }
+
     let handler_result: Result<String, String> = match name {
         "mimir_remember" => tools::handle_remember(db, args).map_err(|e| e.to_string()),
 
@@ -5458,6 +5526,7 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
         "mimir_state_list" => tools::handle_state_list(db, args).map_err(|e| e.to_string()),
 
         "mimir_health" => Ok(tools::handle_health(db)),
+        "mimir_handoff_restart" => crate::live_update::handle_handoff_restart(args),
         "mimir_quality_telemetry" => tools::handle_quality_telemetry(db, args),
 
         "mimir_stats" => Ok(tools::handle_stats(db)),
@@ -5618,7 +5687,7 @@ mod tests {
         );
         assert_eq!(
             registry_names.len(),
-            91,
+            92,
             "update public metadata when adding a tool"
         );
 

@@ -4,6 +4,7 @@ mod claim_card;
 mod communities;
 mod connectors;
 mod db;
+mod live_update;
 mod dedup;
 mod embedding;
 mod encryption;
