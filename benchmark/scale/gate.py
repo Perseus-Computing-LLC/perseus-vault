@@ -5,8 +5,9 @@ Runs the scale harness at the gated corpus size (default 10K on the fast CI
 path; the weekly workflow dispatches 100K — a 100K bulk load currently takes
 ~4h, see the #476 write-path issue) and asserts the documented budgets from
 README.md. Budgets are per-size and conservative — roughly 3× headroom over
-the first committed run (benchmark/scale/report.json names that hardware) —
-so a pass means "no regression" and a failure means something genuinely
+the measured baseline on the runner the gate runs on (2-vCPU ubuntu-latest;
+recalibrated 2026-08-08 in #898/#900 — see the DEFAULT_BUDGETS comment) — so
+a pass means "no regression" and a failure means something genuinely
 degraded at scale.
 
 Every budget is env-overridable (SCALE_BUDGET_*) so the workflow file is the
@@ -26,32 +27,42 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 
 # Measured baselines live in report.json; budgets carry ~3x headroom (more on
-# sub-millisecond metrics, where absolute jitter dominates). Tightened after
-# #476 (signature-driven dedup scan: 100K load 7 -> 46/s), #507 (covering
-# dense index: dense p99 447 -> 25ms), and #511 (hybrid sparse-arm hydration
-# + concurrent arms: hybrid p99 337 -> 94ms @100K) so the wins cannot
-# silently regress — the 100K hybrid budget sits deliberately BELOW the
-# pre-#511 p99 (282-337ms on the baseline box).
+# sub-millisecond metrics, where absolute jitter dominates).
+#
+# 2026-08-08 (#898 / #900) — budgets recalibrated to the runner the gate
+# ACTUALLY runs on. The previous budgets came from the committed report.json
+# (16-core Windows box); the gate runs on GitHub's shared 2-vCPU
+# ubuntu-latest, which measures ~25-35x slower for fts5/temporal and made the
+# gate permanently red. New baselines:
+#   - 10K: measured on the gate runner itself via workflow_dispatch
+#     (run 31284616793, head 2afee8a, post-#899 batched suppression filter):
+#     fts5 p99 322.7ms, temporal p99 296.0ms, hybrid p99 204.0ms (was
+#     334-354 pre-#899), dense p99 38.9ms, as_of 0.31ms, cold start 377.9ms,
+#     write 1260/1160 docs/s. Budgets = measured x3.
+#   - 100K: 8-vCPU reference reports (report-v2.21.0-linux-8vcpu-100k.json)
+#     x3 as a START — first weekly 100K run may need a follow-up tweak:
+#     the 10K 2vCPU/8vCPU ratios suggest temporal (~35x) and cold start
+#     (~16x) could land well above these on 2-vCPU.
 DEFAULT_BUDGETS = {
     10_000: {
-        "WRITE_DOCS_PER_SEC": 150,         # measured 529 (was 141 pre-#476)
-        "WRITE_LAST10_DOCS_PER_SEC": 100,  # measured 328 (was 68)
-        "FTS5_P99_MS": 30,                 # measured 8.9
-        "DENSE_P99_MS": 60,                # measured 14.0
-        "HYBRID_P99_MS": 100,              # measured 24.6 (was 33.9 pre-#511)
-        "AS_OF_P99_MS": 5,                 # measured 0.3
-        "TEMPORAL_RECALL_P99_MS": 15,      # measured 3.4
-        "COLD_START_MS": 500,              # measured 26.8
+        "WRITE_DOCS_PER_SEC": 420,         # measured 1260 (2-vCPU, 2026-08-08)
+        "WRITE_LAST10_DOCS_PER_SEC": 386,  # measured 1160
+        "FTS5_P99_MS": 968,                # measured 322.7
+        "DENSE_P99_MS": 117,               # measured 38.9
+        "HYBRID_P99_MS": 612,              # measured 204.0 (was 334-354 pre-#899)
+        "AS_OF_P99_MS": 5,                 # measured 0.31 — sub-ms, extra headroom
+        "TEMPORAL_RECALL_P99_MS": 888,     # measured 296.0
+        "COLD_START_MS": 1134,             # measured 377.9
     },
     100_000: {
-        "WRITE_DOCS_PER_SEC": 15,          # measured 46 (was 7 pre-#476)
-        "WRITE_LAST10_DOCS_PER_SEC": 7,    # measured 21 (was 3)
-        "FTS5_P99_MS": 100,                # measured 19.1 (was 181.7)
-        "DENSE_P99_MS": 150,               # measured 24.9 (was 446.9, #507)
-        "HYBRID_P99_MS": 250,              # measured 93.8 (was 337, #511 locked)
-        "AS_OF_P99_MS": 5,                 # measured 0.3 — flat 10K→100K
-        "TEMPORAL_RECALL_P99_MS": 50,      # measured 13.3
-        "COLD_START_MS": 500,              # measured 54.7 @ ~890MB
+        "WRITE_DOCS_PER_SEC": 8,           # 8-vCPU ref 26 /3 (first weekly may need tweak)
+        "WRITE_LAST10_DOCS_PER_SEC": 4,    # 8-vCPU ref 14 /3
+        "FTS5_P99_MS": 375,                # 8-vCPU ref 125.0 x3
+        "DENSE_P99_MS": 499,               # 8-vCPU ref 166.3 x3
+        "HYBRID_P99_MS": 1173,             # 8-vCPU ref 390.9 x3
+        "AS_OF_P99_MS": 132,               # 8-vCPU ref 44.0 x3
+        "TEMPORAL_RECALL_P99_MS": 241,     # 8-vCPU ref 80.2 x3 — 2-vCPU est ~2.8s, likely tweak
+        "COLD_START_MS": 686,              # 8-vCPU ref 228.7 x3 — 2-vCPU est ~3.6s, likely tweak
     },
     # 1M rung (#589). Keyword/hybrid latency budgets carry the corpus-scaling
     # MEASURED on the #589 Lambda A10 run (benchmark/lambda/results/, 2026-07-12):
