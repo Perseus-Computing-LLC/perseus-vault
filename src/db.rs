@@ -403,6 +403,10 @@ pub struct Database {
     /// mutex (rusqlite::Connection is !Send/!Sync, so it cannot live in a
     /// OnceLock inside the shared Database).
     governance_overlay: std::sync::Mutex<Option<rusqlite::Connection>>,
+    /// #882: cached suppression-active gate. Re-checked on first use after
+    /// invalidation; invalidated by any reject_value / assert_erasure write
+    /// so hot read paths never pay the pool-checkout + SQL-query cost.
+    cached_suppression_active: std::sync::Mutex<Option<bool>>,
 }
 
 /// #619: bumped by every in-place emb_sig write; one of the sig cache's two
@@ -847,6 +851,7 @@ impl Database {
             embed_queue_cap: EMBED_QUEUE_CAP,
             sig_cache: std::sync::Mutex::new(None),
             governance_overlay: std::sync::Mutex::new(None),
+            cached_suppression_active: std::sync::Mutex::new(None),
         })
     }
 
@@ -2508,6 +2513,24 @@ impl Database {
     }
 
     fn governance_may_suppress(&self) -> Result<bool, Box<dyn std::error::Error>> {
+        {
+            let cached = self.cached_suppression_active.lock().unwrap();
+            if let Some(v) = *cached {
+                return Ok(v);
+            }
+        }
+        let active = self.governance_check_suppression()?;
+        *self.cached_suppression_active.lock().unwrap() = Some(active);
+        Ok(active)
+    }
+
+    /// Invalidate the cached suppression gate. Call after any write that
+    /// could create or expire a tombstone / permanent mandate.
+    fn invalidate_suppression_cache(&self) {
+        *self.cached_suppression_active.lock().unwrap() = None;
+    }
+
+    fn governance_check_suppression(&self) -> Result<bool, Box<dyn std::error::Error>> {
         let conn = self.conn()?;
         let primary: bool = conn.query_row(
             "SELECT EXISTS(
@@ -4154,6 +4177,7 @@ impl Database {
         if expires_at_unix_ms.is_none() {
             self.assert_erasure(value, predicate, reason, workspace_hash)?;
         }
+        self.invalidate_suppression_cache();
         Ok(id)
     }
 
@@ -4313,6 +4337,8 @@ impl Database {
              DO UPDATE SET reason=excluded.reason",
             params![digest, predicate, reason, workspace_hash, now_ms()],
         )?;
+        drop(guard);
+        self.invalidate_suppression_cache();
         Ok(())
     }
 
@@ -16763,6 +16789,7 @@ mod tests {
             embed_queue_cap: EMBED_QUEUE_CAP,
             sig_cache: std::sync::Mutex::new(None),
             governance_overlay: std::sync::Mutex::new(None),
+            cached_suppression_active: std::sync::Mutex::new(None),
         };
 
         db.remember_skip_dedup(&make_entity(
