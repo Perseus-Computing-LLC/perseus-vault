@@ -36,7 +36,12 @@ env:
 
 jobs:
   scale-gate:
-    runs-on: ubuntu-latest
+    # 8-core: the committed reference baselines (benchmark/scale/report-v2.21.0-*)
+    # were measured on 8-vCPU hardware, and budgets carry ~3x headroom over
+    # them. GitHub provides larger runners free for public repositories; the
+    # default 2-vCPU runner measures 30x+ over the same budgets and made the
+    # gate permanently red (#898).
+    runs-on: ubuntu-8core
     timeout-minutes: 350
     steps:
       - uses: actions/checkout@v4

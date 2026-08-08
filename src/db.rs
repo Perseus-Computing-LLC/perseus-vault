@@ -4482,6 +4482,76 @@ impl Database {
         Ok(Some(conn))
     }
 
+    /// #898: batched suppression membership check. One query per distinct
+    /// (workspace, predicate) pair with candidate digests IN-chunked — instead
+    /// of 2-3 queries per candidate — so broad FTS5 matches (10K+ candidates)
+    /// do not pay 20-30K SQL round-trips per recall. Predicate semantics are
+    /// EXACTLY the per-row predicates (see primary_entity_suppressed_with_conn
+    /// / is_value_erased_with_conn):
+    ///   tombstone matches entity iff
+    ///     tombstone.workspace_hash IN ('', entity.ws)
+    ///     AND tombstone.predicate IN ('', entity.cat)
+    ///     AND tombstone.value_sha256 = digest(entity.body_json)
+    ///     AND (no expiry column, OR expires_at_unix_ms IS NULL OR > now)
+    /// Returns the set of (workspace, predicate, value_sha256) triples that
+    /// matched; `table` is an internal constant, never user input.
+    fn mandate_hits_batched(
+        conn: &rusqlite::Connection,
+        triples: &[(String, String, String)],
+        table: &str,
+        expiry_after: Option<i64>,
+    ) -> Result<std::collections::HashSet<(String, String, String)>, Box<dyn std::error::Error>> {
+        use rusqlite::types::Value;
+        use std::collections::{HashMap, HashSet};
+        if triples.is_empty() {
+            return Ok(HashSet::new());
+        }
+        let mut by_pair: HashMap<(&str, &str), Vec<&str>> = HashMap::new();
+        for (ws, cat, digest) in triples {
+            by_pair.entry((ws.as_str(), cat.as_str())).or_default().push(digest.as_str());
+        }
+        let mut hits: HashSet<(String, String, String)> = HashSet::new();
+        const CHUNK: usize = 512;
+        for ((ws, cat), digests) in by_pair {
+            for chunk in digests.chunks(CHUNK) {
+                // Explicit placeholder numbering: the digest IN-list occupies
+                // ?3..?{2+n}; the optional expiry predicate must not collide
+                // with it (SQLite numbers `?` by appearance).
+                let n = chunk.len();
+                let ph = (3..3 + n)
+                    .map(|i| format!("?{i}"))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let expiry_sql = match expiry_after {
+                    Some(_) => format!(" AND (expires_at_unix_ms IS NULL OR expires_at_unix_ms > ?{})", 3 + n),
+                    None => String::new(),
+                };
+                let sql = format!(
+                    "SELECT value_sha256 FROM {table}
+                     WHERE workspace_hash IN ('', ?1) AND predicate IN ('', ?2)
+                       AND value_sha256 IN ({ph}){expiry_sql}"
+                );
+                let mut values: Vec<Value> = vec![
+                    Value::Text(ws.to_string()),
+                    Value::Text(cat.to_string()),
+                ];
+                for d in chunk {
+                    values.push(Value::Text(d.to_string()));
+                }
+                if let Some(now) = expiry_after {
+                    values.push(Value::Integer(now));
+                }
+                let mut stmt = conn.prepare(&sql)?;
+                let mut rows = stmt.query(rusqlite::params_from_iter(values.iter()))?;
+                while let Some(row) = rows.next()? {
+                    let sha: String = row.get(0)?;
+                    hits.insert((ws.to_string(), cat.to_string(), sha));
+                }
+            }
+        }
+        Ok(hits)
+    }
+
     fn filter_suppressed_with_conn(
         &self,
         conn: &rusqlite::Connection,
@@ -4492,28 +4562,35 @@ impl Database {
         }
         let overlay = self.governance_read_conn_compatible()?;
         let now = now_ms();
-        let mut kept = Vec::with_capacity(entities.len());
-        for entity in entities {
-            let erased = overlay
-                .as_ref()
-                .map(|sidecar| {
-                    self.is_value_erased_with_conn(
-                        sidecar,
-                        &entity.workspace_hash,
-                        &entity.category,
-                        &entity.body_json,
-                    )
-                })
-                .transpose()?
-                .unwrap_or(false);
-            let primary_suppressed = self.primary_entity_suppressed_with_conn(&conn, &entity, now)?;
-            if !erased && !primary_suppressed {
-                kept.push(entity);
-            }
-        }
-        Ok(kept)
+        // #898: batch the per-candidate suppression probes into a handful of
+        // queries (see mandate_hits_batched). Deterministic ordering preserved:
+        // kept entities stay in input order.
+        let triples: Vec<(String, String, String)> = entities
+            .iter()
+            .map(|e| {
+                (
+                    e.workspace_hash.clone(),
+                    e.category.clone(),
+                    rejected_value_digest(&e.body_json),
+                )
+            })
+            .collect();
+        let primary = Self::mandate_hits_batched(conn, &triples, "rejected_value_tombstones", Some(now))?;
+        let erased = match overlay.as_ref() {
+            Some(sidecar) => Self::mandate_hits_batched(sidecar, &triples, "erasure_mandates", None)?,
+            None => std::collections::HashSet::new(),
+        };
+        Ok(entities
+            .into_iter()
+            .zip(triples.into_iter())
+            .filter(|(_, t)| !primary.contains(t) && !erased.contains(t))
+            .map(|(e, _)| e)
+            .collect())
     }
 
+    /// #898: per-row suppression check — still used by bounded single/small
+    /// candidate paths (search pages, history pagination, graph traversal);
+    /// the recall paths use the batched mandate_hits_batched.
     fn primary_entity_suppressed_with_conn(
         &self,
         conn: &rusqlite::Connection,
@@ -4607,7 +4684,9 @@ impl Database {
     /// Read-only suppression check for an already-materialized entity. The
     /// caller owns the primary connection so this helper never performs a
     /// nested pool checkout. Sidecar lookup is still independent and
-    /// workspace/predicate scoped.
+    /// workspace/predicate scoped. #898: bounded paths keep the per-row form;
+    /// the recall paths batch via mandate_hits_batched (also the test oracle
+    /// for batched-path equivalence).
     fn entity_suppressed_with_conn(
         &self,
         conn: &rusqlite::Connection,
@@ -4654,14 +4733,34 @@ impl Database {
         conn: &rusqlite::Connection,
         scored: Vec<(Entity, f64)>,
     ) -> Result<Vec<(Entity, f64)>, Box<dyn std::error::Error>> {
-        let now = now_ms();
-        let mut kept = Vec::with_capacity(scored.len());
-        for (entity, score) in scored {
-            if !self.entity_suppressed_with_conn(conn, &entity, now)? {
-                kept.push((entity, score));
-            }
+        if scored.is_empty() {
+            return Ok(scored);
         }
-        Ok(kept)
+        let overlay = self.governance_read_conn_compatible()?;
+        let now = now_ms();
+        // #898: batched suppression probes (same semantics as the per-row
+        // path); scores and input order are preserved.
+        let triples: Vec<(String, String, String)> = scored
+            .iter()
+            .map(|(e, _)| {
+                (
+                    e.workspace_hash.clone(),
+                    e.category.clone(),
+                    rejected_value_digest(&e.body_json),
+                )
+            })
+            .collect();
+        let primary = Self::mandate_hits_batched(conn, &triples, "rejected_value_tombstones", Some(now))?;
+        let erased = match overlay.as_ref() {
+            Some(sidecar) => Self::mandate_hits_batched(sidecar, &triples, "erasure_mandates", None)?,
+            None => std::collections::HashSet::new(),
+        };
+        Ok(scored
+            .into_iter()
+            .zip(triples.into_iter())
+            .filter(|((_, _), t)| !primary.contains(t) && !erased.contains(t))
+            .map(|((e, s), _)| (e, s))
+            .collect())
     }
 
 
@@ -20749,6 +20848,135 @@ mod tests {
         let global = db.remember(&ent_c);
         assert!(global.is_err(), "global tombstone must block ws-c: {global:?}");
 
+        let _ = fs::remove_file(&path);
+    }
+
+    /// #898: the batched suppression filter must return EXACTLY what the
+    /// per-row reference implementation returns, across global/workspace/
+    /// predicate-scoped tombstones, sidecar erasure mandates, expiry, and a
+    /// multi-workspace candidate set.
+    #[test]
+    fn suppression_batched_matches_per_row_reference() {
+        let (db, path) = temp_db();
+        let bodies: Vec<String> = (0..6)
+            .map(|i| format!(r#"{{"note":"eq-body-{i}"}}"#))
+            .collect();
+        // (workspace, category, body-index) per entity.
+        let spec = [
+            ("ws-a", "cat-x", 0),
+            ("ws-a", "cat-y", 1),
+            ("ws-b", "cat-x", 2),
+            ("ws-b", "cat-y", 3),
+            ("ws-a", "cat-x", 4),
+            ("ws-c", "cat-z", 5),
+        ];
+        let mut entities = Vec::new();
+        for (i, (ws, cat, bi)) in spec.iter().enumerate() {
+            let mut e = make_entity(&format!("key-{i}"), cat, &format!("k{i}"), &bodies[*bi]);
+            e.workspace_hash = ws.to_string();
+            db.remember(&e).unwrap();
+            entities.push(e);
+        }
+        // Tombstones: global, workspace-scoped, predicate-scoped,
+        // workspace+predicate-scoped, and expired (far in the past so
+        // now_ms() drift cannot flip it).
+        db.reject_value("", "g", "", &bodies[0], "global", "", "t", None)
+            .unwrap();
+        db.reject_value("ws-a", "k", "", &bodies[1], "ws", "", "t", None)
+            .unwrap();
+        db.reject_value("", "k", "cat-x", &bodies[2], "cat", "", "t", None)
+            .unwrap();
+        db.reject_value("ws-b", "k", "cat-y", &bodies[3], "ws+cat", "", "t", None)
+            .unwrap();
+        db.reject_value("ws-a", "k", "", &bodies[4], "expired", "", "t", Some(now_ms() - 100_000))
+            .unwrap();
+        // Sidecar erasure mandates: global (body5) and ws-a-scoped (body0 —
+        // already tombstoned globally; same outcome).
+        db.assert_erasure(&bodies[5], "", "erased-global", "").unwrap();
+        db.assert_erasure(&bodies[0], "", "erased-ws-a", "ws-a").unwrap();
+
+        // Per-row reference oracle.
+        let conn = db.conn().unwrap();
+        let now = now_ms();
+        let expected: Vec<&Entity> = entities
+            .iter()
+            .filter(|e| !db.entity_suppressed_with_conn(&conn, e, now).unwrap())
+            .collect();
+        // Only entity 4 (expired tombstone) survives.
+        assert_eq!(expected.len(), 1, "oracle: exactly one survivor");
+        assert_eq!(expected[0].key, "k4");
+
+        // Batched path must agree exactly (content AND order).
+        let got = db.filter_suppressed(entities.clone()).unwrap();
+        let got_keys: Vec<String> = got.iter().map(|e| e.key.clone()).collect();
+        let exp_keys: Vec<String> = expected.iter().map(|e| e.key.clone()).collect();
+        assert_eq!(got_keys, exp_keys);
+
+        // Scored variant agrees too.
+        let scored: Vec<(Entity, f64)> = entities
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(i, e)| (e, i as f64))
+            .collect();
+        let got_s = db.filter_suppressed_scored(scored).unwrap();
+        assert_eq!(got_s.len(), 1);
+        assert_eq!(got_s[0].0.key, "k4");
+
+        let _ = fs::remove_file(&path);
+    }
+
+    /// #898: chunk boundaries (512 per IN-list) must not change results.
+    #[test]
+    fn suppression_batched_chunk_boundaries_match_reference() {
+        let (db, path) = temp_db();
+        // 1300 entities in ONE (ws, cat) pair → three IN-chunks (512/512/276).
+        let mut entities = Vec::new();
+        for i in 0..1300 {
+            let body = format!(r#"{{"note":"chunk-{i}"}}"#);
+            let mut e = make_entity(&format!("ck-{i}"), "cat-x", &format!("c{i}"), &body);
+            e.workspace_hash = "ws-a".to_string();
+            db.remember(&e).unwrap();
+            entities.push(e);
+        }
+        // Suppress one body in chunk 2 (index 700) and one in chunk 3 (1299).
+        db.reject_value(
+            "ws-a",
+            "k",
+            "cat-x",
+            &format!(r#"{{"note":"chunk-700"}}"#),
+            "r",
+            "",
+            "t",
+            None,
+        )
+        .unwrap();
+        db.reject_value(
+            "ws-a",
+            "k",
+            "cat-x",
+            &format!(r#"{{"note":"chunk-1299"}}"#),
+            "r",
+            "",
+            "t",
+            None,
+        )
+        .unwrap();
+        let conn = db.conn().unwrap();
+        let now = now_ms();
+        let expected: Vec<String> = entities
+            .iter()
+            .filter(|e| !db.entity_suppressed_with_conn(&conn, e, now).unwrap())
+            .map(|e| e.key.clone())
+            .collect();
+        assert_eq!(expected.len(), 1298);
+        let got: Vec<String> = db
+            .filter_suppressed(entities)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.key)
+            .collect();
+        assert_eq!(got, expected);
         let _ = fs::remove_file(&path);
     }
 
