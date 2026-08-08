@@ -27839,17 +27839,35 @@ mod tests {
             .join(format!("mimir-no-model-{}", uuid::Uuid::new_v4()))
             .join("model.onnx");
         db.set_embedding_model(missing.to_str().unwrap());
-        // A port with nothing listening: bind then drop to reserve-and-refuse.
-        let dead_port = {
-            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            l.local_addr().unwrap().port()
+        // A live endpoint that REJECTS every request (HTTP 500). Deterministic:
+        // a bare dead port can collide with another test's ephemeral mock
+        // server in the same process (ephemeral port reuse) and accidentally
+        // serve embeddings — the flake seen on the grpc build.
+        let rejecting_port = {
+            use std::io::{Read, Write};
+            let listener =
+                std::net::TcpListener::bind("127.0.0.1:0").expect("bind rejecting embed server");
+            let port = listener.local_addr().unwrap().port();
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(mut s) = stream else { break };
+                    std::thread::spawn(move || {
+                        let mut buf = [0u8; 1024];
+                        let _ = s.read(&mut buf);
+                        let resp = b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                        let _ = s.write_all(resp);
+                        let _ = s.flush();
+                    });
+                }
+            });
+            port
         };
         db.set_llm(
             true,
-            &format!("http://127.0.0.1:{dead_port}/api/generate"),
+            &format!("http://127.0.0.1:{rejecting_port}/api/generate"),
             "fake-embed",
             None,
-            Some(&format!("http://127.0.0.1:{dead_port}/api/embed")),
+            Some(&format!("http://127.0.0.1:{rejecting_port}/api/embed")),
             None,
         );
         let total = 30;
