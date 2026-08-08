@@ -3742,6 +3742,20 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
           "type": "boolean",
           "default": false,
           "description": "Archive merged source entities after the observation is created (archive_reason names the observation; reversible). Verified or importance-floored sources are never archived."
+        },
+        "workspace_hash": {
+          "type": "string",
+          "description": "#854 workspace scope for this run. Scans, clusters, evidence links, and archive operations are strictly restricted to this workspace, and derived observations inherit it. Mutually exclusive with global=true. One of workspace_hash or global is required."
+        },
+        "global": {
+          "type": "boolean",
+          "default": false,
+          "description": "#854 explicit cross-workspace mode for deliberate whole-vault consolidation. Capability-gated (memory.maintenance.global) when the caller carries a host identity. Mutually exclusive with workspace_hash."
+        },
+        "requesting_agent_id": {
+          "type": "string",
+          "default": "",
+          "description": "Host identity stamped by the MCP transport. Used for global-mode authorization and stamped as author on derived observations."
         }
       },
       "required": [
@@ -3772,6 +3786,14 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
         },
         "dry_run": {
           "type": "boolean"
+        },
+        "workspace_hash": {
+          "type": "string",
+          "description": "#854 effective scope: the workspace this run operated in"
+        },
+        "global": {
+          "type": "boolean",
+          "description": "#854 true when this run deliberately crossed all workspaces"
         },
         "observations": {
           "type": "array",
@@ -3840,6 +3862,20 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
           "type": "boolean",
           "default": false,
           "description": "When no --llm-endpoint is configured, run the mechanical (non-LLM) mimir_consolidate cold_first pass instead of returning an error."
+        },
+        "workspace_hash": {
+          "type": "string",
+          "description": "#854 workspace scope for this run. Scans, clusters, and evidence lookups are strictly restricted to this workspace, and derived insights inherit it. Mutually exclusive with global=true. One of workspace_hash or global is required."
+        },
+        "global": {
+          "type": "boolean",
+          "default": false,
+          "description": "#854 explicit cross-workspace mode for deliberate whole-vault dreaming. Capability-gated (memory.maintenance.global) when the caller carries a host identity. Mutually exclusive with workspace_hash."
+        },
+        "requesting_agent_id": {
+          "type": "string",
+          "default": "",
+          "description": "Host identity stamped by the MCP transport. Used for global-mode authorization and stamped as author on derived insights."
         }
       },
       "required": []
@@ -3879,6 +3915,14 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
         },
         "dry_run": {
           "type": "boolean"
+        },
+        "workspace_hash": {
+          "type": "string",
+          "description": "#854 effective scope: the workspace this run operated in"
+        },
+        "global": {
+          "type": "boolean",
+          "description": "#854 true when this run deliberately crossed all workspaces"
         },
         "insights": {
           "type": "array",
@@ -4413,6 +4457,11 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
           "type": "string",
           "default": "",
           "description": "Agent that authored the correction (stamped on the tombstone)."
+        },
+        "requesting_agent_id": {
+          "type": "string",
+          "default": "",
+          "description": "#855 host identity (stamped by the MCP transport). When present, it is authoritative: the correction entity, journal event, and tombstone attribute the host, not any model-supplied agent_id."
         }
       },
       "required": [
@@ -4431,6 +4480,14 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
         "journal_id": {
           "type": "string",
           "description": "Created journal entry ID"
+        },
+        "agent_id": {
+          "type": "string",
+          "description": "#855 agent attribution persisted on the entity and journal event (host identity when the transport stamped one)"
+        },
+        "workspace_hash": {
+          "type": "string",
+          "description": "#855 workspace scope persisted on the entity and journal event. Empty = global/legacy."
         },
         "category": {
           "type": "string"
@@ -4619,6 +4676,20 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
         "capture_max_entities": {
           "type": "integer",
           "description": "Maximum durable notes extracted from capture_text (1-20)"
+        },
+        "workspace_hash": {
+          "type": "string",
+          "description": "#854 workspace scope for the consolidation step. When set, only that workspace's entities are consolidated and the observations inherit the scope. Omit for the whole-vault pass."
+        },
+        "global": {
+          "type": "boolean",
+          "default": false,
+          "description": "#854 explicit whole-vault consolidation mode (capability-gated with a host identity). Mutually exclusive with workspace_hash."
+        },
+        "requesting_agent_id": {
+          "type": "string",
+          "default": "",
+          "description": "Host identity stamped by the MCP transport. Used for global-mode authorization and consolidation author attribution."
         }
       }
     },
