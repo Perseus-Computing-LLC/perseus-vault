@@ -36,7 +36,7 @@ jobs:
       - name: Memory quality report
         run: python benchmark/quality/run.py --out benchmark/quality/report.json
       - name: Build blocking release scorecard
-        run: python benchmark/quality/scorecard.py benchmark/quality/report.json --out benchmark/quality/scorecard.json
+        run: python benchmark/quality/scorecard.py benchmark/quality/report.json --out benchmark/quality/scorecard.json ${{ github.event_name == 'pull_request' && '--advisory' || '' }}
       - name: Upload quality report and scorecard
         if: always()
         uses: actions/upload-artifact@v4

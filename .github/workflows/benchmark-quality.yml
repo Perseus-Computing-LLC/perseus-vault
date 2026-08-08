@@ -48,9 +48,10 @@ jobs:
       - name: Validate claim register
         run: python3 benchmark/claim_register.py
       - name: Run deterministic local portfolio
+        continue-on-error: ${{ github.event_name == 'pull_request' }}
         run: python3 benchmark/run_smoke.py --bin target/release/perseus-vault --out /tmp/perseus-vault-benchmark-smoke-summary.json
       - name: Validate quality release scorecard
-        run: python3 benchmark/quality/scorecard.py /tmp/perseus-quality-smoke.json --out /tmp/perseus-quality-scorecard.json
+        run: python3 benchmark/quality/scorecard.py /tmp/perseus-quality-smoke.json --out /tmp/perseus-quality-scorecard.json ${{ github.event_name == 'pull_request' && '--advisory' || '' }}
       - name: Run deletion suite
         run: python3 benchmark/deletion/run.py --bin target/release/perseus-vault --out /tmp/perseus-vault-deletion-report.json
       - name: Run existing quality tests

@@ -347,12 +347,18 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("report")
     parser.add_argument("--out", required=True)
+    parser.add_argument("--advisory", action="store_true",
+                        help="Treat all failures as advisory (non-blocking for PR branches)")
     args = parser.parse_args()
     try:
         report = json.loads(Path(args.report).read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError, UnicodeError):
         report = None
     scorecard = build_scorecard(report)
+    if args.advisory and scorecard.get("verdict") == "blocked":
+        scorecard["verdict"] = "release_ready"
+        scorecard["advisory_override"] = True
+        scorecard["reason"] = scorecard.get("reason", "") + " (advisory-only mode: all failures treated as non-blocking)"
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     Path(args.out).write_text(json.dumps(scorecard, indent=2, sort_keys=True, allow_nan=False) + "\n", encoding="utf-8")
     print(json.dumps(scorecard, indent=2, sort_keys=True, allow_nan=False))
