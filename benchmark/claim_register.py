@@ -24,12 +24,18 @@ def main() -> int:
         if not isinstance(claim, dict) or not claim.get("id") or claim["id"] in ids:
             raise SystemExit("claim IDs must be unique")
         ids.add(claim["id"])
+        if not isinstance(claim["id"], str) or not __import__("re").fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}", claim["id"]):
+            raise SystemExit(f"invalid claim id: {claim['id']}")
         if claim.get("status") not in ALLOWED:
             raise SystemExit(f"invalid claim status: {claim.get('status')}")
         if claim["status"] in {"not_measured", "blocked"} and not claim.get("negative_claim"):
             raise SystemExit(f"{claim['id']} needs a negative_claim")
-        if claim["status"] == "supported" and not claim.get("evidence"):
-            raise SystemExit(f"{claim['id']} needs evidence")
+        if claim["status"] in {"supported", "review"}:
+            for field in ("suite", "scope", "evidence"):
+                if not isinstance(claim.get(field), str) or not claim[field] or any(token in claim[field].lower() for token in ("private", "query", "token", "credential")):
+                    raise SystemExit(f"{claim['id']} needs safe {field}")
+        if claim["status"] == "supported" and claim.get("evidence") in {"focused_unit_tests_only", "not_measured"}:
+            raise SystemExit(f"{claim['id']} cannot be supported by non-execution evidence")
     print(f"CLAIM REGISTER OK ({len(claims)} claims)")
     return 0
 

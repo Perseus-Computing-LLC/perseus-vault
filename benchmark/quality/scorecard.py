@@ -41,12 +41,12 @@ def _unavailable_categories(report):
     return sorted(categories), sorted(item for item in cases if item)
 
 
-def _unavailable_capabilities(report):
+def _blocking_capabilities(report):
     capabilities = report.get("capabilities", {})
     return sorted(
         name
         for name, state in capabilities.items()
-        if isinstance(state, dict) and state.get("status") in {"unavailable", "unknown"}
+        if not isinstance(state, dict) or state.get("status") != "available"
     )
 
 
@@ -124,7 +124,7 @@ def build_scorecard(report):
             continue
         observed_passed += case_passed
         observed_total += case_total
-        if status == "failed" or case_passed < case_total:
+        if status != "passed" or case_passed < case_total:
             if case.get("category"):
                 failed_categories.add(case["category"])
     failed_categories = sorted(category for category in failed_categories if category)
@@ -135,18 +135,23 @@ def build_scorecard(report):
         | (required_categories - actual_categories)
     )
     unavailable_categories, unavailable_cases = _unavailable_categories(report)
-    unavailable_capabilities = _unavailable_capabilities(report)
+    unavailable_capabilities = _blocking_capabilities(report)
     metrics = report.get("metrics", {}) or {}
     metric_rates = report.get("metric_rates", {}) or {}
     unavailable_metrics = set(
         name
         for name, metric in metrics.items()
-        if isinstance(metric, dict) and metric.get("status") in {"unavailable", "partial"}
+        if isinstance(metric, dict) and metric.get("status") in {"unavailable"}
     )
     failed_metrics = set(
         name
         for name, metric in metrics.items()
         if isinstance(metric, dict) and metric.get("status") == "failed"
+    )
+    partial_metrics = set(
+        name
+        for name, metric in metrics.items()
+        if isinstance(metric, dict) and metric.get("status") in {"partial", "not_measured"}
     )
     invalid_metrics = set()
     required_metric_rates = REQUIRED_METRIC_RATES | (V1_REQUIRED_METRIC_RATES if _is_v1_report(report) else set())
@@ -157,7 +162,7 @@ def build_scorecard(report):
             continue
         status = metric.get("status")
         rate = metric.get("rate")
-        if status in {"unavailable", "partial"} or rate is None:
+        if status in {"unavailable", "partial", "not_measured"} or rate is None:
             unavailable_metrics.add(name)
         elif status == "failed":
             failed_metrics.add(name)
@@ -198,6 +203,7 @@ def build_scorecard(report):
         and not unavailable_categories
         and not unavailable_capabilities
         and not unavailable_metrics
+        and not partial_metrics
         and not failed_metrics
         and not invalid_metrics
         and not invalid_cases
@@ -221,6 +227,7 @@ def build_scorecard(report):
         "unavailable_cases": unavailable_cases,
         "unavailable_capabilities": unavailable_capabilities,
         "unavailable_metrics": sorted(unavailable_metrics),
+        "partial_metrics": sorted(partial_metrics),
         "failed_metrics": sorted(failed_metrics),
         "invalid_metrics": sorted(invalid_metrics),
         "case_count": case_count,

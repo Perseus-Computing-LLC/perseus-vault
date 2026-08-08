@@ -33,25 +33,33 @@ def token_proxy(text: str) -> int:
 
 
 def token_cost(input_tokens: int, output_tokens: int = 0, *, input_usd_per_million: float | None = None, output_usd_per_million: float | None = None) -> float | None:
+    if not isinstance(input_tokens, int) or isinstance(input_tokens, bool) or input_tokens < 0:
+        raise ValueError("input_tokens must be a non-negative integer")
+    if not isinstance(output_tokens, int) or isinstance(output_tokens, bool) or output_tokens < 0:
+        raise ValueError("output_tokens must be a non-negative integer")
     if input_usd_per_million is None and output_usd_per_million is None:
         return None
     in_price = 0.0 if input_usd_per_million is None else float(input_usd_per_million)
     out_price = 0.0 if output_usd_per_million is None else float(output_usd_per_million)
-    if in_price < 0 or out_price < 0:
-        raise ValueError("token prices must be non-negative")
+    if not math.isfinite(in_price) or not math.isfinite(out_price) or in_price < 0 or out_price < 0:
+        raise ValueError("token prices must be finite and non-negative")
     return (input_tokens * in_price + output_tokens * out_price) / 1_000_000
 
 
-def database_counts(db_path: str | Path) -> dict[str, int]:
+def database_counts(db_path: str | Path) -> dict[str, int | None]:
     """Return bounded table counts when the SQLite file is readable."""
     connection = sqlite3.connect(str(db_path))
     try:
-        counts: dict[str, int] = {}
+        counts: dict[str, int | None] = {}
         for table in ("entities", "entity_history", "journal", "links"):
-            try:
-                counts[table] = int(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
-            except sqlite3.Error:
-                counts[table] = 0
+            row = connection.execute(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?",
+                (table,),
+            ).fetchone()
+            if not row or row[0] != 1:
+                counts[table] = None
+                continue
+            counts[table] = int(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
         return counts
     finally:
         connection.close()
@@ -62,7 +70,7 @@ def resource_overlay(*, db_path: str | Path, injected_text: str = "", output_tex
     output_tokens = token_proxy(output_text)
     storage = sqlite_bytes(db_path)
     counts = database_counts(db_path)
-    active = max(0, counts.get("entities", 0))
+    active = max(0, counts.get("entities") or 0)
     return {
         "storage": {**storage, "bytes_per_entity": storage["total_bytes"] / active if active else None},
         "tokens": {"input_proxy": input_tokens, "output_proxy": output_tokens, "injected_chars": len(injected_text), "output_chars": len(output_text)},

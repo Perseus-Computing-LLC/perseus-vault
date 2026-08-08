@@ -16,12 +16,18 @@ import os
 import subprocess
 import sys
 import tempfile
+import shutil
 import time
+import queue
+import threading
 from pathlib import Path
 from typing import Any
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent.parent
+if str(REPO) not in sys.path:
+    sys.path.insert(0, str(REPO))
+from benchmark.package.common.publication import build_common_report
 
 
 def stable_json(value: Any) -> str:
@@ -77,6 +83,8 @@ def find_binary(explicit: str | None) -> str:
 class Client:
     def __init__(self, binary: str, db: Path):
         self.p = subprocess.Popen([binary, "--db", str(db)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        self.responses: queue.Queue[object] = queue.Queue()
+        threading.Thread(target=self._reader_loop, daemon=True).start()
         self.i = 0
         self.send({"jsonrpc": "2.0", "id": self.next_id(), "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "freshness-benchmark", "version": "1"}}})
         self.read()
@@ -86,6 +94,17 @@ class Client:
         self.i += 1
         return self.i
 
+    def _reader_loop(self) -> None:
+        assert self.p.stdout is not None
+        for line in self.p.stdout:
+            try:
+                response = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if "result" in response or "error" in response:
+                self.responses.put(response)
+        self.responses.put(None)
+
     def send(self, message: dict[str, Any]) -> None:
         assert self.p.stdin is not None
         self.p.stdin.write(json.dumps(message, separators=(",", ":")) + "\n")
@@ -93,10 +112,9 @@ class Client:
 
     def read(self) -> dict[str, Any]:
         assert self.p.stdout is not None
-        line = self.p.stdout.readline()
-        if not line:
+        response = self.responses.get(timeout=30)
+        if response is None or not isinstance(response, dict):
             raise RuntimeError("Vault closed MCP stream")
-        response = json.loads(line)
         if "error" in response:
             raise RuntimeError("MCP request failed")
         result = response.get("result", {})
@@ -171,23 +189,41 @@ def main() -> int:
         rows.append({"case": "restart", "axis": "restart_outcome_explicit", "ok": classify_outcome(probe.get("outcome")) != "missing"})
     finally:
         restarted.close()
+        shutil.rmtree(db.parent, ignore_errors=True)
     passed = sum(bool(row["ok"]) for row in rows)
-    report = {
-        "benchmark": "perseus-vault-freshness",
-        "suite_version": "v1",
-        "binary": Path(binary).name,
-        "offline": True,
+    if not rows:
+        raise ValueError("freshness benchmark produced no checks")
+    raw_report = {
+        "passed": passed == len(rows),
         "network_calls": 0,
-        "checks_passed": passed,
-        "checks_total": len(rows),
-        "accuracy": round(passed / len(rows), 4) if rows else 0.0,
-        "metrics": {"write_to_fts_ms": {"p50_ms": percentile_nearest_rank(fts_lags, 50), "p95_ms": percentile_nearest_rank(fts_lags, 95), "p99_ms": percentile_nearest_rank(fts_lags, 99), "samples": len(fts_lags)}, "outcome_classes": outcome_classes},
-        "cases": rows,
-        "signature_sha256": freshness_signature(rows),
+        "cases": [
+            {
+                "id": f"{row['case']}-{row['axis']}",
+                "category": "freshness",
+                "status": "passed" if row["ok"] else "failed",
+                "checks": {row["axis"]: bool(row["ok"])},
+                "evidence": {},
+                **({"failure_class": "freshness_check_failed"} if not row["ok"] else {}),
+            }
+            for row in rows
+        ],
+        "metrics": {"freshness_durability": {"status": "available", "numerator": passed, "denominator": len(rows), "rate": passed / len(rows)}},
     }
+    report = build_common_report(
+        suite_id="perseus-vault-freshness",
+        suite_version="v1",
+        raw_report=raw_report,
+        binary=binary,
+        manifest={"suite": "freshness", "samples": args.samples, "deadline_ms": args.deadline_ms},
+        profile={"suite": "freshness", "version": "v1", "samples": args.samples, "deadline_ms": args.deadline_ms},
+        repo_root=REPO,
+        not_measured=[],
+        claim_ids=["freshness-v1-healthy-path"],
+        negative_claim_ids=["provider-failure-stress"],
+    )
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
-    Path(args.out).write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
-    print(json.dumps({"checks_passed": passed, "checks_total": len(rows), "accuracy": report["accuracy"], "p50_ms": report["metrics"]["write_to_fts_ms"]["p50_ms"], "out": args.out}, sort_keys=True))
+    Path(args.out).write_text(json.dumps(report, indent=2, sort_keys=True, allow_nan=False) + "\n")
+    print(json.dumps({"checks_passed": passed, "checks_total": len(rows), "accuracy": passed / len(rows), "p50_ms": percentile_nearest_rank(fts_lags, 50), "out": args.out}, sort_keys=True))
     return 0 if passed == len(rows) else 1
 
 

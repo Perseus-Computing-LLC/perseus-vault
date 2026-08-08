@@ -16,11 +16,18 @@ import subprocess
 import sys
 import tempfile
 import time
+import shutil
+import queue
+import threading
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent.parent
+if str(REPO) not in sys.path:
+    sys.path.insert(0, str(REPO))
+from benchmark.package.common.publication import build_common_report
 
 
 def stable_json(value: Any) -> str:
@@ -29,6 +36,14 @@ def stable_json(value: Any) -> str:
 
 def sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def sha256_file(path: str | Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def correction_signature(rows: list[dict[str, Any]]) -> str:
@@ -60,6 +75,9 @@ class VaultClient:
             text=True,
             encoding="utf-8",
         )
+        self._reader = threading.Thread(target=self._reader_loop, daemon=True)
+        self._responses: queue.Queue[object] = queue.Queue()
+        self._reader.start()
         self.request_id = 0
         self._send(
             {
@@ -80,6 +98,19 @@ class VaultClient:
         self.request_id += 1
         return self.request_id
 
+    def _reader_loop(self) -> None:
+        try:
+            assert self.process.stdout is not None
+            for line in self.process.stdout:
+                try:
+                    message = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if "result" in message or "error" in message:
+                    self._responses.put(message)
+        finally:
+            self._responses.put(None)
+
     def _send(self, message: dict[str, Any]) -> None:
         if self.process.stdin is None:
             raise RuntimeError("MCP stdin is closed")
@@ -89,10 +120,9 @@ class VaultClient:
     def _read(self) -> dict[str, Any]:
         if self.process.stdout is None:
             raise RuntimeError("MCP stdout is closed")
-        line = self.process.stdout.readline()
-        if not line:
+        response = self._responses.get(timeout=30)
+        if response is None or not isinstance(response, dict):
             raise RuntimeError("perseus-vault closed the MCP stream")
-        response = json.loads(line)
         if "error" in response:
             raise RuntimeError("MCP request failed")
         result = response.get("result", {})
@@ -174,7 +204,7 @@ def main() -> int:
             key = case["key"]
             remember(client, category, key, case["original"], valid_from_unix_ms=case["original"]["valid_from_unix_ms"])
             initial = items(client, case["current_query"], category)
-            record(case["id"], "setup_original_readable", any(case["expected_current"] not in body_blob(item) and case["expected_history"] in body_blob(item) for item in initial) or bool(initial))
+            record(case["id"], "setup_original_readable", any(case["expected_history"] in body_blob(item) for item in initial))
 
             remember(client, category, key, case["updated"], valid_from_unix_ms=case["updated"]["valid_from_unix_ms"])
             current = items(client, case["current_query"], category)
@@ -211,25 +241,43 @@ def main() -> int:
             record(case["id"], "E_derived_reach", case["expected_current"] in historical_blob or case["expected_history"] in historical_blob)
     finally:
         client.close()
+        with suppress(Exception):
+            shutil.rmtree(db.parent)
 
     passed = sum(row["ok"] for row in rows)
-    report = {
-        "benchmark": "perseus-vault-correction-durability",
-        "dataset": manifest["name"],
-        "suite_version": "v1",
-        "binary": Path(binary).name,
-        "binary_sha256": sha256_text(Path(binary).read_bytes().hex()),
-        "offline": True,
+    if not rows:
+        raise ValueError("correction benchmark produced no checks")
+    raw_report = {
+        "passed": passed == len(rows),
         "network_calls": 0,
-        "cases": rows,
-        "checks_passed": passed,
-        "checks_total": len(rows),
-        "accuracy": round(passed / len(rows), 4) if rows else 0.0,
-        "signature_sha256": correction_signature(rows),
+        "cases": [
+            {
+                "id": f"{row['case']}-{row['axis']}",
+                "category": "correction",
+                "status": "passed" if row["ok"] else "failed",
+                "checks": {row["axis"]: bool(row["ok"])},
+                "evidence": {},
+                **({"failure_class": "correction_check_failed"} if not row["ok"] else {}),
+            }
+            for row in rows
+        ],
+        "metrics": {"correction_durability": {"status": "available", "numerator": passed, "denominator": len(rows), "rate": passed / len(rows)}},
     }
+    report = build_common_report(
+        suite_id="perseus-vault-correction-durability",
+        suite_version="v1",
+        raw_report=raw_report,
+        binary=binary,
+        manifest=manifest,
+        profile={"suite": "correction", "version": "v1", "network_calls": 0},
+        repo_root=REPO,
+        not_measured=[],
+        claim_ids=["correction-v1-durability"],
+        negative_claim_ids=["provider-failure-stress", "deletion-external-propagation"],
+    )
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
-    Path(args.out).write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    print(json.dumps({"checks_passed": passed, "checks_total": len(rows), "accuracy": report["accuracy"], "out": args.out}, sort_keys=True))
+    Path(args.out).write_text(json.dumps(report, indent=2, sort_keys=True, allow_nan=False) + "\n", encoding="utf-8")
+    print(json.dumps({"checks_passed": passed, "checks_total": len(rows), "accuracy": passed / len(rows), "out": args.out}, sort_keys=True))
     return 0 if passed == len(rows) else 1
 
 

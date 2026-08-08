@@ -98,7 +98,7 @@ class QualityHarnessTests(unittest.TestCase):
             self.assertNotIn(forbidden, encoded)
         self.assertNotIn("id_sha256", encoded)
         self.assertNotIn("mem-random", encoded)
-        self.assertEqual(evidence["nested"]["key"], "safe-key")
+        self.assertNotIn("nested", encoded)
 
     def test_public_evidence_drops_credentials_timestamps_and_unknown_keys(self):
         evidence = sanitize_evidence(
@@ -239,7 +239,7 @@ class QualityHarnessTests(unittest.TestCase):
             self.skipTest(str(exc))
         out = Path(tempfile.mkdtemp()) / "report.json"
         report = run_benchmark(Path(__file__).with_name("manifest.json"), None, out)
-        self.assertEqual(report["dataset"], "perseus-vault-memory-quality-v0")
+        self.assertEqual(report["dataset"], "perseus-vault-memory-quality-v1")
         self.assertEqual(report["checks_total"], 41)
         self.assertEqual(len(report["cases"]), 30)
         self.assertTrue(all(case["evidence"] for case in report["cases"]))

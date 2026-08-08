@@ -18,7 +18,10 @@
     "excluded",
     "public_evidence",
     "raw_inputs_captured",
-    "result_signature_sha256"
+    "result_signature_sha256",
+    "binary_sha256",
+    "dataset_sha256",
+    "harness_commit"
   ],
   "properties": {
     "schema_version": {"const": "perseus-vault-benchmark-report/v1"},
@@ -30,13 +33,29 @@
     "capabilities": {"$ref": "#/$defs/statusMap"},
     "cases": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/case"}},
     "metrics": {"type": "object", "minProperties": 1, "additionalProperties": {"$ref": "#/$defs/metric"}},
-    "not_measured": {"type": "array", "items": {"$ref": "#/$defs/identifier"}},
-    "excluded": {"type": "array", "items": {"$ref": "#/$defs/identifier"}},
+    "not_measured": {"type": "array", "items": {"$ref": "#/$defs/publicIdentifier"}},
+    "excluded": {"type": "array", "items": {"$ref": "#/$defs/publicIdentifier"}},
     "public_evidence": {"const": "hash-only"},
     "raw_inputs_captured": {"const": false},
     "network_calls": {"type": "integer", "minimum": 0},
     "result_signature_sha256": {"$ref": "#/$defs/sha256"},
-    "claim_ids": {"type": "array", "items": {"$ref": "#/$defs/identifier"}}
+    "binary_sha256": {"$ref": "#/$defs/sha256"},
+    "dataset_sha256": {"$ref": "#/$defs/sha256"},
+    "harness_commit": {"type": "string", "pattern": "^(unknown|[0-9a-f]{40})$"},
+    "benchmark": {"$ref": "#/$defs/publicIdentifier"},
+    "dataset": {"$ref": "#/$defs/publicIdentifier"},
+    "harness_version": {"$ref": "#/$defs/publicIdentifier"},
+    "binary": {"$ref": "#/$defs/publicIdentifier"},
+    "required_categories": {"type": "array", "items": {"$ref": "#/$defs/publicIdentifier"}},
+    "metric_rates": {"type": "object"},
+    "offline": {"type": "boolean"},
+    "passed": {"type": "boolean"},
+    "checks_passed": {"type": "integer", "minimum": 0},
+    "checks_total": {"type": "integer", "minimum": 0},
+    "accuracy": {"type": "number", "minimum": 0, "maximum": 1},
+    "signature_sha256": {"$ref": "#/$defs/sha256"},
+    "claim_ids": {"type": "array", "items": {"$ref": "#/$defs/publicIdentifier"}},
+    "negative_claim_ids": {"type": "array", "items": {"$ref": "#/$defs/publicIdentifier"}}
   },
   "$defs": {
     "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
@@ -64,12 +83,12 @@
       "additionalProperties": false,
       "required": ["id", "category", "status", "checks", "evidence"],
       "properties": {
-        "id": {"$ref": "#/$defs/identifier"},
-        "category": {"$ref": "#/$defs/identifier"},
+        "id": {"$ref": "#/$defs/publicIdentifier"},
+        "category": {"$ref": "#/$defs/publicIdentifier"},
         "status": {"enum": ["passed", "failed", "blocked", "unavailable", "not_measured"]},
         "checks": {"type": "object", "minProperties": 1, "additionalProperties": {"type": "boolean"}},
         "evidence": {"$ref": "#/$defs/evidence"},
-        "failure_class": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$"}
+        "failure_class": {"$ref": "#/$defs/publicIdentifier"}
       }
     },
     "metric": {
@@ -85,7 +104,7 @@
         "p95_ms": {"type": ["number", "null"], "minimum": 0},
         "p99_ms": {"type": ["number", "null"], "minimum": 0},
         "value": {"type": ["number", "null"], "minimum": 0},
-        "reason": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$"}
+        "reason": {"$ref": "#/$defs/publicIdentifier"}
       },
       "allOf": [
         {
@@ -138,16 +157,16 @@
         "profiles_compared": {
           "type": "array",
           "minItems": 1,
-          "items": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$"}
+          "items": {"$ref": "#/$defs/publicIdentifier"}
         },
-        "capability": {"$ref": "#/$defs/identifier"},
-        "category": {"$ref": "#/$defs/identifier"},
-        "check": {"$ref": "#/$defs/identifier"},
-        "failure_class": {"$ref": "#/$defs/identifier"},
-        "mode": {"$ref": "#/$defs/identifier"},
+        "capability": {"$ref": "#/$defs/publicIdentifier"},
+        "category": {"$ref": "#/$defs/publicIdentifier"},
+        "check": {"$ref": "#/$defs/publicIdentifier"},
+        "failure_class": {"$ref": "#/$defs/publicIdentifier"},
+        "mode": {"$ref": "#/$defs/publicIdentifier"},
         "reason": {"$ref": "#/$defs/publicIdentifier"},
-        "scope": {"$ref": "#/$defs/identifier"},
-        "status": {"$ref": "#/$defs/identifier"}
+        "scope": {"$ref": "#/$defs/publicIdentifier"},
+        "status": {"$ref": "#/$defs/publicIdentifier"}
       }
     },
     "identifier": {

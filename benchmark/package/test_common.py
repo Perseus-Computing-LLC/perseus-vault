@@ -128,6 +128,9 @@ class CommonArtifactTests(unittest.TestCase):
             "suite_version": "v1",
             "control_profile_sha256": "a" * 64,
             "run_fingerprint_sha256": "b" * 64,
+            "binary_sha256": "c" * 64,
+            "dataset_sha256": "d" * 64,
+            "harness_commit": "a" * 40,
             "status": "passed",
             "capabilities": {"mcp": {"status": "available"}},
             "cases": [
@@ -234,8 +237,8 @@ class CommonArtifactTests(unittest.TestCase):
             validate_report(report)
 
     def test_run_fingerprint_binds_binary_profile_dataset_and_commit(self):
-        args = dict(binary_sha256="a" * 64, control_profile_sha256="b" * 64, dataset_sha256="c" * 64, harness_commit="commit-a")
-        self.assertNotEqual(run_fingerprint(**args), run_fingerprint(**{**args, "harness_commit": "commit-b"}))
+        args = dict(binary_sha256="a" * 64, control_profile_sha256="b" * 64, dataset_sha256="c" * 64, harness_commit="a" * 40)
+        self.assertNotEqual(run_fingerprint(**args), run_fingerprint(**{**args, "harness_commit": "b" * 40}))
 
     def test_sha256_file_is_real_content_hash(self):
         with tempfile.TemporaryDirectory() as directory:

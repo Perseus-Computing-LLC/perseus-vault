@@ -9,11 +9,17 @@ import os
 import subprocess
 import sys
 import tempfile
+import shutil
+import queue
+import threading
 from pathlib import Path
 from typing import Any
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent.parent
+if str(REPO) not in sys.path:
+    sys.path.insert(0, str(REPO))
+from benchmark.package.common.publication import build_common_report
 
 
 def stable_json(value: Any) -> str:
@@ -38,6 +44,8 @@ def find_binary(explicit: str | None) -> str:
 class Client:
     def __init__(self, binary: str, db: Path):
         self.p = subprocess.Popen([binary, "--db", str(db)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        self.responses: queue.Queue[object] = queue.Queue()
+        threading.Thread(target=self._reader_loop, daemon=True).start()
         self.i = 0
         self.send({"jsonrpc": "2.0", "id": self.next_id(), "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "deletion-benchmark", "version": "1"}}})
         self.read()
@@ -47,6 +55,17 @@ class Client:
         self.i += 1
         return self.i
 
+    def _reader_loop(self) -> None:
+        assert self.p.stdout is not None
+        for line in self.p.stdout:
+            try:
+                response = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if "result" in response or "error" in response:
+                self.responses.put(response)
+        self.responses.put(None)
+
     def send(self, message: dict[str, Any]) -> None:
         assert self.p.stdin is not None
         self.p.stdin.write(json.dumps(message, separators=(",", ":")) + "\n")
@@ -54,10 +73,9 @@ class Client:
 
     def read(self) -> dict[str, Any]:
         assert self.p.stdout is not None
-        line = self.p.stdout.readline()
-        if not line:
+        response = self.responses.get(timeout=30)
+        if response is None or not isinstance(response, dict):
             raise RuntimeError("Vault closed MCP stream")
-        response = json.loads(line)
         if "error" in response:
             raise RuntimeError("MCP request failed")
         result = response.get("result", {})
@@ -133,7 +151,7 @@ def run_case(c: Client, case: dict[str, Any], db: Path, rows: list[dict[str, Any
     rows.append({"case": case["id"], "axis": "after_reingest_stays_hidden", "ok": not contains_marker(c, category, canary)})
     exported = db.parent / f"{case['id']}-derived.md"
     c.call("perseus_vault_derived_export", {"output_path": str(exported), "workspace_hash": ""})
-    rows.append({"case": case["id"], "axis": "derived_export_excludes_canary", "ok": not source_contains_marker(exported, canary)})
+    rows.append({"case": case["id"], "axis": "derived_export_excludes_canary", "ok": exported.exists() and not source_contains_marker(exported, canary)})
     if case["policy"] == "permanent_purge":
         c.call("perseus_vault_purge", {"dry_run": False})
         rows.append({"case": case["id"], "axis": "purge_removes_archived_canary", "ok": not contains_marker(c, category, canary, True)})
@@ -150,6 +168,8 @@ def main() -> int:
     args = ap.parse_args()
     binary = find_binary(args.bin)
     manifest = json.loads(Path(args.manifest).read_text())
+    if not isinstance(manifest.get("cases"), list) or not manifest["cases"]:
+        raise ValueError("deletion manifest must contain at least one case")
     db = Path(tempfile.mkdtemp(prefix="perseus-vault-deletion-")) / "deletion.db"
     c = Client(binary, db)
     rows: list[dict[str, Any]] = []
@@ -158,23 +178,41 @@ def main() -> int:
             run_case(c, case, db, rows)
     finally:
         c.close()
+        shutil.rmtree(db.parent, ignore_errors=True)
     passed = sum(bool(row["ok"]) for row in rows)
-    report = {
-        "benchmark": "perseus-vault-deletion-durability",
-        "dataset": manifest["name"],
-        "suite_version": "v1",
-        "binary": Path(binary).name,
-        "offline": True,
+    if not rows:
+        raise ValueError("deletion benchmark produced no checks")
+    raw_report = {
+        "passed": passed == len(rows),
         "network_calls": 0,
-        "cases": rows,
-        "checks_passed": passed,
-        "checks_total": len(rows),
-        "accuracy": round(passed / len(rows), 4) if rows else 0.0,
-        "signature_sha256": make_report_rows(rows),
+        "cases": [
+            {
+                "id": f"{row['case']}-{row['axis']}",
+                "category": "deletion",
+                "status": "passed" if row["ok"] else "failed",
+                "checks": {row["axis"]: bool(row["ok"])},
+                "evidence": {},
+                **({"failure_class": "deletion_check_failed"} if not row["ok"] else {}),
+            }
+            for row in rows
+        ],
+        "metrics": {"deletion_durability": {"status": "available", "numerator": passed, "denominator": len(rows), "rate": passed / len(rows)}},
     }
+    report = build_common_report(
+        suite_id="perseus-vault-deletion-durability",
+        suite_version="v1",
+        raw_report=raw_report,
+        binary=binary,
+        manifest=manifest,
+        profile={"suite": "deletion", "version": "v1", "network_calls": 0},
+        repo_root=REPO,
+        not_measured=[],
+        claim_ids=["deletion-v1-local-durability"],
+        negative_claim_ids=["provider-failure-stress", "deletion-external-propagation"],
+    )
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
-    Path(args.out).write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
-    print(json.dumps({"checks_passed": passed, "checks_total": len(rows), "accuracy": report["accuracy"], "out": args.out}, sort_keys=True))
+    Path(args.out).write_text(json.dumps(report, indent=2, sort_keys=True, allow_nan=False) + "\n")
+    print(json.dumps({"checks_passed": passed, "checks_total": len(rows), "accuracy": passed / len(rows), "out": args.out}, sort_keys=True))
     return 0 if passed == len(rows) else 1
 
 

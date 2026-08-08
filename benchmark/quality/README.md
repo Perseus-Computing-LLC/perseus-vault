@@ -5,7 +5,9 @@ for [issue #862](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/8
 It remains the same manifest-driven MCP stdio harness; there is no parallel
 benchmark runner.
 
-The current v1 manifest contains **30 deterministic cases and 41 checks**. Synthetic fixtures use stable category/key/token commitments, while the report
+The current v1 manifest contains **30 deterministic cases and 41 checks**. The
+manifest identity is `perseus-vault-memory-quality-v1`; generated reports bind
+the manifest digest, binary digest, control profile, and harness commit. Synthetic fixtures use stable category/key/token commitments, while the report
 retains only booleans, counters, scope/key labels, and SHA-256 digests. Prompts,
 memory bodies, tool arguments, credentials, timestamps, random identifiers, and
 raw MCP payloads are not written to public artifacts. Evidence uses an explicit

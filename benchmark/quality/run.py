@@ -11,8 +11,10 @@ are deliberately not retained.
 import argparse
 import hashlib
 import json
+import math
 import os
 import queue
+import re
 import subprocess
 import sys
 import tempfile
@@ -21,6 +23,10 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent.parent
+if str(REPO) not in sys.path:
+    sys.path.insert(0, str(REPO))
+
+from benchmark.package.common.publication import build_common_report
 MCP_RESPONSE_TIMEOUT_SECONDS = 30.0
 
 LEGACY_REQUIRED_CATEGORIES = (
@@ -220,7 +226,29 @@ class CapabilityUnavailable(RuntimeError):
 
 
 def stable_json(value):
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False)
+
+
+def finite_tree(value, path="value"):
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError(f"{path} contains a non-finite number")
+    if isinstance(value, dict):
+        for key, child in value.items():
+            finite_tree(child, f"{path}.{key}")
+    elif isinstance(value, (list, tuple)):
+        for index, child in enumerate(value):
+            finite_tree(child, f"{path}[{index}]")
+
+
+def manifest_sha256(manifest):
+    return hashlib.sha256(stable_json(manifest).encode("utf-8")).hexdigest()
+
+
+def git_commit():
+    try:
+        return subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=REPO, text=True).strip()
+    except (OSError, subprocess.CalledProcessError):
+        return "unknown"
 
 
 def sha256_text(value):
@@ -238,31 +266,23 @@ def sha256_file(path):
 def sanitize_evidence(value, *, _key=None):
     """Return only deterministic, hash-only public evidence.
 
-    ``id``-like values are committed as SHA-256 digests because entity/action
-    IDs are random per run.  Raw content and input-shaped fields are omitted.
-    Unknown strings are hashed unless their key is an explicitly safe small
-    vocabulary field.  This function is intentionally usable independently in
-    unit tests and by callers adding a new scenario.
+    Every scalar string is either rejected/dropped or reduced to a bounded
+    vocabulary. Evidence fields that identify a fixture or entity use boolean,
+    count, or digest forms only; raw keys, labels, paths, prompts, and query
+    values never cross the publication boundary.
     """
-
+    finite_tree(value)
     if isinstance(value, dict):
         result = {}
         for raw_key, raw_value in value.items():
-            key = str(raw_key)
-            lowered = key.lower()
-            if evidence_key_forbidden(lowered):
+            lowered = str(raw_key).lower()
+            if evidence_key_forbidden(lowered) or lowered == "id" or lowered.endswith("_id") or lowered.endswith("_ids"):
                 continue
-            if lowered == "id" or lowered.endswith("_id") or lowered.endswith("_ids"):
-                # IDs are often random UUIDs from the live producer. Even a
-                # digest would make otherwise deterministic public evidence
-                # vary across fresh runs, so omit them entirely.
-                continue
-            if lowered not in SAFE_EVIDENCE_KEYS:
+            if lowered not in SAFE_EVIDENCE_KEYS or lowered in {"key", "keys", "target_key", "scope_anchor", "tool", "workspace_hash", "profiles_compared", "nested"}:
                 continue
             clean = sanitize_evidence(raw_value, _key=lowered)
-            if clean is _DROP:
-                continue
-            result[key] = clean
+            if clean is not _DROP and clean not in ({}, []):
+                result[str(raw_key)] = clean
         return result
     if isinstance(value, list):
         result = []
@@ -271,16 +291,17 @@ def sanitize_evidence(value, *, _key=None):
             if clean is not _DROP:
                 result.append(clean)
         return result
-    if value is None or isinstance(value, (bool, int, float)):
+    if value is None or isinstance(value, bool):
         return value
+    if isinstance(value, int):
+        return value if _key in SAFE_EVIDENCE_KEYS else _DROP
+    if isinstance(value, float):
+        return value if _key in SAFE_EVIDENCE_KEYS else _DROP
     if isinstance(value, str):
-        if _key in FORBIDDEN_EVIDENCE_KEYS or _key in NONDETERMINISTIC_EVIDENCE_KEYS:
-            return _DROP
-        if _key in SAFE_EVIDENCE_KEYS:
+        if _key in {"digest", "evidence_hash"} and re.fullmatch(r"[0-9a-f]{64}", value):
             return value
-        return sha256_text(value)
-    return sha256_text(repr(value))
-
+        return _DROP
+    return _DROP
 
 class _DropSentinel:
     pass
@@ -1758,7 +1779,7 @@ def run_benchmark(manifest_path, binary=None, out=None):
             "benchmark": "perseus-vault-memory-quality",
             "dataset": manifest["name"],
             "harness_version": "perseus-vault-memory-quality/v1",
-            "required_categories": manifest.get("required_categories", list(V0_REQUIRED_CATEGORIES)),
+            "required_categories": list(manifest.get("required_categories", list(V0_REQUIRED_CATEGORIES))),
             "cases": cases,
             "metrics": metrics,
             "metric_rates": metric_rates,
@@ -1769,14 +1790,48 @@ def run_benchmark(manifest_path, binary=None, out=None):
             "raw_inputs_captured": False,
             "binary": Path(binary).name,
             "binary_sha256": sha256_file(binary),
+            "dataset_sha256": manifest_sha256(manifest),
+            "harness_commit": git_commit(),
+            "control_profile_sha256": sha256_text(stable_json({
+                "benchmark_id": "perseus-vault-memory-quality",
+                "manifest_sha256": manifest_sha256(manifest),
+                "retrieval_modes": ["fts5", "hybrid"],
+                "context_budget_chars": 240,
+                "network_calls": 0,
+            })),
         }
+        payload["run_fingerprint_sha256"] = sha256_text(stable_json({
+            "binary_sha256": payload["binary_sha256"],
+            "control_profile_sha256": payload["control_profile_sha256"],
+            "dataset_sha256": payload["dataset_sha256"],
+            "harness_commit": payload["harness_commit"],
+        }))
         verdict = evaluate_report(payload, manifest.get("required_categories", V0_REQUIRED_CATEGORIES))
         signature_payload = {**payload, **verdict}
         signature = sha256_text(stable_json(report_signature_payload(signature_payload)))
-        report = {**payload, **verdict, "signature_sha256": signature}
+        payload.update(verdict)
+        payload["signature_sha256"] = signature
+        report = build_common_report(
+            suite_id="perseus-vault-memory-quality",
+            suite_version="v1",
+            raw_report=payload,
+            binary=binary,
+            manifest=manifest,
+            profile={
+                "suite": "quality",
+                "version": "v1",
+                "manifest_sha256": manifest_sha256(manifest),
+                "retrieval_modes": ["fts5", "hybrid"],
+                "context_budget_chars": 240,
+                "network_calls": 0,
+            },
+            repo_root=REPO,
+            claim_ids=["quality-v1-contract"],
+            negative_claim_ids=["provider-failure-stress", "downstream-agent-utility"],
+        )
         if out:
             Path(out).parent.mkdir(parents=True, exist_ok=True)
-            Path(out).write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            Path(out).write_text(json.dumps(report, indent=2, sort_keys=True, allow_nan=False) + "\n", encoding="utf-8")
         return report
     finally:
         client.close()
@@ -1785,6 +1840,12 @@ def run_benchmark(manifest_path, binary=None, out=None):
                 (Path(str(db) + suffix)).unlink()
             except OSError:
                 pass
+        for child in tmpdir.iterdir():
+            if child.is_file():
+                try:
+                    child.unlink()
+                except OSError:
+                    pass
         try:
             tmpdir.rmdir()
         except OSError:

@@ -1,5 +1,5 @@
 {
-  "name": "perseus-vault-memory-quality-v0",
+  "name": "perseus-vault-memory-quality-v1",
   "description": "Bounded offline quality-contract manifest for retrieval, temporal validity, scope validity, provenance, replay, mutation/supersession, compaction/projection, action grounding, recall outcomes, admission, poisoning, and identity ambiguity.",
   "version": 3,
   "case_count": {"min": 20, "max": 40},
