@@ -38,6 +38,169 @@ fn rejected_value_digest(value: &str) -> String {
     format!("{:x}", Sha256::digest(normalized.as_bytes()))
 }
 
+/// Hex sha256 of raw bytes (no normalization) — used for hash-only audit
+/// evidence of identifiers (contract §6.2/§6.4 in
+/// docs/specs/data-boundaries-retention-lifecycle.md).
+fn sha256_hex(value: &str) -> String {
+    format!("{:x}", Sha256::digest(value.as_bytes()))
+}
+
+/// #868: extract the retention expiry (unix ms) from an entity body's
+/// `expires_at` field, if present. Accepts an integer (unix ms), a numeric
+/// string (unix ms), or an ISO 8601 UTC timestamp (util::parse_iso8601_ms).
+/// `None` means "never expires" (the column default). Written to
+/// `entities.expires_at_unix_ms` on every remember/update so the lifecycle
+/// sweep and the recall filters agree on one value.
+pub fn entity_expiry_ms(body_json: &str) -> Option<i64> {
+    let v: serde_json::Value = serde_json::from_str(body_json).ok()?;
+    match v.get("expires_at") {
+        Some(serde_json::Value::Number(n)) => n.as_i64(),
+        Some(serde_json::Value::String(s)) => {
+            let t = s.trim();
+            if !t.is_empty() && t.bytes().all(|c| c.is_ascii_digit()) {
+                t.parse().ok()
+            } else {
+                crate::util::parse_iso8601_ms(t)
+            }
+        }
+        _ => None,
+    }
+}
+
+/// #868: evidence relationships marking a link as "derived content cites its
+/// source" (mirrors claim_card.rs EVIDENCE_RELS and beliefs.rs).
+const ERASE_EVIDENCE_RELS: [&str; 3] = ["evidence_for", "derived_from", "promoted_to"];
+
+/// #868: derived categories whose rows are QUARANTINED (not deleted) when a
+/// cited source is erased: the content aggregates evidence and an operator
+/// must decide keep/refine/delete (contract §5.6).
+const ERASE_DERIVED_CATEGORIES: [&str; 3] = ["beliefs", "observation", "synthesis"];
+
+/// #868: remove `erased_id` from every community membership in the workspace;
+/// delete communities left empty; clear `summary_entity_id` that pointed at
+/// the erased row and invalidate `member_digest` so the summary recomputes on
+/// the next maintenance pass (communities are derived, regenerable artifacts).
+/// With `apply=false` this only counts what the real run would change.
+fn erase_cleanup_communities(
+    conn: &rusqlite::Connection,
+    erased_id: &str,
+    workspace_hash: &str,
+    apply: bool,
+) -> Result<(i64, i64), Box<dyn std::error::Error>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, member_ids, summary_entity_id FROM communities
+         WHERE workspace_hash = ?1",
+    )?;
+    let rows = stmt.query_map(params![workspace_hash], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+        ))
+    })?;
+    let mut memberships_cleaned = 0i64;
+    let mut rows_deleted = 0i64;
+    for row in rows {
+        let (cid, member_ids_json, summary_entity_id) = row?;
+        let mut members: Vec<String> =
+            serde_json::from_str(&member_ids_json).unwrap_or_default();
+        let before = members.len();
+        members.retain(|m| m != erased_id);
+        if members.len() == before {
+            continue;
+        }
+        memberships_cleaned += 1;
+        if !apply {
+            continue;
+        }
+        if members.is_empty() {
+            conn.execute("DELETE FROM communities WHERE id = ?1", params![cid])?;
+            rows_deleted += 1;
+        } else {
+            let summary_entity_id = if summary_entity_id == erased_id {
+                String::new()
+            } else {
+                summary_entity_id
+            };
+            conn.execute(
+                "UPDATE communities SET member_ids = ?1, member_digest = '',
+                 summary_entity_id = ?2
+                 WHERE id = ?3",
+                params![serde_json::to_string(&members)?, summary_entity_id, cid],
+            )?;
+        }
+    }
+    Ok((memberships_cleaned, rows_deleted))
+}
+
+/// #868: sweep inbound link edges pointing at the erased id from all other
+/// rows in the workspace; QUARANTINE derived-category rows that cited the
+/// erased source via an evidence relationship (contract §5.6 — derived
+/// content must not keep serving as if its source still existed). Returns
+/// (inbound_links_cleaned, derived_quarantined). With `apply=false` this
+/// only counts what the real run would change.
+fn erase_sweep_inbound_links(
+    conn: &rusqlite::Connection,
+    erased_id: &str,
+    workspace_hash: &str,
+    reason: &str,
+    apply: bool,
+) -> Result<(i64, i64), Box<dyn std::error::Error>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, category, links FROM entities
+         WHERE workspace_hash = ?1 AND id != ?2",
+    )?;
+    let rows = stmt.query_map(params![workspace_hash, erased_id], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+        ))
+    })?;
+    let mut links_cleaned = 0i64;
+    let mut derived_quarantined = 0i64;
+    for row in rows {
+        let (eid, category, links_json) = row?;
+        let mut links: Vec<crate::models::MemoryLink> =
+            serde_json::from_str(&links_json).unwrap_or_default();
+        let before = links.len();
+        let mut cited_evidence = false;
+        links.retain(|l| {
+            if l.target_id == erased_id {
+                if ERASE_EVIDENCE_RELS.contains(&l.relationship.as_str()) {
+                    cited_evidence = true;
+                }
+                false
+            } else {
+                true
+            }
+        });
+        if links.len() == before {
+            continue;
+        }
+        links_cleaned += 1;
+        if !apply {
+            continue;
+        }
+        conn.execute(
+            "UPDATE entities SET links = ?1 WHERE id = ?2",
+            params![serde_json::to_string(&links)?, eid],
+        )?;
+        // Quarantine only when the erased edge was an evidence relationship:
+        // a derived row must not keep serving as if its cited source still
+        // existed. Plain 'related'-style edges just lose the edge.
+        if cited_evidence && ERASE_DERIVED_CATEGORIES.contains(&category.as_str()) {
+            conn.execute(
+                "UPDATE entities SET status = 'quarantined', archive_reason = ?1
+                 WHERE id = ?2",
+                params![reason, eid],
+            )?;
+            derived_quarantined += 1;
+        }
+    }
+    Ok((links_cleaned, derived_quarantined))
+}
+
 /// Ensure every durable entity written through the database has an explicit,
 /// hash-only provenance state. Public tool handlers may supply a richer
 /// admission envelope; direct CLI/import/connector/derived writers reach this
@@ -93,6 +256,7 @@ use crate::models::{
     AuthorizedAction, CompactReport, DecayReport, EmbedParams, EmbeddingBackendHealth, Entity,
     ExternalRef, GraphEdge, GraphNode, IngestParams, JournalEvent, MemoryLink, OriginRecord,
     PruneParams, PruneReport, PurgeReport, Readiness, RecallOutcome, RecallParams, RecallStatus,
+    RedactReport, EraseReport, ExpireReport,
     SearchMode, StateEntry, Stats, TimelineParams, VaultReport,
 };
 
@@ -5133,6 +5297,7 @@ impl Database {
                     epistemic_state = ?22,
                     valid_from_unix_ms = COALESCE(?20, valid_from_unix_ms),
                     valid_to_unix_ms = COALESCE(?21, valid_to_unix_ms),
+                    expires_at_unix_ms = ?23,
                     retrieval_count = retrieval_count + 1
                  WHERE id = ?19",
                 params![
@@ -5173,6 +5338,10 @@ impl Database {
                     } else {
                         crate::models::default_epistemic_state()
                     },
+                    // #868: retention expiry from the body `expires_at`
+                    // convention (None clears a prior expiry — the body is
+                    // the source of truth for the fact, expiry included).
+                    entity_expiry_ms(&entity.body_json),
                 ],
             )?;
 
@@ -5315,11 +5484,13 @@ impl Database {
                   archived, archive_reason, links, verified, source,
                   always_on, certainty, created_at_unix_ms, last_accessed_unix_ms,
                   workspace_hash, agent_id, visibility, recorded_at_unix_ms,
-                  valid_from_unix_ms, valid_to_unix_ms, epistemic_state)
+                  valid_from_unix_ms, valid_to_unix_ms, epistemic_state,
+                  expires_at_unix_ms)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7,
                          ?8, ?9, ?10, ?11,
                          ?12, ?13, ?14, ?15, ?16,
-                         ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)",
+                         ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27,
+                         ?28)",
                 params![
                     id,
                     entity.category,
@@ -5359,6 +5530,9 @@ impl Database {
                     } else {
                         crate::models::default_epistemic_state()
                     },
+                    // #868: retention expiry from the body `expires_at`
+                    // convention (unix ms, numeric string, or ISO 8601 UTC).
+                    entity_expiry_ms(&entity.body_json),
                 ],
             )?;
 
@@ -6383,6 +6557,17 @@ impl Database {
             conditions.push("archived = 0".to_string());
         }
 
+        // #868: exclude lifecycle-retired rows (same predicate as the
+        // bm25_metadata_conditions path and the dense arm, so every recall
+        // arm agrees). `include_archived` is a historical/audit opt-in and
+        // deliberately does NOT resurface expired rows — expiry is a state
+        // transition, not an archive flag.
+        conditions.push(format!(
+            "(expires_at_unix_ms IS NULL OR expires_at_unix_ms > ?{})",
+            param_values.len() + 1
+        ));
+        param_values.push(Box::new(now_ms()));
+
         // Build query
         let mut sql = String::from(
             "SELECT id, category, key, body_json, status, type, tags,
@@ -6851,6 +7036,17 @@ impl Database {
         param_values: &mut Vec<Box<dyn rusqlite::types::ToSql>>,
     ) -> Vec<String> {
         let mut conditions: Vec<String> = vec!["e.archived = 0".to_string()];
+
+        // #868: lifecycle-retired rows are not serveable by the FTS arms.
+        // The expire sweep transitions status to 'expired' (content retained
+        // for history); the timestamp guard covers the window between an
+        // expiry passing and the next sweep, and mirrors the dense arm's
+        // existing expiry predicate so all arms agree.
+        conditions.push(format!(
+            "(e.expires_at_unix_ms IS NULL OR e.expires_at_unix_ms > ?{})",
+            param_values.len() + 1
+        ));
+        param_values.push(Box::new(now_ms()));
 
         if let Some(ref cat) = params.category {
             if !cat.is_empty() {
@@ -11792,6 +11988,360 @@ Return a JSON object with an "insights" array. Each insight has:
             dry_run: false,
             completed_at_unix_ms: now_ms(),
         })
+    }
+
+    // ─── #868/#866: retention lifecycle ops — expire / redact / erase ──────
+    //
+    // Contract: docs/specs/data-boundaries-retention-lifecycle.md (v1).
+    // Expiry transitions state while retaining content; redaction scrubs
+    // content while retaining metadata (re-ingest allowed); erasure removes
+    // the identity from every derived layer and installs a permanent
+    // re-ingest suppression (tombstone + decoupled governance mandate).
+    // forget (archived=1, content kept) and purge (space reclamation of
+    // archived rows) remain the pre-existing neighbors; each op is distinct
+    // and covered by its own tests.
+
+    /// Time-based lifecycle sweep (#868): rows past `expires_at_unix_ms`
+    /// transition status='active' → 'expired'. Content, history, and FTS are
+    /// RETAINED — expiry is not erasure — and recall already excludes rows
+    /// past their expiry timestamp, so the sweep makes the lifecycle state
+    /// explicit, observable, and filterable. Idempotent and re-runnable;
+    /// `dry_run` counts with identical predicates.
+    pub fn expire_due(
+        &self,
+        dry_run: bool,
+        workspace_hash: Option<&str>,
+    ) -> Result<ExpireReport, Box<dyn std::error::Error>> {
+        let now = now_ms();
+        let ws = workspace_hash.unwrap_or("");
+        let conn = self.conn()?;
+        let entities_expired: i64 = if dry_run {
+            conn.query_row::<i64, _, _>(
+                "SELECT COUNT(*) FROM entities
+                 WHERE expires_at_unix_ms IS NOT NULL AND expires_at_unix_ms <= ?1
+                   AND status = 'active' AND archived = 0
+                   AND (?2 = '' OR workspace_hash = ?2)",
+                params![now, ws],
+                |r| r.get(0),
+            )?
+        } else {
+            conn.execute(
+                "UPDATE entities
+                 SET status = 'expired', archive_reason = 'expired'
+                 WHERE expires_at_unix_ms IS NOT NULL AND expires_at_unix_ms <= ?1
+                   AND status = 'active' AND archived = 0
+                   AND (?2 = '' OR workspace_hash = ?2)",
+                params![now, ws],
+            )? as i64
+        };
+        Ok(ExpireReport {
+            entities_expired,
+            workspace_hash: ws.to_string(),
+            dry_run,
+            completed_at_unix_ms: now_ms(),
+        })
+    }
+
+    /// Content redaction (#868): scrub the body of every workspace-scoped row
+    /// matching (category, key, workspace_hash) to a hash-only marker, hide
+    /// the row from recall (archived=1 — content is gone, unlike forget),
+    /// delete its history snapshots + FTS text, and append a hash-only
+    /// `redacted` journal event. Metadata (id, key, links, provenance,
+    /// community membership) is RETAINED; re-ingest of the same value stays
+    /// allowed (redaction ≠ erasure).
+    pub fn redact_entity(
+        &self,
+        category: &str,
+        key: &str,
+        workspace_hash: &str,
+        agent_id: &str,
+    ) -> Result<RedactReport, Box<dyn std::error::Error>> {
+        let now = now_ms();
+        let conn = self.conn()?;
+        let targets: Vec<(String, String)> = {
+            let mut stmt = conn.prepare(
+                "SELECT id, body_json FROM entities
+                 WHERE category = ?1 AND key = ?2 AND workspace_hash = ?3
+                 ORDER BY id ASC",
+            )?;
+            let rows = stmt.query_map(params![category, key, workspace_hash], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        if targets.is_empty() {
+            return Ok(RedactReport {
+                found: false,
+                entity_id: String::new(),
+                value_sha256: String::new(),
+                history_deleted: 0,
+                fts_cleaned: 0,
+                journal_event_id: String::new(),
+                workspace_hash: workspace_hash.to_string(),
+                completed_at_unix_ms: now_ms(),
+            });
+        }
+
+        // Digests BEFORE scrubbing (hash-only audit evidence, contract §6.2).
+        let digests: Vec<(String, String)> = targets
+            .iter()
+            .map(|(id, body)| (id.clone(), rejected_value_digest(body)))
+            .collect();
+
+        let tx = conn.unchecked_transaction()?;
+        let mut fts_cleaned = 0i64;
+        let mut history_deleted = 0i64;
+        for (id, _) in &targets {
+            let digest = digests
+                .iter()
+                .find(|(i, _)| i == id)
+                .map(|(_, d)| d.clone())
+                .unwrap_or_default();
+            let marker = serde_json::json!({
+                "redacted": true,
+                "redacted_at_unix_ms": now,
+                "value_sha256": digest,
+            })
+            .to_string();
+            tx.execute(
+                "UPDATE entities SET body_json = ?1, status = 'redacted',
+                 archive_reason = 'redacted', archived = 1,
+                 last_accessed_unix_ms = ?2
+                 WHERE id = ?3",
+                params![marker, now, id],
+            )?;
+            fts_cleaned += tx.execute(
+                "DELETE FROM entities_fts
+                 WHERE rowid IN (SELECT rowid FROM entities WHERE id = ?1)",
+                params![id],
+            )? as i64;
+            history_deleted += tx.execute("DELETE FROM entity_history WHERE id = ?1", params![id])?
+                as i64;
+            tx.execute(
+                "DELETE FROM entity_history_fts
+                 WHERE rowid IN (SELECT rowid FROM entity_history WHERE id = ?1)",
+                params![id],
+            )?;
+        }
+        tx.commit()?;
+        drop(conn);
+
+        // Hash-only `redacted` journal events (metadata is retained by
+        // definition, so entity_id stays; only the VALUE is hashed).
+        let mut journal_event_id = String::new();
+        for (id, digest) in &digests {
+            let event = crate::models::JournalEvent {
+                id: format!("jrn-{}", uuid::Uuid::new_v4().simple()),
+                event_type: "redacted".to_string(),
+                evaluated_json: serde_json::json!({
+                    "entity_id": id,
+                    "value_sha256": digest,
+                })
+                .to_string(),
+                acted_json: "{}".to_string(),
+                forward_json: "{}".to_string(),
+                category: category.to_string(),
+                key: key.to_string(),
+                entity_id: id.clone(),
+                agent_id: agent_id.to_string(),
+                workspace_hash: workspace_hash.to_string(),
+                created_at_unix_ms: now,
+            };
+            self.journal(&event)?;
+            journal_event_id = event.id;
+        }
+
+        Ok(RedactReport {
+            found: true,
+            entity_id: targets[0].0.clone(),
+            value_sha256: digests[0].1.clone(),
+            history_deleted,
+            fts_cleaned,
+            journal_event_id,
+            workspace_hash: workspace_hash.to_string(),
+            completed_at_unix_ms: now_ms(),
+        })
+    }
+
+    /// Physical erasure (#868/#866): remove every workspace-scoped row
+    /// matching (category, key, workspace_hash) from the primary store AND
+    /// all derived layers (FTS, history, history-FTS, community membership,
+    /// inbound links, journal payloads), quarantine derived entities citing
+    /// the erased source via evidence links, install a permanent rejection
+    /// tombstone + decoupled governance mandate (re-ingest fails closed and
+    /// survives primary-DB rollback), and append a hash-only `erased`
+    /// journal event. `dry_run` reports exact counts with identical
+    /// predicates and makes no changes.
+    pub fn erase_entity(
+        &self,
+        category: &str,
+        key: &str,
+        workspace_hash: &str,
+        agent_id: &str,
+        dry_run: bool,
+    ) -> Result<EraseReport, Box<dyn std::error::Error>> {
+        let now = now_ms();
+        let ws = workspace_hash.to_string();
+        let conn = self.conn()?;
+        let targets: Vec<(String, String)> = {
+            let mut stmt = conn.prepare(
+                "SELECT id, body_json FROM entities
+                 WHERE category = ?1 AND key = ?2 AND workspace_hash = ?3
+                 ORDER BY id ASC",
+            )?;
+            let rows = stmt.query_map(params![category, key, workspace_hash], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let base = EraseReport {
+            entities_erased: 0,
+            history_deleted: 0,
+            fts_cleaned: 0,
+            community_memberships_cleaned: 0,
+            community_rows_deleted: 0,
+            inbound_links_cleaned: 0,
+            derived_quarantined: 0,
+            journal_rows_redacted: 0,
+            journal_event_id: String::new(),
+            value_sha256: String::new(),
+            workspace_hash: ws.clone(),
+            dry_run,
+            governance_mandate_ok: true,
+            completed_at_unix_ms: now_ms(),
+        };
+        if targets.is_empty() {
+            return Ok(base);
+        }
+
+        if dry_run {
+            let mut report = base;
+            report.entities_erased = targets.len() as i64;
+            for (id, _) in &targets {
+                report.history_deleted += conn.query_row::<i64, _, _>(
+                    "SELECT COUNT(*) FROM entity_history WHERE id = ?1",
+                    params![id],
+                    |r| r.get(0),
+                )?;
+                report.fts_cleaned += conn.query_row::<i64, _, _>(
+                    "SELECT COUNT(*) FROM entities_fts
+                     WHERE rowid IN (SELECT rowid FROM entities WHERE id = ?1)",
+                    params![id],
+                    |r| r.get(0),
+                )?;
+                report.journal_rows_redacted += conn.query_row::<i64, _, _>(
+                    "SELECT COUNT(*) FROM journal
+                     WHERE event_type != 'redacted' AND (entity_id = ?1 OR
+                       (category = ?2 AND key = ?3 AND key != '' AND
+                        (COALESCE(workspace_hash,'') = ?4 OR COALESCE(workspace_hash,'') = '')))",
+                    params![id, category, key, ws],
+                    |r| r.get(0),
+                )?;
+            }
+            let ids: Vec<String> = targets.iter().map(|(i, _)| i.clone()).collect();
+            for id in &ids {
+                let (m, r) = erase_cleanup_communities(&conn, id, &ws, false)?;
+                report.community_memberships_cleaned += m;
+                report.community_rows_deleted += r;
+                let (l, d) = erase_sweep_inbound_links(&conn, id, &ws, "", false)?;
+                report.inbound_links_cleaned += l;
+                report.derived_quarantined += d;
+            }
+            return Ok(report);
+        }
+
+        // Real run: one transaction over the primary DB.
+        let tx = conn.unchecked_transaction()?;
+        let mut report = base;
+        for (id, body) in &targets {
+            let digest = rejected_value_digest(body);
+            report.value_sha256 = digest.clone();
+            // 1. Live FTS text.
+            report.fts_cleaned += tx.execute(
+                "DELETE FROM entities_fts
+                 WHERE rowid IN (SELECT rowid FROM entities WHERE id = ?1)",
+                params![id],
+            )? as i64;
+            // 2. History + history FTS (bi-temporal snapshots hold content).
+            report.history_deleted +=
+                tx.execute("DELETE FROM entity_history WHERE id = ?1", params![id])? as i64;
+            tx.execute(
+                "DELETE FROM entity_history_fts
+                 WHERE rowid IN (SELECT rowid FROM entity_history WHERE id = ?1)",
+                params![id],
+            )?;
+            // 3. Journal payloads → {} (chain tuple preserved, #417 scoping).
+            report.journal_rows_redacted += tx.execute(
+                "UPDATE journal SET event_type = 'redacted', evaluated_json = '{}',
+                 acted_json = '{}', forward_json = '{}', category = '', key = '',
+                 entity_id = ''
+                 WHERE event_type != 'redacted' AND (entity_id = ?1 OR
+                   (category = ?2 AND key = ?3 AND key != '' AND
+                    (COALESCE(workspace_hash,'') = ?4 OR COALESCE(workspace_hash,'') = '')))",
+                params![id, category, key, ws],
+            )? as i64;
+            // 4. Graph membership (communities are derived/regenerable).
+            let (m, r) = erase_cleanup_communities(&tx, id, &ws, true)?;
+            report.community_memberships_cleaned += m;
+            report.community_rows_deleted += r;
+            // 5. Inbound links + derived-source revocation (quarantine).
+            let reason = format!("source_erased:{}", digest);
+            let (l, d) = erase_sweep_inbound_links(&tx, id, &ws, &reason, true)?;
+            report.inbound_links_cleaned += l;
+            report.derived_quarantined += d;
+            // 6. The row itself (embedding + emb_sig columns go with it).
+            tx.execute("DELETE FROM entities WHERE id = ?1", params![id])?;
+            report.entities_erased += 1;
+        }
+        tx.commit()?;
+        drop(conn);
+
+        // 7. Permanent re-ingest suppression: primary tombstone + decoupled
+        //    governance mandate (the write gate consults both; the overlay
+        //    survives primary-DB rollback). Runs post-commit on its own
+        //    connections; a failure is reported loudly, never silent.
+        let mut mandate_ok = true;
+        for (id, body) in &targets {
+            if let Err(e) =
+                self.reject_value(&ws, key, category, body, "erased", id, agent_id, None)
+            {
+                mandate_ok = false;
+                eprintln!(
+                    "erase_entity: governance mandate failed for {}: {}",
+                    id, e
+                );
+            }
+        }
+        report.governance_mandate_ok = mandate_ok;
+
+        // 8. Hash-only `erased` journal event (entity_id replaced by its
+        //    digest — contract §6.4; workspace passed explicitly since the
+        //    row no longer exists for journal() to derive it).
+        let mut journal_event_id = String::new();
+        for (id, body) in &targets {
+            let event = crate::models::JournalEvent {
+                id: format!("jrn-{}", uuid::Uuid::new_v4().simple()),
+                event_type: "erased".to_string(),
+                evaluated_json: serde_json::json!({
+                    "entity_id_sha256": sha256_hex(id),
+                    "value_sha256": rejected_value_digest(body),
+                })
+                .to_string(),
+                acted_json: "{}".to_string(),
+                forward_json: "{}".to_string(),
+                category: String::new(),
+                key: String::new(),
+                entity_id: sha256_hex(id),
+                agent_id: agent_id.to_string(),
+                workspace_hash: ws.clone(),
+                created_at_unix_ms: now,
+            };
+            self.journal(&event)?;
+            journal_event_id = event.id;
+        }
+        report.journal_event_id = journal_event_id;
+        report.completed_at_unix_ms = now_ms();
+        Ok(report)
     }
 
     /// #398 — enforce the entity_history retention policy (see
@@ -29838,6 +30388,384 @@ mod tests {
         assert_eq!(unchanged.status, "intent");
         assert!(unchanged.outcome_hash.is_empty());
         let _ = std::fs::remove_file(path);
+    }
+
+    // ─── #868/#866: retention lifecycle — expire / redact / erase ──────────
+    // Contract: docs/specs/data-boundaries-retention-lifecycle.md (v1).
+
+    #[test]
+    fn expires_at_body_convention_writes_column_and_recall_excludes() {
+        // `expires_at` in the body (ISO 8601 or unix ms) lands in
+        // entities.expires_at_unix_ms; recall excludes rows past expiry while
+        // future/no-expiry rows still serve.
+        let (db, path) = temp_db();
+        let now = now_ms();
+        let mut past = make_entity("exp-past", "general", "exp-past", "{}");
+        past.body_json = format!(
+            r#"{{"content":"expired fact","expires_at":"{}"}}"#,
+            crate::util::format_iso8601(now / 1000 - 3600)
+        );
+        past.workspace_hash = "ws-exp".to_string();
+        db.remember(&past).expect("write past");
+        let mut future = make_entity("exp-future", "general", "exp-future", "{}");
+        future.body_json = format!(r#"{{"content":"live fact","expires_at":{}}}"#, now + 3_600_000);
+        future.workspace_hash = "ws-exp".to_string();
+        db.remember(&future).expect("write future");
+        let mut none = make_entity("exp-none", "general", "exp-none", r#"{"content":"no expiry"}"#);
+        none.workspace_hash = "ws-exp".to_string();
+        db.remember(&none).expect("write none");
+
+        let conn = db.conn().unwrap();
+        for (id, expect_some) in [("exp-past", true), ("exp-future", true), ("exp-none", false)] {
+            let v: Option<i64> = conn
+                .query_row(
+                    "SELECT expires_at_unix_ms FROM entities WHERE id = ?1",
+                    params![id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(v.is_some(), expect_some, "expiry column for {id}");
+            if let Some(v) = v {
+                // Formatter truncates to whole seconds, so allow <1s slack on
+                // the past bound; the future value is exact.
+                assert!(
+                    v <= now + 3_600_000 && v >= now - 3_700_000,
+                    "sane value for {id}: {v} (now={now})"
+                );
+            }
+        }
+        conn.execute("UPDATE entities SET status = 'active'", []).unwrap();
+        drop(conn);
+
+        // "fact" matches both expired + live bodies; only the live one serves.
+        let params = RecallParams {
+            query: "fact".to_string(),
+            limit: 20,
+            skip_side_effects: true,
+            workspace_hash: Some("ws-exp".to_string()),
+            ..RecallParams::default()
+        };
+        let hits = db.recall(&params).unwrap();
+        let ids: Vec<&str> = hits.iter().map(|e| e.id.as_str()).collect();
+        assert!(ids.contains(&"exp-future"), "live row served: {ids:?}");
+        assert!(!ids.contains(&"exp-past"), "expired row excluded: {ids:?}");
+    }
+
+    #[test]
+    fn expire_due_transitions_status_and_is_idempotent() {
+        let (db, _path) = temp_db();
+        let now = now_ms();
+        for (id, body) in [
+            ("ex-a", format!(r#"{{"content":"a","expires_at":{}}}"#, now - 1000)),
+            ("ex-b", format!(r#"{{"content":"b","expires_at":{}}}"#, now + 86_400_000)),
+        ] {
+            let mut e = make_entity(id, "general", id, &body);
+            e.workspace_hash = "ws-exp2".to_string();
+            db.remember(&e).unwrap();
+        }
+        let dry = db.expire_due(true, Some("ws-exp2")).unwrap();
+        assert_eq!(dry.entities_expired, 1);
+        let conn = db.conn().unwrap();
+        let s: String = conn
+            .query_row("SELECT status FROM entities WHERE id='ex-a'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(s, "active", "dry run must not mutate");
+        drop(conn);
+
+        let report = db.expire_due(false, Some("ws-exp2")).unwrap();
+        assert_eq!(report.entities_expired, 1);
+        let conn = db.conn().unwrap();
+        let s: String = conn
+            .query_row("SELECT status FROM entities WHERE id='ex-a'", [], |r| r.get(0))
+            .unwrap();
+        let r: String = conn
+            .query_row("SELECT archive_reason FROM entities WHERE id='ex-a'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(s, "expired");
+        assert_eq!(r, "expired");
+        drop(conn);
+        // Idempotent.
+        assert_eq!(db.expire_due(false, Some("ws-exp2")).unwrap().entities_expired, 0);
+        // Workspace-scoped: another workspace's due row is untouched.
+        let mut e = make_entity("ex-c", "general", "ex-c", &format!(r#"{{"expires_at":{}}}"#, now - 1000));
+        e.workspace_hash = "ws-other".to_string();
+        db.remember(&e).unwrap();
+        assert_eq!(db.expire_due(false, Some("ws-exp2")).unwrap().entities_expired, 0);
+        assert_eq!(db.expire_due(false, Some("ws-other")).unwrap().entities_expired, 1);
+    }
+
+    #[test]
+    fn redact_scrubs_body_history_fts_and_journal_is_hash_only() {
+        let (db, path) = temp_db();
+        let mut e = make_entity("red-1", "general", "red-1", r#"{"content":"sensitive payload alpha"}"#);
+        e.workspace_hash = "ws-red".to_string();
+        db.remember(&e).unwrap();
+        let mut e2 = make_entity("red-1", "general", "red-1", r#"{"content":"sensitive payload beta"}"#);
+        e2.workspace_hash = "ws-red".to_string();
+        db.remember(&e2).unwrap();
+        let params = RecallParams {
+            query: "sensitive".to_string(),
+            limit: 20,
+            skip_side_effects: true,
+            workspace_hash: Some("ws-red".to_string()),
+            ..RecallParams::default()
+        };
+        assert_eq!(db.recall(&params).unwrap().len(), 1, "content searchable before redaction");
+
+        let report = db.redact_entity("general", "red-1", "ws-red", "agent-a").unwrap();
+        assert!(report.found);
+        assert!(!report.value_sha256.is_empty());
+        assert!(report.history_deleted >= 1, "history content removed");
+        assert!(report.fts_cleaned >= 1);
+
+        let stored = db.get_entity("general", "red-1").unwrap().expect("row metadata kept");
+        assert_eq!(stored.status, "redacted");
+        assert!(stored.archived, "redacted rows are hidden from recall");
+        let body: serde_json::Value = serde_json::from_str(&stored.body_json).unwrap();
+        assert_eq!(body["redacted"], true);
+        assert_eq!(body["value_sha256"], report.value_sha256);
+        assert!(!stored.body_json.contains("sensitive"), "content must not survive");
+
+        // FTS no longer finds the content.
+        assert!(db.recall(&params).unwrap().is_empty(), "redacted content not searchable");
+
+        // Journal: hash-only 'redacted' event; chain still verifies.
+        let conn = db.conn().unwrap();
+        let ev: String = conn
+            .query_row(
+                "SELECT evaluated_json FROM journal WHERE event_type='redacted' ORDER BY created_at_unix_ms DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let ev: serde_json::Value = serde_json::from_str(&ev).unwrap();
+        assert_eq!(ev["value_sha256"], report.value_sha256);
+        drop(conn);
+        assert!(verify_audit_chain(&db).is_ok(), "audit chain verifies after redaction");
+    }
+
+    #[test]
+    fn redact_allows_reingest_erase_blocks_it() {
+        // Distinctness (#868): redaction keeps the value re-ingestable;
+        // erasure installs a permanent suppression that fails closed.
+        let (db, path) = temp_db();
+        let body = r#"{"content":"same value re-ingest test"}"#;
+        let mut e = make_entity("re-1", "general", "re-1", body);
+        e.workspace_hash = "ws-re".to_string();
+        db.remember(&e).unwrap();
+        db.redact_entity("general", "re-1", "ws-re", "agent-a").unwrap();
+        let mut again = make_entity("re-1", "general", "re-1", body);
+        again.workspace_hash = "ws-re".to_string();
+        db.remember(&again).expect("redact allows re-ingest");
+
+        let report = db.erase_entity("general", "re-1", "ws-re", "agent-a", false).unwrap();
+        assert!(report.governance_mandate_ok);
+        assert!(report.entities_erased >= 1);
+        assert!(db.is_value_erased("ws-re", "general", body).unwrap());
+
+        let mut third = make_entity("re-1", "general", "re-1", body);
+        third.workspace_hash = "ws-re".to_string();
+        let err = db.remember(&third).expect_err("erased value must be rejected");
+        assert!(
+            err.to_string().contains("rejected") || err.to_string().contains("tombstone"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn erase_propagates_to_fts_history_and_removes_row() {
+        let (db, path) = temp_db();
+        let mut e = make_entity("er-1", "general", "er-1", r#"{"content":"erase me completely"}"#);
+        e.workspace_hash = "ws-er".to_string();
+        db.remember(&e).unwrap();
+        let mut e2 = make_entity("er-1", "general", "er-1", r#"{"content":"erase me completely v2"}"#);
+        e2.workspace_hash = "ws-er".to_string();
+        db.remember(&e2).unwrap();
+
+        let dry = db.erase_entity("general", "er-1", "ws-er", "agent-a", true).unwrap();
+        assert_eq!(dry.entities_erased, 1);
+        assert!(dry.history_deleted >= 1);
+        assert!(dry.fts_cleaned >= 1);
+
+        let report = db.erase_entity("general", "er-1", "ws-er", "agent-a", false).unwrap();
+        assert_eq!(report.entities_erased, 1);
+        assert!(report.history_deleted >= 1);
+        assert!(report.fts_cleaned >= 1);
+        assert!(report.governance_mandate_ok);
+        assert!(!report.journal_event_id.is_empty());
+
+        assert!(db.get_entity("general", "er-1").unwrap().is_none());
+        let params = RecallParams {
+            query: "completely".to_string(),
+            limit: 20,
+            skip_side_effects: true,
+            workspace_hash: Some("ws-er".to_string()),
+            ..RecallParams::default()
+        };
+        assert!(db.recall(&params).unwrap().is_empty());
+        let conn = db.conn().unwrap();
+        let h: i64 = conn
+            .query_row("SELECT COUNT(*) FROM entity_history WHERE id='er-1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(h, 0, "history removed");
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM journal WHERE event_type='erased'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1, "hash-only erased event");
+        drop(conn);
+        assert!(verify_audit_chain(&db).is_ok(), "audit chain verifies after erase");
+    }
+
+    #[test]
+    fn erase_cleans_community_membership_and_inbound_links() {
+        let (db, path) = temp_db();
+        let mut src = make_entity("src-1", "general", "src-1", r#"{"content":"source entity"}"#);
+        src.workspace_hash = "ws-g".to_string();
+        db.remember(&src).unwrap();
+        let mut other = make_entity("other-1", "general", "other-1", r#"{"content":"other entity"}"#);
+        other.workspace_hash = "ws-g".to_string();
+        db.remember(&other).unwrap();
+        let src_id = db.get_entity("general", "src-1").unwrap().unwrap().id;
+        db.link("general", "other-1", &src_id, "related").unwrap();
+        let conn = db.conn().unwrap();
+        conn.execute(
+            "INSERT INTO communities (id, workspace_hash, member_ids, member_digest, member_count, generated_at_unix_ms)
+             VALUES ('com-1', 'ws-g', ?1, 'd1', 2, 0)",
+            params![serde_json::to_string(&vec![src_id.clone(), "other-id".to_string()]).unwrap()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO communities (id, workspace_hash, member_ids, member_digest, member_count, generated_at_unix_ms)
+             VALUES ('com-2', 'ws-g', ?1, 'd2', 1, 0)",
+            params![serde_json::to_string(&vec![src_id.clone()]).unwrap()],
+        )
+        .unwrap();
+        drop(conn);
+
+        let report = db.erase_entity("general", "src-1", "ws-g", "agent-a", false).unwrap();
+        assert_eq!(report.community_memberships_cleaned, 2);
+        assert_eq!(report.community_rows_deleted, 1);
+        assert_eq!(report.inbound_links_cleaned, 1);
+
+        let other = db.get_entity("general", "other-1").unwrap().unwrap();
+        assert!(!other.links.iter().any(|l| l.target_id == src_id), "inbound edge swept");
+        let conn = db.conn().unwrap();
+        let members: String = conn
+            .query_row("SELECT member_ids FROM communities WHERE id='com-1'", [], |r| r.get(0))
+            .unwrap();
+        assert!(!members.contains(&src_id));
+        let digest: String = conn
+            .query_row("SELECT member_digest FROM communities WHERE id='com-1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(digest, "", "member_digest invalidated so the summary recomputes");
+        let c2: i64 = conn
+            .query_row("SELECT COUNT(*) FROM communities WHERE id='com-2'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(c2, 0, "empty community deleted");
+    }
+
+    #[test]
+    fn erase_quarantines_derived_beliefs_citing_source() {
+        let (db, path) = temp_db();
+        let mut src = make_entity("src-b", "general", "src-b", r#"{"content":"belief source"}"#);
+        src.workspace_hash = "ws-b".to_string();
+        db.remember(&src).unwrap();
+        let src_id = db.get_entity("general", "src-b").unwrap().unwrap().id;
+        let mut belief = make_entity("belief-1", "beliefs", "belief-1", r#"{"content":"derived belief"}"#);
+        belief.workspace_hash = "ws-b".to_string();
+        belief.links = vec![crate::models::MemoryLink {
+            target_id: src_id.clone(),
+            relationship: "derived_from".to_string(),
+            weight: 1.0,
+        }];
+        db.remember(&belief).unwrap();
+        let mut plain = make_entity("plain-1", "general", "plain-1", r#"{"content":"plain row"}"#);
+        plain.workspace_hash = "ws-b".to_string();
+        db.remember(&plain).unwrap();
+        db.link("general", "plain-1", &src_id, "related").unwrap();
+
+        let report = db.erase_entity("general", "src-b", "ws-b", "agent-a", false).unwrap();
+        assert_eq!(report.derived_quarantined, 1, "evidence-citing belief quarantined");
+
+        let b = db.get_entity("beliefs", "belief-1").unwrap().unwrap();
+        assert_eq!(b.status, "quarantined");
+        assert!(b.archive_reason.starts_with("source_erased:"), "{}", b.archive_reason);
+        assert!(!b.links.iter().any(|l| l.target_id == src_id), "dangling evidence edge removed");
+        let p = db.get_entity("general", "plain-1").unwrap().unwrap();
+        assert!(!p.links.iter().any(|l| l.target_id == src_id), "plain edge removed");
+        assert_ne!(p.status, "quarantined", "plain rows are not quarantined");
+    }
+
+    #[test]
+    fn erase_is_workspace_scoped() {
+        let (db, _path) = temp_db();
+        for (id, ws) in [("shared-a", "wa"), ("shared-b", "wb")] {
+            let mut e = make_entity(id, "general", "shared-key", r#"{"content":"scoped erase"}"#);
+            e.id = id.to_string();
+            e.workspace_hash = ws.to_string();
+            db.remember(&e).unwrap();
+        }
+        let report = db.erase_entity("general", "shared-key", "wa", "agent-a", false).unwrap();
+        assert_eq!(report.entities_erased, 1);
+        let remaining = db.get_entity("general", "shared-key").unwrap().unwrap();
+        assert_eq!(remaining.workspace_hash, "wb", "other workspace untouched");
+        // Unknown workspace -> no-op, not an error.
+        let noop = db.erase_entity("general", "shared-key", "nope", "agent-a", false).unwrap();
+        assert_eq!(noop.entities_erased, 0);
+    }
+
+    #[test]
+    fn erase_and_redact_handlers_fail_closed_without_workspace() {
+        // Tools layer (#854): a bare category/key without workspace_hash is
+        // refused instead of guessing across workspaces.
+        let (db, _path) = temp_db();
+        let err = crate::tools::handle_erase(&db, serde_json::json!({"category": "general", "key": "k"}))
+            .unwrap_err();
+        assert!(err.contains("workspace_hash"), "{err}");
+        let err2 = crate::tools::handle_redact(&db, serde_json::json!({"category": "general", "key": "k"}))
+            .unwrap_err();
+        assert!(err2.contains("workspace_hash"), "{err2}");
+    }
+
+    #[test]
+    fn erase_mandate_survives_primary_db_rollback() {
+        // #868 acceptance: restoring the primary DB cannot resurrect an
+        // erased value — the decoupled governance overlay keeps suppressing.
+        let dir = std::env::temp_dir();
+        let path = dir
+            .join(format!("mimir-erase-rollback-{}.db", uuid::Uuid::new_v4().simple()))
+            .to_string_lossy()
+            .to_string();
+        let body = r#"{"content":"erased before rollback"}"#;
+        {
+            let db = Database::open(&path).unwrap();
+            let mut e = make_entity("rb-1", "general", "rb-1", body);
+            e.workspace_hash = "ws-rb".to_string();
+            db.remember(&e).unwrap();
+        }
+        std::fs::copy(&path, format!("{path}.bak")).unwrap();
+        {
+            let db = Database::open(&path).unwrap();
+            let report = db.erase_entity("general", "rb-1", "ws-rb", "agent-a", false).unwrap();
+            assert!(report.governance_mandate_ok);
+        }
+        // Roll the primary DB back to the pre-erase copy; the overlay file is
+        // untouched, so the mandate must still suppress.
+        std::fs::copy(format!("{path}.bak"), &path).unwrap();
+        let db = Database::open(&path).unwrap();
+        assert!(db.is_value_erased("ws-rb", "general", body).unwrap());
+        let mut e = make_entity("rb-1", "general", "rb-1", body);
+        e.workspace_hash = "ws-rb".to_string();
+        let err = db
+            .remember(&e)
+            .expect_err("resurrected store must still reject the erased value");
+        assert!(
+            err.to_string().contains("rejected") || err.to_string().contains("tombstone"),
+            "{err}"
+        );
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{path}.bak"));
+        let _ = std::fs::remove_file(format!("{path}.governance.db"));
     }
 }
 

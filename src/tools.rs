@@ -6262,6 +6262,92 @@ pub fn handle_purge(db: &Database, args: Value) -> Result<String, String> {
     serde_json::to_string(&report).map_err(|e| format!("Serialization failed: {}", e))
 }
 
+// ─── #868/#866: retention lifecycle tools — expire / redact / erase ────────
+// Contract: docs/specs/data-boundaries-retention-lifecycle.md (v1).
+// Distinct semantics: expire (time transition, content kept), redact (content
+// scrub, metadata kept, re-ingest allowed), erase (physical removal across
+// derived layers + permanent re-ingest suppression). All destructive ops are
+// workspace-explicit (fail-closed on ambiguity, #854) and attribute the actor.
+
+#[derive(Debug, Deserialize)]
+pub struct ExpireArgs {
+    #[serde(default)]
+    pub dry_run: bool,
+    /// Empty = global sweep; otherwise restricted to one workspace.
+    #[serde(default)]
+    pub workspace_hash: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RedactArgs {
+    pub category: String,
+    pub key: String,
+    #[serde(default)]
+    pub workspace_hash: String,
+    #[serde(default)]
+    pub agent_id: String,
+    /// MCP session identity stamped by the transport (#855): overrides any
+    /// caller-supplied agent_id so attribution cannot be forged.
+    #[serde(default)]
+    pub requesting_agent_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct EraseArgs {
+    pub category: String,
+    pub key: String,
+    #[serde(default)]
+    pub workspace_hash: String,
+    #[serde(default)]
+    pub agent_id: String,
+    #[serde(default)]
+    pub dry_run: bool,
+    #[serde(default)]
+    pub requesting_agent_id: Option<String>,
+}
+
+pub fn handle_expire(db: &Database, args: Value) -> Result<String, String> {
+    let a: ExpireArgs = serde_json::from_value(args)
+        .map_err(|e| format!("Invalid expire arguments: {}", e))?;
+    let report = db
+        .expire_due(
+            a.dry_run,
+            if a.workspace_hash.is_empty() {
+                None
+            } else {
+                Some(&a.workspace_hash)
+            },
+        )
+        .map_err(|e| format!("Expire failed: {}", e))?;
+    serde_json::to_string(&report).map_err(|e| format!("Serialization failed: {}", e))
+}
+
+pub fn handle_redact(db: &Database, args: Value) -> Result<String, String> {
+    let a: RedactArgs = serde_json::from_value(args)
+        .map_err(|e| format!("Invalid redact arguments: {}", e))?;
+    if a.workspace_hash.is_empty() {
+        return Err("redact requires an explicit workspace_hash (fail-closed: a bare category/key is ambiguous across workspaces, #854)".to_string());
+    }
+    let agent = a.requesting_agent_id.as_deref().unwrap_or(&a.agent_id);
+    let report = db
+        .redact_entity(&a.category, &a.key, &a.workspace_hash, agent)
+        .map_err(|e| format!("Redact failed: {}", e))?;
+    serde_json::to_string(&report).map_err(|e| format!("Serialization failed: {}", e))
+}
+
+pub fn handle_erase(db: &Database, args: Value) -> Result<String, String> {
+    let a: EraseArgs = serde_json::from_value(args)
+        .map_err(|e| format!("Invalid erase arguments: {}", e))?;
+    if a.workspace_hash.is_empty() {
+        return Err("erase requires an explicit workspace_hash (fail-closed: a bare category/key is ambiguous across workspaces, #854)".to_string());
+    }
+    let agent = a.requesting_agent_id.as_deref().unwrap_or(&a.agent_id);
+    let report = db
+        .erase_entity(&a.category, &a.key, &a.workspace_hash, agent, a.dry_run)
+        .map_err(|e| format!("Erase failed: {}", e))?;
+    serde_json::to_string(&report).map_err(|e| format!("Serialization failed: {}", e))
+}
+
 // ─── /memories directory-convention adapter ──────────────────────
 //
 // Implements Anthropic's memory-tool convention (the `memory_20250818`

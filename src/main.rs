@@ -498,6 +498,79 @@ enum Commands {
         encryption_key: Option<String>,
     },
 
+    /// Time-based lifecycle sweep (#868): transition entities whose
+    /// expires_at_unix_ms has passed to status='expired'. Content, history,
+    /// and searchability are RETAINED — expiry is not erasure.
+    Expire {
+        /// SQLite database path
+        #[arg(long, default_value_t = default_db_path())]
+        db: String,
+        /// Preview what would be expired without changing anything
+        #[arg(long)]
+        dry_run: bool,
+        /// Restrict the sweep to one workspace (default: global)
+        #[arg(long, default_value_t = String::new())]
+        workspace_hash: String,
+        /// Path to AES-256-GCM encryption key file; falls back to the standard
+        /// key path when one exists.
+        #[arg(long)]
+        encryption_key: Option<String>,
+    },
+
+    /// Content redaction (#868): scrub a workspace-scoped entity's body to a
+    /// hash-only marker, delete its history snapshots and FTS text, keep
+    /// metadata. Re-ingest of the same value stays allowed.
+    Redact {
+        /// SQLite database path
+        #[arg(long, default_value_t = default_db_path())]
+        db: String,
+        /// Entity category
+        #[arg(long)]
+        category: String,
+        /// Entity key
+        #[arg(long)]
+        key: String,
+        /// Workspace scope (required — a bare category/key is ambiguous)
+        #[arg(long)]
+        workspace_hash: String,
+        /// Acting agent for attribution
+        #[arg(long, default_value_t = String::new())]
+        agent_id: String,
+        /// Path to AES-256-GCM encryption key file; falls back to the standard
+        /// key path when one exists.
+        #[arg(long)]
+        encryption_key: Option<String>,
+    },
+
+    /// Physical erasure (#868/#866): permanently remove a workspace-scoped
+    /// entity from the primary store and ALL derived layers, quarantine
+    /// derived entities that cited it, and install a permanent re-ingest
+    /// suppression. ERASED DATA IS NOT RECOVERABLE.
+    Erase {
+        /// SQLite database path
+        #[arg(long, default_value_t = default_db_path())]
+        db: String,
+        /// Entity category
+        #[arg(long)]
+        category: String,
+        /// Entity key
+        #[arg(long)]
+        key: String,
+        /// Workspace scope (required — a bare category/key is ambiguous)
+        #[arg(long)]
+        workspace_hash: String,
+        /// Acting agent for attribution
+        #[arg(long, default_value_t = String::new())]
+        agent_id: String,
+        /// Preview exactly what would be erased without changing anything
+        #[arg(long)]
+        dry_run: bool,
+        /// Path to AES-256-GCM encryption key file; falls back to the standard
+        /// key path when one exists.
+        #[arg(long)]
+        encryption_key: Option<String>,
+    },
+
     /// Validate the local install + config and report MCP client compatibility (#272).
     Doctor {
         /// SQLite database path
@@ -669,6 +742,9 @@ impl Commands {
             | Commands::VaultExport { db, .. }
             | Commands::VaultImport { db, .. }
             | Commands::Purge { db, .. }
+            | Commands::Expire { db, .. }
+            | Commands::Redact { db, .. }
+            | Commands::Erase { db, .. }
             | Commands::Doctor { db, .. }
             | Commands::Connect { db, .. }
             | Commands::Prepare { db, .. }
@@ -3220,6 +3296,96 @@ fn run() {
                 Ok(report) => print_json(&report),
                 Err(e) => {
                     eprintln!("mimir: purge failed: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        Some(Commands::Expire {
+            db: ref db_path,
+            dry_run,
+            ref workspace_hash,
+            ref encryption_key,
+        }) => {
+            let mut database = open_db_or_exit(db_path);
+            let encryption_key = configured_encryption_key_for_database(&mut database, encryption_key.as_deref());
+            if let Some(ref key_file) = encryption_key {
+                if let Err(e) = database.set_encryption(key_file) {
+                    eprintln!("mimir: encryption setup failed: {}", e);
+                    std::process::exit(1);
+                }
+            } else {
+                warn_plaintext_writes_to_encrypted_db(&database);
+            }
+            let ws = if workspace_hash.is_empty() {
+                None
+            } else {
+                Some(workspace_hash.as_str())
+            };
+            match database.expire_due(dry_run, ws) {
+                Ok(report) => print_json(&report),
+                Err(e) => {
+                    eprintln!("mimir: expire failed: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        Some(Commands::Redact {
+            db: ref db_path,
+            ref category,
+            ref key,
+            ref workspace_hash,
+            ref agent_id,
+            ref encryption_key,
+        }) => {
+            let mut database = open_db_or_exit(db_path);
+            let encryption_key = configured_encryption_key_for_database(&mut database, encryption_key.as_deref());
+            if let Some(ref key_file) = encryption_key {
+                if let Err(e) = database.set_encryption(key_file) {
+                    eprintln!("mimir: encryption setup failed: {}", e);
+                    std::process::exit(1);
+                }
+            } else {
+                warn_plaintext_writes_to_encrypted_db(&database);
+            }
+            if workspace_hash.is_empty() {
+                eprintln!("mimir: redact requires --workspace-hash (fail-closed, #854)");
+                std::process::exit(1);
+            }
+            match database.redact_entity(category, key, workspace_hash, agent_id) {
+                Ok(report) => print_json(&report),
+                Err(e) => {
+                    eprintln!("mimir: redact failed: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        Some(Commands::Erase {
+            db: ref db_path,
+            ref category,
+            ref key,
+            ref workspace_hash,
+            ref agent_id,
+            dry_run,
+            ref encryption_key,
+        }) => {
+            let mut database = open_db_or_exit(db_path);
+            let encryption_key = configured_encryption_key_for_database(&mut database, encryption_key.as_deref());
+            if let Some(ref key_file) = encryption_key {
+                if let Err(e) = database.set_encryption(key_file) {
+                    eprintln!("mimir: encryption setup failed: {}", e);
+                    std::process::exit(1);
+                }
+            } else {
+                warn_plaintext_writes_to_encrypted_db(&database);
+            }
+            if workspace_hash.is_empty() {
+                eprintln!("mimir: erase requires --workspace-hash (fail-closed, #854)");
+                std::process::exit(1);
+            }
+            match database.erase_entity(category, key, workspace_hash, agent_id, dry_run) {
+                Ok(report) => print_json(&report),
+                Err(e) => {
+                    eprintln!("mimir: erase failed: {}", e);
                     std::process::exit(1);
                 }
             }
