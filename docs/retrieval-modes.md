@@ -115,5 +115,11 @@ perseus_vault_recall { "query": "decay policy", "mode": "fts5", "as_of_unix_ms":
   corpora where hybrid holds; see `benchmark/` for measured recall@k across modes.
 - **Provenance.** All modes return deterministic, inspectable results; see
   [deterministic-recall-and-provenance.md](deterministic-recall-and-provenance.md).
+- **Validity-aware profile (#860).** Any recall mode accepts
+  `profile: "validity"` (and/or `validity_annotate: true`) to weigh
+  freshness, scope match, provenance class, supersession, and expiry
+  proximity into a per-hit validity block — fused mode additionally
+  re-ranks the pool by the multiplier; see
+  [validity-aware-recall.md](specs/validity-aware-recall.md).
 
 See also: the full tool reference in the [README](../README.md#mcp-tools).

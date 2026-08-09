@@ -21,6 +21,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -53,6 +54,7 @@ V1_REQUIRED_CATEGORIES = V0_REQUIRED_CATEGORIES + (
     "prompt_safety",
     "identity_ambiguity",
     "graph_gate",
+    "validity_recall",
 )
 
 CAPABILITY_TOOLS = {
@@ -1511,18 +1513,16 @@ def run_graph_gate(client, **_):
         "quality-fixture-gateway-load-balancer",
         workspace_hash=ws,
     )
-    remember(
+    # The neighbor's id comes from the remember response — get_entity only
+    # resolves by id (its contract), so lookup-by-category/key is not used.
+    neighbor_resp = remember(
         client,
         "quality_graph_gate",
         "gate-neighbor",
         "quality-fixture-tls-termination-proxy",
         workspace_hash=ws,
     )
-    neighbor = client.call(
-        "perseus_vault_get_entity",
-        {"category": "quality_graph_gate", "key": "gate-neighbor"},
-    )
-    neighbor_id = neighbor.get("id") if isinstance(neighbor, dict) else None
+    neighbor_id = neighbor_resp.get("id") if isinstance(neighbor_resp, dict) else None
     if neighbor_id:
         client.call(
             "perseus_vault_link",
@@ -1614,7 +1614,9 @@ def run_graph_gate(client, **_):
     drift_consistent = isinstance(drift, dict) and drift.get("consistent") is True
     unattested_skipped = multi_route.get("unattested_edges_skipped", 0)
     total_served = len(multi.get("items") or [])
-    fabricated_edge_rate = 0.0 if unattested_skipped == 0 else float("nan")
+    # Bounded [0,1] rate: evidence sanitizers reject non-finite values, so a
+    # violation must report as a failed check, never as a harness crash.
+    fabricated_edge_rate = 0.0 if unattested_skipped == 0 else 1.0
 
     checks = {
         "multi_hop_selected": multi_hop_selected,
@@ -1626,19 +1628,16 @@ def run_graph_gate(client, **_):
         "drift_consistent": drift_consistent,
         "no_fabricated_edges_served": unattested_skipped == 0,
     }
+    # Evidence stays inside the shared public allowlist (found/count/rate/
+    # total/reason/status); reason values are reduced to digest form.
     evidence = {
-        "workspace": ws,
-        "multi_hop_reason": multi_route.get("reason"),
-        "multi_hop_selected": multi_hop_selected,
-        "ordinary_reason": ordinary_route.get("reason"),
-        "ordinary_status": ordinary_graph.get("status"),
-        "temporal_reason": temporal_route.get("reason"),
-        "graph_arm_latency_ms": graph_arm_latency_ms,
-        "graph_arm_candidates": graph_arm_candidates,
-        "total_served": total_served,
-        "unattested_edges_skipped": unattested_skipped,
-        "fabricated_edge_rate": fabricated_edge_rate,
-        "drift_consistent": drift_consistent,
+        "found": neighbor_surfaced,
+        "count": total_served,
+        "total": total_served,
+        "rate": fabricated_edge_rate,
+        "reason": multi_route.get("reason") or "none",
+        "status": ordinary_graph.get("status") or "none",
+        "workspace_hash": ws,
     }
     metric_events = {
         "graph-gate-multi-hop-routes": {
@@ -1655,6 +1654,144 @@ def run_graph_gate(client, **_):
         },
         "graph-gate-consistency": {
             "numerator": int(drift_consistent and unattested_skipped == 0),
+            "denominator": 1,
+        },
+    }
+    return output(checks, evidence, metric_events)
+
+
+def run_validity_recall(client, **_):
+    # #860: validity-aware recall over the MCP surface. Fixture: a current
+    # entity, a superseded predecessor (status deprecated), an expiring-soon
+    # entity, and an already-expired entity. The validity profile must keep
+    # the current entity first, structurally exclude deprecated/expired
+    # rows, grade the expiring entity `stale`, and expose the decision in
+    # fused_trace.validity + per-item validity blocks.
+    ws = "quality-validity-workspace"
+    now_ms = int(time.time() * 1000)
+
+    remember(
+        client,
+        "quality_validity",
+        "validity-current",
+        "quality-fixture-delta-protocol-v2-current",
+        workspace_hash=ws,
+        skip_dedup=True,
+    )
+    remember(
+        client,
+        "quality_validity",
+        "validity-v1",
+        "quality-fixture-delta-protocol-v1-legacy",
+        workspace_hash=ws,
+        skip_dedup=True,
+    )
+    # Expiring/expired fixtures carry `expires_at` inside body_json (the
+    # read-time expiry contract reads it from the body).
+    client.call(
+        "perseus_vault_remember",
+        {
+            "category": "quality_validity",
+            "key": "validity-expiring",
+            "body_json": stable_json(
+                {
+                    "note": "quality-fixture-delta-protocol-expiring-note",
+                    "expires_at": now_ms + 120_000,
+                }
+            ),
+            "workspace_hash": ws,
+            "skip_dedup": True,
+        },
+    )
+    client.call(
+        "perseus_vault_remember",
+        {
+            "category": "quality_validity",
+            "key": "validity-expired",
+            "body_json": stable_json(
+                {
+                    "note": "quality-fixture-delta-protocol-expired-note",
+                    "expires_at": now_ms - 1_000,
+                }
+            ),
+            "workspace_hash": ws,
+            "skip_dedup": True,
+        },
+    )
+
+    # Supersede v1 -> current: flips v1's status to deprecated (#684), so the
+    # read-time lifecycle excludes it from recall.
+    client.call(
+        "perseus_vault_supersede",
+        {
+            "from_category": "quality_validity",
+            "from_key": "validity-v1",
+            "to_category": "quality_validity",
+            "to_key": "validity-current",
+            "relationship": "supersedes",
+            "reason": "benchmark fixture: v2 replaces v1",
+        },
+    )
+
+    result = client.call(
+        "perseus_vault_recall",
+        {
+            "query": "delta protocol",
+            "category": "quality_validity",
+            "mode": "fused",
+            "strategies": ["fts5", "graph"],
+            "profile": "validity",
+            "limit": 10,
+        },
+    )
+    items = result.get("items") or []
+    trace = result.get("fused_trace") or {}
+    vtrace = trace.get("validity") or {}
+
+    keys = [item.get("key") for item in items]
+    current_first = bool(keys) and keys[0] == "validity-current"
+    superseded_not_served = "validity-v1" not in keys
+    expired_not_served = "validity-expired" not in keys
+    expiring = next((i for i in items if i.get("key") == "validity-expiring"), None)
+    expiring_graded_stale = bool(
+        expiring
+        and (expiring.get("validity") or {}).get("grade") == "stale"
+        and (expiring.get("validity") or {}).get("expiring_soon") is True
+    )
+    validity_trace_observable = bool(
+        vtrace.get("profile") == "validity"
+        and vtrace.get("method") == "validity-multiplier-v1"
+        and isinstance(vtrace.get("grade_counts"), dict)
+        and len(vtrace.get("grade_counts") or {}) > 0
+    )
+
+    checks = {
+        "current_ranks_first": current_first,
+        "superseded_not_served": superseded_not_served,
+        "expired_not_served": expired_not_served,
+        "expiring_graded_stale": expiring_graded_stale,
+        "validity_trace_observable": validity_trace_observable,
+    }
+    evidence = {
+        "found": current_first,
+        "count": len(items),
+        "rate": (int(superseded_not_served) + int(expired_not_served)) / 2.0,
+    }
+    metric_events = {
+        "validity-recall-orders-fresh-first": {
+            "numerator": int(current_first and validity_trace_observable),
+            "denominator": 1,
+        },
+        "validity-recall-excludes-superseded": {
+            "numerator": int(superseded_not_served),
+            "denominator": 1,
+        },
+        "validity-recall-excludes-expired": {
+            "numerator": int(expired_not_served),
+            "denominator": 1,
+        },
+        "validity-recall-grades-expiring": {
+            "numerator": int(expiring_graded_stale),
             "denominator": 1,
         },
     }
@@ -1829,6 +1966,7 @@ SCENARIO_RUNNERS = {
     "action_grounding": run_action_grounding,
     "recall_outcome": run_recall_outcome,
     "graph_gate": run_graph_gate,
+    "validity_recall": run_validity_recall,
     "admission": run_admission,
     "prompt_safety": run_prompt_safety,
     "identity_ambiguity": run_identity_ambiguity,

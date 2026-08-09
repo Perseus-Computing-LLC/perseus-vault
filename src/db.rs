@@ -6726,6 +6726,62 @@ impl Database {
             cand.into_iter().map(|e| (e, 0.0)).collect()
         };
         trace.rerank = rerank_trace;
+        let rerank_applied = trace.rerank.applied;
+
+        // ── #860: validity-aware profile (opt-in deterministic re-rank) ──
+        // Re-scores the fused pool by validity multiplier (freshness decay,
+        // scope match, provenance class, supersession, expiry proximity) on
+        // top of a rank-derived base: the rerank score when that stage
+        // applied, otherwise (pool_size - rank)/pool_size. Rank-derived
+        // bases are scale-free and deterministic (#247), so the profile
+        // never invents a score scale. A stale/superseded top hit is pushed
+        // below fresher, in-scope candidates instead of being silently
+        // dropped; everything stays observable via `trace.validity`.
+        if params.profile.as_deref() == Some("validity") && !ranked.is_empty() {
+            let now_ms = params
+                .query_time_unix_ms
+                .unwrap_or_else(crate::db::now_ms);
+            let weights = crate::validity::ValidityWeights::default();
+            let n = ranked.len() as f64;
+            let mut grade_counts: std::collections::BTreeMap<String, usize> = Default::default();
+            let mut validity_scored: Vec<(Entity, f64)> = ranked
+                .iter()
+                .enumerate()
+                .map(|(i, (e, base))| {
+                    let info = crate::validity::score(
+                        now_ms,
+                        e.created_at_unix_ms,
+                        crate::db::entity_expiry_ms(&e.body_json),
+                        &e.workspace_hash,
+                        params.workspace_hash.as_deref(),
+                        &e.epistemic_state,
+                        &e.status,
+                        &weights,
+                    );
+                    *grade_counts.entry(info.grade.clone()).or_insert(0) += 1;
+                    let base_score = if params.rerank && rerank_applied && *base > 0.0 {
+                        *base
+                    } else {
+                        (n - i as f64).max(1.0) / n
+                    };
+                    (e.clone(), base_score * info.multiplier)
+                })
+                .collect();
+            validity_scored.sort_by(|a, b| {
+                b.1.partial_cmp(&a.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.0.id.cmp(&b.0.id))
+            });
+            let flagged = grade_counts.get("context_invalid").copied().unwrap_or(0);
+            trace.validity = Some(crate::models::ValidityTrace {
+                profile: "validity".to_string(),
+                method: "validity-multiplier-v1".to_string(),
+                weights: weights.clone(),
+                grade_counts,
+                flagged_context_invalid: flagged,
+            });
+            ranked = validity_scored;
+        }
 
         // ── caller limit, then token-budget truncation ──────────────────
         ranked.truncate(limit);
@@ -33755,6 +33811,210 @@ mod tests {
         assert!(trace.sources["c-a"].contains(&"temporal".to_string()));
         assert_eq!(trace.truncation.dropped, 0, "no budget pressure in this fixture");
         let _ = std::fs::remove_file(path);
+    }
+
+    // ── #860 validity-aware profile ─────────────────────────────────────
+
+    #[test]
+    fn fused_recall_validity_profile_reorders_stale_below_fresh_and_traces() {
+        // A 200-day-old entity that matches the query MORE strongly (repeated
+        // terms => higher BM25 term frequency) vs a fresh partial match:
+        // default profile keeps relevance order (stale first); the validity
+        // profile must put the fresh entity first and trace the decision
+        // with grade counts.
+        let (db, path) = temp_db();
+        let now = crate::db::now_ms();
+        let day_ms: i64 = 86_400_000;
+
+        // Stale but lexically strong match (repeated terms beat BM25 length
+        // normalization). remember_skip_dedup: the repeated-token body and
+        // the thin body would otherwise be near-dup merged.
+        db.remember_skip_dedup(&make_entity(
+            "v-stale",
+            "insight",
+            "v-stale",
+            r#"{"note":"alpha beta alpha beta alpha beta alpha beta"}"#,
+        ))
+        .unwrap();
+        // Fresh but thinner lexical match.
+        db.remember_skip_dedup(&make_entity(
+            "v-fresh",
+            "insight",
+            "v-fresh",
+            r#"{"note":"alpha beta"}"#,
+        ))
+        .unwrap();
+        // Age the stale entity 200 days via the column fused_recall reads.
+        let conn = db.conn().unwrap();
+        conn.execute(
+            "UPDATE entities SET created_at_unix_ms = ?1 WHERE id = 'v-stale'",
+            rusqlite::params![now - 200 * day_ms],
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut params = fused_params("alpha beta");
+        params.strategies = vec!["fts5".to_string(), "graph".to_string()];
+        params.profile = Some("validity".to_string());
+        let (entities, _c, trace) = db.fused_recall(&params).unwrap();
+        let ids: Vec<&str> = entities.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(
+            ids.first(),
+            Some(&"v-fresh"),
+            "validity profile promotes the fresh entity above the stale one: {ids:?}"
+        );
+        let vt = trace.validity.as_ref().expect("validity trace present");
+        assert_eq!(vt.profile, "validity");
+        assert_eq!(vt.method, "validity-multiplier-v1");
+        assert!(
+            vt.grade_counts.get("context_invalid").copied().unwrap_or(0) >= 1,
+            "200-day-old entity must be context-invalid: {:?}",
+            vt.grade_counts
+        );
+        assert!(vt.flagged_context_invalid >= 1);
+
+        // Default profile keeps the fused/FTS relevance order (no trace).
+        // The graph arm is gate-skipped for this ordinary query, so the
+        // fused order is the pure FTS5 relevance order: stale first.
+        let mut params = fused_params("alpha beta");
+        params.strategies = vec!["fts5".to_string(), "graph".to_string()];
+        let (entities, _c, trace) = db.fused_recall(&params).unwrap();
+        assert!(trace.validity.is_none(), "no validity trace without the profile");
+        assert_eq!(
+            entities.first().unwrap().id,
+            "v-stale",
+            "without the profile, the stronger lexical match still ranks first"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn fused_recall_validity_profile_grades_expiring_and_excludes_deprecated() {
+        // Read-time lifecycle already keeps deprecated (superseded) and
+        // expired entities OUT of recall entirely — the acceptance criterion
+        // is a lower rate of context-invalid memories, which is structural.
+        // What recall CAN show: an expiring-soon entity is served but graded
+        // `stale` with the expiring signal, and the deprecated entity never
+        // surfaces in the first place.
+        let (db, path) = temp_db();
+        let now = crate::db::now_ms();
+
+        db.remember(&make_entity(
+            "v-deprecated",
+            "insight",
+            "v-deprecated",
+            r#"{"note":"delta protocol v1"}"#,
+        ))
+        .unwrap();
+        db.update_entity_status("v-deprecated", "deprecated", "replaced by v2")
+            .unwrap();
+        // Expires in one minute: passes the read-time expiry filter, but is
+        // within one freshness half-life of expiry => stale.
+        db.remember(&make_entity(
+            "v-expiring",
+            "insight",
+            "v-expiring",
+            &format!(r#"{{"note":"delta protocol expiring note","expires_at":{}}}"#, now + 60_000),
+        ))
+        .unwrap();
+        db.remember(&make_entity(
+            "v-current",
+            "insight",
+            "v-current",
+            r#"{"note":"delta protocol v2 current"}"#,
+        ))
+        .unwrap();
+
+        let mut params = fused_params("delta protocol");
+        params.strategies = vec!["fts5".to_string(), "graph".to_string()];
+        params.profile = Some("validity".to_string());
+        let (entities, _c, trace) = db.fused_recall(&params).unwrap();
+        let ids: Vec<&str> = entities.iter().map(|e| e.id.as_str()).collect();
+        assert!(
+            !ids.contains(&"v-deprecated"),
+            "deprecated entity must not be recalled: {ids:?}"
+        );
+        assert_eq!(
+            ids.first(),
+            Some(&"v-current"),
+            "validity profile keeps the current entity first: {ids:?}"
+        );
+        let vt = trace.validity.as_ref().expect("validity trace");
+        assert_eq!(
+            vt.grade_counts.get("valid").copied().unwrap_or(0),
+            1,
+            "only the current entity is fully valid: {:?}",
+            vt.grade_counts
+        );
+        assert_eq!(
+            vt.grade_counts.get("stale").copied().unwrap_or(0),
+            1,
+            "the expiring-soon entity is graded stale: {:?}",
+            vt.grade_counts
+        );
+        assert_eq!(vt.flagged_context_invalid, 0, "nothing context-invalid served");
+
+        // The expiring entity carries the annotation when requested.
+        let out = crate::tools::handle_recall(
+            &db,
+            serde_json::json!({
+                "query": "delta protocol",
+                "mode": "fused",
+                "strategies": ["fts5", "graph"],
+                "profile": "validity",
+            }),
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let expiring_item = v["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["id"] == "v-expiring")
+            .expect("expiring item present");
+        assert_eq!(expiring_item["validity"]["grade"], "stale");
+        assert_eq!(expiring_item["validity"]["expiring_soon"], true);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn recall_validity_annotation_and_profile_validation_via_tools() {
+        // Item annotation + fail-closed profile validation at the tool layer.
+        let (db, path) = temp_db();
+        db.remember(&make_entity(
+            "a-current",
+            "insight",
+            "a-current",
+            r#"{"note":"annotated recall target"}"#,
+        ))
+        .unwrap();
+
+        // Annotate-only: items carry the validity block, no reordering.
+        let out = crate::tools::handle_recall(
+            &db,
+            serde_json::json!({
+                "query": "annotated recall target",
+                "mode": "fts5",
+                "validity_annotate": true,
+            }),
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let item = &v["items"][0];
+        assert!(item["validity"].is_object(), "validity block present");
+        assert_eq!(item["validity"]["grade"], "valid");
+        assert!(item["validity"]["freshness"].as_f64().unwrap() > 0.9);
+        assert!(item["validity"]["signals"].is_array());
+        assert!(item.get("context_invalid").is_none(), "no flag for a valid item");
+
+        // Unknown profile is rejected fail-closed.
+        let err = crate::tools::handle_recall(
+            &db,
+            serde_json::json!({"query": "annotated recall target", "profile": "bogus"}),
+        )
+        .unwrap_err();
+        assert!(err.contains("invalid profile 'bogus'"), "{err}");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

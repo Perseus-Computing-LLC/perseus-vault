@@ -973,6 +973,16 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
           "type": "number",
           "description": "Fused mode only (#869): graph utility gate threshold in [0,1]. The graph strategy engages only when the query's classified graph utility is >= this value. Omit = 0.5 (documented default). 0.0 disables the gate; 1.0 effectively never engages. The routing decision is always observable in fused_trace.graph_route (reason, selected, skipped_reason, gate counts)."
         },
+        "profile": {
+          "type": "string",
+          "enum": ["default", "validity"],
+          "description": "#860: validity-aware recall profile. 'validity' re-ranks fused results by a deterministic validity multiplier (freshness decay, scope match, provenance class, supersession, expiry proximity) and annotates every item with its validity info; 'default'/omitted keeps relevance-only ordering. On non-fused modes the profile only enables item annotation. The weights, grade distribution, and context-invalid count are observable in fused_trace.validity."
+        },
+        "validity_annotate": {
+          "type": "boolean",
+          "default": false,
+          "description": "#860: annotate delivered items with their validity info (grade, freshness, scope match, provenance class, superseded, expiring/expired, multiplier, signals); context-invalid items are additionally flagged 'context_invalid': true. Implied by profile='validity'."
+        },
         "include_archived": {
           "type": "boolean",
           "default": false,
