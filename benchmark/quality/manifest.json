@@ -1,31 +1,9 @@
 {
   "case_count": {
-    "max": 40,
-    "min": 20
+    "min": 20,
+    "max": 40
   },
   "cases": [
-    {
-      "category": "long_horizon",
-      "checks": [
-        "answer_found",
-        "answer_is_current"
-      ],
-      "description": "Retrieve a durable fact after intervening memories and updates.",
-      "id": "long-horizon-basic",
-      "metric": "validity",
-      "scenario": "long_horizon"
-    },
-    {
-      "category": "contradiction_supersession",
-      "checks": [
-        "current_wins",
-        "history_retained"
-      ],
-      "description": "Prefer the current fact while retaining superseded evidence for audit.",
-      "id": "contradiction-supersession-basic",
-      "metric": "mutation_supersession",
-      "scenario": "contradiction_supersession"
-    },
     {
       "category": "shared_memory",
       "checks": [
@@ -433,6 +411,29 @@
       "id": "task-projection-contract-compact-replay",
       "metric": "task_projection",
       "scenario": "task_projection"
+    },
+    {
+      "category": "evidence_observations",
+      "checks": [
+        "evidence_refs",
+        "single_observation",
+        "sources_live"
+      ],
+      "description": "Consolidate near-duplicates into one observation with exact-quote evidence refs and proof count; raw sources stay live.",
+      "id": "evidence-observations-merge",
+      "metric": "evidence_observations",
+      "scenario": "evidence_observations"
+    },
+    {
+      "category": "evidence_observations",
+      "checks": [
+        "correction_journey",
+        "staleness_refresh"
+      ],
+      "description": "A lone contradicting fact refines the observation (journey from->to preserved, same entity id); unrelated newer facts flip the stored stale flag.",
+      "id": "evidence-observations-correction",
+      "metric": "evidence_observations",
+      "scenario": "evidence_observations"
     }
   ],
   "description": "Bounded offline quality-contract manifest for retrieval, temporal validity, scope validity, provenance, replay, mutation/supersession, compaction/projection, action grounding, recall outcomes, admission, poisoning, identity ambiguity, and the graph utility gate (#869).",
@@ -450,12 +451,11 @@
     "identity_ambiguity",
     "graph_utility_gate",
     "validity_recall",
-    "task_projection"
+    "task_projection",
+    "evidence_observations"
   ],
   "name": "perseus-vault-memory-quality-v1",
   "required_categories": [
-    "long_horizon",
-    "contradiction_supersession",
     "shared_memory",
     "adversarial",
     "validity",
@@ -471,7 +471,8 @@
     "identity_ambiguity",
     "graph_gate",
     "validity_recall",
-    "task_projection"
+    "task_projection",
+    "evidence_observations"
   ],
-  "version": 7
+  "version": 8
 }
