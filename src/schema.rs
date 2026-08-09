@@ -416,7 +416,7 @@ CREATE INDEX IF NOT EXISTS idx_artifact_bindings_derived_from
 /// 'defensively_recalled', orthogonal to the lifecycle `status` column.
 /// Backfill-free: existing rows default to 'candidate' (useful but unverified),
 /// which is the safe reading for any legacy record lacking admission evidence.
-pub(crate) const SCHEMA_VERSION: i64 = 31;
+pub(crate) const SCHEMA_VERSION: i64 = 32;
 
 /// Initialize the v0.2.0 schema on a fresh database.
 pub fn initialize_schema(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
@@ -1174,6 +1174,33 @@ fn apply_migrations(conn: &Connection) -> Result<(), Box<dyn std::error::Error>>
          CREATE INDEX IF NOT EXISTS idx_displacement_ts ON displacement_events(ts_unix_ms);",
     )?;
     // ── end v31 ──────────────────────────────────────────────────────────
+
+    // ── v32 (#889 keystone-suggestion queue) ─────────────────────────────
+    // Candidate directive/keystone suggestions extracted from `correct`
+    // captures by word-boundary-anchored patterns. Suggestions are never
+    // policy: only an explicit operator decision (`approve`) promotes one to
+    // the keystones table, preserving the governance gate.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS keystone_suggestions (
+            id TEXT PRIMARY KEY,
+            source_entity_id TEXT NOT NULL,
+            source_category TEXT NOT NULL DEFAULT 'correction',
+            instruction TEXT NOT NULL,
+            pattern_locale TEXT NOT NULL,
+            matched_pattern TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            created_at_unix_ms INTEGER NOT NULL,
+            decided_at_unix_ms INTEGER,
+            decided_by TEXT,
+            workspace_hash TEXT NOT NULL DEFAULT '',
+            UNIQUE(source_entity_id, instruction)
+         );
+         CREATE INDEX IF NOT EXISTS idx_ksug_status_created
+            ON keystone_suggestions(status, created_at_unix_ms);
+         CREATE INDEX IF NOT EXISTS idx_ksug_source
+            ON keystone_suggestions(source_entity_id);",
+    )?;
+    // ── end v32 ──────────────────────────────────────────────────────────
 
     // Stamp the migration level so subsequent opens skip the probe block above.
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;

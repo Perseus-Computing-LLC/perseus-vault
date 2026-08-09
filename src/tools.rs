@@ -4431,6 +4431,153 @@ pub fn handle_keystone_get(db: &Database, args: Value) -> Result<String, String>
     Ok(json!({ "keystones": items, "count": items.len() }).to_string())
 }
 
+// ─── #889 keystone-suggestion queue ───────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct KeystoneSuggestionsArgs {
+    /// Filter by status: "" (all) | "pending" | "approved" | "rejected".
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub workspace_hash: Option<String>,
+    #[serde(default = "default_suggestion_limit")]
+    pub limit: i64,
+}
+
+fn default_suggestion_limit() -> i64 {
+    50
+}
+
+/// List keystone-suggestion candidates (never policy — read-only).
+pub fn handle_keystone_suggestions(db: &Database, args: Value) -> Result<String, String> {
+    let a: KeystoneSuggestionsArgs = serde_json::from_value(args)
+        .map_err(|e| format!("Invalid keystone_suggestions arguments: {e}"))?;
+    let items = db
+        .keystone_suggestions_list(&a.status, a.workspace_hash.as_deref(), a.limit)
+        .map_err(|e| format!("keystone_suggestions failed: {e}"))?;
+    Ok(json!({
+        "suggestions": items,
+        "count": items.len(),
+        "note": "suggestions are candidates only; keystone promotion requires an explicit approve decision",
+    })
+    .to_string())
+}
+
+#[derive(Debug, Deserialize)]
+pub struct KeystoneSuggestionDecideArgs {
+    pub id: String,
+    /// "approve" (promote to keystone) or "reject".
+    pub action: String,
+    #[serde(default)]
+    pub scope: String,
+    #[serde(default)]
+    pub scope_id: String,
+    #[serde(default = "default_keystone_weight")]
+    pub weight: f64,
+    #[serde(default = "default_keystone_tier_required")]
+    pub trust_tier_required: i64,
+    #[serde(default)]
+    pub author_trust_tier: Option<i64>,
+    #[serde(default)]
+    pub agent_id: String,
+    #[serde(default)]
+    pub workspace_hash: String,
+}
+
+/// Decide a suggestion. `approve` re-runs the keystone trust-tier gate
+/// (#683/#684) and, on success, promotes the suggestion's instruction into
+/// the keystones table; the suggestion is then marked `approved`. `reject`
+/// marks the suggestion `rejected` and writes nothing. Governance is
+/// preserved: extraction never calls this path.
+pub fn handle_keystone_suggestion_decide(db: &Database, args: Value) -> Result<String, String> {
+    let a: KeystoneSuggestionDecideArgs = serde_json::from_value(args)
+        .map_err(|e| format!("Invalid keystone_suggestion_decide arguments: {e}"))?;
+    // Resolve the row by id; a caller-supplied workspace must match the
+    // suggestion's own (no cross-workspace decisions).
+    let sug = db
+        .keystone_suggestions_list("", None, 1000)
+        .map_err(|e| format!("suggestion lookup failed: {e}"))?
+        .into_iter()
+        .find(|s| s.id == a.id)
+        .ok_or_else(|| format!("suggestion {} not found", a.id))?;
+    if !a.workspace_hash.is_empty() && a.workspace_hash != sug.workspace_hash {
+        return Err(format!(
+            "suggestion {} belongs to workspace '{}', not '{}'",
+            a.id, sug.workspace_hash, a.workspace_hash
+        ));
+    }
+    match a.action.as_str() {
+        "approve" => {
+            // Re-run the same trust gate as handle_keystone_set (#683/#684).
+            let registered_tier = if a.agent_id.trim().is_empty() {
+                None
+            } else {
+                db.agent_get(&a.agent_id).ok().flatten().map(|g| g.trust_tier)
+            };
+            let (effective_tier, trust_enforced) = match registered_tier {
+                Some(t) => (Some(t), true),
+                None => (a.author_trust_tier, false),
+            };
+            if let Some(t) = effective_tier {
+                if t < a.trust_tier_required {
+                    return Err(format!(
+                        "insufficient trust tier: promoting this keystone requires tier >= {}, {} has {}",
+                        a.trust_tier_required,
+                        if trust_enforced { "registered agent" } else { "caller asserted" },
+                        t
+                    ));
+                }
+            }
+            let scope = if a.scope.is_empty() {
+                "agent".to_string()
+            } else {
+                a.scope.clone()
+            };
+            let scope_id = if a.scope_id.is_empty() {
+                a.agent_id.clone()
+            } else {
+                a.scope_id.clone()
+            };
+            let (id, created) = db
+                .keystone_set(
+                    &sug.instruction,
+                    &scope,
+                    &scope_id,
+                    a.weight,
+                    a.trust_tier_required,
+                    &a.workspace_hash,
+                    &a.agent_id,
+                )
+                .map_err(|e| format!("keystone promotion failed: {e}"))?;
+            db.keystone_suggestion_decide(&a.id, "approved", &a.agent_id)
+                .map_err(|e| format!("suggestion decision failed: {e}"))?;
+            Ok(json!({
+                "ok": true,
+                "keystone_id": id,
+                "created": created,
+                "suggestion_id": a.id,
+                "suggestion_status": "approved",
+                "trust_enforced": trust_enforced,
+            })
+            .to_string())
+        }
+        "reject" => {
+            db.keystone_suggestion_decide(&a.id, "rejected", &a.agent_id)
+                .map_err(|e| format!("suggestion decision failed: {e}"))?;
+            Ok(json!({
+                "ok": true,
+                "suggestion_id": a.id,
+                "suggestion_status": "rejected",
+                "keystone_promoted": false,
+            })
+            .to_string())
+        }
+        other => Err(format!(
+            "invalid decision action '{other}': expected 'approve' or 'reject'"
+        )),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct AgentArgs {
     pub agent_id: String,
@@ -4584,9 +4731,17 @@ pub fn handle_operator_review(db: &Database, args: Value) -> Result<String, Stri
         cursor = rows.get(take - 1).map(|e| e.id.clone());
     }
     supersession_lag.truncate(limit as usize);
+    // #889: pending keystone-suggestion candidates surface in the operator
+    // review queue with their source citation (the correction entity id).
+    let pending_suggestions = db
+        .keystone_suggestions_list("pending", None, limit)
+        .map_err(|e| format!("keystone suggestions failed: {e}"))?;
     Ok(json!({"reviewed_at_unix_ms": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as i64, "category":a.category,
         "contradictions":contradictions, "stale_candidates":stale["flagged"],
-        "supersession_lag":supersession_lag, "read_only":true}).to_string())
+        "supersession_lag":supersession_lag,
+        "keystone_suggestions": pending_suggestions,
+        "keystone_suggestions_note": "pending directive candidates from correct captures; promote via keystone_suggestion_decide(approve)",
+        "read_only":true}).to_string())
 }
 
 pub fn handle_conflicts(db: &Database, args: Value) -> String {
@@ -6494,6 +6649,17 @@ pub fn handle_correct(db: &Database, args: Value) -> Result<String, String> {
         a.requesting_agent_id
     };
 
+    // #889: anchored instruction extraction -> suggestion queue. Extraction
+    // never writes policy — candidates require an explicit operator
+    // `approve` decision before promotion to a keystone. (Clone the source
+    // texts first: the args are moved into CorrectParams below.)
+    let suggestion_texts = [
+        a.user_correction.clone(),
+        a.wrong_approach.clone(),
+        a.task_context.clone(),
+    ];
+    let suggestion_workspace = a.workspace_hash.clone();
+
     let params = crate::models::CorrectParams {
         wrong_approach: a.wrong_approach,
         user_correction: a.user_correction,
@@ -6512,7 +6678,46 @@ pub fn handle_correct(db: &Database, args: Value) -> Result<String, String> {
     let result = db.correct(&params)
         .map_err(|e| format!("Correct failed: {}", e))?;
 
-    serde_json::to_string(&result).map_err(|e| format!("Serialization failed: {}", e))
+    // #889: anchored instruction extraction -> suggestion queue. Extraction
+    // never writes policy — candidates require an explicit operator
+    // `approve` decision before promotion to a keystone.
+    let mut suggestions: Vec<Value> = Vec::new();
+    let mut extraction_errors: Vec<String> = Vec::new();
+    for field in &suggestion_texts {
+        for sug in crate::instruction_extraction::extract_suggestions(field) {
+            match db.keystone_suggestion_add(
+                &result.entity_id,
+                &result.category,
+                &sug.instruction,
+                sug.locale,
+                sug.pattern,
+                &suggestion_workspace,
+            ) {
+                Ok(sid) => {
+                    suggestions.push(json!({
+                        "id": sid,
+                        "instruction": sug.instruction,
+                        "locale": sug.locale,
+                        "pattern": sug.pattern,
+                    }));
+                }
+                Err(e) => extraction_errors.push(format!("{e}")),
+            }
+        }
+    }
+    let mut out = serde_json::to_value(&result)
+        .map_err(|e| format!("Serialization failed: {e}"))?;
+    if let Some(obj) = out.as_object_mut() {
+        obj.insert(
+            "keystone_suggestions".to_string(),
+            json!(suggestions),
+        );
+        obj.insert("keystone_suggestions_count".to_string(), json!(suggestions.len()));
+        if !extraction_errors.is_empty() {
+            obj.insert("extraction_errors".to_string(), json!(extraction_errors));
+        }
+    }
+    serde_json::to_string(&out).map_err(|e| format!("Serialization failed: {e}"))
 }
 
 // ─── perseus_vault_synthesize handler ────────────────────────────────────
@@ -9167,6 +9372,171 @@ mod tests {
         )
         .expect("tier-2 allowed");
         assert!(ok.contains("\"trust_enforced\":true"), "registry-enforced: {ok}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ── #889 keystone-suggestion queue ───────────────────────────────────
+
+    #[test]
+    fn correct_capture_extracts_suggestions_but_never_writes_policy() {
+        // Extraction is suggestions-only: the correct call must queue
+        // candidates and must NOT touch the keystones table.
+        let (db, path) = temp_db();
+        let response = handle_correct(
+            &db,
+            json!({
+                "wrong_approach": "guessing instead of asking",
+                "user_correction": "whenever needed we can use it",
+                "task_context": "writing a memory",
+            }),
+        )
+        .expect("correct");
+        let v: Value = serde_json::from_str(&response).unwrap();
+        let sugs = v["keystone_suggestions"].as_array().unwrap();
+        assert!(
+            sugs.iter().any(|s| s["pattern"] == "whenever"),
+            "whenever directive must be extracted: {response}"
+        );
+        assert!(
+            sugs.iter().all(|s| !s["instruction"].as_str().unwrap().starts_with("never")),
+            "inversion regression: no 'never' suggestion from a 'whenever' text: {response}"
+        );
+        assert_eq!(v["keystone_suggestions_count"], json!(sugs.len()));
+        // Suggestion is pending in the queue.
+        let listed = db.keystone_suggestions_list("pending", None, 50).unwrap();
+        assert_eq!(listed.len(), 1, "{response}");
+        assert_eq!(listed[0].source_entity_id, v["entity_id"].as_str().unwrap());
+        // No policy was written by extraction.
+        let ks = db.keystone_get(None, None, None).unwrap();
+        assert!(ks.is_empty(), "extraction must never create keystones");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn correction_rewrite_deduplicates_suggestions() {
+        // Same (source, instruction) pair queues once.
+        let (db, path) = temp_db();
+        for _ in 0..2 {
+            handle_correct(
+                &db,
+                json!({
+                    "wrong_approach": "x",
+                    "user_correction": "always cite sources",
+                    "task_context": "y",
+                }),
+            )
+            .expect("correct");
+        }
+        let listed = db.keystone_suggestions_list("pending", None, 50).unwrap();
+        let always: Vec<_> = listed
+            .iter()
+            .filter(|s| s.matched_pattern == "always")
+            .collect();
+        assert_eq!(always.len(), 1, "dedupe failed: {listed:?}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn suggestion_approve_promotes_with_trust_gate() {
+        let (db, path) = temp_db();
+        db.agent_upsert("low", "Low", 1, "").unwrap(); // below default required 2
+        db.agent_upsert("high", "High", 2, "").unwrap();
+        handle_correct(
+            &db,
+            json!({
+                "wrong_approach": "x",
+                "user_correction": "never share credentials in logs",
+                "task_context": "y",
+            }),
+        )
+        .expect("correct");
+        let sug = &db.keystone_suggestions_list("pending", None, 10).unwrap()[0];
+
+        // Registry-enforced tier-1 author is denied promotion.
+        let denied = handle_keystone_suggestion_decide(
+            &db,
+            json!({"id": sug.id, "action": "approve", "agent_id": "low"}),
+        );
+        assert!(
+            denied.is_err() && denied.unwrap_err().contains("registered agent"),
+            "tier-1 registered agent must be denied"
+        );
+        assert_eq!(
+            db.keystone_suggestions_list("pending", None, 10).unwrap().len(),
+            1,
+            "denied approval must leave the suggestion pending"
+        );
+        assert!(
+            db.keystone_get(None, None, None).unwrap().is_empty(),
+            "no keystone may be created by a denied approval"
+        );
+
+        // Tier-2 author succeeds; the suggestion is approved and the
+        // keystone exists with the extracted instruction.
+        let ok = handle_keystone_suggestion_decide(
+            &db,
+            json!({"id": sug.id, "action": "approve", "agent_id": "high"}),
+        )
+        .expect("tier-2 approval");
+        assert!(ok.contains("\"trust_enforced\":true"), "{ok}");
+        let approved = db.keystone_suggestions_list("approved", None, 10).unwrap();
+        assert_eq!(approved.len(), 1);
+        let ks = db.keystone_get(None, None, None).unwrap();
+        assert_eq!(ks.len(), 1);
+        assert_eq!(ks[0].content, "never share credentials in logs");
+
+        // Deciding twice fails.
+        let again = handle_keystone_suggestion_decide(
+            &db,
+            json!({"id": sug.id, "action": "approve", "agent_id": "high"}),
+        );
+        assert!(again.is_err(), "already-decided suggestion must be immutable");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn suggestion_reject_writes_nothing() {
+        let (db, path) = temp_db();
+        handle_correct(
+            &db,
+            json!({
+                "wrong_approach": "x",
+                "user_correction": "always verify before publishing",
+                "task_context": "y",
+            }),
+        )
+        .expect("correct");
+        let sug = &db.keystone_suggestions_list("pending", None, 10).unwrap()[0];
+        let ok = handle_keystone_suggestion_decide(
+            &db,
+            json!({"id": sug.id, "action": "reject", "agent_id": "op"}),
+        )
+        .expect("reject");
+        assert!(ok.contains("\"keystone_promoted\":false"), "{ok}");
+        assert!(db.keystone_get(None, None, None).unwrap().is_empty());
+        assert_eq!(db.keystone_suggestions_list("rejected", None, 10).unwrap().len(), 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn operator_review_surfaces_pending_suggestions() {
+        let (db, path) = temp_db();
+        handle_correct(
+            &db,
+            json!({
+                "wrong_approach": "x",
+                "user_correction": "whenever the connection drops retry once",
+                "task_context": "y",
+            }),
+        )
+        .expect("correct");
+        let raw = handle_operator_review(&db, json!({"category":"facts", "limit":20})).unwrap();
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        let sugs = v["keystone_suggestions"].as_array().unwrap();
+        assert!(!sugs.is_empty(), "operator review must surface suggestions: {raw}");
+        assert_eq!(sugs[0]["status"], "pending");
+        assert!(sugs[0]["source_entity_id"].as_str().unwrap().starts_with("cor-"));
         let _ = std::fs::remove_file(&path);
     }
 

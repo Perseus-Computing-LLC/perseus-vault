@@ -8323,6 +8323,154 @@ impl Database {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    // ── #889 Keystone-suggestion queue ───────────────────────────────────
+    // Candidates extracted from `correct` captures by anchored patterns.
+    // Extraction only ever INSERTs suggestions; promotion to the keystones
+    // table happens exclusively through keystone_suggestion_decide(approve),
+    // which re-runs the keystone trust-tier gate. Idempotent per
+    // (source_entity_id, instruction).
+
+    /// Add a candidate suggestion. Returns the suggestion id (existing id
+    /// when the (source, instruction) pair — or the same instruction already
+    /// pending from another source — was already queued). A directive that is
+    /// already awaiting a decision is never re-queued.
+    pub fn keystone_suggestion_add(
+        &self,
+        source_entity_id: &str,
+        source_category: &str,
+        instruction: &str,
+        pattern_locale: &str,
+        matched_pattern: &str,
+        workspace_hash: &str,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let conn = self.conn()?;
+        let existing: Option<String> = conn
+            .query_row(
+                "SELECT id FROM keystone_suggestions \
+                 WHERE source_entity_id = ?1 AND instruction = ?2 \
+                    OR (instruction = ?2 AND status = 'pending') \
+                 ORDER BY created_at_unix_ms ASC LIMIT 1",
+                params![source_entity_id, instruction],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(id) = existing {
+            return Ok(id);
+        }
+        let id = format!(
+            "ksug-{}",
+            uuid::Uuid::new_v4().to_string().replace('-', "")[..12].to_string()
+        );
+        conn.execute(
+            "INSERT INTO keystone_suggestions \
+             (id, source_entity_id, source_category, instruction, pattern_locale, \
+              matched_pattern, status, created_at_unix_ms, workspace_hash) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, ?8)",
+            params![
+                id,
+                source_entity_id,
+                source_category,
+                instruction,
+                pattern_locale,
+                matched_pattern,
+                now_ms(),
+                workspace_hash
+            ],
+        )?;
+        Ok(id)
+    }
+
+    /// List suggestions, newest first. `status` filters ("" = all);
+    /// `workspace_hash` filters when non-empty.
+    pub fn keystone_suggestions_list(
+        &self,
+        status: &str,
+        workspace_hash: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<crate::models::KeystoneSuggestion>, Box<dyn std::error::Error>> {
+        let conn = self.conn()?;
+        let mut conds: Vec<String> = Vec::new();
+        let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        if !status.is_empty() {
+            conds.push(format!("status = ?{}", binds.len() + 1));
+            binds.push(Box::new(status.to_string()));
+        }
+        if let Some(ws) = workspace_hash.filter(|w| !w.is_empty()) {
+            conds.push(format!("workspace_hash = ?{}", binds.len() + 1));
+            binds.push(Box::new(ws.to_string()));
+        }
+        let where_clause = if conds.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", conds.join(" AND "))
+        };
+        let sql = format!(
+            "SELECT id, source_entity_id, source_category, instruction, \
+                    pattern_locale, matched_pattern, status, created_at_unix_ms, \
+                    decided_at_unix_ms, decided_by, workspace_hash \
+             FROM keystone_suggestions {where_clause} \
+             ORDER BY created_at_unix_ms DESC LIMIT ?{}",
+            binds.len() + 1
+        );
+        binds.push(Box::new(limit.clamp(1, 1000)));
+        let mut stmt = conn.prepare(&sql)?;
+        let bind_refs: Vec<&dyn rusqlite::ToSql> = binds.iter().map(|b| b.as_ref()).collect();
+        let rows = stmt.query_map(bind_refs.as_slice(), |r| {
+            Ok(crate::models::KeystoneSuggestion {
+                id: r.get(0)?,
+                source_entity_id: r.get(1)?,
+                source_category: r.get(2)?,
+                instruction: r.get(3)?,
+                pattern_locale: r.get(4)?,
+                matched_pattern: r.get(5)?,
+                status: r.get(6)?,
+                created_at_unix_ms: r.get(7)?,
+                decided_at_unix_ms: r.get(8)?,
+                decided_by: r.get(9)?,
+                workspace_hash: r.get(10)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Mark a suggestion decided (approved/rejected). Returns the suggestion
+    /// id and its current status. Only pending suggestions can be decided.
+    pub fn keystone_suggestion_decide(
+        &self,
+        id: &str,
+        action: &str,
+        decided_by: &str,
+    ) -> Result<(String, String), Box<dyn std::error::Error>> {
+        if !matches!(action, "approved" | "rejected") {
+            return Err(format!(
+                "invalid decision action '{action}': expected 'approved' or 'rejected'"
+            )
+            .into());
+        }
+        let conn = self.conn()?;
+        let status: Option<String> = conn
+            .query_row(
+                "SELECT status FROM keystone_suggestions WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let _status = match status {
+            None => return Err(format!("suggestion {id} not found").into()),
+            Some(s) if s != "pending" => {
+                return Err(format!("suggestion {id} already {s}").into())
+            }
+            Some(s) => s,
+        };
+        let now = now_ms();
+        conn.execute(
+            "UPDATE keystone_suggestions \
+             SET status = ?1, decided_at_unix_ms = ?2, decided_by = ?3 WHERE id = ?4",
+            params![action, now, decided_by, id],
+        )?;
+        Ok((id.to_string(), action.to_string()))
+    }
+
     // ── #684 Multi-agent scoping: agent registry + trust tiers ───────────
 
     /// An empty agent_id means "no session identity" (single-agent deployment
@@ -33221,7 +33369,7 @@ mod tests {
         // Report carries denominator + artifact hash (acceptance #5).
         assert!(rep["denominator"]["slots"].as_i64().unwrap() >= 3);
         assert!(rep["artifact"]["git_hash"].as_str().unwrap().len() >= 7);
-        assert_eq!(rep["artifact"]["schema_version"], 31);
+        assert_eq!(rep["artifact"]["schema_version"], 32);
         let _ = std::fs::remove_file(path);
     }
 
