@@ -50,7 +50,7 @@ perseus-vault/
                             ▼
 ┌─────────────────────────────────────────────────────────────┐
 │              PERSEUS VAULT MCP SERVER                       │
-│  (Orange Pi 3B @ 192.168.1.54:8767)                         │
+│  (Your server: ip-server:port)                              │
 ├─────────────────────────────────────────────────────────────┤
 │  • 81 MCP tools (recall, remember, semantic_search, etc.)  │
 │  • SQLite + FTS5 + vector embeddings                        │
@@ -93,7 +93,7 @@ perseus-vault/
 
 ### One-liner (non-interactive)
 ```bash
-MCP_HOST_PORT=192.168.1.54:8767 MCP_TOKEN=devon-token-2026 \
+MCP_HOST_PORT=ip-server:port MCP_TOKEN=your-token-here \
   curl -fsSL https://raw.githubusercontent.com/sowerkoku/perseus-vault/main/integrations/hermes/install-perseus-vault.py | python3
 ```
 
@@ -107,7 +107,7 @@ python3 install-perseus-vault.py
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `MCP_HOST_PORT` | Perseus Vault server `host:port` | `localhost:8767` |
-| `MCP_TOKEN` | MCP Bearer token | `devon-token-2026` |
+| `MCP_TOKEN` | MCP Bearer token | *(required)* |
 | `HERMES_HOME` | Hermes config directory | `~/.hermes` |
 
 ## Post-Install Verification
@@ -119,7 +119,7 @@ hermes memory status
 
 # Plugin connection
 hermes perseus-vault status
-# → Connected: True | URL: http://192.168.1.54:8767/message | Tools: 81
+# → Connected: True | URL: http://ip-server:port/message | Tools: 81
 
 # List available tools
 hermes perseus-vault tools
