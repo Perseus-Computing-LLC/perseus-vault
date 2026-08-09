@@ -34,6 +34,7 @@ mod transport;
 mod grpc;
 mod util;
 mod validity;
+mod vector_quant;
 mod web;
 
 use clap::{Parser, Subcommand};
@@ -99,6 +100,15 @@ struct Cli {
     /// chat model name is reused, which fails (HTTP 501) on chat-only models (#525).
     #[arg(long)]
     embedding_model_name: Option<String>,
+
+    /// #885: optional quantized embedding storage format: none (float32,
+    /// default), int8, or bit (MIB-style sign bits, Hamming scoring).
+    /// Declares the format for FRESH stores; on an existing store it must
+    /// match the `embedding_format` record (fail-closed at startup) — migrate
+    /// with `perseus_vault_embed` quant_mode instead of flipping this flag.
+    /// Environment equivalent: PERSEUS_VAULT_EMBEDDING_QUANT.
+    #[arg(long, value_name = "none|int8|bit")]
+    embedding_quant: Option<String>,
 
     /// Ollama model name (default: llama3)
     #[arg(long, default_value_t = String::from("llama3"))]
@@ -3303,6 +3313,30 @@ fn run() {
             if let Some(ref model_path) = embedding_model_path {
                 database.set_embedding_model(model_path);
                 eprintln!("perseus-vault: local ONNX embedding enabled (model: {})", model_path);
+            }
+
+            // #885: declare the embedding storage format (fresh stores only;
+            // mismatches on existing stores fail closed with a migration hint)
+            if let Some(ref quant) = cli.embedding_quant {
+                let q = match crate::vector_quant::EmbeddingQuant::parse(quant) {
+                    Some(q) => q,
+                    None => {
+                        eprintln!(
+                            "perseus-vault: invalid --embedding-quant '{quant}': expected \
+                             none | int8 | bit (also settable via \
+                             PERSEUS_VAULT_EMBEDDING_QUANT)"
+                        );
+                        std::process::exit(1);
+                    }
+                };
+                if let Err(e) = database.set_embedding_quant(q) {
+                    eprintln!("perseus-vault: {}", e);
+                    std::process::exit(1);
+                }
+                eprintln!(
+                    "perseus-vault: embedding storage format declared: {}",
+                    q.as_str()
+                );
             }
 
             // Load connectors from YAML config if provided

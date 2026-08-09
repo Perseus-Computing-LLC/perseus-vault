@@ -1528,6 +1528,22 @@ pub struct EmbedParams {
     /// Max entities to embed in batch mode (default: 100).
     #[serde(default = "default_batch_limit")]
     pub batch_limit: usize,
+    /// #885: store-wide reindex — convert ALL stored embeddings (every row,
+    /// archived included) from float32 to this format in one transaction:
+    /// "int8" or "bit". The pre-quantization float32 column is snapshotted
+    /// (once) so `restore_quantized_backup` is lossless. Refused when the
+    /// store is already quantized (restore first). float32 target is refused
+    /// here — the return path is the snapshot restore.
+    #[serde(default)]
+    pub quant_mode: Option<String>,
+    /// #885: rollback — restore the `embedding` column from the
+    /// pre-quantization snapshot and flip the format record back to float32.
+    #[serde(default)]
+    pub restore_quantized_backup: bool,
+    /// #885: drop the pre-quantization snapshot after the operator verified
+    /// the quantized store. Irreversible (rollback then requires re-embed).
+    #[serde(default)]
+    pub drop_quantized_backup: bool,
 }
 
 fn default_batch_limit() -> usize {

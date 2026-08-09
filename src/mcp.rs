@@ -2423,7 +2423,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
   },
   {
     "name": "perseus_vault_embed",
-    "description": "Generate and store dense vector embeddings for entities via Ollama /api/embed. Supports single entity (category+key) or batch mode (batch_category). Requires --llm-endpoint to be set.",
+    "description": "Generate and store dense vector embeddings for entities via Ollama /api/embed. Supports single entity (category+key) or batch mode (batch_category). Requires --llm-endpoint to be set. #885: also the operator surface for optional quantized embedding storage — quant_mode converts ALL stored float32 embeddings to int8 or bit (MIB-style sign-bit vectors scored by Hamming) in one transaction with a pre-quantization snapshot; restore_quantized_backup rolls back losslessly from that snapshot; drop_quantized_backup removes it after verification.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -2447,6 +2447,21 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
           "type": "integer",
           "default": 100,
           "description": "Max entities in batch mode"
+        },
+        "quant_mode": {
+          "type": "string",
+          "enum": ["int8", "bit"],
+          "description": "Store-wide reindex: convert ALL stored embeddings from float32 to int8 or bit (one transaction; pre-quantization float32 snapshot created once). Refused when already quantized — restore first."
+        },
+        "restore_quantized_backup": {
+          "type": "boolean",
+          "default": false,
+          "description": "Roll back the embedding column to float32 from the pre-quantization snapshot (lossless for rows that existed at quantization time)"
+        },
+        "drop_quantized_backup": {
+          "type": "boolean",
+          "default": false,
+          "description": "Drop the pre-quantization snapshot after verifying the quantized store (irreversible; rollback then requires re-embed)"
         }
       }
     },

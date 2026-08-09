@@ -4,6 +4,7 @@ use uuid::Uuid;
 use rusqlite::OptionalExtension;
 
 use crate::db::{now_ms, Database};
+use crate::vector_quant::EmbeddingQuant;
 use crate::log_digest;
 use crate::models::{
     ArtifactRepresentation, Entity, ExternalRef, JournalEvent, OriginRecord, SearchMode,
@@ -6061,6 +6062,36 @@ pub fn handle_artifact_verify_value(db: &Database, args: Value) -> Result<String
 pub fn handle_embed(db: &Database, args: Value) -> Result<String, String> {
     let params: EmbedParams =
         serde_json::from_value(args).map_err(|e| format!("Invalid embed arguments: {}", e))?;
+    // #885: store-wide reindex / rollback modes — they deliberately ignore
+    // the single/batch embedding args (mutually exclusive by contract).
+    if let Some(ref mode) = params.quant_mode {
+        let target = EmbeddingQuant::parse(mode)
+            .ok_or_else(|| format!("invalid quant_mode '{}': expected float32 | int8 | bit", mode))?;
+        if target == EmbeddingQuant::F32 {
+            return Err(
+                "quant_mode=float32 is refused: quantization is lossy — restore the \
+                 pre-quantization snapshot instead (restore_quantized_backup=true) or \
+                 re-embed from entity text"
+                    .to_string(),
+            );
+        }
+        return db
+            .reindex_embeddings(target)
+            .map(|v| v.to_string())
+            .map_err(|e| format!("Embedding reindex failed: {}", e));
+    }
+    if params.restore_quantized_backup {
+        return db
+            .restore_embeddings_snapshot()
+            .map(|v| v.to_string())
+            .map_err(|e| format!("Embedding restore failed: {}", e));
+    }
+    if params.drop_quantized_backup {
+        return db
+            .drop_embeddings_snapshot()
+            .map(|v| v.to_string())
+            .map_err(|e| format!("Embedding snapshot drop failed: {}", e));
+    }
     match db.embed_entity(&params) {
         Ok(result) => Ok(result.to_string()),
         Err(e) => Err(format!("Embed failed: {}", e)),
@@ -11069,6 +11100,71 @@ mod tests {
         )
         .expect_err("oversized category must be rejected");
         assert!(err.contains("category too long"), "unexpected error: {err}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ─── #885: quantized embedding reindex via the embed tool ──────────
+
+    #[test]
+    fn embed_tool_quant_mode_reindex_restore_drop_roundtrip() {
+        let (db, path) = temp_db();
+        // Raw INSERT (not handle_remember): no auto-embed worker involvement
+        // (the bundled build would asynchronously overwrite fixture vectors).
+        let v: Vec<f32> = (0..32).map(|i| ((i as f32) - 16.0) / 8.0).collect();
+        let blob: Vec<u8> = v.iter().flat_map(|f| f.to_le_bytes()).collect();
+        db.conn()
+            .unwrap()
+            .execute(
+                "INSERT INTO entities (id, category, key, body_json, type, status,
+                    retrieval_count, last_accessed_unix_ms, created_at_unix_ms,
+                    decay_score, layer, embedding, archived)
+                 VALUES ('vq-1', 'insight', 'vq-1', '{\"content\":\"vq-1\"}', 'insight',
+                    'active', 0, 0, 0, 1.0, 'working', ?1, 0)",
+                rusqlite::params![blob],
+            )
+            .unwrap();
+        let get_blob = |db: &Database, id: &str| -> Vec<u8> {
+            db.conn()
+                .unwrap()
+                .query_row(
+                    "SELECT embedding FROM entities WHERE id = ?1",
+                    rusqlite::params![id],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+
+        // Invalid mode → error.
+        assert!(handle_embed(&db, json!({"quant_mode": "int4"})).is_err());
+        // float32 target → refused with the restore hint.
+        let err = handle_embed(&db, json!({"quant_mode": "float32"}))
+            .expect_err("quant_mode=float32 must be refused");
+        assert!(err.contains("restore"), "unexpected error: {err}");
+
+        // Migrate to bit.
+        let resp = handle_embed(&db, json!({"quant_mode": "bit"})).expect("reindex");
+        let report: Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(report["format_after"], "bit");
+        assert_eq!(report["reindexed"], 1);
+        let b = get_blob(&db, "vq-1");
+        assert_eq!(b.len(), 1 + 32 / 8);
+        assert_eq!(db.embedding_quant(), crate::vector_quant::EmbeddingQuant::Bit);
+
+        // Rollback via restore_quantized_backup.
+        let resp = handle_embed(&db, json!({"restore_quantized_backup": true}))
+            .expect("restore");
+        let report: Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(report["restored"], 1);
+        assert_eq!(report["format_after"], "float32");
+        assert_eq!(get_blob(&db, "vq-1").len(), 32 * 4);
+
+        // Drop the backup; a second restore then fails loudly.
+        let resp = handle_embed(&db, json!({"drop_quantized_backup": true})).expect("drop");
+        let report: Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(report["snapshot_dropped"], 1);
+        let err = handle_embed(&db, json!({"restore_quantized_backup": true}))
+            .expect_err("restore without snapshot must fail");
+        assert!(err.contains("no embedding snapshot"), "unexpected error: {err}");
         let _ = std::fs::remove_file(&path);
     }
 
