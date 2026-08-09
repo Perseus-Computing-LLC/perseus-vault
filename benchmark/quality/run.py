@@ -55,6 +55,7 @@ V1_REQUIRED_CATEGORIES = V0_REQUIRED_CATEGORIES + (
     "identity_ambiguity",
     "graph_gate",
     "validity_recall",
+    "task_projection",
 )
 
 CAPABILITY_TOOLS = {
@@ -1798,6 +1799,143 @@ def run_validity_recall(client, **_):
     return output(checks, evidence, metric_events)
 
 
+def run_task_projection(client, **_):
+    # #859: task-scoped projection surfaces over the MCP surface. Fixture:
+    # a live external reference (external_refs pointer), a derived
+    # inference (inferred origin), and a durable fact — the projection must
+    # separate all three, expose the contract (permission scope, counts,
+    # freshness, provenance, trust class), stay compact (no raw body
+    # dumps), and replay to the same projection_id.
+    ws = "quality-task-projection-workspace"
+    remember(
+        client,
+        "quality_task_projection",
+        "proj-live",
+        "quality-fixture-proj-delta-incident-901",
+        workspace_hash=ws,
+        external_refs=[
+            {
+                "ref_type": "jira_key",
+                "ref_value": "PLT-901",
+                "source_system": "jira",
+                "relationship": "about",
+            }
+        ],
+    )
+    remember(
+        client,
+        "quality_task_projection",
+        "proj-derived",
+        "quality-fixture-proj-delta-deploy-window",
+        workspace_hash=ws,
+        origin={
+            "memory_kind": "inferred",
+            "source_system": "quality-fixture",
+            "capture_method": "rule_based_extractor",
+        },
+    )
+    remember(
+        client,
+        "quality_task_projection",
+        "proj-durable",
+        "quality-fixture-proj-delta-holiday-schedule",
+        workspace_hash=ws,
+    )
+
+    args = {
+        "task_title": "delta",
+        "category": "quality_task_projection",
+        "workspace_hash": ws,
+        "limit": 5,
+        # Pin the freshness anchor: determinism means identical inputs
+        # (including the anchor, #247) replay to the same projection_id.
+        "query_time_unix_ms": int(time.time() * 1000),
+    }
+    result = client.call("perseus_vault_project_task", args)
+    replay = client.call("perseus_vault_project_task", args)
+
+    sections = result.get("sections") or {}
+    live = sections.get("live_references") or []
+    durable = sections.get("durable_memories") or []
+    derived = sections.get("derived_inferences") or []
+    contract = result.get("contract") or {}
+    counts = contract.get("counts") or {}
+    scope = result.get("scope") or {}
+
+    live_keys = [i.get("key") for i in live]
+    durable_keys = [i.get("key") for i in durable]
+    derived_keys = [i.get("key") for i in derived]
+
+    separated = (
+        "proj-live" in live_keys
+        and "proj-durable" in durable_keys
+        and "proj-derived" in derived_keys
+    )
+    all_items = live + durable + derived
+    contract_visible = (
+        contract.get("permission") == "workspace_scoped"
+        and scope.get("workspace_hash") == ws
+        and counts.get("live") == len(live)
+        and counts.get("durable") == len(durable)
+        and counts.get("derived") == len(derived)
+        and all(
+            isinstance(i.get("trust_class"), str)
+            and isinstance((i.get("freshness") or {}).get("grade"), str)
+            and isinstance(i.get("provenance"), dict)
+            for i in all_items
+        )
+    )
+    compact = all(
+        isinstance(i.get("summary"), str) and i.get("summary") and "body" not in i
+        and i.get("source_of_truth_hint") in ("live_external", "memory_internal")
+        for i in all_items
+    )
+    deterministic = (
+        isinstance(result.get("task"), dict)
+        and isinstance(replay.get("task"), dict)
+        and bool(result["task"].get("projection_id"))
+        and result["task"]["projection_id"] == replay["task"]["projection_id"]
+    )
+    live_hint = (
+        any(i.get("source_of_truth_hint") == "live_external" for i in live)
+        and any(i.get("source_of_truth_hint") == "memory_internal" for i in durable)
+    )
+
+    checks = {
+        "separated": separated,
+        "contract_visible": contract_visible,
+        "compact": compact,
+        "deterministic": deterministic,
+        "live_hint": live_hint,
+    }
+    evidence = {
+        "found": separated and live_hint,
+        "count": len(all_items),
+        "rate": (int(contract_visible) + int(compact) + int(deterministic)) / 3.0,
+        "status": "passed" if all(checks.values()) else "partial",
+        "workspace_hash": ws,
+    }
+    metric_events = {
+        "task-projection-separates-sections": {
+            "numerator": int(separated and live_hint),
+            "denominator": 1,
+        },
+        "task-projection-contract-visible": {
+            "numerator": int(contract_visible),
+            "denominator": 1,
+        },
+        "task-projection-compact-consumable": {
+            "numerator": int(compact),
+            "denominator": 1,
+        },
+        "task-projection-replay-deterministic": {
+            "numerator": int(deterministic),
+            "denominator": 1,
+        },
+    }
+    return output(checks, evidence, metric_events)
+
+
 def run_admission(client, **_):
     untrusted_body = stable_json({"note": "quality-fixture-admission-hostile-marker"})
     untrusted = client.call(
@@ -1967,6 +2105,7 @@ SCENARIO_RUNNERS = {
     "recall_outcome": run_recall_outcome,
     "graph_gate": run_graph_gate,
     "validity_recall": run_validity_recall,
+    "task_projection": run_task_projection,
     "admission": run_admission,
     "prompt_safety": run_prompt_safety,
     "identity_ambiguity": run_identity_ambiguity,

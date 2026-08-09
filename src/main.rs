@@ -20,6 +20,7 @@ mod log_digest;
 mod mcp;
 mod models;
 mod multimodal;
+mod projection;
 mod retrieval_telemetry;
 mod instruction_extraction;
 mod deployment_profile;
