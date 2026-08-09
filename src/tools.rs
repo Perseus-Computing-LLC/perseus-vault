@@ -3484,6 +3484,10 @@ pub fn handle_health(db: &Database) -> String {
     // Lets a long-lived client distinguish "stale server" from "empty store"
     // and gives it the reconnect path (perseus_vault_handoff_restart).
     let live = crate::live_update::running_identity();
+    // #870: the resolved deployment profile (offline/local_only/
+    // local_with_approved_network/external_actions_enabled) — the runtime
+    // posture for model/embedding/network/connectors/encryption/retention.
+    let profile = crate::deployment_profile::resolve(db, db.deployment_context());
     json!({
         "status": if r.db_responds { "healthy" } else { "unhealthy" },
         "db_path": db.db_path(),
@@ -3495,8 +3499,21 @@ pub fn handle_health(db: &Database) -> String {
         "binary_stale": crate::live_update::running_stale(),
         "binary_path": live.map(|i| i.path.display().to_string()).unwrap_or_default(),
         "pid": std::process::id(),
+        "deployment_profile": profile,
     })
     .to_string()
+}
+
+// ─── perseus_vault_deployment_profile (#870) ──────────────────────────────
+
+/// Resolved runtime deployment profile: model/embedding backends, network
+/// listeners + egress (hosts only), connectors, external mutations,
+/// encryption at rest, raw-retention policy, and the derived profile class
+/// (`offline` | `local_only` | `local_with_approved_network` |
+/// `external_actions_enabled`). Sanitized: no secrets, URLs, or raw bodies.
+pub fn handle_deployment_profile(db: &Database, _args: Value) -> Result<String, String> {
+    let profile = crate::deployment_profile::resolve(db, db.deployment_context());
+    serde_json::to_string(&profile).map_err(|e| format!("Serialization failed: {e}"))
 }
 
 fn default_telemetry_category() -> String { "general".to_string() }

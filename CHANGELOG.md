@@ -6,6 +6,19 @@ All notable changes to Perseus Vault are documented here. This project adheres t
 ## [Unreleased]
 
 ### Added
+- **Deployment profiles (#870).** New `perseus_vault_deployment_profile` tool
+  (registry 102→103): one machine-readable, runtime-derived answer to "what
+  is this vault actually connected to?" — `offline` | `local_only` |
+  `local_with_approved_network` | `external_actions_enabled`, with
+  model/embedding backends (degraded reported explicitly, never silently
+  reclassified as empty success), network listeners + sanitized egress hosts,
+  connectors, cloud-provider use, external-mutation posture, encryption
+  at-rest/storage-state/in-transit, and raw-retention policy. `serve`
+  snapshots the effective flags after offline-mode zeroing so the profile
+  reflects runtime state, not config intent; health and `doctor` expose it;
+  benchmark run manifests embed it. Fixes a latent loopback-classification
+  bug: `localhost:11434` and `[::1]:8767` now classify as loopback (port
+  stripped before host comparison).
 - **Keystone-suggestion instruction extraction (#889).** New
   `perseus_vault_keystone_suggestions` + `perseus_vault_keystone_suggestion_decide`
   tools (schema v32): `perseus_vault_correct` captures are scanned with

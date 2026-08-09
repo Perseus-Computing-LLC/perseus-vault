@@ -21,6 +21,7 @@ mod models;
 mod multimodal;
 mod retrieval_telemetry;
 mod instruction_extraction;
+mod deployment_profile;
 mod schema;
 mod signed_profile;
 pub(crate) mod stage_trace;
@@ -1154,6 +1155,53 @@ fn run_doctor(db_path: &str) {
             ),
             Some(days) => println!("  freshness: last write {:.1} days ago", days),
             None => println!("  freshness: (no writes recorded yet)"),
+        }
+    }
+
+    // #870: resolved deployment profile (offline/local_only/
+    // local_with_approved_network/external_actions_enabled) — what this
+    // vault is actually connected to, from runtime state. When run outside
+    // `serve`, the flag-driven context is the default (no web/grpc), so the
+    // profile reports the DB/backends the binary was opened with.
+    if dbp.exists() {
+        match db::Database::open(db_path) {
+            Ok(database) => {
+                let p = crate::deployment_profile::resolve(&database, database.deployment_context());
+                println!("  profile:    {}", p.profile);
+                println!(
+                    "  model:      {} ({}), available={}",
+                    p.model_backend.kind, p.model_backend.model, p.model_backend.available
+                );
+                println!(
+                    "  embedding:  {} ({}), available={}, degraded={}, semantic_recall={}",
+                    p.embedding_backend.kind,
+                    if p.embedding_backend.degraded { "DEGRADED" } else { "ok" },
+                    p.embedding_backend.available,
+                    p.embedding_backend.degraded,
+                    p.embedding_backend.semantic_recall
+                );
+                println!(
+                    "  network:    listeners={} egress=[{}] loopback_only={}",
+                    p.network.listeners.join(","),
+                    p.network.egress_hosts.join(","),
+                    p.network.loopback_only
+                );
+                println!(
+                    "  cloud:      {} | external_mutations={}",
+                    p.cloud_provider_use, p.external_mutations
+                );
+                println!(
+                    "  encryption: at_rest={} (storage {}) in_transit={}",
+                    p.encryption.at_rest, p.encryption.storage_state, p.encryption.in_transit
+                );
+                println!(
+                    "  retention:  bodies={} logs={}",
+                    p.raw_retention.memory_bodies, p.raw_retention.raw_logs
+                );
+            }
+            Err(e) => {
+                println!("  profile:    unavailable (could not open database: {})", e);
+            }
         }
     }
 
@@ -3267,6 +3315,18 @@ fn run() {
                     }
                 }
             }
+
+            // #870: snapshot the EFFECTIVE deployment flags (post
+            // offline-mode zeroing) so the deployment profile reports
+            // runtime state, not config intent. The web bind is captured for
+            // listener classification; grpc is not started by serve today.
+            // External-mutation opt-in is a startup decision (not a live env
+            // read) so concurrent profile calls never race a global.
+            let external_actions = std::env::var("PERSEUS_VAULT_EXTERNAL_ACTIONS")
+                .ok()
+                .as_deref()
+                == Some("1");
+            database.set_deployment_context(offline, effective_web, web_bind, false, external_actions);
 
             // One Database (one connection pool) per process (#402): every
             // surface — web dashboard, MCP transport, stdio server — shares
