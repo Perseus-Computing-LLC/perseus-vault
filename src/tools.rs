@@ -3791,6 +3791,77 @@ pub fn handle_context(db: &Database, args: Value) -> String {
     }
 }
 
+// ─── #859: task-scoped projections ─────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct ProjectTaskArgs {
+    /// The task this projection is scoped to. Also the recall query when
+    /// `query` is omitted.
+    pub task_title: String,
+    /// Optional task context; currently advisory (the query wins).
+    #[serde(default)]
+    pub task_description: Option<String>,
+    /// Explicit retrieval query. Defaults to task_title.
+    #[serde(default)]
+    pub query: Option<String>,
+    /// Restrict the recall pool to one category.
+    #[serde(default)]
+    pub category: Option<String>,
+    /// Permission scope: when set, only matching-workspace or global
+    /// entities are projected (permission: "workspace_scoped" in the
+    /// contract).
+    #[serde(default)]
+    pub workspace_hash: Option<String>,
+    /// Max items per section (1-100, default 12).
+    #[serde(default = "default_projection_limit")]
+    pub limit: i64,
+    /// Only entities created within this many days are projected; older
+    /// hits are counted in contract.excluded.outside_freshness_window.
+    #[serde(default)]
+    pub freshness_window_days: Option<i64>,
+    /// Minimum trust class: "candidate" (default) | "corroborated" |
+    /// "verified". Rejected entities are never projected.
+    #[serde(default = "default_projection_min_trust")]
+    pub min_trust: String,
+    /// Section subset: "live" | "durable" | "derived". Empty = all three.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub include_sections: Vec<String>,
+    /// Anchor instant for freshness grades; omitted = server now (#247
+    /// replay).
+    #[serde(default)]
+    pub query_time_unix_ms: Option<i64>,
+}
+
+fn default_projection_limit() -> i64 {
+    12
+}
+
+fn default_projection_min_trust() -> String {
+    "candidate".to_string()
+}
+
+/// #859: build a compact task-scoped projection separating live external
+/// references, durable recalled memory, and derived inferences, with
+/// permission scope, freshness, provenance, and trust class visible in the
+/// result contract.
+pub fn handle_project_task(db: &Database, args: Value) -> Result<String, String> {
+    let a: ProjectTaskArgs = serde_json::from_value(args)
+        .map_err(|e| format!("Invalid project_task arguments: {e}"))?;
+    let req = crate::projection::ProjectionRequest::parse(
+        a.task_title,
+        a.query,
+        a.category,
+        a.workspace_hash,
+        a.limit,
+        a.freshness_window_days,
+        a.min_trust,
+        a.include_sections,
+        a.query_time_unix_ms,
+    )?;
+    let report = crate::projection::build_projection(db, &req)?;
+    serde_json::to_string(&report).map_err(|e| format!("Projection serialization failed: {e}"))
+}
+
 /// Extract structured knowledge (facts/preferences/temporal events/episodes) from
 /// raw text or a stored entity, using a local, deterministic extractor (#234).
 /// Read-only: this never writes to the store, so the zero-dependency / air-gapped
@@ -10442,6 +10513,316 @@ mod tests {
         let lv: Value = serde_json::from_str(&legacy).unwrap();
         assert_eq!(lv["mode"], "always_inject");
         assert_eq!(lv["budget_chars"], 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ─── #859: task-scoped projections ─────────────────────────────────
+
+    fn projection_entity(id: &str, category: &str, key: &str, body: &str, ws: &str) -> Entity {
+        let now = crate::db::now_ms();
+        Entity {
+            id: id.to_string(),
+            category: category.to_string(),
+            key: key.to_string(),
+            body_json: body.to_string(),
+            status: "active".to_string(),
+            entity_type: "insight".to_string(),
+            tags: vec![],
+            decay_score: 1.0,
+            retrieval_count: 0,
+            layer: "working".to_string(),
+            topic_path: String::new(),
+            archived: false,
+            archive_reason: String::new(),
+            links: vec![],
+            verified: false,
+            source: "test".to_string(),
+            always_on: false,
+            certainty: 1.0,
+            workspace_hash: ws.to_string(),
+            agent_id: "tester".to_string(),
+            visibility: "workspace".to_string(),
+            created_at_unix_ms: now,
+            last_accessed_unix_ms: now,
+            follow_count: 0,
+            miss_count: 0,
+            follow_rate: 0.0,
+            efficacy_status: "unverified".to_string(),
+            epistemic_state: "candidate".to_string(),
+            embedding: None,
+            _parsed_body: None,
+        }
+    }
+
+    fn projection_set_epistemic(db: &Database, key: &str, state: &str) {
+        db.conn()
+            .unwrap()
+            .execute(
+                "UPDATE entities SET epistemic_state = ?1 WHERE key = ?2",
+                rusqlite::params![state, key],
+            )
+            .unwrap();
+    }
+
+    fn projection_set_created_at(db: &Database, key: &str, unix_ms: i64) {
+        db.conn()
+            .unwrap()
+            .execute(
+                "UPDATE entities SET created_at_unix_ms = ?1 WHERE key = ?2",
+                rusqlite::params![unix_ms, key],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn handle_project_task_separates_sections_and_contract_visible() {
+        let (db, path) = temp_tool_db();
+        let ws = "ws-a";
+        let cat = "quality_projection";
+        // Live: first-class pointer into an external system of record.
+        db.remember_skip_dedup(&projection_entity(
+            "mem-proj-live",
+            cat,
+            "proj-live",
+            r#"{"note": "delta live incident tracker", "external_refs": [{"ref_type": "jira_key", "ref_value": "PLT-901", "source_system": "jira", "relationship": "about"}]}"#,
+            ws,
+        ))
+        .unwrap();
+        // Derived: inferred origin.
+        db.remember_skip_dedup(&projection_entity(
+            "mem-proj-derived",
+            cat,
+            "proj-derived",
+            r#"{"note": "delta deploy window inference", "origin": {"memory_kind": "inferred", "source_system": "quality-fixture", "capture_method": "rule_based_extractor"}}"#,
+            ws,
+        ))
+        .unwrap();
+        // Durable: plain recalled fact.
+        db.remember_skip_dedup(&projection_entity(
+            "mem-proj-durable",
+            cat,
+            "proj-durable",
+            r#"{"note": "delta holiday schedule"}"#,
+            ws,
+        ))
+        .unwrap();
+
+        let out = handle_project_task(
+            &db,
+            json!({
+                "task_title": "delta triage",
+                "category": cat,
+                "workspace_hash": ws,
+                "limit": 5,
+                "query_time_unix_ms": crate::db::now_ms(),
+            }),
+        )
+        .expect("projection must succeed");
+        let v: Value = serde_json::from_str(&out).unwrap();
+
+        let live = &v["sections"]["live_references"];
+        let durable = &v["sections"]["durable_memories"];
+        let derived = &v["sections"]["derived_inferences"];
+        assert_eq!(live[0]["key"], "proj-live", "live section: {out}");
+        assert_eq!(durable[0]["key"], "proj-durable", "durable section: {out}");
+        assert_eq!(derived[0]["key"], "proj-derived", "derived section: {out}");
+
+        // Contract visibility: permission, counts, freshness, provenance,
+        // trust class — and no raw body dump.
+        assert_eq!(v["contract"]["permission"], "workspace_scoped");
+        assert_eq!(v["contract"]["counts"]["live"], 1);
+        assert_eq!(v["contract"]["counts"]["durable"], 1);
+        assert_eq!(v["contract"]["counts"]["derived"], 1);
+        assert_eq!(v["contract"]["excluded"]["rejected"], 0);
+        assert!(v["contract"]["trust_classes"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("candidate")));
+        assert_eq!(v["scope"]["workspace_hash"], ws);
+        assert!(!v["task"]["projection_id"].as_str().unwrap().is_empty());
+
+        let item = &live[0];
+        assert_eq!(item["trust_class"], "candidate");
+        assert_eq!(item["freshness"]["grade"], "valid");
+        assert!(item["freshness"]["value"].as_f64().unwrap() > 0.0);
+        assert_eq!(item["provenance"]["external_refs"][0]["ref_value"], "PLT-901");
+        assert_eq!(item["source_of_truth_hint"], "live_external");
+        assert_eq!(item["summary"], "delta live incident tracker");
+        assert!(item.get("body").is_none(), "no raw body dump: {item}");
+        assert_eq!(derived[0]["source_of_truth_hint"], "memory_internal");
+        assert_eq!(
+            derived[0]["provenance"]["memory_kind"],
+            "inferred",
+            "provenance digest must be visible: {out}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn handle_project_task_filters_rejected_and_min_trust() {
+        let (db, path) = temp_tool_db();
+        let ws = "ws-b";
+        let cat = "quality_projection_trust";
+        for (id, key) in [("mem-t1", "t-rejected"), ("mem-t2", "t-defensive"), ("mem-t3", "t-verified")] {
+            db.remember_skip_dedup(&projection_entity(
+                id,
+                cat,
+                key,
+                &format!(r#"{{"note": "gamma fact {key}"}}"#),
+                ws,
+            ))
+            .unwrap();
+        }
+        projection_set_epistemic(&db, "t-rejected", "rejected");
+        projection_set_epistemic(&db, "t-defensive", "defensively_recalled");
+        projection_set_epistemic(&db, "t-verified", "verified");
+
+        let out = handle_project_task(
+            &db,
+            json!({
+                "task_title": "gamma",
+                "category": cat,
+                "workspace_hash": ws,
+                "query_time_unix_ms": crate::db::now_ms(),
+            }),
+        )
+        .expect("projection must succeed");
+        let v: Value = serde_json::from_str(&out).unwrap();
+        let durable = &v["sections"]["durable_memories"];
+        let keys: Vec<&str> = durable
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|i| i["key"].as_str())
+            .collect();
+        assert!(!keys.contains(&"t-rejected"), "rejected must never project: {out}");
+        assert!(!keys.contains(&"t-defensive"), "defensively_recalled below default min_trust: {out}");
+        assert!(keys.contains(&"t-verified"));
+        assert_eq!(v["contract"]["excluded"]["rejected"], 1);
+        assert_eq!(v["contract"]["excluded"]["below_min_trust"], 1);
+        // Verified item carries its trust class.
+        let verified_item = durable
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["key"] == "t-verified")
+            .unwrap();
+        assert_eq!(verified_item["trust_class"], "verified");
+
+        // min_trust "verified" narrows to verified only.
+        let out2 = handle_project_task(
+            &db,
+            json!({
+                "task_title": "gamma",
+                "category": cat,
+                "workspace_hash": ws,
+                "min_trust": "verified",
+                "query_time_unix_ms": crate::db::now_ms(),
+            }),
+        )
+        .expect("projection must succeed");
+        let v2: Value = serde_json::from_str(&out2).unwrap();
+        let keys2: Vec<&str> = v2["sections"]["durable_memories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|i| i["key"].as_str())
+            .collect();
+        assert_eq!(keys2, vec!["t-verified"], "min_trust verified: {out2}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn handle_project_task_freshness_window_excludes_old() {
+        let (db, path) = temp_tool_db();
+        let ws = "ws-c";
+        let cat = "quality_projection_fresh";
+        db.remember_skip_dedup(&projection_entity(
+            "mem-f1",
+            cat,
+            "f-fresh",
+            r#"{"note": "epsilon current note"}"#,
+            ws,
+        ))
+        .unwrap();
+        db.remember_skip_dedup(&projection_entity(
+            "mem-f2",
+            cat,
+            "f-stale",
+            r#"{"note": "epsilon ancient note"}"#,
+            ws,
+        ))
+        .unwrap();
+        let now = crate::db::now_ms();
+        projection_set_created_at(&db, "f-stale", now - 40 * 86_400_000);
+
+        let out = handle_project_task(
+            &db,
+            json!({
+                "task_title": "epsilon",
+                "category": cat,
+                "workspace_hash": ws,
+                "freshness_window_days": 7,
+                "query_time_unix_ms": now,
+            }),
+        )
+        .expect("projection must succeed");
+        let v: Value = serde_json::from_str(&out).unwrap();
+        let keys: Vec<&str> = v["sections"]["durable_memories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|i| i["key"].as_str())
+            .collect();
+        assert_eq!(keys, vec!["f-fresh"], "window must drop the old hit: {out}");
+        assert_eq!(v["contract"]["excluded"]["outside_freshness_window"], 1);
+        // The surviving item still carries its freshness grade annotation.
+        assert_eq!(v["sections"]["durable_memories"][0]["freshness"]["grade"], "valid");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn handle_project_task_rejects_invalid_args_fail_closed() {
+        let (db, path) = temp_tool_db();
+        assert!(handle_project_task(&db, json!({"task_title": "  "})).is_err());
+        assert!(handle_project_task(&db, json!({})).is_err(), "missing task_title");
+        assert!(handle_project_task(&db, json!({"task_title": "t", "min_trust": "bogus"})).is_err());
+        assert!(handle_project_task(&db, json!({"task_title": "t", "include_sections": ["nope"]})).is_err());
+        assert!(handle_project_task(&db, json!({"task_title": "t", "limit": 0})).is_err());
+        assert!(handle_project_task(&db, json!({"task_title": "t", "freshness_window_days": 0})).is_err());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn handle_project_task_replay_produces_deterministic_id() {
+        let (db, path) = temp_tool_db();
+        db.remember_skip_dedup(&projection_entity(
+            "mem-r1",
+            "quality_projection_replay",
+            "r-note",
+            r#"{"note": "zeta replay note"}"#,
+            "ws-r",
+        ))
+        .unwrap();
+        let now = 1_700_000_000_000i64;
+        let args = json!({
+            "task_title": "zeta",
+            "category": "quality_projection_replay",
+            "workspace_hash": "ws-r",
+            "query_time_unix_ms": now,
+        });
+        let a = handle_project_task(&db, args.clone()).unwrap();
+        let b = handle_project_task(&db, args.clone()).unwrap();
+        let va: Value = serde_json::from_str(&a).unwrap();
+        let vb: Value = serde_json::from_str(&b).unwrap();
+        assert_eq!(va["task"]["projection_id"], vb["task"]["projection_id"]);
+        assert_eq!(va["generated_at_unix_ms"], now);
+        // A different anchor changes the id (freshness is anchored to it).
+        let mut shifted = args.clone();
+        shifted["query_time_unix_ms"] = json!(now + 1000);
+        let c = handle_project_task(&db, shifted).unwrap();
+        let vc: Value = serde_json::from_str(&c).unwrap();
+        assert_ne!(va["task"]["projection_id"], vc["task"]["projection_id"]);
         let _ = std::fs::remove_file(&path);
     }
 

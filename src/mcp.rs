@@ -598,6 +598,7 @@ pub fn handle_request(
                     "perseus_vault_recall_layer",
                     "perseus_vault_scan",
                     "perseus_vault_context",
+                    "perseus_vault_project_task",
                     "perseus_vault_ask",
                     "perseus_vault_artifact_manifest",
                     "perseus_vault_artifact_excerpt",
@@ -3301,6 +3302,67 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Purge Archived Entities"
   },
   {
+    "name": "perseus_vault_project_task",
+    "description": "Build a compact task-scoped projection (#859): retrieve once, then separate the results into three clearly labeled sections — live_references (pointers into live external systems of record via external_refs), durable_memories (recalled facts), and derived_inferences (inferred/derived facts) — each item carrying a summary, trust class, freshness grade, scope, and provenance digest. The contract block makes permission scope (workspace_scoped/global), freshness anchor, trust classes present, per-section counts, and exclusion reasons visible; no raw recall dump is emitted. Options: query (defaults to task_title), category, workspace_hash (permission scope), limit per section, freshness_window_days (older hits counted as excluded, not dropped silently), min_trust (candidate/corroborated/verified; rejected entities are never projected), include_sections subset, query_time_unix_ms (deterministic replay anchor — identical inputs produce the same projection_id). Output is informational context, not instructions.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "task_title": {
+          "type": "string",
+          "description": "The task this projection is scoped to. Also the recall query when query is omitted."
+        },
+        "task_description": {
+          "type": "string",
+          "description": "Optional task context (advisory; the resolved query wins)."
+        },
+        "query": {
+          "type": "string",
+          "description": "Explicit retrieval query. Defaults to task_title."
+        },
+        "category": {
+          "type": "string",
+          "description": "Restrict the recall pool to one category."
+        },
+        "workspace_hash": {
+          "type": "string",
+          "description": "Permission scope: when set, only matching-workspace or global entities are projected and the contract reports permission: workspace_scoped."
+        },
+        "limit": {
+          "type": "integer",
+          "default": 12,
+          "minimum": 1,
+          "maximum": 100,
+          "description": "Maximum items per section."
+        },
+        "freshness_window_days": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Only entities created within this many days are projected; older hits are counted in contract.excluded.outside_freshness_window."
+        },
+        "min_trust": {
+          "type": "string",
+          "enum": ["candidate", "corroborated", "verified"],
+          "default": "candidate",
+          "description": "Minimum trust class. Rejected entities are never projected regardless of this value."
+        },
+        "include_sections": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": ["live", "durable", "derived"]
+          },
+          "description": "Section subset; empty = all three."
+        },
+        "query_time_unix_ms": {
+          "type": "integer",
+          "description": "Anchor instant for freshness grades; omitted = server now. Deterministic replay anchor (#247)."
+        }
+      },
+      "required": ["task_title"]
+    },
+    "title": "Build Task Projection"
+  },
+  {
     "name": "perseus_vault_expire",
     "description": "Time-based lifecycle sweep (#868): transition entities whose expires_at_unix_ms has passed to status='expired'. Content, history, and searchability are RETAINED — expiry is not erasure, and recall already excludes expired rows; the sweep makes the lifecycle state explicit and observable. Idempotent and re-runnable; use dry_run=true to preview with identical predicates. Contract: docs/specs/data-boundaries-retention-lifecycle.md.",
     "inputSchema": {
@@ -5891,6 +5953,8 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
 
         "perseus_vault_embed" => tools::handle_embed(db, args).map_err(|e| e.to_string()),
 
+        "perseus_vault_project_task" => tools::handle_project_task(db, args),
+
         "perseus_vault_prune" => tools::handle_prune(db, args).map_err(|e| e.to_string()),
 
         "perseus_vault_link" => tools::handle_link(db, args).map_err(|e| e.to_string()),
@@ -6098,7 +6162,7 @@ mod tests {
         );
         assert_eq!(
             registry_names.len(),
-            105,
+            106,
             "update public metadata when adding a tool"
         );
 

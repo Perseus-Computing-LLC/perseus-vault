@@ -410,6 +410,29 @@
       "id": "validity-recall-grades-expiring",
       "metric": "validity_recall",
       "scenario": "validity_recall"
+    },
+    {
+      "category": "task_projection",
+      "checks": [
+        "separated",
+        "live_hint"
+      ],
+      "description": "A task projection separates live external references (external_refs), durable recalled memory, and derived inferences into distinct sections, with the source-of-truth hint on each item.",
+      "id": "task-projection-separates-and-hints",
+      "metric": "task_projection",
+      "scenario": "task_projection"
+    },
+    {
+      "category": "task_projection",
+      "checks": [
+        "contract_visible",
+        "compact",
+        "deterministic"
+      ],
+      "description": "The projection contract exposes permission scope, counts, freshness grades, trust class, and provenance digests; items are compact (summary, no raw body dump); identical requests replay to the same projection_id (#247).",
+      "id": "task-projection-contract-compact-replay",
+      "metric": "task_projection",
+      "scenario": "task_projection"
     }
   ],
   "description": "Bounded offline quality-contract manifest for retrieval, temporal validity, scope validity, provenance, replay, mutation/supersession, compaction/projection, action grounding, recall outcomes, admission, poisoning, identity ambiguity, and the graph utility gate (#869).",
@@ -426,7 +449,8 @@
     "prompt_safety",
     "identity_ambiguity",
     "graph_utility_gate",
-    "validity_recall"
+    "validity_recall",
+    "task_projection"
   ],
   "name": "perseus-vault-memory-quality-v1",
   "required_categories": [
@@ -446,7 +470,8 @@
     "prompt_safety",
     "identity_ambiguity",
     "graph_gate",
-    "validity_recall"
+    "validity_recall",
+    "task_projection"
   ],
-  "version": 6
+  "version": 7
 }
