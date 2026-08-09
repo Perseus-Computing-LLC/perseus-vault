@@ -33070,7 +33070,7 @@ mod tests {
         drop(conn);
 
         // Lexical arm.
-        let mut p = crate::models::RecallParams {
+        let p = crate::models::RecallParams {
             query: "zeppelin core".to_string(),
             limit: 10,
             ..Default::default()
@@ -33083,12 +33083,18 @@ mod tests {
         );
 
         // Hybrid arm (sparse + graph; dense is empty without embeddings).
-        p.mode = crate::models::SearchMode::Hybrid;
-        let results = db.recall(&p).unwrap();
-        assert!(
-            results.iter().all(|e| e.id != "c2" && e.id != "c3"),
-            "hybrid arm never re-enters superseded/quarantined"
-        );
+        // The hybrid mode requires the embedding backend, which is compiled
+        // out under --no-default-features — gate the exercise accordingly.
+        #[cfg(feature = "bundled-embeddings")]
+        {
+            let mut hp = p.clone();
+            hp.mode = crate::models::SearchMode::Hybrid;
+            let results = db.recall(&hp).unwrap();
+            assert!(
+                results.iter().all(|e| e.id != "c2" && e.id != "c3"),
+                "hybrid arm never re-enters superseded/quarantined"
+            );
+        }
 
         // Fused arm (fts5 + graph + temporal consensus).
         let mut fp = fused_params("zeppelin core");
@@ -33143,7 +33149,7 @@ mod tests {
         // limit+offset wide, so offset>0 lets the quota see the core-only
         // entities (2 slots for "zeppelin" across the first two candidates;
         // the core-only drops are recorded as sole-evidence displacement).
-        let mut p = crate::models::RecallParams {
+        let p = crate::models::RecallParams {
             query: "zeppelin core".to_string(),
             limit: 2,
             offset: 1,
@@ -33152,10 +33158,15 @@ mod tests {
         };
         db.recall(&p).unwrap();
 
-        // Hybrid recall -> sparse/dense/graph audits.
-        p.mode = crate::models::SearchMode::Hybrid;
-        p.diversity_halving = 1.0;
-        db.recall(&p).unwrap();
+        // Hybrid recall -> sparse/dense/graph audits (embedding backend
+        // required; compiled out under --no-default-features).
+        #[cfg(feature = "bundled-embeddings")]
+        {
+            let mut hp = p.clone();
+            hp.mode = crate::models::SearchMode::Hybrid;
+            hp.diversity_halving = 1.0;
+            db.recall(&hp).unwrap();
+        }
 
         // Fused recall -> fts5/dense/graph/temporal audits.
         let fp = fused_params("zeppelin core");
@@ -33183,10 +33194,17 @@ mod tests {
             Some(1),
             "lexical arm audited"
         );
+        #[cfg(feature = "bundled-embeddings")]
         assert_eq!(
             by_mode.get("hybrid").map(|s| s.len()),
             Some(3),
             "hybrid sparse+dense+graph audited: {:?}",
+            by_mode
+        );
+        #[cfg(not(feature = "bundled-embeddings"))]
+        assert!(
+            !by_mode.contains_key("hybrid"),
+            "no hybrid audits without the embedding backend: {:?}",
             by_mode
         );
         assert_eq!(
@@ -33197,6 +33215,7 @@ mod tests {
         // Retrieval profile reflects every mode that served.
         let modes = &rep["retrieval_profile"]["modes"];
         assert!(modes["lexical"].as_i64().unwrap() >= 1);
+        #[cfg(feature = "bundled-embeddings")]
         assert!(modes["hybrid"].as_i64().unwrap() >= 1);
         assert!(modes["fused"].as_i64().unwrap() >= 1);
         // Report carries denominator + artifact hash (acceptance #5).
