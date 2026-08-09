@@ -218,6 +218,7 @@ null_as_named_default!(null_as_default_entity_type, String, default_entity_type)
 null_as_named_default!(null_as_default_importance, f64, default_importance);
 null_as_named_default!(null_as_default_certainty, f64, default_certainty);
 null_as_named_default!(null_as_default_visibility, String, default_visibility);
+null_as_named_default!(null_as_default_true, bool, default_true);
 null_as_named_default!(
     null_as_default_artifact_candidate_encoding,
     String,
@@ -3943,6 +3944,14 @@ pub struct CaptureArgs {
     /// `consume` to have anything to prune; ignored otherwise.
     #[serde(default)]
     pub source_file: Option<String>,
+    /// #888: retain the raw payload as a durable `transcript` entity and
+    /// stamp every spanned note with a `source_chunk` reference (source id,
+    /// char span, span hash) so `perseus_vault_expand_source` can return the
+    /// verbatim source text. Default true — capture is the transcript
+    /// distillation surface; set false to skip retention (notes then carry
+    /// no source refs and degrade gracefully). Skipped under `dry_run`.
+    #[serde(default = "default_true", deserialize_with = "null_as_default_true")]
+    pub retain_transcript: bool,
     /// Optional write-time evidence envelope for the captured source. When
     /// absent, captured notes are explicitly marked legacy_unknown by the
     /// persistence boundary rather than treated as a reproducible snapshot.
@@ -4052,6 +4061,82 @@ pub fn handle_capture(db: &Database, args: Value) -> Result<String, String> {
 
     let mut written = Vec::with_capacity(report.notes.len());
     let (mut created, mut updated, mut merged) = (0i64, 0i64, 0i64);
+
+    // #888: retain the raw payload as a durable transcript BEFORE the notes,
+    // so every spanned note can reference its source id. Identical payloads
+    // re-captured update the SAME transcript row (anti-flood, like notes).
+    //
+    // The transcript body also carries a `chunk_hashes` manifest
+    // ("{start}:{end}" -> SHA-256 of the verbatim span). The hashes live HERE
+    // (in the bi-temporal retained store), not in the note bodies: a 64-hex
+    // hash per note would push capture-note trigram Jaccard below the 0.7
+    // dedup threshold (#520 flood control is dedup). Note bodies carry only
+    // the minimal deterministic pointer {source_category, source_key, span}.
+    let mut transcript_retained = false;
+    let mut transcript_id = String::new();
+    let mut transcript_key = String::new();
+    let transcript_captured_at = now_ms();
+    if a.retain_transcript && !a.dry_run && !a.text.trim().is_empty() {
+        transcript_key = crate::capture::transcript_key(&a.text);
+        let mut chunk_hashes = serde_json::Map::new();
+        for note in &report.notes {
+            if let Some(span) = note.span {
+                if let Some(verbatim) = crate::capture::span_text(&a.text, span) {
+                    chunk_hashes.insert(
+                        format!("{}:{}", span.start_char, span.end_char),
+                        json!(crate::capture::span_sha256(verbatim)),
+                    );
+                }
+            }
+        }
+        let raw_id = Uuid::new_v4().to_string().replace('-', "");
+        let tid = format!("mem-{}", &raw_id[..12.min(raw_id.len())]);
+        let transcript_entity = Entity {
+            id: tid.clone(),
+            category: "transcript".to_string(),
+            key: transcript_key.clone(),
+            body_json: json!({
+                "content": a.text,
+                "source_path": a.source_file,
+                "distiller": distiller,
+                "captured_at_unix_ms": transcript_captured_at,
+                "chunk_hashes": serde_json::Value::Object(chunk_hashes),
+            })
+            .to_string(),
+            status: "active".to_string(),
+            entity_type: "document".to_string(),
+            tags: vec!["transcript".to_string(), "capture".to_string()],
+            decay_score: 1.0,
+            retrieval_count: 0,
+            layer: "buffer".to_string(),
+            topic_path: String::new(),
+            archived: false,
+            archive_reason: String::new(),
+            links: vec![],
+            verified: false,
+            source: "capture".to_string(),
+            always_on: false,
+            certainty: 0.6,
+            workspace_hash: a.workspace_hash.clone(),
+            agent_id: a.agent_id.clone(),
+            visibility: "workspace".to_string(),
+            created_at_unix_ms: transcript_captured_at,
+            last_accessed_unix_ms: transcript_captured_at,
+            follow_count: 0,
+            miss_count: 0,
+            follow_rate: 0.0,
+            efficacy_status: "unverified".to_string(),
+            epistemic_state: crate::models::default_epistemic_state(),
+            embedding: None,
+            _parsed_body: None,
+        };
+        let (eid, _action) = db
+            .remember_with_options(&transcript_entity, false, None, None, false)
+            .map_err(|e| format!("Transcript retention failed: {}", e))?;
+        transcript_id = eid;
+        transcript_retained = true;
+    }
+
     for note in &report.notes {
         let now = now_ms();
         let raw_id = Uuid::new_v4().to_string().replace('-', "");
@@ -4066,6 +4151,21 @@ pub fn handle_capture(db: &Database, args: Value) -> Result<String, String> {
             captured_at_unix_ms: now,
             replayable: false,
         })).unwrap_or(json!({"capture_mode":"legacy_unknown","replayable":false}));
+        // #888: stamp the minimal source_chunk pointer when the note has a
+        // span and the transcript was actually retained. The pointer is fully
+        // deterministic (source_key + char span — no random ids, no hashes)
+        // so capture-note trigram dedup (#520 flood control) is unaffected;
+        // the span's SHA-256 lives in the transcript's chunk_hashes manifest,
+        // which expand re-verifies against the retained store.
+        if let (Some(span), true) = (note.span, transcript_retained) {
+            if crate::capture::span_text(&a.text, span).is_some() {
+                body_value["source_chunk"] = json!({
+                    "source_category": "transcript",
+                    "source_key": transcript_key,
+                    "span": { "start_char": span.start_char, "end_char": span.end_char },
+                });
+            }
+        }
         let body = body_value.to_string();
         let entity = Entity {
             id,
@@ -4134,6 +4234,11 @@ pub fn handle_capture(db: &Database, args: Value) -> Result<String, String> {
         "dry_run": a.dry_run,
         "distiller": distiller,
         "notes": written,
+        "transcript": {
+            "retained": transcript_retained,
+            "id": if transcript_id.is_empty() { Value::Null } else { json!(transcript_id) },
+            "key": if transcript_key.is_empty() { Value::Null } else { json!(transcript_key) },
+        },
     });
     if let Some(reason) = llm_fallback {
         result["llm_fallback"] = json!(reason);
@@ -4176,6 +4281,283 @@ pub fn handle_capture(db: &Database, args: Value) -> Result<String, String> {
         }
     }
     Ok(reviewable_write_result(result, "capture").to_string())
+}
+
+// ─── #888: source-chunk expansion ────────────────────────────────
+
+const DEFAULT_EXPAND_BUDGET_CHARS: usize = 2000;
+const MAX_EXPAND_BUDGET_CHARS: usize = 16384;
+
+fn default_expand_budget() -> usize {
+    DEFAULT_EXPAND_BUDGET_CHARS
+}
+
+null_as_named_default!(null_as_default_expand_budget, usize, default_expand_budget);
+
+/// #888: `perseus_vault_expand_source` — resolve a distilled fact's
+/// `source_chunk` reference back to the verbatim span of its retained
+/// transcript, budget-constrained, with integrity verification and
+/// bi-temporal as-of semantics.
+#[derive(Debug, Deserialize)]
+pub struct ExpandSourceArgs {
+    /// Fact mode: category of the distilled fact entity.
+    #[serde(default)]
+    pub category: Option<String>,
+    /// Fact mode: key of the distilled fact entity.
+    #[serde(default)]
+    pub key: Option<String>,
+    /// Explicit mode: category of the retained source (transcript/document).
+    #[serde(default)]
+    pub source_category: Option<String>,
+    /// Explicit mode: key of the retained source.
+    #[serde(default)]
+    pub source_key: Option<String>,
+    /// Explicit mode: span start (char offset, inclusive).
+    #[serde(default)]
+    pub start_char: Option<usize>,
+    /// Explicit mode: span end (char offset, exclusive).
+    #[serde(default)]
+    pub end_char: Option<usize>,
+    /// Explicit mode: optional expected SHA-256 of the verbatim span; when
+    /// present it is verified exactly like a fact-stamped hash.
+    #[serde(default)]
+    pub span_sha256: Option<String>,
+    /// Token budget in chars (1..=16384, default 2000). Longer spans are
+    /// truncated with `truncated: true`.
+    #[serde(
+        default = "default_expand_budget",
+        deserialize_with = "null_as_default_expand_budget"
+    )]
+    pub max_chars: usize,
+    /// Bi-temporal anchor: return the span as it existed at this instant.
+    /// Defaults to the fact's `captured_at_unix_ms` (the span at capture
+    /// time) — pass a later timestamp to read the source as it is today.
+    #[serde(default, deserialize_with = "string_or_int_opt")]
+    pub as_of_unix_ms: Option<i64>,
+    /// Permission scope (read tool).
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub workspace_hash: String,
+}
+
+/// #888: `perseus_vault_expand_source` — read-only span resolution.
+///
+/// Two modes:
+/// - **Fact mode** (`category` + `key` of a distilled fact): reads the
+///   fact's `source_chunk` reference and expands the retained transcript's
+///   verbatim span. Facts without a source ref degrade gracefully
+///   (`status: no_source_ref`), never an error.
+/// - **Explicit mode** (`source_category` + `source_key` + `start_char` +
+///   `end_char`): expands an arbitrary span of any retained source, with
+///   optional `span_sha256` verification.
+///
+/// The source is resolved bi-temporally: `as_of_unix_ms` defaults to the
+/// fact's capture time, so the returned text is the span as it existed when
+/// the fact was distilled. Every span is integrity-checked against the
+/// retained store (bounds + SHA-256 of the verbatim text); a mismatch
+/// returns `status: span_invalid` fail-closed (no text).
+pub fn handle_expand_source(db: &Database, args: Value) -> Result<String, String> {
+    let a: ExpandSourceArgs = serde_json::from_value(args)
+        .map_err(|e| format!("Invalid expand_source arguments: {}", e))?;
+    let budget = a.max_chars.clamp(1, MAX_EXPAND_BUDGET_CHARS);
+
+    // ── Resolve the source reference ─────────────────────────────
+    let explicit = a.source_category.is_some()
+        && a.source_key.is_some()
+        && a.start_char.is_some()
+        && a.end_char.is_some();
+    let mut source_category = String::new();
+    let mut source_key = String::new();
+    let mut fact_category = String::new();
+    let mut fact_key = String::new();
+    let mut fact_id = String::new();
+    let mut span: Option<crate::capture::CharSpan> = None;
+    let mut expected_hash: Option<String> = None;
+    let mut default_as_of: Option<i64> = None;
+
+    let need_fact_err = "expand_source requires category+key (fact mode) or \
+         source_category+source_key+start_char+end_char (explicit mode)"
+        .to_string();
+    if explicit {
+        source_category = a.source_category.clone().unwrap_or_default();
+        source_key = a.source_key.clone().unwrap_or_default();
+        span = Some(crate::capture::CharSpan {
+            start_char: a.start_char.unwrap_or(0),
+            end_char: a.end_char.unwrap_or(0),
+        });
+        expected_hash = a.span_sha256.clone();
+    } else {
+        let category = a.category.as_deref().ok_or_else(|| need_fact_err.clone())?;
+        let key = a.key.as_deref().ok_or_else(|| need_fact_err)?;
+        fact_category = category.to_string();
+        fact_key = key.to_string();
+        let fact = db
+            .get_entity(category, key)
+            .map_err(|e| format!("lookup failed: {}", e))?;
+        let Some(fact) = fact else {
+            return Ok(json!({
+                "status": "fact_not_found",
+                "fact": {"category": category, "key": key},
+                "budget": {"max_chars": budget},
+            })
+            .to_string());
+        };
+        fact_id = fact.id.clone();
+        let body: Value = serde_json::from_str(&fact.body_json).unwrap_or(json!({}));
+        let Some(chunk) = body.get("source_chunk") else {
+            // Graceful degradation: the fact carries no source reference
+            // (API writes, LLM-distilled notes, retain_transcript=false).
+            return Ok(json!({
+                "status": "no_source_ref",
+                "fact": {"category": category, "key": key, "id": fact.id},
+                "budget": {"max_chars": budget},
+                "excluded": ["fact_body_has_no_source_chunk_reference"],
+            })
+            .to_string());
+        };
+        source_category = chunk
+            .get("source_category")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        source_key = chunk
+            .get("source_key")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        span = Some(crate::capture::CharSpan {
+            start_char: chunk["span"]["start_char"].as_u64().unwrap_or(0) as usize,
+            end_char: chunk["span"]["end_char"].as_u64().unwrap_or(0) as usize,
+        });
+        // The integrity hash is NOT in the note body — it lives in the
+        // transcript's chunk_hashes manifest (kept there so note bodies stay
+        // dedup-neutral; see handle_capture). Resolved after the source is
+        // fetched. The bi-temporal anchor defaults to the FACT's creation
+        // time: the span as it existed when the fact was distilled.
+        default_as_of = Some(fact.created_at_unix_ms);
+    }
+    let span = span.expect("span resolved above");
+    if source_category.is_empty() || source_key.is_empty() {
+        return Ok(json!({
+            "status": "no_source_ref",
+            "fact": {"category": fact_category, "key": fact_key, "id": fact_id},
+            "budget": {"max_chars": budget},
+            "excluded": ["source_chunk_missing_category_or_key"],
+        })
+        .to_string());
+    }
+
+    // ── Resolve the source as of the anchor ──────────────────────
+    // Default anchor = the fact's capture time, so the returned text is the
+    // span as it existed when the fact was distilled (#888 bi-temporal).
+    let as_of = a.as_of_unix_ms.or(default_as_of);
+    let source = match as_of {
+        Some(t) => db
+            .as_of(&source_category, &source_key, t)
+            .map_err(|e| format!("as_of lookup failed: {}", e))?,
+        None => db
+            .get_entity(&source_category, &source_key)
+            .map_err(|e| format!("lookup failed: {}", e))?,
+    };
+    let Some(source) = source else {
+        return Ok(json!({
+            "status": "source_missing",
+            "source": {"category": source_category, "key": source_key},
+            "span": {"start_char": span.start_char, "end_char": span.end_char},
+            "budget": {"max_chars": budget},
+            "as_of_unix_ms": as_of,
+            "excluded": ["retained_source_not_found"],
+        })
+        .to_string());
+    };
+
+    let source_meta = json!({
+        "id": source.id,
+        "category": source.category,
+        "key": source.key,
+        "entity_type": source.entity_type,
+        "source": source.source,
+        "created_at_unix_ms": source.created_at_unix_ms,
+    });
+
+    // ── Extract + verify the verbatim span ───────────────────────
+    let body: Value = serde_json::from_str(&source.body_json).unwrap_or(json!({}));
+    let Some(content) = body.get("content").and_then(|v| v.as_str()) else {
+        return Ok(json!({
+            "status": "source_missing",
+            "source": source_meta,
+            "span": {"start_char": span.start_char, "end_char": span.end_char},
+            "budget": {"max_chars": budget},
+            "as_of_unix_ms": as_of,
+            "excluded": ["retained_source_body_has_no_content"],
+        })
+        .to_string());
+    };
+
+    let Some(verbatim) = crate::capture::span_text(content, span) else {
+        return Ok(json!({
+            "status": "span_invalid",
+            "source": source_meta,
+            "span": {"start_char": span.start_char, "end_char": span.end_char},
+            "verification": "out_of_bounds",
+            "budget": {"max_chars": budget},
+            "as_of_unix_ms": as_of,
+            "excluded": ["span_out_of_bounds_of_retained_source"],
+        })
+        .to_string());
+    };
+
+    // Span integrity against the retained store: the expected hash comes
+    // from the source body's chunk_hashes manifest (capture-stamped) or, in
+    // explicit mode, from the caller-supplied span_sha256. The hash of the
+    // currently-extracted verbatim text must match; a changed source body
+    // fails closed (no text returned).
+    let manifest_hash = body
+        .get("chunk_hashes")
+        .and_then(|m| m.get(&format!("{}:{}", span.start_char, span.end_char)))
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let expected_hash = expected_hash.or(manifest_hash);
+    let computed_hash = crate::capture::span_sha256(verbatim);
+    if let Some(expected) = expected_hash.as_deref() {
+        if expected != computed_hash {
+            return Ok(json!({
+                "status": "span_invalid",
+                "source": source_meta,
+                "span": {"start_char": span.start_char, "end_char": span.end_char},
+                "verification": "hash_mismatch",
+                "span_sha256": {"stored": expected, "computed": computed_hash},
+                "budget": {"max_chars": budget},
+                "as_of_unix_ms": as_of,
+                "excluded": ["retained_source_changed_since_capture"],
+            })
+            .to_string());
+        }
+    }
+
+    // ── Budget-constrained verbatim text ─────────────────────────
+    let span_chars = verbatim.chars().count();
+    let (text, truncated) = if span_chars > budget {
+        (crate::capture::clip_chars(verbatim, budget), true)
+    } else {
+        (verbatim.to_string(), false)
+    };
+
+    let mut out = json!({
+        "status": "expanded",
+        "source": source_meta,
+        "span": {"start_char": span.start_char, "end_char": span.end_char, "chars": span_chars},
+        "span_sha256": computed_hash,
+        "verification": if expected_hash.is_some() { "ok" } else { "unchecked" },
+        "as_of_unix_ms": as_of,
+        "text": text,
+        "truncated": truncated,
+        "budget": {"max_chars": budget, "chars": 0, "span_chars": span_chars},
+    });
+    out["budget"]["chars"] = json!(text.chars().count());
+    if !fact_category.is_empty() {
+        out["fact"] = json!({"category": fact_category, "key": fact_key});
+    }
+    Ok(out.to_string())
 }
 
 #[derive(Debug, Deserialize)]
@@ -7673,6 +8055,519 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    // ─── #888: source-chunk expansion ────────────────────────────
+
+    #[test]
+    fn capture_retains_transcript_and_notes_carry_source_chunk_expand_roundtrips() {
+        let (db, path) = temp_db();
+        let section1 = "# Root cause of the deploy failure\n\
+                         The deploy failed because the schema version was never bumped by #487.";
+        let section2 = "# Toolchain decision\n\
+                        We decided to standardize on the MSVC toolchain for Windows builds.";
+        let payload = format!("{}\n\n{}", section1, section2);
+        let r = handle_capture(&db, json!({"text": payload, "workspace_hash": "ws-888"}))
+            .expect("capture must succeed");
+        let v: Value = serde_json::from_str(&r).unwrap();
+
+        // Transcript retained as a durable entity.
+        assert_eq!(v["transcript"]["retained"], json!(true), "{r}");
+        let t_key = v["transcript"]["key"].as_str().expect("transcript key").to_string();
+        let t_id = v["transcript"]["id"].as_str().expect("transcript id").to_string();
+        let t_ent = db
+            .get_entity("transcript", &t_key)
+            .expect("get_entity")
+            .expect("transcript exists");
+        assert_eq!(t_ent.entity_type, "document");
+        assert_eq!(t_ent.source, "capture");
+        let t_body: Value = serde_json::from_str(&t_ent.body_json).unwrap();
+        assert_eq!(
+            t_body["content"],
+            json!(payload),
+            "transcript must retain the full payload"
+        );
+
+        // Notes carry minimal source_chunk refs (no random ids / hashes —
+        // keeps capture dedup neutral); the hashes live in the transcript.
+        assert_eq!(v["captured"], json!(2), "{r}");
+        let note_key = v["notes"][0]["key"].as_str().expect("note key").to_string();
+        let ent = db
+            .get_entity("capture", &note_key)
+            .expect("get_entity")
+            .expect("note exists");
+        let body: Value = serde_json::from_str(&ent.body_json).unwrap();
+        let chunk = body.get("source_chunk").expect("note must carry source_chunk");
+        assert!(chunk.get("source_id").is_none(), "no random ids in the chunk: {chunk}");
+        assert!(chunk.get("span_sha256").is_none(), "no hashes in the chunk: {chunk}");
+        assert_eq!(chunk["source_category"], json!("transcript"));
+        assert_eq!(chunk["source_key"], json!(t_key));
+        let span = &chunk["span"];
+        let sc = span["start_char"].as_u64().unwrap() as usize;
+        let ec = span["end_char"].as_u64().unwrap() as usize;
+        assert!(ec > sc, "span must be non-empty: {chunk}");
+        // The span hash lives in the transcript's chunk_hashes manifest.
+        let manifest: &serde_json::Map<String, Value> = t_body["chunk_hashes"]
+            .as_object()
+            .expect("transcript must carry a chunk_hashes manifest");
+        let sha = manifest
+            .get(&format!("{}:{}", sc, ec))
+            .expect("manifest must cover the note's span")
+            .as_str()
+            .expect("manifest hash")
+            .to_string();
+        assert_eq!(sha.len(), 64);
+
+        // Expand (fact mode) returns the verbatim span, integrity verified.
+        let out = handle_expand_source(&db, json!({"category": "capture", "key": note_key}))
+            .expect("expand must succeed");
+        let x: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(x["status"], json!("expanded"), "{out}");
+        assert_eq!(x["verification"], json!("ok"), "{out}");
+        assert_eq!(x["source"]["id"], json!(t_id), "{out}");
+        assert_eq!(x["source"]["category"], json!("transcript"), "{out}");
+        assert_eq!(
+            x["text"],
+            json!(section1),
+            "verbatim span must equal the note's source section: {out}"
+        );
+        assert_eq!(x["truncated"], json!(false), "{out}");
+        assert_eq!(x["span"]["chars"], json!(section1.chars().count()), "{out}");
+        assert_eq!(x["span_sha256"], json!(sha), "{out}");
+        assert_eq!(x["budget"]["chars"], json!(section1.chars().count()), "{out}");
+        assert_eq!(x["fact"]["category"], json!("capture"), "{out}");
+
+        // Explicit mode: same span via source_category+key+offsets, hash verified.
+        let out2 = handle_expand_source(
+            &db,
+            json!({
+                "source_category": "transcript",
+                "source_key": t_key,
+                "start_char": sc,
+                "end_char": ec,
+                "span_sha256": sha,
+            }),
+        )
+        .expect("explicit expand");
+        let x2: Value = serde_json::from_str(&out2).unwrap();
+        assert_eq!(x2["status"], json!("expanded"), "{out2}");
+        assert_eq!(x2["text"], json!(section1), "{out2}");
+        assert_eq!(x2["verification"], json!("ok"), "{out2}");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn expand_is_bitemporal_and_fails_closed_on_source_edit() {
+        let (db, path) = temp_db();
+        let payload = "# Decision on the storage engine\n\
+                        We decided to standardize on SQLite with WAL mode for the vault backend.";
+        let r = handle_capture(&db, json!({"text": payload})).expect("capture");
+        let v: Value = serde_json::from_str(&r).unwrap();
+        let t_key = v["transcript"]["key"].as_str().unwrap().to_string();
+        let note_key = v["notes"][0]["key"].as_str().unwrap().to_string();
+        let captured_at = db
+            .get_entity("capture", &note_key)
+            .unwrap()
+            .unwrap()
+            .created_at_unix_ms;
+
+        // Expand without an anchor defaults to the fact's capture time and
+        // returns the span as it existed then — the #888 bi-temporal
+        // contract (even after a later edit, verified below).
+        let x0: Value = serde_json::from_str(
+            &handle_expand_source(&db, json!({"category": "capture", "key": note_key})).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(x0["status"], json!("expanded"), "{x0}");
+        assert_eq!(x0["verification"], json!("ok"), "{x0}");
+
+        // Edit the retained transcript in place: new content that still
+        // COVERS the original span (so the failure mode is hash_mismatch,
+        // not out_of_bounds), while the capture-stamped chunk_hashes
+        // manifest survives (an operator patch that rewrites the body but
+        // keeps metadata).
+        let edited = "# Decision on the storage engine\n\
+                      We decided to standardize on Postgres with the logical replication \
+                      extension for the vault backend.";
+        let orig_body: Value = serde_json::from_str(
+            &db.get_entity("transcript", &t_key).unwrap().unwrap().body_json,
+        )
+        .unwrap();
+        let edited_body = json!({
+            "content": edited,
+            "edited": true,
+            "chunk_hashes": orig_body["chunk_hashes"],
+        });
+        handle_remember(
+            &db,
+            json!({
+                "category": "transcript",
+                "key": t_key,
+                "body_json": edited_body.to_string(),
+            }),
+        )
+        .expect("remember edit");
+
+        // as_of = capture time still returns the ORIGINAL span (history).
+        let x1: Value = serde_json::from_str(
+            &handle_expand_source(
+                &db,
+                json!({"category": "capture", "key": note_key, "as_of_unix_ms": captured_at}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(x1["status"], json!("expanded"), "{x1}");
+        assert_eq!(x1["verification"], json!("ok"), "{x1}");
+        assert!(
+            x1["text"].as_str().unwrap().contains("SQLite with WAL"),
+            "as_of must return the original span: {x1}"
+        );
+
+        // Current-state read (as_of = now): the edited content no longer
+        // matches the manifest hash → fail closed, no text.
+        let now = now_ms();
+        let x2: Value = serde_json::from_str(
+            &handle_expand_source(
+                &db,
+                json!({"category": "capture", "key": note_key, "as_of_unix_ms": now}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(x2["status"], json!("span_invalid"), "{x2}");
+        assert_eq!(x2["verification"], json!("hash_mismatch"), "{x2}");
+        assert!(x2.get("text").is_none(), "fail-closed: no text on mismatch: {x2}");
+        assert!(
+            x2["excluded"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e == "retained_source_changed_since_capture"),
+            "{x2}"
+        );
+
+        // as_of BEFORE the transcript existed → source_missing (bi-temporal honesty).
+        let x3: Value = serde_json::from_str(
+            &handle_expand_source(
+                &db,
+                json!({"category": "capture", "key": note_key, "as_of_unix_ms": captured_at - 1000}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(x3["status"], json!("source_missing"), "{x3}");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn expand_degrades_gracefully_without_source_ref() {
+        let (db, path) = temp_db();
+        // API-written fact: no source_chunk anywhere.
+        handle_remember(
+            &db,
+            json!({
+                "category": "insight",
+                "key": "api-fact",
+                "body_json": "{\"content\":\"postgres reindex after major upgrade\"}",
+            }),
+        )
+        .expect("remember");
+        let out = handle_expand_source(&db, json!({"category": "insight", "key": "api-fact"}))
+            .expect("expand must not error on a fact without a source ref");
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["status"], json!("no_source_ref"), "{out}");
+        assert!(
+            v["excluded"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e == "fact_body_has_no_source_chunk_reference"),
+            "{out}"
+        );
+
+        // Unknown fact → fact_not_found, still a graceful contract response.
+        let out2 = handle_expand_source(&db, json!({"category": "insight", "key": "nope"}))
+            .expect("expand must not error on missing facts");
+        let v2: Value = serde_json::from_str(&out2).unwrap();
+        assert_eq!(v2["status"], json!("fact_not_found"), "{out2}");
+
+        // No mode args at all → fail-closed argument error.
+        let err = handle_expand_source(&db, json!({}))
+            .expect_err("missing mode args must be rejected");
+        assert!(err.contains("requires category+key"), "{err}");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn expand_respects_budget_and_truncates() {
+        let (db, path) = temp_db();
+        let section = "# Long decision\nWe decided to adopt the long pipeline because \
+                       the short one lost recall on the medium corpus while the long one \
+                       kept every measured metric inside the tolerance band.";
+        let r = handle_capture(&db, json!({"text": section})).expect("capture");
+        let v: Value = serde_json::from_str(&r).unwrap();
+        let note_key = v["notes"][0]["key"].as_str().unwrap().to_string();
+
+        let out = handle_expand_source(
+            &db,
+            json!({"category": "capture", "key": note_key, "max_chars": 40}),
+        )
+        .expect("expand");
+        let x: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(x["status"], json!("expanded"), "{out}");
+        assert_eq!(x["truncated"], json!(true), "{out}");
+        let text = x["text"].as_str().unwrap();
+        assert_eq!(text.chars().count(), 40, "{out}");
+        assert_eq!(x["budget"]["max_chars"], json!(40), "{out}");
+        assert_eq!(x["budget"]["chars"], json!(40), "{out}");
+        assert!(x["budget"]["span_chars"].as_u64().unwrap() > 40, "{out}");
+        assert!(
+            section.starts_with(text),
+            "truncated text must be a clean prefix of the verbatim span: {out}"
+        );
+
+        // Budget is clamped to the hard cap.
+        let out2 = handle_expand_source(
+            &db,
+            json!({"category": "capture", "key": note_key, "max_chars": 999999}),
+        )
+        .expect("expand");
+        let x2: Value = serde_json::from_str(&out2).unwrap();
+        assert_eq!(x2["budget"]["max_chars"], json!(16384), "{out2}");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn expand_explicit_mode_unchecked_and_out_of_bounds() {
+        let (db, path) = temp_db();
+        let payload = "# Root cause\nDeployment failed because the port was already bound by an older daemon.";
+        let r = handle_capture(&db, json!({"text": payload})).expect("capture");
+        let v: Value = serde_json::from_str(&r).unwrap();
+        let t_key = v["transcript"]["key"].as_str().unwrap().to_string();
+        let t_ent = db.get_entity("transcript", &t_key).unwrap().unwrap();
+        let t_body: Value = serde_json::from_str(&t_ent.body_json).unwrap();
+        let content = t_body["content"].as_str().unwrap();
+        let chars = content.chars().count();
+
+        // Explicit span without a hash → verification unchecked.
+        let out = handle_expand_source(
+            &db,
+            json!({
+                "source_category": "transcript",
+                "source_key": t_key,
+                "start_char": 0,
+                "end_char": 10,
+            }),
+        )
+        .expect("expand");
+        let x: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(x["status"], json!("expanded"), "{out}");
+        assert_eq!(x["verification"], json!("unchecked"), "{out}");
+        assert_eq!(x["text"], json!(&content[..10]), "{out}");
+
+        // Out-of-bounds span → span_invalid, fail-closed.
+        let out2 = handle_expand_source(
+            &db,
+            json!({
+                "source_category": "transcript",
+                "source_key": t_key,
+                "start_char": 0,
+                "end_char": chars + 100,
+            }),
+        )
+        .expect("expand");
+        let x2: Value = serde_json::from_str(&out2).unwrap();
+        assert_eq!(x2["status"], json!("span_invalid"), "{out2}");
+        assert_eq!(x2["verification"], json!("out_of_bounds"), "{out2}");
+        assert!(x2.get("text").is_none(), "{out2}");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn capture_without_retention_writes_no_transcript_or_refs() {
+        let (db, path) = temp_db();
+        let r = handle_capture(
+            &db,
+            json!({
+                "text": "# Decision\nWe decided to skip retention for API-sourced payloads.",
+                "retain_transcript": false,
+            }),
+        )
+        .expect("capture");
+        let v: Value = serde_json::from_str(&r).unwrap();
+        assert_eq!(v["transcript"]["retained"], json!(false), "{r}");
+        let note_key = v["notes"][0]["key"].as_str().unwrap().to_string();
+        let ent = db.get_entity("capture", &note_key).unwrap().unwrap();
+        let body: Value = serde_json::from_str(&ent.body_json).unwrap();
+        assert!(
+            body.get("source_chunk").is_none(),
+            "no retention ⇒ no source ref: {body}"
+        );
+
+        // Expand degrades gracefully to no_source_ref.
+        let out = handle_expand_source(&db, json!({"category": "capture", "key": note_key}))
+            .unwrap();
+        let x: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(x["status"], json!("no_source_ref"), "{out}");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn capture_spans_are_deterministic_and_utf8_safe() {
+        let (db, path) = temp_db();
+        let payload = "# Deployment lesson\nDeployment failed for lack of headroom, so the retry loop never recovered.\n\n\
+                       # 🎉 WAL decision\nWe decided to use WAL mode for writes, and the decision was recorded for good.";
+        let r1 = handle_capture(&db, json!({"text": payload})).expect("capture 1");
+        let v1: Value = serde_json::from_str(&r1).unwrap();
+        assert_eq!(v1["captured"], json!(2), "{r1}");
+        let key1 = v1["notes"][0]["key"].as_str().unwrap().to_string();
+        let ent1 = db.get_entity("capture", &key1).unwrap().unwrap();
+        let b1: Value = serde_json::from_str(&ent1.body_json).unwrap();
+        let chunk1 = b1["source_chunk"].clone();
+
+        // Re-capture identical payload: same key, same spans, same hashes.
+        let r2 = handle_capture(&db, json!({"text": payload})).expect("capture 2");
+        let v2: Value = serde_json::from_str(&r2).unwrap();
+        let key2 = v2["notes"][0]["key"].as_str().unwrap().to_string();
+        assert_eq!(key1, key2, "identical payload must keep the same note key");
+        let ent2 = db.get_entity("capture", &key2).unwrap().unwrap();
+        let b2: Value = serde_json::from_str(&ent2.body_json).unwrap();
+        let chunk2 = b2["source_chunk"].clone();
+        assert_eq!(chunk1["span"], chunk2["span"], "spans must be deterministic");
+        // The transcript manifest is deterministic too (same payload → same
+        // hashes), and the re-captured note points at the same transcript.
+        let t2 = db
+            .get_entity("transcript", v2["transcript"]["key"].as_str().unwrap())
+            .unwrap()
+            .unwrap();
+        let tb2: Value = serde_json::from_str(&t2.body_json).unwrap();
+        assert_eq!(
+            tb2["chunk_hashes"],
+            {
+                let t1 = db
+                    .get_entity("transcript", v1["transcript"]["key"].as_str().unwrap())
+                    .unwrap()
+                    .unwrap();
+                let tb1: Value = serde_json::from_str(&t1.body_json).unwrap();
+                tb1["chunk_hashes"].clone()
+            },
+            "manifest must be deterministic across re-captures"
+        );
+        assert_eq!(chunk1["source_key"], chunk2["source_key"]);
+
+        // Expand returns the exact UTF-8 verbatim span (char offsets, not bytes).
+        let out = handle_expand_source(&db, json!({"category": "capture", "key": key1})).unwrap();
+        let x: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(x["status"], json!("expanded"), "{out}");
+        let first_section = payload.split("\n\n").next().unwrap().trim();
+        assert_eq!(x["text"], json!(first_section), "{out}");
+        assert_eq!(
+            x["span"]["chars"],
+            json!(first_section.chars().count()),
+            "{out}"
+        );
+        assert_eq!(
+            x["span"]["start_char"],
+            json!(0),
+            "span must be char-offset aligned: {out}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn capture_dry_run_skips_transcript_retention() {
+        let (db, path) = temp_db();
+        let r = handle_capture(
+            &db,
+            json!({
+                "text": "# Decision\nWe decided to preview the capture pipeline end to end.",
+                "dry_run": true,
+            }),
+        )
+        .expect("capture dry run");
+        let v: Value = serde_json::from_str(&r).unwrap();
+        assert_eq!(v["dry_run"], json!(true), "{r}");
+        assert_eq!(v["transcript"]["retained"], json!(false), "{r}");
+        assert!(v["transcript"]["id"].is_null(), "{r}");
+        assert!(v["transcript"]["key"].is_null(), "{r}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    #[ignore = "manual probe: cargo test -- --ignored expand_source_latency_probe"]
+    fn expand_source_latency_probe() {
+        // #888 measured numbers for docs/specs/source-chunk-expansion.md:
+        // expand p50 latency (1 MiB + 4 KiB transcripts) and per-note /
+        // per-transcript storage overhead. Deterministic corpus (LCG-free
+        // template text) so the run is reproducible.
+        let (db, path) = temp_db();
+
+        let big_sections: Vec<String> = (0..100)
+            .map(|i| {
+                let filler = "the deployment pipeline keeps every measured metric inside the tolerance band, "
+                    .repeat(220);
+                format!("# Section {i}\nDurable lesson {i}: {filler}")
+            })
+            .collect();
+        let big_payload = big_sections.join("\n\n");
+        assert!(big_payload.len() > 1_000_000, "corpus must be ~1 MiB");
+        let r = handle_capture(&db, json!({"text": big_payload})).expect("capture");
+        let v: Value = serde_json::from_str(&r).unwrap();
+        let note_key = v["notes"][0]["key"].as_str().unwrap().to_string();
+        let t_key = v["transcript"]["key"].as_str().unwrap().to_string();
+
+        // Warm up, then time 500 verified fact-mode expands.
+        handle_expand_source(&db, json!({"category": "capture", "key": note_key})).unwrap();
+        let mut times: Vec<f64> = Vec::new();
+        for _ in 0..500 {
+            let t0 = std::time::Instant::now();
+            let out =
+                handle_expand_source(&db, json!({"category": "capture", "key": note_key}))
+                    .expect("expand");
+            let x: Value = serde_json::from_str(&out).unwrap();
+            assert_eq!(x["status"], "expanded", "{x}");
+            assert_eq!(x["verification"], "ok", "{x}");
+            times.push(t0.elapsed().as_micros() as f64);
+        }
+        times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let p50_big = times[times.len() / 2];
+
+        // Small transcript: ~4 KiB, one note.
+        let small = "# Small decision\nWe decided to standardize on the WAL mode for the vault backend, \
+                     and to rerun flaky suites once before investigating further."
+            .repeat(30);
+        assert!(small.len() > 3_000 && small.len() < 6_000, "{}", small.len());
+        let r2 = handle_capture(&db, json!({"text": small})).expect("capture small");
+        let v2: Value = serde_json::from_str(&r2).unwrap();
+        let note2 = v2["notes"][0]["key"].as_str().unwrap().to_string();
+        handle_expand_source(&db, json!({"category": "capture", "key": note2})).unwrap();
+        let mut times2: Vec<f64> = Vec::new();
+        for _ in 0..200 {
+            let t0 = std::time::Instant::now();
+            handle_expand_source(&db, json!({"category": "capture", "key": note2})).unwrap();
+            times2.push(t0.elapsed().as_micros() as f64);
+        }
+        times2.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let p50_small = times2[times2.len() / 2];
+
+        let note_ent = db.get_entity("capture", &note_key).unwrap().unwrap();
+        let t_ent = db.get_entity("transcript", &t_key).unwrap().unwrap();
+        eprintln!(
+            "EXPAND_PROBE p50_big_us={p50_big:.0} p50_small_us={p50_small:.0} \
+             note_body_bytes={} transcript_body_bytes={} payload_bytes={}",
+            note_ent.body_json.len(),
+            t_ent.body_json.len(),
+            big_payload.len()
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn health_reports_status_and_db_path() {
         // #671: health must surface the absolute db path so a "wrote here,
@@ -8007,7 +8902,8 @@ mod tests {
         assert_eq!(v["created"], json!(1), "{r}");
         assert_eq!(v["merged"], json!(2), "{r}");
         let stats = db.stats().expect("stats");
-        assert_eq!(stats.total_entities, 1);
+        // 1 deduped note + 1 retained transcript (the #888 durable source).
+        assert_eq!(stats.total_entities, 2);
 
         let _ = std::fs::remove_file(&path);
     }

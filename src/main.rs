@@ -3881,14 +3881,18 @@ mod tests {
             .expect("re-capture must succeed");
         assert_eq!(v["created"], serde_json::json!(0), "{v}");
         let stats = database.stats().expect("stats");
-        assert_eq!(stats.total_entities, 2, "re-capture must not add rows");
+        // 2 notes + 1 retained transcript (the #888 durable source). The
+        // transcript updates IN PLACE on re-capture, so the flood-control
+        // contract (no new rows) still holds — just with the transcript row
+        // counted alongside the notes.
+        assert_eq!(stats.total_entities, 3, "re-capture must not add rows");
 
         // dry_run distills but writes nothing.
         let v = run_capture(&database, "A brand new durable takeaway about caching.", None, None, 20, true, false, false, None)
             .expect("dry-run capture");
         assert_eq!(v["dry_run"], serde_json::json!(true));
         let stats = database.stats().expect("stats");
-        assert_eq!(stats.total_entities, 2);
+        assert_eq!(stats.total_entities, 3);
 
         // Empty payload surfaces the pipeline's error through the CLI path.
         let err = run_capture(&database, "   ", None, None, 20, false, false, false, None)

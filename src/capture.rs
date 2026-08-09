@@ -19,6 +19,9 @@
 
 use serde::Serialize;
 
+// #888: span-of-origin hashing for source-chunk expansion.
+use sha2::{Digest, Sha256};
+
 /// Hard cap on entities written per capture invocation (anti-flood, #520).
 /// Callers can lower it per call; they cannot raise it.
 pub const MAX_CAPTURE_NOTES: usize = 20;
@@ -33,6 +36,14 @@ const MAX_SUMMARY_CHARS: usize = 160;
 /// Max length of the slugified key (chars).
 const MAX_KEY_CHARS: usize = 64;
 
+/// A character-offset span into the ORIGINAL capture payload (char offsets,
+/// not bytes — safe on any UTF-8). `end_char` is exclusive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct CharSpan {
+    pub start_char: usize,
+    pub end_char: usize,
+}
+
 /// A single distilled, durable note ready to be remembered.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CaptureNote {
@@ -46,6 +57,10 @@ pub struct CaptureNote {
     pub summary: String,
     /// The full candidate note text.
     pub content: String,
+    /// #888: the char span of this note inside the payload it was distilled
+    /// from. `Some` only on the rule-based path (LLM output has no reliable
+    /// span); the writer stamps `source_chunk` refs only for spanned notes.
+    pub span: Option<CharSpan>,
 }
 
 /// The distiller's output: capped notes plus accounting for what was dropped.
@@ -152,7 +167,7 @@ pub fn classify(text: &str) -> &'static str {
 }
 
 /// Truncate to at most `max` chars (not bytes — safe on any UTF-8).
-fn clip_chars(s: &str, max: usize) -> String {
+pub fn clip_chars(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
     } else {
@@ -250,6 +265,178 @@ fn jsonl_note_text(record: &serde_json::Map<String, serde_json::Value>) -> Strin
     serde_json::Value::Object(record.clone()).to_string()
 }
 
+/// Trim a raw char range of `payload` to its non-whitespace core, returning
+/// the trimmed text and the correspondingly adjusted span. `None` when the
+/// range is out of bounds or empty after trimming.
+fn trimmed_span(payload: &str, start_char: usize, end_char: usize) -> Option<(String, CharSpan)> {
+    let total = payload.chars().count();
+    if start_char > end_char || end_char > total {
+        return None;
+    }
+    let mut it = payload.char_indices();
+    let start_byte = it.nth(start_char).map(|(b, _)| b)?;
+    let end_byte = if end_char == start_char {
+        start_byte
+    } else {
+        match it.nth(end_char - start_char - 1) {
+            Some((b, _)) => b,
+            None => payload.len(),
+        }
+    };
+    let raw = &payload[start_byte..end_byte];
+    let raw_chars = raw.chars().count();
+    let lead = raw.chars().take_while(|c| c.is_whitespace()).count();
+    let trail = raw
+        .chars()
+        .rev()
+        .take_while(|c| c.is_whitespace())
+        .count();
+    if lead + trail >= raw_chars {
+        return None;
+    }
+    let content: String = raw
+        .chars()
+        .skip(lead)
+        .take(raw_chars - lead - trail)
+        .collect();
+    Some((
+        content,
+        CharSpan {
+            start_char: start_char + lead,
+            end_char: end_char - trail,
+        },
+    ))
+}
+
+/// Extract the verbatim text of `span` from `payload` (char offsets).
+/// `None` when the span is out of bounds.
+pub fn span_text<'a>(payload: &'a str, span: CharSpan) -> Option<&'a str> {
+    let total = payload.chars().count();
+    if span.start_char > span.end_char || span.end_char > total {
+        return None;
+    }
+    let mut it = payload.char_indices();
+    let start_byte = it.nth(span.start_char).map(|(b, _)| b)?;
+    let end_byte = if span.end_char == span.start_char {
+        start_byte
+    } else {
+        match it.nth(span.end_char - span.start_char - 1) {
+            Some((b, _)) => b,
+            None => payload.len(),
+        }
+    };
+    Some(&payload[start_byte..end_byte])
+}
+
+/// SHA-256 hex digest of the verbatim span text — the integrity anchor the
+/// expand surface re-verifies against the retained transcript store.
+pub fn span_sha256(text: &str) -> String {
+    let mut h = Sha256::new();
+    h.update(text.as_bytes());
+    format!("{:x}", h.finalize())
+}
+
+/// Stable key for the retained transcript entity: identical payloads
+/// re-captured update the SAME transcript row (anti-flood, like notes).
+pub fn transcript_key(payload: &str) -> String {
+    format!("transcript-{:016x}", fnv1a(payload))
+}
+
+/// Split a payload into candidate note texts WITH their char spans.
+///
+/// Same three shapes as [`split_candidates`] (JSONL / headed markdown /
+/// plain paragraphs). Each returned span points at the trimmed candidate
+/// inside the ORIGINAL payload, so a writer can later re-extract the
+/// verbatim text ([`span_text`]) and hash it for integrity verification.
+///
+/// Candidates shorter than [`MIN_CANDIDATE_CHARS`] are discarded.
+pub fn split_candidates_spanned(payload: &str) -> Vec<(String, CharSpan)> {
+    let trimmed = payload.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+
+    // Walk the ORIGINAL payload line by line, tracking char offsets, so
+    // spans survive any trimming. `pos` = char offset of the current line's
+    // first char; a line's raw char range is [pos, pos + line_chars).
+    let mut ranges: Vec<(usize, usize)> = Vec::new(); // (start_char, end_char)
+    let mut pos: usize = 0;
+    let mut current_start: Option<usize> = None;
+    let mut current_end = 0usize;
+    let mut headed = false;
+    let jsonl = looks_like_jsonl(trimmed);
+
+    for line in payload.split('\n') {
+        let line_chars = line.chars().count();
+        let line_start = pos;
+        let line_end = pos + line_chars;
+        pos += line_chars + 1; // +1 for the '\n'
+
+        if jsonl {
+            // One candidate per parseable JSON-object line.
+            let t = line.trim();
+            if !t.is_empty() {
+                if let Ok(rec) =
+                    serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(t)
+                {
+                    if !jsonl_note_text(&rec).is_empty() {
+                        ranges.push((line_start, line_end));
+                    }
+                }
+            }
+            continue;
+        }
+        if line.trim_start().starts_with('#') {
+            headed = true;
+            if let Some(s) = current_start.take() {
+                ranges.push((s, current_end));
+            }
+            current_start = Some(line_start);
+        } else if current_start.is_none() {
+            current_start = Some(line_start);
+        }
+        current_end = line_end;
+    }
+    if let Some(s) = current_start.take() {
+        ranges.push((s, current_end));
+    }
+
+    if !jsonl && !headed {
+        // Plain text: blank-line-separated paragraphs.
+        ranges.clear();
+        let mut para_start: Option<usize> = None;
+        let mut para_end = 0usize;
+        let mut ppos = 0usize;
+        for line in payload.split('\n') {
+            let line_chars = line.chars().count();
+            if line.trim().is_empty() {
+                if let Some(s) = para_start.take() {
+                    ranges.push((s, para_end));
+                }
+            } else if para_start.is_none() {
+                para_start = Some(ppos);
+                para_end = ppos + line_chars;
+            } else {
+                para_end = ppos + line_chars;
+            }
+            ppos += line_chars + 1;
+        }
+        if let Some(s) = para_start.take() {
+            ranges.push((s, para_end));
+        }
+    }
+
+    let mut out = Vec::new();
+    for (s, e) in ranges {
+        if let Some((content, span)) = trimmed_span(payload, s, e) {
+            if content.chars().count() >= MIN_CANDIDATE_CHARS {
+                out.push((content, span));
+            }
+        }
+    }
+    out
+}
+
 /// Split a payload into candidate note texts.
 ///
 /// Three shapes, auto-detected:
@@ -262,53 +449,9 @@ fn jsonl_note_text(record: &serde_json::Map<String, serde_json::Value>) -> Strin
 ///
 /// Candidates shorter than [`MIN_CANDIDATE_CHARS`] are discarded.
 pub fn split_candidates(payload: &str) -> Vec<String> {
-    let trimmed = payload.trim();
-    if trimmed.is_empty() {
-        return Vec::new();
-    }
-
-    let raw: Vec<String> = if looks_like_jsonl(trimmed) {
-        trimmed
-            .lines()
-            .filter_map(|l| {
-                let t = l.trim();
-                if t.is_empty() {
-                    return None;
-                }
-                serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(t)
-                    .ok()
-                    .map(|rec| jsonl_note_text(&rec))
-            })
-            .collect()
-    } else if trimmed.lines().any(|l| l.trim_start().starts_with('#')) {
-        // Headed sections: heading line + everything until the next heading.
-        let mut sections: Vec<String> = Vec::new();
-        let mut current = String::new();
-        for line in trimmed.lines() {
-            if line.trim_start().starts_with('#') {
-                if !current.trim().is_empty() {
-                    sections.push(current.trim().to_string());
-                }
-                current = String::new();
-            }
-            current.push_str(line);
-            current.push('\n');
-        }
-        if !current.trim().is_empty() {
-            sections.push(current.trim().to_string());
-        }
-        sections
-    } else {
-        // Blank-line-separated paragraphs.
-        trimmed
-            .split("\n\n")
-            .map(|p| p.trim().to_string())
-            .filter(|p| !p.is_empty())
-            .collect()
-    };
-
-    raw.into_iter()
-        .filter(|c| c.chars().count() >= MIN_CANDIDATE_CHARS)
+    split_candidates_spanned(payload)
+        .into_iter()
+        .map(|(text, _)| text)
         .collect()
 }
 
@@ -318,11 +461,11 @@ pub fn split_candidates(payload: &str) -> Vec<String> {
 /// trigram dedup handles near-duplicates across invocations).
 pub fn distill(payload: &str, max_notes: usize) -> DistillReport {
     let cap = max_notes.clamp(1, MAX_CAPTURE_NOTES);
-    let candidates = split_candidates(payload);
+    let candidates = split_candidates_spanned(payload);
     let total = candidates.len();
 
     let mut notes: Vec<CaptureNote> = Vec::new();
-    for candidate in candidates {
+    for (candidate, span) in candidates {
         let summary = summary_line(&candidate);
         if summary.is_empty() {
             continue;
@@ -336,6 +479,7 @@ pub fn distill(payload: &str, max_notes: usize) -> DistillReport {
             key,
             summary,
             content: candidate,
+            span: Some(span),
         });
     }
 
@@ -425,6 +569,9 @@ pub fn parse_llm_notes(raw: &str, max_notes: usize) -> Option<DistillReport> {
             key,
             summary,
             content,
+            // LLM output has no reliable span into the payload; the writer
+            // stamps no source_chunk for such notes (#888 graceful path).
+            span: None,
         });
     }
 
@@ -722,6 +869,7 @@ mod tests {
             key: key_for(&summary),
             summary,
             content: content.to_string(),
+            span: None,
         }
     }
 
@@ -782,5 +930,113 @@ mod tests {
         assert_eq!(bak, source, "backup must hold the pre-prune original");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ─── #888: spanned splitting / span math ─────────────────────
+
+    #[test]
+    fn split_candidates_matches_the_spanned_wrapper() {
+        let payload = "First paragraph about the failure and its root cause.\n\n\
+                       Second paragraph about the decision taken.";
+        let want = vec![
+            "First paragraph about the failure and its root cause.".to_string(),
+            "Second paragraph about the decision taken.".to_string(),
+        ];
+        assert_eq!(split_candidates(payload), want);
+        let spanned = split_candidates_spanned(payload);
+        assert_eq!(
+            spanned.iter().map(|(t, _)| t.clone()).collect::<Vec<_>>(),
+            want
+        );
+        // Every span re-extracts exactly its candidate (verbatim roundtrip).
+        for (text, span) in &spanned {
+            assert_eq!(span_text(payload, *span).unwrap(), text.as_str());
+        }
+    }
+
+    #[test]
+    fn spanned_char_offsets_are_utf8_safe() {
+        // Multibyte content: offsets are CHARS, not bytes — a byte-counted
+        // split would land mid-codepoint on the emoji character.
+        let payload = "Key lesson: the deployment failed for lack of headroom, so the retry loop never recovered.\n\n\
+                       🎉 WAL mode decision: we decided to use WAL for writes.\n\n\
+                       Third paragraph about the cache invalidation decision.";
+        let cands = split_candidates_spanned(payload);
+        assert_eq!(cands.len(), 3, "{:?}", cands);
+        for (text, span) in &cands {
+            let verbatim = span_text(payload, *span).expect("span in bounds");
+            assert_eq!(verbatim, text.as_str());
+            assert!(verbatim.chars().count() >= MIN_CANDIDATE_CHARS);
+        }
+        // Paragraph spans are ordered and non-overlapping.
+        let (_, s0) = cands[0];
+        let (_, s1) = cands[1];
+        let (_, s2) = cands[2];
+        assert!(s0.start_char < s0.end_char);
+        assert!(s1.start_char > s0.end_char, "{s0:?} vs {s1:?}");
+        assert!(s2.start_char > s1.end_char, "{s1:?} vs {s2:?}");
+        // The emoji paragraph begins at the emoji's CHAR offset — the byte
+        // offset is larger because the emoji is 4 bytes. This pins the
+        // char-vs-byte distinction that the splitter must preserve.
+        let emoji_byte = payload.find("🎉").unwrap();
+        assert_eq!(
+            cands[1].1.start_char,
+            payload[..emoji_byte].chars().count(),
+            "start_char is a CHAR offset, not a byte offset"
+        );
+    }
+
+    #[test]
+    fn spanned_jsonl_keeps_per_line_ranges() {
+        let payload = "{\"content\": \"first note about the token expiry\"}\n\
+                       {\"content\": \"second note about the refresh margin\"}\n";
+        let cands = split_candidates_spanned(payload);
+        assert_eq!(cands.len(), 2);
+        let (_, s0) = cands[0];
+        let (_, s1) = cands[1];
+        assert_eq!(s0.start_char, 0);
+        assert!(s1.start_char > s0.end_char, "{s0:?} vs {s1:?}");
+        assert_eq!(span_text(payload, s0).unwrap(), cands[0].0.as_str());
+        assert_eq!(span_text(payload, s1).unwrap(), cands[1].0.as_str());
+    }
+
+    #[test]
+    fn span_text_rejects_out_of_bounds_and_empty() {
+        assert_eq!(span_text("short", CharSpan { start_char: 0, end_char: 99 }), None);
+        assert_eq!(span_text("short", CharSpan { start_char: 5, end_char: 3 }), None);
+        assert_eq!(span_text("short", CharSpan { start_char: 0, end_char: 0 }).unwrap(), "");
+        assert_eq!(span_text("short", CharSpan { start_char: 2, end_char: 5 }).unwrap(), "ort");
+    }
+
+    #[test]
+    fn distill_notes_carry_spans_only_on_the_rule_based_path() {
+        let payload = "# Root cause\nThe deploy failed because of the stale cache.\n\n\
+                       # Next step\nAlways invalidate the cache before deploying.";
+        let report = distill(payload, 20);
+        assert_eq!(report.notes.len(), 2);
+        for note in &report.notes {
+            let span = note.span.expect("rule-based notes must carry spans");
+            assert_eq!(span_text(payload, span).unwrap(), note.content);
+        }
+        // LLM path: no spans (untrusted offsets).
+        let llm = parse_llm_notes(
+            r#"{"notes": [{"type": "takeaway", "summary": "Token expiry", "content": "Token expiry broke retries."}]}"#,
+            20,
+        )
+        .unwrap();
+        assert!(llm.notes[0].span.is_none(), "LLM notes must not fabricate spans");
+    }
+
+    #[test]
+    fn transcript_key_is_stable_and_span_hash_is_sha256() {
+        let a = "same payload twice";
+        let b = "same payload twice";
+        let c = "different payload";
+        assert_eq!(transcript_key(a), transcript_key(b));
+        assert_ne!(transcript_key(a), transcript_key(c));
+        let h = span_sha256("verbatim span text");
+        assert_eq!(h.len(), 64);
+        assert_eq!(h, span_sha256("verbatim span text"));
+        assert_ne!(h, span_sha256("verbatim span text!"));
     }
 }
