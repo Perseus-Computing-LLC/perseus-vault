@@ -857,7 +857,7 @@ def main() -> int:
         mcp_host_port = env_host_port
         mcp_url = f"http://{mcp_host_port}/message"
         log_info(f"Non-interactive mode: using MCP_HOST_PORT={mcp_host_port}")
-        default_token = env_token or "devon-token-2026"
+        default_token = env_token or "mcp_bearer_token"
         mcp_token = prompt_with_default("MCP Bearer token (MCP_PERSEUS_VAULT_API_KEY)", default_token)
         log_info("Token configured")
         # Determine connection type from IP
@@ -885,7 +885,7 @@ def main() -> int:
         log_info(f"MCP URL: {mcp_url}")
 
         # Prompt for API key
-        default_token = env_token or "devon-token-2026"
+        default_token = env_token or "mcp_bearer_token"
         mcp_token = prompt_with_default("MCP Bearer token (MCP_PERSEUS_VAULT_API_KEY)", default_token)
         log_info("Token configured")
 
