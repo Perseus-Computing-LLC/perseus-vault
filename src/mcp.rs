@@ -4235,6 +4235,82 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     }
   },
   {
+    "name": "perseus_vault_mental_model_set",
+    "description": "#886: create or refresh a curated mental model — the ONLY sanctioned write path for the mental_model category (auto-generated passes refuse it). Versioned via the audited remember path (entity_history); provenance stamped (curated_by/curated_at); revision bumps on every re-assert; review clock resets. recall_when triggers attach for scheduled re-verification.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "key": {
+          "type": "string",
+          "description": "Stable key of the mental model (e.g. \"stack-portal\")"
+        },
+        "summary": {
+          "type": "string",
+          "description": "The curated summary (1..=4096 chars) — what the model answers; consulted before observations and raw facts in ask/recall"
+        },
+        "scope": {
+          "type": "string",
+          "description": "Raw-fact category this model covers (\"\" = none); enables the newer-facts staleness check"
+        },
+        "source_ids": {
+          "type": "array",
+          "items": {"type": "string"},
+          "description": "Provenance: raw fact / observation entity ids it was curated from"
+        },
+        "recall_when": {
+          "type": "array",
+          "items": {"type": "string"},
+          "description": "Triggers for scheduled re-verification (matched by perseus_vault_recall_when / prepare)"
+        },
+        "review_interval_days": {
+          "type": "integer",
+          "default": 30,
+          "description": "Age-based review interval (1..=3650)"
+        },
+        "workspace_hash": {"type": "string", "description": "Workspace scope (default global/empty)"},
+        "requesting_agent_id": {"type": "string", "description": "Curator identity (default \"operator\")"}
+      },
+      "required": ["key", "summary"]
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "ok": {"type": "boolean"},
+        "id": {"type": "string"},
+        "key": {"type": "string"},
+        "revision": {"type": "integer"},
+        "curated_by": {"type": "string"}
+      }
+    }
+  },
+  {
+    "name": "perseus_vault_mental_model_review",
+    "description": "#886: mental-model review — list flagged stale curated summaries (reason: age / newer_facts:<key> / malformed_body, with age_days and newest-fact trace), or stamp an operator approve/dismiss decision (resets the age clock and records the decision; the summary itself only changes via perseus_vault_mental_model_set). Flags are also surfaced in perseus_vault_operator_review.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "action": {
+          "type": "string",
+          "enum": ["list", "approve", "dismiss"],
+          "default": "list",
+          "description": "list flagged stale models (default) | approve | dismiss"
+        },
+        "key": {"type": "string", "description": "Key of the model to decide on (required for approve/dismiss)"},
+        "workspace_hash": {"type": "string", "description": "Workspace scope (default global/empty)"},
+        "requesting_agent_id": {"type": "string", "description": "Reviewer identity (default \"operator\")"},
+        "limit": {"type": "integer", "default": 50, "maximum": 1000}
+      }
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "action": {"type": "string"},
+        "flagged": {"type": "array", "items": {"type": "object"}},
+        "flagged_count": {"type": "integer"}
+      }
+    }
+  },
+  {
     "name": "perseus_vault_conflicts",
     "description": "Detect conflicting entities in the same category — pairs with low trigram similarity in their body_json. Flags potential contradictions, duplicate-but-divergent entries, and stale-overwritten facts. Read-only by default. Opt in with resolve=true to actively invalidate the lower-certainty side of clear conflicts (superseding it into history, reversible + time-travelable via perseus_vault_as_of); that path defaults to dry_run=true so you preview first, and never resolves pairs whose certainties are within certainty_margin.",
     "inputSchema": {
@@ -6104,6 +6180,8 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
         "perseus_vault_beliefs" => beliefs::handle_beliefs(db, args),
         "perseus_vault_claim_card" => claim_card::handle_claim_card(db, args),
         "perseus_vault_operator_review" => tools::handle_operator_review(db, args),
+        "perseus_vault_mental_model_set" => tools::handle_mental_model_set(db, args),
+        "perseus_vault_mental_model_review" => tools::handle_mental_model_review(db, args),
         "perseus_vault_conflicts" => Ok(tools::handle_conflicts(db, args)),
         "perseus_vault_consolidate" => Ok(tools::handle_consolidate(db, args)),
         "perseus_vault_dream" => tools::handle_dream(db, args),
@@ -6194,7 +6272,7 @@ mod tests {
         );
         assert_eq!(
             registry_names.len(),
-            106,
+            108,
             "update public metadata when adding a tool"
         );
 

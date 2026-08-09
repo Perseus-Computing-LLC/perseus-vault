@@ -18,6 +18,7 @@ mod graph_route;
 mod httplimit;
 mod log_digest;
 mod mcp;
+mod mental_model;
 mod models;
 mod multimodal;
 mod observations;
