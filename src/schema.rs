@@ -416,7 +416,7 @@ CREATE INDEX IF NOT EXISTS idx_artifact_bindings_derived_from
 /// 'defensively_recalled', orthogonal to the lifecycle `status` column.
 /// Backfill-free: existing rows default to 'candidate' (useful but unverified),
 /// which is the safe reading for any legacy record lacking admission evidence.
-const SCHEMA_VERSION: i64 = 30;
+pub(crate) const SCHEMA_VERSION: i64 = 31;
 
 /// Initialize the v0.2.0 schema on a fresh database.
 pub fn initialize_schema(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
@@ -1119,6 +1119,61 @@ fn apply_migrations(conn: &Connection) -> Result<(), Box<dyn std::error::Error>>
     // admission evidence; writers set verified/corroborated explicitly.
     ensure_column(conn, "entities", "epistemic_state", "TEXT DEFAULT 'candidate'")?;
     // ── end v27 ──────────────────────────────────────────────────────────
+
+    // ── v31 (#872 retrieval concentration / contamination telemetry) ─────
+    // Read-only observability substrate: served events (one row per
+    // delivered entity per recall), per-arm audit rows (candidate /
+    // re-entry / delivered counts per recall mode), and displacement
+    // events (cooldown/diversity controls removing entities). All three
+    // are write-on-read side effects of serving (like retrieval_count),
+    // bounded by retention pruning in the recording helpers.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS served_events (
+            id TEXT PRIMARY KEY,
+            ts_unix_ms INTEGER NOT NULL,
+            batch_id TEXT NOT NULL,
+            profile TEXT NOT NULL DEFAULT '',
+            workspace_hash TEXT NOT NULL DEFAULT '',
+            entity_id TEXT NOT NULL,
+            category TEXT NOT NULL DEFAULT '',
+            key TEXT NOT NULL DEFAULT '',
+            source TEXT NOT NULL DEFAULT '',
+            verified INTEGER NOT NULL DEFAULT 0,
+            certainty REAL NOT NULL DEFAULT 0.5,
+            mode TEXT NOT NULL DEFAULT '',
+            query TEXT NOT NULL DEFAULT '',
+            query_class TEXT NOT NULL DEFAULT '',
+            tokens_est INTEGER NOT NULL DEFAULT 0,
+            slot INTEGER NOT NULL DEFAULT 0
+         );
+         CREATE INDEX IF NOT EXISTS idx_served_events_ts ON served_events(ts_unix_ms);
+         CREATE INDEX IF NOT EXISTS idx_served_events_entity ON served_events(entity_id);
+         CREATE TABLE IF NOT EXISTS recall_arm_audits (
+            id TEXT PRIMARY KEY,
+            ts_unix_ms INTEGER NOT NULL,
+            mode TEXT NOT NULL,
+            arm TEXT NOT NULL,
+            candidates INTEGER NOT NULL,
+            reentry_candidates INTEGER NOT NULL,
+            delivered INTEGER NOT NULL,
+            profile TEXT NOT NULL DEFAULT '',
+            workspace_hash TEXT NOT NULL DEFAULT '',
+            query_hash TEXT NOT NULL DEFAULT ''
+         );
+         CREATE INDEX IF NOT EXISTS idx_arm_audits_ts ON recall_arm_audits(ts_unix_ms);
+         CREATE TABLE IF NOT EXISTS displacement_events (
+            id TEXT PRIMARY KEY,
+            ts_unix_ms INTEGER NOT NULL,
+            entity_id TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            was_sole_evidence INTEGER NOT NULL DEFAULT 0,
+            mode TEXT NOT NULL DEFAULT '',
+            workspace_hash TEXT NOT NULL DEFAULT '',
+            query TEXT NOT NULL DEFAULT ''
+         );
+         CREATE INDEX IF NOT EXISTS idx_displacement_ts ON displacement_events(ts_unix_ms);",
+    )?;
+    // ── end v31 ──────────────────────────────────────────────────────────
 
     // Stamp the migration level so subsequent opens skip the probe block above.
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;

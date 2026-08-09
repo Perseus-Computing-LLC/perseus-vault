@@ -6,6 +6,17 @@ All notable changes to Perseus Vault are documented here. This project adheres t
 ## [Unreleased]
 
 ### Added
+- **Retrieval telemetry & trust concentration (#872).** New
+  `perseus_vault_retrieval_telemetry` tool (schema v31) reporting
+  concentration (HHI, top shares), repeated serving, low-trust fanout,
+  diversity displacement (with sole-evidence flag), per-arm recall audits,
+  cross-arm contamination probing, and an artifact hash — fail-closed
+  `empty`/`degraded` states. Non-serveable statuses
+  (`deprecated/expired/quarantined/redacted`) are now excluded at the SQL
+  boundary in **every** recall arm plus a Rust guard in both hydrators;
+  the contamination probe fails `invariant` when raw arms could reach
+  retired rows. Spec: `docs/specs/retrieval-telemetry.md`; harness:
+  `benchmark/telemetry/run.py`.
 - **Fused multi-strategy recall (#883, #867).** New `fused` recall mode
   fusing up to four strategies — `fts5`, `dense`, `graph` (one-hop
   neighbor expansion), `temporal` (proximity to `query_time`) — via
