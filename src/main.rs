@@ -19,6 +19,8 @@ mod log_digest;
 mod mcp;
 mod models;
 mod multimodal;
+mod retrieval_telemetry;
+mod instruction_extraction;
 mod schema;
 mod signed_profile;
 pub(crate) mod stage_trace;

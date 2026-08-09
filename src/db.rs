@@ -1907,7 +1907,7 @@ impl Database {
         }
         match mode {
             SearchMode::Fts5 => crate::models::Completeness::Exact,
-            SearchMode::Dense | SearchMode::Hybrid => {
+            SearchMode::Dense | SearchMode::Hybrid | SearchMode::Fused => {
                 let population = outcome
                     .backend_health
                     .as_ref()
@@ -2005,10 +2005,16 @@ impl Database {
             // FTS/keyword arm served), that is PARTIAL, not fresh.
             let semantic_served = match mode {
                 SearchMode::Fts5 => true,
-                SearchMode::Dense | SearchMode::Hybrid => query_embedding_available,
+                SearchMode::Dense | SearchMode::Hybrid | SearchMode::Fused => {
+                    query_embedding_available
+                }
             };
             let degraded = !semantic_served
-                || (pending > 0 && matches!(mode, SearchMode::Dense | SearchMode::Hybrid));
+                || (pending > 0
+                    && matches!(
+                        mode,
+                        SearchMode::Dense | SearchMode::Hybrid | SearchMode::Fused
+                    ));
             return RecallOutcome {
                 status: if degraded {
                     RecallStatus::Partial
@@ -2795,7 +2801,9 @@ impl Database {
                     follow_count, miss_count, follow_rate, efficacy_status,
                     epistemic_state, embedding
              FROM entities
-             WHERE archived = 0 AND embedding IS NOT NULL"
+             WHERE archived = 0 AND embedding IS NOT NULL
+               AND (status IS NULL OR status = '' OR status NOT IN
+                   ('deprecated','expired','quarantined','redacted'))"
                 .to_string()
         } else {
             format!(
@@ -2808,6 +2816,8 @@ impl Database {
                         epistemic_state, embedding
                  FROM entities
                  WHERE archived = 0 AND embedding IS NOT NULL
+                   AND (status IS NULL OR status = '' OR status NOT IN
+                       ('deprecated','expired','quarantined','redacted'))
                  LIMIT {}",
                 max_scan
             )
@@ -2970,7 +2980,9 @@ impl Database {
         {
             let mut stmt = conn.prepare(&format!(
                 "SELECT id, embedding FROM entities \
-                 WHERE archived = 0 AND embedding IS NOT NULL LIMIT {}",
+                 WHERE archived = 0 AND embedding IS NOT NULL \
+                   AND (status IS NULL OR status = '' OR status NOT IN \
+                       ('deprecated','expired','quarantined','redacted')) LIMIT {}",
                 max_scan
             ))?;
             let rows = stmt.query_map([], |row| {
@@ -3038,7 +3050,9 @@ impl Database {
                     };
                     let mut stmt = conn.prepare(
                         "SELECT id, emb_sig, emb_sig4 FROM entities \
-                         WHERE archived = 0 AND emb_sig IS NOT NULL",
+                         WHERE archived = 0 AND emb_sig IS NOT NULL
+                           AND (status IS NULL OR status = '' OR status NOT IN
+                              ('deprecated','expired','quarantined','redacted'))",
                     )?;
                     let rows = stmt.query_map([], |row| {
                         Ok((
@@ -3307,7 +3321,9 @@ impl Database {
                 // is gone with the invariant that made it necessary.
                 let mut stmt = conn.prepare(&format!(
                     "SELECT id, emb_sig FROM entities \
-                     WHERE archived = 0 AND emb_sig IS NOT NULL LIMIT {}",
+                     WHERE archived = 0 AND emb_sig IS NOT NULL
+                       AND (status IS NULL OR status = '' OR status NOT IN
+                           ('deprecated','expired','quarantined','redacted')) LIMIT {}",
                     max_scan
                 ))?;
                 let rows = stmt.query_map([], |row| {
@@ -5693,7 +5709,8 @@ impl Database {
     }
 
     pub fn recall(&self, params: &RecallParams) -> Result<Vec<Entity>, Box<dyn std::error::Error>> {
-        Ok(self.recall_with_completeness(params)?.0)
+        let (entities, _) = self.recall_with_completeness(params)?;
+        Ok(entities)
     }
 
     /// #856: recall plus top-k completeness metadata. Dense/hybrid paths
@@ -5710,6 +5727,12 @@ impl Database {
 
         // No-op (single cached-bool check per stage) when disabled.
         let mut timer = RecallTimer::start();
+        // #883: fused multi-strategy recall has its own path (trace carried
+        // to the handler); other callers get entities + completeness only.
+        if params.mode == crate::models::SearchMode::Fused {
+            let (entities, completeness, _trace) = self.fused_recall(params)?;
+            return Ok((entities, completeness));
+        }
         // Dense vector search path
         if params.mode == crate::models::SearchMode::Dense
             || params.mode == crate::models::SearchMode::Hybrid
@@ -5800,6 +5823,24 @@ impl Database {
                     timer.finish("dense");
                     // #882: governance interceptor on the dense arm.
                     let out = self.filter_suppressed(out)?;
+                    // #872: per-arm telemetry audit (bounded, pruned).
+                    if !params.skip_side_effects {
+                        if let Ok(conn) = self.conn() {
+                            let _ = crate::retrieval_telemetry::record_arm_audit(
+                                &*conn,
+                                "dense",
+                                "dense",
+                                dense_returned,
+                                0,
+                                out.len(),
+                                "",
+                                params.workspace_hash.as_deref().unwrap_or(""),
+                                &crate::retrieval_telemetry::hash_query(&params.query),
+                            );
+                        }
+                    }
+                    // #872: dense completion point.
+                    self.record_served_telemetry(params, &out);
                     return Ok((
                         out,
                         crate::models::RecallCompleteness {
@@ -5833,6 +5874,10 @@ impl Database {
                 let mut out: Vec<Entity> = Vec::new();
                 let mut dense_returned: usize = 0;
                 let mut attempts = 0;
+                // #872: last-iteration per-arm candidate counts for the
+                // hybrid arm audit (the pool loop re-fetches arms; only the
+                // final pool's numbers are recorded).
+                let mut last_arms: Option<(usize, usize, usize)> = None;
                 'hybrid_pool: loop {
                 let candidate_k = pool;
                 let mut wide = params.clone();
@@ -5901,6 +5946,7 @@ impl Database {
                     }
                 }
                 let graph_scored = self.filter_suppressed_scored(self.graph_expand(&graph_seeds, candidate_k)?)?;
+                last_arms = Some((sparse_scored.len(), dense_scored.len(), graph_scored.len()));
                 timer.stage("graph");
                 let graph_weight = crate::db::graph_arm_weight(graph_scored.len());
 
@@ -6054,6 +6100,25 @@ impl Database {
                 timer.finish("hybrid");
                 // #882: governance interceptor on the hybrid arm.
                 let out = self.filter_suppressed(out)?;
+                // #872: per-arm telemetry audits for the hybrid path
+                // (sparse / dense / graph arms of the final pool).
+                if !params.skip_side_effects {
+                    if let (Ok(conn), Some((s, d, g))) = (self.conn(), last_arms) {
+                        let qh = crate::retrieval_telemetry::hash_query(&params.query);
+                        let _ = crate::retrieval_telemetry::record_arm_audit(
+                            &*conn, "hybrid", "sparse", s, 0, s, "",
+                            params.workspace_hash.as_deref().unwrap_or(""), &qh,
+                        );
+                        let _ = crate::retrieval_telemetry::record_arm_audit(
+                            &*conn, "hybrid", "dense", d, 0, d, "",
+                            params.workspace_hash.as_deref().unwrap_or(""), &qh,
+                        );
+                        let _ = crate::retrieval_telemetry::record_arm_audit(
+                            &*conn, "hybrid", "graph", g, 0, g, "",
+                            params.workspace_hash.as_deref().unwrap_or(""), &qh,
+                        );
+                    }
+                }
                 let exhausted = dense_returned < pool;
                 let completeness = if exhausted {
                     crate::models::Completeness::Exact
@@ -6071,6 +6136,8 @@ impl Database {
                     },
                     pool_bound: if exhausted { None } else { Some(pool as i64) },
                 };
+                // #872: hybrid completion point.
+                self.record_served_telemetry(params, &out);
                 return Ok((
                     out,
                     crate::models::RecallCompleteness {
@@ -6093,19 +6160,541 @@ impl Database {
             results.sort_by_key(|e| e.workspace_hash.is_empty());
         }
         timer.finish("fts5");
+        // #872: lexical arm audit — candidates before the suppression
+        // interceptor, delivered after.
+        let keyword_candidates = results.len();
         // #882: read-layer governance interceptor — drop any retrieved
         // entity under a permanent erasure mandate (decoupled overlay) or an
         // in-DB tombstone. Runs on the recall funnel, which recall_batch,
         // context_block, ask, and the grpc surface all feed through.
         let results = self.filter_suppressed(results)?;
-        // #856: FTS ranks the full match set — the top-k is exact by
-        // construction; no candidate pool is involved.
+        if !params.skip_side_effects {
+            if let Ok(conn) = self.conn() {
+                let _ = crate::retrieval_telemetry::record_arm_audit(
+                    &*conn,
+                    "lexical",
+                    "lexical",
+                    keyword_candidates,
+                    0,
+                    results.len(),
+                    "",
+                    params.workspace_hash.as_deref().unwrap_or(""),
+                    &crate::retrieval_telemetry::hash_query(&params.query),
+                );
+            }
+        }
+        // #872: served-event telemetry — recorded at every completion point
+        // so each entry path (MCP handler calls recall_with_completeness
+        // directly) counts exactly once. Fused recalls record inside
+        // fused_recall.
+        self.record_served_telemetry(params, &results);
         Ok((
             results,
             crate::models::RecallCompleteness {
                 completeness: crate::models::Completeness::Exact,
                 scope: None,
             },
+        ))
+    }
+
+    /// #872: record served-event telemetry for a completed recall (bounded,
+    /// pruned; side-effect-free probes stay clean). Fused recalls record
+    /// inside fused_recall so every entity is counted exactly once.
+    fn record_served_telemetry(&self, params: &RecallParams, entities: &[Entity]) {
+        if params.skip_side_effects || params.mode == crate::models::SearchMode::Fused {
+            return;
+        }
+        if let Ok(conn) = self.conn() {
+            let batch_id = format!("rb-{:x}", uuid::Uuid::new_v4().simple());
+            let mode = crate::retrieval_telemetry::mode_label(&params.mode);
+            let _ = crate::retrieval_telemetry::record_served(
+                &*conn,
+                &batch_id,
+                "",
+                mode,
+                &params.query,
+                entities,
+            );
+        }
+    }
+
+    /// #883 (TEMPR-style fused multi-strategy recall) + #867 (retrieval
+    /// trace). Engages 2-4 strategies — `fts5` (BM25 keyword), `dense`
+    /// (vector), `graph` (one-hop link expansion off the strongest hits),
+    /// `temporal` (bi-temporal currency + proximity to `query_time`) — and
+    /// fuses their RANKINGS with weighted Reciprocal Rank Fusion (rank-based
+    /// consensus; no raw score sum, #867), then applies the optional
+    /// min-max-calibrated rerank stage, filters, and truncates to a token
+    /// budget. Returns the delivered entities, top-k completeness, and a
+    /// full trace (original query, per-strategy pre-fusion rankings, fusion
+    /// weights, truncation accounting, rerank outcome, final placement).
+    pub fn fused_recall(
+        &self,
+        params: &RecallParams,
+    ) -> Result<
+        (
+            Vec<Entity>,
+            crate::models::RecallCompleteness,
+            crate::models::FusedTrace,
+        ),
+        Box<dyn std::error::Error>,
+    > {
+        const ALL: [&str; 4] = ["fts5", "dense", "graph", "temporal"];
+        let started = std::time::Instant::now();
+
+        // ── strategy selection & validation ─────────────────────────────
+        let mut strategies: Vec<&str> = if params.strategies.is_empty() {
+            ALL.to_vec()
+        } else {
+            let mut s: Vec<&str> = Vec::new();
+            for name in &params.strategies {
+                if !ALL.contains(&name.as_str()) {
+                    return Err(format!(
+                        "fused recall: unknown strategy '{name}' (expected one of {ALL:?})"
+                    )
+                    .into());
+                }
+                if !s.contains(&name.as_str()) {
+                    s.push(name);
+                }
+            }
+            if s.len() < 2 {
+                return Err("fused recall: engage at least 2 strategies".into());
+            }
+            s
+        };
+        strategies.sort_by(|a, b| {
+            ALL.iter()
+                .position(|x| x == a)
+                .unwrap_or(99)
+                .cmp(&ALL.iter().position(|x| x == b).unwrap_or(99))
+        });
+        let wants = |s: &str| strategies.contains(&s);
+
+        // ── per-strategy weights (validated, fail-closed) ───────────────
+        let mut base_weights: std::collections::HashMap<String, f64> =
+            std::collections::HashMap::new();
+        if let Some(w) = &params.strategy_weights {
+            for (k, v) in w {
+                if !ALL.contains(&k.as_str()) {
+                    return Err(format!("fused recall: unknown strategy weight '{k}'").into());
+                }
+                if !v.is_finite() || *v < 0.0 {
+                    return Err(format!(
+                        "fused recall: strategy weight for '{k}' must be finite and >= 0, got {v}"
+                    )
+                    .into());
+                }
+                base_weights.insert(k.clone(), *v);
+            }
+        }
+
+        // ── budget & anchor instant ─────────────────────────────────────
+        let budget_tokens = if params.max_tokens > 0 {
+            params.max_tokens
+        } else {
+            match params.depth_budget.as_deref().unwrap_or("mid") {
+                "low" => 1024,
+                "high" => 16384,
+                _ => 4096,
+            }
+        };
+        let query_time = params.query_time_unix_ms.unwrap_or_else(now_ms);
+        let limit = params.limit.max(0) as usize;
+        // Over-fetch pool for the arms; RRF then truncates to the budget.
+        let candidate_k = limit.saturating_mul(5).clamp(64, 2000);
+        let mut wide = params.clone();
+        wide.limit = candidate_k as i64;
+
+        let mut trace = crate::models::FusedTrace {
+            original_query: params.query.clone(),
+            ..Default::default()
+        };
+        if let Some(ws) = &params.workspace_hash {
+            trace
+                .state_filters
+                .push(format!("workspace:{ws}"));
+        }
+        if let Some(ep) = &params.epistemic_state {
+            trace.state_filters.push(format!("epistemic:{ep}"));
+        }
+        if let Some(l) = &params.layer {
+            trace.state_filters.push(format!("layer:{l}"));
+        }
+        if let Some(c) = &params.category {
+            trace.state_filters.push(format!("category:{c}"));
+        }
+        if let Some(t) = &params.entity_type {
+            trace.state_filters.push(format!("entity_type:{t}"));
+        }
+        if let Some(a) = &params.agent_id {
+            trace.state_filters.push(format!("agent:{a}"));
+        }
+        if params.include_archived {
+            trace.state_filters.push("archived:include".to_string());
+        }
+
+        // ── wave 1: fts5 + dense arms in parallel (independent, read-only) ─
+        let (fts5_scored, fts5_ms, dense_scored, dense_ms, dense_note) =
+            std::thread::scope(|sc| {
+                let fts5_handle = sc.spawn(|| {
+                    let t0 = std::time::Instant::now();
+                    let r = if wants("fts5") {
+                        self.fts5_bm25_search(&wide)
+                            .and_then(|v| self.filter_suppressed_scored(v))
+                    } else {
+                        Ok(Vec::new())
+                    };
+                    (r.map_err(|e| e.to_string()), t0.elapsed().as_secs_f64() * 1000.0)
+                });
+                let t0 = std::time::Instant::now();
+                let (dense, note) = if wants("dense") && !params.query.trim().is_empty() {
+                    match self.generate_embedding_with_fallback(&params.query) {
+                        Ok(qv) => {
+                            let _ = self.settle_dense_candidates(128);
+                            let _ = self
+                                .embed_queue_flush(std::time::Duration::from_millis(250));
+                            (
+                                self.dense_search_governed(&qv, candidate_k)
+                                    .and_then(|v| self.filter_suppressed_scored(v))
+                                    .map_err(|e| e.to_string()),
+                                String::new(),
+                            )
+                        }
+                        Err(e) => (
+                            Err(e.to_string()),
+                            format!("embedding backend unavailable: {e}"),
+                        ),
+                    }
+                } else {
+                    (Ok(Vec::new()), String::new())
+                };
+                let (f, fm) = fts5_handle
+                    .join()
+                    .unwrap_or_else(|_| (Err("fts5 arm panicked".to_string()), 0.0));
+                (
+                    f,
+                    fm,
+                    dense.map_err(|e| e.to_string()),
+                    t0.elapsed().as_secs_f64() * 1000.0,
+                    note,
+                )
+            });
+
+        // The keyword arm is core: its failure fails the recall (fail-closed,
+        // matching the hybrid path). The dense arm degrades (recorded above).
+        let fts5_scored = fts5_scored.map_err(|e| format!("fused recall fts5 arm failed: {e}"))?;
+        let dense_scored = dense_scored.unwrap_or_default();
+
+        let mut arm_status = |name: &str, scored: &[(Entity, f64)], degraded: bool| {
+            let status = if degraded {
+                "degraded".to_string()
+            } else if scored.is_empty() {
+                "empty".to_string()
+            } else {
+                "ok".to_string()
+            };
+            crate::models::FusedStrategyTrace {
+                strategy: name.to_string(),
+                candidates: scored.len(),
+                top: scored.iter().take(20).map(|(e, _)| e.id.clone()).collect(),
+                status,
+                latency_ms: 0.0,
+            }
+        };
+
+        // fts5 arm record
+        if wants("fts5") {
+            let mut st = arm_status("fts5", &fts5_scored, false);
+            st.latency_ms = fts5_ms;
+            trace.strategies.push(st);
+        }
+        // dense arm record (embedding failure = degraded, never silent)
+        if wants("dense") {
+            let mut st = arm_status("dense", &dense_scored, !dense_note.is_empty());
+            st.latency_ms = dense_ms;
+            if !dense_note.is_empty() {
+                st.top = Vec::new();
+            }
+            trace.strategies.push(st);
+        }
+        let dense_returned = dense_scored.len();
+
+        // ── wave 2: graph arm (seeds = top of fts5 ∪ dense) ─────────────
+        let mut graph_scored: Vec<(Entity, f64)> = Vec::new();
+        let mut graph_ms = 0.0;
+        if wants("graph") {
+            let t0 = std::time::Instant::now();
+            let seed_n = limit.clamp(1, 20);
+            let mut seeds: Vec<Entity> = fts5_scored
+                .iter()
+                .take(seed_n)
+                .map(|(e, _)| e.clone())
+                .collect();
+            for (e, _) in dense_scored.iter().take(seed_n) {
+                if !seeds.iter().any(|s| s.id == e.id) {
+                    seeds.push(e.clone());
+                }
+            }
+            graph_scored = self
+                .graph_expand(&seeds, candidate_k)
+                .and_then(|v| self.filter_suppressed_scored(v))
+                .map_err(|e| e.to_string())?;
+            graph_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            let mut st = arm_status("graph", &graph_scored, false);
+            st.latency_ms = graph_ms;
+            trace.strategies.push(st);
+        }
+
+        // ── wave 2: temporal arm (proximity to query_time) ──────────────
+        let mut temporal_scored: Vec<(Entity, f64)> = Vec::new();
+        let mut temporal_ms = 0.0;
+        if wants("temporal") {
+            let t0 = std::time::Instant::now();
+            // Base: the keyword match set (temporal ranks MATCHING facts by
+            // time; it never invents candidates the query didn't match).
+            // Currency is guaranteed by the store: UNIQUE(category, key,
+            // workspace) means the live table holds exactly one version per
+            // key — the current one. Point-in-time (bi-temporal) bodies are
+            // reconstructed downstream by the as_of/valid_at handler path
+            // (#472/#363), which composes with fused recall unchanged.
+            let mut temps: Vec<Entity> = fts5_scored.iter().map(|(e, _)| e.clone()).collect();
+            // Proximity: nearest created_at to query_time first; unset
+            // timestamps last; id tie-break for determinism.
+            temps.sort_by(|a, b| {
+                let da = if a.created_at_unix_ms > 0 {
+                    (a.created_at_unix_ms - query_time).abs()
+                } else {
+                    i64::MAX
+                };
+                let db = if b.created_at_unix_ms > 0 {
+                    (b.created_at_unix_ms - query_time).abs()
+                } else {
+                    i64::MAX
+                };
+                da.cmp(&db).then_with(|| a.id.cmp(&b.id))
+            });
+            temporal_scored = temps.into_iter().map(|e| (e, 1.0)).collect();
+            temporal_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            let mut st = arm_status("temporal", &temporal_scored, false);
+            st.latency_ms = temporal_ms;
+            trace.strategies.push(st);
+        }
+
+        // ── weighted RRF fusion (rank-based; no raw score sum) ──────────
+        let arms: Vec<(Vec<String>, f64)> = strategies
+            .iter()
+            .map(|name| {
+                let scored = match *name {
+                    "fts5" => &fts5_scored,
+                    "dense" => &dense_scored,
+                    "graph" => &graph_scored,
+                    _ => &temporal_scored,
+                };
+                let base = base_weights.get(*name).copied().unwrap_or(1.0);
+                let effective = if scored.is_empty() { 0.0 } else { base };
+                trace
+                    .fusion
+                    .weights
+                    .insert(name.to_string(), effective);
+                (scored.iter().map(|(e, _)| e.id.clone()).collect(), effective)
+            })
+            .collect();
+        let mut by_id: std::collections::HashMap<String, Entity> =
+            std::collections::HashMap::new();
+        for (e, _) in fts5_scored
+            .iter()
+            .chain(dense_scored.iter())
+            .chain(graph_scored.iter())
+            .chain(temporal_scored.iter())
+        {
+            by_id.entry(e.id.clone()).or_insert_with(|| e.clone());
+        }
+        let mut fused = crate::db::flat_rrf(&arms, &by_id, candidate_k);
+        trace.fusion.rrf_k = 60.0;
+        trace.fusion.fused_count = fused.len();
+
+        // Post-fusion pipeline mirrors the hybrid path (honest-usage boost,
+        // scope preference, supersede recency, then layer + metadata
+        // filters, then the governance interceptor).
+        let fused = self.apply_usefulness_rank_boost(fused)?;
+        let fused = Self::apply_scope_rank_weight(fused, params);
+        let fused = Self::apply_supersede_recency(fused);
+        let mut cand: Vec<Entity> = fused.into_iter().map(|(e, _)| e).collect();
+        Self::retain_layer(&mut cand, params);
+        Self::retain_metadata_filters(&mut cand, params);
+        let cand = self.filter_suppressed(cand)?;
+
+        // ── optional rerank stage (default off; rank-calibrated) ────────
+        let mut rerank_trace = crate::models::FusedRerankTrace {
+            enabled: params.rerank,
+            method: "rankcal-dense-bm25".to_string(),
+            ..Default::default()
+        };
+        let mut ranked: Vec<(Entity, f64)> = if params.rerank && !cand.is_empty() {
+            // Re-score the pool with RANK-DERIVED signals: an entity present
+            // in an arm scores 1/(1+rank) on that arm (rank 0 = 1.0), then
+            // min-max calibrated over the SAME pool, combined 0.6 x dense +
+            // 0.4 x BM25. Rank-derived signals are scale-free by construction
+            // — no raw score of a different scale is ever summed (#867) —
+            // and always distinct, so the calibration never degenerates on
+            // tied raw scores. Entities absent from an arm score 0 there.
+            let dense_rank: std::collections::HashMap<String, usize> = dense_scored
+                .iter()
+                .enumerate()
+                .map(|(i, (e, _))| (e.id.clone(), i))
+                .collect();
+            let fts_rank: std::collections::HashMap<String, usize> = fts5_scored
+                .iter()
+                .enumerate()
+                .map(|(i, (e, _))| (e.id.clone(), i))
+                .collect();
+            let has_dense = !dense_rank.is_empty();
+            let has_fts = !fts_rank.is_empty();
+            if has_dense || has_fts {
+                let mut rescored: Vec<(Entity, f64)> = cand
+                    .iter()
+                    .map(|e| {
+                        let dn = dense_rank
+                            .get(&e.id)
+                            .map(|r| 1.0 / (1.0 + *r as f64))
+                            .unwrap_or(0.0);
+                        let bn = fts_rank
+                            .get(&e.id)
+                            .map(|r| 1.0 / (1.0 + *r as f64))
+                            .unwrap_or(0.0);
+                        (e.clone(), 0.6 * dn + 0.4 * bn)
+                    })
+                    .collect();
+                rescored.sort_by(|a, b| {
+                    b.1.partial_cmp(&a.1)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| a.0.id.cmp(&b.0.id))
+                });
+                rerank_trace.applied = true;
+                rerank_trace.note = format!(
+                    "rank-calibrated over pool of {} candidates (dense {} / bm25 {})",
+                    cand.len(),
+                    if has_dense { "on" } else { "off" },
+                    if has_fts { "on" } else { "off" }
+                );
+                rescored
+            } else {
+                rerank_trace.note =
+                    "no score-bearing arms engaged (dense+fts5 both absent); kept RRF order"
+                        .to_string();
+                cand.into_iter().map(|e| (e, 0.0)).collect()
+            }
+        } else {
+            if params.rerank && cand.is_empty() {
+                rerank_trace.note = "empty fused pool".to_string();
+            }
+            cand.into_iter().map(|e| (e, 0.0)).collect()
+        };
+        trace.rerank = rerank_trace;
+
+        // ── caller limit, then token-budget truncation ──────────────────
+        ranked.truncate(limit);
+        let mut retained: Vec<Entity> = Vec::new();
+        let mut tokens_used: i64 = 0;
+        let mut dropped = 0usize;
+        for (e, _) in ranked {
+            let est = (e.body_json.chars().count() / 4).max(1) as i64;
+            if !retained.is_empty() && tokens_used + est > budget_tokens {
+                dropped += 1;
+                continue;
+            }
+            tokens_used += est;
+            retained.push(e);
+        }
+        trace.truncation = crate::models::FusedTruncationTrace {
+            budget_tokens,
+            estimated_tokens_used: tokens_used,
+            retained: retained.len(),
+            dropped,
+        };
+
+        // ── trace: placement + consensus sources ────────────────────────
+        trace.placement = retained.iter().map(|e| e.id.clone()).collect();
+        for e in &retained {
+            let mut srcs = Vec::new();
+            for (name, list) in [
+                ("fts5", &fts5_scored),
+                ("dense", &dense_scored),
+                ("graph", &graph_scored),
+                ("temporal", &temporal_scored),
+            ] {
+                if list.iter().any(|(c, _)| c.id == e.id) {
+                    srcs.push(name.to_string());
+                }
+            }
+            trace.sources.insert(e.id.clone(), srcs);
+        }
+
+        // ── completeness (dense pool dynamics; fts exact when not engaged) ─
+        let (completeness, scope) = if wants("dense") {
+            let exhausted = dense_returned < candidate_k;
+            let c = if exhausted {
+                crate::models::Completeness::Exact
+            } else if retained.len() >= limit {
+                crate::models::Completeness::Bounded
+            } else {
+                crate::models::Completeness::Partial
+            };
+            (
+                c,
+                Some(crate::models::CandidateScope {
+                    scanned: dense_returned as i64,
+                    embedded_population: if exhausted {
+                        Some(dense_returned as i64)
+                    } else {
+                        None
+                    },
+                    pool_bound: if exhausted { None } else { Some(candidate_k as i64) },
+                }),
+            )
+        } else {
+            (
+                crate::models::Completeness::Exact,
+                None,
+            )
+        };
+
+        // ── side effects (opt-in, like the semantic paths) ──────────────
+        self.reinforce_if_requested(params, &retained)?;
+        let _ = started;
+        // #872: per-strategy arm audits + served events for fused recalls.
+        // Single recording point so fused entities count exactly once
+        // (the `recall()` wrapper skips the fused branch).
+        if !params.skip_side_effects {
+            if let Ok(conn) = self.conn() {
+                let qh = crate::retrieval_telemetry::hash_query(&params.query);
+                let audits: [(&str, &[(Entity, f64)]); 4] = [
+                    ("fts5", fts5_scored.as_slice()),
+                    ("dense", dense_scored.as_slice()),
+                    ("graph", graph_scored.as_slice()),
+                    ("temporal", temporal_scored.as_slice()),
+                ];
+                for (arm, list) in audits {
+                    let reentry = crate::retrieval_telemetry::count_non_serveable_scored(list);
+                    let _ = crate::retrieval_telemetry::record_arm_audit(
+                        &*conn, "fused", arm, list.len(), reentry, list.len(),
+                        "", params.workspace_hash.as_deref().unwrap_or(""), &qh,
+                    );
+                }
+                let batch_id = format!("rb-{:x}", uuid::Uuid::new_v4().simple());
+                let _ = crate::retrieval_telemetry::record_served(
+                    &*conn, &batch_id, "", "fused", &params.query, &retained,
+                );
+            }
+        }
+        Ok((
+            retained,
+            crate::models::RecallCompleteness {
+                completeness,
+                scope,
+            },
+            trace,
         ))
     }
 
@@ -6368,6 +6957,11 @@ impl Database {
         let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
         // #401: set when the FTS-driven (selective) plan was chosen below.
         let mut fts_selective = false;
+        // #872: non-serveable lifecycle statuses are excluded at the SQL
+        // boundary (keyword path) — the same truth controls as the FTS
+        // arms, so superseded/quarantined/expired/redacted rows cannot
+        // re-enter through this arm either.
+        conditions.push(crate::retrieval_telemetry::SERVEABLE_STATUS_SQL.to_string());
 
         // Keyword search: FTS5 OR match + LIKE fallback
         if !params.query.is_empty() {
@@ -6760,13 +7354,16 @@ impl Database {
 
         // #105: Two-level diversity quota (BrainDB-inspired)
         // Per-keyword halving: each distinct keyword gets ceil(max_results x halving^n) slots
+        let mut displacements: Vec<(String, bool)> = Vec::new();
         if params.diversity_halving < 1.0 && params.diversity_halving > 0.0 && !items.is_empty() {
-            items = Self::apply_diversity_quota(
+            let (applied, disp) = Self::apply_diversity_quota(
                 items,
                 params.limit as usize,
                 params.diversity_halving,
                 &params.query,
             );
+            items = applied;
+            displacements = disp;
         }
 
         let start = params.offset.clamp(0, 10000) as usize;
@@ -6782,6 +7379,18 @@ impl Database {
         if !params.skip_side_effects && !items.is_empty() {
             let ids: Vec<String> = items.iter().map(|e| e.id.clone()).collect();
             let _ = Self::apply_recall_side_effects_with_conn(&conn, &ids);
+        }
+        // #872: displacement telemetry — entities the diversity quota
+        // removed, with the sole-evidence flag (its dominant keyword has
+        // zero representation in the delivered set).
+        if !params.skip_side_effects && !displacements.is_empty() {
+            let mode = crate::retrieval_telemetry::mode_label(&params.mode);
+            for (eid, sole) in displacements {
+                let _ = crate::retrieval_telemetry::record_displacement(
+                    &*conn, &eid, "diversity_halving", sole, mode,
+                    params.workspace_hash.as_deref().unwrap_or(""), &params.query,
+                );
+            }
         }
         Ok(items)
     }
@@ -7039,6 +7648,12 @@ impl Database {
     ) -> Vec<String> {
         let mut conditions: Vec<String> = vec!["e.archived = 0".to_string()];
 
+        // #872: lifecycle truth controls are not serveable by ANY arm —
+        // superseded (deprecated), expired, quarantined, and redacted rows
+        // are excluded at the SQL boundary here (shared by the FTS arms)
+        // so they cannot re-enter through another arm.
+        conditions.push(crate::retrieval_telemetry::serveable_status_clause("e"));
+
         // #868: lifecycle-retired rows are not serveable by the FTS arms.
         // The expire sweep transitions status to 'expired' (content retained
         // for history); the timestamp guard covers the window between an
@@ -7121,12 +7736,15 @@ impl Database {
     /// #105: Apply per-keyword halving diversity quota.
     /// Each distinct matched keyword gets ceil(max_results x halving^n) slots,
     /// preventing a single popular keyword from monopolizing results.
+    /// #872: returns `(items, displacements)` where each displacement is
+    /// `(entity_id, was_sole_evidence)` — entities the quota skipped whose
+    /// dominant keyword has NO representation in the delivered set.
     fn apply_diversity_quota(
         mut items: Vec<Entity>,
         max_results: usize,
         halving: f64,
         query: &str,
-    ) -> Vec<Entity> {
+    ) -> (Vec<Entity>, Vec<(String, bool)>) {
         // Extract the dominant matched keyword for each entity
         // (the first query word that appears in the entity body)
         let query_words: Vec<&str> = query.split_whitespace().filter(|w| w.len() >= 3).collect();
@@ -7134,10 +7752,29 @@ impl Database {
         let mut kw_order: Vec<String> = Vec::new();
         let mut out: Vec<Entity> = Vec::new();
         let mut taken: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // #872: quota-exhausted skips (entity_id, dominant keyword).
+        let mut displaced: Vec<(String, String)> = Vec::new();
 
         for entity in items.drain(..) {
             if out.len() >= max_results {
-                break;
+                // #872: quota selection reached the cap — remaining entities
+                // are dropped. Record the meaningful signal: a drop whose
+                // dominant keyword has NO representative in the kept set
+                // (the control displaced sole-answer evidence).
+                let body_lower = entity.body_json.to_lowercase();
+                if let Some(kw) = query_words
+                    .iter()
+                    .find(|w| body_lower.contains(&w.to_lowercase()))
+                {
+                    let kw = kw.to_string();
+                    let sole = !out.iter().any(|e| {
+                        e.body_json.to_lowercase().contains(&kw.to_lowercase())
+                    });
+                    if sole {
+                        displaced.push((entity.id.clone(), kw));
+                    }
+                }
+                continue;
             }
             if taken.contains(&entity.id) {
                 continue;
@@ -7164,6 +7801,7 @@ impl Database {
                     None => continue, // Should not happen: key was just inserted
                 };
                 if *remaining <= 0 {
+                    displaced.push((entity.id.clone(), kw.clone()));
                     continue; // This keyword's quota exhausted
                 }
                 *remaining -= 1;
@@ -7173,7 +7811,20 @@ impl Database {
             out.push(entity);
         }
 
-        out
+        // #872: sole-evidence displacement = the entity's dominant keyword
+        // appears in NO delivered entity (the quota removed the keyword's
+        // last representative).
+        let displacements: Vec<(String, bool)> = displaced
+            .into_iter()
+            .map(|(id, kw)| {
+                let sole = !out.iter().any(|e| {
+                    e.body_json.to_lowercase().contains(&kw.to_lowercase())
+                });
+                (id, sole)
+            })
+            .collect();
+
+        (out, displacements)
     }
 
     /// Get a single entity by category and key.
@@ -7670,6 +8321,154 @@ impl Database {
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    // ── #889 Keystone-suggestion queue ───────────────────────────────────
+    // Candidates extracted from `correct` captures by anchored patterns.
+    // Extraction only ever INSERTs suggestions; promotion to the keystones
+    // table happens exclusively through keystone_suggestion_decide(approve),
+    // which re-runs the keystone trust-tier gate. Idempotent per
+    // (source_entity_id, instruction).
+
+    /// Add a candidate suggestion. Returns the suggestion id (existing id
+    /// when the (source, instruction) pair — or the same instruction already
+    /// pending from another source — was already queued). A directive that is
+    /// already awaiting a decision is never re-queued.
+    pub fn keystone_suggestion_add(
+        &self,
+        source_entity_id: &str,
+        source_category: &str,
+        instruction: &str,
+        pattern_locale: &str,
+        matched_pattern: &str,
+        workspace_hash: &str,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let conn = self.conn()?;
+        let existing: Option<String> = conn
+            .query_row(
+                "SELECT id FROM keystone_suggestions \
+                 WHERE source_entity_id = ?1 AND instruction = ?2 \
+                    OR (instruction = ?2 AND status = 'pending') \
+                 ORDER BY created_at_unix_ms ASC LIMIT 1",
+                params![source_entity_id, instruction],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(id) = existing {
+            return Ok(id);
+        }
+        let id = format!(
+            "ksug-{}",
+            uuid::Uuid::new_v4().to_string().replace('-', "")[..12].to_string()
+        );
+        conn.execute(
+            "INSERT INTO keystone_suggestions \
+             (id, source_entity_id, source_category, instruction, pattern_locale, \
+              matched_pattern, status, created_at_unix_ms, workspace_hash) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, ?8)",
+            params![
+                id,
+                source_entity_id,
+                source_category,
+                instruction,
+                pattern_locale,
+                matched_pattern,
+                now_ms(),
+                workspace_hash
+            ],
+        )?;
+        Ok(id)
+    }
+
+    /// List suggestions, newest first. `status` filters ("" = all);
+    /// `workspace_hash` filters when non-empty.
+    pub fn keystone_suggestions_list(
+        &self,
+        status: &str,
+        workspace_hash: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<crate::models::KeystoneSuggestion>, Box<dyn std::error::Error>> {
+        let conn = self.conn()?;
+        let mut conds: Vec<String> = Vec::new();
+        let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        if !status.is_empty() {
+            conds.push(format!("status = ?{}", binds.len() + 1));
+            binds.push(Box::new(status.to_string()));
+        }
+        if let Some(ws) = workspace_hash.filter(|w| !w.is_empty()) {
+            conds.push(format!("workspace_hash = ?{}", binds.len() + 1));
+            binds.push(Box::new(ws.to_string()));
+        }
+        let where_clause = if conds.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", conds.join(" AND "))
+        };
+        let sql = format!(
+            "SELECT id, source_entity_id, source_category, instruction, \
+                    pattern_locale, matched_pattern, status, created_at_unix_ms, \
+                    decided_at_unix_ms, decided_by, workspace_hash \
+             FROM keystone_suggestions {where_clause} \
+             ORDER BY created_at_unix_ms DESC LIMIT ?{}",
+            binds.len() + 1
+        );
+        binds.push(Box::new(limit.clamp(1, 1000)));
+        let mut stmt = conn.prepare(&sql)?;
+        let bind_refs: Vec<&dyn rusqlite::ToSql> = binds.iter().map(|b| b.as_ref()).collect();
+        let rows = stmt.query_map(bind_refs.as_slice(), |r| {
+            Ok(crate::models::KeystoneSuggestion {
+                id: r.get(0)?,
+                source_entity_id: r.get(1)?,
+                source_category: r.get(2)?,
+                instruction: r.get(3)?,
+                pattern_locale: r.get(4)?,
+                matched_pattern: r.get(5)?,
+                status: r.get(6)?,
+                created_at_unix_ms: r.get(7)?,
+                decided_at_unix_ms: r.get(8)?,
+                decided_by: r.get(9)?,
+                workspace_hash: r.get(10)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Mark a suggestion decided (approved/rejected). Returns the suggestion
+    /// id and its current status. Only pending suggestions can be decided.
+    pub fn keystone_suggestion_decide(
+        &self,
+        id: &str,
+        action: &str,
+        decided_by: &str,
+    ) -> Result<(String, String), Box<dyn std::error::Error>> {
+        if !matches!(action, "approved" | "rejected") {
+            return Err(format!(
+                "invalid decision action '{action}': expected 'approved' or 'rejected'"
+            )
+            .into());
+        }
+        let conn = self.conn()?;
+        let status: Option<String> = conn
+            .query_row(
+                "SELECT status FROM keystone_suggestions WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let _status = match status {
+            None => return Err(format!("suggestion {id} not found").into()),
+            Some(s) if s != "pending" => {
+                return Err(format!("suggestion {id} already {s}").into())
+            }
+            Some(s) => s,
+        };
+        let now = now_ms();
+        conn.execute(
+            "UPDATE keystone_suggestions \
+             SET status = ?1, decided_at_unix_ms = ?2, decided_by = ?3 WHERE id = ?4",
+            params![action, now, decided_by, id],
+        )?;
+        Ok((id.to_string(), action.to_string()))
     }
 
     // ── #684 Multi-agent scoping: agent registry + trust tiers ───────────
@@ -14171,6 +14970,8 @@ last_accessed: {}
                     epistemic_state
              FROM entities
              WHERE archived = 0
+               AND (status IS NULL OR status = '' OR status NOT IN
+                   ('deprecated','expired','quarantined','redacted'))
                AND rowid IN (SELECT rowid FROM entities_fts WHERE entities_fts MATCH ?1)
                {}
              ORDER BY decay_score DESC, retrieval_count DESC
@@ -14196,6 +14997,18 @@ last_accessed: {}
         drop(conn);
         let mut visible = self.filter_suppressed(candidates)?;
         visible.truncate(safe_limit as usize);
+        // #872: proactive-path telemetry (served events + arm audit).
+        if let Ok(conn) = self.conn() {
+            let batch_id = format!("rb-{:x}", uuid::Uuid::new_v4().simple());
+            let _ = crate::retrieval_telemetry::record_served(
+                &*conn, &batch_id, "", "proactive", context, &visible,
+            );
+            let _ = crate::retrieval_telemetry::record_arm_audit(
+                &*conn, "proactive", "proactive", visible.len(), 0, visible.len(),
+                "", workspace_hash.unwrap_or(""),
+                &crate::retrieval_telemetry::hash_query(context),
+            );
+        }
         Ok(visible)
     }
 
@@ -16532,6 +17345,11 @@ impl Database {
             }
             for id in chunk {
                 if let Some(e) = by_id.remove(id) {
+                    if crate::retrieval_telemetry::NON_SERVEABLE_STATUSES
+                        .contains(&e.status.as_str())
+                    {
+                        continue; // #872: lifecycle truth controls never re-enter
+                    }
                     out.push((e, 1.0));
                 }
             }
@@ -16587,6 +17405,11 @@ impl Database {
             }
             for id in chunk {
                 if let Some(e) = by_id.remove(id) {
+                    if crate::retrieval_telemetry::NON_SERVEABLE_STATUSES
+                        .contains(&e.status.as_str())
+                    {
+                        continue; // #872: lifecycle truth controls never re-enter
+                    }
                     out.push(e);
                 }
             }
@@ -17612,6 +18435,7 @@ mod tests {
                 visibility: None,
                 layer: None,
                 reinforce: false,
+                ..Default::default()
             })
             .unwrap();
         assert!(hits.iter().any(|e| e.key == "sup-1"));
@@ -17646,6 +18470,7 @@ mod tests {
                 visibility: None,
                 layer: None,
                 reinforce: false,
+                ..Default::default()
             })
             .unwrap();
         assert!(!hits2.iter().any(|e| e.key == "sup-1"));
@@ -17708,6 +18533,7 @@ mod tests {
                 visibility: None,
                 layer: None,
                 reinforce: false,
+                ..Default::default()
             })
             .unwrap();
         assert!(!hits.iter().any(|e| e.key == "revert-1"), "reverted store must still suppress");
@@ -28116,6 +28942,7 @@ mod tests {
             visibility: None,
             layer: None,
             reinforce: false,
+            ..Default::default()
             },
         )
         .unwrap();
@@ -28590,6 +29417,7 @@ mod tests {
                     visibility: None,
                     layer: None,
                     reinforce: false,
+                    ..Default::default()
                 }) {
                     Ok(_) => {},
                     Err(e) => {
@@ -28656,6 +29484,7 @@ mod tests {
             visibility: None,
             layer: None,
             reinforce: false,
+            ..Default::default()
         };
 
         // Scope to "alpha" — should only see ent_a
@@ -28704,6 +29533,7 @@ mod tests {
             visibility: None,
             layer: None,
             reinforce: false,
+            ..Default::default()
         };
         let results = db.recall(&params).unwrap();
         let found = results.iter().find(|e| e.key == "key1").expect("entity recalled");
@@ -31935,6 +32765,660 @@ mod tests {
         assert_eq!(s[0].profile_name, "p1");
         assert_eq!(s[0].workspace_hash, "ws-x");
         assert!(s[0].metadata_json.contains("h1"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    // ── #883/#867 fused multi-strategy recall ───────────────────────────
+
+    fn fused_params(query: &str) -> crate::models::RecallParams {
+        crate::models::RecallParams {
+            query: query.to_string(),
+            limit: 20,
+            mode: crate::models::SearchMode::Fused,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn fused_recall_consensus_outranks_single_strategy_and_trace_is_complete() {
+        // #883: a fact matching several strategies outranks a single-strategy
+        // match; #867: the trace records original query, per-strategy
+        // pre-fusion rankings, fusion weights, and final placement.
+        let (db, path) = temp_db();
+        let now = crate::db::now_ms();
+        // A: short body (ranks high on bm25) AND temporally near query_time —
+        // consensus of the fts5 + temporal strategies.
+        let mut a = make_entity("c-a", "insight", "c-a", r#"{"note":"zeppelin core"}"#);
+        a.created_at_unix_ms = now - 3600_000;
+        db.remember(&a).unwrap();
+        // B: matches the query but is temporally far and ranks lower on bm25.
+        let mut b = make_entity(
+            "c-b",
+            "insight",
+            "c-b",
+            r#"{"note":"zeppelin airship design notes from the archive"}"#,
+        );
+        b.created_at_unix_ms = now - 2 * 365 * 24 * 3600_000;
+        db.remember(&b).unwrap();
+
+        let mut params = fused_params("zeppelin");
+        params.strategies = vec!["fts5".into(), "temporal".into()];
+        params.query_time_unix_ms = Some(now);
+        let (entities, _completeness, trace) = db.fused_recall(&params).unwrap();
+
+        let ids: Vec<&str> = entities.iter().map(|e| e.id.as_str()).collect();
+        assert!(ids.contains(&"c-a"), "consensus entity must survive: {ids:?}");
+        assert!(ids.contains(&"c-b"), "single-strategy entity must survive: {ids:?}");
+        let ia = ids.iter().position(|i| *i == "c-a").unwrap();
+        let ib = ids.iter().position(|i| *i == "c-b").unwrap();
+        assert!(ia < ib, "multi-strategy consensus must outrank single-strategy: {ids:?}");
+
+        // Trace contract (#867): original query preserved verbatim, no
+        // expansions, per-strategy rankings, weights, placement, sources.
+        assert_eq!(trace.original_query, "zeppelin");
+        assert!(trace.expansions.is_empty());
+        assert_eq!(trace.strategies.len(), 2);
+        assert_eq!(trace.strategies[0].strategy, "fts5");
+        assert_eq!(trace.strategies[0].status, "ok");
+        assert_eq!(trace.strategies[1].strategy, "temporal");
+        assert_eq!(trace.strategies[1].status, "ok");
+        assert!(trace.fusion.rrf_k > 0.0);
+        assert_eq!(trace.fusion.weights["fts5"], 1.0);
+        assert_eq!(trace.fusion.weights["temporal"], 1.0);
+        assert_eq!(trace.placement, ids);
+        assert!(trace.sources["c-a"].contains(&"fts5".to_string()));
+        assert!(trace.sources["c-a"].contains(&"temporal".to_string()));
+        assert_eq!(trace.truncation.dropped, 0, "no budget pressure in this fixture");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn fused_recall_temporal_proximity_and_bi_temporal_currency() {
+        // #883/#867 fixtures: temporal queries and stale/current competition.
+        let (db, path) = temp_db();
+        let now = crate::db::now_ms();
+        let mut near = make_entity(
+            "t-near",
+            "insight",
+            "t-near",
+            r#"{"note":"clockspring core"}"#,
+        );
+        near.created_at_unix_ms = now - 3600_000; // 1h ago
+        db.remember(&near).unwrap();
+        let mut far = make_entity(
+            "t-far",
+            "insight",
+            "t-far",
+            r#"{"note":"clockspring assembly with many extra words to lower its bm25 score relative to the shorter body"}"#,
+        );
+        far.created_at_unix_ms = now - 2 * 365 * 24 * 3600_000; // 2y ago
+        db.remember(&far).unwrap();
+
+        let mut params = fused_params("clockspring");
+        params.strategies = vec!["fts5".into(), "temporal".into()];
+        params.query_time_unix_ms = Some(now);
+        let (entities, _c, _t) = db.fused_recall(&params).unwrap();
+        assert_eq!(entities[0].id, "t-near", "nearest to query_time must rank first");
+
+        // Stale/current competition: the store is UNIQUE on (category, key,
+        // workspace) — updating a key REPLACES its content, so the live row
+        // is always the current version. Updating the fact makes the old
+        // text un-serveable (the store-level currency semantics), and the
+        // temporal arm ranks the current version by proximity. The old and
+        // new vocabularies are disjoint so the fts5 OR-term arm cannot
+        // re-match the new body through a shared word.
+        db.remember(&make_entity(
+            "db-url",
+            "convention",
+            "db-url",
+            r#"{"note":"purple kangaroo alpha"}"#,
+        ))
+        .unwrap();
+        // Same key, new content -> in-place update.
+        db.remember(&make_entity(
+            "db-url",
+            "convention",
+            "db-url",
+            r#"{"note":"silver otter beta"}"#,
+        ))
+        .unwrap();
+
+        let mut params = fused_params("silver otter");
+        params.strategies = vec!["fts5".into(), "temporal".into()];
+        params.query_time_unix_ms = Some(now);
+        let (entities, _c, _t) = db.fused_recall(&params).unwrap();
+        let current = entities.iter().find(|e| e.key == "db-url").expect("current version serves");
+        assert!(
+            current.body_json.contains("silver otter"),
+            "the served version must be the current one: {}",
+            current.body_json
+        );
+
+        // The superseded text no longer matches anything: stale content does
+        // not serve (store-level currency), and fused recall agrees.
+        let mut params = fused_params("purple kangaroo");
+        params.strategies = vec!["fts5".into(), "temporal".into()];
+        params.query_time_unix_ms = Some(now);
+        let (entities, _c, _t) = db.fused_recall(&params).unwrap();
+        assert!(
+            !entities.iter().any(|e| e.key == "db-url"),
+            "superseded text must not serve"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn fused_recall_multi_hop_graph_surfaces_linked_entity() {
+        // #867 fixture: multi-hop queries. A neighbor two hops from the
+        // seed is discovered through the graph arm (seed -> hop1 -> hop2).
+        let (db, path) = temp_db();
+        db.remember(&make_entity(
+            "m-seed",
+            "architecture",
+            "m-seed",
+            r#"{"note":"gateway load balancer"}"#,
+        ))
+        .unwrap();
+        db.remember(&make_entity(
+            "m-hop1",
+            "architecture",
+            "m-hop1",
+            r#"{"note":"tls termination proxy"}"#,
+        ))
+        .unwrap();
+        db.remember(&make_entity(
+            "m-hop2",
+            "architecture",
+            "m-hop2",
+            r#"{"note":"certificate rotation cron"}"#,
+        ))
+        .unwrap();
+        db.link("architecture", "m-seed", "m-hop1", "depends_on").unwrap();
+        db.link("architecture", "m-hop1", "m-hop2", "depends_on").unwrap();
+
+        let mut params = fused_params("load balancer");
+        params.strategies = vec!["fts5".into(), "graph".into()];
+        let (entities, _c, trace) = db.fused_recall(&params).unwrap();
+        let ids: Vec<&str> = entities.iter().map(|e| e.id.as_str()).collect();
+        // hop2 is two hops out — v1 graph_expand is one-hop, so it must NOT
+        // surface (documented bound); hop1 (one hop) must.
+        assert!(ids.contains(&"m-hop1"), "one-hop neighbor must surface: {ids:?}");
+        assert!(
+            !ids.contains(&"m-hop2"),
+            "two-hop entity stays out of the one-hop bound: {ids:?}"
+        );
+        assert!(trace.sources["m-hop1"].contains(&"graph".to_string()));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn fused_recall_token_budget_and_depth_budget_truncate() {
+        // #883: max_tokens budget truncation + depth_budget default caps.
+        let (db, path) = temp_db();
+        // remember() merges near-duplicate bodies (trigram similarity), so
+        // use skip_dedup: this fixture tests FUSION truncation, not write
+        // dedup. Distinct bodies per entity, all carrying the query terms.
+        for i in 0..10 {
+            db.remember_skip_dedup(&make_entity(
+                &format!("bud-{i}"),
+                "insight",
+                &format!("bud-{i}"),
+                &format!(r#"{{"note":"budget topic alpha variant {i} {}"}}"#, "z".repeat(180)),
+            ))
+            .unwrap();
+        }
+        let mut params = fused_params("budget topic alpha");
+        params.strategies = vec!["fts5".into(), "graph".into()];
+        params.max_tokens = 1;
+        let (entities, _c, trace) = db.fused_recall(&params).unwrap();
+        // Every body costs >= 1 estimated token: budget 1 keeps exactly the
+        // first-ranked entity (min-1 semantics: the top entity is always
+        // delivered even when it alone exceeds the budget) and drops the
+        // rest — deterministic regardless of stored body size.
+        assert_eq!(entities.len(), 1, "budget 1 must keep exactly the top entity");
+        assert_eq!(trace.truncation.budget_tokens, 1);
+        assert!(trace.truncation.estimated_tokens_used >= 1);
+        assert_eq!(trace.truncation.retained, 1);
+        assert_eq!(trace.truncation.dropped, 9);
+
+        // An effectively unbounded budget keeps everything.
+        let mut params = fused_params("budget topic alpha");
+        params.strategies = vec!["fts5".into(), "graph".into()];
+        params.max_tokens = 100_000;
+        let (entities, _c, trace) = db.fused_recall(&params).unwrap();
+        assert_eq!(entities.len(), 10);
+        assert_eq!(trace.truncation.dropped, 0);
+
+        let mut params = fused_params("budget topic alpha");
+        params.strategies = vec!["fts5".into(), "graph".into()];
+        params.max_tokens = 0;
+        params.depth_budget = Some("low".to_string());
+        let (_e, _c, trace) = db.fused_recall(&params).unwrap();
+        assert_eq!(trace.truncation.budget_tokens, 1024, "low -> 1024");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn fused_recall_validates_input_and_preserves_exact_identifiers() {
+        // #867: exact identifiers survive (no rewriting) + fail-closed
+        // validation of strategies/weights.
+        let (db, path) = temp_db();
+        db.remember(&make_entity(
+            "exact-1",
+            "insight",
+            "exact-1",
+            r#"{"note":"the ERR7781 quota error was raised by the billing service"}"#,
+        ))
+        .unwrap();
+        db.remember(&make_entity(
+            "exact-2",
+            "insight",
+            "exact-2",
+            r#"{"note":"general quota discussion"}"#,
+        ))
+        .unwrap();
+
+        let mut params = fused_params("ERR7781");
+        params.strategies = vec!["fts5".into(), "temporal".into()];
+        let (entities, _c, trace) = db.fused_recall(&params).unwrap();
+        assert_eq!(trace.original_query, "ERR7781", "query preserved verbatim");
+        assert_eq!(entities[0].id, "exact-1", "exact identifier match ranks first");
+        assert!(trace.expansions.is_empty());
+
+        // Fail-closed validation.
+        let mut p = fused_params("x");
+        p.strategies = vec!["fts5".into()];
+        assert!(db.fused_recall(&p).is_err(), "fewer than 2 strategies rejected");
+        let mut p = fused_params("x");
+        p.strategies = vec!["fts5".into(), "wat".into()];
+        assert!(db.fused_recall(&p).is_err(), "unknown strategy rejected");
+        let mut p = fused_params("x");
+        p.strategies = vec!["fts5".into(), "graph".into()];
+        p.strategy_weights = Some(
+            [("wat".to_string(), 2.0)].into_iter().collect(),
+        );
+        assert!(db.fused_recall(&p).is_err(), "unknown weight key rejected");
+        let mut p = fused_params("x");
+        p.strategies = vec!["fts5".into(), "graph".into()];
+        p.strategy_weights = Some([("fts5".to_string(), -1.0)].into_iter().collect());
+        assert!(db.fused_recall(&p).is_err(), "negative weight rejected");
+        let mut p = fused_params("x");
+        p.strategies = vec!["fts5".into(), "graph".into()];
+        p.strategy_weights = Some([("fts5".to_string(), f64::NAN)].into_iter().collect());
+        assert!(db.fused_recall(&p).is_err(), "non-finite weight rejected");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn fused_recall_rerank_stage_applies_or_falls_back_cleanly() {
+        // #883: rerank optional, default off; when on, min-max calibrated
+        // over the pool; falls back to RRF order with a note when no
+        // score-bearing arm engaged.
+        let (db, path) = temp_db();
+        for i in 0..3 {
+            db.remember(&make_entity(
+                &format!("rr-{i}"),
+                "insight",
+                &format!("rr-{i}"),
+                &format!(r#"{{"note":"rerank topic variant {i} detail"}}"#),
+            ))
+            .unwrap();
+        }
+        let mut params = fused_params("rerank topic");
+        params.strategies = vec!["fts5".into(), "graph".into()];
+        params.rerank = true;
+        let (_e, _c, trace) = db.fused_recall(&params).unwrap();
+        assert!(trace.rerank.enabled);
+        assert!(trace.rerank.applied, "fts5 arm present -> calibration possible");
+        assert_eq!(trace.rerank.method, "rankcal-dense-bm25");
+        assert!(trace.rerank.note.contains("rank-calibrated"));
+
+        let mut params = fused_params("rerank topic");
+        params.strategies = vec!["fts5".into(), "graph".into()];
+        params.rerank = false;
+        let (_e, _c, trace) = db.fused_recall(&params).unwrap();
+        assert!(!trace.rerank.enabled);
+        assert!(!trace.rerank.applied);
+
+        // No score-bearing arm: graph + temporal only, query matches nothing.
+        let mut params = fused_params("zzz-no-match-zzz");
+        params.strategies = vec!["graph".into(), "temporal".into()];
+        params.rerank = true;
+        let (entities, _c, trace) = db.fused_recall(&params).unwrap();
+        assert!(entities.is_empty());
+        assert!(!trace.rerank.applied);
+        assert!(trace.rerank.note.contains("empty fused pool"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn telemetry_high_similarity_low_trust_cannot_dominate_verified_evidence() {
+        // #872 acceptance #2: a high-similarity low-trust record cannot
+        // dominate verified/current evidence. The low-trust entity's body
+        // is the VERBATIM query (max lexical similarity); the verified
+        // entity is a moderately-similar corroborated record. Trust-weighted
+        // ranking must put the verified record first, and concentration
+        // telemetry must show the verified record holding the top share.
+        let (db, path) = temp_db();
+        let mut verified = make_entity("vt-1", "facts", "vt-1", r#"{"note":"quark fusion reactor temperature report"}"#);
+        verified.verified = true;
+        verified.certainty = 0.95;
+        verified.source = "registry".to_string();
+        db.remember(&verified).unwrap();
+        let mut low_trust = make_entity("lt-1", "facts", "lt-1", r#"{"note":"quark fusion reactor"}"#);
+        low_trust.verified = false;
+        low_trust.certainty = 0.1;
+        low_trust.source = "agent".to_string();
+        db.remember(&low_trust).unwrap();
+
+        let params = crate::models::RecallParams {
+            query: "quark fusion reactor".to_string(),
+            limit: 10,
+            trust_weight: 1.0,
+            ..Default::default()
+        };
+        let results = db.recall(&params).unwrap();
+        assert!(!results.is_empty());
+        assert_eq!(results[0].id, "vt-1", "verified evidence outranks verbatim low-trust");
+
+        // Concentration: the delivered set's top slot is the verified record.
+        let rep = crate::retrieval_telemetry::retrieval_telemetry_report(
+            &db,
+            &crate::retrieval_telemetry::TelemetryArgs::default(),
+        )
+        .unwrap();
+        assert_eq!(rep["state"], "ok");
+        assert_eq!(rep["concentration"]["top_entity_id"], "vt-1");
+        // Fan-out flags the low-trust record as low-trust (verified=false,
+        // certainty 0.1) — it entered the query class "quark fusion".
+        let fanout = rep["fanout_low_trust"].as_array().unwrap();
+        assert!(fanout.iter().any(|f| f["entity_id"] == "lt-1"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn telemetry_repeated_serving_and_low_trust_fanout_across_query_classes() {
+        // #872 acceptance #3: repeated context is measured (repeat_rate)
+        // and low-trust candidates are tracked across query classes.
+        let (db, path) = temp_db();
+        let mut e = make_entity("rp-1", "facts", "rp-1", r#"{"note":"alpha beta gamma config"}"#);
+        e.verified = false;
+        e.certainty = 0.2;
+        db.remember(&e).unwrap();
+
+        let mut p = crate::models::RecallParams {
+            query: "alpha config".to_string(),
+            limit: 5,
+            ..Default::default()
+        };
+        db.recall(&p).unwrap();
+        db.recall(&p).unwrap(); // repeat serve of the same entity
+        p.query = "beta config".to_string();
+        db.recall(&p).unwrap();
+        p.query = "gamma config".to_string();
+        db.recall(&p).unwrap();
+
+        let rep = crate::retrieval_telemetry::retrieval_telemetry_report(
+            &db,
+            &crate::retrieval_telemetry::TelemetryArgs::default(),
+        )
+        .unwrap();
+        assert_eq!(rep["denominator"]["recalls"], 4);
+        assert_eq!(rep["denominator"]["unique_entities"], 1);
+        assert!(rep["repeated_serving"]["repeat_rate"].as_f64().unwrap() > 0.0);
+        let repeats = rep["repeated_serving"]["top_repeat"].as_array().unwrap();
+        assert_eq!(repeats[0]["entity_id"], "rp-1");
+        assert_eq!(repeats[0]["serves"], 4);
+        let fanout = rep["fanout_low_trust"].as_array().unwrap();
+        assert_eq!(fanout.len(), 1);
+        assert_eq!(fanout[0]["query_classes"].as_i64().unwrap(), 3);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn telemetry_cross_arm_contamination_superseded_and_quarantined_never_serve() {
+        // #872 acceptance #4: superseded/quarantined records cannot
+        // re-enter through ANY arm (lexical, hybrid, fused) without an
+        // explicit historical mode. Lifecycle truth controls (status) are
+        // enforced at the SQL boundary per arm; telemetry verifies the
+        // delivered set stays clean and the probe measures the block.
+        let (db, path) = temp_db();
+        db.remember(&make_entity(
+            "c1",
+            "insight",
+            "c1",
+            r#"{"note":"zeppelin core notes current"}"#,
+        ))
+        .unwrap();
+        db.remember(&make_entity(
+            "c2",
+            "insight",
+            "c2",
+            r#"{"note":"zeppelin core notes superseded variant"}"#,
+        ))
+        .unwrap();
+        db.remember(&make_entity(
+            "c3",
+            "insight",
+            "c3",
+            r#"{"note":"zeppelin core notes quarantined variant"}"#,
+        ))
+        .unwrap();
+        let conn = db.conn().unwrap();
+        conn.execute(
+            "UPDATE entities SET status = 'deprecated' WHERE category = 'insight' AND key = 'c2'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE entities SET status = 'quarantined' WHERE category = 'insight' AND key = 'c3'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        // Lexical arm.
+        let p = crate::models::RecallParams {
+            query: "zeppelin core".to_string(),
+            limit: 10,
+            ..Default::default()
+        };
+        let results = db.recall(&p).unwrap();
+        assert!(!results.is_empty());
+        assert!(
+            results.iter().all(|e| e.id != "c2" && e.id != "c3"),
+            "lexical arm never serves deprecated/quarantined"
+        );
+
+        // Hybrid arm (sparse + graph; dense is empty without embeddings).
+        // The hybrid mode requires the embedding backend, which is compiled
+        // out under --no-default-features — gate the exercise accordingly.
+        #[cfg(feature = "bundled-embeddings")]
+        {
+            let mut hp = p.clone();
+            hp.mode = crate::models::SearchMode::Hybrid;
+            let results = db.recall(&hp).unwrap();
+            assert!(
+                results.iter().all(|e| e.id != "c2" && e.id != "c3"),
+                "hybrid arm never re-enters superseded/quarantined"
+            );
+        }
+
+        // Fused arm (fts5 + graph + temporal consensus).
+        let mut fp = fused_params("zeppelin core");
+        fp.strategies = vec!["fts5".into(), "graph".into(), "temporal".into()];
+        let (results, _c, _trace) = db.fused_recall(&fp).unwrap();
+        assert!(
+            results.iter().all(|e| e.id != "c2" && e.id != "c3"),
+            "fused arm never re-enters superseded/quarantined"
+        );
+
+        // Telemetry: delivered-set validation is clean; probe measures the
+        // SQL-boundary block (>= 2 excluded-status matches across arms).
+        let rep = crate::retrieval_telemetry::retrieval_telemetry_report(
+            &db,
+            &crate::retrieval_telemetry::TelemetryArgs {
+                probe_query: Some("zeppelin core".to_string()),
+                probe_mode: Some("fused".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(rep["contamination"]["served_reentry"], 0);
+        let probe = rep["contamination"]["probe"].as_object().expect("probe present");
+        assert_eq!(probe["invariant"], false, "probe measures the blocked re-entry");
+        let arms = probe["arms"].as_array().unwrap();
+        let blocked: i64 = arms.iter().map(|a| a["blocked_reentry"].as_i64().unwrap_or(0)).sum();
+        assert!(blocked >= 2, "at least the two retired records blocked, got {blocked}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn telemetry_diversity_displacement_and_arm_audits_per_mode() {
+        // #872 acceptance #1 (per-path metrics): every mode emits arm
+        // audits; diversity controls record displacement events.
+        let (db, path) = temp_db();
+        // Distinct bodies; dz-2/dz-3 match ONLY via "core" (no "zeppelin"),
+        // so the diversity quota cutting at limit drops them with their
+        // keyword unrepresented -> sole-evidence displacement.
+        let bodies = [
+            "zeppelin config alpha",
+            "zeppelin routing beta",
+            "core hardening checklist",
+            "core provisioning notes",
+        ];
+        for (i, body) in bodies.iter().enumerate() {
+            let body = format!(r#"{{"note":"{body}"}}"#);
+            db.remember(&make_entity(&format!("dz-{i}"), "facts", &format!("dz-{i}"), &body))
+                .unwrap();
+        }
+
+        // Keyword recall with aggressive diversity halving: the SQL fetch is
+        // limit+offset wide, so offset>0 lets the quota see the core-only
+        // entities (2 slots for "zeppelin" across the first two candidates;
+        // the core-only drops are recorded as sole-evidence displacement).
+        let p = crate::models::RecallParams {
+            query: "zeppelin core".to_string(),
+            limit: 2,
+            offset: 1,
+            diversity_halving: 0.5,
+            ..Default::default()
+        };
+        db.recall(&p).unwrap();
+
+        // Hybrid recall -> sparse/dense/graph audits (embedding backend
+        // required; compiled out under --no-default-features).
+        #[cfg(feature = "bundled-embeddings")]
+        {
+            let mut hp = p.clone();
+            hp.mode = crate::models::SearchMode::Hybrid;
+            hp.diversity_halving = 1.0;
+            db.recall(&hp).unwrap();
+        }
+
+        // Fused recall -> fts5/dense/graph/temporal audits.
+        let fp = fused_params("zeppelin core");
+        db.fused_recall(&fp).unwrap();
+
+        let rep = crate::retrieval_telemetry::retrieval_telemetry_report(
+            &db,
+            &crate::retrieval_telemetry::TelemetryArgs::default(),
+        )
+        .unwrap();
+        // Displacement recorded for the quota-exhausted entity.
+        assert!(rep["displacement"]["count"].as_i64().unwrap() >= 1);
+        // Arm audits per mode (one audit row per arm).
+        let audits = rep["contamination"]["arm_audits"].as_array().unwrap();
+        let mut by_mode: std::collections::HashMap<&str, std::collections::BTreeSet<&str>> =
+            std::collections::HashMap::new();
+        for a in audits {
+            by_mode
+                .entry(a["mode"].as_str().unwrap())
+                .or_default()
+                .insert(a["arm"].as_str().unwrap());
+        }
+        assert_eq!(
+            by_mode.get("lexical").map(|s| s.len()),
+            Some(1),
+            "lexical arm audited"
+        );
+        #[cfg(feature = "bundled-embeddings")]
+        assert_eq!(
+            by_mode.get("hybrid").map(|s| s.len()),
+            Some(3),
+            "hybrid sparse+dense+graph audited: {:?}",
+            by_mode
+        );
+        #[cfg(not(feature = "bundled-embeddings"))]
+        assert!(
+            !by_mode.contains_key("hybrid"),
+            "no hybrid audits without the embedding backend: {:?}",
+            by_mode
+        );
+        assert_eq!(
+            by_mode.get("fused").map(|s| s.len()),
+            Some(4),
+            "fused fts5+dense+graph+temporal audited"
+        );
+        // Retrieval profile reflects every mode that served.
+        let modes = &rep["retrieval_profile"]["modes"];
+        assert!(modes["lexical"].as_i64().unwrap() >= 1);
+        #[cfg(feature = "bundled-embeddings")]
+        assert!(modes["hybrid"].as_i64().unwrap() >= 1);
+        assert!(modes["fused"].as_i64().unwrap() >= 1);
+        // Report carries denominator + artifact hash (acceptance #5).
+        assert!(rep["denominator"]["slots"].as_i64().unwrap() >= 3);
+        assert!(rep["artifact"]["git_hash"].as_str().unwrap().len() >= 7);
+        assert_eq!(rep["artifact"]["schema_version"], 32);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn telemetry_state_separation_empty_vs_ok_and_scope_filtering() {
+        // #872 acceptance #6: empty windows report "empty" — never a zero
+        // concentration misread; scoped reports filter by workspace.
+        let (db, path) = temp_db();
+        // No serving activity at all -> empty state, zero denominator.
+        let rep = crate::retrieval_telemetry::retrieval_telemetry_report(
+            &db,
+            &crate::retrieval_telemetry::TelemetryArgs::default(),
+        )
+        .unwrap();
+        assert_eq!(rep["state"], "empty");
+        assert_eq!(rep["zero_vs_empty"], "empty");
+        assert_eq!(rep["denominator"]["recalls"], 0);
+        assert_eq!(rep["concentration"]["herfindahl"], 0.0);
+
+        // Serve an entity in a specific workspace.
+        let mut e = make_entity("sc-1", "facts", "sc-1", r#"{"note":"scope config note"}"#);
+        e.workspace_hash = "ws-abc".to_string();
+        db.remember(&e).unwrap();
+        let p = crate::models::RecallParams {
+            query: "scope config".to_string(),
+            limit: 5,
+            workspace_hash: Some("ws-abc".to_string()),
+            ..Default::default()
+        };
+        db.recall(&p).unwrap();
+
+        // Unscoped report: ok, 1 recall.
+        let rep = crate::retrieval_telemetry::retrieval_telemetry_report(
+            &db,
+            &crate::retrieval_telemetry::TelemetryArgs::default(),
+        )
+        .unwrap();
+        assert_eq!(rep["state"], "ok");
+        assert_eq!(rep["denominator"]["recalls"], 1);
+        // Scoped to another workspace: empty again.
+        let rep = crate::retrieval_telemetry::retrieval_telemetry_report(
+            &db,
+            &crate::retrieval_telemetry::TelemetryArgs {
+                workspace_hash: Some("ws-zzz".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(rep["state"], "empty");
         let _ = std::fs::remove_file(path);
     }
 }
