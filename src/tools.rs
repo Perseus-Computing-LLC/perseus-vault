@@ -366,6 +366,31 @@ pub struct RecallArgs {
     /// responses stay byte-identical; set true to always include it.
     #[serde(default, deserialize_with = "null_as_default")]
     pub include_outcome: bool,
+    /// #883 (TEMPR-style fused recall, mode "fused"): the strategies to
+    /// engage. Recognized: "fts5", "dense", "graph", "temporal" (2-4).
+    /// Omit = all four.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub strategies: Vec<String>,
+    /// #883: token-budget truncation (estimated tokens = chars/4 per body).
+    /// 0 = derive from depth_budget. Default 4096.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub max_tokens: i64,
+    /// #883: depth budget "low" | "mid" | "high" → 1024 / 4096 / 16384
+    /// default tokens when max_tokens is unset. Omit = mid.
+    #[serde(default)]
+    pub depth_budget: Option<String>,
+    /// #883: per-strategy RRF weight multipliers (default 1.0 each).
+    #[serde(default)]
+    pub strategy_weights: Option<std::collections::HashMap<String, f64>>,
+    /// #883: optional rerank stage over the fused pool (default off —
+    /// latency-preserving). When enabled, the fused pool is re-scored with
+    /// min-max calibrated dense + BM25 signals before truncation.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub rerank: bool,
+    /// #883: anchor instant for the temporal strategy (unix ms; default
+    /// now). Accepts a number or a numeric string.
+    #[serde(default, deserialize_with = "string_or_int_opt")]
+    pub query_time_unix_ms: Option<i64>,
 }
 
 pub type BatchQuery = RecallArgs;
@@ -1384,6 +1409,7 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
         "dense" => SearchMode::Dense,
         "hybrid" => SearchMode::Hybrid,
         "fts5" => SearchMode::Fts5,
+        "fused" => SearchMode::Fused,
         "" => {
             if db.embedding_enabled() && db.embedding_coverage() > 0 {
                 SearchMode::Hybrid
@@ -1471,6 +1497,12 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
         visibility: None,
         layer: a.layer.as_deref().filter(|s| !s.is_empty()).map(canonical_layer),
         reinforce: a.reinforce,
+        strategies: a.strategies,
+        max_tokens: a.max_tokens,
+        depth_budget: a.depth_budget,
+        strategy_weights: a.strategy_weights,
+        rerank: a.rerank,
+        query_time_unix_ms: a.query_time_unix_ms,
     };
 
     // #864: bounded recall — time the query when the caller set a deadline.
@@ -1479,9 +1511,20 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
     let deadline_ms = a.deadline_ms.filter(|ms| *ms > 0);
     let started = std::time::Instant::now();
 
-    let (mut entities, recall_completeness) = db
-        .recall_with_completeness(&params)
-        .map_err(|e| format!("Recall failed: {}", e))?;
+    // #883: the fused path carries its trace out of the DB layer; the
+    // standard path returns entities + completeness only.
+    let (mut entities, recall_completeness, fused_trace) =
+        if mode_for_side_effects == SearchMode::Fused {
+        let (e, c, t) = db
+            .fused_recall(&params)
+            .map_err(|e| format!("Recall failed: {}", e))?;
+        (e, c, Some(t))
+    } else {
+        let (e, c) = db
+            .recall_with_completeness(&params)
+            .map_err(|e| format!("Recall failed: {}", e))?;
+        (e, c, None)
+    };
 
     let elapsed_ms = started.elapsed().as_millis() as i64;
     let deadline_elapsed = deadline_ms.is_some_and(|ms| elapsed_ms >= ms);
@@ -1492,10 +1535,25 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
     // empty query falls through to the FTS path inside recall. FTS is always
     // "semantically available" (it has no separate backend).
     let query_embedding_available = match mode_for_side_effects {
-        SearchMode::Dense | SearchMode::Hybrid => !params.query.trim().is_empty(),
+        SearchMode::Dense | SearchMode::Hybrid | SearchMode::Fused => {
+            !params.query.trim().is_empty()
+        }
         SearchMode::Fts5 => true,
     };
     let outcome = db.recall_outcome(&mode_for_side_effects, query_embedding_available, entities.len(), None);
+    // #883: a fused recall with a DEGRADED arm (e.g. embedding backend down
+    // for the dense strategy) is never silently fresh — report Partial with
+    // the reason so an incomplete consensus is distinguishable from a
+    // complete one.
+    let outcome = match &fused_trace {
+        Some(t) if t.strategies.iter().any(|s| s.status == "degraded") => {
+            let mut o = outcome;
+            o.status = crate::models::RecallStatus::Partial;
+            o.reason = "partial_arms".to_string();
+            o
+        }
+        _ => outcome,
+    };
     let outcome = Database::apply_recall_deadline(outcome, deadline_elapsed);
     // #856: the recall path's pool dynamics are authoritative over the
     // standalone estimate; abstention (no evidence / backend unavailable)
@@ -1659,6 +1717,17 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
             obj.insert("outcome".to_string(), outcome_value);
         }
     }
+    // #883/#867: attach the fused recall trace (strategies, fusion weights,
+    // truncation, rerank outcome, placement, consensus sources) whenever the
+    // fused path produced one.
+    if let Some(t) = fused_trace {
+        if let Some(obj) = result.as_object_mut() {
+            obj.insert(
+                "fused_trace".to_string(),
+                serde_json::to_value(t).unwrap_or(serde_json::json!({})),
+            );
+        }
+    }
     Ok(result.to_string())
 }
 
@@ -1708,6 +1777,7 @@ pub fn handle_recall_batch(db: &Database, args: Value) -> Result<String, String>
             "dense" => SearchMode::Dense,
             "hybrid" => SearchMode::Hybrid,
             "fts5" => SearchMode::Fts5,
+            "fused" => SearchMode::Fused,
             "" => {
                 if db.embedding_enabled() && db.embedding_coverage() > 0 {
                     SearchMode::Hybrid
@@ -1747,6 +1817,12 @@ pub fn handle_recall_batch(db: &Database, args: Value) -> Result<String, String>
             visibility: None,
             layer: q.layer.as_deref().filter(|s| !s.is_empty()).map(canonical_layer),
             reinforce: q.reinforce,
+            strategies: q.strategies.clone(),
+            max_tokens: q.max_tokens,
+            depth_budget: q.depth_budget.clone(),
+            strategy_weights: q.strategy_weights.clone(),
+            rerank: q.rerank,
+            query_time_unix_ms: q.query_time_unix_ms,
         };
 
         let mut entities = db
@@ -2082,6 +2158,7 @@ fn handle_recall_with_expansion(db: &Database, a: &RecallArgs) -> Result<String,
             // Fts5-only path: reinforcement is handled by the batched
             // side-effect below, not the per-variant recalls.
             reinforce: false,
+            ..Default::default()
         };
 
         if let Ok(entities) = db.recall(&params) {
