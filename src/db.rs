@@ -254,6 +254,7 @@ use crate::models::{
     ArtifactRepresentation, ArtifactRetrievalCapabilities, ArtifactStructure, ArtifactWhyServed,
     AskParams, AskResult, AskSource, AuthorityManifest, AuthorityManifestInput,
     AuthorizedAction, CompactReport, DecayReport, EmbedParams, EmbeddingBackendHealth, Entity,
+    WorkspaceBinding,
     ExternalRef, GraphEdge, GraphNode, IngestParams, JournalEvent, MemoryLink, OriginRecord,
     PruneParams, PruneReport, PurgeReport, Readiness, RecallOutcome, RecallParams, RecallStatus,
     RedactReport, EraseReport, ExpireReport,
@@ -10168,6 +10169,341 @@ impl Database {
             self.journal(&event)?;
         }
         Ok(count)
+    }
+
+    // ── #879 Hermes profile <-> Vault workspace binding ─────────────────
+
+    fn journal_workspace_binding_event(
+        &self,
+        event_type: &str,
+        profile_name: &str,
+        workspace_hash: &str,
+        detail: serde_json::Value,
+        actor: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let event = crate::models::JournalEvent {
+            id: format!("jrn-{}", uuid::Uuid::new_v4().simple()),
+            event_type: event_type.to_string(),
+            evaluated_json: serde_json::json!({
+                "profile_name": profile_name,
+                "workspace_hash": workspace_hash,
+            })
+            .to_string(),
+            acted_json: serde_json::to_string(&detail)?,
+            forward_json: "{}".to_string(),
+            category: String::new(),
+            key: String::new(),
+            entity_id: String::new(),
+            agent_id: actor.to_string(),
+            workspace_hash: workspace_hash.to_string(),
+            created_at_unix_ms: now_ms(),
+        };
+        self.journal(&event)
+    }
+
+    /// #879: bind (or re-bind) a Hermes profile to a Vault workspace.
+    /// One profile <-> one workspace; re-binding switches workspace and
+    /// resets the lifecycle state to active. Journaled
+    /// (workspace_bound / workspace_rebound).
+    pub fn workspace_bind(
+        &self,
+        profile_name: &str,
+        workspace_hash: &str,
+        access_mode: &str,
+        metadata_json: &str,
+        actor: &str,
+    ) -> Result<WorkspaceBinding, Box<dyn std::error::Error>> {
+        if profile_name.trim().is_empty() {
+            return Err("profile_name must not be empty".into());
+        }
+        if !matches!(access_mode, "read_write" | "read_only") {
+            return Err(format!(
+                "access_mode must be read_write or read_only, got '{access_mode}'"
+            )
+            .into());
+        }
+        let now = now_ms();
+        let conn = self.conn()?;
+        let existing: Option<String> = conn
+            .query_row(
+                "SELECT binding_state FROM workspace_bindings WHERE profile_name = ?1",
+                params![profile_name],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let (event_type, rebound) = if existing.is_some() {
+            conn.execute(
+                "UPDATE workspace_bindings
+                 SET workspace_hash = ?1, access_mode = ?2, binding_state = 'active',
+                     quarantine_reason = '', rebound_at_unix_ms = ?3, unbound_at_unix_ms = NULL,
+                     last_seen_unix_ms = ?3, metadata_json = ?4
+                 WHERE profile_name = ?5",
+                params![workspace_hash, access_mode, now, metadata_json, profile_name],
+            )?;
+            ("workspace_rebound", Some(now))
+        } else {
+            conn.execute(
+                "INSERT INTO workspace_bindings
+                 (profile_name, workspace_hash, access_mode, binding_state, quarantine_reason,
+                  bound_at_unix_ms, rebound_at_unix_ms, unbound_at_unix_ms, last_seen_unix_ms,
+                  metadata_json)
+                 VALUES (?1, ?2, ?3, 'active', '', ?4, NULL, NULL, ?4, ?5)",
+                params![profile_name, workspace_hash, access_mode, now, metadata_json],
+            )?;
+            ("workspace_bound", None)
+        };
+        let binding = self.workspace_binding_for(profile_name)?.ok_or_else(|| {
+            format!("workspace binding for '{profile_name}' vanished after write")
+        })?;
+        self.journal_workspace_binding_event(
+            event_type,
+            profile_name,
+            workspace_hash,
+            serde_json::json!({
+                "access_mode": access_mode,
+                "rebound_at_unix_ms": rebound,
+            }),
+            actor,
+        )?;
+        Ok(binding)
+    }
+
+    /// #879: unbind a profile (lifecycle: active/quarantined -> unbound).
+    /// The row is retained for audit; journaled (workspace_unbound).
+    pub fn workspace_unbind(
+        &self,
+        profile_name: &str,
+        reason: &str,
+        actor: &str,
+    ) -> Result<WorkspaceBinding, Box<dyn std::error::Error>> {
+        let conn = self.conn()?;
+        let changed = conn.execute(
+            "UPDATE workspace_bindings
+             SET binding_state = 'unbound', quarantine_reason = ?1, unbound_at_unix_ms = ?2
+             WHERE profile_name = ?3 AND binding_state != 'unbound'",
+            params![reason, now_ms(), profile_name],
+        )?;
+        if changed == 0 {
+            return Err(format!(
+                "no active workspace binding to unbind for profile '{profile_name}'"
+            )
+            .into());
+        }
+        let binding = self.workspace_binding_for(profile_name)?.ok_or_else(|| {
+            format!("workspace binding for '{profile_name}' vanished after unbind")
+        })?;
+        self.journal_workspace_binding_event(
+            "workspace_unbound",
+            profile_name,
+            &binding.workspace_hash,
+            serde_json::json!({ "reason": reason }),
+            actor,
+        )?;
+        Ok(binding)
+    }
+
+    /// #879: quarantine a profile's binding (operator lifecycle control —
+    /// stops mutations and cross-workspace access until reactivated).
+    /// Journaled (workspace_quarantined).
+    pub fn workspace_quarantine(
+        &self,
+        profile_name: &str,
+        reason: &str,
+        actor: &str,
+    ) -> Result<WorkspaceBinding, Box<dyn std::error::Error>> {
+        let conn = self.conn()?;
+        let changed = conn.execute(
+            "UPDATE workspace_bindings
+             SET binding_state = 'quarantined', quarantine_reason = ?1
+             WHERE profile_name = ?2 AND binding_state = 'active'",
+            params![reason, profile_name],
+        )?;
+        if changed == 0 {
+            return Err(format!(
+                "no ACTIVE workspace binding to quarantine for profile '{profile_name}'"
+            )
+            .into());
+        }
+        let binding = self.workspace_binding_for(profile_name)?.ok_or_else(|| {
+            format!("workspace binding for '{profile_name}' vanished after quarantine")
+        })?;
+        self.journal_workspace_binding_event(
+            "workspace_quarantined",
+            profile_name,
+            &binding.workspace_hash,
+            serde_json::json!({ "reason": reason }),
+            actor,
+        )?;
+        Ok(binding)
+    }
+
+    /// #879: reactivate a quarantined/unbound profile binding (access_mode is
+    /// preserved). Journaled (workspace_reactivated).
+    pub fn workspace_reactivate(
+        &self,
+        profile_name: &str,
+        actor: &str,
+    ) -> Result<WorkspaceBinding, Box<dyn std::error::Error>> {
+        let conn = self.conn()?;
+        let changed = conn.execute(
+            "UPDATE workspace_bindings
+             SET binding_state = 'active', quarantine_reason = '', unbound_at_unix_ms = NULL,
+                 last_seen_unix_ms = ?1
+             WHERE profile_name = ?2 AND binding_state != 'active'",
+            params![now_ms(), profile_name],
+        )?;
+        if changed == 0 {
+            return Err(format!(
+                "no inactive workspace binding to reactivate for profile '{profile_name}'"
+            )
+            .into());
+        }
+        let binding = self.workspace_binding_for(profile_name)?.ok_or_else(|| {
+            format!("workspace binding for '{profile_name}' vanished after reactivation")
+        })?;
+        self.journal_workspace_binding_event(
+            "workspace_reactivated",
+            profile_name,
+            &binding.workspace_hash,
+            serde_json::json!({}),
+            actor,
+        )?;
+        Ok(binding)
+    }
+
+    /// #879: client heartbeat — bumps last_seen_unix_ms for an active
+    /// binding (diagnostics distinguish live, stale, quarantined, unbound).
+    pub fn workspace_heartbeat(
+        &self,
+        profile_name: &str,
+        workspace_hash: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let conn = self.conn()?;
+        let changed = conn.execute(
+            "UPDATE workspace_bindings SET last_seen_unix_ms = ?1
+             WHERE profile_name = ?2 AND workspace_hash = ?3 AND binding_state = 'active'",
+            params![now_ms(), profile_name, workspace_hash],
+        )?;
+        if changed == 0 {
+            return Err(format!(
+                "no ACTIVE workspace binding for profile '{profile_name}' in workspace '{workspace_hash}'"
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    pub fn workspace_binding_for(
+        &self,
+        profile_name: &str,
+    ) -> Result<Option<WorkspaceBinding>, Box<dyn std::error::Error>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT profile_name, workspace_hash, access_mode, binding_state,
+                    quarantine_reason, bound_at_unix_ms, rebound_at_unix_ms,
+                    unbound_at_unix_ms, last_seen_unix_ms, metadata_json
+             FROM workspace_bindings WHERE profile_name = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![profile_name], |r| {
+            Ok(WorkspaceBinding {
+                profile_name: r.get(0)?,
+                workspace_hash: r.get(1)?,
+                access_mode: r.get(2)?,
+                binding_state: r.get(3)?,
+                quarantine_reason: r.get(4)?,
+                bound_at_unix_ms: r.get(5)?,
+                rebound_at_unix_ms: r.get(6)?,
+                unbound_at_unix_ms: r.get(7)?,
+                last_seen_unix_ms: r.get(8)?,
+                metadata_json: r.get(9)?,
+            })
+        })?;
+        let mut out = None;
+        if let Some(row) = rows.next() {
+            out = Some(row?);
+        }
+        drop(rows);
+        Ok(out)
+    }
+
+    pub fn workspace_status(
+        &self,
+    ) -> Result<Vec<WorkspaceBinding>, Box<dyn std::error::Error>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT profile_name, workspace_hash, access_mode, binding_state,
+                    quarantine_reason, bound_at_unix_ms, rebound_at_unix_ms,
+                    unbound_at_unix_ms, last_seen_unix_ms, metadata_json
+             FROM workspace_bindings ORDER BY profile_name ASC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(WorkspaceBinding {
+                profile_name: r.get(0)?,
+                workspace_hash: r.get(1)?,
+                access_mode: r.get(2)?,
+                binding_state: r.get(3)?,
+                quarantine_reason: r.get(4)?,
+                bound_at_unix_ms: r.get(5)?,
+                rebound_at_unix_ms: r.get(6)?,
+                unbound_at_unix_ms: r.get(7)?,
+                last_seen_unix_ms: r.get(8)?,
+                metadata_json: r.get(9)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// #879 tool-boundary enforcement. A bound profile may only touch its own
+    /// workspace (read or write); a read_only or non-active binding denies
+    /// mutations. Unbound profiles keep the legacy unscoped behavior —
+    /// binding is an opt-in governance surface.
+    pub fn enforce_workspace_binding(
+        &self,
+        profile: Option<&str>,
+        workspace: Option<&str>,
+        mutation: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(profile) = profile.filter(|p| !p.trim().is_empty()) else {
+            return Ok(());
+        };
+        let Some(binding) = self.workspace_binding_for(profile)? else {
+            return Ok(());
+        };
+        if binding.binding_state == "active" {
+            if let Some(ws) = workspace.filter(|w| !w.trim().is_empty()) {
+                if binding.workspace_hash != ws {
+                    return Err(format!(
+                        "profile '{profile}' is bound to workspace '{}', not '{ws}': cross-workspace access denied",
+                        binding.workspace_hash
+                    )
+                    .into());
+                }
+            }
+            if mutation && binding.access_mode == "read_only" {
+                return Err(format!(
+                    "profile '{profile}' has a read_only binding to workspace '{}': mutation denied",
+                    binding.workspace_hash
+                )
+                .into());
+            }
+        } else {
+            // quarantined / unbound: no access at all (fail-closed).
+            return Err(format!(
+                "profile '{profile}' binding is {}: access denied{}",
+                binding.binding_state,
+                if binding.quarantine_reason.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (reason: {})", binding.quarantine_reason)
+                }
+            )
+            .into());
+        }
+        Ok(())
     }
 
     pub fn artifact_resolve_visible(
@@ -31473,6 +31809,130 @@ mod tests {
         // Idempotent: a second flag does not double-journal.
         let flagged2 = db.flag_artifacts_stale_for_source("lm-src-4", ws).unwrap();
         assert_eq!(flagged2, 0);
+        let _ = std::fs::remove_file(path);
+    }
+
+    // ── #879 profile <-> workspace binding ──────────────────────────────
+
+    #[test]
+    fn workspace_binding_lifecycle_and_tool_boundary_enforcement() {
+        // #879: bind/rebind/heartbeat/quarantine/reactivate/unbind lifecycle
+        // with journal evidence, shared-workspace support, and fail-closed
+        // tool-boundary enforcement for bound profiles.
+        let (db, path) = temp_db();
+
+        // Bind two profiles: one read_write, one read_only, SAME workspace.
+        let b_a = db
+            .workspace_bind("profile-a", "ws-shared", "read_write", "{}", "operator")
+            .unwrap();
+        assert_eq!(b_a.binding_state, "active");
+        let b_b = db
+            .workspace_bind("profile-b", "ws-shared", "read_only", "{}", "operator")
+            .unwrap();
+        assert_eq!(b_b.access_mode, "read_only");
+        assert_eq!(db.workspace_status().unwrap().len(), 2);
+
+        // Enforcement: cross-workspace denied for read AND write.
+        let err = db
+            .enforce_workspace_binding(Some("profile-a"), Some("ws-other"), true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("cross-workspace"), "{err}");
+        let err = db
+            .enforce_workspace_binding(Some("profile-a"), Some("ws-other"), false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("cross-workspace"), "{err}");
+
+        // Own workspace: read_write profile may mutate; read_only may not.
+        db.enforce_workspace_binding(Some("profile-a"), Some("ws-shared"), true)
+            .unwrap();
+        let err = db
+            .enforce_workspace_binding(Some("profile-b"), Some("ws-shared"), true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("read_only"), "{err}");
+        db.enforce_workspace_binding(Some("profile-b"), Some("ws-shared"), false)
+            .unwrap();
+
+        // Unbound profile keeps legacy behavior.
+        db.enforce_workspace_binding(Some("profile-c"), Some("anything"), true)
+            .unwrap();
+        // No profile at all: legacy.
+        db.enforce_workspace_binding(None, Some("anything"), true).unwrap();
+
+        // Heartbeat: active binding only; wrong workspace refused.
+        db.workspace_heartbeat("profile-a", "ws-shared").unwrap();
+        assert!(db.workspace_heartbeat("profile-a", "ws-other").is_err());
+        assert!(db.workspace_heartbeat("profile-c", "ws-shared").is_err());
+
+        // Quarantine stops everything; reactivate restores.
+        db.workspace_quarantine("profile-a", "suspicious activity", "operator")
+            .unwrap();
+        let err = db
+            .enforce_workspace_binding(Some("profile-a"), Some("ws-shared"), false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("quarantined"), "{err}");
+        let err = db
+            .enforce_workspace_binding(Some("profile-a"), Some("ws-shared"), true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("quarantined"), "{err}");
+        db.workspace_reactivate("profile-a", "operator").unwrap();
+        db.enforce_workspace_binding(Some("profile-a"), Some("ws-shared"), true)
+            .unwrap();
+
+        // Rebind switches workspace and resets state.
+        let rebound = db
+            .workspace_bind("profile-a", "ws-other", "read_write", "{}", "operator")
+            .unwrap();
+        assert!(rebound.rebound_at_unix_ms.is_some());
+        db.enforce_workspace_binding(Some("profile-a"), Some("ws-other"), true)
+            .unwrap();
+
+        // Unbind denies everything; second unbind errors.
+        db.workspace_unbind("profile-a", "decommission", "operator").unwrap();
+        let err = db
+            .enforce_workspace_binding(Some("profile-a"), Some("ws-other"), false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unbound"), "{err}");
+        assert!(db.workspace_unbind("profile-a", "again", "operator").is_err());
+
+        // Journal evidence for every transition.
+        let conn = db.conn().unwrap();
+        for event in [
+            "workspace_bound",
+            "workspace_rebound",
+            "workspace_unbound",
+            "workspace_quarantined",
+            "workspace_reactivated",
+        ] {
+            let n: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM journal WHERE event_type = ?1",
+                    params![event],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(n >= 1, "missing journal event {event}");
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn workspace_bind_validates_input_and_reports_status() {
+        let (db, path) = temp_db();
+        assert!(db.workspace_bind("", "ws-x", "read_write", "{}", "op").is_err());
+        assert!(db.workspace_bind("p", "ws-x", "admin", "{}", "op").is_err());
+        db.workspace_bind("p1", "ws-x", "read_write", r#"{"host":"h1"}"#, "op")
+            .unwrap();
+        let s = db.workspace_status().unwrap();
+        assert_eq!(s.len(), 1);
+        assert_eq!(s[0].profile_name, "p1");
+        assert_eq!(s[0].workspace_hash, "ws-x");
+        assert!(s[0].metadata_json.contains("h1"));
         let _ = std::fs::remove_file(path);
     }
 }

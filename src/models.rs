@@ -1791,6 +1791,32 @@ pub struct ArtifactWhyServed {
     pub anchors: Vec<ExternalRef>,
 }
 
+/// #879 first-class Hermes profile <-> Vault workspace binding. One row per
+/// profile; a workspace may be shared by several profiles (intentional
+/// shared memory). `access_mode` drives read-only vs read/write enforcement
+/// at the tool boundary; `binding_state` drives lifecycle controls.
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkspaceBinding {
+    pub profile_name: String,
+    pub workspace_hash: String,
+    pub access_mode: String,
+    pub binding_state: String,
+    pub quarantine_reason: String,
+    pub bound_at_unix_ms: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rebound_at_unix_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unbound_at_unix_ms: Option<i64>,
+    pub last_seen_unix_ms: i64,
+    pub metadata_json: String,
+}
+
+impl WorkspaceBinding {
+    pub fn is_mutation_allowed(&self) -> bool {
+        self.binding_state == "active" && self.access_mode == "read_write"
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ArtifactManifestBinding {
     pub binding_id: String,

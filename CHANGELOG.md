@@ -6,6 +6,18 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
 ## [Unreleased]
 
 ### Added
+- **First-class Hermes profile ↔ Vault workspace binding (#879).** New
+  `workspace_bindings` registry (schema v30) + tools
+  `mimir_workspace_bind` / `mimir_workspace_unbind` /
+  `mimir_workspace_quarantine` / `mimir_workspace_status`. One profile ↔ one
+  workspace (a workspace may be shared by several profiles); `read_only`
+  bindings, cross-workspace targets, and quarantined/unbound states are
+  **denied at the tool boundary** (fail-closed for bound profiles; unbound
+  profiles keep legacy behavior — binding is an opt-in governance surface).
+  Every transition journaled (`workspace_bound` / `workspace_rebound` /
+  `workspace_unbound` / `workspace_quarantined` / `workspace_reactivated`).
+  Client heartbeats drive a stale/live diagnostic signal. Spec:
+  `docs/specs/hermes-profile-workspace-binding.md`.
 - **Governed distillation (#876).** New `learned_memory` capability + tool
   `mimir_learned_artifact_register`: learned artifacts (trained weights /
   distilled cartridges) are registered fail-closed against a **completed**
