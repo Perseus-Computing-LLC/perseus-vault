@@ -1,7 +1,8 @@
 # Perseus Vault — Hermes Native Memory Provider Plugin
 
 > **This is a native Hermes MemoryProvider plugin**, not an MCP tool integration.
-> It implements the `MemoryProvider` ABC from Hermes core, enabling **automatic lifecycle hooks** (SessionStart, on_insight, SessionStop) that the agent calls without manual tool invocation.
+> It implements the `MemoryProvider` ABC from Hermes core, so the agent calls it
+> automatically via lifecycle hooks — no manual tool invocation required.
 
 ## Repository Structure
 
@@ -19,10 +20,10 @@ perseus-vault/
 | Aspect | Old (MCP Tools) | New (Native Plugin) |
 |--------|-----------------|---------------------|
 | **Integration type** | Manual MCP tool calls | Native `MemoryProvider` plugin |
-| **Lifecycle** | Agent must remember to call tools | **Automatic** via `on_turn_start`, `on_memory_write`, `on_session_end` |
-| **Memory injection** | Manual `perseus_vault_context` | Injected into system prompt each turn |
-| **Capture** | Manual `perseus_vault_remember` | Auto-captures on insight + session consolidation |
-| **Setup** | `hermes mcp add perseus-vault` | `hermes memory setup perseus-vault` |
+| **Memory injection** | Manual `perseus_vault_context` | Automatic — `prefetch()` recall block injected before each turn |
+| **Capture** | Manual `perseus_vault_remember` | Scoped session-end capture + built-in memory mirroring |
+| **Tool surface** | All 81 MCP tools (incl. admin) | Curated 9-tool allowlist (read + scoped writes only) |
+| **Setup** | `hermes mcp add perseus-vault` | One installer: plugin + `.env` token + `memory.provider` |
 
 ## Architecture
 
@@ -31,93 +32,127 @@ perseus-vault/
 │                        HERMES AGENT                         │
 ├─────────────────────────────────────────────────────────────┤
 │  MemoryManager                                              │
-│    ├── on_turn_start  ──▶ SessionStart hook                │
-│    ├── on_memory_write ──▶ on_insight hook                 │
-│    └── on_session_end  ──▶ SessionStop hook                │
-└───────────────────────────┬─────────────────────────────────┘
-                            │
-                            ▼
-┌─────────────────────────────────────────────────────────────┐
-│              PERSEUS VAULT MEMORY PROVIDER                  │
-│  (~/.hermes/plugins/perseus-vault/)                         │
-├─────────────────────────────────────────────────────────────┤
-│  plugin.yaml    # Plugin manifest                          │
-│  __init__.py    # register(ctx) → MemoryProvider           │
-│  provider.py    # PerseusVaultProvider (implements hooks)  │
-│  cli.py         # hermes perseus-vault <cmd>               │
+│    ├── prefetch(query) ──▶ return value INJECTED per turn   │
+│    ├── queue_prefetch  ──▶ background warm for next turn    │
+│    ├── on_turn_start   ──▶ turn-1 warm (results discarded)  │
+│    ├── sync_turn       ──▶ non-blocking local buffer        │
+│    ├── on_memory_write ──▶ mirrors built-in memory writes   │
+│    └── on_session_end  ──▶ SCOPED capture (primary ctx)     │
 └───────────────────────────┬─────────────────────────────────┘
                             │ HTTP/JSON-RPC (MCP protocol)
-                            ▼
 ┌─────────────────────────────────────────────────────────────┐
 │              PERSEUS VAULT MCP SERVER                       │
-│  (Your server: ip-server:port)                              │
-├─────────────────────────────────────────────────────────────┤
-│  • 81 MCP tools (recall, remember, semantic_search, etc.)  │
+│  (Your server: host:port)                                   │
+│  • 81 MCP tools — provider exposes a curated 9-tool subset  │
 │  • SQLite + FTS5 + vector embeddings                        │
-│  • Bi-temporal queries, decay, consolidation                │
+│  • Bi-temporal queries, decay, consolidation (nightly cron) │
 └─────────────────────────────────────────────────────────────┘
 ```
 
-## Lifecycle Hooks (per `docs/lifecycle-hooks.md`)
+## Lifecycle Hooks
 
-### 1. SessionStart — `on_turn_start(turn=1, message)`
-**Runs before first substantive action.** Seeds session with relevant memories.
+### 1. Per-turn memory injection — `prefetch(query) -> str`
+**The return value of `prefetch()` is what Hermes injects into the agent
+context** (via `MemoryManager.prefetch_all`, which runs it inside a timed
+thread with an ~8s budget). The provider returns a deduplicated markdown
+block built from:
 
 ```python
-# Hook calls THREE MCP tools:
-1. perseus_vault_context(query=message, mode="on_demand", limit=10)
-2. perseus_vault_recall(query=message, limit=10)          # keyword search
-3. perseus_vault_recall_when(context=message, limit=5)    # trigger matching (turns 2+)
+1. perseus_vault_recall_when(context=query, limit=4)   # trigger matching
+2. perseus_vault_recall(query=query, limit=6, preview_cap=400)  # keyword
 ```
 
-### 2. on_insight — `on_memory_write(action, target, content, metadata)`
-**Runs mid-session** when agent learns something durable. Dispatches to appropriate tool:
+`queue_prefetch()` warms the block in the background after each turn;
+`on_turn_start(turn=1)` pre-warms for the first turn. On a cold start,
+`prefetch()` falls back to a bounded synchronous recall (3s per call, so
+both calls fit inside the host's prefetch budget). A recall hiccup never
+breaks the turn — failures degrade to an empty string.
 
-| Action/Type | MCP Tool | Purpose |
-|-------------|----------|---------|
-| `remember`/`fact`/`decision`/`lesson` | `perseus_vault_remember` | Durable facts with `recall_when` |
-| `event`/`journal` | `perseus_vault_journal` | Significant events |
-| `capture`/`raw` | `perseus_vault_capture` | Distill raw payload |
+> Note: `on_turn_start`'s return value is discarded by Hermes; only
+> `prefetch()`'s return string is injected. That is why the injection
+> logic lives in `prefetch()`.
+
+### 2. Insight mirroring — `on_memory_write(action, target, content)`
+Mirrors built-in memory writes (MEMORY.md/USER.md) to the Vault under
+`hermes-memory` entities, so a hybrid setup never loses a write.
 
 ### 3. SessionStop — `on_session_end(messages)`
-**Runs before finishing.** Consolidates session memories into durable observations.
+Runs a **scoped capture** — the session transcript (≤ 8k chars, last 40
+turns buffered) is distilled via `perseus_vault_capture(max_entities=5)`.
+This runs only for `primary` agent contexts (cron/subagent sessions are
+skipped to avoid polluting shared memory). It does **not** run a global
+`consolidate` — that is the server's nightly `maintain` cron job, and
+running it on every session end would be wasteful and race the cron.
 
-```python
-# Two-step consolidation:
-1. perseus_vault_consolidate(dry_run=True)     # preview
-2. perseus_vault_consolidate(dry_run=False, archive_sources=True)  # merge
-```
-*Separate from cron's nightly `perseus-vault maintain` (decay + compact + vacuum).*
+### Tool surface
+
+The provider exposes a **curated 9-tool allowlist** — read tools plus
+scoped writes — and rejects everything else, so the agent never sees
+admin/destructive tools (`purge`, `consolidate`, `state_*`, `authority_*`,
+`action_*`, …):
+
+`perseus_vault_recall`, `perseus_vault_recall_when`,
+`perseus_vault_context`, `perseus_vault_semantic_search`,
+`perseus_vault_stats`, `perseus_vault_remember`, `perseus_vault_forget`,
+`perseus_vault_journal`, `perseus_vault_capture`
+
+Tool schemas are **static** (fetched at install time and embedded) because
+Hermes snapshots provider tool schemas *before* `initialize()` runs —
+dynamically discovered schemas would be missing on turn 1.
 
 ## Quick Install
 
 ### One-liner (non-interactive)
+
 ```bash
-MCP_HOST_PORT=ip-server:port MCP_PERSEUS_VAULT_API_KEY=mcp_perseus-vault_token \
-  curl -fsSL https://raw.githubusercontent.com/sowerkoku/perseus-vault/main/integrations/hermes/install-perseus-vault.py | python3
+PERSEUS_VAULT_MCP_TOKEN=your-token-here \
+PERSEUS_VAULT_URL=http://ip-server:port/message \
+  curl -fsSL https://raw.githubusercontent.com/Perseus-Computing-LLC/perseus-vault/main/integrations/hermes/install-perseus-vault.py | python3
 ```
 
-### Interactive
-```bash
-curl -fsSL https://raw.githubusercontent.com/sowerkoku/perseus-vault/main/integrations/hermes/install-perseus-vault.py > install-perseus-vault.py
+The token is **required** in non-interactive mode — the installer refuses
+to run with a placeholder. It persists the token to `$HERMES_HOME/.env`
+(backed up first) and sets `memory.provider: perseus-vault`.
 
+### Interactive
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Perseus-Computing-LLC/perseus-vault/main/integrations/hermes/install-perseus-vault.py > install-perseus-vault.py
 python3 install-perseus-vault.py
-# Prompts: local/remote → IP:port → token
+# Prompts: local/remote → IP:port → token (required)
 ```
 
 ### Environment Variables (for automation)
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `MCP_HOST_PORT` | Perseus Vault server `host:port` | `localhost:8767` |
-| `MCP_PERSEUS_VAULT_API_KEY` | MCP Bearer token | *(required)* |
+
+| Variable | Purpose | Default |
+|----------|---------|---------|
+| `PERSEUS_VAULT_MCP_TOKEN` | MCP bearer token (required, non-interactive) | *(required)* |
+| `PERSEUS_VAULT_URL` | Vault MCP endpoint | `http://localhost:8767/message` |
+| `PERSEUS_VAULT_WORKSPACE` | Workspace scope hash (blank = global) | *(blank)* |
+| `MCP_PERSEUS_VAULT_API_KEY` | Legacy alias for the token | — |
+| `MCP_HOST_PORT` | Legacy alias: `host:port` → `http://host:port/message` | — |
 | `HERMES_HOME` | Hermes config directory | `~/.hermes` |
+
+The provider resolves config in this order: **env vars → config.yaml
+`memory.perseus-vault:` → `$HERMES_HOME/perseus-vault.json` → defaults**.
+
+## What the installer does
+
+1. Writes the plugin to `$HERMES_HOME/plugins/perseus-vault/`
+   (`plugin.yaml`, `__init__.py`, `provider.py`, `cli.py`)
+2. `hermes plugins enable perseus-vault`
+3. Writes `PERSEUS_VAULT_MCP_TOKEN=…` to `$HERMES_HOME/.env` (mode 600,
+   existing `.env` backed up; skipped if already set)
+4. Writes non-secret config to `$HERMES_HOME/perseus-vault.json` (mode 600)
+5. `hermes config set memory.provider perseus-vault`
+6. Verifies with `hermes memory status`
 
 ## Post-Install Verification
 
 ```bash
 # Memory provider status
 hermes memory status
-# → Provider: perseus-vault | Status: available ✓
+# → … perseus-vault (API key / local) ← active
 
 # Plugin connection
 hermes perseus-vault status
@@ -127,54 +162,27 @@ hermes perseus-vault status
 hermes perseus-vault tools
 ```
 
-## ⚠️ Important: Disable Built-in Memory
+Restart Hermes (or the gateway) after installing so the new `.env` token
+is picked up.
 
-The installer enables the Perseus Vault provider, but Hermes also has a built-in memory system (MEMORY.md/USER.md) that runs in parallel. To avoid **duplicate memory injection** and conflicts, **disable the built-in memory** after installation:
+## Built-in Memory (optional)
 
-```bash
-# Edit ~/.hermes/config.yaml
-# Find the memory: section and set both to false:
+The Vault provider works in **hybrid mode**: built-in memory
+(MEMORY.md/USER.md) stays active and every built-in write is mirrored to
+the Vault via `on_memory_write`. For a vault-only setup, disable the
+built-in stores in `$HERMES_HOME/config.yaml`:
+
+```yaml
 memory:
   memory_enabled: false
   user_profile_enabled: false
-```
-
-Then verify:
-```bash
-hermes memory status
-# Should show:
-#   Memory injection:   disabled ✗
-#   User profile:       disabled ✗
-#   Memory tool:        enabled ✓
-#   Provider:  perseus-vault | Status: available ✓
-```
-
-## Usage in Session
-
-The provider is **automatic** — no manual tool calls needed:
-
-```
-User: "What did we decide about the cache layer?"
-→ Agent automatically has relevant context injected via SessionStart hook
-→ Agent answers from seeded memory (no manual recall needed)
-```
-
-When the agent learns something:
-```
-User: "Remember: we chose SQLite WAL mode for the cache layer"
-→ Agent calls on_memory_write → perseus_vault_remember with recall_when
-```
-
-At session end:
-```
-→ on_session_end runs perseus_vault_consolidate (dry_run + archive)
 ```
 
 ## CLI Commands (optional, for debugging)
 
 ```bash
 hermes perseus-vault status          # Connection health
-hermes perseus-vault tools           # List 81 MCP tools
+hermes perseus-vault tools           # List MCP tools
 hermes perseus-vault recall "query"  # FTS5 keyword search
 hermes perseus-vault semantic "query" # Vector search
 hermes perseus-vault remember        # Manual store
@@ -184,7 +192,8 @@ hermes perseus-vault config          # Show config (non-secret)
 
 ## Cron (Server-side Hygiene)
 
-The **server** runs nightly maintenance (separate from agent's SessionStop):
+The **server** runs nightly maintenance (separate from the agent's
+session-end capture):
 
 ```bash
 # Nightly: cohere → decay → compact → consolidate → dedup/orphans/reindex
@@ -196,7 +205,8 @@ The **server** runs nightly maintenance (separate from agent's SessionStop):
 
 ## Requirements
 
-- **Hermes Agent** ≥ 0.20.0 (native plugin support)
+- **Hermes Agent** ≥ 0.20.0 (native plugin support; `prefetch` injection,
+  `on_turn_start`, `on_delegation`, `backup_paths` hooks)
 - **Perseus Vault MCP Server** ≥ 2.22.0 running at `host:port`
 - **Python** 3.10+ (for installer)
 
@@ -204,16 +214,15 @@ The **server** runs nightly maintenance (separate from agent's SessionStop):
 
 | File | Purpose |
 |------|---------|
-| `plugin.yaml` | Plugin manifest (name, version, config schema, entry_point) |
-| `__init__.py` | `register(ctx)` → returns `create_provider()` |
-| `provider.py` | `PerseusVaultProvider` implementing `MemoryProvider` ABC + 3 lifecycle hooks |
+| `plugin.yaml` | Plugin manifest (name, version, description, cli_commands) |
+| `__init__.py` | `register(ctx)` → registers `create_provider()` |
+| `provider.py` | `PerseusVaultProvider` implementing the `MemoryProvider` ABC |
 | `cli.py` | `hermes perseus-vault <cmd>` subcommands |
 
 ## References
 
 - **Hermes MemoryProvider Plugin Spec**: https://hermes-agent.nousresearch.com/docs/developer-guide/memory-provider-plugin
-- **Perseus Vault Lifecycle Hooks**: https://github.com/sowerkoku/perseus-vault/blob/main/docs/lifecycle-hooks.md
-- **Perseus Vault MCP Tools**: https://github.com/sowerkoku/perseus-vault/blob/main/docs/tools-reference.md
+- **Perseus Vault Lifecycle Hooks**: https://github.com/Perseus-Computing-LLC/perseus-vault/blob/main/docs/lifecycle-hooks.md
 
 ## License
 
