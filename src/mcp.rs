@@ -969,6 +969,10 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
           "type": "integer",
           "description": "Fused mode only: anchor instant for the temporal strategy (unix ms; default now). Accepts a number or numeric string."
         },
+        "graph_utility_threshold": {
+          "type": "number",
+          "description": "Fused mode only (#869): graph utility gate threshold in [0,1]. The graph strategy engages only when the query's classified graph utility is >= this value. Omit = 0.5 (documented default). 0.0 disables the gate; 1.0 effectively never engages. The routing decision is always observable in fused_trace.graph_route (reason, selected, skipped_reason, gate counts)."
+        },
         "include_archived": {
           "type": "boolean",
           "default": false,
@@ -3925,6 +3929,91 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Traverse Entity Graph"
   },
   {
+    "name": "perseus_vault_graph_drift",
+    "description": "Read-only graph/entities/indexes/receipts drift report (#869): counts unattested edges (no evidence anchor — NOT serveable by the graph recall arms), dangling links, links to archived/expired targets, cross-workspace links, stale community memberships, FTS drift, and journal receipts referencing missing entities. `consistent` is true when all structural graph checks are clear. Run this after upgrades or bulk imports to see whether the link graph is in a serveable, synchronized state.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "workspace_hash": {
+          "type": "string",
+          "description": "Optional workspace scope. Omit (or \"\") for all workspaces."
+        }
+      }
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "checked_at_unix_ms": {
+          "type": "integer"
+        },
+        "workspace": {
+          "type": "string"
+        },
+        "entities": {
+          "type": "object"
+        },
+        "links": {
+          "type": "object"
+        },
+        "drift": {
+          "type": "object"
+        },
+        "consistent": {
+          "type": "boolean"
+        }
+      }
+    },
+    "annotations": {
+      "readOnlyHint": true
+    },
+    "title": "Graph Drift Report"
+  },
+  {
+    "name": "perseus_vault_graph_attest",
+    "description": "Stamp the from-side entity id as the evidence anchor on legacy edges that lack one (pre-#869 rows, hand-edited data), making them serveable by the graph recall arms. Workspace-scoped; use dry_run to preview. Applied runs journal one `graph_attest` event. After attestation, perseus_vault_graph_drift reports unattested = 0 for the covered scope.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "workspace_hash": {
+          "type": "string",
+          "description": "Optional workspace scope. Omit (or \"\") for all workspaces."
+        },
+        "dry_run": {
+          "type": "boolean",
+          "default": false,
+          "description": "Preview the stamping without writing."
+        }
+      }
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "dry_run": {
+          "type": "boolean"
+        },
+        "workspace": {
+          "type": "string"
+        },
+        "entities_affected": {
+          "type": "integer"
+        },
+        "links_to_stamp": {
+          "type": "integer"
+        },
+        "links_stamped": {
+          "type": "integer"
+        },
+        "journal_event": {
+          "type": "string"
+        }
+      }
+    },
+    "annotations": {
+      "destructiveHint": true
+    },
+    "title": "Attest Legacy Graph Edges"
+  },
+  {
     "name": "perseus_vault_score",
     "description": "Assign a quality score (0.0–1.0) to an entity. The score persists as an importance floor: decay_tick/cohere never recompute decay_score below it, so an explicitly scored memory survives idle time indefinitely (fidelity beats recency). Scores >= 0.7 also mark the entity verified. Re-score with 0.0 to clear the floor. Use this to mark entities as accurate, verified, or deprecated.",
     "inputSchema": {
@@ -5855,6 +5944,8 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
         "perseus_vault_capture" => tools::handle_capture(db, args).map_err(|e| e.to_string()),
 
         "perseus_vault_traverse" => Ok(tools::handle_traverse(db, args)),
+        "perseus_vault_graph_drift" => tools::handle_graph_drift(db, args),
+        "perseus_vault_graph_attest" => tools::handle_graph_attest(db, args),
         "perseus_vault_score" => Ok(tools::handle_score(db, args)),
         "perseus_vault_follow" => tools::handle_follow(db, args).map_err(|e| e.to_string()),
         "perseus_vault_keystone_set" => tools::handle_keystone_set(db, args),
@@ -5997,7 +6088,7 @@ mod tests {
         );
         assert_eq!(
             registry_names.len(),
-            103,
+            105,
             "update public metadata when adding a tool"
         );
 

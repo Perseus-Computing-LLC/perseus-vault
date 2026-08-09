@@ -19,7 +19,7 @@
 
 Give your agents memory that survives the session, so they stop re-deriving what they
 already learned and stop repeating past mistakes. Hybrid recall (BM25 + dense + RRF),
-bi-temporal history, and **AES-256-GCM** at rest, exposed as **103 canonical MCP tools**
+bi-temporal history, and **AES-256-GCM** at rest, exposed as **105 canonical MCP tools**
 that work with any host. Legacy `mimir_*`/`mneme_*` aliases were removed in the 2026-27
 major release and are
 not counted separately. **73.8% on LongMemEval's official harness** (vs Zep 63.8%, Mem0
@@ -229,7 +229,7 @@ the reference. [Methodology & dataset →](benchmark/temporal/README.md)
 |---|---|---|---|---|
 | **Deployment** | Single binary | Cloud + self-host | Docker/Postgres | Docker/Neo4j |
 | **Dependencies** | None (SQLite embedded) | Python + vector DB | Postgres + Python | Neo4j + Go (Graphiti) |
-| **MCP-Native** | ✅ 103 canonical tools | ❌ Not MCP-native | ❌ Not MCP-native | ❌ Not MCP-native |
+| **MCP-Native** | ✅ 105 canonical tools | ❌ Not MCP-native | ❌ Not MCP-native | ❌ Not MCP-native |
 | **Offline/Local** | ✅ Fully local | Cloud-dependent | Docker needed | Docker needed |
 | **Encryption** | AES-256-GCM ✅ | ❌ | ❌ | ❌ |
 | **Hybrid Search** | BM25 + Dense + RRF | Vector only | Vector only | Vector + Graph |
@@ -396,6 +396,8 @@ Any MCP-compatible framework works with Perseus Vault directly. See
 | `perseus_vault_communities` | GraphRAG community detection over the link graph (deterministic label propagation or greedy-modularity "louvain"; pure Rust, offline). |
 | `perseus_vault_community_summary` | Extractive (optionally LLM-polished) summary of one community, materialized as an entity with `evidence_for` links to members. |
 | `perseus_vault_global_recall` | GraphRAG global search: breadth over community summaries, then depth into the best communities' members — holistic answers across clusters. |
+| `perseus_vault_graph_drift` | Read-only graph/entities/indexes/receipts drift report (#869): unattested, dangling, archived/expired-target, and cross-workspace edges, stale community memberships, FTS drift, journal refs to missing entities. |
+| `perseus_vault_graph_attest` | Stamp the from-side entity id as the evidence anchor on legacy edges so they become serveable by the graph recall arms (#869); dry-run preview, journaled. |
 
 ### Journal
 | Tool | Description |

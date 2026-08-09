@@ -844,6 +844,7 @@ impl Database {
         };
         let raw_id = uuid::Uuid::new_v4().to_string().replace('-', "");
         let now = now_ms();
+        let summary_id = format!("mem-{}", &raw_id[..12.min(raw_id.len())]);
         let mut links: Vec<MemoryLink> = member_ids
             .iter()
             .take(MAX_EVIDENCE_LINKS)
@@ -851,6 +852,8 @@ impl Database {
                 target_id: mid.clone(),
                 relationship: "evidence_for".to_string(),
                 weight: 0.5,
+                // #869: the community summary asserts its member edges.
+                source: Some(summary_id.clone()),
             })
             .collect();
         if let Some(old_summary_id) = prior_summary_id {
@@ -858,10 +861,11 @@ impl Database {
                 target_id: old_summary_id,
                 relationship: "rehydrates".to_string(),
                 weight: 1.0,
+                source: Some(summary_id.clone()),
             });
         }
         let entity = Entity {
-            id: format!("mem-{}", &raw_id[..12.min(raw_id.len())]),
+            id: summary_id,
             category: "community_summary".to_string(),
             key: id.clone(),
             body_json: json!({
@@ -1197,6 +1201,7 @@ mod tests {
                     target_id: t.to_string(),
                     relationship: "related".to_string(),
                     weight: 0.5,
+                    source: None,
                 })
                 .collect()
         };

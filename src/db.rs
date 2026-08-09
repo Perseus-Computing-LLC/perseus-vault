@@ -5129,7 +5129,10 @@ impl Database {
         }
         let conn = self.conn()?;
         let tags_json = serde_json::to_string(&entity.tags)?;
-        let links_json = serde_json::to_string(&entity.links)?;
+        // #869: every durable write stamps the evidence anchor (the writing
+        // entity) on links that lack one, so edges created by the current
+        // software are attested and serveable by the graph arms.
+        let links_json = serde_json::to_string(&Self::stamp_link_sources(&entity.id, &entity.links))?;
         let archived_int = if entity.archived { 1 } else { 0 };
         let verified_int = if entity.verified { 1 } else { 0 };
 
@@ -5375,7 +5378,13 @@ impl Database {
                     serde_json::from_str(&stored).unwrap_or_default();
                 for l in &entity.links {
                     if !merged.iter().any(|m| m.target_id == l.target_id) {
-                        merged.push(l.clone());
+                        // #869: caller-supplied edges are attested with the
+                        // re-asserting entity as the default anchor.
+                        let mut l = l.clone();
+                        if l.source.is_none() {
+                            l.source = Some(id.clone());
+                        }
+                        merged.push(l);
                     }
                 }
                 serde_json::to_string(&merged)?
@@ -6022,7 +6031,10 @@ impl Database {
                         graph_seeds.push(e.clone());
                     }
                 }
-                let graph_scored = self.filter_suppressed_scored(self.graph_expand(&graph_seeds, candidate_k)?)?;
+                let (graph_scored, _graph_stats) = self
+                    .graph_expand(&graph_seeds, candidate_k)?;
+                let graph_scored =
+                    self.filter_suppressed_scored(graph_scored)?;
                 last_arms = Some((sparse_scored.len(), dense_scored.len(), graph_scored.len()));
                 timer.stage("graph");
                 let graph_weight = crate::db::graph_arm_weight(graph_scored.len());
@@ -6498,30 +6510,75 @@ impl Database {
         let dense_returned = dense_scored.len();
 
         // ── wave 2: graph arm (seeds = top of fts5 ∪ dense) ─────────────
+        // #869 utility gate: the arm engages only when the query classifies
+        // as graph-shaped (multi_hop/global/entity_centric/relational above
+        // the threshold). Low-utility queries fall back to the other arms
+        // WITHOUT failure — the skip is recorded in the strategies list and
+        // the routing reason in `trace.graph_route`.
         let mut graph_scored: Vec<(Entity, f64)> = Vec::new();
         let mut graph_ms = 0.0;
-        if wants("graph") {
-            let t0 = std::time::Instant::now();
-            let seed_n = limit.clamp(1, 20);
-            let mut seeds: Vec<Entity> = fts5_scored
-                .iter()
-                .take(seed_n)
-                .map(|(e, _)| e.clone())
-                .collect();
-            for (e, _) in dense_scored.iter().take(seed_n) {
-                if !seeds.iter().any(|s| s.id == e.id) {
-                    seeds.push(e.clone());
+        let mut graph_route = crate::models::GraphRouteTrace::default();
+        let graph_strategy_requested = wants("graph");
+        if graph_strategy_requested {
+            let route = crate::graph_route::classify_graph_utility(&params.query);
+            let threshold = params
+                .graph_utility_threshold
+                .map(|t| t.clamp(0.0, 1.0))
+                .unwrap_or(crate::graph_route::DEFAULT_GRAPH_UTILITY_THRESHOLD);
+            let selected = route.selected(threshold);
+            graph_route.utility = route.utility;
+            graph_route.reason = route.reason.as_str().to_string();
+            graph_route.selected = selected;
+            graph_route.skipped_reason = if selected {
+                String::new()
+            } else if route.reason == crate::graph_route::GraphRouteReason::NoSignal {
+                "no_signal".to_string()
+            } else {
+                "low_utility".to_string()
+            };
+            if selected {
+                let t0 = std::time::Instant::now();
+                let seed_n = limit.clamp(1, 20);
+                let mut seeds: Vec<Entity> = fts5_scored
+                    .iter()
+                    .take(seed_n)
+                    .map(|(e, _)| e.clone())
+                    .collect();
+                for (e, _) in dense_scored.iter().take(seed_n) {
+                    if !seeds.iter().any(|s| s.id == e.id) {
+                        seeds.push(e.clone());
+                    }
                 }
+                let (raw, stats) = self
+                    .graph_expand(&seeds, candidate_k)
+                    .map_err(|e| e.to_string())?;
+                graph_route.unattested_edges_skipped = stats.unattested_edges;
+                graph_route.out_of_scope_edges_skipped = stats.out_of_scope_edges;
+                graph_route.expired_targets_skipped = stats.expired_targets;
+                graph_route.dangling_targets_skipped = stats.dangling_targets;
+                graph_scored =
+                    self.filter_suppressed_scored(raw).map_err(|e| e.to_string())?;
+                graph_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                let mut st = arm_status("graph", &graph_scored, false);
+                st.latency_ms = graph_ms;
+                trace.strategies.push(st);
+            } else {
+                // Skipped by the gate: still observable in the strategies
+                // list (status "skipped"), never a failure.
+                trace.strategies.push(crate::models::FusedStrategyTrace {
+                    strategy: "graph".to_string(),
+                    candidates: 0,
+                    top: Vec::new(),
+                    status: "skipped".to_string(),
+                    latency_ms: 0.0,
+                });
             }
-            graph_scored = self
-                .graph_expand(&seeds, candidate_k)
-                .and_then(|v| self.filter_suppressed_scored(v))
-                .map_err(|e| e.to_string())?;
-            graph_ms = t0.elapsed().as_secs_f64() * 1000.0;
-            let mut st = arm_status("graph", &graph_scored, false);
-            st.latency_ms = graph_ms;
-            trace.strategies.push(st);
         }
+        trace.graph_route = if graph_strategy_requested {
+            Some(graph_route)
+        } else {
+            None
+        };
 
         // ── wave 2: temporal arm (proximity to query_time) ──────────────
         let mut temporal_scored: Vec<(Entity, f64)> = Vec::new();
@@ -8041,6 +8098,25 @@ impl Database {
     }
 
     /// Create a link from one entity to another.
+    /// #869: stamp the evidence anchor on links that lack one. The asserting
+    /// record (the from-side entity id) is the default anchor; a caller-
+    /// supplied richer anchor (source event / external ref) is preserved.
+    fn stamp_link_sources(
+        id: &str,
+        links: &[MemoryLink],
+    ) -> Vec<MemoryLink> {
+        links
+            .iter()
+            .map(|l| {
+                let mut l = l.clone();
+                if l.source.is_none() {
+                    l.source = Some(id.to_string());
+                }
+                l
+            })
+            .collect()
+    }
+
     pub fn link(
         &self,
         from_category: &str,
@@ -8083,6 +8159,10 @@ impl Database {
                 target_id: to_id.to_string(),
                 relationship: relationship.to_string(),
                 weight: 0.5,
+                // #869: the linking entity is the evidence anchor — the edge
+                // exists because this record asserts it. Attested edges are
+                // serveable by the graph arms; unattested ones are not.
+                source: Some(from_id.clone()),
             });
         }
         let new_links = serde_json::to_string(&links)?;
@@ -9975,9 +10055,19 @@ impl Database {
         let root_links: Vec<MemoryLink> = serde_json::from_str(&root_links_json).unwrap_or_default();
 
         // Get root links from the already-authorized root entity.
+        // #869: edges are annotated with their evidence state (attested /
+        // source anchor) so consumers of the walk can see which edges are
+        // serveable by the recall arms — additive, no behavior change.
         let root_links_json: Vec<serde_json::Value> = root_links
             .iter()
-            .map(|l| serde_json::json!({"target_id": l.target_id, "relationship": l.relationship}))
+            .map(|l| {
+                serde_json::json!({
+                    "target_id": l.target_id,
+                    "relationship": l.relationship,
+                    "attested": l.source.is_some(),
+                    "source": l.source,
+                })
+            })
             .collect();
 
         let mut visited = std::collections::HashSet::new();
@@ -10090,7 +10180,12 @@ impl Database {
                     let child_links: Vec<MemoryLink> =
                         serde_json::from_str(&child_links_json).unwrap_or_default();
                     let child_links_json: Vec<serde_json::Value> = child_links.iter().map(|l| {
-                    serde_json::json!({"target_id": l.target_id, "relationship": l.relationship})
+                    serde_json::json!({
+                        "target_id": l.target_id,
+                        "relationship": l.relationship,
+                        "attested": l.source.is_some(),
+                        "source": l.source,
+                    })
                 }).collect();
 
                     let node = serde_json::json!({
@@ -10099,6 +10194,10 @@ impl Database {
                         "key": entity.key,
                         "body_json": entity.body_json,
                         "relationship": link.relationship,
+                        // #869: evidence state of the edge this node was
+                        // reached through (additive annotation).
+                        "edge_attested": link.source.is_some(),
+                        "edge_source": link.source,
                         "depth": current_depth + 1,
                         "links": child_links_json
                     });
@@ -10477,6 +10576,269 @@ impl Database {
             orphan_count += (original_len - live) as i64;
         }
         Ok(orphan_count)
+    }
+
+    /// #869: graph/entities/indexes/receipts drift report. Read-only
+    /// diagnostic that counts every class of edge inconsistency the
+    /// serve-time gates enforce — unattested edges (no evidence anchor),
+    /// dangling links (target missing), links to archived/expired targets,
+    /// cross-workspace links, stale community memberships, FTS drift, and
+    /// journal receipts referencing missing entities. `consistent` is true
+    /// when all STRUCTURAL graph checks are clear (index/journal drift is
+    /// reported separately — purge intentionally leaves journal receipts).
+    pub fn graph_drift_report(
+        &self,
+        workspace_hash: Option<&str>,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+        let conn = self.conn()?;
+        let now = now_ms();
+        // One scoped pass over every row (archived included — an archived
+        // source's edges are still drift) plus a target lookup map.
+        let rows: Vec<(String, String, String, bool, Option<i64>, bool, String)> = {
+            let mut stmt = conn.prepare(
+                "SELECT id, workspace_hash, category, archived,
+                        expires_at_unix_ms, embedding IS NOT NULL, links
+                 FROM entities WHERE (?1 IS NULL OR workspace_hash = ?1)",
+            )?;
+            let iter = stmt.query_map(params![workspace_hash], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i32>(3).unwrap_or(0) != 0,
+                    r.get::<_, Option<i64>>(4).unwrap_or(None),
+                    r.get::<_, i32>(5).unwrap_or(0) != 0,
+                    r.get::<_, String>(6).unwrap_or_else(|_| "[]".to_string()),
+                ))
+            })?;
+            iter.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+
+        let target: std::collections::HashMap<&str, (&str, bool, Option<i64>)> = rows
+            .iter()
+            .map(|(id, ws, _cat, archived, expires, _emb, _links)| {
+                (id.as_str(), (ws.as_str(), *archived, *expires))
+            })
+            .collect();
+
+        let mut active = 0i64;
+        let mut with_links = 0i64;
+        let mut embedded_active = 0i64;
+        let mut total_links = 0usize;
+        let mut attested = 0usize;
+        let mut dangling = 0usize;
+        let mut to_archived = 0usize;
+        let mut to_expired = 0usize;
+        let mut out_of_scope = 0usize;
+        let mut stale_memberships = 0usize;
+        for (id, ws, cat, archived, _expires, embedded, links_json) in &rows {
+            if !archived {
+                active += 1;
+                if *embedded {
+                    embedded_active += 1;
+                }
+            }
+            let links: Vec<MemoryLink> =
+                serde_json::from_str(links_json).unwrap_or_default();
+            if links.is_empty() {
+                continue;
+            }
+            if !archived {
+                with_links += 1;
+            }
+            for l in &links {
+                total_links += 1;
+                if l.source.is_some() {
+                    attested += 1;
+                }
+                match target.get(l.target_id.as_str()) {
+                    None => {
+                        dangling += 1;
+                        if cat == "community_summary" {
+                            stale_memberships += 1;
+                        }
+                    }
+                    Some((tws, t_archived, t_expires)) => {
+                        if *t_archived {
+                            to_archived += 1;
+                            if cat == "community_summary" {
+                                stale_memberships += 1;
+                            }
+                            continue;
+                        }
+                        if let Some(exp) = t_expires {
+                            if *exp <= now {
+                                to_expired += 1;
+                                continue;
+                            }
+                        }
+                        // Scope: target must share the source workspace or be
+                        // global (''), mirroring the serve-time gate.
+                        if *tws != *ws && !tws.is_empty() {
+                            out_of_scope += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        let fts_drift = self.fts_drift_estimate().unwrap_or(0);
+        let journal_missing: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM journal
+                 WHERE entity_id != ''
+                   AND entity_id NOT IN (SELECT id FROM entities)
+                   AND entity_id NOT IN (SELECT id FROM entity_history)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        let embedding_coverage = if active > 0 {
+            (embedded_active as f64 / active as f64).min(1.0)
+        } else {
+            0.0
+        };
+        let consistent = total_links - attested == 0
+            && dangling == 0
+            && to_archived == 0
+            && to_expired == 0
+            && out_of_scope == 0
+            && stale_memberships == 0;
+
+        Ok(serde_json::json!({
+            "checked_at_unix_ms": now,
+            "workspace": workspace_hash.unwrap_or(""),
+            "entities": {
+                "active": active,
+                "with_links": with_links,
+                "embedded_active": embedded_active,
+                "embedding_coverage": embedding_coverage,
+            },
+            "links": {
+                "total": total_links,
+                "attested": attested,
+                "unattested": total_links - attested,
+            },
+            "drift": {
+                "dangling_links": dangling,
+                "links_to_archived_targets": to_archived,
+                "links_to_expired_targets": to_expired,
+                "out_of_scope_links": out_of_scope,
+                "stale_community_memberships": stale_memberships,
+                "fts_drift_estimate": fts_drift,
+                "journal_receipts_referencing_missing_entities": journal_missing,
+            },
+            "consistent": consistent,
+        }))
+    }
+
+    /// #869: stamp the from-side entity id as the evidence anchor on every
+    /// link that lacks one (pre-#869 rows, hand-edited data). Workspace-
+    /// scoped; `dry_run` previews without writing. Applied runs journal one
+    /// `graph_attest` event. After attestation, `graph_drift` reports
+    /// unattested = 0 for the covered scope.
+    pub fn graph_attest(
+        &self,
+        workspace_hash: Option<&str>,
+        dry_run: bool,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+        let conn = self.conn()?;
+        let affected: Vec<(String, String)> = {
+            let mut stmt = conn.prepare(
+                "SELECT id, links FROM entities
+                 WHERE (?1 IS NULL OR workspace_hash = ?1) AND links != '[]'",
+            )?;
+            let iter = stmt.query_map(params![workspace_hash], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?;
+            let mut out = Vec::new();
+            for row in iter {
+                let (id, links_json) = row?;
+                let links: Vec<MemoryLink> =
+                    serde_json::from_str(&links_json).unwrap_or_default();
+                if links.iter().any(|l| l.source.is_none()) {
+                    out.push((id, links_json));
+                }
+            }
+            out
+        };
+        let links_to_stamp: usize = affected
+            .iter()
+            .map(|(_, json)| {
+                let links: Vec<MemoryLink> =
+                    serde_json::from_str(json).unwrap_or_default();
+                links.iter().filter(|l| l.source.is_none()).count()
+            })
+            .sum();
+
+        if dry_run {
+            return Ok(serde_json::json!({
+                "dry_run": true,
+                "workspace": workspace_hash.unwrap_or(""),
+                "entities_affected": affected.len(),
+                "links_to_stamp": links_to_stamp,
+            }));
+        }
+
+        let mut stamped = 0usize;
+        for (id, links_json) in &affected {
+            let links: Vec<MemoryLink> =
+                serde_json::from_str(links_json).unwrap_or_default();
+            let mut changed = false;
+            let updated: Vec<MemoryLink> = links
+                .iter()
+                .map(|l| {
+                    let mut l = l.clone();
+                    if l.source.is_none() {
+                        l.source = Some(id.clone());
+                        changed = true;
+                    }
+                    l
+                })
+                .collect();
+            if !changed {
+                continue;
+            }
+            let tx = Self::audited_write_tx(&conn)?;
+            tx.execute(
+                "UPDATE entities SET links = ?1 WHERE id = ?2",
+                params![serde_json::to_string(&updated)?, id],
+            )?;
+            tx.commit()?;
+            stamped += links.iter().filter(|l| l.source.is_none()).count();
+        }
+
+        let event = crate::models::JournalEvent {
+            id: format!("jrn-{}", uuid::Uuid::new_v4().simple()),
+            event_type: "graph_attest".to_string(),
+            evaluated_json: serde_json::to_string(&serde_json::json!({
+                "workspace": workspace_hash.unwrap_or(""),
+                "entities_affected": affected.len(),
+                "links_to_stamp": links_to_stamp,
+            }))?,
+            acted_json: serde_json::to_string(&serde_json::json!({
+                "stamped": stamped,
+                "dry_run": false,
+            }))?,
+            forward_json:
+                "{\"next\":\"run perseus_vault_graph_drift to confirm unattested = 0\"}"
+                    .to_string(),
+            category: String::new(),
+            key: String::new(),
+            entity_id: String::new(),
+            agent_id: String::new(),
+            workspace_hash: workspace_hash.unwrap_or("").to_string(),
+            created_at_unix_ms: now_ms(),
+        };
+        self.journal(&event)?;
+
+        Ok(serde_json::json!({
+            "dry_run": false,
+            "workspace": workspace_hash.unwrap_or(""),
+            "entities_affected": affected.len(),
+            "links_stamped": stamped,
+            "journal_event": event.id,
+        }))
     }
 
     /// Run SQLite VACUUM command to reclaim space.
@@ -12467,6 +12829,9 @@ impl Database {
                             target_id: sid.clone(),
                             relationship: "evidence_for".to_string(),
                             weight: 1.0,
+                            // #869: the consolidated observation asserts the
+                            // evidence_for edges to its sources.
+                            source: Some(entity_id.clone()),
                         })
                         .collect(),
                     verified: false,
@@ -12918,6 +13283,9 @@ impl Database {
                                     target_id: sid.clone(),
                                     relationship: "evidence_for".to_string(),
                                     weight: 1.0,
+                                    // #869: the dreamed insight asserts the
+                                    // evidence_for edges to its sources.
+                                    source: Some(entity_id.clone()),
                                 })
                                 .collect(),
                             verified: false,
@@ -15409,19 +15777,22 @@ last_accessed: {}
                 }
                 format!("promoted-{:x}", h.finalize())[..21].to_string()
             };
+            let promoted_id = format!(
+                "mem-{}",
+                &uuid::Uuid::new_v4().to_string().replace('-', "")[..12]
+            );
             let links: Vec<MemoryLink> = cluster
                 .iter()
                 .map(|&i| MemoryLink {
                     target_id: rows[i].id.clone(),
                     relationship: "promoted_from".to_string(),
                     weight: 1.0,
+                    // #869: the promoted entity asserts the edge.
+                    source: Some(promoted_id.clone()),
                 })
                 .collect();
             let entity = crate::models::Entity {
-                id: format!(
-                    "mem-{}",
-                    &uuid::Uuid::new_v4().to_string().replace('-', "")[..12]
-                ),
+                id: promoted_id,
                 category: rep_row.category.clone(),
                 key,
                 body_json: rep_row.body.clone(),
@@ -15648,13 +16019,16 @@ last_accessed: {}
                     continue;
                 }
                 let entry = pending
-                    .entry(e1_id)
+                    .entry(e1_id.clone())
                     .or_insert_with(|| serde_json::from_str(&e1_links_json).unwrap_or_default());
                 if !entry.iter().any(|l| l.target_id == e2_id) {
                     entry.push(MemoryLink {
                         target_id: e2_id,
                         relationship: "auto-related".to_string(),
                         weight: sim,
+                        // #869: the source entity is the evidence anchor for
+                        // the derived edge.
+                        source: Some(e1_id.clone()),
                     });
                     candidate_links += 1;
                     if candidate_links >= max_links {
@@ -17331,6 +17705,24 @@ pub fn reciprocal_rank_fusion(
 /// pattern: an arm that found nothing contributes nothing, and a firing arm
 /// gets a fixed, conservative weight regardless of how many neighbors were
 /// found (so a hub entity with many links can't dominate the fused ranking).
+/// #869: counts of edges skipped by the serve-time gates during one graph
+/// expansion. Attached to every graph recall arm so the evidence/scope/
+/// lifecycle enforcement is observable; consumed by the fused trace's
+/// `graph_route` block and the `graph_drift` report.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GraphArmStats {
+    /// Links with no `source` evidence anchor (never serveable).
+    pub unattested_edges: usize,
+    /// Links whose target workspace is outside {source ws, global ''}.
+    pub out_of_scope_edges: usize,
+    /// Links to targets past their expiry (expires_at_unix_ms <= now).
+    pub expired_targets: usize,
+    /// Links to targets that are missing entirely or archived.
+    pub dangling_targets: usize,
+}
+
+/// Graph arm RRF weight: fixed 0.5 when the arm produced candidates, 0
+/// when empty (an arm that found nothing contributes nothing).
 pub fn graph_arm_weight(hit_count: usize) -> f64 {
     if hit_count == 0 {
         0.0
@@ -17351,25 +17743,51 @@ pub fn graph_arm_weight(hit_count: usize) -> f64 {
 /// found" expansion, fed into RRF as a third arm alongside dense and sparse.
 /// A neighbor's rank in the returned Vec is its first-discovery order, which
 /// RRF then converts into a rank-based score exactly like the other arms.
+///
+/// #869 serve-time gates — an edge is serveable only when it carries the
+/// required metadata and its target is eligible under the SAME rules as
+/// ordinary recall:
+///
+/// 1. **Evidence gate** — only links with a `source` evidence anchor are
+///    followed. Links without one (legacy rows, hand-edited data) are
+///    counted in [`GraphArmStats::unattested_edges`] and never served; they
+///    surface via `perseus_vault_graph_drift` / `graph_attest` instead.
+/// 2. **Scope gate** — a link is followed only into the source entity's
+///    workspace or the global ('') partition (the recall scope convention).
+///    Targets in unrelated workspaces are counted and skipped.
+/// 3. **Lifecycle gate** — targets must be live like ordinary recall: not
+///    archived, not expired (`expires_at_unix_ms`), status outside
+///    `NON_SERVEABLE_STATUSES`, and not suppressed. Expired/missing targets
+///    are counted; suppressed rows are filtered by the caller.
 impl Database {
     pub fn graph_expand(
         &self,
         seeds: &[crate::models::Entity],
         max_neighbors: usize,
-    ) -> Result<Vec<(crate::models::Entity, f64)>, Box<dyn std::error::Error>> {
+    ) -> Result<
+        (Vec<(crate::models::Entity, f64)>, GraphArmStats),
+        Box<dyn std::error::Error>,
+    > {
         if seeds.is_empty() || max_neighbors == 0 {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), GraphArmStats::default()));
         }
 
         let seed_ids: std::collections::HashSet<&str> =
             seeds.iter().map(|e| e.id.as_str()).collect();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut stats = GraphArmStats::default();
 
         // Phase 1: discover candidate neighbor ids in deterministic seed/link
         // order (which is what makes the max_neighbors cut reproducible).
+        // #869 evidence gate: unattested edges (no `source` anchor) are
+        // counted and skipped here.
         let mut ordered_ids: Vec<String> = Vec::new();
         for seed in seeds {
             for link in &seed.links {
+                if link.source.is_none() {
+                    stats.unattested_edges += 1;
+                    continue;
+                }
                 if seed_ids.contains(link.target_id.as_str()) {
                     continue; // already in the seed set, not a new discovery
                 }
@@ -17380,17 +17798,32 @@ impl Database {
             }
         }
         if ordered_ids.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), stats));
+        }
+
+        // Allowed target workspaces: every seed's workspace plus the global
+        // ('') partition (recall scope convention: current OR global).
+        let mut allowed_ws: Vec<&str> = Vec::new();
+        for seed in seeds {
+            if !allowed_ws.contains(&seed.workspace_hash.as_str()) {
+                allowed_ws.push(seed.workspace_hash.as_str());
+            }
+        }
+        if !allowed_ws.iter().any(|w| w.is_empty()) {
+            allowed_ws.push("");
         }
 
         // Phase 2: hydrate neighbors with one IN(...) query per chunk instead
         // of a point-query per link (this was an N+1 on the hybrid-recall hot
         // path). Chunked to keep the SQL variable count bounded; iteration
-        // order over chunks preserves phase-1 order, and archived/missing
-        // neighbors don't count toward the cap — both as before.
+        // order over chunks preserves phase-1 order. `expires_at_unix_ms` is
+        // appended as an extra column (index 29) so the lifecycle gate can
+        // read it without touching `entity_from_row`'s column contract.
         let conn = self.conn()?;
         let enc = self.encryption.as_ref();
+        let now = now_ms();
         let mut out = Vec::new();
+        let mut found_total = 0usize;
         for chunk in ordered_ids.chunks(500) {
             let placeholders = (1..=chunk.len())
                 .map(|i| format!("?{}", i))
@@ -17403,7 +17836,7 @@ impl Database {
                         created_at_unix_ms, last_accessed_unix_ms, NULL as embedding,
                         always_on, certainty, workspace_hash, agent_id, visibility,
                         follow_count, miss_count, follow_rate, efficacy_status,
-                    epistemic_state
+                    epistemic_state, expires_at_unix_ms
                  FROM entities WHERE archived = 0 AND id IN ({})",
                 placeholders
             );
@@ -17412,16 +17845,38 @@ impl Database {
                 .iter()
                 .map(|s| s as &dyn rusqlite::types::ToSql)
                 .collect();
-            let rows =
-                stmt.query_map(param_refs.as_slice(), |row| entity_from_row(row, enc))?;
+            // Map with the extra expiry column (index 29) alongside the
+            // standard entity columns; entity_from_row's own contract is
+            // untouched.
+            let rows = stmt.query_map(param_refs.as_slice(), |row| {
+                let e = entity_from_row(row, enc)?;
+                let expires = row.get::<_, Option<i64>>(29).unwrap_or(None);
+                Ok((e, expires))
+            })?;
             let mut by_id: std::collections::HashMap<String, crate::models::Entity> =
                 std::collections::HashMap::new();
             for row in rows {
-                let e = row?;
+                let (e, expires) = row?;
+                found_total += 1;
+                // #869 lifecycle gate: expired targets are counted and
+                // skipped, matching ordinary recall's read-time expiry
+                // filter (an expired fact must not re-enter via the graph).
+                if let Some(exp) = expires {
+                    if exp <= now {
+                        stats.expired_targets += 1;
+                        continue;
+                    }
+                }
                 by_id.insert(e.id.clone(), e);
             }
             for id in chunk {
                 if let Some(e) = by_id.remove(id) {
+                    // #869 scope gate: never follow an edge into an unrelated
+                    // workspace (targets in {seed ws, ''} only).
+                    if !allowed_ws.iter().any(|w| *w == e.workspace_hash.as_str()) {
+                        stats.out_of_scope_edges += 1;
+                        continue;
+                    }
                     if crate::retrieval_telemetry::NON_SERVEABLE_STATUSES
                         .contains(&e.status.as_str())
                     {
@@ -17432,9 +17887,12 @@ impl Database {
             }
         }
         drop(conn);
+        // #869: targets that were not hydrateable at all (missing entirely
+        // or archived) are drift, reported alongside the other gates.
+        stats.dangling_targets = ordered_ids.len().saturating_sub(found_total);
         let mut visible = self.filter_suppressed_scored(out)?;
         visible.truncate(max_neighbors);
-        Ok(visible)
+        Ok((visible, stats))
     }
 
     /// Hydrate non-archived entities by id, preserving the order of `ids`.
@@ -18734,6 +19192,8 @@ mod tests {
             target_id: "g-hidden".to_string(),
             relationship: "references".to_string(),
             weight: 0.5,
+            // #869: attested edge (the root asserts it).
+            source: Some("g-root".to_string()),
         }];
         db.remember_skip_dedup(&root).unwrap();
         // Target entity — will be suppressed.
@@ -18741,14 +19201,14 @@ mod tests {
             r#"{"content":"suppressed neighbor"}"#)).unwrap();
         // Baseline: expansion finds the neighbor.
         let baseline = db.graph_expand(&[root.clone()], 5).unwrap();
-        assert!(baseline.iter().any(|(e, _)| e.key == "hidden"));
+        assert!(baseline.0.iter().any(|(e, _)| e.key == "hidden"));
         // Suppress the target.
         db.reject_value("", "s", "insight",
             r#"{"content":"suppressed neighbor"}"#, "test", "ev", "agent-1", None).unwrap();
         // Governed expansion must exclude the suppressed neighbor.
         let governed = db.graph_expand(&[root], 5).unwrap();
         assert!(
-            !governed.iter().any(|(e, _)| e.key == "hidden"),
+            !governed.0.iter().any(|(e, _)| e.key == "hidden"),
             "suppressed linked entity must not appear in graph expansion"
         );
         let _ = std::fs::remove_file(&path);
@@ -21103,6 +21563,7 @@ mod tests {
             target_id: "e-382v".to_string(),
             relationship: "caused-by".to_string(),
             weight: 0.9,
+            source: None,
         });
         db.remember(&e).unwrap();
 
@@ -27973,13 +28434,13 @@ mod tests {
     fn graph_expand_returns_empty_for_no_seeds_or_no_links() {
         let (db, path) = temp_db();
         // No seeds at all.
-        assert!(db.graph_expand(&[], 10).unwrap().is_empty());
+        assert!(db.graph_expand(&[], 10).unwrap().0.is_empty());
 
         // A seed entity exists but has no links.
         let lone = make_entity("lone", "insight", "lone", r#"{"note":"solo"}"#);
         db.remember(&lone).unwrap();
         let seed = db.get_entity("insight", "lone").unwrap().unwrap();
-        assert!(db.graph_expand(&[seed], 10).unwrap().is_empty());
+        assert!(db.graph_expand(&[seed], 10).unwrap().0.is_empty());
         let _ = fs::remove_file(&path);
     }
 
@@ -28026,7 +28487,7 @@ mod tests {
 
         let seed = db.get_entity("architecture", "api-gateway").unwrap().unwrap();
         let expanded = db.graph_expand(&[seed], 10).unwrap();
-        let ids: Vec<&str> = expanded.iter().map(|(e, _)| e.id.as_str()).collect();
+        let ids: Vec<&str> = expanded.0.iter().map(|(e, _)| e.id.as_str()).collect();
 
         assert!(
             ids.contains(&"g-neighbor1"),
@@ -28088,7 +28549,7 @@ mod tests {
 
         let seed = db.get_entity("architecture", "cap-hub-key").unwrap().unwrap();
         let expanded = db.graph_expand(&[seed], 2).unwrap();
-        let ids: Vec<&str> = expanded.iter().map(|(e, _)| e.id.as_str()).collect();
+        let ids: Vec<&str> = expanded.0.iter().map(|(e, _)| e.id.as_str()).collect();
         assert_eq!(
             ids,
             vec!["cap-n1", "cap-n3"],
@@ -28096,6 +28557,390 @@ mod tests {
         );
 
         let _ = fs::remove_file(&path);
+    }
+
+    // ── #869 graph utility gate, evidence gates, drift & attestation ───────
+
+    /// Legacy rows (links JSON written without a `source` anchor) are NOT
+    /// serveable by the graph arm: expansion skips the edge, counts it, and
+    /// `graph_attest` makes it serveable again.
+    #[test]
+    fn graph_expand_excludes_unattested_edges_and_counts_them() {
+        let (db, path) = temp_db();
+        db.remember_skip_dedup(&make_entity(
+            "t-root",
+            "facts",
+            "t-root",
+            r#"{"note":"root asserting a legacy edge"}"#,
+        ))
+        .unwrap();
+        db.remember_skip_dedup(&make_entity(
+            "t-target",
+            "facts",
+            "t-target",
+            r#"{"note":"a wholly distinct target body for the edge test"}"#,
+        ))
+        .unwrap();
+
+        // Simulate a pre-#869 row: write the link JSON directly, no source.
+        let conn = db.conn().unwrap();
+        conn.execute(
+            "UPDATE entities SET links = ?1 WHERE id = 't-root'",
+            rusqlite::params![serde_json::to_string(&vec![crate::models::MemoryLink {
+                target_id: "t-target".to_string(),
+                relationship: "related".to_string(),
+                weight: 0.5,
+                source: None,
+            }])
+            .unwrap()],
+        )
+        .unwrap();
+        drop(conn);
+
+        let root = db.get_entity("facts", "t-root").unwrap().unwrap();
+        let (expanded, stats) = db.graph_expand(&[root], 10).unwrap();
+        assert!(expanded.is_empty(), "unattested edge must not be serveable");
+        assert_eq!(stats.unattested_edges, 1);
+        assert_eq!(stats.dangling_targets, 0, "target exists; only evidence is missing");
+
+        // graph_attest stamps the from-side id; the edge becomes serveable.
+        let preview = db.graph_attest(None, true).unwrap();
+        assert_eq!(preview["links_to_stamp"].as_u64().unwrap(), 1);
+        let applied = db.graph_attest(None, false).unwrap();
+        assert_eq!(applied["links_stamped"].as_u64().unwrap(), 1);
+        let root = db.get_entity("facts", "t-root").unwrap().unwrap();
+        assert_eq!(root.links[0].source.as_deref(), Some("t-root"));
+        let (expanded, stats) = db.graph_expand(&[root], 10).unwrap();
+        assert_eq!(expanded.len(), 1);
+        assert_eq!(stats.unattested_edges, 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// #869 scope + lifecycle gates: the graph arm follows edges only into
+    /// {seed ws, global}; expired and cross-workspace targets are counted
+    /// and skipped, exactly like ordinary recall's read-time filters.
+    #[test]
+    fn graph_expand_applies_scope_and_expiry_gates() {
+        let (db, path) = temp_db();
+        let mut root = make_entity(
+            "s-root",
+            "facts",
+            "s-root",
+            r#"{"note":"root in ws-a asserting attested edges"}"#,
+        );
+        root.workspace_hash = "ws-a".to_string();
+        db.remember_skip_dedup(&root).unwrap();
+
+        let mut same_ws = make_entity(
+            "s-same",
+            "facts",
+            "s-same",
+            r#"{"note":"same workspace neighbor with a very distinct body"}"#,
+        );
+        same_ws.workspace_hash = "ws-a".to_string();
+        db.remember_skip_dedup(&same_ws).unwrap();
+
+        let mut global = make_entity(
+            "s-global",
+            "facts",
+            "s-global",
+            r#"{"note":"global partition neighbor with an unmistakably distinct body"}"#,
+        );
+        global.workspace_hash = String::new();
+        db.remember_skip_dedup(&global).unwrap();
+
+        let mut other_ws = make_entity(
+            "s-other",
+            "facts",
+            "s-other",
+            r#"{"note":"foreign workspace neighbor with an unmistakably distinct body"}"#,
+        );
+        other_ws.workspace_hash = "ws-b".to_string();
+        db.remember_skip_dedup(&other_ws).unwrap();
+
+        let mut expired = make_entity(
+            "s-expired",
+            "facts",
+            "s-expired",
+            r#"{"note":"expired neighbor with an unmistakably distinct body","expires_at":12345}"#,
+        );
+        expired.workspace_hash = "ws-a".to_string();
+        db.remember_skip_dedup(&expired).unwrap();
+
+        for target in ["s-same", "s-global", "s-other", "s-expired"] {
+            db.link("facts", "s-root", target, "related").unwrap();
+        }
+
+        let seed = db.get_entity("facts", "s-root").unwrap().unwrap();
+        let (expanded, stats) = db.graph_expand(&[seed], 10).unwrap();
+        let ids: Vec<&str> = expanded.iter().map(|(e, _)| e.id.as_str()).collect();
+        assert!(ids.contains(&"s-same"), "same-workspace target served");
+        assert!(ids.contains(&"s-global"), "global target served (scope widening)");
+        assert!(!ids.contains(&"s-other"), "cross-workspace target excluded");
+        assert!(!ids.contains(&"s-expired"), "expired target excluded");
+        assert_eq!(stats.out_of_scope_edges, 1);
+        assert_eq!(stats.expired_targets, 1);
+        assert_eq!(stats.dangling_targets, 0);
+        assert_eq!(stats.unattested_edges, 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Attested links to missing targets are counted as dangling drift and
+    /// never served (a recall candidate, not a ghost).
+    #[test]
+    fn graph_expand_counts_dangling_targets() {
+        let (db, path) = temp_db();
+        let mut e = make_entity(
+            "d-root",
+            "facts",
+            "d-root",
+            r#"{"note":"root with a link to nowhere"}"#,
+        );
+        e.links = vec![crate::models::MemoryLink {
+            target_id: "d-ghost".to_string(),
+            relationship: "related".to_string(),
+            weight: 0.5,
+            source: Some("d-root".to_string()),
+        }];
+        db.remember(&e).unwrap();
+        let seed = db.get_entity("facts", "d-root").unwrap().unwrap();
+        let (expanded, stats) = db.graph_expand(&[seed], 10).unwrap();
+        assert!(expanded.is_empty());
+        assert_eq!(stats.dangling_targets, 1);
+        assert_eq!(stats.unattested_edges, 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// #869 AC1/AC2: ordinary queries fall back without failure — the graph
+    /// strategy is skipped (observable in the trace), the other arms still
+    /// serve, and threshold overrides re-engage or keep the arm off.
+    #[test]
+    fn fused_recall_graph_gate_skips_ordinary_queries_without_failure() {
+        let (db, path) = temp_db();
+        db.remember(&make_entity(
+            "f-seed",
+            "architecture",
+            "f-seed",
+            r#"{"note":"gateway load balancer"}"#,
+        ))
+        .unwrap();
+        db.remember(&make_entity(
+            "f-hop",
+            "architecture",
+            "f-hop",
+            r#"{"note":"tls termination proxy"}"#,
+        ))
+        .unwrap();
+        db.link("architecture", "f-seed", "f-hop", "depends_on").unwrap();
+
+        // Ordinary lookup query: the gate keeps the graph arm off.
+        let mut params = fused_params("load balancer");
+        params.strategies = vec!["fts5".into(), "graph".into()];
+        let (entities, _c, trace) = db.fused_recall(&params).unwrap();
+        assert!(
+            entities.iter().any(|e| e.id == "f-seed"),
+            "fts5 arm still serves"
+        );
+        assert!(
+            !entities.iter().any(|e| e.id == "f-hop"),
+            "graph arm must not run for an ordinary query"
+        );
+        let graph = trace
+            .strategies
+            .iter()
+            .find(|s| s.strategy == "graph")
+            .expect("graph strategy trace present");
+        assert_eq!(graph.status, "skipped");
+        let route = trace.graph_route.as_ref().expect("graph_route present");
+        assert!(!route.selected);
+        assert_eq!(route.reason, "ordinary");
+        assert_eq!(route.skipped_reason, "low_utility");
+        assert_eq!(route.unattested_edges_skipped, 0);
+
+        // Threshold override 0.0 disables the gate: the graph arm engages.
+        let mut params = fused_params("load balancer");
+        params.strategies = vec!["fts5".into(), "graph".into()];
+        params.graph_utility_threshold = Some(0.0);
+        let (entities, _c, trace) = db.fused_recall(&params).unwrap();
+        assert!(
+            entities.iter().any(|e| e.id == "f-hop"),
+            "gate off -> graph arm runs"
+        );
+        assert!(trace.graph_route.as_ref().unwrap().selected);
+
+        // Threshold override 1.0 keeps the arm off even for a graph-shaped
+        // query (operator-enforced disable).
+        let mut params = fused_params("what depends on the load balancer");
+        params.strategies = vec!["fts5".into(), "graph".into()];
+        params.graph_utility_threshold = Some(1.0);
+        let (entities, _c, _trace) = db.fused_recall(&params).unwrap();
+        assert!(!entities.iter().any(|e| e.id == "f-hop"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// #869 AC5: the drift report counts every class of inconsistency across
+    /// graph/entities/indexes/receipts, and attest clears the evidence class.
+    #[test]
+    fn graph_drift_report_counts_inconsistencies_and_attest_clears_evidence() {
+        let (db, path) = temp_db();
+        // A clean, attested edge.
+        db.remember(&make_entity(
+            "x-src",
+            "facts",
+            "x-src",
+            r#"{"note":"clean source with an attested edge"}"#,
+        ))
+        .unwrap();
+        db.remember(&make_entity(
+            "x-tgt",
+            "facts",
+            "x-tgt",
+            r#"{"note":"clean target with a wholly distinct body"}"#,
+        ))
+        .unwrap();
+        db.link("facts", "x-src", "x-tgt", "related").unwrap();
+
+        // A legacy unattested edge (raw links JSON, as pre-#869 rows look).
+        db.remember(&make_entity(
+            "x-legacy",
+            "facts",
+            "x-legacy",
+            r#"{"note":"legacy row with an unattested edge"}"#,
+        ))
+        .unwrap();
+        let conn = db.conn().unwrap();
+        conn.execute(
+            "UPDATE entities SET links = ?1 WHERE id = 'x-legacy'",
+            rusqlite::params![serde_json::to_string(&vec![crate::models::MemoryLink {
+                target_id: "x-tgt".to_string(),
+                relationship: "related".to_string(),
+                weight: 0.5,
+                source: None,
+            }])
+            .unwrap()],
+        )
+        .unwrap();
+        drop(conn);
+
+        let report = db.graph_drift_report(None).unwrap();
+        assert_eq!(report["links"]["total"].as_u64().unwrap(), 2);
+        assert_eq!(report["links"]["attested"].as_u64().unwrap(), 1);
+        assert_eq!(report["links"]["unattested"].as_u64().unwrap(), 1);
+        assert!(!report["consistent"].as_bool().unwrap());
+
+        // Attest the legacy edge -> evidence class clears; everything else
+        // was already clean, so the report turns consistent.
+        db.graph_attest(None, false).unwrap();
+        let report = db.graph_drift_report(None).unwrap();
+        assert_eq!(report["links"]["unattested"].as_u64().unwrap(), 0);
+        assert_eq!(report["drift"]["dangling_links"].as_u64().unwrap(), 0);
+        assert!(report["consistent"].as_bool().unwrap());
+
+        // The attest run was journaled (receipt).
+        let journaled: i64 = db
+            .conn()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM journal WHERE event_type = 'graph_attest'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(journaled, 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// #869 write contract: links supplied without an evidence anchor get the
+    /// writing entity stamped as the source; caller anchors are preserved.
+    #[test]
+    fn remember_stamps_evidence_anchor_on_links() {
+        let (db, path) = temp_db();
+        db.remember_skip_dedup(&make_entity(
+            "w-tgt",
+            "facts",
+            "w-tgt",
+            r#"{"note":"target for stamping"}"#,
+        ))
+        .unwrap();
+        let mut e = make_entity(
+            "w-src",
+            "facts",
+            "w-src",
+            r#"{"note":"source asserting two edges"}"#,
+        );
+        e.links = vec![
+            crate::models::MemoryLink {
+                target_id: "w-tgt".to_string(),
+                relationship: "related".to_string(),
+                weight: 0.5,
+                source: None,
+            },
+            crate::models::MemoryLink {
+                target_id: "w-ghost".to_string(),
+                relationship: "references".to_string(),
+                weight: 0.5,
+                source: Some("external-ref-42".to_string()),
+            },
+        ];
+        db.remember(&e).unwrap();
+        let stored = db.get_entity("facts", "w-src").unwrap().unwrap();
+        assert_eq!(
+            stored.links[0].source.as_deref(),
+            Some("w-src"),
+            "writing entity stamped as the anchor"
+        );
+        assert_eq!(
+            stored.links[1].source.as_deref(),
+            Some("external-ref-42"),
+            "caller-supplied anchor preserved"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// #869: traverse annotates every edge with its evidence state.
+    #[test]
+    fn traverse_annotates_edges_with_attested_and_source() {
+        let (db, path) = temp_db();
+        db.remember(&make_entity(
+            "v-root",
+            "facts",
+            "v-root",
+            r#"{"note":"traverse root"}"#,
+        ))
+        .unwrap();
+        db.remember(&make_entity(
+            "v-child",
+            "facts",
+            "v-child",
+            r#"{"note":"traverse child with distinct body"}"#,
+        ))
+        .unwrap();
+        db.link("facts", "v-root", "v-child", "depends_on").unwrap();
+        let chain = db.traverse_chain("facts", "v-root", 2, 10).unwrap();
+        let root_links = &chain["entity"]["links"];
+        assert_eq!(root_links[0]["attested"].as_bool(), Some(true));
+        assert_eq!(root_links[0]["source"].as_str(), Some("v-root"));
+        let child = &chain["traversed"][0];
+        assert_eq!(child["edge_attested"].as_bool(), Some(true));
+        assert_eq!(child["edge_source"].as_str(), Some("v-root"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// #869: the recall surface rejects an out-of-range gate threshold.
+    #[test]
+    fn recall_rejects_out_of_range_graph_utility_threshold() {
+        let (db, path) = temp_db();
+        let err = crate::tools::handle_recall(
+            &db,
+            serde_json::json!({
+                "query": "alpha",
+                "mode": "fused",
+                "graph_utility_threshold": 1.5,
+            }),
+        )
+        .unwrap_err();
+        assert!(err.contains("graph_utility_threshold"), "{err}");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[cfg(feature = "bundled-embeddings")]
@@ -30922,6 +31767,7 @@ mod tests {
             target_id: "e-swin-t".to_string(),
             relationship: "caused-by".to_string(),
             weight: 0.99,
+            source: None,
         });
         db.remember(&e).unwrap();
 
@@ -32365,6 +33211,7 @@ mod tests {
             target_id: src_id.clone(),
             relationship: "derived_from".to_string(),
             weight: 1.0,
+            source: None,
         }];
         db.remember(&belief).unwrap();
         let mut plain = make_entity("plain-1", "general", "plain-1", r#"{"content":"plain row"}"#);
@@ -33014,7 +33861,7 @@ mod tests {
         db.link("architecture", "m-seed", "m-hop1", "depends_on").unwrap();
         db.link("architecture", "m-hop1", "m-hop2", "depends_on").unwrap();
 
-        let mut params = fused_params("load balancer");
+        let mut params = fused_params("what depends on the load balancer");
         params.strategies = vec!["fts5".into(), "graph".into()];
         let (entities, _c, trace) = db.fused_recall(&params).unwrap();
         let ids: Vec<&str> = entities.iter().map(|e| e.id.as_str()).collect();
@@ -33026,6 +33873,12 @@ mod tests {
             "two-hop entity stays out of the one-hop bound: {ids:?}"
         );
         assert!(trace.sources["m-hop1"].contains(&"graph".to_string()));
+        // #869: the graph-shaped query passes the utility gate, and the
+        // routing decision is observable on the trace.
+        let route = trace.graph_route.as_ref().expect("graph_route on trace");
+        assert!(route.selected, "graph arm must engage for a multi-hop query");
+        assert_eq!(route.reason, "multi_hop");
+        assert!(route.skipped_reason.is_empty());
         let _ = std::fs::remove_file(path);
     }
 

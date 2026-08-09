@@ -160,6 +160,14 @@ pub struct MemoryLink {
     pub relationship: String,
     #[serde(default = "default_weight")]
     pub weight: f64,
+    /// #869: evidence anchor for the edge. Every programmatic write path
+    /// stamps the from-side entity id (the record that asserts the edge);
+    /// callers may supply a richer anchor (source event / external ref).
+    /// Links WITHOUT this metadata are NOT serveable by the graph recall
+    /// arms (`graph_expand` gates on it) — they surface only via the
+    /// `graph_drift` report and `graph_attest` migration tool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 fn default_weight() -> f64 {
@@ -462,6 +470,13 @@ pub struct RecallParams {
     /// first within the temporal arm; bi-temporal semantics keep the
     /// version current at the instant when a (category, key) has several.
     pub query_time_unix_ms: Option<i64>,
+    /// #869: graph utility gate threshold in [0, 1]. The fused path engages
+    /// the graph arm only when the query's classified graph utility is >=
+    /// this value. None = 0.5 (the documented default). 0.0 disables the
+    /// gate (always engage when the strategy is requested); 1.0 effectively
+    /// never engages. The routing decision is always observable in the
+    /// fused trace's `graph_route`.
+    pub graph_utility_threshold: Option<f64>,
 }
 
 /// Search mode for recall: FTS5 keyword, dense vector, hybrid fusion, or
@@ -646,6 +661,36 @@ pub struct FusedTrace {
     /// Entity id -> strategies that surfaced it (consensus map). Only for
     /// entities that survived into the delivered set.
     pub sources: std::collections::BTreeMap<String, Vec<String>>,
+    /// #869: the graph utility gate decision for this recall. Present when
+    /// the caller requested the "graph" strategy; records the routing
+    /// reason, whether the arm engaged, and how many edges the serve-time
+    /// gates (evidence/scope/expiry) skipped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph_route: Option<GraphRouteTrace>,
+}
+
+/// #869: observable graph utility-gate decision attached to a fused recall.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct GraphRouteTrace {
+    /// The classified utility score in [0, 1].
+    pub utility: f64,
+    /// Dominant question shape: "multi_hop" | "global" | "temporal" |
+    /// "entity_centric" | "relational" | "ordinary" | "no_signal".
+    pub reason: String,
+    /// Whether the graph arm engaged (utility >= threshold).
+    pub selected: bool,
+    /// Empty when engaged; otherwise why the arm was skipped
+    /// ("low_utility", "no_signal").
+    pub skipped_reason: String,
+    /// Edges skipped by the evidence gate (no `source` anchor).
+    pub unattested_edges_skipped: usize,
+    /// Edges skipped by the scope gate (target workspace outside
+    /// {source workspace, global}).
+    pub out_of_scope_edges_skipped: usize,
+    /// Linked targets skipped because they are expired.
+    pub expired_targets_skipped: usize,
+    /// Linked targets that are missing entirely or archived (drift).
+    pub dangling_targets_skipped: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -762,6 +807,7 @@ impl Default for RecallParams {
             strategy_weights: None,
             rerank: false,
             query_time_unix_ms: None,
+            graph_utility_threshold: None,
         }
     }
 }

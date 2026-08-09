@@ -325,9 +325,53 @@
       "id": "identity-ambiguity-abstains",
       "metric": "identity_ambiguity",
       "scenario": "identity_ambiguity"
+    },
+    {
+      "category": "graph_gate",
+      "checks": [
+        "multi_hop_selected",
+        "route_reason_observable",
+        "neighbor_surfaced"
+      ],
+      "description": "A multi-hop/impact query routes to the graph arm (reason observable) and the linked neighbor surfaces through it (#869).",
+      "id": "graph-gate-multi-hop-routes",
+      "metric": "graph_utility_gate",
+      "scenario": "graph_gate"
+    },
+    {
+      "category": "graph_gate",
+      "checks": [
+        "ordinary_skipped",
+        "recall_succeeds"
+      ],
+      "description": "An ordinary single-hop query falls back without failure: the graph arm is observably skipped and the keyword arm still serves (#869).",
+      "id": "graph-gate-ordinary-falls-back",
+      "metric": "graph_utility_gate",
+      "scenario": "graph_gate"
+    },
+    {
+      "category": "graph_gate",
+      "checks": [
+        "temporal_not_routed"
+      ],
+      "description": "A temporal question is classified temporal and not routed to the graph arm (the fused temporal strategy owns that shape) (#869).",
+      "id": "graph-gate-temporal-not-routed",
+      "metric": "graph_utility_gate",
+      "scenario": "graph_gate"
+    },
+    {
+      "category": "graph_gate",
+      "checks": [
+        "drift_consistent",
+        "no_fabricated_edges_served"
+      ],
+      "description": "All-attested in-scope fixtures keep the drift report consistent and the graph arm serves zero fabricated (unattested) edges; latency and candidate counts are reported (#869).",
+      "id": "graph-gate-consistency",
+      "metric": "graph_utility_gate",
+      "scenario": "graph_gate"
     }
   ],
-  "description": "Bounded offline quality-contract manifest for retrieval, temporal validity, scope validity, provenance, replay, mutation/supersession, compaction/projection, action grounding, recall outcomes, admission, poisoning, and identity ambiguity.",
+  "description": "Bounded offline quality-contract manifest for retrieval, temporal validity, scope validity, provenance, replay, mutation/supersession, compaction/projection, action grounding, recall outcomes, admission, poisoning, identity ambiguity, and the graph utility gate (#869).",
   "metrics": [
     "validity",
     "scope_invalid_recall",
@@ -339,7 +383,8 @@
     "recall_outcome",
     "admission",
     "prompt_safety",
-    "identity_ambiguity"
+    "identity_ambiguity",
+    "graph_utility_gate"
   ],
   "name": "perseus-vault-memory-quality-v1",
   "required_categories": [
@@ -357,7 +402,8 @@
     "recall_outcome",
     "admission",
     "prompt_safety",
-    "identity_ambiguity"
+    "identity_ambiguity",
+    "graph_gate"
   ],
-  "version": 4
+  "version": 5
 }

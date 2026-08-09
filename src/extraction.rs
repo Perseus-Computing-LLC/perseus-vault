@@ -93,7 +93,9 @@ const FACT_MARKERS: &[&str] = &[
 
 impl RuleBasedExtractor {
     /// True when the sentence carries an explicit date/time marker.
-    fn has_temporal_marker(lower: &str) -> bool {
+    /// `pub(crate)`: shared with the graph utility gate (#869), which uses
+    /// temporal markers to classify query shape.
+    pub(crate) fn has_temporal_marker(lower: &str) -> bool {
         if Self::contains_year(lower) {
             return true;
         }
