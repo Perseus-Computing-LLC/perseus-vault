@@ -14,12 +14,12 @@
 [![LangGraph](https://img.shields.io/badge/integrations-LangGraph-blue)](integrations/langgraph/)
 [![CrewAI](https://img.shields.io/badge/integrations-CrewAI-orange)](integrations/crewai/)
 [![AutoGen](https://img.shields.io/badge/integrations-AutoGen-purple)](integrations/autogen/)
-[![MCP Tools](https://img.shields.io/badge/MCP%20tools-92%20canonical-brightgreen)]()
+[![MCP Tools](https://img.shields.io/badge/MCP%20tools-95%20canonical-brightgreen)]()
 [![Listed on mcpservers.org](https://img.shields.io/badge/listed-mcpservers.org-blue)](https://mcpservers.org/servers/perseus-computing-llc/perseus-vault)
 
 Give your agents memory that survives the session, so they stop re-deriving what they
 already learned and stop repeating past mistakes. Hybrid recall (BM25 + dense + RRF),
-bi-temporal history, and **AES-256-GCM** at rest, exposed as **92 canonical MCP tools**
+bi-temporal history, and **AES-256-GCM** at rest, exposed as **95 canonical MCP tools**
 that work with any host. Legacy `mimir_*` and `mneme_*` aliases remain callable but are
 not counted separately. **73.8% on LongMemEval's official harness** (vs Zep 63.8%, Mem0
 49.0%).
@@ -228,7 +228,7 @@ the reference. [Methodology & dataset →](benchmark/temporal/README.md)
 |---|---|---|---|---|
 | **Deployment** | Single binary | Cloud + self-host | Docker/Postgres | Docker/Neo4j |
 | **Dependencies** | None (SQLite embedded) | Python + vector DB | Postgres + Python | Neo4j + Go (Graphiti) |
-| **MCP-Native** | ✅ 92 canonical tools | ❌ Not MCP-native | ❌ Not MCP-native | ❌ Not MCP-native |
+| **MCP-Native** | ✅ 95 canonical tools | ❌ Not MCP-native | ❌ Not MCP-native | ❌ Not MCP-native |
 | **Offline/Local** | ✅ Fully local | Cloud-dependent | Docker needed | Docker needed |
 | **Encryption** | AES-256-GCM ✅ | ❌ | ❌ | ❌ |
 | **Hybrid Search** | BM25 + Dense + RRF | Vector only | Vector only | Vector + Graph |
@@ -236,7 +236,7 @@ the reference. [Methodology & dataset →](benchmark/temporal/README.md)
 | **Entity Graph** | Link + Traverse | ❌ | ❌ | ✅ |
 | **Journal Audit Trail** | ✅ Immutable | ❌ | ❌ | ❌ |
 | **State Management** | ✅ Key-value + TTL | ❌ | ❌ | ❌ |
-| **MCP Tools** | 92 canonical | 5 | 8 | 0 |
+| **MCP Tools** | 95 canonical | 5 | 8 | 0 |
 | **License** | MIT | Apache 2.0 | Apache 2.0 | Apache 2.0 |
 
 [Full comparison: Perseus Vault vs Mem0 →](docs/comparison/mimir-vs-mem0.md)
@@ -417,6 +417,9 @@ Any MCP-compatible framework works with Perseus Vault directly. See
 | `mimir_decay` | Recalculate Ebbinghaus decay scores (batched 1000-entity transactions). |
 | `mimir_prune` | Bulk archive by category, decay threshold, or age. |
 | `mimir_purge` | Permanently delete archived entities + VACUUM. Destructive. |
+| `mimir_expire` | Time-based lifecycle sweep: entities past their body `expires_at` transition to `status='expired'` (content retained, dry-run supported). |
+| `mimir_redact` | Content redaction: scrub a workspace-scoped entity's body to a hash-only marker, delete history + FTS text, keep metadata (re-ingest allowed). Requires explicit `workspace_hash`. |
+| `mimir_erase` | Physical erasure of a workspace-scoped entity across ALL derived layers (FTS, history, communities, links, journal) + permanent re-ingest suppression. Requires explicit `workspace_hash`; dry-run supported. |
 | `mimir_cohere` | Autonomous coherence grooming pass — promote, decay, link, archive. |
 | `mimir_autocohere` | Full atomic grooming: cohere → decay → compact in one pass (supports dry-run). |
 | `mimir_compact` | Archive entities below decay threshold. |
@@ -749,7 +752,13 @@ Perseus Vault is a **local-first MCP server** — it runs entirely on your machi
 - The optional dense vector embeddings feature uses a locally-compiled model — no external embedding API is called.
 
 ### Data Retention
-- You control retention: entities can be soft-deleted (`mimir_forget`), archived (via decay/compact), or permanently purged (`mimir_purge`).
+- You control retention with four distinct lifecycle operations (see
+  `docs/specs/data-boundaries-retention-lifecycle.md`): soft-delete
+  (`mimir_forget`, content recoverable), expiry (`mimir_expire`, time-based
+  `status='expired'` with content retained), redaction (`mimir_redact`,
+  content scrubbed to hash-only, metadata kept), and physical erasure
+  (`mimir_erase`, removal across all derived layers with permanent re-ingest
+  suppression). `mimir_purge` reclaims space from archived rows.
 - No automatic off-machine backup is performed.
 
 ### Contact

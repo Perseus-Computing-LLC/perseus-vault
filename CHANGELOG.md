@@ -5,7 +5,35 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
 
 ## [Unreleased]
 
+### Added
+- **Retention lifecycle: expiry, redaction, and physical erasure** (#868,
+  #866). Three distinct operations, documented in
+  `docs/specs/data-boundaries-retention-lifecycle.md`:
+  - `mimir_expire` / `expire` CLI — time-based lifecycle sweep: entities whose
+    body `expires_at` (unix ms, numeric string, or ISO 8601 UTC) has passed
+    transition to `status='expired'`. Content and history are retained;
+    recall already excludes expired rows. The write path now persists
+    `expires_at` into `entities.expires_at_unix_ms` on every remember/update.
+  - `mimir_redact` / `redact` CLI — content scrub with metadata retention:
+    body → hash-only marker, history + FTS text deleted, `redacted` journal
+    event (hash-only evidence). Re-ingest of the same value stays allowed.
+  - `mimir_erase` / `erase` CLI — physical erasure across ALL derived layers:
+    primary row, FTS, history (+FTS), community membership (empty communities
+    deleted, `member_digest` invalidated so summaries recompute), inbound
+    links, journal payloads (chain tuple preserved), plus quarantine of
+    derived beliefs/observations/syntheses that cited the erased source via
+    evidence links. Installs a permanent rejection tombstone + decoupled
+    governance mandate, so re-ingest fails closed even after a primary-DB
+    rollback; appends a hash-only `erased` journal event. `dry_run` previews
+    exact counts. All ops are workspace-explicit (fail-closed on ambiguity,
+    #854) and attribute the actor.
+
 ### Fixed
+- **Recall now excludes expired rows on every arm** (#868 follow-up): the FTS
+  keyword/hybrid arms previously served rows past `expires_at_unix_ms` — only
+  the dense arm filtered them. Both FTS plans (two-phase `bm25` and the
+  FTS-driven single query) now apply the same `(expires_at IS NULL OR
+  expires_at > now)` predicate as the dense arm.
 - **Encryption diagnostics and key propagation.** `doctor` now reports a
   database as encrypted only when the authoritative `encryption_canary` row
   (`id=1`) exists; the schema table alone is not evidence of encryption.

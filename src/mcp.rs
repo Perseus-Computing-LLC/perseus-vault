@@ -3183,6 +3183,232 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Purge Archived Entities"
   },
   {
+    "name": "mimir_expire",
+    "description": "Time-based lifecycle sweep (#868): transition entities whose expires_at_unix_ms has passed to status='expired'. Content, history, and searchability are RETAINED — expiry is not erasure, and recall already excludes expired rows; the sweep makes the lifecycle state explicit and observable. Idempotent and re-runnable; use dry_run=true to preview with identical predicates. Contract: docs/specs/data-boundaries-retention-lifecycle.md.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "dry_run": {
+          "type": "boolean",
+          "default": false,
+          "description": "If true, report what would be expired without making changes"
+        },
+        "workspace_hash": {
+          "type": "string",
+          "default": "",
+          "description": "Restrict the sweep to one workspace (empty = global sweep)"
+        }
+      },
+      "required": []
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "entities_expired": {
+          "type": "integer",
+          "description": "Entities transitioned to status='expired'"
+        },
+        "workspace_hash": {
+          "type": "string",
+          "description": "Workspace the sweep was restricted to ('' = global)"
+        },
+        "dry_run": {
+          "type": "boolean",
+          "description": "Whether this was a dry run"
+        },
+        "completed_at_unix_ms": {
+          "type": "integer",
+          "description": "Completion timestamp"
+        }
+      }
+    },
+    "annotations": {
+      "destructiveHint": true
+    },
+    "title": "Expire Due Entities"
+  },
+  {
+    "name": "mimir_redact",
+    "description": "Content redaction (#868): scrub the body of a workspace-scoped entity to a hash-only marker, delete its history snapshots and FTS text, and append a hash-only 'redacted' journal event. Metadata (id, key, links, provenance) is RETAINED; re-ingest of the same value stays allowed (redaction ≠ erasure). Requires an explicit workspace_hash (fail-closed, #854). Contract: docs/specs/data-boundaries-retention-lifecycle.md.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "category": {
+          "type": "string",
+          "description": "Entity category"
+        },
+        "key": {
+          "type": "string",
+          "description": "Entity key"
+        },
+        "workspace_hash": {
+          "type": "string",
+          "description": "Workspace scope of the entity (required — a bare category/key is ambiguous)"
+        },
+        "agent_id": {
+          "type": "string",
+          "default": "",
+          "description": "Acting agent for attribution (overridden by the transport-stamped requesting_agent_id when present)"
+        },
+        "requesting_agent_id": {
+          "type": "string",
+          "description": "MCP session identity stamped by the transport; overrides agent_id"
+        }
+      },
+      "required": [
+        "category",
+        "key",
+        "workspace_hash"
+      ]
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "found": {
+          "type": "boolean",
+          "description": "Whether a matching entity was found and redacted"
+        },
+        "entity_id": {
+          "type": "string",
+          "description": "Id of the first redacted row"
+        },
+        "value_sha256": {
+          "type": "string",
+          "description": "Hash-only audit evidence: sha256 of the scrubbed body"
+        },
+        "history_deleted": {
+          "type": "integer",
+          "description": "History snapshot rows deleted (content-bearing)"
+        },
+        "fts_cleaned": {
+          "type": "integer",
+          "description": "FTS index rows removed"
+        },
+        "journal_event_id": {
+          "type": "string",
+          "description": "Id of the hash-only 'redacted' journal event"
+        },
+        "workspace_hash": {
+          "type": "string",
+          "description": "Workspace the redaction was scoped to"
+        },
+        "completed_at_unix_ms": {
+          "type": "integer",
+          "description": "Completion timestamp"
+        }
+      }
+    },
+    "annotations": {
+      "destructiveHint": true
+    },
+    "title": "Redact Entity Content"
+  },
+  {
+    "name": "mimir_erase",
+    "description": "Physical erasure (#868/#866): permanently remove a workspace-scoped entity from the primary store AND all derived layers (FTS, history, history-FTS, community membership, inbound links, journal payloads), quarantine derived entities that cited it via evidence links, install a permanent rejection tombstone + governance mandate (re-ingest fails closed and survives primary-DB rollback), and append a hash-only 'erased' journal event. ERASED DATA IS NOT RECOVERABLE. Requires an explicit workspace_hash (fail-closed, #854). Use dry_run=true to preview exact counts. Contract: docs/specs/data-boundaries-retention-lifecycle.md.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "category": {
+          "type": "string",
+          "description": "Entity category"
+        },
+        "key": {
+          "type": "string",
+          "description": "Entity key"
+        },
+        "workspace_hash": {
+          "type": "string",
+          "description": "Workspace scope of the entity (required — a bare category/key is ambiguous)"
+        },
+        "agent_id": {
+          "type": "string",
+          "default": "",
+          "description": "Acting agent for attribution (overridden by the transport-stamped requesting_agent_id when present)"
+        },
+        "dry_run": {
+          "type": "boolean",
+          "default": false,
+          "description": "If true, report exactly what would be erased without making changes"
+        },
+        "requesting_agent_id": {
+          "type": "string",
+          "description": "MCP session identity stamped by the transport; overrides agent_id"
+        }
+      },
+      "required": [
+        "category",
+        "key",
+        "workspace_hash"
+      ]
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "entities_erased": {
+          "type": "integer",
+          "description": "Primary rows removed"
+        },
+        "history_deleted": {
+          "type": "integer",
+          "description": "History snapshot rows removed"
+        },
+        "fts_cleaned": {
+          "type": "integer",
+          "description": "FTS index rows removed"
+        },
+        "community_memberships_cleaned": {
+          "type": "integer",
+          "description": "Community member_ids entries removed"
+        },
+        "community_rows_deleted": {
+          "type": "integer",
+          "description": "Communities deleted because the erased entity was their last member"
+        },
+        "inbound_links_cleaned": {
+          "type": "integer",
+          "description": "Inbound link edges removed from other rows"
+        },
+        "derived_quarantined": {
+          "type": "integer",
+          "description": "Derived entities citing the erased source, now quarantined pending operator review"
+        },
+        "journal_rows_redacted": {
+          "type": "integer",
+          "description": "Journal payloads scrubbed in place (audit chain preserved)"
+        },
+        "journal_event_id": {
+          "type": "string",
+          "description": "Id of the hash-only 'erased' journal event"
+        },
+        "value_sha256": {
+          "type": "string",
+          "description": "Hash-only evidence: sha256 of the erased body"
+        },
+        "workspace_hash": {
+          "type": "string",
+          "description": "Workspace the erasure was scoped to"
+        },
+        "dry_run": {
+          "type": "boolean",
+          "description": "Whether this was a dry run"
+        },
+        "governance_mandate_ok": {
+          "type": "boolean",
+          "description": "False if the permanent re-ingest mandate could not be installed (content is gone; guard needs operator attention)"
+        },
+        "completed_at_unix_ms": {
+          "type": "integer",
+          "description": "Completion timestamp"
+        }
+      }
+    },
+    "annotations": {
+      "destructiveHint": true
+    },
+    "title": "Erase Entity Permanently"
+  },
+  {
     "name": "mimir_memories",
     "description": "Anthropic memory-tool compatible file interface over the vault: view / create / str_replace / insert / delete / rename on paths under /memories. Files are stored as vault entities (category 'memories', FTS-indexed, encrypted at rest, edits versioned via history), so clients built against Claude's native memory directory convention can use the vault unchanged. Use command='view' with path='/memories' to list files.",
     "inputSchema": {
@@ -5533,6 +5759,9 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
         "mimir_compact" => Ok(tools::handle_compact(db, args)),
 
         "mimir_purge" => tools::handle_purge(db, args).map_err(|e| e.to_string()),
+        "mimir_expire" => tools::handle_expire(db, args).map_err(|e| e.to_string()),
+        "mimir_redact" => tools::handle_redact(db, args).map_err(|e| e.to_string()),
+        "mimir_erase" => tools::handle_erase(db, args).map_err(|e| e.to_string()),
         "mimir_memories" => tools::handle_memories(db, args).map_err(|e| e.to_string()),
 
         "mimir_migrate" => Ok(tools::handle_migrate(db, args)),
@@ -5686,7 +5915,7 @@ mod tests {
         );
         assert_eq!(
             registry_names.len(),
-            92,
+            95,
             "update public metadata when adding a tool"
         );
 

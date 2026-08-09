@@ -80,7 +80,14 @@ CREATE TABLE IF NOT EXISTS entities (
     -- demonstrably informed a subsequent write. Feeds decay_tick (cited
     -- memories decay slower) and the hybrid-recall rank boost.
     usefulness_count INTEGER DEFAULT 0,  -- times cited as a derived_from source
-    last_useful_unix_ms INTEGER DEFAULT 0 -- when it was last cited (0 = never)
+    last_useful_unix_ms INTEGER DEFAULT 0, -- when it was last cited (0 = never)
+
+    -- Retention expiry (#868): when this fact stops being serveable.
+    -- Written by the remember path from the body `expires_at` convention
+    -- (unix ms, numeric string, or ISO 8601 UTC); recall excludes rows past
+    -- it, and the expire sweep transitions them to status='expired'. NULL =
+    -- never expires (the default for every pre-existing row).
+    expires_at_unix_ms INTEGER
 );
 
 -- Identity index: (category, key, workspace_hash) — #339. Created in
@@ -409,7 +416,7 @@ CREATE INDEX IF NOT EXISTS idx_artifact_bindings_derived_from
 /// 'defensively_recalled', orthogonal to the lifecycle `status` column.
 /// Backfill-free: existing rows default to 'candidate' (useful but unverified),
 /// which is the safe reading for any legacy record lacking admission evidence.
-const SCHEMA_VERSION: i64 = 27;
+const SCHEMA_VERSION: i64 = 28;
 
 /// Initialize the v0.2.0 schema on a fresh database.
 pub fn initialize_schema(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
@@ -519,6 +526,10 @@ fn apply_migrations(conn: &Connection) -> Result<(), Box<dyn std::error::Error>>
     // ALTERs to already-migrated stores.
     ensure_column(conn, "entities", "usefulness_count", "INTEGER DEFAULT 0")?;
     ensure_column(conn, "entities", "last_useful_unix_ms", "INTEGER DEFAULT 0")?;
+
+    // v28 (#868): retention expiry on the live row. NULL = never expires
+    // (the correct reading for every legacy row), so this is purely additive.
+    ensure_column(conn, "entities", "expires_at_unix_ms", "INTEGER")?;
 
     // Backfill transaction time for pre-existing rows: a fact's recorded_at is
     // when Mneme first stored it, i.e. its created_at. (No-op on a fresh DB.)
@@ -1554,12 +1565,12 @@ mod tests {
         .unwrap();
 
         // Migrate.
-        initialize_schema(&conn).expect("migrate v26 -> v27");
+        initialize_schema(&conn).expect("migrate legacy store to current");
 
         let v: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 27, "migration must stamp v27");
+        assert_eq!(v, SCHEMA_VERSION, "migration must stamp the current version");
         let state: String = conn
             .query_row(
                 "SELECT epistemic_state FROM entities WHERE id = 'legacy'",

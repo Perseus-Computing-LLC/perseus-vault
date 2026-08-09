@@ -806,6 +806,87 @@ pub struct PurgeReport {
     pub completed_at_unix_ms: i64,
 }
 
+/// Lifecycle axis vocabulary (#868): the `status` field on entities is the
+/// lifecycle axis, orthogonal to the epistemic trust axis (#880). The ops
+/// that transition these states are distinct: expire (time-based, content
+/// kept), supersede (correctness replacement, history kept), forget (logical
+/// delete), redact (content scrub, metadata kept), erase (physical removal
+/// across derived layers + re-ingest suppression). See
+/// docs/specs/data-boundaries-retention-lifecycle.md (v1).
+pub const LIFECYCLE_STATES: [&str; 9] = [
+    "active",
+    "proposed",
+    "superseded",
+    "resolved",
+    "quarantined",
+    "expired",
+    "redacted",
+    "logically_deleted",
+    "physically_erased",
+];
+
+/// Expire report (#868) — time-based lifecycle sweep: rows past
+/// `expires_at_unix_ms` transition to status='expired'. Content and history
+/// are retained; recall already excludes expired rows.
+#[derive(Debug, Clone, Serialize)]
+pub struct ExpireReport {
+    pub entities_expired: i64,
+    /// Empty string = global sweep; otherwise restricted to one workspace.
+    pub workspace_hash: String,
+    pub dry_run: bool,
+    pub completed_at_unix_ms: i64,
+}
+
+/// Redact report (#868) — content scrub with metadata retention. The body is
+/// replaced by a hash-only marker, history + FTS text are deleted, and a
+/// hash-only `redacted` journal event is appended. Re-ingest of the same
+/// value remains allowed (redaction ≠ erasure).
+#[derive(Debug, Clone, Serialize)]
+pub struct RedactReport {
+    pub found: bool,
+    pub entity_id: String,
+    /// sha256 of the scrubbed body (normalized like rejection digests), kept
+    /// as hash-only audit evidence.
+    pub value_sha256: String,
+    pub history_deleted: i64,
+    pub fts_cleaned: i64,
+    pub journal_event_id: String,
+    pub workspace_hash: String,
+    pub completed_at_unix_ms: i64,
+}
+
+/// Erase report (#868/#866) — physical erasure of one (category, key,
+/// workspace) identity across ALL derived layers, plus permanent re-ingest
+/// suppression via tombstone + governance overlay mandate. Journal content
+/// referencing the erased rows is redacted; a hash-only `erased` event is
+/// appended. Contract: docs/specs/data-boundaries-retention-lifecycle.md.
+#[derive(Debug, Clone, Serialize)]
+pub struct EraseReport {
+    pub entities_erased: i64,
+    pub history_deleted: i64,
+    pub fts_cleaned: i64,
+    /// Community memberships (member_ids entries) removed.
+    pub community_memberships_cleaned: i64,
+    /// Community rows deleted because the erased entity was their last member.
+    pub community_rows_deleted: i64,
+    /// Inbound link edges (other rows pointing at the erased id) removed.
+    pub inbound_links_cleaned: i64,
+    /// Derived entities (beliefs/observation/synthesis) citing the erased
+    /// source via evidence links, now quarantined pending operator review.
+    pub derived_quarantined: i64,
+    /// Journal rows scrubbed in place (payloads → {}, chain tuple preserved).
+    pub journal_rows_redacted: i64,
+    pub journal_event_id: String,
+    /// sha256 of the erased body (hash-only evidence, contract §6.2).
+    pub value_sha256: String,
+    pub workspace_hash: String,
+    pub dry_run: bool,
+    /// False if the permanent governance mandate could not be installed —
+    /// content is gone but the re-ingest guard needs operator attention.
+    pub governance_mandate_ok: bool,
+    pub completed_at_unix_ms: i64,
+}
+
 /// #398: entity_history retention knobs. Every knob defaults OFF (None =
 /// unlimited), preserving the pre-#398 keep-everything behavior — enabling a
 /// bound is a deliberate operator decision, made via env:
