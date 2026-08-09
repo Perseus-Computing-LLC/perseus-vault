@@ -42,6 +42,7 @@ remains runnable.
 - `deletion/`: re-ingestion, background-job, derived-store, and propagation protocol;
 - `freshness/`: write-to-readable lag and failure/concurrency stress;
 - `economics/`: storage, token, and optional cost overlays;
+- `security/`: deterministic authority gold traces (accept/reject/failed-to-confirm/blocked) with negative assertions;
 - `scale/` and `beam/`: latency, throughput, and corpus-size overlays;
 - `context_selection/`: provenance-preserving context selection without a model judge;
 - `agent_tasks/`: planned deterministic downstream task utility.

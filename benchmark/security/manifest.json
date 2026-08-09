@@ -1,0 +1,21 @@
+{
+  "name": "perseus-vault-authority-traces-v1",
+  "version": 1,
+  "category": "benchmark_security_authority",
+  "trace_count": 10,
+  "traces_file": "traces/authority_traces.json",
+  "generator": "traces/generate_authority_traces.py",
+  "outcome_taxonomy": ["accept", "reject", "failed_to_confirm", "blocked"],
+  "trace_ids": [
+    "authority-canonical-revoke",
+    "authority-revoke-different-actor",
+    "authority-replay-grant-after-revoke",
+    "authority-expired-grant",
+    "authority-revoked-memory-deleted",
+    "authority-success-toast-no-readback",
+    "authority-split-brain-continuation",
+    "authority-derived-revocation",
+    "authority-key-rotation",
+    "authority-identity-collision"
+  ]
+}
