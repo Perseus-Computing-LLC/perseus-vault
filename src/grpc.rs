@@ -150,6 +150,7 @@ pub mod grpc {
                     visibility: r.visibility,
                     layer: None,
                     reinforce: false,
+                    ..Default::default() // #883 fused-mode params default here
                 };
                 let entities = db.recall(&params)?;
                 let items: Vec<EntityMessage> =
