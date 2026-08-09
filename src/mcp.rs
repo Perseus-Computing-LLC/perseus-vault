@@ -5576,6 +5576,54 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Get Keystones"
   },
   {
+    "name": "perseus_vault_keystone_suggestions",
+    "description": "List candidate directive/keystone suggestions (#889) extracted from `correct` captures by word-boundary-anchored patterns (en/de/ru/it/es). Suggestions are candidates only — never policy: promotion to the keystones table requires an explicit operator `approve` decision via perseus_vault_keystone_suggestion_decide. Each suggestion carries its source correction entity id for citation. Filter by status (pending/approved/rejected) and workspace; read-only.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "status": { "type": "string", "description": "Filter: '' (all), 'pending', 'approved', or 'rejected'. Default ''." },
+        "workspace_hash": { "type": "string", "description": "Optional workspace scope filter." },
+        "limit": { "type": "integer", "description": "Max rows (1-1000). Default 50." }
+      }
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "suggestions": { "type": "array", "items": { "type": "object" } },
+        "count": { "type": "integer" }
+      }
+    },
+    "title": "List Keystone Suggestions"
+  },
+  {
+    "name": "perseus_vault_keystone_suggestion_decide",
+    "description": "Decide a keystone-suggestion candidate (#889): 'approve' promotes the suggestion's instruction into the keystones table (re-running the #683/#684 trust-tier gate — authoring requires tier >= trust_tier_required) and marks the suggestion approved; 'reject' marks it rejected and writes nothing. Extraction never writes policy — this explicit operator decision is the only promotion path.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Suggestion id (ksug-...)." },
+        "action": { "type": "string", "description": "'approve' (promote to keystone) or 'reject'." },
+        "scope": { "type": "string", "description": "Keystone scope: 'tenant' | 'fleet' | 'agent'. Default 'agent'." },
+        "scope_id": { "type": "string", "description": "Keystone scope_id; defaults to agent_id." },
+        "weight": { "type": "number", "description": "Conflict-resolution weight. Default 1.0." },
+        "trust_tier_required": { "type": "integer", "description": "Minimum authoring tier. Default 2." },
+        "author_trust_tier": { "type": "integer", "description": "Caller-asserted tier (used when the agent is not registry-registered)." },
+        "agent_id": { "type": "string", "description": "Author agent id (registry-backed tier wins when registered)." },
+        "workspace_hash": { "type": "string", "description": "Must match the suggestion's own workspace." }
+      },
+      "required": ["id", "action"]
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "ok": { "type": "boolean" },
+        "keystone_id": { "type": "string" },
+        "suggestion_status": { "type": "string" }
+      }
+    },
+    "title": "Decide Keystone Suggestion"
+  },
+  {
     "name": "perseus_vault_agent",
     "description": "Register/update or look up an agent in the multi-agent registry (#684). Agents carry a trust tier (0-3) that gates sensitive ops (e.g. authoring keystones needs tier >= 2) and drives visibility enforcement on recall: tier 0 = read own only, 1 = fleet, 2 = read all + write keystones, 3 = admin. Pass trust_tier (and optionally name/fleet_id) to upsert; omit trust_tier to just look up. entities/journal already stamp agent_id (v1.2.0); this adds the identity + tier metadata. NOTE: an empty/unknown agent has no registry row — unknown identified agents resolve to tier 0, and a caller with no session identity is unscoped.",
     "inputSchema": {
@@ -5779,6 +5827,10 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
         "perseus_vault_score" => Ok(tools::handle_score(db, args)),
         "perseus_vault_follow" => tools::handle_follow(db, args).map_err(|e| e.to_string()),
         "perseus_vault_keystone_set" => tools::handle_keystone_set(db, args),
+        "perseus_vault_keystone_suggestions" => tools::handle_keystone_suggestions(db, args),
+        "perseus_vault_keystone_suggestion_decide" => {
+            tools::handle_keystone_suggestion_decide(db, args)
+        }
         "perseus_vault_keystone_get" => tools::handle_keystone_get(db, args),
         "perseus_vault_agent" => tools::handle_agent(db, args),
         "perseus_vault_authority_set" => tools::handle_authority_set(db, args),
@@ -5914,7 +5966,7 @@ mod tests {
         );
         assert_eq!(
             registry_names.len(),
-            100,
+            102,
             "update public metadata when adding a tool"
         );
 

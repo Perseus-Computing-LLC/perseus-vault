@@ -216,6 +216,25 @@ pub struct Keystone {
     pub updated_at_unix_ms: i64,
 }
 
+/// #889: a candidate directive/keystone suggestion extracted from a
+/// `correct` capture by word-boundary-anchored patterns. Suggestions are
+/// never policy: only an operator `approve` decision promotes one to the
+/// keystones table.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeystoneSuggestion {
+    pub id: String,
+    pub source_entity_id: String,
+    pub source_category: String,
+    pub instruction: String,
+    pub pattern_locale: String,
+    pub matched_pattern: String,
+    pub status: String,
+    pub created_at_unix_ms: i64,
+    pub decided_at_unix_ms: Option<i64>,
+    pub decided_by: Option<String>,
+    pub workspace_hash: String,
+}
+
 /// #684: a registered agent — identity + a trust tier (0-3) that gates
 /// sensitive ops and drives visibility enforcement on reads.
 #[derive(Debug, Clone, Serialize, Deserialize)]
