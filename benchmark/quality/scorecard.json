@@ -1,0 +1,164 @@
+{
+  "accuracy": 1.0,
+  "benchmark": "perseus-vault-memory-quality",
+  "blocking": true,
+  "case_count": 30,
+  "case_count_valid": true,
+  "checks_passed": 41,
+  "checks_total": 41,
+  "dataset": "perseus-vault-memory-quality-v1",
+  "failed_categories": [],
+  "failed_metrics": [],
+  "harness_version": "perseus-vault-memory-quality/v1",
+  "invalid_cases": [],
+  "invalid_metrics": [],
+  "metric_rates": {
+    "action_grounding_rate": {
+      "rate": 1.0,
+      "status": "available"
+    },
+    "admission_rate": {
+      "rate": 1.0,
+      "status": "available"
+    },
+    "compaction_projection_rate": {
+      "rate": 1.0,
+      "status": "available"
+    },
+    "identity_ambiguity_rate": {
+      "rate": 1.0,
+      "status": "available"
+    },
+    "mutation_supersession_rate": {
+      "rate": 1.0,
+      "status": "available"
+    },
+    "prompt_safety_rate": {
+      "rate": 1.0,
+      "status": "available"
+    },
+    "provenance_completeness": {
+      "rate": 1.0,
+      "status": "available"
+    },
+    "recall_outcome_rate": {
+      "rate": 1.0,
+      "status": "available"
+    },
+    "replay_fidelity": {
+      "rate": 1.0,
+      "status": "available"
+    },
+    "scope_invalid_recall_rate": {
+      "rate": 0.0,
+      "status": "available"
+    },
+    "stale_recall_rate": {
+      "rate": 0.0,
+      "status": "available"
+    },
+    "validity_rate": {
+      "rate": 1.0,
+      "status": "available"
+    }
+  },
+  "metrics": {
+    "action_grounding": {
+      "denominator": 4,
+      "numerator": 4,
+      "rate": 1.0,
+      "status": "available"
+    },
+    "admission": {
+      "denominator": 2,
+      "numerator": 2,
+      "rate": 1.0,
+      "status": "available"
+    },
+    "compaction_projection": {
+      "denominator": 3,
+      "numerator": 3,
+      "rate": 1.0,
+      "status": "available"
+    },
+    "identity_ambiguity": {
+      "denominator": 1,
+      "numerator": 1,
+      "rate": 1.0,
+      "status": "available"
+    },
+    "mutation_supersession": {
+      "denominator": 5,
+      "numerator": 5,
+      "rate": 1.0,
+      "status": "available"
+    },
+    "prompt_safety": {
+      "denominator": 1,
+      "numerator": 1,
+      "rate": 1.0,
+      "status": "available"
+    },
+    "provenance": {
+      "denominator": 13,
+      "numerator": 13,
+      "rate": 1.0,
+      "status": "available"
+    },
+    "recall_outcome": {
+      "denominator": 2,
+      "numerator": 2,
+      "rate": 1.0,
+      "status": "available"
+    },
+    "replay_fidelity": {
+      "denominator": 3,
+      "numerator": 3,
+      "rate": 1.0,
+      "status": "available"
+    },
+    "scope_invalid_recall": {
+      "denominator": 3,
+      "numerator": 0,
+      "rate": 0.0,
+      "status": "available"
+    },
+    "validity": {
+      "denominator": 6,
+      "numerator": 6,
+      "rate": 1.0,
+      "status": "available"
+    }
+  },
+  "missing_categories": [],
+  "override_policy": {
+    "allowed": true,
+    "required_approver": "maintainer",
+    "requirements": [
+      "document the failing checks and user impact",
+      "link a remediation issue",
+      "record the override in release notes"
+    ]
+  },
+  "partial_metrics": [],
+  "scorecard_version": "perseus-vault-memory-quality-scorecard/v2",
+  "source_report_signature": "015e691904b9cfc80139dadebd2bec4d18926d5a84a61be7bcfecf96a8947009",
+  "thresholds": {
+    "all_category_checks_pass": true,
+    "all_required_categories_present": true,
+    "case_count_20_to_40_for_v1": true,
+    "consistent_check_counts": true,
+    "counts_match_cases": true,
+    "exact_accuracy": true,
+    "minimum_accuracy": 1.0,
+    "no_failed_metrics": true,
+    "no_unavailable_capabilities": true,
+    "no_unavailable_metrics": true,
+    "no_unavailable_required_cases": true
+  },
+  "unavailable_capabilities": [],
+  "unavailable_cases": [],
+  "unavailable_categories": [],
+  "unavailable_metrics": [],
+  "verdict": "release_ready"
+}

@@ -649,6 +649,71 @@ pub fn handle_request(
                 }
             }
 
+            // #879: enforce profile <-> workspace bindings at the tool
+            // boundary. The transport-stamped requesting_agent_id is the
+            // Hermes profile name; the binding registry is vault-authoritative.
+            // Mutations on the scoped surface deny cross-workspace targets,
+            // read_only bindings, and quarantined/unbound bindings. Reads
+            // deny cross-workspace targets when the caller names a workspace.
+            // Unbound profiles keep the legacy unscoped behavior (binding is
+            // an opt-in governance surface).
+            {
+                const SCOPE_MUTATION_TOOLS: &[&str] = &[
+                    "mimir_remember",
+                    "mimir_reject_value",
+                    "mimir_forget",
+                    "mimir_link",
+                    "mimir_unlink",
+                    "mimir_supersede",
+                    "mimir_state_set",
+                    "mimir_embed",
+                    "mimir_artifact_register",
+                    "mimir_learned_artifact_register",
+                    "mimir_expire",
+                    "mimir_redact",
+                    "mimir_erase",
+                    "mimir_correct",
+                    "mimir_follow",
+                ];
+                const SCOPE_READ_TOOLS: &[&str] = &[
+                    "mimir_recall",
+                    "mimir_recall_batch",
+                    "mimir_recall_layer",
+                    "mimir_scan",
+                    "mimir_context",
+                    "mimir_ask",
+                    "mimir_artifact_manifest",
+                    "mimir_artifact_excerpt",
+                    "mimir_artifact_verify_value",
+                ];
+                let profile = tool_args
+                    .get("requesting_agent_id")
+                    .and_then(|v| v.as_str());
+                let ws = tool_args.get("workspace_hash").and_then(|v| v.as_str());
+                let denied = if SCOPE_MUTATION_TOOLS.contains(&tool_name) {
+                    db.enforce_workspace_binding(profile, ws, true)
+                        .err()
+                        .map(|e| e.to_string())
+                } else if SCOPE_READ_TOOLS.contains(&tool_name) {
+                    db.enforce_workspace_binding(profile, ws, false)
+                        .err()
+                        .map(|e| e.to_string())
+                } else {
+                    None
+                };
+                if let Some(msg) = denied {
+                    return Some(JsonRpcResponse {
+                        jsonrpc: "2.0".to_string(),
+                        id,
+                        result: Some(json!({
+                            "content": [{ "type": "text", "text": msg }],
+                            "isError": true,
+                        })),
+                        error: None,
+                    });
+                }
+            }
+
             // v23 (Chancery cross-ref, #6): extract the chancery writ ID from
             // `_meta.chancery/lease` on the tools/call params envelope. When
             // Chancery wraps an MCP server it stamps every request with this so
@@ -2233,6 +2298,67 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
       "destructiveHint": false
     },
     "title": "Register Governed Learned Artifact"
+  },
+  {
+    "name": "mimir_workspace_bind",
+    "description": "#879: bind a Hermes profile to a Vault workspace (one profile <-> one workspace; re-binding switches workspace and resets lifecycle state). access_mode read_write | read_only; read_only bindings deny mutations at the tool boundary. Journaled (workspace_bound / workspace_rebound).",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "profile_name": { "type": "string", "description": "Hermes profile name (must match the MCP clientInfo.name used at handshake)" },
+        "workspace_hash": { "type": "string", "default": "", "description": "Workspace to bind the profile to" },
+        "access_mode": { "type": "string", "default": "read_write", "enum": ["read_write", "read_only"], "description": "read_write or read_only" },
+        "metadata": { "type": "object", "description": "Optional metadata (host, hermes version, actor, ...)" }
+      },
+      "required": ["profile_name", "workspace_hash"]
+    },
+    "outputSchema": { "type": "object" },
+    "title": "Bind Hermes Profile to Workspace"
+  },
+  {
+    "name": "mimir_workspace_unbind",
+    "description": "#879: unbind a Hermes profile from its workspace (lifecycle: active/quarantined -> unbound; row retained for audit). Journaled (workspace_unbound).",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "profile_name": { "type": "string", "description": "Hermes profile name to unbind" },
+        "reason": { "type": "string", "description": "Unbind reason (journaled)" }
+      },
+      "required": ["profile_name"]
+    },
+    "outputSchema": { "type": "object" },
+    "title": "Unbind Hermes Profile"
+  },
+  {
+    "name": "mimir_workspace_quarantine",
+    "description": "#879: operator lifecycle control — quarantine an active binding (stops all access until reactivated) or reactivate a quarantined/unbound binding. Journaled (workspace_quarantined / workspace_reactivated).",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "profile_name": { "type": "string", "description": "Hermes profile name" },
+        "action": { "type": "string", "default": "quarantine", "enum": ["quarantine", "reactivate"], "description": "quarantine or reactivate" },
+        "reason": { "type": "string", "description": "Reason (required for quarantine, journaled)" }
+      },
+      "required": ["profile_name"]
+    },
+    "outputSchema": { "type": "object" },
+    "title": "Quarantine or Reactivate Profile Binding"
+  },
+  {
+    "name": "mimir_workspace_status",
+    "description": "#879: diagnostics — all profile <-> workspace bindings with lifecycle state, access mode, heartbeat, and staleness signal; distinguishes live, stale, quarantined, and unbound bindings.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {}
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "bindings": { "type": "array", "items": { "type": "object" } },
+        "count": { "type": "integer" }
+      }
+    },
+    "title": "Workspace Binding Status"
   },
   {
     "name": "mimir_artifact_manifest",
@@ -5806,6 +5932,19 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
         "mimir_learned_artifact_register" => {
             tools::handle_learned_artifact_register(db, args).map_err(|e| e.to_string())
         }
+
+        "mimir_workspace_bind" => {
+            tools::handle_workspace_bind(db, args).map_err(|e| e.to_string())
+        }
+        "mimir_workspace_unbind" => {
+            tools::handle_workspace_unbind(db, args).map_err(|e| e.to_string())
+        }
+        "mimir_workspace_quarantine" => {
+            tools::handle_workspace_quarantine(db, args).map_err(|e| e.to_string())
+        }
+        "mimir_workspace_status" => {
+            tools::handle_workspace_status(db, args).map_err(|e| e.to_string())
+        }
         "mimir_memories" => tools::handle_memories(db, args).map_err(|e| e.to_string()),
 
         "mimir_migrate" => Ok(tools::handle_migrate(db, args)),
@@ -5959,7 +6098,7 @@ mod tests {
         );
         assert_eq!(
             registry_names.len(),
-            96,
+            100,
             "update public metadata when adding a tool"
         );
 
@@ -7167,5 +7306,88 @@ mod tests {
             !super::is_orphaned_by_ppid(),
             "after recording baseline, a process with a live parent is not orphaned"
         );
+    }
+
+    #[test]
+    fn call_boundary_enforces_profile_workspace_bindings() {
+        // #879 end-to-end: the transport-captured clientInfo.name is the
+        // profile identity; a read_only binding denies mutations and a bound
+        // profile cannot touch another workspace — the denial surfaces as an
+        // isError at the tools/call boundary.
+        let db_path = std::env::temp_dir()
+            .join(format!("mimir-binding-{}.db", uuid::Uuid::new_v4()));
+        let db = Database::open(db_path.to_str().expect("temp db path")).expect("open temp db");
+        db.workspace_bind("profile-ro", "ws-own", "read_only", "{}", "operator")
+            .unwrap();
+
+        let state = MCPState::new();
+        // Handshake as the bound read_only profile.
+        let init = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(1)),
+            method: "initialize".to_string(),
+            params: Some(json!({"clientInfo": {"name": "profile-ro", "version": "1.0"}})),
+        };
+        handle_request(&init, &state, &db).expect("initialize");
+        assert_eq!(*state.session_agent_id.read().unwrap(), "profile-ro");
+
+        // Mutation in the bound (read_only) workspace -> denied.
+        let call = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(2)),
+            method: "tools/call".to_string(),
+            params: Some(json!({
+                "name": "mimir_remember",
+                "arguments": {"category": "decision", "key": "k",
+                              "body_json": "{\"v\":1}", "workspace_hash": "ws-own"}
+            })),
+        };
+        let resp = handle_request(&call, &state, &db).expect("remember response");
+        let result = resp.result.expect("result");
+        assert_eq!(result["isError"], json!(true), "{result}");
+        assert!(
+            result["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("read_only"),
+            "{result}"
+        );
+
+        // Mutation in a DIFFERENT workspace -> denied (cross-workspace).
+        let call = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(3)),
+            method: "tools/call".to_string(),
+            params: Some(json!({
+                "name": "mimir_remember",
+                "arguments": {"category": "decision", "key": "k2",
+                              "body_json": "{\"v\":2}", "workspace_hash": "ws-other"}
+            })),
+        };
+        let resp = handle_request(&call, &state, &db).expect("remember response");
+        let result = resp.result.expect("result");
+        assert_eq!(result["isError"], json!(true), "{result}");
+        assert!(
+            result["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("cross-workspace"),
+            "{result}"
+        );
+
+        // Reads within the bound workspace stay allowed.
+        let call = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(4)),
+            method: "tools/call".to_string(),
+            params: Some(json!({
+                "name": "mimir_recall",
+                "arguments": {"query": "anything", "mode": "fts5", "workspace_hash": "ws-own"}
+            })),
+        };
+        let resp = handle_request(&call, &state, &db).expect("recall response");
+        assert!(resp.result.expect("result").get("isError").is_none(), "read must pass");
+
+        let _ = std::fs::remove_file(db_path);
     }
 }

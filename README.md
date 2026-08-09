@@ -19,7 +19,7 @@
 
 Give your agents memory that survives the session, so they stop re-deriving what they
 already learned and stop repeating past mistakes. Hybrid recall (BM25 + dense + RRF),
-bi-temporal history, and **AES-256-GCM** at rest, exposed as **96 canonical MCP tools**
+bi-temporal history, and **AES-256-GCM** at rest, exposed as **100 canonical MCP tools**
 that work with any host. Legacy `mimir_*` and `mneme_*` aliases remain callable but are
 not counted separately. **73.8% on LongMemEval's official harness** (vs Zep 63.8%, Mem0
 49.0%).

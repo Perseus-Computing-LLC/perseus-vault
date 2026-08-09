@@ -1,0 +1,641 @@
+{
+  "accuracy": 1.0,
+  "benchmark": "perseus-vault-memory-quality",
+  "benchmark_id": "perseus-vault-memory-quality",
+  "binary": "perseus-vault",
+  "binary_sha256": "2cc12b85b67f95e3cb0331632e9cdd832936947dfce8b50fbdf8d73445a36262",
+  "capabilities": {
+    "action_control_plane": {
+      "missing_tools": [],
+      "required_tools": [
+        "perseus_vault_agent",
+        "perseus_vault_authority_set",
+        "perseus_vault_action_intent",
+        "perseus_vault_action_complete",
+        "perseus_vault_action_receipt_get",
+        "perseus_vault_action_lease_acquire",
+        "perseus_vault_action_lease_release"
+      ],
+      "status": "available"
+    },
+    "compact": {
+      "missing_tools": [],
+      "required_tools": [
+        "perseus_vault_compact"
+      ],
+      "status": "available"
+    },
+    "context": {
+      "missing_tools": [],
+      "required_tools": [
+        "perseus_vault_context"
+      ],
+      "status": "available"
+    },
+    "mcp_stdio": {
+      "count": 100,
+      "status": "available"
+    },
+    "stage_trace_validate": {
+      "missing_tools": [],
+      "required_tools": [
+        "perseus_vault_stage_trace_validate"
+      ],
+      "status": "available"
+    }
+  },
+  "cases": [
+    {
+      "category": "long_horizon",
+      "checks": {
+        "answer_found": true,
+        "answer_is_current": true
+      },
+      "evidence": {
+        "ranked_key_count": 13,
+        "seed_count": 13,
+        "target_key_present": true
+      },
+      "id": "long-horizon-basic",
+      "status": "passed"
+    },
+    {
+      "category": "contradiction_supersession",
+      "checks": {
+        "current_wins": true,
+        "history_retained": true
+      },
+      "evidence": {
+        "current_key_present": true,
+        "history_total": 1,
+        "superseded_evidence_present": true
+      },
+      "id": "contradiction-supersession-basic",
+      "status": "passed"
+    },
+    {
+      "category": "shared_memory",
+      "checks": {
+        "eligible_memory_served": true,
+        "ineligible_memory_hidden": true
+      },
+      "evidence": {
+        "author_key_present": true,
+        "other_key_present": false
+      },
+      "id": "shared-memory-scope-basic",
+      "status": "passed"
+    },
+    {
+      "category": "adversarial",
+      "checks": {
+        "contamination_does_not_win": true,
+        "verified_truth_wins": true
+      },
+      "evidence": {
+        "contamination_key_present": true,
+        "truth_key_present": true
+      },
+      "id": "adversarial-contamination-basic",
+      "status": "passed"
+    },
+    {
+      "category": "validity",
+      "checks": {
+        "valid_interval_hit": true,
+        "validity_provenance_present": true
+      },
+      "evidence": {
+        "inside_found": true,
+        "outside_found": false,
+        "provenance_field_count": 3
+      },
+      "id": "validity-valid-at-current",
+      "status": "passed"
+    },
+    {
+      "category": "validity",
+      "checks": {
+        "valid_interval_gap_empty": true
+      },
+      "evidence": {
+        "inside_found": true,
+        "outside_found": false,
+        "provenance_field_count": 3
+      },
+      "id": "validity-valid-at-gap",
+      "status": "passed"
+    },
+    {
+      "category": "scope_validity",
+      "checks": {
+        "other_workspace_hidden": true
+      },
+      "evidence": {
+        "other_workspace_key_present": false,
+        "personal_profile_key_present": true,
+        "scoped_key_count": 1,
+        "shared_profile_personal_key_present": false
+      },
+      "id": "scope-invalid-recall-external",
+      "status": "passed"
+    },
+    {
+      "category": "scope_validity",
+      "checks": {
+        "requested_workspace_served": true
+      },
+      "evidence": {
+        "other_workspace_key_present": false,
+        "personal_profile_key_present": true,
+        "scoped_key_count": 1,
+        "shared_profile_personal_key_present": false
+      },
+      "id": "scope-invalid-recall-workspace",
+      "status": "passed"
+    },
+    {
+      "category": "provenance",
+      "checks": {
+        "core_provenance_complete": true
+      },
+      "evidence": {
+        "core_field_count": 11,
+        "core_field_total": 11,
+        "evidence_hash": "2b6b868454f52e040b2e4f1ea01cbe0a48c2796fa8ae16920579313fc02e9e57",
+        "evidence_mode": "480fcdae08b13a66f688aba3822cfd3271bda2591382b8b5b4dd63ebfdb1f0e6",
+        "external_ref_count": 1,
+        "origin_present": true
+      },
+      "id": "provenance-core-fields",
+      "status": "passed"
+    },
+    {
+      "category": "provenance",
+      "checks": {
+        "origin_and_reference_complete": true
+      },
+      "evidence": {
+        "core_field_count": 11,
+        "core_field_total": 11,
+        "evidence_hash": "2b6b868454f52e040b2e4f1ea01cbe0a48c2796fa8ae16920579313fc02e9e57",
+        "evidence_mode": "480fcdae08b13a66f688aba3822cfd3271bda2591382b8b5b4dd63ebfdb1f0e6",
+        "external_ref_count": 1,
+        "origin_present": true
+      },
+      "id": "provenance-origin-refs",
+      "status": "passed"
+    },
+    {
+      "category": "provenance",
+      "checks": {
+        "evidence_hash_complete": true
+      },
+      "evidence": {
+        "core_field_count": 11,
+        "core_field_total": 11,
+        "evidence_hash": "2b6b868454f52e040b2e4f1ea01cbe0a48c2796fa8ae16920579313fc02e9e57",
+        "evidence_mode": "480fcdae08b13a66f688aba3822cfd3271bda2591382b8b5b4dd63ebfdb1f0e6",
+        "external_ref_count": 1,
+        "origin_present": true
+      },
+      "id": "provenance-evidence-hash",
+      "status": "passed"
+    },
+    {
+      "category": "replay",
+      "checks": {
+        "frozen_recall_replays": true
+      },
+      "evidence": {
+        "frozen_digest": "3368cf399ff745c612bdebcb4528edef93d707a6cb9749878ff4d106c20420f8",
+        "frozen_key_count": 19,
+        "stage_trace_checked": true,
+        "temporal_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "id": "replay-frozen-recall",
+      "status": "passed"
+    },
+    {
+      "category": "replay",
+      "checks": {
+        "temporal_recall_replays": true
+      },
+      "evidence": {
+        "frozen_digest": "3368cf399ff745c612bdebcb4528edef93d707a6cb9749878ff4d106c20420f8",
+        "frozen_key_count": 19,
+        "stage_trace_checked": true,
+        "temporal_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "id": "replay-temporal-recall",
+      "status": "passed"
+    },
+    {
+      "category": "replay",
+      "checks": {
+        "stage_trace_replay_matches": true
+      },
+      "evidence": {
+        "frozen_digest": "3368cf399ff745c612bdebcb4528edef93d707a6cb9749878ff4d106c20420f8",
+        "frozen_key_count": 19,
+        "stage_trace_checked": true,
+        "temporal_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "id": "replay-stage-fingerprint",
+      "status": "passed"
+    },
+    {
+      "category": "mutation",
+      "checks": {
+        "single_current_key": true
+      },
+      "evidence": {
+        "current_row_count": 1,
+        "history_total": 1,
+        "live_key_present": true,
+        "prior_version_content_present": true
+      },
+      "id": "mutation-idempotent-update",
+      "status": "passed"
+    },
+    {
+      "category": "mutation",
+      "checks": {
+        "prior_version_retained": true
+      },
+      "evidence": {
+        "current_row_count": 1,
+        "history_total": 1,
+        "live_key_present": true,
+        "prior_version_content_present": true
+      },
+      "id": "mutation-history-retained",
+      "status": "passed"
+    },
+    {
+      "category": "mutation",
+      "checks": {
+        "superseded_version_not_recalled": true
+      },
+      "evidence": {
+        "current_row_count": 1,
+        "history_total": 1,
+        "live_key_present": true,
+        "prior_version_content_present": true
+      },
+      "id": "mutation-live-recall",
+      "status": "passed"
+    },
+    {
+      "category": "compaction_projection",
+      "checks": {
+        "low_decay_compacted": true
+      },
+      "evidence": {
+        "entities_archived": 2,
+        "entities_examined": 28
+      },
+      "id": "compaction-archive",
+      "status": "passed"
+    },
+    {
+      "category": "compaction_projection",
+      "checks": {
+        "projection_budget_bounded": true
+      },
+      "evidence": {
+        "always_inject_budget": 240,
+        "always_inject_entities": 1,
+        "always_inject_injected_chars": 240,
+        "always_inject_total_chars": 244,
+        "on_demand_budget": 240,
+        "on_demand_entities": 1,
+        "on_demand_injected_chars": 240,
+        "on_demand_total_chars": 244,
+        "other_workspace_visible": false
+      },
+      "id": "projection-context-budget",
+      "status": "passed"
+    },
+    {
+      "category": "compaction_projection",
+      "checks": {
+        "projection_scope_respected": true
+      },
+      "evidence": {
+        "always_inject_budget": 240,
+        "always_inject_entities": 1,
+        "always_inject_injected_chars": 240,
+        "always_inject_total_chars": 244,
+        "on_demand_budget": 240,
+        "on_demand_entities": 1,
+        "on_demand_injected_chars": 240,
+        "on_demand_total_chars": 244,
+        "other_workspace_visible": false
+      },
+      "id": "projection-scope",
+      "status": "passed"
+    },
+    {
+      "category": "action_grounding",
+      "checks": {
+        "authority_scope_matches": true
+      },
+      "evidence": {
+        "authority_version": 1,
+        "intent_hash": "7ba26df34a18456752a3452986abd8865ff0d84f7e4718aa20ccbae363c50ba4",
+        "lease_released": true,
+        "outcome_hash": "b136db6f2e98b27448bcd1460aa1965fb8d358245f2e8476f41a023e6cb9def2",
+        "receipt_present": true
+      },
+      "id": "action-authority",
+      "status": "passed"
+    },
+    {
+      "category": "action_grounding",
+      "checks": {
+        "receipt_hashes_complete": true
+      },
+      "evidence": {
+        "authority_version": 1,
+        "intent_hash": "7ba26df34a18456752a3452986abd8865ff0d84f7e4718aa20ccbae363c50ba4",
+        "lease_released": true,
+        "outcome_hash": "b136db6f2e98b27448bcd1460aa1965fb8d358245f2e8476f41a023e6cb9def2",
+        "receipt_present": true
+      },
+      "id": "action-receipt",
+      "status": "passed"
+    },
+    {
+      "category": "action_grounding",
+      "checks": {
+        "action_reference_grounded": true
+      },
+      "evidence": {
+        "authority_version": 1,
+        "intent_hash": "7ba26df34a18456752a3452986abd8865ff0d84f7e4718aa20ccbae363c50ba4",
+        "lease_released": true,
+        "outcome_hash": "b136db6f2e98b27448bcd1460aa1965fb8d358245f2e8476f41a023e6cb9def2",
+        "receipt_present": true
+      },
+      "id": "action-grounding-ref",
+      "status": "passed"
+    },
+    {
+      "category": "action_grounding",
+      "checks": {
+        "lease_lifecycle_complete": true
+      },
+      "evidence": {
+        "authority_version": 1,
+        "intent_hash": "7ba26df34a18456752a3452986abd8865ff0d84f7e4718aa20ccbae363c50ba4",
+        "lease_released": true,
+        "outcome_hash": "b136db6f2e98b27448bcd1460aa1965fb8d358245f2e8476f41a023e6cb9def2",
+        "receipt_present": true
+      },
+      "id": "action-lease",
+      "status": "passed"
+    },
+    {
+      "category": "recall_outcome",
+      "checks": {
+        "empty_abstains": true,
+        "empty_status_explicit": true
+      },
+      "evidence": {
+        "empty_abstained": true,
+        "pending_health_present": false
+      },
+      "id": "recall-outcome-empty-abstains",
+      "status": "passed"
+    },
+    {
+      "category": "recall_outcome",
+      "checks": {
+        "pending_not_silent": true,
+        "pending_outcome_explicit": true
+      },
+      "evidence": {
+        "empty_abstained": true,
+        "pending_health_present": false
+      },
+      "id": "recall-outcome-pending-is-stale",
+      "status": "passed"
+    },
+    {
+      "category": "admission",
+      "checks": {
+        "not_authoritative": true,
+        "quarantined": true
+      },
+      "evidence": {
+        "proposed_requires_review": true,
+        "untrusted_authoritative": false
+      },
+      "id": "admission-untrusted-instruction",
+      "status": "passed"
+    },
+    {
+      "category": "admission",
+      "checks": {
+        "proposed": true,
+        "requires_review": true
+      },
+      "evidence": {
+        "proposed_requires_review": true,
+        "untrusted_authoritative": false
+      },
+      "id": "admission-authoritative-needs-source",
+      "status": "passed"
+    },
+    {
+      "category": "prompt_safety",
+      "checks": {
+        "context_remains_bounded": true,
+        "hostile_marker_not_executable": true
+      },
+      "evidence": {
+        "hostile_marker_visible": false,
+        "injected_chars": 240
+      },
+      "id": "prompt-safety-hostile-memory",
+      "status": "passed"
+    },
+    {
+      "category": "identity_ambiguity",
+      "checks": {
+        "ambiguous_not_selected": true,
+        "ambiguous_scope_safe": true
+      },
+      "evidence": {
+        "selected_a": false,
+        "selected_b": false
+      },
+      "id": "identity-ambiguity-abstains",
+      "status": "passed"
+    }
+  ],
+  "checks_passed": 41,
+  "checks_total": 41,
+  "claim_ids": [
+    "quality-v1-contract"
+  ],
+  "claims_sha256": "9361b8ccf4fbd570bc62000f98db10045907667abd053a3b047af6758d44782a",
+  "control_profile_sha256": "e52775af9dd5f74c0ef9f1d38f5874997846230ffc296507fff62ba695282ad3",
+  "dataset": "perseus-vault-memory-quality-v1",
+  "dataset_sha256": "739beed898668642887a0c55485747e1ec5c8d6ff27b9e0cc0f6c0b0909ca249",
+  "excluded": [],
+  "harness_commit": "cc75c0450340287b3a11a3593048f1cd56159a7a",
+  "harness_version": "perseus-vault-memory-quality/v1",
+  "metric_rates": {
+    "action_grounding_rate": {
+      "rate": 1.0,
+      "status": "available"
+    },
+    "admission_rate": {
+      "rate": 1.0,
+      "status": "available"
+    },
+    "compaction_projection_rate": {
+      "rate": 1.0,
+      "status": "available"
+    },
+    "identity_ambiguity_rate": {
+      "rate": 1.0,
+      "status": "available"
+    },
+    "mutation_supersession_rate": {
+      "rate": 1.0,
+      "status": "available"
+    },
+    "prompt_safety_rate": {
+      "rate": 1.0,
+      "status": "available"
+    },
+    "provenance_completeness": {
+      "rate": 1.0,
+      "status": "available"
+    },
+    "recall_outcome_rate": {
+      "rate": 1.0,
+      "status": "available"
+    },
+    "replay_fidelity": {
+      "rate": 1.0,
+      "status": "available"
+    },
+    "scope_invalid_recall_rate": {
+      "rate": 0.0,
+      "status": "available"
+    },
+    "stale_recall_rate": {
+      "rate": 0.0,
+      "status": "available"
+    },
+    "validity_rate": {
+      "rate": 1.0,
+      "status": "available"
+    }
+  },
+  "metrics": {
+    "action_grounding": {
+      "denominator": 4,
+      "numerator": 4,
+      "rate": 1.0,
+      "status": "available"
+    },
+    "admission": {
+      "denominator": 2,
+      "numerator": 2,
+      "rate": 1.0,
+      "status": "available"
+    },
+    "compaction_projection": {
+      "denominator": 3,
+      "numerator": 3,
+      "rate": 1.0,
+      "status": "available"
+    },
+    "identity_ambiguity": {
+      "denominator": 1,
+      "numerator": 1,
+      "rate": 1.0,
+      "status": "available"
+    },
+    "mutation_supersession": {
+      "denominator": 5,
+      "numerator": 5,
+      "rate": 1.0,
+      "status": "available"
+    },
+    "prompt_safety": {
+      "denominator": 1,
+      "numerator": 1,
+      "rate": 1.0,
+      "status": "available"
+    },
+    "provenance": {
+      "denominator": 13,
+      "numerator": 13,
+      "rate": 1.0,
+      "status": "available"
+    },
+    "recall_outcome": {
+      "denominator": 2,
+      "numerator": 2,
+      "rate": 1.0,
+      "status": "available"
+    },
+    "replay_fidelity": {
+      "denominator": 3,
+      "numerator": 3,
+      "rate": 1.0,
+      "status": "available"
+    },
+    "scope_invalid_recall": {
+      "denominator": 3,
+      "numerator": 0,
+      "rate": 0.0,
+      "status": "available"
+    },
+    "validity": {
+      "denominator": 6,
+      "numerator": 6,
+      "rate": 1.0,
+      "status": "available"
+    }
+  },
+  "negative_claim_ids": [
+    "downstream-agent-utility",
+    "provider-failure-stress"
+  ],
+  "network_calls": 0,
+  "not_measured": [],
+  "offline": true,
+  "passed": true,
+  "public_evidence": "hash-only",
+  "raw_inputs_captured": false,
+  "required_categories": [
+    "long_horizon",
+    "contradiction_supersession",
+    "shared_memory",
+    "adversarial",
+    "validity",
+    "scope_validity",
+    "provenance",
+    "replay",
+    "mutation",
+    "compaction_projection",
+    "action_grounding",
+    "recall_outcome",
+    "admission",
+    "prompt_safety",
+    "identity_ambiguity"
+  ],
+  "result_signature_sha256": "015e691904b9cfc80139dadebd2bec4d18926d5a84a61be7bcfecf96a8947009",
+  "run_fingerprint_sha256": "3b8d99f9a99afb33cb8ab557c577a0c7c3908d508f31ba22ac22c3cb129460c7",
+  "schema_version": "perseus-vault-benchmark-report/v1",
+  "signature_sha256": "da47e190f11c9e5372855597e61154200fd6ec936770362638755f40224078a6",
+  "status": "passed",
+  "suite_version": "v1"
+}

@@ -4723,6 +4723,42 @@ pub struct LearnedArtifactRegisterArgs {
     pub derivation_version: Option<String>,
 }
 
+/// #879: bind args — one profile <-> one workspace, explicit access mode.
+#[derive(Debug, Deserialize)]
+pub struct WorkspaceBindArgs {
+    pub profile_name: String,
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub workspace_hash: String,
+    #[serde(default = "default_binding_access_mode")]
+    pub access_mode: String,
+    #[serde(default)]
+    pub metadata: Option<serde_json::Value>,
+}
+
+fn default_binding_access_mode() -> String {
+    "read_write".to_string()
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WorkspaceUnbindArgs {
+    pub profile_name: String,
+    #[serde(default)]
+    pub reason: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WorkspaceQuarantineArgs {
+    pub profile_name: String,
+    #[serde(default = "default_quarantine_action")]
+    pub action: String,
+    #[serde(default)]
+    pub reason: String,
+}
+
+fn default_quarantine_action() -> String {
+    "quarantine".to_string()
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ArtifactManifestArgs {
     pub sha256: String,
@@ -5172,6 +5208,98 @@ pub fn handle_learned_artifact_register(db: &Database, args: Value) -> Result<St
         "action_id": a.action_id,
         "evidence": evidence,
         "manifest": manifest,
+    })
+    .to_string())
+}
+
+pub fn handle_workspace_bind(db: &Database, args: Value) -> Result<String, String> {
+    let a: WorkspaceBindArgs = serde_json::from_value(args)
+        .map_err(|e| format!("Invalid workspace_bind arguments: {}", e))?;
+    let actor = a
+        .metadata
+        .as_ref()
+        .and_then(|m| m.get("actor"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("operator");
+    let binding = db
+        .workspace_bind(
+            &a.profile_name,
+            &a.workspace_hash,
+            &a.access_mode,
+            &a.metadata
+                .as_ref()
+                .map(|m| m.to_string())
+                .unwrap_or_else(|| "{}".to_string()),
+            actor,
+        )
+        .map_err(|e| format!("workspace_bind failed: {}", e))?;
+    Ok(json!(binding).to_string())
+}
+
+pub fn handle_workspace_unbind(db: &Database, args: Value) -> Result<String, String> {
+    // Extract the transport-stamped identity BEFORE args is consumed.
+    let actor = args
+        .get("requesting_agent_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("operator")
+        .to_string();
+    let a: WorkspaceUnbindArgs = serde_json::from_value(args)
+        .map_err(|e| format!("Invalid workspace_unbind arguments: {}", e))?;
+    let binding = db
+        .workspace_unbind(&a.profile_name, &a.reason, &actor)
+        .map_err(|e| format!("workspace_unbind failed: {}", e))?;
+    Ok(json!(binding).to_string())
+}
+
+pub fn handle_workspace_quarantine(db: &Database, args: Value) -> Result<String, String> {
+    // Extract the transport-stamped identity BEFORE args is consumed.
+    let actor = args
+        .get("requesting_agent_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("operator")
+        .to_string();
+    let a: WorkspaceQuarantineArgs = serde_json::from_value(args)
+        .map_err(|e| format!("Invalid workspace_quarantine arguments: {}", e))?;
+    let binding = match a.action.as_str() {
+        "quarantine" => db
+            .workspace_quarantine(&a.profile_name, &a.reason, &actor)
+            .map_err(|e| format!("workspace_quarantine failed: {}", e))?,
+        "reactivate" => db
+            .workspace_reactivate(&a.profile_name, &actor)
+            .map_err(|e| format!("workspace_reactivate failed: {}", e))?,
+        other => {
+            return Err(format!(
+                "invalid action '{other}': expected 'quarantine' or 'reactivate'"
+            ))
+        }
+    };
+    Ok(json!(binding).to_string())
+}
+
+pub fn handle_workspace_status(db: &Database, _args: Value) -> Result<String, String> {
+    let bindings = db
+        .workspace_status()
+        .map_err(|e| format!("workspace_status failed: {}", e))?;
+    let now = now_ms();
+    let list: Vec<serde_json::Value> = bindings
+        .iter()
+        .map(|b| {
+            let mut v = serde_json::to_value(b).unwrap_or(serde_json::json!({}));
+            // Machine-readable staleness signal: active binding whose client
+            // heartbeat is older than 7 days (0 = no heartbeat yet).
+            if b.binding_state == "active" && b.last_seen_unix_ms > 0 {
+                let stale = now - b.last_seen_unix_ms > 7 * 24 * 3600 * 1000;
+                v["stale"] = serde_json::json!(stale);
+            } else {
+                v["stale"] = serde_json::json!(false);
+            }
+            v
+        })
+        .collect();
+    Ok(json!({
+        "bindings": list,
+        "count": list.len(),
+        "effective_scope_rule": "vault-side scope rules are authoritative; bindings are an opt-in governance surface for Hermes profiles",
     })
     .to_string())
 }

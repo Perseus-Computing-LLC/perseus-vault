@@ -416,7 +416,7 @@ CREATE INDEX IF NOT EXISTS idx_artifact_bindings_derived_from
 /// 'defensively_recalled', orthogonal to the lifecycle `status` column.
 /// Backfill-free: existing rows default to 'candidate' (useful but unverified),
 /// which is the safe reading for any legacy record lacking admission evidence.
-const SCHEMA_VERSION: i64 = 29;
+const SCHEMA_VERSION: i64 = 30;
 
 /// Initialize the v0.2.0 schema on a fresh database.
 pub fn initialize_schema(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
@@ -563,6 +563,30 @@ fn apply_migrations(conn: &Connection) -> Result<(), Box<dyn std::error::Error>>
          );
          CREATE INDEX IF NOT EXISTS idx_learned_sources_entity
             ON learned_artifact_sources(entity_id);",
+    )?;
+
+    // v30 (#879): first-class Hermes profile <-> Vault workspace binding.
+    // One row per profile (PK); a workspace may be shared by several
+    // profiles (intentional shared memory). access_mode enforces read-only
+    // vs read/write at the tool boundary; binding_state drives lifecycle
+    // controls (active | quarantined | unbound); last_seen_unix_ms is the
+    // client heartbeat so stale bindings are diagnosable. Bindings are
+    // journaled (workspace_bound/rebound/unbound/quarantined/reactivated).
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS workspace_bindings (
+            profile_name TEXT PRIMARY KEY,
+            workspace_hash TEXT NOT NULL,
+            access_mode TEXT NOT NULL DEFAULT 'read_write',
+            binding_state TEXT NOT NULL DEFAULT 'active',
+            quarantine_reason TEXT NOT NULL DEFAULT '',
+            bound_at_unix_ms INTEGER NOT NULL,
+            rebound_at_unix_ms INTEGER,
+            unbound_at_unix_ms INTEGER,
+            last_seen_unix_ms INTEGER NOT NULL DEFAULT 0,
+            metadata_json TEXT NOT NULL DEFAULT '{}'
+         );
+         CREATE INDEX IF NOT EXISTS idx_workspace_bindings_ws
+            ON workspace_bindings(workspace_hash);",
     )?;
 
     // Backfill transaction time for pre-existing rows: a fact's recorded_at is
