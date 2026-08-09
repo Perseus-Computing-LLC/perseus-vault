@@ -49,13 +49,15 @@
         }
       }
     }
-  },
-  "compatibility": {
-    "claude_desktop": ">=1.0.0",
-    "platforms": [
-      "darwin",
-      "win32",
-      "linux"
-    ]
+   }
   }
+ },
+ "compatibility": {
+  "claude_desktop": ">=1.0.0",
+  "platforms": [
+   "darwin",
+   "win32",
+   "linux"
+  ]
+ }
 }
