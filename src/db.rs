@@ -275,6 +275,7 @@ fn with_legacy_evidence(body_json: String, captured_at_unix_ms: i64, source_syst
     body.to_string()
 }
 use crate::schema;
+use crate::vector_quant::{self, EmbeddingQuant, StoredVec};
 
 fn canonical_constraint_json(raw: &str) -> Result<String, Box<dyn std::error::Error>> {
     let value: serde_json::Value = serde_json::from_str(raw)?;
@@ -437,6 +438,12 @@ pub struct DenseOpts {
     /// embedded rows); the small-corpus exact path always reranks. `None` =
     /// default (rerank ON — the shipped behavior).
     pub rerank: Option<bool>,
+    /// #885: stored embedding format override. `None` = the Database's
+    /// resolved format (`embedding_quant`). Bit mode ranks the WHOLE corpus
+    /// by Hamming over the stored sign bits (flat recall at any corpus size —
+    /// the MIB design); int8 decodes to a scale·code approximation and keeps
+    /// the cosine pipeline.
+    pub quant: Option<EmbeddingQuant>,
 }
 
 struct SigCache {
@@ -576,6 +583,15 @@ pub struct Database {
     /// invalidation; invalidated by any reject_value / assert_erasure write
     /// so hot read paths never pay the pool-checkout + SQL-query cost.
     cached_suppression_active: std::sync::Mutex<Option<bool>>,
+    /// #885: resolved storage format of the `entities.embedding` BLOB column.
+    /// Resolved at open from `PERSEUS_VAULT_EMBEDDING_QUANT` / `--embedding-quant`
+    /// against the `embedding_format` store record (fail-closed on mismatch);
+    /// used for WRITE encoding and dense-arm policy (bit mode ranks the whole
+    /// corpus by Hamming). Reads decode per-row from the self-describing tags
+    /// (see `vector_quant::decode_stored`) and never depend on this field.
+    /// Atomic so the reindex/restore tools can flip it through `&self` (the
+    /// tool dispatcher only holds a shared reference).
+    embedding_quant: std::sync::atomic::AtomicU8,
 }
 
 /// #619: bumped by every in-place emb_sig write; one of the sig cache's two
@@ -1006,6 +1022,12 @@ impl Database {
         // Initialize schema once if this is a new database.
         let setup_conn = pool.get()?;
         schema::initialize_schema(&setup_conn)?;
+        // #885: resolve the stored embedding format BEFORE any embedding
+        // write or dense read. Fail-closed: a declared format that disagrees
+        // with the store record (or with an existing f32 corpus) aborts
+        // startup with the migration hint instead of serving mis-decoded
+        // vectors.
+        let embedding_quant = Self::resolve_embedding_quant(&setup_conn)?;
         drop(setup_conn);
 
         Ok(Database {
@@ -1022,7 +1044,147 @@ impl Database {
             sig_cache: std::sync::Mutex::new(None),
             governance_overlay: std::sync::Mutex::new(None),
             cached_suppression_active: std::sync::Mutex::new(None),
+            embedding_quant: std::sync::atomic::AtomicU8::new(embedding_quant.to_byte()),
         })
+    }
+
+    /// #885: resolve the effective `entities.embedding` storage format for
+    /// this process from the `PERSEUS_VAULT_EMBEDDING_QUANT` flag against the
+    /// store's `embedding_format` record:
+    ///
+    /// - flag unset → the store record (default `float32` when the store has
+    ///   no record yet — every pre-#885 store, and every fresh store whose
+    ///   operator never declared a format).
+    /// - flag set → must equal the record; a mismatch (or a record-less store
+    ///   that already holds float32 embeddings) is an error — the migration
+    ///   path is `perseus_vault_embed` `quant_mode`, not a silent flag flip.
+    ///   A fresh store with no embeddings accepts the flag and records it, so
+    ///   later opens resolve consistently without the flag.
+    fn resolve_embedding_quant(
+        conn: &rusqlite::Connection,
+    ) -> Result<EmbeddingQuant, Box<dyn std::error::Error>> {
+        let record: Option<String> = conn
+            .query_row(
+                "SELECT format FROM embedding_format WHERE id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let record_q = record
+            .as_deref()
+            .and_then(EmbeddingQuant::parse)
+            .unwrap_or(EmbeddingQuant::F32);
+        let flag = std::env::var("PERSEUS_VAULT_EMBEDDING_QUANT").ok();
+        let Some(flag_str) = flag else {
+            return Ok(record_q);
+        };
+        let flag_q = EmbeddingQuant::parse(&flag_str).ok_or_else(|| {
+            format!(
+                "invalid PERSEUS_VAULT_EMBEDDING_QUANT '{flag_str}': expected \
+                 float32 | int8 | bit"
+            )
+        })?;
+        if record.is_some() {
+            if record_q != flag_q {
+                return Err(format!(
+                    "PERSEUS_VAULT_EMBEDDING_QUANT={} does not match this store's \
+                     embedding format record '{}' — run `perseus_vault_embed` with \
+                     quant_mode={} (reindex) or unset the flag; dense recall will \
+                     NOT start with a mismatched format",
+                    flag_q.as_str(),
+                    record_q.as_str(),
+                    flag_q.as_str(),
+                )
+                .into());
+            }
+            return Ok(flag_q);
+        }
+        // No record: a store that already holds embeddings is float32 (every
+        // pre-#885 writer) — refuse the flag rather than mis-decode.
+        let embedded: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM entities WHERE embedding IS NOT NULL",
+            [],
+            |r| r.get(0),
+        )?;
+        if embedded > 0 {
+            return Err(format!(
+                "PERSEUS_VAULT_EMBEDDING_QUANT={} set on a store that already holds \
+                 {} float32 embedding(s) — migrate with `perseus_vault_embed` \
+                 quant_mode={} (or unset the flag)",
+                flag_q.as_str(),
+                embedded,
+                flag_q.as_str(),
+            )
+            .into());
+        }
+        // Fresh store: declare the format so later opens resolve consistently.
+        conn.execute(
+            "INSERT OR REPLACE INTO embedding_format (id, format, updated_at_unix_ms) \
+             VALUES (1, ?1, ?2)",
+            params![flag_q.as_str(), now_ms()],
+        )?;
+        Ok(flag_q)
+    }
+
+    /// #885: stored embedding format getter (surfaced in health/status so the
+    /// operator can tell Hamming-ranked dense recall from cosine at a glance).
+    pub fn embedding_quant(&self) -> EmbeddingQuant {
+        EmbeddingQuant::from_byte(self.embedding_quant.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// #885: apply the `--embedding-quant` CLI declaration AFTER open (the
+    /// open-time env resolution already ran). Validates against the store
+    /// record exactly like `resolve_embedding_quant` — fail-closed.
+    pub fn set_embedding_quant(&mut self, quant: EmbeddingQuant) -> Result<(), String> {
+        let conn = self.conn().map_err(|e| e.to_string())?;
+        let record: Option<String> = conn
+            .query_row(
+                "SELECT format FROM embedding_format WHERE id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        match record.as_deref() {
+            Some(stored) if EmbeddingQuant::parse(stored) != Some(quant) => {
+                return Err(format!(
+                    "--embedding-quant {} does not match this store's embedding format \
+                     record '{}' — run `perseus_vault_embed` with quant_mode={} (reindex) \
+                     or drop the flag; dense recall will NOT start with a mismatched format",
+                    quant.as_str(),
+                    stored,
+                    quant.as_str(),
+                ));
+            }
+            Some(_) => {}
+            None => {
+                let embedded: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM entities WHERE embedding IS NOT NULL",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .map_err(|e| e.to_string())?;
+                if embedded > 0 {
+                    return Err(format!(
+                        "--embedding-quant {} set on a store that already holds \
+                         {embedded} float32 embedding(s) — migrate with \
+                         `perseus_vault_embed` quant_mode={} (or drop the flag)",
+                        quant.as_str(),
+                        quant.as_str(),
+                    ));
+                }
+                conn.execute(
+                    "INSERT OR REPLACE INTO embedding_format (id, format, updated_at_unix_ms) \
+                     VALUES (1, ?1, ?2)",
+                    params![quant.as_str(), now_ms()],
+                )
+                .map_err(|e| e.to_string())?;
+            }
+        }
+        self.embedding_quant
+            .store(quant.to_byte(), std::sync::atomic::Ordering::Relaxed);
+        Ok(())
     }
 
     /// Check out a pooled connection. Each DB method binds one of these and uses
@@ -1746,7 +1908,7 @@ impl Database {
         embedding: &[f32],
     ) -> Result<(), Box<dyn std::error::Error>> {
         let conn = self.conn()?;
-        Self::store_embedding_with_conn(&conn, id, embedding)
+        Self::store_embedding_with_conn(&conn, id, embedding, self.embedding_quant())
     }
 
     /// #397: `store_embedding` on the CALLER's already-held connection, so hot
@@ -1756,8 +1918,18 @@ impl Database {
         conn: &rusqlite::Connection,
         id: &str,
         embedding: &[f32],
+        quant: EmbeddingQuant,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let blob: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
+        // #885: the stored blob follows the resolved format — raw f32 LE
+        // (legacy), tagged int8 (scale + i8 codes), or tagged bit (sign
+        // bits). sig/sig4 are pure functions of the source vector and are
+        // always derived from it BEFORE quantization, so the prefilter tiers
+        // are format-independent.
+        let blob: Vec<u8> = match quant {
+            EmbeddingQuant::F32 => embedding.iter().flat_map(|f| f.to_le_bytes()).collect(),
+            EmbeddingQuant::Int8 => vector_quant::quantize_int8(embedding),
+            EmbeddingQuant::Bit => vector_quant::quantize_bit(embedding),
+        };
         let sig = embedding_signature(embedding);
         let sig4 = embedding_sig4(embedding);
         conn.execute(
@@ -1785,8 +1957,13 @@ impl Database {
         id: &str,
         plaintext: &str,
         embedding: &[f32],
+        quant: EmbeddingQuant,
     ) -> Result<bool, Box<dyn std::error::Error>> {
-        let blob: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
+        let blob: Vec<u8> = match quant {
+            EmbeddingQuant::F32 => embedding.iter().flat_map(|f| f.to_le_bytes()).collect(),
+            EmbeddingQuant::Int8 => vector_quant::quantize_int8(embedding),
+            EmbeddingQuant::Bit => vector_quant::quantize_bit(embedding),
+        };
         let sig = embedding_signature(embedding);
         let sig4 = embedding_sig4(embedding);
         let changed = conn.execute(
@@ -1819,6 +1996,7 @@ impl Database {
                 self.embedding_config.clone(),
                 self.llm_config.clone(),
                 self.embed_queue_cap,
+                self.embedding_quant(),
             )
         });
 
@@ -1868,6 +2046,7 @@ impl Database {
         embedding_config: crate::embedding::EmbeddingConfig,
         llm_config: LlmConfig,
         queue_cap: usize,
+        quant: EmbeddingQuant,
     ) -> EmbedWorker {
         use std::sync::{Arc, Condvar, Mutex};
 
@@ -1906,6 +2085,7 @@ impl Database {
                                         &job.id,
                                         &job.plaintext,
                                         &vec,
+                                        quant,
                                     ) {
                                         rate_limited_log(
                                             "embed-store",
@@ -2301,7 +2481,12 @@ impl Database {
                     Ok(vec) => {
                         // #397: reuse the connection held since the top of
                         // embed_entity — no nested pool draw.
-                        Self::store_embedding_with_conn(&conn, &rows_vec[i].0, &vec)?;
+                        Self::store_embedding_with_conn(
+                            &conn,
+                            &rows_vec[i].0,
+                            &vec,
+                            self.embedding_quant(),
+                        )?;
                         embedded += 1;
                     }
                     Err(e) => errors.push(format!("{}: {}", rows_vec[i].0, e)),
@@ -2355,6 +2540,273 @@ impl Database {
             "embedded": 1,
             "id": entity.id,
             "dimensions": embedding.len(),
+        }))
+    }
+
+    /// #885: store-wide embedding reindex — convert every stored `embedding`
+    /// blob from float32 to the target quantized format (int8 or bit) in ONE
+    /// transaction. This is the migration path for the opt-in modes:
+    ///
+    /// - float32 → int8/bit: pure function of the stored blobs (no model
+    ///   needed). Before converting, the current float32 column is snapshotted
+    ///   into `entities_embedding_snapshot` (unless a snapshot already
+    ///   exists — it is never overwritten), which is what makes rollback
+    ///   lossless: `restore_embeddings_snapshot` puts the EXACT original
+    ///   bytes back.
+    /// - any → float32: REFUSED here — the information is lost after
+    ///   quantization, so the only honest float32 return is the snapshot
+    ///   restore (or a full re-embed from entity text).
+    /// - quantized → quantized: REFUSED (restore to float32 first; bit cannot
+    ///   recover int8 magnitudes and vice versa).
+    ///
+    /// In bit mode the stored payload is byte-identical to `emb_sig` (same
+    /// sign-bit rule), so the conversion also rewrites `emb_sig` — keeping
+    /// the v18 "embedded ⟺ signed" invariant true by construction, not by
+    /// coincidence, and keeping the covering-index prefilter consistent.
+    pub fn reindex_embeddings(
+        &self,
+        target: EmbeddingQuant,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+        if target == EmbeddingQuant::F32 {
+            return Err("reindex to float32 is refused: quantization is lossy, so the only \
+                         honest float32 return is the snapshot restore \
+                         (perseus_vault_embed restore_quantized_backup=true) or a full \
+                         re-embed from entity text"
+                .into());
+        }
+        let conn = self.conn()?;
+        conn.execute_batch("BEGIN IMMEDIATE;")?;
+        let result = (|| -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+            let current = conn
+                .query_row(
+                    "SELECT format FROM embedding_format WHERE id = 1",
+                    [],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()?
+                .unwrap_or_else(|| "float32".to_string());
+            let current_q = EmbeddingQuant::parse(&current)
+                .unwrap_or(EmbeddingQuant::F32);
+            if current_q != EmbeddingQuant::F32 {
+                return Err(format!(
+                    "reindex refused: this store's embeddings are already '{}' — \
+                     quantized → quantized conversion is lossy; restore the float32 \
+                     snapshot first (perseus_vault_embed restore_quantized_backup=true), \
+                     then reindex",
+                    current_q.as_str()
+                )
+                .into());
+            }
+            if target == EmbeddingQuant::F32 {
+                // Unreachable (guarded above); kept for exhaustiveness.
+                return Err("reindex to float32 is refused".into());
+            }
+
+            // Snapshot the current float32 column exactly once. A snapshot
+            // that already exists is reused (never overwritten) — reindexing
+            // again after a restore must still be able to restore to the
+            // ORIGINAL pre-quantization bytes.
+            let snapshot_rows: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM entities_embedding_snapshot",
+                [],
+                |r| r.get(0),
+            )?;
+            let snapshot_reused = snapshot_rows > 0;
+            if !snapshot_reused {
+                conn.execute(
+                    "INSERT INTO entities_embedding_snapshot (id, embedding, created_at_unix_ms) \
+                     SELECT id, embedding, ?1 FROM entities WHERE embedding IS NOT NULL",
+                    params![now_ms()],
+                )?;
+            }
+
+            // Convert in place. Rows whose blob is not legacy float32 (a
+            // mixed/foreign corpus) are counted as skipped, never mangled.
+            let mut stmt = conn.prepare(
+                "SELECT id, embedding FROM entities WHERE embedding IS NOT NULL",
+            )?;
+            let rows: Vec<(String, Vec<u8>)> = stmt
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<Result<Vec<_>, _>>()?;
+            drop(stmt);
+            let mut converted = 0i64;
+            let mut skipped: Vec<String> = Vec::new();
+            let mut bytes_before = 0i64;
+            let mut bytes_after = 0i64;
+            for (id, blob) in rows {
+                // Legacy float32: any multiple-of-4 length is a valid vector
+                // of len/4 dims (the store's own dim varies per row only if
+                // the backend changed — conversion is per-row anyway).
+                if blob.is_empty() || blob.len() % 4 != 0 {
+                    skipped.push(id);
+                    continue;
+                }
+                let v: Vec<f32> = blob
+                    .chunks_exact(4)
+                    .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                    .collect();
+                let (new_blob, new_sig) = match target {
+                    EmbeddingQuant::Int8 => {
+                        let q = vector_quant::quantize_int8(&v);
+                        (q, None) // sig unchanged (sign bits of the same vector)
+                    }
+                    EmbeddingQuant::Bit => {
+                        let q = vector_quant::quantize_bit(&v);
+                        // Payload == sign bits; rewrite emb_sig so the v18
+                        // invariant holds by construction.
+                        let sig = q[1..].to_vec();
+                        (q, Some(sig))
+                    }
+                    EmbeddingQuant::F32 => unreachable!("guarded above"),
+                };
+                bytes_before += blob.len() as i64;
+                bytes_after += new_blob.len() as i64;
+                match new_sig {
+                    Some(sig) => {
+                        conn.execute(
+                            "UPDATE entities SET embedding = ?1, emb_sig = ?2 WHERE id = ?3",
+                            params![new_blob, sig, id],
+                        )?;
+                    }
+                    None => {
+                        conn.execute(
+                            "UPDATE entities SET embedding = ?1 WHERE id = ?2",
+                            params![new_blob, id],
+                        )?;
+                    }
+                }
+                converted += 1;
+            }
+            conn.execute(
+                "INSERT OR REPLACE INTO embedding_format (id, format, updated_at_unix_ms) \
+                 VALUES (1, ?1, ?2)",
+                params![target.as_str(), now_ms()],
+            )?;
+            SIG_WRITE_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed); // #619
+            Ok(serde_json::json!({
+                "reindexed": converted,
+                "format_before": current_q.as_str(),
+                "format_after": target.as_str(),
+                "skipped": skipped.len(),
+                "skipped_ids_sample": skipped.iter().take(5).cloned().collect::<Vec<_>>(),
+                "snapshot_rows": if snapshot_reused { snapshot_rows } else { converted },
+                "snapshot_reused": snapshot_reused,
+                "bytes_before": bytes_before,
+                "bytes_after": bytes_after,
+                "bytes_saved": bytes_before - bytes_after,
+                "bytes_per_vector_before": if converted > 0 { bytes_before / converted } else { 0 },
+                "bytes_per_vector_after": if converted > 0 { bytes_after / converted } else { 0 },
+            }))
+        })();
+        match result {
+            Ok(v) => {
+                conn.execute_batch("COMMIT;")?;
+                // Mirror the record in-process so NEW writes (auto-embed
+                // worker, batch embed) follow the migrated format immediately.
+                self.embedding_quant
+                    .store(target.to_byte(), std::sync::atomic::Ordering::Relaxed);
+                Ok(v)
+            }
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK;");
+                Err(e)
+            }
+        }
+    }
+
+    /// #885: rollback path — restore the `embedding` column from the
+    /// pre-quantization snapshot and flip the format record back to float32.
+    /// Lossless for every row that existed at quantization time (the exact
+    /// original bytes come back); rows written AFTER the snapshot keep their
+    /// quantized form (their float32 never existed — they are counted and
+    /// remain fully searchable via per-tag decode). The snapshot is kept
+    /// after restore; drop it explicitly with `drop_embeddings_snapshot`
+    /// once the operator has verified the store.
+    pub fn restore_embeddings_snapshot(
+        &self,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+        let conn = self.conn()?;
+        let snapshot_rows: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM entities_embedding_snapshot",
+            [],
+            |r| r.get(0),
+        )?;
+        if snapshot_rows == 0 {
+            return Err(
+                "no embedding snapshot to restore — this store was never quantized \
+                 (or the snapshot was already dropped)"
+                    .into(),
+            );
+        }
+        conn.execute_batch("BEGIN IMMEDIATE;")?;
+        let result = (|| -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+            let restored = conn.execute(
+                "UPDATE entities SET embedding = \
+                     (SELECT s.embedding FROM entities_embedding_snapshot s \
+                      WHERE s.id = entities.id) \
+                 WHERE embedding IS NOT NULL AND EXISTS \
+                     (SELECT 1 FROM entities_embedding_snapshot s WHERE s.id = entities.id)",
+                [],
+            )?;
+            // Rows written after the snapshot (not covered by it) keep their
+            // quantized blobs — count them per layout for the report.
+            let mut still_quantized = 0i64;
+            {
+                let mut stmt =
+                    conn.prepare("SELECT embedding FROM entities WHERE embedding IS NOT NULL")?;
+                let blobs: Vec<Vec<u8>> = stmt
+                    .query_map([], |r| r.get::<_, Vec<u8>>(0))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                for b in blobs {
+                    if let Some((q, _)) = vector_quant::classify_stored(&b) {
+                        if q != EmbeddingQuant::F32 {
+                            still_quantized += 1;
+                        }
+                    }
+                }
+            }
+            conn.execute(
+                "INSERT OR REPLACE INTO embedding_format (id, format, updated_at_unix_ms) \
+                 VALUES (1, 'float32', ?1)",
+                params![now_ms()],
+            )?;
+            SIG_WRITE_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed); // #619
+            Ok(serde_json::json!({
+                "restored": restored,
+                "still_quantized": still_quantized,
+                "format_after": "float32",
+                "snapshot_rows_remaining": snapshot_rows,
+                "note": "rows written after the quantization snapshot keep their quantized \
+                         form (their float32 was never stored); they remain searchable via \
+                         per-tag decode — re-embed them (perseus_vault_embed batch) to \
+                         normalize",
+            }))
+        })();
+        match result {
+            Ok(v) => {
+                conn.execute_batch("COMMIT;")?;
+                self.embedding_quant
+                    .store(EmbeddingQuant::F32.to_byte(), std::sync::atomic::Ordering::Relaxed);
+                Ok(v)
+            }
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK;");
+                Err(e)
+            }
+        }
+    }
+
+    /// #885: drop the pre-quantization snapshot after the operator has
+    /// verified the quantized store. Irreversible — after this, rollback
+    /// requires a full re-embed from entity text.
+    pub fn drop_embeddings_snapshot(
+        &self,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+        let conn = self.conn()?;
+        let dropped = conn.execute("DELETE FROM entities_embedding_snapshot", [])?;
+        Ok(serde_json::json!({
+            "snapshot_dropped": dropped,
+            "rollback_available": false,
         }))
     }
 
@@ -2834,6 +3286,9 @@ impl Database {
             // #630: PERSEUS_VAULT_DENSE_SIG_RERANK=0 skips the exact-cosine rerank to
             // measure the pure 1-bit (Hamming-only) recall row. Default ON.
             rerank: tri("PERSEUS_VAULT_DENSE_SIG_RERANK"),
+            // #885: None = the Database's resolved format (open-time
+            // resolution of PERSEUS_VAULT_EMBEDDING_QUANT vs the store record).
+            quant: None,
         };
         if self.governance_may_suppress()? {
             let scan_limit = if opts.use_sig_cache == Some(true) {
@@ -2935,17 +3390,23 @@ impl Database {
         let rows = stmt.query_map([], |row| {
             let entity = entity_from_row(row, self.encryption.as_ref())?;
             let blob: Vec<u8> = row.get(29)?;
-            let embedding: Vec<f32> = blob
-                .chunks_exact(4)
-                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-                .collect();
-            Ok((entity, embedding))
+            // #885: decode per-row from the self-describing tag — float32
+            // (legacy), int8 (scale·code approx), or bit (sign bits). Rows
+            // that match no layout for the query dim are dropped below.
+            let stored = vector_quant::decode_stored(&blob, query_vec.len());
+            Ok((entity, stored))
         })?;
         let mut candidates = Vec::new();
         for row in rows {
-            let (entity, embedding) = row?;
-            if embedding.len() == query_vec.len() {
-                candidates.push((entity, embedding));
+            let (entity, stored) = row?;
+            match stored {
+                Some(StoredVec::Full(v)) if v.len() == query_vec.len() => {
+                    candidates.push((entity, StoredVec::Full(v)));
+                }
+                Some(StoredVec::Bits(b)) if b.len() == query_vec.len().div_ceil(8) => {
+                    candidates.push((entity, StoredVec::Bits(b)));
+                }
+                _ => {}
             }
         }
         drop(stmt);
@@ -2966,19 +3427,36 @@ impl Database {
             .map(|value| (*value as f64) * (*value as f64))
             .sum::<f64>()
             .sqrt();
+        // #885: bit rows score by Hamming similarity on the stored sign bits
+        // (in-store distance scoring — the MIB metric); float32/int8 rows keep
+        // cosine. Both are similarities in [0,1], so mixed corpora (only
+        // possible mid-rollback) rank coherently.
+        let query_sig = embedding_signature(query_vec);
         let mut scored = Vec::new();
-        for (entity, embedding) in candidates {
-            if !visible_ids.contains(&entity.id) || query_norm <= 0.0 {
+        for (entity, stored) in candidates {
+            if !visible_ids.contains(&entity.id) {
                 continue;
             }
-            let mut dot = 0.0;
-            let mut norm = 0.0;
-            for (query, value) in query_vec.iter().zip(embedding.iter()) {
-                dot += (*query as f64) * (*value as f64);
-                norm += (*value as f64) * (*value as f64);
-            }
-            let denominator = query_norm * norm.sqrt();
-            let score = if denominator > 0.0 { dot / denominator } else { 0.0 };
+            let score = match stored {
+                StoredVec::Full(embedding) => {
+                    if query_norm <= 0.0 {
+                        continue;
+                    }
+                    let mut dot = 0.0;
+                    let mut norm = 0.0;
+                    for (query, value) in query_vec.iter().zip(embedding.iter()) {
+                        dot += (*query as f64) * (*value as f64);
+                        norm += (*value as f64) * (*value as f64);
+                    }
+                    let denominator = query_norm * norm.sqrt();
+                    if denominator > 0.0 {
+                        dot / denominator
+                    } else {
+                        0.0
+                    }
+                }
+                StoredVec::Bits(bits) => vector_quant::bit_similarity(&query_sig, &bits),
+            };
             scored.push((entity, score));
         }
         scored.sort_by(|left, right| {
@@ -3041,6 +3519,16 @@ impl Database {
     ) -> Result<Vec<(Entity, f64)>, Box<dyn std::error::Error>> {
         let conn = self.conn()?;
         let dim = query_vec.len();
+        // #885: resolved stored format (opts override wins; else the
+        // Database's open-time resolution). Bit mode changes the pipeline:
+        // the stored sign bits ARE the vectors, so the corpus is ranked by
+        // Hamming with full coverage (pool = whole corpus) and phase 2 scores
+        // the stored bits directly instead of cosine on decoded floats.
+        let quant = opts.quant.unwrap_or(self.embedding_quant());
+        let bit_mode = quant == EmbeddingQuant::Bit;
+        // Query sign bits — needed for bit-row scoring in phase 2 and for
+        // the prefilter (computed once; 48 bytes for 384-dim).
+        let query_sig = embedding_signature(query_vec);
 
         // Signature prefilter cutover point. Below this many embedded rows the
         // exact full scan is already cheap AND stays byte-identical to the
@@ -3070,7 +3558,14 @@ impl Database {
         // scan can no longer cover the corpus (under the bound the SQL scan
         // sees every row and results are identical; an unbounded exact scan —
         // max_scan = i64::MAX via PERSEUS_VAULT_DENSE_MAX_SCAN=0 — never auto-caches).
-        let use_sig_cache = opts.use_sig_cache.unwrap_or(embedded_rows > max_scan as i64);
+        // #885: bit mode FORCES the resident cache on (unless explicitly
+        // disabled) — its full-corpus Hamming ranking IS the recall story
+        // (flat at any corpus size), and the bounded id-order scan would
+        // silently reintroduce the #619 recall cliff.
+        let use_sig_cache = match opts.use_sig_cache {
+            Some(v) => v,
+            None => bit_mode || embedded_rows > max_scan as i64,
+        };
         let sig4_resident = opts.sig4_resident.unwrap_or(false);
         let sig4_refine = opts.sig4_refine.unwrap_or(false);
         // #630: rerank ON by default. When OFF (pure 1-bit), the signature
@@ -3084,7 +3579,7 @@ impl Database {
         // The old query hydrated EVERY candidate (decrypt body, parse tags/links)
         // up to max_scan just to score and then keep top-k. Defer full hydration
         // to the surviving top-k in phase 3.
-        let candidates: Vec<(String, Vec<f32>)> = if embedded_rows
+        let candidates: Vec<(String, StoredVec)> = if embedded_rows
             < DENSE_SIG_PREFILTER_MIN_ROWS
         {
             let mut stmt = conn.prepare(&format!(
@@ -3097,14 +3592,20 @@ impl Database {
             let rows = stmt.query_map([], |row| {
                 let id: String = row.get(0)?;
                 let emb_blob: Vec<u8> = row.get(1)?;
-                let emb: Vec<f32> = emb_blob
-                    .chunks_exact(4)
-                    .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-                    .collect();
-                Ok((id, emb))
+                // #885: per-row tag decode; rows that match no layout for the
+                // query dim are dropped by the filter below (fail-closed).
+                let stored = vector_quant::decode_stored(&emb_blob, dim);
+                Ok((id, stored))
             })?;
             rows.filter_map(|r| r.ok())
-                .filter(|(_, emb)| emb.len() == dim)
+                .filter_map(|(id, stored)| {
+                    let ok = match &stored {
+                        Some(StoredVec::Full(v)) => v.len() == dim,
+                        Some(StoredVec::Bits(b)) => b.len() == dim.div_ceil(8),
+                        None => false,
+                    };
+                    ok.then_some((id, stored.expect("checked above")))
+                })
                 .collect()
         } else {
             // Phase 0: signature prefilter. Scan only id + emb_sig (~48 bytes
@@ -3222,10 +3723,18 @@ impl Database {
                 // (1 per 256 rows → ~3.9k@1M) inside [pool_target, 8192]
                 // guardrails; the exact rerank pays ~3KB/candidate, so 8k
                 // candidates is ~24MB of page-cached reads, not a scan.
-                let pool = pool
-                    .max(cache.ids.len() / 256)
-                    .min(8192)
-                    .min(cache.ids.len().max(1));
+                // #885: bit mode takes the WHOLE corpus into phase 2 — the
+                // stored bits are 49 bytes each (vs ~1.5KB f32), so full
+                // coverage costs ~5MB page-cached at 100K and buys the flat
+                // recall curve the MIB design promises (no pool truncation =
+                // global top-k by Hamming, not approximate).
+                let pool = if bit_mode {
+                    cache.ids.len().max(1)
+                } else {
+                    pool.max(cache.ids.len() / 256)
+                        .min(8192)
+                        .min(cache.ids.len().max(1))
+                };
                 // #619 step 2a: rank by the ASYMMETRIC score ⟨q, sign(v)⟩
                 // (higher = closer) — the full-precision query's magnitudes
                 // stay in the ranking instead of being discarded by symmetric
@@ -3451,9 +3960,11 @@ impl Database {
                 ranked.into_iter().map(|(_, id)| id).collect()
             };
 
-            // Fetch full embeddings for the pool only (chunked IN to bound
-            // SQL variable count).
-            let mut fetched: Vec<(String, Vec<f32>)> = Vec::with_capacity(pool_ids.len());
+            // Fetch embeddings for the pool only (chunked IN to bound
+            // SQL variable count). #885: decode per-row from the tag —
+            // float32/int8 rows carry their full (or approximated) vector,
+            // bit rows carry the sign bits scored by Hamming in phase 2.
+            let mut fetched: Vec<(String, StoredVec)> = Vec::with_capacity(pool_ids.len());
             for chunk in pool_ids.chunks(500) {
                 let placeholders = vec!["?"; chunk.len()].join(",");
                 let sql = format!(
@@ -3468,16 +3979,18 @@ impl Database {
                 let erows = estmt.query_map(refs.as_slice(), |row| {
                     let id: String = row.get(0)?;
                     let emb_blob: Vec<u8> = row.get(1)?;
-                    let emb: Vec<f32> = emb_blob
-                        .chunks_exact(4)
-                        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-                        .collect();
-                    Ok((id, emb))
+                    let stored = vector_quant::decode_stored(&emb_blob, dim);
+                    Ok((id, stored))
                 })?;
                 for r in erows {
-                    let (id, emb) = r?;
-                    if emb.len() == dim {
-                        fetched.push((id, emb));
+                    let (id, stored) = r?;
+                    let ok = match &stored {
+                        Some(StoredVec::Full(v)) => v.len() == dim,
+                        Some(StoredVec::Bits(b)) => b.len() == dim.div_ceil(8),
+                        None => false,
+                    };
+                    if ok {
+                        fetched.push((id, stored.expect("checked above")));
                     }
                 }
             }
@@ -3513,12 +4026,16 @@ impl Database {
             );
         }
 
-        // Phase 2: score by cosine similarity, keep the top `limit` ids.
-        // #630 pure-1-bit: skip cosine entirely — `candidates` is already in
+        // Phase 2: score the surviving candidates, keep the top `limit` ids.
+        // #630 pure-1-bit: skip scoring entirely — `candidates` is already in
         // Hamming order (best first) and truncated to `limit`. Assign a
         // strictly-descending pseudo-score so the sort/truncate below preserve
         // that order and phase 3 hydrates it. The returned score is rank-based,
         // NOT a cosine similarity (callers treat it as opaque ordering).
+        // #885: float32/int8 candidates score by cosine on the full (or
+        // scale·code-approximated) vector; bit candidates score by Hamming
+        // similarity on the STORED sign bits — in-store distance scoring,
+        // no full-precision vector involved. Both are similarities in [0,1].
         let mut scored_ids: Vec<(String, f64)>;
         if pure_1bit {
             scored_ids = candidates
@@ -3527,27 +4044,35 @@ impl Database {
                 .map(|(i, (id, _))| (id, -(i as f64)))
                 .collect();
         } else {
+            let mut full_cands: Vec<(String, Vec<f32>)> = Vec::new();
+            let mut bit_cands: Vec<(String, Vec<u8>)> = Vec::new();
+            for (id, stored) in candidates {
+                match stored {
+                    StoredVec::Full(v) => full_cands.push((id, v)),
+                    StoredVec::Bits(b) if b.len() == query_sig.len() => bit_cands.push((id, b)),
+                    _ => {} // dim-mismatched bit row — dropped (fail-closed)
+                }
+            }
+            scored_ids = Vec::with_capacity(full_cands.len() + bit_cands.len());
+            if !full_cands.is_empty() {
         #[cfg(feature = "bundled-embeddings")]
         {
             // Batched cosine similarity using SIMD-accelerated ndarray ops.
-            scored_ids = Vec::with_capacity(candidates.len());
-            if !candidates.is_empty() {
-                let n = candidates.len();
-                let mut all_embs: Vec<f32> = Vec::with_capacity(n * dim);
-                for (_, emb) in &candidates {
-                    all_embs.extend_from_slice(emb);
-                }
-                let q = ndarray::Array1::from_vec(query_vec.to_vec());
-                let embs = ndarray::Array2::from_shape_vec((n, dim), all_embs)
-                    .unwrap_or_else(|_| ndarray::Array2::zeros((n, dim)));
-                let q_norm = q.iter().map(|v| v * v).sum::<f32>().sqrt();
-                let emb_norms = embs.mapv(|v| v * v).sum_axis(ndarray::Axis(1)).mapv(f32::sqrt);
-                let dots = embs.dot(&q);
-                for (i, (id, _)) in candidates.into_iter().enumerate() {
-                    let denom = q_norm * emb_norms[i];
-                    let sim = if denom > 0.0 { dots[i] as f64 / denom as f64 } else { 0.0 };
-                    scored_ids.push((id, sim));
-                }
+            let n = full_cands.len();
+            let mut all_embs: Vec<f32> = Vec::with_capacity(n * dim);
+            for (_, emb) in &full_cands {
+                all_embs.extend_from_slice(emb);
+            }
+            let q = ndarray::Array1::from_vec(query_vec.to_vec());
+            let embs = ndarray::Array2::from_shape_vec((n, dim), all_embs)
+                .unwrap_or_else(|_| ndarray::Array2::zeros((n, dim)));
+            let q_norm = q.iter().map(|v| v * v).sum::<f32>().sqrt();
+            let emb_norms = embs.mapv(|v| v * v).sum_axis(ndarray::Axis(1)).mapv(f32::sqrt);
+            let dots = embs.dot(&q);
+            for (i, (id, _)) in full_cands.into_iter().enumerate() {
+                let denom = q_norm * emb_norms[i];
+                let sim = if denom > 0.0 { dots[i] as f64 / denom as f64 } else { 0.0 };
+                scored_ids.push((id, sim));
             }
         }
         #[cfg(not(feature = "bundled-embeddings"))]
@@ -3561,12 +4086,16 @@ impl Database {
                 .map(|&v| (v as f64) * (v as f64))
                 .sum::<f64>()
                 .sqrt();
-            scored_ids = candidates
-                .into_iter()
-                .map(|(id, emb)| (id, cosine_with_query_norm(query_vec, q_norm, &emb)))
-                .collect();
+            for (id, emb) in full_cands {
+                scored_ids.push((id, cosine_with_query_norm(query_vec, q_norm, &emb)));
+            }
         }
-        } // end else (non-pure-1-bit cosine rerank)
+            }
+            // Bit rows: Hamming similarity on the stored sign bits.
+            for (id, bits) in bit_cands {
+                scored_ids.push((id, vector_quant::bit_similarity(&query_sig, &bits)));
+            }
+        } // end else (non-pure-1-bit cosine/Hamming rerank)
         scored_ids.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         // Governance (#882): the governed path uses dense_search_governed_scan
         // (which does its own suppression + truncation). This raw path serves
@@ -5861,6 +6390,9 @@ impl Database {
                 key: Some(key),
                 batch_category: None,
                 batch_limit: 100,
+                quant_mode: None,
+                restore_quantized_backup: false,
+                drop_quantized_backup: false,
             });
         }
         Ok(())
@@ -18858,7 +19390,7 @@ fn sig4_score(luts: &[[f32; 256]], blob: &[u8]) -> Option<f32> {
 
 /// Hamming distance between two signatures. Length mismatch (different
 /// embedding dims) scores maximally distant so it can never win a slot.
-fn signature_hamming(a: &[u8], b: &[u8]) -> u32 {
+pub(crate) fn signature_hamming(a: &[u8], b: &[u8]) -> u32 {
     if a.len() != b.len() {
         return u32::MAX;
     }
@@ -20808,6 +21340,7 @@ mod tests {
             sig_cache: std::sync::Mutex::new(None),
             governance_overlay: std::sync::Mutex::new(None),
             cached_suppression_active: std::sync::Mutex::new(None),
+            embedding_quant: std::sync::atomic::AtomicU8::new(EmbeddingQuant::F32.to_byte()),
         };
 
         db.remember_skip_dedup(&make_entity(
@@ -20825,6 +21358,9 @@ mod tests {
             key: Some("pool1-key".to_string()),
             batch_category: None,
             batch_limit: 100,
+            quant_mode: None,
+            restore_quantized_backup: false,
+            drop_quantized_backup: false,
         });
         match res {
             Ok(v) => assert_eq!(v["embedded"], 1, "single-mode embed should succeed: {v}"),
@@ -26597,6 +27133,502 @@ mod tests {
         let _ = fs::remove_file(&path);
     }
 
+    // ── #885: optional quantized embedding storage (vector compression) ──
+
+    /// Deterministic LCG vector fixture (no rand dependency in tests that
+    /// need reproducibility across runs and platforms). Values uniform in
+    /// [-1, 1): `s >> 33` yields 31 top bits — scale by 2^31, not u32::MAX,
+    /// or the whole vector collapses to negative-only (zero sign bits).
+    fn seeded_vec(seed: u64, dim: usize) -> Vec<f32> {
+        let mut s = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        (0..dim)
+            .map(|_| {
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((s >> 33) as u32 as f64 / (1u64 << 31) as f64) * 2.0 - 1.0
+            })
+            .map(|x| x as f32)
+            .collect()
+    }
+
+    fn insert_entity_with_embedding(
+        db: &Database,
+        id: &str,
+        emb: &[f32],
+        with_sig: bool,
+    ) {
+        let blob: Vec<u8> = emb.iter().flat_map(|f| f.to_le_bytes()).collect();
+        let sig = embedding_signature(emb);
+        db.conn()
+            .unwrap()
+            .execute(
+                "INSERT INTO entities (id, category, key, body_json, type, status,
+                    retrieval_count, last_accessed_unix_ms, created_at_unix_ms,
+                    decay_score, layer, embedding, emb_sig, archived)
+                 VALUES (?1, 'insight', ?1, ?2, 'insight', 'active', 0, 0, 0, 1.0, 'working',
+                    ?3, ?4, 0)",
+                params![
+                    id,
+                    format!("{{\"k\":\"{id}\"}}"),
+                    blob,
+                    if with_sig { sig } else { Vec::new() }
+                ],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn embedding_format_tables_exist_on_fresh_schema() {
+        let (db, path) = temp_db();
+        let n: i64 = db
+            .conn()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type='table' AND name IN ('embedding_format', 'entities_embedding_snapshot')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 2, "v33 tables must exist on a fresh store");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn quantized_reindex_roundtrip_is_byte_lossless() {
+        let (mut db, path) = temp_db();
+        db.embedding_config.enabled = false;
+        let dim = 384usize;
+        let mut originals: Vec<(String, Vec<u8>)> = Vec::new();
+        for i in 0..50 {
+            let v = seeded_vec(i as u64 + 1, dim);
+            let id = format!("qr-{i:04}");
+            let blob: Vec<u8> = v.iter().flat_map(|f| f.to_le_bytes()).collect();
+            insert_entity_with_embedding(&db, &id, &v, true);
+            originals.push((id, blob));
+        }
+        assert_eq!(db.embedding_quant(), EmbeddingQuant::F32);
+
+        // Migrate to bit.
+        let report = db.reindex_embeddings(EmbeddingQuant::Bit).unwrap();
+        assert_eq!(report["reindexed"], 50);
+        assert_eq!(report["format_after"], "bit");
+        assert_eq!(report["bytes_per_vector_after"], 49); // 1 tag + 48 sign bits
+        assert_eq!(db.embedding_quant(), EmbeddingQuant::Bit);
+        // Record mirrored.
+        let stored: String = db
+            .conn()
+            .unwrap()
+            .query_row("SELECT format FROM embedding_format WHERE id = 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(stored, "bit");
+        // Snapshot holds every row's original bytes.
+        let snap: i64 = db
+            .conn()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM entities_embedding_snapshot", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(snap, 50);
+        // Blobs converted to tagged sign bits; emb_sig == payload (v18 invariant).
+        let conn = db.conn().unwrap();
+        for (id, _) in &originals {
+            let blob: Vec<u8> = conn
+                .query_row("SELECT embedding FROM entities WHERE id = ?1", params![id], |r| r.get(0))
+                .unwrap();
+            assert_eq!(blob.len(), 1 + dim / 8);
+            assert_eq!(blob[0], vector_quant::TAG_BIT);
+            let sig: Vec<u8> = conn
+                .query_row("SELECT emb_sig FROM entities WHERE id = ?1", params![id], |r| r.get(0))
+                .unwrap();
+            assert_eq!(&blob[1..], &sig[..], "bit payload must equal emb_sig");
+        }
+        drop(conn);
+        // Dense search still works in bit mode (query = the exact stored
+        // vector of qr-0007, whose seed is i+1 = 8).
+        let q = seeded_vec(8, dim);
+        let top = db.dense_search(&q, 3).unwrap();
+        assert!(
+            top.iter().any(|(e, _)| e.id == "qr-0007"),
+            "exact bit vector must rank in top-3 by Hamming"
+        );
+        assert!(!top.is_empty());
+
+        // Rollback: restore is byte-lossless for every row that existed at
+        // snapshot time.
+        let restored = db.restore_embeddings_snapshot().unwrap();
+        assert_eq!(restored["restored"], 50);
+        assert_eq!(db.embedding_quant(), EmbeddingQuant::F32);
+        let conn = db.conn().unwrap();
+        for (id, orig_blob) in &originals {
+            let now_blob: Vec<u8> = conn
+                .query_row("SELECT embedding FROM entities WHERE id = ?1", params![id], |r| r.get(0))
+                .unwrap();
+            assert_eq!(
+                &now_blob, orig_blob,
+                "restored embedding must be byte-identical to the original f32 blob"
+            );
+        }
+        drop(conn);
+        // Second migration reuses the snapshot (never overwrites).
+        let report2 = db.reindex_embeddings(EmbeddingQuant::Bit).unwrap();
+        assert_eq!(report2["snapshot_reused"], true);
+        assert_eq!(report2["snapshot_rows"], 50);
+
+        // int8 path: sizes and tag.
+        let _ = db.restore_embeddings_snapshot().unwrap();
+        let report3 = db.reindex_embeddings(EmbeddingQuant::Int8).unwrap();
+        assert_eq!(report3["bytes_per_vector_after"], 1 + 4 + dim);
+        let blob: Vec<u8> = db
+            .conn()
+            .unwrap()
+            .query_row(
+                "SELECT embedding FROM entities WHERE id = 'qr-0007'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(blob[0], vector_quant::TAG_INT8);
+        assert_eq!(blob.len(), 1 + 4 + dim);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn quantized_reindex_refuses_lossy_paths() {
+        let (mut db, path) = temp_db();
+        db.embedding_config.enabled = false;
+        let v = seeded_vec(1, 16);
+        insert_entity_with_embedding(&db, "r1", &v, true);
+
+        // float32 target is refused (quantization is lossy).
+        assert!(db.reindex_embeddings(EmbeddingQuant::F32).is_err());
+        // quantized → quantized is refused.
+        db.reindex_embeddings(EmbeddingQuant::Bit).unwrap();
+        assert!(db.reindex_embeddings(EmbeddingQuant::Int8).is_err());
+        assert!(db.reindex_embeddings(EmbeddingQuant::Bit).is_err());
+        // Restore works while the snapshot exists, then becomes impossible
+        // once the operator drops it — but the store stays searchable.
+        db.restore_embeddings_snapshot().unwrap();
+        db.drop_embeddings_snapshot().unwrap();
+        assert!(db.restore_embeddings_snapshot().is_err());
+        // A fresh store that was never quantized has no snapshot either.
+        let (mut db3, path3) = temp_db();
+        db3.embedding_config.enabled = false;
+        let v3 = seeded_vec(3, 16);
+        insert_entity_with_embedding(&db3, "r3", &v3, true);
+        assert!(db3.restore_embeddings_snapshot().is_err());
+        // Everything still searchable after the failed/refused ops.
+        let top = db.dense_search(&v, 1).unwrap();
+        assert_eq!(top[0].0.id, "r1");
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(&path3);
+    }
+
+    #[test]
+    fn quantized_write_format_follows_resolved_mode_and_ranks_by_hamming() {
+        let (mut db, path) = temp_db();
+        db.embedding_config.enabled = false;
+        db.remember_skip_dedup(&make_entity(
+            "qw-1", "insight", "qw-1", "{\"content\":\"qw-1\"}",
+        ))
+        .unwrap();
+        let v = seeded_vec(42, 32);
+        // Default: raw f32 blob.
+        db.store_embedding("qw-1", &v).unwrap();
+        assert_eq!(raw_embedding(&db, "qw-1").unwrap().len(), 32 * 4);
+        // Migrate to bit, then a NEW write lands as tagged bits (in-process
+        // mirror flips with the record).
+        db.reindex_embeddings(EmbeddingQuant::Bit).unwrap();
+        db.store_embedding("qw-1", &v).unwrap();
+        let blob = raw_embedding(&db, "qw-1").unwrap();
+        assert_eq!(blob[0], vector_quant::TAG_BIT);
+        assert_eq!(blob.len(), 1 + 32 / 8);
+
+        // Hamming ranking: exact vector beats a half-flipped cousin.
+        db.remember_skip_dedup(&make_entity(
+            "qw-2", "insight", "qw-2", "{\"content\":\"qw-2\"}",
+        ))
+        .unwrap();
+        let mut cousin = v.clone();
+        for i in 0..16 {
+            cousin[i] = -cousin[i];
+        }
+        db.store_embedding("qw-2", &cousin).unwrap();
+        let top = db.dense_search(&v, 2).unwrap();
+        assert_eq!(top[0].0.id, "qw-1", "bit mode must rank by Hamming");
+        assert_eq!(top[1].0.id, "qw-2");
+        assert!(top[0].1 > top[1].1);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn int8_mode_keeps_recall_parity_on_fixture_corpus() {
+        let (mut db, path) = temp_db();
+        db.embedding_config.enabled = false;
+        let dim = 64usize;
+        // 10 topic clusters × 4 members; the query is cluster-0's centroid
+        // plus noise, so ground truth is the 4 cluster-0 members.
+        let mut cluster0: Vec<Vec<f32>> = Vec::new();
+        for c in 0..10 {
+            let centroid = seeded_vec(1000 + c as u64, dim);
+            let norm = centroid.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-6);
+            let centroid: Vec<f32> = centroid.iter().map(|x| x / norm).collect();
+            for m in 0..4 {
+                // Member = centroid + 5% deterministic per-member noise.
+                let noise = seeded_vec(2000 + c as u64 * 10 + m as u64, dim);
+                let v: Vec<f32> = centroid
+                    .iter()
+                    .zip(noise.iter())
+                    .map(|(c, n)| c + n * 0.05)
+                    .collect();
+                let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-6);
+                let v: Vec<f32> = v.iter().map(|x| x / norm).collect();
+                let id = format!("ic-{c}-{m}");
+                insert_entity_with_embedding(&db, &id, &v, true);
+                if c == 0 {
+                    cluster0.push(v);
+                }
+            }
+        }
+        let q = cluster0[0].clone();
+
+        let f32_top: Vec<String> = db
+            .dense_search(&q, 5)
+            .unwrap()
+            .into_iter()
+            .map(|(e, _)| e.id)
+            .collect();
+        let f32_set: std::collections::HashSet<&str> =
+            f32_top.iter().map(|s| s.as_str()).collect();
+
+        // int8 mode (migrate store, same query) must keep every f32 top-5 hit.
+        db.reindex_embeddings(EmbeddingQuant::Int8).unwrap();
+        let int8_top: Vec<String> = db
+            .dense_search(&q, 5)
+            .unwrap()
+            .into_iter()
+            .map(|(e, _)| e.id)
+            .collect();
+        assert_eq!(
+            int8_top.len(),
+            5,
+            "int8 dense search must still return limit rows"
+        );
+        let overlap: usize = int8_top
+            .iter()
+            .filter(|id| f32_set.contains(id.as_str()))
+            .count();
+        assert!(
+            overlap >= 4,
+            "int8 recall@5 must keep >=4/5 of the f32 top-5 (got {overlap}/5: f32={f32_top:?} int8={int8_top:?})"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn bit_mode_full_corpus_pool_ranks_globally_by_hamming() {
+        // ≥ DENSE_SIG_PREFILTER_MIN_ROWS (2048) rows → the sig-cache prefilter
+        // path with full-corpus pool in bit mode. Query = an exact stored
+        // vector; its Hamming-0 row must be #1 even with the cache engaged.
+        // dim 64 (not 8): the sign-bit space must be wide enough that no
+        // other row shares the query's exact pattern (tie-breaking would
+        // then be by stable fetch order, which is not what this test pins).
+        let (mut db, path) = temp_db();
+        db.embedding_config.enabled = false;
+        let dim = 64usize;
+        let n = 2100usize;
+        for i in 0..n {
+            let v = seeded_vec(i as u64 + 1, dim);
+            insert_entity_with_embedding(&db, &format!("bc-{i:05}"), &v, true);
+        }
+        db.reindex_embeddings(EmbeddingQuant::Bit).unwrap();
+        let target_id = "bc-01234";
+        let q = {
+            // Reconstruct the stored vector for bc-01234 (seed i+1).
+            let i = 1234usize;
+            seeded_vec(i as u64 + 1, dim)
+        };
+        let top = db
+            .dense_search_with_opts(
+                &q,
+                5,
+                100_000,
+                DenseOpts {
+                    use_sig_cache: Some(true),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(top.len(), 5);
+        assert_eq!(
+            top[0].0.id, target_id,
+            "bit mode + sig cache must rank the exact Hamming-0 row first (got {:?})",
+            top.iter().map(|(e, _)| e.id.clone()).collect::<Vec<_>>()
+        );
+        assert_eq!(top[0].1, 1.0, "the exact row's Hamming similarity must be 1.0");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn restore_keeps_post_snapshot_rows_searchable_and_reported() {
+        let (mut db, path) = temp_db();
+        db.embedding_config.enabled = false;
+        let v1 = seeded_vec(1, 16);
+        insert_entity_with_embedding(&db, "pre-1", &v1, true);
+        db.reindex_embeddings(EmbeddingQuant::Bit).unwrap();
+        // Row written AFTER the snapshot: stored directly as bits.
+        db.remember_skip_dedup(&make_entity(
+            "post-1", "insight", "post-1", "{\"content\":\"post-1\"}",
+        ))
+        .unwrap();
+        db.store_embedding("post-1", &v1).unwrap();
+        let report = db.restore_embeddings_snapshot().unwrap();
+        assert_eq!(report["restored"], 1, "only the pre-snapshot row restores");
+        assert_eq!(report["still_quantized"], 1, "post-snapshot row reported");
+        // Both rows remain searchable (mixed corpus decodes per-row).
+        let top = db.dense_search(&v1, 2).unwrap();
+        assert_eq!(top.len(), 2);
+        assert!(top.iter().any(|(e, _)| e.id == "pre-1"));
+        assert!(top.iter().any(|(e, _)| e.id == "post-1"));
+        // New writes land as f32 again (record + in-process mirror flipped).
+        let blob = raw_embedding(&db, "pre-1").unwrap();
+        assert_eq!(blob.len(), 16 * 4);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn set_embedding_quant_declares_fresh_store_and_fails_closed_on_existing() {
+        // Fresh store: the declaration lands and is recorded.
+        let (mut db, path) = temp_db();
+        db.set_embedding_quant(EmbeddingQuant::Bit).unwrap();
+        assert_eq!(db.embedding_quant(), EmbeddingQuant::Bit);
+        let stored: String = db
+            .conn()
+            .unwrap()
+            .query_row("SELECT format FROM embedding_format WHERE id = 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(stored, "bit");
+        let _ = fs::remove_file(&path);
+
+        // Store with existing embeddings: declaration refused (fail-closed).
+        let (mut db2, path2) = temp_db();
+        db2.embedding_config.enabled = false;
+        let v = seeded_vec(9, 16);
+        insert_entity_with_embedding(&db2, "x-1", &v, true);
+        assert!(
+            db2.set_embedding_quant(EmbeddingQuant::Bit).is_err(),
+            "must refuse to flip the format on a store that already holds f32 embeddings"
+        );
+        assert_eq!(db2.embedding_quant(), EmbeddingQuant::F32);
+        // Mismatch against a migrated store's record: refused.
+        db2.reindex_embeddings(EmbeddingQuant::Bit).unwrap();
+        assert!(
+            db2.set_embedding_quant(EmbeddingQuant::Int8).is_err(),
+            "must refuse a declaration that contradicts the store record"
+        );
+        assert!(db2.set_embedding_quant(EmbeddingQuant::Bit).is_ok());
+        let _ = fs::remove_file(&path2);
+    }
+
+    /// #885 benchmark probe — storage bytes/vector, recall@k delta, latency
+    /// delta between float32 / int8 / bit storage. `#[ignore]`d: not part of
+    /// the suite; run explicitly:
+    ///   cargo test --locked --no-default-features -- --ignored \
+    ///     vector_quant_bench_probe --nocapture
+    /// Numbers printed are the evidence for docs/specs/vector-compression.md.
+    #[test]
+    #[ignore]
+    fn vector_quant_bench_probe() {
+        let (mut db, path) = temp_db();
+        db.embedding_config.enabled = false;
+        let dim = 384usize;
+        let clusters = 10usize;
+        let members = 300usize; // 3000 rows total
+        // Corpus: 10 topic clusters; member = centroid + 5% noise, normalized.
+        let mut queries: Vec<Vec<f32>> = Vec::new();
+        for c in 0..clusters {
+            let centroid = seeded_vec(50_000 + c as u64, dim);
+            let norm = centroid.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-6);
+            let centroid: Vec<f32> = centroid.iter().map(|x| x / norm).collect();
+            for m in 0..members {
+                let noise = seeded_vec(60_000 + c as u64 * 1000 + m as u64, dim);
+                let v: Vec<f32> = centroid
+                    .iter()
+                    .zip(noise.iter())
+                    .map(|(c, n)| c + n * 0.05)
+                    .collect();
+                let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-6);
+                let v: Vec<f32> = v.iter().map(|x| x / norm).collect();
+                let id = format!("bm-{c:02}-{m:04}");
+                insert_entity_with_embedding(&db, &id, &v, true);
+            }
+            // Query = centroid + noise (an unseen member of the cluster).
+            let qnoise = seeded_vec(70_000 + c as u64, dim);
+            let q: Vec<f32> = centroid
+                .iter()
+                .zip(qnoise.iter())
+                .map(|(c, n)| c + n * 0.05)
+                .collect();
+            queries.push(q);
+        }
+        assert_eq!(queries.len(), clusters);
+
+        let measure = |db: &Database, label: &str| {
+            // Warmup (cache build + page cache).
+            let _ = db.dense_search(&queries[0], 5).unwrap();
+            let _ = db.dense_search(&queries[1], 5).unwrap();
+            let mut r5 = Vec::new();
+            let mut r10 = Vec::new();
+            let mut lat = Vec::new();
+            for (ci, q) in queries.iter().enumerate() {
+                let prefix = format!("bm-{ci:02}-");
+                let t = std::time::Instant::now();
+                let top = db.dense_search(q, 10).unwrap();
+                lat.push(t.elapsed().as_secs_f64() * 1000.0);
+                let ids: Vec<String> = top.into_iter().map(|(e, _)| e.id).collect();
+                let hit5 = ids.iter().take(5).filter(|id| id.starts_with(&prefix)).count();
+                let hit10 = ids.iter().take(10).filter(|id| id.starts_with(&prefix)).count();
+                r5.push(hit5 as f64 / 5.0);
+                r10.push(hit10 as f64 / 10.0);
+            }
+            lat.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let p50 = lat[lat.len() / 2];
+            let mean: f64 = lat.iter().sum::<f64>() / lat.len() as f64;
+            eprintln!(
+                "[bench:{label}] recall@5={:.4} recall@10={:.4} latency_p50={:.2}ms mean={:.2}ms",
+                r5.iter().sum::<f64>() / r5.len() as f64,
+                r10.iter().sum::<f64>() / r10.len() as f64,
+                p50,
+                mean
+            );
+        };
+
+        // float32 baseline.
+        measure(&db, "float32");
+        // int8.
+        db.reindex_embeddings(EmbeddingQuant::Int8).unwrap();
+        measure(&db, "int8");
+        // bit (restore first — the snapshot is float32).
+        db.restore_embeddings_snapshot().unwrap();
+        db.reindex_embeddings(EmbeddingQuant::Bit).unwrap();
+        measure(&db, "bit");
+
+        // Storage bytes/vector (measured from the column).
+        let conn = db.conn().unwrap();
+        let len: i64 = conn
+            .query_row("SELECT length(embedding) FROM entities LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        eprintln!("[bench:storage] bytes/vector(bit mode)={}", len);
+        drop(conn);
+        eprintln!(
+            "[bench:note] float32=1536 int8=389 bit={} (dim {dim}) — seed anchors: \
+             clusters=50_000+i, members=60_000+c*1000+m, queries=70_000+c",
+            len
+        );
+        let _ = fs::remove_file(&path);
+    }
+
     /// v18 (#507): the phase-0 signature scan and the embedded-row count must
     /// plan as USING COVERING INDEX — the whole point of
     /// idx_entities_dense_sig is that neither query touches an entity RECORD
@@ -26859,7 +27891,8 @@ mod tests {
         // query vector through the store_embedding helper (bumps
         // SIG_WRITE_GEN; row count unchanged). The stale cache still holds its
         // old far-away signature — only the gen stamp can catch this.
-        Database::store_embedding_with_conn(&conn, "filler-00042", &query).unwrap();
+        Database::store_embedding_with_conn(&conn, "filler-00042", &query, EmbeddingQuant::F32)
+            .unwrap();
         let after_reembed = db.dense_search_with_opts(&query, 5, 100, DenseOpts { use_sig_cache: Some(true), ..Default::default() }).unwrap();
         assert_eq!(
             after_reembed[0].0.id, "filler-00042",
@@ -32107,6 +33140,7 @@ mod tests {
             "sg-1",
             "{\"content\":\"an OLDER body\"}",
             &[0.25, 0.5],
+            EmbeddingQuant::F32,
         )
         .unwrap();
         assert!(!landed, "stale-plaintext embed must be refused");
@@ -32118,6 +33152,7 @@ mod tests {
             "sg-1",
             "{\"content\":\"current body\"}",
             &[0.25, 0.5],
+            EmbeddingQuant::F32,
         )
         .unwrap();
         assert!(landed, "current-plaintext embed must land");
@@ -32135,6 +33170,7 @@ mod tests {
             "sg-1",
             "{\"content\":\"current body\"}",
             &[0.9, 0.9],
+            EmbeddingQuant::F32,
         )
         .unwrap();
         assert!(!landed, "an entity without an FTS row must be refused");
@@ -32283,6 +33319,9 @@ mod tests {
                 key: None,
                 batch_category: Some("insight".to_string()),
                 batch_limit: 100,
+                quant_mode: None,
+                restore_quantized_backup: false,
+                drop_quantized_backup: false,
             })
             .unwrap();
         assert!(
@@ -32328,6 +33367,9 @@ mod tests {
                 key: None,
                 batch_category: Some("cepool".to_string()),
                 batch_limit: 100,
+                quant_mode: None,
+                restore_quantized_backup: false,
+                drop_quantized_backup: false,
             })
             .unwrap();
         assert_eq!(
@@ -32410,6 +33452,9 @@ mod tests {
                 key: None,
                 batch_category: Some("abpool".to_string()),
                 batch_limit: total,
+                quant_mode: None,
+                restore_quantized_backup: false,
+                drop_quantized_backup: false,
             })
             .unwrap();
         assert_eq!(report["embedded"].as_i64().unwrap(), 0, "nothing can embed: {report}");
@@ -35654,7 +36699,7 @@ mod tests {
         // Report carries denominator + artifact hash (acceptance #5).
         assert!(rep["denominator"]["slots"].as_i64().unwrap() >= 3);
         assert!(rep["artifact"]["git_hash"].as_str().unwrap().len() >= 7);
-        assert_eq!(rep["artifact"]["schema_version"], 32);
+        assert_eq!(rep["artifact"]["schema_version"], 33);
         let _ = std::fs::remove_file(path);
     }
 

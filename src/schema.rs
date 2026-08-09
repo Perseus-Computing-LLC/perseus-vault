@@ -350,6 +350,24 @@ CREATE INDEX IF NOT EXISTS idx_artifact_bindings_scope
  ON artifact_bindings(sha256, workspace_hash, visibility, created_at_unix_ms DESC);
 CREATE INDEX IF NOT EXISTS idx_artifact_bindings_derived_from
  ON artifact_bindings(derived_from_sha256);
+
+-- #885 Optional quantized embedding storage: the store-wide `entities.embedding`
+-- format record (single row, written by the reindex path and mirrored at open
+-- for fresh stores) and the pre-quantization float32 snapshot used by the
+-- documented rollback path (perseus_vault_embed restore_quantized_backup).
+-- The snapshot is a migration artifact owned by the operator: it exists only
+-- between `quantize` and the operator-confirmed drop, and nothing else reads
+-- or writes it.
+CREATE TABLE IF NOT EXISTS embedding_format (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    format TEXT NOT NULL,
+    updated_at_unix_ms INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS entities_embedding_snapshot (
+    id TEXT PRIMARY KEY,
+    embedding BLOB NOT NULL,
+    created_at_unix_ms INTEGER NOT NULL
+);
 ";
 
 /// Current schema migration level, stamped into `PRAGMA user_version` once all
@@ -416,7 +434,13 @@ CREATE INDEX IF NOT EXISTS idx_artifact_bindings_derived_from
 /// 'defensively_recalled', orthogonal to the lifecycle `status` column.
 /// Backfill-free: existing rows default to 'candidate' (useful but unverified),
 /// which is the safe reading for any legacy record lacking admission evidence.
-pub(crate) const SCHEMA_VERSION: i64 = 32;
+/// v33 (#885 vector compression): `embedding_format` (store-wide declared
+/// `entities.embedding` storage format: float32 | int8 | bit) and
+/// `entities_embedding_snapshot` (pre-quantization float32 column backup for
+/// the documented rollback path). New tables, idempotent, no backfill — the
+/// format record is written by the reindex path / fresh-store open, and the
+/// snapshot only by the quantization step.
+pub(crate) const SCHEMA_VERSION: i64 = 33;
 
 /// Initialize the v0.2.0 schema on a fresh database.
 pub fn initialize_schema(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
@@ -1201,6 +1225,26 @@ fn apply_migrations(conn: &Connection) -> Result<(), Box<dyn std::error::Error>>
             ON keystone_suggestions(source_entity_id);",
     )?;
     // ── end v32 ──────────────────────────────────────────────────────────
+
+    // ── v33 (#885): optional quantized embedding storage ─────────────────
+    // New tables (the base DDL also has these IF NOT EXISTS creates for
+    // fresh DBs). No backfill: the `embedding_format` record is written by
+    // the reindex path (perseus_vault_embed quant_mode) and by open() for
+    // fresh stores declared quantized from the start; the snapshot is
+    // created only by the quantization step itself.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS embedding_format (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            format TEXT NOT NULL,
+            updated_at_unix_ms INTEGER NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS entities_embedding_snapshot (
+            id TEXT PRIMARY KEY,
+            embedding BLOB NOT NULL,
+            created_at_unix_ms INTEGER NOT NULL
+         );",
+    )?;
+    // ── end v33 ──────────────────────────────────────────────────────────
 
     // Stamp the migration level so subsequent opens skip the probe block above.
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
