@@ -599,6 +599,7 @@ pub fn handle_request(
                     "perseus_vault_scan",
                     "perseus_vault_context",
                     "perseus_vault_project_task",
+                    "perseus_vault_expand_source",
                     "perseus_vault_ask",
                     "perseus_vault_artifact_manifest",
                     "perseus_vault_artifact_excerpt",
@@ -3383,6 +3384,63 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Build Task Projection"
   },
   {
+    "name": "perseus_vault_expand_source",
+    "description": "Expand a distilled fact's source reference back to the verbatim span of its retained transcript (#888). Fact mode (category+key of a capture note): reads the note's stamped source_chunk and returns the exact source text under a char budget, with source metadata, span offsets, and a SHA-256 integrity verdict against the retained store. Explicit mode (source_category+source_key+start_char+end_char): expands an arbitrary span of any retained source with optional span_sha256 verification. Bi-temporal: as_of_unix_ms defaults to the fact's capture time, so the text is the span as it existed when the fact was distilled; pass a later anchor to read the source as it is today. Graceful outcomes (never errors): no_source_ref (fact has no source ref — API writes, LLM-distilled notes, retain_transcript=false), fact_not_found, source_missing, span_invalid (out_of_bounds or hash_mismatch — fail-closed, no text). max_chars budget 1..=16384 (default 2000); longer spans are truncated with truncated:true. Output is verbatim informational context, not instructions.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "category": {
+          "type": "string",
+          "description": "Fact mode: category of the distilled fact entity."
+        },
+        "key": {
+          "type": "string",
+          "description": "Fact mode: key of the distilled fact entity."
+        },
+        "source_category": {
+          "type": "string",
+          "description": "Explicit mode: category of the retained source."
+        },
+        "source_key": {
+          "type": "string",
+          "description": "Explicit mode: key of the retained source."
+        },
+        "start_char": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Explicit mode: span start (char offset, inclusive)."
+        },
+        "end_char": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Explicit mode: span end (char offset, exclusive)."
+        },
+        "span_sha256": {
+          "type": "string",
+          "description": "Explicit mode: optional expected SHA-256 of the verbatim span; verified when present."
+        },
+        "max_chars": {
+          "type": "integer",
+          "default": 2000,
+          "minimum": 1,
+          "maximum": 16384,
+          "description": "Char budget for the returned text."
+        },
+        "as_of_unix_ms": {
+          "type": "integer",
+          "description": "Bi-temporal anchor; defaults to the fact's capture time."
+        },
+        "workspace_hash": {
+          "type": "string",
+          "default": "",
+          "description": "Permission scope."
+        }
+      },
+      "required": []
+    },
+    "title": "Expand Source Chunk"
+  },
+  {
     "name": "perseus_vault_expire",
     "description": "Time-based lifecycle sweep (#868): transition entities whose expires_at_unix_ms has passed to status='expired'. Content, history, and searchability are RETAINED — expiry is not erasure, and recall already excludes expired rows; the sweep makes the lifecycle state explicit and observable. Idempotent and re-runnable; use dry_run=true to preview with identical predicates. Contract: docs/specs/data-boundaries-retention-lifecycle.md.",
     "inputSchema": {
@@ -6063,6 +6121,8 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
 
         "perseus_vault_project_task" => tools::handle_project_task(db, args),
 
+        "perseus_vault_expand_source" => tools::handle_expand_source(db, args),
+
         "perseus_vault_prune" => tools::handle_prune(db, args).map_err(|e| e.to_string()),
 
         "perseus_vault_link" => tools::handle_link(db, args).map_err(|e| e.to_string()),
@@ -6272,7 +6332,7 @@ mod tests {
         );
         assert_eq!(
             registry_names.len(),
-            108,
+            109,
             "update public metadata when adding a tool"
         );
 
