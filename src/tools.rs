@@ -300,6 +300,11 @@ pub struct RecallArgs {
     pub epistemic_state: Option<String>,
     #[serde(default)]
     pub layer: Option<String>,
+    /// #886: hierarchical tier ordering — mental models first, then
+    /// consolidated observations, then raw facts (stable within each tier).
+    /// Reorders the returned list only; default false = ranking order.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub tier_order: bool,
     /// #784: serving posture applied after authorization: personal, agent, or shared.
     #[serde(default)]
     pub retrieval_profile: Option<String>,
@@ -1533,6 +1538,7 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
         epistemic_state: a.epistemic_state.clone(),
         visibility: None,
         layer: a.layer.as_deref().filter(|s| !s.is_empty()).map(canonical_layer),
+        tier_order: a.tier_order,
         reinforce: a.reinforce,
         strategies: a.strategies,
         max_tokens: a.max_tokens,
@@ -1918,6 +1924,7 @@ pub fn handle_recall_batch(db: &Database, args: Value) -> Result<String, String>
             validity_annotate: q.validity_annotate,
             query_time_unix_ms: q.query_time_unix_ms,
             graph_utility_threshold: q.graph_utility_threshold,
+            tier_order: q.tier_order,
         };
 
         let mut entities = db
@@ -4999,7 +5006,75 @@ pub fn handle_operator_review(db: &Database, args: Value) -> Result<String, Stri
         "supersession_lag":supersession_lag,
         "keystone_suggestions": pending_suggestions,
         "keystone_suggestions_note": "pending directive candidates from correct captures; promote via keystone_suggestion_decide(approve)",
+        // #886: the mental-model review queue rides the same operator
+        // review surface (read-only listing; decisions go through
+        // perseus_vault_mental_model_review).
+        "mental_models": db
+            .mental_model_review_list(limit, None)
+            .unwrap_or_default(),
         "read_only":true}).to_string())
+}
+
+/// #886: create or refresh a curated mental model — the ONLY sanctioned
+/// write path for the `mental_model` category (auto-generated passes refuse
+/// it). Versioned via the audited remember path; provenance stamped;
+/// revision bumped on every re-assert; the review clock resets.
+pub fn handle_mental_model_set(db: &Database, args: Value) -> Result<String, String> {
+    let a: crate::models::MentalModelSetParams = serde_json::from_value(args)
+        .map_err(|e| format!("Invalid mental_model_set arguments: {e}"))?;
+    match db.mental_model_set(&a) {
+        Ok(v) => Ok(v.to_string()),
+        Err(e) => Err(format!("Mental model set failed: {e}")),
+    }
+}
+
+/// #886: mental-model review — `list` flagged stale models (reason, age,
+/// newest-fact trace), or stamp an operator `approve`/`dismiss` decision
+/// (resets the age clock; the summary only changes via a re-assert through
+/// perseus_vault_mental_model_set).
+pub fn handle_mental_model_review(db: &Database, args: Value) -> Result<String, String> {
+    let a: crate::models::MentalModelReviewArgs = serde_json::from_value(args)
+        .map_err(|e| format!("Invalid mental_model_review arguments: {e}"))?;
+    match a.action.as_str() {
+        "list" | "" => {
+            let flagged = db
+                .mental_model_review_list(
+                    a.limit,
+                    if a.workspace_hash.is_empty() {
+                        None
+                    } else {
+                        Some(a.workspace_hash.as_str())
+                    },
+                )
+                .map_err(|e| format!("Mental model review list failed: {e}"))?;
+            Ok(json!({
+                "action": "list",
+                "flagged": flagged,
+                "flagged_count": flagged.len(),
+                "note": "decide via action=approve|dismiss + key; summary changes only \
+                         via perseus_vault_mental_model_set",
+                "reviewed_at_unix_ms": crate::db::now_ms(),
+            })
+            .to_string())
+        }
+        "approve" | "dismiss" => {
+            if a.key.trim().is_empty() {
+                return Err("key is required for approve/dismiss".to_string());
+            }
+            match db.mental_model_review_decide(
+                &a.action,
+                &a.key,
+                &a.workspace_hash,
+                &a.requesting_agent_id,
+            ) {
+                Ok(v) => Ok(v.to_string()),
+                Err(e) => Err(format!("Mental model review decision failed: {e}")),
+            }
+        }
+        other => Err(format!(
+            "invalid mental_model_review action '{other}': expected list | approve | dismiss"
+        )),
+    }
 }
 
 pub fn handle_conflicts(db: &Database, args: Value) -> String {

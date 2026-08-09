@@ -1622,6 +1622,11 @@ impl Database {
             query: params.query.clone(),
             limit: params.top_k as i64,
             skip_side_effects: true,
+            // #886: hierarchical retrieval — mental models first, then
+            // observations, then raw facts (curated summaries are consulted
+            // before consolidated beliefs, which are consulted before raw
+            // facts).
+            tier_order: true,
             ..Default::default()
         };
         let mut entities = self.recall(&recall_params)?;
@@ -1669,19 +1674,52 @@ impl Database {
             .into());
         }
 
+        // Step 1c (#886): stale mental models are FLAGGED, never dropped —
+        // they are curated content, so the honest behavior is to surface
+        // them with a pending-review marker (the review tool resolves it),
+        // not to refuse them like unverified observations.
+        let mut gated = gated;
+        for (e, verification) in gated.iter_mut() {
+            if e.category != crate::mental_model::MENTAL_MODEL_CATEGORY {
+                continue;
+            }
+            if verification.is_some() {
+                continue;
+            }
+            if let Ok((true, _reason)) =
+                self.mental_model_staleness(&e.workspace_hash, e)
+            {
+                *verification =
+                    Some("stale_mental_model_pending_review".to_string());
+            }
+        }
+
         // Step 2: Assemble context (truncate bodies to ~600 chars each)
         let mut context_parts = Vec::new();
         let mut sources = Vec::new();
         for (e, verification) in gated {
             let snippet: String = e.body_json.chars().take(600).collect();
-            if verification.is_some() {
-                context_parts.push(format!(
-                    "[key: {}] (verified against raw facts) {}",
-                    e.key, snippet
-                ));
-            } else {
-                context_parts.push(format!("[key: {}] {}", e.key, snippet));
-            }
+            // #886: mental models get a structural context prefix so the
+            // curated tier is visibly consulted first.
+            let prefix = crate::mental_model::context_prefix(
+                &e.key,
+                &e.category,
+                verification.as_deref()
+                    == Some("stale_mental_model_pending_review"),
+            );
+            let tagged = match (prefix, verification.as_deref()) {
+                (Some(p), Some("verified_against_raw")) => {
+                    format!("{p} (verified against raw facts) {snippet}")
+                }
+                (Some(p), Some(v)) => format!("{p} ({v}) {snippet}"),
+                (Some(p), None) => format!("{p} {snippet}"),
+                (None, Some("verified_against_raw")) => {
+                    format!("[key: {}] (verified against raw facts) {}", e.key, snippet)
+                }
+                (None, Some(v)) => format!("[key: {}] ({v}) {}", e.key, snippet),
+                (None, None) => format!("[key: {}] {}", e.key, snippet),
+            };
+            context_parts.push(tagged);
             sources.push(AskSource {
                 key: e.key.clone(),
                 category: e.category.clone(),
@@ -6399,7 +6437,12 @@ impl Database {
     }
 
     pub fn recall(&self, params: &RecallParams) -> Result<Vec<Entity>, Box<dyn std::error::Error>> {
-        let (entities, _) = self.recall_with_completeness(params)?;
+        let (mut entities, _) = self.recall_with_completeness(params)?;
+        // #886: hierarchical tier ordering (mental models → observations →
+        // raw facts) — opt-in, reorders the returned list only.
+        if params.tier_order {
+            crate::mental_model::apply_tier_order(&mut entities);
+        }
         Ok(entities)
     }
 
@@ -7481,6 +7524,11 @@ impl Database {
                     &*conn, &batch_id, "", "fused", &params.query, &retained,
                 );
             }
+        }
+        // #886: hierarchical tier ordering (mental models → observations →
+        // raw facts) for direct fused callers — opt-in, reorders only.
+        if params.tier_order {
+            crate::mental_model::apply_tier_order(&mut retained);
         }
         Ok((
             retained,
@@ -13405,6 +13453,338 @@ impl Database {
         }
     }
 
+    // ─── #886: mental-models tier ─────────────────────────────────────
+
+    /// The ONLY sanctioned write path for the curated `mental_model`
+    /// category. Curated means: the operator/agent explicitly asserts the
+    /// summary; no auto-generated pass (consolidate/dream/cohere) creates
+    /// these — consolidate refuses the category. Versioned by the audited
+    /// remember path (entity_history snapshot, #371); provenance is stamped
+    /// (curated_by/curated_at); every re-assert bumps `revision` and resets
+    /// the review clock.
+    pub fn mental_model_set(
+        &self,
+        params: &crate::models::MentalModelSetParams,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+        if let Some(err) = crate::mental_model::validate_curation(
+            &params.key,
+            &params.summary,
+            params.review_interval_days,
+            &params.recall_when,
+            &params.source_ids,
+        ) {
+            return Err(err.into());
+        }
+        let now = now_ms();
+        let ws = params.workspace_hash.clone();
+        let curator = if params.requesting_agent_id.trim().is_empty() {
+            "operator".to_string()
+        } else {
+            params.requesting_agent_id.clone()
+        };
+
+        // Read the existing entity (if any) so omitted fields carry over and
+        // the revision bumps monotonically. get_entity takes (category, key).
+        let existing = self.get_entity(crate::mental_model::MENTAL_MODEL_CATEGORY, &params.key)?;
+        let prev_meta = existing.as_ref().and_then(|e| {
+            crate::mental_model::parse_mental_model(&e.body_json)
+        });
+        let mut meta = crate::mental_model::MentalModelMeta {
+            summary: params.summary.trim().to_string(),
+            scope: if params.scope.trim().is_empty() {
+                prev_meta.as_ref().map(|m| m.scope.clone()).unwrap_or_default()
+            } else {
+                params.scope.clone()
+            },
+            source_ids: if params.source_ids.is_empty() {
+                prev_meta.as_ref().map(|m| m.source_ids.clone()).unwrap_or_default()
+            } else {
+                params.source_ids.clone()
+            },
+            recall_when: if params.recall_when.is_empty() {
+                prev_meta.as_ref().map(|m| m.recall_when.clone()).unwrap_or_default()
+            } else {
+                params.recall_when.clone()
+            },
+            curated_by: curator.clone(),
+            curated_at_unix_ms: now,
+            reviewed_at_unix_ms: now,
+            review_interval_days: params.review_interval_days,
+            revision: prev_meta.as_ref().map(|m| m.revision + 1).unwrap_or(1),
+            stale: false,
+            stale_reason: String::new(),
+            last_review_decision: prev_meta
+                .as_ref()
+                .map(|m| m.last_review_decision.clone())
+                .unwrap_or_default(),
+        };
+        // Preserve the last review decision across a plain re-assert? No:
+        // a re-assert IS the review (the curator is looking at it now).
+        meta.last_review_decision = String::new();
+
+        let entity = crate::models::Entity {
+            id: existing.as_ref().map(|e| e.id.clone()).unwrap_or_else(|| {
+                let raw = uuid::Uuid::new_v4().to_string().replace('-', "");
+                format!("mem-{}", &raw[..12.min(raw.len())])
+            }),
+            category: crate::mental_model::MENTAL_MODEL_CATEGORY.to_string(),
+            key: params.key.clone(),
+            body_json: crate::mental_model::serialize_meta(&meta),
+            status: "active".to_string(),
+            entity_type: crate::mental_model::MENTAL_MODEL_TYPE.to_string(),
+            tags: vec![],
+            decay_score: 1.0,
+            retrieval_count: 0,
+            layer: "core".to_string(),
+            topic_path: String::new(),
+            archived: false,
+            archive_reason: String::new(),
+            links: vec![],
+            verified: true,
+            source: "mental_model_curation".to_string(),
+            workspace_hash: ws,
+            agent_id: curator.clone(),
+            created_at_unix_ms: existing
+                .as_ref()
+                .map(|e| e.created_at_unix_ms)
+                .unwrap_or(now),
+            last_accessed_unix_ms: now,
+            always_on: false,
+            certainty: 1.0,
+            visibility: "workspace".to_string(),
+            follow_count: 0,
+            miss_count: 0,
+            follow_rate: 0.0,
+            efficacy_status: "active".to_string(),
+            epistemic_state: "verified".to_string(),
+            embedding: None,
+            _parsed_body: None,
+        };
+        let (id, action) = self.remember(&entity)?;
+        Ok(serde_json::json!({
+            "ok": true,
+            "id": id,
+            "category": crate::mental_model::MENTAL_MODEL_CATEGORY,
+            "key": params.key,
+            "action": action,
+            "revision": meta.revision,
+            "curated_by": curator,
+            "curated_at_unix_ms": now,
+            "review_interval_days": meta.review_interval_days,
+            "recall_when": meta.recall_when,
+            "note": "versioned via the audited remember path (entity_history); \
+                     refresh via a new set; review via perseus_vault_mental_model_review",
+        }))
+    }
+
+    /// #886: the newest raw fact in the model's `scope` category created
+    /// after curation and not already cited as a source — the
+    /// newer-facts staleness evidence (mirrors
+    /// `newest_unconsolidated_fact` for observations). None when the model
+    /// has no scope or no such fact exists.
+    fn mental_model_newest_fact(
+        &self,
+        workspace_hash: &str,
+        meta: &crate::mental_model::MentalModelMeta,
+    ) -> Result<Option<(String, String)>, Box<dyn std::error::Error>> {
+        if meta.scope.is_empty() {
+            return Ok(None);
+        }
+        let conn = self.conn()?;
+        let n = meta.source_ids.len();
+        let mut sql = String::from(
+            "SELECT id, key FROM entities WHERE category = ?1 AND archived = 0 \
+             AND created_at_unix_ms > ?2",
+        );
+        if n > 0 {
+            let ph: Vec<String> = (0..n).map(|i| format!("?{}", i + 3)).collect();
+            sql.push_str(" AND id NOT IN (");
+            sql.push_str(&ph.join(", "));
+            sql.push(')');
+        }
+        sql.push_str(&format!(
+            " AND (workspace_hash = ?{} OR workspace_hash = '')
+             ORDER BY created_at_unix_ms DESC, id ASC LIMIT 1",
+            n + 3
+        ));
+        let mut params_vec: Vec<rusqlite::types::Value> = vec![
+            meta.scope.clone().into(),
+            meta.curated_at_unix_ms.into(),
+        ];
+        for sid in &meta.source_ids {
+            params_vec.push(sid.clone().into());
+        }
+        params_vec.push(workspace_hash.to_string().into());
+        let mut stmt = conn.prepare(&sql)?;
+        let mut rows = stmt.query(rusqlite::params_from_iter(params_vec.iter()))?;
+        if let Some(row) = rows.next()? {
+            Ok(Some((row.get(0)?, row.get(1)?)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// #886: read-time staleness of a mental-model entity — (stale,
+    /// reason). Reasons: `age` (review interval elapsed since the last
+    /// review/curation stamp) and `newer_facts:<key>` (a raw fact in the
+    /// model's scope exists after curation that the summary does not
+    /// account for). Read-time computation wins over the stored snapshot.
+    pub fn mental_model_staleness(
+        &self,
+        workspace_hash: &str,
+        entity: &crate::models::Entity,
+    ) -> Result<(bool, String), Box<dyn std::error::Error>> {
+        let Some(meta) = crate::mental_model::parse_mental_model(&entity.body_json) else {
+            return Ok((false, String::new()));
+        };
+        let newer = self.mental_model_newest_fact(workspace_hash, &meta)?;
+        let (stale, reason) = meta.staleness(now_ms(), newer.as_ref().map(|(_, k)| k.as_str()));
+        Ok((stale, reason))
+    }
+
+    /// #886: the review queue for stale mental models (read-only building
+    /// block; surfaced by `perseus_vault_operator_review` and the review
+    /// tool). Flagged entries carry the reason and the newest-fact trace.
+    pub fn mental_model_review_list(
+        &self,
+        limit: i64,
+        workspace_hash: Option<&str>,
+    ) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
+        let conn = self.conn()?;
+        // Single query shape: an empty workspace filter matches everything
+        // (global review); a concrete workspace restricts the scan.
+        let mut stmt = conn.prepare(
+            "SELECT id, key, body_json, created_at_unix_ms FROM entities \
+             WHERE category = ?1 AND archived = 0 AND (?2 = '' OR workspace_hash = ?2) \
+             ORDER BY created_at_unix_ms ASC",
+        )?;
+        let rows = stmt.query_map(
+            rusqlite::params![
+                crate::mental_model::MENTAL_MODEL_CATEGORY,
+                workspace_hash.unwrap_or("")
+            ],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)?,
+                ))
+            },
+        )?;
+        let rows: Vec<(String, String, String, i64)> =
+            rows.collect::<Result<Vec<_>, _>>()?;
+        let mut flagged = Vec::new();
+        let now = now_ms();
+        for (id, key, body, created_at) in rows {
+            let Some(meta) = crate::mental_model::parse_mental_model(&body) else {
+                flagged.push(serde_json::json!({
+                    "id": id, "key": key, "reason": "malformed_body",
+                    "detail": "mental-model body failed to parse (missing summary?)",
+                }));
+                continue;
+            };
+            let newer = self.mental_model_newest_fact(workspace_hash.unwrap_or(""), &meta)?;
+            let (stale, reason) =
+                meta.staleness(now, newer.as_ref().map(|(_, k)| k.as_str()));
+            if stale {
+                let anchor = meta.review_anchor_ms();
+                flagged.push(serde_json::json!({
+                    "id": id,
+                    "key": key,
+                    "reason": reason,
+                    "age_days": (now - anchor).max(0) / 86_400_000,
+                    "curated_at_unix_ms": meta.curated_at_unix_ms,
+                    "reviewed_at_unix_ms": meta.reviewed_at_unix_ms,
+                    "review_interval_days": meta.review_interval_days,
+                    "revision": meta.revision,
+                    "newest_fact_id": newer.as_ref().map(|(i, _)| i.clone()),
+                    "newest_fact_key": newer.as_ref().map(|(_, k)| k.clone()),
+                    "created_at_unix_ms": created_at,
+                    "summary": meta.summary,
+                }));
+            }
+        }
+        flagged.truncate(limit.clamp(1, 1000) as usize);
+        Ok(flagged)
+    }
+
+    /// #886: stamp an operator review decision on a mental model —
+    /// `approve` (summary reviewed and kept) or `dismiss` (flag
+    /// acknowledged, summary kept). Both re-assert with reviewed_at = now
+    /// (resets the age clock), record the decision, and bump revision —
+    /// versioned by the audited path like any curated write. The summary
+    /// itself only changes via a new `perseus_vault_mental_model_set`.
+    /// `newer_facts` staleness stays derived: a contradicting fact still
+    /// flags the model on the next list — the decision is a review stamp,
+    /// not a blind.
+    pub fn mental_model_review_decide(
+        &self,
+        action: &str,
+        key: &str,
+        workspace_hash: &str,
+        requesting_agent_id: &str,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+        if action != "approve" && action != "dismiss" {
+            return Err(format!(
+                "invalid mental-model review action '{action}': expected approve | dismiss"
+            )
+            .into());
+        }
+        let Some(entity) = self
+            .get_entity(crate::mental_model::MENTAL_MODEL_CATEGORY, key)?
+        else {
+            return Err(format!(
+                "mental model not found: {}/{}",
+                crate::mental_model::MENTAL_MODEL_CATEGORY,
+                key
+            )
+            .into());
+        };
+        if !workspace_hash.is_empty() && entity.workspace_hash != workspace_hash {
+            return Err(format!(
+                "mental model '{key}' belongs to workspace '{}', not '{workspace_hash}'",
+                entity.workspace_hash
+            )
+            .into());
+        }
+        let Some(mut meta) =
+            crate::mental_model::parse_mental_model(&entity.body_json)
+        else {
+            return Err(format!(
+                "mental model '{key}' has a malformed body (missing summary?) — \
+                 re-assert it with perseus_vault_mental_model_set first"
+            )
+            .into());
+        };
+        let now = now_ms();
+        meta.reviewed_at_unix_ms = now;
+        meta.last_review_decision = action.to_string();
+        meta.stale = false;
+        meta.stale_reason = String::new();
+        meta.revision += 1;
+        let mut updated = entity.clone();
+        updated.body_json = crate::mental_model::serialize_meta(&meta);
+        updated.source = "mental_model_review".to_string();
+        updated.agent_id = if requesting_agent_id.trim().is_empty() {
+            "operator".to_string()
+        } else {
+            requesting_agent_id.to_string()
+        };
+        let (id, write_action) = self.remember(&updated)?;
+        Ok(serde_json::json!({
+            "ok": true,
+            "id": id,
+            "key": key,
+            "action": write_action,
+            "decision": action,
+            "reviewed_at_unix_ms": now,
+            "revision": meta.revision,
+            "note": "age clock reset; newer-facts staleness remains derived \
+                     (a contradicting fact still flags the model on the next list)",
+        }))
+    }
+
     /// #884: the ask stale gate — verify observation candidates against
     /// newer unconsolidated raw facts before citation. Kept entries carry
     /// an optional verification note; refused entries name the newest
@@ -13510,6 +13890,19 @@ impl Database {
         &self,
         params: &crate::models::ConsolidateParams,
     ) -> Result<crate::models::ConsolidateReport, Box<dyn std::error::Error>> {
+        // #886: the curated mental_model category is OFF-LIMITS to
+        // auto-generated consolidation — mental models are only ever
+        // created/refreshed by explicit curation
+        // (perseus_vault_mental_model_set / review decisions).
+        if params.category == crate::mental_model::MENTAL_MODEL_CATEGORY {
+            return Err(format!(
+                "consolidate refuses category '{}': mental models are curated, \
+                 not auto-generated — use perseus_vault_mental_model_set to create \
+                 or refresh one",
+                crate::mental_model::MENTAL_MODEL_CATEGORY
+            )
+            .into());
+        }
         // #854: ordinary runs require an explicit workspace; global mode is
         // deliberate and authorization-gated.
         let (scope_ws, global) = Self::resolve_maintenance_scope(
@@ -20953,6 +21346,513 @@ mod tests {
         let (db, path) = temp_db();
         assert!(db.health_check());
         let _ = fs::remove_file(&path);
+    }
+
+    // ─── #886: mental-models tier ──────────────────────────────────────
+
+    #[test]
+    fn mental_model_set_curates_versioned_with_provenance() {
+        let db = Database::open(":memory:").unwrap();
+        let out = db
+            .mental_model_set(&crate::models::MentalModelSetParams {
+                key: "stack-portal".to_string(),
+                summary: "stack uses vue for the portal".to_string(),
+                scope: "tech".to_string(),
+                source_ids: vec!["mem-1".to_string()],
+                recall_when: vec!["stack".to_string(), "portal".to_string()],
+                review_interval_days: 30,
+                workspace_hash: String::new(),
+                requesting_agent_id: "alice".to_string(),
+            })
+            .unwrap();
+        assert_eq!(out["revision"], 1);
+        assert_eq!(out["curated_by"], "alice");
+
+        let e = db
+            .get_entity(crate::mental_model::MENTAL_MODEL_CATEGORY, "stack-portal")
+            .unwrap()
+            .expect("entity exists");
+        assert_eq!(e.entity_type, crate::mental_model::MENTAL_MODEL_TYPE);
+        assert_eq!(e.source, "mental_model_curation");
+        let meta = crate::mental_model::parse_mental_model(&e.body_json).unwrap();
+        assert_eq!(meta.summary, "stack uses vue for the portal");
+        assert_eq!(meta.scope, "tech");
+        assert_eq!(meta.curated_by, "alice");
+        assert_eq!(meta.recall_when, vec!["stack".to_string(), "portal".to_string()]);
+
+        // Re-assert bumps revision and keeps the same entity id (versioned
+        // via the audited remember path — entity_history snapshots).
+        let id = e.id.clone();
+        let out2 = db
+            .mental_model_set(&crate::models::MentalModelSetParams {
+                key: "stack-portal".to_string(),
+                summary: "stack uses vue 3 for the portal".to_string(),
+                scope: String::new(),
+                source_ids: vec![],
+                recall_when: vec![],
+                review_interval_days: 30,
+                workspace_hash: String::new(),
+                requesting_agent_id: "alice".to_string(),
+            })
+            .unwrap();
+        assert_eq!(out2["revision"], 2);
+        assert_eq!(out2["id"], id);
+        let e2 = db
+            .get_entity(crate::mental_model::MENTAL_MODEL_CATEGORY, "stack-portal")
+            .unwrap()
+            .unwrap();
+        assert_eq!(e2.id, id);
+        // Omitted fields carry over from the previous assertion.
+        let meta2 = crate::mental_model::parse_mental_model(&e2.body_json).unwrap();
+        assert_eq!(meta2.scope, "tech");
+        assert_eq!(meta2.source_ids, vec!["mem-1".to_string()]);
+        assert_eq!(meta2.revision, 2);
+        // entity_history holds the prior version.
+        let conn = db.conn().unwrap();
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM entity_history WHERE category = ?1 AND key = ?2",
+                rusqlite::params![crate::mental_model::MENTAL_MODEL_CATEGORY, "stack-portal"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(n >= 1, "prior version must be snapshotted in entity_history");
+    }
+
+    #[test]
+    fn mental_model_set_validation_fail_closed() {
+        let db = Database::open(":memory:").unwrap();
+        let mk = |key: &str, summary: &str, interval: i64| {
+            db.mental_model_set(&crate::models::MentalModelSetParams {
+                key: key.to_string(),
+                summary: summary.to_string(),
+                scope: String::new(),
+                source_ids: vec![],
+                recall_when: vec![],
+                review_interval_days: interval,
+                workspace_hash: String::new(),
+                requesting_agent_id: String::new(),
+            })
+        };
+        assert!(mk("", "summary", 30).is_err());
+        assert!(mk("k", "", 30).is_err());
+        assert!(mk("k", &"x".repeat(5000), 30).is_err());
+        assert!(mk("k", "summary", 0).is_err());
+        assert!(mk("k", "summary", 99999).is_err());
+        assert!(db
+            .mental_model_set(&crate::models::MentalModelSetParams {
+                key: "k".to_string(),
+                summary: "summary".to_string(),
+                scope: String::new(),
+                source_ids: vec![],
+                recall_when: vec!["".to_string()],
+                review_interval_days: 30,
+                workspace_hash: String::new(),
+                requesting_agent_id: String::new(),
+            })
+            .is_err());
+        // Nothing was written by the rejected attempts.
+        let hits = db.recall(&crate::models::RecallParams {
+            query: "summary".to_string(),
+            category: Some(crate::mental_model::MENTAL_MODEL_CATEGORY.to_string()),
+            limit: 10,
+            skip_side_effects: true,
+            ..crate::models::RecallParams::default()
+        });
+        assert!(hits.unwrap().is_empty());
+    }
+
+    #[test]
+    fn consolidate_refuses_mental_model_category() {
+        let db = Database::open(":memory:").unwrap();
+        let err = db
+            .consolidate(&crate::models::ConsolidateParams {
+                category: crate::mental_model::MENTAL_MODEL_CATEGORY.to_string(),
+                similarity_threshold: 0.5,
+                limit: 5,
+                offset: 0,
+                dry_run: true,
+                cold_first: false,
+                archive_sources: false,
+                workspace_hash: Some("ws-1".to_string()),
+                global: false,
+                requesting_agent_id: String::new(),
+                quote_cap_chars: 0,
+                refine_existing: false,
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("curated"), "err: {err}");
+    }
+
+    #[test]
+    fn recall_tier_order_mental_models_first() {
+        let db = Database::open(":memory:").unwrap();
+        let now = now_ms();
+        let mk = |key: &str, category: &str, body: &str, retrieval_count: i64| Entity {
+            id: format!("mem-{key}"),
+            category: category.to_string(),
+            key: key.to_string(),
+            body_json: body.to_string(),
+            status: "active".to_string(),
+            entity_type: category.to_string(),
+            tags: vec![],
+            decay_score: 1.0,
+            retrieval_count,
+            layer: "core".to_string(),
+            topic_path: String::new(),
+            archived: false,
+            archive_reason: String::new(),
+            links: vec![],
+            verified: false,
+            source: "test".to_string(),
+            always_on: false,
+            certainty: 1.0,
+            workspace_hash: String::new(),
+            agent_id: String::new(),
+            visibility: "workspace".to_string(),
+            created_at_unix_ms: now,
+            last_accessed_unix_ms: now,
+            follow_count: 0,
+            miss_count: 0,
+            follow_rate: 0.0,
+            efficacy_status: "unverified".to_string(),
+            epistemic_state: "candidate".to_string(),
+            embedding: None,
+            _parsed_body: None,
+        };
+        db.remember_skip_dedup(&mk(
+            "raw-plan",
+            "facts",
+            "aurora launch plan approved for december",
+            5,
+        ))
+        .unwrap();
+        db.remember_skip_dedup(&mk(
+            "obs-aurora",
+            crate::observations::OBSERVATION_CATEGORY,
+            "aurora observations consolidated over the quarter",
+            3,
+        ))
+        .unwrap();
+        db.mental_model_set(&crate::models::MentalModelSetParams {
+            key: "mm-aurora".to_string(),
+            summary: "the aurora program runs on schedule".to_string(),
+            scope: "facts".to_string(),
+            source_ids: vec![],
+            recall_when: vec![],
+            review_interval_days: 30,
+            workspace_hash: String::new(),
+            requesting_agent_id: String::new(),
+        })
+        .unwrap();
+
+        // Default: pure keyword-mode order (retrieval_count DESC, id ASC) —
+        // the high-retrieval raw fact leads, mental models are NOT promoted.
+        let ranked = db
+            .recall(&crate::models::RecallParams {
+                query: "aurora launch plan approved".to_string(),
+                limit: 10,
+                skip_side_effects: true,
+                ..crate::models::RecallParams::default()
+            })
+            .unwrap();
+        assert_eq!(ranked[0].key, "raw-plan");
+
+        // tier_order: mental model first, observation second, raw fact last.
+        let tiered = db
+            .recall(&crate::models::RecallParams {
+                query: "aurora launch plan approved".to_string(),
+                limit: 10,
+                skip_side_effects: true,
+                tier_order: true,
+                ..crate::models::RecallParams::default()
+            })
+            .unwrap();
+        let keys: Vec<&str> = tiered.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(keys[0], "mm-aurora", "keys: {keys:?}");
+        assert!(keys.contains(&"obs-aurora"));
+        assert!(keys.contains(&"raw-plan"));
+        let tiers: Vec<u8> = tiered
+            .iter()
+            .map(|e| crate::mental_model::tier_of(&e.category))
+            .collect();
+        assert_eq!(
+            tiers,
+            {
+                let mut t = tiers.clone();
+                t.sort_unstable();
+                t
+            },
+            "tier order must be non-decreasing: {tiers:?}"
+        );
+    }
+
+    #[test]
+    fn mental_model_review_age_flag_and_approve() {
+        // File-backed (temp_db): the test needs direct conn() SQL access to
+        // backdate the review stamp, and :memory: pools hand out independent
+        // in-memory DBs per connection.
+        let (db, path) = temp_db();
+        db.mental_model_set(&crate::models::MentalModelSetParams {
+            key: "mm-old".to_string(),
+            summary: "a stale summary".to_string(),
+            scope: String::new(),
+            source_ids: vec![],
+            recall_when: vec![],
+            review_interval_days: 1,
+            workspace_hash: String::new(),
+            requesting_agent_id: String::new(),
+        })
+        .unwrap();
+
+        // Freshly curated: nothing flagged.
+        assert!(db
+            .mental_model_review_list(50, None)
+            .unwrap()
+            .is_empty());
+
+        // Backdate the review stamp (direct SQL — tests are allowed to
+        // manipulate state; the derived staleness reads the body).
+        let conn = db.conn().unwrap();
+        let body: String = conn
+            .query_row(
+                "SELECT body_json FROM entities WHERE category = ?1 AND key = ?2",
+                rusqlite::params![crate::mental_model::MENTAL_MODEL_CATEGORY, "mm-old"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let mut meta = crate::mental_model::parse_mental_model(&body).unwrap();
+        meta.reviewed_at_unix_ms = now_ms() - 2 * 86_400_000;
+        meta.curated_at_unix_ms = now_ms() - 2 * 86_400_000;
+        conn.execute(
+            "UPDATE entities SET body_json = ?1 WHERE category = ?2 AND key = ?3",
+            rusqlite::params![
+                crate::mental_model::serialize_meta(&meta),
+                crate::mental_model::MENTAL_MODEL_CATEGORY,
+                "mm-old"
+            ],
+        )
+        .unwrap();
+
+        let flagged = db.mental_model_review_list(50, None).unwrap();
+        assert_eq!(flagged.len(), 1);
+        assert!(flagged[0]["reason"].as_str().unwrap().contains("age"));
+        assert_eq!(flagged[0]["key"], "mm-old");
+
+        // approve stamps reviewed_at (resets the age clock) and records the
+        // decision; the model leaves the age-flag list.
+        db.mental_model_review_decide("approve", "mm-old", "", "bob")
+            .unwrap();
+        let e = db
+            .get_entity(crate::mental_model::MENTAL_MODEL_CATEGORY, "mm-old")
+            .unwrap()
+            .unwrap();
+        let meta2 = crate::mental_model::parse_mental_model(&e.body_json).unwrap();
+        assert_eq!(meta2.last_review_decision, "approve");
+        assert_eq!(meta2.revision, 2);
+        assert_eq!(e.source, "mental_model_review");
+        assert!(db.mental_model_review_list(50, None).unwrap().is_empty());
+
+        // Unknown action / missing model fail closed.
+        assert!(db
+            .mental_model_review_decide("bogus", "mm-old", "", "")
+            .is_err());
+        assert!(db
+            .mental_model_review_decide("approve", "no-such-model", "", "")
+            .is_err());
+    }
+
+    #[test]
+    fn mental_model_review_newer_facts_staleness() {
+        // File-backed (temp_db): direct conn() SQL access (see the age test).
+        let (db, path) = temp_db();
+        db.mental_model_set(&crate::models::MentalModelSetParams {
+            key: "mm-tech".to_string(),
+            summary: "the stack is vue".to_string(),
+            scope: "tech".to_string(),
+            source_ids: vec![],
+            recall_when: vec![],
+            review_interval_days: 3650,
+            workspace_hash: String::new(),
+            requesting_agent_id: String::new(),
+        })
+        .unwrap();
+        // Backdate the curation so a newer fact can exist.
+        let conn = db.conn().unwrap();
+        let body: String = conn
+            .query_row(
+                "SELECT body_json FROM entities WHERE category = ?1 AND key = ?2",
+                rusqlite::params![crate::mental_model::MENTAL_MODEL_CATEGORY, "mm-tech"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let mut meta = crate::mental_model::parse_mental_model(&body).unwrap();
+        meta.curated_at_unix_ms = now_ms() - 86_400_000;
+        meta.reviewed_at_unix_ms = now_ms() - 86_400_000;
+        conn.execute(
+            "UPDATE entities SET body_json = ?1 WHERE category = ?2 AND key = ?3",
+            rusqlite::params![
+                crate::mental_model::serialize_meta(&meta),
+                crate::mental_model::MENTAL_MODEL_CATEGORY,
+                "mm-tech"
+            ],
+        )
+        .unwrap();
+
+        // No newer fact yet → clean.
+        assert!(db.mental_model_review_list(50, None).unwrap().is_empty());
+
+        // A raw fact in scope created after curation, not a cited source →
+        // flagged with the fact key for trace-back.
+        db.remember_skip_dedup(&Entity {
+            id: "mem-new-fact".to_string(),
+            category: "tech".to_string(),
+            key: "new-fact".to_string(),
+            body_json: "the stack migrated to react".to_string(),
+            status: "active".to_string(),
+            entity_type: "fact".to_string(),
+            tags: vec![],
+            decay_score: 1.0,
+            retrieval_count: 0,
+            layer: "core".to_string(),
+            topic_path: String::new(),
+            archived: false,
+            archive_reason: String::new(),
+            links: vec![],
+            verified: false,
+            source: "test".to_string(),
+            always_on: false,
+            certainty: 1.0,
+            workspace_hash: String::new(),
+            agent_id: String::new(),
+            visibility: "workspace".to_string(),
+            created_at_unix_ms: now_ms(),
+            last_accessed_unix_ms: now_ms(),
+            follow_count: 0,
+            miss_count: 0,
+            follow_rate: 0.0,
+            efficacy_status: "unverified".to_string(),
+            epistemic_state: "candidate".to_string(),
+            embedding: None,
+            _parsed_body: None,
+        })
+        .unwrap();
+        let flagged = db.mental_model_review_list(50, None).unwrap();
+        assert_eq!(flagged.len(), 1);
+        assert!(flagged[0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("newer_facts:new-fact"));
+        assert_eq!(flagged[0]["newest_fact_key"], "new-fact");
+
+        // Citing the fact as a source clears the newer-facts flag.
+        db.mental_model_set(&crate::models::MentalModelSetParams {
+            key: "mm-tech".to_string(),
+            summary: "the stack is vue".to_string(),
+            scope: "tech".to_string(),
+            source_ids: vec!["mem-new-fact".to_string()],
+            recall_when: vec![],
+            review_interval_days: 3650,
+            workspace_hash: String::new(),
+            requesting_agent_id: String::new(),
+        })
+        .unwrap();
+        assert!(db.mental_model_review_list(50, None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn recall_when_attaches_to_mental_model() {
+        let db = Database::open(":memory:").unwrap();
+        db.mental_model_set(&crate::models::MentalModelSetParams {
+            key: "mm-stack".to_string(),
+            summary: "the stack uses vue".to_string(),
+            scope: String::new(),
+            source_ids: vec![],
+            recall_when: vec!["stack".to_string()],
+            review_interval_days: 30,
+            workspace_hash: String::new(),
+            requesting_agent_id: String::new(),
+        })
+        .unwrap();
+        // Scheduled re-verification: the trigger fires on a matching task.
+        let hits = db.recall_when("what is our stack for the portal", 10, None).unwrap();
+        assert!(
+            hits.iter().any(|e| e.key == "mm-stack"),
+            "recall_when must surface the mental model: {:?}",
+            hits.iter().map(|e| e.key.as_str()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn ask_sources_orders_mental_model_first() {
+        let db = Database::open(":memory:").unwrap();
+        let now = now_ms();
+        let raw = Entity {
+            id: "mem-raw".to_string(),
+            category: "facts".to_string(),
+            key: "raw-aurora".to_string(),
+            body_json: "aurora launch plan approved for december".to_string(),
+            status: "active".to_string(),
+            entity_type: "fact".to_string(),
+            tags: vec![],
+            decay_score: 1.0,
+            retrieval_count: 0,
+            layer: "core".to_string(),
+            topic_path: String::new(),
+            archived: false,
+            archive_reason: String::new(),
+            links: vec![],
+            verified: false,
+            source: "test".to_string(),
+            always_on: false,
+            certainty: 1.0,
+            workspace_hash: String::new(),
+            agent_id: String::new(),
+            visibility: "workspace".to_string(),
+            created_at_unix_ms: now,
+            last_accessed_unix_ms: now,
+            follow_count: 0,
+            miss_count: 0,
+            follow_rate: 0.0,
+            efficacy_status: "unverified".to_string(),
+            epistemic_state: "candidate".to_string(),
+            embedding: None,
+            _parsed_body: None,
+        };
+        db.remember_skip_dedup(&raw).unwrap();
+        db.mental_model_set(&crate::models::MentalModelSetParams {
+            key: "mm-aurora".to_string(),
+            summary: "the aurora program runs on schedule".to_string(),
+            scope: "facts".to_string(),
+            source_ids: vec![],
+            recall_when: vec![],
+            review_interval_days: 30,
+            workspace_hash: String::new(),
+            requesting_agent_id: String::new(),
+        })
+        .unwrap();
+        let sources = db
+            .ask_sources(&AskParams {
+                query: "aurora launch plan approved".to_string(),
+                top_k: 10,
+                as_of_unix_ms: None,
+                valid_at_unix_ms: None,
+                requesting_agent_id: Some("alice".to_string()),
+                verify_stale_observations: true,
+            })
+            .unwrap();
+        assert!(
+            sources
+                .iter()
+                .position(|e| e.key == "mm-aurora")
+                .unwrap()
+                < sources
+                    .iter()
+                    .position(|e| e.key == "raw-aurora")
+                    .unwrap(),
+            "mental model must be consulted before the raw fact: {:?}",
+            sources.iter().map(|e| e.key.as_str()).collect::<Vec<_>>()
+        );
     }
 
     // ─── #588: multi-query expansion + date arm ──────────────────────────

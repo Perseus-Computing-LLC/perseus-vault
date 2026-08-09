@@ -490,6 +490,12 @@ pub struct RecallParams {
     /// expired, multiplier, signals). Off by default so response bytes stay
     /// stable unless asked. Implied by `profile: "validity"`.
     pub validity_annotate: bool,
+    /// #886: hierarchical tier ordering — mental models first, then
+    /// consolidated observations, then raw facts (stable within each tier).
+    /// Reorders the RETURNED list only; ranking membership is untouched, so
+    /// default behavior (false) is byte-identical. The ask path enables it
+    /// internally so curated summaries are consulted before raw facts.
+    pub tier_order: bool,
 }
 
 /// Search mode for recall: FTS5 keyword, dense vector, hybrid fusion, or
@@ -847,6 +853,7 @@ impl Default for RecallParams {
             graph_utility_threshold: None,
             profile: None,
             validity_annotate: false,
+            tier_order: false,
         }
     }
 }
@@ -1548,6 +1555,66 @@ pub struct EmbedParams {
 
 fn default_batch_limit() -> usize {
     100
+}
+
+/// #886: parameters for perseus_vault_mental_model_set — the ONLY sanctioned
+/// write path for the curated `mental_model` category (auto-generated passes
+/// never create these; the consolidate path refuses the category).
+#[derive(Debug, Deserialize)]
+pub struct MentalModelSetParams {
+    /// Stable key of the mental model (e.g. "stack-portal").
+    pub key: String,
+    /// The curated summary (1..=4096 chars) — what the model answers.
+    pub summary: String,
+    /// Raw-fact category this model covers ("" = none). Enables the
+    /// newer-facts staleness check.
+    #[serde(default)]
+    pub scope: String,
+    /// Provenance: raw fact / observation entity ids it was curated from.
+    #[serde(default)]
+    pub source_ids: Vec<String>,
+    /// recall_when triggers for scheduled re-verification (matched by
+    /// perseus_vault_recall_when / prepare).
+    #[serde(default)]
+    pub recall_when: Vec<String>,
+    /// Age-based review interval in days (default 30, 1..=3650).
+    #[serde(default = "default_mm_review_interval")]
+    pub review_interval_days: i64,
+    #[serde(default)]
+    pub workspace_hash: String,
+    /// Curator identity (stamped by the transport when present; else "operator").
+    #[serde(default)]
+    pub requesting_agent_id: String,
+}
+
+fn default_mm_review_interval() -> i64 {
+    crate::mental_model::DEFAULT_REVIEW_INTERVAL_DAYS
+}
+
+/// #886: parameters for perseus_vault_mental_model_review — list flagged
+/// stale mental models, or stamp an operator review decision.
+#[derive(Debug, Deserialize)]
+pub struct MentalModelReviewArgs {
+    /// "list" (default) | "approve" | "dismiss". approve/dismiss stamp
+    /// reviewed_at (resets the age clock) and record the decision; the
+    /// summary itself is only changed by a re-assert via
+    /// perseus_vault_mental_model_set.
+    #[serde(default)]
+    pub action: String,
+    /// Key of the model to decide on (required for approve/dismiss).
+    #[serde(default)]
+    pub key: String,
+    #[serde(default)]
+    pub workspace_hash: String,
+    #[serde(default)]
+    pub requesting_agent_id: String,
+    /// Max flagged models to list (default 50, cap 1000).
+    #[serde(default = "default_review_list_limit")]
+    pub limit: i64,
+}
+
+fn default_review_list_limit() -> i64 {
+    50
 }
 
 /// Parameters for the perseus_vault_prune tool — bulk archive entities.
