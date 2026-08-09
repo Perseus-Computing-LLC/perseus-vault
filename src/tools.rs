@@ -4693,6 +4693,36 @@ pub struct ArtifactRegisterArgs {
     pub representation: ArtifactRepresentation,
 }
 
+/// #876 governed distillation: registration args for a learned-memory
+/// artifact (trained weights / distilled cartridge). `action_id` must name a
+/// COMPLETED `learned_memory` action receipt; `source_entities` are the
+/// (category, key) pairs the artifact was distilled from, snapshotted
+/// hash-only at registration.
+#[derive(Debug, Deserialize)]
+pub struct LearnedArtifactRegisterArgs {
+    pub path: String,
+    #[serde(default)]
+    pub mime_type: Option<String>,
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub workspace_hash: String,
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub agent_id: String,
+    #[serde(
+        default = "default_visibility",
+        deserialize_with = "null_as_default_visibility"
+    )]
+    pub visibility: String,
+    pub action_id: String,
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub source_entities: Vec<(String, String)>,
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub external_refs: Vec<ExternalRef>,
+    #[serde(default)]
+    pub retention_policy: Option<String>,
+    #[serde(default)]
+    pub derivation_version: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ArtifactManifestArgs {
     pub sha256: String,
@@ -5057,6 +5087,90 @@ pub fn handle_artifact_register(db: &Database, args: Value) -> Result<String, St
         "sha256": sha256,
         "artifact_action": if artifact_created { "created" } else { "existing" },
         "binding_action": if binding_created { "created" } else { "existing" },
+        "manifest": manifest,
+    })
+    .to_string())
+}
+
+pub fn handle_learned_artifact_register(db: &Database, args: Value) -> Result<String, String> {
+    let a: LearnedArtifactRegisterArgs = serde_json::from_value(args)
+        .map_err(|e| format!("Invalid learned_artifact_register arguments: {}", e))?;
+    let path = std::path::Path::new(&a.path);
+    let meta = std::fs::metadata(path).map_err(|e| format!("stat {}: {}", path.display(), e))?;
+    if !meta.is_file() {
+        return Err(format!(
+            "artifact path must be a regular file: {}",
+            path.display()
+        ));
+    }
+    if meta.len() as usize > MAX_ARTIFACT_BYTES {
+        return Err(format!(
+            "artifact too large: {} bytes (max {})",
+            meta.len(),
+            MAX_ARTIFACT_BYTES
+        ));
+    }
+    let mime_type = a
+        .mime_type
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| guess_artifact_mime_type(path));
+    if !matches!(
+        a.visibility.as_str(),
+        "private" | "fleet" | "workspace" | "tenant" | "public" | ""
+    ) {
+        return Err(format!(
+            "invalid visibility '{}': expected private, fleet, workspace, tenant, or public",
+            a.visibility
+        ));
+    }
+    if a.source_entities.is_empty() {
+        return Err("learned artifacts require at least one source_entities (category, key) pair"
+            .to_string());
+    }
+    if a.external_refs.len() > MAX_ARTIFACT_EXTERNAL_REFS {
+        return Err(format!(
+            "external_refs too long: {} refs (max {})",
+            a.external_refs.len(),
+            MAX_ARTIFACT_EXTERNAL_REFS
+        ));
+    }
+    let retention_policy = a.retention_policy.and_then(|s| {
+        let t = s.trim().to_string();
+        (!t.is_empty()).then_some(t)
+    });
+    if let Some(ref policy) = retention_policy {
+        if !crate::models::RETENTION_POLICIES.contains(&policy.as_str()) {
+            return Err(format!(
+                "invalid retention_policy '{policy}': expected one of {:?}",
+                crate::models::RETENTION_POLICIES
+            ));
+        }
+    }
+    let bytes = std::fs::read(path).map_err(|e| format!("read {}: {}", path.display(), e))?;
+    let (sha256, artifact_created, binding_created, evidence) = db
+        .learned_artifact_register(
+            &bytes,
+            &mime_type,
+            &a.workspace_hash,
+            &a.agent_id,
+            &a.visibility,
+            &a.action_id,
+            &a.source_entities,
+            canonicalize_external_refs(a.external_refs),
+            retention_policy,
+            a.derivation_version,
+        )
+        .map_err(|e| format!("learned artifact register failed: {}", e))?;
+    let manifest = db
+        .artifact_manifest(&sha256, Some(a.workspace_hash.as_str()), None)
+        .map_err(|e| format!("artifact manifest failed: {}", e))?;
+    Ok(json!({
+        "sha256": sha256,
+        "artifact_action": if artifact_created { "created" } else { "existing" },
+        "binding_action": if binding_created { "created" } else { "existing" },
+        "source_bindings_count": evidence["source_bindings"].as_array().map(|v| v.len()).unwrap_or(0),
+        "action_id": a.action_id,
+        "evidence": evidence,
         "manifest": manifest,
     })
     .to_string())
@@ -5837,6 +5951,13 @@ pub fn handle_supersede(db: &Database, args: Value) -> Result<String, String> {
     // handler has always had.
     db.update_entity_status(&from_entity.id, "deprecated", &a.reason)
         .map_err(|e| format!("Failed to deprecate 'from' entity: {}", e))?;
+
+    // #876: superseding a bound source entity flags dependent learned
+    // artifacts STALE (retraining trigger). Hash-only journal evidence is
+    // written by the database layer when any binding is affected.
+    let _stale_count = db
+        .flag_artifacts_stale_for_source(&from_entity.id, &from_entity.workspace_hash)
+        .map_err(|e| format!("Failed to flag stale learned artifacts: {}", e))?;
 
     let result = json!({
         "from_entity_id": from_entity.id,

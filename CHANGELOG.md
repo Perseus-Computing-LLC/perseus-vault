@@ -6,6 +6,22 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
 ## [Unreleased]
 
 ### Added
+- **Governed distillation (#876).** New `learned_memory` capability + tool
+  `mimir_learned_artifact_register`: learned artifacts (trained weights /
+  distilled cartridges) are registered fail-closed against a **completed**
+  `learned_memory` action receipt (capability, actor/workspace, and
+  outcome-hash all verified) and bound hash-only to their source entities
+  (`learned_artifact_sources`: entity id + body digest + recorded_at, schema
+  v29). Erasing or purging a source **revokes** the binding — serve paths
+  (`artifact_manifest`/`excerpt`/`verify_value`) refuse revoked artifacts as
+  not-found; superseding a source flags it **stale** (retraining trigger,
+  still serveable). `artifact_revoked` / `artifact_stale` journal events carry
+  hash-only evidence; `mimir_purge` reports `artifact_bindings_revoked`
+  (dry-run + real). Spec: `docs/specs/governed-distillation.md`.
+- **AAR denial clarity (#768 follow-up).** `action_intent` denials name the
+  offending value and the permitted set; `authority_set` validates
+  agent_id/workspace_hash per-field with a self-explanatory per-workspace
+  regime message.
 - **Retention lifecycle: expiry, redaction, and physical erasure** (#868,
   #866). Three distinct operations, documented in
   `docs/specs/data-boundaries-retention-lifecycle.md`:

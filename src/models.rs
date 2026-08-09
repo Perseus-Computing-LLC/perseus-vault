@@ -801,6 +801,9 @@ pub struct PurgeReport {
     /// #398: journal rows referencing the purged entities whose payloads were
     /// scrubbed in place (rows are kept so the audit hash chain stays valid).
     pub journal_rows_redacted: i64,
+    /// #876: learned-artifact bindings revoked because their source entity
+    /// was physically removed (serve paths refuse revoked bindings).
+    pub artifact_bindings_revoked: i64,
     pub bytes_freed: i64,
     pub dry_run: bool,
     pub completed_at_unix_ms: i64,
@@ -1767,6 +1770,17 @@ pub struct ArtifactBinding {
     pub retention_policy: Option<String>,
     pub representation: ArtifactRepresentation,
     pub created_at_unix_ms: i64,
+    /// #876 governed distillation: set when a bound source entity was
+    /// physically erased — serve paths refuse revoked bindings (fail-closed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revoked_at_unix_ms: Option<i64>,
+    /// #876: set when a bound source entity was superseded — the artifact is
+    /// still serveable but flagged for operator review / retraining.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stale_at_unix_ms: Option<i64>,
+    /// #876: machine-readable revocation reason (e.g. `source_erased:<digest>`).
+    #[serde(default)]
+    pub revocation_reason: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1792,6 +1806,17 @@ pub struct ArtifactManifestBinding {
     pub representation: ArtifactRepresentation,
     pub created_at_unix_ms: i64,
     pub why_served: ArtifactWhyServed,
+    /// #876: set when a bound source entity was physically erased — the
+    /// artifact is refused by serve paths; exposed here for operators.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revoked_at_unix_ms: Option<i64>,
+    /// #876: set when a bound source entity was superseded — retraining
+    /// trigger; the artifact remains serveable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stale_at_unix_ms: Option<i64>,
+    /// #876: machine-readable revocation reason (e.g. `source_erased:<digest>`).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub revocation_reason: String,
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -2199,6 +2199,42 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Register Immutable Artifact"
   },
   {
+    "name": "mimir_learned_artifact_register",
+    "description": "#876 governed distillation: register a learned-memory artifact (trained weights / distilled cartridge) bound to its source entities with hash-only evidence, gated fail-closed on a COMPLETED 'learned_memory' action receipt (no receipt, no registration). Every source (category, key) in the workspace is snapshotted (entity id + normalized body digest + recorded_at) into learned_artifact_sources; physically erasing or purging a source revokes the binding (serve paths refuse revoked artifacts), superseding a source flags it stale (retraining trigger). Returns the artifact sha256, source-bindings count, and receipt-replay evidence.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "path": { "type": "string", "description": "Local file path to register (trained artifact / cartridge)" },
+        "mime_type": { "type": "string", "description": "Optional MIME type override; otherwise inferred from the file extension" },
+        "workspace_hash": { "type": "string", "default": "", "description": "Workspace scope for the metadata binding. Omit/empty = global." },
+        "agent_id": { "type": "string", "default": "", "description": "Owning agent id for visibility checks." },
+        "visibility": { "type": "string", "default": "workspace", "description": "private | fleet | workspace | tenant | public" },
+        "action_id": { "type": "string", "description": "Action id of a COMPLETED 'learned_memory' action receipt (intent -> lease -> complete); the gate refuses registration without it." },
+        "source_entities": { "type": "array", "items": { "type": "array", "items": { "type": "string" }, "minItems": 2, "maxItems": 2 }, "description": "(category, key) pairs the artifact was distilled from; snapshotted hash-only at registration." },
+        "external_refs": { "type": "array", "items": { "type": "object" }, "description": "Optional external source anchors; pointers only, never access grants." },
+        "retention_policy": { "type": "string", "description": "Optional retention policy from the existing vocabulary." },
+        "derivation_version": { "type": "string", "description": "Optional distillation pipeline version tag." }
+      },
+      "required": ["path", "action_id", "source_entities"]
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "sha256": { "type": "string" },
+        "artifact_action": { "type": "string" },
+        "binding_action": { "type": "string" },
+        "source_bindings_count": { "type": "integer" },
+        "action_id": { "type": "string" },
+        "evidence": { "type": "object" },
+        "manifest": { "type": "object" }
+      }
+    },
+    "annotations": {
+      "destructiveHint": false
+    },
+    "title": "Register Governed Learned Artifact"
+  },
+  {
     "name": "mimir_artifact_manifest",
     "description": "Serve the compact deterministic manifest for one artifact identity after scope + visibility filtering. When workspace_hash is omitted, only global bindings are considered — an artifact hash alone is a pointer, not an access grant.",
     "inputSchema": {
@@ -3162,6 +3198,10 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
         "journal_rows_redacted": {
           "type": "integer",
           "description": "Journal rows referencing purged entities scrubbed in place; the audit hash chain stays valid (#398)"
+        },
+        "artifact_bindings_revoked": {
+          "type": "integer",
+          "description": "Learned-artifact bindings revoked because their source entity was physically removed; serve paths refuse revoked bindings (#876)"
         },
         "bytes_freed": {
           "type": "integer",
@@ -5762,6 +5802,10 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
         "mimir_expire" => tools::handle_expire(db, args).map_err(|e| e.to_string()),
         "mimir_redact" => tools::handle_redact(db, args).map_err(|e| e.to_string()),
         "mimir_erase" => tools::handle_erase(db, args).map_err(|e| e.to_string()),
+
+        "mimir_learned_artifact_register" => {
+            tools::handle_learned_artifact_register(db, args).map_err(|e| e.to_string())
+        }
         "mimir_memories" => tools::handle_memories(db, args).map_err(|e| e.to_string()),
 
         "mimir_migrate" => Ok(tools::handle_migrate(db, args)),
@@ -5915,7 +5959,7 @@ mod tests {
         );
         assert_eq!(
             registry_names.len(),
-            95,
+            96,
             "update public metadata when adding a tool"
         );
 
