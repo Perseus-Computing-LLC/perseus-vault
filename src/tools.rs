@@ -3542,6 +3542,21 @@ pub fn handle_quality_telemetry(db: &Database, args: Value) -> Result<String, St
     }).to_string())
 }
 
+/// #872: read-only retrieval concentration / repeated-serving /
+/// cross-arm contamination telemetry. Reports are windowed (turns or
+/// seconds), scoped (profile / workspace), and always carry denominators,
+/// the retrieval profile, source classes, and the versioned artifact
+/// hash; empty / degraded / unavailable states are separated from zero
+/// concentration. Optional `probe_query` runs arm-level SQL deltas that
+/// measure what the lifecycle status boundary blocks per arm.
+pub fn handle_retrieval_telemetry(db: &Database, args: Value) -> Result<String, String> {
+    let a: crate::retrieval_telemetry::TelemetryArgs = serde_json::from_value(args)
+        .map_err(|e| format!("Invalid retrieval_telemetry arguments: {e}"))?;
+    let report = crate::retrieval_telemetry::retrieval_telemetry_report(db, &a)
+        .map_err(|e| format!("Retrieval telemetry report failed: {e}"))?;
+    serde_json::to_string_pretty(&report).map_err(|e| format!("Serialization failed: {e}"))
+}
+
 pub fn handle_stats(db: &Database) -> String {
     match db.stats() {
         Ok(stats) => serde_json::to_string(&stats).unwrap_or_else(|e| {

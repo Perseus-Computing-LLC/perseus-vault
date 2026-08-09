@@ -3079,6 +3079,22 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     }
   },
   {
+    "name": "perseus_vault_retrieval_telemetry",
+
+    "description": "Read-only retrieval telemetry: concentration (top slot/token shares, Herfindahl), repeated-serving rate over a turn/second window, diversity (sources, source classes, Simpson), cross-arm contamination (per-arm audits, delivered-set validation, optional arm-level probe), low-trust query-class fan-out, and diversity/cooldown displacement. Reports include denominators, scope, retrieval profile, source class, and the versioned artifact hash; empty/degraded/unavailable states are separated from zero concentration.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "window_turns": {"type": "integer", "description": "Window in serving batches (distinct recalls). Default: none (window_secs wins)."},
+        "window_secs": {"type": "integer", "description": "Window in seconds (default 86400)."},
+        "profile": {"type": "string", "description": "Scope: only events recorded under this profile."},
+        "workspace_hash": {"type": "string", "description": "Scope: only events from this workspace."},
+        "probe_query": {"type": "string", "description": "Optional contamination probe: run arm-level SQL deltas for this query and report blocked re-entry per arm."},
+        "probe_mode": {"type": "string", "description": "Probe mode: lexical|dense|hybrid|fused|graph|proactive (default lexical)."}
+      }
+    }
+  },
+  {
     "name": "perseus_vault_stats",
     "description": "Return comprehensive database statistics: entity counts by category, type, and decay layer; journal event count; state entry count; database file size; date range of stored data; and history growth (stored version rows, bytes, and the top-10 keys by version count — #398).",
     "inputSchema": {
@@ -5723,6 +5739,7 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
         "perseus_vault_health" => Ok(tools::handle_health(db)),
         "perseus_vault_handoff_restart" => crate::live_update::handle_handoff_restart(args),
         "perseus_vault_quality_telemetry" => tools::handle_quality_telemetry(db, args),
+        "perseus_vault_retrieval_telemetry" => tools::handle_retrieval_telemetry(db, args),
 
         "perseus_vault_stats" => Ok(tools::handle_stats(db)),
 
@@ -5897,7 +5914,7 @@ mod tests {
         );
         assert_eq!(
             registry_names.len(),
-            99,
+            100,
             "update public metadata when adding a tool"
         );
 
