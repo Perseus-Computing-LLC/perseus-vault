@@ -16,7 +16,7 @@ source-artifact version tracking on extracted entities, selective
 re-extraction, lineage preservation, duplicate avoidance, and the
 invalidation policy for capture/extract pipelines. It is a conventions
 spec: it composes existing fields and tools (`derived_from`,
-`mimir_supersede`, valid-time, write-time dedup) rather than adding a new
+`perseus_vault_supersede`, valid-time, write-time dedup) rather than adding a new
 subsystem.
 
 ## 1. Source-artifact version tracking
@@ -66,22 +66,22 @@ Refresh flow when a watched artifact is re-ingested:
    flag) and re-derived lazily on next consolidation pass — never eagerly
    recomputed on every artifact save.
 
-Write-path placement: steps 1–2 belong in `mimir_ingest_file` /
-`mimir_capture` / connector ingest; steps 3–5 are pipeline conventions the
+Write-path placement: steps 1–2 belong in `perseus_vault_ingest_file` /
+`perseus_vault_capture` / connector ingest; steps 3–5 are pipeline conventions the
 caller (or a refresh helper) executes. Existing tools keep their semantics;
 refresh is orchestration over them.
 
 ## 3. Lineage preservation
 
 - Supersession, not mutation: a changed fact is replaced via
-  `mimir_supersede` (new entity `supersedes` old, old entity's `valid_to`
-  closed). The old version stays queryable via `mimir_as_of` / `valid_at`;
+  `perseus_vault_supersede` (new entity `supersedes` old, old entity's `valid_to`
+  closed). The old version stays queryable via `perseus_vault_as_of` / `valid_at`;
   the audit trail from current observation to source version is the
   supersession chain plus the `source_hash` recorded on each link.
 - The new entity records the *new* `source_hash`; comparing hashes along
   the chain shows exactly which artifact version each version of the fact
   came from.
-- `mimir_traverse` over `derived_from` + `supersedes` renders the full
+- `perseus_vault_traverse` over `derived_from` + `supersedes` renders the full
   lineage: artifact v3 → fact v2 → observation (graph-first spec §3).
 
 ## 4. Duplicate avoidance
@@ -95,7 +95,7 @@ refresh is orchestration over them.
   path uses), updating only the source metadata in place when content is
   unchanged.
 - Observations re-derived after refresh reuse the existing
-  `(category, key)` so `mimir_remember` updates in place rather than
+  `(category, key)` so `perseus_vault_remember` updates in place rather than
   spawning a parallel observation.
 
 ## 5. Invalidation policy
@@ -126,8 +126,8 @@ refresh is orchestration over them.
 
 ## 7. Implementation slice
 
-- Add `source_artifact` metadata population to `mimir_ingest_file`,
-  `mimir_capture`, and connector ingest (metadata only, no schema change).
+- Add `source_artifact` metadata population to `perseus_vault_ingest_file`,
+  `perseus_vault_capture`, and connector ingest (metadata only, no schema change).
 - Refresh helper: hash-compare + refresh-set enumeration over
   `derived_from` chains; reconciliation rules of §3–§5.
 - `stale_evidence` flag surfaced in served explanations until re-derived.

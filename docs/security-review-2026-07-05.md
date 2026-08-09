@@ -8,7 +8,7 @@ that were then **re-traced to source and re-verified by hand**, and — critical
 recorded below under "By design" rather than inflated into vulnerabilities.
 
 Threat model (from `docs/THREAT-MODEL.md`, verbatim): *"the primary trust boundary is
-… local-first deployment, not a multi-tenant network service"*; *"Mimir trusts its MCP
+… local-first deployment, not a multi-tenant network service"*; *"Perseus Vault trusts its MCP
 caller"*; and — explicitly — *"Cross-workspace/agent … scoping is a **routing/relevance**
 control, not an enforced security boundary … Don't treat it as multi-tenant isolation."*
 The audit respects that boundary.
@@ -16,7 +16,7 @@ The audit respects that boundary.
 ## TL;DR
 The engine is **well-hardened for its stated model**: no SQL injection (fully
 parameterized), no FTS5 operator injection (every term quoted + bound), **no shell/
-raw-SQL tool exists at all** (the `@query`/`allow_query_shell` gate is a Python-Mimir
+raw-SQL tool exists at all** (the `@query`/`allow_query_shell` gate is a Python-Perseus Vault
 concept absent from this binary), no `unsafe`, request-path panics confined to tests,
 strong resource caps (ingest/zip-bomb/scan/traverse), and a genuinely secure-by-default
 transport posture (`stdio`, `127.0.0.1`, dashboard off, `guard_bind` **fail-closed** on
@@ -65,7 +65,7 @@ internally consistent with the threat model:
   the caller is trusted. (Note `as_of` also ignores `archived` — a *functional* hygiene
   inconsistency worth a follow-up, not a security bug.)
 - **`forget` is soft-delete only (leaves embeddings/history).** Explicitly documented
-  (README: "`mimir_forget` — Soft-delete (archived=1)"; `mimir_purge` is the eraser).
+  (README: "`perseus_vault_forget` — Soft-delete (archived=1)"; `perseus_vault_purge` is the eraser).
 
 **Recommendation:** keep launch/marketing/CMMC language aligned with this — do **not**
 describe workspace scoping as "isolation" or the current chain as "tamper-proof." Finding
@@ -81,10 +81,10 @@ describe workspace scoping as "isolation" or the current chain as "tamper-proof.
   anywhere** — all read paths honor `AuthFailed`; fail-fast key canary on startup;
   legacy-plaintext rows correctly classified.
 - **Transport**: default `stdio`/`127.0.0.1`/dashboard-off; `guard_bind` exits on any
-  non-loopback bind without a token (unless `MIMIR_ALLOW_INSECURE_BIND=1`); constant-time
+  non-loopback bind without a token (unless `PERSEUS_VAULT_ALLOW_INSECURE_BIND=1`); constant-time
   token compare (`subtle`); SSE GET behind `route_layer` auth; gRPC dormant (no reflection).
 - **Resource caps**: `limit` clamp `(0,1000)`; traverse `visited` cycle guard; community
-  `MAX_ALGO_ITERS`; ingest `MIMIR_MAX_INGEST_BYTES`; DOCX zip-bomb decompressed-bytes cap;
+  `MAX_ALGO_ITERS`; ingest `PERSEUS_VAULT_MAX_INGEST_BYTES`; DOCX zip-bomb decompressed-bytes cap;
   dense `max_scan`/pool clamp. **Concurrency**: WAL + `BEGIN IMMEDIATE` + busy-timeout +
   transient-`SQLITE_BUSY` retry; purge is single-transaction (no readable history after delete).
 - **Deps**: `Cargo.lock` committed, no git/`[patch]` deps, no known-CVE crate; OCI label

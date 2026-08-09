@@ -1,4 +1,4 @@
-# Claims Audit — Perseus Vault (formerly Mimir/Mneme)
+# Claims Audit — Perseus Vault
 
 **Date:** 2026-08-01 (refreshed) · **Audited:** README.md vs code and committed benchmark artifacts on `main`
 
@@ -25,9 +25,9 @@
 
 Claims verified against `src/`:
 
-- **100 canonical MCP tools**: ✓ The current registry contains 92 distinct base
+- **99 canonical MCP tools**: ✓ The current registry contains 99 distinct base
   tool names in `src/mcp.rs`, each exposed under the canonical
-  `perseus_vault_*` prefix. The legacy `mimir_*` and `mneme_*` aliases remain
+  `perseus_vault_*` prefix. The legacy `perseus_vault_*` and `perseus_vault_*` aliases remain
   callable but are not counted separately.
 
   Verify the count against source and current-facing metadata (this parser is
@@ -56,10 +56,11 @@ Claims verified against `src/`:
 ## History
 
 - 2026-06-12 (v0.5.0): 23 tools. 2026-06 interim: 30 tools (#130). 2026-06-28
-  (v2.6.0): 46 (#271 mimir_semantic_search, #269 mimir_recall_layer, review
-  follow-up mimir_history). v2.13.0: 49 (#327 mimir_consolidate, #332
-  mimir_follow, #345 mimir_memories). Post-v2.13.0: 53 (#365
-  mimir_communities, mimir_community_summary, mimir_global_recall; #364
-  mimir_dream). 55 (#363 mimir_valid_at, mimir_bitemporal). 56 (#521
-  mimir_check_failure_pattern). Now **95** (registry-derived; #520 mimir_capture and subsequent tools).
+  (v2.6.0): 46 (#271 perseus_vault_semantic_search, #269 perseus_vault_recall_layer, review
+  follow-up perseus_vault_history). v2.13.0: 49 (#327 perseus_vault_consolidate, #332
+  perseus_vault_follow, #345 perseus_vault_memories). Post-v2.13.0: 53 (#365
+  perseus_vault_communities, perseus_vault_community_summary, perseus_vault_global_recall; #364
+  perseus_vault_dream). 55 (#363 perseus_vault_valid_at, perseus_vault_bitemporal). 56 (#521
+  perseus_vault_check_failure_pattern). Now **95 canonical MCP tools** (registry-derived; #520 perseus_vault_capture and subsequent tools).
+
   Earlier figures kept as historical record only.

@@ -111,7 +111,7 @@ This is deliberate: before v2.12.x, `autocohere` compacted at a hardcoded 0.1
 |---|---|
 | `verified: true` | `decay_score` floored at `VERIFIED_DECAY_FLOOR = 0.2` — a verified fact can fade but is **never auto-archived**. |
 | `always_on: true` | Injected into `context`/`prepare` blocks regardless of decay; being injected does not itself bump retrieval stats. Under the recall-first default (see below) the always-on set is hard-capped at 5 entities and counts against the context budget — overflow truncates and warns. Reserve it for identity-critical facts; prefer `recall_when` triggers. |
-| `mimir_score` (importance) | The explicit score is stored as a persistent `importance` floor: `decay_tick` and `cohere` never recompute `decay_score` below it, so a scored memory survives idle time indefinitely (fidelity beats recency). Re-score with `0.0` to clear. |
+| `perseus_vault_score` (importance) | The explicit score is stored as a persistent `importance` floor: `decay_tick` and `cohere` never recompute `decay_score` below it, so a scored memory survives idle time indefinitely (fidelity beats recency). Re-score with `0.0` to clear. |
 | regular use | Every recall boosts the score by 0.25 and resets the idle clock. |
 
 The verified floor exists because curated facts match few queries and are
@@ -167,14 +167,14 @@ Deletion is explicit and two-step:
   archived source entities, their `entity_history`, and journal rows. Content
   *derived* from a purged entity is out of scope and, if it may echo the erased
   body, must be handled separately:
-  - **Dream/consolidate outputs** — `mimir_dream` and `mimir_consolidate` write
+  - **Dream/consolidate outputs** — `perseus_vault_dream` and `perseus_vault_consolidate` write
     new entities (`derived: true`) whose bodies summarize their sources. These
     are ordinary entities: to erase them, `forget` + `purge` them too (the
     `derivation`/source metadata on each derived entity identifies candidates).
   - **Community summaries** — LLM summaries over community clusters can quote
     member bodies; regenerate or clear them after a purge if the purged entity
     was a member.
-  - **`mimir_vault_export` files** — exported Markdown/JSON on disk is a point-in-
+  - **`perseus_vault_vault_export` files** — exported Markdown/JSON on disk is a point-in-
     time copy outside the database and is never touched by `purge`; delete the
     export artifacts out-of-band.
   - **Derived knowledge projections** — `perseus_vault_derived_export` output is
@@ -222,7 +222,7 @@ Vault closes that laundering window with scoped **rejected-value tombstones**
 - **Trusted override.** Re-remembering with `allow_rejected=true` is a
   deliberate, audited override: the write proceeds, a `rejected_write_override`
   journal entry records it, and the tombstone stays in place so ordinary
-  future writes remain blocked. `mimir_correct` records a scoped tombstone for
+  future writes remain blocked. `perseus_vault_correct` records a scoped tombstone for
   the rejected `wrong_approach` *before* writing its correction, then uses the
   override path so the correction itself is never mis-blocked.
 - **Expiry and reactivation.** Tombstones carry an optional
@@ -250,36 +250,36 @@ audited write appends to `journal`. Both are append-only by default —
 exactly the historical one: keep everything.
 
 Opt-in bounds (env knobs; enforcement runs only in maintenance paths —
-`mimir_maintenance` `history`/`all`, `mimir_autocohere`, and
-`mimir_prune scope='history'` — never on the write path):
+`perseus_vault_maintenance` `history`/`all`, `perseus_vault_autocohere`, and
+`perseus_vault_prune scope='history'` — never on the write path):
 
 | Knob | Meaning |
 |---|---|
-| `MIMIR_HISTORY_MAX_AGE_DAYS` | Evict versions invalidated more than N days ago. |
-| `MIMIR_HISTORY_MAX_VERSIONS_PER_KEY` | Keep at most N stored versions per `(category, key, workspace)`; oldest evicted first. Hot state-like keys are the pathological growth case — 100–500 is a sensible cap. |
-| `MIMIR_HISTORY_MAX_BYTES` | Global budget over stored history body bytes; globally-oldest versions evicted until under budget. |
-| `MIMIR_HISTORY_TOMBSTONES` | Default ON. Set `0` to hard-delete instead of tombstoning. |
+| `PERSEUS_VAULT_HISTORY_MAX_AGE_DAYS` | Evict versions invalidated more than N days ago. |
+| `PERSEUS_VAULT_HISTORY_MAX_VERSIONS_PER_KEY` | Keep at most N stored versions per `(category, key, workspace)`; oldest evicted first. Hot state-like keys are the pathological growth case — 100–500 is a sensible cap. |
+| `PERSEUS_VAULT_HISTORY_MAX_BYTES` | Global budget over stored history body bytes; globally-oldest versions evicted until under budget. |
+| `PERSEUS_VAULT_HISTORY_TOMBSTONES` | Default ON. Set `0` to hard-delete instead of tombstoning. |
 
 Eviction is always oldest-first along the transaction-time axis, so the
 evicted rows form a contiguous prefix of each key's version trail. With
 tombstones ON (the default, and the mode aligned with the bi-temporal
 contract), each evicted prefix is replaced by **one** synthetic history row
 spanning `[first_recorded_at, last_invalidated_at)` carrying the rolled-up
-version count and a hash-chain digest of the evicted rows. `mimir_as_of` at
+version count and a hash-chain digest of the evicted rows. `perseus_vault_as_of` at
 an instant inside a compacted window returns an explicit
 `compacted: true` marker (with `versions_compacted` and `digest`) instead of
 silently-wrong data; instants covered by surviving versions are answered
-exactly as before. The same holds on the valid-time axis: `mimir_valid_at`
-and `mimir_bitemporal` inside a compacted window return the marker or
+exactly as before. The same holds on the valid-time axis: `perseus_vault_valid_at`
+and `perseus_vault_bitemporal` inside a compacted window return the marker or
 nothing, never a wrong version — the tombstone keeps the run's earliest
 effective `valid_from`, so even retroactively-valid compacted versions keep
 their window answerable. Successive passes merge tombstones (counts
 accumulate, digests chain).
 
-`mimir_prune` with `scope: 'history'` enforces the same policy on demand
+`perseus_vault_prune` with `scope: 'history'` enforces the same policy on demand
 (per-call overrides: `max_age_days`, `max_versions_per_key`, `max_bytes`) and
 `dry_run: true` reports the exact rows + bytes the real run would evict.
-`mimir_stats` surfaces the growth signal: `total_history_rows`,
+`perseus_vault_stats` surfaces the growth signal: `total_history_rows`,
 `history_bytes`, and `top_history_keys` (top-10 keys by version count).
 
 Export-then-delete ("compose don't replace": archive evicted versions to
@@ -289,7 +289,7 @@ implemented.
 ## Consolidation ("local dreaming")
 
 Decay forgets one memory at a time; consolidation compresses instead of
-losing. `mimir_consolidate` merges overlapping same-category entities into a
+losing. `perseus_vault_consolidate` merges overlapping same-category entities into a
 single evidence-tracked *observation* (category `observation`, linked to each
 source via `evidence_for`, carrying a `proof_count`). Two opt-in flags shape
 it into background forgetting:
@@ -301,7 +301,7 @@ it into background forgetting:
   and reversible). **Verified or importance-floored sources are never
   archived** — the same exemption promise decay makes.
 
-`mimir_autocohere` runs a bounded pass automatically (a few observations per
+`perseus_vault_autocohere` runs a bounded pass automatically (a few observations per
 category per run, cold-first, archiving sources), skipping the `observation`
 category (no meta-observations) and `memories` (files from the /memories
 adapter are never similarity-merged).
@@ -309,7 +309,7 @@ adapter are never similarity-merged).
 ## Recall-first injection (the context/prepare default)
 
 Retention decides what the vault *keeps*; injection decides what a turn
-*sees*. Since #356/#366, `mimir_context` and `perseus-vault prepare` are
+*sees*. Since #356/#366, `perseus_vault_context` and `perseus-vault prepare` are
 **recall-first** (`mode: on_demand`) by default:
 
 - Only entities topically relevant to the supplied `query` (the current
@@ -328,12 +328,12 @@ Retention decides what the vault *keeps*; injection decides what a turn
   instructions.
 
 The legacy unconditional top-N dump remains available as an explicit opt-in
-(`mode: "always_inject"` on `mimir_context`, `--legacy-context` on
+(`mode: "always_inject"` on `perseus_vault_context`, `--legacy-context` on
 `prepare`) and is unclamped unless a budget is passed. The gRPC `context`
 RPC keeps the legacy semantics for wire compatibility.
 ## Dreaming (LLM consolidation, episodic → semantic)
 
-Consolidation compresses *duplicates*; `mimir_dream` goes one step further and
+Consolidation compresses *duplicates*; `perseus_vault_dream` goes one step further and
 **reasons** over clusters of merely *related* memories. It batches the coldest
 entities per category (cold-first by default — consolidate fading memories
 before decay claims them), sends each trigram-neighborhood cluster to the
@@ -360,7 +360,7 @@ storage layer for the `semantic` biomimetic alias). Properties:
 
 Dreaming requires `--llm-endpoint` (fully local via Ollama). Without one it
 returns a clean error — or, with `fallback_consolidate: true`, degrades to the
-mechanical `mimir_consolidate` cold-first pass. `dry_run: true` previews the
+mechanical `perseus_vault_consolidate` cold-first pass. `dry_run: true` previews the
 candidate insights and their evidence sets without writing anything (not even
 a journal entry).
 
@@ -372,7 +372,7 @@ stays byte-deterministic (#247, see
 `deterministic-recall-and-provenance.md`). A memory that is only ever found
 semantically therefore decays as if unused — unless you opt in:
 
-- **`reinforce: true`** on `mimir_recall` with `mode: 'dense'`/`'hybrid'`
+- **`reinforce: true`** on `perseus_vault_recall` with `mode: 'dense'`/`'hybrid'`
   applies the standard side-effects (retrieval-count bump, recency reset,
   +0.25 decay boost, layer promotion) to the returned hits. This trades
   byte-determinism of *subsequent* recalls for "used memories resist decay" —

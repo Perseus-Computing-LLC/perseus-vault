@@ -1,9 +1,9 @@
 syntax = "proto3";
 
-package mneme.v1;
+package perseus_vault.v1;
 
-// Mneme gRPC service — maps all MCP tools to gRPC RPCs for the v2.0 platform.
-service Mneme {
+// Perseus Vault gRPC service — maps all MCP tools to gRPC RPCs for the v2.0 platform.
+service PerseusVault {
     // CRUD
     rpc Remember(RememberRequest) returns (RememberResponse);
     rpc Recall(RecallRequest) returns (RecallResponse);

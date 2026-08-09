@@ -1,4 +1,4 @@
-# Mimir Roadmap
+# Perseus Vault Roadmap
 
 The canonical roadmap lives at the repository root: [`../ROADMAP.md`](../ROADMAP.md).
 

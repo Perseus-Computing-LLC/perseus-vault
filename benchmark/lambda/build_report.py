@@ -107,7 +107,7 @@ if ql:
         sm = m["summary"]
         series[short] = [sm["accuracy"], sm["citation_rate"], sm["p50_latency_s"]]
     sections.append(grouped_bars(
-        "mimir_ask grounded QA — model quality vs latency (both pre-warmed)",
+        "perseus_vault_ask grounded QA — model quality vs latency (both pre-warmed)",
         series, groups, maxv=max(3.0, max(v for vs in series.values() for v in vs))))
 
 # 4. Competitive: Perseus Vault vs Mem0 (same box, local Ollama)
@@ -115,7 +115,7 @@ mem0 = load("mem0_bench.json")
 if mem0 and mem0.get("summary") and ql:
     pv14 = next((m for m in ql["models"] if "14b" in m["model"]), ql["models"][0])
     svg = ['<svg width="640" height="90" font-family="system-ui">']
-    rows = [("Perseus Vault (mimir_ask RAG)", pv14["summary"]["accuracy"], "#5fd18b"),
+    rows = [("Perseus Vault (perseus_vault_ask RAG)", pv14["summary"]["accuracy"], "#5fd18b"),
             ("Mem0 (search)", mem0["summary"]["recall_accuracy"], "#e0a56b")]
     for i, (lab, v, c) in enumerate(rows):
         y = 6 + i * 34

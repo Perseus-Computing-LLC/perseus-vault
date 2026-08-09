@@ -15,7 +15,7 @@ Reuses the MCP JSON-RPC driver from rag_bench.py (same directory).
 import argparse, json, random, statistics, time, sys, os
 
 # Distinct filler vocabulary so entities within a cluster are NOT >70% trigram-
-# similar (which would trip mimir_remember's content dedup and collapse the
+# similar (which would trip perseus_vault_remember's content dedup and collapse the
 # corpus — see #529 retraction). Each entity gets a unique sentence.
 _WORDS = ("alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo "
           "lima mike november oscar papa quebec romeo sierra tango uniform victor "
@@ -106,7 +106,7 @@ def recall_at_k(mcp, queries, k, mode, cluster_size):
     hits, lats = [], []
     for q, gold_ci in queries:
         t = time.time()
-        r = mcp.tool("mimir_recall", {"query": q, "mode": mode, "limit": k})
+        r = mcp.tool("perseus_vault_recall", {"query": q, "mode": mode, "limit": k})
         lats.append((time.time()-t)*1000)
         items = r.get("items", []) if isinstance(r, dict) else (r or [])
         gold_cat = f"cluster{gold_ci:03d}"
@@ -177,7 +177,7 @@ def main():
         else:
             t0 = time.time()
             for cat, key, body, _ in rows:
-                mcp.tool("mimir_remember", {"category": cat, "key": key,
+                mcp.tool("perseus_vault_remember", {"category": cat, "key": key,
                          "body_json": json.dumps({"content": body})})
             seed_dt = time.time()-t0
             out["summary"]["seed"] = {"secs": round(seed_dt,2),
@@ -194,15 +194,15 @@ def main():
             guard = 0
             while guard < 50:
                 guard += 1
-                e = mcp.tool("mimir_embed", {"batch_category": c, "batch_limit": 5000})
+                e = mcp.tool("perseus_vault_embed", {"batch_category": c, "batch_limit": 5000})
                 got = (e.get("embedded", e.get("count", 0)) or 0)
                 n += got
                 if got == 0:
                     break
         emb_dt = time.time()-t0
         # Verify actual stored coverage; keep ONLY the integer, never the full
-        # mimir_stats blob (it carries a per-category map that is huge at scale).
-        cov = mcp.tool("mimir_stats", {})
+        # perseus_vault_stats blob (it carries a per-category map that is huge at scale).
+        cov = mcp.tool("perseus_vault_stats", {})
         embedded_count = None
         if isinstance(cov, dict):
             embedded_count = cov.get("embedding_coverage") or cov.get("total_entities")

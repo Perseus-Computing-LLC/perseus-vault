@@ -20,7 +20,7 @@ Usage:
     cargo build --release
     python benchmark/temporal/gauntlet.py
     python benchmark/temporal/gauntlet.py --bin /path/to/perseus-vault
-    MIMIR_BIN=/path/to/binary python benchmark/temporal/gauntlet.py
+    PERSEUS_VAULT_BIN=/path/to/binary python benchmark/temporal/gauntlet.py
 
 Exit code is non-zero if any check fails, so CI can gate on it.
 """
@@ -43,9 +43,9 @@ def find_binary(explicit):
     cands = []
     if explicit:
         cands.append(explicit)
-    if os.environ.get("MIMIR_BIN"):
-        cands.append(os.environ["MIMIR_BIN"])
-    for name in ("perseus-vault", "mneme", "mimir"):
+    if os.environ.get("PERSEUS_VAULT_BIN"):
+        cands.append(os.environ["PERSEUS_VAULT_BIN"])
+    for name in ("perseus-vault",):
         exe = f"{name}.exe" if os.name == "nt" else name
         cands += [str(REPO / "target" / "release" / exe),
                   str(REPO / "target" / "debug" / exe)]
@@ -53,7 +53,7 @@ def find_binary(explicit):
         if c and Path(c).exists():
             return str(Path(c).resolve())
     sys.exit("error: perseus-vault binary not found. Build it (`cargo build --release`) "
-             "or pass --bin / set MIMIR_BIN.")
+             "or pass --bin / set PERSEUS_VAULT_BIN.")
 
 
 class Vault:
@@ -118,7 +118,7 @@ def run_scenarios(v, data):
             if wr.get("recorded_offset_ms"):
                 # separate writes in transaction time so as_of can distinguish beliefs
                 time.sleep(wr["recorded_offset_ms"] / 1000.0)
-            v.call("mimir_remember", rargs)
+            v.call("perseus_vault_remember", rargs)
             if wr.get("mark_tx"):
                 tx_marks[wr["mark_tx"]] = now_ms()
 
@@ -127,15 +127,15 @@ def run_scenarios(v, data):
         for chk in scn["checks"]:
             axis = chk["axis"]
             if axis == "valid_at":
-                res = v.call("mimir_valid_at",
+                res = v.call("perseus_vault_valid_at",
                              {"category": cat, "key": key,
                               "valid_at_unix_ms": anchor + chk["at_days"] * DAY_MS})
             elif axis == "as_of":
-                res = v.call("mimir_as_of",
+                res = v.call("perseus_vault_as_of",
                              {"category": cat, "key": key,
                               "as_of_unix_ms": tx_marks[chk["tx_mark"]]})
             elif axis == "bitemporal":
-                res = v.call("mimir_bitemporal",
+                res = v.call("perseus_vault_bitemporal",
                              {"category": cat, "key": key,
                               "tx_at_unix_ms": tx_marks[chk["tx_mark"]],
                               "valid_at_unix_ms": anchor + chk["valid_at_days"] * DAY_MS})

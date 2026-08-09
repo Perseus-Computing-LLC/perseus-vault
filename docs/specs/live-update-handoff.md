@@ -1,7 +1,7 @@
 # Live-update / reconnect workflow (#858)
 
 Status: implemented (branch `feat/vault-858-live-update`)
-Surface: `mimir_handoff_restart` + binary-staleness gate, `mimir_health` fields
+Surface: `perseus_vault_handoff_restart` + binary-staleness gate, `perseus_vault_health` fields
 
 ## Problem
 
@@ -28,8 +28,8 @@ startup: path + `(dev, ino)` + `(len, mtime_ns)`.
 
 ### 2. Fail loud (never silently stale)
 
-When the binary was replaced, **every tool except `mimir_handoff_restart` and
-`mimir_health`** returns an explicit `isError` result:
+When the binary was replaced, **every tool except `perseus_vault_handoff_restart` and
+`perseus_vault_health`** returns an explicit `isError` result:
 
 ```
 perseus-vault: the running binary was replaced on disk (pid N, /path/to/binary);
@@ -39,10 +39,10 @@ the same stdio connection, or restart the client session. To override for
 diagnostics: PERSEUS_VAULT_IGNORE_STALE_BINARY=1
 ```
 
-`mimir_health` stays callable and reports `binary_stale`, `binary_path`, and
+`perseus_vault_health` stays callable and reports `binary_stale`, `binary_path`, and
 `pid` so a client can self-diagnose.
 
-### 3. Hot-swap handoff (`mimir_handoff_restart`)
+### 3. Hot-swap handoff (`perseus_vault_handoff_restart`)
 
 Four states, all with clear feedback:
 

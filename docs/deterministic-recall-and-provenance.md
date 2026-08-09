@@ -1,6 +1,6 @@
 # Deterministic Recall, Provenance, and State Digest
 
-This document specifies three contracts that let Mimir serve as the
+This document specifies three contracts that let Perseus Vault serve as the
 deterministic backend for Perseus's `@memory` directive — backing the
 resolve-before-context reproducibility and auditability claims.
 
@@ -8,7 +8,7 @@ Issues: #254 (determinism), #255 (provenance), #256 (state digest).
 
 ## 1. Deterministic recall ordering (#254)
 
-`mimir_recall` (and the `recall` API) returns results in a **stable total
+`perseus_vault_recall` (and the `recall` API) returns results in a **stable total
 order**. The keyword (FTS5/LIKE) path orders by:
 
 ```
@@ -37,16 +37,16 @@ time. This is proven by
 
 ### Pinning recall to an instant (`as_of`)
 
-Mimir's bi-temporal `mimir_as_of` returns the version of a fact that was live at
+Perseus Vault's bi-temporal `perseus_vault_as_of` returns the version of a fact that was live at
 a given transaction-time instant. Recall reproducibility can therefore be
 pinned not only to "current frozen state" but to a fixed historical instant:
 re-running an `as_of` query reproduces exactly what was believed then, even
-after later writes. This is the strongest reproducibility primitive Mimir
+after later writes. This is the strongest reproducibility primitive Perseus Vault
 offers and directly supports the patent's reproducibility limitation.
 
 ## 2. Provenance on recall results (#255)
 
-Every entity returned by `mimir_recall` carries a complete provenance record.
+Every entity returned by `perseus_vault_recall` carries a complete provenance record.
 `to_json_expanded()` serializes the full `Entity`, so each result includes:
 
 | Field | Meaning |
@@ -72,7 +72,7 @@ dependent claim and the §101 auditability argument.
 
 ## 3. State digest for cache-keying (#256)
 
-`mimir state-digest --db <path>` (and `Database::state_digest()`) returns a
+`perseus_vault state-digest --db <path>` (and `Database::state_digest()`) returns a
 cheap, deterministic content digest of the recall-visible (non-archived) entity
 set:
 
@@ -100,7 +100,7 @@ set:
 ### Use as a Perseus cache key
 
 Perseus can cache a resolved `@memory` output keyed by
-`(directive_args, mimir_state_digest)`. While the digest is unchanged the cached
+`(directive_args, perseus_vault_state_digest)`. While the digest is unchanged the cached
 resolution is valid; when any relevant memory changes, the digest changes and
 the cache entry is naturally invalidated. This backs the "caching of resolved
 directive outputs keyed by source state" dependent claim.

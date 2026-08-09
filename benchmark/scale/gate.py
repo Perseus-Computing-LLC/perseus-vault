@@ -70,7 +70,7 @@ DEFAULT_BUDGETS = {
     # UNPATCHED fts5 path scales the same way (broad p95 67ms@100K -> 396ms@1M),
     # so this is FTS5 posting-list growth, not a regression. The two-phase sparse
     # arm's ADDED O(matches) superlinearity (the #511 residual: broad p50
-    # 181ms@100K -> 2699ms@1M, ~15x) is what MIMIR_BM25_SCAN_CAP bounds: at
+    # 181ms@100K -> 2699ms@1M, ~15x) is what PERSEUS_VAULT_BM25_SCAN_CAP bounds: at
     # cap=2048 the 1M broad-term sparse p50 drops to ~450ms (~5x, i.e. down to the
     # inherent FTS floor), exact whenever the match set <= cap. The cap is OFF by
     # default (opt-in dial, #617); these budgets therefore reflect the shipped

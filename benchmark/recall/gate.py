@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """CI regression gate for the #271 invariant: semantic recall is the DEFAULT.
 
-Runs the real mimir binary over MCP stdio on the in-repo recall dataset, using
-exactly the calls a bare user makes — `mimir_remember` then `mimir_recall` with
-NO manual `mimir_embed` and NO `mode` argument. It then asserts that this default
+Runs the real perseus_vault binary over MCP stdio on the in-repo recall dataset, using
+exactly the calls a bare user makes — `perseus_vault_remember` then `perseus_vault_recall` with
+NO manual `perseus_vault_embed` and NO `mode` argument. It then asserts that this default
 path retrieves far better than keyword-only FTS5. If a future change breaks
 auto-embed-on-write or the hybrid default, recall collapses toward FTS5 and this
 gate fails loudly.
@@ -40,20 +40,20 @@ MAX_AUTO_BELOW_DENSE_MRR = 0.15    # and within this of pure dense on MRR
 
 
 def find_binary(explicit):
-    cands = [explicit, os.environ.get("MIMIR_BIN")]
+    cands = [explicit, os.environ.get("PERSEUS_VAULT_BIN")]
     # Perseus Vault rename: the release binary is now "perseus-vault"; fall
-    # back through the prior names ("mneme", then "mimir") so this script
+    # back through the prior names ("perseus_vault", then "perseus-vault") so this script
     # still finds an already-built binary from an older checkout/cache.
-    for name in ("perseus-vault", "mneme", "mimir"):
+    for name in ("perseus-vault",):
         exe = f"{name}.exe" if os.name == "nt" else name
         cands += [str(REPO / "target" / "release" / exe), str(REPO / "target" / "debug" / exe)]
     for c in cands:
         if c and Path(c).exists():
             return str(Path(c).resolve())
-    sys.exit("error: perseus-vault binary not found (build it or pass --bin / set MIMIR_BIN).")
+    sys.exit("error: perseus-vault binary not found (build it or pass --bin / set PERSEUS_VAULT_BIN).")
 
 
-class Mimir:
+class PerseusVault:
     def __init__(self, binary, db):
         # Capture stderr (#632): the binary reports embedding-backend failures
         # there (rate-limited), so a gate failure can self-diagnose instead of
@@ -82,7 +82,7 @@ class Mimir:
         while True:
             line = self.p.stdout.readline()
             if not line:
-                raise RuntimeError("mimir closed the stream")
+                raise RuntimeError("perseus_vault closed the stream")
             try:
                 m = json.loads(line)
             except json.JSONDecodeError:
@@ -129,7 +129,7 @@ def wait_for_autoembed(db, expected, timeout_s=180):
     runner the ONNX session init loses, dense reads zero vectors, and the gate
     fails with dense=0.000 even though nothing regressed (#632, observed 2/2
     first attempts on 2026-07-13). Waiting bounded-long tests the actual
-    invariant — vectors arrive WITHOUT a manual mimir_embed — instead of the
+    invariant — vectors arrive WITHOUT a manual perseus_vault_embed — instead of the
     worker's scheduling luck; a genuinely broken embed path still fails, now
     with a named cause. Returns the embedded-row count."""
     deadline = time.time() + timeout_s
@@ -173,35 +173,35 @@ def main():
     data = json.loads(Path(args.dataset).read_text(encoding="utf-8"))
     memories, queries = data["memories"], data["queries"]
 
-    db = str(Path(os.environ.get("TEMP") or "/tmp") / "mimir-recall-gate.db")
+    db = str(Path(os.environ.get("TEMP") or "/tmp") / "perseus_vault-recall-gate.db")
     for ext in ("", "-wal", "-shm"):
         try:
             os.remove(db + ext)
         except OSError:
             pass
 
-    m = Mimir(binary, db)
+    m = PerseusVault(binary, db)
     try:
-        # Bare ingest. NO mimir_embed call: auto-embed-on-write (#271) must populate vectors.
+        # Bare ingest. NO perseus_vault_embed call: auto-embed-on-write (#271) must populate vectors.
         for mem in memories:
-            m.call("mimir_remember", {"category": mem["category"], "key": mem["key"],
+            m.call("perseus_vault_remember", {"category": mem["category"], "key": mem["key"],
                                       "body_json": json.dumps({"note": mem["note"]}), "type": "fact"})
         # #632: settle the ASYNC embed worker before measuring (see wait_for_autoembed).
         embedded = wait_for_autoembed(db, len(memories))
         if embedded < len(memories):
             print(f"FAIL (infra, not retrieval): auto-embed produced {embedded}/{len(memories)} "
                   f"vectors after 180s — embedding backend / model-cache problem "
-                  f"(MIMIR_BUNDLED_MODEL_DIR contents?), NOT a recall regression.")
+                  f"(PERSEUS_VAULT_BUNDLED_MODEL_DIR contents?), NOT a recall regression.")
             print(f"--- binary stderr tail ---\n{m.stderr_tail()}")
             return 1
         auto5 = fts5 = dense5 = 0.0
         auto_mrr = dense_mrr = 0.0
         for q in queries:
             # default path: no mode -> server auto-selects (#271)
-            ra = m.call("mimir_recall", {"query": q["q"], "limit": 5, "trust_weight": 0, "min_decay": 0})
-            rf = m.call("mimir_recall", {"query": q["q"], "mode": "fts5", "limit": 5,
+            ra = m.call("perseus_vault_recall", {"query": q["q"], "limit": 5, "trust_weight": 0, "min_decay": 0})
+            rf = m.call("perseus_vault_recall", {"query": q["q"], "mode": "fts5", "limit": 5,
                                          "trust_weight": 0, "min_decay": 0})
-            rd = m.call("mimir_recall", {"query": q["q"], "mode": "dense", "limit": 5,
+            rd = m.call("perseus_vault_recall", {"query": q["q"], "mode": "dense", "limit": 5,
                                          "trust_weight": 0, "min_decay": 0})
             auto = [it.get("key") for it in (ra.get("items", []) if isinstance(ra, dict) else [])]
             keyw = [it.get("key") for it in (rf.get("items", []) if isinstance(rf, dict) else [])]

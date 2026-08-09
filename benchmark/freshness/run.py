@@ -71,8 +71,8 @@ def freshness_signature(rows: list[dict[str, Any]]) -> str:
 
 
 def find_binary(explicit: str | None) -> str:
-    candidates = [explicit, os.environ.get("PERSEUS_VAULT_BIN"), os.environ.get("MIMIR_BIN")]
-    for name in ("perseus-vault", "mneme", "mimir"):
+    candidates = [explicit, os.environ.get("PERSEUS_VAULT_BIN")]
+    for name in ("perseus-vault",):
         exe = f"{name}.exe" if os.name == "nt" else name
         candidates.extend((str(REPO / "target" / "release" / exe), str(REPO / "target" / "debug" / exe)))
     for candidate in candidates:

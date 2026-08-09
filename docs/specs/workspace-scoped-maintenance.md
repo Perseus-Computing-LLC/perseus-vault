@@ -1,12 +1,12 @@
 # Workspace-scoped maintenance (consolidate / dream)
 
 Status: implemented (#854)
-Scope: `mimir_consolidate`, `mimir_dream`, and the consolidation step of
-`mimir_autocohere`
+Scope: `perseus_vault_consolidate`, `perseus_vault_dream`, and the consolidation step of
+`perseus_vault_autocohere`
 
 ## Problem
 
-`mimir_consolidate` and `mimir_dream` previously scanned `entities` by
+`perseus_vault_consolidate` and `perseus_vault_dream` previously scanned `entities` by
 category with **no workspace predicate**. A maintenance or dream run could
 cluster same-category facts from multiple workspaces and emit a derived
 record (`observation` / `insight`) with `workspace_hash = ''` whose
@@ -59,9 +59,9 @@ out-of-scope row), and dream's idempotency dedup resolves the insight key
 ONLY within the run's workspace — an identical evidence set dreamed in
 another workspace never suppresses or reuses the local insight.
 
-## `mimir_autocohere`
+## `perseus_vault_autocohere`
 
-`mimir_autocohere`'s consolidation step accepts the same `workspace_hash` /
+`perseus_vault_autocohere`'s consolidation step accepts the same `workspace_hash` /
 `global` fields. When neither is given it keeps its historical whole-vault
 behavior (global pass, now capability-gated for identity-carrying callers).
 The other grooming steps (cohere/decay/compact) remain whole-vault by design

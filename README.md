@@ -14,13 +14,14 @@
 [![LangGraph](https://img.shields.io/badge/integrations-LangGraph-blue)](integrations/langgraph/)
 [![CrewAI](https://img.shields.io/badge/integrations-CrewAI-orange)](integrations/crewai/)
 [![AutoGen](https://img.shields.io/badge/integrations-AutoGen-purple)](integrations/autogen/)
-[![MCP Tools](https://img.shields.io/badge/MCP%20tools-95%20canonical-brightgreen)]()
+[![MCP Tools](https://img.shields.io/badge/MCP%20tools-99%20canonical-brightgreen)]()
 [![Listed on mcpservers.org](https://img.shields.io/badge/listed-mcpservers.org-blue)](https://mcpservers.org/servers/perseus-computing-llc/perseus-vault)
 
 Give your agents memory that survives the session, so they stop re-deriving what they
 already learned and stop repeating past mistakes. Hybrid recall (BM25 + dense + RRF),
-bi-temporal history, and **AES-256-GCM** at rest, exposed as **100 canonical MCP tools**
-that work with any host. Legacy `mimir_*` and `mneme_*` aliases remain callable but are
+bi-temporal history, and **AES-256-GCM** at rest, exposed as **99 canonical MCP tools**
+that work with any host. Legacy `mimir_*`/`mneme_*` aliases were removed in the 2026-27
+major release and are
 not counted separately. **73.8% on LongMemEval's official harness** (vs Zep 63.8%, Mem0
 49.0%).
 **One binary. One file. No Docker. No Postgres. No cloud.** Local-first, air-gap ready, MIT.
@@ -34,7 +35,7 @@ curl -sSf https://raw.githubusercontent.com/Perseus-Computing-LLC/perseus-vault/
 That's it. Perseus Vault is installed to `~/.local/bin/perseus-vault`. Start it:
 
 ```bash
-perseus-vault serve --db ~/.mimir/data/perseus-vault.db
+perseus-vault serve --db ~/.perseus-vault/data/perseus-vault.db
 ```
 
 > **Encryption is enabled automatically for the default installation.** The first
@@ -82,7 +83,7 @@ Or connect any MCP host by hand (Claude Desktop, Cursor, Hermes Agent, Perseus, 
   "mcpServers": {
     "perseus-vault": {
       "command": "perseus-vault",
-      "args": ["serve", "--db", "~/.mimir/data/perseus-vault.db"]
+      "args": ["serve", "--db", "~/.perseus-vault/data/perseus-vault.db"]
     }
   }
 }
@@ -96,10 +97,10 @@ perseus-vault serve --db memory.db &
 sleep 1
 
 # Remember a fact (via MCP JSON-RPC on stdio)
-echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"mimir_remember","arguments":{"category":"demo","key":"hello","body_json":"{\"text\":\"Hello from Perseus Vault!\"}"}}}' | perseus-vault serve --db memory.db
+echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"perseus_vault_remember","arguments":{"category":"demo","key":"hello","body_json":"{\"text\":\"Hello from Perseus Vault!\"}"}}}' | perseus-vault serve --db memory.db
 
 # Search for it
-echo '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"mimir_recall","arguments":{"query":"Hello"}}}' | perseus-vault serve --db memory.db
+echo '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"perseus_vault_recall","arguments":{"query":"Hello"}}}' | perseus-vault serve --db memory.db
 ```
 
 ## Memory model and operational boundaries
@@ -228,7 +229,7 @@ the reference. [Methodology & dataset →](benchmark/temporal/README.md)
 |---|---|---|---|---|
 | **Deployment** | Single binary | Cloud + self-host | Docker/Postgres | Docker/Neo4j |
 | **Dependencies** | None (SQLite embedded) | Python + vector DB | Postgres + Python | Neo4j + Go (Graphiti) |
-| **MCP-Native** | ✅ 95 canonical tools | ❌ Not MCP-native | ❌ Not MCP-native | ❌ Not MCP-native |
+| **MCP-Native** | ✅ 99 canonical tools | ❌ Not MCP-native | ❌ Not MCP-native | ❌ Not MCP-native |
 | **Offline/Local** | ✅ Fully local | Cloud-dependent | Docker needed | Docker needed |
 | **Encryption** | AES-256-GCM ✅ | ❌ | ❌ | ❌ |
 | **Hybrid Search** | BM25 + Dense + RRF | Vector only | Vector only | Vector + Graph |
@@ -236,12 +237,12 @@ the reference. [Methodology & dataset →](benchmark/temporal/README.md)
 | **Entity Graph** | Link + Traverse | ❌ | ❌ | ✅ |
 | **Journal Audit Trail** | ✅ Immutable | ❌ | ❌ | ❌ |
 | **State Management** | ✅ Key-value + TTL | ❌ | ❌ | ❌ |
-| **MCP Tools** | 95 canonical | 5 | 8 | 0 |
+| **MCP Tools** | 99 canonical | 5 | 8 | 0 |
 | **License** | MIT | Apache 2.0 | Apache 2.0 | Apache 2.0 |
 
-[Full comparison: Perseus Vault vs Mem0 →](docs/comparison/mimir-vs-mem0.md)
-[vs Letta →](docs/comparison/mimir-vs-letta.md)
-[vs Zep →](docs/comparison/mimir-vs-zep.md)
+[Full comparison: Perseus Vault vs Mem0 →](docs/comparison/perseus-vault-vs-mem0.md)
+[vs Letta →](docs/comparison/perseus-vault-vs-letta.md)
+[vs Zep →](docs/comparison/perseus-vault-vs-zep.md)
 
 ### Stress Test: 100K Entities
 
@@ -321,9 +322,9 @@ popular AI agent frameworks:
 
 | Framework | Integration | Type |
 |---|---|---|
-| [**LangGraph**](integrations/langgraph/) | `MimirStore` | `BaseStore` implementation |
-| [**CrewAI**](integrations/crewai/) | `MimirMemoryTool` | Agent tool |
-| [**AutoGen**](integrations/autogen/) | `MimirMemory` | `Memory` implementation |
+| [**LangGraph**](integrations/langgraph/) | `PerseusVaultStore` | `BaseStore` implementation |
+| [**CrewAI**](integrations/crewai/) | `PerseusVaultMemoryTool` | Agent tool |
+| [**AutoGen**](integrations/autogen/) | `PerseusVaultMemory` | `Memory` implementation |
 
 Each adapter:
 - Connects via MCP stdio subprocess (persistent session)
@@ -336,21 +337,21 @@ Any MCP-compatible framework works with Perseus Vault directly. See
 
 ## 65 Canonical MCP Tools
 
-> **Canonical product and tool names.** Perseus Vault is the product name, and new integrations should use the canonical `perseus_vault_*` tools (for example, `perseus_vault_remember`). Legacy `mimir_*` and `mneme_*` tool names remain supported for compatibility.
+> **Canonical product and tool names.** Perseus Vault is the product name, and integrations use the canonical `perseus_vault_*` tools (for example, `perseus_vault_remember`). The legacy `mimir_*` / `mneme_*` / `plutus_*` names were removed in the 2026-27 major release — the canonical names are the only interface.
 > The count is the number of unique canonical tools in the source registry. Compatibility aliases are callable but are not counted separately.
-> The legacy `mimir_*` and `mneme_*` names remain fully *callable* — every prefix
+> The legacy `perseus_vault_*` and `perseus_vault_*` names remain fully *callable* — every prefix
 > dispatches to the same handler — they are just no longer advertised in
 > `tools/list`. This keeps the advertised manifest to one name per tool instead
 > of tripling it (3× alias bloat), so connected clients don't reload a tripled
 > tool-schema payload on every request. To restore the historical behaviour of advertising all three
 > prefixes, set `PERSEUS_VAULT_TOOL_ALIASES=all` (the legacy env
-> `MIMIR_TOOL_ALIASES` is also honoured; `PERSEUS_VAULT_` takes precedence).
+> `PERSEUS_VAULT_TOOL_ALIASES` is also honoured; `PERSEUS_VAULT_` takes precedence).
 >
 > **Client compatibility (#633).** Clients that *gate on the advertised list* —
 > they check `tools/list` before calling and skip tools they don't see — will
-> silently skip legacy `mimir_*` calls against a 2.x vault even though the call
+> silently skip legacy `perseus_vault_*` calls against a 2.x vault even though the call
 > itself would succeed. Known case: the `perseus` CLI **≤ 1.0.22** hard-codes
-> `mimir_recall` and degrades to empty local-only recall. Fix either side:
+> `perseus_vault_recall` and degrades to empty local-only recall. Fix either side:
 > upgrade the CLI to **≥ 1.0.23** (calls canonical names, with dynamic
 > fallback), or set `PERSEUS_VAULT_TOOL_ALIASES=all` on the vault as a bridge
 > while older clients remain deployed.
@@ -358,116 +359,116 @@ Any MCP-compatible framework works with Perseus Vault directly. See
 ### Entity CRUD
 | Tool | Description |
 |---|---|
-| `mimir_remember` | Store/update entity. Idempotent by (category, key); a content change snapshots the prior version into history. |
-| `mimir_recall` | Search with FTS5/dense/hybrid modes, filters, stemming expansion. Query contract (#562): `query=""` is match-all enumeration (the "list all" path); `"*"` and other wildcards are literal FTS5 terms, **not** globs — `"*"` matches nothing. |
-| `mimir_scan` | Deterministic paginated enumeration of a category or the whole store (#562): immutable `id ASC` keyset pages with a `next_cursor`/`has_more` contract, so export/sync/reset callers can walk every entity exactly once. Read-only — no retrieval-count/decay side-effects, no offset cap. |
-| `mimir_hygiene` | Read-only startup-memory hygiene report (#675): scores active memories by "actionability" (concrete anchors — issue keys, #refs, paths, URLs, decisions — vs vague/date-only/short) and lists the worst offenders with reasons, for archive/consolidate curation. |
-| `mimir_recall_layer` | Recall from a specific biomimetic layer (world, episodic, semantic). |
-| `mimir_recall_when` | Proactive just-in-time recall: surface entities whose `recall_when` triggers match. |
-| `mimir_get_entity` | Fetch one entity by ID with full `body_json`. |
-| `mimir_as_of` | Transaction-time time-travel: the version of a fact (category + key) that was *believed* at a past instant. |
-| `mimir_valid_at` | Valid-time lookup: the version that was *actually true in the world* at an instant, per current knowledge (SQL:2011 APPLICATION_TIME). |
-| `mimir_bitemporal` | Full 2-axis bi-temporal query: "as of transaction time T, what did we believe was true at valid time V" — the exact rectangle cell. |
-| `mimir_history` | List superseded versions of a fact (category + key), newest first — paginated (`limit` default 20, plus `offset`); `total` reports the full trail size (companion to `mimir_as_of`). |
-| `mimir_forget` | Soft-delete (archived=1). |
+| `perseus_vault_remember` | Store/update entity. Idempotent by (category, key); a content change snapshots the prior version into history. |
+| `perseus_vault_recall` | Search with FTS5/dense/hybrid modes, filters, stemming expansion. Query contract (#562): `query=""` is match-all enumeration (the "list all" path); `"*"` and other wildcards are literal FTS5 terms, **not** globs — `"*"` matches nothing. |
+| `perseus_vault_scan` | Deterministic paginated enumeration of a category or the whole store (#562): immutable `id ASC` keyset pages with a `next_cursor`/`has_more` contract, so export/sync/reset callers can walk every entity exactly once. Read-only — no retrieval-count/decay side-effects, no offset cap. |
+| `perseus_vault_hygiene` | Read-only startup-memory hygiene report (#675): scores active memories by "actionability" (concrete anchors — issue keys, #refs, paths, URLs, decisions — vs vague/date-only/short) and lists the worst offenders with reasons, for archive/consolidate curation. |
+| `perseus_vault_recall_layer` | Recall from a specific biomimetic layer (world, episodic, semantic). |
+| `perseus_vault_recall_when` | Proactive just-in-time recall: surface entities whose `recall_when` triggers match. |
+| `perseus_vault_get_entity` | Fetch one entity by ID with full `body_json`. |
+| `perseus_vault_as_of` | Transaction-time time-travel: the version of a fact (category + key) that was *believed* at a past instant. |
+| `perseus_vault_valid_at` | Valid-time lookup: the version that was *actually true in the world* at an instant, per current knowledge (SQL:2011 APPLICATION_TIME). |
+| `perseus_vault_bitemporal` | Full 2-axis bi-temporal query: "as of transaction time T, what did we believe was true at valid time V" — the exact rectangle cell. |
+| `perseus_vault_history` | List superseded versions of a fact (category + key), newest first — paginated (`limit` default 20, plus `offset`); `total` reports the full trail size (companion to `perseus_vault_as_of`). |
+| `perseus_vault_forget` | Soft-delete (archived=1). |
 
 ### Search & RAG
 | Tool | Description |
 |---|---|
-| `mimir_ask` | RAG: recall context, query LLM, return grounded answer with sources. |
-| `mimir_embed` | Generate dense vectors via the bundled model, Ollama, or OpenAI-compatible endpoint. |
-| `mimir_semantic_search` | Dense-only semantic search shortcut — find entities by meaning, ranked purely by embedding similarity (no keyword fallback). |
-| `mimir_context` | Pre-formatted markdown block for session injection. Recall-first by default: pass `query` (the current task/message) and only topically relevant entities are injected, clamped to a per-model budget; the legacy unconditional dump requires `mode: "always_inject"`. |
-| `mimir_ingest` | Trigger connector syncs (GitHub, file watcher). |
-| `mimir_ingest_file` | Locally extract a document's text (plaintext/markdown always; DOCX/PDF with the `multimodal` feature) and store it as a recallable entity. |
-| `mimir_extract` | Local, deterministic, rule-based knowledge extraction (facts / preferences / temporal events / episodes) from text or a stored entity. Read-only. |
-| `mimir_capture` | Opt-in in-session capture (#520): distill a transcript/insight payload (text, markdown, or JSONL) into durable entities (root-cause / pitfall / decision / pattern / takeaway) the moment a problem is solved. Local rule-based distiller by default, optional `llm: true` with graceful fallback; near-dup merging stays ON plus a per-invocation cap (anti-flood). Also a CLI verb: `perseus-vault capture`. |
-| `mimir_memories` | Anthropic memory-tool compatible file interface (`view`/`create`/`str_replace`/`insert`/`delete`/`rename` under `/memories`), backed by vault entities. |
+| `perseus_vault_ask` | RAG: recall context, query LLM, return grounded answer with sources. |
+| `perseus_vault_embed` | Generate dense vectors via the bundled model, Ollama, or OpenAI-compatible endpoint. |
+| `perseus_vault_semantic_search` | Dense-only semantic search shortcut — find entities by meaning, ranked purely by embedding similarity (no keyword fallback). |
+| `perseus_vault_context` | Pre-formatted markdown block for session injection. Recall-first by default: pass `query` (the current task/message) and only topically relevant entities are injected, clamped to a per-model budget; the legacy unconditional dump requires `mode: "always_inject"`. |
+| `perseus_vault_ingest` | Trigger connector syncs (GitHub, file watcher). |
+| `perseus_vault_ingest_file` | Locally extract a document's text (plaintext/markdown always; DOCX/PDF with the `multimodal` feature) and store it as a recallable entity. |
+| `perseus_vault_extract` | Local, deterministic, rule-based knowledge extraction (facts / preferences / temporal events / episodes) from text or a stored entity. Read-only. |
+| `perseus_vault_capture` | Opt-in in-session capture (#520): distill a transcript/insight payload (text, markdown, or JSONL) into durable entities (root-cause / pitfall / decision / pattern / takeaway) the moment a problem is solved. Local rule-based distiller by default, optional `llm: true` with graceful fallback; near-dup merging stays ON plus a per-invocation cap (anti-flood). Also a CLI verb: `perseus-vault capture`. |
+| `perseus_vault_memories` | Anthropic memory-tool compatible file interface (`view`/`create`/`str_replace`/`insert`/`delete`/`rename` under `/memories`), backed by vault entities. |
 
 > 📖 **[docs/retrieval-modes.md](docs/retrieval-modes.md)** — one enumerated reference for every retrieval mode (keyword · dense · hybrid · graph · GraphRAG · proactive `recall_when` · temporal `as_of`): mechanism, when to use, invocation, and examples.
 
 ### Graph
 | Tool | Description |
 |---|---|
-| `mimir_link` | Create typed relationship links between entities. |
-| `mimir_unlink` | Remove entity links. |
-| `mimir_traverse` | Walk entity link graph up to configurable depth. |
-| `mimir_communities` | GraphRAG community detection over the link graph (deterministic label propagation or greedy-modularity "louvain"; pure Rust, offline). |
-| `mimir_community_summary` | Extractive (optionally LLM-polished) summary of one community, materialized as an entity with `evidence_for` links to members. |
-| `mimir_global_recall` | GraphRAG global search: breadth over community summaries, then depth into the best communities' members — holistic answers across clusters. |
+| `perseus_vault_link` | Create typed relationship links between entities. |
+| `perseus_vault_unlink` | Remove entity links. |
+| `perseus_vault_traverse` | Walk entity link graph up to configurable depth. |
+| `perseus_vault_communities` | GraphRAG community detection over the link graph (deterministic label propagation or greedy-modularity "louvain"; pure Rust, offline). |
+| `perseus_vault_community_summary` | Extractive (optionally LLM-polished) summary of one community, materialized as an entity with `evidence_for` links to members. |
+| `perseus_vault_global_recall` | GraphRAG global search: breadth over community summaries, then depth into the best communities' members — holistic answers across clusters. |
 
 ### Journal
 | Tool | Description |
 |---|---|
-| `mimir_journal` | Append structured event with actor attribution. |
-| `mimir_check_failure_pattern` | Deja-vu guard: check an action against previously recorded failures (journal + failure/pitfall entities) before retrying it. Read-only. |
-| `mimir_timeline` | Query journal by time range with filters. |
+| `perseus_vault_journal` | Append structured event with actor attribution. |
+| `perseus_vault_check_failure_pattern` | Deja-vu guard: check an action against previously recorded failures (journal + failure/pitfall entities) before retrying it. Read-only. |
+| `perseus_vault_timeline` | Query journal by time range with filters. |
 
 ### State
 | Tool | Description |
 |---|---|
-| `mimir_state_set` | Set key-value state with optional TTL. |
-| `mimir_state_get` | Get state value. Returns null if expired. |
-| `mimir_state_delete` | Delete state entry. |
-| `mimir_state_list` | List state keys, optionally filtered by prefix. |
+| `perseus_vault_state_set` | Set key-value state with optional TTL. |
+| `perseus_vault_state_get` | Get state value. Returns null if expired. |
+| `perseus_vault_state_delete` | Delete state entry. |
+| `perseus_vault_state_list` | List state keys, optionally filtered by prefix. |
 
 ### Lifecycle
 | Tool | Description |
 |---|---|
-| `mimir_decay` | Recalculate Ebbinghaus decay scores (batched 1000-entity transactions). |
-| `mimir_prune` | Bulk archive by category, decay threshold, or age. |
-| `mimir_purge` | Permanently delete archived entities + VACUUM. Destructive. |
-| `mimir_expire` | Time-based lifecycle sweep: entities past their body `expires_at` transition to `status='expired'` (content retained, dry-run supported). |
-| `mimir_redact` | Content redaction: scrub a workspace-scoped entity's body to a hash-only marker, delete history + FTS text, keep metadata (re-ingest allowed). Requires explicit `workspace_hash`. |
-| `mimir_erase` | Physical erasure of a workspace-scoped entity across ALL derived layers (FTS, history, communities, links, journal) + permanent re-ingest suppression. Requires explicit `workspace_hash`; dry-run supported. |
-| `mimir_cohere` | Autonomous coherence grooming pass — promote, decay, link, archive. |
-| `mimir_autocohere` | Full atomic grooming: cohere → decay → compact in one pass (supports dry-run). |
-| `mimir_compact` | Archive entities below decay threshold. |
-| `mimir_reindex` | Rebuild FTS5 search index from entities table. |
-| `mimir_consolidate` | Merge overlapping/duplicative entities in a category into durable, evidence-tracked observations (mirror image of `mimir_conflicts`). |
-| `mimir_dream` | Sleep-time LLM consolidation: reflect over clusters of related episodic memories via the configured LLM and write back durable semantic insights, provenance-linked to every source. Idempotent (evidence-set hash), contradiction-aware, bounded; requires `--llm-endpoint`. |
+| `perseus_vault_decay` | Recalculate Ebbinghaus decay scores (batched 1000-entity transactions). |
+| `perseus_vault_prune` | Bulk archive by category, decay threshold, or age. |
+| `perseus_vault_purge` | Permanently delete archived entities + VACUUM. Destructive. |
+| `perseus_vault_expire` | Time-based lifecycle sweep: entities past their body `expires_at` transition to `status='expired'` (content retained, dry-run supported). |
+| `perseus_vault_redact` | Content redaction: scrub a workspace-scoped entity's body to a hash-only marker, delete history + FTS text, keep metadata (re-ingest allowed). Requires explicit `workspace_hash`. |
+| `perseus_vault_erase` | Physical erasure of a workspace-scoped entity across ALL derived layers (FTS, history, communities, links, journal) + permanent re-ingest suppression. Requires explicit `workspace_hash`; dry-run supported. |
+| `perseus_vault_cohere` | Autonomous coherence grooming pass — promote, decay, link, archive. |
+| `perseus_vault_autocohere` | Full atomic grooming: cohere → decay → compact in one pass (supports dry-run). |
+| `perseus_vault_compact` | Archive entities below decay threshold. |
+| `perseus_vault_reindex` | Rebuild FTS5 search index from entities table. |
+| `perseus_vault_consolidate` | Merge overlapping/duplicative entities in a category into durable, evidence-tracked observations (mirror image of `perseus_vault_conflicts`). |
+| `perseus_vault_dream` | Sleep-time LLM consolidation: reflect over clusters of related episodic memories via the configured LLM and write back durable semantic insights, provenance-linked to every source. Idempotent (evidence-set hash), contradiction-aware, bounded; requires `--llm-endpoint`. |
 
 ### Quality
 | Tool | Description |
 |---|---|
-| `mimir_score` | Assign quality score (0.0-1.0). |
-| `mimir_conflicts` | Detect conflicting entities via trigram similarity; opt-in `resolve=true` invalidates the lower-certainty side into history (reversible, dry-run by default). |
-| `mimir_correct` | Structured correction capture for learning from errors. |
-| `mimir_supersede` | Mark a new fact as superseding an old one (sets the old entity to `deprecated`). |
-| `mimir_follow` | Record whether an entity was actually FOLLOWED or MISSED — follow-rate efficacy signal that feeds both decay scoring and outcome-weighted recall ranking (#681). |
+| `perseus_vault_score` | Assign quality score (0.0-1.0). |
+| `perseus_vault_conflicts` | Detect conflicting entities via trigram similarity; opt-in `resolve=true` invalidates the lower-certainty side into history (reversible, dry-run by default). |
+| `perseus_vault_correct` | Structured correction capture for learning from errors. |
+| `perseus_vault_supersede` | Mark a new fact as superseding an old one (sets the old entity to `deprecated`). |
+| `perseus_vault_follow` | Record whether an entity was actually FOLLOWED or MISSED — follow-rate efficacy signal that feeds both decay scoring and outcome-weighted recall ranking (#681). |
 
 ### Keystones (policy rules)
 | Tool | Description |
 |---|---|
-| `mimir_keystone_set` | Author a Keystone — a mandatory policy rule that survives context compaction (#683). Scoped (tenant/fleet/agent), weight-ranked, crypto-chained on every mutation; authoring is trust-tier-gated. |
-| `mimir_keystone_get` | Fetch the merged Keystones for a scope, ordered by weight (highest first) then scope specificity — the deterministic session-start counterpart to recall. A renderer injects these ahead of all other context. |
-| `mimir_agent` | Register/update or look up an agent in the multi-agent registry (#684): identity + trust tier (0-3) + fleet. Trust tier gates sensitive ops (e.g. authoring keystones needs tier ≥ 2) and drives visibility enforcement on recall. |
+| `perseus_vault_keystone_set` | Author a Keystone — a mandatory policy rule that survives context compaction (#683). Scoped (tenant/fleet/agent), weight-ranked, crypto-chained on every mutation; authoring is trust-tier-gated. |
+| `perseus_vault_keystone_get` | Fetch the merged Keystones for a scope, ordered by weight (highest first) then scope specificity — the deterministic session-start counterpart to recall. A renderer injects these ahead of all other context. |
+| `perseus_vault_agent` | Register/update or look up an agent in the multi-agent registry (#684): identity + trust tier (0-3) + fleet. Trust tier gates sensitive ops (e.g. authoring keystones needs tier ≥ 2) and drives visibility enforcement on recall. |
 
 ### Vault & Federation
 | Tool | Description |
 |---|---|
-| `mimir_vault_export` | Export entities to .md files with YAML frontmatter. |
-| `mimir_vault_import` | Import from .md vault directory (idempotent). |
-| `mimir_federate` | Copy entities between workspaces. This is a local export / workspace-rename / re-import (file based, no network peers); the Windows-safe default path is tracked in #704. |
-| `mimir_share` | Share one entity (by category + key) into another workspace, preserving content. |
-| `mimir_workspace_list` | List all distinct entity categories. |
+| `perseus_vault_vault_export` | Export entities to .md files with YAML frontmatter. |
+| `perseus_vault_vault_import` | Import from .md vault directory (idempotent). |
+| `perseus_vault_federate` | Copy entities between workspaces. This is a local export / workspace-rename / re-import (file based, no network peers); the Windows-safe default path is tracked in #704. |
+| `perseus_vault_share` | Share one entity (by category + key) into another workspace, preserving content. |
+| `perseus_vault_workspace_list` | List all distinct entity categories. |
 
 ### Metrics & Ops
 | Tool | Description |
 |---|---|
-| `mimir_stats` | Full DB statistics across all tables. |
-| `mimir_health` | Server and DB health check. |
-| `mimir_bench` | Performance benchmark tracking. |
-| `mimir_maintenance` | DB maintenance: dedup, orphan detection, VACUUM, FTS5 reindex (supports dry-run). |
-| `mimir_synthesize` | LLM session synthesis — extract lessons from transcripts. |
-| `mimir_migrate` | Migrate v0.1.x DB to current schema. |
+| `perseus_vault_stats` | Full DB statistics across all tables. |
+| `perseus_vault_health` | Server and DB health check. |
+| `perseus_vault_bench` | Performance benchmark tracking. |
+| `perseus_vault_maintenance` | DB maintenance: dedup, orphan detection, VACUUM, FTS5 reindex (supports dry-run). |
+| `perseus_vault_synthesize` | LLM session synthesis — extract lessons from transcripts. |
+| `perseus_vault_migrate` | Migrate v0.1.x DB to current schema. |
 
 ## CLI
 
 ```bash
 # Server
 perseus-vault serve --db /data/perseus-vault.db
-perseus-vault serve --web --port 8767 --encryption-key ~/.mimir/secret.key
+perseus-vault serve --web --port 8767 --encryption-key ~/.perseus-vault/secret.key
 perseus-vault serve --llm-endpoint http://localhost:11434/api/generate --llm-model llama3
 perseus-vault serve --transport sse --port 8787 --mcp-token my-secret-token
 
@@ -484,7 +485,7 @@ perseus-vault obsidian-sync  ~/obsidian-vault/Perseus Vault/          # one-shot
 perseus-vault obsidian-sync  ~/obsidian-vault/Perseus Vault/ --watch  # continuous sync on every memory change
 
 # Key management
-perseus-vault keygen --key-file ~/.mimir/secret.key
+perseus-vault keygen --key-file ~/.perseus-vault/secret.key
 ```
 
 > **Manual DB edits.** The maintenance verbs above and the normal MCP write path
@@ -498,14 +499,14 @@ perseus-vault keygen --key-file ~/.mimir/secret.key
 
 | Flag | Description |
 |---|---|
-| `--db` | SQLite database path (default: `~/.mimir/data/perseus-vault.db`) |
+| `--db` | SQLite database path (default: `~/.perseus-vault/data/perseus-vault.db`) |
 | `--web` | Start web dashboard |
 | `--port` | Dashboard port (default: 8767) |
 | `--web-bind` | Dashboard bind address (default: 127.0.0.1) |
 | `--transport` | MCP transport: `stdio` (default), `sse`, or `http` |
 | `--mcp-token` | Bearer token for SSE/HTTP transport auth |
 | `--encryption-key` | AES-256-GCM key file path |
-| `--llm-endpoint` | LLM API endpoint for `mimir_ask` and embeddings |
+| `--llm-endpoint` | LLM API endpoint for `perseus_vault_ask` and embeddings |
 | `--llm-model` | LLM model name (default: llama3) |
 | `--llm-api-key` | API key for LLM endpoints (OpenAI, Azure, etc.) |
 | `--embedding-endpoint` | OpenAI-compatible embedding endpoint |
@@ -516,25 +517,25 @@ perseus-vault keygen --key-file ~/.mimir/secret.key
 The **canonical** database path is:
 
 ```
-~/.mimir/data/perseus-vault.db
+~/.perseus-vault/data/perseus-vault.db
 ```
 
-Always pass `--db` (or set `$MIMIR_DB_PATH`) in scripts, MCP host configs, and
+Always pass `--db` (or set `$PERSEUS_VAULT_DB_PATH`) in scripts, MCP host configs, and
 cron/harvest jobs so every invocation targets the same file. When neither is
 set, Perseus Vault resolves the default in this order and uses the **first that
 already exists** (so upgraders and legacy single-user installs are picked up
 instead of silently starting empty):
 
-1. `~/.mimir/data/perseus-vault.db` — canonical (current name)
-2. `~/.mimir/data/mneme.db` — pre-rename
-3. `~/.mimir/data/mimir.db` — pre-rename
-4. `~/mimir.db` — legacy single-user install location
+1. `~/.perseus-vault/data/perseus-vault.db` — canonical (current name)
+2. `~/.perseus-vault/data/perseus-vault.db` — pre-rename
+3. `~/.perseus-vault/data/perseus-vault.db` — pre-rename
+4. `~/perseus-vault.db` — legacy single-user install location
 
-If none exist, it creates `~/.mimir/data/perseus-vault.db`. If **more than one**
-of these exists and you did not pass `--db`/`$MIMIR_DB_PATH`, Perseus Vault
+If none exist, it creates `~/.perseus-vault/data/perseus-vault.db`. If **more than one**
+of these exists and you did not pass `--db`/`$PERSEUS_VAULT_DB_PATH`, Perseus Vault
 prints a stderr warning naming the chosen file and the others it ignored, so an
 ambiguous multi-database state is visible rather than silent. Setting `--db` or
-`$MIMIR_DB_PATH` explicitly always wins and suppresses the warning.
+`$PERSEUS_VAULT_DB_PATH` explicitly always wins and suppresses the warning.
 
 ## Your AI Memory in Obsidian
 
@@ -553,7 +554,7 @@ perseus-vault obsidian-sync ~/obsidian-vault/Perseus Vault/ --watch
 
 Open the vault in Obsidian and you get a graph of your agent's knowledge.
 
-**WikiLink backlinks.** When one entity links to another (via `mimir_link` or a
+**WikiLink backlinks.** When one entity links to another (via `perseus_vault_link` or a
 `depends_on` / `implements` / `references` relationship), the exported note gets
 a `## Links` section with `[[WikiLink]]` backlinks that resolve natively in
 Obsidian's graph view:
@@ -581,8 +582,8 @@ clickable knowledge map.
 
 **`--watch`** polls Perseus Vault's cheap, deterministic state digest on an interval and
 re-exports only when memory actually changes. It naturally catches every
-`mimir_remember` write with no filesystem-watcher dependency and no coupling to
-the server. Tune the interval with `MIMIR_SYNC_INTERVAL_SECS` (default: 2s).
+`perseus_vault_remember` write with no filesystem-watcher dependency and no coupling to
+the server. Tune the interval with `PERSEUS_VAULT_SYNC_INTERVAL_SECS` (default: 2s).
 
 ### Other PKM tools
 
@@ -603,16 +604,16 @@ stale memories fade — your knowledge base stays yours and stays fresh.
   (384-dim) is compiled into the binary, so dense/semantic search works with
   **zero config and zero network**: no Ollama, no API key, no model download.
   This is the default build (`bundled-embeddings` feature).
-- **Auto-embed on write (#271)** — `mimir_remember` embeds each new (or
+- **Auto-embed on write (#271)** — `perseus_vault_remember` embeds each new (or
   content-changed) entity **synchronously** as it is written, using the bundled
   model. Single-entity embedding is deterministic and LRU-cached, so it is cheap
   and adds no background tasks. Embedding failures are non-fatal (logged to
   stderr); the write always succeeds.
-- **Hybrid is the default recall mode (#271)** — `mimir_recall(query=...)` with
+- **Hybrid is the default recall mode (#271)** — `perseus_vault_recall(query=...)` with
   no `mode` flag automatically selects **hybrid** (dense + keyword fused via RRF)
   whenever embeddings exist, and transparently falls back to **fts5** keyword
-  search when none do. No manual `mimir_embed` step, no flags to remember.
-- **`mimir_semantic_search(query, limit)`** — a one-tool shortcut for pure
+  search when none do. No manual `perseus_vault_embed` step, no flags to remember.
+- **`perseus_vault_semantic_search(query, limit)`** — a one-tool shortcut for pure
   dense, meaning-based search (no keyword fallback) when you just want "find
   things like this".
 - **Optional alternate embedder** — to use **Ollama** or any OpenAI-compatible
@@ -636,7 +637,7 @@ Perseus Vault models memory using three biomimetic layers, inspired by human mem
 - **Episodic (Buffer):** Fast-decaying, session-specific interaction history.
 - **Semantic (Working):** Medium-decaying, general knowledge and learned concepts.
 
-You can interact with these layers directly using the `mimir_recall_layer` tool or by specifying the `layer` parameter in `mimir_remember`.
+You can interact with these layers directly using the `perseus_vault_recall_layer` tool or by specifying the `layer` parameter in `perseus_vault_remember`.
 
 - **Ebbinghaus decay** — memories naturally fade unless retrieved (refresh on access)
 - **Layer promotion** — buffer → working → core based on access frequency
@@ -647,7 +648,7 @@ You can interact with these layers directly using the `mimir_recall_layer` tool 
 
 The vault is the query layer — it retrieves the few facts a turn needs instead of
 handing the host a standing blob to staple into every system prompt.
-`mimir_context` and `perseus-vault prepare` are **recall-first by default**:
+`perseus_vault_context` and `perseus-vault prepare` are **recall-first by default**:
 
 - **Relevance gating** — pass `query` (the current task/message) and only entities
   whose `recall_when` triggers or indexed content match it are injected. No query,
@@ -670,8 +671,8 @@ perseus-vault prepare --task "..." --legacy-context            # old dump, opt-i
 ```
 
 ### RAG & Embeddings
-- **`mimir_ask`** — natural language Q&A over stored memories via any LLM (Ollama, OpenAI, etc.)
-- **`mimir_embed`** — generate and store dense vectors via Ollama or OpenAI-compatible `/v1/embeddings`
+- **`perseus_vault_ask`** — natural language Q&A over stored memories via any LLM (Ollama, OpenAI, etc.)
+- **`perseus_vault_embed`** — generate and store dense vectors via Ollama or OpenAI-compatible `/v1/embeddings`
 - Supports single-entity and batch-category embedding
 
 ### Encryption
@@ -703,10 +704,10 @@ perseus-vault prepare --task "..." --legacy-context            # old dump, opt-i
 Perseus Vault is the default memory backend for [Perseus](https://perseus.observer):
 
 ```yaml
-mimir:
+perseus_vault:
   enabled: true
   transport: "stdio"
-  command: ["perseus-vault", "serve", "--db", "~/.mimir/data/perseus-vault.db"]
+  command: ["perseus-vault", "serve", "--db", "~/.perseus-vault/data/perseus-vault.db"]
   timeout_s: 30.0
   merge_strategy: "local_first"
   fallback_to_local: true
@@ -754,11 +755,11 @@ Perseus Vault is a **local-first MCP server** — it runs entirely on your machi
 ### Data Retention
 - You control retention with four distinct lifecycle operations (see
   `docs/specs/data-boundaries-retention-lifecycle.md`): soft-delete
-  (`mimir_forget`, content recoverable), expiry (`mimir_expire`, time-based
-  `status='expired'` with content retained), redaction (`mimir_redact`,
+  (`perseus_vault_forget`, content recoverable), expiry (`perseus_vault_expire`, time-based
+  `status='expired'` with content retained), redaction (`perseus_vault_redact`,
   content scrubbed to hash-only, metadata kept), and physical erasure
-  (`mimir_erase`, removal across all derived layers with permanent re-ingest
-  suppression). `mimir_purge` reclaims space from archived rows.
+  (`perseus_vault_erase`, removal across all derived layers with permanent re-ingest
+  suppression). `perseus_vault_purge` reclaims space from archived rows.
 - No automatic off-machine backup is performed.
 
 ### Contact

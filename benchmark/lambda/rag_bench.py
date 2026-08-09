@@ -4,9 +4,9 @@
 Drives the perseus-vault MCP stdio server (JSON-RPC) against a live Ollama endpoint.
 Measures the GPU-dependent numbers that are citable as first-party/measured:
 
-  1. Embedding throughput   — mimir_embed batch over N seeded entities (Ollama /api/embed)
-  2. Dense vs FTS5 recall    — mimir_recall mode=dense vs mode=fts5 on the same queries
-  3. RAG answer latency      — mimir_ask (recall -> assemble -> qwen2.5:14b generate)
+  1. Embedding throughput   — perseus_vault_embed batch over N seeded entities (Ollama /api/embed)
+  2. Dense vs FTS5 recall    — perseus_vault_recall mode=dense vs mode=fts5 on the same queries
+  3. RAG answer latency      — perseus_vault_ask (recall -> assemble -> qwen2.5:14b generate)
 
 All timings are wall-clock around the JSON-RPC round trip. Honest labeling: the
 embedding + ask calls hit the GPU; fts5 recall is CPU (that's the baseline we compare against).
@@ -54,7 +54,7 @@ CORPUS = [
     ("architecture", "sqlite-fts5", "Adopt SQLite FTS5 for full-text memory search with porter stemming and bm25 ranking."),
     ("architecture", "dense-embeddings", "Dense vector embeddings via nomic-embed-text enable semantic recall beyond keyword match."),
     ("architecture", "encryption-aes", "Vault bodies encrypted at rest with AES-256-GCM; keys derived per workspace."),
-    ("decision", "ollama-endpoint", "Use Ollama as the local LLM endpoint for the mimir_ask RAG tool and embeddings."),
+    ("decision", "ollama-endpoint", "Use Ollama as the local LLM endpoint for the perseus_vault_ask RAG tool and embeddings."),
     ("decision", "weekly-billing", "Lambda credits decrement weekly, never mid-cycle; terminate idle GPU instances."),
     ("convention", "absolute-paths", "Always use absolute filesystem paths in scripts and never inline secret keys."),
     ("insight", "recall-first", "Recall-first context retrieves only relevant memories on demand to preserve token budget."),
@@ -75,7 +75,7 @@ def bench(mcp, ask_model):
     # --- Seed ---
     t0 = time.time()
     for cat, key, body in CORPUS:
-        mcp.tool("mimir_remember", {"category": cat, "key": key,
+        mcp.tool("perseus_vault_remember", {"category": cat, "key": key,
                  "body_json": json.dumps({"content": body})})
     out["detail"]["seed_secs"] = round(time.time()-t0, 3)
 
@@ -83,7 +83,7 @@ def bench(mcp, ask_model):
     cats = sorted({c for c, _, _ in CORPUS})
     t0 = time.time(); n = 0
     for c in cats:
-        emb = mcp.tool("mimir_embed", {"batch_category": c})
+        emb = mcp.tool("perseus_vault_embed", {"batch_category": c})
         n += emb.get("embedded", emb.get("count", 0)) or 0
     dt = time.time()-t0
     if not n:  # fall back to corpus size if the tool doesn't echo a count
@@ -98,7 +98,7 @@ def bench(mcp, ask_model):
         hits = 0; lats = []
         for q, gold in QUERIES:
             t=time.time()
-            r = mcp.tool("mimir_recall", {"query": q, "mode": mode, "limit": 3})
+            r = mcp.tool("perseus_vault_recall", {"query": q, "mode": mode, "limit": 3})
             lats.append((time.time()-t)*1000)
             res = r.get("items", []) if isinstance(r, dict) else (r or [])
             keys = [ (x.get("key") if isinstance(x,dict) else "") for x in res ]
@@ -116,7 +116,7 @@ def bench(mcp, ask_model):
     lats=[]; sample=None
     for q,_ in QUERIES[:4]:
         t=time.time()
-        a = mcp.tool("mimir_ask", {"query": q, "top_k": 4})
+        a = mcp.tool("perseus_vault_ask", {"query": q, "top_k": 4})
         lats.append(time.time()-t)
         if sample is None: sample = str(a)[:300]
     out["summary"]["rag_ask"] = {

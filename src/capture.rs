@@ -89,7 +89,7 @@ const ROOT_CAUSE_MARKERS: &[&str] = &[
 /// deja-vu guard's `db::FAILURE_MARKERS` (same substring semantics: "fail"
 /// covers failed/failure/failing; "bug" deliberately excluded because
 /// "debug" false-positives on routine payloads) so a captured pitfall is
-/// findable by `mimir_check_failure_pattern`. The root-cause-only markers
+/// findable by `perseus_vault_check_failure_pattern`. The root-cause-only markers
 /// live in [`ROOT_CAUSE_MARKERS`] and win first.
 const FAILURE_MARKERS: &[&str] = &[
     "fail",
@@ -353,7 +353,7 @@ pub fn distill(payload: &str, max_notes: usize) -> DistillReport {
 //
 // The prompt/parse pair for the opt-in LLM path. The transport call itself
 // lives on `Database` (`llm_generate`, gated on `llm_config.enabled` with
-// the #528 MIMIR_LLM_TIMEOUT_SECS timeout); `tools::handle_capture` wires
+// the #528 PERSEUS_VAULT_LLM_TIMEOUT_SECS timeout); `tools::handle_capture` wires
 // prompt → call → parse and falls back to [`distill`] on ANY failure.
 
 /// Build the distillation prompt. Strict-JSON contract, same style as
@@ -626,7 +626,7 @@ mod tests {
     fn failure_markers_align_with_the_deja_vu_guard() {
         // Alignment pin (#521): every capture failure marker must be one the
         // deja-vu guard (`db::FAILURE_MARKERS`) also recognizes, so a
-        // captured pitfall is findable by mimir_check_failure_pattern. The
+        // captured pitfall is findable by perseus_vault_check_failure_pattern. The
         // guard's list may be a superset (e.g. "root cause"/"root-cause"
         // live in ROOT_CAUSE_MARKERS here, which classify() checks first).
         for m in FAILURE_MARKERS {

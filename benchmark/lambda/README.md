@@ -56,7 +56,7 @@ extraction, not Zep Cloud (frontier models). See `results/competitors.json` and
 
 At **1M** entities **hybrid holds recall@5 = 1.000 while keyword collapses to 0.001 — a
 ~1000× gap** (keyword degrades further at 10× scale). Corpus: 995,562 persisted of 1,000,000
-seeded via `mimir_remember` (0.44% dedup gap — distinctness holds). Fleet-embedded at
+seeded via `perseus_vault_remember` (0.44% dedup gap — distinctness holds). Fleet-embedded at
 196.8 emb/s across 2 pinned H100 daemons (see §2). `uniform ≈ warm_set` recall confirms
 the `dense_search` 50k brute-force scan cap acts as a uniform sampler across clusters
 (random `mem-<uuid>` ids: 9,937/10,000 clusters reachable), not a first-N wall; standalone
@@ -69,9 +69,9 @@ and **~4.7× a single Ollama daemon's saturation ceiling (~137 eps)**. Achieved 
 load balancer (`serve_fleet.sh` / `parallel_embed_fleet.py`). Near-linear per-GPU
 scaling to ~concurrency 32-48, rolling off as request queuing dominates.
 
-> **Re-validation 2026-07-12:** 100K recall-hold re-confirmed — hybrid recall@5 = recall@10 = **1.0** (matches §1 exactly; the fleet throughput win costs no accuracy). 8×H100 had zero in-region (us-south-2) capacity across the poll window, so the largest available in-region multi-GPU (8× Tesla V100) was used as a labeled fallback: peak **432 emb/s @ conc 64** — see `results/fleet_8gpu_v100_throughput.json` and `results/fleet100k_recall.json`. The 651 emb/s figure above is the H100 headline and is **retained unrefreshed** (not overwritten with V100 data). Caveat: today the vault's own embed path (`mimir_embed`) is sequential and cannot reach these fleet rates — see [#601](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/601).
+> **Re-validation 2026-07-12:** 100K recall-hold re-confirmed — hybrid recall@5 = recall@10 = **1.0** (matches §1 exactly; the fleet throughput win costs no accuracy). 8×H100 had zero in-region (us-south-2) capacity across the poll window, so the largest available in-region multi-GPU (8× Tesla V100) was used as a labeled fallback: peak **432 emb/s @ conc 64** — see `results/fleet_8gpu_v100_throughput.json` and `results/fleet100k_recall.json`. The 651 emb/s figure above is the H100 headline and is **retained unrefreshed** (not overwritten with V100 data). Caveat: today the vault's own embed path (`perseus_vault_embed`) is sequential and cannot reach these fleet rates — see [#601](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/601).
 
-### 3. Model quality vs latency — mimir_ask grounded QA
+### 3. Model quality vs latency — perseus_vault_ask grounded QA
 Both `qwen2.5:14b` and `qwen2.5:72b` scored **100% accuracy with citations** (pre-warmed).
 14B at ~2.5× lower latency. Takeaway: when retrieval is strong, a smaller model suffices
 for grounded recall — reinforcing the edge/offline story.
@@ -86,7 +86,7 @@ for grounded recall — reinforcing the edge/offline story.
 | `scale_bench.py` | Seed → embed → recall@k (fts5/dense/hybrid) at configurable corpus size |
 | `scale_bench_1m.py` | 1M-scale variant of `scale_bench.py`: client-side **fleet embedding** (direct DB write, binary-identical `embedding`+`emb_sig`), query sampling, and uniform + warm-set recall |
 | `parallel_embed_fleet.py` | Aggregate embedding throughput vs concurrency across the fleet |
-| `quality_lift.py` | mimir_ask accuracy/latency across chat models (14B vs 72B) |
+| `quality_lift.py` | perseus_vault_ask accuracy/latency across chat models (14B vs 72B) |
 | `mem0_bench.py` | Competitive: same recall task against Mem0, same box + Ollama |
 | `competitors_bench.py` | Competitive 4-way: same recall task vs Mem0, Zep (Graphiti/Neo4j) and Letta (pgvector), same box + Ollama → `results/competitors.json` |
 | `rag_bench.py` | MCP JSON-RPC driver + single-endpoint RAG smoke bench |
@@ -141,7 +141,7 @@ python3 build_report.py results   # -> results/results.html
   can use a dedicated embed model distinct from the chat model. Without it, a chat-only
   model returns HTTP 501 and dense/hybrid recall silently empties. These scripts pass
   the embedding model explicitly.
-- **Content dedup:** `mimir_remember` collapses writes ≥70% trigram-similar (by design).
+- **Content dedup:** `perseus_vault_remember` collapses writes ≥70% trigram-similar (by design).
   Benchmark corpora must use genuinely distinct content per entity (`scale_bench.py`
   uses randomized filler) or the corpus silently collapses.
 - **Build:** use `cargo build --release --no-default-features` on glibc<2.38 hosts

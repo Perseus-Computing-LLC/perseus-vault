@@ -9,7 +9,7 @@
   },
   "tools": [
     {
-      "name": "mimir_remember",
+      "name": "perseus_vault_remember",
       "description": "Store or update an entity by (category, key). Idempotent \u2014 call as often as you want, same key returns an update. Use this for saving facts, decisions, architecture notes, and conventions.",
       "inputSchema": {
         "type": "object",
@@ -86,7 +86,7 @@
       }
     },
     {
-      "name": "mimir_recall",
+      "name": "perseus_vault_recall",
       "description": "Search entities with FTS5 keyword search. Words are OR'd together. Returns entities sorted by relevance with expanded content/summary fields at top level. Use this to find previously stored facts, decisions, or architecture notes.",
       "inputSchema": {
         "type": "object",
@@ -148,7 +148,7 @@
       }
     },
     {
-      "name": "mimir_forget",
+      "name": "perseus_vault_forget",
       "description": "Soft-delete an entity by setting archived=1. The entity is hidden from queries but recoverable. Use this to clean up stale or incorrect facts without permanent data loss.",
       "inputSchema": {
         "type": "object",
@@ -194,8 +194,8 @@
       }
     },
     {
-      "name": "mimir_link",
-      "description": "Create a relationship link from one entity to another. Builds a knowledge graph that mimir_traverse can walk. Use 'depends_on', 'implements', 'extends', 'references', or custom relationships.",
+      "name": "perseus_vault_link",
+      "description": "Create a relationship link from one entity to another. Builds a knowledge graph that perseus_vault_traverse can walk. Use 'depends_on', 'implements', 'extends', 'references', or custom relationships.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -209,7 +209,7 @@
           },
           "to_id": {
             "type": "string",
-            "description": "Target entity ID (from mimir_remember return value)"
+            "description": "Target entity ID (from perseus_vault_remember return value)"
           },
           "relationship": {
             "type": "string",
@@ -248,7 +248,7 @@
       }
     },
     {
-      "name": "mimir_unlink",
+      "name": "perseus_vault_unlink",
       "description": "Remove a relationship link from one entity to another. Use this to correct outdated or incorrect links in the knowledge graph.",
       "inputSchema": {
         "type": "object",
@@ -293,7 +293,7 @@
       }
     },
     {
-      "name": "mimir_journal",
+      "name": "perseus_vault_journal",
       "description": "Append a structured decision/observation log entry. Uses evaluated/acted/forward pattern: what was considered, what was done, and what happens next. Essential for audit trails and timeline reconstruction.",
       "inputSchema": {
         "type": "object",
@@ -352,7 +352,7 @@
       }
     },
     {
-      "name": "mimir_timeline",
+      "name": "perseus_vault_timeline",
       "description": "Query journal events by time range with optional filters for event type, category, or entity. Use this to reconstruct the decision history and understand what happened when.",
       "inputSchema": {
         "type": "object",
@@ -406,7 +406,7 @@
       }
     },
     {
-      "name": "mimir_state_set",
+      "name": "perseus_vault_state_set",
       "description": "Set a key-value state entry with optional TTL for auto-expiration. Use this for session state, temporary flags, or configuration values that should expire after a set time.",
       "inputSchema": {
         "type": "object",
@@ -451,8 +451,8 @@
       }
     },
     {
-      "name": "mimir_state_get",
-      "description": "Get a state value by key. Returns null if the key has expired or doesn't exist. Use this instead of mimir_recall for transient session state that doesn't need FTS5 search.",
+      "name": "perseus_vault_state_get",
+      "description": "Get a state value by key. Returns null if the key has expired or doesn't exist. Use this instead of perseus_vault_recall for transient session state that doesn't need FTS5 search.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -495,8 +495,8 @@
       }
     },
     {
-      "name": "mimir_state_delete",
-      "description": "Delete a state entry by key. Permanent removal \u2014 unlike mimir_forget which is a soft-delete. Use this to clean up expired or unused state entries.",
+      "name": "perseus_vault_state_delete",
+      "description": "Delete a state entry by key. Permanent removal \u2014 unlike perseus_vault_forget which is a soft-delete. Use this to clean up expired or unused state entries.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -527,7 +527,7 @@
       }
     },
     {
-      "name": "mimir_state_list",
+      "name": "perseus_vault_state_list",
       "description": "List all state keys, optionally filtered by a key prefix. Use this to discover what state entries exist without knowing exact keys ahead of time.",
       "inputSchema": {
         "type": "object",
@@ -561,8 +561,8 @@
       }
     },
     {
-      "name": "mimir_health",
-      "description": "Check whether the Perseus Vault server and its SQLite database are healthy. Returns a simple healthy/unhealthy status. Use this for health checks and monitoring, not for detailed stats (use mimir_stats).",
+      "name": "perseus_vault_health",
+      "description": "Check whether the Perseus Vault server and its SQLite database are healthy. Returns a simple healthy/unhealthy status. Use this for health checks and monitoring, not for detailed stats (use perseus_vault_stats).",
       "inputSchema": {
         "type": "object",
         "properties": {}
@@ -585,7 +585,7 @@
       }
     },
     {
-      "name": "mimir_stats",
+      "name": "perseus_vault_stats",
       "description": "Return comprehensive database statistics: entity counts by category, type, and decay layer; journal event count; state entry count; database file size; and date range of stored data.",
       "inputSchema": {
         "type": "object",
@@ -637,7 +637,7 @@
       }
     },
     {
-      "name": "mimir_compact",
+      "name": "perseus_vault_compact",
       "description": "Archive entities whose decay score has fallen below a threshold. Supports dry-run mode to preview without making changes. Run periodically or threshold-triggered to keep the database focused on active, high-value memories.",
       "inputSchema": {
         "type": "object",
@@ -681,8 +681,8 @@
       }
     },
     {
-      "name": "mimir_migrate",
-      "description": "Migrate a v0.1.x Mimir database to the current v0.5.0 schema. Reads the old database, converts memories to the entity model, and merges into the current database. Use this once per legacy database during upgrade.",
+      "name": "perseus_vault_migrate",
+      "description": "Migrate a v0.1.x Perseus Vault database to the current v0.5.0 schema. Reads the old database, converts memories to the entity model, and merges into the current database. Use this once per legacy database during upgrade.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -728,7 +728,7 @@
       }
     },
     {
-      "name": "mimir_context",
+      "name": "perseus_vault_context",
       "description": "Return a pre-formatted markdown context block of the most important entities for session injection. The downstream system (Perseus) uses this to pre-load AI agent context with relevant memories before work begins.",
       "inputSchema": {
         "type": "object",
@@ -762,8 +762,8 @@
       }
     },
     {
-      "name": "mimir_traverse",
-      "description": "Walk the entity link graph starting from a given entity up to a configurable depth. Returns a chain of linked entities \u2014 useful for exploring dependencies, decision trees, and relationship graphs built via mimir_link.",
+      "name": "perseus_vault_traverse",
+      "description": "Walk the entity link graph starting from a given entity up to a configurable depth. Returns a chain of linked entities \u2014 useful for exploring dependencies, decision trees, and relationship graphs built via perseus_vault_link.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -803,7 +803,7 @@
       }
     },
     {
-      "name": "mimir_score",
+      "name": "perseus_vault_score",
       "description": "Assign a quality score (0.0\u20131.0) to an entity. Verified entities with high scores resist decay and rank higher in recall results. Use this to mark entities as accurate, verified, or deprecated.",
       "inputSchema": {
         "type": "object",
@@ -853,7 +853,7 @@
       }
     },
     {
-      "name": "mimir_conflicts",
+      "name": "perseus_vault_conflicts",
       "description": "Detect conflicting entities in the same category \u2014 pairs with low trigram similarity in their body_json. Flags potential contradictions, duplicate-but-divergent entries, and stale-overwritten facts that need human review.",
       "inputSchema": {
         "type": "object",
@@ -895,14 +895,14 @@
       }
     },
     {
-      "name": "mimir_vault_export",
+      "name": "perseus_vault_vault_export",
       "description": "Export all non-archived entities to .md files with YAML frontmatter in a vault directory. Files are human-readable, git-trackable, and Obsidian-compatible. Use this for backup, transfer between workspaces, or offline review.",
       "inputSchema": {
         "type": "object",
         "properties": {
           "vault_dir": {
             "type": "string",
-            "default": "~/.mimir/vault",
+            "default": "~/.perseus-vault/vault",
             "description": "Directory path to write .md files. Created if it doesn't exist. Use ~ for home directory."
           }
         },
@@ -941,14 +941,14 @@
       }
     },
     {
-      "name": "mimir_vault_import",
-      "description": "Import .md files from a vault directory into the database. Reads YAML frontmatter for metadata and markdown body for content. Idempotent \u2014 re-running on the same vault won't duplicate entities. Pair with mimir_vault_export for transfer.",
+      "name": "perseus_vault_vault_import",
+      "description": "Import .md files from a vault directory into the database. Reads YAML frontmatter for metadata and markdown body for content. Idempotent \u2014 re-running on the same vault won't duplicate entities. Pair with perseus_vault_vault_export for transfer.",
       "inputSchema": {
         "type": "object",
         "properties": {
           "vault_dir": {
             "type": "string",
-            "default": "~/.mimir/vault",
+            "default": "~/.perseus-vault/vault",
             "description": "Directory path to read .md files from. Use ~ for home directory."
           }
         },
@@ -987,7 +987,7 @@
       }
     },
     {
-      "name": "mimir_decay",
+      "name": "perseus_vault_decay",
       "description": "Recalculate Ebbinghaus decay scores for all entities based on time since last access. Auto-archives entities that have fully decayed (score < 0.05). Run periodically to keep memory fresh \u2014 decayed entities surface less often in recall results.",
       "inputSchema": {
         "type": "object",
@@ -1019,8 +1019,8 @@
       }
     },
     {
-      "name": "mimir_workspace_list",
-      "description": "List all distinct entity categories present in the database. Use this to discover what knowledge domains exist before querying with mimir_recall or mimir_context.",
+      "name": "perseus_vault_workspace_list",
+      "description": "List all distinct entity categories present in the database. Use this to discover what knowledge domains exist before querying with perseus_vault_recall or perseus_vault_context.",
       "inputSchema": {
         "type": "object",
         "properties": {}

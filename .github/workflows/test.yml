@@ -14,7 +14,7 @@ env:
   CARGO_TERM_COLOR: always
   # build.rs copies the bundled embedding model from here instead of hitting
   # HuggingFace, so the (cached) model is fetched at most once per runner.
-  MIMIR_BUNDLED_MODEL_DIR: ${{ github.workspace }}/.model-cache
+  PERSEUS_VAULT_BUNDLED_MODEL_DIR: ${{ github.workspace }}/.model-cache
 
 jobs:
   static-quality:

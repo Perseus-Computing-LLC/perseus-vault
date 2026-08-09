@@ -78,7 +78,7 @@ TIERS = [
         "compression": "32x",
         "source": "scale1m_pure1bit.json",
         "note": "the 1-bit prefilter's candidate order WITHOUT the exact-cosine "
-                "rerank (MIMIR_DENSE_SIG_RERANK=0, #630). Measures the prefilter "
+                "rerank (PERSEUS_VAULT_DENSE_SIG_RERANK=0, #630). Measures the prefilter "
                 "ALONE: far below the reranked default (0.312 vs 0.726 r@5) at "
                 "near-identical latency (~184 vs ~195 ms) — so the exact rerank "
                 "over the 1-bit-selected pool is what does the denoising, not the "

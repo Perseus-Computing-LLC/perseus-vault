@@ -1,9 +1,9 @@
-# Mimir on LongMemEval (session-level retrieval, offline & judge-free)
+# Perseus Vault on LongMemEval (session-level retrieval, offline & judge-free)
 
-A **reproducible, fully offline** measurement of how well Mimir retrieves the
+A **reproducible, fully offline** measurement of how well Perseus Vault retrieves the
 right memory on the public [LongMemEval](https://github.com/xiaowu0162/LongMemEval)
 benchmark. It reports **session-level recall@k** against LongMemEval's own
-`answer_session_ids`, across Mimir's three search modes (fts5 keyword, dense
+`answer_session_ids`, across Perseus Vault's three search modes (fts5 keyword, dense
 vector, hybrid RRF). No API key, no network, no LLM. Anyone can re-run it and get
 the same number.
 
@@ -21,13 +21,13 @@ LongMemEval has two stages:
    pick. **This harness deliberately does not produce a QA number** (see "Honesty"
    below).
 
-Mimir's pitch is local-first, so its credibility benchmark is the half that needs
+Perseus Vault's pitch is local-first, so its credibility benchmark is the half that needs
 no cloud: retrieval quality you can reproduce on your own machine.
 
 ## Run it
 
 ```bash
-# 1. Build mimir (bundled embeddings are on by default)
+# 1. Build perseus_vault (bundled embeddings are on by default)
 cargo build --release
 
 # 2. Get the real LongMemEval _s split (500 instances, ~48 sessions each, 277 MB)
@@ -66,8 +66,8 @@ embedding (and therefore a byte-identical signature) on every run.
 Full LongMemEval `_s` split: **500 questions, 23,867 sessions, offline** on Windows 11
 with the release binary (bundled ONNX embeddings). Fingerprinted (sha256) in `report.json`.
 
-This is the **default user experience after #271**: a bare `mimir_remember` then
-`mimir_recall` with no manual `mimir_embed` and no `mode` argument
+This is the **default user experience after #271**: a bare `perseus_vault_remember` then
+`perseus_vault_recall` with no manual `perseus_vault_embed` and no `mode` argument
 (`--skip-explicit-embed --modes auto`). `auto` exercises #271's auto-select; the run
 skips the explicit embed to prove #271's auto-embed-on-write is what populates the
 vectors.
@@ -120,7 +120,7 @@ sha256) plus hypotheses files in LongMemEval's official format so their
 `evaluate_qa.py` can cross-check our judge. See [COMPARISON.md](COMPARISON.md)
 for the comparison rules and the scoreboard vs Zep's published 63.8%.
 
-Systems: `fullcontext` (all ~48 sessions), `mimir` (top-k hybrid-retrieved sessions,
+Systems: `fullcontext` (all ~48 sessions), `perseus_vault` (top-k hybrid-retrieved sessions,
 the default), `oracle` (gold sessions only, upper bound).
 
 **Token efficiency (offline, no key needed, `--dry-run`).** On 50 `_s` instances,
@@ -129,10 +129,10 @@ k=5 retrieval:
 | system | avg sessions/q | relative context | 
 |---|--:|--:|
 | fullcontext | 48.7 | 8.0x (baseline) |
-| **mimir (k=5)** | **5.0** | **1.0x (8.0x less)** |
+| **perseus_vault (k=5)** | **5.0** | **1.0x (8.0x less)** |
 | oracle | 1.0 | ~34x less |
 
-**Mimir feeds the LLM ~8x fewer tokens than dumping the whole history** — and from the
+**Perseus Vault feeds the LLM ~8x fewer tokens than dumping the whole history** — and from the
 retrieval result above, hybrid recall@5 is 97%, so those 5 sessions contain the evidence
 almost every time. (Token counts use tiktoken when present, else a ~4-chars/token
 estimate; the *ratio* is tokenizer-independent. This is the honest, reproducible version
@@ -215,7 +215,7 @@ the interesting engine cases for multi-query / aggregation-aware retrieval).
 - QA-accuracy comparisons across papers use different LLMs and judges and are not
   apples-to-apples. If we ever publish a QA number, it must name the exact LLM +
   judge and run every baseline through the identical models on the identical split.
-- Mimir's headline mode is **hybrid** (it fuses keyword + vector). Report all three
+- Perseus Vault's headline mode is **hybrid** (it fuses keyword + vector). Report all three
   modes; do not cherry-pick.
 - The `_s` split is the retrieval-stressing one (distractors present). The `oracle`
   split contains only evidence sessions, so retrieval recall there is trivially ~1.0

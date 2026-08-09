@@ -1,7 +1,7 @@
 # gRPC Security Model
 
 The gRPC surface (`grpc` feature, `src/grpc.rs`) maps the MCP tools to protobuf
-RPCs on the `mneme.v1` service. It is **off by default** and, like the HTTP
+RPCs on the `perseus_vault.v1` service. It is **off by default** and, like the HTTP
 transport, is a remote surface reachable by attacker profile **A4** the moment
 it binds beyond loopback. This document is the security design; it is
 implemented in `serve_with` and enforced whether or not individual RPC handlers
@@ -22,20 +22,20 @@ always on.
 
 | Control | Mechanism | Env |
 |---|---|---|
-| **Secure-bind guard** | Refuses to serve on a non-loopback address without either an auth token or mTLS. Mirrors the HTTP `guard_bind` policy. | `MIMIR_ALLOW_INSECURE_BIND=1` to override (trusted network only) |
-| **Authentication** | `AuthInterceptor` requires `authorization: Bearer <token>` metadata on every RPC; constant-time compared; rejects with `UNAUTHENTICATED`. | `MIMIR_GRPC_AUTH_TOKEN` |
-| **TLS** | `ServerTlsConfig` with a PEM server identity. | `MIMIR_GRPC_TLS_CERT`, `MIMIR_GRPC_TLS_KEY` |
-| **Mutual TLS** | Adds a client-CA root; clients must present a cert chaining to it. Counts as authentication for the bind guard. | `MIMIR_GRPC_TLS_CLIENT_CA` |
-| **Message-size cap** | `max_decoding_message_size` / `max_encoding_message_size` bound per-message memory. | `MIMIR_GRPC_MAX_MSG_BYTES` (default 4 MiB) |
+| **Secure-bind guard** | Refuses to serve on a non-loopback address without either an auth token or mTLS. Mirrors the HTTP `guard_bind` policy. | `PERSEUS_VAULT_ALLOW_INSECURE_BIND=1` to override (trusted network only) |
+| **Authentication** | `AuthInterceptor` requires `authorization: Bearer <token>` metadata on every RPC; constant-time compared; rejects with `UNAUTHENTICATED`. | `PERSEUS_VAULT_GRPC_AUTH_TOKEN` |
+| **TLS** | `ServerTlsConfig` with a PEM server identity. | `PERSEUS_VAULT_GRPC_TLS_CERT`, `PERSEUS_VAULT_GRPC_TLS_KEY` |
+| **Mutual TLS** | Adds a client-CA root; clients must present a cert chaining to it. Counts as authentication for the bind guard. | `PERSEUS_VAULT_GRPC_TLS_CLIENT_CA` |
+| **Message-size cap** | `max_decoding_message_size` / `max_encoding_message_size` bound per-message memory. | `PERSEUS_VAULT_GRPC_MAX_MSG_BYTES` (default 4 MiB) |
 | **Error hygiene** | Internal error text (SQLite constraints, paths) is logged server-side and genericized to `INTERNAL` before reaching clients (`sanitize_error`). | — |
 
 ### Example: authenticated + mTLS
 
 ```bash
-MIMIR_GRPC_AUTH_TOKEN="$(openssl rand -hex 32)" \
-MIMIR_GRPC_TLS_CERT=/etc/perseus/server.crt \
-MIMIR_GRPC_TLS_KEY=/etc/perseus/server.key \
-MIMIR_GRPC_TLS_CLIENT_CA=/etc/perseus/client-ca.crt \
+PERSEUS_VAULT_GRPC_AUTH_TOKEN="$(openssl rand -hex 32)" \
+PERSEUS_VAULT_GRPC_TLS_CERT=/etc/perseus/server.crt \
+PERSEUS_VAULT_GRPC_TLS_KEY=/etc/perseus/server.key \
+PERSEUS_VAULT_GRPC_TLS_CLIENT_CA=/etc/perseus/client-ca.crt \
 perseus-vault --db /path/to/perseus-vault.db  # (once a --grpc flag is wired)
 ```
 

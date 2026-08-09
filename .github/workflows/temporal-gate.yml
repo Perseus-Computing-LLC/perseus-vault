@@ -1,6 +1,6 @@
 name: Bi-temporal gate
 
-# Guards Mimir's bi-temporal contract: time-travel (mimir_as_of) returns the
+# Guards Perseus Vault's bi-temporal contract: time-travel (perseus_vault_as_of) returns the
 # version that was live at a past instant, supersede moves the prior version to
 # history, and current recall is live-only (a superseded version must never
 # resurface). A single failing check means time-travel or supersede regressed,
@@ -22,7 +22,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  MIMIR_BUNDLED_MODEL_DIR: ${{ github.workspace }}/.model-cache
+  PERSEUS_VAULT_BUNDLED_MODEL_DIR: ${{ github.workspace }}/.model-cache
 
 jobs:
   temporal-gate:

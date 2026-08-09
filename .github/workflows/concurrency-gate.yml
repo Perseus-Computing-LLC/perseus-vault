@@ -42,12 +42,12 @@ jobs:
         run: cargo build --locked --release --no-default-features --tests
       - name: Pool load test at 2x oversubscription (32 clients / pool 16)
         env:
-          MIMIR_LOADTEST_CLIENTS: "32"
-          MIMIR_LOADTEST_WRITES: "25"
-          MIMIR_LOADTEST_READS: "75"
-          MIMIR_POOL_MAX_SIZE: "16"
-          MIMIR_BUSY_TIMEOUT_MS: "5000"
-          MIMIR_LOADTEST_MAX_WALL_SECS: "60"
+          PERSEUS_VAULT_LOADTEST_CLIENTS: "32"
+          PERSEUS_VAULT_LOADTEST_WRITES: "25"
+          PERSEUS_VAULT_LOADTEST_READS: "75"
+          PERSEUS_VAULT_POOL_MAX_SIZE: "16"
+          PERSEUS_VAULT_BUSY_TIMEOUT_MS: "5000"
+          PERSEUS_VAULT_LOADTEST_MAX_WALL_SECS: "60"
         run: |
           cargo test --locked --release --no-default-features \
             pool_load_test_http_transport -- --ignored --nocapture

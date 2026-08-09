@@ -523,10 +523,10 @@ pub fn build_claim_card(
     };
 
     let lifecycle = LifecycleOps {
-        confirm: "mimir_score (persistent importance floor) / mimir_follow (efficacy) — both additive".to_string(),
-        correct: "mimir_correct — creates a correction entity with history; the original row is retained".to_string(),
-        exclude_or_revoke: "mimir_supersede — marks status=deprecated + superseded_by link; original row retained (or mimir_forget to archive)".to_string(),
-        revalidate: "mimir_follow / recall refresh — records efficacy and re-touches last_accessed; or operator re-extraction for extracted classes".to_string(),
+        confirm: "perseus_vault_score (persistent importance floor) / perseus_vault_follow (efficacy) — both additive".to_string(),
+        correct: "perseus_vault_correct — creates a correction entity with history; the original row is retained".to_string(),
+        exclude_or_revoke: "perseus_vault_supersede — marks status=deprecated + superseded_by link; original row retained (or perseus_vault_forget to archive)".to_string(),
+        revalidate: "perseus_vault_follow / recall refresh — records efficacy and re-touches last_accessed; or operator re-extraction for extracted classes".to_string(),
     };
 
     // Deterministic digest subset (version 1): claim, class, times, trust
@@ -656,7 +656,7 @@ mod tests {
     use std::fs;
 
     fn temp_db() -> (TestDatabase, String) {
-        let db = TestDatabase::new("mimir-test-claim-cards");
+        let db = TestDatabase::new("perseus_vault-test-claim-cards");
         let path = db.path().to_string();
         (db, path)
     }

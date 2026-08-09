@@ -214,79 +214,6 @@ pub struct JsonRpcError {
     pub message: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ToolPrefix {
-    Canonical,
-    Mimir,
-    Mneme,
-    Other,
-}
-
-fn classify_tool_prefix(name: &str) -> ToolPrefix {
-    if name.starts_with("perseus_vault_") {
-        ToolPrefix::Canonical
-    } else if name.starts_with("mimir_") {
-        ToolPrefix::Mimir
-    } else if name.starts_with("mneme_") {
-        ToolPrefix::Mneme
-    } else {
-        ToolPrefix::Other
-    }
-}
-
-struct AliasUsageCounters {
-    canonical_calls: std::sync::atomic::AtomicU64,
-    mimir_calls: std::sync::atomic::AtomicU64,
-    mneme_calls: std::sync::atomic::AtomicU64,
-    other_calls: std::sync::atomic::AtomicU64,
-    since_process_start_unix_ms: u64,
-}
-
-impl AliasUsageCounters {
-    fn new() -> Self {
-        let since_process_start_unix_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-        Self {
-            canonical_calls: std::sync::atomic::AtomicU64::new(0),
-            mimir_calls: std::sync::atomic::AtomicU64::new(0),
-            mneme_calls: std::sync::atomic::AtomicU64::new(0),
-            other_calls: std::sync::atomic::AtomicU64::new(0),
-            since_process_start_unix_ms,
-        }
-    }
-
-    fn record(&self, prefix: ToolPrefix) {
-        use std::sync::atomic::Ordering;
-        let counter = match prefix {
-            ToolPrefix::Canonical => &self.canonical_calls,
-            ToolPrefix::Mimir => &self.mimir_calls,
-            ToolPrefix::Mneme => &self.mneme_calls,
-            ToolPrefix::Other => &self.other_calls,
-        };
-        counter.fetch_add(1, Ordering::Relaxed);
-    }
-
-    fn snapshot(&self) -> Value {
-        use std::sync::atomic::Ordering;
-        json!({
-            "canonical_calls": self.canonical_calls.load(Ordering::Relaxed),
-            "mimir_calls": self.mimir_calls.load(Ordering::Relaxed),
-            "mneme_calls": self.mneme_calls.load(Ordering::Relaxed),
-            "other_calls": self.other_calls.load(Ordering::Relaxed),
-            "since_process_start_unix_ms": self.since_process_start_unix_ms,
-        })
-    }
-}
-
-fn is_alias_usage_tool(name: &str) -> bool {
-    name.strip_prefix("perseus_vault_")
-        .or_else(|| name.strip_prefix("mimir_"))
-        .or_else(|| name.strip_prefix("mneme_"))
-        == Some("alias_usage")
-}
-
 pub struct MCPState {
     // #210: AtomicBool so the HTTP/SSE transport can share &MCPState across
     // concurrent requests without a Mutex (which would re-serialize them now
@@ -298,7 +225,6 @@ pub struct MCPState {
     // clientInfo (single-agent / legacy) → unscoped, preserving old behavior.
     // RwLock: set once at initialize, read per tools/call across the shared &state.
     pub session_agent_id: std::sync::RwLock<String>,
-    alias_usage: AliasUsageCounters,
 }
 
 impl MCPState {
@@ -306,12 +232,11 @@ impl MCPState {
         MCPState {
             initialized: std::sync::atomic::AtomicBool::new(false),
             session_agent_id: std::sync::RwLock::new(String::new()),
-            alias_usage: AliasUsageCounters::new(),
         }
     }
 }
 
-/// Parse the `MIMIR_IDLE_TIMEOUT_SECS` env value into an idle-watchdog duration.
+/// Parse the `PERSEUS_VAULT_IDLE_TIMEOUT_SECS` env value into an idle-watchdog duration.
 ///
 /// - unset / "0" / unparseable  -> disabled (None). DEFAULT IS OFF since #748:
 ///   inactivity is NOT proof of abandonment — a quiet-but-alive host (Claude
@@ -333,7 +258,7 @@ pub fn parse_idle_timeout(raw: Option<&str>) -> Option<std::time::Duration> {
             Ok(secs) => Some(std::time::Duration::from_secs(secs)),
             Err(_) => {
                 eprintln!(
-                    "mimir: ignoring unparseable MIMIR_IDLE_TIMEOUT_SECS value {:?} — idle watchdog disabled",
+                    "perseus-vault: ignoring unparseable PERSEUS_VAULT_IDLE_TIMEOUT_SECS value {:?} — idle watchdog disabled",
                     v
                 );
                 None
@@ -358,7 +283,7 @@ pub fn run_server(db: std::sync::Arc<Database>) {
     let mut stdout = std::io::stdout();
     let state = MCPState::new();
 
-    // Idle watchdog — OPT-IN since #748 (MIMIR_IDLE_TIMEOUT_SECS, default off).
+    // Idle watchdog — OPT-IN since #748 (PERSEUS_VAULT_IDLE_TIMEOUT_SECS, default off).
     //
     // The original #57228 guard treated 600s of silence as proof of orphanhood.
     // That proxy is wrong on every platform without a real parent-death signal
@@ -369,10 +294,10 @@ pub fn run_server(db: std::sync::Arc<Database>) {
     // detection (PR_SET_PDEATHSIG on Linux; the ppid watcher thread below on
     // all Unix), so the flat timer remains only as an opt-in for hosts that
     // leak a child's stdin write-end while STAYING ALIVE (the actual #57228
-    // Hermes-worker topology) — those hosts set MIMIR_IDLE_TIMEOUT_SECS when
+    // Hermes-worker topology) — those hosts set PERSEUS_VAULT_IDLE_TIMEOUT_SECS when
     // spawning. EOF on stdin (well-behaved host shutdown) exits regardless.
     let idle_timeout: Option<std::time::Duration> =
-        parse_idle_timeout(std::env::var("MIMIR_IDLE_TIMEOUT_SECS").ok().as_deref());
+        parse_idle_timeout(std::env::var("PERSEUS_VAULT_IDLE_TIMEOUT_SECS").ok().as_deref());
 
     // Read stdin on a dedicated thread so the main loop can time out on silence.
     let (tx, rx) = std::sync::mpsc::channel::<std::io::Result<String>>();
@@ -389,7 +314,7 @@ pub fn run_server(db: std::sync::Arc<Database>) {
         // EOF: closing tx makes the main loop's recv return Disconnected.
     });
 
-    eprintln!("mimir: MCP server ready");
+    eprintln!("perseus-vault: MCP server ready");
 
     // --- Deterministic parent-death detection (Linux, fixes #547) ---
     //
@@ -414,9 +339,10 @@ pub fn run_server(db: std::sync::Arc<Database>) {
                 libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM, 0, 0, 0);
             }
             if is_orphaned_by_ppid() {
-                eprintln!("mimir: parent already dead at server start — exiting (orphan-reap race guard, #547)");
+                eprintln!("perseus-vault: parent already dead at server start — exiting (orphan-reap race guard, #547)");
                 return;
             }
+
         }
     }
 
@@ -438,7 +364,7 @@ pub fn run_server(db: std::sync::Arc<Database>) {
             std::thread::sleep(std::time::Duration::from_secs(5));
             if is_orphaned_by_ppid() {
                 eprintln!(
-                    "mimir: parent process died — exiting orphaned stdio server (orphan watcher, #547/#748)"
+                    "perseus-vault: parent process died — exiting orphaned stdio server (orphan watcher, #547/#748)"
                 );
                 // process::exit from the watcher: the main loop is blocked in
                 // recv() and cannot be woken without traffic. SQLite is in WAL
@@ -454,7 +380,7 @@ pub fn run_server(db: std::sync::Arc<Database>) {
                 Ok(l) => l,
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                     eprintln!(
-                        "mimir: no client activity for {}s — exiting idle stdio server (orphan-leak guard, #57228)",
+                        "perseus-vault: no client activity for {}s — exiting idle stdio server (orphan-leak guard, #57228)",
                         timeout.as_secs()
                     );
                     break;
@@ -470,7 +396,7 @@ pub fn run_server(db: std::sync::Arc<Database>) {
         let line = match line {
             Ok(l) => l,
             Err(e) => {
-                eprintln!("mimir: stdin read error: {}", e);
+                eprintln!("perseus-vault: stdin read error: {}", e);
                 break;
             }
         };
@@ -484,14 +410,14 @@ pub fn run_server(db: std::sync::Arc<Database>) {
         // kernels that ignore the signal or on non-Linux platforms this is the
         // deterministic fallback. One getppid() syscall per request is negligible.
         if is_orphaned_by_ppid() {
-            eprintln!("mimir: ppid == 1 detected — parent died, exiting (orphan-reap, #547)");
+            eprintln!("perseus-vault: ppid == 1 detected — parent died, exiting (orphan-reap, #547)");
             break;
         }
 
         let request: JsonRpcRequest = match serde_json::from_str(&line) {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("mimir: JSON parse error: {} in line: {}", e, line);
+                eprintln!("perseus-vault: JSON parse error: {} in line: {}", e, line);
                 let error_response = json!({
                     "jsonrpc": "2.0",
                     "id": Value::Null,
@@ -523,7 +449,7 @@ pub fn run_server(db: std::sync::Arc<Database>) {
             // pipes, so the MCP session continues uninterrupted.
             if crate::live_update::handoff_pending() {
                 if let Err(e) = crate::live_update::perform_handoff() {
-                    eprintln!("mimir: handoff spawn failed: {e}");
+                    eprintln!("perseus-vault: handoff spawn failed: {e}");
                 }
                 // Exit regardless: on success the child owns the session; on
                 // failure the client sees EOF and can restart cleanly (the
@@ -559,9 +485,8 @@ pub fn handle_request(
                     "serverInfo": {
                         // Tracks Cargo.toml's package name automatically, so a
                         // future rename doesn't leave this handshake reporting
-                        // stale branding like it did across Mimir -> Mneme ->
-                        // Perseus Vault (this was hardcoded to "mimir" the
-                        // whole time).
+                        // stale branding (it was hardcoded through the earlier
+                        // product renames).
                         "name": env!("CARGO_PKG_NAME"),
                         "version": env!("CARGO_PKG_VERSION")
                     },
@@ -625,14 +550,6 @@ pub fn handle_request(
                 None => return Some(error_response(id, -32602, "Missing tool name")),
             };
 
-            // Count only the original call name at the tools/call boundary,
-            // before aliases are normalized. The readout itself is excluded so
-            // repeated operator checks do not perturb the evidence being read.
-            let is_alias_usage = is_alias_usage_tool(tool_name);
-            if !is_alias_usage {
-                state.alias_usage.record(classify_tool_prefix(tool_name));
-            }
-
             let mut tool_args = params.get("arguments").cloned().unwrap_or(json!({}));
 
             // #684: stamp the captured session identity so tools that enforce
@@ -659,32 +576,32 @@ pub fn handle_request(
             // an opt-in governance surface).
             {
                 const SCOPE_MUTATION_TOOLS: &[&str] = &[
-                    "mimir_remember",
-                    "mimir_reject_value",
-                    "mimir_forget",
-                    "mimir_link",
-                    "mimir_unlink",
-                    "mimir_supersede",
-                    "mimir_state_set",
-                    "mimir_embed",
-                    "mimir_artifact_register",
-                    "mimir_learned_artifact_register",
-                    "mimir_expire",
-                    "mimir_redact",
-                    "mimir_erase",
-                    "mimir_correct",
-                    "mimir_follow",
+                    "perseus_vault_remember",
+                    "perseus_vault_reject_value",
+                    "perseus_vault_forget",
+                    "perseus_vault_link",
+                    "perseus_vault_unlink",
+                    "perseus_vault_supersede",
+                    "perseus_vault_state_set",
+                    "perseus_vault_embed",
+                    "perseus_vault_artifact_register",
+                    "perseus_vault_learned_artifact_register",
+                    "perseus_vault_expire",
+                    "perseus_vault_redact",
+                    "perseus_vault_erase",
+                    "perseus_vault_correct",
+                    "perseus_vault_follow",
                 ];
                 const SCOPE_READ_TOOLS: &[&str] = &[
-                    "mimir_recall",
-                    "mimir_recall_batch",
-                    "mimir_recall_layer",
-                    "mimir_scan",
-                    "mimir_context",
-                    "mimir_ask",
-                    "mimir_artifact_manifest",
-                    "mimir_artifact_excerpt",
-                    "mimir_artifact_verify_value",
+                    "perseus_vault_recall",
+                    "perseus_vault_recall_batch",
+                    "perseus_vault_recall_layer",
+                    "perseus_vault_scan",
+                    "perseus_vault_context",
+                    "perseus_vault_ask",
+                    "perseus_vault_artifact_manifest",
+                    "perseus_vault_artifact_excerpt",
+                    "perseus_vault_artifact_verify_value",
                 ];
                 let profile = tool_args
                     .get("requesting_agent_id")
@@ -727,11 +644,7 @@ pub fn handle_request(
                 .unwrap_or("");
             crate::db::set_chancery_writ_id(chancery_writ_id);
 
-            let result_text = if is_alias_usage {
-                state.alias_usage.snapshot().to_string()
-            } else {
-                call_tool(tool_name, db, tool_args, id.clone())
-            };
+            let result_text = call_tool(tool_name, db, tool_args, id.clone());
 
             // Try to parse the result as JSON for structuredContent
             let structured: Option<serde_json::Value> = serde_json::from_str(&result_text).ok();
@@ -765,30 +678,17 @@ pub fn handle_request(
     }
 }
 
-/// Clone a canonical `perseus_vault_*` tool under one retained legacy prefix.
-/// Legacy aliases remain callable during the v2 observation window; only the
-/// canonical public registry and documentation lead with Perseus Vault.
-fn legacy_alias_tool(tool: &serde_json::Value, prefix: &str) -> Option<serde_json::Value> {
-    let name = tool.get("name")?.as_str()?;
-    let suffix = name.strip_prefix("perseus_vault_")?;
-    let mut alias = tool.clone();
-    alias["name"] = serde_json::Value::String(format!("{}_{}", prefix, suffix));
-    Some(alias)
-}
-
 /// Parse-once cache of the canonical Perseus Vault tool registry. The embedded
-/// literal keeps legacy names only as an implementation migration detail; names
-/// and descriptions are canonicalized before any public registry is built.
-/// `mimir_*` and `mneme_*` are synthesized solely as retained compatibility
-/// aliases at advertise time by `build_tools_array`.
+/// literal is the single source of truth for tool schemas; no legacy aliases
+/// are synthesized.
 fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     static BASE: OnceLock<Vec<serde_json::Value>> = OnceLock::new();
     BASE.get_or_init(|| {
-        let mut registry = serde_json::from_str::<serde_json::Value>(
+        let registry = serde_json::from_str::<serde_json::Value>(
         r###"[
   {
     "name": "perseus_vault_remember",
-    "description": "Store or update an entity by (category, key). Idempotent — call as often as you want, same key returns an update. NEAR-DUPLICATE MERGING (#531): a NEW key whose body is >=70% trigram-similar to an existing entity in the same category+workspace does NOT create a new entity — the write is folded into the existing one (result: action='deduped', deduped=true, merged_into=<id>). Right for conversational memory; wrong for bulk ingest of templated records, which are similar by construction and will silently collapse to a handful of rows. For bulk ingest pass skip_dedup=true (or use mimir_ingest_file), and check the returned action. Prefer recall_when triggers (retrieve when relevant) over always_on=true (inject unconditionally): the recall-first mimir_context hard-caps the always-on set and warns when it overflows, so reserve always_on for genuinely identity-critical facts. Optional certainty (0.0-1.0) is used by mimir_conflicts for typed-entity conflict detection. Pass derived_from (ids or {category,key} pairs of the memories you recalled) to auto-mark those sources useful — cited memories rank higher and decay slower. Use this for saving facts, decisions, architecture notes, and conventions. When encryption is enabled, body_json is encrypted at rest with AES-256-GCM.",
+    "description": "Store or update an entity by (category, key). Idempotent — call as often as you want, same key returns an update. NEAR-DUPLICATE MERGING (#531): a NEW key whose body is >=70% trigram-similar to an existing entity in the same category+workspace does NOT create a new entity — the write is folded into the existing one (result: action='deduped', deduped=true, merged_into=<id>). Right for conversational memory; wrong for bulk ingest of templated records, which are similar by construction and will silently collapse to a handful of rows. For bulk ingest pass skip_dedup=true (or use perseus_vault_ingest_file), and check the returned action. Prefer recall_when triggers (retrieve when relevant) over always_on=true (inject unconditionally): the recall-first perseus_vault_context hard-caps the always-on set and warns when it overflows, so reserve always_on for genuinely identity-critical facts. Optional certainty (0.0-1.0) is used by perseus_vault_conflicts for typed-entity conflict detection. Pass derived_from (ids or {category,key} pairs of the memories you recalled) to auto-mark those sources useful — cited memories rank higher and decay slower. Use this for saving facts, decisions, architecture notes, and conventions. When encryption is enabled, body_json is encrypted at rest with AES-256-GCM.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -869,7 +769,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
         },
         "valid_from_unix_ms": {
           "type": "integer",
-          "description": "Application-time period start (#363): when the fact became TRUE IN THE WORLD, independent of when it was recorded. Set in the past for retroactive facts ('this was true last week, we just learned it') without rewriting transaction history. Default: transaction time (now). Query with mimir_valid_at / mimir_bitemporal / recall's valid_at filter."
+          "description": "Application-time period start (#363): when the fact became TRUE IN THE WORLD, independent of when it was recorded. Set in the past for retroactive facts ('this was true last week, we just learned it') without rewriting transaction history. Default: transaction time (now). Query with perseus_vault_valid_at / perseus_vault_bitemporal / recall's valid_at filter."
         },
         "valid_to_unix_ms": {
           "type": "integer",
@@ -994,7 +894,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Remember Entity"
   },
   {
-    "name": "mimir_recall",
+    "name": "perseus_vault_recall",
     "description": "Search entities with FTS5 keyword search. Words are OR'd together. Returns entities sorted by relevance with expanded content/summary fields at top level. Use this to find previously stored facts, decisions, or architecture notes. When encryption is enabled, body_json is decrypted transparently.",
     "inputSchema": {
       "type": "object",
@@ -1102,7 +1002,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
         },
         "preview_cap": {
           "type": "integer",
-          "description": "If set, truncate body_json at N chars and append drill-down footer. Use mimir_get_entity to read full body."
+          "description": "If set, truncate body_json at N chars and append drill-down footer. Use perseus_vault_get_entity to read full body."
         },
         "content_weight": {
           "type": "number",
@@ -1228,7 +1128,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Recall Entities"
   },
   {
-    "name": "mimir_recall_batch",
+    "name": "perseus_vault_recall_batch",
     "description": "Recall entities across a batch of queries, fusing their results server-side using reciprocal rank fusion (RRF) to merge, deduplicate, and surface the most globally relevant memories first.",
     "inputSchema": {
       "type": "object",
@@ -1397,7 +1297,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Recall Entities Batch"
   },
   {
-    "name": "mimir_recall_layer",
+    "name": "perseus_vault_recall_layer",
     "description": "Recall entities from a specific biomimetic memory layer (world, episodic, semantic).",
     "inputSchema": {
       "type": "object",
@@ -1434,7 +1334,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     }
   },
   {
-    "name": "mimir_scan",
+    "name": "perseus_vault_scan",
     "description": "Enumerate every entity in a category (or the whole store) deterministically, page by page (#562). This is the first-class 'list all / export / sync / reset' path: pages are keyed by immutable entity id (ascending) with a continuation cursor, so repeated calls walk the full set exactly once — unlike recall(query=\"\") pagination, whose relevance ordering mutates as recalls reinforce entities (pages can skip or repeat rows) and whose offset is capped. Call with no cursor for the first page, then pass back next_cursor until has_more is false. Read-only: scanning does not bump retrieval counts or decay. Note the recall query contract this complements: recall's query=\"\" is match-all enumeration; \"*\" is a literal FTS5 term (NOT a glob) and matches nothing.",
     "inputSchema": {
       "type": "object",
@@ -1492,7 +1392,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Scan / Enumerate Entities"
   },
   {
-    "name": "mimir_hygiene",
+    "name": "perseus_vault_hygiene",
     "description": "Read-only hygiene report: surface likely low-signal memories so a startup-memory block stays dense without manual forensics. Scores every active memory by startup 'actionability' (the same signal as recall's startup mode) — concrete anchors like issue/ticket keys, #refs, paths, URLs, named systems, and decision/escalation language score high; vague, date-only titles (e.g. '2026-07-13') and very short bodies score low — and returns the worst offenders (below `threshold`) with the reasons they were flagged. Keyset-scans in pages; never bumps retrieval counts or decay. Use it to find archive/consolidate candidates before curating startup recall.",
     "inputSchema": {
       "type": "object",
@@ -1551,7 +1451,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Startup-Memory Hygiene Report"
   },
   {
-    "name": "mimir_promote",
+    "name": "perseus_vault_promote",
     "description": "Promote a memory across the class ladder (to_category) and/or the scope ladder (to_workspace_hash) per the shared-memory promotion ladder (perseus docs/shared-memory-promotion-ladder.md §4). Creates a new entity that carries a promoted_from provenance record (source category/key/id/scope, reason, timestamp) and links the source to it with relationship='promoted_to'. The source entity is never edited or hidden — raw evidence stays reachable. Uses skip_dedup internally so the promoted copy always creates its own key even when near-identical to the source.",
     "inputSchema": {
       "type": "object",
@@ -1599,7 +1499,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Promote Memory"
   },
   {
-    "name": "mimir_demote",
+    "name": "perseus_vault_demote",
     "description": "Demote a governed memory exactly one rung down the durable-memory ladder. Writes a provenance-preserving copy, a demoted_to link, and an append-only demotion journal event.",
     "inputSchema": {"type":"object","properties":{
       "from_category":{"type":"string"},"from_key":{"type":"string"},"to_category":{"type":"string"},"to_key":{"type":"string"},"reason":{"type":"string"}
@@ -1609,7 +1509,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Demote Memory"
   },
   {
-    "name": "mimir_beliefs",
+    "name": "perseus_vault_beliefs",
     "description": "Derived-belief overlay (#717, spec: docs/specs/belief-overlay.md): compute the current effective belief for a topic from the live entity store, with fresh local corrections always outranking stale global beliefs regardless of semantic similarity (precedence tiers are absolute, never blended).",
     "inputSchema": {
       "type": "object",
@@ -1636,7 +1536,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Derived Beliefs Overlay"
   },
   {
-    "name": "mimir_claim_card",
+    "name": "perseus_vault_claim_card",
     "description": "Evidence-backed claim card (#852, spec: docs/specs/claim-cards.md): a deterministic, versioned projection of one entity's claim, provenance class (source_human/fact_extracted/fact_derived/inference_agent), valid vs recorded time, confidence/support, supersession/contradiction/stale state, evidence references, a sanitized agent_projection hash-bound to the selected evidence and policy, and machine-readable reason codes (serveable / archived / scope_mismatch / revoked_access + flags). Read-only view over existing entities and links — never a second source of truth.",
     "inputSchema": {
       "type": "object",
@@ -1672,9 +1572,9 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Evidence-Backed Claim Card"
   },
   {
-    "name": "mimir_semantic_search",
-    "description": "Dense-only semantic search: find entities by meaning, ranked purely by embedding similarity (no keyword fallback). On by default via the bundled in-process ONNX model — zero config, zero network. A one-tool shortcut for 'find things like this'. For fused keyword+vector results use mimir_recall.",
-    "inputSchema": {
+    "name": "perseus_vault_semantic_search",
+    "description": "Dense-only semantic search: find entities by meaning, ranked purely by embedding similarity (no keyword fallback). On by default via the bundled in-process ONNX model — zero config, zero network. A one-tool shortcut for 'find things like this'. For fused keyword+vector results use perseus_vault_recall.",
+      "inputSchema": {
       "type": "object",
       "properties": {
         "query": {
@@ -1725,8 +1625,8 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Semantic Search Entities"
   },
   {
-    "name": "mimir_ask",
-    "description": "Ask a natural language question and get a grounded answer from stored memories via RAG. Internally recalls top-k entities, assembles context, and queries the configured LLM (Ollama) for an answer with cited sources. Requires --llm-endpoint to be set. LLM request timeout defaults to 30s; set MIMIR_LLM_TIMEOUT_SECS for large/cold models that need longer to load (#528).",
+    "name": "perseus_vault_ask",
+    "description": "Ask a natural language question and get a grounded answer from stored memories via RAG. Internally recalls top-k entities, assembles context, and queries the configured LLM (Ollama) for an answer with cited sources. Requires --llm-endpoint to be set. LLM request timeout defaults to 30s; set PERSEUS_VAULT_LLM_TIMEOUT_SECS for large/cold models that need longer to load (#528).",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -1789,8 +1689,8 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Ask Question from Memories"
   },
   {
-    "name": "mimir_get_entity",
-    "description": "Get an entity by ID with its full body_json content. Use after mimir_recall with preview_cap to read the complete body of a truncated result. The drill-down footer embedded in preview-capped results references this tool with the entity ID to use.",
+    "name": "perseus_vault_get_entity",
+    "description": "Get an entity by ID with its full body_json content. Use after perseus_vault_recall with preview_cap to read the complete body of a truncated result. The drill-down footer embedded in preview-capped results references this tool with the entity ID to use.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -1848,8 +1748,8 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Get Entity by ID"
   },
   {
-    "name": "mimir_history",
-    "description": "List superseded (historical) versions of a fact (category + key), newest first. Each entry was the live fact for an interval before it was overwritten. The companion to mimir_as_of: as_of returns the single version live at one instant; history returns the version trail. Paginated: returns the `limit` newest versions (default 20) starting at `offset`; `total` in the response is the FULL trail size, so total > returned means there are more pages. Returns an empty list if the fact has never been overwritten (its only version is the current live one in recall).",
+    "name": "perseus_vault_history",
+    "description": "List superseded (historical) versions of a fact (category + key), newest first. Each entry was the live fact for an interval before it was overwritten. The companion to perseus_vault_as_of: as_of returns the single version live at one instant; history returns the version trail. Paginated: returns the `limit` newest versions (default 20) starting at `offset`; `total` in the response is the FULL trail size, so total > returned means there are more pages. Returns an empty list if the fact has never been overwritten (its only version is the current live one in recall).",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -1879,8 +1779,8 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     }
   },
   {
-    "name": "mimir_as_of",
-    "description": "Transaction-time time-travel: return the version of a fact (category + key) that Mneme believed at a given past instant. When a fact is overwritten, the prior version is kept in history; this returns whichever version was live at as_of_unix_ms. Use to answer 'what did we believe about X back then?' or to audit how a fact changed. For the orthogonal valid-time axis ('what was actually TRUE in the world at time T') use mimir_valid_at; for both axes at once use mimir_bitemporal. Returns found=false if the fact had not been recorded yet at that time. If the instant falls inside a window compacted by history retention (#398), returns an explicit marker (compacted=true, versions_compacted, digest) instead of the original — now unrecoverable — versions.",
+    "name": "perseus_vault_as_of",
+    "description": "Transaction-time time-travel: return the version of a fact (category + key) that Perseus Vault believed at a given past instant. When a fact is overwritten, the prior version is kept in history; this returns whichever version was live at as_of_unix_ms. Use to answer 'what did we believe about X back then?' or to audit how a fact changed. For the orthogonal valid-time axis ('what was actually TRUE in the world at time T') use perseus_vault_valid_at; for both axes at once use perseus_vault_bitemporal. Returns found=false if the fact had not been recorded yet at that time. If the instant falls inside a window compacted by history retention (#398), returns an explicit marker (compacted=true, versions_compacted, digest) instead of the original — now unrecoverable — versions.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -1952,8 +1852,8 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Time-Travel Entity Lookup"
   },
   {
-    "name": "mimir_valid_at",
-    "description": "Valid-time (application-time) lookup: return the version of a fact (category + key) that — per CURRENT knowledge — was actually true in the world at a given instant. Orthogonal to mimir_as_of: as_of answers 'what did we BELIEVE at time T' (transaction time); valid_at answers 'what WAS TRUE at time T, as we understand it now'. Facts carry a valid period [valid_from, valid_to) settable on mimir_remember; a later-recorded version's claim supersedes earlier claims for the instants it covers. Returns found=false if no version's valid period contains the instant.",
+    "name": "perseus_vault_valid_at",
+    "description": "Valid-time (application-time) lookup: return the version of a fact (category + key) that — per CURRENT knowledge — was actually true in the world at a given instant. Orthogonal to perseus_vault_as_of: as_of answers 'what did we BELIEVE at time T' (transaction time); valid_at answers 'what WAS TRUE at time T, as we understand it now'. Facts carry a valid period [valid_from, valid_to) settable on perseus_vault_remember; a later-recorded version's claim supersedes earlier claims for the instants it covers. Returns found=false if no version's valid period contains the instant.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -2029,8 +1929,8 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Valid-Time Lookup (What Was True)"
   },
   {
-    "name": "mimir_bitemporal",
-    "description": "Full bi-temporal query (SQL:2011 SYSTEM_TIME + APPLICATION_TIME): 'as of transaction time tx_at, which version did we believe was true in the world at valid time valid_at?' Returns the exact cell of the bi-temporal rectangle — the audit-grade 'who knew what, as-of-when' question. Combines both axes: mimir_as_of is this with valid_at pinned to tx_at; mimir_valid_at is this with tx_at pinned to now. Retroactive and proactive updates land in the correct rectangle cell. Returns found=false if nothing recorded by tx_at was valid at valid_at.",
+    "name": "perseus_vault_bitemporal",
+    "description": "Full bi-temporal query (SQL:2011 SYSTEM_TIME + APPLICATION_TIME): 'as of transaction time tx_at, which version did we believe was true in the world at valid time valid_at?' Returns the exact cell of the bi-temporal rectangle — the audit-grade 'who knew what, as-of-when' question. Combines both axes: perseus_vault_as_of is this with valid_at pinned to tx_at; perseus_vault_valid_at is this with tx_at pinned to now. Retroactive and proactive updates land in the correct rectangle cell. Returns found=false if nothing recorded by tx_at was valid at valid_at.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -2114,7 +2014,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Bi-Temporal Rectangle Query"
   },
   {
-    "name": "mimir_forget",
+    "name": "perseus_vault_forget",
     "description": "Soft-delete an entity by setting archived=1. The entity is hidden from queries but recoverable. Use this to clean up stale or incorrect facts without permanent data loss.",
     "inputSchema": {
       "type": "object",
@@ -2161,8 +2061,8 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Forget Entity (Soft-Delete)"
   },
   {
-    "name": "mimir_ingest",
-    "description": "Sync external data connectors (GitHub issues, file watcher) into Mneme. Call with no arguments to run all enabled connectors, or specify a connector name to run only that one. Use dry_run=true to preview without storing.",
+    "name": "perseus_vault_ingest",
+    "description": "Sync external data connectors (GitHub issues, file watcher) into Perseus Vault. Call with no arguments to run all enabled connectors, or specify a connector name to run only that one. Use dry_run=true to preview without storing.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -2203,8 +2103,8 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Ingest External Data"
   },
   {
-    "name": "mimir_ingest_file",
-    "description": "Ingest a document file into memory by extracting its text LOCALLY (no cloud, no network). Plaintext/markdown/structured-text work in any build; DOCX and PDF require a binary built with --features multimodal (otherwise a clear error is returned). The extracted text is stored as a normal entity (recallable via mimir_recall). category defaults to 'document', key defaults to the file name.",
+    "name": "perseus_vault_ingest_file",
+    "description": "Ingest a document file into memory by extracting its text LOCALLY (no cloud, no network). Plaintext/markdown/structured-text work in any build; DOCX and PDF require a binary built with --features multimodal (otherwise a clear error is returned). The extracted text is stored as a normal entity (recallable via perseus_vault_recall). category defaults to 'document', key defaults to the file name.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -2261,7 +2161,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Ingest Document File"
   },
   {
-    "name": "mimir_artifact_register",
+    "name": "perseus_vault_artifact_register",
     "description": "Register an immutable artifact by reading a local file, hashing its exact bytes with full SHA-256, and storing a scope-bound metadata binding plus the preserved original bytes. Returns the compact deterministic manifest by default. This first slice accepts only uncompressed source bytes so retrieval anchors stay exact to the original artifact.",
     "inputSchema": {
       "type": "object",
@@ -2293,7 +2193,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Register Immutable Artifact"
   },
   {
-    "name": "mimir_learned_artifact_register",
+    "name": "perseus_vault_learned_artifact_register",
     "description": "#876 governed distillation: register a learned-memory artifact (trained weights / distilled cartridge) bound to its source entities with hash-only evidence, gated fail-closed on a COMPLETED 'learned_memory' action receipt (no receipt, no registration). Every source (category, key) in the workspace is snapshotted (entity id + normalized body digest + recorded_at) into learned_artifact_sources; physically erasing or purging a source revokes the binding (serve paths refuse revoked artifacts), superseding a source flags it stale (retraining trigger). Returns the artifact sha256, source-bindings count, and receipt-replay evidence.",
     "inputSchema": {
       "type": "object",
@@ -2329,7 +2229,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Register Governed Learned Artifact"
   },
   {
-    "name": "mimir_workspace_bind",
+    "name": "perseus_vault_workspace_bind",
     "description": "#879: bind a Hermes profile to a Vault workspace (one profile <-> one workspace; re-binding switches workspace and resets lifecycle state). access_mode read_write | read_only; read_only bindings deny mutations at the tool boundary. Journaled (workspace_bound / workspace_rebound).",
     "inputSchema": {
       "type": "object",
@@ -2345,7 +2245,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Bind Hermes Profile to Workspace"
   },
   {
-    "name": "mimir_workspace_unbind",
+    "name": "perseus_vault_workspace_unbind",
     "description": "#879: unbind a Hermes profile from its workspace (lifecycle: active/quarantined -> unbound; row retained for audit). Journaled (workspace_unbound).",
     "inputSchema": {
       "type": "object",
@@ -2359,7 +2259,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Unbind Hermes Profile"
   },
   {
-    "name": "mimir_workspace_quarantine",
+    "name": "perseus_vault_workspace_quarantine",
     "description": "#879: operator lifecycle control — quarantine an active binding (stops all access until reactivated) or reactivate a quarantined/unbound binding. Journaled (workspace_quarantined / workspace_reactivated).",
     "inputSchema": {
       "type": "object",
@@ -2374,7 +2274,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Quarantine or Reactivate Profile Binding"
   },
   {
-    "name": "mimir_workspace_status",
+    "name": "perseus_vault_workspace_status",
     "description": "#879: diagnostics — all profile <-> workspace bindings with lifecycle state, access mode, heartbeat, and staleness signal; distinguishes live, stale, quarantined, and unbound bindings.",
     "inputSchema": {
       "type": "object",
@@ -2390,7 +2290,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Workspace Binding Status"
   },
   {
-    "name": "mimir_artifact_manifest",
+    "name": "perseus_vault_artifact_manifest",
     "description": "Serve the compact deterministic manifest for one artifact identity after scope + visibility filtering. When workspace_hash is omitted, only global bindings are considered — an artifact hash alone is a pointer, not an access grant.",
     "inputSchema": {
       "type": "object",
@@ -2416,7 +2316,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Serve Artifact Manifest"
   },
   {
-    "name": "mimir_artifact_excerpt",
+    "name": "perseus_vault_artifact_excerpt",
     "description": "Retrieve an exact bounded excerpt from the preserved original artifact bytes by either a half-open byte range [start,end) or an inclusive 1-indexed line range. Returns exact source anchors plus base64 bytes, and UTF-8 text when the slice decodes cleanly.",
     "inputSchema": {
       "type": "object",
@@ -2445,7 +2345,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Retrieve Exact Artifact Excerpt"
   },
   {
-    "name": "mimir_artifact_log_digest",
+    "name": "perseus_vault_artifact_log_digest",
     "description": "Build a deterministic, evidence-preserving navigation digest over a visible UTF-8 log artifact. Repeated non-protected templates are collapsed with exact counts and first/last source anchors. Lines containing error, warn, exception, fatal, panic, denied, refused, timeout, assertion, or traceback remain verbatim. This is never an LLM summary or replacement for original bytes.",
     "inputSchema": {
       "type": "object",
@@ -2473,7 +2373,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Build Deterministic Evidence-Preserving Log Digest"
   },
   {
-    "name": "mimir_artifact_verify_value",
+    "name": "perseus_vault_artifact_verify_value",
     "description": "Verify that a candidate value occurs verbatim in the preserved original artifact bytes, with bounded exact-match search only (no regex). Returns exact source anchors for each match found.",
     "inputSchema": {
       "type": "object",
@@ -2502,7 +2402,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Verify Candidate Against Original Artifact Bytes"
   },
   {
-    "name": "mimir_embed",
+    "name": "perseus_vault_embed",
     "description": "Generate and store dense vector embeddings for entities via Ollama /api/embed. Supports single entity (category+key) or batch mode (batch_category). Requires --llm-endpoint to be set.",
     "inputSchema": {
       "type": "object",
@@ -2549,8 +2449,8 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Generate Entity Embeddings"
   },
   {
-    "name": "mimir_prune",
-    "description": "Bulk archive entities by category, decay threshold, or age. Use dry_run=true to preview without archiving. Useful for cleaning stale or low-quality memories. With scope='history' (#398) it instead evicts old superseded versions from entity_history under the given (or env-configured MIMIR_HISTORY_*) bounds, rolling each evicted run into a compaction tombstone; dry_run reports the rows and bytes that would be evicted.",
+    "name": "perseus_vault_prune",
+    "description": "Bulk archive entities by category, decay threshold, or age. Use dry_run=true to preview without archiving. Useful for cleaning stale or low-quality memories. With scope='history' (#398) it instead evicts old superseded versions from entity_history under the given (or env-configured PERSEUS_VAULT_HISTORY_*) bounds, rolling each evicted run into a compaction tombstone; dry_run reports the rows and bytes that would be evicted.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -2578,15 +2478,15 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
         },
         "max_age_days": {
           "type": "integer",
-          "description": "scope='history': evict versions invalidated more than this many days ago (overrides MIMIR_HISTORY_MAX_AGE_DAYS)"
+          "description": "scope='history': evict versions invalidated more than this many days ago (overrides PERSEUS_VAULT_HISTORY_MAX_AGE_DAYS)"
         },
         "max_versions_per_key": {
           "type": "integer",
-          "description": "scope='history': keep at most this many stored versions per key, oldest evicted first (overrides MIMIR_HISTORY_MAX_VERSIONS_PER_KEY)"
+          "description": "scope='history': keep at most this many stored versions per key, oldest evicted first (overrides PERSEUS_VAULT_HISTORY_MAX_VERSIONS_PER_KEY)"
         },
         "max_bytes": {
           "type": "integer",
-          "description": "scope='history': global stored-history byte budget, globally-oldest evicted first (overrides MIMIR_HISTORY_MAX_BYTES)"
+          "description": "scope='history': global stored-history byte budget, globally-oldest evicted first (overrides PERSEUS_VAULT_HISTORY_MAX_BYTES)"
         },
         "dry_run": {
           "type": "boolean",
@@ -2618,8 +2518,8 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Prune Stale Entities"
   },
   {
-    "name": "mimir_link",
-    "description": "Create a relationship link from one entity to another. Builds a knowledge graph that mimir_traverse can walk. Use 'depends_on', 'implements', 'extends', 'references', or custom relationships.",
+    "name": "perseus_vault_link",
+    "description": "Create a relationship link from one entity to another. Builds a knowledge graph that perseus_vault_traverse can walk. Use 'depends_on', 'implements', 'extends', 'references', or custom relationships.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -2633,7 +2533,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
         },
         "to_id": {
           "type": "string",
-          "description": "Target entity ID (from mimir_remember return value)"
+          "description": "Target entity ID (from perseus_vault_remember return value)"
         },
         "relationship": {
           "type": "string",
@@ -2673,7 +2573,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Link Entities"
   },
   {
-    "name": "mimir_unlink",
+    "name": "perseus_vault_unlink",
     "description": "Remove a relationship link from one entity to another. Use this to correct outdated or incorrect links in the knowledge graph.",
     "inputSchema": {
       "type": "object",
@@ -2719,7 +2619,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Unlink Entities"
   },
   {
-    "name": "mimir_journal",
+    "name": "perseus_vault_journal",
     "description": "Append a structured decision/observation log entry. Uses evaluated/acted/forward pattern: what was considered, what was done, and what happens next. Essential for audit trails and timeline reconstruction.",
     "inputSchema": {
       "type": "object",
@@ -2789,8 +2689,8 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Append Journal Entry"
   },
   {
-    "name": "mimir_check_failure_pattern",
-    "description": "Deja-vu guard (#521): call BEFORE retrying a failed command or committing to an approach. Checks the action against workspace-scoped prior failures in both the journal (error events and failure-marked acted/forward payloads) and the entity store (failure/pitfall/root-cause memories), ranked by similarity, recency, and trust. Returns matching prior failures with the recorded cause and resolution, a deja_vu flag, and a one-line warning when the action was already tried and failed. Read-only: never bumps retrieval counts or decay. Record failures via mimir_journal (event_type 'error') or mimir_remember so the guard can find them.",
+    "name": "perseus_vault_check_failure_pattern",
+    "description": "Deja-vu guard (#521): call BEFORE retrying a failed command or committing to an approach. Checks the action against workspace-scoped prior failures in both the journal (error events and failure-marked acted/forward payloads) and the entity store (failure/pitfall/root-cause memories), ranked by similarity, recency, and trust. Returns matching prior failures with the recorded cause and resolution, a deja_vu flag, and a one-line warning when the action was already tried and failed. Read-only: never bumps retrieval counts or decay. Record failures via perseus_vault_journal (event_type 'error') or perseus_vault_remember so the guard can find them.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -2849,7 +2749,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Check Failure Pattern (Deja-Vu Guard)"
   },
   {
-    "name": "mimir_timeline",
+    "name": "perseus_vault_timeline",
     "description": "Query workspace-scoped journal events by time range with optional filters for event type, category, or entity. Use this to reconstruct the decision history and understand what happened when.",
     "inputSchema": {
       "type": "object",
@@ -2927,7 +2827,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Query Journal Timeline"
   },
   {
-    "name": "mimir_state_set",
+    "name": "perseus_vault_state_set",
     "description": "Set a key-value state entry with optional TTL for auto-expiration. Use this for session state, temporary flags, or configuration values that should expire after a set time.",
     "inputSchema": {
       "type": "object",
@@ -2973,8 +2873,8 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Set State Entry"
   },
   {
-    "name": "mimir_state_get",
-    "description": "Get a state value by key. Returns null if the key has expired or doesn't exist. Use this instead of mimir_recall for transient session state that doesn't need FTS5 search.",
+    "name": "perseus_vault_state_get",
+    "description": "Get a state value by key. Returns null if the key has expired or doesn't exist. Use this instead of perseus_vault_recall for transient session state that doesn't need FTS5 search.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -3018,8 +2918,8 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Get State Entry"
   },
   {
-    "name": "mimir_state_delete",
-    "description": "Delete a state entry by key. Permanent removal — unlike mimir_forget which is a soft-delete. Use this to clean up expired or unused state entries.",
+    "name": "perseus_vault_state_delete",
+    "description": "Delete a state entry by key. Permanent removal — unlike perseus_vault_forget which is a soft-delete. Use this to clean up expired or unused state entries.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -3051,7 +2951,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Delete State Entry"
   },
   {
-    "name": "mimir_state_list",
+    "name": "perseus_vault_state_list",
     "description": "List all state keys, optionally filtered by a key prefix. Use this to discover what state entries exist without knowing exact keys ahead of time.",
     "inputSchema": {
       "type": "object",
@@ -3086,8 +2986,8 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "List State Entries"
   },
   {
-    "name": "mimir_health",
-    "description": "Cheap readiness probe for the vault server and its SQLite database. Returns healthy/unhealthy plus a readiness snapshot: `ready` (DB answers AND at least one active memory), `active_memories`, `embedded_memories`, `semantic_recall` (available|no_coverage|disabled), `db_path`, and `warnings[]` with likely causes. Call this before a recall-heavy workflow, or when recall unexpectedly returns empty, to tell an empty/degraded store apart from a broken MCP child. Use mimir_stats for detailed statistics.",
+    "name": "perseus_vault_health",
+    "description": "Cheap readiness probe for the vault server and its SQLite database. Returns healthy/unhealthy plus a readiness snapshot: `ready` (DB answers AND at least one active memory), `active_memories`, `embedded_memories`, `semantic_recall` (available|no_coverage|disabled), `db_path`, and `warnings[]` with likely causes. Call this before a recall-heavy workflow, or when recall unexpectedly returns empty, to tell an empty/degraded store apart from a broken MCP child. Use perseus_vault_stats for detailed statistics.",
     "inputSchema": {
       "type": "object",
       "properties": {}
@@ -3153,7 +3053,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Check Health"
   },
   {
-    "name": "mimir_handoff_restart",
+    "name": "perseus_vault_handoff_restart",
     "description": "Live-update / reconnect for long-lived stdio sessions (#858). When the perseus-vault binary was rebuilt or replaced on disk mid-session, the running process image is stale: every other tool refuses loudly (isError) until the session is restarted — or this tool hot-swaps the process on the SAME stdio connection. States: binary unchanged -> no_handoff_needed (identity report); stale + dry_run -> dry_run (what would happen); stale without confirm -> confirm_required; stale + confirm:true -> the replacement binary is spawned on this session's stdio and the old process exits immediately after this response — the MCP session continues uninterrupted in the new process image. Do not pipeline requests during the handoff.",
     "inputSchema": {
       "type": "object",
@@ -3170,7 +3070,8 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     }
   },
   {
-    "name": "mimir_quality_telemetry",
+    "name": "perseus_vault_quality_telemetry",
+
     "description": "Machine-readable memory-quality telemetry: contradiction rate, supersession lag, class/layer distribution, and promotion-flow proxy.",
     "inputSchema": {
       "type": "object",
@@ -3178,7 +3079,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     }
   },
   {
-    "name": "mimir_stats",
+    "name": "perseus_vault_stats",
     "description": "Return comprehensive database statistics: entity counts by category, type, and decay layer; journal event count; state entry count; database file size; date range of stored data; and history growth (stored version rows, bytes, and the top-10 keys by version count — #398).",
     "inputSchema": {
       "type": "object",
@@ -3243,45 +3144,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Get Database Statistics"
   },
   {
-    "name": "mimir_alias_usage",
-    "description": "Return privacy-preserving process-local counts of MCP tool calls by original prefix. Counters reset on restart, are never persisted, and exclude this readout tool itself.",
-    "inputSchema": {
-      "type": "object",
-      "properties": {}
-    },
-    "outputSchema": {
-      "type": "object",
-      "properties": {
-        "canonical_calls": {
-          "type": "integer",
-          "description": "Calls using the canonical perseus_vault_ prefix"
-        },
-        "mimir_calls": {
-          "type": "integer",
-          "description": "Calls using the legacy mimir_ prefix"
-        },
-        "mneme_calls": {
-          "type": "integer",
-          "description": "Calls using the legacy mneme_ prefix"
-        },
-        "other_calls": {
-          "type": "integer",
-          "description": "Calls whose tool name used none of the recognized prefixes"
-        },
-        "since_process_start_unix_ms": {
-          "type": "integer",
-          "description": "Unix-millisecond timestamp when this process-local counter set started"
-        }
-      },
-      "required": ["canonical_calls", "mimir_calls", "mneme_calls", "other_calls", "since_process_start_unix_ms"]
-    },
-    "annotations": {
-      "readOnlyHint": true
-    },
-    "title": "Get Legacy Prefix Usage"
-  },
-  {
-    "name": "mimir_compact",
+    "name": "perseus_vault_compact",
     "description": "Archive entities whose decay score has fallen below a threshold. Supports dry-run mode to preview without making changes. Run periodically or threshold-triggered to keep the database focused on active, high-value memories.",
     "inputSchema": {
       "type": "object",
@@ -3326,7 +3189,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Compact Low-Decay Entities"
   },
   {
-    "name": "mimir_purge",
+    "name": "perseus_vault_purge",
     "description": "Permanently delete all archived entities and run VACUUM to reclaim disk space. This is the only operation that actually removes entities — prune/forget only soft-archive. Erasure is complete (#398): every superseded version of a purged entity is deleted from entity_history, and journal rows referencing it are redacted in place (payloads scrubbed; rows kept so the audit hash chain stays verifiable). Purged data is DELETED and NOT RECOVERABLE — this forget-then-purge path is the GDPR-style erasure mechanism. Supports dry_run=true to preview first.",
     "inputSchema": {
       "type": "object",
@@ -3378,7 +3241,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Purge Archived Entities"
   },
   {
-    "name": "mimir_expire",
+    "name": "perseus_vault_expire",
     "description": "Time-based lifecycle sweep (#868): transition entities whose expires_at_unix_ms has passed to status='expired'. Content, history, and searchability are RETAINED — expiry is not erasure, and recall already excludes expired rows; the sweep makes the lifecycle state explicit and observable. Idempotent and re-runnable; use dry_run=true to preview with identical predicates. Contract: docs/specs/data-boundaries-retention-lifecycle.md.",
     "inputSchema": {
       "type": "object",
@@ -3423,7 +3286,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Expire Due Entities"
   },
   {
-    "name": "mimir_redact",
+    "name": "perseus_vault_redact",
     "description": "Content redaction (#868): scrub the body of a workspace-scoped entity to a hash-only marker, delete its history snapshots and FTS text, and append a hash-only 'redacted' journal event. Metadata (id, key, links, provenance) is RETAINED; re-ingest of the same value stays allowed (redaction ≠ erasure). Requires an explicit workspace_hash (fail-closed, #854). Contract: docs/specs/data-boundaries-retention-lifecycle.md.",
     "inputSchema": {
       "type": "object",
@@ -3499,7 +3362,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Redact Entity Content"
   },
   {
-    "name": "mimir_erase",
+    "name": "perseus_vault_erase",
     "description": "Physical erasure (#868/#866): permanently remove a workspace-scoped entity from the primary store AND all derived layers (FTS, history, history-FTS, community membership, inbound links, journal payloads), quarantine derived entities that cited it via evidence links, install a permanent rejection tombstone + governance mandate (re-ingest fails closed and survives primary-DB rollback), and append a hash-only 'erased' journal event. ERASED DATA IS NOT RECOVERABLE. Requires an explicit workspace_hash (fail-closed, #854). Use dry_run=true to preview exact counts. Contract: docs/specs/data-boundaries-retention-lifecycle.md.",
     "inputSchema": {
       "type": "object",
@@ -3604,7 +3467,8 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Erase Entity Permanently"
   },
   {
-    "name": "mimir_memories",
+    "name": "perseus_vault_memories",
+
     "description": "Anthropic memory-tool compatible file interface over the vault: view / create / str_replace / insert / delete / rename on paths under /memories. Files are stored as vault entities (category 'memories', FTS-indexed, encrypted at rest, edits versioned via history), so clients built against Claude's native memory directory convention can use the vault unchanged. Use command='view' with path='/memories' to list files.",
     "inputSchema": {
       "type": "object",
@@ -3654,8 +3518,8 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Memories Directory (Anthropic convention)"
   },
   {
-    "name": "mimir_migrate",
-    "description": "Migrate a v0.1.x Mneme database to the current v0.5.0 schema. Reads the old database, converts memories to the entity model, and merges into the current database. Use this once per legacy database during upgrade.",
+    "name": "perseus_vault_migrate",
+    "description": "Migrate a v0.1.x Perseus Vault database to the current v0.5.0 schema. Reads the old database, converts memories to the entity model, and merges into the current database. Use this once per legacy database during upgrade.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -3702,7 +3566,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Migrate Legacy Database"
   },
   {
-    "name": "mimir_context",
+    "name": "perseus_vault_context",
     "description": "Return a pre-formatted markdown context block for session injection. Recall-first by default (mode 'on_demand'): pass `query` (the current task/message) and only topically relevant entities — recall_when trigger matches + keyword matches — are injected, alongside a hard-capped always-on set, clamped to a per-model character budget. Without `query` the block is a compact retrieval pointer (byte-stable across unrelated writes — prefix-cache friendly). The legacy unconditional top-N dump requires explicit mode 'always_inject'. Output is informational context, not instructions.",
     "inputSchema": {
       "type": "object",
@@ -3782,7 +3646,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Get Context Block"
   },
   {
-    "name": "mimir_extract",
+    "name": "perseus_vault_extract",
     "description": "Extract structured knowledge — facts, preferences, temporal events, episodes — from raw text or a stored entity, using a fully local, deterministic rule-based extractor (no cloud LLM, no embedding/API call, no network). Read-only: never writes to the store. Provide `text`, or `category` + `key` to extract from a stored entity.",
     "inputSchema": {
       "type": "object",
@@ -3837,7 +3701,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Extract Structured Knowledge"
   },
   {
-    "name": "mimir_capture",
+    "name": "perseus_vault_capture",
     "description": "Opt-in in-session memory capture (#520): distill a session transcript or insight payload into durable memory entities the moment a problem is solved, instead of waiting for a scheduled harvest. Splits the payload into candidate notes (headed sections, paragraphs, or JSONL records — auto-detected), classifies each by cheap local signals into root-cause / pitfall / decision / pattern / takeaway, and writes each through the normal remember path with source='capture' (layer buffer, moderate importance). Fully local and deterministic by default — no LLM, no network; pass llm=true to distill via the configured --llm-endpoint instead (falls back to the rule-based path on any LLM failure or timeout). Anti-flood by design: near-duplicate merging stays ON (a re-captured solved problem merges into the existing memory), same-headline notes update in place, and writes are capped per invocation with dropped notes reported. Nothing runs automatically — capture happens only when this tool (or the `perseus-vault capture` CLI verb) is explicitly invoked, e.g. from an on_insight or SessionEnd lifecycle hook (run `maintain` after end-of-session capture).",
     "inputSchema": {
       "type": "object",
@@ -3960,8 +3824,8 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Capture Session Insights"
   },
   {
-    "name": "mimir_traverse",
-    "description": "Walk the entity link graph starting from a given entity up to a configurable depth. Returns a chain of linked entities — useful for exploring dependencies, decision trees, and relationship graphs built via mimir_link.",
+    "name": "perseus_vault_traverse",
+    "description": "Walk the entity link graph starting from a given entity up to a configurable depth. Returns a chain of linked entities — useful for exploring dependencies, decision trees, and relationship graphs built via perseus_vault_link.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -4015,7 +3879,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Traverse Entity Graph"
   },
   {
-    "name": "mimir_score",
+    "name": "perseus_vault_score",
     "description": "Assign a quality score (0.0–1.0) to an entity. The score persists as an importance floor: decay_tick/cohere never recompute decay_score below it, so an explicitly scored memory survives idle time indefinitely (fidelity beats recency). Scores >= 0.7 also mark the entity verified. Re-score with 0.0 to clear the floor. Use this to mark entities as accurate, verified, or deprecated.",
     "inputSchema": {
       "type": "object",
@@ -4066,7 +3930,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Score Entity Quality"
   },
   {
-    "name": "mimir_follow",
+    "name": "perseus_vault_follow",
     "description": "Record whether an entity (typically a convention/insight/lesson) was actually FOLLOWED or MISSED by the agent — the honest follow-rate signal. Unlike retrieval_count (how often a memory is recalled), this tracks whether recall changed behavior. After enough attempts, efficacy_status flips to 'useful' or 'dead' and feeds into decay scoring so ignored rules decay out of recall while followed ones resist decay.",
     "inputSchema": {
       "type": "object",
@@ -4132,7 +3996,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Record Follow/Miss Efficacy Signal"
   },
   {
-    "name": "mimir_operator_review",
+    "name": "perseus_vault_operator_review",
     "description": "Read-only operator review queue for contradictions, stale/low-actionability facts, and deprecated supersession lag. Does not resolve or hide findings.",
     "inputSchema": {
       "type": "object",
@@ -4144,8 +4008,8 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     }
   },
   {
-    "name": "mimir_conflicts",
-    "description": "Detect conflicting entities in the same category — pairs with low trigram similarity in their body_json. Flags potential contradictions, duplicate-but-divergent entries, and stale-overwritten facts. Read-only by default. Opt in with resolve=true to actively invalidate the lower-certainty side of clear conflicts (superseding it into history, reversible + time-travelable via mimir_as_of); that path defaults to dry_run=true so you preview first, and never resolves pairs whose certainties are within certainty_margin.",
+    "name": "perseus_vault_conflicts",
+    "description": "Detect conflicting entities in the same category — pairs with low trigram similarity in their body_json. Flags potential contradictions, duplicate-but-divergent entries, and stale-overwritten facts. Read-only by default. Opt in with resolve=true to actively invalidate the lower-certainty side of clear conflicts (superseding it into history, reversible + time-travelable via perseus_vault_as_of); that path defaults to dry_run=true so you preview first, and never resolves pairs whose certainties are within certainty_margin.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -4214,8 +4078,8 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Detect Conflicting Entities"
   },
   {
-    "name": "mimir_consolidate",
-    "description": "Merge overlapping/duplicative entities in the same category into durable, evidence-tracked 'observations' — the mirror image of mimir_conflicts, which flags dissimilar (contradictory) pairs. Groups entities whose pairwise trigram similarity meets similarity_threshold, then creates one new entity per group (category='observation') whose body carries a summary (the highest-certainty source's content), the full list of source entity ids as evidence, and a proof_count. The observation links back to each source (relationship='evidence_for') for full audit. By default sources stay live; set archive_sources=true to retire merged sources ('local dreaming' — verified or importance-floored sources are never archived), and cold_first=true to target the memories decay is about to claim. mimir_autocohere runs a bounded cold_first+archive_sources pass automatically. Read-only preview with dry_run=true.",
+    "name": "perseus_vault_consolidate",
+    "description": "Merge overlapping/duplicative entities in the same category into durable, evidence-tracked 'observations' — the mirror image of perseus_vault_conflicts, which flags dissimilar (contradictory) pairs. Groups entities whose pairwise trigram similarity meets similarity_threshold, then creates one new entity per group (category='observation') whose body carries a summary (the highest-certainty source's content), the full list of source entity ids as evidence, and a proof_count. The observation links back to each source (relationship='evidence_for') for full audit. By default sources stay live; set archive_sources=true to retire merged sources ('local dreaming' — verified or importance-floored sources are never archived), and cold_first=true to target the memories decay is about to claim. perseus_vault_autocohere runs a bounded cold_first+archive_sources pass automatically. Read-only preview with dry_run=true.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -4320,8 +4184,8 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Consolidate Overlapping Facts into Observations"
   },
   {
-    "name": "mimir_dream",
-    "description": "Sleep-time LLM consolidation: batch clusters of related cold/episodic memories, reflect over each cluster via the configured LLM endpoint, and write back durable higher-order SEMANTIC insights (category='insight', semantic layer) — 'given these N memories, what stable pattern/preference/fact do they collectively imply?'. Each written insight carries evidence_for links to every source entity (full provenance), a certainty blended from LLM confidence and evidence coverage, and derivation='dream' so it is auditable and reversible. Idempotent: insights are keyed by an evidence-set hash, so re-dreaming an unchanged cluster never spawns duplicates. Contradictory sources surface as a flagged 'contradiction' insight, never a silent merge. Never fabricates: clusters that support no durable generalization are a no-op. Requires --llm-endpoint (fully local via Ollama); returns a clean error without it unless fallback_consolidate=true, which runs the non-LLM mimir_consolidate pass instead. Bounded by max_entities/max_clusters budgets. Preview with dry_run=true.",
+    "name": "perseus_vault_dream",
+    "description": "Sleep-time LLM consolidation: batch clusters of related cold/episodic memories, reflect over each cluster via the configured LLM endpoint, and write back durable higher-order SEMANTIC insights (category='insight', semantic layer) — 'given these N memories, what stable pattern/preference/fact do they collectively imply?'. Each written insight carries evidence_for links to every source entity (full provenance), a certainty blended from LLM confidence and evidence coverage, and derivation='dream' so it is auditable and reversible. Idempotent: insights are keyed by an evidence-set hash, so re-dreaming an unchanged cluster never spawns duplicates. Contradictory sources surface as a flagged 'contradiction' insight, never a silent merge. Never fabricates: clusters that support no durable generalization are a no-op. Requires --llm-endpoint (fully local via Ollama); returns a clean error without it unless fallback_consolidate=true, which runs the non-LLM perseus_vault_consolidate pass instead. Bounded by max_entities/max_clusters budgets. Preview with dry_run=true.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -4371,21 +4235,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
         "fallback_consolidate": {
           "type": "boolean",
           "default": false,
-          "description": "When no --llm-endpoint is configured, run the mechanical (non-LLM) mimir_consolidate cold_first pass instead of returning an error."
-        },
-        "workspace_hash": {
-          "type": "string",
-          "description": "#854 workspace scope for this run. Scans, clusters, and evidence lookups are strictly restricted to this workspace, and derived insights inherit it. Mutually exclusive with global=true. One of workspace_hash or global is required."
-        },
-        "global": {
-          "type": "boolean",
-          "default": false,
-          "description": "#854 explicit cross-workspace mode for deliberate whole-vault dreaming. Capability-gated (memory.maintenance.global) when the caller carries a host identity. Mutually exclusive with workspace_hash."
-        },
-        "requesting_agent_id": {
-          "type": "string",
-          "default": "",
-          "description": "Host identity stamped by the MCP transport. Used for global-mode authorization and stamped as author on derived insights."
+          "description": "When no --llm-endpoint is configured, run the mechanical (non-LLM) perseus_vault_consolidate cold_first pass instead of returning an error."
         }
       },
       "required": []
@@ -4461,14 +4311,14 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Dream: LLM Consolidation of Episodic Memory into Semantic Insights"
   },
   {
-    "name": "mimir_vault_export",
+    "name": "perseus_vault_vault_export",
     "description": "Export all non-archived entities to .md files with YAML frontmatter in a vault directory. Files are human-readable, git-trackable, and Obsidian-compatible. Use this for backup, transfer between workspaces, or offline review.",
     "inputSchema": {
       "type": "object",
       "properties": {
         "vault_dir": {
           "type": "string",
-          "default": "~/.mimir/vault",
+          "default": "~/.perseus-vault/vault",
           "description": "Directory path to write .md files. Created if it doesn't exist. Use ~ for home directory."
         }
       },
@@ -4508,7 +4358,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Export Vault to Files"
   },
   {
-    "name": "mimir_derived_export",
+    "name": "perseus_vault_derived_export",
     "description": "Compile durable knowledge into a deterministic, provenance-rich Markdown surface. The export is derived and read-only; SQLite remains the source of truth.",
     "inputSchema": {
       "type": "object",
@@ -4520,7 +4370,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     }
   },
   {
-    "name": "mimir_markdown_import",
+    "name": "perseus_vault_markdown_import",
     "description": "Import one Markdown file as explicitly non-authoritative, provenance-labeled draft evidence. Duplicate source content is idempotently detected.",
     "inputSchema": {
       "type": "object",
@@ -4533,7 +4383,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     }
   },
   {
-    "name": "mimir_structured_index_anchor",
+    "name": "perseus_vault_structured_index_anchor",
     "description": "Represent an upstream structured-index record as a refetchable anchor, or import it explicitly as low-confidence non-authoritative draft evidence.",
     "inputSchema": {
       "type": "object",
@@ -4552,14 +4402,14 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     }
   },
   {
-    "name": "mimir_vault_import",
-    "description": "Import .md files from a vault directory into the database. Reads YAML frontmatter for metadata and markdown body for content. Idempotent — re-running on the same vault won't duplicate entities. Pair with mimir_vault_export for transfer.",
+    "name": "perseus_vault_vault_import",
+    "description": "Import .md files from a vault directory into the database. Reads YAML frontmatter for metadata and markdown body for content. Idempotent — re-running on the same vault won't duplicate entities. Pair with perseus_vault_vault_export for transfer.",
     "inputSchema": {
       "type": "object",
       "properties": {
         "vault_dir": {
           "type": "string",
-          "default": "~/.mimir/vault",
+          "default": "~/.perseus-vault/vault",
           "description": "Directory path to read .md files from. Use ~ for home directory."
         }
       },
@@ -4599,7 +4449,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Import Vault from Files"
   },
   {
-    "name": "mimir_decay",
+    "name": "perseus_vault_decay",
     "description": "Recalculate Ebbinghaus decay scores for all entities based on time since last access. Auto-archives entities that have fully decayed (score < 0.05). Run periodically to keep memory fresh — decayed entities surface less often in recall results.",
     "inputSchema": {
       "type": "object",
@@ -4632,7 +4482,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Recalculate Decay Scores"
   },
   {
-    "name": "mimir_reindex",
+    "name": "perseus_vault_reindex",
     "description": "Rebuild the FTS5 search index from the entities table. Repairs index drift — e.g. after a direct SQLite write, an interrupted archive, or a legacy database written before the atomic prune/forget fixes — so archived entities stop surfacing in recall/search. Returns the number of entities reindexed.",
     "inputSchema": {
       "type": "object",
@@ -4653,8 +4503,8 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Rebuild Search Index"
   },
   {
-    "name": "mimir_workspace_list",
-    "description": "List all distinct entity categories present in the database. Use this to discover what knowledge domains exist before querying with mimir_recall or mimir_context.",
+    "name": "perseus_vault_workspace_list",
+    "description": "List all distinct entity categories present in the database. Use this to discover what knowledge domains exist before querying with perseus_vault_recall or perseus_vault_context.",
     "inputSchema": {
       "type": "object",
       "properties": {}
@@ -4681,7 +4531,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "List Workspace Categories"
   },
   {
-    "name": "mimir_recall_when",
+    "name": "perseus_vault_recall_when",
     "description": "Search entities whose recall_when triggers match a given context. Use this for proactive just-in-time memory injection — before writing code, before plans, at session start. Pass the current task description as context and get back memories that declared they should be recalled in similar situations.",
     "inputSchema": {
       "type": "object",
@@ -4727,7 +4577,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Proactive Recall by Context"
   },
   {
-    "name": "mimir_cohere",
+    "name": "perseus_vault_cohere",
     "description": "Run an autonomous coherence grooming pass over the memory. Promotes buffer entities to working layer, applies decay, auto-links related entities, and archives stale ones below the decay threshold. Use dry_run=true to preview without making changes.",
     "inputSchema": {
       "type": "object",
@@ -4818,7 +4668,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Run Coherence Grooming"
   },
   {
-    "name": "mimir_share",
+    "name": "perseus_vault_share",
     "description": "Share an entity to another workspace. Copies the entity (by category + key) from its current workspace into the target workspace, preserving content and metadata while generating a new ID. The original entity is unchanged. Use this for controlled cross-workspace knowledge transfer.",
     "inputSchema": {
       "type": "object",
@@ -4869,7 +4719,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Share Entity to Workspace"
   },
   {
-    "name": "mimir_federate",
+    "name": "perseus_vault_federate",
     "description": "Federate entities from one workspace to another. Exports entities scoped to from_workspace, remaps their workspace_hash to to_workspace, and imports them — effectively copying or moving knowledge between workspaces. Use this for cross-agent or cross-project knowledge sharing without manual file transfer.",
     "inputSchema": {
       "type": "object",
@@ -4884,7 +4734,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
         },
         "vault_dir": {
           "type": "string",
-          "default": "/tmp/mimir-federate",
+          "default": "/tmp/perseus-vault-federate",
           "description": "Temporary vault directory for the intermediate .md export files"
         }
       },
@@ -4923,7 +4773,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Federate Entities Between Workspaces"
   },
   {
-    "name": "mimir_correct",
+    "name": "perseus_vault_correct",
     "description": "Capture a user correction to the agent. Stores what went wrong, what the user said, and the lesson learned — as both a 'correction' entity and a journal entry. Use this every time the user corrects your approach. Enables the self-improving feedback loop: the agent learns from mistakes across sessions.",
     "inputSchema": {
       "type": "object",
@@ -5042,7 +4892,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Capture Agent Correction"
   },
   {
-    "name": "mimir_synthesize",
+    "name": "perseus_vault_synthesize",
     "description": "LLM-driven session synthesis. Reviews a session transcript and extracts structured lessons: what worked (success), what failed (failure), what was corrected (correction), what was abandoned (dead_end), and key decisions made (decision). Each lesson becomes an entity linked to a synthesis journal entry. Requires --llm-endpoint to be configured. This is the Perplexity-Brain-style overnight synthesis loop for agent self-improvement.",
     "inputSchema": {
       "type": "object",
@@ -5118,8 +4968,8 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Synthesize Session Lessons"
   },
   {
-    "name": "mimir_bench",
-    "description": "Record a performance benchmark data point. Tracks task metrics (turns taken, tokens used, success) alongside whether memory recall was used — enabling measurement of Mneme's impact on agent performance. Aggregate with mimir_recall to analyze trends.",
+    "name": "perseus_vault_bench",
+    "description": "Record a performance benchmark data point. Tracks task metrics (turns taken, tokens used, success) alongside whether memory recall was used — enabling measurement of Perseus Vault's impact on agent performance. Aggregate with perseus_vault_recall to analyze trends.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -5137,7 +4987,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
         },
         "memory_recall_used": {
           "type": "boolean",
-          "description": "Whether memory recall (mimir_recall) was used during this task"
+          "description": "Whether memory recall (perseus_vault_recall) was used during this task"
         },
         "recall_count": {
           "type": "integer",
@@ -5187,7 +5037,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Record Benchmark"
   },
   {
-    "name": "mimir_autocohere",
+    "name": "perseus_vault_autocohere",
     "description": "Run a full atomic grooming pass. When capture_text is supplied, capture runs first and must succeed before cohere, decay, compact, consolidation, or retention can compress source context. Returns a summary report. Use dry_run=true to preview without writing.",
     "inputSchema": {
       "type": "object",
@@ -5258,7 +5108,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
         },
         "history_rows_evicted": {
           "type": "integer",
-          "description": "entity_history rows evicted by the retention policy (#398; 0 while no MIMIR_HISTORY_* knob is set)"
+          "description": "entity_history rows evicted by the retention policy (#398; 0 while no PERSEUS_VAULT_HISTORY_* knob is set)"
         },
         "history_bytes_evicted": {
           "type": "integer",
@@ -5303,7 +5153,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Atomic Coherence Pass"
   },
   {
-    "name": "mimir_supersede",
+    "name": "perseus_vault_supersede",
     "description": "Create a 'supersedes' relationship from a new fact to an old one, setting the old entity's status to 'deprecated'. Use this when a newer entity makes an older one obsolete.",
     "inputSchema": {
       "type": "object",
@@ -5336,7 +5186,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
         },
         "valid_to_unix_ms": {
           "type": "integer",
-          "description": "When the OLD fact stopped being true in the world (#363, unix ms). Defaults to transaction time (now). Closes the old entity's application-time period so mimir_valid_at stops returning it from that instant on. Must be after the fact's valid_from, and may only TIGHTEN an already-closed period (a fact that ended cannot be retroactively extended); violations are rejected before any mutation."
+          "description": "When the OLD fact stopped being true in the world (#363, unix ms). Defaults to transaction time (now). Closes the old entity's application-time period so perseus_vault_valid_at stops returning it from that instant on. Must be after the fact's valid_from, and may only TIGHTEN an already-closed period (a fact that ended cannot be retroactively extended); violations are rejected before any mutation."
         }
       },
       "required": [
@@ -5388,8 +5238,8 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Supersede Entity"
   },
   {
-    "name": "mimir_maintenance",
-    "description": "Database maintenance operations: deduplicate entities with identical (category, key), detect orphan journal entries and links, vacuum (reclaim disk space), reindex FTS5, and enforce the entity_history retention policy (#398 — no-op unless MIMIR_HISTORY_* env knobs are set). Set dry_run=true to preview. Use 'all' to run everything.",
+    "name": "perseus_vault_maintenance",
+    "description": "Database maintenance operations: deduplicate entities with identical (category, key), detect orphan journal entries and links, vacuum (reclaim disk space), reindex FTS5, and enforce the entity_history retention policy (#398 — no-op unless PERSEUS_VAULT_HISTORY_* env knobs are set). Set dry_run=true to preview. Use 'all' to run everything.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -5415,7 +5265,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
         },
         "history": {
           "type": "boolean",
-          "description": "Enforce the entity_history retention policy from MIMIR_HISTORY_* env knobs (#398; no-op while none are set)",
+          "description": "Enforce the entity_history retention policy from PERSEUS_VAULT_HISTORY_* env knobs (#398; no-op while none are set)",
           "default": false
         },
         "all": {
@@ -5483,8 +5333,8 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Run Database Maintenance"
   },
   {
-    "name": "mimir_communities",
-    "description": "GraphRAG community detection: partition the entity link graph (built via mimir_link) into communities using deterministic label propagation or greedy modularity ('louvain'). Persists the result with an extractive summary per community; community ids are derived from the member set, so re-detection after membership changes yields new ids. Local-first — no LLM or network required.",
+    "name": "perseus_vault_communities",
+    "description": "GraphRAG community detection: partition the entity link graph (built via perseus_vault_link) into communities using deterministic label propagation or greedy modularity ('louvain'). Persists the result with an extractive summary per community; community ids are derived from the member set, so re-detection after membership changes yields new ids. Local-first — no LLM or network required.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -5537,14 +5387,14 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Detect Link-Graph Communities"
   },
   {
-    "name": "mimir_community_summary",
+    "name": "perseus_vault_community_summary",
     "description": "Return (and materialize) the summary of one detected community. Default is the extractive summary (top representative members); set use_llm=true for an optional LLM polish that degrades back to extractive when no LLM endpoint is configured. The summary is stored as a 'community_summary' entity carrying evidence_for links to its members, and cached while membership is unchanged.",
     "inputSchema": {
       "type": "object",
       "properties": {
         "community_id": {
           "type": "string",
-          "description": "Community id from mimir_communities, e.g. 'com-1a2b3c4d5e6f7a8b'"
+          "description": "Community id from perseus_vault_communities, e.g. 'com-1a2b3c4d5e6f7a8b'"
         },
         "use_llm": {
           "type": "boolean",
@@ -5576,7 +5426,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Get Community Summary"
   },
   {
-    "name": "mimir_global_recall",
+    "name": "perseus_vault_global_recall",
     "description": "GraphRAG global search: answer a broad 'what does the vault know about X, holistically' query by scoring it against community summaries first (breadth), then drilling into the best communities' member entities (depth). Cites entities across multiple communities instead of returning only the single nearest cluster like flat recall. Detects communities automatically on first use. Local-first and deterministic; optional use_llm synthesizes the final answer.",
     "inputSchema": {
       "type": "object",
@@ -5651,8 +5501,8 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Global Recall (GraphRAG)"
   },
   {
-    "name": "mimir_keystone_set",
-    "description": "Author a Keystone — a mandatory policy rule that survives context compaction (#683). Unlike ordinary memories (retrieved when relevant), keystones are fetched deterministically at session start via mimir_keystone_get, merged across scope, and are meant to be obeyed over any conflicting instruction (e.g. 'Every memory write MUST carry a retention class', 'Customer PII MUST NOT cross agent boundaries'). Higher weight wins on contradiction. Re-setting the same (scope, scope_id, content) updates it in place. Every mutation is appended to the cryptographic audit chain. Authoring is gated on trust tier: pass author_trust_tier (>= trust_tier_required, default 2). NOTE: until multi-agent trust tiers land (#684), author_trust_tier is caller-asserted; when omitted the write is allowed and the response flags that enforcement is pending.",
+    "name": "perseus_vault_keystone_set",
+    "description": "Author a Keystone — a mandatory policy rule that survives context compaction (#683). Unlike ordinary memories (retrieved when relevant), keystones are fetched deterministically at session start via perseus_vault_keystone_get, merged across scope, and are meant to be obeyed over any conflicting instruction (e.g. 'Every memory write MUST carry a retention class', 'Customer PII MUST NOT cross agent boundaries'). Higher weight wins on contradiction. Re-setting the same (scope, scope_id, content) updates it in place. Every mutation is appended to the cryptographic audit chain. Authoring is gated on trust tier: pass author_trust_tier (>= trust_tier_required, default 2). NOTE: until multi-agent trust tiers land (#684), author_trust_tier is caller-asserted; when omitted the write is allowed and the response flags that enforcement is pending.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -5678,7 +5528,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Set Keystone"
   },
   {
-    "name": "mimir_keystone_get",
+    "name": "perseus_vault_keystone_get",
     "description": "Fetch the merged Keystones (mandatory policy rules, #683) that apply at session start — the deterministic counterpart to recall. Returns rules ordered by weight (highest first, then scope tenant<fleet<agent, then id) so a renderer can inject them ahead of all other context and resolve contradictions by weight. Filter by scope/scope_id/workspace to get exactly the set an agent must obey. Read-only.",
     "inputSchema": {
       "type": "object",
@@ -5710,7 +5560,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Get Keystones"
   },
   {
-    "name": "mimir_agent",
+    "name": "perseus_vault_agent",
     "description": "Register/update or look up an agent in the multi-agent registry (#684). Agents carry a trust tier (0-3) that gates sensitive ops (e.g. authoring keystones needs tier >= 2) and drives visibility enforcement on recall: tier 0 = read own only, 1 = fleet, 2 = read all + write keystones, 3 = admin. Pass trust_tier (and optionally name/fleet_id) to upsert; omit trust_tier to just look up. entities/journal already stamp agent_id (v1.2.0); this adds the identity + tier metadata. NOTE: an empty/unknown agent has no registry row — unknown identified agents resolve to tier 0, and a caller with no session identity is unscoped.",
     "inputSchema": {
       "type": "object",
@@ -5741,121 +5591,46 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Agent Registry"
   },
   {
-    "name":"mimir_authority_set", "description":"Create a versioned authority manifest for a registered agent.", "inputSchema":{"type":"object","properties":{"agent_id":{"type":"string"},"workspace_hash":{"type":"string"},"allowed_capabilities":{"type":"array","items":{"type":"string"}},"scope_anchors":{"type":"array","items":{"type":"string"}},"approval_required_capabilities":{"type":"array","items":{"type":"string"}},"approver_principals":{"type":"array","items":{"type":"string"}},"allowed_inbound_principals":{"type":"array","items":{"type":"string"}},"permitted_external_ref_prefixes":{"type":"array","items":{"type":"string"}},"max_parallel_actions":{"type":"integer","default":1},"mode":{"type":"string","default":"shadow"},"expires_at_unix_ms":{"type":"integer"},"author_agent_id":{"type":"string"},"capability_constraints_json":{"type":"string","default":"{}"}},"required":["agent_id","workspace_hash","allowed_capabilities","scope_anchors"]}, "title":"Set Action Authority"},
-  {"name":"mimir_authority_get", "description":"Get the active authority manifest for an agent and workspace.", "inputSchema":{"type":"object","properties":{"agent_id":{"type":"string"},"workspace_hash":{"type":"string"},"include_revoked":{"type":"boolean","default":false}},"required":["agent_id","workspace_hash"]}, "title":"Get Action Authority"},
-  {"name":"mimir_authority_revoke", "description":"Revoke an authority manifest.", "inputSchema":{"type":"object","properties":{"manifest_id":{"type":"string"},"actor_agent_id":{"type":"string"},"reason":{"type":"string"}},"required":["manifest_id"]}, "title":"Revoke Action Authority"},
-  {"name":"mimir_authority_set_signed", "description":"Load a signed, distributable policy/authority profile (Ed25519 sigstore-style attestation); verification failure grants no authority (fail closed) and the verification result lands in the ledger journal.", "inputSchema":{"type":"object","properties":{"profile_json":{"type":"string"},"trusted_public_key_b64":{"type":"string"},"author_agent_id":{"type":"string"}},"required":["profile_json","trusted_public_key_b64","author_agent_id"]}, "title":"Load Signed Authority Profile"},
-  {"name":"mimir_action_intent", "description":"Record a fail-closed authorized action intent.", "inputSchema":{"type":"object","properties":{"agent_id":{"type":"string"},"workspace_hash":{"type":"string"},"scope_anchor":{"type":"string"},"external_ref":{"type":"string"},"capability":{"type":"string"},"action_key":{"type":"string"},"intent_hash":{"type":"string"},"resource_constraints_json":{"type":"string","default":"{}"}},"required":["agent_id","workspace_hash","scope_anchor","external_ref","capability","action_key","intent_hash"]}, "title":"Record Action Intent"},
-  {"name":"mimir_action_approve", "description":"Grant or deny an approval-requested action.", "inputSchema":{"type":"object","properties":{"action_id":{"type":"string"},"approver_principal":{"type":"string"},"decision":{"type":"string","enum":["granted","denied"]}},"required":["action_id","approver_principal","decision"]}, "title":"Decide Action Approval"},
-  {"name":"mimir_action_complete", "description":"Record an executed, failed, cancelled, or denied action outcome by hash.", "inputSchema":{"type":"object","properties":{"action_id":{"type":"string"},"actor_agent_id":{"type":"string"},"outcome":{"type":"string","enum":["executed","failed","cancelled","denied"]},"outcome_hash":{"type":"string"}},"required":["action_id","actor_agent_id","outcome","outcome_hash"]}, "title":"Complete Authorized Action"},
-  {"name":"mimir_action_resolve_timeout", "description":"Resolve a pending approval to deny once its window has expired (timeout defaults to deny).", "inputSchema":{"type":"object","properties":{"action_id":{"type":"string"},"approval_timeout_ms":{"type":"integer"}},"required":["action_id","approval_timeout_ms"]}, "title":"Resolve Approval Timeout"},
-  {"name":"mimir_action_receipt_get", "description":"Get durable action receipt metadata and hashes.", "inputSchema":{"type":"object","properties":{"action_id":{"type":"string"}},"required":["action_id"]}, "title":"Get Action Receipt"},
-  {"name":"mimir_action_lease_acquire", "description":"Acquire the single active lease for an action key.", "inputSchema":{"type":"object","properties":{"action_id":{"type":"string"},"holder_id":{"type":"string"},"ttl_seconds":{"type":"integer","default":1}},"required":["action_id","holder_id"]}, "title":"Acquire Action Lease"},
-  {"name":"mimir_action_lease_release", "description":"Release an action lease held by its owner.", "inputSchema":{"type":"object","properties":{"lease_id":{"type":"string"},"holder_id":{"type":"string"}},"required":["lease_id","holder_id"]}, "title":"Release Action Lease"},
-  {"name":"mimir_stage_trace_validate", "description":"Validate a versioned hash-only runtime stage trace and optionally compare replay semantics. Raw prompts, memory bodies, credentials, and tool payloads are not accepted.", "inputSchema":{"type":"object","properties":{"trace":{"type":"object","description":"perseus-vault-stage-trace/v1 structured trace"},"replay_of":{"type":"object","description":"Optional second trace to compare by replay fingerprint"}},"required":["trace"]}, "title":"Validate Runtime Stage Trace"},
-  {"name":"mimir_reject_value", "description":"Record a scoped digest-only rejected-value tombstone. Equivalent values remain rejected across new entity keys and writer paths until the tombstone expires or is explicitly superseded.", "inputSchema":{"type":"object","properties":{"workspace_hash":{"type":"string","description":"Workspace scope; empty means global."},"subject":{"type":"string"},"predicate":{"type":"string"},"value":{"type":"string","description":"Normalized only for matching; the value is not stored."},"reason":{"type":"string"},"evidence_ref":{"type":"string"},"author_agent_id":{"type":"string"},"expires_at_unix_ms":{"type":"integer"}},"required":["workspace_hash","subject","predicate","value"]}, "title":"Reject Value"}
+    "name":"perseus_vault_authority_set", "description":"Create a versioned authority manifest for a registered agent.", "inputSchema":{"type":"object","properties":{"agent_id":{"type":"string"},"workspace_hash":{"type":"string"},"allowed_capabilities":{"type":"array","items":{"type":"string"}},"scope_anchors":{"type":"array","items":{"type":"string"}},"approval_required_capabilities":{"type":"array","items":{"type":"string"}},"approver_principals":{"type":"array","items":{"type":"string"}},"allowed_inbound_principals":{"type":"array","items":{"type":"string"}},"permitted_external_ref_prefixes":{"type":"array","items":{"type":"string"}},"max_parallel_actions":{"type":"integer","default":1},"mode":{"type":"string","default":"shadow"},"expires_at_unix_ms":{"type":"integer"},"author_agent_id":{"type":"string"},"capability_constraints_json":{"type":"string","default":"{}"}},"required":["agent_id","workspace_hash","allowed_capabilities","scope_anchors"]}, "title":"Set Action Authority"},
+  {"name":"perseus_vault_authority_get", "description":"Get the active authority manifest for an agent and workspace.", "inputSchema":{"type":"object","properties":{"agent_id":{"type":"string"},"workspace_hash":{"type":"string"},"include_revoked":{"type":"boolean","default":false}},"required":["agent_id","workspace_hash"]}, "title":"Get Action Authority"},
+  {"name":"perseus_vault_authority_revoke", "description":"Revoke an authority manifest.", "inputSchema":{"type":"object","properties":{"manifest_id":{"type":"string"},"actor_agent_id":{"type":"string"},"reason":{"type":"string"}},"required":["manifest_id"]}, "title":"Revoke Action Authority"},
+  {"name":"perseus_vault_authority_set_signed", "description":"Load a signed, distributable policy/authority profile (Ed25519 sigstore-style attestation); verification failure grants no authority (fail closed) and the verification result lands in the ledger journal.", "inputSchema":{"type":"object","properties":{"profile_json":{"type":"string"},"trusted_public_key_b64":{"type":"string"},"author_agent_id":{"type":"string"}},"required":["profile_json","trusted_public_key_b64","author_agent_id"]}, "title":"Load Signed Authority Profile"},
+  {"name":"perseus_vault_action_intent", "description":"Record a fail-closed authorized action intent.", "inputSchema":{"type":"object","properties":{"agent_id":{"type":"string"},"workspace_hash":{"type":"string"},"scope_anchor":{"type":"string"},"external_ref":{"type":"string"},"capability":{"type":"string"},"action_key":{"type":"string"},"intent_hash":{"type":"string"},"resource_constraints_json":{"type":"string","default":"{}"}},"required":["agent_id","workspace_hash","scope_anchor","external_ref","capability","action_key","intent_hash"]}, "title":"Record Action Intent"},
+  {"name":"perseus_vault_action_approve", "description":"Grant or deny an approval-requested action.", "inputSchema":{"type":"object","properties":{"action_id":{"type":"string"},"approver_principal":{"type":"string"},"decision":{"type":"string","enum":["granted","denied"]}},"required":["action_id","approver_principal","decision"]}, "title":"Decide Action Approval"},
+  {"name":"perseus_vault_action_complete", "description":"Record an executed, failed, cancelled, or denied action outcome by hash.", "inputSchema":{"type":"object","properties":{"action_id":{"type":"string"},"actor_agent_id":{"type":"string"},"outcome":{"type":"string","enum":["executed","failed","cancelled","denied"]},"outcome_hash":{"type":"string"}},"required":["action_id","actor_agent_id","outcome","outcome_hash"]}, "title":"Complete Authorized Action"},
+  {"name":"perseus_vault_action_resolve_timeout", "description":"Resolve a pending approval to deny once its window has expired (timeout defaults to deny).", "inputSchema":{"type":"object","properties":{"action_id":{"type":"string"},"approval_timeout_ms":{"type":"integer"}},"required":["action_id","approval_timeout_ms"]}, "title":"Resolve Approval Timeout"},
+  {"name":"perseus_vault_action_receipt_get", "description":"Get durable action receipt metadata and hashes.", "inputSchema":{"type":"object","properties":{"action_id":{"type":"string"}},"required":["action_id"]}, "title":"Get Action Receipt"},
+  {"name":"perseus_vault_action_lease_acquire", "description":"Acquire the single active lease for an action key.", "inputSchema":{"type":"object","properties":{"action_id":{"type":"string"},"holder_id":{"type":"string"},"ttl_seconds":{"type":"integer","default":1}},"required":["action_id","holder_id"]}, "title":"Acquire Action Lease"},
+  {"name":"perseus_vault_action_lease_release", "description":"Release an action lease held by its owner.", "inputSchema":{"type":"object","properties":{"lease_id":{"type":"string"},"holder_id":{"type":"string"}},"required":["lease_id","holder_id"]}, "title":"Release Action Lease"},
+  {"name":"perseus_vault_stage_trace_validate", "description":"Validate a versioned hash-only runtime stage trace and optionally compare replay semantics. Raw prompts, memory bodies, credentials, and tool payloads are not accepted.", "inputSchema":{"type":"object","properties":{"trace":{"type":"object","description":"perseus-vault-stage-trace/v1 structured trace"},"replay_of":{"type":"object","description":"Optional second trace to compare by replay fingerprint"}},"required":["trace"]}, "title":"Validate Runtime Stage Trace"},
+  {"name":"perseus_vault_reject_value", "description":"Record a scoped digest-only rejected-value tombstone. Equivalent values remain rejected across new entity keys and writer paths until the tombstone expires or is explicitly superseded.", "inputSchema":{"type":"object","properties":{"workspace_hash":{"type":"string","description":"Workspace scope; empty means global."},"subject":{"type":"string"},"predicate":{"type":"string"},"value":{"type":"string","description":"Normalized only for matching; the value is not stored."},"reason":{"type":"string"},"evidence_ref":{"type":"string"},"author_agent_id":{"type":"string"},"expires_at_unix_ms":{"type":"integer"}},"required":["workspace_hash","subject","predicate","value"]}, "title":"Reject Value"}
 ]"###,
         )
         .expect("tools JSON must be valid");
-        let tools = registry
-            .as_array_mut()
-            .expect("tools registry must be a JSON array");
-        for tool in tools.iter_mut() {
-            if let Some(name) = tool.get("name").and_then(|v| v.as_str()) {
-                if let Some(suffix) = name.strip_prefix("mimir_") {
-                    tool["name"] = serde_json::Value::String(format!("perseus_vault_{}", suffix));
-                }
-            }
-            if let Some(description) = tool.get("description").and_then(|v| v.as_str()) {
-                tool["description"] = serde_json::Value::String(
-                    description.replace("mimir_", "perseus_vault_").replace("Mimir", "Perseus Vault"),
-                );
-            }
-        }
-        tools.clone()
+        registry
+            .as_array()
+            .expect("tools registry must be a JSON array")
+            .clone()
     })
 }
 
-/// Whether tools/list advertises all three rename-transition prefixes
-/// (`mimir_`/`mneme_`/`perseus_vault_`) or only the canonical
-/// `perseus_vault_*` set. Legacy names stay dispatchable via `call_tool`
-/// regardless — this controls only what is *advertised*, so a client sees one
-/// copy of each tool instead of three (the 3× manifest was tripling the
-/// tool-schema payload on every request for every connected client).
-///
-/// Default (unset or "canonical"): canonical-only. Opt back into the historical
-/// 3× manifest with `PERSEUS_VAULT_TOOL_ALIASES=all` (the legacy env
-/// `MIMIR_TOOL_ALIASES` is also honored, with `PERSEUS_VAULT_` taking
-/// precedence).
-fn advertise_all_aliases() -> bool {
-    let mode = std::env::var("PERSEUS_VAULT_TOOL_ALIASES")
-        .or_else(|_| std::env::var("MIMIR_TOOL_ALIASES"))
-        .unwrap_or_default();
-    matches!(
-        mode.trim().to_ascii_lowercase().as_str(),
-        "all" | "legacy" | "1" | "true"
-    )
-}
-
-/// Build the advertised tool array from the canonical registry. When
-/// `advertise_all` is false, only the canonical `perseus_vault_*` name is
-/// emitted for each tool; when true, all three rename-transition prefixes are
-/// emitted (the historical behavior).
-fn build_tools_array(base_array: &[serde_json::Value], advertise_all: bool) -> serde_json::Value {
-    let mut aliased: Vec<serde_json::Value> =
-        Vec::with_capacity(base_array.len() * if advertise_all { 3 } else { 1 });
-    for tool in base_array {
-        // The base registry is canonical Perseus Vault names. Legacy names are
-        // present only when a caller explicitly opts into the compatibility
-        // manifest during the v2 observation window.
-        aliased.push(tool.clone());
-        if advertise_all {
-            if let Some(mimir_alias) = legacy_alias_tool(tool, "mimir") {
-                aliased.push(mimir_alias);
-            }
-            if let Some(mneme_alias) = legacy_alias_tool(tool, "mneme") {
-                aliased.push(mneme_alias);
-            }
-        }
-    }
-    serde_json::Value::Array(aliased)
-}
-
-/// Build the tools/list response. The canonical registry is parsed once
-/// (`tool_registry_base`); the advertised array is cached per advertise-mode so
-/// repeated tools/list calls don't re-synthesize it (perf review #208).
+/// Build the tools/list response from the canonical registry (parsed once by
+/// `tool_registry_base`; cached there so repeated tools/list calls don't
+/// re-parse the embedded literal — perf review #208).
 fn list_tools(id: Option<Value>) -> JsonRpcResponse {
-    static TOOLS_ALL: OnceLock<serde_json::Value> = OnceLock::new();
-    static TOOLS_CANONICAL: OnceLock<serde_json::Value> = OnceLock::new();
-    let tools_json = if advertise_all_aliases() {
-        TOOLS_ALL.get_or_init(|| build_tools_array(tool_registry_base(), true))
-    } else {
-        TOOLS_CANONICAL.get_or_init(|| build_tools_array(tool_registry_base(), false))
-    };
-
     JsonRpcResponse {
         jsonrpc: "2.0".to_string(),
         id,
         result: Some(json!({
-            "tools": tools_json.clone()
+            "tools": tool_registry_base()
         })),
         error: None,
     }
 }
 fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> String {
-    // Keep the caller's original (un-normalized) name for error messages —
-    // a "mneme_bogus"/"perseus_vault_bogus" call should say so, not report
-    // back the normalized "mimir_bogus" it was rewritten to below.
+    // Keep the caller's original name for error messages — a
+    // "perseus_vault_bogus" call should say so, not report a rewritten name.
     let original_name = name;
-    // Mneme/Perseus Vault rename (transition release): "mneme_*" and
-    // "perseus_vault_*" are back-compat aliases for "mimir_*" — normalize
-    // whichever prefix is present once here so every match arm below keeps
-    // dispatching on the original name without needing its own alias arm.
-    let owned_name = name
-        .strip_prefix("perseus_vault_")
-        .or_else(|| name.strip_prefix("mneme_"))
-        .map(|suffix| format!("mimir_{}", suffix));
-    let name: &str = owned_name.as_deref().unwrap_or(name);
 
     // #858: fail loud when the running binary was replaced on disk — never
     // silently serve results from a stale process image. The handoff tool and
@@ -5874,134 +5649,133 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
     }
 
     let handler_result: Result<String, String> = match name {
-        "mimir_remember" => tools::handle_remember(db, args).map_err(|e| e.to_string()),
+        "perseus_vault_remember" => tools::handle_remember(db, args).map_err(|e| e.to_string()),
 
-        "mimir_reject_value" => tools::handle_reject_value(db, args).map_err(|e| e.to_string()),
+        "perseus_vault_reject_value" => tools::handle_reject_value(db, args).map_err(|e| e.to_string()),
 
-        "mimir_recall" => tools::handle_recall(db, args).map_err(|e| e.to_string()),
+        "perseus_vault_recall" => tools::handle_recall(db, args).map_err(|e| e.to_string()),
 
-        "mimir_recall_batch" => tools::handle_recall_batch(db, args).map_err(|e| e.to_string()),
+        "perseus_vault_recall_batch" => tools::handle_recall_batch(db, args).map_err(|e| e.to_string()),
 
-        "mimir_recall_layer" => tools::handle_recall_layer(db, args).map_err(|e| e.to_string()),
+        "perseus_vault_recall_layer" => tools::handle_recall_layer(db, args).map_err(|e| e.to_string()),
 
-        "mimir_scan" => tools::handle_scan(db, args).map_err(|e| e.to_string()),
+        "perseus_vault_scan" => tools::handle_scan(db, args).map_err(|e| e.to_string()),
 
-        "mimir_hygiene" => tools::handle_hygiene(db, args).map_err(|e| e.to_string()),
+        "perseus_vault_hygiene" => tools::handle_hygiene(db, args).map_err(|e| e.to_string()),
 
-        "mimir_semantic_search" => {
+        "perseus_vault_semantic_search" => {
             tools::handle_semantic_search(db, args).map_err(|e| e.to_string())
         }
 
-        "mimir_ask" => tools::handle_ask(db, args).map_err(|e| e.to_string()),
+        "perseus_vault_ask" => tools::handle_ask(db, args).map_err(|e| e.to_string()),
 
-        "mimir_get_entity" => tools::handle_get_entity(db, args).map_err(|e| e.to_string()),
-        "mimir_history" => tools::handle_history(db, args).map_err(|e| e.to_string()),
-        "mimir_as_of" => tools::handle_as_of(db, args).map_err(|e| e.to_string()),
-        "mimir_valid_at" => tools::handle_valid_at(db, args).map_err(|e| e.to_string()),
-        "mimir_bitemporal" => tools::handle_bitemporal(db, args).map_err(|e| e.to_string()),
-        "mimir_forget" => tools::handle_forget(db, args).map_err(|e| e.to_string()),
+        "perseus_vault_get_entity" => tools::handle_get_entity(db, args).map_err(|e| e.to_string()),
+        "perseus_vault_history" => tools::handle_history(db, args).map_err(|e| e.to_string()),
+        "perseus_vault_as_of" => tools::handle_as_of(db, args).map_err(|e| e.to_string()),
+        "perseus_vault_valid_at" => tools::handle_valid_at(db, args).map_err(|e| e.to_string()),
+        "perseus_vault_bitemporal" => tools::handle_bitemporal(db, args).map_err(|e| e.to_string()),
+        "perseus_vault_forget" => tools::handle_forget(db, args).map_err(|e| e.to_string()),
 
-        "mimir_ingest" => tools::handle_ingest(db, args).map_err(|e| e.to_string()),
+        "perseus_vault_ingest" => tools::handle_ingest(db, args).map_err(|e| e.to_string()),
 
-        "mimir_ingest_file" => tools::handle_ingest_file(db, args).map_err(|e| e.to_string()),
+        "perseus_vault_ingest_file" => tools::handle_ingest_file(db, args).map_err(|e| e.to_string()),
 
-        "mimir_artifact_register" => {
+        "perseus_vault_artifact_register" => {
             tools::handle_artifact_register(db, args).map_err(|e| e.to_string())
         }
-        "mimir_artifact_manifest" => {
+        "perseus_vault_artifact_manifest" => {
             tools::handle_artifact_manifest(db, args).map_err(|e| e.to_string())
         }
-        "mimir_artifact_excerpt" => {
+        "perseus_vault_artifact_excerpt" => {
             tools::handle_artifact_excerpt(db, args).map_err(|e| e.to_string())
         }
-        "mimir_artifact_log_digest" => {
+        "perseus_vault_artifact_log_digest" => {
             tools::handle_artifact_log_digest(db, args).map_err(|e| e.to_string())
         }
-        "mimir_artifact_verify_value" => {
+        "perseus_vault_artifact_verify_value" => {
             tools::handle_artifact_verify_value(db, args).map_err(|e| e.to_string())
         }
 
-        "mimir_embed" => tools::handle_embed(db, args).map_err(|e| e.to_string()),
+        "perseus_vault_embed" => tools::handle_embed(db, args).map_err(|e| e.to_string()),
 
-        "mimir_prune" => tools::handle_prune(db, args).map_err(|e| e.to_string()),
+        "perseus_vault_prune" => tools::handle_prune(db, args).map_err(|e| e.to_string()),
 
-        "mimir_link" => tools::handle_link(db, args).map_err(|e| e.to_string()),
+        "perseus_vault_link" => tools::handle_link(db, args).map_err(|e| e.to_string()),
 
-        "mimir_unlink" => tools::handle_unlink(db, args).map_err(|e| e.to_string()),
+        "perseus_vault_unlink" => tools::handle_unlink(db, args).map_err(|e| e.to_string()),
 
-        "mimir_journal" => tools::handle_journal(db, args).map_err(|e| e.to_string()),
+        "perseus_vault_journal" => tools::handle_journal(db, args).map_err(|e| e.to_string()),
 
-        "mimir_check_failure_pattern" => {
+        "perseus_vault_check_failure_pattern" => {
             tools::handle_check_failure_pattern(db, args).map_err(|e| e.to_string())
         }
 
-        "mimir_timeline" => tools::handle_timeline(db, args).map_err(|e| e.to_string()),
+        "perseus_vault_timeline" => tools::handle_timeline(db, args).map_err(|e| e.to_string()),
 
-        "mimir_state_set" => tools::handle_state_set(db, args).map_err(|e| e.to_string()),
+        "perseus_vault_state_set" => tools::handle_state_set(db, args).map_err(|e| e.to_string()),
 
-        "mimir_state_get" => tools::handle_state_get(db, args).map_err(|e| e.to_string()),
+        "perseus_vault_state_get" => tools::handle_state_get(db, args).map_err(|e| e.to_string()),
 
-        "mimir_state_delete" => tools::handle_state_delete(db, args).map_err(|e| e.to_string()),
+        "perseus_vault_state_delete" => tools::handle_state_delete(db, args).map_err(|e| e.to_string()),
 
-        "mimir_state_list" => tools::handle_state_list(db, args).map_err(|e| e.to_string()),
+        "perseus_vault_state_list" => tools::handle_state_list(db, args).map_err(|e| e.to_string()),
 
-        "mimir_health" => Ok(tools::handle_health(db)),
-        "mimir_handoff_restart" => crate::live_update::handle_handoff_restart(args),
-        "mimir_quality_telemetry" => tools::handle_quality_telemetry(db, args),
+        "perseus_vault_health" => Ok(tools::handle_health(db)),
+        "perseus_vault_handoff_restart" => crate::live_update::handle_handoff_restart(args),
+        "perseus_vault_quality_telemetry" => tools::handle_quality_telemetry(db, args),
 
-        "mimir_stats" => Ok(tools::handle_stats(db)),
+        "perseus_vault_stats" => Ok(tools::handle_stats(db)),
 
-        "mimir_compact" => Ok(tools::handle_compact(db, args)),
+        "perseus_vault_compact" => Ok(tools::handle_compact(db, args)),
 
-        "mimir_purge" => tools::handle_purge(db, args).map_err(|e| e.to_string()),
-        "mimir_expire" => tools::handle_expire(db, args).map_err(|e| e.to_string()),
-        "mimir_redact" => tools::handle_redact(db, args).map_err(|e| e.to_string()),
-        "mimir_erase" => tools::handle_erase(db, args).map_err(|e| e.to_string()),
-
-        "mimir_learned_artifact_register" => {
+        "perseus_vault_purge" => tools::handle_purge(db, args).map_err(|e| e.to_string()),
+        "perseus_vault_expire" => tools::handle_expire(db, args).map_err(|e| e.to_string()),
+        "perseus_vault_redact" => tools::handle_redact(db, args).map_err(|e| e.to_string()),
+        "perseus_vault_erase" => tools::handle_erase(db, args).map_err(|e| e.to_string()),
+        "perseus_vault_learned_artifact_register" => {
             tools::handle_learned_artifact_register(db, args).map_err(|e| e.to_string())
         }
 
-        "mimir_workspace_bind" => {
+        "perseus_vault_workspace_bind" => {
             tools::handle_workspace_bind(db, args).map_err(|e| e.to_string())
         }
-        "mimir_workspace_unbind" => {
+        "perseus_vault_workspace_unbind" => {
             tools::handle_workspace_unbind(db, args).map_err(|e| e.to_string())
         }
-        "mimir_workspace_quarantine" => {
+        "perseus_vault_workspace_quarantine" => {
             tools::handle_workspace_quarantine(db, args).map_err(|e| e.to_string())
         }
-        "mimir_workspace_status" => {
+        "perseus_vault_workspace_status" => {
             tools::handle_workspace_status(db, args).map_err(|e| e.to_string())
         }
-        "mimir_memories" => tools::handle_memories(db, args).map_err(|e| e.to_string()),
+        "perseus_vault_memories" => tools::handle_memories(db, args).map_err(|e| e.to_string()),
 
-        "mimir_migrate" => Ok(tools::handle_migrate(db, args)),
+        "perseus_vault_migrate" => Ok(tools::handle_migrate(db, args)),
 
-        "mimir_context" => Ok(tools::handle_context(db, args)),
+        "perseus_vault_context" => Ok(tools::handle_context(db, args)),
 
-        "mimir_extract" => tools::handle_extract(db, args).map_err(|e| e.to_string()),
+        "perseus_vault_extract" => tools::handle_extract(db, args).map_err(|e| e.to_string()),
 
-        "mimir_capture" => tools::handle_capture(db, args).map_err(|e| e.to_string()),
+        "perseus_vault_capture" => tools::handle_capture(db, args).map_err(|e| e.to_string()),
 
-        "mimir_traverse" => Ok(tools::handle_traverse(db, args)),
-        "mimir_score" => Ok(tools::handle_score(db, args)),
-        "mimir_follow" => tools::handle_follow(db, args).map_err(|e| e.to_string()),
-        "mimir_keystone_set" => tools::handle_keystone_set(db, args),
-        "mimir_keystone_get" => tools::handle_keystone_get(db, args),
-        "mimir_agent" => tools::handle_agent(db, args),
-        "mimir_authority_set" => tools::handle_authority_set(db, args),
-        "mimir_authority_set_signed" => tools::handle_authority_set_signed(db, args),
-        "mimir_authority_get" => tools::handle_authority_get(db, args),
-        "mimir_authority_revoke" => tools::handle_authority_revoke(db, args),
-        "mimir_action_intent" => tools::handle_action_intent(db, args),
-        "mimir_action_approve" => tools::handle_action_approve(db, args),
-        "mimir_action_complete" => tools::handle_action_complete(db, args),
-        "mimir_action_resolve_timeout" => tools::handle_action_resolve_timeout(db, args),
-        "mimir_action_receipt_get" => tools::handle_action_receipt_get(db, args),
-        "mimir_action_lease_acquire" => tools::handle_action_lease_acquire(db, args),
-        "mimir_action_lease_release" => tools::handle_action_lease_release(db, args),
-        "mimir_stage_trace_validate" => (|| -> Result<String, String> {
+        "perseus_vault_traverse" => Ok(tools::handle_traverse(db, args)),
+        "perseus_vault_score" => Ok(tools::handle_score(db, args)),
+        "perseus_vault_follow" => tools::handle_follow(db, args).map_err(|e| e.to_string()),
+        "perseus_vault_keystone_set" => tools::handle_keystone_set(db, args),
+        "perseus_vault_keystone_get" => tools::handle_keystone_get(db, args),
+        "perseus_vault_agent" => tools::handle_agent(db, args),
+        "perseus_vault_authority_set" => tools::handle_authority_set(db, args),
+        "perseus_vault_authority_set_signed" => tools::handle_authority_set_signed(db, args),
+        "perseus_vault_authority_get" => tools::handle_authority_get(db, args),
+        "perseus_vault_authority_revoke" => tools::handle_authority_revoke(db, args),
+        "perseus_vault_action_intent" => tools::handle_action_intent(db, args),
+        "perseus_vault_action_approve" => tools::handle_action_approve(db, args),
+        "perseus_vault_action_complete" => tools::handle_action_complete(db, args),
+        "perseus_vault_action_resolve_timeout" => tools::handle_action_resolve_timeout(db, args),
+        "perseus_vault_action_receipt_get" => tools::handle_action_receipt_get(db, args),
+        "perseus_vault_action_lease_acquire" => tools::handle_action_lease_acquire(db, args),
+        "perseus_vault_action_lease_release" => tools::handle_action_lease_release(db, args),
+        "perseus_vault_stage_trace_validate" => (|| -> Result<String, String> {
             let trace_value = args
                 .get("trace")
                 .cloned()
@@ -6028,39 +5802,39 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
             }))
             .map_err(|e| e.to_string())
         })(),
-        "mimir_promote" => tools::handle_promote(db, args),
-        "mimir_demote" => tools::handle_demote(db, args),
-        "mimir_beliefs" => beliefs::handle_beliefs(db, args),
-        "mimir_claim_card" => claim_card::handle_claim_card(db, args),
-        "mimir_operator_review" => tools::handle_operator_review(db, args),
-        "mimir_conflicts" => Ok(tools::handle_conflicts(db, args)),
-        "mimir_consolidate" => Ok(tools::handle_consolidate(db, args)),
-        "mimir_dream" => tools::handle_dream(db, args),
-        "mimir_vault_export" => Ok(tools::handle_vault_export(db, args)),
-        "mimir_derived_export" => tools::handle_derived_export(db, args),
-        "mimir_markdown_import" => tools::handle_markdown_import(db, args),
-        "mimir_structured_index_anchor" => tools::handle_structured_index_anchor(db, args),
-        "mimir_vault_import" => Ok(tools::handle_vault_import(db, args)),
-        "mimir_decay" => Ok(tools::handle_decay(db, args)),
-        "mimir_reindex" => Ok(tools::handle_reindex(db, args)),
-        "mimir_share" => tools::handle_share(db, args).map_err(|e| e.to_string()),
-        "mimir_federate" => tools::handle_federate(db, args).map_err(|e| e.to_string()),
-        "mimir_workspace_list" => Ok(tools::handle_workspace_list(db)),
-        "mimir_recall_when" => tools::handle_recall_when(db, args).map_err(|e| e.to_string()),
-        "mimir_cohere" => tools::handle_cohere(db, args).map_err(|e| e.to_string()),
-        "mimir_correct" => tools::handle_correct(db, args).map_err(|e| e.to_string()),
-        "mimir_synthesize" => tools::handle_synthesize(db, args).map_err(|e| e.to_string()),
-        "mimir_bench" => tools::handle_bench(db, args).map_err(|e| e.to_string()),
+        "perseus_vault_promote" => tools::handle_promote(db, args),
+        "perseus_vault_demote" => tools::handle_demote(db, args),
+        "perseus_vault_beliefs" => beliefs::handle_beliefs(db, args),
+        "perseus_vault_claim_card" => claim_card::handle_claim_card(db, args),
+        "perseus_vault_operator_review" => tools::handle_operator_review(db, args),
+        "perseus_vault_conflicts" => Ok(tools::handle_conflicts(db, args)),
+        "perseus_vault_consolidate" => Ok(tools::handle_consolidate(db, args)),
+        "perseus_vault_dream" => tools::handle_dream(db, args),
+        "perseus_vault_vault_export" => Ok(tools::handle_vault_export(db, args)),
+        "perseus_vault_derived_export" => tools::handle_derived_export(db, args),
+        "perseus_vault_markdown_import" => tools::handle_markdown_import(db, args),
+        "perseus_vault_structured_index_anchor" => tools::handle_structured_index_anchor(db, args),
+        "perseus_vault_vault_import" => Ok(tools::handle_vault_import(db, args)),
+        "perseus_vault_decay" => Ok(tools::handle_decay(db, args)),
+        "perseus_vault_reindex" => Ok(tools::handle_reindex(db, args)),
+        "perseus_vault_share" => tools::handle_share(db, args).map_err(|e| e.to_string()),
+        "perseus_vault_federate" => tools::handle_federate(db, args).map_err(|e| e.to_string()),
+        "perseus_vault_workspace_list" => Ok(tools::handle_workspace_list(db)),
+        "perseus_vault_recall_when" => tools::handle_recall_when(db, args).map_err(|e| e.to_string()),
+        "perseus_vault_cohere" => tools::handle_cohere(db, args).map_err(|e| e.to_string()),
+        "perseus_vault_correct" => tools::handle_correct(db, args).map_err(|e| e.to_string()),
+        "perseus_vault_synthesize" => tools::handle_synthesize(db, args).map_err(|e| e.to_string()),
+        "perseus_vault_bench" => tools::handle_bench(db, args).map_err(|e| e.to_string()),
 
-        "mimir_communities" => tools::handle_communities(db, args).map_err(|e| e.to_string()),
-        "mimir_community_summary" => {
+        "perseus_vault_communities" => tools::handle_communities(db, args).map_err(|e| e.to_string()),
+        "perseus_vault_community_summary" => {
             tools::handle_community_summary(db, args).map_err(|e| e.to_string())
         }
-        "mimir_global_recall" => tools::handle_global_recall(db, args).map_err(|e| e.to_string()),
+        "perseus_vault_global_recall" => tools::handle_global_recall(db, args).map_err(|e| e.to_string()),
 
-        "mimir_autocohere" => tools::handle_autocohere(db, args).map_err(|e| e.to_string()),
-        "mimir_supersede" => tools::handle_supersede(db, args).map_err(|e| e.to_string()),
-        "mimir_maintenance" => tools::handle_maintenance(db, args).map_err(|e| e.to_string()),
+        "perseus_vault_autocohere" => tools::handle_autocohere(db, args).map_err(|e| e.to_string()),
+        "perseus_vault_supersede" => tools::handle_supersede(db, args).map_err(|e| e.to_string()),
+        "perseus_vault_maintenance" => tools::handle_maintenance(db, args).map_err(|e| e.to_string()),
 
         _ => Err(format!("Unknown tool: {}", original_name)),
     };
@@ -6099,13 +5873,9 @@ mod tests {
     use super::*;
     use std::fs;
 
-    /// Tool names advertised by tools/list for a given advertise-mode. Bypasses
-    /// the env var + OnceLock caching in `list_tools` so the two modes can be
-    /// asserted deterministically in the same process (no cross-test races).
-    fn advertised_names(advertise_all: bool) -> Vec<String> {
-        build_tools_array(tool_registry_base(), advertise_all)
-            .as_array()
-            .unwrap()
+    /// Tool names advertised by tools/list (the canonical registry).
+    fn advertised_names() -> Vec<String> {
+        tool_registry_base()
             .iter()
             .map(|t| t["name"].as_str().unwrap().to_string())
             .collect()
@@ -6127,11 +5897,11 @@ mod tests {
         );
         assert_eq!(
             registry_names.len(),
-            100,
+            99,
             "update public metadata when adding a tool"
         );
 
-        let canonical = advertised_names(false);
+        let canonical = advertised_names();
         let canonical_set: std::collections::HashSet<&str> =
             canonical.iter().map(String::as_str).collect();
         assert_eq!(canonical.len(), registry_names.len());
@@ -6143,24 +5913,13 @@ mod tests {
         assert!(canonical
             .iter()
             .all(|name| name.starts_with("perseus_vault_")));
-
-        let all = advertised_names(true);
-        let all_set: std::collections::HashSet<&str> = all.iter().map(String::as_str).collect();
-        assert_eq!(all.len(), canonical.len() * 3);
-        assert_eq!(
-            all_set.len(),
-            all.len(),
-            "compatibility names must be unique"
-        );
     }
 
     #[test]
-    fn journal_scope_attribution_is_advertised_in_canonical_and_alias_schemas() {
-        let canonical = build_tools_array(tool_registry_base(), false);
+    fn journal_scope_attribution_is_advertised_in_schemas() {
+        let canonical = tool_registry_base();
         for name in ["perseus_vault_journal", "perseus_vault_timeline"] {
             let tool = canonical
-                .as_array()
-                .unwrap()
                 .iter()
                 .find(|tool| tool["name"] == name)
                 .unwrap_or_else(|| panic!("missing {name}"));
@@ -6172,18 +5931,6 @@ mod tests {
                     "string"
                 );
             }
-        }
-
-        let aliases = build_tools_array(tool_registry_base(), true);
-        for name in ["mimir_journal", "mneme_journal", "mimir_timeline", "mneme_timeline"] {
-            assert!(
-                aliases
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .any(|tool| tool["name"] == name),
-                "missing alias {name}"
-            );
         }
     }
 
@@ -6204,137 +5951,27 @@ mod tests {
     }
 
     #[test]
-    fn tool_prefix_classifier_distinguishes_all_call_names() {
-        assert_eq!(
-            classify_tool_prefix("perseus_vault_recall"),
-            ToolPrefix::Canonical
-        );
-        assert_eq!(classify_tool_prefix("mimir_recall"), ToolPrefix::Mimir);
-        assert_eq!(classify_tool_prefix("mneme_recall"), ToolPrefix::Mneme);
-        assert_eq!(classify_tool_prefix("custom_tool"), ToolPrefix::Other);
-    }
-
-    #[test]
-    fn alias_usage_counts_calls_once_without_counting_or_leaking_readouts() {
-        let db_path = std::env::temp_dir().join(format!(
-            "perseus-alias-usage-{}.db",
-            uuid::Uuid::new_v4()
-        ));
-        let db = Database::open(db_path.to_str().expect("temp db path")).expect("open temp db");
-        let state = MCPState::new();
-        state
-            .initialized
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-
-        let call = |name: &str, arguments: Value| {
-            let response = handle_request(
-                &JsonRpcRequest {
-                    jsonrpc: "2.0".to_string(),
-                    id: Some(json!(1)),
-                    method: "tools/call".to_string(),
-                    params: Some(json!({"name": name, "arguments": arguments})),
-                },
-                &state,
-                &db,
-            )
-            .expect("tools/call response");
-            response.result.expect("tools/call result")["structuredContent"].clone()
-        };
-
-        call(
-            "perseus_vault_health",
-            json!({"sentinel": "must-not-appear-in-alias-usage"}),
-        );
-        call("mimir_health", json!({}));
-        call("mneme_health", json!({}));
-        call("custom_tool", json!({}));
-
-        let first = call("perseus_vault_alias_usage", json!({}));
-        assert_eq!(first["canonical_calls"], json!(1));
-        assert_eq!(first["mimir_calls"], json!(1));
-        assert_eq!(first["mneme_calls"], json!(1));
-        assert_eq!(first["other_calls"], json!(1));
-        assert!(first["since_process_start_unix_ms"].as_u64().unwrap() > 0);
-        assert!(!first.to_string().contains("must-not-appear-in-alias-usage"));
-
-        let second = call("mimir_alias_usage", json!({}));
-        assert_eq!(
-            second, first,
-            "alias-usage readouts must not count themselves"
-        );
-
-        assert!(advertised_names(false).contains(&"perseus_vault_alias_usage".to_string()));
-        for name in [
-            "mimir_alias_usage",
-            "mneme_alias_usage",
-            "perseus_vault_alias_usage",
-        ] {
-            assert!(advertised_names(true).contains(&name.to_string()));
-        }
-
-        let _ = fs::remove_file(db_path);
-    }
-
-    #[test]
-    fn tool_aliases_default_to_canonical_only() {
-        // The regression this guards (#tool-alias-triple): every connected
-        // client was loading each tool three times (mimir_/mneme_/perseus_vault_),
-        // tripling the tool-schema payload on every request. Default advertise
-        // mode must emit exactly one canonical `perseus_vault_*` copy per tool.
-        let canonical = advertised_names(false);
-        let all = advertised_names(true);
-        assert_eq!(
-            all.len(),
-            canonical.len() * 3,
-            "all-aliases must advertise 3× the canonical set"
-        );
-        assert!(
-            canonical.iter().all(|n| n.starts_with("perseus_vault_")),
-            "canonical mode must advertise only perseus_vault_* names"
-        );
-        assert!(
-            !canonical.iter().any(|n| n.starts_with("mimir_") || n.starts_with("mneme_")),
-            "canonical mode must not advertise legacy mimir_/mneme_ names"
-        );
-    }
-
-    #[test]
-    fn dream_is_registered_with_aliases_and_errors_cleanly_without_llm() {
-        // Default advertises only the canonical name; the legacy prefixes stay
-        // dispatchable (asserted via call_tool below) but unadvertised. Opt-in
-        // `all` restores every rename-transition alias.
-        assert!(advertised_names(false).contains(&"perseus_vault_dream".to_string()));
-        assert!(!advertised_names(false).contains(&"mimir_dream".to_string()));
-        for name in ["mimir_dream", "mneme_dream", "perseus_vault_dream"] {
-            assert!(
-                advertised_names(true).contains(&name.to_string()),
-                "all-aliases missing {name}"
-            );
-        }
+    fn dream_is_registered_and_errors_cleanly_without_llm() {
+        assert!(advertised_names().contains(&"perseus_vault_dream".to_string()));
 
         let db_path = std::env::temp_dir()
-            .join(format!("mimir-dream-{}.db", uuid::Uuid::new_v4()));
+            .join(format!("perseus_vault-dream-{}.db", uuid::Uuid::new_v4()));
         let db = Database::open(db_path.to_str().expect("temp db path")).expect("open temp db");
 
         // No --llm-endpoint configured: the tool must answer with a clean MCP
         // tool error (isError, spec §3.3) — never a crash or protocol error —
         // and the message must name the flag and the non-LLM alternative.
-        let r = call_tool("mimir_dream", &db, json!({"category": "episodes"}), None);
+        let r = call_tool("perseus_vault_dream", &db, json!({"category": "episodes"}), None);
         let v: Value = serde_json::from_str(&r).unwrap();
         assert_eq!(v["isError"], json!(true), "got: {r}");
         let msg = v["content"][0]["text"].as_str().unwrap();
         assert!(msg.contains("--llm-endpoint"), "got: {msg}");
-        assert!(msg.contains("mimir_consolidate"), "got: {msg}");
-
-        // Alias prefixes normalize into the same handler.
-        let r = call_tool("perseus_vault_dream", &db, json!({}), None);
-        let v: Value = serde_json::from_str(&r).unwrap();
-        assert_eq!(v["isError"], json!(true));
+        assert!(msg.contains("perseus_vault_consolidate"), "got: {msg}");
 
         // Opt-in graceful degradation: fallback_consolidate runs the non-LLM
         // consolidate pass instead of erroring, and says so.
         let r = call_tool(
-            "mimir_dream",
+            "perseus_vault_dream",
             &db,
             json!({"fallback_consolidate": true, "dry_run": true}),
             None,
@@ -6347,24 +5984,12 @@ mod tests {
     }
 
     #[test]
-    fn check_failure_pattern_is_registered_and_dispatches_under_aliases() {
-        // #521: tools/list must expose the deja-vu guard under the canonical
-        // name AND the rename-transition aliases (which come from the shared
-        // alias synthesis, not hand-duplicated entries).
-        assert!(advertised_names(false).contains(&"perseus_vault_check_failure_pattern".to_string()));
-        for name in [
-            "mimir_check_failure_pattern",
-            "mneme_check_failure_pattern",
-            "perseus_vault_check_failure_pattern",
-        ] {
-            assert!(
-                advertised_names(true).contains(&name.to_string()),
-                "all-aliases missing {name}"
-            );
-        }
+    fn check_failure_pattern_is_registered_and_dispatches() {
+        // #521: tools/list must expose the deja-vu guard under the canonical name.
+        assert!(advertised_names().contains(&"perseus_vault_check_failure_pattern".to_string()));
 
         let db_path = std::env::temp_dir()
-            .join(format!("mimir-fpguard-{}.db", uuid::Uuid::new_v4()));
+            .join(format!("perseus_vault-fpguard-{}.db", uuid::Uuid::new_v4()));
         let db = Database::open(db_path.to_str().expect("temp db path")).expect("open temp db");
 
         // Alias prefixes normalize into the same handler; empty store answers
@@ -6386,7 +6011,7 @@ mod tests {
         );
 
         // Missing required `action` → clean MCP tool error (isError, §3.3).
-        let r = call_tool("mimir_check_failure_pattern", &db, json!({}), None);
+        let r = call_tool("perseus_vault_check_failure_pattern", &db, json!({}), None);
         let v: Value = serde_json::from_str(&r).unwrap();
         assert_eq!(v["isError"], json!(true), "got: {r}");
 
@@ -6394,24 +6019,16 @@ mod tests {
     }
 
     #[test]
-    fn capture_is_registered_and_dispatches_under_aliases() {
+    fn capture_is_registered_and_dispatches() {
         // #520: tools/list must expose the capture pipeline under the
-        // canonical name AND the rename-transition aliases (which come from
-        // the shared alias synthesis, not hand-duplicated entries).
-        assert!(advertised_names(false).contains(&"perseus_vault_capture".to_string()));
-        for name in ["mimir_capture", "mneme_capture", "perseus_vault_capture"] {
-            assert!(
-                advertised_names(true).contains(&name.to_string()),
-                "all-aliases missing {name}"
-            );
-        }
+        // canonical name.
+        assert!(advertised_names().contains(&"perseus_vault_capture".to_string()));
 
         let db_path = std::env::temp_dir()
-            .join(format!("mimir-capture-{}.db", uuid::Uuid::new_v4()));
+            .join(format!("perseus_vault-capture-{}.db", uuid::Uuid::new_v4()));
         let db = Database::open(db_path.to_str().expect("temp db path")).expect("open temp db");
 
-        // Alias prefixes normalize into the same handler; a real payload
-        // distills and writes through the remember path.
+        // A real payload distills and writes through the remember path.
         let r = call_tool(
             "perseus_vault_capture",
             &db,
@@ -6424,7 +6041,7 @@ mod tests {
         assert_eq!(v["notes"][0]["type"], json!("root-cause"), "got: {r}");
 
         // Empty payload → clean MCP tool error (isError, spec §3.3).
-        let r = call_tool("mimir_capture", &db, json!({"text": "  "}), None);
+        let r = call_tool("perseus_vault_capture", &db, json!({"text": "  "}), None);
         let v: Value = serde_json::from_str(&r).unwrap();
         assert_eq!(v["isError"], json!(true), "got: {r}");
 
@@ -6438,10 +6055,10 @@ mod tests {
         // rename, delete, and recreate-after-delete (revival must also
         // restore the FTS row so the file is searchable again).
         let db_path = std::env::temp_dir()
-            .join(format!("mimir-memories-{}.db", uuid::Uuid::new_v4()));
+            .join(format!("perseus_vault-memories-{}.db", uuid::Uuid::new_v4()));
         let db = Database::open(db_path.to_str().expect("temp db path")).expect("open temp db");
         let call = |args: Value| -> String {
-            call_tool("mimir_memories", &db, args, None)
+            call_tool("perseus_vault_memories", &db, args, None)
         };
 
         // create
@@ -6518,41 +6135,31 @@ mod tests {
     }
 
     #[test]
-    fn bitemporal_tools_are_registered_and_dispatch_under_all_aliases() {
-        // #363: mimir_valid_at / mimir_bitemporal exist in the registry (with
-        // mneme_/perseus_vault_ aliases synthesized like every other tool) and
-        // dispatch through call_tool under each prefix.
+    fn bitemporal_tools_are_registered_and_dispatch() {
+        // #363: perseus_vault_valid_at / perseus_vault_bitemporal exist in the
+        // registry and dispatch through call_tool.
         let db_path = std::env::temp_dir()
-            .join(format!("mimir-bitemporal-tools-{}.db", uuid::Uuid::new_v4()));
+            .join(format!("perseus_vault-bitemporal-tools-{}.db", uuid::Uuid::new_v4()));
         let db = Database::open(db_path.to_str().expect("temp db path")).expect("open temp db");
 
-        let names = advertised_names(true);
+        let names = advertised_names();
         for expect in [
-            "mimir_valid_at",
-            "mneme_valid_at",
             "perseus_vault_valid_at",
-            "mimir_bitemporal",
-            "mneme_bitemporal",
             "perseus_vault_bitemporal",
         ] {
             assert!(names.contains(&expect.to_string()), "missing tool {expect}");
         }
-        // Canonical default advertises exactly the perseus_vault_* variants.
-        let canonical = advertised_names(false);
-        assert!(canonical.contains(&"perseus_vault_valid_at".to_string()));
-        assert!(canonical.contains(&"perseus_vault_bitemporal".to_string()));
-        assert!(!canonical.contains(&"mimir_valid_at".to_string()));
 
-        // Round-trip through call_tool under every prefix.
+        // Round-trip through call_tool.
         let stored = call_tool(
-            "mimir_remember",
+            "perseus_vault_remember",
             &db,
             json!({"category": "f", "key": "k", "body_json": "{\"note\":\"x\"}",
                    "valid_from_unix_ms": 1000}),
             None,
         );
         assert!(stored.contains("created"), "{stored}");
-        for prefix in ["mimir", "mneme", "perseus_vault"] {
+        for prefix in ["perseus_vault"] {
             let r = call_tool(
                 &format!("{prefix}_valid_at"),
                 &db,
@@ -6582,21 +6189,19 @@ mod tests {
 
     #[test]
     fn keystone_tools_register_dispatch_order_and_gate() {
-        // #683: keystones are registered (with aliases), round-trip through
+        // #683: keystones are registered, round-trip through
         // call_tool, merge by weight, are updated in place on re-set, gate on
         // trust tier, and every mutation lands on the audit chain.
         let db_path = std::env::temp_dir()
-            .join(format!("mimir-keystones-{}.db", uuid::Uuid::new_v4()));
+            .join(format!("perseus_vault-keystones-{}.db", uuid::Uuid::new_v4()));
         let db = Database::open(db_path.to_str().expect("temp db path")).expect("open temp db");
 
-        // Registered under canonical + both back-compat prefixes.
-        let all = advertised_names(true);
+        // Registered under the canonical prefix.
         for expect in [
-            "mimir_keystone_set",
             "perseus_vault_keystone_set",
-            "mneme_keystone_get",
+            "perseus_vault_keystone_get",
         ] {
-            assert!(all.contains(&expect.to_string()), "missing tool {expect}");
+            assert!(advertised_names().contains(&expect.to_string()), "missing tool {expect}");
         }
 
         // Author two keystones with different weights (author tier satisfies).
@@ -6612,7 +6217,7 @@ mod tests {
         // registry-enforced. trust_enforced reflects registry backing only.
         assert!(low.contains("\"trust_enforced\":false"), "{low}");
         let _ = call_tool(
-            "mimir_keystone_set",
+            "perseus_vault_keystone_set",
             &db,
             json!({"content": "PII MUST NOT cross agent boundaries", "scope": "fleet",
                    "scope_id": "sec", "weight": 9.0, "author_trust_tier": 3}),
@@ -6620,7 +6225,7 @@ mod tests {
         );
 
         // get merges both, highest weight first.
-        let got = call_tool("mimir_keystone_get", &db, json!({}), None);
+        let got = call_tool("perseus_vault_keystone_get", &db, json!({}), None);
         let v: Value = serde_json::from_str(&got).unwrap();
         assert_eq!(v["count"], json!(2), "{got}");
         assert_eq!(v["keystones"][0]["content"], json!("PII MUST NOT cross agent boundaries"));
@@ -6628,20 +6233,20 @@ mod tests {
 
         // Re-setting the same (scope, scope_id, content) updates in place.
         let again = call_tool(
-            "mimir_keystone_set",
+            "perseus_vault_keystone_set",
             &db,
             json!({"content": "cite source memory IDs", "scope": "tenant",
                    "weight": 5.0, "author_trust_tier": 2}),
             None,
         );
         assert!(again.contains("\"created\":false"), "re-set must update: {again}");
-        let got2 = call_tool("mimir_keystone_get", &db, json!({}), None);
+        let got2 = call_tool("perseus_vault_keystone_get", &db, json!({}), None);
         let v2: Value = serde_json::from_str(&got2).unwrap();
         assert_eq!(v2["count"], json!(2), "no duplicate row on re-set: {got2}");
 
         // Trust gate: asserting tier below required is rejected.
         let denied = call_tool(
-            "mimir_keystone_set",
+            "perseus_vault_keystone_set",
             &db,
             json!({"content": "denied rule", "author_trust_tier": 1}),
             None,
@@ -6649,7 +6254,7 @@ mod tests {
         assert!(denied.contains("insufficient trust tier"), "{denied}");
         // Omitting the tier is allowed but flagged as unenforced.
         let unenforced = call_tool(
-            "mimir_keystone_set",
+            "perseus_vault_keystone_set",
             &db,
             json!({"content": "unenforced rule", "scope": "agent", "scope_id": "a1"}),
             None,
@@ -6696,21 +6301,21 @@ mod tests {
         let value: Value = serde_json::from_str(&response).expect("structured response");
         assert_eq!(value["valid"], true, "{response}");
         assert_eq!(value["replay_match"], true, "{response}");
-        assert!(advertised_names(false).contains(&"perseus_vault_stage_trace_validate".to_string()));
+        assert!(advertised_names().contains(&"perseus_vault_stage_trace_validate".to_string()));
         let _ = fs::remove_file(db_path);
     }
 
     #[test]
     fn rejected_value_tombstones_block_laundering_and_support_audited_override() {
         let db_path = std::env::temp_dir()
-            .join(format!("mimir-rejected-value-{}.db", uuid::Uuid::new_v4()));
+            .join(format!("perseus_vault-rejected-value-{}.db", uuid::Uuid::new_v4()));
         let db = Database::open(db_path.to_str().expect("temp db path")).expect("open temp db");
 
         // Reject the value explicitly with the new tool. The value is the
         // canonical body string the writer would store (digest matching is
         // case/whitespace-insensitive, so any equivalent spelling matches).
         let reject = call_tool(
-            "mimir_reject_value",
+            "perseus_vault_reject_value",
             &db,
             json!({
                 "workspace_hash": "ws-a",
@@ -6833,7 +6438,7 @@ mod tests {
         // Correcting a wrong approach records a tombstone and the correction
         // itself still writes.
         let corrected = call_tool(
-            "mimir_correct",
+            "perseus_vault_correct",
             &db,
             json!({
                 "workspace_hash": "ws-a",
@@ -6858,23 +6463,17 @@ mod tests {
     }
 
     #[test]
-    fn unknown_tool_error_reports_original_unnormalized_name() {
+    fn unknown_tool_error_reports_the_caller_name() {
         let db_path = std::env::temp_dir()
-            .join(format!("mimir-unknown-tool-{}.db", uuid::Uuid::new_v4()));
+            .join(format!("perseus_vault-unknown-tool-{}.db", uuid::Uuid::new_v4()));
         let db = Database::open(db_path.to_str().expect("temp db path")).expect("open temp db");
 
-        // A caller using either back-compat prefix should see ITS OWN name in
-        // the error, not the "mimir_*" name it gets normalized to internally.
-        let mneme_result = call_tool("mneme_bogus", &db, json!({}), None);
-        assert!(mneme_result.contains("Unknown tool: mneme_bogus"), "got: {mneme_result}");
-        assert!(!mneme_result.contains("mimir_bogus"), "got: {mneme_result}");
+        // An unknown tool name is reported verbatim — no prefix normalization.
+        let result = call_tool("perseus_vault_bogus", &db, json!({}), None);
+        assert!(result.contains("Unknown tool: perseus_vault_bogus"), "got: {result}");
 
-        let vault_result = call_tool("perseus_vault_bogus", &db, json!({}), None);
-        assert!(
-            vault_result.contains("Unknown tool: perseus_vault_bogus"),
-            "got: {vault_result}"
-        );
-        assert!(!vault_result.contains("mimir_bogus"), "got: {vault_result}");
+        let other = call_tool("custom_bogus", &db, json!({}), None);
+        assert!(other.contains("Unknown tool: custom_bogus"), "got: {other}");
 
         let _ = fs::remove_file(&db_path);
     }
@@ -6882,7 +6481,7 @@ mod tests {
     #[test]
     fn rejects_non_json_rpc_2_requests() {
         let db_path =
-            std::env::temp_dir().join(format!("mimir-jsonrpc-version-{}.db", uuid::Uuid::new_v4()));
+            std::env::temp_dir().join(format!("perseus_vault-jsonrpc-version-{}.db", uuid::Uuid::new_v4()));
         let db = Database::open(db_path.to_str().expect("temp db path")).expect("open temp db");
         let req = JsonRpcRequest {
             jsonrpc: "1.0".to_string(),
@@ -6901,11 +6500,11 @@ mod tests {
 
     #[test]
     fn initialize_reports_the_current_crate_name_not_a_hardcoded_one() {
-        // Regression: serverInfo.name was a hardcoded "mimir" literal,
-        // reporting stale branding through the Mimir -> Mneme -> Perseus
-        // Vault renames. It must track Cargo.toml's package name instead.
+        // Regression: serverInfo.name was a hardcoded literal that went stale
+        // across the earlier product renames. It must track Cargo.toml's
+        // package name instead.
         let db_path = std::env::temp_dir()
-            .join(format!("mimir-initialize-name-{}.db", uuid::Uuid::new_v4()));
+            .join(format!("perseus_vault-initialize-name-{}.db", uuid::Uuid::new_v4()));
         let db = Database::open(db_path.to_str().expect("temp db path")).expect("open temp db");
         let req = JsonRpcRequest {
             jsonrpc: "2.0".to_string(),
@@ -6931,7 +6530,7 @@ mod tests {
         // stamped onto tool calls as requesting_agent_id, so a private entity is
         // transparently hidden from a different client — no explicit arg needed.
         let db_path = std::env::temp_dir()
-            .join(format!("mimir-clientinfo-{}.db", uuid::Uuid::new_v4()));
+            .join(format!("perseus_vault-clientinfo-{}.db", uuid::Uuid::new_v4()));
         let db = Database::open(db_path.to_str().expect("temp db path")).expect("open temp db");
         db.agent_upsert("alice", "Alice", 0, "eng").unwrap();
         db.agent_upsert("bob", "Bob", 0, "eng").unwrap();
@@ -6964,7 +6563,7 @@ mod tests {
             id: Some(json!(2)),
             method: "tools/call".to_string(),
             params: Some(json!({
-                "name": "mimir_recall",
+                "name": "perseus_vault_recall",
                 "arguments": {"query": "quantum", "mode": "fts5"}
             })),
         };
@@ -6984,7 +6583,7 @@ mod tests {
         // (or passes an empty one), the transport overwrites it with the
         // captured clientInfo.name — a model cannot claim another identity.
         let db_path = std::env::temp_dir()
-            .join(format!("mimir-forged-id-{}.db", uuid::Uuid::new_v4()));
+            .join(format!("perseus_vault-forged-id-{}.db", uuid::Uuid::new_v4()));
         let db = Database::open(db_path.to_str().expect("temp db path")).expect("open temp db");
 
         let state = MCPState::new();
@@ -7003,7 +6602,7 @@ mod tests {
             id: Some(json!(2)),
             method: "tools/call".to_string(),
             params: Some(json!({
-                "name": "mimir_correct",
+                "name": "perseus_vault_correct",
                 "arguments": {
                     "wrong_approach": "assistant guessed the state",
                     "user_correction": "user corrected",
@@ -7026,7 +6625,7 @@ mod tests {
     #[test]
     fn recall_confidence_is_opt_in_and_normalized() {
         let db_path =
-            std::env::temp_dir().join(format!("mimir-confidence-{}.db", uuid::Uuid::new_v4()));
+            std::env::temp_dir().join(format!("perseus_vault-confidence-{}.db", uuid::Uuid::new_v4()));
         let db = Database::open(db_path.to_str().expect("temp db path")).expect("open temp db");
 
         tools::handle_remember(
@@ -7059,7 +6658,7 @@ mod tests {
     #[test]
     fn history_tool_lists_superseded_versions() {
         let db_path =
-            std::env::temp_dir().join(format!("mimir-history-{}.db", uuid::Uuid::new_v4()));
+            std::env::temp_dir().join(format!("perseus_vault-history-{}.db", uuid::Uuid::new_v4()));
         let db = Database::open(db_path.to_str().expect("temp db path")).expect("open temp db");
 
         tools::handle_remember(
@@ -7096,10 +6695,10 @@ mod tests {
     #[test]
     fn graphrag_tools_dispatch_including_aliases() {
         // #365: the three GraphRAG tools must be dispatchable under the
-        // canonical mimir_* name and both rename aliases, and must appear in
+        // canonical perseus_vault_* name and both rename aliases, and must appear in
         // tools/list.
         let db_path =
-            std::env::temp_dir().join(format!("mimir-graphrag-{}.db", uuid::Uuid::new_v4()));
+            std::env::temp_dir().join(format!("perseus_vault-graphrag-{}.db", uuid::Uuid::new_v4()));
         let db = Database::open(db_path.to_str().expect("temp db path")).expect("open temp db");
 
         // Two linked entities so detection has a community to find.
@@ -7116,12 +6715,12 @@ mod tests {
         let n2 = db.get_entity("g", "n2").unwrap().expect("n2 exists");
         db.link("g", "n1", &n2.id, "related").expect("link");
 
-        let detect = call_tool("mimir_communities", &db, json!({}), None);
+        let detect = call_tool("perseus_vault_communities", &db, json!({}), None);
         let v: Value = serde_json::from_str(&detect).expect("valid JSON");
         assert_eq!(v["communities"].as_array().unwrap().len(), 1, "got: {detect}");
         let cid = v["communities"][0]["id"].as_str().unwrap().to_string();
 
-        // Alias dispatch: perseus_vault_* and mneme_* normalize to mimir_*.
+        // Dispatch via the canonical names.
         let summary = call_tool(
             "perseus_vault_community_summary",
             &db,
@@ -7132,26 +6731,20 @@ mod tests {
         assert_eq!(sv["community_id"].as_str().unwrap(), cid, "got: {summary}");
         assert!(sv.get("isError").is_none(), "got: {summary}");
 
-        let recall = call_tool("mneme_global_recall", &db, json!({"query": "quasar"}), None);
+        let recall = call_tool("perseus_vault_global_recall", &db, json!({"query": "quasar"}), None);
         let rv: Value = serde_json::from_str(&recall).expect("valid JSON");
         assert!(rv.get("isError").is_none(), "got: {recall}");
         assert_eq!(rv["communities"].as_array().unwrap().len(), 1, "got: {recall}");
 
-        // In `all` mode tools/list advertises every prefix (x3 with aliases).
-        let all = advertised_names(true);
+        // tools/list advertises the graph tools under the canonical prefix.
+        let names = advertised_names();
         for tool in [
-            "mimir_communities",
-            "mimir_community_summary",
-            "mimir_global_recall",
-            "mneme_global_recall",
             "perseus_vault_communities",
+            "perseus_vault_community_summary",
+            "perseus_vault_global_recall",
         ] {
-            assert!(all.contains(&tool.to_string()), "all-aliases must advertise {tool}");
+            assert!(names.contains(&tool.to_string()), "must advertise {tool}");
         }
-        // Canonical default advertises only the perseus_vault_* variants.
-        let canonical = advertised_names(false);
-        assert!(canonical.contains(&"perseus_vault_global_recall".to_string()));
-        assert!(!canonical.contains(&"mimir_global_recall".to_string()));
 
         drop(db);
         let _ = fs::remove_file(&db_path);
@@ -7160,7 +6753,7 @@ mod tests {
     #[test]
     fn recall_layer_filter_scopes_by_canonical_and_alias() {
         let db_path =
-            std::env::temp_dir().join(format!("mimir-layerfilter-{}.db", uuid::Uuid::new_v4()));
+            std::env::temp_dir().join(format!("perseus_vault-layerfilter-{}.db", uuid::Uuid::new_v4()));
         let db = Database::open(db_path.to_str().expect("temp db path")).expect("open temp db");
 
         tools::handle_remember(
@@ -7212,8 +6805,8 @@ mod tests {
     }
 
     #[test]
-    fn artifact_tools_advertise_canonical_names_and_dispatch_aliases() {
-        let names = advertised_names(false);
+    fn artifact_tools_advertise_canonical_names_and_dispatch() {
+        let names = advertised_names();
         for name in [
             "perseus_vault_artifact_register",
             "perseus_vault_artifact_manifest",
@@ -7224,7 +6817,7 @@ mod tests {
             assert!(names.contains(&name.to_string()), "canonical list must advertise {name}");
         }
 
-        let db_path = std::env::temp_dir().join(format!("mimir-artifact-tools-{}.db", uuid::Uuid::new_v4()));
+        let db_path = std::env::temp_dir().join(format!("perseus_vault-artifact-tools-{}.db", uuid::Uuid::new_v4()));
         let db = Database::open(db_path.to_str().expect("temp db path")).expect("open temp db");
         let source = std::env::temp_dir().join(format!("artifact-mcp-{}.txt", uuid::Uuid::new_v4()));
         std::fs::write(&source, "artifact via MCP\n").unwrap();
@@ -7239,7 +6832,7 @@ mod tests {
         let sha = rv["sha256"].as_str().unwrap();
 
         let manifest = call_tool(
-            "mneme_artifact_manifest",
+            "perseus_vault_artifact_manifest",
             &db,
             json!({"sha256": sha, "workspace_hash": "ws-mcp"}),
             None,
@@ -7344,7 +6937,7 @@ mod tests {
         // profile cannot touch another workspace — the denial surfaces as an
         // isError at the tools/call boundary.
         let db_path = std::env::temp_dir()
-            .join(format!("mimir-binding-{}.db", uuid::Uuid::new_v4()));
+            .join(format!("perseus-vault-binding-{}.db", uuid::Uuid::new_v4()));
         let db = Database::open(db_path.to_str().expect("temp db path")).expect("open temp db");
         db.workspace_bind("profile-ro", "ws-own", "read_only", "{}", "operator")
             .unwrap();
@@ -7366,7 +6959,7 @@ mod tests {
             id: Some(json!(2)),
             method: "tools/call".to_string(),
             params: Some(json!({
-                "name": "mimir_remember",
+                "name": "perseus_vault_remember",
                 "arguments": {"category": "decision", "key": "k",
                               "body_json": "{\"v\":1}", "workspace_hash": "ws-own"}
             })),
@@ -7388,7 +6981,7 @@ mod tests {
             id: Some(json!(3)),
             method: "tools/call".to_string(),
             params: Some(json!({
-                "name": "mimir_remember",
+                "name": "perseus_vault_remember",
                 "arguments": {"category": "decision", "key": "k2",
                               "body_json": "{\"v\":2}", "workspace_hash": "ws-other"}
             })),
@@ -7410,7 +7003,7 @@ mod tests {
             id: Some(json!(4)),
             method: "tools/call".to_string(),
             params: Some(json!({
-                "name": "mimir_recall",
+                "name": "perseus_vault_recall",
                 "arguments": {"query": "anything", "mode": "fts5", "workspace_hash": "ws-own"}
             })),
         };

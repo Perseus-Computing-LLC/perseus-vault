@@ -137,7 +137,7 @@ def populate(binary, db, n_entities, log):
     v = PersistentVault(binary, db)
     t0 = time.time()
     for i in range(n_entities):
-        v.call("mimir_remember", {
+        v.call("perseus_vault_remember", {
             "category": "beam_filler", "key": f"f{i}",
             "body_json": json.dumps(filler_body(i)),
             "type": "fact", "skip_dedup": True,
@@ -155,9 +155,9 @@ def measure_latency(binary, db, samples=40):
     v = gauntlet.Vault(binary, db)
     now = gauntlet.now_ms()
     probes = {
-        "as_of": ("mimir_as_of", {"category": "beam_filler", "key": "f0",
+        "as_of": ("perseus_vault_as_of", {"category": "beam_filler", "key": "f0",
                                    "as_of_unix_ms": now}),
-        "valid_at": ("mimir_valid_at", {"category": "beam_filler", "key": "f0",
+        "valid_at": ("perseus_vault_valid_at", {"category": "beam_filler", "key": "f0",
                                         "valid_at_unix_ms": now}),
     }
     out = {}

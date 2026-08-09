@@ -12,8 +12,8 @@ Related: `structured-truth-retrieval-policy.md` (retrieval order, tier 1),
 Some questions are graph questions, not text-search questions: impact,
 ownership, lineage, downstream effect. Answering them with keyword search
 means broad sweeps over large note/page corpora and hand-reassembled
-provenance. Vault already has the primitives — `mimir_link` relationships,
-`mimir_traverse`, `mimir_communities` / `mimir_global_recall`, belief
+provenance. Vault already has the primitives — `perseus_vault_link` relationships,
+`perseus_vault_traverse`, `perseus_vault_communities` / `perseus_vault_global_recall`, belief
 overlay evidence sets. This spec promotes traversal to the *primary*
 strategy for these question shapes, defines higher-level helpers, fixes
 path rendering, and adds score boosts for linked evidence. It composes
@@ -23,11 +23,11 @@ existing tools; it does not add graph storage (strategy doc non-goal).
 
 | Question shape | Example | Primary strategy | Why not keyword |
 |---|---|---|---|
-| Dependency / impact | "what depends on the stripe_events replay job?" | `mimir_traverse` over `depends_on` | keyword finds mentions, not dependents; misses implied links |
+| Dependency / impact | "what depends on the stripe_events replay job?" | `perseus_vault_traverse` over `depends_on` | keyword finds mentions, not dependents; misses implied links |
 | Change propagation | "what changed because of PR #176?" | traverse `derived_from`/`supersedes` from the anchor | freshness filters can't see causality |
 | Evidence support | "what evidence supports 'deploy windows drop webhooks'?" | traverse `evidence_for` / belief `supporting_entity_ids` | the claim's text doesn't contain its evidence |
 | Decision consequences | "what follows from the decision to gate on #4?" | traverse `implements`/`references`/`depends_on` forward | consequences rarely repeat the decision's keywords |
-| Neighborhood / context | "what's around this customer account?" | `mimir_communities`, `mimir_global_recall` | community structure is not a text property |
+| Neighborhood / context | "what's around this customer account?" | `perseus_vault_communities`, `perseus_vault_global_recall` | community structure is not a text property |
 
 Heuristic: if the question contains a relational verb (depends, supports,
 follows, caused, blocks, supersedes) or names an entity as a *hub*, start
@@ -36,7 +36,7 @@ hub entity* when its `(category, key)` isn't known.
 
 ## 2. Higher-level helpers
 
-Convenience queries over `mimir_traverse` + the link vocabulary. These are
+Convenience queries over `perseus_vault_traverse` + the link vocabulary. These are
 serving-layer compositions (read-only), not new storage:
 
 | Helper | Definition | Implementation |
@@ -58,9 +58,9 @@ see *how* the answer connects:
 ```
 what_follows_from(decision "gate subscriptions on #4"):
   decision/gate-on-4
-    ├─ implements → operations/enable-PLUTUS_SUBSCRIPTIONS_ENABLED (open loop)
+    ├─ implements → operations/enable-LEDGER_SUBSCRIPTIONS_ENABLED (open loop)
     ├─ depends_on → operations/stripe-webhook-replay-runbook
-    └─ references → pull_request github:Perseus-Computing-LLC/plutus#176
+    └─ references → pull_request github:Perseus-Computing-LLC/ledger#176
 ```
 
 Rules:
@@ -70,7 +70,7 @@ Rules:
   marker.
 - Path length feeds ranking: shorter paths to the hub outrank longer ones
   within a result set (§4).
-- `mimir_context` inlines paths compactly (one line per path, hub-first);
+- `perseus_vault_context` inlines paths compactly (one line per path, hub-first);
   full trees belong to served views with a budget.
 
 ## 4. Score boosts for linked evidence
@@ -96,10 +96,10 @@ matches:
 
 | Existing | Relationship |
 |---|---|
-| `mimir_traverse` | The primitive; helpers are relationship-filtered, direction-aware compositions of it. Unchanged. |
-| `mimir_link` / `mimir_unlink` | The write side; helpers assume the documented relationship vocabulary and tolerate custom types by treating them as `related`. |
-| `mimir_communities` / `mimir_global_recall` | Neighborhood questions (§1 last row) and the breadth-first entry when no hub is known. |
-| `mimir_recall` | Hub discovery fallback and non-graph questions. Unchanged. |
+| `perseus_vault_traverse` | The primitive; helpers are relationship-filtered, direction-aware compositions of it. Unchanged. |
+| `perseus_vault_link` / `perseus_vault_unlink` | The write side; helpers assume the documented relationship vocabulary and tolerate custom types by treating them as `related`. |
+| `perseus_vault_communities` / `perseus_vault_global_recall` | Neighborhood questions (§1 last row) and the breadth-first entry when no hub is known. |
+| `perseus_vault_recall` | Hub discovery fallback and non-graph questions. Unchanged. |
 | belief overlay | `what_supports` reads its `supporting_entity_ids`; no new derivation. |
 
 ## 6. Success criteria mapping (#735)
@@ -115,8 +115,8 @@ matches:
 
 - Serving-layer helper queries (`what_depends_on`, `what_supports`,
   `what_follows_from`, `what_changed_because_of`, `lineage_of`) as
-  compositions over `mimir_traverse` + belief derivation; read-only.
-- Path rendering per §3 in served views and `mimir_context`.
+  compositions over `perseus_vault_traverse` + belief derivation; read-only.
+- Path rendering per §3 in served views and `perseus_vault_context`.
 - Graph boost signals into the composite score behind question-shape
   detection (§4); golden-vector tests: direct dependent beats depth-3
   neighbor; path-linked beats unlinked lexical match on lineage queries.

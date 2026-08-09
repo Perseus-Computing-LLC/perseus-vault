@@ -34,7 +34,7 @@ runs (86.7 / 83.3 / 80.0) — no robustness trade.
 Independently confirmed, one run per prompt variant, re-graded by LongMemEval's
 own `src/evaluation/evaluate_qa.py`: plain run 2 produced **368/500 = 73.60%**
 (bit-for-bit match, [`official-eval-results-gpt-4o.jsonl`](official-eval-results-gpt-4o.jsonl));
-the CoT primary run's 500 answers ([`hypotheses-cot-mimir-gpt-4o-2024-08-06.jsonl`](hypotheses-cot-mimir-gpt-4o-2024-08-06.jsonl))
+the CoT primary run's 500 answers ([`hypotheses-cot-perseus-vault-gpt-4o-2024-08-06.jsonl`](hypotheses-cot-perseus-vault-gpt-4o-2024-08-06.jsonl))
 re-grade to the **identical aggregate 400/500 = 80.00%**, with 4 individual
 judge verdicts differing (2 flips in each direction — normal LLM-judge
 nondeterminism at temperature 0, net zero; see
@@ -128,7 +128,7 @@ tuning toward gold answers was done, and none is acceptable here.**
   per-type `get_anscheck_prompt`, ported verbatim in [`qa.py`](qa.py). The
   earlier judge caveat is now resolved: grading matches the authors'
   `evaluate_qa.py` bit-for-bit (368/500 both ways). Hypotheses are emitted in
-  LongMemEval's official format ([`hypotheses-mimir-gpt-4o-2024-08-06.jsonl`](hypotheses-mimir-gpt-4o-2024-08-06.jsonl))
+  LongMemEval's official format ([`hypotheses-perseus-vault-gpt-4o-2024-08-06.jsonl`](hypotheses-perseus-vault-gpt-4o-2024-08-06.jsonl))
   so anyone can re-grade independently.
 - **Retrieval:** perseus-vault hybrid recall, top-k 10, bundled ONNX embeddings,
   real binary (`perseus-vault 2.19.1`) over MCP stdio. Full k=10 context on every
@@ -188,17 +188,17 @@ python benchmark/longmemeval/qa.py --yes --cot      # official CoT prompt (the 7
 #    (plain run 2 reproduces 368/500 = 73.60%; the CoT hypotheses file
 #    re-grades the 80.0% primary run)
 python evaluate_qa.py gpt-4o \
-  benchmark/longmemeval/hypotheses-mimir-gpt-4o-2024-08-06.jsonl \
+  benchmark/longmemeval/hypotheses-perseus-vault-gpt-4o-2024-08-06.jsonl \
   benchmark/longmemeval/longmemeval_s_cleaned.json
 python evaluate_qa.py gpt-4o \
-  benchmark/longmemeval/hypotheses-cot-mimir-gpt-4o-2024-08-06.jsonl \
+  benchmark/longmemeval/hypotheses-cot-perseus-vault-gpt-4o-2024-08-06.jsonl \
   benchmark/longmemeval/longmemeval_s_cleaned.json
 ```
 
 Defaults are the pinned models above; `--model`, `--judge`, `--split`, `--k`,
 `--limit` override (every override is recorded in `qa_report.json`). This run is
 **opt-in and NOT part of any CI gate** — it costs real money (estimate printed
-upfront; roughly $28 for the full 500-question mimir-only run at k=10 and
+upfront; roughly $28 for the full 500-question perseus_vault-only run at k=10 and
 2026-07 GPT-4o pricing).
 
 ## Related numbers (do not conflate)
@@ -206,5 +206,5 @@ upfront; roughly $28 for the full 500-question mimir-only run at k=10 and
 - **Session-level retrieval recall** ([`README.md`](README.md), `report.json`):
   recall@1 0.846 / recall@10 0.992, fully offline, judge-free. That is a
   *retrieval* metric — never present it as QA accuracy.
-- **Token efficiency** (`qa.py --dry-run`): mimir feeds ~8x fewer tokens than
+- **Token efficiency** (`qa.py --dry-run`): perseus_vault feeds ~8x fewer tokens than
   full-context stuffing at k=5. Offline and reproducible.

@@ -96,21 +96,21 @@ fn too_many_requests() -> Response {
 
 /// Wrap `router` with the body-size cap and (unless disabled) the global rate
 /// limit. Env knobs:
-///   * `MIMIR_MAX_HTTP_BODY_BYTES` (default 8 MiB)
-///   * `MIMIR_HTTP_RATE_PER_SEC`   (default 50; set 0 to disable rate limiting)
-///   * `MIMIR_HTTP_RATE_BURST`     (default 100)
+///   * `PERSEUS_VAULT_MAX_HTTP_BODY_BYTES` (default 8 MiB)
+///   * `PERSEUS_VAULT_HTTP_RATE_PER_SEC`   (default 50; set 0 to disable rate limiting)
+///   * `PERSEUS_VAULT_HTTP_RATE_BURST`     (default 100)
 ///
 /// Layer order matters: the rate limit is applied LAST so it sits OUTERMOST and
 /// sheds a flood cheaply, before the body is buffered or routed.
 pub fn apply_http_limits(router: Router) -> Router {
-    let max_body = env_usize("MIMIR_MAX_HTTP_BODY_BYTES", DEFAULT_MAX_BODY_BYTES);
+    let max_body = env_usize("PERSEUS_VAULT_MAX_HTTP_BODY_BYTES", DEFAULT_MAX_BODY_BYTES);
     let router = router.layer(DefaultBodyLimit::max(max_body));
 
-    let rate = env_f64("MIMIR_HTTP_RATE_PER_SEC", DEFAULT_RATE_PER_SEC);
+    let rate = env_f64("PERSEUS_VAULT_HTTP_RATE_PER_SEC", DEFAULT_RATE_PER_SEC);
     if rate <= 0.0 {
         return router; // rate limiting disabled
     }
-    let burst = env_f64("MIMIR_HTTP_RATE_BURST", DEFAULT_BURST).max(1.0);
+    let burst = env_f64("PERSEUS_VAULT_HTTP_RATE_BURST", DEFAULT_BURST).max(1.0);
     let bucket = Arc::new(Mutex::new(TokenBucket::new(rate, burst)));
 
     router.layer(middleware::from_fn(move |req: Request, next: Next| {

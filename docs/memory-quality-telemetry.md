@@ -1,6 +1,6 @@
 # Memory-quality telemetry
 
-`perseus_vault_quality_telemetry` is a machine-readable operational report for memory-health monitoring. The legacy `mimir_quality_telemetry` alias remains callable during the v2 compatibility window.
+`perseus_vault_quality_telemetry` is a machine-readable operational report for memory-health monitoring. The legacy `perseus_vault_quality_telemetry` alias remains callable during the v2 compatibility window.
 
 ```json
 {"category":"general"}

@@ -18,7 +18,7 @@ Defaults (all overridable, always recorded in the report):
 
 Systems (same idea as before; run every system through the SAME model):
   stateless    no history at all: question only                    (arm 0 — why memory exists)
-  mimir        top-k sessions from perseus-vault hybrid retrieval  (the product)
+  perseus_vault        top-k sessions from perseus-vault hybrid retrieval  (the product)
   fullcontext  every haystack session concatenated                 (no-memory-layer baseline)
   oracle       only the gold evidence sessions                     (upper bound)
 
@@ -44,7 +44,7 @@ Usage:
   python qa.py --data longmemeval_s_cleaned.json --mock-llm --limit 5
 
   # Offline token-efficiency comparison (no key needed):
-  python qa.py --data longmemeval_s_cleaned.json --systems fullcontext mimir --dry-run --limit 50
+  python qa.py --data longmemeval_s_cleaned.json --systems fullcontext perseus_vault --dry-run --limit 50
 
   # Cheap real smoke run (needs OPENAI_API_KEY or ~/.openai_key):
   python qa.py --data longmemeval_s_cleaned.json --limit 10
@@ -78,7 +78,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent.parent
 sys.path.insert(0, str(HERE))
-from run import MimirServer, session_text, find_binary  # noqa: E402
+from run import PerseusVaultServer, session_text, find_binary  # noqa: E402
 
 # Pinned defaults. Zep's published LongMemEval number is quoted as "GPT-4o";
 # gpt-4o-2024-08-06 is the standard GPT-4o snapshot of that period and is the
@@ -361,9 +361,9 @@ def _date_ms(datestr):
 def build_context(system, inst, srv, qid, k, ku_shared=False):
     """Return (context_text, [chosen_session_ids]) for the given system.
 
-    With ku_shared, the mimir arm ingests the gold (fact-version) sessions
+    With ku_shared, the perseus_vault arm ingests the gold (fact-version) sessions
     under ONE shared key with valid_from = session date — the PRODUCT shape
-    (INGEST_590.md demo B): `mimir_remember` collapses versions to a live
+    (INGEST_590.md demo B): `perseus_vault_remember` collapses versions to a live
     latest-wins row and stale versions go to `entity_history`. Grouping uses
     the dataset's evidence labels — authoring-time knowledge, exactly what a
     real caller has when it re-remembers a fact under its key."""
@@ -380,7 +380,7 @@ def build_context(system, inst, srv, qid, k, ku_shared=False):
         chosen = sids
     elif system == "oracle":
         chosen = inst.get("answer_session_ids", [])
-    elif system == "mimir":
+    elif system == "perseus-vault":
         # Ingest this instance's haystack, embed, hybrid-retrieve top-k sessions.
         gold = inst.get("answer_session_ids", []) or []
         dated_gold = sorted([g for g in gold if by_id.get(g, (None, None))[1]],
@@ -390,16 +390,16 @@ def build_context(system, inst, srv, qid, k, ku_shared=False):
             if sid in shared:
                 continue  # fact versions ingest below, ascending by date
             turns, d = by_id[sid]
-            srv.call("mimir_remember", {"category": qid, "key": sid,
+            srv.call("perseus_vault_remember", {"category": qid, "key": sid,
                                         "body_json": json.dumps({"note": session_note(d, turns)}),
                                         "type": "fact"})
         for g in dated_gold if shared else []:
             turns, d = by_id[g]
-            srv.call("mimir_remember", {"category": qid, "key": SHARED_FACT_KEY,
+            srv.call("perseus_vault_remember", {"category": qid, "key": SHARED_FACT_KEY,
                                         "body_json": json.dumps({"note": session_note(d, turns)}),
                                         "type": "fact", "valid_from_unix_ms": _date_ms(d)})
-        srv.call("mimir_embed", {"batch_category": qid, "batch_limit": 1000})
-        r = srv.call("mimir_recall", {"query": inst["question"], "mode": "hybrid",
+        srv.call("perseus_vault_embed", {"batch_category": qid, "batch_limit": 1000})
+        r = srv.call("perseus_vault_recall", {"query": inst["question"], "mode": "hybrid",
                                       "category": qid, "limit": k, "trust_weight": 0,
                                       "min_decay": 0})
         items = r.get("items", []) if isinstance(r, dict) else []
@@ -436,7 +436,7 @@ def estimate_cost(data, systems, k, model, judge):
     avg_sess = sum(sess_toks) / max(1, len(sess_toks))
     avg_n = sum(sess_counts) / max(1, len(sess_counts))
 
-    ctx_per_system = {"mimir": k * avg_sess, "fullcontext": avg_n * avg_sess,
+    ctx_per_system = {"perseus-vault": k * avg_sess, "fullcontext": avg_n * avg_sess,
                       "oracle": 2 * avg_sess, "stateless": 12}
     n = len(data)
     answer_out, judge_in_fixed, judge_out = 150, 250, 5
@@ -479,15 +479,15 @@ def main():
                     help="Path to longmemeval_<split>_cleaned.json (default: ./longmemeval_<split>_cleaned.json)")
     ap.add_argument("--split", default="s", choices=["s", "m"],
                     help="LongMemEval split; 's' (500 instances) is what Zep reports on")
-    ap.add_argument("--systems", nargs="+", default=["mimir"],
-                    choices=["stateless", "fullcontext", "mimir", "oracle"],
-                    help="Run every system through the SAME model (default: mimir only). "
+    ap.add_argument("--systems", nargs="+", default=["perseus-vault"],
+                    choices=["stateless", "fullcontext", "perseus-vault", "oracle"],
+                    help="Run every system through the SAME model (default: perseus_vault only). "
                          "stateless = no history at all (arm 0); fullcontext = whole "
-                         "haystack stuffed (no-memory-layer baseline); mimir = the product; "
+                         "haystack stuffed (no-memory-layer baseline); perseus_vault = the product; "
                          "oracle = gold evidence only (upper bound)")
     ap.add_argument("--model", default=DEFAULT_ANSWERER, help=f"Answerer model id (default {DEFAULT_ANSWERER})")
     ap.add_argument("--judge", default=DEFAULT_JUDGE, help=f"Judge model id (default {DEFAULT_JUDGE})")
-    ap.add_argument("--k", type=int, default=10, help="Sessions retrieved for the mimir system (default 10)")
+    ap.add_argument("--k", type=int, default=10, help="Sessions retrieved for the perseus_vault system (default 10)")
     ap.add_argument("--limit", type=int, default=0, help="Only run the first N instances (0 = all; smoke tests)")
     ap.add_argument("--cot", action="store_true",
                     help="#579: use LongMemEval's OFFICIAL chain-of-thought answer prompt (still "
@@ -501,10 +501,10 @@ def main():
                          "weak-category slice experiments. Pinned into the journal config so a "
                          "--resume can't silently mix a slice with a full run.")
     ap.add_argument("--ku-shared-key", action="store_true",
-                    help="PRODUCT-shape ingest for version-bearing questions (mimir arm): gold "
+                    help="PRODUCT-shape ingest for version-bearing questions (perseus_vault arm): gold "
                          "fact-version sessions share one key with valid_from = session date "
                          "(latest-wins; stale versions live in entity_history). See INGEST_590.md.")
-    ap.add_argument("--bin", default=None, help="perseus-vault binary (else auto-located / MIMIR_BIN)")
+    ap.add_argument("--bin", default=None, help="perseus-vault binary (else auto-located / PERSEUS_VAULT_BIN)")
     ap.add_argument("--mock-llm", action="store_true",
                     help="Stub the answerer+judge (deterministic, no key, no network): proves the plumbing")
     ap.add_argument("--dry-run", action="store_true",
@@ -565,10 +565,10 @@ def main():
             sys.exit("\nThis is a paid full run. Re-run with --yes to accept the estimate "
                      "(or use --limit 10 for a cheap smoke run, --mock-llm for free plumbing).")
 
-    need_mimir = "mimir" in args.systems
-    binary = find_binary(args.bin) if need_mimir else None
+    need_vault = "perseus-vault" in args.systems
+    binary = find_binary(args.bin) if need_vault else None
     bin_ver = binary_version(binary) if binary else "n/a"
-    db = str(Path(os.environ.get("TMPDIR") or os.environ.get("TEMP") or "/tmp") / "mimir-qa.db")
+    db = str(Path(os.environ.get("TMPDIR") or os.environ.get("TEMP") or "/tmp") / "perseus_vault-qa.db")
 
     def wipe():
         for ext in ("", "-wal", "-shm"):
@@ -657,9 +657,9 @@ def main():
         if not args.dry_run and all((qid, s) in done for s in args.systems):
             continue
         srv = None
-        if need_mimir:
+        if need_vault:
             wipe()
-            srv = MimirServer(binary, db)
+            srv = PerseusVaultServer(binary, db)
         try:
             for system in args.systems:
                 if (qid, system) in done:
@@ -736,7 +736,7 @@ def main():
                       / max(1, len(graded_so_far)) * 100)
         print(f"  {idx + 1}/{len(data)}  graded={len(graded_so_far)} "
               f"acc={acc_so_far:.1f}%  ({time.time() - t0:.0f}s)", flush=True)
-    if need_mimir:
+    if need_vault:
         wipe()
     if journal:
         journal.close()
@@ -760,8 +760,8 @@ def main():
     print("-" * 56)
     for system in args.systems:
         print(f"{system:<13}{nsess[system] / n:>14.1f}{tok[system] / n:>14.0f}{tok[system]:>15,}")
-    if "fullcontext" in args.systems and "mimir" in args.systems and tok["mimir"]:
-        print(f"\nmimir feeds {tok['fullcontext'] / tok['mimir']:.1f}x fewer tokens to the LLM "
+    if "fullcontext" in args.systems and "perseus-vault" in args.systems and tok["perseus-vault"]:
+        print(f"\nvault feeds {tok['fullcontext'] / tok['perseus-vault']:.1f}x fewer tokens to the LLM "
               f"than fullcontext (k={args.k}).")
     if args.dry_run:
         return 0
@@ -836,7 +836,7 @@ def main():
         # next to any competitor row.
         "answer_prompt": "official-cot" if args.cot else "plain",
         "only_types": sorted(args.only_types) if args.only_types else None,
-        # #590: ingest shape for the mimir arm. NEVER compare a ku-shared-key
+        # #590: ingest shape for the perseus_vault arm. NEVER compare a ku-shared-key
         # accuracy against a benchmark-shape one without labeling both.
         "ingest_shape": "ku-shared-key (product)" if args.ku_shared_key else "unique-key-per-session (benchmark)",
         "answerer_model": "mock" if args.mock_llm else args.model,

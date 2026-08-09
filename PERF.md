@@ -70,7 +70,7 @@ two on both axes, confirming the trend isn't an artifact of the 1-bit endpoint.
 
 The shipped 1-bit tier is a **prefilter + exact-cosine rerank** — the Hamming
 scan picks the candidate pool, phase-2 cosine reorders it. `DenseOpts.rerank` /
-env `MIMIR_DENSE_SIG_RERANK=0` (added this cycle; default **ON**, default path
+env `PERSEUS_VAULT_DENSE_SIG_RERANK=0` (added this cycle; default **ON**, default path
 byte-identical) turns the rerank off to measure the prefilter **alone**. Same
 1M corpus, same instance, 500 queries:
 
@@ -216,11 +216,11 @@ IDENTICAL loaded 100K store (seeded once by `benchmark/scale/run.py
 scale harness's exact query shape and limit, before = main + the timing
 instrumentation only, after = this change. Every number below is `measured`.
 
-### Where the time went (stage attribution, new `MIMIR_RECALL_TIMING=1`)
+### Where the time went (stage attribution, new `PERSEUS_VAULT_RECALL_TIMING=1`)
 
 Windows has no cheap flamegraph story for a release binary driven over MCP
 stdio, so this change adds the permanent alternative: opt-in per-stage timing
-on the recall path (`MIMIR_RECALL_TIMING=1`, one line per query to stderr,
+on the recall path (`PERSEUS_VAULT_RECALL_TIMING=1`, one line per query to stderr,
 zero cost when off). 30 timed hybrid queries at 100K, p50 per stage:
 
 | Stage | Before | After | data_source |

@@ -559,7 +559,7 @@ fn augment_temporal_with_history(
     Ok(())
 }
 
-/// #287: presentation-layer confidence rollup over signals Mneme already has.
+/// #287: presentation-layer confidence rollup over signals Perseus Vault already has.
 /// Does NOT affect ranking — purely a convenience score for the caller.
 fn confidence_for(entity: &crate::models::Entity, rank: usize, total: usize) -> f64 {
     let relevance = if total > 1 {
@@ -1889,8 +1889,8 @@ pub struct SemanticSearchArgs {
     pub agent_id: Option<String>,
 }
 
-/// #271: `mimir_semantic_search` — dense-only semantic search shortcut. Unlike
-/// `mimir_recall` (which fuses keyword + dense in hybrid mode), this runs the
+/// #271: `perseus_vault_semantic_search` — dense-only semantic search shortcut. Unlike
+/// `perseus_vault_recall` (which fuses keyword + dense in hybrid mode), this runs the
 /// pure dense vector arm with NO FTS5 fallback: results are ranked solely by
 /// embedding cosine similarity. Requires an embedding backend (on by default via
 /// the bundled in-process ONNX model). Errors clearly when no backend is
@@ -1955,7 +1955,7 @@ where
     Ok(opt.unwrap_or_else(default_scan_limit))
 }
 
-/// #562: `mimir_scan` — deterministic paginated enumeration of a category (or
+/// #562: `perseus_vault_scan` — deterministic paginated enumeration of a category (or
 /// the whole store). Unlike `recall(query="")`, whose ranking keys mutate on
 /// every reinforcing recall (so offset pages can skip/repeat rows) and whose
 /// offset is capped, scan pages by immutable `id ASC` with a keyset cursor:
@@ -2329,7 +2329,7 @@ pub fn handle_as_of(db: &Database, args: Value) -> Result<String, String> {
 /// #398: the returned version falls inside a retention-compacted window —
 /// surface an explicit marker (flag + version count + roll-up digest from the
 /// tombstone body) instead of letting the synthetic row pass for a real
-/// version. Shared by mimir_as_of, mimir_valid_at, and mimir_bitemporal so
+/// version. Shared by perseus_vault_as_of, perseus_vault_valid_at, and perseus_vault_bitemporal so
 /// all three temporal axes decorate identically. No-op for real versions.
 fn decorate_compacted_marker(r: &mut serde_json::Value, status: &str, body_json: &str) {
     if status != "compacted" {
@@ -2346,7 +2346,7 @@ fn decorate_compacted_marker(r: &mut serde_json::Value, status: &str, body_json:
 }
 
 /// Serialize a TemporalVersion into the shared found=true response shape used
-/// by mimir_valid_at and mimir_bitemporal (#363). Tombstone versions carry
+/// by perseus_vault_valid_at and perseus_vault_bitemporal (#363). Tombstone versions carry
 /// the #398 compacted-marker decoration.
 fn temporal_version_json(v: &crate::db::TemporalVersion) -> serde_json::Value {
     let mut r = json!({
@@ -2367,8 +2367,8 @@ fn temporal_version_json(v: &crate::db::TemporalVersion) -> serde_json::Value {
     r
 }
 
-/// #363: mimir_valid_at — the valid-time axis. "What was actually true in the
-/// world at instant T, per current knowledge?" Orthogonal to mimir_as_of.
+/// #363: perseus_vault_valid_at — the valid-time axis. "What was actually true in the
+/// world at instant T, per current knowledge?" Orthogonal to perseus_vault_as_of.
 pub fn handle_valid_at(db: &Database, args: Value) -> Result<String, String> {
     let category = args
         .get("category")
@@ -2403,7 +2403,7 @@ pub fn handle_valid_at(db: &Database, args: Value) -> Result<String, String> {
     Ok(result.to_string())
 }
 
-/// #363: mimir_bitemporal — the full 2-axis query. "As of transaction time
+/// #363: perseus_vault_bitemporal — the full 2-axis query. "As of transaction time
 /// tx_at, what did we believe was true in the world at valid time valid_at?"
 pub fn handle_bitemporal(db: &Database, args: Value) -> Result<String, String> {
     let category = args
@@ -2548,7 +2548,7 @@ pub fn handle_unlink(db: &Database, args: Value) -> Result<String, String> {
     Ok(result.to_string())
 }
 
-// ─── mimir_promote handler (#832) ───────────────────────────────────────────
+// ─── perseus_vault_promote handler (#832) ───────────────────────────────────────────
 // Spec: perseus docs/shared-memory-promotion-ladder.md §4. Promotes an entity
 // across the class ladder (to_category) and/or the scope ladder
 // (to_workspace_hash), preserving provenance: the new entity carries a
@@ -3169,7 +3169,7 @@ fn is_failure_entity(e: &Entity) -> bool {
     crate::db::FAILURE_MARKERS.iter().any(|m| hay.contains(m))
 }
 
-/// #521: `mimir_check_failure_pattern` — the deja-vu guard. Given an action
+/// #521: `perseus_vault_check_failure_pattern` — the deja-vu guard. Given an action
 /// (command line or approach description), search prior failures in BOTH the
 /// journal (error events + failure-marked payloads) and the entity store
 /// (failure/pitfall/root-cause memories, via the existing FTS5 recall), rank
@@ -3471,7 +3471,7 @@ pub fn handle_state_list(db: &Database, args: Value) -> Result<String, String> {
 
 pub fn handle_health(db: &Database) -> String {
     // #671: include the absolute db path so a "remember succeeded but the row
-    // isn't in ~/mimir.db" mismatch (server bound to a different --db than the
+    // isn't in ~/perseus-vault.db" mismatch (server bound to a different --db than the
     // file being inspected) is self-diagnosing rather than looking like a
     // silent no-op.
     //
@@ -3692,7 +3692,7 @@ pub struct CaptureArgs {
     /// Distill via the configured LLM endpoint instead of the local
     /// rule-based distiller. Falls back to the rule-based path on ANY LLM
     /// failure (not configured, transport error, timeout — #528
-    /// MIMIR_LLM_TIMEOUT_SECS — or unparseable output).
+    /// PERSEUS_VAULT_LLM_TIMEOUT_SECS — or unparseable output).
     #[serde(default, deserialize_with = "null_as_default")]
     pub llm: bool,
     /// #563: after a successful non-dry-run capture, atomically remove the
@@ -3717,7 +3717,7 @@ fn default_capture_max() -> i64 {
 
 null_as_named_default!(null_as_default_capture_max, i64, default_capture_max);
 
-/// #520: `mimir_capture` / `perseus-vault capture` — the shared in-session
+/// #520: `perseus_vault_capture` / `perseus-vault capture` — the shared in-session
 /// capture pipeline. Distills a transcript/insight payload into durable
 /// notes (root-cause / pitfall / decision / pattern / takeaway) and writes
 /// each through the normal remember path with `source="capture"`, layer
@@ -3783,7 +3783,7 @@ pub fn handle_capture(db: &Database, args: Value) -> Result<String, String> {
             crate::capture::distill(&a.text, max_notes)
         } else {
             // Existing #365 completion helper: gated on llm_config.enabled,
-            // with the #528 MIMIR_LLM_TIMEOUT_SECS transport timeout applied.
+            // with the #528 PERSEUS_VAULT_LLM_TIMEOUT_SECS transport timeout applied.
             match db.llm_generate(&crate::capture::llm_prompt(&a.text)) {
                 Ok(raw) => match crate::capture::parse_llm_notes(&raw, max_notes) {
                     Some(r) => {
@@ -4616,9 +4616,9 @@ pub fn handle_consolidate(db: &Database, args: Value) -> String {
     }
 }
 
-// ─── mimir_dream handler ─────────────────────────────────────────
+// ─── perseus_vault_dream handler ─────────────────────────────────────────
 
-/// Wire args for mimir_dream: DreamParams plus the handler-level
+/// Wire args for perseus_vault_dream: DreamParams plus the handler-level
 /// `fallback_consolidate` switch (LLM-less environments can opt into the
 /// mechanical consolidate pass instead of an error).
 #[derive(Debug, Deserialize)]
@@ -4626,7 +4626,7 @@ pub struct DreamArgs {
     #[serde(flatten)]
     pub params: crate::models::DreamParams,
     /// When the LLM endpoint is not configured: instead of a clean error,
-    /// fall back to the non-LLM mimir_consolidate (cold_first) over the same
+    /// fall back to the non-LLM perseus_vault_consolidate (cold_first) over the same
     /// categories. Off by default — dreaming and mechanical merging produce
     /// different artifacts, so the substitution must be explicit.
     #[serde(default)]
@@ -4676,7 +4676,7 @@ pub fn handle_dream(db: &Database, args: Value) -> Result<String, String> {
         }
         return Ok(json!({
             "fallback": "consolidate",
-            "note": "LLM endpoint not configured — ran the non-LLM mimir_consolidate (cold_first) pass instead. Set --llm-endpoint for real dreaming.",
+            "note": "LLM endpoint not configured — ran the non-LLM perseus_vault_consolidate (cold_first) pass instead. Set --llm-endpoint for real dreaming.",
             "categories_scanned": categories,
             "entities_examined": entities_examined,
             "observations_created": observations_created,
@@ -4713,7 +4713,7 @@ pub fn handle_ask(db: &Database, args: Value) -> Result<String, String> {
         serde_json::from_value(args).map_err(|e| format!("Invalid ask arguments: {}", e))?;
 
     if !db.llm_enabled() {
-        return Err("LLM is not enabled. Set --llm-endpoint to enable mimir_ask.".to_string());
+        return Err("LLM is not enabled. Set --llm-endpoint to enable perseus_vault_ask.".to_string());
     }
 
     match db.ask(&params) {
@@ -5660,7 +5660,7 @@ pub fn handle_prune(db: &Database, args: Value) -> Result<String, String> {
         if policy.is_unlimited() {
             return Err(
                 "prune scope='history' requires a bound: pass max_age_days, \
-                 max_versions_per_key, or max_bytes (or set the MIMIR_HISTORY_* env knobs)"
+                 max_versions_per_key, or max_bytes (or set the PERSEUS_VAULT_HISTORY_* env knobs)"
                     .to_string(),
             );
         }
@@ -5704,7 +5704,7 @@ pub fn handle_federate(db: &Database, args: Value) -> Result<String, String> {
     return Err("federate requires an authenticated authoritative admission and rollback-capable transfer boundary".to_string());
 
     let vault_dir = if a.vault_dir.is_empty() {
-        std::env::temp_dir().join("mimir-federate").to_string_lossy().to_string()
+        std::env::temp_dir().join("perseus_vault-federate").to_string_lossy().to_string()
     } else {
         a.vault_dir
     };
@@ -5927,7 +5927,7 @@ pub fn handle_autocohere(db: &Database, args: Value) -> Result<String, String> {
         .file_size_bytes()
         .map_err(|e| format!("Failed to get initial DB size: {}", e))?;
 
-    // 1. Run mimir_cohere (promote, link, archive)
+    // 1. Run perseus_vault_cohere (promote, link, archive)
     let cohere_params = crate::models::CohereParams {
         dry_run: a.dry_run,
         ..Default::default()
@@ -5940,7 +5940,7 @@ pub fn handle_autocohere(db: &Database, args: Value) -> Result<String, String> {
     total_links += cohere_report.linked;
     total_archived_cohere += cohere_report.archived;
 
-    // 2. Then mimir_decay (recalculate Ebbinghaus decay). #490: honor
+    // 2. Then perseus_vault_decay (recalculate Ebbinghaus decay). #490: honor
     // dry_run — this step previously ran the LIVE tick inside the "preview"
     // pass, rewriting scores and auto-archiving mid-dry-run.
     let decay_report = if a.dry_run {
@@ -5950,7 +5950,7 @@ pub fn handle_autocohere(db: &Database, args: Value) -> Result<String, String> {
     }
     .map_err(|e| format!("Autocohere step (decay) failed: {}", e))?;
 
-    // 3. Then mimir_compact (archive below threshold). Use the same archive
+    // 3. Then perseus_vault_compact (archive below threshold). Use the same archive
     // threshold as decay_tick/cohere so "run everything" forgets at the same
     // point as the individual tools (was a hardcoded 0.1 → ~5 idle days sooner).
     let compact_report = db
@@ -5961,7 +5961,7 @@ pub fn handle_autocohere(db: &Database, args: Value) -> Result<String, String> {
     // memories in each category into evidence-tracked observations and retire
     // the merged sources — running in the BACKGROUND as part of "run
     // everything", instead of only when an agent thinks to call
-    // mimir_consolidate. Bounded: a few observations per category per run,
+    // perseus_vault_consolidate. Bounded: a few observations per category per run,
     // over the same scan window the manual tool uses. Skips 'observation'
     // (no meta-observations / runaway recursion) and 'memories' (files from
     // the /memories adapter must never be similarity-merged).
@@ -5996,7 +5996,7 @@ pub fn handle_autocohere(db: &Database, args: Value) -> Result<String, String> {
     }
 
     // 5. History retention (#398): enforce the env-configured budget over
-    // entity_history in the same background pass. With no MIMIR_HISTORY_*
+    // entity_history in the same background pass. With no PERSEUS_VAULT_HISTORY_*
     // knob set this is a guaranteed no-op, so autocohere's default behavior
     // is unchanged.
     let retention_report = db
@@ -6046,7 +6046,7 @@ pub fn handle_cohere(db: &Database, args: Value) -> Result<String, String> {
     serde_json::to_string(&report).map_err(|e| format!("Serialization failed: {}", e))
 }
 
-// ─── mimir_supersede handler ────────────────────────────────────
+// ─── perseus_vault_supersede handler ────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
 pub struct SupersedeArgs {
@@ -6178,7 +6178,7 @@ pub fn handle_supersede(db: &Database, args: Value) -> Result<String, String> {
     Ok(result.to_string())
 }
 
-// ─── mimir_maintenance handler ──────────────────────────────────
+// ─── perseus_vault_maintenance handler ──────────────────────────────────
 
 #[derive(Debug, Deserialize)]
 pub struct MaintenanceArgs {
@@ -6317,7 +6317,7 @@ pub fn handle_maintenance(db: &Database, args: Value) -> Result<String, String> 
     }
 
     // History retention (#398): enforce the env-configured budget over
-    // entity_history. A no-op (zero rows) while no MIMIR_HISTORY_* knob is
+    // entity_history. A no-op (zero rows) while no PERSEUS_VAULT_HISTORY_* knob is
     // set — the default stays "keep everything". dry_run reports what would
     // be evicted.
     if a.history || a.all {
@@ -6349,7 +6349,7 @@ pub fn handle_maintenance(db: &Database, args: Value) -> Result<String, String> 
 /// the caller explicitly asks (`vacuum: true`) — schedulers should throttle
 /// it to ~weekly rather than every pass. Hard delete (`purge`) is never part
 /// of this path. History retention stays a guaranteed no-op unless the
-/// `MIMIR_HISTORY_*` env knobs opt in; it runs inside the autocohere step,
+/// `PERSEUS_VAULT_HISTORY_*` env knobs opt in; it runs inside the autocohere step,
 /// so it is deliberately NOT requested again from maintenance.
 pub fn run_maintenance_pass(db: &Database, dry_run: bool, vacuum: bool) -> Result<Value, String> {
     let autocohere: Value = handle_autocohere(db, json!({ "dry_run": dry_run }))
@@ -6381,7 +6381,7 @@ pub fn run_maintenance_pass(db: &Database, dry_run: bool, vacuum: bool) -> Resul
     }))
 }
 
-// ─── mimir_correct handler ────────────────────────────────────────
+// ─── perseus_vault_correct handler ────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
 pub struct CorrectArgs {
@@ -6458,7 +6458,7 @@ pub fn handle_correct(db: &Database, args: Value) -> Result<String, String> {
     let a: CorrectArgs = serde_json::from_value(args)
         .map_err(|e| format!("Invalid correct arguments: {}", e))?;
 
-    // #363 review: same inverted-period rejection as mimir_remember — an
+    // #363 review: same inverted-period rejection as perseus_vault_remember — an
     // inverted period would shadow older versions in bitemporal_at while
     // never matching itself, making the fact unanswerable.
     if let (Some(vf), Some(vt)) = (a.valid_from_unix_ms, a.valid_to_unix_ms) {
@@ -6500,7 +6500,7 @@ pub fn handle_correct(db: &Database, args: Value) -> Result<String, String> {
     serde_json::to_string(&result).map_err(|e| format!("Serialization failed: {}", e))
 }
 
-// ─── mimir_synthesize handler ────────────────────────────────────
+// ─── perseus_vault_synthesize handler ────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
 pub struct SynthesizeArgs {
@@ -6534,7 +6534,7 @@ pub fn handle_synthesize(db: &Database, args: Value) -> Result<String, String> {
 }
 
 
-// ─── mimir_bench handler ─────────────────────────────────────────
+// ─── perseus_vault_bench handler ─────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
 pub struct BenchArgs {
@@ -6959,7 +6959,7 @@ mod tests {
     use super::*;
 
     fn temp_db() -> (crate::db::TestDatabase, String) {
-        let db = crate::db::TestDatabase::new("mimir-test-tools");
+        let db = crate::db::TestDatabase::new("perseus_vault-test-tools");
         let path = db.path().to_string();
         (db, path)
     }
@@ -7085,7 +7085,7 @@ mod tests {
     #[test]
     fn health_reports_status_and_db_path() {
         // #671: health must surface the absolute db path so a "wrote here,
-        // inspected ~/mimir.db there" mismatch is self-diagnosing.
+        // inspected ~/perseus-vault.db there" mismatch is self-diagnosing.
         let (db, path) = temp_db();
         let v: Value = serde_json::from_str(&handle_health(&db)).unwrap();
         assert_eq!(v["status"], json!("healthy"), "{v}");
@@ -8486,7 +8486,7 @@ mod tests {
 
     #[test]
     fn supersede_close_inherits_the_audit_snapshot() {
-        // #373: mimir_supersede funnels through set_valid_to, so closing the
+        // #373: perseus_vault_supersede funnels through set_valid_to, so closing the
         // old fact's period now snapshots it — the pre-supersede open version
         // stays reconstructable at earlier transaction instants.
         use std::thread::sleep;
@@ -9674,7 +9674,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    // #330: mimir_remember rejected the documented optional `topic_path`
+    // #330: perseus_vault_remember rejected the documented optional `topic_path`
     // field (and other optional fields with custom defaults) whenever a
     // caller sent explicit JSON `null` instead of omitting the key. Many
     // MCP clients do this because the tool schema lists the field as
@@ -9837,7 +9837,7 @@ mod tests {
 
     fn temp_tool_db() -> (Database, String) {
         let dir = std::env::temp_dir();
-        let path = dir.join(format!("mimir-tools-test-{}.db", uuid::Uuid::new_v4()));
+        let path = dir.join(format!("perseus_vault-tools-test-{}.db", uuid::Uuid::new_v4()));
         let path_str = path.to_str().unwrap().to_string();
         let db = Database::open(&path_str).expect("open test db");
         (db, path_str)
@@ -9876,7 +9876,7 @@ mod tests {
 
     // ─── History retention hooks (#398) ──────────────────────────
 
-    /// #398: mimir_prune scope='history' enforces retention with dry_run
+    /// #398: perseus_vault_prune scope='history' enforces retention with dry_run
     /// preview (count + bytes that WOULD be evicted) matching the real run,
     /// and requires an explicit bound.
     #[test]
@@ -9967,7 +9967,7 @@ mod tests {
     }
 
     /// #398 rider: the valid-time tools decorate a compacted-window answer
-    /// with the same explicit marker as mimir_as_of — a retroactively-valid
+    /// with the same explicit marker as perseus_vault_as_of — a retroactively-valid
     /// version's window keeps answering after compaction.
     #[test]
     fn valid_at_tool_surfaces_compacted_marker_for_retroactive_window() {
@@ -10130,7 +10130,7 @@ mod tests {
                 "origin": {"memory_kind": "observed", "source_system": "agent"},
                 "external_refs": [
                     {"ref_type": "pull_request",
-                     "ref_value": "github:Perseus-Computing-LLC/plutus#176"}
+                     "ref_value": "github:Perseus-Computing-LLC/ledger#176"}
                 ]
             }),
         )
@@ -10147,7 +10147,7 @@ mod tests {
         assert_eq!(body["origin"]["source_system"], json!("agent"));
         assert_eq!(
             body["external_refs"][0]["ref_value"],
-            json!("github:Perseus-Computing-LLC/plutus#176")
+            json!("github:Perseus-Computing-LLC/ledger#176")
         );
         assert_eq!(body["content"], json!("gate shipped"));
 
@@ -10213,11 +10213,11 @@ mod tests {
         handle_remember(
             &db,
             json!({
-                "category": "facts", "key": "about-plutus",
+                "category": "facts", "key": "about-ledger",
                 "body_json": "{\"content\": \"deployment gate\"}",
                 "skip_dedup": true,
                 "external_refs": [{"ref_type": "repo",
-                                   "ref_value": "github:Perseus-Computing-LLC/plutus"}]
+                                   "ref_value": "github:Perseus-Computing-LLC/ledger"}]
             }),
         )
         .unwrap();
@@ -10244,13 +10244,13 @@ mod tests {
         let out = handle_recall(
             &db,
             json!({"query": "deployment",
-                   "ref_value": "github:Perseus-Computing-LLC/plutus"}),
+                   "ref_value": "github:Perseus-Computing-LLC/ledger"}),
         )
         .unwrap();
         let v: Value = serde_json::from_str(&out).unwrap();
         let items = v["items"].as_array().unwrap();
         assert_eq!(items.len(), 1, "{v}");
-        assert_eq!(items[0]["key"], json!("about-plutus"));
+        assert_eq!(items[0]["key"], json!("about-ledger"));
         let _ = std::fs::remove_file(&path);
     }
 
@@ -10410,7 +10410,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    // ─── #832: mimir_promote ────────────────────────────────────────────
+    // ─── #832: perseus_vault_promote ────────────────────────────────────────────
 
     #[test]
     fn promote_creates_provenance_linked_copy() {

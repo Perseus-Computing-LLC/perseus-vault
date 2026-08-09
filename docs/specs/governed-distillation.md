@@ -39,7 +39,7 @@ authority_set(manifest: [learned_memory])
 (categories/keys), provider identity, retention bound, and compute budget are
 recorded there by the training runner and become part of the receipt.
 
-### Registration gate: `mimir_learned_artifact_register`
+### Registration gate: `perseus_vault_learned_artifact_register`
 
 Fail-closed — every refusal is an error, never a silent fallback:
 
@@ -70,9 +70,9 @@ workspace` without trusting the caller.
 
 | event | flag | serve behavior | journal evidence |
 |---|---|---|---|
-| source **erased** (`mimir_erase`, #868) | `revoked_at_unix_ms` + `revocation_reason` | **refused** (fail-closed, all bindings revoked ⇒ not-found) | `artifact_revoked` (entity id + binding count, hash-only) |
-| source **purged** (`mimir_purge`) | same | refused | `artifact_revoked` (per source) |
-| source **superseded** (`mimir_supersede`) | `stale_at_unix_ms` | still serveable, flag visible in manifest | `artifact_stale` (entity id + binding count) |
+| source **erased** (`perseus_vault_erase`, #868) | `revoked_at_unix_ms` + `revocation_reason` | **refused** (fail-closed, all bindings revoked ⇒ not-found) | `artifact_revoked` (entity id + binding count, hash-only) |
+| source **purged** (`perseus_vault_purge`) | same | refused | `artifact_revoked` (per source) |
+| source **superseded** (`perseus_vault_supersede`) | `stale_at_unix_ms` | still serveable, flag visible in manifest | `artifact_stale` (entity id + binding count) |
 
 The purge report exposes `artifact_bindings_revoked` (dry-run preview and real
 count). Stale flags are the retraining trigger: an operator (or a later

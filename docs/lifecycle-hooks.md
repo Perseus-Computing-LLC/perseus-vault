@@ -140,14 +140,14 @@ contract:
 
 - Every tool is dispatchable under **three interchangeable prefixes**:
   `perseus_vault_*` (canonical), plus the two existing legacy aliases
-  `mimir_*` and `mneme_*`
+  `perseus_vault_*` and `perseus_vault_*`
   from earlier product names). The default `tools/list` advertises only the
   canonical `perseus_vault_*` set to avoid tripling the schema payload; operators
   can opt into advertising all aliases with `PERSEUS_VAULT_TOOL_ALIASES=all`.
   `tools/call` normalizes any of the three prefixes to the same handler (see
   `src/mcp.rs`).
 - **Write new hooks against `perseus_vault_*`.** Existing hooks written
-  against `mimir_*` or `mneme_*` keep working because dispatch aliases remain
+  against `perseus_vault_*` or `perseus_vault_*` keep working because dispatch aliases remain
   supported for the lifetime of the v2 series. New tools are canonical by
   default; the opt-in alias advertisement mode is the compatibility bridge.
 - CLI verbs referenced by this contract (`prepare`, `write`, `capture`,

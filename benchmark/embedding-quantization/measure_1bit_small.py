@@ -24,9 +24,9 @@ from tokenizers import Tokenizer
 
 # ── configuration ──────────────────────────────────────────────────────────
 
-MODEL_PATH = "/opt/data/webui/mimir-repo/target/release/build/perseus-vault-8a943c6d28eb020c/out/model_quantized.onnx"
-TOKENIZER_PATH = "/opt/data/webui/mimir-repo/target/release/build/perseus-vault-8a943c6d28eb020c/out/tokenizer.json"
-DATASET_PATH = "/opt/data/webui/mimir-repo/benchmark/recall/dataset.json"
+MODEL_PATH = "/opt/data/webui/perseus-vault-repo/target/release/build/perseus-vault-8a943c6d28eb020c/out/model_quantized.onnx"
+TOKENIZER_PATH = "/opt/data/webui/perseus-vault-repo/target/release/build/perseus-vault-8a943c6d28eb020c/out/tokenizer.json"
+DATASET_PATH = "/opt/data/webui/perseus-vault-repo/benchmark/recall/dataset.json"
 BASELINE_PATH = "/tmp/baseline-recall.json"
 OUT_PATH = "/tmp/1bit-recall.json"
 
@@ -259,8 +259,8 @@ def main():
     Path(OUT_PATH).write_text(json.dumps(report, indent=2) + "\n")
     print(f"\nReport: {OUT_PATH}")
 
-    # ── Quality ratio for Plutus cost model ──
-    print("\n── Plutus multiplier guidance ──")
+    # ── Quality ratio for Ledger cost model ──
+    print("\n── Ledger multiplier guidance ──")
     if agg_full["recall@1"] > 0:
         r1_ratio = agg_1bit["recall@1"] / agg_full["recall@1"]
         print(f"  1-bit / full-precision recall@1 ratio: {r1_ratio:.3f}")

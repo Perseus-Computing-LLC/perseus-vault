@@ -53,8 +53,8 @@ FACTS = [
 m = MCP([binp,"serve","--db",db,"--llm-endpoint",oll+"/api/generate","--llm-model",binp and "qwen2.5:14b-instruct",
          "--embedding-endpoint",oll+"/api/embed","--embedding-model-name","nomic-embed-text"])
 for c,k,v in FACTS:
-    m.tool("mimir_remember",{"category":c,"key":k,"body_json":json.dumps({"content":v})})
-while (m.tool("mimir_embed",{"batch_category":"kb","batch_limit":100}).get("embedded",0) or 0)>0: pass
+    m.tool("perseus_vault_remember",{"category":c,"key":k,"body_json":json.dumps({"content":v})})
+while (m.tool("perseus_vault_embed",{"batch_category":"kb","batch_limit":100}).get("embedded",0) or 0)>0: pass
 m.close()
 print("seeded+embedded", len(FACTS))
 PY
@@ -71,7 +71,7 @@ m = MCP([binp,"serve","--db",db,"--llm-endpoint",oll+"/api/generate","--llm-mode
 t=time.time()
 ok=False
 try:
-    r=m.tool("mimir_ask",{"query":"How does Perseus keep data safe with no internet, and how does it search?"})
+    r=m.tool("perseus_vault_ask",{"query":"How does Perseus keep data safe with no internet, and how does it search?"})
     ans=r.get("answer") or r.get("_raw") or json.dumps(r)
     # r may be the raw MCP envelope with isError; treat that as a failure, not an answer.
     ok = not (isinstance(r,dict) and r.get("isError")) and "Ask failed" not in str(ans) and "error" not in str(ans).lower()[:40]

@@ -27,10 +27,10 @@ confidence:
 
 | Tier | Substrate | Vault surface | Use for |
 |---|---|---|---|
-| 1. Structured truth | typed, extracted/derived entities with provenance | `mimir_recall` on extracted/derived classes, belief overlay, `mimir_traverse` for lineage | factual, impact, lineage, dependency questions |
-| 2. Targeted source fetch | the specific artifact an entity anchors to | `external_refs` / anchors, `mimir_get_entity` drill-down | verification, gap-filling, quoting exactly |
-| 3. Broad search | keyword/semantic sweep over the whole corpus | `mimir_recall` fts5/hybrid unfiltered, connector corpora | discovery when tiers 1–2 miss |
-| 4. Synthesis | deriving a new answer from evidence | `mimir_dream`, `mimir_synthesize`, agent reasoning | only when no stored truth answers the question |
+| 1. Structured truth | typed, extracted/derived entities with provenance | `perseus_vault_recall` on extracted/derived classes, belief overlay, `perseus_vault_traverse` for lineage | factual, impact, lineage, dependency questions |
+| 2. Targeted source fetch | the specific artifact an entity anchors to | `external_refs` / anchors, `perseus_vault_get_entity` drill-down | verification, gap-filling, quoting exactly |
+| 3. Broad search | keyword/semantic sweep over the whole corpus | `perseus_vault_recall` fts5/hybrid unfiltered, connector corpora | discovery when tiers 1–2 miss |
+| 4. Synthesis | deriving a new answer from evidence | `perseus_vault_dream`, `perseus_vault_synthesize`, agent reasoning | only when no stored truth answers the question |
 
 Rules:
 
@@ -47,8 +47,8 @@ Rules:
 
 | Question shape | Starts at tier | Notes |
 |---|---|---|
-| "what is X / what is the state of X" | 1 | `mimir_recall` with provenance filter (see provenance spec) |
-| "what depends on / supports / follows from X" | 1 (graph) | `mimir_traverse` per `graph-first-retrieval.md` |
+| "what is X / what is the state of X" | 1 | `perseus_vault_recall` with provenance filter (see provenance spec) |
+| "what depends on / supports / follows from X" | 1 (graph) | `perseus_vault_traverse` per `graph-first-retrieval.md` |
 | "quote the exact wording / show the source" | 2 | resolve anchor, fetch artifact |
 | "what do we know about <new topic>" | 1→3 | tier 1 miss escalates to broad search |
 | "summarize / what should we conclude" | 1→4 | synthesize over tier-1 evidence, citing it |
