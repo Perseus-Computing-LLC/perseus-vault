@@ -14,6 +14,7 @@ mod extraction;
 // — the dominant cloud/CI base image (#526).
 #[cfg(all(feature = "bundled-embeddings", target_os = "linux", target_env = "gnu"))]
 mod glibc_compat;
+mod graph_route;
 mod httplimit;
 mod log_digest;
 mod mcp;

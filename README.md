@@ -396,6 +396,8 @@ Any MCP-compatible framework works with Perseus Vault directly. See
 | `perseus_vault_communities` | GraphRAG community detection over the link graph (deterministic label propagation or greedy-modularity "louvain"; pure Rust, offline). |
 | `perseus_vault_community_summary` | Extractive (optionally LLM-polished) summary of one community, materialized as an entity with `evidence_for` links to members. |
 | `perseus_vault_global_recall` | GraphRAG global search: breadth over community summaries, then depth into the best communities' members — holistic answers across clusters. |
+| `perseus_vault_graph_drift` | Read-only graph/entities/indexes/receipts drift report (#869): unattested, dangling, archived/expired-target, and cross-workspace edges, stale community memberships, FTS drift, journal refs to missing entities. |
+| `perseus_vault_graph_attest` | Stamp the from-side entity id as the evidence anchor on legacy edges so they become serveable by the graph recall arms (#869); dry-run preview, journaled. |
 
 ### Journal
 | Tool | Description |

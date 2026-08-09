@@ -7,7 +7,8 @@ Resolves: #735
 Related: `structured-truth-retrieval-policy.md` (retrieval order, tier 1),
 `provenance-classes-derived-facts.md` (evidence links),
 `hybrid-retrieval-ranking.md` (score boosts), `served-memory-api.md`
-(served explanations), `memory-provenance-and-external-refs.md` (refs)
+(served explanations), `memory-provenance-and-external-refs.md` (refs),
+`graph-utility-gate.md` (operational gate contract, #869)
 
 Some questions are graph questions, not text-search questions: impact,
 ownership, lineage, downstream effect. Answering them with keyword search

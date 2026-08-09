@@ -52,6 +52,7 @@ V1_REQUIRED_CATEGORIES = V0_REQUIRED_CATEGORIES + (
     "admission",
     "prompt_safety",
     "identity_ambiguity",
+    "graph_gate",
 )
 
 CAPABILITY_TOOLS = {
@@ -1498,6 +1499,168 @@ def run_recall_outcome(client, **_):
     )
 
 
+def run_graph_gate(client, **_):
+    # #869: the graph utility gate, evidence/scope/lifecycle consistency, and
+    # fabricated-edge accounting, measured over the MCP surface. The fixture
+    # is a hub entity + one linked neighbor (attested via perseus_vault_link).
+    ws = "quality-graph-gate-workspace"
+    remember(
+        client,
+        "quality_graph_gate",
+        "gate-hub",
+        "quality-fixture-gateway-load-balancer",
+        workspace_hash=ws,
+    )
+    remember(
+        client,
+        "quality_graph_gate",
+        "gate-neighbor",
+        "quality-fixture-tls-termination-proxy",
+        workspace_hash=ws,
+    )
+    neighbor = client.call(
+        "perseus_vault_get_entity",
+        {"category": "quality_graph_gate", "key": "gate-neighbor"},
+    )
+    neighbor_id = neighbor.get("id") if isinstance(neighbor, dict) else None
+    if neighbor_id:
+        client.call(
+            "perseus_vault_link",
+            {
+                "from_category": "quality_graph_gate",
+                "from_key": "gate-hub",
+                "to_id": neighbor_id,
+                "relationship": "depends_on",
+            },
+        )
+
+    # 1. Multi-hop/impact query: the graph arm must engage (reason
+    # observable) and the linked neighbor must surface through it.
+    multi = client.call(
+        "perseus_vault_recall",
+        {
+            "query": "what depends on the gateway load balancer",
+            "category": "quality_graph_gate",
+            "mode": "fused",
+            "strategies": ["fts5", "graph"],
+            "limit": 5,
+        },
+    )
+    multi_trace = multi.get("fused_trace") if isinstance(multi, dict) else {}
+    multi_route = multi_trace.get("graph_route") or {}
+    multi_graph = next(
+        (s for s in multi_trace.get("strategies", []) if s.get("strategy") == "graph"), {}
+    )
+    multi_hop_selected = multi_route.get("selected") is True
+    route_reason_observable = multi_route.get("reason") == "multi_hop"
+    neighbor_surfaced = neighbor_id is not None and any(
+        item.get("id") == neighbor_id for item in (multi.get("items") or [])
+    )
+    graph_arm_latency_ms = multi_graph.get("latency_ms")
+    graph_arm_candidates = multi_graph.get("candidates")
+
+    # 2. Ordinary single-hop query: falls back WITHOUT failure — the graph
+    # arm is observably skipped and the keyword arm still serves the hub.
+    ordinary = client.call(
+        "perseus_vault_recall",
+        {
+            "query": "gateway load balancer",
+            "category": "quality_graph_gate",
+            "mode": "fused",
+            "strategies": ["fts5", "graph"],
+            "limit": 5,
+        },
+    )
+    ordinary_trace = ordinary.get("fused_trace") if isinstance(ordinary, dict) else {}
+    ordinary_route = ordinary_trace.get("graph_route") or {}
+    ordinary_graph = next(
+        (s for s in ordinary_trace.get("strategies", []) if s.get("strategy") == "graph"), {}
+    )
+    ordinary_skipped = (
+        ordinary_route.get("selected") is False
+        and ordinary_route.get("reason") == "ordinary"
+        and ordinary_graph.get("status") == "skipped"
+    )
+    recall_succeeds = isinstance(ordinary, dict) and not ordinary.get("isError")
+    hub_served = any(
+        item.get("key") == "gate-hub" for item in (ordinary.get("items") or [])
+    )
+
+    # 3. Temporal question: classified "temporal" — the fused path's
+    # dedicated temporal strategy owns that shape, so the graph arm must
+    # stay off (routing reasons observable for every class).
+    temporal = client.call(
+        "perseus_vault_recall",
+        {
+            "query": "what shipped on 2026-06-20",
+            "category": "quality_graph_gate",
+            "mode": "fused",
+            "strategies": ["fts5", "graph"],
+            "limit": 5,
+        },
+    )
+    temporal_route = {}
+    if isinstance(temporal, dict) and isinstance(temporal.get("fused_trace"), dict):
+        temporal_route = temporal["fused_trace"].get("graph_route") or {}
+    temporal_not_routed = (
+        temporal_route.get("selected") is False
+        and temporal_route.get("reason") == "temporal"
+    )
+
+    # 4. Evidence/scope/lifecycle consistency: every edge in this fixture is
+    # attested and in-scope, so the drift report is consistent and the graph
+    # arm served ZERO fabricated (unattested) edges.
+    drift = client.call("perseus_vault_graph_drift", {"workspace_hash": ws})
+    drift_consistent = isinstance(drift, dict) and drift.get("consistent") is True
+    unattested_skipped = multi_route.get("unattested_edges_skipped", 0)
+    total_served = len(multi.get("items") or [])
+    fabricated_edge_rate = 0.0 if unattested_skipped == 0 else float("nan")
+
+    checks = {
+        "multi_hop_selected": multi_hop_selected,
+        "route_reason_observable": route_reason_observable,
+        "neighbor_surfaced": neighbor_surfaced,
+        "ordinary_skipped": ordinary_skipped,
+        "recall_succeeds": recall_succeeds,
+        "temporal_not_routed": temporal_not_routed,
+        "drift_consistent": drift_consistent,
+        "no_fabricated_edges_served": unattested_skipped == 0,
+    }
+    evidence = {
+        "workspace": ws,
+        "multi_hop_reason": multi_route.get("reason"),
+        "multi_hop_selected": multi_hop_selected,
+        "ordinary_reason": ordinary_route.get("reason"),
+        "ordinary_status": ordinary_graph.get("status"),
+        "temporal_reason": temporal_route.get("reason"),
+        "graph_arm_latency_ms": graph_arm_latency_ms,
+        "graph_arm_candidates": graph_arm_candidates,
+        "total_served": total_served,
+        "unattested_edges_skipped": unattested_skipped,
+        "fabricated_edge_rate": fabricated_edge_rate,
+        "drift_consistent": drift_consistent,
+    }
+    metric_events = {
+        "graph-gate-multi-hop-routes": {
+            "numerator": int(multi_hop_selected and route_reason_observable and neighbor_surfaced),
+            "denominator": 1,
+        },
+        "graph-gate-ordinary-falls-back": {
+            "numerator": int(ordinary_skipped and recall_succeeds and hub_served),
+            "denominator": 1,
+        },
+        "graph-gate-temporal-not-routed": {
+            "numerator": int(temporal_not_routed),
+            "denominator": 1,
+        },
+        "graph-gate-consistency": {
+            "numerator": int(drift_consistent and unattested_skipped == 0),
+            "denominator": 1,
+        },
+    }
+    return output(checks, evidence, metric_events)
+
+
 def run_admission(client, **_):
     untrusted_body = stable_json({"note": "quality-fixture-admission-hostile-marker"})
     untrusted = client.call(
@@ -1665,6 +1828,7 @@ SCENARIO_RUNNERS = {
     "projection": run_projection,
     "action_grounding": run_action_grounding,
     "recall_outcome": run_recall_outcome,
+    "graph_gate": run_graph_gate,
     "admission": run_admission,
     "prompt_safety": run_prompt_safety,
     "identity_ambiguity": run_identity_ambiguity,

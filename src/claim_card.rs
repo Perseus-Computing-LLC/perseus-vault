@@ -705,6 +705,7 @@ mod tests {
             relationship: rel.to_string(),
             target_id: target.to_string(),
             weight: 0.5,
+            source: None,
         }
     }
 

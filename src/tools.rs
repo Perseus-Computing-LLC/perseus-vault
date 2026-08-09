@@ -391,6 +391,13 @@ pub struct RecallArgs {
     /// now). Accepts a number or a numeric string.
     #[serde(default, deserialize_with = "string_or_int_opt")]
     pub query_time_unix_ms: Option<i64>,
+    /// #869: graph utility gate threshold in [0, 1] (fused mode only).
+    /// The graph strategy engages only when the query's classified graph
+    /// utility is >= this value. Omit = 0.5 (documented default). 0.0
+    /// disables the gate; 1.0 effectively never engages. The routing
+    /// decision is always observable in `fused_trace.graph_route`.
+    #[serde(default)]
+    pub graph_utility_threshold: Option<f64>,
 }
 
 pub type BatchQuery = RecallArgs;
@@ -1400,6 +1407,16 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
         }
     }
 
+    // #869: graph utility gate threshold is a probability-like knob — reject
+    // junk up front rather than silently clamping in the fused path.
+    if let Some(t) = a.graph_utility_threshold {
+        if !t.is_finite() || !(0.0..=1.0).contains(&t) {
+            return Err(format!(
+                "graph_utility_threshold must be between 0.0 and 1.0, got {t}"
+            ));
+        }
+    }
+
     // #271: an unset `mode` ("" — the serde default) auto-selects the best
     // available strategy. When the embedding backend is on AND at least one
     // entity is embedded, default to Hybrid (deterministic dense + keyword RRF);
@@ -1503,6 +1520,7 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
         strategy_weights: a.strategy_weights,
         rerank: a.rerank,
         query_time_unix_ms: a.query_time_unix_ms,
+        graph_utility_threshold: a.graph_utility_threshold,
     };
 
     // #864: bounded recall — time the query when the caller set a deadline.
@@ -1766,6 +1784,15 @@ pub fn handle_recall_batch(db: &Database, args: Value) -> Result<String, String>
                 );
             }
         }
+
+        // #869: graph utility gate threshold validation (fused mode only).
+        if let Some(t) = q.graph_utility_threshold {
+            if !t.is_finite() || !(0.0..=1.0).contains(&t) {
+                return Err(format!(
+                    "graph_utility_threshold must be between 0.0 and 1.0, got {t}"
+                ));
+            }
+        }
     }
 
     let limit = a.queries.iter().map(|q| q.limit).max().unwrap_or(10) as usize;
@@ -1823,6 +1850,7 @@ pub fn handle_recall_batch(db: &Database, args: Value) -> Result<String, String>
             strategy_weights: q.strategy_weights.clone(),
             rerank: q.rerank,
             query_time_unix_ms: q.query_time_unix_ms,
+            graph_utility_threshold: q.graph_utility_threshold,
         };
 
         let mut entities = db
@@ -4222,6 +4250,47 @@ pub fn handle_traverse(db: &Database, args: Value) -> String {
             .unwrap_or_else(|e| json!({"error": format!("{}", e)}).to_string()),
         Err(e) => json!({"error": format!("Traverse failed: {}", e)}).to_string(),
     }
+}
+
+// ─── Graph utility gate, drift & attestation (#869) ────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct GraphDriftArgs {
+    /// Optional workspace scope. Omit (or "") for all workspaces.
+    #[serde(default)]
+    pub workspace_hash: Option<String>,
+}
+
+/// #869: read-only graph/entities/indexes/receipts drift report.
+pub fn handle_graph_drift(db: &Database, args: Value) -> Result<String, String> {
+    let a: GraphDriftArgs = serde_json::from_value(args)
+        .map_err(|e| format!("Invalid graph_drift arguments: {}", e))?;
+    let report = db
+        .graph_drift_report(a.workspace_hash.as_deref())
+        .map_err(|e| format!("graph_drift failed: {}", e))?;
+    serde_json::to_string(&report).map_err(|e| format!("Serialization failed: {}", e))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GraphAttestArgs {
+    /// Optional workspace scope. Omit (or "") for all workspaces.
+    #[serde(default)]
+    pub workspace_hash: Option<String>,
+    /// Preview the stamping without writing.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub dry_run: bool,
+}
+
+/// #869: stamp the from-side entity id as the evidence anchor on legacy
+/// edges (pre-#869 rows). Dry-run previews; applied runs journal one
+/// `graph_attest` event.
+pub fn handle_graph_attest(db: &Database, args: Value) -> Result<String, String> {
+    let a: GraphAttestArgs = serde_json::from_value(args)
+        .map_err(|e| format!("Invalid graph_attest arguments: {}", e))?;
+    let report = db
+        .graph_attest(a.workspace_hash.as_deref(), a.dry_run)
+        .map_err(|e| format!("graph_attest failed: {}", e))?;
+    serde_json::to_string(&report).map_err(|e| format!("Serialization failed: {}", e))
 }
 
 // ─── GraphRAG community tools (#365) ────────────────────────────────────────
