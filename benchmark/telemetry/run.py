@@ -261,7 +261,13 @@ def main() -> int:
                 assert m in modes, f"{m} exercised but not audited: {modes}"
         assert rep["displacement"]["count"] >= 1, rep["displacement"]
         art = rep["artifact"]
-        assert art.get("schema_version") == 31 and art.get("content_hash"), art
+        assert art.get("schema_version") == 32 and art.get("content_hash"), art
+
+        # 6) #870: deployment profile joins the run manifest — the runtime
+        # posture the results were produced under (sanitized: hosts only).
+        prof = json.loads(v.call("perseus_vault_deployment_profile", {}))
+        assert prof["profile"] in ("offline", "local_only", "local_with_approved_network",
+                                   "external_actions_enabled"), prof
 
         # replayable report: counts + ids + hashes only.
         report = {
@@ -280,6 +286,14 @@ def main() -> int:
             "retrieval_profile": rep["retrieval_profile"],
             "artifact": {"schema_version": art["schema_version"],
                          "content_hash": art["content_hash"][:16]},
+            "deployment_profile": {
+                "profile": prof["profile"],
+                "model_backend": prof["model_backend"]["kind"],
+                "embedding_backend": prof["embedding_backend"]["kind"],
+                "egress_hosts": prof["network"]["egress_hosts"],
+                "external_mutations": prof["external_mutations"],
+                "encryption_at_rest": prof["encryption"]["at_rest"],
+            },
             "assertions_passed": True,
         }
         print(json.dumps(report, indent=2, sort_keys=True))

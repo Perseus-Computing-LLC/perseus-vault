@@ -3053,6 +3053,36 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Check Health"
   },
   {
+    "name": "perseus_vault_deployment_profile",
+    "description": "Resolved runtime deployment profile (#870): one machine-readable answer to 'what is this vault actually connected to?'. Reports the profile class (`offline` | `local_only` | `local_with_approved_network` | `external_actions_enabled`), model backend (bundled/ollama/provider/none), embedding backend (kind + available + degraded — a missing/unavailable local backend is reported as degraded, never silently reclassified as empty success), network listeners and non-loopback egress hosts (hosts only — sanitized, no URLs/keys/raw bodies), connectors, cloud-provider use, external-mutation posture, encryption at rest (aes_256_gcm|plaintext + storage-state probe) and in transit, and raw-retention policy. Describes ACTUAL runtime state: offline mode zeroes web/LLM/embedding/connectors at startup, and the profile reflects the effective flags. Read-only.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {}
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "profile": {
+          "type": "string",
+          "enum": ["offline", "local_only", "local_with_approved_network", "external_actions_enabled"],
+          "description": "Derived deployment class from runtime state"
+        },
+        "model_backend": { "type": "object", "description": "kind/model/available/degraded" },
+        "embedding_backend": { "type": "object", "description": "kind/available/degraded/semantic_recall" },
+        "network": { "type": "object", "description": "listeners/egress_hosts/loopback_only" },
+        "connectors": { "type": "array", "description": "name/remote/remote_host" },
+        "cloud_provider_use": { "type": "string", "description": "'none' or comma-joined non-loopback hosts" },
+        "external_mutations": { "type": "string", "enum": ["disabled", "enabled"] },
+        "encryption": { "type": "object", "description": "at_rest/storage_state/in_transit" },
+        "raw_retention": { "type": "object", "description": "memory_bodies/raw_logs" }
+      }
+    },
+    "annotations": {
+      "readOnlyHint": true
+    },
+    "title": "Deployment Profile"
+  },
+  {
     "name": "perseus_vault_handoff_restart",
     "description": "Live-update / reconnect for long-lived stdio sessions (#858). When the perseus-vault binary was rebuilt or replaced on disk mid-session, the running process image is stale: every other tool refuses loudly (isError) until the session is restarted — or this tool hot-swaps the process on the SAME stdio connection. States: binary unchanged -> no_handoff_needed (identity report); stale + dry_run -> dry_run (what would happen); stale without confirm -> confirm_required; stale + confirm:true -> the replacement binary is spawned on this session's stdio and the old process exits immediately after this response — the MCP session continues uninterrupted in the new process image. Do not pipeline requests during the handoff.",
     "inputSchema": {
@@ -5785,6 +5815,7 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
         "perseus_vault_state_list" => tools::handle_state_list(db, args).map_err(|e| e.to_string()),
 
         "perseus_vault_health" => Ok(tools::handle_health(db)),
+        "perseus_vault_deployment_profile" => tools::handle_deployment_profile(db, args),
         "perseus_vault_handoff_restart" => crate::live_update::handle_handoff_restart(args),
         "perseus_vault_quality_telemetry" => tools::handle_quality_telemetry(db, args),
         "perseus_vault_retrieval_telemetry" => tools::handle_retrieval_telemetry(db, args),
@@ -5966,7 +5997,7 @@ mod tests {
         );
         assert_eq!(
             registry_names.len(),
-            102,
+            103,
             "update public metadata when adding a tool"
         );
 

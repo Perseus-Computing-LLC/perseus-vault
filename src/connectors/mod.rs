@@ -10,6 +10,12 @@ pub trait Connector: Send + Sync {
     fn name(&self) -> &str;
     fn fetch(&self) -> Result<Vec<RawDocument>, String>;
     fn last_sync(&self) -> &AtomicI64;
+    /// #870: the remote host this connector reaches (None = local-only,
+    /// e.g. a file watcher). Used by the deployment profile to report
+    /// network egress; hosts only, never URLs or credentials.
+    fn remote_host(&self) -> Option<&str> {
+        None
+    }
 }
 
 /// Helper: current unix timestamp in milliseconds.

@@ -46,6 +46,12 @@ impl Connector for GitHubConnector {
         "github"
     }
 
+    /// #870: the GitHub connector reaches api.github.com — a network egress
+    /// the deployment profile must report.
+    fn remote_host(&self) -> Option<&str> {
+        Some("api.github.com")
+    }
+
     fn fetch(&self) -> Result<Vec<RawDocument>, String> {
         if !self.config.enabled || self.config.token.is_empty() {
             return Err("GitHub connector is not enabled or missing token".to_string());

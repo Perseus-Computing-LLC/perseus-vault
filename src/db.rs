@@ -548,6 +548,10 @@ pub struct Database {
     db_path: String,
     encryption: Option<EncryptionManager>,
     llm_config: LlmConfig,
+    /// #870: startup snapshot of the effective deployment flags (offline
+    /// mode zeroes web/LLM/embedding/connectors before this is captured), so
+    /// the deployment profile describes runtime state, not config intent.
+    deployment_ctx: crate::deployment_profile::DeploymentContext,
     #[allow(dead_code)]
     embedding_config: crate::embedding::EmbeddingConfig,
     embedding_cache: std::sync::Mutex<EmbeddingCache>,
@@ -1009,6 +1013,7 @@ impl Database {
             db_path: path.to_string(),
             encryption: None,
             llm_config: LlmConfig::default(),
+            deployment_ctx: crate::deployment_profile::DeploymentContext::default(),
             embedding_config: crate::embedding::EmbeddingConfig::default(),
             embedding_cache: std::sync::Mutex::new(EmbeddingCache::new(256)),
             connectors: Vec::new(),
@@ -1255,6 +1260,78 @@ impl Database {
     /// returns `false` unless a remote endpoint is wired separately.
     pub fn embedding_enabled(&self) -> bool {
         self.embedding_config.enabled
+    }
+
+    // ── #870 deployment-profile runtime state ────────────────────────────
+    // The profile must describe ACTUAL runtime state: the serve handler
+    // snapshots the effective flags (post offline-mode zeroing) here, and
+    // the accessors below expose live LLM/embedding/connector state without
+    // exposing secrets (hosts only, never endpoints with keys).
+
+    /// Snapshot the effective deployment flags at serve startup.
+    pub fn set_deployment_context(
+        &mut self,
+        offline: bool,
+        web_enabled: bool,
+        web_bind: &str,
+        grpc_enabled: bool,
+        external_actions: bool,
+    ) {
+        self.deployment_ctx = crate::deployment_profile::DeploymentContext {
+            offline,
+            web_enabled,
+            web_bind: web_bind.to_string(),
+            grpc_enabled,
+            external_actions,
+        };
+    }
+
+    pub fn deployment_context(&self) -> &crate::deployment_profile::DeploymentContext {
+        &self.deployment_ctx
+    }
+
+    /// LLM endpoint (full URL; caller sanitizes — profile reports host only).
+    pub fn llm_endpoint(&self) -> String {
+        self.llm_config.endpoint.clone()
+    }
+
+    pub fn llm_model(&self) -> String {
+        self.llm_config.model.clone()
+    }
+
+    /// Separate embedding endpoint, when configured (None = derive from the
+    /// LLM endpoint or use the bundled backend).
+    pub fn llm_embedding_endpoint(&self) -> Option<String> {
+        self.llm_config.embedding_endpoint.clone()
+    }
+
+    /// Embedding backend kind: `bundled` (compiled-in ONNX), `provider`
+    /// (remote endpoint configured), or `none` (lite build, no provider).
+    pub fn embedding_kind(&self) -> &'static str {
+        if self.embedding_config.bundled {
+            "bundled"
+        } else if self
+            .llm_config
+            .embedding_endpoint
+            .as_deref()
+            .is_some_and(|s| !s.is_empty())
+        {
+            "provider"
+        } else {
+            "none"
+        }
+    }
+
+    /// Runtime connector list snapshot (name + remote host when the
+    /// connector reaches a network target).
+    pub fn connectors_snapshot(&self) -> Vec<crate::deployment_profile::ConnectorRuntimeInfo> {
+        self.connectors
+            .iter()
+            .map(|c| crate::deployment_profile::ConnectorRuntimeInfo {
+                name: c.name().to_string(),
+                remote_host: c.remote_host().map(|s| s.to_string()),
+            })
+            .collect()
     }
 
     /// #271: count of non-archived entities that carry a stored dense embedding.
@@ -19521,6 +19598,7 @@ mod tests {
             db_path: path_str.clone(),
             encryption: None,
             llm_config: LlmConfig::default(),
+            deployment_ctx: crate::deployment_profile::DeploymentContext::default(),
             embedding_config: crate::embedding::EmbeddingConfig::default(),
             embedding_cache: std::sync::Mutex::new(EmbeddingCache::new(256)),
             connectors: Vec::new(),
