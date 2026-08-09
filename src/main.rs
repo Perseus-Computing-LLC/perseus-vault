@@ -31,6 +31,7 @@ mod tools;
 mod transport;
 mod grpc;
 mod util;
+mod validity;
 mod web;
 
 use clap::{Parser, Subcommand};

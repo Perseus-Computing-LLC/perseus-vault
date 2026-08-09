@@ -369,6 +369,47 @@
       "id": "graph-gate-consistency",
       "metric": "graph_utility_gate",
       "scenario": "graph_gate"
+    },
+    {
+      "category": "validity_recall",
+      "checks": [
+        "current_ranks_first",
+        "validity_trace_observable"
+      ],
+      "description": "Under the validity profile the current (fresh, in-scope) entity ranks above older matches and the decision is observable in fused_trace.validity (profile, method, grade counts).",
+      "id": "validity-recall-orders-fresh-first",
+      "metric": "validity_recall",
+      "scenario": "validity_recall"
+    },
+    {
+      "category": "validity_recall",
+      "checks": [
+        "superseded_not_served"
+      ],
+      "description": "Superseded memories (status deprecated) are structurally excluded from recall: a lower rate of stale/context-invalid memories.",
+      "id": "validity-recall-excludes-superseded",
+      "metric": "validity_recall",
+      "scenario": "validity_recall"
+    },
+    {
+      "category": "validity_recall",
+      "checks": [
+        "expired_not_served"
+      ],
+      "description": "Expired memories are structurally excluded from recall (read-time lifecycle).",
+      "id": "validity-recall-excludes-expired",
+      "metric": "validity_recall",
+      "scenario": "validity_recall"
+    },
+    {
+      "category": "validity_recall",
+      "checks": [
+        "expiring_graded_stale"
+      ],
+      "description": "An expiring-soon memory is served but graded stale with the expiring signal in its validity block.",
+      "id": "validity-recall-grades-expiring",
+      "metric": "validity_recall",
+      "scenario": "validity_recall"
     }
   ],
   "description": "Bounded offline quality-contract manifest for retrieval, temporal validity, scope validity, provenance, replay, mutation/supersession, compaction/projection, action grounding, recall outcomes, admission, poisoning, identity ambiguity, and the graph utility gate (#869).",
@@ -384,7 +425,8 @@
     "admission",
     "prompt_safety",
     "identity_ambiguity",
-    "graph_utility_gate"
+    "graph_utility_gate",
+    "validity_recall"
   ],
   "name": "perseus-vault-memory-quality-v1",
   "required_categories": [
@@ -403,7 +445,8 @@
     "admission",
     "prompt_safety",
     "identity_ambiguity",
-    "graph_gate"
+    "graph_gate",
+    "validity_recall"
   ],
-  "version": 5
+  "version": 6
 }

@@ -477,6 +477,19 @@ pub struct RecallParams {
     /// never engages. The routing decision is always observable in the
     /// fused trace's `graph_route`.
     pub graph_utility_threshold: Option<f64>,
+    /// #860: validity-aware recall profile. `"validity"` re-ranks the fused
+    /// pool by a deterministic validity multiplier (freshness decay, scope
+    /// match, provenance class, supersession, expiry proximity) and
+    /// annotates every delivered item with its validity info; `"default"` /
+    /// None keeps the relevance-only ordering. On non-fused modes the
+    /// profile only enables item annotation (no re-ranking). Unknown
+    /// profiles are rejected fail-closed.
+    pub profile: Option<String>,
+    /// #860: annotate delivered items with their validity info (grade,
+    /// freshness, scope match, provenance class, superseded, expiring/
+    /// expired, multiplier, signals). Off by default so response bytes stay
+    /// stable unless asked. Implied by `profile: "validity"`.
+    pub validity_annotate: bool,
 }
 
 /// Search mode for recall: FTS5 keyword, dense vector, hybrid fusion, or
@@ -667,6 +680,30 @@ pub struct FusedTrace {
     /// gates (evidence/scope/expiry) skipped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub graph_route: Option<GraphRouteTrace>,
+    /// #860: validity-aware profile outcome. Present when the caller
+    /// requested `profile: "validity"`; records the weights applied, the
+    /// grade distribution over the fused pool, and how many candidates were
+    /// flagged context-invalid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validity: Option<ValidityTrace>,
+}
+
+/// #860: observable validity-profile trace attached to a fused recall.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct ValidityTrace {
+    /// "validity" when the profile engaged.
+    pub profile: String,
+    /// "validity-multiplier-v1" — deterministic multiplier over
+    /// freshness/scope/provenance/supersession/expiry signals.
+    pub method: String,
+    /// The exact weights used (freshness half-life, bonuses, penalties).
+    pub weights: crate::validity::ValidityWeights,
+    /// Grade distribution over the fused pool ("valid"/"stale"/
+    /// "context_invalid" -> count).
+    pub grade_counts: std::collections::BTreeMap<String, usize>,
+    /// How many pool candidates were flagged context-invalid (superseded,
+    /// expired, or below the freshness floor).
+    pub flagged_context_invalid: usize,
 }
 
 /// #869: observable graph utility-gate decision attached to a fused recall.
@@ -808,6 +845,8 @@ impl Default for RecallParams {
             rerank: false,
             query_time_unix_ms: None,
             graph_utility_threshold: None,
+            profile: None,
+            validity_annotate: false,
         }
     }
 }

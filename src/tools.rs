@@ -398,6 +398,15 @@ pub struct RecallArgs {
     /// decision is always observable in `fused_trace.graph_route`.
     #[serde(default)]
     pub graph_utility_threshold: Option<f64>,
+    /// #860: validity-aware recall profile: "validity" (re-ranks fused
+    /// results by freshness/scope/provenance/supersession/expiry and
+    /// annotates items) or "default"/omitted (relevance-only ordering).
+    #[serde(default)]
+    pub profile: Option<String>,
+    /// #860: annotate delivered items with their validity info (grade,
+    /// freshness, scope match, provenance, superseded, expiry, multiplier).
+    #[serde(default)]
+    pub validity_annotate: bool,
 }
 
 pub type BatchQuery = RecallArgs;
@@ -1417,6 +1426,16 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
         }
     }
 
+    // #860: validity profile is a closed enum — fail closed on unknowns so a
+    // typo never silently degrades to relevance-only ordering.
+    if let Some(p) = &a.profile {
+        if p != "default" && p != "validity" {
+            return Err(format!(
+                "invalid profile '{p}': expected 'default' or 'validity'"
+            ));
+        }
+    }
+
     // #271: an unset `mode` ("" — the serde default) auto-selects the best
     // available strategy. When the embedding backend is on AND at least one
     // entity is embedded, default to Hybrid (deterministic dense + keyword RRF);
@@ -1519,6 +1538,8 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
         depth_budget: a.depth_budget,
         strategy_weights: a.strategy_weights,
         rerank: a.rerank,
+        profile: a.profile.clone(),
+        validity_annotate: a.validity_annotate,
         query_time_unix_ms: a.query_time_unix_ms,
         graph_utility_threshold: a.graph_utility_threshold,
     };
@@ -1693,6 +1714,40 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
         }
     }
 
+    // #860: validity-aware item annotation (opt-in; implied by the
+    // "validity" profile). Every delivered item gets a `validity` block —
+    // grade, freshness, scope match, provenance class, superseded/expiring/
+    // expired flags, multiplier, and the human-readable signal list — and
+    // context-invalid items are additionally flagged so a consuming agent
+    // can skip or re-verify them. Deterministic per (entity, now): recall
+    // stays byte-reproducible for a fixed DB (#247).
+    let annotate_validity = a.profile.as_deref() == Some("validity") || a.validity_annotate;
+    if annotate_validity {
+        let now_ms = a.query_time_unix_ms.unwrap_or_else(crate::db::now_ms);
+        let weights = crate::validity::ValidityWeights::default();
+        for (item, entity) in items_expanded.iter_mut().zip(entities.iter()) {
+            let info = crate::validity::score(
+                now_ms,
+                entity.created_at_unix_ms,
+                crate::db::entity_expiry_ms(&entity.body_json),
+                &entity.workspace_hash,
+                a.workspace_hash.as_deref(),
+                &entity.epistemic_state,
+                &entity.status,
+                &weights,
+            );
+            if let Some(obj) = item.as_object_mut() {
+                obj.insert(
+                    "validity".to_string(),
+                    serde_json::to_value(&info).unwrap_or(serde_json::json!({})),
+                );
+                if info.grade == "context_invalid" {
+                    obj.insert("context_invalid".to_string(), serde_json::json!(true));
+                }
+            }
+        }
+    }
+
     // #472: stamp point-in-time provenance onto each reconstructed hit.
     if let Some(meta) = &temporal_meta {
         for (item, h) in items_expanded.iter_mut().zip(meta.iter()) {
@@ -1793,6 +1848,15 @@ pub fn handle_recall_batch(db: &Database, args: Value) -> Result<String, String>
                 ));
             }
         }
+
+        // #860: validity profile is a closed enum — fail closed on unknowns.
+        if let Some(p) = &q.profile {
+            if p != "default" && p != "validity" {
+                return Err(format!(
+                    "invalid profile '{p}': expected 'default' or 'validity'"
+                ));
+            }
+        }
     }
 
     let limit = a.queries.iter().map(|q| q.limit).max().unwrap_or(10) as usize;
@@ -1849,6 +1913,8 @@ pub fn handle_recall_batch(db: &Database, args: Value) -> Result<String, String>
             depth_budget: q.depth_budget.clone(),
             strategy_weights: q.strategy_weights.clone(),
             rerank: q.rerank,
+            profile: q.profile.clone(),
+            validity_annotate: q.validity_annotate,
             query_time_unix_ms: q.query_time_unix_ms,
             graph_utility_threshold: q.graph_utility_threshold,
         };
@@ -1895,6 +1961,40 @@ pub fn handle_recall_batch(db: &Database, args: Value) -> Result<String, String>
     let include_confidence = a.queries.first().map_or(false, |q| q.include_confidence);
     if include_confidence {
         apply_confidence(&mut items_expanded, &entities_only);
+    }
+
+    // #860: batch validity annotation (first query's profile/flag governs,
+    // mirroring include_confidence). Fused batch queries re-rank inside
+    // fused_recall when the profile is "validity"; this block annotates.
+    let first = a.queries.first();
+    let annotate_validity =
+        first.map_or(false, |q| q.profile.as_deref() == Some("validity") || q.validity_annotate);
+    if annotate_validity {
+        let now_ms = first
+            .and_then(|q| q.query_time_unix_ms)
+            .unwrap_or_else(crate::db::now_ms);
+        let weights = crate::validity::ValidityWeights::default();
+        for (item, entity) in items_expanded.iter_mut().zip(entities_only.iter()) {
+            let info = crate::validity::score(
+                now_ms,
+                entity.created_at_unix_ms,
+                crate::db::entity_expiry_ms(&entity.body_json),
+                &entity.workspace_hash,
+                first.and_then(|q| q.workspace_hash.as_deref()),
+                &entity.epistemic_state,
+                &entity.status,
+                &weights,
+            );
+            if let Some(obj) = item.as_object_mut() {
+                obj.insert(
+                    "validity".to_string(),
+                    serde_json::to_value(&info).unwrap_or(serde_json::json!({})),
+                );
+                if info.grade == "context_invalid" {
+                    obj.insert("context_invalid".to_string(), serde_json::json!(true));
+                }
+            }
+        }
     }
 
     let result = json!({
