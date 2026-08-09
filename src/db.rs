@@ -1487,17 +1487,45 @@ impl Database {
             return Err("No matching memories found for this question.".into());
         }
 
+        // Step 1b (#884): the stale-observation gate — observation candidates
+        // with newer unconsolidated raw facts are verified against those
+        // facts before citation; contradicted observations are refused and
+        // reported (never silently dropped).
+        let (gated, refused) = if params.verify_stale_observations {
+            self.gate_stale_observations(
+                entities,
+                crate::observations::OBSERVATION_VERIFY_THRESHOLD,
+            )?
+        } else {
+            (entities.into_iter().map(|e| (e, None)).collect(), Vec::new())
+        };
+        if gated.is_empty() && !refused.is_empty() {
+            return Err(format!(
+                "No matching memories found ({} observation source(s) refused as stale/unverified).",
+                refused.len()
+            )
+            .into());
+        }
+
         // Step 2: Assemble context (truncate bodies to ~600 chars each)
         let mut context_parts = Vec::new();
         let mut sources = Vec::new();
-        for e in &entities {
+        for (e, verification) in gated {
             let snippet: String = e.body_json.chars().take(600).collect();
-            context_parts.push(format!("[key: {}] {}", e.key, snippet));
+            if verification.is_some() {
+                context_parts.push(format!(
+                    "[key: {}] (verified against raw facts) {}",
+                    e.key, snippet
+                ));
+            } else {
+                context_parts.push(format!("[key: {}] {}", e.key, snippet));
+            }
             sources.push(AskSource {
                 key: e.key.clone(),
                 category: e.category.clone(),
                 score: e.decay_score,
                 snippet,
+                verification,
             });
         }
         let context = context_parts.join("\n\n");
@@ -1550,7 +1578,11 @@ impl Database {
             .unwrap_or("(no response from model)")
             .to_string();
 
-        Ok(AskResult { answer, sources })
+        Ok(AskResult {
+            answer,
+            sources,
+            refused_sources: refused,
+        })
     }
 
     /// Assemble a persona context block from special reserved entities in the
@@ -3956,7 +3988,7 @@ impl Database {
     // ─── Entities ────────────────────────────────────────────────
 
     /// Character-trigram set of a string (fast, language-agnostic).
-    fn trigrams(s: &str) -> std::collections::HashSet<[char; 3]> {
+    pub(crate) fn trigrams(s: &str) -> std::collections::HashSet<[char; 3]> {
         let chars: Vec<char> = s.chars().collect();
         if chars.len() < 3 {
             return std::collections::HashSet::new();
@@ -3965,7 +3997,7 @@ impl Database {
     }
 
     /// Jaccard overlap of two precomputed trigram sets (0.0–1.0).
-    fn trigram_overlap(
+    pub(crate) fn trigram_overlap(
         ta: &std::collections::HashSet<[char; 3]>,
         tb: &std::collections::HashSet<[char; 3]>,
     ) -> f64 {
@@ -3978,6 +4010,46 @@ impl Database {
             return 0.0;
         }
         intersection as f64 / union as f64
+    }
+
+    /// Public trigram similarity between two bodies (#884): exact text match
+    /// scores 1.0 (short bodies have no trigrams), otherwise Jaccard overlap
+    /// of the character-trigram sets.
+    pub(crate) fn trigram_overlap_public(a: &str, b: &str) -> f64 {
+        if !a.is_empty() && a == b {
+            return 1.0;
+        }
+        let ta = Self::trigrams(a);
+        let tb = Self::trigrams(b);
+        Self::trigram_overlap(&ta, &tb)
+    }
+
+    /// #884: containment of the smaller trigram set in the larger
+    /// (|A∩B| / min(|A|,|B|)) — 1.0 when one text is a trigram-subset of the
+    /// other. Signals "extension of the same claim" where raw Jaccard is
+    /// diluted by length. 0.0 when either set is empty.
+    pub(crate) fn trigram_containment(
+        ta: &std::collections::HashSet<[char; 3]>,
+        tb: &std::collections::HashSet<[char; 3]>,
+    ) -> f64 {
+        if ta.is_empty() || tb.is_empty() {
+            return 0.0;
+        }
+        let intersection = ta.intersection(tb).count() as f64;
+        intersection / (ta.len().min(tb.len()) as f64)
+    }
+
+    /// Public containment between two body texts (#884).
+    pub(crate) fn trigram_containment_public(a: &str, b: &str) -> f64 {
+        if a.is_empty() || b.is_empty() {
+            return 0.0;
+        }
+        if a == b {
+            return 1.0;
+        }
+        let ta = Self::trigrams(a);
+        let tb = Self::trigrams(b);
+        Self::trigram_containment(&ta, &tb)
     }
 
     /// Compute trigram overlap similarity between two strings (0.0–1.0).
@@ -12704,6 +12776,204 @@ impl Database {
     /// rather than a destructive merge.
     ///
     /// `dry_run` reports what would be created without writing anything.
+    ///
+    /// #884: evidence-grounded observations — created observations carry
+    /// exact-quote evidence refs, a proof count, updated_at, a staleness
+    /// flag, and (on contradiction) a preserved journey; `refine_existing`
+    /// folds new evidence into existing observations instead of creating
+    /// duplicates, and a staleness refresh pass marks observations stale
+    /// when newer unconsolidated facts exist.
+    ///
+    /// #884: is the observation stale — does a newer unconsolidated fact
+    /// exist in its merged-from category (not already folded into it)?
+    /// Deterministic; used by the consolidate refresh pass and the ask gate.
+    pub fn observation_stale(
+        &self,
+        workspace_hash: &str,
+        meta: &crate::observations::ObservationMeta,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        if meta.merged_from_category.is_empty() {
+            return Ok(false);
+        }
+        let conn = self.conn()?;
+        let ws = workspace_hash;
+        let n = meta.source_ids.len();
+        let mut sql = String::from(
+            "SELECT EXISTS(SELECT 1 FROM entities WHERE category = ?1 AND archived = 0
+             AND created_at_unix_ms > ?2",
+        );
+        if n > 0 {
+            let ph: Vec<String> = (0..n).map(|i| format!("?{}", i + 3)).collect();
+            sql.push_str(" AND id NOT IN (");
+            sql.push_str(&ph.join(", "));
+            sql.push(')');
+        }
+        sql.push_str(&format!(
+            " AND (workspace_hash = ?{} OR workspace_hash = '') LIMIT 1)",
+            n + 3
+        ));
+        let mut params_vec: Vec<rusqlite::types::Value> = vec![
+            meta.merged_from_category.clone().into(),
+            meta.updated_at_unix_ms.into(),
+        ];
+        for sid in &meta.source_ids {
+            params_vec.push(sid.clone().into());
+        }
+        params_vec.push(ws.to_string().into());
+        let mut stmt = conn.prepare(&sql)?;
+        let v: i64 = stmt.query_row(rusqlite::params_from_iter(params_vec.iter()), |r| {
+            r.get(0)
+        })?;
+        Ok(v > 0)
+    }
+
+    /// #884: the newest unconsolidated raw fact in the observation's
+    /// merged-from category (id, key, body_json) — the verification anchor
+    /// for the ask gate.
+    fn newest_unconsolidated_fact(
+        &self,
+        workspace_hash: &str,
+        meta: &crate::observations::ObservationMeta,
+    ) -> Result<Option<(String, String, String)>, Box<dyn std::error::Error>> {
+        if meta.merged_from_category.is_empty() {
+            return Ok(None);
+        }
+        let conn = self.conn()?;
+        let ws = workspace_hash;
+        let n = meta.source_ids.len();
+        let mut sql = String::from(
+            "SELECT id, key, body_json FROM entities WHERE category = ?1 AND archived = 0
+             AND created_at_unix_ms > ?2",
+        );
+        if n > 0 {
+            let ph: Vec<String> = (0..n).map(|i| format!("?{}", i + 3)).collect();
+            sql.push_str(" AND id NOT IN (");
+            sql.push_str(&ph.join(", "));
+            sql.push(')');
+        }
+        sql.push_str(&format!(
+            " AND (workspace_hash = ?{} OR workspace_hash = '')
+             ORDER BY created_at_unix_ms DESC, id ASC LIMIT 1",
+            n + 3
+        ));
+        let mut params_vec: Vec<rusqlite::types::Value> = vec![
+            meta.merged_from_category.clone().into(),
+            meta.updated_at_unix_ms.into(),
+        ];
+        for sid in &meta.source_ids {
+            params_vec.push(sid.clone().into());
+        }
+        params_vec.push(ws.to_string().into());
+        let mut stmt = conn.prepare(&sql)?;
+        let mut rows = stmt.query(rusqlite::params_from_iter(params_vec.iter()))?;
+        if let Some(row) = rows.next()? {
+            Ok(Some((row.get(0)?, row.get(1)?, row.get(2)?)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// #884: the ask stale gate — verify observation candidates against
+    /// newer unconsolidated raw facts before citation. Kept entries carry
+    /// an optional verification note; refused entries name the newest
+    /// contradicting fact for trace-back. Non-observations pass through
+    /// untouched.
+    pub fn gate_stale_observations(
+        &self,
+        entities: Vec<crate::models::Entity>,
+        threshold: f64,
+    ) -> Result<
+        (
+            Vec<(crate::models::Entity, Option<String>)>,
+            Vec<crate::models::RefusedSource>,
+        ),
+        Box<dyn std::error::Error>,
+    > {
+        let mut kept = Vec::with_capacity(entities.len());
+        let mut refused = Vec::new();
+        for e in entities {
+            let is_observation = e.category == crate::observations::OBSERVATION_CATEGORY
+                || e.body_json.contains("merged_from_category");
+            if !is_observation {
+                kept.push((e, None));
+                continue;
+            }
+            let Some(meta) =
+                crate::observations::parse_observation(&e.body_json, e.created_at_unix_ms)
+            else {
+                kept.push((e, None));
+                continue;
+            };
+            if meta.merged_from_category.is_empty() {
+                kept.push((e, None));
+                continue;
+            }
+            if !self.observation_stale(&e.workspace_hash, &meta)? {
+                kept.push((e, None));
+                continue;
+            }
+            // Stale: verify against the newest unconsolidated raw fact.
+            let Some((_id, newest_key, newest_body)) =
+                self.newest_unconsolidated_fact(&e.workspace_hash, &meta)?
+            else {
+                // No newer fact anymore (race with a refresh): treat as
+                // verified — the stored flag was computed before the fold.
+                kept.push((e, Some("verified_against_raw".to_string())));
+                continue;
+            };
+            match crate::observations::classify(&meta.summary, &newest_body, threshold) {
+                crate::observations::MatchClass::Contradiction => {
+                    refused.push(crate::models::RefusedSource {
+                        key: e.key.clone(),
+                        category: e.category.clone(),
+                        reason: "stale_observation_unverified".to_string(),
+                        detail: Some(newest_key),
+                    });
+                }
+                crate::observations::MatchClass::Fold
+                | crate::observations::MatchClass::Unrelated => {
+                    // Consistent (foldable) or no contradicting evidence:
+                    // cite, but say it was verified against raw facts.
+                    kept.push((e, Some("verified_against_raw".to_string())));
+                }
+            }
+        }
+        Ok((kept, refused))
+    }
+
+    /// Merge overlapping/duplicative entities within a category into durable,
+    /// evidence-tracked "observations" (#steal-2, competitive research:
+    /// Hindsight's Observation layer). Where `detect_conflicts` flags pairs
+    /// that are DISSIMILAR (contradictory), `consolidate` flags pairs that are
+    /// SIMILAR (redundant/overlapping) and merges them into a single higher-
+    /// confidence entity, rather than leaving N near-duplicate facts to pile up.
+    ///
+    /// Algorithm: within the scan window, greedily group entities whose
+    /// pairwise trigram similarity is >= `similarity_threshold` into clusters
+    /// (union-style: if A~B and B~C, all three merge, even if A~C alone would
+    /// be just under threshold). Clusters of size 1 (nothing to merge) are
+    /// left untouched — only real groups of 2+ produce a new observation.
+    /// Singletons are NOT archived or altered.
+    ///
+    /// Each observation stores: a summary (the highest-certainty source's body,
+    /// since that source is presumed most reliable), the full list of source
+    /// entity ids as evidence (`source_ids`), a `proof_count` (how many
+    /// sources back it), and the average certainty across sources. The source
+    /// entities are NOT deleted — they remain accessible via their own
+    /// category/key and via the observation's `source_ids` for audit — this
+    /// mirrors Hindsight's "continuous refinement, history preserved" design
+    /// rather than a destructive merge.
+    ///
+    /// `dry_run` reports what would be created without writing anything.
+    ///
+    /// #884: evidence-grounded observations — created observations carry
+    /// exact-quote evidence refs, a proof count, updated_at, a staleness
+    /// flag, and (on contradiction) a preserved journey; `refine_existing`
+    /// folds new evidence into existing observations instead of creating
+    /// duplicates, and a staleness refresh pass marks observations stale
+    /// when newer unconsolidated facts exist. Fold/refine writes go through
+    /// the audited re-assert path (entity_history snapshot, #371); the
+    /// staleness flag is derived state refreshed in place.
     pub fn consolidate(
         &self,
         params: &crate::models::ConsolidateParams,
@@ -12761,8 +13031,28 @@ impl Database {
             Some(ws) => stmt.query_map(params![params.category, ws, params.offset], map_row)?,
             None => stmt.query_map(params![params.category, params.offset], map_row)?,
         };
-        let entities: Vec<(String, String, String, f64, bool, f64)> =
-            rows.filter_map(|r| r.ok()).collect();
+        // #884: at-rest encryption — the scan reads body_json via raw SQL,
+        // so decrypt each row before any clustering. AuthFailed rows are
+        // dropped (never cluster on unauthenticated bytes).
+        let entities: Vec<(String, String, String, f64, bool, f64)> = rows
+            .filter_map(|r| r.ok())
+            .filter_map(|(id, key, raw_body, certainty, verified, importance)| {
+                let body = match self.encryption.as_ref() {
+                    Some(enc) => match Self::decrypt_body_with_aad_fallback(
+                        enc,
+                        &raw_body,
+                        &params.category,
+                        &key,
+                    ) {
+                        crate::encryption::BodyDecrypt::Plaintext(p)
+                        | crate::encryption::BodyDecrypt::LegacyPlaintext(p) => p,
+                        crate::encryption::BodyDecrypt::AuthFailed(_) => return None,
+                    },
+                    None => raw_body,
+                };
+                Some((id, key, body, certainty, verified, importance))
+            })
+            .collect();
         drop(stmt);
 
         // Union-find over entity indices, joining any pair whose trigram
@@ -12789,16 +13079,31 @@ impl Database {
         // of the O(n²) comparisons. The equal-body check preserves
         // trigram_similarity's exact-match semantics for bodies shorter than
         // one trigram (their sets are empty, which would otherwise score 0.0).
+        // #884: cluster on EXTRACTED text (the note), not raw body_json —
+        // remember() appends provenance (state, record_digest, actor) that
+        // differs per entity and would drown the signal. This also makes the
+        // cluster scan consistent with classify()/refine()/match, which all
+        // compare extracted text.
+        let body_texts: Vec<String> = entities
+            .iter()
+            .map(|e| crate::observations::body_text(&e.2))
+            .collect();
         let trigram_sets: Vec<std::collections::HashSet<[char; 3]>> =
-            entities.iter().map(|e| Self::trigrams(&e.2)).collect();
+            body_texts.iter().map(|t| Self::trigrams(t)).collect();
         for i in 0..n {
             for j in (i + 1)..n {
-                let sim = if entities[i].2 == entities[j].2 && !entities[i].2.is_empty() {
+                let sim = if !body_texts[i].is_empty() && body_texts[i] == body_texts[j] {
                     1.0
                 } else {
                     Self::trigram_overlap(&trigram_sets[i], &trigram_sets[j])
                 };
-                if sim >= params.similarity_threshold {
+                // #884: join on Jaccard OR near-subset containment — must
+                // agree with classify() (FOLD_CONTAINMENT_FLOOR), so cluster
+                // members always fold rather than contradict each other.
+                let containment = Self::trigram_containment(&trigram_sets[i], &trigram_sets[j]);
+                if sim >= params.similarity_threshold
+                    || containment >= crate::observations::FOLD_CONTAINMENT_FLOOR
+                {
                     union(&mut parent, i, j);
                 }
             }
@@ -12814,22 +13119,198 @@ impl Database {
         let mut observations = Vec::new();
         let mut source_entities_merged: i64 = 0;
         let mut sources_archived: i64 = 0;
+        let mut observations_refined: i64 = 0;
+        let mut observations_refreshed: i64 = 0;
+        let mut observations_stale: i64 = 0;
+        let mut quotes_captured: i64 = 0;
         let now = now_ms();
+
+        // #884: load existing live observations in scope once — they are the
+        // fold targets for refine_existing and the staleness refresh pass.
+        // v1 bodies parse tolerantly (fallback updated_at = created_at).
+        #[derive(Clone)]
+        struct ExistingObs {
+            entity: crate::models::Entity,
+            meta: crate::observations::ObservationMeta,
+        }
+        let existing_observations: Vec<ExistingObs> = {
+            let sql = match scope_ws.as_deref() {
+                Some(ws) => format!(
+                    "SELECT id, key, body_json, created_at_unix_ms
+                     FROM entities WHERE category = '{}' AND archived = 0
+                     AND workspace_hash = ?1",
+                    crate::observations::OBSERVATION_CATEGORY
+                ),
+                None => format!(
+                    "SELECT id, key, body_json, created_at_unix_ms
+                     FROM entities WHERE category = '{}' AND archived = 0",
+                    crate::observations::OBSERVATION_CATEGORY
+                ),
+            };
+            let mut stmt = conn.prepare(&sql)?;
+            let rows: Vec<(String, String, String, i64)> = match scope_ws.as_deref() {
+                Some(ws) => {
+                    let mapped = stmt.query_map(params![ws], |r| {
+                        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                    })?;
+                    mapped.filter_map(|r| r.ok()).collect()
+                }
+                None => {
+                    let mapped = stmt.query_map([], |r| {
+                        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                    })?;
+                    mapped.filter_map(|r| r.ok()).collect()
+                }
+            };
+            drop(stmt);
+            let mut out = Vec::new();
+            for (id, key, raw_body, created_at) in rows {
+                // #884: at-rest encryption — decrypt before parse; AuthFailed
+                // rows are skipped (never parse unauthenticated bytes).
+                let body_json = match self.encryption.as_ref() {
+                    Some(enc) => match Self::decrypt_body_with_aad_fallback(
+                        enc,
+                        &raw_body,
+                        crate::observations::OBSERVATION_CATEGORY,
+                        &key,
+                    ) {
+                        crate::encryption::BodyDecrypt::Plaintext(p)
+                        | crate::encryption::BodyDecrypt::LegacyPlaintext(p) => p,
+                        crate::encryption::BodyDecrypt::AuthFailed(_) => continue,
+                    },
+                    None => raw_body,
+                };
+                if let Some(meta) =
+                    crate::observations::parse_observation(&body_json, created_at)
+                {
+                    // Only observations about the scanned category are fold
+                    // targets; others are still refreshed below.
+                    out.push(ExistingObs {
+                        entity: self.get_entity(&crate::observations::OBSERVATION_CATEGORY, &key)?.unwrap_or_else(|| crate::models::Entity {
+                            id: id.clone(),
+                            category: crate::observations::OBSERVATION_CATEGORY.to_string(),
+                            key,
+                            body_json,
+                            status: "active".to_string(),
+                            entity_type: "insight".to_string(),
+                            tags: vec![],
+                            decay_score: 1.0,
+                            retrieval_count: 0,
+                            layer: "working".to_string(),
+                            topic_path: String::new(),
+                            archived: false,
+                            archive_reason: String::new(),
+                            links: vec![],
+                            verified: false,
+                            source: "perseus_vault_consolidate".to_string(),
+                            always_on: false,
+                            certainty: 0.5,
+                            workspace_hash: scope_ws.clone().unwrap_or_default(),
+                            agent_id: String::new(),
+                            visibility: "workspace".to_string(),
+                            follow_count: 0,
+                            miss_count: 0,
+                            follow_rate: 0.0,
+                            efficacy_status: "unverified".to_string(),
+                            epistemic_state: crate::models::default_epistemic_state(),
+                            embedding: None,
+                            _parsed_body: None,
+                            created_at_unix_ms: created_at,
+                            last_accessed_unix_ms: created_at,
+                        }),
+                        meta,
+                    });
+                }
+            }
+            out
+        };
+
+        // Folded source ids across the whole run (prevents re-folding).
+        let mut folded_ids: std::collections::HashSet<String> = existing_observations
+            .iter()
+            .flat_map(|o| o.meta.source_ids.iter().cloned())
+            .collect();
+
+        // #884: best fold/refine target among existing observations about the
+        // same category, by trigram similarity of summary vs candidate body
+        // (ties broken by entity id — deterministic). None when
+        // refine_existing is off or nothing overlaps (Unrelated).
+        fn match_observation<'a>(
+            candidate_body: &str,
+            existing: &'a [ExistingObs],
+            category: &str,
+            refine_existing: bool,
+            threshold: f64,
+        ) -> Option<&'a ExistingObs> {
+            if !refine_existing {
+                return None;
+            }
+            existing
+                .iter()
+                .filter(|o| o.meta.merged_from_category == category)
+                .filter(|o| {
+                    crate::observations::classify(&o.meta.summary, candidate_body, threshold)
+                        != crate::observations::MatchClass::Unrelated
+                })
+                .max_by(|a, b| {
+                    crate::db::Database::trigram_overlap_public(&a.meta.summary, candidate_body)
+                        .partial_cmp(&crate::db::Database::trigram_overlap_public(
+                            &b.meta.summary,
+                            candidate_body,
+                        ))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| b.entity.id.cmp(&a.entity.id))
+                })
+        }
+
+        // #884: apply a refined observation back to storage via the audited
+        // re-assert path (remember snapshots the prior row into
+        // entity_history, #371) — refinement is never a silent overwrite.
+        let write_refined = |obs: &ExistingObs,
+                             meta: &crate::observations::ObservationMeta,
+                             entity_id: &str,
+                             key: &str|
+         -> Result<(), Box<dyn std::error::Error>> {
+            let mut entity = obs.entity.clone();
+            entity.id = entity_id.to_string();
+            entity.key = key.to_string();
+            entity.body_json = crate::observations::observation_body(meta);
+            entity.last_accessed_unix_ms = now;
+            self.remember_skip_dedup(&entity)?;
+            Ok(())
+        };
 
         // Deterministic order: sort clusters by their lowest member index so
         // repeated runs over an unchanged DB produce the same observation order.
         let mut cluster_list: Vec<Vec<usize>> = clusters.into_values().collect();
         cluster_list.sort_by_key(|c| *c.iter().min().unwrap_or(&0));
 
+        let mut cluster_membership: std::collections::HashSet<usize> =
+            cluster_list.iter().flatten().copied().collect();
+
+        // #884: observation entities written this run (created or refined).
+        // The staleness refresh pass must NOT clobber them with the pre-run
+        // snapshot — their stale flag was just computed by refine()/create
+        // (updated_at = now ⇒ nothing newer can exist ⇒ stale=false is exact).
+        let mut touched_obs: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+
         for cluster in cluster_list {
-            if cluster.len() < 2 || observations.len() as i64 >= params.limit {
+            if observations.len() as i64 >= params.limit {
+                break;
+            }
+            // Skip members already folded into an observation (idempotent
+            // re-runs never double-count evidence).
+            let unfolded: Vec<usize> = cluster
+                .iter()
+                .copied()
+                .filter(|&i| !folded_ids.contains(&entities[i].0))
+                .collect();
+            if unfolded.is_empty() {
                 continue;
             }
-
             let members: Vec<&(String, String, String, f64, bool, f64)> =
-                cluster.iter().map(|&i| &entities[i]).collect();
-            // The highest-certainty member's body becomes the summary (most
-            // reliable source), ties broken by entity id for determinism.
+                unfolded.iter().map(|&i| &entities[i]).collect();
             let best = members
                 .iter()
                 .max_by(|a, b| {
@@ -12837,127 +13318,324 @@ impl Database {
                         .unwrap_or(std::cmp::Ordering::Equal)
                         .then_with(|| b.0.cmp(&a.0))
                 })
-                .expect("cluster has at least 2 members");
-
-            let source_ids: Vec<String> = members.iter().map(|m| m.0.clone()).collect();
-            let avg_certainty =
-                members.iter().map(|m| m.3).sum::<f64>() / members.len() as f64;
-            let proof_count = members.len() as i64;
+                .expect("cluster has at least one unfolded member");
+            let best_text = crate::observations::body_text(&best.2);
+            let new_sources: Vec<(String, String)> = members
+                .iter()
+                .map(|m| (m.0.clone(), m.2.clone()))
+                .collect();
 
             let raw_id = uuid::Uuid::new_v4().to_string().replace('-', "");
             let entity_id = format!("obs-{}", &raw_id[..12.min(raw_id.len())]);
             let key = format!("{}-{}", params.category, &raw_id[..8.min(raw_id.len())]);
 
-            let body = serde_json::json!({
-                "summary": serde_json::from_str::<serde_json::Value>(&best.2).unwrap_or(serde_json::json!(best.2)),
-                "source_ids": source_ids,
-                "proof_count": proof_count,
-                "merged_from_category": params.category,
-            });
+            let created_or_refined: Option<&ExistingObs> =
+                match_observation(
+                    &best_text,
+                    &existing_observations,
+                    &params.category,
+                    params.refine_existing,
+                    params.similarity_threshold,
+                );
 
-            let observation = crate::models::Observation {
-                entity_id: entity_id.clone(),
-                key: key.clone(),
-                summary: best.2.clone(),
-                source_ids: source_ids.clone(),
-                proof_count,
-                certainty: avg_certainty,
-            };
+            // A 1-member unfolded cluster is only ever a fold/refine target —
+            // never a fresh observation (legacy singleton semantics). If
+            // nothing matches, it stays untouched.
+            if unfolded.len() < 2 && created_or_refined.is_none() {
+                continue;
+            }
 
-            if !params.dry_run {
-                let entity = crate::models::Entity {
-                    id: entity_id.clone(),
-                    category: "observation".to_string(),
-                    key: key.clone(),
-                    body_json: body.to_string(),
-                    status: "active".to_string(),
-                    entity_type: "insight".to_string(),
-                    tags: vec!["consolidated".to_string()],
-                    decay_score: avg_certainty.max(0.5),
-                    retrieval_count: 0,
-                    layer: "working".to_string(),
-                    topic_path: String::new(),
-                    archived: false,
-                    archive_reason: String::new(),
-                    links: source_ids
+            let final_meta: Option<crate::observations::ObservationMeta>;
+            let mut refined_entity_id = String::new();
+
+            if let Some(target) = created_or_refined {
+                // Fold or reconcile into the existing observation.
+                let mut meta = crate::observations::refine(
+                    &target.meta,
+                    &new_sources,
+                    now,
+                    params.similarity_threshold,
+                    params.quote_cap_chars.max(64) as usize,
+                );
+                meta.merged_from_category = params.category.clone();
+                refined_entity_id = target.entity.id.clone();
+                touched_obs.insert(target.entity.id.clone());
+                if !params.dry_run {
+                    write_refined(target, &meta, &refined_entity_id, &target.entity.key)?;
+                }
+                quotes_captured += new_sources.len() as i64;
+                observations_refined += 1;
+                final_meta = Some(meta);
+            } else {
+                // Fresh observation (v2 body: quotes, updated_at, stale,
+                // history). Stale is false by construction — the newest
+                // facts in the category are its own sources.
+                let avg_certainty =
+                    members.iter().map(|m| m.3).sum::<f64>() / members.len() as f64;
+                let proof_count = members.len() as i64;
+                let meta = crate::observations::ObservationMeta {
+                    summary: best_text.clone(),
+                    source_ids: members.iter().map(|m| m.0.clone()).collect(),
+                    quotes: members
                         .iter()
-                        .map(|sid| crate::models::MemoryLink {
-                            target_id: sid.clone(),
-                            relationship: "evidence_for".to_string(),
-                            weight: 1.0,
-                            // #869: the consolidated observation asserts the
-                            // evidence_for edges to its sources.
-                            source: Some(entity_id.clone()),
+                        .map(|m| crate::observations::QuoteRef {
+                            source_id: m.0.clone(),
+                            quote: crate::observations::quote_for(&m.2, params.quote_cap_chars.max(64) as usize),
                         })
                         .collect(),
-                    verified: false,
-                    source: "perseus_vault_consolidate".to_string(),
-                    always_on: false,
-                    certainty: avg_certainty,
-                    workspace_hash: scope_ws.clone().unwrap_or_default(),
-                    agent_id: params.requesting_agent_id.clone(),
-                    visibility: "workspace".to_string(),
-                    follow_count: 0,
-                    miss_count: 0,
-                    follow_rate: 0.0,
-                    efficacy_status: "unverified".to_string(),
-                    epistemic_state: crate::models::default_epistemic_state(),
-                    embedding: None,
-                    _parsed_body: None,
-                    created_at_unix_ms: now,
-                    last_accessed_unix_ms: now,
+                    proof_count,
+                    merged_from_category: params.category.clone(),
+                    updated_at_unix_ms: now,
+                    stale: false,
+                    history: Vec::new(),
                 };
-                self.remember(&entity)?;
+                final_meta = Some(meta.clone());
+                quotes_captured += proof_count;
+                touched_obs.insert(entity_id.clone());
 
-                // Local dreaming: retire the merged sources now that their
-                // content lives in the observation (which links back to each
-                // via evidence_for, and the archive_reason names the
-                // observation — traceable and reversible). Verified or
-                // importance-floored sources keep the decay exemption promise
-                // and stay live alongside the observation.
-                if params.archive_sources {
-                    let tx = conn.unchecked_transaction()?;
-                    for m in &members {
-                        let (id, _, _, _, verified, importance) =
-                            (&m.0, &m.1, &m.2, m.3, m.4, m.5);
-                        if verified || importance > 0.0 {
-                            continue;
-                        }
-                        // #854 review: archive reasserts the run's workspace so
-                        // a scope change (or direct writer) can never make a
-                        // scoped run retire a row outside its scope.
-                        let affected = match scope_ws.as_deref() {
-                            Some(ws) => tx.execute(
-                                "UPDATE entities SET archived = 1, archive_reason = ?1,
-                                 last_accessed_unix_ms = ?2 WHERE id = ?3 AND archived = 0
-                                 AND workspace_hash = ?4",
-                                params![
-                                    format!("consolidated into {}", entity_id),
-                                    now,
-                                    id,
-                                    ws
-                                ],
-                            )?,
-                            None => tx.execute(
-                                "UPDATE entities SET archived = 1, archive_reason = ?1,
-                                 last_accessed_unix_ms = ?2 WHERE id = ?3 AND archived = 0",
-                                params![format!("consolidated into {}", entity_id), now, id],
-                            )?,
-                        };
-                        if affected > 0 {
-                            sources_archived += 1;
-                            let _ = tx.execute(
-                                "DELETE FROM entities_fts WHERE rowid = (SELECT rowid FROM entities WHERE id = ?1)",
-                                params![id],
-                            );
-                        }
-                    }
-                    tx.commit()?;
+                if !params.dry_run {
+                    let entity = crate::models::Entity {
+                        id: entity_id.clone(),
+                        category: crate::observations::OBSERVATION_CATEGORY.to_string(),
+                        key: key.clone(),
+                        body_json: crate::observations::observation_body(&meta),
+                        status: "active".to_string(),
+                        entity_type: "insight".to_string(),
+                        tags: vec!["consolidated".to_string()],
+                        decay_score: avg_certainty.max(0.5),
+                        retrieval_count: 0,
+                        layer: "working".to_string(),
+                        topic_path: String::new(),
+                        archived: false,
+                        archive_reason: String::new(),
+                        links: meta
+                            .source_ids
+                            .iter()
+                            .map(|sid| crate::models::MemoryLink {
+                                target_id: sid.clone(),
+                                relationship: "evidence_for".to_string(),
+                                weight: 1.0,
+                                // #869: the consolidated observation asserts the
+                                // evidence_for edges to its sources.
+                                source: Some(entity_id.clone()),
+                            })
+                            .collect(),
+                        verified: false,
+                        source: "perseus_vault_consolidate".to_string(),
+                        always_on: false,
+                        certainty: avg_certainty,
+                        workspace_hash: scope_ws.clone().unwrap_or_default(),
+                        agent_id: params.requesting_agent_id.clone(),
+                        visibility: "workspace".to_string(),
+                        follow_count: 0,
+                        miss_count: 0,
+                        follow_rate: 0.0,
+                        efficacy_status: "unverified".to_string(),
+                        epistemic_state: crate::models::default_epistemic_state(),
+                        embedding: None,
+                        _parsed_body: None,
+                        created_at_unix_ms: now,
+                        last_accessed_unix_ms: now,
+                    };
+                    self.remember(&entity)?;
                 }
             }
 
-            source_entities_merged += proof_count;
-            observations.push(observation);
+            let meta = final_meta.expect("final_meta set above");
+            for (sid, _) in &new_sources {
+                folded_ids.insert(sid.clone());
+            }
+            source_entities_merged += new_sources.len() as i64;
+
+            // Archive policy: folding/refining NEVER retires sources — they
+            // are the evidence trail (journey trace-back). Fresh-created
+            // observations honor archive_sources (verified/importance-floored
+            // sources stay live, same exemption as decay).
+            if params.archive_sources && created_or_refined.is_none() && !params.dry_run {
+                let tx = conn.unchecked_transaction()?;
+                for m in &members {
+                    let (id, _, _, _, verified, importance) = (&m.0, &m.1, &m.2, m.3, m.4, m.5);
+                    if verified || importance > 0.0 {
+                        continue;
+                    }
+                    // #854 review: archive reasserts the run's workspace so
+                    // a scope change (or direct writer) can never make a
+                    // scoped run retire a row outside its scope.
+                    let affected = match scope_ws.as_deref() {
+                        Some(ws) => tx.execute(
+                            "UPDATE entities SET archived = 1, archive_reason = ?1,
+                             last_accessed_unix_ms = ?2 WHERE id = ?3 AND archived = 0
+                             AND workspace_hash = ?4",
+                            params![
+                                format!("consolidated into {}", entity_id),
+                                now,
+                                id,
+                                ws
+                            ],
+                        )?,
+                        None => tx.execute(
+                            "UPDATE entities SET archived = 1, archive_reason = ?1,
+                             last_accessed_unix_ms = ?2 WHERE id = ?3 AND archived = 0",
+                            params![format!("consolidated into {}", entity_id), now, id],
+                        )?,
+                    };
+                    if affected > 0 {
+                        sources_archived += 1;
+                        let _ = tx.execute(
+                            "DELETE FROM entities_fts WHERE rowid = (SELECT rowid FROM entities WHERE id = ?1)",
+                            params![id],
+                        );
+                    }
+                }
+                tx.commit()?;
+            }
+
+            // The report lists what the run WOULD produce — dry-run included
+            // (legacy contract: dry-run reports candidate observations without
+            // writing anything).
+            {
+                let is_refined = !refined_entity_id.is_empty();
+                observations.push(crate::models::Observation {
+                    entity_id: if is_refined {
+                        refined_entity_id
+                    } else {
+                        entity_id
+                    },
+                    key: if is_refined {
+                        created_or_refined
+                            .map(|t| t.entity.key.clone())
+                            .unwrap_or_else(|| key)
+                    } else {
+                        key
+                    },
+                    summary: meta.summary.clone(),
+                    source_ids: meta.source_ids.clone(),
+                    proof_count: meta.proof_count,
+                    certainty: members.iter().map(|m| m.3).sum::<f64>() / members.len() as f64,
+                    updated_at_unix_ms: meta.updated_at_unix_ms,
+                    stale: meta.stale,
+                    refined: created_or_refined.is_some(),
+                    quotes: meta.quotes.clone(),
+                });
+            }
+        }
+
+        // Pass 2 (#884): fold/refine SINGLE new facts (unclustered, unfolded)
+        // into their best-matching observation — this is the correction
+        // path (a lone contradicting fact reconciles into the journey).
+        if params.refine_existing && !params.dry_run {
+            for i in 0..n {
+                if cluster_membership.contains(&i) || folded_ids.contains(&entities[i].0) {
+                    continue;
+                }
+                let body = &entities[i].2;
+                let text = crate::observations::body_text(body);
+                let Some(target) = match_observation(
+                    &text,
+                    &existing_observations,
+                    &params.category,
+                    params.refine_existing,
+                    params.similarity_threshold,
+                ) else {
+                    continue;
+                };
+                let mut meta = crate::observations::refine(
+                    &target.meta,
+                    &[(entities[i].0.clone(), body.clone())],
+                    now,
+                    params.similarity_threshold,
+                    params.quote_cap_chars.max(64) as usize,
+                );
+                meta.merged_from_category = params.category.clone();
+                touched_obs.insert(target.entity.id.clone());
+                write_refined(target, &meta, &target.entity.id, &target.entity.key)?;
+                folded_ids.insert(entities[i].0.clone());
+                source_entities_merged += 1;
+                quotes_captured += 1;
+                observations_refined += 1;
+                observations.push(crate::models::Observation {
+                    entity_id: target.entity.id.clone(),
+                    key: target.entity.key.clone(),
+                    summary: meta.summary.clone(),
+                    source_ids: meta.source_ids.clone(),
+                    proof_count: meta.proof_count,
+                    certainty: entities[i].3,
+                    updated_at_unix_ms: meta.updated_at_unix_ms,
+                    stale: meta.stale,
+                    refined: true,
+                    quotes: meta.quotes.clone(),
+                });
+                if observations.len() as i64 >= params.limit {
+                    break;
+                }
+            }
+        }
+
+        // #884 staleness refresh: recompute the stored stale flag for every
+        // live observation about this category (newer unconsolidated facts
+        // mark it stale). The flag is derived state, so refresh is a
+        // lightweight body_json update (no history snapshot); the body
+        // itself only changes through the audited re-assert path above.
+        if !params.dry_run {
+            for obs in &existing_observations {
+                if obs.meta.merged_from_category != params.category {
+                    continue;
+                }
+                // Touched this run: flag is exact, skip the snapshot clobber.
+                if touched_obs.contains(&obs.entity.id) {
+                    continue;
+                }
+                let stale = self.observation_stale(&obs.entity.workspace_hash, &obs.meta)?;
+                if stale != obs.meta.stale {
+                    let mut entity = obs.entity.clone();
+                    let mut meta = obs.meta.clone();
+                    meta.stale = stale;
+                    entity.body_json = crate::observations::observation_body(&meta);
+                    self.conn()?.execute(
+                        "UPDATE entities SET body_json = ?1, last_accessed_unix_ms = ?2
+                         WHERE id = ?3 AND archived = 0",
+                        params![entity.body_json, now, obs.entity.id],
+                    )?;
+                    observations_refreshed += 1;
+                }
+                if stale {
+                    observations_stale += 1;
+                }
+            }
+            // Newly created/refined observations: refresh too (a run that
+            // folds f3 into O1 while a newer unrelated f4 exists leaves O1
+            // stale — the flag must say so).
+            let created_metas: Vec<(String, crate::observations::ObservationMeta)> =
+                observations
+                    .iter()
+                    .filter(|o| !existing_observations.iter().any(|e| e.entity.id == o.entity_id))
+                    .map(|o| (o.entity_id.clone(), crate::observations::ObservationMeta {
+                        summary: o.summary.clone(),
+                        source_ids: o.source_ids.clone(),
+                        quotes: o.quotes.clone(),
+                        proof_count: o.proof_count,
+                        merged_from_category: params.category.clone(),
+                        updated_at_unix_ms: o.updated_at_unix_ms,
+                        stale: o.stale,
+                        history: Vec::new(),
+                    }))
+                    .collect();
+            for (id, meta) in created_metas {
+                let stale = self.observation_stale(scope_ws.as_deref().unwrap_or_default(), &meta)?;
+                if stale != meta.stale {
+                    let mut m = meta.clone();
+                    m.stale = stale;
+                    self.conn()?.execute(
+                        "UPDATE entities SET body_json = ?1, last_accessed_unix_ms = ?2
+                         WHERE id = ?3 AND archived = 0",
+                        params![crate::observations::observation_body(&m), now, id],
+                    )?;
+                    observations_refreshed += 1;
+                }
+                if stale {
+                    observations_stale += 1;
+                }
+            }
         }
 
         // #854: a deliberate cross-workspace run is an audit event — label it
@@ -12974,6 +13652,7 @@ impl Database {
                 .to_string(),
                 acted_json: serde_json::json!({
                     "observations_created": observations.len(),
+                    "observations_refined": observations_refined,
                     "sources_archived": sources_archived,
                 })
                 .to_string(),
@@ -12993,6 +13672,10 @@ impl Database {
             observations_created: observations.len() as i64,
             source_entities_merged,
             sources_archived,
+            observations_refined,
+            observations_refreshed,
+            observations_stale,
+            quotes_captured,
             dry_run: params.dry_run,
             observations,
             workspace_hash: scope_ws,
@@ -19721,12 +20404,14 @@ mod tests {
             query: "aurora launch plan".to_string(), top_k: 10,
             as_of_unix_ms: None, valid_at_unix_ms: None,
             requesting_agent_id: Some("bob".to_string()),
+        verify_stale_observations: true,
         }).unwrap();
         assert_eq!(bob.iter().map(|e| e.key.as_str()).collect::<Vec<_>>(), vec!["shared-plan"]);
         let alice = db.ask_sources(&AskParams {
             query: "aurora launch plan".to_string(), top_k: 10,
             as_of_unix_ms: None, valid_at_unix_ms: None,
             requesting_agent_id: Some("alice".to_string()),
+        verify_stale_observations: true,
         }).unwrap();
         assert_eq!(alice.len(), 2);
     }
@@ -27259,6 +27944,8 @@ mod tests {
             workspace_hash: Some(String::new()),
             global: false,
             requesting_agent_id: String::new(),
+        refine_existing: true,
+        quote_cap_chars: 512,
         };
         let report = db.consolidate(&params).unwrap();
 
@@ -27349,6 +28036,8 @@ mod tests {
             workspace_hash: Some(String::new()),
             global: false,
             requesting_agent_id: String::new(),
+        refine_existing: true,
+        quote_cap_chars: 512,
         };
         let report = db.consolidate(&params).unwrap();
         assert_eq!(report.observations_created, 1);
@@ -27389,6 +28078,8 @@ mod tests {
             workspace_hash: Some(String::new()),
             global: false,
             requesting_agent_id: String::new(),
+        refine_existing: true,
+        quote_cap_chars: 512,
         };
         let report = db.consolidate(&params).unwrap();
         assert_eq!(
@@ -27446,6 +28137,8 @@ mod tests {
                 workspace_hash: Some(String::new()),
                 global: false,
                 requesting_agent_id: String::new(),
+            refine_existing: true,
+            quote_cap_chars: 512,
             })
             .unwrap();
         assert_eq!(report.observations_created, 1);
@@ -27535,6 +28228,8 @@ mod tests {
                 workspace_hash: Some(String::new()),
                 global: false,
                 requesting_agent_id: String::new(),
+            refine_existing: true,
+            quote_cap_chars: 512,
             })
             .unwrap();
         assert_eq!(report.observations_created, 1);
@@ -27564,6 +28259,8 @@ mod tests {
             workspace_hash: None,
             global: false,
             requesting_agent_id: String::new(),
+        refine_existing: true,
+        quote_cap_chars: 512,
         };
         let err = db.consolidate(&params).unwrap_err().to_string();
         assert!(
@@ -27591,6 +28288,8 @@ mod tests {
             workspace_hash: Some(String::new()),
             global: true,
             requesting_agent_id: String::new(),
+        refine_existing: true,
+        quote_cap_chars: 512,
         };
         let err3 = db.consolidate(&amb2).unwrap_err().to_string();
         assert!(err3.contains("mutually exclusive"), "{err3}");
@@ -27633,6 +28332,8 @@ mod tests {
                 workspace_hash: Some("ws-one".to_string()),
                 global: false,
                 requesting_agent_id: String::new(),
+            refine_existing: true,
+            quote_cap_chars: 512,
             })
             .unwrap();
 
@@ -27677,6 +28378,8 @@ mod tests {
                 workspace_hash: Some("ws-two".to_string()),
                 global: false,
                 requesting_agent_id: String::new(),
+            refine_existing: true,
+            quote_cap_chars: 512,
             })
             .unwrap();
         assert_eq!(report2.entities_examined, 1);
@@ -27720,6 +28423,8 @@ mod tests {
                 workspace_hash: Some("ws-one".to_string()),
                 global: false,
                 requesting_agent_id: String::new(),
+            refine_existing: true,
+            quote_cap_chars: 512,
             })
             .unwrap();
         assert_eq!(report.observations_created, 1);
@@ -27787,6 +28492,8 @@ mod tests {
                 workspace_hash: None,
                 global: true,
                 requesting_agent_id: "sweeper".to_string(),
+            refine_existing: true,
+            quote_cap_chars: 512,
             })
             .unwrap();
 
@@ -27839,6 +28546,8 @@ mod tests {
                 workspace_hash: None,
                 global: true,
                 requesting_agent_id: "ghost".to_string(),
+            refine_existing: true,
+            quote_cap_chars: 512,
             })
             .unwrap_err()
             .to_string();
@@ -27861,6 +28570,8 @@ mod tests {
                 workspace_hash: Some(String::new()),
                 global: false,
                 requesting_agent_id: "ghost".to_string(),
+            refine_existing: true,
+            quote_cap_chars: 512,
             })
             .is_ok();
         assert!(ok, "scoped runs must not require a manifest");
@@ -27899,6 +28610,8 @@ mod tests {
                 workspace_hash: None,
                 global: true,
                 requesting_agent_id: "maintainer".to_string(),
+            refine_existing: true,
+            quote_cap_chars: 512,
             })
             .unwrap_err()
             .to_string();
@@ -27920,9 +28633,390 @@ mod tests {
                 workspace_hash: Some(String::new()),
                 global: false,
                 requesting_agent_id: "maintainer".to_string(),
+                refine_existing: true,
+                quote_cap_chars: 512,
             })
             .is_ok();
         assert!(ok, "scoped runs must not require the global capability");
+        let _ = fs::remove_file(&path);
+    }
+
+    // ─── #884: evidence-grounded observations ─────────────────────────
+
+    fn cons_params(category: &str, ws: &str) -> crate::models::ConsolidateParams {
+        crate::models::ConsolidateParams {
+            category: category.to_string(),
+            similarity_threshold: 0.6,
+            limit: 50,
+            offset: 0,
+            dry_run: false,
+            cold_first: false,
+            archive_sources: false,
+            workspace_hash: Some(ws.to_string()),
+            global: false,
+            requesting_agent_id: String::new(),
+            refine_existing: true,
+            quote_cap_chars: 512,
+        }
+    }
+
+    fn cons_entity(id: &str, category: &str, key: &str, note: &str, ws: &str) -> crate::models::Entity {
+        let mut e = make_entity(id, category, key, &format!(r#"{{"note": "{note}"}}"#));
+        e.workspace_hash = ws.to_string();
+        e
+    }
+
+    #[test]
+    fn consolidate_folds_singleton_evidence_into_existing_observation() {
+        let (db, path) = temp_db();
+        let ws = "ws-884";
+        let cat = "facts884";
+        db.remember_skip_dedup(&cons_entity("f884-1", cat, "f1", "stack uses react", ws)).unwrap();
+        db.remember_skip_dedup(&cons_entity("f884-2", cat, "f2", "stack uses react with hooks", ws)).unwrap();
+        let r1 = db.consolidate(&cons_params(cat, ws)).unwrap();
+        assert_eq!(r1.observations_created, 1);
+        let obs_id = r1.observations[0].entity_id.clone();
+        assert_eq!(r1.observations[0].proof_count, 2);
+        assert_eq!(r1.observations[0].quotes.len(), 2, "exact-quote refs on creation");
+        assert!(!r1.observations[0].refined);
+
+        // A single near-duplicate fact folds in (no duplicate observation).
+        db.remember_skip_dedup(&cons_entity("f884-3", cat, "f3", "stack uses react and redux", ws)).unwrap();
+        let r2 = db.consolidate(&cons_params(cat, ws)).unwrap();
+        assert_eq!(r2.observations.len(), 1, "fold, not duplicate");
+        assert_eq!(r2.observations_refined, 1);
+        assert!(r2.observations[0].refined);
+        assert_eq!(r2.observations[0].entity_id, obs_id, "same observation updated");
+        assert_eq!(r2.observations[0].proof_count, 3);
+        assert_eq!(r2.observations[0].quotes.len(), 3);
+        assert_eq!(r2.observations[0].quotes[2].source_id, "f884-3");
+        assert_eq!(r2.observations[0].quotes[2].quote, "stack uses react and redux");
+        assert!(r2.observations[0].updated_at_unix_ms >= r1.observations[0].updated_at_unix_ms);
+        assert_eq!(r2.observations[0].summary, "stack uses react");
+
+        // Folded sources are never archived even when archive_sources is on.
+        let mut p = cons_params(cat, ws);
+        p.archive_sources = true;
+        db.remember_skip_dedup(&cons_entity("f884-4", cat, "f4", "stack uses react with suspense", ws)).unwrap();
+        let r3 = db.consolidate(&p).unwrap();
+        assert_eq!(r3.observations_refined, 1);
+        assert_eq!(r3.sources_archived, 0, "fold never retires the evidence trail");
+        let live: i64 = db.conn().unwrap().query_row(
+            "SELECT COUNT(*) FROM entities WHERE category = ?1 AND archived = 0",
+            [cat], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(live, 4, "all raw facts intact for trace-back");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn consolidate_clusters_provenance_enriched_bodies() {
+        // remember() enriches bodies with a per-record provenance envelope
+        // (record_digest differs per entity). Clustering must run on the
+        // extracted note, not the raw JSON — otherwise the digest noise
+        // drowns the near-duplicate signal (#884 benchmark scenario).
+        let (db, path) = temp_db();
+        let ws = "ws-prov";
+        let cat = "prov884";
+        let enrich = |note: &str, digest: &str| {
+            format!(
+                r#"{{"note":"{note}","provenance":{{"actor":{{"identity":"","kind":"assistant"}},"reason":"missing_admission_envelope","record_digest":"{digest}","requires_review":true,"state":"proposed","workspace_hash":"{ws}"}}}}"#
+            )
+        };
+        let mut e1 = make_entity("p884-1", cat, "p1", &enrich("quality-fixture-ev-stack-uses-react", &"a".repeat(64)));
+        e1.workspace_hash = ws.to_string();
+        let mut e2 = make_entity("p884-2", cat, "p2", &enrich("quality-fixture-ev-stack-uses-react-with-hooks", &"b".repeat(64)));
+        e2.workspace_hash = ws.to_string();
+        db.remember_skip_dedup(&e1).unwrap();
+        db.remember_skip_dedup(&e2).unwrap();
+        let r = db.consolidate(&cons_params(cat, ws)).unwrap();
+        assert_eq!(r.observations_created, 1, "provenance noise must not block clustering");
+        assert_eq!(r.observations[0].proof_count, 2);
+        assert_eq!(r.observations[0].quotes.len(), 2);
+        assert_eq!(r.observations[0].source_ids, vec!["p884-1", "p884-2"]);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn consolidate_clusters_encrypted_at_rest_rows() {
+        // At-rest encryption: the consolidate scan reads body_json via raw
+        // SQL (ciphertext). Clustering must decrypt each row first — legacy
+        // behavior clustered on base64 and silently no-op'd on any encrypted
+        // deployment (found via the #884 benchmark scenario).
+        use crate::encryption::EncryptionManager;
+        use std::io::Write;
+
+        let (mut db, path) = temp_db();
+        let ws = "ws-enc884";
+        let cat = "enc884";
+        let key = EncryptionManager::generate_key();
+        let key_dir = std::env::temp_dir();
+        let key_path = key_dir.join(format!("perseus_vault-test-key-{}.key", uuid::Uuid::new_v4()));
+        let key_path_str = key_path.to_str().unwrap().to_string();
+        let mut f = std::fs::File::create(&key_path).unwrap();
+        f.write_all(key.as_bytes()).unwrap();
+        drop(f);
+        db.set_encryption(&key_path_str).unwrap();
+
+        db.remember_skip_dedup(&cons_entity("e884-1", cat, "e1", "encrypted stack uses react", ws)).unwrap();
+        db.remember_skip_dedup(&cons_entity("e884-2", cat, "e2", "encrypted stack uses react with hooks", ws)).unwrap();
+
+        // Prove the rows really are ciphertext at rest.
+        let stored: String = db.conn().unwrap()
+            .query_row("SELECT body_json FROM entities WHERE id = 'e884-1'", [], |r| r.get(0))
+            .unwrap();
+        assert!(!stored.starts_with('{'), "row must be encrypted at rest");
+
+        let r = db.consolidate(&cons_params(cat, ws)).unwrap();
+        assert_eq!(r.observations_created, 1, "encrypted rows must cluster after decryption");
+        assert_eq!(r.observations[0].proof_count, 2);
+        assert_eq!(r.observations[0].quotes.len(), 2);
+        let got: std::collections::HashSet<&String> = r.observations[0].source_ids.iter().collect();
+        assert_eq!(
+            got,
+            [&"e884-1".to_string(), &"e884-2".to_string()].into_iter().collect::<std::collections::HashSet<_>>(),
+            "both sources cited (scan order is newest-first, so id order varies)"
+        );
+        let _ = fs::remove_file(&key_path);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn consolidate_preserves_correction_journey() {
+        let (db, path) = temp_db();
+        let ws = "ws-j";
+        let cat = "tech884";
+        db.remember_skip_dedup(&cons_entity("j884-1", cat, "j1", "stack uses react", ws)).unwrap();
+        db.remember_skip_dedup(&cons_entity("j884-2", cat, "j2", "stack uses react with hooks", ws)).unwrap();
+        let r1 = db.consolidate(&cons_params(cat, ws)).unwrap();
+        let obs_id = r1.observations[0].entity_id.clone();
+        let obs_key = r1.observations[0].key.clone();
+
+        // Correction: a lone contradicting fact ("switched to Vue").
+        db.remember_skip_dedup(&cons_entity("j884-3", cat, "j3", "stack switched to vue", ws)).unwrap();
+        let r2 = db.consolidate(&cons_params(cat, ws)).unwrap();
+        assert_eq!(r2.observations_refined, 1, "single contradicting fact reconciles");
+        let o = &r2.observations[0];
+        assert_eq!(o.entity_id, obs_id);
+        assert_eq!(o.summary, "stack switched to vue", "summary reflects the correction");
+        assert_eq!(o.proof_count, 3);
+        assert_eq!(o.quotes.len(), 3);
+        assert!(!o.stale);
+
+        // The stored body carries the journey with the raw trigger.
+        let stored = db.get_entity("observation", &obs_key).unwrap().unwrap();
+        let body: serde_json::Value = serde_json::from_str(&stored.body_json).unwrap();
+        let history = body["history"].as_array().unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0]["from"], "stack uses react");
+        assert_eq!(history[0]["to"], "stack switched to vue");
+        assert_eq!(history[0]["triggered_by"], "j884-3");
+        assert_eq!(history[0]["reason"], "contradiction");
+        assert_eq!(body["summary"], "stack switched to vue");
+        assert!(body.get("updated_at_unix_ms").is_some());
+        assert_eq!(body["stale"], false);
+
+        // Audited re-assert: the prior observation version is in history.
+        let versions: i64 = db.conn().unwrap().query_row(
+            "SELECT COUNT(*) FROM entity_history WHERE id = ?1",
+            [&obs_id], |r| r.get(0),
+        ).unwrap();
+        assert!(versions >= 1, "refinement must be versioned, not a silent overwrite");
+
+        // Raw facts intact for trace-back.
+        let live: i64 = db.conn().unwrap().query_row(
+            "SELECT COUNT(*) FROM entities WHERE category = ?1 AND archived = 0",
+            [cat], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(live, 3);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn consolidate_staleness_refresh_flags_observations() {
+        let (db, path) = temp_db();
+        let ws = "ws-s";
+        let cat = "fact884s";
+        db.remember_skip_dedup(&cons_entity("s884-1", cat, "s1", "deploys run on tuesdays", ws)).unwrap();
+        db.remember_skip_dedup(&cons_entity("s884-2", cat, "s2", "deploys run on tuesdays weekly", ws)).unwrap();
+        let r1 = db.consolidate(&cons_params(cat, ws)).unwrap();
+        let obs_key = r1.observations[0].key.clone();
+
+        // A newer unconsolidated (unrelated) fact marks the observation stale.
+        db.remember_skip_dedup(&cons_entity("s884-3", cat, "s3", "the weather is sunny in berlin", ws)).unwrap();
+        let r2 = db.consolidate(&cons_params(cat, ws)).unwrap();
+        assert_eq!(r2.observations_refined, 0, "unrelated fact is not folded");
+        assert_eq!(r2.observations_stale, 1, "refresh marks the observation stale");
+        assert_eq!(r2.observations_refreshed, 1, "stored flag flipped");
+        let stored = db.get_entity("observation", &obs_key).unwrap().unwrap();
+        let body: serde_json::Value = serde_json::from_str(&stored.body_json).unwrap();
+        assert_eq!(body["stale"], true);
+        assert_eq!(body["source_ids"].as_array().unwrap().len(), 2);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn consolidate_cluster_folds_into_existing_not_duplicate() {
+        let (db, path) = temp_db();
+        let ws = "ws-c";
+        let cat = "fact884c";
+        db.remember_skip_dedup(&cons_entity("c884-1", cat, "c1", "search cluster in frankfurt", ws)).unwrap();
+        db.remember_skip_dedup(&cons_entity("c884-2", cat, "c2", "search cluster in frankfurt region", ws)).unwrap();
+        let r1 = db.consolidate(&cons_params(cat, ws)).unwrap();
+        let obs_id = r1.observations[0].entity_id.clone();
+        assert_eq!(r1.observations_created, 1);
+
+        // A fresh 2-member cluster about the same topic folds into O1.
+        db.remember_skip_dedup(&cons_entity("c884-3", cat, "c3", "search cluster in frankfurt region today", ws)).unwrap();
+        db.remember_skip_dedup(&cons_entity("c884-4", cat, "c4", "search cluster in frankfurt region deployed today", ws)).unwrap();
+        let r2 = db.consolidate(&cons_params(cat, ws)).unwrap();
+        assert_eq!(r2.observations.len(), 1, "cluster folds into the existing observation");
+        assert_eq!(r2.observations_refined, 1);
+        assert!(r2.observations[0].refined);
+        assert_eq!(r2.observations[0].entity_id, obs_id);
+        assert_eq!(r2.observations[0].proof_count, 4);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn consolidate_refine_off_restores_legacy_duplicate_behavior() {
+        let (db, path) = temp_db();
+        let ws = "ws-l";
+        let cat = "fact884l";
+        db.remember_skip_dedup(&cons_entity("l884-1", cat, "l1", "billing cron at midnight", ws)).unwrap();
+        db.remember_skip_dedup(&cons_entity("l884-2", cat, "l2", "billing cron at midnight utc", ws)).unwrap();
+        let mut p = cons_params(cat, ws);
+        p.refine_existing = false;
+        db.consolidate(&p).unwrap();
+        db.remember_skip_dedup(&cons_entity("l884-3", cat, "l3", "billing cron at midnight utc daily", ws)).unwrap();
+        db.remember_skip_dedup(&cons_entity("l884-4", cat, "l4", "billing cron at midnight utc daily now", ws)).unwrap();
+        let r2 = db.consolidate(&p).unwrap();
+        assert_eq!(r2.observations_created, 1, "legacy: new cluster creates a new observation");
+        assert_eq!(r2.observations_refined, 0);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn consolidate_is_idempotent_across_reruns() {
+        let (db, path) = temp_db();
+        let ws = "ws-i";
+        let cat = "fact884i";
+        db.remember_skip_dedup(&cons_entity("i884-1", cat, "i1", "gateway restarts at 4am", ws)).unwrap();
+        db.remember_skip_dedup(&cons_entity("i884-2", cat, "i2", "gateway restarts at 4am daily", ws)).unwrap();
+        db.consolidate(&cons_params(cat, ws)).unwrap();
+        let r2 = db.consolidate(&cons_params(cat, ws)).unwrap();
+        assert_eq!(r2.observations_created, 0);
+        assert_eq!(r2.observations_refined, 0, "already-folded sources never re-fold");
+        assert_eq!(r2.source_entities_merged, 0);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn consolidate_refresh_migrates_legacy_v1_observation_bodies() {
+        let (db, path) = temp_db();
+        let ws = "ws-v";
+        let cat = "fact884v";
+        db.remember_skip_dedup(&cons_entity("v884-1", cat, "v1", "old pipeline runs at noon", ws)).unwrap();
+        db.remember_skip_dedup(&cons_entity("v884-2", cat, "v2", "old pipeline runs at noon daily", ws)).unwrap();
+        let r1 = db.consolidate(&cons_params(cat, ws)).unwrap();
+        let obs_key = r1.observations[0].key.clone();
+        // Downgrade the body to v1 (no quotes/updated_at/stale/history).
+        db.conn().unwrap().execute(
+            "UPDATE entities SET body_json = ?1 WHERE key = ?2 AND category = 'observation'",
+            rusqlite::params![r#"{"summary": "old pipeline runs at noon", "source_ids": ["v884-1", "v884-2"], "proof_count": 2, "merged_from_category": "fact884v"}"#, obs_key],
+        ).unwrap();
+        // Newer fact + refresh pass must tolerate the v1 body and migrate it.
+        db.remember_skip_dedup(&cons_entity("v884-3", cat, "v3", "brand new unrelated topic arrives", ws)).unwrap();
+        let r2 = db.consolidate(&cons_params(cat, ws)).unwrap();
+        assert_eq!(r2.observations_stale, 1);
+        let stored = db.get_entity("observation", &obs_key).unwrap().unwrap();
+        let body: serde_json::Value = serde_json::from_str(&stored.body_json).unwrap();
+        assert_eq!(body["stale"], true);
+        assert!(body.get("updated_at_unix_ms").is_some(), "v1 body migrated to v2 on refresh");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn ask_gate_refuses_contradicted_stale_observation() {
+        let (db, path) = temp_db();
+        let ws = "ws-g";
+        let cat = "fact884g";
+        db.remember_skip_dedup(&cons_entity("g884-1", cat, "g1", "stack uses react", ws)).unwrap();
+        db.remember_skip_dedup(&cons_entity("g884-2", cat, "g2", "stack uses react with hooks", ws)).unwrap();
+        let r1 = db.consolidate(&cons_params(cat, ws)).unwrap();
+        let obs_key = r1.observations[0].key.clone();
+        db.remember_skip_dedup(&cons_entity("g884-3", cat, "g3", "stack switched to vue", ws)).unwrap();
+        let obs = db.get_entity("observation", &obs_key).unwrap().unwrap();
+        let (kept, refused) = db
+            .gate_stale_observations(vec![obs], crate::observations::OBSERVATION_VERIFY_THRESHOLD)
+            .unwrap();
+        assert!(kept.is_empty(), "contradicted stale observation must not be citable");
+        assert_eq!(refused.len(), 1);
+        assert_eq!(refused[0].key, obs_key);
+        assert_eq!(refused[0].reason, "stale_observation_unverified");
+        assert_eq!(refused[0].detail.as_deref(), Some("g3"), "newest contradicting fact named for trace-back");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn ask_gate_verifies_consistent_and_unrelated_stale_observations() {
+        let (db, path) = temp_db();
+        let ws = "ws-g2";
+        let cat = "fact884h";
+        db.remember_skip_dedup(&cons_entity("h884-1", cat, "h1", "stack uses react", ws)).unwrap();
+        db.remember_skip_dedup(&cons_entity("h884-2", cat, "h2", "stack uses react with hooks", ws)).unwrap();
+        let r1 = db.consolidate(&cons_params(cat, ws)).unwrap();
+        let obs_key = r1.observations[0].key.clone();
+        // Consistent newer fact (would fold, sim >= threshold) → cited with
+        // verification note.
+        db.remember_skip_dedup(&cons_entity("h884-3", cat, "h3", "stack uses react hooks", ws)).unwrap();
+        let obs = db.get_entity("observation", &obs_key).unwrap().unwrap();
+        let (kept, refused) = db
+            .gate_stale_observations(vec![obs.clone()], crate::observations::OBSERVATION_VERIFY_THRESHOLD)
+            .unwrap();
+        assert!(refused.is_empty());
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].1.as_deref(), Some("verified_against_raw"));
+
+        // Unrelated newer fact → no contradicting evidence → cited verified.
+        let mut p = cons_params(cat, ws);
+        p.workspace_hash = Some("ws-g3".to_string());
+        db.remember_skip_dedup(&cons_entity("h884-4", "fact884i", "h4", "the weather is sunny in berlin", "ws-g3")).unwrap();
+        let obs2 = db.get_entity("observation", &obs_key).unwrap().unwrap();
+        let (kept2, refused2) = db
+            .gate_stale_observations(vec![obs2], crate::observations::OBSERVATION_VERIFY_THRESHOLD)
+            .unwrap();
+        assert!(refused2.is_empty());
+        assert_eq!(kept2.len(), 1);
+        assert_eq!(kept2[0].1.as_deref(), Some("verified_against_raw"));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn ask_gate_passes_fresh_and_non_observations_untouched() {
+        let (db, path) = temp_db();
+        let ws = "ws-g4";
+        let cat = "fact884k";
+        db.remember_skip_dedup(&cons_entity("k884-1", cat, "k1", "stack uses react", ws)).unwrap();
+        db.remember_skip_dedup(&cons_entity("k884-2", cat, "k2", "stack uses react with hooks", ws)).unwrap();
+        let r1 = db.consolidate(&cons_params(cat, ws)).unwrap();
+        let obs_key = r1.observations[0].key.clone();
+        // Fresh observation (no newer facts) → kept plain.
+        let obs = db.get_entity("observation", &obs_key).unwrap().unwrap();
+        let (kept, refused) = db
+            .gate_stale_observations(vec![obs.clone()], crate::observations::OBSERVATION_VERIFY_THRESHOLD)
+            .unwrap();
+        assert!(refused.is_empty());
+        assert_eq!(kept.len(), 1);
+        assert!(kept[0].1.is_none(), "fresh observations carry no verification note");
+        // Non-observation → untouched.
+        let raw = db.get_entity(cat, "k1").unwrap().unwrap();
+        let (kept2, refused2) = db
+            .gate_stale_observations(vec![raw], crate::observations::OBSERVATION_VERIFY_THRESHOLD)
+            .unwrap();
+        assert!(refused2.is_empty());
+        assert_eq!(kept2.len(), 1);
+        assert!(kept2[0].1.is_none());
         let _ = fs::remove_file(&path);
     }
 

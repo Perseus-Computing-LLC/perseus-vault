@@ -34,8 +34,9 @@ from benchmark.package.common.publication import build_common_report, digest_cla
 MCP_RESPONSE_TIMEOUT_SECONDS = 30.0
 
 LEGACY_REQUIRED_CATEGORIES = (
-    "long_horizon",
-    "contradiction_supersession",
+    # long_horizon + contradiction_supersession were subsumed by the
+    # validity_recall / mutation + replay scenarios in manifest v8 and
+    # removed from the case set (their coverage is asserted there).
     "shared_memory",
     "adversarial",
 )
@@ -56,6 +57,7 @@ V1_REQUIRED_CATEGORIES = V0_REQUIRED_CATEGORIES + (
     "graph_gate",
     "validity_recall",
     "task_projection",
+    "evidence_observations",
 )
 
 CAPABILITY_TOOLS = {
@@ -1936,6 +1938,146 @@ def run_task_projection(client, **_):
     return output(checks, evidence, metric_events)
 
 
+def run_evidence_observations(client, **_):
+    # #884: evidence-grounded observations. Fixture: two near-duplicate
+    # facts consolidate into ONE observation carrying exact-quote evidence
+    # refs (source_id + quote), proof_count, updated_at and stale=false; a
+    # lone contradicting fact then REFINES that observation (same entity id,
+    # journey preserved, raw facts still live); an unrelated newer fact
+    # marks it stale so ask verification can gate on it.
+    ws = "quality-evidence-observations-workspace"
+    cat = "quality_evidence_observations"
+    remember(client, cat, "ev-1", "quality-fixture-ev-stack-uses-react", workspace_hash=ws)
+    remember(client, cat, "ev-2", "quality-fixture-ev-stack-uses-react-with-hooks", workspace_hash=ws)
+
+    r1 = client.call(
+        "perseus_vault_consolidate",
+        {
+            "category": cat,
+            "workspace_hash": ws,
+            "similarity_threshold": 0.6,
+            "refine_existing": True,
+            "quote_cap_chars": 512,
+        },
+    )
+    obs1 = (r1.get("observations") or [{}])[0]
+    quotes1 = obs1.get("quotes") or []
+    src_ids = {i.get("key"): i.get("id") for i in scan_items(client, cat) if i.get("category") == cat}
+    merged = (
+        r1.get("observations_created") == 1
+        and len(r1.get("observations") or []) == 1
+        and obs1.get("proof_count") == 2
+        and len(quotes1) == 2
+        and all(
+            q.get("source_id") and isinstance(q.get("quote"), str) and q["quote"]
+            for q in quotes1
+        )
+        and obs1.get("stale") is False
+        and obs1.get("refined") is False
+        and isinstance(obs1.get("updated_at_unix_ms"), int)
+        and len(obs1.get("source_ids") or []) == 2
+        and set(obs1.get("source_ids") or []) == {src_ids.get("ev-1"), src_ids.get("ev-2")}
+    )
+    entity_id1 = obs1.get("entity_id")
+
+    # Correction path: a single contradicting fact reconciles into the SAME
+    # observation (no duplicate), preserving the journey from -> to.
+    remember(client, cat, "ev-3", "quality-fixture-ev-stack-switched-to-vue", workspace_hash=ws)
+    r2 = client.call(
+        "perseus_vault_consolidate",
+        {
+            "category": cat,
+            "workspace_hash": ws,
+            "similarity_threshold": 0.6,
+            "refine_existing": True,
+            "quote_cap_chars": 512,
+        },
+    )
+    obs2 = (r2.get("observations") or [{}])[0]
+    # ev-3 now exists — refresh the key→id map for the journey anchor.
+    src_ids = {i.get("key"): i.get("id") for i in scan_items(client, cat) if i.get("category") == cat}
+    obs_items = scan_items(client, "observation", workspace_hash=ws)
+    obs_bodies = [body_object(i) for i in obs_items]
+    obs_body = obs_bodies[0] if obs_bodies else {}
+    journey = (obs_body.get("history") or [{}])[0]
+    corrected = (
+        r2.get("observations_refined") == 1
+        and len(r2.get("observations") or []) == 1
+        and obs2.get("entity_id") == entity_id1
+        and obs2.get("proof_count") == 3
+        and obs2.get("refined") is True
+        and obs2.get("summary") == "quality-fixture-ev-stack-switched-to-vue"
+        # The pre-correction summary is the newest source's note (timing-
+        # dependent which of ev-1/ev-2 won the same-ms tie) — accept either.
+        and journey.get("from") in (
+            "quality-fixture-ev-stack-uses-react",
+            "quality-fixture-ev-stack-uses-react-with-hooks",
+        )
+        and journey.get("to") == "quality-fixture-ev-stack-switched-to-vue"
+        and journey.get("triggered_by") == src_ids.get("ev-3")
+        and journey.get("reason") == "contradiction"
+    )
+    raw_live = [
+        i.get("key")
+        for i in scan_items(client, cat)
+        if i.get("category") == cat
+    ]
+    sources_live = "ev-1" in raw_live and "ev-2" in raw_live and "ev-3" in raw_live
+
+    # Staleness: a truly UNRELATED newer fact (no shared trigram prefix with
+    # the observation's summary) must flip the stored stale flag instead of
+    # folding into the observation.
+    remember(client, cat, "ev-4", "the weather in berlin is sunny today", workspace_hash=ws)
+    r3 = client.call(
+        "perseus_vault_consolidate",
+        {
+            "category": cat,
+            "workspace_hash": ws,
+            "similarity_threshold": 0.6,
+            "refine_existing": True,
+            "quote_cap_chars": 512,
+        },
+    )
+    obs_body3 = body_object(
+        next(iter(scan_items(client, "observation", workspace_hash=ws)), {})
+    )
+    staleness = (
+        r3.get("observations_stale") == 1
+        and obs_body3.get("stale") is True
+        and len(obs_body3.get("source_ids") or []) == 3
+    )
+
+    checks = {
+        "evidence_refs": merged,
+        "single_observation": bool(entity_id1) and len(obs_bodies) == 1,
+        "correction_journey": corrected,
+        "sources_live": sources_live,
+        "staleness_refresh": staleness,
+    }
+    evidence = {
+        "found": merged and corrected and staleness,
+        "count": len(obs_bodies),
+        "rate": (int(merged) + int(corrected) + int(staleness)) / 3.0,
+        "status": "passed" if all(checks.values()) else "partial",
+        "workspace_hash": ws,
+    }
+    metric_events = {
+        "evidence-observations-merge": {
+            "numerator": int(merged),
+            "denominator": 1,
+        },
+        "evidence-observations-correction": {
+            "numerator": int(corrected and sources_live),
+            "denominator": 1,
+        },
+        "evidence-observations-staleness": {
+            "numerator": int(staleness),
+            "denominator": 1,
+        },
+    }
+    return output(checks, evidence, metric_events)
+
+
 def run_admission(client, **_):
     untrusted_body = stable_json({"note": "quality-fixture-admission-hostile-marker"})
     untrusted = client.call(
@@ -2106,6 +2248,7 @@ SCENARIO_RUNNERS = {
     "graph_gate": run_graph_gate,
     "validity_recall": run_validity_recall,
     "task_projection": run_task_projection,
+    "evidence_observations": run_evidence_observations,
     "admission": run_admission,
     "prompt_safety": run_prompt_safety,
     "identity_ambiguity": run_identity_ambiguity,

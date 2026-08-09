@@ -1661,6 +1661,11 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
         "valid_at_unix_ms": {
           "type": "integer",
           "description": "#472 Temporal RAG: answer from the context that was TRUE IN THE WORLD at this valid-time instant (unix ms), per current (or as_of) knowledge. Omit for the live view."
+        },
+        "verify_stale_observations": {
+          "type": "boolean",
+          "default": true,
+          "description": "#884: stale-observation gate. When true (default), observation sources with newer unconsolidated raw facts are verified against those facts before citation — consistent facts are cited with a 'verified against raw facts' note, contradicted observations are refused and reported in refused_sources. Set false to disable the gate."
         }
       },
       "required": [
@@ -4286,7 +4291,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
   },
   {
     "name": "perseus_vault_consolidate",
-    "description": "Merge overlapping/duplicative entities in the same category into durable, evidence-tracked 'observations' — the mirror image of perseus_vault_conflicts, which flags dissimilar (contradictory) pairs. Groups entities whose pairwise trigram similarity meets similarity_threshold, then creates one new entity per group (category='observation') whose body carries a summary (the highest-certainty source's content), the full list of source entity ids as evidence, and a proof_count. The observation links back to each source (relationship='evidence_for') for full audit. By default sources stay live; set archive_sources=true to retire merged sources ('local dreaming' — verified or importance-floored sources are never archived), and cold_first=true to target the memories decay is about to claim. perseus_vault_autocohere runs a bounded cold_first+archive_sources pass automatically. Read-only preview with dry_run=true.",
+    "description": "Merge overlapping/duplicative entities in the same category into durable, evidence-tracked 'observations' — the mirror image of perseus_vault_conflicts, which flags dissimilar (contradictory) pairs. Groups entities whose pairwise trigram similarity meets similarity_threshold, then creates one new entity per group (category='observation') whose body carries a summary (the highest-certainty source's content), exact-quote evidence refs (source id + verbatim quote, capped by quote_cap_chars), the full list of source entity ids as evidence, a proof_count, updated_at, a staleness flag, and (on contradiction) a preserved journey in history. The observation links back to each source (relationship='evidence_for') for full audit. #884: with refine_existing (default true), new evidence FOLDS into the best-matching existing observation (proof_count grows, no duplicates) and contradictions reconcile into its journey — 'was React, switched to Vue' — with raw facts intact for trace-back; fold/refine writes go through the audited re-assert path (entity_history snapshot). A staleness refresh pass marks observations stale when newer unconsolidated facts exist. By default sources stay live; set archive_sources=true to retire merged sources of FRESHLY CREATED observations only ('local dreaming' — verified or importance-floored sources are never archived), and cold_first=true to target the memories decay is about to claim. perseus_vault_autocohere runs a bounded cold_first+archive_sources pass automatically. Read-only preview with dry_run=true.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -4337,6 +4342,18 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
           "type": "string",
           "default": "",
           "description": "Host identity stamped by the MCP transport. Used for global-mode authorization and stamped as author on derived observations."
+        },
+        "refine_existing": {
+          "type": "boolean",
+          "default": true,
+          "description": "#884: fold new evidence into existing observations instead of creating duplicates. Near-duplicate clusters/singletons update the matched observation (proof_count, quotes, updated_at); contradictions are reconciled into its journey (history) rather than blindly overwritten. Folded evidence is never archived."
+        },
+        "quote_cap_chars": {
+          "type": "integer",
+          "default": 512,
+          "minimum": 64,
+          "maximum": 4096,
+          "description": "#884: cap for exact-quote evidence refs (chars). Quotes are each source's note verbatim, truncated at the cap with an ellipsis marker."
         }
       },
       "required": [

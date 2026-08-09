@@ -1441,10 +1441,21 @@ pub struct AskParams {
     /// enforcement on RAG sources. Never treated as an author filter.
     #[serde(default)]
     pub requesting_agent_id: Option<String>,
+    /// #884: stale-observation gate. When true (default), observation
+    /// candidates that have newer unconsolidated raw facts are verified
+    /// against those facts before citation: consistent facts pass with a
+    /// verification note, contradicted observations are refused. Setting
+    /// this false opts out of the gate (documented escape hatch).
+    #[serde(default = "default_verify_stale_observations")]
+    pub verify_stale_observations: bool,
 }
 
 fn default_ask_limit() -> usize {
     5
+}
+
+fn default_verify_stale_observations() -> bool {
+    true
 }
 
 /// Result from perseus_vault_ask: a grounded answer with cited sources.
@@ -1452,6 +1463,23 @@ fn default_ask_limit() -> usize {
 pub struct AskResult {
     pub answer: String,
     pub sources: Vec<AskSource>,
+    /// #884: observation sources the stale gate refused to cite (unverified
+    /// against newer raw facts). Present (possibly empty) when the gate ran.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub refused_sources: Vec<RefusedSource>,
+}
+
+/// A source the ask stale gate refused, with the deterministic reason.
+#[derive(Debug, Serialize)]
+pub struct RefusedSource {
+    pub key: String,
+    pub category: String,
+    /// "stale_observation_unverified" — the observation has newer
+    /// unconsolidated facts and verification failed (see detail).
+    pub reason: String,
+    /// The newest unconsolidated raw fact's key (trace-back anchor).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 /// A cited source entity in an ask result.
@@ -1461,6 +1489,10 @@ pub struct AskSource {
     pub category: String,
     pub score: f64,
     pub snippet: String,
+    /// #884: set to "verified_against_raw" when the stale gate verified the
+    /// observation against newer unconsolidated facts before citation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification: Option<String>,
 }
 
 /// Parameters for the perseus_vault_ingest connector sync tool.
@@ -1688,6 +1720,26 @@ pub struct ConsolidateParams {
     /// attribution. Never trusted from the model when a host identity exists.
     #[serde(default)]
     pub requesting_agent_id: String,
+    /// #884: fold new evidence into existing observations instead of
+    /// creating duplicates — near-duplicate clusters/singletons update the
+    /// matched observation (proof_count, quotes, updated_at) and
+    /// contradictions are reconciled into its journey (history) rather than
+    /// blindly overwritten. Default true.
+    #[serde(default = "default_refine_existing")]
+    pub refine_existing: bool,
+    /// #884: cap for exact-quote extraction (chars, 64..=4096, validated
+    /// fail-closed by the handler). Quotes are the source `note` verbatim,
+    /// truncated at the cap with an ellipsis marker.
+    #[serde(default = "default_quote_cap")]
+    pub quote_cap_chars: i64,
+}
+
+fn default_refine_existing() -> bool {
+    true
+}
+
+fn default_quote_cap() -> i64 {
+    512
 }
 
 fn default_consolidate_threshold() -> f64 {
@@ -1844,6 +1896,16 @@ pub struct Observation {
     pub proof_count: i64,
     /// Average certainty across merged sources.
     pub certainty: f64,
+    /// #884: last write time (creation or refinement).
+    pub updated_at_unix_ms: i64,
+    /// #884: staleness snapshot — newer unconsolidated raw facts exist in
+    /// the merged-from category (read-time computation wins over storage).
+    pub stale: bool,
+    /// #884: true when this run folded evidence into an existing
+    /// observation instead of creating a fresh one.
+    pub refined: bool,
+    /// #884: exact-quote evidence refs (source id + verbatim quote).
+    pub quotes: Vec<crate::observations::QuoteRef>,
 }
 
 /// Result from perseus_vault_consolidate.
@@ -1856,6 +1918,16 @@ pub struct ConsolidateReport {
     /// Sources archived because archive_sources was set. Always <=
     /// source_entities_merged: verified/importance-floored sources stay live.
     pub sources_archived: i64,
+    /// #884: observations updated by folding/reconciling new evidence into
+    /// an existing observation (never a blind overwrite; journey preserved).
+    pub observations_refined: i64,
+    /// #884: observations whose stored stale flag was recomputed this run.
+    pub observations_refreshed: i64,
+    /// #884: observations stale after this run (newer unconsolidated facts
+    /// exist in their merged-from category).
+    pub observations_stale: i64,
+    /// #884: exact-quote evidence refs captured this run.
+    pub quotes_captured: i64,
     pub dry_run: bool,
     pub observations: Vec<Observation>,
     /// #854: effective scope of this run. `Some(ws)` = scoped to that

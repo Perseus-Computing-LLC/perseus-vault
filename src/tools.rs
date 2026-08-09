@@ -5036,6 +5036,10 @@ pub fn handle_consolidate(db: &Database, args: Value) -> String {
             return json!({"error": format!("Invalid consolidate arguments: {}", e)}).to_string()
         }
     };
+    // #884: quote cap validated fail-closed (64..=4096 chars).
+    if params.quote_cap_chars < 64 || params.quote_cap_chars > 4096 {
+        return json!({"error": "Invalid consolidate arguments: quote_cap_chars must be in 64..=4096"}).to_string();
+    }
     match db.consolidate(&params) {
         Ok(report) => serde_json::to_string(&report)
             .unwrap_or_else(|e| json!({"error": format!("{}", e)}).to_string()),
@@ -5095,6 +5099,8 @@ pub fn handle_dream(db: &Database, args: Value) -> Result<String, String> {
                     workspace_hash: a.params.workspace_hash.clone(),
                     global: a.params.global,
                     requesting_agent_id: a.params.requesting_agent_id.clone(),
+                    refine_existing: true,
+                    quote_cap_chars: 512,
                 })
                 .map_err(|e| format!("Dream fallback (consolidate {}) failed: {}", cat, e))?;
             observations_created += report.observations_created;
@@ -6416,6 +6422,8 @@ pub fn handle_autocohere(db: &Database, args: Value) -> Result<String, String> {
                 // consolidation step.
                 global: a.global || a.workspace_hash.is_none(),
                 requesting_agent_id: a.requesting_agent_id.clone(),
+                refine_existing: true,
+                quote_cap_chars: 512,
             })
             .map_err(|e| format!("Autocohere step (consolidate {}) failed: {}", cat, e))?;
         observations_created += report.observations_created;
@@ -10824,6 +10832,56 @@ mod tests {
         let vc: Value = serde_json::from_str(&c).unwrap();
         assert_ne!(va["task"]["projection_id"], vc["task"]["projection_id"]);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn handle_consolidate_rejects_bad_quote_cap_fail_closed() {
+        let (db, path) = temp_tool_db();
+        for bad in [10i64, 63, 4097, 5000] {
+            let out = handle_consolidate(&db, json!({
+                "category": "facts",
+                "workspace_hash": "ws-x",
+                "quote_cap_chars": bad,
+            }));
+            let v: Value = serde_json::from_str(&out).unwrap();
+            assert!(
+                v["error"].as_str().unwrap_or("").contains("quote_cap_chars"),
+                "quote_cap {bad} must be rejected: {out}"
+            );
+        }
+        // Boundary values pass validation (and run cleanly on an empty store).
+        for ok in [64i64, 4096] {
+            let out = handle_consolidate(&db, json!({
+                "category": "facts",
+                "workspace_hash": "ws-x",
+                "quote_cap_chars": ok,
+            }));
+            let v: Value = serde_json::from_str(&out).unwrap();
+            assert!(
+                v.get("error").is_none(),
+                "quote_cap {ok} must be accepted: {out}"
+            );
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn consolidate_args_default_refine_existing_and_quote_cap() {
+        // Defaults: refine on, 512-char cap (serde default on missing keys).
+        let v = json!({"category": "facts"});
+        let a: crate::models::ConsolidateParams = serde_json::from_value(v).unwrap();
+        assert!(a.refine_existing);
+        assert_eq!(a.quote_cap_chars, 512);
+    }
+
+    #[test]
+    fn ask_args_default_verify_stale_observations_on() {
+        let v = json!({"query": "q"});
+        let a: AskParams = serde_json::from_value(v).unwrap();
+        assert!(a.verify_stale_observations, "fail-closed: gate on by default");
+        let v3 = json!({"query": "q", "verify_stale_observations": false});
+        let a3: AskParams = serde_json::from_value(v3).unwrap();
+        assert!(!a3.verify_stale_observations);
     }
 
     // ─── History retention hooks (#398) ──────────────────────────
