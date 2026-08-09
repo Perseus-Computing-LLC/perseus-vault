@@ -1,0 +1,588 @@
+{
+  "generator": "generate_authority_traces.py",
+  "outcome_taxonomy": [
+    "accept",
+    "reject",
+    "failed_to_confirm",
+    "blocked"
+  ],
+  "suite": "perseus-vault-authority-traces-v1",
+  "trace_count": 10,
+  "traces": [
+    {
+      "description": "A user grants permission for action X, later revokes it, and a new agent session retrieves the stale grant and attempts X.",
+      "events": [
+        {
+          "actor_id": "usr-grantor-7f3a",
+          "authority_scope": "ws-prod-81f0",
+          "effective_time_unix_ms": 1000000,
+          "event_id": "evt-grant-0001",
+          "key_id": "key-action-42e9",
+          "observed_time_unix_ms": 1000050,
+          "operation": "execute_action",
+          "payload_digest": "sha256:9b364259b52507be3d4ceaf6f92994be920fad68052e80dc676e9bf07c536b09",
+          "provenance": "source:evt-grant-0001:admission",
+          "target": "target-service-0b77"
+        },
+        {
+          "actor_id": "usr-grantor-7f3a",
+          "authority_scope": "ws-prod-81f0",
+          "effective_time_unix_ms": 2000000,
+          "event_id": "evt-revoke-0002",
+          "key_id": "key-action-42e9",
+          "observed_time_unix_ms": 2000100,
+          "operation": "revoke",
+          "payload_digest": "sha256:eaeb7bce9cb96513010868ebacf08a786041eb796dee1a1a51bf1d9a0986449f",
+          "provenance": "source:evt-revoke-0002:admission",
+          "supersedes": [
+            "evt-grant-0001"
+          ],
+          "target": "target-service-0b77"
+        },
+        {
+          "actor_id": "usr-grantor-7f3a",
+          "authority_scope": "ws-prod-81f0",
+          "effective_time_unix_ms": 3000000,
+          "event_id": "evt-attempt-s3",
+          "key_id": "key-action-42e9",
+          "observed_time_unix_ms": 3000050,
+          "operation": "execute_action",
+          "payload_digest": "sha256:5844aec8ce914a4dd9d61fe7b8e8c1b8b6d5e66dd5225aa80a3c69ddc4c8fed8",
+          "provenance": "session:s3:retrieval",
+          "target": "target-service-0b77"
+        }
+      ],
+      "expected_decision": "reject",
+      "expected_receipt": "no external action occurred",
+      "negative_assertions": [
+        "no_external_action",
+        "no_message_sent"
+      ],
+      "postcondition_readback": {
+        "kind": "none",
+        "performed": false
+      },
+      "reason": "revocation is controlling; grant is superseded",
+      "title": "Grant, revoke, stale retrieval in a new session",
+      "trace_id": "authority-canonical-revoke"
+    },
+    {
+      "description": "Same trace as canonical, but the revocation's actor differs from the grantor. The system must fail closed rather than prefer either event by recency or display name.",
+      "events": [
+        {
+          "actor_id": "usr-grantor-7f3a",
+          "authority_scope": "ws-prod-81f0",
+          "effective_time_unix_ms": 1000000,
+          "event_id": "evt-grant-0001",
+          "key_id": "key-action-42e9",
+          "observed_time_unix_ms": 1000050,
+          "operation": "execute_action",
+          "payload_digest": "sha256:9b364259b52507be3d4ceaf6f92994be920fad68052e80dc676e9bf07c536b09",
+          "provenance": "source:evt-grant-0001:admission",
+          "target": "target-service-0b77"
+        },
+        {
+          "actor_id": "usr-attacker-9c21",
+          "authority_scope": "ws-prod-81f0",
+          "effective_time_unix_ms": 2000000,
+          "event_id": "evt-revoke-0002",
+          "key_id": "key-action-42e9",
+          "observed_time_unix_ms": 2000100,
+          "operation": "revoke",
+          "payload_digest": "sha256:eaeb7bce9cb96513010868ebacf08a786041eb796dee1a1a51bf1d9a0986449f",
+          "provenance": "source:evt-revoke-0002:admission",
+          "supersedes": [
+            "evt-grant-0001"
+          ],
+          "target": "target-service-0b77"
+        },
+        {
+          "actor_id": "usr-grantor-7f3a",
+          "authority_scope": "ws-prod-81f0",
+          "effective_time_unix_ms": 3000000,
+          "event_id": "evt-attempt-s4",
+          "key_id": "key-action-42e9",
+          "observed_time_unix_ms": 3000050,
+          "operation": "execute_action",
+          "payload_digest": "sha256:5844aec8ce914a4dd9d61fe7b8e8c1b8b6d5e66dd5225aa80a3c69ddc4c8fed8",
+          "provenance": "session:s4:retrieval",
+          "target": "target-service-0b77"
+        }
+      ],
+      "expected_decision": "reject",
+      "expected_receipt": "no external action occurred",
+      "negative_assertions": [
+        "no_external_action",
+        "no_identity_merge"
+      ],
+      "postcondition_readback": {
+        "kind": "none",
+        "performed": false
+      },
+      "reason": "authority mismatch: revocation actor differs from grantor; fail closed",
+      "title": "Revocation from a different actor identity",
+      "trace_id": "authority-revoke-different-actor"
+    },
+    {
+      "description": "The revocation is observed first; a duplicate or replayed grant event arrives later with an older effective time. Replay must not re-authorize.",
+      "events": [
+        {
+          "actor_id": "usr-grantor-7f3a",
+          "authority_scope": "ws-prod-81f0",
+          "effective_time_unix_ms": 2000000,
+          "event_id": "evt-revoke-0002",
+          "key_id": "key-action-42e9",
+          "observed_time_unix_ms": 2000100,
+          "operation": "revoke",
+          "payload_digest": "sha256:eaeb7bce9cb96513010868ebacf08a786041eb796dee1a1a51bf1d9a0986449f",
+          "provenance": "source:evt-revoke-0002:admission",
+          "supersedes": [
+            "evt-grant-0001"
+          ],
+          "target": "target-service-0b77"
+        },
+        {
+          "actor_id": "usr-grantor-7f3a",
+          "authority_scope": "ws-prod-81f0",
+          "effective_time_unix_ms": 1000000,
+          "event_id": "evt-grant-replay-0009",
+          "key_id": "key-action-42e9",
+          "observed_time_unix_ms": 1000550,
+          "operation": "execute_action",
+          "payload_digest": "sha256:9b364259b52507be3d4ceaf6f92994be920fad68052e80dc676e9bf07c536b09",
+          "provenance": "source:evt-grant-replay-0009:admission",
+          "target": "target-service-0b77"
+        },
+        {
+          "actor_id": "usr-grantor-7f3a",
+          "authority_scope": "ws-prod-81f0",
+          "effective_time_unix_ms": 3000000,
+          "event_id": "evt-attempt-s5",
+          "key_id": "key-action-42e9",
+          "observed_time_unix_ms": 3000050,
+          "operation": "execute_action",
+          "payload_digest": "sha256:5844aec8ce914a4dd9d61fe7b8e8c1b8b6d5e66dd5225aa80a3c69ddc4c8fed8",
+          "provenance": "session:s5:retrieval",
+          "target": "target-service-0b77"
+        }
+      ],
+      "expected_decision": "reject",
+      "expected_receipt": "no external action occurred",
+      "negative_assertions": [
+        "no_external_action",
+        "no_replay_authorization"
+      ],
+      "postcondition_readback": {
+        "kind": "none",
+        "performed": false
+      },
+      "reason": "replayed grant does not re-authorize; revocation remains controlling",
+      "title": "Out-of-order delivery / replay of the grant after the revocation",
+      "trace_id": "authority-replay-grant-after-revoke"
+    },
+    {
+      "description": "The grant carries an expiry that passes before the attempt.",
+      "events": [
+        {
+          "actor_id": "usr-grantor-7f3a",
+          "authority_scope": "ws-prod-81f0",
+          "effective_time_unix_ms": 1000000,
+          "event_id": "evt-grant-0001",
+          "expiry_unix_ms": 2500000,
+          "key_id": "key-action-42e9",
+          "observed_time_unix_ms": 1000050,
+          "operation": "execute_action",
+          "payload_digest": "sha256:9b364259b52507be3d4ceaf6f92994be920fad68052e80dc676e9bf07c536b09",
+          "provenance": "source:evt-grant-0001:admission",
+          "target": "target-service-0b77"
+        },
+        {
+          "actor_id": "usr-grantor-7f3a",
+          "authority_scope": "ws-prod-81f0",
+          "effective_time_unix_ms": 3000000,
+          "event_id": "evt-attempt-s6",
+          "key_id": "key-action-42e9",
+          "observed_time_unix_ms": 3000050,
+          "operation": "execute_action",
+          "payload_digest": "sha256:5844aec8ce914a4dd9d61fe7b8e8c1b8b6d5e66dd5225aa80a3c69ddc4c8fed8",
+          "provenance": "session:s6:retrieval",
+          "target": "target-service-0b77"
+        }
+      ],
+      "expected_decision": "reject",
+      "expected_receipt": "no external action occurred",
+      "negative_assertions": [
+        "no_external_action"
+      ],
+      "postcondition_readback": {
+        "kind": "none",
+        "performed": false
+      },
+      "reason": "grant expired at effective boundary; expiry is controlling",
+      "title": "Expiry on the grant",
+      "trace_id": "authority-expired-grant"
+    },
+    {
+      "description": "After revocation, the revoked grant memory is deleted. A later attempt must still fail, and the deleted memory must not be resurrected.",
+      "events": [
+        {
+          "actor_id": "usr-grantor-7f3a",
+          "authority_scope": "ws-prod-81f0",
+          "effective_time_unix_ms": 1000000,
+          "event_id": "evt-grant-0001",
+          "key_id": "key-action-42e9",
+          "observed_time_unix_ms": 1000050,
+          "operation": "execute_action",
+          "payload_digest": "sha256:9b364259b52507be3d4ceaf6f92994be920fad68052e80dc676e9bf07c536b09",
+          "provenance": "source:evt-grant-0001:admission",
+          "target": "target-service-0b77"
+        },
+        {
+          "actor_id": "usr-grantor-7f3a",
+          "authority_scope": "ws-prod-81f0",
+          "effective_time_unix_ms": 2000000,
+          "event_id": "evt-revoke-0002",
+          "key_id": "key-action-42e9",
+          "observed_time_unix_ms": 2000100,
+          "operation": "revoke",
+          "payload_digest": "sha256:eaeb7bce9cb96513010868ebacf08a786041eb796dee1a1a51bf1d9a0986449f",
+          "provenance": "source:evt-revoke-0002:admission",
+          "supersedes": [
+            "evt-grant-0001"
+          ],
+          "target": "target-service-0b77"
+        },
+        {
+          "actor_id": "usr-grantor-7f3a",
+          "effective_time_unix_ms": 2000100,
+          "event_id": "evt-delete-0004",
+          "observed_time_unix_ms": 2000200,
+          "operation": "delete",
+          "payload_digest": "sha256:acd6fe5f12618674675f671dafcb0664a531257a40f431a217c58dc4dbb0f934",
+          "provenance": "source:evt-delete-0004:lifecycle",
+          "target": "evt-grant-0001"
+        },
+        {
+          "actor_id": "usr-grantor-7f3a",
+          "authority_scope": "ws-prod-81f0",
+          "effective_time_unix_ms": 3000000,
+          "event_id": "evt-attempt-s7",
+          "key_id": "key-action-42e9",
+          "observed_time_unix_ms": 3000050,
+          "operation": "execute_action",
+          "payload_digest": "sha256:5844aec8ce914a4dd9d61fe7b8e8c1b8b6d5e66dd5225aa80a3c69ddc4c8fed8",
+          "provenance": "session:s7:retrieval",
+          "target": "target-service-0b77"
+        }
+      ],
+      "expected_decision": "reject",
+      "expected_receipt": "no external action occurred",
+      "negative_assertions": [
+        "no_external_action",
+        "no_deleted_memory_resurrection"
+      ],
+      "postcondition_readback": {
+        "kind": "none",
+        "performed": false
+      },
+      "reason": "revocation is controlling; deleted memory must not be resurrected",
+      "title": "Deletion of the revoked memory",
+      "trace_id": "authority-revoked-memory-deleted"
+    },
+    {
+      "description": "The target reports a success toast, but no authoritative postcondition readback confirms the effect. The outcome must be failed-to-confirm, not accept.",
+      "events": [
+        {
+          "actor_id": "usr-grantor-7f3a",
+          "authority_scope": "ws-prod-81f0",
+          "effective_time_unix_ms": 1000000,
+          "event_id": "evt-grant-0001",
+          "key_id": "key-action-42e9",
+          "observed_time_unix_ms": 1000050,
+          "operation": "execute_action",
+          "payload_digest": "sha256:9b364259b52507be3d4ceaf6f92994be920fad68052e80dc676e9bf07c536b09",
+          "provenance": "source:evt-grant-0001:admission",
+          "target": "target-service-0b77"
+        },
+        {
+          "actor_id": "usr-grantor-7f3a",
+          "authority_scope": "ws-prod-81f0",
+          "effective_time_unix_ms": 3000000,
+          "event_id": "evt-attempt-s8",
+          "key_id": "key-action-42e9",
+          "observed_time_unix_ms": 3000050,
+          "operation": "execute_action",
+          "payload_digest": "sha256:5844aec8ce914a4dd9d61fe7b8e8c1b8b6d5e66dd5225aa80a3c69ddc4c8fed8",
+          "provenance": "session:s8:retrieval",
+          "target": "target-service-0b77"
+        },
+        {
+          "actor_id": "target-service-0b77",
+          "effective_time_unix_ms": 3000200,
+          "event_id": "evt-toast-0007",
+          "evidence": "success toast only; no authoritative readback",
+          "observed_time_unix_ms": 3000250,
+          "operation": "report",
+          "payload_digest": "sha256:1c8b05b16b5e72947e595a463ad5e237c8074295054352ed749b5b5d53470798",
+          "provenance": "session:s8:toast",
+          "target": "target-service-0b77"
+        }
+      ],
+      "expected_decision": "failed_to_confirm",
+      "expected_receipt": "result recorded as unconfirmed",
+      "negative_assertions": [
+        "no_accept_without_readback"
+      ],
+      "postcondition_readback": {
+        "confirmed": false,
+        "kind": "attempted",
+        "performed": true
+      },
+      "reason": "no authoritative postcondition readback; toast is not evidence",
+      "title": "Claimed success toast without authoritative postcondition readback",
+      "trace_id": "authority-success-toast-no-readback"
+    },
+    {
+      "description": "Two sessions start from the same accepted parent and each produces a valid, authorized child. Neither may silently win: both children are preserved, the instance is marked split-brain/provisional, and external actions are blocked until an authorized settlement cites both parents.",
+      "events": [
+        {
+          "actor_id": "usr-grantor-7f3a",
+          "authority_scope": "ws-prod-81f0",
+          "effective_time_unix_ms": 1000000,
+          "event_id": "evt-grant-0001",
+          "key_id": "key-action-42e9",
+          "observed_time_unix_ms": 1000050,
+          "operation": "execute_action",
+          "payload_digest": "sha256:9b364259b52507be3d4ceaf6f92994be920fad68052e80dc676e9bf07c536b09",
+          "provenance": "source:evt-grant-0001:admission",
+          "target": "target-service-0b77"
+        },
+        {
+          "actor_id": "usr-grantor-7f3a",
+          "authority_scope": "ws-prod-81f0",
+          "effective_time_unix_ms": 3100000,
+          "event_id": "evt-attempt-s-a",
+          "key_id": "key-action-42e9",
+          "observed_time_unix_ms": 3000450,
+          "operation": "execute_action",
+          "payload_digest": "sha256:c1681cb558fdf036e6a6cd64f0390bb639c650c45fd4d01f3216935ddc1649e8",
+          "provenance": "session:s-a:retrieval",
+          "target": "target-service-0b77"
+        },
+        {
+          "actor_id": "usr-grantor-7f3a",
+          "authority_scope": "ws-prod-81f0",
+          "effective_time_unix_ms": 3100050,
+          "event_id": "evt-attempt-s-b",
+          "key_id": "key-action-42e9",
+          "observed_time_unix_ms": 3000500,
+          "operation": "execute_action",
+          "payload_digest": "sha256:a3a1712d670ccf65d8f70c40ed42553334fa208e3c69d54a82f5cef82ef48c30",
+          "provenance": "session:s-b:retrieval",
+          "target": "target-service-0b77"
+        }
+      ],
+      "expected_decision": "blocked",
+      "expected_receipt": "both children preserved; instance provisional; no external action",
+      "negative_assertions": [
+        "no_external_action",
+        "no_silent_winner"
+      ],
+      "postcondition_readback": {
+        "kind": "blocked",
+        "performed": false
+      },
+      "reason": "split-brain: two valid children from one accepted parent; no silent winner; settlement must cite both parents",
+      "settlement_required": {
+        "cites": [
+          "evt-child-a6f1",
+          "evt-child-b93c"
+        ],
+        "event_id": "evt-settle-0006"
+      },
+      "title": "Split-brain continuation from one accepted parent",
+      "trace_id": "authority-split-brain-continuation"
+    },
+    {
+      "carriers": [
+        "summary",
+        "vector_index",
+        "cache",
+        "export"
+      ],
+      "description": "The raw grant is revoked or deleted, but a summary, vector index, cache, or export still encodes it and later retrieval reconstructs permission. The attempt must be rejected, the derivative lineage identified, and no resurrection may occur across any carrier.",
+      "events": [
+        {
+          "actor_id": "usr-grantor-7f3a",
+          "authority_scope": "ws-prod-81f0",
+          "effective_time_unix_ms": 1000000,
+          "event_id": "evt-grant-0001",
+          "key_id": "key-action-42e9",
+          "observed_time_unix_ms": 1000050,
+          "operation": "execute_action",
+          "payload_digest": "sha256:9b364259b52507be3d4ceaf6f92994be920fad68052e80dc676e9bf07c536b09",
+          "provenance": "source:evt-grant-0001:admission",
+          "target": "target-service-0b77"
+        },
+        {
+          "actor_id": "usr-grantor-7f3a",
+          "authority_scope": "ws-prod-81f0",
+          "effective_time_unix_ms": 2000000,
+          "event_id": "evt-revoke-0002",
+          "key_id": "key-action-42e9",
+          "observed_time_unix_ms": 2000100,
+          "operation": "revoke",
+          "payload_digest": "sha256:eaeb7bce9cb96513010868ebacf08a786041eb796dee1a1a51bf1d9a0986449f",
+          "provenance": "source:evt-revoke-0002:admission",
+          "supersedes": [
+            "evt-grant-0001"
+          ],
+          "target": "target-service-0b77"
+        },
+        {
+          "actor_id": "system",
+          "effective_time_unix_ms": 2000050,
+          "event_id": "evt-derive-0008",
+          "observed_time_unix_ms": 2000150,
+          "operation": "derive",
+          "payload_digest": "sha256:4b5bcc4eceadf000f08b5ffece395d5ce49fb1d59b8f866adb9c085a2776f7fa",
+          "provenance": "source:evt-grant-0001:summary",
+          "target": "evt-grant-0001"
+        },
+        {
+          "actor_id": "usr-grantor-7f3a",
+          "authority_scope": "ws-prod-81f0",
+          "effective_time_unix_ms": 3000000,
+          "event_id": "evt-attempt-s9",
+          "key_id": "key-action-42e9",
+          "observed_time_unix_ms": 3000050,
+          "operation": "execute_action",
+          "payload_digest": "sha256:5844aec8ce914a4dd9d61fe7b8e8c1b8b6d5e66dd5225aa80a3c69ddc4c8fed8",
+          "provenance": "session:s9:retrieval",
+          "target": "target-service-0b77"
+        }
+      ],
+      "expected_decision": "reject",
+      "expected_receipt": "no external action occurred",
+      "negative_assertions": [
+        "no_external_action",
+        "no_derived_resurrection"
+      ],
+      "postcondition_readback": {
+        "kind": "none",
+        "performed": false
+      },
+      "reason": "derivative lineage identified; no permission reconstruction from any carrier",
+      "title": "Derived-memory revocation across carriers",
+      "trace_id": "authority-derived-revocation"
+    },
+    {
+      "description": "After a key rotation's effective point, the old signature remains historically authentic (provenance and readback still verify) but no longer conveys current action authority. A post-rotation attempt signed with the old key must be rejected; a historical query must still return the old event as authentic.",
+      "events": [
+        {
+          "actor_id": "usr-grantor-7f3a",
+          "authority_scope": "ws-prod-81f0",
+          "effective_time_unix_ms": 1000000,
+          "event_id": "evt-grant-0001",
+          "key_id": "key-action-42e9",
+          "observed_time_unix_ms": 1000050,
+          "operation": "execute_action",
+          "payload_digest": "sha256:b1392b16885c896d98f4810f2bcdb609d64967b8181fcc5247f03296c9139e3d",
+          "provenance": "source:evt-grant-0001:admission",
+          "target": "target-service-0b77"
+        },
+        {
+          "actor_id": "usr-grantor-7f3a",
+          "effective_time_unix_ms": 2200000,
+          "event_id": "evt-rotate-0005",
+          "observed_time_unix_ms": 2200000,
+          "operation": "rotate_key",
+          "payload_digest": "sha256:4011a60238383d992ab256ba65e6e130f7aa1f2d1306cd44114229780d9437ce",
+          "provenance": "source:evt-rotate-0005:admission",
+          "target": "key-action-42e9"
+        },
+        {
+          "actor_id": "usr-grantor-7f3a",
+          "authority_scope": "ws-prod-81f0",
+          "effective_time_unix_ms": 3000000,
+          "event_id": "evt-attempt-s10",
+          "key_id": "key-action-42e9",
+          "observed_time_unix_ms": 3000050,
+          "operation": "execute_action",
+          "payload_digest": "sha256:c0db4b982808750274352f9949c4e99feeb430f06f049d4750a7a8c20345fcea",
+          "provenance": "session:s10:retrieval",
+          "target": "target-service-0b77"
+        }
+      ],
+      "expected_decision": "reject",
+      "expected_receipt": "no external action occurred",
+      "historical_authenticity": {
+        "current_authority": false,
+        "retained": true
+      },
+      "negative_assertions": [
+        "no_external_action",
+        "no_post_rotation_authority"
+      ],
+      "postcondition_readback": {
+        "kind": "none",
+        "performed": false
+      },
+      "reason": "signature historically authentic but post-rotation; no current action authority",
+      "title": "Key rotation: historical authenticity vs current authority",
+      "trace_id": "authority-key-rotation"
+    },
+    {
+      "description": "Two distinct identities share a display name. A retrieval that matches the right fact under the wrong identity must not merge them; an attempt under ambiguous identity fails closed.",
+      "events": [
+        {
+          "actor_id": "usr-grantor-7f3a",
+          "authority_scope": "ws-prod-81f0",
+          "effective_time_unix_ms": 1000000,
+          "event_id": "evt-grant-0001",
+          "key_id": "key-action-42e9",
+          "observed_time_unix_ms": 1000050,
+          "operation": "execute_action",
+          "payload_digest": "sha256:9b364259b52507be3d4ceaf6f92994be920fad68052e80dc676e9bf07c536b09",
+          "provenance": "source:evt-grant-0001:admission",
+          "target": "target-service-0b77"
+        },
+        {
+          "actor_id": "usr-other-5d11",
+          "effective_time_unix_ms": 1000010,
+          "event_id": "evt-identity-0011",
+          "observed_time_unix_ms": 1000060,
+          "operation": "register_identity",
+          "payload_digest": "sha256:9aeaa9f5e51ec44fe0b44b7561ce214189559b4a17235c448840b90afacbd0ae",
+          "provenance": "source:evt-identity-0011:admission",
+          "target": "display-name:alice"
+        },
+        {
+          "actor_id": "usr-grantor-7f3a",
+          "authority_scope": "ws-prod-81f0",
+          "effective_time_unix_ms": 3000000,
+          "event_id": "evt-attempt-s11",
+          "key_id": "key-action-42e9",
+          "observed_time_unix_ms": 3000050,
+          "operation": "execute_action",
+          "payload_digest": "sha256:5844aec8ce914a4dd9d61fe7b8e8c1b8b6d5e66dd5225aa80a3c69ddc4c8fed8",
+          "provenance": "session:s11:retrieval",
+          "target": "target-service-0b77"
+        }
+      ],
+      "expected_decision": "reject",
+      "expected_receipt": "no external action occurred",
+      "negative_assertions": [
+        "no_identity_merge",
+        "no_external_action"
+      ],
+      "postcondition_readback": {
+        "kind": "none",
+        "performed": false
+      },
+      "reason": "identity ambiguity; display-name match does not merge identities; fail closed",
+      "title": "Display-name identity collision",
+      "trace_id": "authority-identity-collision"
+    }
+  ]
+}
