@@ -93,12 +93,14 @@ perseus-vault/
 
 ### One-liner (non-interactive)
 ```bash
-MCP_HOST_PORT=ip-server:port MCP_TOKEN=your-token-here \
+MCP_HOST_PORT=ip-server:port MCP_PERSEUS_VAULT_API_KEY=mcp_perseus-vault_token \
   curl -fsSL https://raw.githubusercontent.com/sowerkoku/perseus-vault/main/integrations/hermes/install-perseus-vault.py | python3
 ```
 
 ### Interactive
 ```bash
+curl -fsSL https://raw.githubusercontent.com/sowerkoku/perseus-vault/main/integrations/hermes/install-perseus-vault.py > install-perseus-vault.py
+
 python3 install-perseus-vault.py
 # Prompts: local/remote → IP:port → token
 ```
@@ -107,7 +109,7 @@ python3 install-perseus-vault.py
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `MCP_HOST_PORT` | Perseus Vault server `host:port` | `localhost:8767` |
-| `MCP_TOKEN` | MCP Bearer token | *(required)* |
+| `MCP_PERSEUS_VAULT_API_KEY` | MCP Bearer token | *(required)* |
 | `HERMES_HOME` | Hermes config directory | `~/.hermes` |
 
 ## Post-Install Verification
