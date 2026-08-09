@@ -1,10 +1,18 @@
 {
-  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
-  "name": "io.github.Perseus-Computing-LLC/perseus-vault",
-  "title": "Perseus Vault — persistent, encrypted memory for AI agents",
-  "description": "Persistent, deterministic memory for AI agents. Local-first: SQLite, FTS5, AES-256-GCM enabled by default for fresh installs, 99 canonical tools.",
-  "version": "2.20.2",
-  "packages": [
+ "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+ "name": "io.github.Perseus-Computing-LLC/perseus-vault",
+ "title": "Perseus Vault — persistent, encrypted memory for AI agents",
+ "description": "Persistent, deterministic memory for AI agents. Local-first: SQLite, FTS5, AES-256-GCM enabled by default for fresh installs, 99 canonical tools.",
+ "version": "2.20.2",
+ "packages": [
+  {
+   "registryType": "oci",
+   "identifier": "ghcr.io/perseus-computing-llc/perseus-vault:2.20.2",
+   "transport": {
+    "type": "stdio"
+   },
+   "runtimeHint": "docker",
+   "runtimeArguments": [
     {
      "type": "named",
      "name": "-i"
