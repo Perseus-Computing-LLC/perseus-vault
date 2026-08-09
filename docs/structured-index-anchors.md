@@ -1,6 +1,6 @@
 # Structured-index anchors
 
-`perseus_vault_structured_index_anchor` records a stable pointer to a fact in an upstream structured source such as an IDE index or domain fact map. The legacy `mimir_structured_index_anchor` alias remains callable during the v2 compatibility window.
+`perseus_vault_structured_index_anchor` records a stable pointer to a fact in an upstream structured source such as an IDE index or domain fact map. The legacy `perseus_vault_structured_index_anchor` alias remains callable during the v2 compatibility window.
 
 ## Reference vs. import
 

@@ -66,14 +66,14 @@ def bench_perseus(bin_path, db, ollama):
              "--llm-endpoint", ollama + "/api/generate", "--llm-model", "qwen2.5:14b-instruct",
              "--embedding-endpoint", ollama + "/api/embed", "--embedding-model-name", "nomic-embed-text"])
     for i, f in enumerate(FACTS):
-        m.tool("mimir_remember", {"category": "kb", "key": "f%d" % i,
+        m.tool("perseus_vault_remember", {"category": "kb", "key": "f%d" % i,
                "body_json": json.dumps({"content": f})})
     while True:
-        e = m.tool("mimir_embed", {"batch_category": "kb", "batch_limit": 100})
+        e = m.tool("perseus_vault_embed", {"batch_category": "kb", "batch_limit": 100})
         if (e.get("embedded", 0) or 0) == 0:
             break
     def q(query):
-        r = m.tool("mimir_recall", {"query": query, "mode": "hybrid", "limit": 3})
+        r = m.tool("perseus_vault_recall", {"query": query, "mode": "hybrid", "limit": 3})
         items = r.get("items", []) if isinstance(r, dict) else r
         return " ".join(json.loads(it.get("body_json", "{}")).get("content", "")
                         if it.get("body_json") else (it.get("content") or "")

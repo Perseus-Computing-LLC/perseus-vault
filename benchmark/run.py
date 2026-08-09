@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
-"""Mimir benchmark suite — publishable latency / throughput results.
+"""Perseus Vault benchmark suite — publishable latency / throughput results.
 
-Drives the real `mimir` binary over MCP stdio and measures write throughput,
+Drives the real `perseus_vault` binary over MCP stdio and measures write throughput,
 recall latency, category filtering, decay ordering, journal throughput,
 near-duplicate detection, and vault export.
 
 Runs anywhere: the binary is auto-located (repo `target/release|debug`, or
-`--bin` / `MIMIR_BIN`), and all scratch paths are OS-temp based. A single
-persistent mimir process serves every call, so the throughput numbers reflect
-Mimir's actual per-op cost rather than process-spawn overhead.
+`--bin` / `PERSEUS_VAULT_BIN`), and all scratch paths are OS-temp based. A single
+persistent perseus_vault process serves every call, so the throughput numbers reflect
+Perseus Vault's actual per-op cost rather than process-spawn overhead.
 
 Usage:
     cargo build --release
     python benchmark/run.py                 # auto-locate the binary, print + save report
-    python benchmark/run.py --bin /path/to/mimir --out report.json
-    MIMIR_BIN=/path/to/mimir python benchmark/run.py
+    python benchmark/run.py --bin /path/to/perseus-vault --out report.json
+    PERSEUS_VAULT_BIN=/path/to/perseus-vault python benchmark/run.py
 """
 import argparse
 import hashlib
@@ -32,19 +32,19 @@ REPO = HERE.parent
 
 
 def find_binary(explicit):
-    cands = [explicit, os.environ.get("MIMIR_BIN")]
+    cands = [explicit, os.environ.get("PERSEUS_VAULT_BIN")]
     # Perseus Vault rename: the release binary is now "perseus-vault"; fall
-    # back through the prior names ("mneme", then "mimir") for older builds.
-    for name in ("perseus-vault", "mneme", "mimir"):
+    # The release binary is "perseus-vault".
+    for name in ("perseus-vault",):
         exe = f"{name}.exe" if os.name == "nt" else name
         cands += [str(REPO / "target" / "release" / exe), str(REPO / "target" / "debug" / exe)]
     for c in cands:
         if c and Path(c).exists():
             return str(Path(c).resolve())
-    sys.exit("error: perseus-vault binary not found (build it or pass --bin / set MIMIR_BIN).")
+    sys.exit("error: perseus-vault binary not found (build it or pass --bin / set PERSEUS_VAULT_BIN).")
 
 
-class Mimir:
+class PerseusVault:
     """Persistent MCP stdio client — one process, many calls."""
 
     def __init__(self, binary, db):
@@ -70,7 +70,7 @@ class Mimir:
         while True:
             line = self.p.stdout.readline()
             if not line:
-                raise RuntimeError("mimir closed the stream")
+                raise RuntimeError("perseus_vault closed the stream")
             try:
                 m = json.loads(line)
             except json.JSONDecodeError:
@@ -103,19 +103,19 @@ def main():
     ap.add_argument("--bin", default=None)
     # Defaults to OS temp (the curated benchmark/results.json is a hand-annotated
     # artifact and must not be clobbered by a raw run). Pass --out to capture.
-    ap.add_argument("--out", default=str(Path(tempfile.gettempdir()) / "mimir" / "benchmark" / "results.json"))
+    ap.add_argument("--out", default=str(Path(tempfile.gettempdir()) / "perseus-vault" / "benchmark" / "results.json"))
     ap.add_argument("--writes", type=int, default=10000)
     args = ap.parse_args()
 
     binary = find_binary(args.bin)
-    db = str(Path(tempfile.gettempdir()) / "mimir-bench.db")
+    db = str(Path(tempfile.gettempdir()) / "perseus_vault-bench.db")
     for ext in ("", "-wal", "-shm"):
         try:
             os.remove(db + ext)
         except OSError:
             pass
 
-    rpc = Mimir(binary, db)
+    rpc = PerseusVault(binary, db)
     results = {}
     cats = ["decision", "architecture", "convention", "insight", "fact"]
     total_writes = args.writes
@@ -130,8 +130,8 @@ def main():
             # ("Entity 0 in decision", "Entity 1 in decision", ...) are trigram
             # near-dupes and dedup rejects almost all of them, so the throughput
             # and entity-count numbers measure dedup rejections, not inserts.
-            nonce = hashlib.sha1(f"mimir-bench-{i}".encode()).hexdigest()
-            rpc.call("mimir_remember", {
+            nonce = hashlib.sha1(f"perseus_vault-bench-{i}".encode()).hexdigest()
+            rpc.call("perseus_vault_remember", {
                 "category": cats[i % 5], "key": f"bench-{i}",
                 "body_json": json.dumps({"id": i, "desc": f"Entity {i} in {cats[i%5]}",
                                          "tag": f"tag-{i%20}", "nonce": nonce}),
@@ -147,7 +147,7 @@ def main():
         times = []
         for i in range(100):
             t0 = time.perf_counter()
-            rpc.call("mimir_recall", {"query": f"entity {i*100}", "limit": 10})
+            rpc.call("perseus_vault_recall", {"query": f"entity {i*100}", "limit": 10})
             times.append((time.perf_counter() - t0) * 1000)
         times.sort()
         results["recall"] = {"p50_ms": round(statistics.median(times), 1),
@@ -157,21 +157,21 @@ def main():
 
         # ── 3. Category Precision ──
         print("3. Category-filtered recall...", end=" ", flush=True)
-        dec = rpc.call("mimir_recall", {"query": "entity", "category": "decision", "limit": 100})
-        arc = rpc.call("mimir_recall", {"query": "entity", "category": "architecture", "limit": 100})
-        all_cats = all(rpc.call("mimir_recall", {"query": "entity", "category": c, "limit": 1})["total"] > 0 for c in cats)
+        dec = rpc.call("perseus_vault_recall", {"query": "entity", "category": "decision", "limit": 100})
+        arc = rpc.call("perseus_vault_recall", {"query": "entity", "category": "architecture", "limit": 100})
+        all_cats = all(rpc.call("perseus_vault_recall", {"query": "entity", "category": c, "limit": 1})["total"] > 0 for c in cats)
         results["category_filter"] = {"decision_hits": dec["total"], "architecture_hits": arc["total"],
                                       "all_categories_match": all_cats}
         print(f"decision={dec['total']}, architecture={arc['total']}")
 
         # ── 4. Decay ──
         print("4. Decay accuracy...", end=" ", flush=True)
-        rpc.call("mimir_remember", {"category": "bench", "key": "fresh", "body_json": "{\"d\":\"fresh\"}", "importance": 1.0})
-        rpc.call("mimir_remember", {"category": "bench", "key": "stale", "body_json": "{\"d\":\"stale\"}", "importance": 0.1})
+        rpc.call("perseus_vault_remember", {"category": "bench", "key": "fresh", "body_json": "{\"d\":\"fresh\"}", "importance": 1.0})
+        rpc.call("perseus_vault_remember", {"category": "bench", "key": "stale", "body_json": "{\"d\":\"stale\"}", "importance": 0.1})
         for _ in range(10):
-            rpc.call("mimir_recall", {"query": "fresh", "limit": 1})
-        fresh = rpc.call("mimir_recall", {"query": "fresh", "limit": 1})["items"][0]
-        stale = rpc.call("mimir_recall", {"query": "stale", "limit": 1})["items"][0]
+            rpc.call("perseus_vault_recall", {"query": "fresh", "limit": 1})
+        fresh = rpc.call("perseus_vault_recall", {"query": "fresh", "limit": 1})["items"][0]
+        stale = rpc.call("perseus_vault_recall", {"query": "stale", "limit": 1})["items"][0]
         results["decay"] = {"fresh_score": fresh["decay_score"], "stale_score": stale["decay_score"],
                             "fresh_layer": fresh["layer"], "stale_layer": stale["layer"],
                             "fresh_ranks_higher": fresh["decay_score"] > stale["decay_score"]}
@@ -181,7 +181,7 @@ def main():
         print("5. Journal writes (1000 events)...", end=" ", flush=True)
         t0 = time.perf_counter()
         for i in range(1000):
-            rpc.call("mimir_journal", {"event_type": "bench", "evaluated": {"i": i}, "acted": {"ok": True}, "forward": {"n": i + 1}})
+            rpc.call("perseus_vault_journal", {"event_type": "bench", "evaluated": {"i": i}, "acted": {"ok": True}, "forward": {"n": i + 1}})
         elapsed = time.perf_counter() - t0
         results["journal"] = {"count": 1000, "elapsed_s": round(elapsed, 1),
                               "events_per_sec": round(1000 / elapsed)}
@@ -189,9 +189,9 @@ def main():
 
         # ── 6. Dedup ──
         print("6. Near-duplicate detection...", end=" ", flush=True)
-        rpc.call("mimir_remember", {"category": "test", "key": "orig", "body_json": "{\"unique\":\"content for dedup test 12345\"}", "importance": 0.8})
-        dup = rpc.call("mimir_remember", {"category": "test", "key": "copy", "body_json": "{\"unique\":\"content for dedup test 12345\"}", "importance": 0.8})
-        # Match the action substring: current Mimir returns "deduped (new key not
+        rpc.call("perseus_vault_remember", {"category": "test", "key": "orig", "body_json": "{\"unique\":\"content for dedup test 12345\"}", "importance": 0.8})
+        dup = rpc.call("perseus_vault_remember", {"category": "test", "key": "copy", "body_json": "{\"unique\":\"content for dedup test 12345\"}", "importance": 0.8})
+        # Match the action substring: current Perseus Vault returns "deduped (new key not
         # created)" rather than the bare "deduped" this check originally expected.
         results["dedup"] = {"detected": "deduped" in (dup.get("action") or ""), "action": dup.get("action")}
         print(results["dedup"]["action"])
@@ -200,7 +200,7 @@ def main():
         print("7. Vault export...", end=" ", flush=True)
         vd = tempfile.mkdtemp()
         t0 = time.perf_counter()
-        rpc.call("mimir_vault_export", {"vault_dir": vd})
+        rpc.call("perseus_vault_vault_export", {"vault_dir": vd})
         elapsed = time.perf_counter() - t0
         fc = len([f for f in os.listdir(vd) if f.endswith('.md')])
         results["vault"] = {"files": fc, "elapsed_s": round(elapsed, 2),
@@ -210,7 +210,7 @@ def main():
         print(f"{fc} files in {elapsed:.1f}s")
 
         # ── 8. DB Stats ──
-        stats = rpc.call("mimir_stats", {})
+        stats = rpc.call("perseus_vault_stats", {})
         results["db"] = {"entities": stats["total_entities"], "journal": stats["total_journal_events"],
                         "size_kb": round(stats["db_file_size_bytes"] / 1024),
                         "categories": len(stats["by_category"]),

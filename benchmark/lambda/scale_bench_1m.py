@@ -5,7 +5,7 @@ Extends scale_bench.py (the 100k harness) to the 1M scale point. Three minimal,
 documented deltas over scale_bench.py; everything else (corpus generator, recall
 definition, MCP driver) is reused verbatim so the 1M number is comparable to 100k:
 
-  (a) FLEET EMBEDDING (--embed-fleet N).  The binary's mimir_embed batch loop is
+  (a) FLEET EMBEDDING (--embed-fleet N).  The binary's perseus_vault_embed batch loop is
       strictly serial (one blocking /api/embed per entity, then store) so it caps
       at ~15 emb/s regardless of GPU count — 1M would take ~18h. Instead we embed
       client-side: read every un-embedded (id, body_json) straight from the SQLite
@@ -241,7 +241,7 @@ def recall_over(mcp, queries, mode):
     for q, gold_ci in queries:
         gold_cat = f"cluster{gold_ci:03d}"
         t = time.time()
-        r = mcp.tool("mimir_recall", {"query": q, "mode": mode, "limit": max_k})
+        r = mcp.tool("perseus_vault_recall", {"query": q, "mode": mode, "limit": max_k})
         lats.append((time.time() - t) * 1000)
         items = r.get("items", []) if isinstance(r, dict) else (r or [])
         cats = [str(x.get("category", "")) for x in items if isinstance(x, dict)]
@@ -308,7 +308,7 @@ def main():
         else:
             t0 = time.time()
             for n, (cat, key, body, _) in enumerate(rows):
-                mcp.tool("mimir_remember", {"category": cat, "key": key,
+                mcp.tool("perseus_vault_remember", {"category": cat, "key": key,
                          "body_json": json.dumps({"content": body})})
                 if n and n % 100000 == 0:
                     print(f"  seeded {n}/{total} ({n/(time.time()-t0):.0f}/s)", flush=True)
@@ -317,7 +317,7 @@ def main():
                                       "entities_per_sec": round(total / seed_dt, 1)}
             print(f"seeded in {seed_dt:.1f}s ({total/seed_dt:.0f}/s)", flush=True)
         # persisted distinct count (dedup gap check) + baseline embedded coverage
-        st = mcp.tool("mimir_stats", {})
+        st = mcp.tool("perseus_vault_stats", {})
         persisted = st.get("total_entities") if isinstance(st, dict) else None
         out["corpus"]["persisted"] = persisted
         print(f"persisted entities (post-dedup): {persisted}", flush=True)
@@ -334,7 +334,7 @@ def main():
         # fallback: binary serial embed (100k-style) — reopen MCP.
         # Coverage short-circuit (#619 validation run, 2026-07-13): with a
         # fully-embedded reused corpus (--skip-seed) this loop degenerates to
-        # one no-op mimir_embed call per category — 10k categories × ~0.7s of
+        # one no-op perseus_vault_embed call per category — 10k categories × ~0.7s of
         # category-filtered NULL-scan ≈ 2h of doing nothing at the 1M point.
         # Skip it when the direct count says there is nothing to embed.
         cc0 = sqlite3.connect(a.db, timeout=120)
@@ -352,7 +352,7 @@ def main():
                 guard = 0
                 while guard < 60:
                     guard += 1
-                    e = mcp.tool("mimir_embed", {"batch_category": c, "batch_limit": 5000})
+                    e = mcp.tool("perseus_vault_embed", {"batch_category": c, "batch_limit": 5000})
                     got = (e.get("embedded", e.get("count", 0)) or 0); n += got
                     if got == 0:
                         break

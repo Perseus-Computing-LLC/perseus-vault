@@ -44,7 +44,7 @@ We support responsible disclosure and will credit reporters who follow this poli
 
 ## Security Model
 
-Mimir is a **local-first MCP server** that stores AI agent memory. It processes:
+Perseus Vault is a **local-first MCP server** that stores AI agent memory. It processes:
 
 - Entity CRUD (remember, recall, search, forget)
 - Journaling (append-only decision logs)
@@ -90,7 +90,7 @@ on-disk state.
 > search to work, the FTS5 index (`entities_fts`) stores the body in **plaintext**,
 > and metadata columns (category, key, tags, workspace, timestamps) are plaintext
 > by design. To keep content unreadable from the file itself, **also** enable
-> OS-level disk encryption (LUKS / FileVault / BitLocker). On Windows, Mimir does
+> OS-level disk encryption (LUKS / FileVault / BitLocker). On Windows, Perseus Vault does
 > not restrict the key file's ACL — do it yourself. Details in
 > [docs/ENCRYPTION.md](./docs/ENCRYPTION.md).
 
@@ -108,10 +108,10 @@ on-disk state.
 
 ### Trust boundaries
 
-- **Mimir runs on your machine.** It does not phone home. No telemetry.
+- **Perseus Vault runs on your machine.** It does not phone home. No telemetry.
 - **MCP transport is local stdio by default.** No network exposure unless you enable HTTP transport.
 - **Connectors are opt-in.** GitHub and file watcher connectors are disabled by default.
-- **Encryption keys are your responsibility.** Mimir does not store, transmit, or escrow keys.
+- **Encryption keys are your responsibility.** Perseus Vault does not store, transmit, or escrow keys.
 
 ---
 

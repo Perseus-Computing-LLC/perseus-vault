@@ -30,8 +30,8 @@ WORDS = ("service latency schema deploy index queue worker retry cache shard "
 
 
 def find_binary(explicit: "str | None" = None) -> str:
-    cands = [explicit, os.environ.get("MIMIR_BIN")]
-    for name in ("perseus-vault", "mneme", "mimir"):
+    cands = [explicit, os.environ.get("PERSEUS_VAULT_BIN")]
+    for name in ("perseus-vault",):
         exe = f"{name}.exe" if os.name == "nt" else name
         cands += [str(REPO / "target" / "release" / exe),
                   str(REPO / "target" / "debug" / exe)]
@@ -39,7 +39,7 @@ def find_binary(explicit: "str | None" = None) -> str:
         if c and Path(c).exists():
             return str(Path(c).resolve())
     sys.exit("error: perseus-vault binary not found. Build it "
-             "(`cargo build --release`) or pass --bin / set MIMIR_BIN.")
+             "(`cargo build --release`) or pass --bin / set PERSEUS_VAULT_BIN.")
 
 
 class Vault:
@@ -116,7 +116,7 @@ def seed_store(v: Vault, n: int, seed: int = 530) -> None:
     t0 = time.perf_counter()
     for i in range(n):
         words = " ".join(rng.choices(WORDS, k=rng.randint(40, 120)))
-        v.call("mimir_remember", {
+        v.call("perseus_vault_remember", {
             "category": cats[i % len(cats)],
             "key": f"contention-{i}",
             "body_json": json.dumps({"text": f"[{i}] {words}",
@@ -143,7 +143,7 @@ def measure_recall(v: Vault, probes: list, iters: int, mode: str = "fts5") -> di
     t0 = time.perf_counter()
     for i in range(iters):
         s = time.perf_counter()
-        v.call("mimir_recall", {"query": probes[i % len(probes)],
+        v.call("perseus_vault_recall", {"query": probes[i % len(probes)],
                                 "mode": mode, "limit": 5})
         lat.append((time.perf_counter() - s) * 1000.0)
     wall = time.perf_counter() - t0

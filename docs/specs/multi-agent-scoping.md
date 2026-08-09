@@ -16,7 +16,7 @@ workspace-bound audit chain) was also already present.
 
 ### Agent registry + trust tiers
 `agents` table (schema v22): `agent_id`, `name`, `trust_tier` (0-3), `fleet_id`,
-timestamps. The `mimir_agent` tool registers/updates (pass `trust_tier`) or looks
+timestamps. The `perseus_vault_agent` tool registers/updates (pass `trust_tier`) or looks
 up (omit it). Tier model:
 
 | Tier | Capability |

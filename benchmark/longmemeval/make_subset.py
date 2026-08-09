@@ -5,7 +5,7 @@ The full 500-question `longmemeval_s` run of the expensive `fullcontext` arm
 (~113k tokens/question) costs ~$140 at gpt-4o pricing — outside the harness
 budget. This script cuts a *stratified* subset (proportional per question_type,
 fixed seed, sorted question_ids) so the cheap arms can be compared against the
-existing signed 500-question mimir run on the SAME questions: mimir's subset
+existing signed 500-question perseus_vault run on the SAME questions: perseus_vault's subset
 accuracy is recomputable from report.json's per_question verdicts, so the
 product arm costs nothing to re-measure.
 

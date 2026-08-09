@@ -64,7 +64,7 @@ to infer it from** (not content, not embedding, not score proximity).
 
 Versions should be *known*, not guessed:
 
-1. **Engine** — `mimir_remember` accepts an explicit valid-time; recall exposes
+1. **Engine** — `perseus_vault_remember` accepts an explicit valid-time; recall exposes
    it as a ranking signal (`entity_event_date_key` / `parse_event_date_key` here
    are a first step).
 2. **Harness** — pass each session's `session date:` as that valid-time.

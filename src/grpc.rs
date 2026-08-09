@@ -1,15 +1,12 @@
-// gRPC server — maps all Perseus Vault (formerly Mneme/Mimir) MCP tools to
-// protobuf RPCs. NOTE: the underlying "mneme.v1" proto package/service names
-// and generated Rust types (MnemeGrpcServer, etc.) are left unchanged — this
-// is a wire contract external gRPC clients depend on by that literal name,
-// same category as the "mimir_*" MCP tool names and the MCP Registry LABEL.
-// Renaming those is a breaking API change to schedule separately, not a
-// branding fix.
+// gRPC server — maps all Perseus Vault MCP tools to protobuf RPCs. The proto
+// package/service names (`perseus_vault.v1`, `PerseusVault`) and generated Rust
+// types are the live wire contract for gRPC clients; the legacy product names
+// are gone.
 // Enabled via "grpc" feature flag. Compiles the proto in build.rs.
 
 #[cfg(feature = "grpc")]
 pub mod grpc {
-    tonic::include_proto!("mneme.v1");
+    tonic::include_proto!("perseus_vault.v1");
 
     use std::sync::Arc;
     use tonic::{Request, Response, Status};
@@ -21,11 +18,11 @@ pub mod grpc {
     // #210 comment in transport.rs), and this is the SAME `Arc<Database>` the
     // other surfaces use: one process, one pool. Concurrent RPCs each check
     // out their own pooled connection instead of serializing on a global lock.
-    pub struct MnemeGrpcServer {
+    pub struct PerseusVaultGrpcServer {
         db: Arc<Database>,
     }
 
-    impl MnemeGrpcServer {
+    impl PerseusVaultGrpcServer {
         pub fn new(db: Arc<Database>) -> Self {
             Self { db }
         }
@@ -48,7 +45,7 @@ pub mod grpc {
     // (sanitize_error runs INSIDE the blocking closure: `Box<dyn Error>` is
     // not Send, so it must be mapped to a `Status` before crossing back.)
     async fn with_db<T>(
-        server: &MnemeGrpcServer,
+        server: &PerseusVaultGrpcServer,
         f: impl FnOnce(&Database) -> Result<T, Box<dyn std::error::Error>> + Send + 'static,
     ) -> Result<T, Status>
     where
@@ -58,7 +55,7 @@ pub mod grpc {
         tokio::task::spawn_blocking(move || f(&db).map_err(sanitize_error))
             .await
             .map_err(|e| {
-                eprintln!("mimir grpc: blocking task join error: {e}");
+                eprintln!("perseus-vault grpc: blocking task join error: {e}");
                 Status::internal("internal error")
             })?
     }
@@ -69,14 +66,14 @@ pub mod grpc {
         match e.downcast::<Status>() {
             Ok(status) => *status,
             Err(e) => {
-                eprintln!("mimir grpc: internal error: {e}");
+                eprintln!("perseus-vault grpc: internal error: {e}");
                 Status::internal("internal error")
             }
         }
     }
 
     #[tonic::async_trait]
-    impl mneme_server::Mneme for MnemeGrpcServer {
+    impl perseus_vault_server::PerseusVault for PerseusVaultGrpcServer {
         // ── CRUD ──
         async fn remember(&self, req: Request<RememberRequest>) -> Result<Response<RememberResponse>, Status> {
             let r = req.into_inner();
@@ -371,24 +368,24 @@ pub mod grpc {
 
     impl GrpcSecurity {
         /// Build config from environment:
-        ///   * `MIMIR_GRPC_AUTH_TOKEN`   — Bearer token clients must present
-        ///   * `MIMIR_GRPC_TLS_CERT` / `MIMIR_GRPC_TLS_KEY` — PEM file paths (TLS)
-        ///   * `MIMIR_GRPC_TLS_CLIENT_CA` — PEM path; presence enables mTLS
-        ///   * `MIMIR_GRPC_MAX_MSG_BYTES` — inbound message cap (default 4 MiB)
+        ///   * `PERSEUS_VAULT_GRPC_AUTH_TOKEN`   — Bearer token clients must present
+        ///   * `PERSEUS_VAULT_GRPC_TLS_CERT` / `PERSEUS_VAULT_GRPC_TLS_KEY` — PEM file paths (TLS)
+        ///   * `PERSEUS_VAULT_GRPC_TLS_CLIENT_CA` — PEM path; presence enables mTLS
+        ///   * `PERSEUS_VAULT_GRPC_MAX_MSG_BYTES` — inbound message cap (default 4 MiB)
         pub fn from_env() -> Result<Self, Box<dyn std::error::Error>> {
-            let auth_token = std::env::var("MIMIR_GRPC_AUTH_TOKEN")
+            let auth_token = std::env::var("PERSEUS_VAULT_GRPC_AUTH_TOKEN")
                 .ok()
                 .filter(|t| !t.is_empty());
             let tls = match (
-                std::env::var("MIMIR_GRPC_TLS_CERT").ok(),
-                std::env::var("MIMIR_GRPC_TLS_KEY").ok(),
+                std::env::var("PERSEUS_VAULT_GRPC_TLS_CERT").ok(),
+                std::env::var("PERSEUS_VAULT_GRPC_TLS_KEY").ok(),
             ) {
                 (Some(cert), Some(key)) => Some(GrpcTls {
                     cert_pem: std::fs::read(&cert)
                         .map_err(|e| format!("gRPC TLS cert {cert}: {e}"))?,
                     key_pem: std::fs::read(&key)
                         .map_err(|e| format!("gRPC TLS key {key}: {e}"))?,
-                    client_ca_pem: match std::env::var("MIMIR_GRPC_TLS_CLIENT_CA").ok() {
+                    client_ca_pem: match std::env::var("PERSEUS_VAULT_GRPC_TLS_CLIENT_CA").ok() {
                         Some(ca) => Some(
                             std::fs::read(&ca)
                                 .map_err(|e| format!("gRPC TLS client CA {ca}: {e}"))?,
@@ -398,7 +395,7 @@ pub mod grpc {
                 }),
                 _ => None,
             };
-            let max_message_bytes = std::env::var("MIMIR_GRPC_MAX_MSG_BYTES")
+            let max_message_bytes = std::env::var("PERSEUS_VAULT_GRPC_MAX_MSG_BYTES")
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok())
                 .filter(|&n| n > 0)
@@ -462,12 +459,12 @@ pub mod grpc {
             || cfg.tls.as_ref().map(|t| t.client_ca_pem.is_some()).unwrap_or(false);
         if !addr.ip().is_loopback()
             && !authenticated
-            && std::env::var("MIMIR_ALLOW_INSECURE_BIND").ok().as_deref() != Some("1")
+            && std::env::var("PERSEUS_VAULT_ALLOW_INSECURE_BIND").ok().as_deref() != Some("1")
         {
             return Err(format!(
                 "refusing to expose gRPC on non-loopback {addr} without auth or mTLS. Set \
-                 MIMIR_GRPC_AUTH_TOKEN, enable mTLS via MIMIR_GRPC_TLS_CLIENT_CA, bind to \
-                 loopback, or set MIMIR_ALLOW_INSECURE_BIND=1 for a trusted network."
+                 PERSEUS_VAULT_GRPC_AUTH_TOKEN, enable mTLS via PERSEUS_VAULT_GRPC_TLS_CLIENT_CA, bind to \
+                 loopback, or set PERSEUS_VAULT_ALLOW_INSECURE_BIND=1 for a trusted network."
             )
             .into());
         }
@@ -477,8 +474,8 @@ pub mod grpc {
         } else {
             DEFAULT_MAX_MSG_BYTES
         };
-        let svc = MnemeGrpcServer::new(db);
-        let inner = mneme_server::MnemeServer::new(svc)
+        let svc = PerseusVaultGrpcServer::new(db);
+        let inner = perseus_vault_server::PerseusVaultServer::new(svc)
             .max_decoding_message_size(max_msg)
             .max_encoding_message_size(max_msg);
         let auth = AuthInterceptor {
@@ -501,7 +498,7 @@ pub mod grpc {
 
     #[cfg(test)]
     mod tests {
-        use super::mneme_server::Mneme;
+        use super::perseus_vault_server::PerseusVault;
         use super::*;
         use crate::db::Database;
         use tonic::service::Interceptor;
@@ -539,7 +536,7 @@ pub mod grpc {
         #[tokio::test]
         async fn serve_refuses_insecure_non_loopback_bind() {
             // Non-loopback + no auth + no mTLS must be refused (env override off).
-            std::env::remove_var("MIMIR_ALLOW_INSECURE_BIND");
+            std::env::remove_var("PERSEUS_VAULT_ALLOW_INSECURE_BIND");
             let (_srv, path) = test_server();
             let db = Database::open(&path).unwrap();
             let addr: std::net::SocketAddr = "0.0.0.0:0".parse().unwrap();
@@ -553,12 +550,12 @@ pub mod grpc {
             let _ = std::fs::remove_file(&path);
         }
 
-        fn test_server() -> (MnemeGrpcServer, String) {
+        fn test_server() -> (PerseusVaultGrpcServer, String) {
             let path = std::env::temp_dir()
-                .join(format!("mimir-test-grpc-{}.db", uuid::Uuid::new_v4()));
+                .join(format!("perseus_vault-test-grpc-{}.db", uuid::Uuid::new_v4()));
             let path_str = path.to_str().unwrap().to_string();
             let db = Database::open(&path_str).expect("open test db");
-            (MnemeGrpcServer::new(Arc::new(db)), path_str)
+            (PerseusVaultGrpcServer::new(Arc::new(db)), path_str)
         }
 
         fn remember_req(key: &str) -> RememberRequest {
@@ -761,7 +758,7 @@ pub mod grpc {
         #[tokio::test]
         async fn stub_serve_returns_actionable_error() {
             let path = std::env::temp_dir()
-                .join(format!("mimir-test-grpc-stub-{}.db", uuid::Uuid::new_v4()));
+                .join(format!("perseus_vault-test-grpc-stub-{}.db", uuid::Uuid::new_v4()));
             let path_str = path.to_str().unwrap().to_string();
             let db = Database::open(&path_str).expect("open test db");
             let err = serve(

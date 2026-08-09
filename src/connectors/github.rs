@@ -104,7 +104,7 @@ impl GitHubConnector {
             let response = ureq::get(url)
                 .set("Authorization", &format!("Bearer {}", self.config.token))
                 .set("Accept", "application/vnd.github+json")
-                .set("User-Agent", "mimir-connector")
+                .set("User-Agent", "perseus_vault-connector")
                 .set("X-GitHub-Api-Version", "2022-11-28")
                 .timeout(Duration::from_secs(30))
                 .call()

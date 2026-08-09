@@ -27,7 +27,7 @@ computed from published specs, and write a JSON report (default: OS temp; pass
 ## Prerequisites
 
 - A built binary: `cargo build --release` (auto-located at
-  `target/release/perseus-vault`; override with `--bin` or `MIMIR_BIN`).
+  `target/release/perseus-vault`; override with `--bin` or `PERSEUS_VAULT_BIN`).
 - Python 3.10+. **Stdlib only** — no packages required.
 - `burn_bench.py`: **torch is optional.** With a CUDA/ROCm torch build and a
   GPU, the burn is an FP16 matmul at 100% utilization; without torch (or

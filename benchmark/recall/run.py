@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
-"""Mimir offline recall-quality benchmark.
+"""Perseus Vault offline recall-quality benchmark.
 
-Measures whether Mimir *retrieves the right memory*, not how fast it does so
+Measures whether Perseus Vault *retrieves the right memory*, not how fast it does so
 (the latency/throughput suite lives in ../run.py). It is fully offline and
-deterministic: it drives the real `mimir` binary over MCP stdio, ingests a
+deterministic: it drives the real `perseus_vault` binary over MCP stdio, ingests a
 paraphrase-heavy dataset, populates dense vectors with the **bundled** ONNX
 embedding model (no network, no API key, no LLM), and scores recall@k / MRR for
 each search mode (fts5 keyword, dense vector, hybrid RRF).
 
 Usage:
     python run.py                       # auto-locate the binary, score, write report.json
-    python run.py --bin /path/to/mimir  # explicit binary
+    python run.py --bin /path/to/perseus-vault  # explicit binary
     python run.py --dataset other.json --k 1 3 5 --out report.json
-    MIMIR_BIN=/path/to/mimir python run.py
+    PERSEUS_VAULT_BIN=/path/to/perseus-vault python run.py
 
 Plugging in the real benchmarks: pass --dataset pointing at a JSON file with the
 same shape ({"memories": [...], "queries": [{"q", "relevant": [keys]}]}) built
@@ -35,19 +35,19 @@ def find_binary(explicit: "str | None") -> str:
     candidates = []
     if explicit:
         candidates.append(explicit)
-    if os.environ.get("MIMIR_BIN"):
-        candidates.append(os.environ["MIMIR_BIN"])
-    exe = "mneme.exe" if os.name == "nt" else "mneme"
+    if os.environ.get("PERSEUS_VAULT_BIN"):
+        candidates.append(os.environ["PERSEUS_VAULT_BIN"])
+    exe = "perseus-vault.exe" if os.name == "nt" else "perseus-vault"
     candidates += [str(REPO / "target" / "release" / exe),
                    str(REPO / "target" / "debug" / exe)]
     for c in candidates:
         if c and Path(c).exists():
             return str(Path(c).resolve())
-    sys.exit("error: mimir binary not found. Build it (`cargo build --release`) "
-             "or pass --bin / set MIMIR_BIN.")
+    sys.exit("error: perseus-vault binary not found. Build it (`cargo build --release`) "
+             "or pass --bin / set PERSEUS_VAULT_BIN.")
 
 
-class Mimir:
+class PerseusVault:
     """One MCP tools/call per process (matches the sibling perf harness).
 
     State persists because every call points at the same --db file.
@@ -99,8 +99,8 @@ def score(ranked_keys, relevant, ks):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Mimir offline recall-quality benchmark")
-    ap.add_argument("--bin", default=None, help="Path to the mimir binary")
+    ap = argparse.ArgumentParser(description="Perseus Vault offline recall-quality benchmark")
+    ap.add_argument("--bin", default=None, help="Path to the perseus_vault binary")
     ap.add_argument("--dataset", default=str(HERE / "dataset.json"))
     ap.add_argument("--k", nargs="+", type=int, default=[1, 3, 5])
     ap.add_argument("--modes", nargs="+", default=["fts5", "dense", "hybrid"])
@@ -114,19 +114,19 @@ def main():
     ks = sorted(set(args.k))
 
     db_dir = Path(os.environ.get("TMPDIR") or os.environ.get("TEMP") or "/tmp")
-    db = str(db_dir / "mimir-recall-bench.db")
+    db = str(db_dir / "perseus_vault-recall-bench.db")
     for ext in ("", "-wal", "-shm"):
         try:
             os.remove(db + ext)
         except OSError:
             pass
 
-    m = Mimir(binary, db)
+    m = PerseusVault(binary, db)
 
     # 1. Ingest.
     print(f"Ingesting {len(memories)} memories...", flush=True)
     for mem in memories:
-        m.call("mimir_remember", {
+        m.call("perseus_vault_remember", {
             "category": mem["category"], "key": mem["key"],
             "body_json": json.dumps({"note": mem["note"]}), "type": "fact",
         })
@@ -135,7 +135,7 @@ def main():
     cats = sorted({mem["category"] for mem in memories})
     embedded, dims = 0, None
     for cat in cats:
-        rep = m.call("mimir_embed", {"batch_category": cat, "batch_limit": 1000})
+        rep = m.call("perseus_vault_embed", {"batch_category": cat, "batch_limit": 1000})
         if isinstance(rep, dict):
             embedded += int(rep.get("embedded", 0) or 0)
             dims = rep.get("dimensions", dims)
@@ -148,7 +148,7 @@ def main():
     for q in queries:
         row = {"q": q["q"], "relevant": q["relevant"], "modes": {}}
         for mode in args.modes:
-            r = m.call("mimir_recall", {"query": q["q"], "mode": mode, "limit": args.limit,
+            r = m.call("perseus_vault_recall", {"query": q["q"], "mode": mode, "limit": args.limit,
                                         "trust_weight": 0, "min_decay": 0})
             items = r.get("items", []) if isinstance(r, dict) else []
             ranked = [it.get("key") for it in items]
@@ -168,7 +168,7 @@ def main():
     # deterministic run-to-run: fts5 and dense always were, and `hybrid` (RRF)
     # was made byte-stable in #247 via a deterministic id tie-break in the fusion
     # plus a read-only, BM25-ranked keyword arm that no longer depends on
-    # wall-clock decay or on mimir_recall's access side-effects. The set below is
+    # wall-clock decay or on perseus_vault_recall's access side-effects. The set below is
     # kept (empty) so a future non-reproducible mode can be excluded without
     # reworking the harness. See README.
     NONDETERMINISTIC = set()
@@ -180,7 +180,7 @@ def main():
     signature = hashlib.sha256(sig_payload.encode("utf-8")).hexdigest()
 
     report = {
-        "benchmark": "mimir-recall-quality",
+        "benchmark": "perseus_vault-recall-quality",
         "dataset": data.get("name"),
         "n_memories": len(memories),
         "n_queries": n,
@@ -199,7 +199,7 @@ def main():
     Path(args.out).write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
 
     # Human summary.
-    print(f"\nMimir recall quality - {data.get('name')} ({n} queries, {len(memories)} memories)")
+    print(f"\nPerseus Vault recall quality - {data.get('name')} ({n} queries, {len(memories)} memories)")
     hdr = "mode    " + "".join(f"  R@{k:<5}" for k in ks) + "  MRR"
     print(hdr)
     print("-" * len(hdr))

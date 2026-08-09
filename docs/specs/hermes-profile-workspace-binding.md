@@ -39,10 +39,10 @@ any binding.
 
 | tool | purpose |
 |---|---|
-| `mimir_workspace_bind(profile_name, workspace_hash, access_mode, metadata?)` | bind or re-bind (re-bind switches workspace, resets state to active; journaled) |
-| `mimir_workspace_unbind(profile_name, reason?)` | lifecycle → `unbound` (row retained for audit; journaled) |
-| `mimir_workspace_quarantine(profile_name, action=quarantine\|reactivate, reason?)` | operator lifecycle control (journaled) |
-| `mimir_workspace_status()` | diagnostics: all bindings with state, access mode, heartbeat (`last_seen_unix_ms`), and a computed `stale` signal (active binding whose heartbeat is older than 7 days) |
+| `perseus_vault_workspace_bind(profile_name, workspace_hash, access_mode, metadata?)` | bind or re-bind (re-bind switches workspace, resets state to active; journaled) |
+| `perseus_vault_workspace_unbind(profile_name, reason?)` | lifecycle → `unbound` (row retained for audit; journaled) |
+| `perseus_vault_workspace_quarantine(profile_name, action=quarantine\|reactivate, reason?)` | operator lifecycle control (journaled) |
+| `perseus_vault_workspace_status()` | diagnostics: all bindings with state, access mode, heartbeat (`last_seen_unix_ms`), and a computed `stale` signal (active binding whose heartbeat is older than 7 days) |
 
 Client heartbeats: `workspace_heartbeat(profile_name, workspace_hash)` bumps
 `last_seen_unix_ms` on the ACTIVE binding (schema v30). Status distinguishes
@@ -54,15 +54,15 @@ results.
 ### Separate companies / projects (isolation default)
 
 - One Hermes profile per company/project; each profile bound to its own
-  workspace: `mimir_workspace_bind(profile_name=<profile>, workspace_hash=<ws>)`.
+  workspace: `perseus_vault_workspace_bind(profile_name=<profile>, workspace_hash=<ws>)`.
 - Profiles never share a Hermes home directory; each profile runs against the
   same vault server but its own workspace.
 
 ### Intentional shared memory
 
 - Two profiles bound to the **same** workspace:
-  `mimir_workspace_bind(profile-a, ws-shared)` and
-  `mimir_workspace_bind(profile-b, ws-shared, access_mode=read_only)` —
+  `perseus_vault_workspace_bind(profile-a, ws-shared)` and
+  `perseus_vault_workspace_bind(profile-b, ws-shared, access_mode=read_only)` —
   writer + reader roles are explicit and enforced.
 - Do **not** point two independent Hermes writers at the same Hermes home
   directory or profile directory — that is the **unsafe shared-home
@@ -72,12 +72,12 @@ results.
 
 ### Diagnostics
 
-`mimir_workspace_status()` is the operator view: it shows every profile, its
+`perseus_vault_workspace_status()` is the operator view: it shows every profile, its
 bound workspace, access mode, lifecycle state, heartbeat, and staleness — and
 states plainly that vault-side scope rules are authoritative. Provider-level
 states (unavailable / timeout / stale / partial / empty) come from the client
 provider diagnostics on top of this binding state; the vault's own embedding
-backend health remains available via `mimir_health`/stats.
+backend health remains available via `perseus_vault_health`/stats.
 
 ## Schema
 

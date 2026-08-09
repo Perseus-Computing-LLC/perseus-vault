@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Mimir bi-temporal benchmark — does time-travel return the right version?
+"""Perseus Vault bi-temporal benchmark — does time-travel return the right version?
 
-Drives the real `mimir` binary over MCP stdio through fact-update scenarios
+Drives the real `perseus_vault` binary over MCP stdio through fact-update scenarios
 (write v1, then overwrite with v2 under the same category+key, which supersedes
 v1 into history) and checks the bi-temporal contract:
 
@@ -18,8 +18,8 @@ the two writes, so absolute times vary run-to-run, but the PASS/FAIL verdicts
 Usage:
     cargo build --release
     python benchmark/temporal/run.py                       # score, write report.json
-    python benchmark/temporal/run.py --bin /path/to/mimir --dataset other.json
-    MIMIR_BIN=/path/to/mimir python benchmark/temporal/run.py
+    python benchmark/temporal/run.py --bin /path/to/perseus-vault --dataset other.json
+    PERSEUS_VAULT_BIN=/path/to/perseus-vault python benchmark/temporal/run.py
 
 Exit code is non-zero if any check fails, so CI can gate on it.
 """
@@ -41,21 +41,21 @@ def find_binary(explicit):
     cands = []
     if explicit:
         cands.append(explicit)
-    if os.environ.get("MIMIR_BIN"):
-        cands.append(os.environ["MIMIR_BIN"])
+    if os.environ.get("PERSEUS_VAULT_BIN"):
+        cands.append(os.environ["PERSEUS_VAULT_BIN"])
     # Perseus Vault rename: the release binary is now "perseus-vault"; fall
-    # back through the prior names ("mneme", then "mimir") for older builds.
-    for name in ("perseus-vault", "mneme", "mimir"):
+    # The release binary is "perseus-vault".
+    for name in ("perseus-vault",):
         exe = f"{name}.exe" if os.name == "nt" else name
         cands += [str(REPO / "target" / "release" / exe), str(REPO / "target" / "debug" / exe)]
     for c in cands:
         if c and Path(c).exists():
             return str(Path(c).resolve())
     sys.exit("error: perseus-vault binary not found. Build it (`cargo build --release`) "
-             "or pass --bin / set MIMIR_BIN.")
+             "or pass --bin / set PERSEUS_VAULT_BIN.")
 
 
-class Mimir:
+class PerseusVault:
     """One MCP tools/call per process (matches the sibling recall harness);
     state persists because every call points at the same --db file."""
 
@@ -94,7 +94,7 @@ def now_ms():
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Mimir bi-temporal benchmark")
+    ap = argparse.ArgumentParser(description="Perseus Vault bi-temporal benchmark")
     ap.add_argument("--bin", default=None)
     ap.add_argument("--dataset", default=str(HERE / "dataset.json"))
     ap.add_argument("--out", default=str(HERE / "report.json"))
@@ -107,13 +107,13 @@ def main():
     updates = data["updates"]
 
     db_dir = Path(os.environ.get("TMPDIR") or os.environ.get("TEMP") or "/tmp")
-    db = str(db_dir / "mimir-temporal-bench.db")
+    db = str(db_dir / "perseus_vault-temporal-bench.db")
     for ext in ("", "-wal", "-shm"):
         try:
             os.remove(db + ext)
         except OSError:
             pass
-    m = Mimir(binary, db)
+    m = PerseusVault(binary, db)
 
     checks = []
 
@@ -125,28 +125,28 @@ def main():
         cat, key = u["category"], u["key"]
         t_before = now_ms() - 60_000  # comfortably before the fact existed
 
-        m.call("mimir_remember", {"category": cat, "key": key,
+        m.call("perseus_vault_remember", {"category": cat, "key": key,
                                   "body_json": json.dumps({"note": u["v1"]}), "type": "fact"})
         time.sleep(gap)
         t_mid = now_ms()             # an instant strictly between the two writes
         time.sleep(gap)
-        m.call("mimir_remember", {"category": cat, "key": key,
+        m.call("perseus_vault_remember", {"category": cat, "key": key,
                                   "body_json": json.dumps({"note": u["v2"]}), "type": "fact"})
         t_now = now_ms() + 60_000    # comfortably after
 
-        a_mid = m.call("mimir_as_of", {"category": cat, "key": key, "as_of_unix_ms": t_mid})
+        a_mid = m.call("perseus_vault_as_of", {"category": cat, "key": key, "as_of_unix_ms": t_mid})
         record(key, "as_of_mid_returns_v1",
                isinstance(a_mid, dict) and a_mid.get("found") and u["v1_token"] in json.dumps(a_mid))
 
-        a_now = m.call("mimir_as_of", {"category": cat, "key": key, "as_of_unix_ms": t_now})
+        a_now = m.call("perseus_vault_as_of", {"category": cat, "key": key, "as_of_unix_ms": t_now})
         record(key, "as_of_now_returns_v2",
                isinstance(a_now, dict) and a_now.get("found") and u["v2_token"] in json.dumps(a_now))
 
-        a_before = m.call("mimir_as_of", {"category": cat, "key": key, "as_of_unix_ms": t_before})
+        a_before = m.call("perseus_vault_as_of", {"category": cat, "key": key, "as_of_unix_ms": t_before})
         record(key, "as_of_before_not_found",
                isinstance(a_before, dict) and a_before.get("found") is False)
 
-        r = m.call("mimir_recall", {"query": u["probe"], "mode": "fts5", "limit": 10,
+        r = m.call("perseus_vault_recall", {"query": u["probe"], "mode": "fts5", "limit": 10,
                                     "trust_weight": 0, "min_decay": 0})
         bodies = json.dumps(r.get("items", []) if isinstance(r, dict) else [])
         record(key, "recall_excludes_superseded_v1", u["v1_token"] not in bodies)
@@ -168,7 +168,7 @@ def main():
     signature = hashlib.sha256(sig_payload.encode("utf-8")).hexdigest()
 
     report = {
-        "benchmark": "mimir-bi-temporal",
+        "benchmark": "perseus_vault-bi-temporal",
         "dataset": data.get("name"),
         "n_scenarios": len(updates),
         "checks_total": total,
@@ -183,7 +183,7 @@ def main():
     }
     Path(args.out).write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
 
-    print(f"Mimir bi-temporal - {data.get('name')} ({len(updates)} scenarios, {total} checks)")
+    print(f"Perseus Vault bi-temporal - {data.get('name')} ({len(updates)} scenarios, {total} checks)")
     for name, b in sorted(by_check.items()):
         mark = "ok " if b["pass"] == b["total"] else "FAIL"
         print(f"  [{mark}] {b['pass']}/{b['total']}  {name}")

@@ -60,10 +60,10 @@ Both may be combined (full bi-temporal recall). Absent → today's live view
 
 ### Surface
 
-- Extend `mimir_recall` with `as_of_unix_ms` + `valid_at_unix_ms` (already have
+- Extend `perseus_vault_recall` with `as_of_unix_ms` + `valid_at_unix_ms` (already have
   `valid_at` filtering on live rows via `valid_periods_for_ids`; this generalizes
   it to historical versions).
-- Extend `mimir_ask` / `mimir_global_recall` to thread the same two params into
+- Extend `perseus_vault_ask` / `perseus_vault_global_recall` to thread the same two params into
   their internal recall call so RAG answers are reconstructable at a past instant.
 - All three keep working with zero params = zero behavior change.
 
@@ -115,7 +115,7 @@ therefore required a searchable history surface:
 - **Maintenance:** indexed at the single history-append site
   (`snapshot_live_row_to_history`), cleared at both history-delete sites
   (purge/forget) to avoid orphaned text and rowid reuse, and rebuilt/backfilled
-  by `reindex_fts` (the `mimir_reindex` tool) — the one-time upgrade path.
+  by `reindex_fts` (the `perseus_vault_reindex` tool) — the one-time upgrade path.
 - **Additive & safe:** the augmentation only appends to fill the caller's limit
   and never reorders live hits; the hot `db::recall` core is untouched, so
   determinism (#247) and benchmark numbers are unaffected.

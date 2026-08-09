@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CI gate for Mimir's bi-temporal contract.
+"""CI gate for Perseus Vault's bi-temporal contract.
 
 Runs the offline bi-temporal benchmark (run.py) and asserts the time-travel /
 supersede invariant holds *exactly*. Unlike a fuzzy quality metric this is a
@@ -35,7 +35,7 @@ def main():
     ap.add_argument("--bin", default=None)
     args = ap.parse_args()
 
-    out = os.path.join(tempfile.gettempdir(), "mimir-temporal-gate.json")
+    out = os.path.join(tempfile.gettempdir(), "perseus_vault-temporal-gate.json")
     cmd = [sys.executable, str(HERE / "run.py"), "--out", out]
     if args.bin:
         cmd += ["--bin", args.bin]

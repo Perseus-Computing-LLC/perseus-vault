@@ -37,10 +37,10 @@ rule an in-place update, not a duplicate.
 
 ### Tools
 
-- `mimir_keystone_set(content, scope, scope_id?, weight?, trust_tier_required?, author_trust_tier?, agent_id?, workspace_hash?)`
+- `perseus_vault_keystone_set(content, scope, scope_id?, weight?, trust_tier_required?, author_trust_tier?, agent_id?, workspace_hash?)`
   → `{ id, created, trust_enforced }`. Every mutation is appended to the
   cryptographic audit chain (`event_type = keystone_set`, `category = keystone`).
-- `mimir_keystone_get(scope?, scope_id?, workspace_hash?)` → `{ keystones[], count }`,
+- `perseus_vault_keystone_get(scope?, scope_id?, workspace_hash?)` → `{ keystones[], count }`,
   ordered **weight DESC, then scope (tenant < fleet < agent), then id** for
   deterministic precedence. Widening filters: an omitted scope/scope_id matches
   all; a provided `workspace_hash` includes global (`''`) keystones; a provided
@@ -69,7 +69,7 @@ orchestrator work is tracked separately.
 ## Acceptance criteria (this repo)
 
 - [x] `keystones` table with scope + weight (schema v21).
-- [x] `mimir_keystone_set` / `mimir_keystone_get` MCP tools.
+- [x] `perseus_vault_keystone_set` / `perseus_vault_keystone_get` MCP tools.
 - [x] Trust-tier gating on authoring (caller-asserted pending #684).
 - [x] Keystone mutations crypto-chained like other vault ops.
 - [x] Deterministic weight/scope ordering for a renderer to consume.

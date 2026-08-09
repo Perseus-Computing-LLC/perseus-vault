@@ -10,7 +10,7 @@ question parameter steers the same reflection), `served-memory-api.md`
 `memory-taxonomy-and-precedence.md` (insight class, R3: evidence beats
 inference)
 
-`mimir_dream` clusters by trigram similarity (threshold 0.3) and reflects
+`perseus_vault_dream` clusters by trigram similarity (threshold 0.3) and reflects
 over each cluster **in isolation**. Similarity tells the LLM that episodes
 *look alike*; it cannot say *what makes them equivalent*. The transferable
 explanation usually depends on context outside the cluster — linked
@@ -34,10 +34,10 @@ accompanies the seeded cluster into reflection.
 For each seeded cluster, the reflection input is expanded with three
 neighborhood sources, all from machinery that already exists:
 
-1. **Linked entities** — one hop of the entity link graph (`mimir_link`
+1. **Linked entities** — one hop of the entity link graph (`perseus_vault_link`
    relationships: `depends_on`, `references`, `evidence_for`, custom) from
    each cluster member.
-2. **Community membership** — the GraphRAG community (`mimir_communities`)
+2. **Community membership** — the GraphRAG community (`perseus_vault_communities`)
    each member belongs to, including its summary; a cluster straddling two
    communities is itself a signal the reflection should see.
 3. **Adjacent categories** — entities in sibling categories sharing a

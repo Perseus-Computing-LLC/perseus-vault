@@ -10,7 +10,7 @@
 //!   relationship (evidence_for / derived_from / promoted_to); merged
 //!   near-duplicates count once because dedup folds them into one row
 //! - confidence = certainty scaled by verification state
-//! - superseded = status 'deprecated' (mimir_supersede's marker)
+//! - superseded = status 'deprecated' (perseus_vault_supersede's marker)
 //!
 //! Retrieval prefers beliefs by scope, confidence, freshness, and support
 //! count, and every returned belief explains that preference.
@@ -271,7 +271,7 @@ mod tests {
     use super::*;
 
     fn temp_db() -> Database {
-        let path = std::env::temp_dir().join(format!("mimir-beliefs-{}.db", uuid::Uuid::new_v4()));
+        let path = std::env::temp_dir().join(format!("perseus_vault-beliefs-{}.db", uuid::Uuid::new_v4()));
         Database::open(path.to_str().expect("temp db path")).expect("open temp db")
     }
 

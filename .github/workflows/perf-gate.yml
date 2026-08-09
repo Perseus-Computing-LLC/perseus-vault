@@ -45,20 +45,20 @@ jobs:
       - name: Perf gate (100k corpus, medians of 5)
         env:
           # Corpus sizes (issue #404 scales)
-          MIMIR_PERF_ROWS: "100000"
-          MIMIR_PERF_HISTORY_ROWS: "50000"
-          MIMIR_PERF_HISTORY_VERSIONS: "200"
+          PERSEUS_VAULT_PERF_ROWS: "100000"
+          PERSEUS_VAULT_PERF_HISTORY_ROWS: "50000"
+          PERSEUS_VAULT_PERF_HISTORY_VERSIONS: "200"
           # Budgets (issue #404; measured baselines in parentheses)
-          MIMIR_PERF_BUDGET_RECALL_RARE_MS: "30" # rare-term FTS p50 (6.4ms; ~0.08ms post-#401)
-          MIMIR_PERF_BUDGET_BROWSE_MS: "10000" # browse p50 (35µs; CI runners need heavy headroom)
-          MIMIR_PERF_BUDGET_GET_ENTITY_MS: "1" # get_entity p50 (41µs)
-          MIMIR_PERF_BUDGET_AS_OF_MS: "1" # as_of p50 @50k history rows (17µs)
-          MIMIR_PERF_BUDGET_DECAY_WALL_S: "10" # decay_tick wall (2.2-3.1s)
-          MIMIR_PERF_BUDGET_DECAY_SECOND_TICK_PCT: "1" # #399 signature: 2nd tick rewrites ~0 rows
-          MIMIR_PERF_BUDGET_DECAY_WAL_RATIO: "2" # #399 signature: WAL < 2x DB (was ~9x)
-          MIMIR_PERF_BUDGET_COHERE_WALL_S: "5" # cohere wall
-          MIMIR_PERF_BUDGET_COHERE_HOLD_MS: "1000" # post-#400 longest writer-lock hold
-          MIMIR_PERF_BUDGET_HISTORY_BYTES_PER_ROW: "2048" # @1KB body (1,448)
+          PERSEUS_VAULT_PERF_BUDGET_RECALL_RARE_MS: "30" # rare-term FTS p50 (6.4ms; ~0.08ms post-#401)
+          PERSEUS_VAULT_PERF_BUDGET_BROWSE_MS: "10000" # browse p50 (35µs; CI runners need heavy headroom)
+          PERSEUS_VAULT_PERF_BUDGET_GET_ENTITY_MS: "1" # get_entity p50 (41µs)
+          PERSEUS_VAULT_PERF_BUDGET_AS_OF_MS: "1" # as_of p50 @50k history rows (17µs)
+          PERSEUS_VAULT_PERF_BUDGET_DECAY_WALL_S: "10" # decay_tick wall (2.2-3.1s)
+          PERSEUS_VAULT_PERF_BUDGET_DECAY_SECOND_TICK_PCT: "1" # #399 signature: 2nd tick rewrites ~0 rows
+          PERSEUS_VAULT_PERF_BUDGET_DECAY_WAL_RATIO: "2" # #399 signature: WAL < 2x DB (was ~9x)
+          PERSEUS_VAULT_PERF_BUDGET_COHERE_WALL_S: "5" # cohere wall
+          PERSEUS_VAULT_PERF_BUDGET_COHERE_HOLD_MS: "1000" # post-#400 longest writer-lock hold
+          PERSEUS_VAULT_PERF_BUDGET_HISTORY_BYTES_PER_ROW: "2048" # @1KB body (1,448)
         # --test-threads=1: the latency medians must not contend with another
         # 100k seed/tick running in parallel.
         run: |

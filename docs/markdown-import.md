@@ -1,6 +1,6 @@
 # Controlled Markdown import
 
-`perseus_vault_markdown_import` imports a single Markdown file as **non-authoritative evidence**, not native Vault truth. The legacy `mimir_markdown_import` alias remains callable during the v2 compatibility window.
+`perseus_vault_markdown_import` imports a single Markdown file as **non-authoritative evidence**, not native Vault truth. The legacy `perseus_vault_markdown_import` alias remains callable during the v2 compatibility window.
 
 ```json
 {"path":"/path/to/wiki-note.md","workspace_hash":"workspace","source_system":"wiki"}

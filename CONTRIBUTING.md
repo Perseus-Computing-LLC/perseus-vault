@@ -17,7 +17,7 @@ cargo build --release
 cargo test
 
 # Run with a test database
-cargo run -- --db /tmp/mimir-test.db
+cargo run -- --db /tmp/perseus-vault-test.db
 ```
 
 **Project structure:**

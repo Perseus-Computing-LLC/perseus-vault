@@ -33,7 +33,7 @@ CREATE TABLE IF NOT EXISTS entities (
     emb_sig BLOB,
     always_on INTEGER DEFAULT 0,
     certainty REAL DEFAULT 0.5,
-    -- Persistent importance floor (v2.13.0). Set by mimir_score; decay_tick and
+    -- Persistent importance floor (v2.13.0). Set by perseus_vault_score; decay_tick and
     -- cohere floor decay_score at this value, so an explicit score survives the
     -- recency-based recompute instead of being erased by the next tick
     -- (fidelity > recency). 0.0 = unset, no effect.
@@ -47,8 +47,8 @@ CREATE TABLE IF NOT EXISTS entities (
     -- before bi-temporal support, so existing rows need no interpretation change.
     valid_from_unix_ms INTEGER,      -- when the fact became true in the world (NULL = since creation)
     valid_to_unix_ms INTEGER,        -- when it stopped being true (NULL = still true)
-    recorded_at_unix_ms INTEGER,     -- transaction time: when Mneme first knew it (backfilled = created_at)
-    invalidated_at_unix_ms INTEGER,  -- transaction time: when Mneme retired it (NULL = live)
+    recorded_at_unix_ms INTEGER,     -- transaction time: when Perseus Vault first knew it (backfilled = created_at)
+    invalidated_at_unix_ms INTEGER,  -- transaction time: when Perseus Vault retired it (NULL = live)
     supersedes TEXT DEFAULT '',      -- id of the entity this one replaced
     superseded_by TEXT DEFAULT '',   -- id of the entity that replaced this one
 
@@ -225,7 +225,7 @@ CREATE INDEX IF NOT EXISTS idx_entity_history_catkey ON entity_history(category,
 CREATE VIRTUAL TABLE IF NOT EXISTS entity_history_fts USING fts5(body_json);
 
 -- #683 Keystones: mandatory policy rules, fetched deterministically at session
--- start (mimir_keystone_get) and obeyed over conflicting instructions. Merged
+-- start (perseus_vault_keystone_get) and obeyed over conflicting instructions. Merged
 -- across scope (tenant < fleet < agent) with weight-based conflict resolution.
 -- UNIQUE(scope, scope_id, content, workspace_hash) makes re-setting the same
 -- rule an in-place update rather than a duplicate. Mutations are appended to
@@ -590,7 +590,7 @@ fn apply_migrations(conn: &Connection) -> Result<(), Box<dyn std::error::Error>>
     )?;
 
     // Backfill transaction time for pre-existing rows: a fact's recorded_at is
-    // when Mneme first stored it, i.e. its created_at. (No-op on a fresh DB.)
+    // when Perseus Vault first stored it, i.e. its created_at. (No-op on a fresh DB.)
     conn.execute_batch(
         "UPDATE entities SET recorded_at_unix_ms = created_at_unix_ms \
          WHERE recorded_at_unix_ms IS NULL;",
@@ -636,7 +636,7 @@ fn apply_migrations(conn: &Connection) -> Result<(), Box<dyn std::error::Error>>
 
     // v4 (#339): identity becomes (category, key, workspace_hash). A plain
     // (category, key) uniqueness made cross-workspace key collisions
-    // unstorable, which is what forced mimir_share's "copy into workspace" to
+    // unstorable, which is what forced perseus_vault_share's "copy into workspace" to
     // clobber the source row. Created here (after the workspace_hash ALTER,
     // like idx_entities_invalidated) rather than in the ungated DDL. Safe on
     // a populated DB — the old constraint was strictly tighter, so no
@@ -674,7 +674,7 @@ fn apply_migrations(conn: &Connection) -> Result<(), Box<dyn std::error::Error>>
 
     // ── v9 (#363): bi-temporal valid-time backfill ──────────────────────
     // Self-contained block (renumber-safe). The valid-time axis becomes
-    // queryable (mimir_valid_at / mimir_bitemporal / recall valid filters),
+    // queryable (perseus_vault_valid_at / perseus_vault_bitemporal / recall valid filters),
     // so make the historical convention "NULL valid_from = valid since the
     // fact was recorded" explicit: backfill valid_from to the row's
     // transaction time. valid_to stays NULL (= still true / unbounded).
@@ -966,7 +966,7 @@ fn apply_migrations(conn: &Connection) -> Result<(), Box<dyn std::error::Error>>
     // INSERT…SELECT: under encryption `entity_history.body_json` is ciphertext,
     // and this migration has no key. New/superseded facts are indexed
     // (decrypt-aware) at the write sites going forward; pre-existing history is
-    // (re)indexed by `reindex_fts` (the `mimir_reindex` tool), which owns the
+    // (re)indexed by `reindex_fts` (the `perseus_vault_reindex` tool), which owns the
     // dual encrypted/plaintext path. Fresh installs have empty history, so this
     // is a no-op backfill for them regardless.
     conn.execute_batch(
@@ -1469,7 +1469,7 @@ mod tests {
 
     fn temp_db() -> (Connection, String) {
         let dir = std::env::temp_dir();
-        let path = dir.join(format!("mimir-test-schema-{}.db", uuid::Uuid::new_v4()));
+        let path = dir.join(format!("perseus_vault-test-schema-{}.db", uuid::Uuid::new_v4()));
         let path_str = path.to_str().unwrap().to_string();
         let conn = Connection::open(&path_str).expect("open test db");
         (conn, path_str)
@@ -1662,7 +1662,7 @@ mod tests {
         // could fail with "duplicate column name"; now BEGIN IMMEDIATE
         // serializes them and the loser's post-lock re-check no-ops.
         let dir = std::env::temp_dir();
-        let path = dir.join(format!("mimir-test-race-{}.db", uuid::Uuid::new_v4()));
+        let path = dir.join(format!("perseus_vault-test-race-{}.db", uuid::Uuid::new_v4()));
         let path_str = path.to_str().unwrap().to_string();
 
         // Pre-upgrade fixture: legacy tables without the ALTER-added columns,
@@ -2184,7 +2184,7 @@ mod tests {
                     retrieval_count INTEGER DEFAULT 0, layer TEXT DEFAULT 'working',
                     topic_path TEXT DEFAULT '', created_at_unix_ms INTEGER NOT NULL,
                     last_accessed_unix_ms INTEGER NOT NULL, workspace_hash TEXT DEFAULT '',
-                    tags TEXT DEFAULT '{}', links TEXT DEFAULT '[]', source TEXT DEFAULT 'mimir',
+                    tags TEXT DEFAULT '{}', links TEXT DEFAULT '[]', source TEXT DEFAULT 'perseus-vault',
                     verified INTEGER DEFAULT 0
                 );",
             )
@@ -2260,7 +2260,7 @@ mod tests {
                     retrieval_count INTEGER DEFAULT 0, layer TEXT DEFAULT 'working',
                     topic_path TEXT DEFAULT '', created_at_unix_ms INTEGER NOT NULL,
                     last_accessed_unix_ms INTEGER NOT NULL, workspace_hash TEXT DEFAULT '',
-                    tags TEXT DEFAULT '{}', links TEXT DEFAULT '[]', source TEXT DEFAULT 'mimir',
+                    tags TEXT DEFAULT '{}', links TEXT DEFAULT '[]', source TEXT DEFAULT 'perseus-vault',
                     verified INTEGER DEFAULT 0
                 );",
             )

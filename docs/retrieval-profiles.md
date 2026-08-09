@@ -1,6 +1,6 @@
 # Retrieval profiles
 
-`perseus_vault_recall` supports `retrieval_profile` as an explicit serving posture applied after Vault visibility enforcement and before external-reference/time filters. The legacy `mimir_recall` alias remains callable during the v2 compatibility window.
+`perseus_vault_recall` supports `retrieval_profile` as an explicit serving posture applied after Vault visibility enforcement and before external-reference/time filters. The legacy `perseus_vault_recall` alias remains callable during the v2 compatibility window.
 
 | Profile | Eligible memory | Scope behavior |
 |---|---|---|

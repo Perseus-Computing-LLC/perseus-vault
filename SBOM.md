@@ -1,11 +1,11 @@
-# Software Bill of Materials (SBOM) for Mimir
+# Software Bill of Materials (SBOM) for Perseus Vault
 
-This Software Bill of Materials (SBOM) lists the direct dependencies of the Mimir project, version 2.0.0, to assist with federal procurement compliance and transparency.
+This Software Bill of Materials (SBOM) lists the direct dependencies of the Perseus Vault project, version 2.0.0, to assist with federal procurement compliance and transparency.
 
 ## NTIA Minimum Elements Checklist
 
 *   **Suppliers:** Perseus-Computing-LLC
-*   **Component Name:** mimir
+*   **Component Name:** perseus_vault
 *   **Component Version:** 2.0.0
 *   **Timestamp:** 2026-06-20T12:00:00Z (YYYY-MM-DDTHH:MM:SSZ)
 *   **Author of SBOM data:** Hermes Agent

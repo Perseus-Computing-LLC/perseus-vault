@@ -66,9 +66,9 @@ for i in $(seq 1 30); do
 done
 
 echo "==> [6/6] Pull models to persistent FS"
-# Instruct LLM for mimir_ask/dream/synthesize + benchmark agent calls.
+# Instruct LLM for perseus_vault_ask/dream/synthesize + benchmark agent calls.
 ollama pull qwen2.5:14b-instruct
-# Embedding model for mimir_embed (Ollama /api/embed).
+# Embedding model for perseus_vault_embed (Ollama /api/embed).
 ollama pull nomic-embed-text
 echo
 echo "GPU check:" && nvidia-smi --query-gpu=name,memory.total,memory.used --format=csv,noheader

@@ -2,7 +2,7 @@
 //!
 //! Parses raw memory text into structured items — facts, preferences, temporal
 //! events, episodes — using pure, dependency-free heuristics. No cloud LLM, no
-//! embedding/API call, no network: this preserves Mneme's air-gapped,
+//! embedding/API call, no network: this preserves Perseus Vault's air-gapped,
 //! zero-dependency path (unlike GoodMem/Synap, which require a Gemini key).
 //!
 //! [`Extractor`] is the plugin point. [`NoopExtractor`] is the default (pure

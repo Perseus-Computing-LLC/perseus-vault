@@ -1,4 +1,4 @@
-# Glama-compatible Dockerfile for Perseus Vault (formerly Mneme/Mimir)
+# Glama-compatible Dockerfile for Perseus Vault
 # Builds a static musl binary for Firecracker microVM sandbox execution.
 #
 # This is the LEAN build (--no-default-features): no bundled ONNX embeddings.
@@ -19,17 +19,10 @@ RUN cargo build --release --no-default-features && strip target/release/perseus-
 FROM alpine:3.21
 # Ownership proof for the MCP Registry: MUST equal server.json "name". The
 # registry validates this OCI annotation against the published name; a mismatch
-# is a hard 400 ("OCI image ownership validation failed"). Migrated mimir →
-# perseus-vault to match the server.json rename so v2.17.0+ can publish under
-# the new namespace (the stale mimir label blocked the v2.16.0/v2.17.0 publishes).
+# is a hard 400 ("OCI image ownership validation failed").
 LABEL io.modelcontextprotocol.server.name="io.github.Perseus-Computing-LLC/perseus-vault"
 RUN apk add --no-cache sqlite-libs
 COPY --from=builder /app/target/release/perseus-vault /usr/local/bin/perseus-vault
-# Perseus Vault rename (transition release): keep "mneme" and "mimir" symlinks
-# so existing `docker run`/compose configs that override CMD with either older
-# command name keep working unchanged.
-RUN ln -s /usr/local/bin/perseus-vault /usr/local/bin/mneme && \
-    ln -s /usr/local/bin/perseus-vault /usr/local/bin/mimir
 # Run as a non-root user. The server parses untrusted memory content and writes
 # the SQLite DB at /data; there is no reason for it to hold root in-container.
 # /data is created and owned by the runtime user so the default CMD works with a

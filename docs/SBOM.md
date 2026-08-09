@@ -1,7 +1,7 @@
 # Perseus Vault SBOM (Software Bill of Materials)
 ## For Federal Procurement Compliance
 
-**Package:** mimir v2.0.0
+**Package:** perseus_vault v2.0.0
 **License:** MIT
 **Repository:** https://github.com/Perseus-Computing-LLC/perseus-vault
 **Language:** Rust (edition 2021)
@@ -110,9 +110,9 @@
 ## NTIA Minimum Elements Checklist
 
 - [x] Supplier name: Perseus Computing LLC
-- [x] Component name: mimir
+- [x] Component name: perseus_vault
 - [x] Version string: 2.0.0
-- [x] Unique identifier: crates.io:mimir@2.0.0
+- [x] Unique identifier: crates.io:perseus_vault@2.0.0
 - [x] Dependency relationship: listed above
 - [x] SBOM author: Perseus Computing LLC
 - [x] Timestamp: included

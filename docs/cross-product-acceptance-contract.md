@@ -1,16 +1,16 @@
 # Cross-product served-memory acceptance contract
 
-**Producer:** `perseus_vault_recall` is the canonical public producer name. Legacy `mimir_*` and `mneme_*` names remain compatibility aliases during v2, but must not appear as the producer of new acceptance evidence.
+**Producer:** `perseus_vault_recall` is the canonical public producer name. Legacy `perseus_vault_*` and `perseus_vault_*` names remain compatibility aliases during v2, but must not appear as the producer of new acceptance evidence.
 
 ## Fixture
 
-`tests/fixtures/cross_product_served_memory_contract.json` is a shareable projection for the Perseus → Vault → Plutus acceptance harness. It includes only:
+`tests/fixtures/cross_product_served_memory_contract.json` is a shareable projection for the Perseus → Vault → Ledger acceptance harness. It includes only:
 
 - served-memory identity, scope, promotion provenance, origin kind, and external reference identifiers;
 - `why_served` explanation fields; and
 - action/authority/approval identifiers plus a SHA-256 outcome commitment.
 
-It deliberately excludes raw memory content, `body_json`, prompts, secrets, and rendered-context text. Perseus hashes its deterministic render and Plutus commits the corresponding hash-only projection in an evidence receipt.
+It deliberately excludes raw memory content, `body_json`, prompts, secrets, and rendered-context text. Perseus hashes its deterministic render and Ledger commits the corresponding hash-only projection in an evidence receipt.
 
 ## Invariants
 

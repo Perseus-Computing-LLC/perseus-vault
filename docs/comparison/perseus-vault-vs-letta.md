@@ -44,7 +44,7 @@ that includes memory as one component.
 ```
 CrewAI ──────────┐
 LangGraph ───────┤
-AutoGen ─────────┼──MCP stdio── mimir (Rust binary)
+AutoGen ─────────┼──MCP stdio── perseus_vault (Rust binary)
 Claude Desktop ──┤                    └── SQLite
 Cursor ──────────┘
 ```
@@ -111,14 +111,14 @@ a standalone memory service.
 Perseus Vault's 90 canonical MCP tools cover the entire memory surface. Letta exposes ~8 tools
 focused on agent state management. Perseus Vault's additional tools enable:
 
-- **mimir_correct** — structured learning from errors
-- **mimir_synthesize** — LLM session synthesis
-- **mimir_bench** — performance tracking
-- **mimir_federate**: cross-workspace entity sharing, implemented as a local
+- **perseus_vault_correct** — structured learning from errors
+- **perseus_vault_synthesize** — LLM session synthesis
+- **perseus_vault_bench** — performance tracking
+- **perseus_vault_federate**: cross-workspace entity sharing, implemented as a local
   export / workspace-rename / re-import (file based, no network peers); the
   Windows-safe default path is tracked in #704
-- **mimir_vault_export/import** — portable markdown format
-- **mimir_purge** — permanent deletion with VACUUM reclaim
+- **perseus_vault_vault_export/import** — portable markdown format
+- **perseus_vault_purge** — permanent deletion with VACUUM reclaim
 
 ## Honest Assessment
 

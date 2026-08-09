@@ -18,7 +18,7 @@ def run_backtest(binary_path, trace_path):
     
     # Perseus Vault typically uses standard env vars for DB configuration
     env["PERSEUS_VAULT_DB"] = sandbox_db
-    env["MIMIR_DB_PATH"] = sandbox_db
+    env["PERSEUS_VAULT_DB_PATH"] = sandbox_db
     
     try:
         process = subprocess.Popen(

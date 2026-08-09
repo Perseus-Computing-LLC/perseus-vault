@@ -32,7 +32,7 @@ query/task, and a budget (max items / max chars — serving is always
 budget-limited, matching the context-injection posture).
 
 ```
-serve(view="briefing", query="plutus status", workspace_hash="…",
+serve(view="briefing", query="ledger status", workspace_hash="…",
       max_items=12, explain=true) -> ServedMemoryView
 ```
 
@@ -48,10 +48,10 @@ bug; explanations must be compact enough for prompt injection and debugging.
   "memory_class": "episode",
   "explanation": {
     "why_served": "briefing view: current state; tier-4 recent episodic evidence",
-    "matched_on": ["lexical: 'plutus'", "semantic similarity 0.81"],
+    "matched_on": ["lexical: 'ledger'", "semantic similarity 0.81"],
     "scope": "global",
     "anchors": [{"ref_type": "pull_request",
-                 "ref_value": "github:Perseus-Computing-LLC/plutus#176"}],
+                 "ref_value": "github:Perseus-Computing-LLC/ledger#176"}],
     "recorded_at": "2026-07-20T00:50Z",
     "last_reinforced_at": "2026-07-20T00:50Z",
     "confidence": 0.72,
@@ -105,11 +105,11 @@ score = relevance(lexical, semantic)
 
 | Existing | Relationship |
 |---|---|
-| `mimir_recall` (fts5/dense/hybrid) | Candidate generator for the `relevant_context` view. Serving adds precedence ordering, explanation payloads, and budgets on top; recall stays the lower-level primitive and is unchanged. |
-| `mimir_context` | The `active_instructions` + `relevant_context` views with prompt-budget clamping. `mimir_context` is effectively the first serving consumer; its on-demand mode already implements the relevance gate. |
-| `mimir_recall_when` | Trigger-matched subset of `active_instructions`. |
-| `mimir_conflicts` | Candidate generator for the `contradictions` view. |
-| `mimir_as_of` / `valid_at` / `history` | Time-travel views; served items from these name the temporal mode in `why_served`. |
+| `perseus_vault_recall` (fts5/dense/hybrid) | Candidate generator for the `relevant_context` view. Serving adds precedence ordering, explanation payloads, and budgets on top; recall stays the lower-level primitive and is unchanged. |
+| `perseus_vault_context` | The `active_instructions` + `relevant_context` views with prompt-budget clamping. `perseus_vault_context` is effectively the first serving consumer; its on-demand mode already implements the relevance gate. |
+| `perseus_vault_recall_when` | Trigger-matched subset of `active_instructions`. |
+| `perseus_vault_conflicts` | Candidate generator for the `contradictions` view. |
+| `perseus_vault_as_of` / `valid_at` / `history` | Time-travel views; served items from these name the temporal mode in `why_served`. |
 
 Design rule: **serving never bypasses the store's invariants** (workspace
 isolation, archived exclusion, valid-time). It is an ordering +
@@ -120,23 +120,23 @@ explanation layer over the same candidate pools.
 Selected synthesis flow (per #722/#726 acceptance): **an operator briefing
 on a subsystem, generated from the live shared Vault.**
 
-Worked example — `serve(view="briefing", query="plutus subscription gate
+Worked example — `serve(view="briefing", query="ledger subscription gate
 deploy")` against the production shared Vault, 2026-07-21 (real entities,
 condensed):
 
 ```markdown
-## Briefing: plutus subscription gate deploy
+## Briefing: ledger subscription gate deploy
 
 ### Current state
-- Subscription gate SHIPPED 2026-07-20 ~00:50Z; plutus#175 closed by PR #176,
+- Subscription gate SHIPPED 2026-07-20 ~00:50Z; ledger#175 closed by PR #176,
   deployed, gate CLOSED in prod.
-  · why: tier-4 recent episodic · anchors: plutus#176 · confidence 0.72
+  · why: tier-4 recent episodic · anchors: ledger#176 · confidence 0.72
   · support: 3 independent ops memories
 
 ### Active instructions
 - Deploys are Greg-side only; Cloud has no deploy host access.
   · why: tier-2 scoped instruction (operations) · scope: global
-- After any plutus deploy, check stripe_events vs Stripe and replay gaps —
+- After any ledger deploy, check stripe_events vs Stripe and replay gaps —
   deploy windows drop webhooks.
   · why: tier-5 synthesized insight · derived from 2 outage episodes
 
@@ -144,7 +144,7 @@ condensed):
 - none on this subject
 
 ### Open loops
-- Flip PLUTUS_SUBSCRIPTIONS_ENABLED=1 when gates #4/#164 close.
+- Flip LEDGER_SUBSCRIPTIONS_ENABLED=1 when gates #4/#164 close.
 - Redeploy main (PRs #172/#173 merged, not yet deployed at time of writing).
 
 ### Contradictions / stale
@@ -166,11 +166,11 @@ Observations from the validation:
 
 ## 6. Implementation notes (follow-up engineering)
 
-- Serving endpoint: read-only MCP tool `mimir_serve(view, query, scope,
+- Serving endpoint: read-only MCP tool `perseus_vault_serve(view, query, scope,
   budget, explain)`; no new storage.
 - Explanation payload is computed from existing fields plus `support_count`
   derivation (taxonomy §5); the only new computed value.
-- Budget enforcement mirrors `mimir_context`'s per-model char budget.
+- Budget enforcement mirrors `perseus_vault_context`'s per-model char budget.
 - First consumer: Perseus render layer (perseus#833/#835/#838) — the
   cross-repo dependency is explicit by design.
 

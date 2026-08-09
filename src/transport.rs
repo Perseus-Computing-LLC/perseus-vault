@@ -81,7 +81,7 @@ pub fn build_transport_router(mode: TransportMode, auth_token: Option<String>) -
     // Tightened CORS: explicit methods + headers instead of the previous
     // `Any/Any/Any`. Origin mirrors the request (auth is header-based Bearer, not
     // cookie/ambient, so reflecting Origin does not enable a cross-site
-    // credential attack), but a `MIMIR_CORS_ALLOWED_ORIGINS` allowlist can lock
+    // credential attack), but a `PERSEUS_VAULT_CORS_ALLOWED_ORIGINS` allowlist can lock
     // it down further.
     let cors = CorsLayer::new()
         .allow_origin(cors_allow_origin())
@@ -102,9 +102,9 @@ pub fn build_transport_router(mode: TransportMode, auth_token: Option<String>) -
 }
 
 /// Resolve the CORS origin policy: an explicit comma-separated allowlist from
-/// `MIMIR_CORS_ALLOWED_ORIGINS` if set, otherwise mirror the request origin.
+/// `PERSEUS_VAULT_CORS_ALLOWED_ORIGINS` if set, otherwise mirror the request origin.
 fn cors_allow_origin() -> AllowOrigin {
-    match std::env::var("MIMIR_CORS_ALLOWED_ORIGINS") {
+    match std::env::var("PERSEUS_VAULT_CORS_ALLOWED_ORIGINS") {
         Ok(list) if !list.trim().is_empty() => {
             let origins: Vec<header::HeaderValue> = list
                 .split(',')
@@ -179,7 +179,7 @@ async fn handle_message(
 
     let state = get_state()?;
     // #210: the handler is blocking and can make synchronous LLM round-trips
-    // (mimir_ask / mimir_synthesize), so run it on the blocking thread pool to
+    // (perseus_vault_ask / perseus_vault_synthesize), so run it on the blocking thread pool to
     // keep the Tokio async workers (SSE streams, connection accept) free (#217).
     // No locks: the DB checks out its own pooled connection and MCPState's
     // `initialized` is atomic, so concurrent requests run in parallel.
@@ -324,13 +324,13 @@ mod tests {
     /// cargo test --release pool_load_test_http_transport -- --ignored --nocapture
     ///
     /// # sweep: small pool, default busy_timeout, more clients
-    /// MIMIR_POOL_MAX_SIZE=4 MIMIR_BUSY_TIMEOUT_MS=5000 MIMIR_LOADTEST_CLIENTS=32 \
+    /// PERSEUS_VAULT_POOL_MAX_SIZE=4 PERSEUS_VAULT_BUSY_TIMEOUT_MS=5000 PERSEUS_VAULT_LOADTEST_CLIENTS=32 \
     ///   cargo test --release pool_load_test_http_transport -- --ignored --nocapture
     /// ```
     ///
-    /// Tunables (env): `MIMIR_LOADTEST_CLIENTS` (default 16),
-    /// `MIMIR_LOADTEST_WRITES` / `MIMIR_LOADTEST_READS` per client (default 25 / 75),
-    /// plus the pool's `MIMIR_POOL_MAX_SIZE` / `MIMIR_BUSY_TIMEOUT_MS`
+    /// Tunables (env): `PERSEUS_VAULT_LOADTEST_CLIENTS` (default 16),
+    /// `PERSEUS_VAULT_LOADTEST_WRITES` / `PERSEUS_VAULT_LOADTEST_READS` per client (default 25 / 75),
+    /// plus the pool's `PERSEUS_VAULT_POOL_MAX_SIZE` / `PERSEUS_VAULT_BUSY_TIMEOUT_MS`
     /// (consumed by `Database::open`).
     ///
     /// Asserts the four properties #223 calls out: no `database is locked` /
@@ -376,9 +376,9 @@ mod tests {
             }
         }
 
-        let clients = env_usize("MIMIR_LOADTEST_CLIENTS", 16);
-        let writes_per = env_usize("MIMIR_LOADTEST_WRITES", 25);
-        let reads_per = env_usize("MIMIR_LOADTEST_READS", 75);
+        let clients = env_usize("PERSEUS_VAULT_LOADTEST_CLIENTS", 16);
+        let writes_per = env_usize("PERSEUS_VAULT_LOADTEST_WRITES", 25);
+        let reads_per = env_usize("PERSEUS_VAULT_LOADTEST_READS", 75);
 
         // This test measures DB-pool concurrency + max throughput by flooding the
         // transport as fast as possible — which is inherently defeated by the HTTP
@@ -386,10 +386,10 @@ mod tests {
         // errors). Disable rate limiting for this run; it has its own unit tests
         // in `httplimit`. (The bucket is per-router, so this only affects the
         // router built below.)
-        std::env::set_var("MIMIR_HTTP_RATE_PER_SEC", "0");
+        std::env::set_var("PERSEUS_VAULT_HTTP_RATE_PER_SEC", "0");
 
         let path = std::env::temp_dir()
-            .join(format!("mimir-loadtest-{}.db", uuid::Uuid::new_v4()));
+            .join(format!("perseus_vault-loadtest-{}.db", uuid::Uuid::new_v4()));
         let path_str = path.to_str().unwrap().to_string();
         let db = Database::open(&path_str).expect("open load-test db");
         init_transport_state(Arc::new(db));
@@ -460,7 +460,7 @@ mod tests {
                 for i in 0..ops {
                     if i < writes_per {
                         // High-entropy unique content so each write is a real
-                        // create — mimir_remember dedups bodies above 70% trigram
+                        // create — perseus_vault_remember dedups bodies above 70% trigram
                         // similarity, so near-identical payloads would collapse
                         // and `persisted == issued` would no longer test durability.
                         let nonce = format!(
@@ -468,7 +468,7 @@ mod tests {
                             uuid::Uuid::new_v4().simple(),
                             uuid::Uuid::new_v4().simple()
                         );
-                        let (text, us) = call("mimir_remember", serde_json::json!({
+                        let (text, us) = call("perseus_vault_remember", serde_json::json!({
                             "category": "loadtest",
                             "key": format!("c{}-w{}", c, i),
                             "body_json": format!("{{\"content\":\"{}\"}}", nonce),
@@ -477,13 +477,13 @@ mod tests {
                         classify(&text, &lock_errors, &other_errors, &writes_ok, true);
                     }
                     if i < reads_per {
-                        let (text, us) = call("mimir_recall", serde_json::json!({
+                        let (text, us) = call("perseus_vault_recall", serde_json::json!({
                             "query": "client", "category": "loadtest", "limit": 10
                         }));
                         latencies.push(us);
                         classify(&text, &lock_errors, &other_errors, &writes_ok, false);
 
-                        let (text2, us2) = call("mimir_context", serde_json::json!({}));
+                        let (text2, us2) = call("perseus_vault_context", serde_json::json!({}));
                         latencies.push(us2);
                         classify(&text2, &lock_errors, &other_errors, &writes_ok, false);
                     }
@@ -532,8 +532,8 @@ mod tests {
              latency p50={}us p99={}us max={}us\n\
              lock_errors={lock} other_errors={other}\n\
              writes: issued={issued_writes} ok={ok_writes} persisted={persisted}",
-            std::env::var("MIMIR_POOL_MAX_SIZE").unwrap_or_else(|_| "16".into()),
-            std::env::var("MIMIR_BUSY_TIMEOUT_MS").unwrap_or_else(|_| "5000".into()),
+            std::env::var("PERSEUS_VAULT_POOL_MAX_SIZE").unwrap_or_else(|_| "16".into()),
+            std::env::var("PERSEUS_VAULT_BUSY_TIMEOUT_MS").unwrap_or_else(|_| "5000".into()),
             all.len(),
             elapsed.as_secs_f64(),
             all.len() as f64 / elapsed.as_secs_f64().max(1e-9),
@@ -561,7 +561,7 @@ mod tests {
         // walls with 30s max latency; the budget catches a regression whose
         // symptom is stalling rather than erroring. Checked LAST so the more
         // specific error/durability asserts above name the failure first.
-        if let Some(budget_secs) = std::env::var("MIMIR_LOADTEST_MAX_WALL_SECS")
+        if let Some(budget_secs) = std::env::var("PERSEUS_VAULT_LOADTEST_MAX_WALL_SECS")
             .ok()
             .and_then(|v| v.parse::<f64>().ok())
         {

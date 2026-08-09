@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
-"""Mimir LongMemEval session-level retrieval benchmark (offline, judge-free).
+"""Perseus Vault LongMemEval session-level retrieval benchmark (offline, judge-free).
 
-Measures whether Mimir *retrieves the gold evidence session* for each LongMemEval
+Measures whether Perseus Vault *retrieves the gold evidence session* for each LongMemEval
 question, the same session-level recall metric LongMemEval itself defines via
 `answer_session_ids`. It is fully offline and deterministic: it drives the real
-`mimir` binary over MCP stdio, ingests each question's haystack (one memory per
+`perseus_vault` binary over MCP stdio, ingests each question's haystack (one memory per
 session, namespaced by question id), populates dense vectors with the **bundled**
 ONNX model (no network, no API key, no LLM), and scores recall@k / MRR per search
 mode (fts5 keyword, dense vector, hybrid RRF).
 
 What this is and is NOT:
   * IS: a reproducible RETRIEVAL-quality number (does the right memory come back?).
-    This is the judge-free half of LongMemEval and the half Mimir's local-first
+    This is the judge-free half of LongMemEval and the half Perseus Vault's local-first
     pitch can own: anyone can re-run it and get the same number with no API key.
   * IS NOT: end-to-end QA accuracy. That second stage feeds the retrieved context
     to an LLM and judges the answer; it needs an LLM + judge model and is therefore
@@ -25,7 +25,7 @@ Dataset (real, public): LongMemEval `_s` split, 500 instances, ~48 sessions each
 Usage:
   python run.py --data /path/to/longmemeval_s_cleaned.json            # full 500
   python run.py --data ... --max-instances 50                          # quick subset
-  python run.py --data ... --bin /path/to/mimir --k 1 3 5 10 --out report.json
+  python run.py --data ... --bin /path/to/perseus-vault --k 1 3 5 10 --out report.json
 """
 import argparse
 import hashlib
@@ -45,21 +45,21 @@ def find_binary(explicit):
     cands = []
     if explicit:
         cands.append(explicit)
-    if os.environ.get("MIMIR_BIN"):
-        cands.append(os.environ["MIMIR_BIN"])
+    if os.environ.get("PERSEUS_VAULT_BIN"):
+        cands.append(os.environ["PERSEUS_VAULT_BIN"])
     # Perseus Vault rename: the release binary is now "perseus-vault"; fall
-    # back through the prior names ("mneme", then "mimir") for older builds.
-    for name in ("perseus-vault", "mneme", "mimir"):
+    # The release binary is "perseus-vault".
+    for name in ("perseus-vault",):
         exe = f"{name}.exe" if os.name == "nt" else name
         cands += [str(REPO / "target" / "release" / exe), str(REPO / "target" / "debug" / exe)]
     for c in cands:
         if c and Path(c).exists():
             return str(Path(c).resolve())
-    sys.exit("error: perseus-vault binary not found. `cargo build --release` or pass --bin / set MIMIR_BIN.")
+    sys.exit("error: perseus-vault binary not found. `cargo build --release` or pass --bin / set PERSEUS_VAULT_BIN.")
 
 
-class MimirServer:
-    """One persistent mimir process; many MCP tools/call over stdio.
+class PerseusVaultServer:
+    """One persistent perseus_vault process; many MCP tools/call over stdio.
 
     Process-per-call (as in ../recall/run.py) does not scale to LongMemEval's
     ~24k session writes, so we keep one process open and stream requests.
@@ -91,7 +91,7 @@ class MimirServer:
         while True:
             line = self.p.stdout.readline()
             if not line:
-                raise RuntimeError("mimir closed the stream unexpectedly")
+                raise RuntimeError("perseus_vault closed the stream unexpectedly")
             line = line.strip()
             if not line:
                 continue
@@ -145,7 +145,7 @@ def recall_scores(ranked_keys, relevant, ks):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Mimir LongMemEval session-level retrieval benchmark")
+    ap = argparse.ArgumentParser(description="Perseus Vault LongMemEval session-level retrieval benchmark")
     ap.add_argument("--data", required=True, help="Path to longmemeval_s_cleaned.json")
     ap.add_argument("--bin", default=None)
     ap.add_argument("--max-instances", type=int, default=0, help="0 = all 500")
@@ -154,7 +154,7 @@ def main():
                     help="Search modes. Use 'auto' to send an empty mode and exercise "
                          "#271's auto-selection (the real default user experience).")
     ap.add_argument("--skip-explicit-embed", action="store_true",
-                    help="Do not call mimir_embed; rely on #271 auto-embed-on-write. "
+                    help="Do not call perseus_vault_embed; rely on #271 auto-embed-on-write. "
                          "Combined with mode 'auto', this is exactly what a user gets "
                          "from a bare remember + recall.")
     ap.add_argument("--limit", type=int, default=10, help="Sessions requested per query")
@@ -168,7 +168,7 @@ def main():
     ks = sorted(set(args.k))
 
     db_dir = Path(os.environ.get("TMPDIR") or os.environ.get("TEMP") or "/tmp")
-    db = str(db_dir / "mimir-longmemeval.db")
+    db = str(db_dir / "perseus_vault-longmemeval.db")
 
     def wipe_db():
         for ext in ("", "-wal", "-shm"):
@@ -195,11 +195,11 @@ def main():
         sids = inst.get("haystack_session_ids", [])
 
         wipe_db()
-        srv = MimirServer(binary, db)
+        srv = PerseusVaultServer(binary, db)
         try:
             # 1. Ingest this instance's sessions.
             for sid, turns in zip(sids, sessions):
-                srv.call("mimir_remember", {
+                srv.call("perseus_vault_remember", {
                     "category": qid, "key": sid,
                     "body_json": json.dumps({"note": session_text(turns)}),
                     "type": "fact",
@@ -210,14 +210,14 @@ def main():
             # write already auto-embeds, so --skip-explicit-embed measures the
             # bare remember+recall path real users actually hit.
             if not args.skip_explicit_embed:
-                srv.call("mimir_embed", {"batch_category": qid, "batch_limit": 1000})
+                srv.call("perseus_vault_embed", {"batch_category": qid, "batch_limit": 1000})
 
             # 3. Query per mode, score session-level recall.
             row = {"question_id": qid, "question_type": qtype, "evidence": evidence, "modes": {}}
             for mode in args.modes:
                 # "auto" sends an empty mode so the server picks per #271.
                 recall_mode = "" if mode == "auto" else mode
-                r = srv.call("mimir_recall", {
+                r = srv.call("perseus_vault_recall", {
                     "query": question, "mode": recall_mode, "category": qid,
                     "limit": args.limit, "trust_weight": 0, "min_decay": 0,
                 })
@@ -257,7 +257,7 @@ def main():
     signature = hashlib.sha256(sig_payload.encode("utf-8")).hexdigest()
 
     report = {
-        "benchmark": "mimir-longmemeval-retrieval",
+        "benchmark": "perseus_vault-longmemeval-retrieval",
         "metric": "session-level recall@k vs answer_session_ids (judge-free, offline)",
         "dataset": "longmemeval_s_cleaned.json",
         "n_instances": n,
@@ -277,7 +277,7 @@ def main():
     }
     Path(args.out).write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
 
-    print(f"\nMimir LongMemEval session-level retrieval - {n} instances, {n_sessions_total} sessions")
+    print(f"\nPerseus Vault LongMemEval session-level retrieval - {n} instances, {n_sessions_total} sessions")
     hdr = "mode    " + "".join(f"  R@{k:<4}" for k in ks) + "  MRR"
     print(hdr)
     print("-" * len(hdr))

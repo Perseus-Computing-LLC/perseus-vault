@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""quality_lift.py — WS4: does a bigger model make mimir_ask meaningfully better?
+"""quality_lift.py — WS4: does a bigger model make perseus_vault_ask meaningfully better?
 
-Runs the SAME question set through mimir_ask twice (14B vs 72B chat model), over
+Runs the SAME question set through perseus_vault_ask twice (14B vs 72B chat model), over
 the SAME seeded+embedded vault, and reports per-model accuracy (expected-substring
 present), citation presence, and answer latency. This quantifies the
 "supercharged when leveraged on a powerful platform" claim honestly.
@@ -43,7 +43,7 @@ def run_model(bin_path, db, chat_model, embed_endpoint, gen_endpoint):
     m = MCP(argv)
     res = {"model": chat_model, "probes": []}
     try:
-        # Pre-warm the chat model so the first timed mimir_ask doesn't eat the
+        # Pre-warm the chat model so the first timed perseus_vault_ask doesn't eat the
         # cold-load penalty (a 72B takes >30s to load into VRAM, which exceeds the
         # vault's hardcoded 30s LLM timeout and confounds the quality comparison).
         # This isolates ANSWER QUALITY from model-load time.
@@ -56,16 +56,16 @@ def run_model(bin_path, db, chat_model, embed_endpoint, gen_endpoint):
         except Exception as e:
             print(f"warmup warning ({chat_model}): {e}")
         for i, f in enumerate(FACTS):
-            m.tool("mimir_remember", {"category": "kb", "key": f"f{i}",
+            m.tool("perseus_vault_remember", {"category": "kb", "key": f"f{i}",
                    "body_json": json.dumps({"content": f})})
         # embed once (idempotent per model DB)
         while True:
-            e = m.tool("mimir_embed", {"batch_category": "kb", "batch_limit": 1000})
+            e = m.tool("perseus_vault_embed", {"batch_category": "kb", "batch_limit": 1000})
             if (e.get("embedded", 0) or 0) == 0:
                 break
         for q, keys in QUESTIONS:
             t = time.time()
-            a = m.tool("mimir_ask", {"query": q, "top_k": 5})
+            a = m.tool("perseus_vault_ask", {"query": q, "top_k": 5})
             dt = time.time() - t
             ans = a.get("answer", str(a)) if isinstance(a, dict) else str(a)
             srcs = a.get("sources", []) if isinstance(a, dict) else []
@@ -93,7 +93,7 @@ def main():
     ap.add_argument("--tier", default="2xH100-80GB")
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
-    report = {"tier": a.tier, "task": "mimir_ask grounded QA", "models": []}
+    report = {"tier": a.tier, "task": "perseus_vault_ask grounded QA", "models": []}
     for mdl in a.models:
         db = f"{a.db_prefix}_{mdl.replace(':','_').replace('.','')}.db"
         os.system(f"rm -f {db}*")

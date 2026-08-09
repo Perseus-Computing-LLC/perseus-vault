@@ -20,7 +20,7 @@ FACTS = [
 ]
 created = 0
 for cat, key, body in FACTS:
-    r = m.tool("mimir_remember", {"category": cat, "key": key, "body_json": json.dumps({"content": body})})
+    r = m.tool("perseus_vault_remember", {"category": cat, "key": key, "body_json": json.dumps({"content": body})})
     if isinstance(r, dict) and r.get("action") == "created":
         created += 1
 
@@ -34,7 +34,7 @@ hits = 0
 lat = []
 for q, gold in QUERIES:
     t = time.time()
-    r = m.tool("mimir_recall", {"query": q, "mode": "fts5", "limit": 3})
+    r = m.tool("perseus_vault_recall", {"query": q, "mode": "fts5", "limit": 3})
     lat.append((time.time()-t)*1000)
     items = r.get("items", []) if isinstance(r, dict) else r
     keys = [it.get("key") for it in items[:3]]

@@ -32,7 +32,7 @@ The capture output is reported under `precompact_capture`:
 }
 ```
 
-Call this through `perseus_vault_autocohere`. Legacy `mimir_autocohere` and `mimir_capture` aliases remain callable during the v2 compatibility window. The pre-compaction capture remains bounded by the ordinary capture cap and near-duplicate merging rules.
+Call this through `perseus_vault_autocohere`. Legacy `perseus_vault_autocohere` and `perseus_vault_capture` aliases remain callable during the v2 compatibility window. The pre-compaction capture remains bounded by the ordinary capture cap and near-duplicate merging rules.
 
 ## Scope and non-goals
 

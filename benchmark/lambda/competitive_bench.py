@@ -40,13 +40,13 @@ def run_perseus(argv_serve):
     res = {"system": "perseus-vault", "source": "measured", "probes": []}
     try:
         for fact, q, exp in PROBES:
-            mcp.tool("mimir_remember", {"category": "conv", "key": f"f{len(res['probes'])}",
+            mcp.tool("perseus_vault_remember", {"category": "conv", "key": f"f{len(res['probes'])}",
                      "body_json": json.dumps({"content": fact})})
         for cat in ["conv"]:
-            mcp.tool("mimir_embed", {"batch_category": cat})
+            mcp.tool("perseus_vault_embed", {"batch_category": cat})
         for fact, q, exp in PROBES:
             t = time.time()
-            a = mcp.tool("mimir_ask", {"query": q, "top_k": 5})
+            a = mcp.tool("perseus_vault_ask", {"query": q, "top_k": 5})
             dt = time.time()-t
             ans = a.get("answer", str(a)) if isinstance(a, dict) else str(a)
             res["probes"].append({"q": q, "correct": judge(ans, exp),

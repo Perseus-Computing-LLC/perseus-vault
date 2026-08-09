@@ -1,7 +1,7 @@
 # Evidence-backed claim cards (#852)
 
 Status: implemented (branch `feat/vault-852-claim-cards`)
-Surface: `mimir_claim_card` (MCP, read-only)
+Surface: `perseus_vault_claim_card` (MCP, read-only)
 
 ## What a claim card is
 
@@ -16,8 +16,8 @@ withheld.
 It is a **view over existing entities and links — never a second source of
 truth**. Nothing is written by building a card; `confirm`/`correct`/
 `exclude`/`revalidate` map to the existing governed mutation tools
-(`mimir_score`, `mimir_follow`, `mimir_correct`, `mimir_supersede`,
-`mimir_forget`), all of which create history rather than editing evidence
+(`perseus_vault_score`, `perseus_vault_follow`, `perseus_vault_correct`, `perseus_vault_supersede`,
+`perseus_vault_forget`), all of which create history rather than editing evidence
 in place. The card's `lifecycle` block states that mapping per state.
 
 ## Provenance class (derived, never guessed)

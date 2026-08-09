@@ -2,7 +2,7 @@
 //
 // When --embedding-model is set, uses a local ONNX model for embeddings
 // instead of requiring Ollama. The all-MiniLM-L6-v2 model (80MB, 384-dim) is
-// downloaded on first use and cached at ~/.mimir/models/.
+// downloaded on first use and cached at ~/.perseus-vault/models/.
 //
 // Inference backends:
 //   - Native (feature = "bundled-embeddings"): ort + tokenizers crates
@@ -45,13 +45,13 @@ impl EmbeddingConfig {
         }
     }
 
-    /// Default model path in ~/.mimir/models/
+    /// Default model path in ~/.perseus-vault/models/
     pub fn default_path() -> PathBuf {
         let home = std::env::var("HOME")
             .or_else(|_| std::env::var("USERPROFILE"))
             .unwrap_or_else(|_| "/tmp".to_string());
         PathBuf::from(home)
-            .join(".mimir")
+            .join(".perseus-vault")
             .join("models")
             .join("all-MiniLM-L6-v2")
             .join("model.onnx")
@@ -87,7 +87,7 @@ pub fn ensure_model(config: &EmbeddingConfig) -> Result<(), String> {
 
     if !config.model_path.exists() {
         eprintln!(
-            "mimir: downloading embedding model to {} ...",
+            "perseus-vault: downloading embedding model to {} ...",
             config.model_path.display()
         );
         download_file(
@@ -99,7 +99,7 @@ pub fn ensure_model(config: &EmbeddingConfig) -> Result<(), String> {
     let tokenizer_path = model_dir.join("tokenizer.json");
     if !tokenizer_path.exists() {
         eprintln!(
-            "mimir: downloading tokenizer to {} ...",
+            "perseus-vault: downloading tokenizer to {} ...",
             tokenizer_path.display()
         );
         download_file(
@@ -178,7 +178,7 @@ pub fn generate_embedding(
         match generate_with_ort(config, text) {
             Ok(vec) => return Ok(vec),
             Err(e) => eprintln!(
-                "mimir: native embedding failed ({}), trying Python fallback...",
+                "perseus-vault: native embedding failed ({}), trying Python fallback...",
                 e
             ),
         }
@@ -187,13 +187,13 @@ pub fn generate_embedding(
     // Try Python onnxruntime fallback
     match generate_with_python(config, text) {
         Ok(vec) => return Ok(vec),
-        Err(e) => eprintln!("mimir: Python embedding fallback failed ({})", e),
+        Err(e) => eprintln!("perseus-vault: Python embedding fallback failed ({})", e),
     }
 
     Err("No embedding backend available. Options:\n\
          - Rebuild with: cargo build --release --features bundled-embeddings\n\
          - Install Python + onnxruntime: pip install onnxruntime\n\
-         - Use Ollama: mimir serve --llm-endpoint http://localhost:11434"
+         - Use Ollama: perseus_vault serve --llm-endpoint http://localhost:11434"
         .into())
 }
 

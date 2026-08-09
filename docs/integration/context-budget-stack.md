@@ -67,7 +67,7 @@ plugins:
 mcp_servers:
   perseus-vault:         # injects + captures memory (this repo)
     command: /usr/local/bin/perseus-vault
-    args: ["--db", "~/.mimir/data/perseus-vault.db"]
+    args: ["--db", "~/.perseus-vault/data/perseus-vault.db"]
 ```
 
 With both active you get full budget control end to end: **Noisegate keeps

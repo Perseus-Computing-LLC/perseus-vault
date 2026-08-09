@@ -3,7 +3,7 @@
 #
 # Polls for a multi-GPU node in us-south-2 (the FS is region-locked there),
 # preferring 8xH100; launches it, provisions, brings up the per-GPU Ollama fleet
-# + nginx LB (serve_fleet.sh), seeds 1M via mimir_remember (real dedup), embeds
+# + nginx LB (serve_fleet.sh), seeds 1M via perseus_vault_remember (real dedup), embeds
 # the corpus CLIENT-SIDE across all GPUs (scale_bench_1m.py --embed-fleet), then
 # measures uniform + warm-set recall. DB + result live on the PERSISTENT FS so a
 # timeout/termination is resumable. Terminates the instance ONLY on a definitive

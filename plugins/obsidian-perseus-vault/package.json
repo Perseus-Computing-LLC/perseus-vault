@@ -1,14 +1,14 @@
 {
-  "name": "obsidian-mimir-sync",
+  "name": "obsidian-perseus-vault-sync",
   "version": "0.1.0",
-  "description": "Obsidian plugin for bidirectional Mimir vault sync",
+  "description": "Obsidian plugin for bidirectional Perseus Vault vault sync",
   "main": "main.js",
   "scripts": {
     "dev": "node esbuild.config.mjs",
     "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
     "version": "node version-bump.mjs && git add manifest.json versions.json"
   },
-  "keywords": ["obsidian", "mimir", "mcp", "memory", "agent"],
+  "keywords": ["obsidian", "perseus-vault", "mcp", "memory", "agent"],
   "author": "tcconnally",
   "license": "MIT",
   "devDependencies": {

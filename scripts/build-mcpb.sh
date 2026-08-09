@@ -44,8 +44,8 @@ mkdir -p "$BUILD/server"
 cp "$ROOT/manifest.json" "$BUILD/manifest.json"
 
 # --- icon (optional but shown in the directory) ---
-if [ -f "$ROOT/assets/mimir-400.png" ]; then
-  cp "$ROOT/assets/mimir-400.png" "$BUILD/icon.png"
+if [ -f "$ROOT/assets/perseus-vault-400.png" ]; then
+  cp "$ROOT/assets/perseus-vault-400.png" "$BUILD/icon.png"
 fi
 
 # --- docs (optional) ---

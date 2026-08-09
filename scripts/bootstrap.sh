@@ -9,7 +9,7 @@
 #  What this does:
 #    1. Installs system dependencies (Rust toolchain via rustup, build tools)
 #    2. Clones and builds Perseus Vault from source (release binary)
-#    3. Installs the binary to ~/.local/bin/perseus-vault (+ mimir/mneme compat symlinks)
+#    3. Installs the binary to ~/.local/bin/perseus-vault (+ perseus_vault/perseus-vault compat symlinks)
 #    4. Creates the data directory and generates .env defaults
 #    5. Verifies the installation and prints a success summary
 #
@@ -34,16 +34,16 @@ info() { printf "${CYAN}→${NC} %s\n" "$*"; }
 header() { printf "\n${BOLD}══ %s ══${NC}\n" "$*"; }
 
 FORCE="${FORCE:-0}"
-# Repo redirects from the historical mimir/mneme names, but use the canonical
+# Repo redirects from the historical perseus_vault/perseus-vault names, but use the canonical
 # one so the clone URL matches what users see everywhere else.
 VAULT_REPO="https://github.com/Perseus-Computing-LLC/perseus-vault.git"
-# Script-local dirs. NOTE: MIMIR_DB_PATH is the *real* env var the binary reads
+# Script-local dirs. NOTE: PERSEUS_VAULT_DB_PATH is the *real* env var the binary reads
 # (see default_db_path() in src/main.rs), so it keeps its name for compatibility;
 # the default filename is the canonical perseus-vault.db.
-MIMIR_DIR="${MIMIR_DIR:-$HOME/.mimir}"
-MIMIR_BIN_DIR="${MIMIR_BIN_DIR:-$HOME/.local/bin}"
-MIMIR_DATA_DIR="${MIMIR_DATA_DIR:-$HOME/.mimir/data}"
-MIMIR_DB_PATH="${MIMIR_DB_PATH:-$MIMIR_DATA_DIR/perseus-vault.db}"
+PERSEUS_VAULT_DIR="${PERSEUS_VAULT_DIR:-$HOME/.perseus-vault}"
+PERSEUS_VAULT_BIN_DIR="${PERSEUS_VAULT_BIN_DIR:-$HOME/.local/bin}"
+PERSEUS_VAULT_DATA_DIR="${PERSEUS_VAULT_DATA_DIR:-$HOME/.perseus-vault/data}"
+PERSEUS_VAULT_DB_PATH="${PERSEUS_VAULT_DB_PATH:-$PERSEUS_VAULT_DATA_DIR/perseus-vault.db}"
 WORKSPACE="${WORKSPACE:-$(pwd)}"
 
 echo ""
@@ -136,31 +136,31 @@ fi
 # ── Step 2: Clone / update repo ─────────────────────────────────────────────
 header "Step 2: Clone & build Perseus Vault"
 
-if [ -d "$MIMIR_DIR/.git" ]; then
-    info "Updating existing checkout at $MIMIR_DIR..."
-    git -C "$MIMIR_DIR" fetch origin 2>/dev/null || true
-    LOCAL_HASH=$(git -C "$MIMIR_DIR" rev-parse HEAD 2>/dev/null || echo "unknown")
-    REMOTE_HASH=$(git -C "$MIMIR_DIR" rev-parse origin/main 2>/dev/null || echo "unknown")
+if [ -d "$PERSEUS_VAULT_DIR/.git" ]; then
+    info "Updating existing checkout at $PERSEUS_VAULT_DIR..."
+    git -C "$PERSEUS_VAULT_DIR" fetch origin 2>/dev/null || true
+    LOCAL_HASH=$(git -C "$PERSEUS_VAULT_DIR" rev-parse HEAD 2>/dev/null || echo "unknown")
+    REMOTE_HASH=$(git -C "$PERSEUS_VAULT_DIR" rev-parse origin/main 2>/dev/null || echo "unknown")
     if [ "$LOCAL_HASH" != "$REMOTE_HASH" ] || [ "$FORCE" = "1" ]; then
         info "Pulling latest changes..."
-        git -C "$MIMIR_DIR" checkout main 2>/dev/null || git -C "$MIMIR_DIR" checkout master 2>/dev/null || true
-        git -C "$MIMIR_DIR" pull origin main 2>/dev/null || git -C "$MIMIR_DIR" pull origin master 2>/dev/null || true
+        git -C "$PERSEUS_VAULT_DIR" checkout main 2>/dev/null || git -C "$PERSEUS_VAULT_DIR" checkout master 2>/dev/null || true
+        git -C "$PERSEUS_VAULT_DIR" pull origin main 2>/dev/null || git -C "$PERSEUS_VAULT_DIR" pull origin master 2>/dev/null || true
     else
         ok "Repo is up to date"
     fi
 else
     info "Cloning Perseus Vault from GitHub..."
-    rm -rf "$MIMIR_DIR"
-    git clone --depth 1 "$VAULT_REPO" "$MIMIR_DIR"
+    rm -rf "$PERSEUS_VAULT_DIR"
+    git clone --depth 1 "$VAULT_REPO" "$PERSEUS_VAULT_DIR"
 fi
 
 # Build release binary. The crate/bin is named perseus-vault, so cargo emits
 # target/release/perseus-vault (this path was stale — it used to look for a
-# `mimir` binary that no longer exists, #424).
+# `perseus_vault` binary that no longer exists, #424).
 info "Building Perseus Vault (release)..."
-cd "$MIMIR_DIR"
+cd "$PERSEUS_VAULT_DIR"
 cargo build --release 2>&1 | tail -5
-BINARY="$MIMIR_DIR/target/release/perseus-vault"
+BINARY="$PERSEUS_VAULT_DIR/target/release/perseus-vault"
 
 if [ ! -f "$BINARY" ]; then
     fail "Build failed (expected $BINARY). Check the output above for errors."
@@ -170,13 +170,9 @@ ok "Binary built: $BINARY ($(du -h "$BINARY" | cut -f1))"
 # ── Step 3: Install binary ──────────────────────────────────────────────────
 header "Step 3: Install binary"
 
-mkdir -p "$MIMIR_BIN_DIR"
-cp "$BINARY" "$MIMIR_BIN_DIR/perseus-vault"
-chmod +x "$MIMIR_BIN_DIR/perseus-vault"
-# Backward-compatible names so existing configs referencing mimir/mneme keep
-# working (mirrors scripts/install.sh).
-ln -sf "$MIMIR_BIN_DIR/perseus-vault" "$MIMIR_BIN_DIR/mimir"
-ln -sf "$MIMIR_BIN_DIR/perseus-vault" "$MIMIR_BIN_DIR/mneme"
+mkdir -p "$PERSEUS_VAULT_BIN_DIR"
+cp "$BINARY" "$PERSEUS_VAULT_BIN_DIR/perseus-vault"
+chmod +x "$PERSEUS_VAULT_BIN_DIR/perseus-vault"
 
 # macOS Apple silicon: a freshly built (unsigned) binary is SIGKILLed on first
 # run — `perseus-vault --version` prints "Killed: 9" with no other output
@@ -184,68 +180,68 @@ ln -sf "$MIMIR_BIN_DIR/perseus-vault" "$MIMIR_BIN_DIR/mneme"
 # arm64 so it is a no-op on Intel macOS and other platforms.
 if [ "$(uname -s)" = "Darwin" ] && [ "$(uname -m)" = "arm64" ] && command -v codesign >/dev/null 2>&1; then
     info "Ad-hoc code-signing binary (macOS Apple silicon, #422)..."
-    if codesign --force --sign - "$MIMIR_BIN_DIR/perseus-vault" 2>/dev/null; then
+    if codesign --force --sign - "$PERSEUS_VAULT_BIN_DIR/perseus-vault" 2>/dev/null; then
         ok "Ad-hoc code-signed"
     else
         warn "Could not code-sign. If 'perseus-vault' is Killed: 9, run:"
-        warn "  codesign --force --sign - $MIMIR_BIN_DIR/perseus-vault"
+        warn "  codesign --force --sign - $PERSEUS_VAULT_BIN_DIR/perseus-vault"
     fi
 fi
 
 # Ensure ~/.local/bin is on PATH
 case ":$PATH:" in
-    *":$MIMIR_BIN_DIR:"*) ;;
-    *) export PATH="$MIMIR_BIN_DIR:$PATH" ;;
+    *":$PERSEUS_VAULT_BIN_DIR:"*) ;;
+    *) export PATH="$PERSEUS_VAULT_BIN_DIR:$PATH" ;;
 esac
 
 if command -v perseus-vault &>/dev/null; then
     VAULT_VER=$(perseus-vault --version 2>&1 || echo "unknown")
-    ok "perseus-vault installed to $MIMIR_BIN_DIR/perseus-vault"
+    ok "perseus-vault installed to $PERSEUS_VAULT_BIN_DIR/perseus-vault"
     ok "Version: $VAULT_VER"
 else
-    fail "perseus-vault not found on PATH after install. Check $MIMIR_BIN_DIR"
+    fail "perseus-vault not found on PATH after install. Check $PERSEUS_VAULT_BIN_DIR"
 fi
 
 # ── Step 4: Create data directory ───────────────────────────────────────────
 header "Step 4: Data directory"
 
-if [ -d "$MIMIR_DATA_DIR" ]; then
-    ok "Data directory exists: $MIMIR_DATA_DIR"
+if [ -d "$PERSEUS_VAULT_DATA_DIR" ]; then
+    ok "Data directory exists: $PERSEUS_VAULT_DATA_DIR"
 else
-    info "Creating data directory: $MIMIR_DATA_DIR"
-    mkdir -p "$MIMIR_DATA_DIR"
+    info "Creating data directory: $PERSEUS_VAULT_DATA_DIR"
+    mkdir -p "$PERSEUS_VAULT_DATA_DIR"
     ok "Data directory created"
 fi
 
 # Warm up the database (creates tables + FTS5 index)
-if [ ! -f "$MIMIR_DB_PATH" ]; then
-    info "Warming up database at $MIMIR_DB_PATH..."
+if [ ! -f "$PERSEUS_VAULT_DB_PATH" ]; then
+    info "Warming up database at $PERSEUS_VAULT_DB_PATH..."
     # Brief serve+kill to trigger DB creation
-    timeout 2 perseus-vault serve --db "$MIMIR_DB_PATH" 2>/dev/null || true
-    if [ -f "$MIMIR_DB_PATH" ]; then
-        ok "Database created: $MIMIR_DB_PATH"
+    timeout 2 perseus-vault serve --db "$PERSEUS_VAULT_DB_PATH" 2>/dev/null || true
+    if [ -f "$PERSEUS_VAULT_DB_PATH" ]; then
+        ok "Database created: $PERSEUS_VAULT_DB_PATH"
     else
         warn "Database warm-up didn't create the file (will be created on first serve)"
     fi
 else
-    ok "Database exists: $MIMIR_DB_PATH"
+    ok "Database exists: $PERSEUS_VAULT_DB_PATH"
 fi
 
 # ── Step 5: .env entries ────────────────────────────────────────────────────
 header "Step 5: Environment"
 
 ENV_FILE="$WORKSPACE/.env"
-MIMIR_ENV_BLOCK="# ── Perseus Vault ──────────────────────────────────────────────────────
+PERSEUS_VAULT_ENV_BLOCK="# ── Perseus Vault ──────────────────────────────────────────────────────
 # Database path (default shown)
-MIMIR_DB_PATH=$MIMIR_DB_PATH
+PERSEUS_VAULT_DB_PATH=$PERSEUS_VAULT_DB_PATH
 "
 
 if [ -f "$ENV_FILE" ]; then
-    if grep -q "MIMIR_DB_PATH" "$ENV_FILE" 2>/dev/null; then
-        ok "MIMIR_DB_PATH already in .env"
+    if grep -q "PERSEUS_VAULT_DB_PATH" "$ENV_FILE" 2>/dev/null; then
+        ok "PERSEUS_VAULT_DB_PATH already in .env"
     else
-        info "Appending MIMIR_DB_PATH to existing .env..."
-        echo "$MIMIR_ENV_BLOCK" >> "$ENV_FILE"
+        info "Appending PERSEUS_VAULT_DB_PATH to existing .env..."
+        echo "$PERSEUS_VAULT_ENV_BLOCK" >> "$ENV_FILE"
         ok "Appended to $ENV_FILE"
     fi
 else
@@ -257,7 +253,7 @@ else
 # =============================================================================
 
 # Database path
-MIMIR_DB_PATH=$MIMIR_DB_PATH
+PERSEUS_VAULT_DB_PATH=$PERSEUS_VAULT_DB_PATH
 
 # ── Optional: LLM Provider Keys (for future versions with LLM extraction) ──
 # DEEPSEEK_API_KEY=***
@@ -271,13 +267,13 @@ fi
 header "Step 6: Verify binary"
 
 # Quick smoke test: start server directly, check it initializes
-SMOKE_OUT=$(timeout 2 perseus-vault serve --db "$MIMIR_DB_PATH" 2>&1 </dev/null || true)
+SMOKE_OUT=$(timeout 2 perseus-vault serve --db "$PERSEUS_VAULT_DB_PATH" 2>&1 </dev/null || true)
 if echo "$SMOKE_OUT" | grep -q "MCP server ready"; then
     ok "MCP server initializes correctly"
     ok "Tools: perseus_vault_recall, perseus_vault_remember, perseus_vault_health"
 else
     warn "MCP smoke test had issues (non-critical). Manual check:"
-    warn "  Run: perseus-vault serve --db $MIMIR_DB_PATH"
+    warn "  Run: perseus-vault serve --db $PERSEUS_VAULT_DB_PATH"
 fi
 
 # ── Step 7: Success summary ─────────────────────────────────────────────────
@@ -285,9 +281,9 @@ header "Success Summary"
 
 echo ""
 printf "  ${BOLD}%-30s${NC} %s\n" "Perseus Vault version:" "$(perseus-vault --version 2>&1 || echo 'unknown')"
-printf "  ${BOLD}%-30s${NC} %s\n" "Binary:" "$MIMIR_BIN_DIR/perseus-vault"
-printf "  ${BOLD}%-30s${NC} %s\n" "Database:" "$([ -f "$MIMIR_DB_PATH" ] && echo "✓ $MIMIR_DB_PATH" || echo 'created on first serve')"
-printf "  ${BOLD}%-30s${NC} %s\n" "Data dir:" "$MIMIR_DATA_DIR"
+printf "  ${BOLD}%-30s${NC} %s\n" "Binary:" "$PERSEUS_VAULT_BIN_DIR/perseus-vault"
+printf "  ${BOLD}%-30s${NC} %s\n" "Database:" "$([ -f "$PERSEUS_VAULT_DB_PATH" ] && echo "✓ $PERSEUS_VAULT_DB_PATH" || echo 'created on first serve')"
+printf "  ${BOLD}%-30s${NC} %s\n" "Data dir:" "$PERSEUS_VAULT_DATA_DIR"
 printf "  ${BOLD}%-30s${NC} %s\n" "MCP tools:" "perseus_vault_recall, perseus_vault_remember, perseus_vault_health"
 printf "  ${BOLD}%-30s${NC} %s\n" "Cargo:" "$(cargo --version 2>&1)"
 printf "  ${BOLD}%-30s${NC} %s\n" "OS:" "$(uname -s) $(uname -m)"
@@ -298,7 +294,7 @@ echo "============================================"
 echo "  ${GREEN}Perseus Vault bootstrap complete!${NC}"
 echo ""
 echo "  Quick commands:"
-echo "    perseus-vault serve --db $MIMIR_DB_PATH   # Start MCP server"
+echo "    perseus-vault serve --db $PERSEUS_VAULT_DB_PATH   # Start MCP server"
 echo "    perseus-vault --version                   # Show version"
 echo ""
 echo "  Docs: https://github.com/Perseus-Computing-LLC/perseus-vault"

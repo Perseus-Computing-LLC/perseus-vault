@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here. This project adheres to
+All notable changes to Perseus Vault are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
@@ -8,8 +8,8 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
 ### Added
 - **First-class Hermes profile ↔ Vault workspace binding (#879).** New
   `workspace_bindings` registry (schema v30) + tools
-  `mimir_workspace_bind` / `mimir_workspace_unbind` /
-  `mimir_workspace_quarantine` / `mimir_workspace_status`. One profile ↔ one
+  `perseus_vault_workspace_bind` / `perseus_vault_workspace_unbind` /
+  `perseus_vault_workspace_quarantine` / `perseus_vault_workspace_status`. One profile ↔ one
   workspace (a workspace may be shared by several profiles); `read_only`
   bindings, cross-workspace targets, and quarantined/unbound states are
   **denied at the tool boundary** (fail-closed for bound profiles; unbound
@@ -19,7 +19,7 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
   Client heartbeats drive a stale/live diagnostic signal. Spec:
   `docs/specs/hermes-profile-workspace-binding.md`.
 - **Governed distillation (#876).** New `learned_memory` capability + tool
-  `mimir_learned_artifact_register`: learned artifacts (trained weights /
+  `perseus_vault_learned_artifact_register`: learned artifacts (trained weights /
   distilled cartridges) are registered fail-closed against a **completed**
   `learned_memory` action receipt (capability, actor/workspace, and
   outcome-hash all verified) and bound hash-only to their source entities
@@ -28,7 +28,7 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
   (`artifact_manifest`/`excerpt`/`verify_value`) refuse revoked artifacts as
   not-found; superseding a source flags it **stale** (retraining trigger,
   still serveable). `artifact_revoked` / `artifact_stale` journal events carry
-  hash-only evidence; `mimir_purge` reports `artifact_bindings_revoked`
+  hash-only evidence; `perseus_vault_purge` reports `artifact_bindings_revoked`
   (dry-run + real). Spec: `docs/specs/governed-distillation.md`.
 - **AAR denial clarity (#768 follow-up).** `action_intent` denials name the
   offending value and the permitted set; `authority_set` validates
@@ -37,15 +37,15 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
 - **Retention lifecycle: expiry, redaction, and physical erasure** (#868,
   #866). Three distinct operations, documented in
   `docs/specs/data-boundaries-retention-lifecycle.md`:
-  - `mimir_expire` / `expire` CLI — time-based lifecycle sweep: entities whose
+  - `perseus_vault_expire` / `expire` CLI — time-based lifecycle sweep: entities whose
     body `expires_at` (unix ms, numeric string, or ISO 8601 UTC) has passed
     transition to `status='expired'`. Content and history are retained;
     recall already excludes expired rows. The write path now persists
     `expires_at` into `entities.expires_at_unix_ms` on every remember/update.
-  - `mimir_redact` / `redact` CLI — content scrub with metadata retention:
+  - `perseus_vault_redact` / `redact` CLI — content scrub with metadata retention:
     body → hash-only marker, history + FTS text deleted, `redacted` journal
     event (hash-only evidence). Re-ingest of the same value stays allowed.
-  - `mimir_erase` / `erase` CLI — physical erasure across ALL derived layers:
+  - `perseus_vault_erase` / `erase` CLI — physical erasure across ALL derived layers:
     primary row, FTS, history (+FTS), community membership (empty communities
     deleted, `member_digest` invalidated so summaries recompute), inbound
     links, journal payloads (chain tuple preserved), plus quarantine of
@@ -66,7 +66,7 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
   database as encrypted only when the authoritative `encryption_canary` row
   (`id=1`) exists; the schema table alone is not evidence of encryption.
   Server and write-capable CLI paths resolve the existing default key file
-  (`~/.perseus-vault/secret.key`, with legacy `~/.mimir/secret.key` fallback),
+  (`~/.perseus-vault/secret.key`, with legacy `~/.perseus-vault/secret.key` fallback),
   warn before plaintext writes to an encrypted vault when no key is available,
   and generated client configurations carry the resolved key path.
 
@@ -87,7 +87,7 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
   signed `report.json`, never hand-written.
 - **Multi-agent scoping — trust tiers + visibility enforcement** (#684). A new
   `agents` registry (schema v22: `agent_id`, `name`, `trust_tier` 0-3,
-  `fleet_id`) plus the `mimir_agent` tool to register/look up agents.
+  `fleet_id`) plus the `perseus_vault_agent` tool to register/look up agents.
   `entities`/`journal` already carried `agent_id` (v1.2.0); this adds the trust
   tier that gates sensitive ops and **enforces the previously stored-but-unused
   `visibility` field** on recall:
@@ -108,7 +108,7 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
     (`ask`/`global_recall`/`memories`), automatic author `agent_id` population
     from the session on writes, and per-agent recall tuning.
 - **Keystones — mandatory policy rules** (#683). A new `keystones` table
-  (schema v21) plus `mimir_keystone_set` / `mimir_keystone_get` MCP tools.
+  (schema v21) plus `perseus_vault_keystone_set` / `perseus_vault_keystone_get` MCP tools.
   Keystones are directives fetched deterministically at session start (unlike
   ordinary memories, which are retrieved when relevant), merged across scope
   (tenant < fleet < agent) with weight-based conflict resolution, and meant to
@@ -135,13 +135,13 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
   are identical to the point-lookup tools. The index stores plaintext
   (decrypt-aware, mirroring `entities_fts`; never indexes ciphertext),
   maintained at the history-append site and cleared at both history-delete
-  sites; pre-existing history is backfilled by `mimir_reindex`. Purely
+  sites; pre-existing history is backfilled by `perseus_vault_reindex`. Purely
   additive: live/relevance-ranked hits keep their positions, history-only hits
   are appended only to fill the caller's limit, and a query that already found
   enough is a no-op. The hot `db::recall` core is untouched (no determinism or
   benchmark impact).
 - **Outcome-weighted recall ranking** (#681). The honest follow-rate efficacy
-  signal (`mimir_follow`) now feeds recall ranking, not just decay: a memory
+  signal (`perseus_vault_follow`) now feeds recall ranking, not just decay: a memory
   that gets FOLLOWED is boosted (`1.0 + follow_rate * 0.3`, mirroring the decay
   composite so the two never drift) and a 'dead' lesson (ignored despite
   ≥ 5 attempts) is gently demoted (×0.5 — not the decay path's near-annihilating
@@ -151,7 +151,7 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
   a strict no-op on any memory without a follow/miss signal — so freshly
   ingested corpora and every benchmark rank exactly as before. Kill-switch:
   `PERSEUS_VAULT_OUTCOME_RANK=0`. Determinism (#247) preserved.
-- **`mimir_scan` — deterministic paginated enumeration** (#562). First-class
+- **`perseus_vault_scan` — deterministic paginated enumeration** (#562). First-class
   "list all / export / sync / reset" path: pages a category (or the whole store)
   by immutable `id ASC` with a keyset continuation cursor (`next_cursor` /
   `has_more`), so callers walk every entity exactly once — unlike paging
@@ -199,7 +199,7 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
     every 5s and exits promptly when orphaned — the existing ppid poll only
     ran per-request, so an idle orphan never noticed. On Linux this backs up
     PR_SET_PDEATHSIG; on macOS it is the primary abandonment signal.
-  - `MIMIR_IDLE_TIMEOUT_SECS` is now **opt-in (default: off)** instead of
+  - `PERSEUS_VAULT_IDLE_TIMEOUT_SECS` is now **opt-in (default: off)** instead of
     defaulting to 600s. It remains for the one topology parent-death detection
     cannot see — a host that leaks the child's stdin write-end while staying
     alive (the original #57228 Hermes-worker reconnect leak); such hosts
@@ -216,7 +216,7 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
 ## [2.20.0] - 2026-07-10
 
 ### Added
-- **`mimir_check_failure_pattern` — failure-pattern / deja-vu guard** (#521). A lightweight
+- **`perseus_vault_check_failure_pattern` — failure-pattern / deja-vu guard** (#521). A lightweight
   pre-retry check: pass the command line or approach you are about to (re)try and get back
   matching prior failures — from BOTH the journal (`error` events and failure-marked
   `acted`/`forward` payloads) and the entity store (failure/pitfall/root-cause memories via
@@ -240,12 +240,12 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
   (append-guarded). Every file mutation is a merge that preserves unknown keys, backs the
   file up as `<name>.bak-perseus` first, and is skipped when already in place — re-running
   changes nothing. `--dry-run` prints every file it would touch with a line diff and
-  writes nothing. The verb now also replaces pre-rename `mimir`/`mneme` server entries
+  writes nothing. The verb now also replaces pre-rename `perseus_vault`/`perseus_vault` server entries
   with the canonical `perseus-vault` one instead of duplicating them, and ends by printing
   the save-in-one-session/recall-in-another verify walkthrough.
 - **Opt-in in-session memory capture** (#520): new CLI verb `perseus-vault capture` (stdin or
-  `--file`; plain text, markdown, or JSONL — auto-detected) and MCP tool `mimir_capture`
-  (aliases `perseus_vault_capture`/`mneme_capture`) that distill a session transcript or
+  `--file`; plain text, markdown, or JSONL — auto-detected) and MCP tool `perseus_vault_capture`
+  (aliases `perseus_vault_capture`/`perseus_vault_capture`) that distill a session transcript or
   insight payload into durable entities the moment a problem is solved, instead of waiting for
   a scheduled harvest. The default distiller is fully local and deterministic (no LLM, no
   network): headed sections / paragraphs / JSONL records become candidate notes, classified by
@@ -253,7 +253,7 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
   markers aligned with the #521 deja-vu guard) and written through the normal remember path
   with `source="capture"`, layer buffer, moderate importance. `--llm` distills via the
   configured `--llm-endpoint` instead and falls back to the rule-based path on any LLM
-  failure/timeout (#528 `MIMIR_LLM_TIMEOUT_SECS`). Flood control by design: trigram
+  failure/timeout (#528 `PERSEUS_VAULT_LLM_TIMEOUT_SECS`). Flood control by design: trigram
   near-duplicate merging stays ON (re-captured solved problems merge instead of piling up),
   same-headline notes update in place, writes are hard-capped per invocation (20, lowerable via
   `max_entities`; dropped notes are reported), and `--dry-run` previews. Off by default: capture
@@ -263,22 +263,22 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
 
 ### Changed
 - **`tools/list` advertises the canonical `perseus_vault_*` names only by default**
-  — the tool manifest is no longer tripled. Since the Mimir→Mneme→Perseus Vault renames,
-  every tool was advertised three times (`mimir_*`, `mneme_*`, `perseus_vault_*`), so a
+  — the tool manifest is no longer tripled. Since the Perseus Vault→Perseus Vault→Perseus Vault renames,
+  every tool was advertised three times (`perseus_vault_*`, `perseus_vault_*`, `perseus_vault_*`), so a
   57-tool server exposed 171 entries. MCP clients that preload tool schemas (Rovo Dev,
   OpenWebUI/Minions, and others) reloaded that tripled ~260 KB payload on **every request**
   — reported in the field as context being "triple-input" each turn. The server now emits
-  one canonical `perseus_vault_*` copy per tool (171 → 57). The legacy `mimir_*`/`mneme_*`
+  one canonical `perseus_vault_*` copy per tool (171 → 57). The legacy `perseus_vault_*`/`perseus_vault_*`
   names remain fully **callable** — `call_tool` still normalizes every prefix to the same
   handler — they are simply no longer advertised, so no existing client that calls them by
   name breaks. Opt back into advertising all three prefixes with
-  `PERSEUS_VAULT_TOOL_ALIASES=all` (legacy env `MIMIR_TOOL_ALIASES` also honored;
+  `PERSEUS_VAULT_TOOL_ALIASES=all` (legacy env `PERSEUS_VAULT_TOOL_ALIASES` also honored;
   `PERSEUS_VAULT_` takes precedence).
 
 ### Performance
 - **Hybrid recall at 100K: 295.5 → 80.9 ms p50 (3.7×)** (#511). Hybrid — the default
   recall mode — carried ~250 ms of cost beyond its dense + fts5 arms at 100K entities.
-  Profile-first attribution (via the new opt-in `MIMIR_RECALL_TIMING=1` stage timing, a
+  Profile-first attribution (via the new opt-in `PERSEUS_VAULT_RECALL_TIMING=1` stage timing, a
   permanent zero-cost-when-off observability surface on the recall path) cleared every
   suspect in the issue — RRF over-fetch/hydration, query expansion, graph expand, and the
   post-RRF weighting passes measure ≤0.5 ms combined — and pinned 88% on the sparse arm:
@@ -303,7 +303,7 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
   100K load 7→39/s (5.6×, ~4h→43min), 100K fts5 p99 182→22ms; recall/`as_of`/cold-start
   unchanged. See PERF.md. The v17 migration adds scope columns + the band index and
   eagerly backfills signatures for every active row (one-time, ~30-60s per 100K rows).
-  The lossy opt-in `MIMIR_DEDUP_FTS_PREFILTER` (#228) is retired — it measured slower
+  The lossy opt-in `PERSEUS_VAULT_DEDUP_FTS_PREFILTER` (#228) is retired — it measured slower
   than the exact scan it pruned. Deliberate trade, pinned by tests: a row rewritten
   behind the engine's back (direct SQL, rolled-back pre-v10 binary) can be MISSED by
   dedup (one extra stored row) until its signature self-heals — it can never cause a
@@ -410,10 +410,10 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
 ## [2.18.1] - 2026-07-07
 
 ### Fixed
-- **Temporal filter args now accept stringified integers** (#480). MCP/LLM tool-call clients frequently emit integer args as JSON strings (e.g. `"as_of_unix_ms": "1783400000000"`); the temporal `Option<i64>` fields on `recall` (`as_of_unix_ms`/`valid_at`/`valid_from_unix_ms`/`valid_to_unix_ms`) rejected them with "invalid type: string, expected i64" — making the v2.18.0 `as_of` filter uncallable from such clients (hit live on deploy). Added a number-or-string deserializer; also applied to `mimir_ask`'s temporal args. Numbers still work unchanged; non-numeric strings still error.
+- **Temporal filter args now accept stringified integers** (#480). MCP/LLM tool-call clients frequently emit integer args as JSON strings (e.g. `"as_of_unix_ms": "1783400000000"`); the temporal `Option<i64>` fields on `recall` (`as_of_unix_ms`/`valid_at`/`valid_from_unix_ms`/`valid_to_unix_ms`) rejected them with "invalid type: string, expected i64" — making the v2.18.0 `as_of` filter uncallable from such clients (hit live on deploy). Added a number-or-string deserializer; also applied to `perseus_vault_ask`'s temporal args. Numbers still work unchanged; non-numeric strings still error.
 
 ### Added
-- **Temporal RAG completion** (#472 / #481). `recall`'s `valid_at` now *reconstructs* the historical world-version (via `bitemporal_at`) instead of narrowing live rows; with `as_of` it forms the full bi-temporal cell. `mimir_ask` gains `as_of_unix_ms` / `valid_at_unix_ms` (shared `Database::resolve_temporal_versions`) so RAG answers are reproducible at a past instant. `global_recall` stays current-view by design (its community summaries are recomputed artifacts, not versioned facts).
+- **Temporal RAG completion** (#472 / #481). `recall`'s `valid_at` now *reconstructs* the historical world-version (via `bitemporal_at`) instead of narrowing live rows; with `as_of` it forms the full bi-temporal cell. `perseus_vault_ask` gains `as_of_unix_ms` / `valid_at_unix_ms` (shared `Database::resolve_temporal_versions`) so RAG answers are reproducible at a past instant. `global_recall` stays current-view by design (its community summaries are recomputed artifacts, not versioned facts).
 
 ## [2.18.0] - 2026-07-07
 
@@ -475,7 +475,7 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
 - **Anthropic MCP Directory bundle was not installable.** The submitted `.mcpb`
   contained only `manifest.json` — the `binary` server it declared was never
   placed inside the bundle, so it could not be installed or run for review. The
-  manifest also carried a stale `mimir serve --db ~/.mimir/...` command. Fixed:
+  manifest also carried a stale `perseus_vault serve --db ~/.perseus-vault/...` command. Fixed:
   `entry_point` now points at `server/perseus-vault` inside the bundle, the
   command uses `${__dirname}/server/...` with `platform_overrides` for Windows
   (`.exe`) and Linux, and the stale `--db` arg is dropped (the binary
@@ -492,7 +492,7 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
   platform the directory listing declares has a prebuilt binary. (#456)
 
 ### Documentation
-- Documented the **stdio idle-watchdog** (`MIMIR_IDLE_TIMEOUT_SECS`, default
+- Documented the **stdio idle-watchdog** (`PERSEUS_VAULT_IDLE_TIMEOUT_SECS`, default
   600s) in `docs/transport.md`, and explicitly warned against external
   process-count reapers of `perseus-vault` stdio subprocesses: those are the
   live transport for in-flight tool calls, so count-based reaping kills them
@@ -512,7 +512,7 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
   code requested a nonexistent `-gnu` asset). (#451)
 - **MCP Registry publish** (had failed on v2.16.0 and v2.17.0): the Docker
   image's `io.modelcontextprotocol.server.name` OCI annotation was still
-  `io.github.Perseus-Computing-LLC/mimir` while `server.json` had moved to
+  `io.github.Perseus-Computing-LLC/perseus-vault` while `server.json` had moved to
   `…/perseus-vault`, so the registry's ownership validation rejected the publish
   with a 400. The label now matches `server.json`, so v2.17.1 publishes under the
   `perseus-vault` namespace. (#452)
@@ -529,28 +529,28 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
 
 ### Security / Hardening
 - Multimodal ingest is now bounded against decompression bombs. A `.docx` is a
-  DEFLATE zip, so a tiny on-disk file (within `MIMIR_MAX_INGEST_BYTES`) could
+  DEFLATE zip, so a tiny on-disk file (within `PERSEUS_VAULT_MAX_INGEST_BYTES`) could
   decompress `word/document.xml` to many GB — the on-disk cap couldn't bound it,
   and the read was unbounded (OOM). The decompressed read is now capped at
-  `MIMIR_MAX_DECOMPRESSED_BYTES` (default 256 MiB) and rejected past it. PDF
+  `PERSEUS_VAULT_MAX_DECOMPRESSED_BYTES` (default 256 MiB) and rejected past it. PDF
   extraction is bounded by the on-disk cap only (`pdf_extract` owns decompression
-  with no limit API — documented; lower `MIMIR_MAX_INGEST_BYTES` for untrusted
+  with no limit API — documented; lower `PERSEUS_VAULT_MAX_INGEST_BYTES` for untrusted
   PDFs).
 - Network transport & gRPC hardening (audit phases 1–3):
   - **Secure-bind guard**: binding an HTTP surface (MCP transport or web
     dashboard) to a non-loopback address with **no** auth token now refuses to
     start instead of coming up wide open. Override with
-    `MIMIR_ALLOW_INSECURE_BIND=1` for a trusted network / auth-terminating proxy.
+    `PERSEUS_VAULT_ALLOW_INSECURE_BIND=1` for a trusted network / auth-terminating proxy.
   - **Constant-time token comparison** for Bearer auth on both HTTP surfaces
     (was a byte-wise `==`, a timing side-channel on the secret).
-  - **Request-body cap** (`MIMIR_MAX_HTTP_BODY_BYTES`, default 8 MiB) and a
-    **global token-bucket rate limit** (`MIMIR_HTTP_RATE_PER_SEC` /
-    `MIMIR_HTTP_RATE_BURST`, default 50 req/s + burst 100 → `429`).
+  - **Request-body cap** (`PERSEUS_VAULT_MAX_HTTP_BODY_BYTES`, default 8 MiB) and a
+    **global token-bucket rate limit** (`PERSEUS_VAULT_HTTP_RATE_PER_SEC` /
+    `PERSEUS_VAULT_HTTP_RATE_BURST`, default 50 req/s + burst 100 → `429`).
   - **Tightened transport CORS** — explicit methods/headers instead of `Any`,
-    with an optional `MIMIR_CORS_ALLOWED_ORIGINS` allowlist.
+    with an optional `PERSEUS_VAULT_CORS_ALLOWED_ORIGINS` allowlist.
   - **gRPC security model**: `serve` now supports a Bearer-token auth interceptor
-    (`MIMIR_GRPC_AUTH_TOKEN`), TLS and mutual-TLS (`MIMIR_GRPC_TLS_CERT/KEY`,
-    `MIMIR_GRPC_TLS_CLIENT_CA`), a message-size cap (`MIMIR_GRPC_MAX_MSG_BYTES`),
+    (`PERSEUS_VAULT_GRPC_AUTH_TOKEN`), TLS and mutual-TLS (`PERSEUS_VAULT_GRPC_TLS_CERT/KEY`,
+    `PERSEUS_VAULT_GRPC_TLS_CLIENT_CA`), a message-size cap (`PERSEUS_VAULT_GRPC_MAX_MSG_BYTES`),
     and the same secure-bind guard. See [docs/GRPC-SECURITY.md](docs/GRPC-SECURITY.md).
 - Encryption canary (fail-fast wrong-key detection). `set_encryption` now
   verifies the configured key against a dedicated canary row at startup and
@@ -567,7 +567,7 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
   revision** (was the mutable `main` ref) and **SHA-256 verified** before being
   baked into the binary via `include_bytes!`. A compromised or updated upstream
   repo can no longer silently change the embedded model — a mismatch fails the
-  build. Operator-supplied files (`MIMIR_BUNDLED_MODEL_DIR`, air-gapped builds)
+  build. Operator-supplied files (`PERSEUS_VAULT_BUNDLED_MODEL_DIR`, air-gapped builds)
   are verified against the same hashes.
 - Windows key-file ACLs: `keygen` now restricts the new key file to the current
   user via `icacls` (Windows has no `0600`-at-creation equivalent), warning
@@ -625,8 +625,8 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
 ### Changed
 - Default on-disk paths moved to `~/.perseus-vault/` (#427, #437), precedence-only
   — fresh installs use `~/.perseus-vault/data/perseus-vault.db`; existing
-  `~/.mimir/` installs keep working via the fallback chain (no data moved).
-  Adds `PERSEUS_VAULT_DB_PATH` (`MIMIR_DB_PATH` still honored); `secret.key`
+  `~/.perseus-vault/` installs keep working via the fallback chain (no data moved).
+  Adds `PERSEUS_VAULT_DB_PATH` (`PERSEUS_VAULT_DB_PATH` still honored); `secret.key`
   default prefers an existing location so encrypted installs never lose their key.
 - MCP-registry server name aligned to `io.github.Perseus-Computing-LLC/perseus-vault` (#428, #436).
 
@@ -635,11 +635,11 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
 ### Fixed
 - Default DB resolution now factors in emptiness (#424, follow-up to #421):
   when the database path is the implicit default (no `--db`, no
-  `$MIMIR_DB_PATH`) and the highest-precedence candidate DB is *known-empty*
+  `$PERSEUS_VAULT_DB_PATH`) and the highest-precedence candidate DB is *known-empty*
   (`SELECT COUNT(*) FROM entities == 0` — a keyless read, works under
   encryption), a lower-precedence but *non-empty* candidate is preferred
   instead. This fixes the reported case where a stale-empty
-  `~/.mimir/data/mimir.db` shadowed a live `~/mimir.db`. Candidates that can't
+  `~/.perseus-vault/data/perseus-vault.db` shadowed a live `~/perseus-vault.db`. Candidates that can't
   be read (locked/corrupt/not-yet-a-vault) are treated as unknown — never
   demoted-on and never promoted-to — so behavior degrades gracefully to the
   path-based order plus the existing split-brain warning. Resolution + its
@@ -647,50 +647,50 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
   `serve` and every maintenance subcommand open the same resolved DB
   (previously only a handful of sites warned). `default_db_path()` (clap's
   eager default) stays path-only and side-effect-free.
-- `scripts/bootstrap.sh` looked for a `target/release/mimir` binary that the
+- `scripts/bootstrap.sh` looked for a `target/release/perseus-vault` binary that the
   `perseus-vault`-named crate no longer produces (the build would report
   success then fail to find the binary). It now builds/installs `perseus-vault`
-  with `mimir`/`mneme` compat symlinks, defaults to `perseus-vault.db`, and
+  with `perseus_vault`/`perseus_vault` compat symlinks, defaults to `perseus-vault.db`, and
   uses the `serve` subcommand — matching `scripts/install.sh` (#424).
-- Onboarding/deploy surface completed the Mimir → Perseus Vault rename: client
+- Onboarding/deploy surface completed the Perseus Vault → Perseus Vault rename: client
   setup docs (`docs/clients/README.md`, all 8 copy-paste snippets), MCP
   packaging (`smithery.yaml`, `manifest.json` version `2.13.0` → `2.14.0`),
   framework integration docs (langgraph/autogen + `docs/integration/*`),
-  transport docs, the clawhub skill, and `awesome-mimir.md` (tool count
+  transport docs, the clawhub skill, and `awesome-perseus-vault.md` (tool count
   `36` → `55`) now use the `perseus-vault` command and the canonical
-  `~/.mimir/data/perseus-vault.db` default path. Fresh operators copy-pasting
+  `~/.perseus-vault/data/perseus-vault.db` default path. Fresh operators copy-pasting
   any client/integration snippet now get a working config that matches the
-  installed binary. The `~/.mimir/` support directory is intentionally
+  installed binary. The `~/.perseus-vault/` support directory is intentionally
   unchanged pending the migration-shim work in #427.
 
 ### Added
 - History retention mechanism (#398): entity_history can now be bounded via
-  env knobs — `MIMIR_HISTORY_MAX_AGE_DAYS`, `MIMIR_HISTORY_MAX_VERSIONS_PER_KEY`
-  (oldest-first per key), `MIMIR_HISTORY_MAX_BYTES` (globally oldest-first).
+  env knobs — `PERSEUS_VAULT_HISTORY_MAX_AGE_DAYS`, `PERSEUS_VAULT_HISTORY_MAX_VERSIONS_PER_KEY`
+  (oldest-first per key), `PERSEUS_VAULT_HISTORY_MAX_BYTES` (globally oldest-first).
   **Every knob defaults OFF** — with none set, behavior is byte-identical to
   before (keep everything); enabling a bound is an explicit operator decision.
-  Enforcement runs only in maintenance paths (`mimir_maintenance` `history`/
-  `all`, `mimir_autocohere`, `mimir_prune scope='history'`), never on the
+  Enforcement runs only in maintenance paths (`perseus_vault_maintenance` `history`/
+  `all`, `perseus_vault_autocohere`, `perseus_vault_prune scope='history'`), never on the
   write path.
 - Tombstone roll-up compaction (#398, issue option 2 — default ON, disable
-  via `MIMIR_HISTORY_TOMBSTONES=0` for hard delete): an evicted run of
+  via `PERSEUS_VAULT_HISTORY_TOMBSTONES=0` for hard delete): an evicted run of
   versions is replaced by ONE synthetic history row spanning
   [first_recorded_at, last_invalidated_at) carrying the rolled-up version
   count and a hash-chain digest of the evicted rows (successive passes merge:
-  counts accumulate, digests chain). `mimir_as_of` at an instant inside a
+  counts accumulate, digests chain). `perseus_vault_as_of` at an instant inside a
   compacted window returns an explicit marker (`compacted: true`,
   `versions_compacted`, `digest`) instead of silently-wrong data; instants
   covered by surviving rows are answered exactly as before. The valid-time
   axis holds too: the tombstone carries the run's earliest effective
   `valid_from` (not first_recorded_at), so a retroactively-valid compacted
-  version's window keeps answering `mimir_valid_at`/`mimir_bitemporal` —
+  version's window keeps answering `perseus_vault_valid_at`/`perseus_vault_bitemporal` —
   with the same explicit marker decoration — instead of flipping to None.
   Option 3 (export-then-delete to vault Markdown/JSONL) is deferred as a
   follow-up.
-- `mimir_prune` gains `scope: 'history'` (#398) with per-call bound overrides
+- `perseus_vault_prune` gains `scope: 'history'` (#398) with per-call bound overrides
   (`max_age_days`, `max_versions_per_key`, `max_bytes`) and dry_run
   preview — reports the exact rows + bytes the real run would evict.
-- `mimir_stats` reports history growth (#398): `total_history_rows`,
+- `perseus_vault_stats` reports history growth (#398): `total_history_rows`,
   `history_bytes` (stored body bytes), and `top_history_keys` (top-10 keys by
   version count with bytes) — the hot state-like keys to cap first.
 - `perf-gate` CI workflow (#404, completing the issue — the concurrency half
@@ -706,7 +706,7 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
   every metric prints a `PERF-GATE |` table row to the job log so a
   regression is diagnosable from the run. Budgets and corpus sizes are pinned
   as env vars in the workflow.
-- `mimir_follow` accepts an optional `workspace_hash` (#396, the #338
+- `perseus_vault_follow` accepts an optional `workspace_hash` (#396, the #338
   pattern): when set, the efficacy stamp resolves its target row with strict
   workspace equality — the same semantics as a workspace-scoped recall — so a
   workspace-scoped agent's follow/miss signal lands on the row it actually
@@ -727,11 +727,11 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
   write transaction, so embed lag — or a dropped job — means the row is
   ABSENT from dense search (keyword search still finds it), never served
   with the previous body's stale vector, and every unembedded row is
-  genuinely recoverable via `mimir_embed` batch mode
+  genuinely recoverable via `perseus_vault_embed` batch mode
   (`WHERE embedding IS NULL`) or its next change. Deferral is within the
   existing contract — auto-embed already ran post-commit with non-fatal
   failures; a row simply doesn't surface in dense/hybrid search until
-  embedded (now milliseconds later). Explicit `mimir_embed` stays
+  embedded (now milliseconds later). Explicit `perseus_vault_embed` stays
   synchronous. The write path also no longer consults the #219 embedding
   session cache (new/changed bodies can never hit it — each write paid up
   to 256 full-body string compares for nothing), and the
@@ -772,19 +772,19 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
   auto-erase (dream/consolidate outputs, community summaries, vault_export
   files).
 - Default DB-path resolution surfaces the split-brain instead of hiding it
-  (#421): the legacy single-user location `~/mimir.db` is now **added to the
+  (#421): the legacy single-user location `~/perseus-vault.db` is now **added to the
   fallback chain** (adopted when it is the *only* existing DB, instead of
-  creating a fresh empty `~/.mimir/data/perseus-vault.db`). Full precedence
-  (first existing wins): `~/.mimir/data/perseus-vault.db` >
-  `~/.mimir/data/mneme.db` > `~/.mimir/data/mimir.db` > `~/mimir.db`; if none
+  creating a fresh empty `~/.perseus-vault/data/perseus-vault.db`). Full precedence
+  (first existing wins): `~/.perseus-vault/data/perseus-vault.db` >
+  `~/.perseus-vault/data/perseus-vault.db` > `~/.perseus-vault/data/perseus-vault.db` > `~/perseus-vault.db`; if none
   exist the canonical `perseus-vault.db` is created. Note this is
   precedence-only, not emptiness-aware: in the issue's reported scenario where
-  a live `~/mimir.db` **and** a stale-empty `~/.mimir/data/mimir.db` both
-  exist, the higher-precedence dir DB still wins — `~/mimir.db` is **surfaced
+  a live `~/perseus-vault.db` **and** a stale-empty `~/.perseus-vault/data/perseus-vault.db` both
+  exist, the higher-precedence dir DB still wins — `~/perseus-vault.db` is **surfaced
   via the warning, not auto-adopted**. When more than one candidate DB exists
-  and no `--db`/`$MIMIR_DB_PATH` was given, a stderr warning names the chosen
+  and no `--db`/`$PERSEUS_VAULT_DB_PATH` was given, a stderr warning names the chosen
   file and the ignored candidate(s) so the ambiguity is visible; passing
-  `--db`/`$MIMIR_DB_PATH` explicitly is the deterministic remedy and suppresses
+  `--db`/`$PERSEUS_VAULT_DB_PATH` explicitly is the deterministic remedy and suppresses
   the warning. Resolution was refactored into a pure, unit-tested
   `resolve_default_db(home, exists)` function. (Emptiness-aware precedence is a
   filed follow-up.)
@@ -793,7 +793,7 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
   install path now ad-hoc code-signs the binary (`codesign --force --sign -`)
   guarded by a `uname` Darwin/arm64 check, and the README build-from-source
   note documents the required signing step after every rebuild.
-- `mimir_purge` now honors its own "actually remove" contract (#398): purging
+- `perseus_vault_purge` now honors its own "actually remove" contract (#398): purging
   an archived entity also DELETEs every superseded version of it from
   `entity_history` (matched by id and by category/key/workspace, so versions
   written under earlier ids of the same key are erased too) and REDACTS
@@ -803,7 +803,7 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
   redaction removes every purged body from the log while
   `verify_audit_chain` stays valid end-to-end. Before this fix a GDPR-style
   forget-then-purge left all historical bodies readable via
-  `mimir_history`/`mimir_as_of` and the journal append-only forever.
+  `perseus_vault_history`/`perseus_vault_as_of` and the journal append-only forever.
   `PurgeReport` gains `history_rows_deleted` / `journal_rows_redacted`
   (dry_run previews both with the same predicates).
 - `remember()`'s near-duplicate scan no longer rebuilds every candidate's
@@ -831,7 +831,7 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
   (release, 1KB uniform-length bodies — the length prefilter's worst
   case; medians over 15 probes, same run for both paths): single-insert
   dedup scan @50k 1363.3ms → 89.4ms (15.3x); bulk import of 5,000
-  (fresh store, dedup ON) 123.6s (pre, per #392) → 15.1s total (~8x). The opt-in `MIMIR_DEDUP_FTS_PREFILTER` path
+  (fresh store, dedup ON) 123.6s (pre, per #392) → 15.1s total (~8x). The opt-in `PERSEUS_VAULT_DEDUP_FTS_PREFILTER` path
   is unchanged and composes with the stored signatures.
 - `follow()`'s row resolution no longer collapses real DB errors into
   "not found" (#396, the #394 principle): only `QueryReturnedNoRows` maps to
@@ -866,7 +866,7 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
   truncation note when capped. Edges dangling outside the returned node set
   are dropped (previously the unscoped path emitted edges to archived/deleted
   targets that the renderer couldn't resolve).
-- `mimir_cohere` no longer holds one writer lock for the whole grooming pass
+- `perseus_vault_cohere` no longer holds one writer lock for the whole grooming pass
   (#400). The single BEGIN IMMEDIATE previously spanned promotion, a
   full-table decay UPDATE, link building, and archive — a lock window linear
   in store size (~4.4s @100k entities) that crossed the default 5000ms
@@ -883,15 +883,15 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
   semantics, and per-transaction drop-safety (#388); the run stays correct
   under interleaved writers, and the new non-atomicity boundaries are
   documented at the split site.
-- `mimir_autocohere`'s cohere step actually creates auto-links now (#412).
+- `perseus_vault_autocohere`'s cohere step actually creates auto-links now (#412).
   `CohereParams`' derived `Default` gave `max_links = 0`, and autocohere
   builds its params with `..Default::default()` — so the link-candidate
   query ran with `LIMIT 0` and the graph-building half of scheduled
   maintenance had silently been a no-op since it shipped. A manual
   `Default` impl now carries the same `max_links = 20` budget the
-  `mimir_cohere` argument path gets from its serde default;
+  `perseus_vault_cohere` argument path gets from its serde default;
   `promote_threshold`/`archive_threshold` keep their fall-through-to-
-  constants sentinels, and explicit `mimir_cohere` args are unaffected.
+  constants sentinels, and explicit `perseus_vault_cohere` args are unaffected.
 - `GET /api/entities`, `GET /api/search`, and `GET /api/journal` clamp
   `limit` to [1, 5000] (#413), exactly like #402's `/api/graph` clamp: an
   explicit `?limit=1000000` previously passed straight into SQL and dumped
@@ -905,25 +905,25 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
 ## [2.14.0] - 2026-07-02
 
 ### Added
-- Recall-first context injection (#366): `mimir_context` / `prepare` default
+- Recall-first context injection (#366): `perseus_vault_context` / `prepare` default
   to `mode: on_demand` — a relevance-gated, budget-clamped block instead of
-  the unconditional top-N dump. New `mimir_context` params: `query`, `mode`,
+  the unconditional top-N dump. New `perseus_vault_context` params: `query`, `mode`,
   `model`, `max_context_chars`; new `prepare` flags: `--max-context-chars`,
   `--model`, `--legacy-context`. Per-model budgets: 1500 chars default, 6000
   for "opus"-class hosts. Legacy dump is opt-in via `mode: "always_inject"`.
 - Always-on set hard-capped (5 entities) under recall-first, with a
   documented overflow warning steering toward `recall_when` triggers (#366).
-- GraphRAG over the link graph (#365): `mimir_communities` (deterministic
+- GraphRAG over the link graph (#365): `perseus_vault_communities` (deterministic
   community detection — label propagation with neighborhood-overlap weighting,
   or greedy one-level modularity "louvain"; pure Rust, no new dependencies),
-  `mimir_community_summary` (extractive by default, optional LLM polish,
+  `perseus_vault_community_summary` (extractive by default, optional LLM polish,
   materialized as a `community_summary` entity with `evidence_for` links,
-  cached by member-set digest), and `mimir_global_recall` (breadth over
+  cached by member-set digest), and `perseus_vault_global_recall` (breadth over
   community summaries, then depth into the best communities' members — cites
   entities across clusters instead of only the nearest one). Communities are
-  persisted in a new `communities` table (schema v8); `mimir_stats` now
+  persisted in a new `communities` table (schema v8); `perseus_vault_stats` now
   reports `total_communities` and `graph_modularity`.
-- `mimir_dream` — sleep-time LLM consolidation of episodic → semantic memory:
+- `perseus_vault_dream` — sleep-time LLM consolidation of episodic → semantic memory:
   clusters related cold memories per category, reflects over each cluster via
   the configured `--llm-endpoint`, and writes back provenance-linked semantic
   insights (`evidence_for` to every source, `derivation: "dream"`, idempotent
@@ -933,13 +933,13 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
   SQL:2011 APPLICATION_TIME).** The `valid_from`/`valid_to` columns are no
   longer write-only: facts now carry a queryable application-time period
   ("when was this true in the world"), orthogonal to the existing
-  transaction-time axis (`mimir_as_of`). New tools `mimir_valid_at`
+  transaction-time axis (`perseus_vault_as_of`). New tools `perseus_vault_valid_at`
   (what was actually true at instant T, per current knowledge) and
-  `mimir_bitemporal` (the full 2-axis rectangle query: "as of transaction
+  `perseus_vault_bitemporal` (the full 2-axis rectangle query: "as of transaction
   time T, what did we believe was true at valid time V"). Valid time is
-  settable on `mimir_remember`/`mimir_correct` (`valid_from_unix_ms` /
+  settable on `perseus_vault_remember`/`perseus_vault_correct` (`valid_from_unix_ms` /
   `valid_to_unix_ms`, defaulting to transaction time / unbounded);
-  `mimir_supersede` closes the old fact's valid period. `mimir_recall` gains
+  `perseus_vault_supersede` closes the old fact's valid period. `perseus_vault_recall` gains
   `valid_at` and SQL:2011 `overlaps`/`contains` period filters. Schema v9
   backfills `valid_from = recorded_at` on existing rows (idempotent). Tool
   count 53 → 55.
@@ -951,9 +951,9 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
   the nested draw — 32 clients vs pool 16 measured 174 req/s with 30-second
   stalls and failed writes; 64 clients wedged. `apply_recall_side_effects`,
   `find_near_duplicate`, and `store_embedding` now reuse the caller's held
-  connection (`_with_conn` variants), including `mimir_embed`'s single-entity
+  connection (`_with_conn` variants), including `perseus_vault_embed`'s single-entity
   path; the same load now runs at ~4,200 req/s with zero errors. r2d2's
-  checkout timeout is tunable via `MIMIR_POOL_TIMEOUT_MS`. A new
+  checkout timeout is tunable via `PERSEUS_VAULT_POOL_TIMEOUT_MS`. A new
   `concurrency-gate` CI workflow pins the load test at 2× pool
   oversubscription plus the four concurrency hammer tests.
 - decay_tick write amplification (#399): every tick rewrote every
@@ -962,7 +962,7 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
   score is within epsilon of the stored value (archive and layer-boundary
   crossings always write), so steady-state ticks write ~zero rows;
   `entities_updated` now reports rows actually written.
-- `mimir_history` pagination (#403): the tool returned every full decrypted
+- `perseus_vault_history` pagination (#403): the tool returned every full decrypted
   version body with no limit — a hot key with 10k versions produced a
   ~10-15MB tool response. Now takes `limit` (default 20, newest-first,
   0 = count-only) and `offset`, and reports `total`/`returned`.
@@ -987,15 +987,15 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
 - remember() erased link graphs (#382): the MCP remember tool constructs
   entities with empty links and remember's full-row UPDATE wrote them
   wholesale — ANY re-remember of a linked entity deterministically erased
-  its edges, and concurrent `mimir_link` calls could lose edges to the
+  its edges, and concurrent `perseus_vault_link` calls could lose edges to the
   unguarded read-modify-write. link/unlink now run under the writer lock and
   remember UNIONS caller links with stored links (dedup by target;
-  stored relationship/weight win; `mimir_unlink` is the only removal path).
+  stored relationship/weight win; `perseus_vault_unlink` is the only removal path).
 - invalidate_entity temporal-window corruption (#381): the fourth
   `entity_history` writer stamped `invalidated_at = now()` raw — an audited
   writer that legitimately set `recorded_at` ahead of the wall clock produced
   an INVERTED window, and a same-millisecond create+invalidate produced a
-  zero-width window that `mimir_as_of` could never reconstruct. It now takes
+  zero-width window that `perseus_vault_as_of` could never reconstruct. It now takes
   the writer lock and bumps `invalidated_at` strictly past `recorded_at`.
 - rekey-aad stale overwrite (#386): a `remember()` landing between rekey's
   read and its re-encrypted write was silently reverted to stale content
@@ -1017,31 +1017,31 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
   expired-fact supersede corner, where the valid period was already closed,
   `set_valid_to`'s close was a no-op that wrote no snapshot, and the
   `deprecated` flip was baked in under the original transaction time (so
-  `mimir_bitemporal` at pre-supersede instants showed the expired fact as
+  `perseus_vault_bitemporal` at pre-supersede instants showed the expired fact as
   already deprecated). A same-status call (e.g. re-superseding an
   already-deprecated fact) still refreshes `archive_reason` in place,
   unversioned by design — a reason overwrite is operational metadata, not a
   knowledge change. A normal supersede now writes two snapshots: the audited
   close, then the audited flip.
-- Supersede snapshot status fidelity (#375): `mimir_supersede` now closes the
+- Supersede snapshot status fidelity (#375): `perseus_vault_supersede` now closes the
   old fact's valid period BEFORE flipping its status to `deprecated`, so the
   #373 audit snapshot captures the true pre-supersede state — previously the
   snapshot baked `deprecated` in under the original transaction time, and
-  `mimir_bitemporal` reconstruction at a pre-supersede instant showed the
+  `perseus_vault_bitemporal` reconstruction at a pre-supersede instant showed the
   fact deprecated while it was still believed active. A failed close now
   also leaves the status untouched.
 - Audited `set_valid_to` closes (#373): closing/tightening a fact's valid
-  period (directly or via `mimir_supersede`) now snapshots the pre-close
+  period (directly or via `perseus_vault_supersede`) now snapshots the pre-close
   version to `entity_history` and advances the live row's transaction time —
-  previously a close was invisible to `mimir_as_of`/`mimir_bitemporal`
+  previously a close was invisible to `perseus_vault_as_of`/`perseus_vault_bitemporal`
   reconstruction, which reported the close even at transaction instants
   before it happened. Tighten-only acceptance semantics are unchanged, and a
   no-op call (an earlier stored close is kept) writes no snapshot.
 - Bi-temporal audit gap (#371): an identical-body re-remember that moves the
   bounds of an already-CLOSED valid period (e.g. re-extending past a
-  `mimir_supersede`/`set_valid_to` close) now snapshots the pre-change version
+  `perseus_vault_supersede`/`set_valid_to` close) now snapshots the pre-change version
   to `entity_history` and advances the live row's transaction time, so
-  `mimir_history`/`mimir_bitemporal` reconstruct both the closed period and
+  `perseus_vault_history`/`perseus_vault_bitemporal` reconstruct both the closed period and
   the re-extension. Acceptance semantics are unchanged (deliberate re-asserts
   may still extend); re-asserts that leave the period untouched write no
   spurious snapshot.
@@ -1063,7 +1063,7 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
   `docs/retention.md` (#341)
 - Opt-in `reinforce` flag for dense/hybrid recall (#343)
 - Persistent `importance` column — explicit scores survive decay recompute (#344)
-- `mimir_memories`: Anthropic `/memories` directory-convention adapter — file
+- `perseus_vault_memories`: Anthropic `/memories` directory-convention adapter — file
   interface (`view`/`create`/`str_replace`/…) backed by vault entities (#345)
 - Coldness-driven consolidation ("local dreaming") wired into autocohere (#350)
 
@@ -1073,7 +1073,7 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
 - `workspace_hash` scoping for context/recall_when/prepare + write-path
   dedup (#338)
 - Workspace-scoped entity identity — identity is now
-  (category, key, workspace_hash), so `mimir_share`/`mimir_federate` copy
+  (category, key, workspace_hash), so `perseus_vault_share`/`perseus_vault_federate` copy
   instead of clobbering the source row (#342, closes #339)
 - Dashboard (web) endpoints workspace-scoped + hardened, with test
   coverage (#346)
@@ -1093,7 +1093,7 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
 ## [2.11.1] - 2026-07-01
 
 ### Fixed
-- `mimir_remember`/`mimir_recall` reject explicit JSON `null` on optional
+- `perseus_vault_remember`/`perseus_vault_recall` reject explicit JSON `null` on optional
   fields instead of misbehaving (#334, closes #330)
 
 ## [2.11.0] - 2026-07-01
@@ -1104,32 +1104,32 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
 ## [2.10.0] - 2026-07-01
 
 ### Added
-- Follow-rate efficacy scoring: `mimir_follow` records whether an entity was
+- Follow-rate efficacy scoring: `perseus_vault_follow` records whether an entity was
   actually followed or missed; `follow_rate`/`efficacy_status` feed decay so
   ignored rules decay out of recall (#332)
-- `mimir_consolidate`: merge overlapping/duplicative entities into durable,
+- `perseus_vault_consolidate`: merge overlapping/duplicative entities into durable,
   evidence-tracked observations (#327)
 
 ## [2.9.0] - 2026-07-01
 
 ### Changed
 - **Product rename: Perseus Vault → Perseus Vault.** "Perseus Vault" collided with an active
-  commercial competitor (mneme.tools) plus several other unrelated AI-memory
+  commercial competitor (perseus_vault.tools) plus several other unrelated AI-memory
   products and open-source projects already using that exact name — a repeat
-  of the earlier Mimir naming collision. The crate and `[[bin]]` are now
+  of the earlier Perseus Vault naming collision. The crate and `[[bin]]` are now
   `perseus-vault`; the default database for fresh installs is
-  `~/.mimir/data/perseus-vault.db` (an existing `perseus-vault.db` or `mimir.db` at
+  `~/.perseus-vault/data/perseus-vault.db` (an existing `perseus-vault.db` or `perseus_vault.db` at
   that path is still used automatically, in that fallback order, so upgraders
   keep their data — see `default_db_path()` in `src/main.rs`). Every
-  `mimir_*` MCP tool is now additionally registered under a `perseus_vault_*`
-  name (on top of the existing `mneme_*` alias from the prior rename) — all
+  `perseus_vault_*` MCP tool is now additionally registered under a `perseus_vault_*`
+  name (on top of the existing `perseus_vault_*` alias from the prior rename) — all
   three names dispatch to the same handler, so existing MCP host configs
-  calling `mimir_remember`/`mimir_recall`/`mneme_remember`/etc. keep working
+  calling `perseus_vault_remember`/`perseus_vault_recall`/`perseus_vault_remember`/etc. keep working
   unchanged. `perseus-vault doctor`/`--help` output now refers to the
   `perseus-vault` binary. The installer (`scripts/install.sh`) and Dockerfile
-  install `perseus-vault` as the primary binary and add `mneme`/`mimir`
+  install `perseus-vault` as the primary binary and add `perseus_vault`/`perseus_vault`
   symlinks for backward compatibility with existing scripts and MCP configs.
-  Internal-only Rust identifiers (`MnemeGrpcServer`, the `mneme.v1` proto
+  Internal-only Rust identifiers (`PerseusVaultGrpcServer`, the `perseus_vault.v1` proto
   package, the MCP Registry `server.json`/Docker LABEL identity string) are
   intentionally left unchanged — those are wire-protocol/registry contracts
   external clients depend on by their literal names, not brand-facing text,
@@ -1138,30 +1138,30 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
 
 ### Breaking (soft — back-compat aliases provided)
 - Fresh installs now default to `perseus-vault.db` instead of `perseus-vault.db`/
-  `mimir.db`. Existing databases at the old paths are auto-detected and used
+  `perseus_vault.db`. Existing databases at the old paths are auto-detected and used
   as-is (no migration needed), but new installs on a machine with no prior
-  database will create the new filename. Set `--db`/`MIMIR_DB_PATH`
+  database will create the new filename. Set `--db`/`PERSEUS_VAULT_DB_PATH`
   explicitly if you need a specific path.
 
 ## [2.8.0] - 2026-06-30
 
 ### Changed
-- **Product rename: Mimir → Perseus Vault.** Avoids a trademark/SEO collision with
-  Grafana Mimir and a same-niche competitor also named Mimir. The crate and
-  `[[bin]]` are now `mneme`; the default database for fresh installs is
-  `~/.mimir/data/perseus-vault.db` (an existing `mimir.db` at that path is still used
+- **Product rename: Perseus Vault → Perseus Vault.** Avoids a trademark/SEO collision with
+  Grafana Perseus Vault and a same-niche competitor also named Perseus Vault. The crate and
+  `[[bin]]` are now `perseus_vault`; the default database for fresh installs is
+  `~/.perseus-vault/data/perseus-vault.db` (an existing `perseus_vault.db` at that path is still used
   automatically, so upgraders keep their data — see `default_db_path()` in
-  `src/main.rs`). Every `mimir_*` MCP tool is now also registered under the
-  equivalent `mneme_*` name — both dispatch to the same handler, so existing
-  MCP host configs that call `mimir_remember`/`mimir_recall`/etc. keep working
-  unchanged during the transition. `mimir doctor`/`--help` output now refers to
-  the `mneme` binary. Internal-only Rust identifiers (`MimirGrpcServer`, the
-  optional `grpc` feature's generated `Mimir`/`MimirServer` proto types) are
+  `src/main.rs`). Every `perseus_vault_*` MCP tool is now also registered under the
+  equivalent `perseus_vault_*` name — both dispatch to the same handler, so existing
+  MCP host configs that call `perseus_vault_remember`/`perseus_vault_recall`/etc. keep working
+  unchanged during the transition. `perseus_vault doctor`/`--help` output now refers to
+  the `perseus_vault` binary. Internal-only Rust identifiers (`PerseusVaultGrpcServer`, the
+  optional `grpc` feature's generated `PerseusVault`/`PerseusVaultServer` proto types) are
   renamed to their `Perseus Vault` equivalents with no back-compat surface, since
   nothing outside the binary depends on them.
 
 ### Fixed
-- **`layer` filter on `mimir_recall` now actually filters (#269 follow-up).** The
+- **`layer` filter on `perseus_vault_recall` now actually filters (#269 follow-up).** The
   `layer` recall parameter was accepted but never applied — `RecallParams.layer`
   was a dead field. It now filters by biomimetic layer in all three modes:
   keyword (`fts5_search`) and BM25 (`fts5_bm25_search`) pre-filter in-query, and a
@@ -1170,10 +1170,10 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
   semantic are normalized to core/buffer/working at the tools layer.
 
 ### Added
-- **`mimir_history` tool (code-review follow-up).** The bi-temporal `history_versions`
+- **`perseus_vault_history` tool (code-review follow-up).** The bi-temporal `history_versions`
   reader (v2.4.0) was complete and tested but no tool exposed it — you could time-travel
-  to one instant via `mimir_as_of` but couldn't list a fact's full version trail. Wired a
-  `mimir_history` tool that returns all superseded versions of a (category, key), newest
+  to one instant via `perseus_vault_as_of` but couldn't list a fact's full version trail. Wired a
+  `perseus_vault_history` tool that returns all superseded versions of a (category, key), newest
   first. Tool count 45 → **46**; README badge/table/section, `server.json`, and
   `CLAIMS-AUDIT.md` reconciled (they had drifted to 44/43).
 
@@ -1182,14 +1182,14 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
   legacy/auth-failure-classifying variant); the old method had zero callers and was the
   exact footgun the security fix replaced. Removed so it can't be reintroduced.
 
-- **`mimir doctor` + verified client compatibility matrix (#272).** New `mimir doctor`
+- **`perseus_vault doctor` + verified client compatibility matrix (#272).** New `perseus_vault doctor`
   subcommand validates the local install (binary path, db path) and prints the MCP
   stdio config plus a compatibility matrix for Claude Desktop, Claude Code/Hermes,
   Cursor, Windsurf, VS Code+Continue.dev, Zed, and Codex CLI. Added a "Works With
   Every MCP Client" table to the README and copy-paste config snippets in
-  `docs/clients/`. Mimir is a standard MCP stdio server, so the same command works
+  `docs/clients/`. Perseus Vault is a standard MCP stdio server, so the same command works
   everywhere — this documents and self-checks it.
-- **`include_confidence` on `mimir_recall` (#287).** Opt-in (default false): each result
+- **`include_confidence` on `perseus_vault_recall` (#287).** Opt-in (default false): each result
   gains a normalized `confidence` (0.0–1.0) rolled up from rank, trust (verified/certainty),
   and decay — a single number for callers/UIs instead of eyeballing raw signals. Purely
   presentation-layer; ranking math and existing snapshots are unchanged.
@@ -1215,7 +1215,7 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
 ### Distribution
 - **Published to the Official MCP Registry (#270).** Fixed `server.json` (valid
   `oci` package on GHCR, current version and 43 tool count, dropped a stale
-  install line) and added the OCI ownership label to the Docker image, so Mimir
+  install line) and added the OCI ownership label to the Docker image, so Perseus Vault
   is discoverable at registry.modelcontextprotocol.io and the directories that
   crawl it (Glama, PulseMCP, mcp.so).
 
@@ -1234,7 +1234,7 @@ improvements.
   capped) and RRF truncates to `limit` afterward. Strictly a recall-quality
   improvement; still fully read-only and byte-deterministic (verified by the
   existing idempotency/#125 tests + a new `hybrid_over_fetches_arms_before_fusion`
-  test that pins the cross-arm consensus hit). The `mimir-recall-mini` headline
+  test that pins the cross-arm consensus hit). The `perseus_vault-recall-mini` headline
   metrics are unchanged (24 docs saturate at `limit=10`), but the benchmark
   signature updates as the fused tail re-orders.
 - **Conflict scan window is now an explicit, wider constant.** `detect_conflicts`
@@ -1251,7 +1251,7 @@ improvements.
   default (vectorized ndarray) build.
 
 ### Fixed
-- **`mimir_reindex` no longer breaks keyword search on encrypted databases.**
+- **`perseus_vault_reindex` no longer breaks keyword search on encrypted databases.**
   `reindex_fts` did a raw `INSERT … SELECT body_json`, which on an encrypted DB
   copied **ciphertext** into the FTS5 index — silently breaking all keyword and
   hybrid recall until re-ingest (the recovery tool corrupted the very index it was
@@ -1260,11 +1260,11 @@ improvements.
   copy. Regression test added.
 
 ### Security
-- **Bounded file size for `mimir_ingest_file` (#236 hardening).** Document ingestion
+- **Bounded file size for `perseus_vault_ingest_file` (#236 hardening).** Document ingestion
   read the entire file into memory with no size limit, then copied the text into a
   JSON body and the FTS index — a single huge or maliciously-sized file could OOM
   the server (denial of service). Ingestion now rejects files larger than a
-  configurable cap (`MIMIR_MAX_INGEST_BYTES`, default 50 MiB) **before** reading,
+  configurable cap (`PERSEUS_VAULT_MAX_INGEST_BYTES`, default 50 MiB) **before** reading,
   for plaintext, DOCX and PDF alike. Regression test added.
 - **Python embedding fallback no longer interpolates text into its script.** The
   lean-build ONNX fallback (`generate_with_python`) escaped only `\` and `'` when
@@ -1280,10 +1280,10 @@ Bi-temporal facts, completed: conflicting facts can now be actively resolved
 (not just detected), with the loser superseded into history rather than deleted.
 
 ### Added
-- **Opt-in conflict invalidation (#253).** `mimir_conflicts` gains `resolve=true`:
+- **Opt-in conflict invalidation (#253).** `perseus_vault_conflicts` gains `resolve=true`:
   the lower-certainty side of a clear conflict is invalidated — superseded into
   `entity_history` and removed from the live table, so it drops out of recall but
-  stays reversible and time-travelable via `mimir_as_of`. Conservative by design:
+  stays reversible and time-travelable via `perseus_vault_as_of`. Conservative by design:
   `dry_run` defaults to **true** (an accidental `resolve` previews, never mutates),
   and pairs whose certainties are within `certainty_margin` (default 0.2) are
   skipped as ambiguous. Detection (`resolve=false`) is unchanged and remains the
@@ -1297,7 +1297,7 @@ Bi-temporal facts, completed: conflicting facts can now be actively resolved
 
 ## [2.4.0] - 2026-06-27
 
-Bi-temporal facts: Mimir now keeps a fact's prior versions when it changes and
+Bi-temporal facts: Perseus Vault now keeps a fact's prior versions when it changes and
 can answer "what did we believe at time T?" — pure SQLite, local, no cloud.
 
 ### Added
@@ -1310,7 +1310,7 @@ can answer "what did we believe at time T?" — pure SQLite, local, no cloud.
   one-row-per-key (its `UNIQUE(category, key)`, recall, and dedup paths are
   untouched), so default recall remains live-only by construction. An identical
   re-assertion creates no version (idempotent, compared on plaintext).
-- **`mimir_as_of` tool + `Database::as_of(category, key, as_of_unix_ms)`.**
+- **`perseus_vault_as_of` tool + `Database::as_of(category, key, as_of_unix_ms)`.**
   Bi-temporal time-travel: returns the version of a fact that was live at a past
   instant (or `found=false` if it had not been recorded yet). Brings the MCP
   tool count to **43**.
@@ -1322,8 +1322,8 @@ can answer "what did we believe at time T?" — pure SQLite, local, no cloud.
 
 ### Documentation
 - Reconciled the README tool count (badge / comparison table / section header)
-  from a stale **40** to the actual **43**, adding the missing `mimir_extract`,
-  `mimir_ingest_file` (both shipped in 2.3.0) and `mimir_as_of` rows.
+  from a stale **40** to the actual **43**, adding the missing `perseus_vault_extract`,
+  `perseus_vault_ingest_file` (both shipped in 2.3.0) and `perseus_vault_as_of` rows.
 
 ## [2.3.0] - 2026-06-27
 
@@ -1332,13 +1332,13 @@ ingestion — plus a reproducible recall-quality benchmark and a relevance-aware
 deterministic hybrid retrieval path.
 
 ### Added
-- **Local multimodal document ingestion (#236).** New `mimir_ingest_file` tool
+- **Local multimodal document ingestion (#236).** New `perseus_vault_ingest_file` tool
   extracts a document's text **locally** (no cloud, no network) and stores it as a
   recallable entity. Plaintext / markdown / structured-text work in any build;
   **DOCX and PDF** are supported when built with the new optional
   `--features multimodal` (pulls `zip` + `pdf-extract`), keeping the lean default
   binary dependency-free. Brings the MCP tool count to **42**.
-- **Local knowledge extraction (#234).** New `mimir_extract` tool turns raw text
+- **Local knowledge extraction (#234).** New `perseus_vault_extract` tool turns raw text
   (or a stored entity) into structured items — facts, preferences, temporal
   events, episodes — via a fully **local, deterministic, rule-based** extractor:
   no cloud LLM, no embedding/API call, no network (unlike GoodMem/Synap, which
@@ -1350,7 +1350,7 @@ deterministic hybrid retrieval path.
   measures recall@k / MRR across `fts5` / `dense` / `hybrid` modes by driving the
   real binary over MCP stdio with the **bundled** ONNX model — no network, no API
   key, no LLM — and emits a signed, re-runnable `report.json`. On the
-  paraphrase-heavy `mimir-recall-mini` set the offline dense model reaches **91.7%
+  paraphrase-heavy `perseus_vault-recall-mini` set the offline dense model reaches **91.7%
   recall@1 / 100% recall@5**, making the local-first promise measurable.
 
 ### Changed
@@ -1360,7 +1360,7 @@ deterministic hybrid retrieval path.
   is fused at a reduced dense-primary weight — so a paraphrase query no longer
   dilutes a confident dense ranking. RRF breaks score ties by entity id and the
   hybrid recall path is fully read-only, making all three modes **byte-stable
-  run-to-run**. Hybrid recall@1 on `mimir-recall-mini`: **20.8% → 87.5%** (MRR
+  run-to-run**. Hybrid recall@1 on `perseus_vault-recall-mini`: **20.8% → 87.5%** (MRR
   0.44 → 0.92).
 
 ### Documentation
@@ -1386,7 +1386,7 @@ the first time-aware retrieval control. The headline since `2.1.0`: dense/hybrid
 search works with zero config and zero network by default.
 
 ### Added
-- **Time-aware / recency-boosted hybrid recall (#235).** `mimir_recall` accepts an
+- **Time-aware / recency-boosted hybrid recall (#235).** `perseus_vault_recall` accepts an
   optional `recency_half_life_secs` for `mode: "hybrid"`. When set, each fused
   (RRF) result's score is multiplied by `0.5^(age / half_life)` based on the
   memory's creation time, so recent context outranks older but lexically/semantically
