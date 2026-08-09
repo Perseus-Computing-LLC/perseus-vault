@@ -25,7 +25,7 @@
 
 Claims verified against `src/`:
 
-- **95 canonical MCP tools**: ✓ The current registry contains 92 distinct base
+- **96 canonical MCP tools**: ✓ The current registry contains 92 distinct base
   tool names in `src/mcp.rs`, each exposed under the canonical
   `perseus_vault_*` prefix. The legacy `mimir_*` and `mneme_*` aliases remain
   callable but are not counted separately.

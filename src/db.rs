@@ -8533,8 +8533,15 @@ impl Database {
         input: &AuthorityManifestInput,
         author_agent_id: &str,
     ) -> Result<AuthorityManifest, Box<dyn std::error::Error>> {
-        if input.agent_id.trim().is_empty() || input.workspace_hash.trim().is_empty() {
-            return Err("authority manifest requires agent_id and workspace_hash".into());
+        if input.agent_id.trim().is_empty() {
+            return Err("authority manifest requires a non-empty agent_id".into());
+        }
+        if input.workspace_hash.trim().is_empty() {
+            // The authority regime is per-workspace by design: a manifest must
+            // name the exact workspace it governs. Empty ("global") scope is
+            // valid for memory entities but NOT for authority manifests, so
+            // fail loudly with the reason instead of a generic shape error.
+            return Err("authority manifest requires a non-empty workspace_hash (authority is per-workspace; empty/global scope is not valid for manifests)".into());
         }
         if !matches!(input.mode.as_str(), "shadow" | "enforce") {
             return Err("authority manifest mode must be shadow or enforce".into());
@@ -8751,9 +8758,18 @@ impl Database {
 
     pub fn action_intent(&self, agent_id:&str, workspace_hash:&str, scope_anchor:&str, external_ref:&str, capability:&str, action_key:&str, intent_hash:&str, resource_constraints_json: Option<&str>) -> Result<AuthorizedAction, Box<dyn std::error::Error>> {
         let manifest = self.active_authority(agent_id, workspace_hash)?;
-        if !manifest.allowed_capabilities.iter().any(|v| v == capability) { return Err("capability is not permitted by authority manifest".into()); }
-        if !manifest.scope_anchors.iter().any(|v| v == scope_anchor) { return Err("trusted scope anchor is not permitted by authority manifest".into()); }
-        if !manifest.permitted_external_ref_prefixes.iter().any(|v| external_ref == v || external_ref.starts_with(&(v.clone()+"/"))) { return Err("external reference is not permitted by authority manifest".into()); }
+        if !manifest.allowed_capabilities.iter().any(|v| v == capability) {
+            return Err(format!("capability {capability:?} is not permitted by authority manifest (allowed capabilities: {})", manifest.allowed_capabilities.join(", ")).into());
+        }
+        if !manifest.scope_anchors.iter().any(|v| v == scope_anchor) {
+            // Scope anchors are exact-match identifiers, not prefixes: the
+            // intent must name one of the trusted anchors verbatim so a
+            // manifest can never be satisfied by a lookalike anchor.
+            return Err(format!("scope anchor {scope_anchor:?} is not permitted by authority manifest (anchors match exactly; allowed: {})", manifest.scope_anchors.join(", ")).into());
+        }
+        if !manifest.permitted_external_ref_prefixes.iter().any(|v| external_ref == v || external_ref.starts_with(&(v.clone()+"/"))) {
+            return Err(format!("external reference {external_ref:?} is not permitted by authority manifest (permitted prefixes: {})", manifest.permitted_external_ref_prefixes.join(", ")).into());
+        }
         if intent_hash.len()!=64 || !intent_hash.bytes().all(|b| b.is_ascii_hexdigit()) { return Err("intent_hash must be a SHA-256 hex digest".into()); }
         let resource_constraints_json = canonical_constraint_json(resource_constraints_json.unwrap_or("{}"))?;
         if !resource_constraints_permit(&manifest.capability_constraints_json, capability, &resource_constraints_json)? {
@@ -9778,6 +9794,10 @@ impl Database {
                 derivation_version: (!derivation_version.is_empty()).then_some(derivation_version),
             },
             created_at_unix_ms: row.get(13)?,
+            // #876: governed-distillation lifecycle flags (NULL = live).
+            revoked_at_unix_ms: row.get(14)?,
+            stale_at_unix_ms: row.get(15)?,
+            revocation_reason: row.get(16)?,
         })
     }
 
@@ -9793,7 +9813,8 @@ impl Database {
             "SELECT binding_id, sha256, mime_type, workspace_hash, agent_id, visibility,
                     origin_json, external_refs_json, retention_policy,
                     representation_kind, derived_from_sha256, derivation_kind,
-                    derivation_version, created_at_unix_ms
+                    derivation_version, created_at_unix_ms,
+                    revoked_at_unix_ms, stale_at_unix_ms, revocation_reason
              FROM artifact_bindings
              WHERE sha256 = ?1 AND workspace_hash = ?2
              ORDER BY created_at_unix_ms ASC, binding_id ASC",
@@ -9901,14 +9922,271 @@ impl Database {
         Ok((sha256, artifact_created, binding_created))
     }
 
+    /// #876 governed distillation: register a learned-memory artifact
+    /// (trained weights / distilled cartridge) with source-entity hash
+    /// binding, gated on a COMPLETED `learned_memory` action receipt.
+    ///
+    /// Fail-closed contract: no `learned_memory` capability in the authority
+    /// manifest → the action can never be intended; no completed receipt →
+    /// registration is refused; a supplied receipt outcome_hash must equal
+    /// the artifact sha256. Every source entity is snapshotted hash-only
+    /// (id + normalized body digest + recorded_at) into
+    /// `learned_artifact_sources`, so revocation (erase/purge), staleness
+    /// (supersede), and receipt replay can bind artifact → sources →
+    /// workspace.
+    pub fn learned_artifact_register(
+        &self,
+        bytes: &[u8],
+        mime_type: &str,
+        workspace_hash: &str,
+        agent_id: &str,
+        visibility: &str,
+        action_id: &str,
+        source_entities: &[(String, String)],
+        external_refs: Vec<ExternalRef>,
+        retention_policy: Option<String>,
+        derivation_version: Option<String>,
+    ) -> Result<(String, bool, bool, serde_json::Value), Box<dyn std::error::Error>> {
+        use sha2::{Digest, Sha256};
+
+        // 1. Fail-closed receipt gate.
+        let receipt = self.action_receipt_get(action_id)?.ok_or_else(|| {
+            format!(
+                "learned artifact registration refused: no action receipt for {action_id}"
+            )
+        })?;
+        if receipt.status != "action_executed" {
+            return Err(format!(
+                "learned artifact registration refused: action {action_id} status is '{}', not 'action_executed' (completed)",
+                receipt.status
+            )
+            .into());
+        }
+        if receipt.capability != "learned_memory" {
+            return Err(format!(
+                "learned artifact registration refused: receipt capability is '{}', not 'learned_memory'",
+                receipt.capability
+            )
+            .into());
+        }
+        if receipt.workspace_hash != workspace_hash || receipt.agent_id != agent_id {
+            return Err(
+                "learned artifact registration refused: receipt actor/workspace mismatch"
+                    .to_string()
+                    .into(),
+            );
+        }
+        let artifact_sha = format!("{:x}", Sha256::digest(bytes));
+        if !receipt.outcome_hash.is_empty() && receipt.outcome_hash != artifact_sha {
+            return Err(format!(
+                "learned artifact registration refused: receipt outcome_hash {} does not match artifact sha256 {}",
+                receipt.outcome_hash, artifact_sha
+            )
+            .into());
+        }
+
+        // 2. Source snapshot (hash-only evidence) resolved in THIS workspace.
+        let conn = self.conn()?;
+        let mut source_bindings: Vec<serde_json::Value> = Vec::new();
+        for (cat, key) in source_entities {
+            let (id, body, recorded_at): (String, String, i64) = conn
+                .query_row(
+                    "SELECT id, body_json, recorded_at_unix_ms FROM entities
+                     WHERE category = ?1 AND key = ?2 AND workspace_hash = ?3
+                     ORDER BY id ASC LIMIT 1",
+                    params![cat, key, workspace_hash],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .map_err(|_| {
+                    format!(
+                        "learned artifact source not found: {cat}/{key} in workspace {workspace_hash}"
+                    )
+                })?;
+            source_bindings.push(serde_json::json!({
+                "entity_id": id,
+                "category": cat,
+                "key": key,
+                "value_sha256": rejected_value_digest(&body),
+                "recorded_at_unix_ms": recorded_at,
+            }));
+        }
+        drop(conn);
+
+        // 3. Register via the generic artifact path with a learned origin.
+        let origin = OriginRecord {
+            memory_kind: Some("learned_memory".to_string()),
+            source_system: Some("distillation".to_string()),
+            capture_method: Some("governed_learned_memory".to_string()),
+            observed_at_unix_ms: Some(receipt.updated_at_unix_ms),
+        };
+        let representation = ArtifactRepresentation {
+            kind: "derived".to_string(),
+            derived_from_sha256: None,
+            derivation_kind: Some("learned_memory".to_string()),
+            derivation_version,
+        };
+        let (sha, artifact_created, binding_created) = self.artifact_register(
+            bytes,
+            mime_type,
+            workspace_hash,
+            agent_id,
+            visibility,
+            Some(origin),
+            external_refs,
+            retention_policy.clone(),
+            representation.clone(),
+        )?;
+        if sha != artifact_sha {
+            return Err(
+                "learned artifact registration failed: digest mismatch after store".to_string()
+                    .into(),
+            );
+        }
+
+        // 4. Persist the source-entity bindings (hash-only, CASCADE-linked).
+        let binding_id = Self::artifact_binding_id(
+            &sha,
+            mime_type,
+            workspace_hash,
+            agent_id,
+            visibility,
+            &serde_json::to_string(&Some(OriginRecord {
+                memory_kind: Some("learned_memory".to_string()),
+                source_system: Some("distillation".to_string()),
+                capture_method: Some("governed_learned_memory".to_string()),
+                observed_at_unix_ms: Some(receipt.updated_at_unix_ms),
+            }))?,
+            &serde_json::to_string(&Vec::<ExternalRef>::new())?,
+            retention_policy.as_deref().unwrap_or(""),
+            &representation.kind,
+            representation.derived_from_sha256.as_deref().unwrap_or(""),
+            representation.derivation_kind.as_deref().unwrap_or(""),
+            representation.derivation_version.as_deref().unwrap_or(""),
+        );
+        let conn = self.conn()?;
+        for binding in &source_bindings {
+            conn.execute(
+                "INSERT INTO learned_artifact_sources
+                 (binding_id, entity_id, category, key, value_sha256, recorded_at_unix_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    &binding_id,
+                    binding["entity_id"].as_str().unwrap_or_default(),
+                    binding["category"].as_str().unwrap_or_default(),
+                    binding["key"].as_str().unwrap_or_default(),
+                    binding["value_sha256"].as_str().unwrap_or_default(),
+                    binding["recorded_at_unix_ms"].as_i64().unwrap_or(0),
+                ],
+            )?;
+        }
+
+        let evidence = serde_json::json!({
+            "artifact_sha256": sha,
+            "binding_id": binding_id,
+            "action_id": action_id,
+            "capability": "learned_memory",
+            "source_bindings": source_bindings,
+            "receipt_replay": {
+                "status": receipt.status,
+                "outcome_hash": receipt.outcome_hash,
+                "intent_hash": receipt.intent_hash,
+            },
+        });
+        Ok((sha, artifact_created, binding_created, evidence))
+    }
+
+    /// #876: revoke every artifact binding in the workspace whose
+    /// `learned_artifact_sources` rows reference `entity_id` — the source
+    /// was physically erased. Serve paths refuse revoked bindings
+    /// (fail-closed). Call inside the erasure/purge transaction; the caller
+    /// journals the evidence after commit. Returns the binding count.
+    fn revoke_artifacts_for_source(
+        conn: &rusqlite::Connection,
+        entity_id: &str,
+        workspace_hash: &str,
+        reason: &str,
+        now: i64,
+    ) -> Result<i64, Box<dyn std::error::Error>> {
+        let rows = conn.execute(
+            "UPDATE artifact_bindings
+             SET revoked_at_unix_ms = ?1, revocation_reason = ?2
+             WHERE workspace_hash = ?3 AND revoked_at_unix_ms IS NULL
+               AND binding_id IN (SELECT binding_id FROM learned_artifact_sources WHERE entity_id = ?4)",
+            params![now, reason, workspace_hash, entity_id],
+        )?;
+        Ok(rows as i64)
+    }
+
+    /// #876: flag artifact bindings STALE when a bound source entity is
+    /// superseded (retraining trigger; still serveable, flagged for
+    /// operator review). Idempotent: already-stale bindings are skipped.
+    /// Returns the binding count.
+    fn flag_artifacts_stale(
+        conn: &rusqlite::Connection,
+        entity_id: &str,
+        workspace_hash: &str,
+        now: i64,
+    ) -> Result<i64, Box<dyn std::error::Error>> {
+        let rows = conn.execute(
+            "UPDATE artifact_bindings
+             SET stale_at_unix_ms = ?1
+             WHERE workspace_hash = ?2 AND revoked_at_unix_ms IS NULL
+               AND stale_at_unix_ms IS NULL
+               AND binding_id IN (SELECT binding_id FROM learned_artifact_sources WHERE entity_id = ?3)",
+            params![now, workspace_hash, entity_id],
+        )?;
+        Ok(rows as i64)
+    }
+
+    /// #876: caller-facing staleness flag for a superseded source entity
+    /// (tools layer). Flags bindings and journals hash-only evidence.
+    pub fn flag_artifacts_stale_for_source(
+        &self,
+        entity_id: &str,
+        workspace_hash: &str,
+    ) -> Result<i64, Box<dyn std::error::Error>> {
+        let conn = self.conn()?;
+        let count = Self::flag_artifacts_stale(&conn, entity_id, workspace_hash, now_ms())?;
+        if count > 0 {
+            let event = crate::models::JournalEvent {
+                id: format!("jrn-{}", uuid::Uuid::new_v4().simple()),
+                event_type: "artifact_stale".to_string(),
+                evaluated_json: serde_json::json!({
+                    "source_entity_id": entity_id,
+                    "bindings_flagged": count,
+                })
+                .to_string(),
+                acted_json: "{}".to_string(),
+                forward_json: "{}".to_string(),
+                category: String::new(),
+                key: String::new(),
+                entity_id: entity_id.to_string(),
+                agent_id: String::new(),
+                workspace_hash: workspace_hash.to_string(),
+                created_at_unix_ms: now_ms(),
+            };
+            self.journal(&event)?;
+        }
+        Ok(count)
+    }
+
     pub fn artifact_resolve_visible(
         &self,
         sha256: &str,
         workspace_hash: Option<&str>,
         requesting_agent_id: Option<&str>,
     ) -> Result<(Vec<u8>, Vec<ArtifactBinding>), Box<dyn std::error::Error>> {
-        let bindings = self.visible_artifact_bindings(sha256, workspace_hash, requesting_agent_id)?;
-        if bindings.is_empty() {
+        let mut bindings = self.visible_artifact_bindings(sha256, workspace_hash, requesting_agent_id)?;
+        // #876: fail-closed serve for revoked learned artifacts. A binding
+        // whose source entity was physically erased is no longer serveable;
+        // a stale binding (source superseded) stays serveable but carries the
+        // flag for operator review. When every visible binding is revoked the
+        // artifact is unreachable — identical to not-found.
+        let live_bindings: Vec<ArtifactBinding> = bindings
+            .drain(..)
+            .filter(|b| b.revoked_at_unix_ms.is_none())
+            .collect();
+        if live_bindings.is_empty() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 "artifact not found in the requested scope or not visible to the requester",
@@ -9929,7 +10207,7 @@ impl Database {
             )
             .into());
         }
-        Ok((bytes, bindings))
+        Ok((bytes, live_bindings))
     }
 
     pub fn artifact_manifest(
@@ -9974,6 +10252,9 @@ impl Database {
                 retention_policy: binding.retention_policy,
                 representation: binding.representation,
                 created_at_unix_ms: binding.created_at_unix_ms,
+                revoked_at_unix_ms: binding.revoked_at_unix_ms,
+                stale_at_unix_ms: binding.stale_at_unix_ms,
+                revocation_reason: binding.revocation_reason.clone(),
                 why_served: ArtifactWhyServed {
                     reason: "artifact binding visible in the requested scope".to_string(),
                     workspace_hash: binding.workspace_hash,
@@ -11895,7 +12176,17 @@ Return a JSON object with an "insights" array. Each insight has:
             // skips them), so the preview must count them once too.
             let mut hist: std::collections::HashSet<String> = std::collections::HashSet::new();
             let mut jrn: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut learned_revoked: i64 = 0;
             for (id, cat, key, ws) in &doomed {
+                // #876: preview the learned-artifact revocations this purge
+                // would trigger (non-revoked bindings bound to the source).
+                learned_revoked += conn.query_row(
+                    "SELECT COUNT(*) FROM artifact_bindings b
+                     WHERE b.workspace_hash = ?1 AND b.revoked_at_unix_ms IS NULL
+                       AND b.binding_id IN (SELECT binding_id FROM learned_artifact_sources WHERE entity_id = ?2)",
+                    params![ws, id],
+                    |r| r.get::<_, i64>(0),
+                )?;
                 let mut stmt = conn.prepare(
                     &format!("SELECT history_id FROM entity_history WHERE {HIST_MATCH}"),
                 )?;
@@ -11912,6 +12203,7 @@ Return a JSON object with an "insights" array. Each insight has:
                 entities_deleted: count,
                 history_rows_deleted: hist.len() as i64,
                 journal_rows_redacted: jrn.len() as i64,
+                artifact_bindings_revoked: learned_revoked,
                 bytes_freed: 0,
                 dry_run: true,
                 completed_at_unix_ms: now_ms(),
@@ -11923,6 +12215,7 @@ Return a JSON object with an "insights" array. Each insight has:
                 entities_deleted: 0,
                 history_rows_deleted: 0,
                 journal_rows_redacted: 0,
+                artifact_bindings_revoked: 0,
                 bytes_freed: 0,
                 dry_run: false,
                 completed_at_unix_ms: now_ms(),
@@ -11939,7 +12232,23 @@ Return a JSON object with an "insights" array. Each insight has:
         )?;
         let mut history_deleted = 0i64;
         let mut journal_redacted = 0i64;
+        let mut artifact_bindings_revoked = 0i64;
+        let mut revoked_sources: Vec<(String, i64)> = Vec::new();
         for (id, cat, key, ws) in &doomed {
+            // #876: physically removing the source entity revokes learned
+            // artifacts bound to it (fail-closed serve). Runs inside the
+            // transaction; evidence is journaled after commit.
+            let revoked = Self::revoke_artifacts_for_source(
+                &tx,
+                id,
+                ws,
+                &format!("source_purged:{id}"),
+                now_ms(),
+            )?;
+            if revoked > 0 {
+                artifact_bindings_revoked += revoked;
+                revoked_sources.push((id.clone(), revoked));
+            }
             // #682: drop the history rows' FTS entries first (by rowid), so the
             // standalone entity_history_fts can't retain orphaned text or, worse,
             // hand a reused rowid to a future snapshot as a false match.
@@ -11971,6 +12280,30 @@ Return a JSON object with an "insights" array. Each insight has:
         }
         tx.commit()?;
 
+        // #876: journal hash-only revocation evidence for every learned
+        // artifact binding whose source was purged.
+        for (source_id, count) in &revoked_sources {
+            let event = crate::models::JournalEvent {
+                id: format!("jrn-{}", uuid::Uuid::new_v4().simple()),
+                event_type: "artifact_revoked".to_string(),
+                evaluated_json: serde_json::json!({
+                    "source_entity_id": source_id,
+                    "bindings_revoked": count,
+                    "reason": format!("source_purged:{source_id}"),
+                })
+                .to_string(),
+                acted_json: "{}".to_string(),
+                forward_json: "{}".to_string(),
+                category: String::new(),
+                key: String::new(),
+                entity_id: source_id.clone(),
+                agent_id: String::new(),
+                workspace_hash: String::new(),
+                created_at_unix_ms: now_ms(),
+            };
+            self.journal(&event)?;
+        }
+
         // VACUUM to reclaim disk space
         conn.execute_batch("VACUUM;")?;
 
@@ -11984,6 +12317,7 @@ Return a JSON object with an "insights" array. Each insight has:
             entities_deleted: count,
             history_rows_deleted: history_deleted,
             journal_rows_redacted: journal_redacted,
+            artifact_bindings_revoked,
             bytes_freed: freed,
             dry_run: false,
             completed_at_unix_ms: now_ms(),
@@ -17282,6 +17616,114 @@ mod tests {
             .action_approve(&intent.id, "github:tcconnally", "granted")
             .unwrap();
         assert_eq!(approval.status, "approval_granted");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn authority_intent_rejections_are_self_explanatory() {
+        let (db, path) = temp_db();
+        db.agent_upsert("agent-aar-msg", "AAR Messages", 3, "perseus")
+            .unwrap();
+        let manifest = crate::models::AuthorityManifestInput {
+            agent_id: "agent-aar-msg".to_string(),
+            workspace_hash: "ws-aar-msg".to_string(),
+            allowed_capabilities: vec!["git_push".to_string(), "issue_closure".to_string()],
+            approval_required_capabilities: vec![],
+            scope_anchors: vec!["Perseus-Computing-LLC/perseus".to_string()],
+            approver_principals: vec![],
+            allowed_inbound_principals: vec![],
+            permitted_external_ref_prefixes: vec![
+                "https://github.com/Perseus-Computing-LLC/perseus".to_string(),
+            ],
+            max_parallel_actions: 1,
+            mode: "enforce".to_string(),
+            expires_at_unix_ms: None,
+            capability_constraints_json: "{}".to_string(),
+        };
+        let _ = db.authority_set(&manifest, "admin").unwrap();
+
+        // Capability denial names the capability and lists the allowed set.
+        let err = db
+            .action_intent(
+                "agent-aar-msg", "ws-aar-msg",
+                "Perseus-Computing-LLC/perseus",
+                "https://github.com/Perseus-Computing-LLC/perseus",
+                "deploy", "act-1", &"a".repeat(64), Some("{}"),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("deploy"), "denial should name the capability: {err}");
+        assert!(err.contains("git_push"), "denial should list allowed capabilities: {err}");
+
+        // Anchor denial names the offending anchor, states exact-match
+        // semantics, and lists the allowed anchors.
+        let err = db
+            .action_intent(
+                "agent-aar-msg", "ws-aar-msg",
+                "Perseus-Computing-LLC/perseus branch feat/x",  // lookalike anchor
+                "https://github.com/Perseus-Computing-LLC/perseus",
+                "git_push", "act-2", &"a".repeat(64), Some("{}"),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("branch feat/x"), "denial should name the anchor: {err}");
+        assert!(err.contains("exactly"), "denial should state exact-match semantics: {err}");
+        assert!(err.contains("Perseus-Computing-LLC/perseus"), "denial should list allowed anchors: {err}");
+
+        // External-ref denial names the reference and lists the prefixes.
+        let err = db
+            .action_intent(
+                "agent-aar-msg", "ws-aar-msg",
+                "Perseus-Computing-LLC/perseus",
+                "https://github.com/Other-Org/other",
+                "git_push", "act-3", &"a".repeat(64), Some("{}"),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Other-Org"), "denial should name the reference: {err}");
+        assert!(err.contains("https://github.com/Perseus-Computing-LLC/perseus"), "denial should list permitted prefixes: {err}");
+
+        // Exact anchor + permitted prefix passes without approval required.
+        let ok = db
+            .action_intent(
+                "agent-aar-msg", "ws-aar-msg",
+                "Perseus-Computing-LLC/perseus",
+                "https://github.com/Perseus-Computing-LLC/perseus/pull/931",
+                "git_push", "act-4", &"a".repeat(64), Some("{}"),
+            )
+            .unwrap();
+        assert_eq!(ok.status, "intent");
+        assert!(!ok.approval_required);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn authority_set_validation_names_the_missing_field() {
+        let (db, path) = temp_db();
+        db.agent_upsert("agent-aar-set", "AAR Set", 3, "perseus")
+            .unwrap();
+        let mut base = crate::models::AuthorityManifestInput {
+            agent_id: "agent-aar-set".to_string(),
+            workspace_hash: "ws-aar-set".to_string(),
+            allowed_capabilities: vec!["git_push".to_string()],
+            approval_required_capabilities: vec![],
+            scope_anchors: vec!["anchor".to_string()],
+            approver_principals: vec![],
+            allowed_inbound_principals: vec![],
+            permitted_external_ref_prefixes: vec!["https://example.com".to_string()],
+            max_parallel_actions: 1,
+            mode: "enforce".to_string(),
+            expires_at_unix_ms: None,
+            capability_constraints_json: "{}".to_string(),
+        };
+        base.agent_id = "   ".to_string();
+        let err = db.authority_set(&base, "admin").unwrap_err().to_string();
+        assert!(err.contains("agent_id"), "should name agent_id: {err}");
+        base.agent_id = "agent-aar-set".to_string();
+        base.workspace_hash = "".to_string();
+        let err = db.authority_set(&base, "admin").unwrap_err().to_string();
+        assert!(err.contains("workspace_hash"), "should name workspace_hash: {err}");
+        assert!(err.contains("per-workspace"), "should explain the per-workspace regime: {err}");
         let _ = std::fs::remove_file(&path);
     }
 
@@ -30766,6 +31208,272 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{path}.bak"));
         let _ = std::fs::remove_file(format!("{path}.governance.db"));
+    }
+
+    // ── #876 governed distillation ──────────────────────────────────────
+
+    fn make_learned_manifest(db: &Database, agent: &str, ws: &str) {
+        db.agent_upsert(agent, agent, 2, "perseus").unwrap();
+        let manifest = crate::models::AuthorityManifestInput {
+            agent_id: agent.to_string(),
+            workspace_hash: ws.to_string(),
+            // git_push is allowed so the receipt-capability gate can be
+            // exercised: a completed git_push receipt must NOT register a
+            // learned artifact.
+            allowed_capabilities: vec!["learned_memory".to_string(), "git_push".to_string()],
+            approval_required_capabilities: vec![],
+            scope_anchors: vec!["vault:ws-lm".to_string()],
+            approver_principals: vec![],
+            allowed_inbound_principals: vec![],
+            permitted_external_ref_prefixes: vec!["vault:ws-lm".to_string()],
+            max_parallel_actions: 1,
+            mode: "enforce".to_string(),
+            expires_at_unix_ms: None,
+            capability_constraints_json: "{}".to_string(),
+        };
+        db.authority_set(&manifest, "admin").unwrap();
+    }
+
+    #[test]
+    fn learned_artifact_register_requires_completed_learned_memory_receipt() {
+        // #876 fail-closed gate: no receipt / wrong capability / outcome
+        // mismatch / actor mismatch — every path refuses registration.
+        let (db, path) = temp_db();
+        let ws = "ws-lm";
+        make_learned_manifest(&db, "agent-lm", ws);
+
+        let mut src = make_entity("lm-src-1", "decision", "lm-src-1", r#"{"v":1}"#);
+        src.workspace_hash = ws.to_string();
+        db.remember(&src).unwrap();
+        let artifact: &[u8] = b"trained-cartridge-v1";
+        let artifact_sha = format!("{:x}", sha2::Sha256::digest(artifact));
+        let sources: Vec<(String, String)> = vec![("decision".into(), "lm-src-1".into())];
+
+        // 1. No receipt at all.
+        let err = db
+            .learned_artifact_register(artifact, "application/octet-stream", ws, "agent-lm", "workspace", "no-such-action", &sources, vec![], None, Some("v1".to_string()))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no action receipt"), "{err}");
+
+        // 2. Completed receipt with the WRONG capability.
+        let action = db
+            .action_intent("agent-lm", ws, "vault:ws-lm", "vault:ws-lm/x", "git_push", "push-x", &"a".repeat(64), Some("{}"))
+            .unwrap();
+        db.action_complete(&action.id, "agent-lm", "executed", &artifact_sha).unwrap();
+        let err = db
+            .learned_artifact_register(artifact, "application/octet-stream", ws, "agent-lm", "workspace", &action.id, &sources, vec![], None, Some("v1".to_string()))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("capability is 'git_push'"), "{err}");
+
+        // 3. Learned_memory receipt whose outcome_hash does not match bytes.
+        let action = db
+            .action_intent("agent-lm", ws, "vault:ws-lm", "vault:ws-lm/y", "learned_memory", "distill-y", &"b".repeat(64), Some("{}"))
+            .unwrap();
+        db.action_complete(&action.id, "agent-lm", "executed", &"c".repeat(64)).unwrap();
+        let err = db
+            .learned_artifact_register(artifact, "application/octet-stream", ws, "agent-lm", "workspace", &action.id, &sources, vec![], None, Some("v1".to_string()))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("outcome_hash"), "{err}");
+
+        // 4. Actor mismatch: a different agent's completed receipt.
+        let action = db
+            .action_intent("agent-lm", ws, "vault:ws-lm", "vault:ws-lm/z", "learned_memory", "distill-z", &"d".repeat(64), Some("{}"))
+            .unwrap();
+        db.action_complete(&action.id, "agent-lm", "executed", &artifact_sha).unwrap();
+        let err = db
+            .learned_artifact_register(artifact, "application/octet-stream", ws, "other-agent", "workspace", &action.id, &sources, vec![], None, Some("v1".to_string()))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("actor/workspace mismatch"), "{err}");
+
+        // 5. Missing source entity in the workspace is refused.
+        let action = db
+            .action_intent("agent-lm", ws, "vault:ws-lm", "vault:ws-lm/w", "learned_memory", "distill-w", &"e".repeat(64), Some("{}"))
+            .unwrap();
+        db.action_complete(&action.id, "agent-lm", "executed", &artifact_sha).unwrap();
+        let ghost: Vec<(String, String)> = vec![("decision".into(), "no-such-key".into())];
+        let err = db
+            .learned_artifact_register(artifact, "application/octet-stream", ws, "agent-lm", "workspace", &action.id, &ghost, vec![], None, Some("v1".to_string()))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("source not found"), "{err}");
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn learned_artifact_flow_binds_sources_hash_only_and_manifests() {
+        // #876 happy path: intent -> complete -> register; evidence carries
+        // the source snapshot; learned_artifact_sources rows persist; the
+        // artifact serves through artifact_manifest.
+        let (db, path) = temp_db();
+        let ws = "ws-lm";
+        make_learned_manifest(&db, "agent-lm", ws);
+
+        let mut src = make_entity("lm-src-2", "decision", "lm-src-2", r#"{"v":2}"#);
+        src.workspace_hash = ws.to_string();
+        db.remember(&src).unwrap();
+        let artifact: &[u8] = b"trained-cartridge-v2";
+        let artifact_sha = format!("{:x}", sha2::Sha256::digest(artifact));
+        let sources: Vec<(String, String)> = vec![("decision".into(), "lm-src-2".into())];
+
+        let action = db
+            .action_intent("agent-lm", ws, "vault:ws-lm", "vault:ws-lm/flow", "learned_memory", "distill-flow", &"f".repeat(64), Some("{}"))
+            .unwrap();
+        db.action_complete(&action.id, "agent-lm", "executed", &artifact_sha).unwrap();
+
+        let (sha, created, binding_created, evidence) = db
+            .learned_artifact_register(artifact, "application/octet-stream", ws, "agent-lm", "workspace", &action.id, &sources, vec![], None, Some("v2".to_string()))
+            .unwrap();
+        assert_eq!(sha, artifact_sha);
+        assert!(created && binding_created);
+        let sb = evidence["source_bindings"].as_array().unwrap();
+        assert_eq!(sb.len(), 1);
+        assert_eq!(sb[0]["entity_id"], "lm-src-2");
+        assert_eq!(sb[0]["value_sha256"], rejected_value_digest(&src.body_json));
+        assert_eq!(evidence["receipt_replay"]["status"], "action_executed");
+
+        // The bound source row is persisted for revocation scans.
+        let conn = db.conn().unwrap();
+        let bound: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM learned_artifact_sources WHERE entity_id = 'lm-src-2'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(bound, 1);
+
+        // Serveable via manifest, with the learned origin + no lifecycle flags.
+        let manifest = db.artifact_manifest(&sha, Some(ws), None).unwrap();
+        assert_eq!(manifest.bindings.len(), 1);
+        let b = &manifest.bindings[0];
+        assert_eq!(b.representation.derivation_kind.as_deref(), Some("learned_memory"));
+        assert_eq!(b.origin.as_ref().unwrap().memory_kind.as_deref(), Some("learned_memory"));
+        assert!(b.revoked_at_unix_ms.is_none() && b.stale_at_unix_ms.is_none());
+
+        // Receipt replay: the receipt still resolves and matches.
+        let replay = db.action_receipt_get(&action.id).unwrap().unwrap();
+        assert_eq!(replay.capability, "learned_memory");
+        assert_eq!(replay.outcome_hash, artifact_sha);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn purge_of_bound_source_revokes_artifact_and_journals_evidence() {
+        // #876: physically removing the source entity (forget -> purge)
+        // revokes the learned binding; serve paths then refuse it fail-closed;
+        // hash-only evidence lands in the journal; the purge report counts it.
+        let (db, path) = temp_db();
+        let ws = "ws-lm";
+        make_learned_manifest(&db, "agent-lm", ws);
+
+        let mut src = make_entity("lm-src-3", "decision", "lm-src-3", r#"{"v":3}"#);
+        src.workspace_hash = ws.to_string();
+        db.remember(&src).unwrap();
+        let artifact: &[u8] = b"trained-cartridge-v3";
+        let artifact_sha = format!("{:x}", sha2::Sha256::digest(artifact));
+        let sources: Vec<(String, String)> = vec![("decision".into(), "lm-src-3".into())];
+        let action = db
+            .action_intent("agent-lm", ws, "vault:ws-lm", "vault:ws-lm/p", "learned_memory", "distill-p", &"c".repeat(64), Some("{}"))
+            .unwrap();
+        db.action_complete(&action.id, "agent-lm", "executed", &artifact_sha).unwrap();
+        let (sha, _, _, _) = db
+            .learned_artifact_register(artifact, "application/octet-stream", ws, "agent-lm", "workspace", &action.id, &sources, vec![], None, Some("v3".to_string()))
+            .unwrap();
+
+        // Serveable before erasure.
+        db.artifact_manifest(&sha, Some(ws), None).unwrap();
+
+        // Forget (archive) first, then the dry-run preview counts the
+        // revocation this purge would trigger.
+        db.forget("decision", "lm-src-3", "test-purge").unwrap();
+        let preview = db.purge(true).unwrap();
+        assert_eq!(preview.artifact_bindings_revoked, 1);
+        assert_eq!(preview.entities_deleted, 1);
+        db.artifact_manifest(&sha, Some(ws), None).unwrap(); // still live
+
+        // Real purge revokes for good.
+        let report = db.purge(false).unwrap();
+        assert_eq!(report.artifact_bindings_revoked, 1);
+        assert_eq!(report.entities_deleted, 1);
+
+        // Fail-closed serve: the artifact is now unreachable.
+        let err = db.artifact_manifest(&sha, Some(ws), None).unwrap_err().to_string();
+        assert!(err.contains("not found") || err.contains("not visible"), "{err}");
+
+        // Journal carries hash-only evidence (entity id + count, no content).
+        let conn = db.conn().unwrap();
+        let ev: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM journal WHERE event_type = 'artifact_revoked'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(ev, 1);
+        let payload: String = conn
+            .query_row(
+                "SELECT evaluated_json FROM journal WHERE event_type = 'artifact_revoked' LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(payload.contains("lm-src-3"), "{payload}");
+        assert!(payload.contains("bindings_revoked"), "{payload}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn supersede_of_bound_source_flags_stale_but_stays_serveable() {
+        // #876: superseding a source entity flags the learned binding STALE
+        // (retraining trigger) with journal evidence; revocation does NOT
+        // happen — the artifact remains serveable.
+        let (db, path) = temp_db();
+        let ws = "ws-lm";
+        make_learned_manifest(&db, "agent-lm", ws);
+
+        let mut src = make_entity("lm-src-4", "decision", "lm-src-4", r#"{"v":4}"#);
+        src.workspace_hash = ws.to_string();
+        db.remember(&src).unwrap();
+        let artifact: &[u8] = b"trained-cartridge-v4";
+        let artifact_sha = format!("{:x}", sha2::Sha256::digest(artifact));
+        let sources: Vec<(String, String)> = vec![("decision".into(), "lm-src-4".into())];
+        let action = db
+            .action_intent("agent-lm", ws, "vault:ws-lm", "vault:ws-lm/s", "learned_memory", "distill-s", &"d".repeat(64), Some("{}"))
+            .unwrap();
+        db.action_complete(&action.id, "agent-lm", "executed", &artifact_sha).unwrap();
+        let (sha, _, _, _) = db
+            .learned_artifact_register(artifact, "application/octet-stream", ws, "agent-lm", "workspace", &action.id, &sources, vec![], None, Some("v4".to_string()))
+            .unwrap();
+
+        let flagged = db
+            .flag_artifacts_stale_for_source("lm-src-4", ws)
+            .unwrap();
+        assert_eq!(flagged, 1);
+
+        // Manifest still resolves; binding carries the stale flag.
+        let manifest = db.artifact_manifest(&sha, Some(ws), None).unwrap();
+        let b = &manifest.bindings[0];
+        assert!(b.stale_at_unix_ms.is_some());
+        assert!(b.revoked_at_unix_ms.is_none());
+
+        let conn = db.conn().unwrap();
+        let ev: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM journal WHERE event_type = 'artifact_stale'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(ev, 1);
+        // Idempotent: a second flag does not double-journal.
+        let flagged2 = db.flag_artifacts_stale_for_source("lm-src-4", ws).unwrap();
+        assert_eq!(flagged2, 0);
+        let _ = std::fs::remove_file(path);
     }
 }
 

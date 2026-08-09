@@ -416,7 +416,7 @@ CREATE INDEX IF NOT EXISTS idx_artifact_bindings_derived_from
 /// 'defensively_recalled', orthogonal to the lifecycle `status` column.
 /// Backfill-free: existing rows default to 'candidate' (useful but unverified),
 /// which is the safe reading for any legacy record lacking admission evidence.
-const SCHEMA_VERSION: i64 = 28;
+const SCHEMA_VERSION: i64 = 29;
 
 /// Initialize the v0.2.0 schema on a fresh database.
 pub fn initialize_schema(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
@@ -530,6 +530,40 @@ fn apply_migrations(conn: &Connection) -> Result<(), Box<dyn std::error::Error>>
     // v28 (#868): retention expiry on the live row. NULL = never expires
     // (the correct reading for every legacy row), so this is purely additive.
     ensure_column(conn, "entities", "expires_at_unix_ms", "INTEGER")?;
+
+    // v29 (#876): governed-distillation lifecycle on artifact bindings.
+    // A learned artifact (trained weights / distilled cartridge) is bound to
+    // its source entities at registration; when a source is physically
+    // erased the binding is REVOKED (serve paths refuse it), and when a
+    // source is superseded it is flagged STALE (retraining trigger, journal
+    // evidence). Both are additive flags; NULL = live binding.
+    ensure_column(conn, "artifact_bindings", "revoked_at_unix_ms", "INTEGER")?;
+    ensure_column(conn, "artifact_bindings", "stale_at_unix_ms", "INTEGER")?;
+    ensure_column(
+        conn,
+        "artifact_bindings",
+        "revocation_reason",
+        "TEXT DEFAULT ''",
+    )?;
+
+    // v29 (#876): source-entity bindings for learned artifacts. One row per
+    // (artifact binding, source entity) with hash-only evidence (entity id +
+    // normalized body digest + recorded_at), so revocation scans and receipt
+    // replay can bind artifact -> sources -> workspace. CASCADE keeps the
+    // table in step with artifact_bindings deletes (pool opens with
+    // foreign_keys=ON).
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS learned_artifact_sources (
+            binding_id TEXT NOT NULL REFERENCES artifact_bindings(binding_id) ON DELETE CASCADE,
+            entity_id TEXT NOT NULL,
+            category TEXT NOT NULL DEFAULT '',
+            key TEXT NOT NULL DEFAULT '',
+            value_sha256 TEXT NOT NULL,
+            recorded_at_unix_ms INTEGER NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS idx_learned_sources_entity
+            ON learned_artifact_sources(entity_id);",
+    )?;
 
     // Backfill transaction time for pre-existing rows: a fact's recorded_at is
     // when Mneme first stored it, i.e. its created_at. (No-op on a fresh DB.)
