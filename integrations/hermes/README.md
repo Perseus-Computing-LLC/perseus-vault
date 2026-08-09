@@ -127,6 +127,28 @@ hermes perseus-vault status
 hermes perseus-vault tools
 ```
 
+## ⚠️ Important: Disable Built-in Memory
+
+The installer enables the Perseus Vault provider, but Hermes also has a built-in memory system (MEMORY.md/USER.md) that runs in parallel. To avoid **duplicate memory injection** and conflicts, **disable the built-in memory** after installation:
+
+```bash
+# Edit ~/.hermes/config.yaml
+# Find the memory: section and set both to false:
+memory:
+  memory_enabled: false
+  user_profile_enabled: false
+```
+
+Then verify:
+```bash
+hermes memory status
+# Should show:
+#   Memory injection:   disabled ✗
+#   User profile:       disabled ✗
+#   Memory tool:        enabled ✓
+#   Provider:  perseus-vault | Status: available ✓
+```
+
 ## Usage in Session
 
 The provider is **automatic** — no manual tool calls needed:
