@@ -9,8 +9,8 @@ fn main() {
         tonic_build::configure()
             .build_server(true)
             .build_client(false)
-            .compile_protos(&["proto/mimir/v1/mimir.proto"], &["proto"])
-            .expect("failed to compile mimir proto");
+            .compile_protos(&["proto/perseus_vault/v1/perseus_vault.proto"], &["proto"])
+            .expect("failed to compile perseus-vault proto");
     }
 
     // #237: when bundled-embeddings is active, fetch the quantized
@@ -105,7 +105,7 @@ fn fetch_model_assets(out_dir: &str) {
     // air-gapped CI) instead of downloading. Overridden files are still checksum-
     // verified below by ensure_asset, so an offline build can't be tricked into
     // embedding a mismatched model either.
-    if let Ok(dir) = std::env::var("MIMIR_BUNDLED_MODEL_DIR") {
+    if let Ok(dir) = std::env::var("PERSEUS_VAULT_BUNDLED_MODEL_DIR") {
         copy_if_present(&dir, "model_quantized.onnx", out_dir);
         copy_if_present(&dir, "tokenizer.json", out_dir);
     }
@@ -136,7 +136,7 @@ fn ensure_asset(url: &str, dest: &str, expected_sha256: &str) {
     let resp = ureq::get(url)
         .timeout(std::time::Duration::from_secs(600))
         .call()
-        .unwrap_or_else(|e| panic!("build.rs: failed to download {url}: {e}\nFor an offline build, set MIMIR_BUNDLED_MODEL_DIR to a dir containing the model + tokenizer (still checksum-verified), or build with --no-default-features."));
+        .unwrap_or_else(|e| panic!("build.rs: failed to download {url}: {e}\nFor an offline build, set PERSEUS_VAULT_BUNDLED_MODEL_DIR to a dir containing the model + tokenizer (still checksum-verified), or build with --no-default-features."));
     let mut reader = resp.into_reader();
     let mut buf = Vec::new();
     std::io::copy(&mut reader, &mut buf)

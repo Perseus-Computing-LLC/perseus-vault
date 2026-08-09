@@ -45,7 +45,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
-from run import MimirServer, session_text, find_binary  # noqa: E402
+from run import PerseusVaultServer, session_text, find_binary  # noqa: E402
 
 from datetime import datetime
 
@@ -78,7 +78,7 @@ def gold_ranks(inst, srv, qid, k, ku_shared=False):
 
     With ku_shared, the gold (fact-version) sessions are instead ingested
     under ONE shared key with valid_from = session date — the PRODUCT shape,
-    where `mimir_remember` collapses versions to a live latest-wins row (see
+    where `perseus_vault_remember` collapses versions to a live latest-wins row (see
     INGEST_590.md demo B). Grouping uses the dataset's evidence labels: which
     sessions update the same fact is authoring-time knowledge, exactly what a
     real caller has when it re-remembers a fact under its key. Stale versions
@@ -99,16 +99,16 @@ def gold_ranks(inst, srv, qid, k, ku_shared=False):
         if sid in shared:
             continue  # fact versions ingest below, ascending by date
         turns, d = by_id[sid]
-        srv.call("mimir_remember", {"category": qid, "key": sid,
+        srv.call("perseus_vault_remember", {"category": qid, "key": sid,
                                     "body_json": json.dumps({"note": session_note(d, turns)}),
                                     "type": "fact"})
     for g in dated_gold if shared else []:
         turns, d = by_id[g]
-        srv.call("mimir_remember", {"category": qid, "key": SHARED_FACT_KEY,
+        srv.call("perseus_vault_remember", {"category": qid, "key": SHARED_FACT_KEY,
                                     "body_json": json.dumps({"note": session_note(d, turns)}),
                                     "type": "fact", "valid_from_unix_ms": to_ms(d)})
-    srv.call("mimir_embed", {"batch_category": qid, "batch_limit": 1000})
-    r = srv.call("mimir_recall", {"query": inst["question"], "mode": "hybrid",
+    srv.call("perseus_vault_embed", {"batch_category": qid, "batch_limit": 1000})
+    r = srv.call("perseus_vault_recall", {"query": inst["question"], "mode": "hybrid",
                                   "category": qid, "limit": k, "trust_weight": 0,
                                   "min_decay": 0})
     items = r.get("items", []) if isinstance(r, dict) else []
@@ -181,7 +181,7 @@ def main():
                     help="PRODUCT-shape ingest for version-bearing questions: gold fact-version "
                          "sessions share one key with valid_from = session date (latest-wins; "
                          "stale versions live in entity_history). See INGEST_590.md.")
-    ap.add_argument("--bin", default=None, help="perseus-vault binary (else auto-located / MIMIR_BIN)")
+    ap.add_argument("--bin", default=None, help="perseus-vault binary (else auto-located / PERSEUS_VAULT_BIN)")
     ap.add_argument("--out", default=str(HERE / "diag_report.json"))
     ap.add_argument("--journal", default=None, help="Crash-safe per-question journal (resumable)")
     ap.add_argument("--resume", action="store_true", help="Resume from --journal")
@@ -202,7 +202,7 @@ def main():
     ladder = [int(x) for x in args.ladder.split(",") if x.strip()]
 
     binary = find_binary(args.bin)
-    db = str(Path(os.environ.get("TMPDIR") or os.environ.get("TEMP") or "/tmp") / "mimir-diag.db")
+    db = str(Path(os.environ.get("TMPDIR") or os.environ.get("TEMP") or "/tmp") / "perseus_vault-diag.db")
 
     def wipe():
         for ext in ("", "-wal", "-shm"):
@@ -246,7 +246,7 @@ def main():
         if qid in done:
             continue
         wipe()
-        srv = MimirServer(binary, db)
+        srv = PerseusVaultServer(binary, db)
         try:
             ranks, n_sess, update_id = gold_ranks(inst, srv, qid, args.k,
                                                   ku_shared=args.ku_shared_key)

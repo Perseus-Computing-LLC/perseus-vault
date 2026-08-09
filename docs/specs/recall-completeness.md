@@ -16,8 +16,8 @@ set), which made the semantic paths the silent offender.
 ## Contract
 
 Every recall now carries top-k completeness metadata. The outcome block on
-`mimir_recall` (with `include_outcome`, and always on degraded responses)
-and the standalone `mimir_recall_outcome` expose:
+`perseus_vault_recall` (with `include_outcome`, and always on degraded responses)
+and the standalone `perseus_vault_recall_outcome` expose:
 
 ```
 completeness: exact | bounded | partial | abstain
@@ -64,18 +64,18 @@ existing `deadline_ms` / `outcome.status = timeout` contract (#864).
 - **Abstention wins:** if the outcome is `abstained` (no evidence, dead
   backend), completeness is `abstain` regardless of pool dynamics.
 - **FTS:** no pool exists — `exact`, `candidate_scope: null`.
-- **Standalone `mimir_recall_outcome`:** a conservative *estimate* derived
+- **Standalone `perseus_vault_recall_outcome`:** a conservative *estimate* derived
   from the scan bound vs the embedded population (`exact` when
-  `population <= MIMIR_DENSE_MAX_SCAN`; `bounded` otherwise; `abstain` on
+  `population <= PERSEUS_VAULT_DENSE_MAX_SCAN`; `bounded` otherwise; `abstain` on
   abstention). The recall path's own pool dynamics (above) are authoritative
-  and override the estimate on `mimir_recall` responses.
+  and override the estimate on `perseus_vault_recall` responses.
 
 ## Behavior preserved
 
 - `limit` is still honored exactly (truncation after the adaptive loop).
 - Byte-stable deterministic ordering on frozen DBs (#254) is untouched: the
   loop re-runs the same deterministic arm functions with a larger pool.
-- The pool ceiling and the `MIMIR_DENSE_MAX_SCAN` dial (#619) are
+- The pool ceiling and the `PERSEUS_VAULT_DENSE_MAX_SCAN` dial (#619) are
   independent: the ceiling bounds recall-side candidate generation; the env
   dial bounds the underlying SQL scan.
 

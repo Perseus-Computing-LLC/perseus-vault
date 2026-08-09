@@ -133,7 +133,7 @@ def _run_accs(primary, seeds):
     for r in [primary] + list(seeds):
         if not r:
             continue
-        a = (r.get("systems", {}).get("mimir", {}) or r.get("mimir", {})).get("accuracy")
+        a = (r.get("systems", {}).get("perseus-vault", {}) or r.get("perseus-vault", {})).get("accuracy")
         if a is not None:
             out.append(a)
     return out
@@ -174,12 +174,12 @@ def sec_qa(qa, seeds=(), cot_html=""):
   report and per-category breakdown will render here when it lands. Until then this
   section shows no number, because there is no signed number to show.</p>
 </section>"""
-    overall = qa.get("systems", {}).get("mimir", {}) or qa.get("mimir", {})
+    overall = qa.get("systems", {}).get("perseus-vault", {}) or qa.get("perseus-vault", {})
     acc = overall.get("accuracy")
     # Multi-seed (#475): when confirmation seed reports exist, the headline is the
     # mean across all runs with the range — a single run's number is never quoted
     # alone once a distribution is available.
-    seed_accs = [s.get("systems", {}).get("mimir", {}).get("accuracy")
+    seed_accs = [s.get("systems", {}).get("perseus-vault", {}).get("accuracy")
                  for s in seeds if s]
     all_accs = [a for a in [acc] + seed_accs if a is not None]
     answerer = esc(qa.get('answerer_model', qa.get('answerer', qa.get('model', 'pinned model'))))
@@ -530,7 +530,7 @@ def main():
       <svg width="26" height="26" viewBox="0 0 56 56" fill="none" aria-hidden="true"><rect x="3" y="14" width="17" height="3.6" rx="1.8" fill="var(--violet)"/><rect x="3" y="21" width="17" height="3.6" rx="1.8" fill="var(--violet)" fill-opacity=".75"/><rect x="3" y="28" width="17" height="3.6" rx="1.8" fill="var(--violet)" fill-opacity=".55"/><rect x="3" y="35" width="17" height="3.6" rx="1.8" fill="var(--violet)" fill-opacity=".4"/><g stroke="var(--amber)" stroke-width="2.4" stroke-linecap="round"><line x1="22" y1="16" x2="42" y2="28"/><line x1="22" y1="23" x2="42" y2="28"/><line x1="22" y1="30" x2="42" y2="28"/><line x1="22" y1="37" x2="42" y2="28"/></g><circle cx="44" cy="28" r="4.2" fill="var(--amber)"/></svg>
       <span class="legal-line">Perseus Computing LLC · generated {today} at {esc(commit)} · perseus.observer/benchmarks</span>
     </div>
-    <div class="sib"><a href="/">Perseus</a><a href="/perseus-vault/">Perseus Vault</a><a href="/plutus/">Plutus</a><a href="{GITHUB}">GitHub</a></div>
+    <div class="sib"><a href="/">Perseus</a><a href="/perseus-vault/">Perseus Vault</a><a href="/ledger/">Ledger</a><a href="{GITHUB}">GitHub</a></div>
   </div>
 </footer>
 <script src="/assets/perseus.js"></script>

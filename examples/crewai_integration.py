@@ -1,34 +1,34 @@
 """
-Mimir + CrewAI Integration Example
+Perseus Vault + CrewAI Integration Example
 
-Shows how to use Mimir as persistent memory for a CrewAI crew.
-Requires: pip install crewai mimir
+Shows how to use Perseus Vault as persistent memory for a CrewAI crew.
+Requires: pip install crewai perseus_vault
 """
 import os
 import json
 import subprocess
 from crewai import Agent, Task, Crew, Process
 
-# Start Mimir in the background
-mimir_process = subprocess.Popen(
-    ["mimir", "--db", "./crew_memory.db"],
+# Start Perseus Vault in the background
+perseus_vault_process = subprocess.Popen(
+    ["perseus-vault", "--db", "./crew_memory.db"],
     stdout=subprocess.PIPE,
     stderr=subprocess.PIPE,
 )
 
-# Connect to Mimir via MCP
+# Connect to Perseus Vault via MCP
 # CrewAI supports MCP tools natively — just add the server config
 mcp_config = {
-    "mimir": {
-        "command": "mimir",
+    "perseus-vault": {
+        "command": "perseus-vault",
         "args": ["--db", "./crew_memory.db"],
         "transport": "stdio",
     }
 }
 
 # Or use the Python client directly
-from mimir import MimirClient
-client = MimirClient(db_path="./crew_memory.db")
+from perseus_vault import PerseusVaultClient
+client = PerseusVaultClient(db_path="./crew_memory.db")
 
 # Store a memory
 client.remember(
@@ -41,7 +41,7 @@ client.remember(
 memories = client.recall("user preferences", limit=5)
 context = "\n".join(m.content for m in memories)
 
-# Create a CrewAI agent with Mimir-backed context
+# Create a CrewAI agent with Perseus Vault-backed context
 agent = Agent(
     role="Assistant",
     goal="Help the user with their tasks",
@@ -67,4 +67,4 @@ client.remember(
     metadata={"session_id": "demo-001"},
 )
 
-mimir_process.terminate()
+perseus_vault_process.terminate()

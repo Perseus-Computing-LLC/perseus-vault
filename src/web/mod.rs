@@ -363,7 +363,7 @@ mod tests {
 
     fn temp_db() -> (Arc<Database>, String) {
         let dir = std::env::temp_dir();
-        let path = dir.join(format!("mimir-web-test-{}.db", uuid::Uuid::new_v4()));
+        let path = dir.join(format!("perseus_vault-web-test-{}.db", uuid::Uuid::new_v4()));
         let path_str = path.to_str().unwrap().to_string();
         let db = Database::open(&path_str).expect("open test db");
         (Arc::new(db), path_str)

@@ -8,8 +8,8 @@ context), `question-conditioned-synthesis.md` (#741 — persistence rule for
 reflective output), `memory-taxonomy-and-precedence.md` (insight class,
 precedence R3), `served-memory-api.md` (explanation payload, serving views)
 
-`mimir_dream` writes durable semantic insights and treats them as settled
-explanations: the only post-write feedback is `mimir_follow` efficacy, and
+`perseus_vault_dream` writes durable semantic insights and treats them as settled
+explanations: the only post-write feedback is `perseus_vault_follow` efficacy, and
 the only referee for a wrong insight is decay or manual supersession. This
 spec recasts synthesis output as *hypotheses* with an explicit lifecycle,
 two typed evidence streams updating certainty, and a revision/split
@@ -31,8 +31,8 @@ restart at `hypothesis`):
 | `split` | Superseded by ≥2 child hypotheses (§4) | History/audit only, via `as_of`/`valid_at` |
 
 Transitions are journaled as `observation` events linked to the insight
-(reconstructable via `mimir_timeline`). Initial state is `hypothesis`;
-`mimir_consolidate` observations (mechanical merges, no causal claim) are
+(reconstructable via `perseus_vault_timeline`). Initial state is `hypothesis`;
+`perseus_vault_consolidate` observations (mechanical merges, no causal claim) are
 exempt.
 
 ## 2. Usefulness vs. predictive validity: two evidence streams
@@ -40,7 +40,7 @@ exempt.
 The discussion's core distinction is made explicit in the data model:
 
 - **Usefulness** — "was the recalled insight followed?" Captured in-band by
-  `mimir_follow`. Continuous, cheap, *weak*: a heuristic can be useful
+  `perseus_vault_follow`. Continuous, cheap, *weak*: a heuristic can be useful
   without capturing the mechanism, and works until the environment shifts.
 - **Predictive validity** — "did the insight correctly predict what happened
   next?" Observable only when the environment produces the test case:
@@ -68,7 +68,7 @@ certainty ← prior
   `durable` at certainty ≥ durability threshold with ≥1 confirmation and no
   open contradiction; `contradicted` on any event dropping certainty below
   the durability floor.
-- `mimir_follow` never promotes a hypothesis to `durable` on its own — pure
+- `perseus_vault_follow` never promotes a hypothesis to `durable` on its own — pure
   usefulness cannot validate a causal claim. This is the guard against
   heuristics that work until they silently don't.
 
@@ -77,11 +77,11 @@ certainty ← prior
 When a hypothesis is contradicted, decay is no longer the only referee:
 
 ```
-mimir_revise(insight_id, children: [{claim, evidence_ids, certainty_hint}],
+perseus_vault_revise(insight_id, children: [{claim, evidence_ids, certainty_hint}],
              reason) -> { parent: bounded, children: [insight_id, ...] }
 ```
 
-- The parent is **superseded, never deleted**: `mimir_supersede` bounds its
+- The parent is **superseded, never deleted**: `perseus_vault_supersede` bounds its
   `valid_to` (bitemporal chain intact for audit), and it moves to the
   `split` terminal state.
 - Each child is a new insight with `derived_from` = parent + cited evidence,
@@ -102,7 +102,7 @@ is later confirmed or contradicted by real outcomes (task results, error
 recurrence, user corrections). Vault's side of the contract:
 
 ```
-mimir_validate(insight_id, outcome: 'confirmed' | 'contradicted',
+perseus_vault_validate(insight_id, outcome: 'confirmed' | 'contradicted',
                context: string, session_id?, source: 'perseus' | 'operator')
 ```
 
@@ -111,7 +111,7 @@ mimir_validate(insight_id, outcome: 'confirmed' | 'contradicted',
   the §3 certainty update, and drives the §1 lifecycle transition.
 - Events are opportunistic, never polled — Vault stores whatever arrives
   and never schedules its own counterfactual tests.
-- User corrections via `mimir_correct` that reference an insight's subject
+- User corrections via `perseus_vault_correct` that reference an insight's subject
   SHOULD also emit a `contradicted` event; corrections are the
   highest-quality falsification source already flowing.
 - Idempotent by (insight_id, session_id, outcome) so orchestration retries
@@ -130,10 +130,10 @@ mimir_validate(insight_id, outcome: 'confirmed' | 'contradicted',
 
 1. Add `lifecycle` + validation tally to dream-insight bodies; default
    existing dream insights to `durable` (grandfathered, no event history).
-2. Implement `mimir_validate` (journal write + certainty update + state
-   transition); wire `mimir_correct` to emit on insight-referencing
+2. Implement `perseus_vault_validate` (journal write + certainty update + state
+   transition); wire `perseus_vault_correct` to emit on insight-referencing
    corrections.
-3. Implement `mimir_revise` on top of `mimir_supersede` + `mimir_remember`;
+3. Implement `perseus_vault_revise` on top of `perseus_vault_supersede` + `perseus_vault_remember`;
    children carry `derived_from` back-links.
 4. Surface `lifecycle` in recall/serving explanation payloads.
 

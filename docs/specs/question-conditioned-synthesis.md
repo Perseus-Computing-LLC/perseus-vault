@@ -9,7 +9,7 @@ context this parameterizes), `memory-taxonomy-and-precedence.md` (insight
 class), `served-memory-api.md` (briefing surface for reflective sections)
 
 There is no purpose-free optimal summary: any "canonical" synthesis has
-implicitly already picked a question. `mimir_dream` asks exactly one fixed
+implicitly already picked a question. `perseus_vault_dream` asks exactly one fixed
 question — "what stable pattern do these collectively imply?" — which is
 why its output resembles thematic compression. Given the same evidence,
 "what did I learn this week?", "which assumptions turned out wrong?", and
@@ -28,18 +28,18 @@ operation** over the canonical store. Resolution: **read-time operation.**
   questions, and the questions themselves drift as the agent's situation
   changes — a precomputed store is stale by construction.
 - The bitemporal store already holds everything the answers are made of:
-  `mimir_as_of`/`mimir_valid_at`/`mimir_bitemporal` track what was believed
-  at T vs. now; `mimir_follow` holds the efficacy record; recall, `mimir_ask`
-  and `mimir_global_recall` are primitive question-conditioned
+  `perseus_vault_as_of`/`perseus_vault_valid_at`/`perseus_vault_bitemporal` track what was believed
+  at T vs. now; `perseus_vault_follow` holds the efficacy record; recall, `perseus_vault_ask`
+  and `perseus_vault_global_recall` are primitive question-conditioned
   retrieval+generation.
 - What gets persisted is not the answer but the **validated hypothesis**:
   a reflective output earns its place in the semantic layer only by
   surviving the prediction-testing lifecycle (see
   `synthesis-hypothesis-lifecycle.md`). The rest stays ephemeral.
 
-## 2. `question` parameter on `mimir_dream`
+## 2. `question` parameter on `perseus_vault_dream`
 
-`mimir_dream` accepts an optional `question` string. When present:
+`perseus_vault_dream` accepts an optional `question` string. When present:
 
 - **Cluster steering** — seeding stays similarity-based
   (`abductive-graph-synthesis.md` §1), but clusters are *ranked and
@@ -52,18 +52,18 @@ operation** over the canonical store. Resolution: **read-time operation.**
   as `question`, so persisted insights are attributable to the purpose
   that produced them.
 
-`mimir_dream(question="what mistake kept repeating?")` must produce
+`perseus_vault_dream(question="what mistake kept repeating?")` must produce
 insights mechanically distinct from a default run on the same corpus —
 different cluster selection, different claims — not just a reworded
 summary of the same clusters.
 
-## 3. Reflective read-time queries: `mimir_reflect`
+## 3. Reflective read-time queries: `perseus_vault_reflect`
 
 New read-only MCP tool answering structured reflective questions over the
 bitemporal store at query time. Writes nothing.
 
 ```
-mimir_reflect(question: string, workspace_hash?, scope?: {
+perseus_vault_reflect(question: string, workspace_hash?, scope?: {
                 from_ms?, to_ms?, category?, topic_path?
               }) -> ReflectiveAnswer
 ```
@@ -83,7 +83,7 @@ Two lenses, cheapest first:
 | Lens | Mechanism | Handles | LLM? |
 |---|---|---|---|
 | `bitemporal_diff` | `as_of`/`valid_at`/`history` diff over the window | "how has my understanding changed?", "which assumptions turned out wrong?" (corrections + supersession trail) | No |
-| `efficacy_record` | `mimir_follow` + validation-event tally query (lifecycle spec §2) | "which explanation survived validation?" | No |
+| `efficacy_record` | `perseus_vault_follow` + validation-event tally query (lifecycle spec §2) | "which explanation survived validation?" | No |
 | `synthesis` | Question-conditioned cluster + reflection (§2 pipeline, read-only) | "what did I learn this week?", "what mistake kept repeating, and why?" | Yes |
 
 Lens selection is deterministic: questions matching diff/efficacy shapes
@@ -92,7 +92,7 @@ without citations is a bug.
 
 ## 4. Persistence rule
 
-`mimir_reflect` itself never writes. Persistence happens only through the
+`perseus_vault_reflect` itself never writes. Persistence happens only through the
 lifecycle: when a reflective answer's claim is subsequently validated
 (predictive stream, per `synthesis-hypothesis-lifecycle.md` §5), the caller
 (or dream on a later pass) writes it as a semantic insight with
@@ -113,9 +113,9 @@ views: a periodic "what changed in my understanding?" section is the
 
 ## 6. Implementation slice
 
-1. Add `question` param to `mimir_dream`: question-relevance cluster
+1. Add `question` param to `perseus_vault_dream`: question-relevance cluster
    ranking + prompt substitution + `question` body field.
-2. Add `mimir_reflect` with the three lenses; implement `bitemporal_diff`
+2. Add `perseus_vault_reflect` with the three lenses; implement `bitemporal_diff`
    and `efficacy_record` first (pure queries over existing machinery), then
    the read-only synthesis lens reusing dream's cluster pipeline with the
    write step removed.

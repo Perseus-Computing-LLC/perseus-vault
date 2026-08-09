@@ -34,7 +34,7 @@ pub struct Entity {
     pub source: String,
     #[serde(default)]
     pub always_on: bool,
-    /// Certainty for typed entities (0.0-1.0). Used by mimir_conflicts:
+    /// Certainty for typed entities (0.0-1.0). Used by perseus_vault_conflicts:
     /// low-certainty entities on the same topic are a conflict signal.
     #[serde(default = "default_certainty")]
     pub certainty: f64,
@@ -600,7 +600,7 @@ pub struct EncryptionConfig {
 
 #[allow(dead_code)]
 fn default_key_file() -> String {
-    "~/.mimir/secret.key".to_string()
+    "~/.perseus-vault/secret.key".to_string()
 }
 
 impl Default for RecallParams {
@@ -893,19 +893,19 @@ pub struct EraseReport {
 /// #398: entity_history retention knobs. Every knob defaults OFF (None =
 /// unlimited), preserving the pre-#398 keep-everything behavior — enabling a
 /// bound is a deliberate operator decision, made via env:
-///   * `MIMIR_HISTORY_MAX_AGE_DAYS` — evict versions invalidated more than N
+///   * `PERSEUS_VAULT_HISTORY_MAX_AGE_DAYS` — evict versions invalidated more than N
 ///     days ago.
-///   * `MIMIR_HISTORY_MAX_VERSIONS_PER_KEY` — keep at most N stored versions
+///   * `PERSEUS_VAULT_HISTORY_MAX_VERSIONS_PER_KEY` — keep at most N stored versions
 ///     per (category, key, workspace); oldest evicted first. Hot state-like
 ///     keys are the pathological case (10k supersedes of one key = +14.5MB).
-///   * `MIMIR_HISTORY_MAX_BYTES` — global budget over stored history body
+///   * `PERSEUS_VAULT_HISTORY_MAX_BYTES` — global budget over stored history body
 ///     bytes; globally-oldest versions evicted until under budget.
-///   * `MIMIR_HISTORY_TOMBSTONES` — default ON: an evicted run is replaced by
+///   * `PERSEUS_VAULT_HISTORY_TOMBSTONES` — default ON: an evicted run is replaced by
 ///     one synthetic tombstone row (see Database::enforce_history_retention)
 ///     so time-travel inside the window answers "compacted", not silence.
 ///     Set to `0`/`false` for hard delete (the degenerate mode).
-/// Enforcement runs only in maintenance paths (mimir_maintenance --all,
-/// mimir_autocohere, mimir_prune scope=history) — never on the write path.
+/// Enforcement runs only in maintenance paths (perseus_vault_maintenance --all,
+/// perseus_vault_autocohere, perseus_vault_prune scope=history) — never on the write path.
 #[derive(Debug, Clone)]
 pub struct HistoryRetentionPolicy {
     pub max_age_days: Option<i64>,
@@ -936,7 +936,7 @@ impl HistoryRetentionPolicy {
                 .filter(|v| *v > 0)
         }
         let tombstones = !matches!(
-            std::env::var("MIMIR_HISTORY_TOMBSTONES")
+            std::env::var("PERSEUS_VAULT_HISTORY_TOMBSTONES")
                 .unwrap_or_default()
                 .trim()
                 .to_ascii_lowercase()
@@ -944,9 +944,9 @@ impl HistoryRetentionPolicy {
             "0" | "false" | "off" | "no"
         );
         Self {
-            max_age_days: env_pos("MIMIR_HISTORY_MAX_AGE_DAYS"),
-            max_versions_per_key: env_pos("MIMIR_HISTORY_MAX_VERSIONS_PER_KEY"),
-            max_bytes: env_pos("MIMIR_HISTORY_MAX_BYTES"),
+            max_age_days: env_pos("PERSEUS_VAULT_HISTORY_MAX_AGE_DAYS"),
+            max_versions_per_key: env_pos("PERSEUS_VAULT_HISTORY_MAX_VERSIONS_PER_KEY"),
+            max_bytes: env_pos("PERSEUS_VAULT_HISTORY_MAX_BYTES"),
             tombstones,
         }
     }
@@ -1104,7 +1104,7 @@ pub struct Stats {
     /// Detected link-graph communities currently persisted (#365 GraphRAG).
     pub total_communities: i64,
     /// Partition modularity of the most recent community-detection run
-    /// (None until `mimir_communities` has run at least once).
+    /// (None until `perseus_vault_communities` has run at least once).
     pub graph_modularity: Option<f64>,
     /// #398: superseded versions stored in entity_history (incl. tombstones).
     pub total_history_rows: i64,
@@ -1205,7 +1205,7 @@ pub struct GraphEdge {
     pub relationship: String,
 }
 
-/// Parameters for the mimir_ask RAG tool.
+/// Parameters for the perseus_vault_ask RAG tool.
 #[derive(Debug, Deserialize)]
 pub struct AskParams {
     pub query: String,
@@ -1231,7 +1231,7 @@ fn default_ask_limit() -> usize {
     5
 }
 
-/// Result from mimir_ask: a grounded answer with cited sources.
+/// Result from perseus_vault_ask: a grounded answer with cited sources.
 #[derive(Debug, Serialize)]
 pub struct AskResult {
     pub answer: String,
@@ -1247,7 +1247,7 @@ pub struct AskSource {
     pub snippet: String,
 }
 
-/// Parameters for the mimir_ingest connector sync tool.
+/// Parameters for the perseus_vault_ingest connector sync tool.
 #[derive(Debug, Deserialize)]
 pub struct IngestParams {
     /// Specific connector to run (None = all enabled connectors).
@@ -1265,7 +1265,7 @@ pub struct RawDocument {
     pub tags: Vec<String>,
 }
 
-/// Parameters for the mimir_embed tool — generate and store dense embeddings.
+/// Parameters for the perseus_vault_embed tool — generate and store dense embeddings.
 #[derive(Debug, Deserialize)]
 pub struct EmbedParams {
     /// Text to embed and store on the entity (uses entity's body_json if omitted).
@@ -1286,7 +1286,7 @@ fn default_batch_limit() -> usize {
     100
 }
 
-/// Parameters for the mimir_prune tool — bulk archive entities.
+/// Parameters for the perseus_vault_prune tool — bulk archive entities.
 #[derive(Debug, Deserialize)]
 pub struct PruneParams {
     /// Archive entities in this category.
@@ -1309,7 +1309,7 @@ fn default_prune_limit() -> usize {
     100
 }
 
-/// Report from mimir_prune.
+/// Report from perseus_vault_prune.
 #[derive(Debug, Serialize)]
 pub struct PruneReport {
     pub archived: usize,
@@ -1318,7 +1318,7 @@ pub struct PruneReport {
     pub reason: String,
 }
 
-/// Parameters for the mimir_correct tool — structured correction capture.
+/// Parameters for the perseus_vault_correct tool — structured correction capture.
 /// Stores what went wrong, what the user said, and what to do instead.
 #[derive(Debug, Deserialize)]
 pub struct CorrectParams {
@@ -1350,7 +1350,7 @@ pub struct CorrectParams {
     pub agent_id: String,
 }
 
-/// Result from mimir_correct.
+/// Result from perseus_vault_correct.
 #[derive(Debug, Serialize)]
 pub struct CorrectResult {
     pub entity_id: String,
@@ -1367,7 +1367,7 @@ pub struct CorrectResult {
     pub workspace_hash: String,
 }
 
-/// Parameters for the mimir_synthesize tool — LLM-driven session synthesis.
+/// Parameters for the perseus_vault_synthesize tool — LLM-driven session synthesis.
 /// Reviews session content and extracts structured lessons learned.
 #[derive(Debug, Deserialize)]
 pub struct SynthesizeParams {
@@ -1391,7 +1391,7 @@ pub struct SynthesizedLesson {
     pub confidence: f64,
 }
 
-/// Result from mimir_synthesize.
+/// Result from perseus_vault_synthesize.
 #[derive(Debug, Serialize)]
 pub struct SynthesizeResult {
     pub lessons: Vec<SynthesizedLesson>,
@@ -1401,7 +1401,7 @@ pub struct SynthesizeResult {
     pub completed_at_unix_ms: i64,
 }
 
-/// Parameters for mimir_bench — performance metrics tracking.
+/// Parameters for perseus_vault_bench — performance metrics tracking.
 #[derive(Debug, Deserialize)]
 pub struct BenchParams {
     pub task_description: String,
@@ -1417,14 +1417,14 @@ pub struct BenchParams {
     pub tags: Vec<String>,
 }
 
-/// Result from mimir_bench.
+/// Result from perseus_vault_bench.
 #[derive(Debug, Serialize)]
 pub struct BenchResult {
     pub entity_id: String,
     pub created_at_unix_ms: i64,
 }
 
-/// Parameters for the mimir_consolidate tool (#steal-2, competitive research:
+/// Parameters for the perseus_vault_consolidate tool (#steal-2, competitive research:
 /// Hindsight's Observation layer). Merges overlapping/duplicative facts within
 /// a category into a smaller number of durable, evidence-tracked observations.
 #[derive(Debug, Deserialize)]
@@ -1482,7 +1482,7 @@ fn default_consolidate_limit() -> i64 {
     50
 }
 
-/// Parameters for the mimir_dream tool (#364) — sleep-time LLM consolidation
+/// Parameters for the perseus_vault_dream tool (#364) — sleep-time LLM consolidation
 /// of episodic memories into higher-order semantic insights. Where
 /// `consolidate` mechanically merges near-duplicates, `dream` REASONS over a
 /// cluster of related memories via the configured LLM and writes back what
@@ -1592,7 +1592,7 @@ pub struct DreamInsight {
     pub deduped: bool,
 }
 
-/// Result from mimir_dream.
+/// Result from perseus_vault_dream.
 #[derive(Debug, Serialize)]
 pub struct DreamReport {
     pub categories_scanned: Vec<String>,
@@ -1630,7 +1630,7 @@ pub struct Observation {
     pub certainty: f64,
 }
 
-/// Result from mimir_consolidate.
+/// Result from perseus_vault_consolidate.
 #[derive(Debug, Serialize)]
 pub struct ConsolidateReport {
     pub category: String,

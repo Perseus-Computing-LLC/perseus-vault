@@ -36,7 +36,7 @@ Rules:
 
 - **Evidence linkage defines the derived/inference boundary.** A derived
   fact MUST carry `derived_from` citations (or `evidence_for` links per
-  `mimir_link`); without them it is `inference_agent` regardless of
+  `perseus_vault_link`); without them it is `inference_agent` regardless of
   author intent. This is what keeps synthesis auditable.
 - **Classes only move up-trust by adding evidence.** Reclassifying
   `inference_agent` → `fact_derived` means attaching the evidence set, not
@@ -49,15 +49,15 @@ Rules:
 Recommended pipeline for artifact-backed knowledge; each stage's output is
 the next stage's input and a first-class, recallable entity:
 
-1. **Ingest** the raw artifact (`mimir_ingest_file`, `mimir_ingest`,
-   `mimir_capture`) → `source_human` record with anchor + artifact hash
+1. **Ingest** the raw artifact (`perseus_vault_ingest_file`, `perseus_vault_ingest`,
+   `perseus_vault_capture`) → `source_human` record with anchor + artifact hash
    (see `incremental-extraction-refresh.md`).
-2. **Extract** facts from it (`mimir_extract`, capture classifiers) →
+2. **Extract** facts from it (`perseus_vault_extract`, capture classifiers) →
    `fact_extracted` entities, each citing the artifact via `derived_from`
    and carrying the artifact's `source_hash`.
-3. **Derive** stable observations across facts (`mimir_consolidate`) →
+3. **Derive** stable observations across facts (`perseus_vault_consolidate`) →
    `fact_derived` with the full evidence set folded in.
-4. **Synthesize** only when needed (`mimir_dream`, agent reasoning) →
+4. **Synthesize** only when needed (`perseus_vault_dream`, agent reasoning) →
    `inference_agent` insights over the derived layer.
 
 Guidance:
@@ -65,7 +65,7 @@ Guidance:
 - **Stop at the lowest sufficient stage.** If extracted facts answer the
   question, do not synthesize (retrieval policy §1, tier 4 last).
 - Each stage links to its inputs; the chain artifact → extracted → derived
-  → synthesized is walkable with `mimir_traverse` and is the audit trail.
+  → synthesized is walkable with `perseus_vault_traverse` and is the audit trail.
 - Skipping stages is allowed (an operator can assert a derived fact
   directly) but the write path must still attach evidence to claim
   `fact_derived`.
@@ -91,14 +91,14 @@ first. This refines taxonomy rule R3 (direct evidence beats inference):
 
 ## 4. Surfacing provenance in context blocks
 
-`mimir_context` and served views render the provenance class inline, one
+`perseus_vault_context` and served views render the provenance class inline, one
 token per item, so the agent can reason about confidence without expanding
 the payload:
 
 ```
 - Gate closed in prod 2026-07-20.            [fact_extracted · conf 0.72]
 - Deploy windows drop webhooks.              [fact_derived · evidence ×2]
-- Enable PLUTUS_SUBSCRIPTIONS_ENABLED next.  [inference_agent]
+- Enable LEDGER_SUBSCRIPTIONS_ENABLED next.  [inference_agent]
 ```
 
 Items without a class render nothing (backwards compatible). When a served
@@ -120,7 +120,7 @@ Items without a class render nothing (backwards compatible). When a served
 
 - Add `provenance_class` derivation (memory_kind + evidence links) at
   write/read time; optional lazy backfill by `source` mapping.
-- `mimir_recall`: optional `provenance_class` post-filter; class signal
+- `perseus_vault_recall`: optional `provenance_class` post-filter; class signal
   into the trust channel of the composite score.
 - Context/serving renderers: one-token class suffix per §4, "ungrounded"
   marker for evidence-less `inference_agent`.

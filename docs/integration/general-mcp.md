@@ -9,7 +9,7 @@ Perseus Vault is an MCP stdio server. It works with **any** MCP-compatible clien
 curl -sSL https://raw.githubusercontent.com/Perseus-Computing-LLC/perseus-vault/main/scripts/bootstrap.sh | bash
 
 # Create data directory
-mkdir -p ~/.mimir/data
+mkdir -p ~/.perseus-vault/data
 
 # Verify it works
 /usr/local/bin/perseus-vault --version
@@ -26,7 +26,7 @@ All MCP clients use the same pattern. The exact config format varies by client:
 command: /usr/local/bin/perseus-vault
 args:
   - "--db"
-  - "~/.mimir/data/perseus-vault.db"
+  - "~/.perseus-vault/data/perseus-vault.db"
 ```
 
 ### Client-specific formats
@@ -47,7 +47,7 @@ args:
 mcp_servers:
   perseus-vault:
     command: "/usr/local/bin/perseus-vault"
-    args: ["--db", "/home/YOUR_USER/.mimir/data/perseus-vault.db"]
+    args: ["--db", "/home/YOUR_USER/.perseus-vault/data/perseus-vault.db"]
     timeout: 60
     connect_timeout: 30
 ```
@@ -59,7 +59,7 @@ mcp_servers:
   "mcpServers": {
     "perseus-vault": {
       "command": "/usr/local/bin/perseus-vault",
-      "args": ["--db", "~/.mimir/data/perseus-vault.db"]
+      "args": ["--db", "~/.perseus-vault/data/perseus-vault.db"]
     }
   }
 }
@@ -73,32 +73,32 @@ mcp_servers:
     "mcpServers": {
       "perseus-vault": {
         "command": "/usr/local/bin/perseus-vault",
-        "args": ["--db", "~/.mimir/data/perseus-vault.db"]
+        "args": ["--db", "~/.perseus-vault/data/perseus-vault.db"]
       }
     }
   }
 }
 ```
 
-## Tools (90 canonical)
+## Tools (99 canonical)
 
-Perseus Vault exposes **90 canonical MCP tools** under the `perseus_vault_*`
-prefix (legacy `mimir_*` / `mneme_*` aliases remain callable). A representative
+Perseus Vault exposes **99 canonical MCP tools** under the `perseus_vault_*`
+prefix (legacy `perseus_vault_*` / `perseus_vault_*` aliases remain callable). A representative
 selection is shown below; run `perseus-vault --version` and your client's tool
 list to see all of them.
 
 | Category | Tools |
 |---|---|
-| **CRUD** | `mimir_remember`, `mimir_recall`, `mimir_forget`, `mimir_get_entity`, `mimir_recall_when` |
-| **Graph** | `mimir_link`, `mimir_unlink`, `mimir_traverse` |
-| **Journal** | `mimir_journal`, `mimir_timeline` |
-| **State** | `mimir_state_set`, `mimir_state_get`, `mimir_state_delete`, `mimir_state_list` |
-| **AI** | `mimir_ask` (RAG), `mimir_embed` (embeddings), `mimir_cohere` (synthesis) |
-| **Connectors** | `mimir_ingest` (GitHub issues, file watcher) |
-| **Lifecycle** | `mimir_decay`, `mimir_prune`, `mimir_compact`, `mimir_score` |
-| **Quality** | `mimir_conflicts` |
-| **Vault** | `mimir_vault_export`, `mimir_vault_import` |
-| **Ops** | `mimir_health`, `mimir_stats`, `mimir_migrate`, `mimir_context`, `mimir_workspace_list` |
+| **CRUD** | `perseus_vault_remember`, `perseus_vault_recall`, `perseus_vault_forget`, `perseus_vault_get_entity`, `perseus_vault_recall_when` |
+| **Graph** | `perseus_vault_link`, `perseus_vault_unlink`, `perseus_vault_traverse` |
+| **Journal** | `perseus_vault_journal`, `perseus_vault_timeline` |
+| **State** | `perseus_vault_state_set`, `perseus_vault_state_get`, `perseus_vault_state_delete`, `perseus_vault_state_list` |
+| **AI** | `perseus_vault_ask` (RAG), `perseus_vault_embed` (embeddings), `perseus_vault_cohere` (synthesis) |
+| **Connectors** | `perseus_vault_ingest` (GitHub issues, file watcher) |
+| **Lifecycle** | `perseus_vault_decay`, `perseus_vault_prune`, `perseus_vault_compact`, `perseus_vault_score` |
+| **Quality** | `perseus_vault_conflicts` |
+| **Vault** | `perseus_vault_vault_export`, `perseus_vault_vault_import` |
+| **Ops** | `perseus_vault_health`, `perseus_vault_stats`, `perseus_vault_migrate`, `perseus_vault_context`, `perseus_vault_workspace_list` |
 
 ## Encryption
 
@@ -112,7 +112,7 @@ Perseus Vault supports AES-256-GCM encryption at rest for `body_json` and it is
 perseus-vault keygen --key-file ~/.perseus-vault/secret.key
 
 # Use with any client (add --encryption-key to args)
-/usr/local/bin/perseus-vault --db ~/.mimir/data/perseus-vault.db --encryption-key ~/.perseus-vault/secret.key
+/usr/local/bin/perseus-vault --db ~/.perseus-vault/data/perseus-vault.db --encryption-key ~/.perseus-vault/secret.key
 ```
 
 Existing plaintext databases fail closed with an actionable `init --rekey`
@@ -123,7 +123,7 @@ plaintext by design (see [docs/ENCRYPTION.md](../ENCRYPTION.md)).
 ## Docker
 
 ```bash
-docker run -v ~/.mimir/data:/data ghcr.io/Perseus-Computing-LLC/perseus-vault:latest --db /data/perseus-vault.db
+docker run -v ~/.perseus-vault/data:/data ghcr.io/Perseus-Computing-LLC/perseus-vault:latest --db /data/perseus-vault.db
 ```
 
 ## What Perseus Vault Is Not

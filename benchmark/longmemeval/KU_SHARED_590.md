@@ -11,8 +11,8 @@ knowledge-update fact versions the way real callers do — is what this measures
 For every version-bearing question (≥2 dated gold sessions), the gold
 (fact-version) sessions ingest under **one shared key** with
 `valid_from` = session date, ascending — `INGEST_590.md` demo B at benchmark
-scale. `mimir_remember` collapses them to a live latest-wins row; stale versions
-go to `entity_history` (still exactly recoverable via `mimir_valid_at`). All
+scale. `perseus_vault_remember` collapses them to a live latest-wins row; stale versions
+go to `entity_history` (still exactly recoverable via `perseus_vault_valid_at`). All
 other haystack sessions ingest unchanged.
 
 **Grouping honesty:** which sessions update the same fact comes from the

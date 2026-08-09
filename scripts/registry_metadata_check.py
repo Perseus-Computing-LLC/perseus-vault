@@ -26,8 +26,8 @@ for tool in registry:
     name = tool.get("name")
     if not isinstance(name, str):
         raise SystemExit("registry entry has no string name")
-    if name.startswith("mimir_"):
-        name = "perseus_vault_" + name[len("mimir_"):]
+    if name.startswith("perseus_vault_"):
+        name = "perseus_vault_" + name[len("perseus_vault_"):]
     canonical.append(name)
 
 if len(set(canonical)) != len(canonical):

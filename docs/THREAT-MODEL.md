@@ -1,28 +1,28 @@
-# Mimir Threat Model
+# Perseus Vault Threat Model
 
-This document states what Mimir defends against, what it does **not**, and the
+This document states what Perseus Vault defends against, what it does **not**, and the
 residual risks an operator owns. It is deliberately honest about limits — a
 threat model that only lists strengths is marketing, not security.
 
 For the precise cryptographic spec, see [ENCRYPTION.md](./ENCRYPTION.md). For
 the reporting process and version support, see [../SECURITY.md](../SECURITY.md).
 
-*Scope: Mimir the local MCP memory engine (the `mimir` binary) at v2.2.1.
+*Scope: Perseus Vault the local MCP memory engine (the `perseus_vault` binary) at v2.2.1.
 Out of scope: the calling AI agent/host, the operating system, and any
-downstream system (e.g. Perseus) that consumes Mimir's output.*
+downstream system (e.g. Perseus) that consumes Perseus Vault's output.*
 
 ---
 
-## 1. What Mimir is, in security terms
+## 1. What Perseus Vault is, in security terms
 
-Mimir is a **single local binary** with an **embedded SQLite database**. It
+Perseus Vault is a **single local binary** with an **embedded SQLite database**. It
 exposes an MCP (JSON-RPC 2.0) interface, by default over **stdio** (no network
 socket). It stores AI-agent memory: entities (content + metadata), an
 append-only journal, key/value state, an FTS5 keyword index, and optional dense
 embeddings. It does not phone home and emits no telemetry.
 
 The security posture follows from that shape: **the primary trust boundary is
-the local machine and its filesystem.** Mimir is designed for single-operator,
+the local machine and its filesystem.** Perseus Vault is designed for single-operator,
 local-first deployment, not as a multi-tenant network service.
 
 ---
@@ -45,22 +45,22 @@ local-first deployment, not as a multi-tenant network service.
 ```
    ┌─────────────────────────── local machine (trusted) ───────────────────────────┐
    │                                                                                 │
-   │   AI agent / MCP host  ──stdio JSON-RPC──▶  mimir binary  ──▶  SQLite file      │
+   │   AI agent / MCP host  ──stdio JSON-RPC──▶  perseus_vault binary  ──▶  SQLite file      │
    │        (trusted)             (B1)            (trusted)    (B2)   (on disk)       │
    │                                                                                 │
-   │                          mimir  ──(opt-in)──▶  connectors (GitHub, file watcher)│
+   │                          perseus_vault  ──(opt-in)──▶  connectors (GitHub, file watcher)│
    │                                       (B3)                                      │
    └─────────────────────────────────────────────────────────────────────────────────┘
                                           │ (opt-in, off by default)
                                    (B4) HTTP/SSE transport ──▶ network clients
 ```
 
-- **B1 — MCP caller → Mimir.** Whoever can speak to the stdio pipe is fully
-  trusted; Mimir does not authenticate MCP callers. On a single-user machine the
+- **B1 — MCP caller → Perseus Vault.** Whoever can speak to the stdio pipe is fully
+  trusted; Perseus Vault does not authenticate MCP callers. On a single-user machine the
   OS process boundary is the control.
-- **B2 — Mimir → SQLite file.** The database file is a plaintext SQLite file
+- **B2 — Perseus Vault → SQLite file.** The database file is a plaintext SQLite file
   unless you enable body encryption *and* OS disk encryption (see §5).
-- **B3 — Mimir → connectors.** Opt-in egress to GitHub / the filesystem.
+- **B3 — Perseus Vault → connectors.** Opt-in egress to GitHub / the filesystem.
 - **B4 — Network transport.** Only exists if you explicitly enable HTTP/SSE.
   This is the one boundary that crosses the machine.
 
@@ -87,7 +87,7 @@ local-first deployment, not as a multi-tenant network service.
 |---|---|---|
 | Disk/backup theft reads memory **content** (A2) | AES-256-GCM on `body_json`, enabled by default for fresh installs | **The FTS5 index stores plaintext** (see [ENCRYPTION.md §3](./ENCRYPTION.md)); metadata is plaintext. Body encryption alone does **not** make the file opaque — layer OS disk encryption. |
 | Disk/backup theft reads **metadata** (A2) | — | Not mitigated by app-layer encryption: category/key/tags/workspace/timestamps are plaintext by design (needed for indexing/routing). Use full-disk encryption. |
-| Co-tenant reads the DB or key file (A1) | Unix: `keygen` sets key file `0o600` | **Windows: key file gets default ACLs — not tightened by Mimir.** Operator must restrict the DB file and key file ACLs. |
+| Co-tenant reads the DB or key file (A1) | Unix: `keygen` sets key file `0o600` | **Windows: key file gets default ACLs — not tightened by Perseus Vault.** Operator must restrict the DB file and key file ACLs. |
 | Key recovered from process memory (A6) | — | Out of scope; a static key is held in process for the session. No `zeroize` of key material today. |
 | Embedding inversion leaks content | — | Vectors are plaintext and semantically reconstructable; protect the file. |
 
@@ -103,7 +103,7 @@ local-first deployment, not as a multi-tenant network service.
 
 | Threat | Mitigation | Residual risk |
 |---|---|---|
-| Unauthenticated MCP caller acts as the user (A3) | stdio is local-only; OS process boundary | By design Mimir trusts its MCP caller. Do not expose the stdio server to untrusted local processes. |
+| Unauthenticated MCP caller acts as the user (A3) | stdio is local-only; OS process boundary | By design Perseus Vault trusts its MCP caller. Do not expose the stdio server to untrusted local processes. |
 | Unauthenticated HTTP caller (A4) | HTTP/SSE is **off by default** | **No built-in auth on the HTTP transport.** If you enable it, put auth + TLS in front (reverse proxy) and bind to localhost. |
 | Cross-workspace/agent memory leakage | `workspace_hash` / `agent_id` / `visibility` scoping on entities | Scoping is a **routing/relevance** control, not an enforced security boundary against a trusted local caller. Don't treat it as multi-tenant isolation. |
 
@@ -134,19 +134,19 @@ local-first deployment, not as a multi-tenant network service.
 | Threat | Mitigation | Residual risk |
 |---|---|---|
 | Malicious crate (A5) | MIT/Apache-only deps; `cargo audit` in CI; [SBOM](./SBOM.md) | Standard ecosystem risk |
-| Malicious embedding model | Bundled model is fetched at build time from a pinned source; air-gapped builds honor `MIMIR_BUNDLED_MODEL_DIR` | Verify model provenance for offline/regulated builds |
+| Malicious embedding model | Bundled model is fetched at build time from a pinned source; air-gapped builds honor `PERSEUS_VAULT_BUNDLED_MODEL_DIR` | Verify model provenance for offline/regulated builds |
 
 ---
 
 ## 6. Security assumptions (must hold for the model above)
 
-1. The **operating system and the local user account are trusted.** Mimir does
+1. The **operating system and the local user account are trusted.** Perseus Vault does
    not defend against a privileged local attacker (A6).
 2. The **MCP caller is trusted.** stdio is not authenticated; do not expose it
    to untrusted local processes.
 3. The **HTTP/SSE transport stays disabled** unless you add auth + TLS in front.
 4. The **key file is protected by the operator** (especially on Windows, where
-   Mimir does not set ACLs), and the key is backed up — there is no recovery.
+   Perseus Vault does not set ACLs), and the key is backed up — there is no recovery.
 5. For "the database file reveals nothing," **OS-level disk encryption is in
    use**, because metadata and the FTS plaintext index are not covered by
    `body_json` encryption.

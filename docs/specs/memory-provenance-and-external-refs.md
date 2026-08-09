@@ -34,9 +34,9 @@ storage-engine change, no forced backfill, no breaking change to
 Definitions:
 
 - `asserted` — a human stated it directly (chat instruction, explicit
-  `mimir_remember` by an operator).
+  `perseus_vault_remember` by an operator).
 - `extracted` — pulled out of transcript/content by a deterministic or LLM
-  extractor (`mimir_capture`, `mimir_extract`).
+  extractor (`perseus_vault_capture`, `perseus_vault_extract`).
 - `inferred` — derived from other memories (dream/consolidate synthesis,
   belief rollup).
 - `imported` — brought in from an external system (vault import, connector
@@ -52,13 +52,13 @@ facts whose world-time differs from write-time (retroactive imports). Where
 
 | Path | memory_kind | source_system | capture_method |
 |---|---|---|---|
-| `mimir_remember` (agent/operator) | asserted | agent/user | manual |
-| `mimir_capture` (rule-based) | extracted | capture | rule_based_extractor |
-| `mimir_capture --llm` | extracted | capture | llm_extractor |
-| `mimir_dream` / `mimir_consolidate` | inferred | agent | llm_extractor / import-free derivation |
-| `mimir_ingest` / `mimir_ingest_file` / `mimir_vault_import` | imported | connector:<name> | import |
-| `mimir_journal` | observed | agent | event_feed |
-| `mimir_correct` | asserted | user | manual |
+| `perseus_vault_remember` (agent/operator) | asserted | agent/user | manual |
+| `perseus_vault_capture` (rule-based) | extracted | capture | rule_based_extractor |
+| `perseus_vault_capture --llm` | extracted | capture | llm_extractor |
+| `perseus_vault_dream` / `perseus_vault_consolidate` | inferred | agent | llm_extractor / import-free derivation |
+| `perseus_vault_ingest` / `perseus_vault_ingest_file` / `perseus_vault_vault_import` | imported | connector:<name> | import |
+| `perseus_vault_journal` | observed | agent | event_feed |
+| `perseus_vault_correct` | asserted | user | manual |
 
 Defaults: when unknown, `memory_kind` is null — never guessed. Existing
 entities are valid unchanged; the mapping above lets a lazy backfill label
@@ -124,7 +124,7 @@ user-steerable substrate.
 - Both contracts are optional JSON metadata carried on the entity record;
   SQLite schema is unchanged (fields serialize into the existing metadata
   channel, indexed where filtering is offered).
-- `mimir_remember` gains optional `origin` and `external_refs` arguments;
+- `perseus_vault_remember` gains optional `origin` and `external_refs` arguments;
   other write paths populate per §1.2.
 - FTS index is unaffected; ref filtering is a post-filter over candidate
   sets, so no reindex is required for existing databases.

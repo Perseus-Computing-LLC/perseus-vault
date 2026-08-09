@@ -32,7 +32,7 @@ env:
   CARGO_TERM_COLOR: always
   # build.rs reads the bundled embedding model from here instead of hitting
   # HuggingFace (#649: an HF CDN 403 outage failed every uncached build job).
-  MIMIR_BUNDLED_MODEL_DIR: ${{ github.workspace }}/.model-cache
+  PERSEUS_VAULT_BUNDLED_MODEL_DIR: ${{ github.workspace }}/.model-cache
 
 jobs:
   scale-gate:

@@ -29,7 +29,7 @@ authority.
 |---|---|---|---|
 | Factual layer (kernel-style, external) | "What is true?" | synchronous lookup | Answers with provenance, or not at all |
 | Episodic/semantic store (Vault recall) | "What happened?" | narrow, task-oriented, in-path | Episodes + memories, budget-clamped |
-| Consolidation (`mimir_dream`, `mimir_consolidate`) | "What should remain?" | automatic, background, question-free | Writes durable semantic memory as *hypotheses* (#739) |
+| Consolidation (`perseus_vault_dream`, `perseus_vault_consolidate`) | "What should remain?" | automatic, background, question-free | Writes durable semantic memory as *hypotheses* (#739) |
 | Reflection (`reflect(topic)`, #741) | "What should be reconsidered?" | invoked, collaborative, question-driven | Writes nothing to semantic memory except through the stabilization gate |
 
 The reasoning layer (LLM / orchestrator) asks the fifth question —

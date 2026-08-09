@@ -14,11 +14,11 @@ import * as fs from "fs";
 
 // ─── Interfaces ────────────────────────────────────────────────────────
 
-interface MimirPluginSettings {
-  /** Path to the mimir binary */
-  mimirBinaryPath: string;
-  /** Path to the Mimir SQLite database */
-  mimirDbPath: string;
+interface PerseusVaultPluginSettings {
+  /** Path to the perseus_vault binary */
+  perseusVaultBinaryPath: string;
+  /** Path to the Perseus Vault SQLite database */
+  perseusVaultDbPath: string;
   /** Sync folder name within the vault (relative) */
   syncFolder: string;
   /** Auto-sync interval in minutes (0 = disabled) */
@@ -27,18 +27,18 @@ interface MimirPluginSettings {
   showStatusBar: boolean;
 }
 
-const DEFAULT_SETTINGS: MimirPluginSettings = {
-  mimirBinaryPath: "mimir",
-  mimirDbPath: "",
-  syncFolder: "mimir",
+const DEFAULT_SETTINGS: PerseusVaultPluginSettings = {
+  perseusVaultBinaryPath: "perseus-vault",
+  perseusVaultDbPath: "",
+  syncFolder: "perseus-vault",
   autoSyncIntervalMinutes: 0,
   showStatusBar: true,
 };
 
 // ─── Plugin ────────────────────────────────────────────────────────────
 
-export default class MimirVaultSyncPlugin extends Plugin {
-  settings: MimirPluginSettings;
+export default class PerseusVaultSyncPlugin extends Plugin {
+  settings: PerseusVaultPluginSettings;
   statusBar: HTMLElement | null = null;
   syncInterval: number | null = null;
 
@@ -53,42 +53,42 @@ export default class MimirVaultSyncPlugin extends Plugin {
 
     // Commands
     this.addCommand({
-      id: "mimir-sync-now",
-      name: "Sync now (pull from Mimir)",
-      callback: () => this.pullFromMimir(),
+      id: "perseus_vault-sync-now",
+      name: "Sync now (pull from Perseus Vault)",
+      callback: () => this.pullFromVault(),
     });
 
     this.addCommand({
-      id: "mimir-export-vault",
-      name: "Export vault to Mimir sync folder",
+      id: "perseus_vault-export-vault",
+      name: "Export vault to Perseus Vault sync folder",
       callback: () => this.exportVault(),
     });
 
     this.addCommand({
-      id: "mimir-push-note",
-      name: "Push current note to Mimir",
+      id: "perseus_vault-push-note",
+      name: "Push current note to Perseus Vault",
       editorCheckCallback: (checking, editor, view) => {
         if (!checking && view?.file) {
-          this.pushNoteToMimir(view.file);
+          this.pushNoteToVault(view.file);
         }
         return true;
       },
     });
 
     // Settings tab
-    this.addSettingTab(new MimirSettingTab(this.app, this));
+    this.addSettingTab(new PerseusVaultSettingTab(this.app, this));
 
     // Status bar
     if (this.settings.showStatusBar) {
       this.statusBar = this.addStatusBarItem();
-      this.statusBar.setText("Mimir: ready");
+      this.statusBar.setText("Perseus Vault: ready");
     }
 
     // File watcher: auto-push on save
     this.registerEvent(
       this.app.vault.on("modify", (file) => {
         if (this.isInSyncFolder(file)) {
-          this.pushNoteToMimir(file);
+          this.pushNoteToVault(file);
         }
       })
     );
@@ -96,7 +96,7 @@ export default class MimirVaultSyncPlugin extends Plugin {
     this.registerEvent(
       this.app.vault.on("create", (file) => {
         if (this.isInSyncFolder(file)) {
-          this.pushNoteToMimir(file);
+          this.pushNoteToVault(file);
         }
       })
     );
@@ -115,15 +115,15 @@ export default class MimirVaultSyncPlugin extends Plugin {
 
   // ─── Sync Operations ───────────────────────────────────────────────
 
-  /** Pull entities from Mimir database into the sync folder. */
-  async pullFromMimir() {
+  /** Pull entities from Perseus Vault database into the sync folder. */
+  async pullFromVault() {
     this.setStatus("Syncing...");
     try {
-      const binary = this.settings.mimirBinaryPath;
+      const binary = this.settings.perseusVaultBinaryPath;
       const dbPath = this.getDbPathArg();
       const vaultDir = this.getSyncFolderPath();
 
-      // Run mimir_vault_export via MCP stdio
+      // Run perseus_vault_vault_export via MCP stdio
       const request = JSON.stringify({
         jsonrpc: "2.0",
         id: 1,
@@ -131,7 +131,7 @@ export default class MimirVaultSyncPlugin extends Plugin {
         params: {
           protocolVersion: "2024-11-05",
           capabilities: {},
-          clientInfo: { name: "obsidian-mimir", version: "0.1.0" },
+          clientInfo: { name: "obsidian-perseus-vault", version: "0.1.0" },
         },
       });
 
@@ -140,7 +140,7 @@ export default class MimirVaultSyncPlugin extends Plugin {
         id: 2,
         method: "tools/call",
         params: {
-          name: "mimir_vault_export",
+          name: "perseus_vault_vault_export",
           arguments: { vault_dir: vaultDir },
         },
       });
@@ -162,25 +162,25 @@ export default class MimirVaultSyncPlugin extends Plugin {
         if (response.result) {
           const content = JSON.parse(response.result.content[0].text);
           new Notice(
-            `Mimir: pulled ${content.exported || "?"} entities to ${this.settings.syncFolder}`
+            `Perseus Vault: pulled ${content.exported || "?"} entities to ${this.settings.syncFolder}`
           );
           this.setStatus(`Synced (${content.exported || "?"} entities)`);
         } else if (response.error) {
-          new Notice(`Mimir sync error: ${response.error.message}`);
+          new Notice(`Perseus Vault sync error: ${response.error.message}`);
           this.setStatus("Error");
         }
       }
     } catch (e: any) {
-      new Notice(`Mimir sync failed: ${e.message}`);
+      new Notice(`Perseus Vault sync failed: ${e.message}`);
       this.setStatus("Error");
     }
   }
 
-  /** Run mimir_vault_export to export all entities to the vault sync folder. */
+  /** Run perseus_vault_vault_export to export all entities to the vault sync folder. */
   async exportVault() {
     this.setStatus("Exporting...");
     try {
-      const binary = this.settings.mimirBinaryPath;
+      const binary = this.settings.perseusVaultBinaryPath;
       const dbPath = this.getDbPathArg();
       const vaultDir = this.getSyncFolderPath();
 
@@ -193,7 +193,7 @@ export default class MimirVaultSyncPlugin extends Plugin {
           params: {
             protocolVersion: "2024-11-05",
             capabilities: {},
-            clientInfo: { name: "obsidian-mimir", version: "0.1.0" },
+            clientInfo: { name: "obsidian-perseus-vault", version: "0.1.0" },
           },
         }) +
         "\n" +
@@ -202,7 +202,7 @@ export default class MimirVaultSyncPlugin extends Plugin {
           id: 2,
           method: "tools/call",
           params: {
-            name: "mimir_vault_export",
+            name: "perseus_vault_vault_export",
             arguments: { vault_dir: vaultDir },
           },
         }) +
@@ -219,21 +219,21 @@ export default class MimirVaultSyncPlugin extends Plugin {
         const response = JSON.parse(lines[1]);
         if (response.result) {
           const content = JSON.parse(response.result.content[0].text);
-          new Notice(`Mimir: exported ${content.exported || "?"} entities`);
+          new Notice(`Perseus Vault: exported ${content.exported || "?"} entities`);
           this.setStatus(`Exported ${content.exported || "?"}`);
         } else if (response.error) {
-          new Notice(`Mimir export error: ${response.error.message}`);
+          new Notice(`Perseus Vault export error: ${response.error.message}`);
         }
       }
     } catch (e: any) {
-      new Notice(`Mimir export failed: ${e.message}`);
+      new Notice(`Perseus Vault export failed: ${e.message}`);
     }
   }
 
-  /** Push a single Obsidian note to Mimir via mimir_remember. */
-  async pushNoteToMimir(file: TFile) {
+  /** Push a single Obsidian note to Perseus Vault via perseus_vault_remember. */
+  async pushNoteToVault(file: TFile) {
     try {
-      const binary = this.settings.mimirBinaryPath;
+      const binary = this.settings.perseusVaultBinaryPath;
       const dbPath = this.getDbPathArg();
       const content = await this.app.vault.read(file);
 
@@ -248,7 +248,7 @@ export default class MimirVaultSyncPlugin extends Plugin {
           params: {
             protocolVersion: "2024-11-05",
             capabilities: {},
-            clientInfo: { name: "obsidian-mimir", version: "0.1.0" },
+            clientInfo: { name: "obsidian-perseus-vault", version: "0.1.0" },
           },
         }) +
         "\n" +
@@ -257,9 +257,9 @@ export default class MimirVaultSyncPlugin extends Plugin {
           id: 2,
           method: "tools/call",
           params: {
-            name: "mimir_remember",
+            name: "perseus_vault_remember",
             arguments: {
-              id: "", // let Mimir generate
+              id: "", // let Perseus Vault generate
               category: category || "obsidian",
               key: key || file.basename,
               body_json: JSON.stringify({ content, source: "obsidian" }),
@@ -281,7 +281,7 @@ export default class MimirVaultSyncPlugin extends Plugin {
       this.setStatus(`Pushed: ${file.basename}`);
     } catch (e: any) {
       // Silently skip push errors to avoid noise on every save
-      console.debug("Mimir push error:", e.message);
+      console.debug("Perseus Vault push error:", e.message);
     }
   }
 
@@ -293,8 +293,8 @@ export default class MimirVaultSyncPlugin extends Plugin {
   }
 
   private getDbPathArg(): string {
-    return this.settings.mimirDbPath
-      ? `--db "${this.settings.mimirDbPath}"`
+    return this.settings.perseusVaultDbPath
+      ? `--db "${this.settings.perseusVaultDbPath}"`
       : "";
   }
 
@@ -304,7 +304,7 @@ export default class MimirVaultSyncPlugin extends Plugin {
 
   private setStatus(text: string) {
     if (this.statusBar) {
-      this.statusBar.setText(`Mimir: ${text}`);
+      this.statusBar.setText(`Perseus Vault: ${text}`);
     }
   }
 
@@ -339,7 +339,7 @@ export default class MimirVaultSyncPlugin extends Plugin {
 
   private startAutoSync() {
     this.syncInterval = window.setInterval(() => {
-      this.pullFromMimir();
+      this.pullFromVault();
     }, this.settings.autoSyncIntervalMinutes * 60 * 1000);
   }
 
@@ -354,10 +354,10 @@ export default class MimirVaultSyncPlugin extends Plugin {
 
 // ─── Settings Tab ──────────────────────────────────────────────────────
 
-class MimirSettingTab extends PluginSettingTab {
-  plugin: MimirVaultSyncPlugin;
+class PerseusVaultSettingTab extends PluginSettingTab {
+  plugin: PerseusVaultSyncPlugin;
 
-  constructor(app: App, plugin: MimirVaultSyncPlugin) {
+  constructor(app: App, plugin: PerseusVaultSyncPlugin) {
     super(app, plugin);
     this.plugin = plugin;
   }
@@ -366,40 +366,40 @@ class MimirSettingTab extends PluginSettingTab {
     const { containerEl } = this;
     containerEl.empty();
 
-    containerEl.createEl("h2", { text: "Mimir Vault Sync Settings" });
+    containerEl.createEl("h2", { text: "Perseus Vault Sync Settings" });
 
     new Setting(containerEl)
-      .setName("Mimir binary path")
-      .setDesc("Path to the mimir executable")
+      .setName("Perseus Vault binary path")
+      .setDesc("Path to the perseus_vault executable")
       .addText((text) =>
         text
-          .setPlaceholder("mimir")
-          .setValue(this.plugin.settings.mimirBinaryPath)
+          .setPlaceholder("perseus-vault")
+          .setValue(this.plugin.settings.perseusVaultBinaryPath)
           .onChange(async (value) => {
-            this.plugin.settings.mimirBinaryPath = value;
+            this.plugin.settings.perseusVaultBinaryPath = value;
             await this.plugin.saveSettings();
           })
       );
 
     new Setting(containerEl)
-      .setName("Mimir database path")
-      .setDesc("Path to the SQLite database (leave empty for default ~/.mimir/data/mimir.db)")
+      .setName("Perseus Vault database path")
+      .setDesc("Path to the SQLite database (leave empty for default ~/.perseus-vault/data/perseus-vault.db)")
       .addText((text) =>
         text
           .setPlaceholder("")
-          .setValue(this.plugin.settings.mimirDbPath)
+          .setValue(this.plugin.settings.perseusVaultDbPath)
           .onChange(async (value) => {
-            this.plugin.settings.mimirDbPath = value;
+            this.plugin.settings.perseusVaultDbPath = value;
             await this.plugin.saveSettings();
           })
       );
 
     new Setting(containerEl)
       .setName("Sync folder")
-      .setDesc("Vault folder to sync with Mimir (created if missing)")
+      .setDesc("Vault folder to sync with Perseus Vault (created if missing)")
       .addText((text) =>
         text
-          .setPlaceholder("mimir")
+          .setPlaceholder("perseus-vault")
           .setValue(this.plugin.settings.syncFolder)
           .onChange(async (value) => {
             this.plugin.settings.syncFolder = value;
@@ -409,7 +409,7 @@ class MimirSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Auto-sync interval (minutes)")
-      .setDesc("0 = disabled. Automatically pulls from Mimir on this interval.")
+      .setDesc("0 = disabled. Automatically pulls from Perseus Vault on this interval.")
       .addText((text) =>
         text
           .setPlaceholder("0")

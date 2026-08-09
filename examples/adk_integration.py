@@ -1,8 +1,8 @@
 """
-Mimir + Google ADK Integration Example
+Perseus Vault + Google ADK Integration Example
 
-Shows Mimir as a BaseMemoryService backend for Google ADK.
-Requires: pip install google-adk mimir
+Shows Perseus Vault as a BaseMemoryService backend for Google ADK.
+Requires: pip install google-adk perseus_vault
 """
 import asyncio
 import json
@@ -11,15 +11,15 @@ from google.adk.memory.base_memory_service import BaseMemoryService, SearchMemor
 from google.adk.memory.memory_entry import MemoryEntry
 from google.adk.sessions.session import Session
 
-class MimirMemoryService(BaseMemoryService):
-    """Mimir-backed memory for Google ADK agents."""
+class PerseusVaultMemoryService(BaseMemoryService):
+    """Perseus Vault-backed memory for Google ADK agents."""
 
     def __init__(self, db_path: str = "./adk_memory.db"):
-        from mimir import MimirClient
-        self.client = MimirClient(db_path)
+        from perseus_vault import PerseusVaultClient
+        self.client = PerseusVaultClient(db_path)
 
     async def add_session_to_memory(self, session: Session) -> None:
-        """Store session events as Mimir memories."""
+        """Store session events as Perseus Vault memories."""
         for event in session.events:
             self.client.remember(
                 content=json.dumps({
@@ -57,11 +57,11 @@ class MimirMemoryService(BaseMemoryService):
 
 
 async def main():
-    # Create ADK agent with Mimir memory
-    memory_service = MimirMemoryService("./adk_memory.db")
+    # Create ADK agent with Perseus Vault memory
+    memory_service = PerseusVaultMemoryService("./adk_memory.db")
 
     agent = Agent(
-        name="mimir_agent",
+        name="perseus_vault_agent",
         model="gemini-2.5-flash",
         instruction="You have persistent memory across sessions.",
     )
@@ -73,7 +73,7 @@ async def main():
     # )
     # await memory_service.add_session_to_memory(session)
 
-    print("MimirMemoryService ready for ADK integration")
+    print("PerseusVaultMemoryService ready for ADK integration")
     print("Memory backend: SQLite + FTS5 + encrypted at rest")
 
 

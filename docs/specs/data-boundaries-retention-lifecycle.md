@@ -1,7 +1,7 @@
 # Data Boundaries & Retention Lifecycle Contract
 
 > **Version:** 1 — 2026-08-09
-> **Status:** accepted (implementation: `mimir_expire`, `mimir_redact`, `mimir_erase`)
+> **Status:** accepted (implementation: `perseus_vault_expire`, `perseus_vault_redact`, `perseus_vault_erase`)
 > **Issues:** #866 (data boundaries, consent, retention, deletion across derived stores) · #868 (retention semantics)
 > **Supersedes:** ad-hoc `archive`/`purge` behavior documented piecemeal in README and tool docs.
 > **Depends on:** #881/#882 (pre-write rejection gate + decoupled governance overlay), #849 (rejected-value tombstones), #854/#855 (workspace scope + attribution), #417 (workspace-scoped journal redaction).
@@ -48,7 +48,7 @@ of this document and ships with a migration/test change in the same PR.
   content-stored, for tamper evidence.
 - **Local-first:** with bundled embeddings (default), dense/hybrid recall,
   graph, temporal, and maintenance paths make **zero network calls** (§8).
-- **Provider paths:** `mimir_ask`/`mimir_embed` with an external endpoint and
+- **Provider paths:** `perseus_vault_ask`/`perseus_vault_embed` with an external endpoint and
   connector sync are explicit opt-ins; each is gated by the deployment profile
   (#870) and the AAR control plane where it mutates state.
 - **Workspace isolation:** every store above carries `workspace_hash` where
@@ -65,13 +65,13 @@ trust axis (`candidate/verified/corroborated/rejected/defensively_recalled`,
 |---|---|---|---|
 | `active` | live, recallable | write | yes |
 | `proposed` | admission proposal awaiting evidence/authority | admission gate (#863) | explicit opt-in only |
-| `superseded` | replaced by a newer version; history preserved | `mimir_supersede` / valid-time close | historical/audit modes only |
-| `resolved` | question/issue closed; record kept | `mimir_resolve`-equivalent (status write) | yes, ranked lower |
+| `superseded` | replaced by a newer version; history preserved | `perseus_vault_supersede` / valid-time close | historical/audit modes only |
+| `resolved` | question/issue closed; record kept | `perseus_vault_resolve`-equivalent (status write) | yes, ranked lower |
 | `quarantined` | suspected harmful/untrusted; withheld | admission gate, erase revocation (§5.6) | never (unless explicit audit mode) |
-| `expired` | passed its `expires_at_unix_ms`; retained for history | `mimir_expire` sweep (§5.1) | no (explicit historical mode only) |
-| `redacted` | content scrubbed to hash-only record; row metadata kept, hidden from recall (archived) | `mimir_redact` (§5.2) | metadata only, no body |
-| `logically_deleted` | user/policy delete; row kept WITH content intact but hidden (recoverable) | `mimir_forget` (existing) | no |
-| `physically_erased` | content + row + derived layers removed; hash-only evidence remains | `mimir_erase` (§5.3) | no — not even metadata |
+| `expired` | passed its `expires_at_unix_ms`; retained for history | `perseus_vault_expire` sweep (§5.1) | no (explicit historical mode only) |
+| `redacted` | content scrubbed to hash-only record; row metadata kept, hidden from recall (archived) | `perseus_vault_redact` (§5.2) | metadata only, no body |
+| `logically_deleted` | user/policy delete; row kept WITH content intact but hidden (recoverable) | `perseus_vault_forget` (existing) | no |
+| `physically_erased` | content + row + derived layers removed; hash-only evidence remains | `perseus_vault_erase` (§5.3) | no — not even metadata |
 
 **Distinctness rule (#868):** these operations are **not interchangeable**.
 - `expire` = time-based lifecycle transition, content retained for history.
@@ -100,7 +100,7 @@ trust axis (`candidate/verified/corroborated/rejected/defensively_recalled`,
 
 ## 5. Operation semantics
 
-### 5.1 Expiry — `mimir_expire`
+### 5.1 Expiry — `perseus_vault_expire`
 
 - **Setting expiry:** the write path derives `entities.expires_at_unix_ms`
   from the body `expires_at` field on every remember/update — an integer
@@ -116,7 +116,7 @@ trust axis (`candidate/verified/corroborated/rejected/defensively_recalled`,
 - The sweep is idempotent and re-runnable; a `state` entry records the last
   sweep timestamp for observability.
 
-### 5.2 Redaction — `mimir_redact`
+### 5.2 Redaction — `perseus_vault_redact`
 
 - Content digest `d = sha256(body_json)` is computed **before** any write.
 - Transaction:
@@ -128,7 +128,7 @@ trust axis (`candidate/verified/corroborated/rejected/defensively_recalled`,
   is **retained** — redaction removes content, not existence.
 - Re-ingest of the same value is allowed (no tombstone, no mandate).
 
-### 5.3 Physical erasure — `mimir_erase`
+### 5.3 Physical erasure — `perseus_vault_erase`
 
 - Scope: exact `(category, key, workspace_hash)` — never a bare `(category,
   key)` across workspaces (#854 fail-closed rule). `dry_run` reports the exact
@@ -144,7 +144,7 @@ trust axis (`candidate/verified/corroborated/rejected/defensively_recalled`,
   8. **Journal (S10):** redact matching journal rows (existing #417 pattern: content → `{}`, preserving the audit-chain hashed tuple), then append `event_type='erased'` with hash-only evidence `{entity_id_sha256, value_sha256, workspace_hash, agent_id}`.
   9. Dedup side tables (S8) cascade via FK.
 - Report: `EraseReport { entities_erased, history_deleted, fts_cleaned, community_memberships_cleaned, inbound_links_cleaned, derived_quarantined, journal_redacted, value_sha256, dry_run, completed_at_unix_ms }`.
-- `VACUUM` is **not** run inside erase (caller may run `mimir_purge`-style
+- `VACUUM` is **not** run inside erase (caller may run `perseus_vault_purge`-style
   maintenance for space reclamation); erase is about reachability, purge is
   about space.
 
@@ -176,7 +176,7 @@ as an anomaly in the report (`cross_workspace_edges_found`).
 `erase` quarantines derived entities citing the erased source (§5.3 step 7).
 Quarantine (not deletion) is chosen because derived content may aggregate
 multiple sources; an operator reviews quarantined derived entities via
-`mimir_operator_review` and decides keep/refine/delete. `ask`/recall never
+`perseus_vault_operator_review` and decides keep/refine/delete. `ask`/recall never
 serve quarantined content except in explicit audit mode.
 
 ## 6. Audit evidence after erasure (minimized, explicit)
@@ -239,5 +239,5 @@ serve quarantined content except in explicit audit mode.
 
 ## 10. Changelog
 
-- **v1 (2026-08-09):** initial contract; ships with `mimir_expire`,
-  `mimir_redact`, `mimir_erase` and the propagation matrix above.
+- **v1 (2026-08-09):** initial contract; ships with `perseus_vault_expire`,
+  `perseus_vault_redact`, `perseus_vault_erase` and the propagation matrix above.

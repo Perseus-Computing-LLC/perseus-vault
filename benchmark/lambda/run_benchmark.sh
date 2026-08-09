@@ -11,9 +11,9 @@ source "$PFS/venv/bin/activate"
 
 # --- Wire the Perseus Vault binary's RAG path to the local A100-backed Ollama ---
 # Confirmed against perseus-vault/src/main.rs CLI flags:
-#   --llm-endpoint      Ollama /api/generate  (enables mimir_ask/dream/synthesize)
+#   --llm-endpoint      Ollama /api/generate  (enables perseus_vault_ask/dream/synthesize)
 #   --llm-model         model name
-#   --embedding-endpoint  Ollama /api/embed   (mimir_embed; else bundled ONNX is used)
+#   --embedding-endpoint  Ollama /api/embed   (perseus_vault_embed; else bundled ONNX is used)
 export PERSEUS_LLM_ENDPOINT="http://localhost:11434/api/generate"
 export PERSEUS_LLM_MODEL="qwen2.5:14b-instruct"
 export PERSEUS_EMBED_ENDPOINT="http://localhost:11434/api/embed"

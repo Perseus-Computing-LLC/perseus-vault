@@ -11,7 +11,7 @@ row (prior versions go to `entity_history`), so there is nothing stale to rank.
 This script demonstrates both behaviors on a real knowledge-update instance:
   A) BENCHMARK shape (unique key per session): recall returns BOTH versions.
   B) PRODUCT shape (shared key + valid_from = session date): recall returns ONLY
-     the latest version; the earlier value is recoverable via mimir_valid_at.
+     the latest version; the earlier value is recoverable via perseus_vault_valid_at.
 
     python knowledge_update_semantics_demo.py --data longmemeval_s_cleaned.json \
         --bin ../../target/release/perseus-vault.exe --id 852ce960
@@ -23,7 +23,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
-from run import MimirServer, session_text, find_binary  # noqa: E402
+from run import PerseusVaultServer, session_text, find_binary  # noqa: E402
 
 
 def to_ms(datestr):
@@ -64,16 +64,16 @@ def main():
     print(f"# {args.id}  Q: {inst['question'][:80]}")
     for g in gold:
         print(f"   gold {g}  date={dm[g]}")
-    db = str(Path(os.environ.get("TEMP") or "/tmp") / "mimir-ku-demo.db")
+    db = str(Path(os.environ.get("TEMP") or "/tmp") / "perseus_vault-ku-demo.db")
 
     # ---- A) BENCHMARK shape: unique key per session ----
-    wipe(db); srv = MimirServer(binary, db)
+    wipe(db); srv = PerseusVaultServer(binary, db)
     try:
         for g in gold:
-            srv.call("mimir_remember", {"category": "A", "key": g,
+            srv.call("perseus_vault_remember", {"category": "A", "key": g,
                                         "body_json": body(dm[g], tm[g]), "type": "fact"})
-        srv.call("mimir_embed", {"batch_category": "A", "batch_limit": 100})
-        r = srv.call("mimir_recall", {"query": inst["question"], "mode": "hybrid",
+        srv.call("perseus_vault_embed", {"batch_category": "A", "batch_limit": 100})
+        r = srv.call("perseus_vault_recall", {"query": inst["question"], "mode": "hybrid",
                                       "category": "A", "limit": 10, "trust_weight": 0, "min_decay": 0})
         keys = [it.get("key") for it in (r.get("items", []) if isinstance(r, dict) else [])]
     finally:
@@ -82,19 +82,19 @@ def main():
     print("   => both stale and update are live; ranking must guess which is latest (the #590 artifact).")
 
     # ---- B) PRODUCT shape: shared key + valid_from = session date ----
-    wipe(db); srv = MimirServer(binary, db)
+    wipe(db); srv = PerseusVaultServer(binary, db)
     try:
         for g in gold:  # ascending date; last remember = latest version
-            srv.call("mimir_remember", {"category": "B", "key": "the_fact",
+            srv.call("perseus_vault_remember", {"category": "B", "key": "the_fact",
                                         "body_json": body(dm[g], tm[g]), "type": "fact",
                                         "valid_from_unix_ms": to_ms(dm[g])})
-        srv.call("mimir_embed", {"batch_category": "B", "batch_limit": 100})
-        r = srv.call("mimir_recall", {"query": inst["question"], "mode": "hybrid",
+        srv.call("perseus_vault_embed", {"batch_category": "B", "batch_limit": 100})
+        r = srv.call("perseus_vault_recall", {"query": inst["question"], "mode": "hybrid",
                                       "category": "B", "limit": 10, "trust_weight": 0, "min_decay": 0})
         items = r.get("items", []) if isinstance(r, dict) else []
         live_bodies = [json.loads(it.get("body_json", "{}")).get("note", "")[:70] for it in items]
         # earlier value via bitemporal valid_at (as-of the stale gold's date)
-        va = srv.call("mimir_valid_at", {"category": "B", "key": "the_fact",
+        va = srv.call("perseus_vault_valid_at", {"category": "B", "key": "the_fact",
                                          "valid_at_unix_ms": to_ms(dm[gold[0]])})
     finally:
         srv.close()
@@ -102,7 +102,7 @@ def main():
     for b_ in live_bodies:
         print(f"   live: {b_!r}")
     print("   => only the LATEST version is live (earlier one is in history); nothing stale to mis-rank.")
-    print(f"   mimir_valid_at(as-of {dm[gold[0]]}): {json.dumps(va)[:200]}")
+    print(f"   perseus_vault_valid_at(as-of {dm[gold[0]]}): {json.dumps(va)[:200]}")
     print("   => the earlier value is still correctly recoverable bi-temporally.")
 
 

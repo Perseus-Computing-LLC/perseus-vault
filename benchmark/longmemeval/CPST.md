@@ -17,7 +17,7 @@ head-to-head in [COMPARISON.md](COMPARISON.md).
 |---|---|---|
 | `stateless` | the question only | an agent with no memory at all — why the category exists |
 | `fullcontext` | every haystack session (~48 sessions, ~105k tokens) | the no-memory-layer default: carry everything, every call |
-| `mimir` | top-10 sessions from perseus-vault hybrid recall (~26k tokens) | the product |
+| `perseus_vault` | top-10 sessions from perseus-vault hybrid recall (~26k tokens) | the product |
 
 Same pinned answerer and judge as the flagship run (`gpt-4o-2024-08-06`,
 temperature 0, LongMemEval official per-type judge). Same stratified,
@@ -36,7 +36,7 @@ errors). Cost is **API-billed** answerer tokens at 2026-07 gpt-4o pricing.
 |---|---:|---:|---:|---:|---:|---|
 | stateless | 100 | 12.0% | 81 | $0.08 | **$0.0068** | (accuracy floor — memory is not optional) |
 | fullcontext | 100 | 70.0% | 104,015 | $26.09 | **$0.3727** | — (the no-memory-layer baseline) |
-| **mimir (Perseus)** | 100 | **80.0%** | 25,270 | $6.39 | **$0.0799** | **4.7× cheaper per correct answer, 4.1× fewer tokens, +10 pts more accurate** |
+| **perseus_vault (Perseus)** | 100 | **80.0%** | 25,270 | $6.39 | **$0.0799** | **4.7× cheaper per correct answer, 4.1× fewer tokens, +10 pts more accurate** |
 
 **The headline: Perseus delivers a correct answer for ~$0.08 versus ~$0.37 for
 the brute-force full-context approach — 4.7× cheaper — while being *more*
@@ -58,7 +58,7 @@ Measured with `qa.py --dry-run` on the same subset — no API, no key:
 |---|---:|---:|---:|
 | stateless | 0.0 | 75 | 7,487 |
 | fullcontext | 47.8 | 105,496 | 10,549,621 |
-| mimir (k=10) | 9.8 | 26,484 | 2,648,425 |
+| perseus_vault (k=10) | 9.8 | 26,484 | 2,648,425 |
 
 **Perseus feeds 4.0× fewer tokens per question than full-context stuffing at
 the flagship k=10 setting.** (At k=5 the ratio is ~8×, with a recall
@@ -88,11 +88,11 @@ price.)
 # free: subset + token table
 python make_subset.py --data longmemeval_s_cleaned.json --n 100
 python qa.py --data longmemeval_s_subset100.json --dry-run \
-    --systems stateless fullcontext mimir
+    --systems stateless fullcontext perseus_vault
 
 # paid (~$34 at 2026-07 gpt-4o pricing; prints estimate, requires --yes)
 python qa.py --data longmemeval_s_subset100.json \
-    --systems stateless fullcontext mimir --tpm 400000 --yes \
+    --systems stateless fullcontext perseus_vault --tpm 400000 --yes \
     --journal qa_progress-cpst100.jsonl --out qa_report_cpst100.json
 
 # synthesis
@@ -107,7 +107,7 @@ python cpst.py --reports qa_report_cpst100.json \
   matches its content-hashed 500-question run sliced to the same 100 questions (80/100),
   a reassuring consistency check. The flagship 500-question accuracy number
   lives in [COMPARISON.md](COMPARISON.md).
-- **Single-session-preference is the shared weak spot** (1/6 for both mimir and
+- **Single-session-preference is the shared weak spot** (1/6 for both perseus_vault and
   fullcontext): a hard recall category, not a Perseus-specific gap — the model
   misses it even when handed the whole haystack. Tracked as retrieval-recall
   R&D, owned openly.

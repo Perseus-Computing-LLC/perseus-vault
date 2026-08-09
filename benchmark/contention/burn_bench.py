@@ -85,7 +85,7 @@ def main() -> int:
                     help="seconds to let the burn ramp before the loaded pass")
     ap.add_argument("--mode", default="fts5", choices=["fts5", "dense", "hybrid"],
                     help="recall mode (dense/hybrid need the bundled-embeddings "
-                         "build plus a mimir_embed pass; default fts5)")
+                         "build plus a perseus_vault_embed pass; default fts5)")
     ap.add_argument("--out", default=str(Path(tempfile.gettempdir()) /
                                          "contention-burn-report.json"))
     args = ap.parse_args()

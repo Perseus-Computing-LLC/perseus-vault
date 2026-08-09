@@ -9,10 +9,10 @@ LongMemEval *models* updates.
 
 ## The mechanism (already in the engine)
 
-`mimir_remember` on an existing `(category, key)` does a COALESCE **update of the
+`perseus_vault_remember` on an existing `(category, key)` does a COALESCE **update of the
 live row** and **snapshots the prior version into `entity_history`** (db.rs, the
 remember/upsert path, #363/#472). It already accepts `valid_from_unix_ms` /
-`valid_to_unix_ms`, and `mimir_valid_at` / `mimir_as_of` reconstruct any past
+`valid_to_unix_ms`, and `perseus_vault_valid_at` / `perseus_vault_as_of` reconstruct any past
 version bi-temporally. Recall runs over the **live index**, so it returns the
 single latest version per key — there is no stale row to mis-rank.
 
@@ -24,7 +24,7 @@ sessions dated 2023/08/11 and 2023/11/30):
 | ingest shape | recall returns |
 |---|---|
 | **A. unique key per session** (LongMemEval) | **both** versions live → ranking must guess the latest → the #590 inversion |
-| **B. shared key + `valid_from` = session date** (real usage) | **only the latest** (2023/11/30); the 08/11 value is in history, recovered exactly by `mimir_valid_at(as-of 08/11)` |
+| **B. shared key + `valid_from` = session date** (real usage) | **only the latest** (2023/11/30); the 08/11 value is in history, recovered exactly by `perseus_vault_valid_at(as-of 08/11)` |
 
 ## Why #590's metric shows an inversion anyway
 

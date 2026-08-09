@@ -46,14 +46,14 @@ Each composite component, and the Vault signal that feeds it today:
 
 | Dimension | Vault signal source | Existing knob / field |
 |---|---|---|
-| lexical | FTS5 rank; exact identifier/literal hits | `mimir_recall` mode `fts5`; `content_weight` boost |
+| lexical | FTS5 rank; exact identifier/literal hits | `perseus_vault_recall` mode `fts5`; `content_weight` boost |
 | structural | scope proximity (repo > workspace > global), topic proximity | `workspace_hash`, `topic_path`, `scope_weight` |
-| semantic | embedding cosine similarity; RRF fusion in hybrid | mode `dense`/`hybrid` (`mimir_semantic_search`) |
+| semantic | embedding cosine similarity; RRF fusion in hybrid | mode `dense`/`hybrid` (`perseus_vault_semantic_search`) |
 | freshness | decay + time since reinforcement | `decay_score`, `last_accessed`, `min_decay`, `recency_half_life_secs` |
 | support | independent supporting entities (dedup-folded) | belief overlay `support_count`; served-memory §3 |
-| confidence | verified × certainty, provenance class | `certainty`, `mimir_score` floors, `trust_weight`; provenance spec §3 |
+| confidence | verified × certainty, provenance class | `certainty`, `perseus_vault_score` floors, `trust_weight`; provenance spec §3 |
 | staleness | age past `valid_from`; `valid_to` exceeded → exclude | valid-time fields; `valid_at` filters |
-| contradiction | live conflict flag | `mimir_conflicts` pairs |
+| contradiction | live conflict flag | `perseus_vault_conflicts` pairs |
 
 Graph relationships are an eighth input in practice: on lineage questions
 the path-proximity boost (`graph-first-retrieval.md` §4) enters through
@@ -70,7 +70,7 @@ scoring* and which boosts apply:
 | Question type | Tier entry | Dominant dimensions | Notes |
 |---|---|---|---|
 | Factual ("what is the gate state") | 1 | lexical, confidence, freshness | exact identifiers and provenance class decide; semantic breaks ties |
-| Narrative ("what happened with plutus last week") | 1–3 | freshness, semantic, support | recency weighting (`recency_half_life_secs`) is appropriate here |
+| Narrative ("what happened with ledger last week") | 1–3 | freshness, semantic, support | recency weighting (`recency_half_life_secs`) is appropriate here |
 | Lineage/impact ("what depends on X") | 1 (graph) | structural (path proximity), support | graph boost active; keyword only finds the hub |
 | Verification ("quote the source") | 2 | lexical | artifact text, not entities; ranking barely matters |
 
@@ -99,7 +99,7 @@ Consistent with, and subordinate to, the composite spec:
 
 ## 5. Renderer contract
 
-Downstream renderers (Perseus context, `mimir_context`, served views)
+Downstream renderers (Perseus context, `perseus_vault_context`, served views)
 SHOULD preserve ranking signals when useful rather than flattening them:
 
 - Served items already carry `matched_on` and confidence (served-memory

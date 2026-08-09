@@ -91,9 +91,9 @@ vectors is the separate, pending model-weight axis.
 
 ## Measured: the rerank is what matters (do not disable it)
 
-`DenseOpts.rerank` / env `MIMIR_DENSE_SIG_RERANK=0` (default **ON**, default path
+`DenseOpts.rerank` / env `PERSEUS_VAULT_DENSE_SIG_RERANK=0` (default **ON**, default path
 byte-identical) skips the phase-2 cosine rerank. Measured on the 1M corpus, the pure
 1-bit prefilter scores **0.312 r@5** vs the shipped **0.726** — turning the rerank off
 saves ~10 ms and less-than-halves recall. The sign code is a strong candidate *filter*
 but a weak *ranker*; the exact-cosine rerank over the 1-bit-selected pool does the heavy
-lifting. Recommendation: never set `MIMIR_DENSE_SIG_RERANK=0` outside benchmarking.
+lifting. Recommendation: never set `PERSEUS_VAULT_DENSE_SIG_RERANK=0` outside benchmarking.

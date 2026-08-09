@@ -34,7 +34,7 @@ use clap::{Parser, Subcommand};
 #[derive(Parser)]
 #[command(name = "perseus-vault")]
 #[command(
-    about = "Perseus Vault — persistent memory for AI agents — MCP JSON-RPC stdio server (formerly Mneme/Mimir)",
+    about = "Perseus Vault — persistent memory for AI agents — MCP JSON-RPC stdio server",
     version = concat!(
         env!("CARGO_PKG_VERSION"),
         " (",
@@ -46,9 +46,8 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
 
-    /// SQLite database path (default: $PERSEUS_VAULT_DB_PATH / $MIMIR_DB_PATH or
-    /// ~/.perseus-vault/data/perseus-vault.db, falling back to an existing
-    /// ~/.mimir/data/{perseus-vault,mneme,mimir}.db from before the rename).
+    /// SQLite database path (default: $PERSEUS_VAULT_DB_PATH or
+    /// ~/.perseus-vault/data/perseus-vault.db).
     /// Used when running the server directly
     /// without the `serve` subcommand — matches the documented MCP host config:
     /// `perseus-vault --db /path/to/perseus-vault.db`.
@@ -71,7 +70,7 @@ struct Cli {
     #[arg(long, default_value_t = String::from("127.0.0.1"))]
     web_bind: String,
 
-    /// Ollama API endpoint for the mimir_ask RAG tool
+    /// Ollama API endpoint for the perseus_vault_ask RAG tool
     #[arg(long)]
     llm_endpoint: Option<String>,
 
@@ -204,7 +203,7 @@ enum Commands {
         #[arg(long, default_value_t = String::from("127.0.0.1"))]
         web_bind: String,
 
-        /// Ollama API endpoint for the mimir_ask RAG tool
+        /// Ollama API endpoint for the perseus_vault_ask RAG tool
         #[arg(long)]
         llm_endpoint: Option<String>,
 
@@ -273,7 +272,7 @@ enum Commands {
         maintain_every: Option<u64>,
     },
 
-    /// Migrate a v0.1.x Mneme database to v0.2.0 schema
+    /// Migrate a v0.1.x Perseus Vault database to v0.2.0 schema
     Migrate {
         /// Path to the source v0.1.x database
         #[arg(long)]
@@ -286,8 +285,7 @@ enum Commands {
 
     /// Generate a new AES-256-GCM encryption key and write it to a file
     Keygen {
-        /// Path to write the key file (default: ~/.perseus-vault/secret.key, or
-        /// an existing ~/.mimir/secret.key from before the rename)
+        /// Path to write the key file (default: ~/.perseus-vault/secret.key)
         #[arg(long, default_value_t = default_key_file())]
         key_file: String,
     },
@@ -442,7 +440,7 @@ enum Commands {
         #[arg(long, default_value_t = default_db_path())]
         db: String,
         /// Target directory for .md files (created if needed)
-        #[arg(long, default_value_t = String::from("~/.mimir/vault"))]
+        #[arg(long, default_value_t = String::from("~/.perseus-vault/vault"))]
         vault_dir: String,
         /// Optional workspace hash to scope the export
         #[arg(long)]
@@ -459,7 +457,7 @@ enum Commands {
         #[arg(long, default_value_t = default_db_path())]
         db: String,
         /// Source directory containing .md files
-        #[arg(long, default_value_t = String::from("~/.mimir/vault"))]
+        #[arg(long, default_value_t = String::from("~/.perseus-vault/vault"))]
         vault_dir: String,
         /// Path to AES-256-GCM encryption key file; falls back to the standard
         /// key path when one exists.
@@ -467,7 +465,7 @@ enum Commands {
         encryption_key: Option<String>,
     },
 
-    /// Sync your Mneme memory into an Obsidian (or Logseq/Notion) vault as
+    /// Sync your Perseus Vault memory into an Obsidian (or Logseq/Notion) vault as
     /// linked Markdown notes. Wraps vault export and writes `[[WikiLink]]`
     /// backlinks between related entities so your AI memory becomes a
     /// navigable personal knowledge base. Pass `--watch` to re-export on every
@@ -476,7 +474,7 @@ enum Commands {
     ObsidianSync {
         /// Target Obsidian vault directory (created if needed)
         vault_path: String,
-        /// SQLite database path (defaults to $PERSEUS_VAULT_DB_PATH / $MIMIR_DB_PATH or ~/.perseus-vault/data/perseus-vault.db)
+        /// SQLite database path (defaults to $PERSEUS_VAULT_DB_PATH or ~/.perseus-vault/data/perseus-vault.db)
         #[arg(long)]
         db: Option<String>,
         /// Continuously re-export whenever memory changes
@@ -703,7 +701,7 @@ enum Commands {
         dry_run: bool,
         /// Distill via the configured LLM endpoint (requires --llm-endpoint;
         /// falls back to the local rule-based distiller on any LLM error or
-        /// timeout — see MIMIR_LLM_TIMEOUT_SECS, #528)
+        /// timeout — see PERSEUS_VAULT_LLM_TIMEOUT_SECS, #528)
         #[arg(long)]
         llm: bool,
         /// LLM endpoint for --llm (same semantics as serve's --llm-endpoint)
@@ -757,7 +755,7 @@ impl Commands {
 }
 
 /// #313: honor the documented top-level `--db` even when a subcommand follows
-/// (`mimir --db PATH serve`). Each subcommand carries its own `--db` defaulted to
+/// (`perseus_vault --db PATH serve`). Each subcommand carries its own `--db` defaulted to
 /// `default_db_path()`; when the user did not pass a subcommand-level `--db` (it
 /// still equals the default), the top-level flag fills it in so it is no longer
 /// silently ignored. An explicit subcommand-level `--db` always wins.
@@ -779,148 +777,18 @@ fn apply_top_level_db(cli: &mut Cli) {
     }
 }
 
-/// Outcome of resolving the default database path when no `--db`/`$MIMIR_DB_PATH`
-/// was given: the chosen path plus any *other* existing candidate databases that
-/// were passed over. When `other_candidates` is non-empty the caller should warn
-/// so an ambiguous multi-DB state is visible rather than silent (#421).
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct DbResolution {
-    chosen: String,
-    other_candidates: Vec<String>,
-}
-
-/// Pure, testable core of default DB-path resolution (#421, #424).
-///
-/// Given the home directory, an existence check, and a keyless entity-count
-/// probe, decides which database the server should open when the user did not
-/// pass `--db` or set `$MIMIR_DB_PATH`.
-///
-/// Precedence (first existing wins):
-///   1. `~/.perseus-vault/data/perseus-vault.db`  (canonical, current brand)
-///   2. `~/.mimir/data/perseus-vault.db`          (pre-dir-rename, #427)
-///   3. `~/.mimir/data/mneme.db`                  (pre-rename)
-///   4. `~/.mimir/data/mimir.db`                  (pre-rename)
-///   5. `~/mimir.db`                               (legacy single-user install location)
-/// If none exist, fall back to creating (1), the canonical path.
-///
-/// #427 is a *precedence-only* directory rename: fresh installs land in
-/// `~/.perseus-vault/`, while any existing `~/.mimir/` install keeps being
-/// adopted via the fallback chain — no data is moved. `~/.mimir/` stays in the
-/// chain indefinitely so upgraders are never orphaned.
-///
-/// Crucially `~/mimir.db` is chosen *before* falling through to create a fresh
-/// canonical DB, so an existing single-user install is picked up instead of
-/// silently starting empty. `other_candidates` reports every *other* database
-/// that also exists so the caller can warn about the ambiguity.
-///
-/// #424: purely path-based precedence let a stale, *empty* higher-precedence DB
-/// (e.g. a `~/.mimir/data/mimir.db` created by an earlier default-path run)
-/// shadow a live lower-precedence one (e.g. `~/mimir.db` with real data). So
-/// when — and only when — the highest-precedence existing candidate is
-/// *known-empty* (`entity_count` returns `Some(0)`), we prefer the
-/// highest-precedence candidate that is *known-non-empty*. Candidates whose
-/// count can't be read (locked/corrupt/not-yet-a-vault → `None`) are treated as
-/// unknown: we never demote *on* an unknown, and never promote *to* one, so an
-/// unreadable top candidate keeps its position (current order + warn). The
-/// probe is only consulted here in the rare multi-candidate case.
-fn resolve_default_db(
-    home: &str,
-    exists: &dyn Fn(&str) -> bool,
-    entity_count: &dyn Fn(&str) -> Option<i64>,
-) -> DbResolution {
-    let new_dir = format!("{}/.perseus-vault/data", home);
-    let legacy_dir = format!("{}/.mimir/data", home);
-    let vault_path = format!("{}/perseus-vault.db", new_dir); // #427 canonical
-    let legacy_vault_path = format!("{}/perseus-vault.db", legacy_dir);
-    let mneme_path = format!("{}/mneme.db", legacy_dir);
-    let mimir_path = format!("{}/mimir.db", legacy_dir);
-    let home_legacy_path = format!("{}/mimir.db", home);
-
-    // Ordered candidate list; the first that exists is chosen.
-    let candidates = [
-        vault_path.clone(),
-        legacy_vault_path,
-        mneme_path,
-        mimir_path,
-        home_legacy_path,
-    ];
-
-    let existing: Vec<String> = candidates
-        .iter()
-        .filter(|p| exists(p))
-        .cloned()
-        .collect();
-
-    // Chosen: first existing candidate in precedence order, else the canonical
-    // path (which will be created fresh).
-    let chosen = match existing.first() {
-        None => vault_path,
-        Some(first) => {
-            // #424: only reconsider precedence when the top candidate is
-            // *known* empty; prefer the highest-precedence known-non-empty DB.
-            if entity_count(first) == Some(0) {
-                existing
-                    .iter()
-                    .find(|p| entity_count(p).is_some_and(|c| c > 0))
-                    .cloned()
-                    .unwrap_or_else(|| first.clone())
-            } else {
-                first.clone()
-            }
-        }
-    };
-    let other_candidates = existing
-        .into_iter()
-        .filter(|p| *p != chosen)
-        .collect();
-
-    DbResolution {
-        chosen,
-        other_candidates,
-    }
-}
-
-/// #424: keyless probe of a candidate DB's entity count. Opens the file
-/// **read-only** so a candidate we don't end up adopting is never mutated (no
-/// schema init, no WAL/SHM churn — unlike [`db::Database::open`], which creates
-/// the schema). Returns `Some(count)` when the `entities` table can be read,
-/// and `None` when the DB can't be opened/read or has no such table (locked,
-/// corrupt, or not yet a vault) — callers treat `None` as "unknown".
-///
-/// A row `COUNT(*)` needs no encryption key: encryption is per-field, so the
-/// table structure and row count are plaintext even on an encrypted store.
-fn probe_entity_count(path: &str) -> Option<i64> {
-    use rusqlite::OpenFlags;
-    let conn = rusqlite::Connection::open_with_flags(
-        path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .ok()?;
-    conn.query_row("SELECT COUNT(*) FROM entities", [], |r| r.get::<_, i64>(0))
-        .ok()
-}
-
 /// Resolve the default database path.
 ///
-/// Perseus Vault rename: fresh installs default to `perseus-vault.db`. If a
-/// pre-rename `mneme.db`/`mimir.db`, or a legacy single-user `~/mimir.db`,
-/// already exists we keep using it so upgraders don't silently start over with
-/// an empty database (#421).
+/// `$PERSEUS_VAULT_DB_PATH` wins when set; otherwise the canonical
+/// `~/.perseus-vault/data/perseus-vault.db` is used (the data dir is created
+/// for fresh installs). Legacy product paths are no longer probed.
 ///
 /// This is intentionally side-effect free apart from creating the data dir: it
 /// is used both as clap's `default_value_t` (evaluated eagerly, even when the
-/// user passes `--db`) and in equality comparisons by `apply_top_level_db`, so
-/// it must NOT print warnings and stays path-only (no DB probing). The
-/// multi-candidate split-brain warning and the emptiness-aware refinement are
-/// emitted separately by `normalize_default_db`, which runs once at real
-/// startup and only when the default path was actually used.
+/// user passes `--db`) and in equality comparisons by `apply_top_level_db`.
 fn default_db_path() -> String {
-    // #427: PERSEUS_VAULT_DB_PATH is the current-brand override; MIMIR_DB_PATH
-    // stays honored for back-compat (checked second).
+    // $PERSEUS_VAULT_DB_PATH is the current-brand override.
     if let Ok(explicit) = std::env::var("PERSEUS_VAULT_DB_PATH") {
-        return explicit;
-    }
-    if let Ok(explicit) = std::env::var("MIMIR_DB_PATH") {
         return explicit;
     }
     let home = std::env::var("HOME")
@@ -929,95 +797,11 @@ fn default_db_path() -> String {
             eprintln!("perseus-vault: could not determine home directory. Set PERSEUS_VAULT_DB_PATH or HOME/USERPROFILE.");
             std::process::exit(1);
         });
-    // Create the current-brand canonical data dir for fresh installs. Existing
-    // ~/.mimir installs are still adopted by resolve_default_db via the fallback
-    // chain (this only ever creates an empty dir alongside them).
+    // Create the canonical data dir for fresh installs.
     let dir = format!("{}/.perseus-vault/data", home);
     let _ = std::fs::create_dir_all(&dir);
 
-    // Path-only here: clap evaluates this eagerly for *every* invocation (even
-    // when `--db` is passed) and `apply_top_level_db` compares against it, so it
-    // must stay cheap and side-effect-free. The emptiness-aware refinement (the
-    // `entity_count` probe) is applied once at real startup by
-    // `normalize_default_db`, not here.
-    resolve_default_db(&home, &|p| std::path::Path::new(p).exists(), &|_| None).chosen
-}
-
-/// #421/#424: single owner of default-DB resolution + its warnings at real
-/// startup. When — and only when — the database path is the *implicit default*
-/// (no `--db` at either level, no `$MIMIR_DB_PATH`), this refines the path with
-/// the keyless emptiness probe (so a stale-empty higher-precedence DB no longer
-/// shadows a live lower-precedence one, #424), rewrites the subcommand's `--db`
-/// field to the resolved path, and surfaces any multi-candidate ambiguity on
-/// stderr. When the user selected a DB explicitly, this is a no-op.
-///
-/// Runs once in `main()` before the command match, so every command path —
-/// `serve` and the maintenance subcommands alike — opens the same resolved DB,
-/// rather than only the handful of sites that used to call `check_legacy_db`.
-fn normalize_default_db(cli: &mut Cli) {
-    // Explicit selection (env or top-level `--db`) is never second-guessed.
-    if std::env::var_os("PERSEUS_VAULT_DB_PATH").is_some()
-        || std::env::var_os("MIMIR_DB_PATH").is_some()
-        || cli.db.is_some()
-    {
-        return;
-    }
-    let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) else {
-        return;
-    };
-    let default = default_db_path();
-    let Some(cmd) = cli.command.as_mut() else {
-        return;
-    };
-
-    // Is this the implicit default? Commands without a `--db` (Keygen/Migrate)
-    // are skipped; ObsidianSync carries an `Option<String>` handled separately.
-    let is_implicit = match cmd {
-        Commands::ObsidianSync { db, .. } => db.is_none(),
-        _ => cmd.db_field_mut().map(|db| *db == default).unwrap_or(false),
-    };
-    if !is_implicit {
-        return;
-    }
-
-    let resolution = resolve_default_db(
-        &home,
-        &|p| std::path::Path::new(p).exists(),
-        &probe_entity_count,
-    );
-
-    // Surface a split-brain (multiple candidate DBs, user picked none) instead
-    // of silently reading/creating one of them.
-    if !resolution.other_candidates.is_empty() {
-        eprintln!(
-            "perseus-vault: ⚠  multiple candidate databases found; using {}",
-            resolution.chosen
-        );
-        // #424: make the emptiness-aware override explicit — otherwise adopting
-        // a lower-precedence DB over the "expected" default looks surprising.
-        if resolution.chosen != default {
-            eprintln!(
-                "perseus-vault:    (preferred a non-empty database over the empty {})",
-                default
-            );
-        }
-        for other in &resolution.other_candidates {
-            eprintln!("perseus-vault:    also present (ignored): {}", other);
-        }
-        eprintln!(
-            "perseus-vault:    pass --db <path> or set PERSEUS_VAULT_DB_PATH to choose explicitly and silence this warning."
-        );
-    }
-
-    // Apply the resolved path back onto the subcommand's `--db` field.
-    match cmd {
-        Commands::ObsidianSync { db, .. } => *db = Some(resolution.chosen),
-        _ => {
-            if let Some(db) = cmd.db_field_mut() {
-                *db = resolution.chosen;
-            }
-        }
-    }
+    format!("{}/perseus-vault.db", dir)
 }
 
 /// Warn when serving an already-encrypted database with NO key loaded.
@@ -1031,7 +815,7 @@ fn normalize_default_db(cli: &mut Cli) {
 fn warn_plaintext_writes_to_encrypted_db(database: &db::Database) {
     if should_warn_plaintext_writes_to_encrypted_db(&database.encryption_storage_state(), false) {
         eprintln!(
-            "mimir: WARNING — this database is encrypted but no --encryption-key was given. \
+            "perseus-vault: WARNING — this database is encrypted but no --encryption-key was given. \
              New memories will be written as PLAINTEXT alongside the existing ciphertext. \
              Pass --encryption-key <file> (see `perseus-vault init --help`)."
         );
@@ -1042,18 +826,7 @@ fn default_key_file() -> String {
     let home = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
         .unwrap_or_else(|_| "/root".to_string());
-    // #427 precedence-only: prefer whichever secret.key already exists so an
-    // existing encrypted install NEVER loses its key (a wrong default would
-    // silently make the vault undecryptable). Fresh installs use the new dir.
-    let new_key = format!("{}/.perseus-vault/secret.key", home);
-    let legacy_key = format!("{}/.mimir/secret.key", home);
-    if std::path::Path::new(&new_key).exists() {
-        new_key
-    } else if std::path::Path::new(&legacy_key).exists() {
-        legacy_key
-    } else {
-        new_key
-    }
+    format!("{}/.perseus-vault/secret.key", home)
 }
 
 /// Resolve an explicitly supplied key, or use the standard key path when it
@@ -1227,7 +1000,7 @@ fn warn_key_acls_on_windows(key_file: &str) {
     #[cfg(windows)]
     {
         eprintln!(
-            "mimir: NOTE (Windows): key-file ACLs are not enforced by an OS umask. \
+            "perseus-vault: NOTE (Windows): key-file ACLs are not enforced by an OS umask. \
              Ensure {key_file} is readable only by your account, e.g.: \
              icacls \"{key_file}\" /inheritance:r /grant:r %USERNAME%:F"
         );
@@ -1237,23 +1010,23 @@ fn warn_key_acls_on_windows(key_file: &str) {
 /// Refuse (by default) to expose an HTTP surface on a non-loopback address with
 /// NO auth token — the "bound to 0.0.0.0 and wide open" footgun. An operator who
 /// intentionally fronts the vault with a trusted network or a proxy that
-/// terminates auth can override with `MIMIR_ALLOW_INSECURE_BIND=1`.
+/// terminates auth can override with `PERSEUS_VAULT_ALLOW_INSECURE_BIND=1`.
 fn guard_bind(surface: &str, bind_host: &str, has_token: bool) {
     if has_token || crate::util::host_is_loopback(bind_host) {
         return;
     }
-    if std::env::var("MIMIR_ALLOW_INSECURE_BIND").ok().as_deref() == Some("1") {
+    if std::env::var("PERSEUS_VAULT_ALLOW_INSECURE_BIND").ok().as_deref() == Some("1") {
         eprintln!(
-            "mimir: WARNING: {surface} is bound to non-loopback {bind_host} with NO auth token \
-             (MIMIR_ALLOW_INSECURE_BIND=1 set — proceeding). Anyone who can reach this port has \
+            "perseus-vault: WARNING: {surface} is bound to non-loopback {bind_host} with NO auth token \
+             (PERSEUS_VAULT_ALLOW_INSECURE_BIND=1 set — proceeding). Anyone who can reach this port has \
              full read/write access to the vault."
         );
         return;
     }
     eprintln!(
-        "mimir: fatal: refusing to expose {surface} on non-loopback address {bind_host} without an \
+        "perseus-vault: fatal: refusing to expose {surface} on non-loopback address {bind_host} without an \
          auth token. Set an auth token, bind to 127.0.0.1, or — if the network is trusted (e.g. an \
-         auth-terminating reverse proxy) — set MIMIR_ALLOW_INSECURE_BIND=1."
+         auth-terminating reverse proxy) — set PERSEUS_VAULT_ALLOW_INSECURE_BIND=1."
     );
     std::process::exit(1);
 }
@@ -1270,7 +1043,7 @@ fn open_db_or_exit(db_path: &str) -> db::Database {
     match db::Database::open(db_path) {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("mimir: failed to open database at {}: {}", db_path, e);
+            eprintln!("perseus-vault: failed to open database at {}: {}", db_path, e);
             std::process::exit(1);
         }
     }
@@ -1472,7 +1245,7 @@ struct ConnectCtx {
     hooks: bool,
     rules: bool,
     dry_run: bool,
-    /// MIMIR_CONNECT_CONFIG override for the MCP config file location.
+    /// PERSEUS_VAULT_CONNECT_CONFIG override for the MCP config file location.
     config_override: Option<String>,
 }
 
@@ -1638,9 +1411,8 @@ fn plan_write(
 
 /// Merge the perseus-vault server registration into a JSON MCP config,
 /// preserving every unknown key. `servers_key` is "mcpServers" (most clients)
-/// or "context_servers" (Zed, whose entry nests under "command"). Legacy
-/// "mimir"/"mneme" entries from pre-rename runs are replaced by the canonical
-/// "perseus-vault" entry.
+/// or "context_servers" (Zed, whose entry nests under "command"). An existing
+/// entry under the canonical "perseus-vault" key is replaced in place.
 fn merge_mcp_json(
     existing: &str,
     servers_key: &str,
@@ -1672,9 +1444,7 @@ fn merge_mcp_json(
         return Err(format!("{} is not an object; refusing to merge", servers_key));
     }
     let servers = servers.as_object_mut().unwrap();
-    // Pre-rename entries point at the same engine — replace, don't duplicate.
-    servers.remove("mimir");
-    servers.remove("mneme");
+    // Replacing the same key updates the entry in place; no legacy keys exist.
     servers.insert("perseus-vault".to_string(), entry);
     Ok(serde_json::to_string_pretty(&root).unwrap() + "\n")
 }
@@ -1710,8 +1480,6 @@ fn merge_hermes_yaml(
     }))
     .unwrap();
     let servers = servers.as_mapping_mut().unwrap();
-    servers.remove(serde_yaml::Value::String("mimir".to_string()));
-    servers.remove(serde_yaml::Value::String("mneme".to_string()));
     servers.insert(serde_yaml::Value::String("perseus-vault".to_string()), entry);
     Ok(serde_yaml::to_string(&root).unwrap_or_default())
 }
@@ -1734,15 +1502,14 @@ fn splice_out_toml_stanza(existing: &str, header: &str) -> String {
 /// simple enough to hand-splice: replace (or append) the
 /// `[mcp_servers.perseus-vault]` table without a TOML parser dependency —
 /// which also preserves the rest of the file byte-for-byte, comments
-/// included. Pre-rename `[mcp_servers.mimir]`/`.mneme` stanzas are removed.
+/// included.
 fn merge_codex_toml(
     existing: &str,
     bin: &str,
     db_path: &str,
     encryption_key: Option<&str>,
 ) -> String {
-    let existing = splice_out_toml_stanza(existing, "[mcp_servers.mimir]");
-    let existing = splice_out_toml_stanza(&existing, "[mcp_servers.mneme]");
+    let existing = splice_out_toml_stanza(existing, "[mcp_servers.perseus-vault]");
     let header = "[mcp_servers.perseus-vault]";
     let args_toml = serve_config_args(db_path, encryption_key)
         .iter()
@@ -1826,7 +1593,7 @@ fn merge_lifecycle_hooks_json(
         // invocation of the same verb under this event counts.
         let present = arr.as_array().unwrap().iter().any(|e| {
             let s = e.to_string();
-            (s.contains("perseus-vault") || s.contains("mimir") || s.contains("mneme"))
+            (s.contains("perseus-vault") || s.contains("perseus-vault") || s.contains("perseus_vault"))
                 && s.contains(spec.verb_marker)
         });
         if !present {
@@ -2027,7 +1794,7 @@ fn connect_one(ctx: &ConnectCtx, client: &str) -> Result<usize, String> {
     // (mcp_config_path, merge kind); None = "generic" (print a snippet).
     let mcp_target: Option<(std::path::PathBuf, &str)> = match client {
         // macOS path; Linux/Windows users can pass a custom path via
-        // MIMIR_CONNECT_CONFIG if their install differs.
+        // PERSEUS_VAULT_CONNECT_CONFIG if their install differs.
         "claude-desktop" => Some((
             over(home.join("Library/Application Support/Claude/claude_desktop_config.json")),
             "json_mcpServers",
@@ -2278,7 +2045,7 @@ fn run_connect(
         hooks,
         rules,
         dry_run,
-        config_override: std::env::var("MIMIR_CONNECT_CONFIG").ok(),
+        config_override: std::env::var("PERSEUS_VAULT_CONNECT_CONFIG").ok(),
     };
 
     let mut changed = 0usize;
@@ -2344,7 +2111,7 @@ fn truncate_for_prepare(s: &str, max_len: usize) -> String {
 /// unconditional top-N dump, which is opt-in via --legacy-context). Prints a
 /// single `<memory-prep>` block so a Hermes pre-turn hook can splice the
 /// result straight into the system prompt, instead of relying on the agent
-/// remembering to call `mimir_recall_when` itself mid-conversation. Cost:
+/// remembering to call `perseus_vault_recall_when` itself mid-conversation. Cost:
 /// local SQLite queries only, no network, no model calls — designed to run
 /// on every turn.
 #[allow(clippy::too_many_arguments)]
@@ -2365,7 +2132,7 @@ fn run_prepare(
         match db.recall_when(task, recall_when_limit, workspace) {
             Ok(hits) => hits,
             Err(e) => {
-                eprintln!("mimir: prepare: recall_when failed: {}", e);
+                eprintln!("perseus-vault: prepare: recall_when failed: {}", e);
                 Vec::new()
             }
         }
@@ -2396,7 +2163,7 @@ fn run_prepare(
     let context_block = match db.context_block(&opts) {
         Ok(block) => block,
         Err(e) => {
-            eprintln!("mimir: prepare: context failed: {}", e);
+            eprintln!("perseus-vault: prepare: context failed: {}", e);
             crate::models::ContextBlock {
                 markdown: String::new(),
                 mode: opts.mode.as_str().to_string(),
@@ -2435,7 +2202,7 @@ fn run_prepare(
 
 /// #520: `perseus-vault capture` — the CLI face of the shared capture
 /// pipeline (`tools::handle_capture`, the same code path as the
-/// `mimir_capture` MCP tool). Builds the tool-args JSON from the CLI flags
+/// `perseus_vault_capture` MCP tool). Builds the tool-args JSON from the CLI flags
 /// and returns the pipeline's structured report, so the verb is testable on
 /// a temp database without stdin plumbing.
 fn run_capture(
@@ -2519,9 +2286,7 @@ fn main() {
 
 fn run() {
     let mut cli = Cli::parse();
-    apply_top_level_db(&mut cli); // #313: `mimir --db PATH serve` must honor --db
-    normalize_default_db(&mut cli); // #421/#424: resolve implicit default DB + warn
-
+    apply_top_level_db(&mut cli); // #313: `perseus-vault --db PATH serve` must honor --db
     match cli.command {
         Some(Commands::Keygen { key_file }) => {
             let expanded = if key_file.starts_with("~/") {
@@ -2537,7 +2302,7 @@ fn run() {
             if let Some(parent) = std::path::Path::new(&expanded).parent() {
                 if let Err(e) = std::fs::create_dir_all(parent) {
                     eprintln!(
-                        "mimir: failed to create directory {}: {}",
+                        "perseus-vault: failed to create directory {}: {}",
                         parent.display(),
                         e
                     );
@@ -2590,7 +2355,7 @@ fn run() {
                     {
                         if !tighten_windows_key_acls(&expanded) {
                             eprintln!(
-                                "mimir: WARNING: could not restrict ACLs on key file {}. \
+                                "perseus-vault: WARNING: could not restrict ACLs on key file {}. \
                                  Other local users may be able to read your encryption key. \
                                  Restrict it manually: icacls \"{}\" /inheritance:r /grant:r %USERNAME%:F",
                                 expanded, expanded
@@ -2604,7 +2369,7 @@ fn run() {
                     );
                 }
                 Err(e) => {
-                    eprintln!("mimir: failed to write key file {}: {}", expanded, e);
+                    eprintln!("perseus-vault: failed to write key file {}: {}", expanded, e);
                     std::process::exit(1);
                 }
             }
@@ -2626,7 +2391,7 @@ fn run() {
             if let Some(parent) = std::path::Path::new(&expanded).parent() {
                 if let Err(e) = std::fs::create_dir_all(parent) {
                     eprintln!(
-                        "mimir: failed to create directory {}: {}",
+                        "perseus-vault: failed to create directory {}: {}",
                         parent.display(),
                         e
                     );
@@ -2666,7 +2431,7 @@ fn run() {
                     {
                         if !tighten_windows_key_acls(&expanded) {
                             eprintln!(
-                                "mimir: WARNING: could not restrict ACLs on key file {}. \
+                                "perseus-vault: WARNING: could not restrict ACLs on key file {}. \
                                  Other local users may be able to read your encryption key. \
                                  Restrict it manually: icacls \"{}\" /inheritance:r /grant:r %USERNAME%:F",
                                 expanded, expanded
@@ -2675,7 +2440,7 @@ fn run() {
                     }
                 }
                 Err(e) => {
-                    eprintln!("mimir: failed to write key file {}: {}", expanded, e);
+                    eprintln!("perseus-vault: failed to write key file {}: {}", expanded, e);
                     std::process::exit(1);
                 }
             }
@@ -2684,13 +2449,13 @@ fn run() {
             let mut database = match db::Database::open(db_path) {
                 Ok(d) => d,
                 Err(e) => {
-                    eprintln!("mimir: failed to open database at {}: {}", db_path, e);
+                    eprintln!("perseus-vault: failed to open database at {}: {}", db_path, e);
                     std::process::exit(1);
                 }
             };
             if let Err(e) = database.set_encryption(&expanded) {
                 eprintln!(
-                    "mimir: encryption setup failed: {}. The key at {} exists but \
+                    "perseus-vault: encryption setup failed: {}. The key at {} exists but \
                      the database could not be encrypted. Key files are precious: \
                      back up {} before retrying.",
                     e, expanded, expanded
@@ -2707,12 +2472,12 @@ fn run() {
                             encrypted, skipped, failed
                         );
                         if failed > 0 {
-                            eprintln!("mimir: init --rekey: some records failed — check stderr above");
+                            eprintln!("perseus-vault: init --rekey: some records failed — check stderr above");
                             std::process::exit(1);
                         }
                     }
                     Err(e) => {
-                        eprintln!("mimir: init --rekey failed: {}", e);
+                        eprintln!("perseus-vault: init --rekey failed: {}", e);
                         std::process::exit(1);
                     }
                 }
@@ -2734,7 +2499,7 @@ fn run() {
         }) => {
             let mut database = open_db_or_exit(db_path);
             if let Err(e) = database.set_encryption(encryption_key) {
-                eprintln!("mimir: encryption setup failed: {}", e);
+                eprintln!("perseus-vault: encryption setup failed: {}", e);
                 std::process::exit(1);
             }
             match database.rekey_aad() {
@@ -2748,7 +2513,7 @@ fn run() {
                     }
                 }
                 Err(e) => {
-                    eprintln!("mimir: rekey-aad failed: {}", e);
+                    eprintln!("perseus-vault: rekey-aad failed: {}", e);
                     std::process::exit(1);
                 }
             }
@@ -2758,7 +2523,7 @@ fn run() {
             match crate::db::verify_audit_chain(&database) {
                 Ok(n) => println!("audit chain OK: {} entries verified", n),
                 Err(e) => {
-                    eprintln!("mimir: audit chain verification FAILED: {}", e);
+                    eprintln!("perseus-vault: audit chain verification FAILED: {}", e);
                     std::process::exit(1);
                 }
             }
@@ -2774,7 +2539,7 @@ fn run() {
             let encryption_key = configured_encryption_key_for_database(&mut database, encryption_key.as_deref());
             if let Some(ref key_file) = encryption_key {
                 if let Err(e) = database.set_encryption(key_file) {
-                    eprintln!("mimir: encryption setup failed: {}", e);
+                    eprintln!("perseus-vault: encryption setup failed: {}", e);
                     std::process::exit(1);
                 }
             } else {
@@ -2783,11 +2548,11 @@ fn run() {
             match database.forget(category, key, reason) {
                 Ok(true) => println!("Archived {}/{}", category, key),
                 Ok(false) => {
-                    eprintln!("mimir: no active entity found for {}/{}", category, key);
+                    eprintln!("perseus-vault: no active entity found for {}/{}", category, key);
                     std::process::exit(1);
                 }
                 Err(e) => {
-                    eprintln!("mimir: forget failed: {}", e);
+                    eprintln!("perseus-vault: forget failed: {}", e);
                     std::process::exit(1);
                 }
             }
@@ -2805,7 +2570,7 @@ fn run() {
             let encryption_key = configured_encryption_key_for_database(&mut database, encryption_key.as_deref());
             if let Some(ref key_file) = encryption_key {
                 if let Err(e) = database.set_encryption(key_file) {
-                    eprintln!("mimir: encryption setup failed: {}", e);
+                    eprintln!("perseus-vault: encryption setup failed: {}", e);
                     std::process::exit(1);
                 }
             } else {
@@ -2822,7 +2587,7 @@ fn run() {
             match database.prune(&params) {
                 Ok(report) => print_json(&report),
                 Err(e) => {
-                    eprintln!("mimir: prune failed: {}", e);
+                    eprintln!("perseus-vault: prune failed: {}", e);
                     std::process::exit(1);
                 }
             }
@@ -2835,7 +2600,7 @@ fn run() {
             let encryption_key = configured_encryption_key_for_database(&mut database, encryption_key.as_deref());
             if let Some(ref key_file) = encryption_key {
                 if let Err(e) = database.set_encryption(key_file) {
-                    eprintln!("mimir: encryption setup failed: {}", e);
+                    eprintln!("perseus-vault: encryption setup failed: {}", e);
                     std::process::exit(1);
                 }
             } else {
@@ -2844,7 +2609,7 @@ fn run() {
             match database.decay_tick() {
                 Ok(report) => print_json(&report),
                 Err(e) => {
-                    eprintln!("mimir: decay failed: {}", e);
+                    eprintln!("perseus-vault: decay failed: {}", e);
                     std::process::exit(1);
                 }
             }
@@ -2859,7 +2624,7 @@ fn run() {
             let encryption_key = configured_encryption_key_for_database(&mut database, encryption_key.as_deref());
             if let Some(ref key_file) = encryption_key {
                 if let Err(e) = database.set_encryption(key_file) {
-                    eprintln!("mimir: encryption setup failed: {}", e);
+                    eprintln!("perseus-vault: encryption setup failed: {}", e);
                     std::process::exit(1);
                 }
             } else {
@@ -2881,7 +2646,7 @@ fn run() {
             let encryption_key = configured_encryption_key_for_database(&mut database, encryption_key.as_deref());
             if let Some(ref key_file) = encryption_key {
                 if let Err(e) = database.set_encryption(key_file) {
-                    eprintln!("mimir: encryption setup failed: {}", e);
+                    eprintln!("perseus-vault: encryption setup failed: {}", e);
                     std::process::exit(1);
                 }
             } else {
@@ -2890,7 +2655,7 @@ fn run() {
             match database.reindex_fts() {
                 Ok(n) => println!("Reindexed {} entities into FTS5", n),
                 Err(e) => {
-                    eprintln!("mimir: reindex failed: {}", e);
+                    eprintln!("perseus-vault: reindex failed: {}", e);
                     std::process::exit(1);
                 }
             }
@@ -2900,7 +2665,7 @@ fn run() {
             match database.stats() {
                 Ok(stats) => print_json(&stats),
                 Err(e) => {
-                    eprintln!("mimir: stats failed: {}", e);
+                    eprintln!("perseus-vault: stats failed: {}", e);
                     std::process::exit(1);
                 }
             }
@@ -2943,7 +2708,7 @@ fn run() {
             let encryption_key = configured_encryption_key_for_database(&mut database, encryption_key.as_deref());
             if let Some(ref key_file) = encryption_key {
                 if let Err(e) = database.set_encryption(key_file) {
-                    eprintln!("mimir: encryption setup failed: {}", e);
+                    eprintln!("perseus-vault: encryption setup failed: {}", e);
                     std::process::exit(1);
                 }
             } else {
@@ -2966,7 +2731,7 @@ fn run() {
             match database.state_digest() {
                 Ok(d) => print_json(&d),
                 Err(e) => {
-                    eprintln!("mimir: state-digest failed: {}", e);
+                    eprintln!("perseus-vault: state-digest failed: {}", e);
                     std::process::exit(1);
                 }
             }
@@ -3064,7 +2829,7 @@ fn run() {
             let encryption_key = configured_encryption_key_for_database(&mut database, encryption_key.as_deref());
             if let Some(ref key_file) = encryption_key {
                 if let Err(e) = database.set_encryption(key_file) {
-                    eprintln!("mimir: encryption setup failed: {}", e);
+                    eprintln!("perseus-vault: encryption setup failed: {}", e);
                     std::process::exit(1);
                 }
             } else {
@@ -3073,7 +2838,7 @@ fn run() {
             let parsed_body: serde_json::Value = match serde_json::from_str(body) {
                 Ok(b) => b,
                 Err(e) => {
-                    eprintln!("mimir: invalid JSON for body: {}", e);
+                    eprintln!("perseus-vault: invalid JSON for body: {}", e);
                     std::process::exit(1);
                 }
             };
@@ -3138,7 +2903,7 @@ fn run() {
                     // on stdout, so callers that parse output instead of $?
                     // still can't mistake a failed write for a persisted one.
                     print_json(&serde_json::json!({ "ok": false, "error": e.to_string() }));
-                    eprintln!("mimir: write failed: {}", e);
+                    eprintln!("perseus-vault: write failed: {}", e);
                     std::process::exit(1);
                 }
             }
@@ -3153,7 +2918,7 @@ fn run() {
             let encryption_key = configured_encryption_key_for_database(&mut database, encryption_key.as_deref());
             if let Some(ref key_file) = encryption_key {
                 if let Err(e) = database.set_encryption(key_file) {
-                    eprintln!("mimir: encryption setup failed: {}", e);
+                    eprintln!("perseus-vault: encryption setup failed: {}", e);
                     std::process::exit(1);
                 }
             } else {
@@ -3170,7 +2935,7 @@ fn run() {
             match database.vault_export(&dir, workspace_hash.as_deref()) {
                 Ok(report) => print_json(&report),
                 Err(e) => {
-                    eprintln!("mimir: vault export failed: {}", e);
+                    eprintln!("perseus-vault: vault export failed: {}", e);
                     std::process::exit(1);
                 }
             }
@@ -3184,7 +2949,7 @@ fn run() {
             let encryption_key = configured_encryption_key_for_database(&mut database, encryption_key.as_deref());
             if let Some(ref key_file) = encryption_key {
                 if let Err(e) = database.set_encryption(key_file) {
-                    eprintln!("mimir: encryption setup failed: {}", e);
+                    eprintln!("perseus-vault: encryption setup failed: {}", e);
                     std::process::exit(1);
                 }
             } else {
@@ -3201,7 +2966,7 @@ fn run() {
             match database.vault_import(&dir) {
                 Ok(report) => print_json(&report),
                 Err(e) => {
-                    eprintln!("mimir: vault import failed: {}", e);
+                    eprintln!("perseus-vault: vault import failed: {}", e);
                     std::process::exit(1);
                 }
             }
@@ -3216,7 +2981,7 @@ fn run() {
             let encryption_key = configured_encryption_key_for_database(&mut database, None);
             if let Some(ref key_file) = encryption_key {
                 if let Err(e) = database.set_encryption(key_file) {
-                    eprintln!("mimir: encryption setup failed: {}", e);
+                    eprintln!("perseus-vault: encryption setup failed: {}", e);
                     std::process::exit(1);
                 }
             } else {
@@ -3235,14 +3000,14 @@ fn run() {
             match database.vault_export(&dir, None) {
                 Ok(report) => print_json(&report),
                 Err(e) => {
-                    eprintln!("mimir: obsidian-sync export failed: {}", e);
+                    eprintln!("perseus-vault: obsidian-sync export failed: {}", e);
                     std::process::exit(1);
                 }
             }
 
             if watch {
                 eprintln!(
-                    "mimir: watching for memory changes — re-syncing {} on change (Ctrl-C to stop)",
+                    "perseus-vault: watching for memory changes — re-syncing {} on change (Ctrl-C to stop)",
                     dir
                 );
                 // Poll the cheap, deterministic state digest (#256). It changes
@@ -3250,7 +3015,7 @@ fn run() {
                 // `remember` writes without any filesystem-watcher dependency and
                 // without coupling to the server write path.
                 let poll = std::time::Duration::from_secs(
-                    std::env::var("MIMIR_SYNC_INTERVAL_SECS")
+                    std::env::var("PERSEUS_VAULT_SYNC_INTERVAL_SECS")
                         .ok()
                         .and_then(|s| s.parse::<u64>().ok())
                         .filter(|&n| n > 0)
@@ -3262,7 +3027,7 @@ fn run() {
                     let current = match database.state_digest() {
                         Ok(d) => d.digest,
                         Err(e) => {
-                            eprintln!("mimir: obsidian-sync digest poll failed: {}", e);
+                            eprintln!("perseus-vault: obsidian-sync digest poll failed: {}", e);
                             continue;
                         }
                     };
@@ -3272,7 +3037,7 @@ fn run() {
                     last = current;
                     match database.vault_export(&dir, None) {
                         Ok(report) => print_json(&report),
-                        Err(e) => eprintln!("mimir: obsidian-sync re-export failed: {}", e),
+                        Err(e) => eprintln!("perseus-vault: obsidian-sync re-export failed: {}", e),
                     }
                 }
             }
@@ -3286,7 +3051,7 @@ fn run() {
             let encryption_key = configured_encryption_key_for_database(&mut database, encryption_key.as_deref());
             if let Some(ref key_file) = encryption_key {
                 if let Err(e) = database.set_encryption(key_file) {
-                    eprintln!("mimir: encryption setup failed: {}", e);
+                    eprintln!("perseus-vault: encryption setup failed: {}", e);
                     std::process::exit(1);
                 }
             } else {
@@ -3295,7 +3060,7 @@ fn run() {
             match database.purge(dry_run) {
                 Ok(report) => print_json(&report),
                 Err(e) => {
-                    eprintln!("mimir: purge failed: {}", e);
+                    eprintln!("perseus-vault: purge failed: {}", e);
                     std::process::exit(1);
                 }
             }
@@ -3310,7 +3075,7 @@ fn run() {
             let encryption_key = configured_encryption_key_for_database(&mut database, encryption_key.as_deref());
             if let Some(ref key_file) = encryption_key {
                 if let Err(e) = database.set_encryption(key_file) {
-                    eprintln!("mimir: encryption setup failed: {}", e);
+                    eprintln!("perseus-vault: encryption setup failed: {}", e);
                     std::process::exit(1);
                 }
             } else {
@@ -3324,7 +3089,7 @@ fn run() {
             match database.expire_due(dry_run, ws) {
                 Ok(report) => print_json(&report),
                 Err(e) => {
-                    eprintln!("mimir: expire failed: {}", e);
+                    eprintln!("perseus-vault: expire failed: {}", e);
                     std::process::exit(1);
                 }
             }
@@ -3341,20 +3106,20 @@ fn run() {
             let encryption_key = configured_encryption_key_for_database(&mut database, encryption_key.as_deref());
             if let Some(ref key_file) = encryption_key {
                 if let Err(e) = database.set_encryption(key_file) {
-                    eprintln!("mimir: encryption setup failed: {}", e);
+                    eprintln!("perseus-vault: encryption setup failed: {}", e);
                     std::process::exit(1);
                 }
             } else {
                 warn_plaintext_writes_to_encrypted_db(&database);
             }
             if workspace_hash.is_empty() {
-                eprintln!("mimir: redact requires --workspace-hash (fail-closed, #854)");
+                eprintln!("perseus-vault: redact requires --workspace-hash (fail-closed, #854)");
                 std::process::exit(1);
             }
             match database.redact_entity(category, key, workspace_hash, agent_id) {
                 Ok(report) => print_json(&report),
                 Err(e) => {
-                    eprintln!("mimir: redact failed: {}", e);
+                    eprintln!("perseus-vault: redact failed: {}", e);
                     std::process::exit(1);
                 }
             }
@@ -3372,20 +3137,20 @@ fn run() {
             let encryption_key = configured_encryption_key_for_database(&mut database, encryption_key.as_deref());
             if let Some(ref key_file) = encryption_key {
                 if let Err(e) = database.set_encryption(key_file) {
-                    eprintln!("mimir: encryption setup failed: {}", e);
+                    eprintln!("perseus-vault: encryption setup failed: {}", e);
                     std::process::exit(1);
                 }
             } else {
                 warn_plaintext_writes_to_encrypted_db(&database);
             }
             if workspace_hash.is_empty() {
-                eprintln!("mimir: erase requires --workspace-hash (fail-closed, #854)");
+                eprintln!("perseus-vault: erase requires --workspace-hash (fail-closed, #854)");
                 std::process::exit(1);
             }
             match database.erase_entity(category, key, workspace_hash, agent_id, dry_run) {
                 Ok(report) => print_json(&report),
                 Err(e) => {
-                    eprintln!("mimir: erase failed: {}", e);
+                    eprintln!("perseus-vault: erase failed: {}", e);
                     std::process::exit(1);
                 }
             }
@@ -3394,7 +3159,7 @@ fn run() {
             let target_db = match db::Database::open(&to) {
                 Ok(db) => db,
                 Err(e) => {
-                    eprintln!("mimir: failed to open target database at {}: {}", to, e);
+                    eprintln!("perseus-vault: failed to open target database at {}: {}", to, e);
                     std::process::exit(1);
                 }
             };
@@ -3409,7 +3174,7 @@ fn run() {
                     );
                 }
                 Err(e) => {
-                    eprintln!("mimir: migration failed: {}", e);
+                    eprintln!("perseus-vault: migration failed: {}", e);
                     std::process::exit(1);
                 }
             }
@@ -3434,7 +3199,7 @@ fn run() {
             ..
         }) => {
             let db_path = db.clone();
-            eprintln!("mimir: using database at {}", db_path);
+            eprintln!("perseus-vault: using database at {}", db_path);
 
             // Offline mode: disable network-dependent features
             let offline = cli.offline;
@@ -3444,14 +3209,14 @@ fn run() {
             let effective_connectors = if offline { None } else { connectors_config.as_deref() };
 
             if offline {
-                eprintln!("mimir: running in offline / air-gapped mode");
-                eprintln!("mimir: web dashboard, LLM, embedding, and connectors disabled");
+                eprintln!("perseus-vault: running in offline / air-gapped mode");
+                eprintln!("perseus-vault: web dashboard, LLM, embedding, and connectors disabled");
             }
 
             let mut database = match db::Database::open(&db_path) {
                 Ok(db) => db,
                 Err(e) => {
-                    eprintln!("mimir: failed to open database at {}: {}", db_path, e);
+                    eprintln!("perseus-vault: failed to open database at {}: {}", db_path, e);
                     std::process::exit(1);
                 }
             };
@@ -3460,11 +3225,11 @@ fn run() {
                 encryption_key.as_deref(),
             );
             if let Some(ref key_file) = encryption_key {
-                eprintln!("mimir: encryption enabled (key: {})", key_file);
+                eprintln!("perseus-vault: encryption enabled (key: {})", key_file);
                 warn_key_acls_on_windows(key_file);
             }
 
-            // Configure LLM for mimir_ask if endpoint is provided
+            // Configure LLM for perseus_vault_ask if endpoint is provided
             if let Some(ref endpoint) = effective_llm {
                 database.set_llm(
                     true,
@@ -3475,7 +3240,7 @@ fn run() {
                     embedding_model_name.as_deref(),
                 );
                 eprintln!(
-                    "mimir: LLM enabled (endpoint: {}, model: {})",
+                    "perseus-vault: LLM enabled (endpoint: {}, model: {})",
                     endpoint, llm_model
                 );
             }
@@ -3483,7 +3248,7 @@ fn run() {
             // Configure local ONNX embeddings if --embedding-model is set
             if let Some(ref model_path) = embedding_model_path {
                 database.set_embedding_model(model_path);
-                eprintln!("mimir: local ONNX embedding enabled (model: {})", model_path);
+                eprintln!("perseus-vault: local ONNX embedding enabled (model: {})", model_path);
             }
 
             // Load connectors from YAML config if provided
@@ -3492,10 +3257,10 @@ fn run() {
                     Ok(connectors) => {
                         let count = connectors.len();
                         database.set_connectors(connectors);
-                        eprintln!("mimir: loaded {} connector(s) from {}", count, config_path);
+                        eprintln!("perseus-vault: loaded {} connector(s) from {}", count, config_path);
                     }
                     Err(e) => {
-                        eprintln!("mimir: fatal — failed to load connectors: {}", e);
+                        eprintln!("perseus-vault: fatal — failed to load connectors: {}", e);
                         std::process::exit(1);
                     }
                 }
@@ -3515,16 +3280,16 @@ fn run() {
                 let every = maintain_loop_interval(hours);
                 let maint_db = std::sync::Arc::clone(&database);
                 eprintln!(
-                    "mimir: in-server maintenance loop enabled (every {}h)",
+                    "perseus-vault: in-server maintenance loop enabled (every {}h)",
                     every.as_secs() / 3600
                 );
                 std::thread::spawn(move || loop {
                     std::thread::sleep(every);
                     match tools::run_maintenance_pass(&maint_db, false, false) {
                         Ok(report) => {
-                            eprintln!("mimir: maintenance pass complete: {}", report)
+                            eprintln!("perseus-vault: maintenance pass complete: {}", report)
                         }
-                        Err(e) => eprintln!("mimir: maintenance pass failed: {}", e),
+                        Err(e) => eprintln!("perseus-vault: maintenance pass failed: {}", e),
                     }
                 });
             }
@@ -3540,13 +3305,13 @@ fn run() {
                 guard_bind("web dashboard", &web_bind_addr, web_auth_token.is_some());
                 let router = crate::web::build_router(web_db, web_auth_token.clone());
                 let addr = format!("{}:{}", web_bind_addr, web_port);
-                eprintln!("mimir: web dashboard starting on http://{}", addr);
+                eprintln!("perseus-vault: web dashboard starting on http://{}", addr);
 
                 std::thread::spawn(move || {
                     let rt = match tokio::runtime::Runtime::new() {
                         Ok(rt) => rt,
                         Err(e) => {
-                            eprintln!("mimir: web dashboard runtime error: {}", e);
+                            eprintln!("perseus-vault: web dashboard runtime error: {}", e);
                             return;
                         }
                     };
@@ -3554,12 +3319,12 @@ fn run() {
                         let listener = match tokio::net::TcpListener::bind(&addr).await {
                             Ok(l) => l,
                             Err(e) => {
-                                eprintln!("mimir: web dashboard bind error: {}", e);
+                                eprintln!("perseus-vault: web dashboard bind error: {}", e);
                                 return;
                             }
                         };
                         if let Err(e) = axum::serve(listener, router).await {
-                            eprintln!("mimir: web dashboard error: {}", e);
+                            eprintln!("perseus-vault: web dashboard error: {}", e);
                         }
                     });
                 });
@@ -3583,17 +3348,17 @@ fn run() {
                     transport::TransportMode::Http => "http",
                 };
                 eprintln!(
-                    "mimir: MCP over {} transport on http://{}",
+                    "perseus-vault: MCP over {} transport on http://{}",
                     mode_label, transport_addr
                 );
-                eprintln!("mimir: POST http://{}/message", transport_addr);
+                eprintln!("perseus-vault: POST http://{}/message", transport_addr);
                 if mode == transport::TransportMode::Sse {
-                    eprintln!("mimir: GET  http://{}/sse", transport_addr);
+                    eprintln!("perseus-vault: GET  http://{}/sse", transport_addr);
                 }
                 let rt = match tokio::runtime::Runtime::new() {
                     Ok(rt) => rt,
                     Err(e) => {
-                        eprintln!("mimir: fatal: transport runtime creation failed: {}", e);
+                        eprintln!("perseus-vault: fatal: transport runtime creation failed: {}", e);
                         std::process::exit(1);
                     }
                 };
@@ -3602,7 +3367,7 @@ fn run() {
                         Ok(l) => l,
                         Err(e) => {
                             eprintln!(
-                                "mimir: fatal: MCP transport bind failed on {}: {}",
+                                "perseus-vault: fatal: MCP transport bind failed on {}: {}",
                                 transport_addr, e
                             );
                             std::process::exit(1);
@@ -3611,7 +3376,7 @@ fn run() {
                     match axum::serve(listener, transport_router).await {
                         Ok(_) => {}
                         Err(e) => {
-                            eprintln!("mimir: fatal: MCP transport server error: {}", e);
+                            eprintln!("perseus-vault: fatal: MCP transport server error: {}", e);
                             std::process::exit(1);
                         }
                     }
@@ -3622,11 +3387,11 @@ fn run() {
         }
         None => {
             let db_path = cli.db.clone().unwrap_or_else(default_db_path);
-            eprintln!("mimir: using database at {}", db_path);
+            eprintln!("perseus-vault: using database at {}", db_path);
             let mut database = match db::Database::open(&db_path) {
                 Ok(db) => db,
                 Err(e) => {
-                    eprintln!("mimir: failed to open database at {}: {}", db_path, e);
+                    eprintln!("perseus-vault: failed to open database at {}: {}", db_path, e);
                     std::process::exit(1);
                 }
             };
@@ -3635,7 +3400,7 @@ fn run() {
                 cli.encryption_key.as_deref(),
             );
             if let Some(ref key_file) = encryption_key {
-                eprintln!("mimir: encryption enabled (key: {})", key_file);
+                eprintln!("perseus-vault: encryption enabled (key: {})", key_file);
                 warn_key_acls_on_windows(key_file);
             }
 
@@ -3649,7 +3414,7 @@ fn run() {
                     cli.embedding_model_name.as_deref(),
                 );
                 eprintln!(
-                    "mimir: LLM enabled (endpoint: {}, model: {})",
+                    "perseus-vault: LLM enabled (endpoint: {}, model: {})",
                     endpoint, cli.llm_model
                 );
             }
@@ -3659,10 +3424,10 @@ fn run() {
                     Ok(connectors) => {
                         let count = connectors.len();
                         database.set_connectors(connectors);
-                        eprintln!("mimir: loaded {} connector(s) from {}", count, config_path);
+                        eprintln!("perseus-vault: loaded {} connector(s) from {}", count, config_path);
                     }
                     Err(e) => {
-                        eprintln!("mimir: fatal — failed to load connectors: {}", e);
+                        eprintln!("perseus-vault: fatal — failed to load connectors: {}", e);
                         std::process::exit(1);
                     }
                 }
@@ -3679,13 +3444,13 @@ fn run() {
                 guard_bind("web dashboard", &web_bind_addr, cli.web_auth_token.is_some());
                 let router = crate::web::build_router(web_db, cli.web_auth_token.clone());
                 let addr = format!("{}:{}", web_bind_addr, web_port);
-                eprintln!("mimir: web dashboard starting on http://{}", addr);
+                eprintln!("perseus-vault: web dashboard starting on http://{}", addr);
 
                 std::thread::spawn(move || {
                     let rt = match tokio::runtime::Runtime::new() {
                         Ok(rt) => rt,
                         Err(e) => {
-                            eprintln!("mimir: web dashboard runtime error: {}", e);
+                            eprintln!("perseus-vault: web dashboard runtime error: {}", e);
                             return;
                         }
                     };
@@ -3693,12 +3458,12 @@ fn run() {
                         let listener = match tokio::net::TcpListener::bind(&addr).await {
                             Ok(l) => l,
                             Err(e) => {
-                                eprintln!("mimir: web dashboard bind error: {}", e);
+                                eprintln!("perseus-vault: web dashboard bind error: {}", e);
                                 return;
                             }
                         };
                         if let Err(e) = axum::serve(listener, router).await {
-                            eprintln!("mimir: web dashboard error: {}", e);
+                            eprintln!("perseus-vault: web dashboard error: {}", e);
                         }
                     });
                 });
@@ -3722,17 +3487,17 @@ fn run() {
                     transport::TransportMode::Http => "http",
                 };
                 eprintln!(
-                    "mimir: MCP over {} transport on http://{}",
+                    "perseus-vault: MCP over {} transport on http://{}",
                     mode_label, transport_addr
                 );
-                eprintln!("mimir: POST http://{}/message", transport_addr);
+                eprintln!("perseus-vault: POST http://{}/message", transport_addr);
                 if mode == transport::TransportMode::Sse {
-                    eprintln!("mimir: GET  http://{}/sse", transport_addr);
+                    eprintln!("perseus-vault: GET  http://{}/sse", transport_addr);
                 }
                 let rt = match tokio::runtime::Runtime::new() {
                     Ok(rt) => rt,
                     Err(e) => {
-                        eprintln!("mimir: fatal: transport runtime creation failed: {}", e);
+                        eprintln!("perseus-vault: fatal: transport runtime creation failed: {}", e);
                         std::process::exit(1);
                     }
                 };
@@ -3741,7 +3506,7 @@ fn run() {
                         Ok(l) => l,
                         Err(e) => {
                             eprintln!(
-                                "mimir: fatal: MCP transport bind failed on {}: {}",
+                                "perseus-vault: fatal: MCP transport bind failed on {}: {}",
                                 transport_addr, e
                             );
                             std::process::exit(1);
@@ -3750,7 +3515,7 @@ fn run() {
                     match axum::serve(listener, transport_router).await {
                         Ok(_) => {}
                         Err(e) => {
-                            eprintln!("mimir: fatal: MCP transport server error: {}", e);
+                            eprintln!("perseus-vault: fatal: MCP transport server error: {}", e);
                             std::process::exit(1);
                         }
                     }
@@ -3866,234 +3631,24 @@ mod tests {
 
     #[test]
     fn parses_direct_server_without_subcommand() {
-        let cli = Cli::parse_from(["mimir"]);
+        let cli = Cli::parse_from(["perseus-vault"]);
         assert!(cli.command.is_none());
-    }
-
-    // ---- #421: default DB-path resolution (split-brain) ----
-
-    /// Helper: existence checker over a fixed set of present paths.
-    fn present(set: &[String]) -> impl Fn(&str) -> bool + '_ {
-        move |p: &str| set.iter().any(|e| e == p)
-    }
-
-    /// Probe that reports every candidate as unknown (`None`) — reproduces the
-    /// pre-#424 purely path-based behavior, so the #421 precedence tests still
-    /// assert exactly what they did before the emptiness refinement.
-    fn unknown(_: &str) -> Option<i64> {
-        None
-    }
-
-    /// Probe backed by a fixed map of path -> entity count; paths not in the map
-    /// are unknown (`None`).
-    fn counts(map: &[(String, i64)]) -> impl Fn(&str) -> Option<i64> + '_ {
-        move |p: &str| map.iter().find(|(k, _)| k == p).map(|(_, c)| *c)
-    }
-
-    #[test]
-    fn resolve_default_db_picks_home_legacy_over_creating_fresh() {
-        // #421 core: only ~/mimir.db exists. It must be selected instead of
-        // creating a fresh ~/.mimir/data/perseus-vault.db (the silent
-        // split-brain the issue reports).
-        let home = "/home/tester";
-        let home_legacy = format!("{}/mimir.db", home);
-        let existing = vec![home_legacy.clone()];
-        let r = resolve_default_db(home, &present(&existing), &unknown);
-        assert_eq!(r.chosen, home_legacy, "should adopt existing ~/mimir.db");
-        assert!(r.other_candidates.is_empty());
-    }
-
-    #[test]
-    fn resolve_default_db_prefers_canonical_when_present() {
-        // Canonical perseus-vault.db wins over legacy names in precedence order.
-        let home = "/home/tester";
-        let vault = format!("{}/.mimir/data/perseus-vault.db", home);
-        let home_legacy = format!("{}/mimir.db", home);
-        let existing = vec![vault.clone(), home_legacy.clone()];
-        let r = resolve_default_db(home, &present(&existing), &unknown);
-        assert_eq!(r.chosen, vault);
-        assert_eq!(r.other_candidates, vec![home_legacy]);
-    }
-
-    #[test]
-    fn resolve_default_db_falls_back_to_canonical_when_none_exist() {
-        // Fresh install: nothing exists -> create the #427 canonical path under
-        // ~/.perseus-vault/, no warning.
-        let home = "/home/tester";
-        let vault = format!("{}/.perseus-vault/data/perseus-vault.db", home);
-        let r = resolve_default_db(home, &present(&[]), &unknown);
-        assert_eq!(r.chosen, vault);
-        assert!(r.other_candidates.is_empty());
-    }
-
-    #[test]
-    fn resolve_default_db_427_prefers_new_dir_when_present() {
-        // Both the new ~/.perseus-vault and a legacy ~/.mimir DB exist: the new
-        // canonical dir wins; the legacy one is reported as an also-present.
-        let home = "/home/tester";
-        let new_vault = format!("{}/.perseus-vault/data/perseus-vault.db", home);
-        let legacy_vault = format!("{}/.mimir/data/perseus-vault.db", home);
-        let existing = vec![new_vault.clone(), legacy_vault.clone()];
-        let r = resolve_default_db(home, &present(&existing), &unknown);
-        assert_eq!(r.chosen, new_vault);
-        assert_eq!(r.other_candidates, vec![legacy_vault]);
-    }
-
-    #[test]
-    fn resolve_default_db_427_adopts_legacy_mimir_dir_on_upgrade() {
-        // Upgrade path: only the legacy ~/.mimir DB exists (no ~/.perseus-vault
-        // yet). It must be adopted, NOT shadowed by a fresh empty new-dir DB —
-        // no data is moved.
-        let home = "/home/tester";
-        let legacy_vault = format!("{}/.mimir/data/perseus-vault.db", home);
-        let existing = vec![legacy_vault.clone()];
-        let r = resolve_default_db(home, &present(&existing), &unknown);
-        assert_eq!(r.chosen, legacy_vault);
-        assert!(r.other_candidates.is_empty());
-    }
-
-    #[test]
-    fn resolve_default_db_reports_multiple_candidates() {
-        // Multiple candidate DBs -> chosen is highest-precedence, others named
-        // so the caller can warn about the ambiguity.
-        let home = "/home/tester";
-        let mneme = format!("{}/.mimir/data/mneme.db", home);
-        let mimir = format!("{}/.mimir/data/mimir.db", home);
-        let home_legacy = format!("{}/mimir.db", home);
-        let existing = vec![mneme.clone(), mimir.clone(), home_legacy.clone()];
-        let r = resolve_default_db(home, &present(&existing), &unknown);
-        // perseus-vault.db absent -> mneme.db is highest precedence.
-        assert_eq!(r.chosen, mneme);
-        assert_eq!(r.other_candidates, vec![mimir, home_legacy]);
-    }
-
-    #[test]
-    fn resolve_default_db_precedence_order_is_stable() {
-        // The full documented order: vault > mneme > mimir(dir) > ~/mimir.db.
-        let home = "/home/tester";
-        let vault = format!("{}/.mimir/data/perseus-vault.db", home);
-        let mneme = format!("{}/.mimir/data/mneme.db", home);
-        let mimir = format!("{}/.mimir/data/mimir.db", home);
-        let home_legacy = format!("{}/mimir.db", home);
-        let all = vec![
-            vault.clone(),
-            mneme.clone(),
-            mimir.clone(),
-            home_legacy.clone(),
-        ];
-        let r = resolve_default_db(home, &present(&all), &unknown);
-        assert_eq!(r.chosen, vault);
-        assert_eq!(r.other_candidates, vec![mneme, mimir, home_legacy]);
-    }
-
-    // ---- #424: factor emptiness into precedence ----
-
-    #[test]
-    fn resolve_default_db_prefers_nonempty_over_empty_higher_precedence() {
-        // The exact #424/#421 scenario: canonical/dir mimir.db is stale-empty,
-        // the live single-user ~/mimir.db has real data. The non-empty DB wins
-        // even though it's lower precedence.
-        let home = "/home/tester";
-        let mimir = format!("{}/.mimir/data/mimir.db", home);
-        let home_legacy = format!("{}/mimir.db", home);
-        let existing = vec![mimir.clone(), home_legacy.clone()];
-        let r = resolve_default_db(
-            home,
-            &present(&existing),
-            &counts(&[(mimir.clone(), 0), (home_legacy.clone(), 26)]),
-        );
-        assert_eq!(r.chosen, home_legacy, "live DB should be adopted over stale-empty");
-        assert_eq!(r.other_candidates, vec![mimir]);
-    }
-
-    #[test]
-    fn resolve_default_db_keeps_top_when_it_is_nonempty() {
-        // A non-empty highest-precedence DB is never demoted, even if a
-        // lower-precedence one also has data.
-        let home = "/home/tester";
-        let vault = format!("{}/.mimir/data/perseus-vault.db", home);
-        let home_legacy = format!("{}/mimir.db", home);
-        let existing = vec![vault.clone(), home_legacy.clone()];
-        let r = resolve_default_db(
-            home,
-            &present(&existing),
-            &counts(&[(vault.clone(), 5), (home_legacy.clone(), 26)]),
-        );
-        assert_eq!(r.chosen, vault);
-        assert_eq!(r.other_candidates, vec![home_legacy]);
-    }
-
-    #[test]
-    fn resolve_default_db_does_not_demote_on_unknown_top() {
-        // An unreadable (locked/corrupt) top candidate is unknown, not empty:
-        // keep it in place (current order + the caller warns) rather than
-        // silently switching to a lower-precedence DB.
-        let home = "/home/tester";
-        let vault = format!("{}/.mimir/data/perseus-vault.db", home);
-        let home_legacy = format!("{}/mimir.db", home);
-        let existing = vec![vault.clone(), home_legacy.clone()];
-        let r = resolve_default_db(
-            home,
-            &present(&existing),
-            // vault -> None (unknown); home_legacy -> 26
-            &counts(&[(home_legacy.clone(), 26)]),
-        );
-        assert_eq!(r.chosen, vault, "unknown top candidate is not demoted");
-        assert_eq!(r.other_candidates, vec![home_legacy]);
-    }
-
-    #[test]
-    fn resolve_default_db_keeps_top_when_all_empty() {
-        // Top is empty and no lower candidate is known-non-empty -> keep the
-        // highest-precedence one (no better option, don't thrash).
-        let home = "/home/tester";
-        let vault = format!("{}/.mimir/data/perseus-vault.db", home);
-        let home_legacy = format!("{}/mimir.db", home);
-        let existing = vec![vault.clone(), home_legacy.clone()];
-        let r = resolve_default_db(
-            home,
-            &present(&existing),
-            &counts(&[(vault.clone(), 0), (home_legacy.clone(), 0)]),
-        );
-        assert_eq!(r.chosen, vault);
-        assert_eq!(r.other_candidates, vec![home_legacy]);
-    }
-
-    #[test]
-    fn resolve_default_db_empty_top_skips_to_nonempty_past_unknown() {
-        // Top known-empty, second unknown, third known-non-empty -> the
-        // known-non-empty one wins (a known-good DB beats both an empty and an
-        // unknown one).
-        let home = "/home/tester";
-        let vault = format!("{}/.mimir/data/perseus-vault.db", home);
-        let mneme = format!("{}/.mimir/data/mneme.db", home);
-        let mimir = format!("{}/.mimir/data/mimir.db", home);
-        let existing = vec![vault.clone(), mneme.clone(), mimir.clone()];
-        let r = resolve_default_db(
-            home,
-            &present(&existing),
-            // vault empty, mneme unknown, mimir non-empty
-            &counts(&[(vault.clone(), 0), (mimir.clone(), 12)]),
-        );
-        assert_eq!(r.chosen, mimir);
-        // other_candidates preserves precedence order minus the chosen.
-        assert_eq!(r.other_candidates, vec![vault, mneme]);
     }
 
     #[test]
     fn parses_top_level_db_without_subcommand() {
-        // Regression: the documented MCP host config is `mimir --db <path>`
+        // Regression: the documented MCP host config is `perseus-vault --db <path>`
         // (no subcommand). This must parse and carry the db path through.
-        let cli = Cli::parse_from(["mimir", "--db", "/tmp/smoke.db"]);
+        let cli = Cli::parse_from(["perseus-vault", "--db", "/tmp/smoke.db"]);
         assert!(cli.command.is_none());
         assert_eq!(cli.db.as_deref(), Some("/tmp/smoke.db"));
     }
 
     #[test]
     fn parses_serve_with_db() {
-        let cli = Cli::parse_from(["mimir", "serve", "--db", "/tmp/mimir-serve.db"]);
+        let cli = Cli::parse_from(["perseus-vault", "serve", "--db", "/tmp/perseus-vault-serve.db"]);
         match cli.command {
-            Some(Commands::Serve { db, .. }) => assert_eq!(db, "/tmp/mimir-serve.db"),
+            Some(Commands::Serve { db, .. }) => assert_eq!(db, "/tmp/perseus-vault-serve.db"),
             _ => panic!("expected serve subcommand"),
         }
     }
@@ -4124,9 +3679,9 @@ mod tests {
 
     #[test]
     fn top_level_db_propagates_to_serve_subcommand() {
-        // #313: `mimir --db PATH serve` must NOT silently fall back to the
+        // #313: `perseus_vault --db PATH serve` must NOT silently fall back to the
         // subcommand's default db — the documented top-level flag fills it in.
-        let mut cli = Cli::parse_from(["mimir", "--db", "/tmp/top.db", "serve"]);
+        let mut cli = Cli::parse_from(["perseus-vault", "--db", "/tmp/top.db", "serve"]);
         apply_top_level_db(&mut cli);
         match cli.command {
             Some(Commands::Serve { db, .. }) => assert_eq!(db, "/tmp/top.db"),
@@ -4207,7 +3762,7 @@ mod tests {
         // end to end on a temp database: distill, write, then re-capture and
         // watch the flood control (same key → update, not a sibling row).
         let dir = std::env::temp_dir();
-        let path = dir.join(format!("mimir-test-capture-cli-{}.db", uuid::Uuid::new_v4()));
+        let path = dir.join(format!("perseus_vault-test-capture-cli-{}.db", uuid::Uuid::new_v4()));
         let path_str = path.to_str().unwrap().to_string();
         let database = db::Database::open(&path_str).expect("open temp db");
 
@@ -4247,7 +3802,7 @@ mod tests {
     fn parses_maintain_with_flags_and_top_level_db() {
         // #490: the scheduled hygiene entry point. Defaults conservative:
         // no dry-run, no vacuum unless asked.
-        let cli = Cli::parse_from(["mimir", "maintain", "--db", "/tmp/maintain.db"]);
+        let cli = Cli::parse_from(["perseus-vault", "maintain", "--db", "/tmp/maintain.db"]);
         match cli.command {
             Some(Commands::Maintain {db,
                 dry_run,
@@ -4259,7 +3814,7 @@ mod tests {
             _ => panic!("expected maintain subcommand"),
         }
 
-        let cli = Cli::parse_from(["mimir", "maintain", "--dry-run", "--vacuum"]);
+        let cli = Cli::parse_from(["perseus-vault", "maintain", "--dry-run", "--vacuum"]);
         match cli.command {
             Some(Commands::Maintain {
                 dry_run, vacuum, ..
@@ -4271,7 +3826,7 @@ mod tests {
         }
 
         // Top-level --db must propagate like the other db-carrying verbs.
-        let mut cli = Cli::parse_from(["mimir", "--db", "/tmp/top-maintain.db", "maintain"]);
+        let mut cli = Cli::parse_from(["perseus-vault", "--db", "/tmp/top-maintain.db", "maintain"]);
         apply_top_level_db(&mut cli);
         match cli.command {
             Some(Commands::Maintain { db, .. }) => assert_eq!(db, "/tmp/top-maintain.db"),
@@ -4282,13 +3837,13 @@ mod tests {
     #[test]
     fn parses_serve_maintain_every_and_clamps_interval() {
         // #492: off unless set — absence must equal today's behavior.
-        let cli = Cli::parse_from(["mimir", "serve"]);
+        let cli = Cli::parse_from(["perseus-vault", "serve"]);
         match cli.command {
             Some(Commands::Serve { maintain_every, .. }) => assert_eq!(maintain_every, None),
             _ => panic!("expected serve subcommand"),
         }
 
-        let cli = Cli::parse_from(["mimir", "serve", "--maintain-every", "6"]);
+        let cli = Cli::parse_from(["perseus-vault", "serve", "--maintain-every", "6"]);
         match cli.command {
             Some(Commands::Serve { maintain_every, .. }) => {
                 assert_eq!(maintain_every, Some(6));
@@ -4360,7 +3915,7 @@ mod tests {
     #[test]
     fn generated_vault_commands_accept_encryption_key_flags() {
         let cli = Cli::parse_from([
-            "mimir",
+            "perseus-vault",
             "vault-export",
             "--db",
             "/tmp/vault.db",
@@ -4377,7 +3932,7 @@ mod tests {
         }
 
         let cli = Cli::parse_from([
-            "mimir",
+            "perseus-vault",
             "vault-import",
             "--db",
             "/tmp/vault.db",
@@ -4397,7 +3952,7 @@ mod tests {
     #[test]
     fn parses_write_with_encryption_key() {
         let cli = Cli::parse_from([
-            "mimir",
+            "perseus-vault",
             "write",
             "--db",
             "/tmp/vault.db",
@@ -4421,7 +3976,7 @@ mod tests {
     #[test]
     fn parses_connect_with_client_and_db() {
         let cli = Cli::parse_from([
-            "mimir", "connect", "--client", "claude-code", "--db", "/tmp/connect.db",
+            "perseus-vault", "connect", "--client", "claude-code", "--db", "/tmp/connect.db",
         ]);
         match cli.command {
             Some(Commands::Connect {client,
@@ -4440,7 +3995,7 @@ mod tests {
 
     #[test]
     fn parses_connect_dry_run_flag() {
-        let cli = Cli::parse_from(["mimir", "connect", "--client", "cursor", "--dry-run"]);
+        let cli = Cli::parse_from(["perseus-vault", "connect", "--client", "cursor", "--dry-run"]);
         match cli.command {
             Some(Commands::Connect { dry_run, .. }) => assert!(dry_run),
             _ => panic!("expected connect subcommand"),
@@ -4452,7 +4007,7 @@ mod tests {
         // #522: `install-client` is a visible alias of `connect`; --client is
         // optional (autodetect) and the loop-wiring flags parse.
         let cli = Cli::parse_from([
-            "mimir",
+            "perseus-vault",
             "install-client",
             "--all-detected",
             "--hooks",
@@ -4478,7 +4033,7 @@ mod tests {
     #[test]
     fn parses_prepare_with_task_and_limits() {
         let cli = Cli::parse_from([
-            "mimir",
+            "perseus-vault",
             "prepare",
             "--db",
             "/tmp/prep.db",
@@ -4518,7 +4073,7 @@ mod tests {
     #[test]
     fn parses_prepare_budget_and_legacy_flags() {
         let cli = Cli::parse_from([
-            "mimir",
+            "perseus-vault",
             "prepare",
             "--task",
             "review auth flow",
@@ -4545,7 +4100,7 @@ mod tests {
 
     #[test]
     fn parses_prepare_workspace_flag() {
-        let cli = Cli::parse_from(["mimir", "prepare", "--workspace", "ws-alpha"]);
+        let cli = Cli::parse_from(["perseus-vault", "prepare", "--workspace", "ws-alpha"]);
         match cli.command {
             Some(Commands::Prepare { workspace, .. }) => {
                 assert_eq!(workspace.as_deref(), Some("ws-alpha"));
@@ -4556,7 +4111,7 @@ mod tests {
 
     #[test]
     fn parses_prepare_defaults_and_json_flag() {
-        let cli = Cli::parse_from(["mimir", "prepare", "--json"]);
+        let cli = Cli::parse_from(["perseus-vault", "prepare", "--json"]);
         match cli.command {
             Some(Commands::Prepare {
                 task,
@@ -4662,7 +4217,7 @@ mod tests {
 
     /// Fresh ConnectCtx rooted in a unique temp dir: home + project subdirs.
     fn test_ctx(hooks: bool, rules: bool, dry_run: bool) -> (std::path::PathBuf, ConnectCtx) {
-        let tmp = std::env::temp_dir().join(format!("mimir-connect-{}", uuid::Uuid::new_v4()));
+        let tmp = std::env::temp_dir().join(format!("perseus_vault-connect-{}", uuid::Uuid::new_v4()));
         let home = tmp.join("home");
         let project = tmp.join("project");
         std::fs::create_dir_all(&home).unwrap();
@@ -4723,7 +4278,7 @@ mod tests {
         let cfg = ctx.project_dir.join(".mcp.json");
         std::fs::write(
             &cfg,
-            r#"{"mcpServers": {"other-tool": {"command": "foo", "args": []}, "mimir": {"command": "old-mimir", "args": []}}, "unrelatedTopLevelKey": true}"#,
+            r#"{"mcpServers": {"other-tool": {"command": "foo", "args": []}, "perseus-vault": {"command": "old-perseus-vault", "args": []}}, "unrelatedTopLevelKey": true}"#,
         )
         .unwrap();
 
@@ -4734,13 +4289,16 @@ mod tests {
         assert!(v["mcpServers"]["perseus-vault"].is_object(), "stanza missing: {}", content);
         assert_eq!(v["mcpServers"]["other-tool"]["command"], "foo", "unrelated server dropped: {}", content);
         assert_eq!(v["unrelatedTopLevelKey"], true, "unrelated top-level key dropped: {}", content);
-        // The pre-rename entry is replaced, not duplicated.
-        assert!(v["mcpServers"]["mimir"].is_null(), "legacy mimir entry should be replaced: {}", content);
+        // The existing entry is updated in place, not duplicated or nulled.
+        assert_eq!(
+            v["mcpServers"]["perseus-vault"]["command"], "/opt/perseus-vault",
+            "stale command should be replaced: {}", content
+        );
 
         // A `.bak-perseus` backup of the pre-merge file must exist.
         let backup = ctx.project_dir.join(".mcp.json.bak-perseus");
         assert!(backup.exists(), "expected {} to exist", backup.display());
-        assert!(std::fs::read_to_string(&backup).unwrap().contains("old-mimir"));
+        assert!(std::fs::read_to_string(&backup).unwrap().contains("old-perseus-vault"));
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -4767,7 +4325,7 @@ mod tests {
         std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
         std::fs::write(
             &config_path,
-            "# my codex config\nmodel = \"o4\"\n\n[mcp_servers.other]\ncommand = \"foo\"\n\n[mcp_servers.mimir]\ncommand = \"old\"\nargs = []\n",
+            "# my codex config\nmodel = \"o4\"\n\n[mcp_servers.other]\ncommand = \"foo\"\n\n[mcp_servers.perseus-vault]\ncommand = \"old\"\nargs = []\n",
         )
         .unwrap();
 
@@ -4777,8 +4335,8 @@ mod tests {
         assert!(first.contains("# my codex config"), "comment dropped:\n{}", first);
         assert!(first.contains("model = \"o4\""), "unknown key dropped:\n{}", first);
         assert!(first.contains("[mcp_servers.other]"), "unrelated table dropped:\n{}", first);
-        assert!(!first.contains("[mcp_servers.mimir]"), "legacy stanza should be replaced:\n{}", first);
         assert!(first.contains("[mcp_servers.perseus-vault]"));
+        assert!(!first.contains("command = \"old\""), "stale command should be replaced:\n{}", first);
         assert!(first.contains("/tmp/codex1.db"));
 
         // Re-running with a different db must REPLACE the stanza in place.
@@ -4820,7 +4378,7 @@ mod tests {
 
     #[test]
     fn detect_clients_by_config_dir_presence() {
-        let tmp = std::env::temp_dir().join(format!("mimir-detect-{}", uuid::Uuid::new_v4()));
+        let tmp = std::env::temp_dir().join(format!("perseus_vault-detect-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(tmp.join(".claude")).unwrap();
         std::fs::create_dir_all(tmp.join(".cursor")).unwrap();
         // A FILE named .codex must not count as a config dir.
@@ -4966,7 +4524,7 @@ mod tests {
 
     #[test]
     fn plan_write_backs_up_and_skips_unchanged() {
-        let tmp = std::env::temp_dir().join(format!("mimir-planwrite-{}", uuid::Uuid::new_v4()));
+        let tmp = std::env::temp_dir().join(format!("perseus_vault-planwrite-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).unwrap();
         let f = tmp.join("cfg.json");
 
@@ -5001,7 +4559,7 @@ mod tests {
     fn explicit_subcommand_db_wins_over_top_level() {
         // #313: an explicit subcommand-level `--db` always beats the top-level one.
         let mut cli =
-            Cli::parse_from(["mimir", "--db", "/tmp/top.db", "serve", "--db", "/tmp/sub.db"]);
+            Cli::parse_from(["perseus-vault", "--db", "/tmp/top.db", "serve", "--db", "/tmp/sub.db"]);
         apply_top_level_db(&mut cli);
         match cli.command {
             Some(Commands::Serve { db, .. }) => assert_eq!(db, "/tmp/sub.db"),
@@ -5012,7 +4570,7 @@ mod tests {
     #[test]
     fn top_level_db_propagates_to_obsidian_sync() {
         // #313: ObsidianSync uses an Option<String> db; the top-level flag fills it.
-        let mut cli = Cli::parse_from(["mimir", "--db", "/tmp/top.db", "obsidian-sync", "/tmp/v"]);
+        let mut cli = Cli::parse_from(["perseus-vault", "--db", "/tmp/top.db", "obsidian-sync", "/tmp/v"]);
         apply_top_level_db(&mut cli);
         match cli.command {
             Some(Commands::ObsidianSync { db, .. }) => assert_eq!(db.as_deref(), Some("/tmp/top.db")),
@@ -5023,7 +4581,7 @@ mod tests {
     #[test]
     fn parses_migrate_subcommand() {
         let cli = Cli::parse_from([
-            "mimir",
+            "perseus-vault",
             "migrate",
             "--from",
             "/tmp/old.db",
@@ -5041,9 +4599,9 @@ mod tests {
 
     #[test]
     fn parses_obsidian_sync_positional_vault() {
-        // `mimir obsidian-sync <dir>` — vault_path is positional, db optional,
+        // `perseus_vault obsidian-sync <dir>` — vault_path is positional, db optional,
         // watch off by default.
-        let cli = Cli::parse_from(["mimir", "obsidian-sync", "/tmp/vault"]);
+        let cli = Cli::parse_from(["perseus-vault", "obsidian-sync", "/tmp/vault"]);
         match cli.command {
             Some(Commands::ObsidianSync {vault_path,
                 db,
@@ -5059,7 +4617,7 @@ mod tests {
     #[test]
     fn parses_obsidian_sync_with_watch_and_db() {
         let cli = Cli::parse_from([
-            "mimir",
+            "perseus-vault",
             "obsidian-sync",
             "/tmp/vault",
             "--db",

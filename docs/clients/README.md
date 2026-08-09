@@ -117,7 +117,7 @@ command = "perseus-vault"
 args = ["serve"]
 ```
 
-> `perseus-vault serve` defaults its database to `~/.mimir/data/perseus-vault.db`
+> `perseus-vault serve` defaults its database to `~/.perseus-vault/data/perseus-vault.db`
 > (with a legacy fallback chain). Pass an absolute `--db` path if your client
 > runs Perseus Vault from a different working directory or you want a specific
 > location. Everything else is identical across clients because Perseus Vault

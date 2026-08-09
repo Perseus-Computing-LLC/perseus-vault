@@ -25,7 +25,7 @@ perseus-vault --version
 ### 2. Create a data directory
 
 ```bash
-mkdir -p ~/.mimir/data
+mkdir -p ~/.perseus-vault/data
 ```
 
 ### 3. Configure Claude Code
@@ -42,13 +42,13 @@ Create `.mcp.json` in your project root:
   "mcpServers": {
     "perseus-vault": {
       "command": "perseus-vault",
-      "args": ["--db", "/home/YOUR_USER/.mimir/data/perseus-vault.db"]
+      "args": ["--db", "/home/YOUR_USER/.perseus-vault/data/perseus-vault.db"]
     }
   }
 }
 ```
 
-Replace `/home/YOUR_USER/.mimir/data/perseus-vault.db` with the absolute path to your
+Replace `/home/YOUR_USER/.perseus-vault/data/perseus-vault.db` with the absolute path to your
 database. Do NOT use `~` — tilde expansion may not work in the MCP spawn context.
 
 **Global** (applies to all projects):
@@ -67,7 +67,7 @@ Ask:
 
 > List your available tools. Do you have access to Perseus Vault tools?
 
-You should see `mimir_remember`, `mimir_recall`, `mimir_context`, and other
+You should see `perseus_vault_remember`, `perseus_vault_recall`, `perseus_vault_context`, and other
 Perseus Vault tools in the tool list.
 
 ### 5. Wire the lifecycle loop (optional)
@@ -84,33 +84,33 @@ contract and copy-paste snippets.
 > I just decided to use SQLite for the caching layer instead of Redis.
 > Remember this architectural decision.
 
-Claude Code will call `mimir_remember` to store the entity.
+Claude Code will call `perseus_vault_remember` to store the entity.
 
 ### Resuming context from a previous session
 
 > What architectural decisions did I make about caching in this project?
 
-Claude Code will call `mimir_recall` to retrieve relevant entities.
+Claude Code will call `perseus_vault_recall` to retrieve relevant entities.
 
 ### Getting a session summary
 
 > Give me the recent memory context for this project.
 
-Claude Code will call `mimir_context` which returns a pre-formatted markdown
+Claude Code will call `perseus_vault_context` which returns a pre-formatted markdown
 block suitable for session injection.
 
 ### Recording journal events
 
 > Log this as a decision: we're dropping PostgreSQL support in favor of SQLite.
 
-Claude Code will call `mimir_journal` to append a structured event.
+Claude Code will call `perseus_vault_journal` to append a structured event.
 
 ## Troubleshooting
 
 ### Perseus Vault tools don't appear
 
 1. **Absolute paths:** Ensure the `--db` argument uses a full absolute path.
-   `/home/user/.mimir/data/perseus-vault.db` not `~/.mimir/data/perseus-vault.db`.
+   `/home/user/.perseus-vault/data/perseus-vault.db` not `~/.perseus-vault/data/perseus-vault.db`.
 
 2. **Binary on PATH:** Run `which perseus-vault`. If not found, install it or use
    the full path in the `command` field: `/usr/local/bin/perseus-vault`.
@@ -124,8 +124,8 @@ Claude Code will call `mimir_journal` to append a structured event.
 ### Permission denied on database
 
 ```bash
-chmod 755 ~/.mimir/data
-chmod 644 ~/.mimir/data/perseus-vault.db
+chmod 755 ~/.perseus-vault/data
+chmod 644 ~/.perseus-vault/data/perseus-vault.db
 ```
 
 ### Perseus Vault exits immediately
@@ -133,7 +133,7 @@ chmod 644 ~/.mimir/data/perseus-vault.db
 Run Perseus Vault manually to check for startup errors:
 
 ```bash
-perseus-vault --db ~/.mimir/data/perseus-vault.db
+perseus-vault --db ~/.perseus-vault/data/perseus-vault.db
 # Should hang waiting for stdin (this is correct — MCP stdio server)
 
 # If it exits with an error, check:
@@ -160,7 +160,7 @@ kill <PID>
   "mcpServers": {
     "perseus-vault": {
       "command": "perseus-vault",
-      "args": ["--db", "/home/YOU/projects/my-project/.mimir/perseus-vault.db"]
+      "args": ["--db", "/home/YOU/projects/my-project/.perseus-vault/perseus-vault.db"]
     }
   }
 }
@@ -173,7 +173,7 @@ This keeps project memories isolated.
 Perseus Vault includes an optional web dashboard for browsing entities:
 
 ```bash
-perseus-vault --db ~/.mimir/data/perseus-vault.db --web --port 8767
+perseus-vault --db ~/.perseus-vault/data/perseus-vault.db --web --port 8767
 ```
 
 Open `http://localhost:8767` in a browser. The dashboard shows entity lists,
@@ -198,7 +198,7 @@ Then in `.mcp.json`:
     "perseus-vault": {
       "command": "perseus-vault",
       "args": [
-        "--db", "/home/YOU/.mimir/data/perseus-vault.db",
+        "--db", "/home/YOU/.perseus-vault/data/perseus-vault.db",
         "--encryption-key", "/home/YOU/.perseus-vault/secret.key"
       ]
     }

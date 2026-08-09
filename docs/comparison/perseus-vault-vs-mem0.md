@@ -8,7 +8,7 @@
 | **Language** | Rust | Python |
 | **Deployment** | Single binary (~8MB) | Cloud API or self-host (Python + vector DB) |
 | **Dependencies** | Zero (SQLite bundled) | Python runtime + PostgreSQL/Qdrant/Neo4j |
-| **MCP-Native** | ✅ 90 canonical tools, full MCP | ❌ Not MCP-native |
+| **MCP-Native** | ✅ 99 canonical tools, full MCP | ❌ Not MCP-native |
 | **Offline/Local** | ✅ Fully local, no network | ❌ Cloud-dependent; self-host needs infra |
 | **Encryption** | AES-256-GCM at rest | ❌ |
 | **Search** | FTS5 + Dense + RRF hybrid | Vector only |
@@ -85,7 +85,7 @@ Full per-question results, configs, and judge outputs:
 ### Perseus Vault: Single Binary, No Dependencies
 
 ```
-Agent ──MCP stdio── mimir (Rust binary)
+Agent ──MCP stdio── perseus_vault (Rust binary)
                       ├── SQLite (entities, journal, state)
                       ├── FTS5 (keyword search)
                       ├── Dense vectors (optional Ollama/OpenAI)
@@ -132,9 +132,9 @@ Mem0 stores flat memory entries with metadata. No structured entity model,
 no decay lifecycle, no journal, no state management. It's a simpler model
 that works well for straightforward RAG use cases.
 
-## MCP Tools: 90 canonical vs 5
+## MCP Tools: 99 canonical vs 5
 
-Perseus Vault exposes 90 canonical MCP tools covering the full memory lifecycle:
+Perseus Vault exposes 99 canonical MCP tools covering the full memory lifecycle:
 
 | Category | Perseus Vault Tools |
 |---|---|
@@ -162,9 +162,9 @@ Perseus Vault is MCP-native — the binary IS an MCP server. Connect via stdio, 
 ```json
 {
   "mcpServers": {
-    "mimir": {
-      "command": "mimir",
-      "args": ["serve", "--db", "~/.mimir/data/mimir.db"]
+    "perseus-vault": {
+      "command": "perseus-vault",
+      "args": ["serve", "--db", "~/.perseus-vault/data/perseus-vault.db"]
     }
   }
 }

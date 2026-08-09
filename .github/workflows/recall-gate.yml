@@ -1,6 +1,6 @@
 name: Recall regression gate
 
-# Guards the #271 invariant: a bare mimir_remember + mimir_recall (no manual
+# Guards the #271 invariant: a bare perseus_vault_remember + perseus_vault_recall (no manual
 # embed, no mode) must use semantic search by default and clearly beat keyword
 # only. If auto-embed-on-write or the hybrid default ever regresses, recall
 # collapses toward FTS5 and this fails. Fast and dependency-free (no network,
@@ -23,7 +23,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  MIMIR_BUNDLED_MODEL_DIR: ${{ github.workspace }}/.model-cache
+  PERSEUS_VAULT_BUNDLED_MODEL_DIR: ${{ github.workspace }}/.model-cache
 
 jobs:
   recall-gate:

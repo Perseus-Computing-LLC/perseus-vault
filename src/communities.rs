@@ -367,7 +367,7 @@ fn token_hits(tokens: &[String], haystack_lower: &str) -> usize {
 
 // ─── Public result types ────────────────────────────────────────────────────
 
-/// One detected community, as returned by `mimir_communities`.
+/// One detected community, as returned by `perseus_vault_communities`.
 #[derive(Debug, Clone, Serialize)]
 pub struct Community {
     pub id: String,
@@ -400,7 +400,7 @@ pub(crate) struct CommunityRow {
     pub member_count: i64,
 }
 
-/// Result of `mimir_community_summary`.
+/// Result of `perseus_vault_community_summary`.
 #[derive(Debug, Serialize)]
 pub struct CommunitySummaryResult {
     pub community_id: String,
@@ -413,7 +413,7 @@ pub struct CommunitySummaryResult {
     pub llm_used: bool,
 }
 
-/// Parameters for `mimir_global_recall`.
+/// Parameters for `perseus_vault_global_recall`.
 #[derive(Debug, Deserialize)]
 pub struct GlobalRecallParams {
     pub query: String,
@@ -468,7 +468,7 @@ pub struct GlobalRecallCommunity {
     pub members: Vec<GlobalRecallMember>,
 }
 
-/// Result of `mimir_global_recall`.
+/// Result of `perseus_vault_global_recall`.
 #[derive(Debug, Serialize)]
 pub struct GlobalRecallResult {
     pub query: String,
@@ -740,7 +740,7 @@ impl Database {
             )
             .map_err(|_| {
                 format!(
-                    "Community not found: {} — run mimir_communities first",
+                    "Community not found: {} — run perseus_vault_communities first",
                     community_id
                 )
             })?
@@ -1117,7 +1117,7 @@ mod tests {
     use serde_json::json;
 
     fn temp_db() -> (crate::db::TestDatabase, String) {
-        let db = crate::db::TestDatabase::new("mimir-test-communities");
+        let db = crate::db::TestDatabase::new("perseus_vault-test-communities");
         let path = db.path().to_string();
         (db, path)
     }

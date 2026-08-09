@@ -407,7 +407,7 @@ impl EmbeddingCache {
 }
 
 /// #619: resident sign-signature cache for the dense arm, opt-in via
-/// `MIMIR_DENSE_SIG_CACHE=1`. The Hamming prefilter (#507) is only as good as
+/// `PERSEUS_VAULT_DENSE_SIG_CACHE=1`. The Hamming prefilter (#507) is only as good as
 /// its coverage: the SQL sig scan is bounded by `max_scan` (50k default), so
 /// past 50k embedded rows candidates are an id-order sample and standalone
 /// dense recall degrades (0.859@100K → 0.458@1M, #619). This cache keeps every
@@ -415,7 +415,7 @@ impl EmbeddingCache {
 /// so the prefilter covers 100% of the corpus; the oversampled exact rerank
 /// (phase 2) is unchanged. A binary-quantized flat index, not ANN: no graph to
 /// persist or maintain, and the exact path stays available via
-/// `MIMIR_DENSE_MAX_SCAN=0`.
+/// `PERSEUS_VAULT_DENSE_MAX_SCAN=0`.
 ///
 /// Validity = two stamps checked per query, rebuilt on mismatch:
 /// - `embedded_rows`: the phase-0 active-signed row count (computed every
@@ -470,7 +470,7 @@ struct SigCache {
 /// holds the entity id + plaintext body (~1KB typical), so 1024 caps queue
 /// memory at roughly a megabyte. Overflow policy is drop-new (see
 /// `enqueue_auto_embed`): auto-embedding is best-effort by contract, and a
-/// dropped row is recoverable via `mimir_embed` batch mode (which embeds rows
+/// dropped row is recoverable via `perseus_vault_embed` batch mode (which embeds rows
 /// `WHERE embedding IS NULL`) or the row's next content change.
 const EMBED_QUEUE_CAP: usize = 1024;
 
@@ -641,12 +641,12 @@ pub(crate) const FAILURE_MARKERS: &[&str] = &[
 /// caller asks for them explicitly (by `category`). Default: `conversation` —
 /// raw auto-captured turns otherwise dominate broad recall and bury curated
 /// facts (#298/#525). Override the list — or disable it entirely with an empty
-/// value — via the `MIMIR_EXCLUDE_CATEGORIES` env var (comma-separated).
+/// value — via the `PERSEUS_VAULT_EXCLUDE_CATEGORIES` env var (comma-separated).
 fn excluded_recall_categories() -> &'static Vec<String> {
     // Read once and cache: this runs on every recall() call (twice for hybrid
     // mode), but the env var never changes within a process's lifetime.
     static EXCLUDED: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
-    EXCLUDED.get_or_init(|| match std::env::var("MIMIR_EXCLUDE_CATEGORIES") {
+    EXCLUDED.get_or_init(|| match std::env::var("PERSEUS_VAULT_EXCLUDE_CATEGORIES") {
         Ok(v) => v
             .split(',')
             .map(|s| s.trim().to_string())
@@ -658,7 +658,7 @@ fn excluded_recall_categories() -> &'static Vec<String> {
 
 /// #511: opt-in, stage-level wall-clock attribution for the recall paths.
 ///
-/// Enabled by setting `MIMIR_RECALL_TIMING` to any non-empty value other than
+/// Enabled by setting `PERSEUS_VAULT_RECALL_TIMING` to any non-empty value other than
 /// `0`; the flag is read once per process. When enabled, `recall()` emits a
 /// single machine-greppable line per query to **stderr** (never stdout — that
 /// is the MCP protocol stream):
@@ -687,7 +687,7 @@ impl RecallTimer {
     fn enabled() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ON.get_or_init(|| {
-            std::env::var("MIMIR_RECALL_TIMING")
+            std::env::var("PERSEUS_VAULT_RECALL_TIMING")
                 .map(|v| !v.is_empty() && v != "0")
                 .unwrap_or(false)
         })
@@ -822,7 +822,7 @@ impl Database {
                         // written under the current AAD — do NOT revert it to
                         // the re-encrypted stale snapshot.
                         eprintln!(
-                            "mimir: rekey_aad skipped {}:{} — row changed during migration (already current)",
+                            "perseus-vault: rekey_aad skipped {}:{} — row changed during migration (already current)",
                             category, key
                         );
                         already_current += 1;
@@ -830,7 +830,7 @@ impl Database {
                 }
                 _ => {
                     eprintln!(
-                        "mimir: rekey_aad could not authenticate {}:{} under either AAD scheme -- left untouched",
+                        "perseus-vault: rekey_aad could not authenticate {}:{} under either AAD scheme -- left untouched",
                         category, key
                     );
                     failed += 1;
@@ -965,14 +965,14 @@ impl Database {
         // decay_tick batches at 1000 rows — so the default 5000ms no longer
         // needs to scale with entity count. If very large stores (many 100k
         // entities) still see SQLITE_BUSY during maintenance under heavy
-        // sustained write load, raise MIMIR_BUSY_TIMEOUT_MS rather than
+        // sustained write load, raise PERSEUS_VAULT_BUSY_TIMEOUT_MS rather than
         // shrinking the store.
-        let max_size: u32 = std::env::var("MIMIR_POOL_MAX_SIZE")
+        let max_size: u32 = std::env::var("PERSEUS_VAULT_POOL_MAX_SIZE")
             .ok()
             .and_then(|v| v.parse().ok())
             .filter(|&n| n > 0)
             .unwrap_or(16);
-        let busy_timeout_ms: u64 = std::env::var("MIMIR_BUSY_TIMEOUT_MS")
+        let busy_timeout_ms: u64 = std::env::var("PERSEUS_VAULT_BUSY_TIMEOUT_MS")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(5000);
@@ -980,7 +980,7 @@ impl Database {
         // up. r2d2's default is 30s, which under pool exhaustion turned into a
         // 30-second brownout per request; operators can now tune it (e.g. fail
         // fast at 2s and let the client retry). Default preserves r2d2's 30s.
-        let pool_timeout_ms: u64 = std::env::var("MIMIR_POOL_TIMEOUT_MS")
+        let pool_timeout_ms: u64 = std::env::var("PERSEUS_VAULT_POOL_TIMEOUT_MS")
             .ok()
             .and_then(|v| v.parse().ok())
             .filter(|&n| n > 0)
@@ -1038,7 +1038,7 @@ impl Database {
     /// Absolute path of the SQLite file this instance is bound to. Surfaced in
     /// `health` so a "wrote here, inspected there" mismatch (#657/#671 — an MCP
     /// server launched with a different `--db` than the file the operator
-    /// queries, e.g. `~/mimir.db`) is immediately visible instead of looking
+    /// queries, e.g. `~/perseus-vault.db`) is immediately visible instead of looking
     /// like a silent no-op. Falls back to the configured path if it cannot be
     /// canonicalized (e.g. the file was removed).
     pub fn db_path(&self) -> String {
@@ -1092,7 +1092,7 @@ impl Database {
     /// AAD for the encryption canary row — same length-prefixed scheme entities
     /// use, so it can't collide with a real (category, key) pair.
     fn canary_aad() -> String {
-        Self::build_aad("mimir_internal", "encryption_canary")
+        Self::build_aad("perseus_vault_internal", "encryption_canary")
     }
 
     /// Known plaintext stored (encrypted) in the canary row. Version-tagged so a
@@ -1323,7 +1323,7 @@ impl Database {
         self.connectors = connectors;
     }
 
-    /// Configure LLM integration for the mimir_ask tool.
+    /// Configure LLM integration for the perseus_vault_ask tool.
     /// Configure local embedding backend with path to ONNX model.
     /// Enables local embeddings via the bundled `ort` + `tokenizers` backend.
     pub fn set_embedding_model(&mut self, model_path: &str) {
@@ -1334,7 +1334,7 @@ impl Database {
     }
 
     /// LLM request timeout (#528): default 30s, overridable via
-    /// MIMIR_LLM_TIMEOUT_SECS. A large model served cold (first mimir_ask
+    /// PERSEUS_VAULT_LLM_TIMEOUT_SECS. A large model served cold (first perseus_vault_ask
     /// loading weights into VRAM) routinely needs more than 30s; junk or
     /// zero values fall back to the default rather than erroring.
     pub fn parse_llm_timeout(raw: Option<&str>) -> u64 {
@@ -1344,7 +1344,7 @@ impl Database {
     }
 
     fn llm_timeout_secs() -> u64 {
-        Self::parse_llm_timeout(std::env::var("MIMIR_LLM_TIMEOUT_SECS").ok().as_deref())
+        Self::parse_llm_timeout(std::env::var("PERSEUS_VAULT_LLM_TIMEOUT_SECS").ok().as_deref())
     }
 
     pub fn set_llm(
@@ -1373,7 +1373,7 @@ impl Database {
     }
 
     /// Recall the source set for RAG, enforcing the same session visibility
-    /// contract as mimir_recall. Kept separate so the security boundary is
+    /// contract as perseus_vault_recall. Kept separate so the security boundary is
     /// testable without requiring a live LLM endpoint (#783).
     pub fn ask_sources(
         &self,
@@ -1400,7 +1400,7 @@ impl Database {
     /// RAG: recall relevant entities, assemble context, ask Ollama for a grounded answer.
     pub fn ask(&self, params: &AskParams) -> Result<AskResult, Box<dyn std::error::Error>> {
         if !self.llm_config.enabled {
-            return Err("LLM is not enabled. Set --llm-endpoint to enable mimir_ask.".into());
+            return Err("LLM is not enabled. Set --llm-endpoint to enable perseus_vault_ask.".into());
         }
 
         // Step 1: Recall top-k relevant entities through the visibility boundary.
@@ -1701,7 +1701,7 @@ impl Database {
     /// The caller's write transaction already cleared the row's embedding on
     /// content change, so a dropped (or still-lagging) job means the row is
     /// ABSENT from dense search — never served with the previous body's stale
-    /// vector — until its next content change or an explicit `mimir_embed`
+    /// vector — until its next content change or an explicit `perseus_vault_embed`
     /// batch pass (`WHERE embedding IS NULL`).
     fn enqueue_auto_embed(&self, id: &str, plaintext: &str) {
         let worker = self.embed_worker.get_or_init(|| {
@@ -1739,12 +1739,12 @@ impl Database {
             }
             // The dropped row's embedding is NULL — the write transaction
             // cleared it on content change — so it is out of dense search
-            // (keyword still finds it) and recoverable by mimir_embed batch
+            // (keyword still finds it) and recoverable by perseus_vault_embed batch
             // mode's `WHERE embedding IS NULL` scan.
             rate_limited_log(
                 "embed-queue-overflow",
-                "mimir: auto-embed queue full — dropping newest job(s); affected rows \
-                 have no embedding until their next change or a mimir_embed batch pass",
+                "perseus-vault: auto-embed queue full — dropping newest job(s); affected rows \
+                 have no embedding until their next change or a perseus_vault_embed batch pass",
             );
         }
     }
@@ -1768,7 +1768,7 @@ impl Database {
 
         let w_pending = Arc::clone(&pending);
         let handle = std::thread::Builder::new()
-            .name("mimir-embed-worker".to_string())
+            .name("perseus_vault-embed-worker".to_string())
             .spawn(move || {
                 // recv() keeps yielding buffered jobs after the sender drops
                 // (Drop disconnects it), so shutdown DRAINS the remaining
@@ -1801,7 +1801,7 @@ impl Database {
                                         rate_limited_log(
                                             "embed-store",
                                             &format!(
-                                                "mimir: auto-embed store failed for {}: {}",
+                                                "perseus-vault: auto-embed store failed for {}: {}",
                                                 job.id, e
                                             ),
                                         );
@@ -1810,7 +1810,7 @@ impl Database {
                                 Err(e) => rate_limited_log(
                                     "embed-pool",
                                     &format!(
-                                        "mimir: auto-embed skipped {} — no pooled connection: {}",
+                                        "perseus-vault: auto-embed skipped {} — no pooled connection: {}",
                                         job.id, e
                                     ),
                                 ),
@@ -1818,7 +1818,7 @@ impl Database {
                             Err(e) => rate_limited_log(
                                 "embed-generate",
                                 &format!(
-                                    "mimir: auto-embed generation failed for {}: {}",
+                                    "perseus-vault: auto-embed generation failed for {}: {}",
                                     job.id, e
                                 ),
                             ),
@@ -1836,7 +1836,7 @@ impl Database {
                 }
                 let _ = done_tx.send(());
             })
-            .expect("spawn mimir-embed-worker");
+            .expect("spawn perseus_vault-embed-worker");
 
         EmbedWorker {
             tx,
@@ -2249,7 +2249,7 @@ impl Database {
     /// 3. Ollama /api/embed or OpenAI /v1/embeddings (if llm_config set)
     ///
     /// Consults + fills the #219 session cache — for the SYNCHRONOUS callers
-    /// (query embedding in recall, explicit `mimir_embed`), whose texts repeat.
+    /// (query embedding in recall, explicit `perseus_vault_embed`), whose texts repeat.
     /// The write path does not come through here anymore (#393): new/changed
     /// bodies are unique by definition, so its lookups were up-to-256 full-body
     /// string compares that could never hit (and its inserts evicted query
@@ -2297,7 +2297,7 @@ impl Database {
                 Err(e) => rate_limited_log(
                     "remote-embed-fallback",
                     &format!(
-                        "mimir: explicit embedding endpoint failed ({}), falling back to local...",
+                        "perseus-vault: explicit embedding endpoint failed ({}), falling back to local...",
                         e
                     ),
                 ),
@@ -2315,7 +2315,7 @@ impl Database {
                 // otherwise logs once per embedding attempt.
                 Err(e) => rate_limited_log(
                     "onnx-fallback",
-                    &format!("mimir: local ONNX embedding failed ({}), falling back...", e),
+                    &format!("perseus-vault: local ONNX embedding failed ({}), falling back...", e),
                 ),
             }
         }
@@ -2585,7 +2585,7 @@ impl Database {
                     | crate::encryption::BodyDecrypt::LegacyPlaintext(s) => s,
                     crate::encryption::BodyDecrypt::AuthFailed(e) => {
                         eprintln!(
-                            "mimir: reindex skipping body text for {}:{} — decryption {}.",
+                            "perseus-vault: reindex skipping body text for {}:{} — decryption {}.",
                             category, key, e
                         );
                         "{}".to_string()
@@ -2655,7 +2655,7 @@ impl Database {
     /// #856: shared env knob — the dense scan ceiling. `unset` → 50,000,
     /// `0` → unbounded (i64::MAX), else N. Mirrors the documented #619 dial.
     pub fn dense_max_scan_from_env() -> usize {
-        match std::env::var("MIMIR_DENSE_MAX_SCAN")
+        match std::env::var("PERSEUS_VAULT_DENSE_MAX_SCAN")
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
         {
@@ -2677,7 +2677,7 @@ impl Database {
         // the covering index yields first (id order — for random ids a uniform
         // sample across the corpus), so standalone dense recall degrades:
         // measured recall@5 0.859@100K → 0.458@1M at the 50k default (#619).
-        // `MIMIR_DENSE_MAX_SCAN` makes the trade explicit until ANN lands:
+        // `PERSEUS_VAULT_DENSE_MAX_SCAN` makes the trade explicit until ANN lands:
         //   unset      → 50,000 (today's behavior, byte-identical)
         //   N > 0      → scan at most N rows (latency ∝ N, recall degrades
         //                once embedded rows exceed N)
@@ -2688,7 +2688,7 @@ impl Database {
         // of the first `max_scan` rows (see `SigCache`). Default is AUTO:
         // the cache engages exactly when the corpus outgrows `max_scan` —
         // below that the bounded scan already covers every row and behavior
-        // is unchanged. `MIMIR_DENSE_SIG_CACHE` overrides:
+        // is unchanged. `PERSEUS_VAULT_DENSE_SIG_CACHE` overrides:
         //   unset / "auto" → engage when embedded rows > max_scan
         //   "1"/"true"/"on"   → always (even under the bound; same results,
         //                        trades memory for skipping the SQL sig scan)
@@ -2706,19 +2706,19 @@ impl Database {
             }
         };
         let opts = DenseOpts {
-            use_sig_cache: tri("MIMIR_DENSE_SIG_CACHE"),
+            use_sig_cache: tri("PERSEUS_VAULT_DENSE_SIG_CACHE"),
             // #619 step 2c′: resident int4 coarse — ~4× the 1-bit cache
             // memory (~390MB@1M×768-dim) for ≈⟨q,v⟩-exact candidate
             // selection. Opt-in; default stays the 96MB 1-bit coarse.
-            sig4_resident: tri("MIMIR_DENSE_SIG4_RESIDENT"),
+            sig4_resident: tri("PERSEUS_VAULT_DENSE_SIG4_RESIDENT"),
             // #619 step 2b, default OFF after the flat 1M measurement
             // (PR #663: recall unchanged, latency +87%): the disk-fetch int4
             // refine of a 1-bit coarse pool cannot recover neighbors the
             // coarse ranking never kept. Env "1" re-enables for A/B.
-            sig4_refine: tri("MIMIR_DENSE_SIG4"),
-            // #630: MIMIR_DENSE_SIG_RERANK=0 skips the exact-cosine rerank to
+            sig4_refine: tri("PERSEUS_VAULT_DENSE_SIG4"),
+            // #630: PERSEUS_VAULT_DENSE_SIG_RERANK=0 skips the exact-cosine rerank to
             // measure the pure 1-bit (Hamming-only) recall row. Default ON.
-            rerank: tri("MIMIR_DENSE_SIG_RERANK"),
+            rerank: tri("PERSEUS_VAULT_DENSE_SIG_RERANK"),
         };
         if self.governance_may_suppress()? {
             let scan_limit = if opts.use_sig_cache == Some(true) {
@@ -2950,7 +2950,7 @@ impl Database {
         // #619 AUTO resolution: the cache engages exactly when the bounded
         // scan can no longer cover the corpus (under the bound the SQL scan
         // sees every row and results are identical; an unbounded exact scan —
-        // max_scan = i64::MAX via MIMIR_DENSE_MAX_SCAN=0 — never auto-caches).
+        // max_scan = i64::MAX via PERSEUS_VAULT_DENSE_MAX_SCAN=0 — never auto-caches).
         let use_sig_cache = opts.use_sig_cache.unwrap_or(embedded_rows > max_scan as i64);
         let sig4_resident = opts.sig4_resident.unwrap_or(false);
         let sig4_refine = opts.sig4_refine.unwrap_or(false);
@@ -2997,7 +2997,7 @@ impl Database {
             // ranks over EVERY active signed row instead of the first
             // `max_scan` by id — full-corpus coverage is the entire point, so
             // the scan bound deliberately does not apply to this path (the
-            // exact escape hatch remains `MIMIR_DENSE_MAX_SCAN=0` with the
+            // exact escape hatch remains `PERSEUS_VAULT_DENSE_MAX_SCAN=0` with the
             // cache off). Cache validity is re-checked against both stamps on
             // every query; on mismatch it rebuilds from the same covering
             // index the SQL path scans.
@@ -3108,11 +3108,11 @@ impl Database {
                 // stay in the ranking instead of being discarded by symmetric
                 // sign-vs-sign Hamming. Same partial-select-then-sort shape as
                 // step 1.5b (O(n + pool·log pool); ties broken by unique id).
-                // `MIMIR_DENSE_SIG_ASYM=0` forces the old symmetric Hamming
+                // `PERSEUS_VAULT_DENSE_SIG_ASYM=0` forces the old symmetric Hamming
                 // for A/B comparison.
                 let n = cache.ids.len();
                 let asym = !matches!(
-                    std::env::var("MIMIR_DENSE_SIG_ASYM")
+                    std::env::var("PERSEUS_VAULT_DENSE_SIG_ASYM")
                         .unwrap_or_default()
                         .trim()
                         .to_ascii_lowercase()
@@ -3183,15 +3183,15 @@ impl Database {
                     // that coarse pool down to the exact-rerank pool. int4
                     // codes are read per query through the covering index —
                     // ~25MB page-cached at 64k×768-dim, deliberately NOT
-                    // resident (the spec's memory budget). MIMIR_DENSE_SIG4=0
+                    // resident (the spec's memory budget). PERSEUS_VAULT_DENSE_SIG4=0
                     // disables the refine (pure step-2a behavior) for A/B;
-                    // MIMIR_DENSE_COARSE_POOL overrides the coarse size.
+                    // PERSEUS_VAULT_DENSE_COARSE_POOL overrides the coarse size.
                     // #619 2b default flip (PR #663 measurement): the
                     // disk-fetch refine is OFF unless explicitly enabled —
                     // it measured recall-flat at +87% latency because the
                     // 1-bit coarse ranking is the binding constraint.
                     let refine = sig4_refine;
-                    let coarse = std::env::var("MIMIR_DENSE_COARSE_POOL")
+                    let coarse = std::env::var("PERSEUS_VAULT_DENSE_COARSE_POOL")
                         .ok()
                         .and_then(|v| v.trim().parse::<usize>().ok())
                         .unwrap_or_else(|| (pool * 8).clamp(16_384, 65_536))
@@ -3380,7 +3380,7 @@ impl Database {
             rate_limited_log(
                 "dense-dim-mismatch",
                 &format!(
-                    "mimir: dense_search produced 0 candidates from {} embedded rows — \
+                    "perseus-vault: dense_search produced 0 candidates from {} embedded rows — \
                      query embedding dim {} likely mismatches the stored corpus dim \
                      (mixed embedding backends?); dense recall will be empty",
                     embedded_rows, dim
@@ -3660,7 +3660,7 @@ impl Database {
     }
 
     /// Recalculate decay scores for all non-archived entities.
-    /// Called periodically or via mimir_decay tool.
+    /// Called periodically or via perseus_vault_decay tool.
     pub fn decay_tick(&self) -> Result<DecayReport, Box<dyn std::error::Error>> {
         self.decay_tick_with_limit(None, false)
     }
@@ -3763,7 +3763,7 @@ impl Database {
                     new_decay = (new_decay * efficacy_weight * usefulness_weight(usefulness))
                         .clamp(0.0, 1.0);
                 }
-                // v2.13.0: explicit importance (mimir_score) is a persistent
+                // v2.13.0: explicit importance (perseus_vault_score) is a persistent
                 // floor applied LAST — fidelity beats recency and beats the
                 // efficacy composite. Previously a manual score was erased by
                 // this very recompute on the next tick.
@@ -5052,7 +5052,7 @@ impl Database {
         // Identity is (category, key, workspace_hash) — #339. Matching on
         // (category, key) alone made a cross-workspace write with a colliding
         // key take the UPDATE path and overwrite the other workspace's row in
-        // place: mimir_share's "clone into target workspace" was actually a
+        // place: perseus_vault_share's "clone into target workspace" was actually a
         // destructive MOVE of the source entity. Single-workspace vaults
         // (workspace_hash = "" everywhere) are unaffected.
         let existing_id: Option<String> = conn
@@ -5120,7 +5120,7 @@ impl Database {
                     // ciphertext. Use a sentinel so content_changed is true and we
                     // conservatively snapshot history.
                     crate::encryption::BodyDecrypt::AuthFailed(_) => {
-                        "\u{0}__mimir_undecryptable__".to_string()
+                        "\u{0}__perseus_vault_undecryptable__".to_string()
                     }
                 }
             } else {
@@ -5175,7 +5175,7 @@ impl Database {
             // (category, key) would otherwise produce a history row with
             // recorded_at == invalidated_at == now, which as_of()'s strict
             // `invalidated_at_unix_ms > ?` can never match for any timestamp
-            // -- permanently unreachable despite mimir_history still listing it.
+            // -- permanently unreachable despite perseus_vault_history still listing it.
             let now = if content_changed || audit_period_change {
                 let old_recorded_or_created: i64 = tx
                     .query_row(
@@ -5359,7 +5359,7 @@ impl Database {
             // the OLD body; with the auto-embed deferred, keeping it would
             // serve a wrong vector to dense search for the whole lag window —
             // permanently, if the re-embed job is dropped on queue overflow,
-            // because a non-NULL embedding is invisible to `mimir_embed` batch
+            // because a non-NULL embedding is invisible to `perseus_vault_embed` batch
             // repair (`WHERE embedding IS NULL`). Absent beats stale: the row
             // drops out of dense search (keyword still finds it) until the
             // worker's guarded store lands, and every dropped job is genuinely
@@ -5445,7 +5445,7 @@ impl Database {
             // Check for near-duplicates before inserting (unless the caller is
             // a file-semantics writer — see remember_skip_dedup).
             let dup_threshold = 0.7; // 70% trigram similarity
-            // v17 (#476): MIMIR_DEDUP_FTS_PREFILTER is retired. The lossy #228
+            // v17 (#476): PERSEUS_VAULT_DEDUP_FTS_PREFILTER is retired. The lossy #228
             // prefilter existed to collapse the entities-walk cost; the scan
             // is now signature-driven + band-indexed (exact, and faster than
             // the prefilter ever was — the 64-term MATCH per write measured
@@ -5706,7 +5706,8 @@ impl Database {
         &self,
         params: &RecallParams,
     ) -> Result<(Vec<Entity>, crate::models::RecallCompleteness), Box<dyn std::error::Error>> {
-        // #511: stage-level attribution, opt-in via MIMIR_RECALL_TIMING=1.
+        // #511: stage-level attribution, opt-in via PERSEUS_VAULT_RECALL_TIMING=1.
+
         // No-op (single cached-bool check per stage) when disabled.
         let mut timer = RecallTimer::start();
         // Dense vector search path
@@ -6215,7 +6216,7 @@ impl Database {
     /// instead. (An earlier build on a pre-#618 base showed a clean reduction;
     /// the #618 retrieval changes moved the gold out of shared buckets and it
     /// vanished.) The effective fix belongs at INGEST time — plumb a valid-time
-    /// via `mimir_remember` and link same-fact versions through the supersede/
+    /// via `perseus_vault_remember` and link same-fact versions through the supersede/
     /// bitemporal machinery (#363/#472) so versions are known, not inferred.
     /// Retained as a documented fallback + the reusable `entity_event_date_key`.
     ///
@@ -6846,7 +6847,7 @@ impl Database {
         // over the WHOLE match set before the LIMIT can discard anything, so a
         // corpus-common term ranks O(matches) rows — the measured 20ms@100K →
         // 196ms@1M linear shape (#589, the #511 residual). When
-        // `MIMIR_BM25_SCAN_CAP` is > 0 we cap the work: enumerate at most `cap`
+        // `PERSEUS_VAULT_BM25_SCAN_CAP` is > 0 we cap the work: enumerate at most `cap`
         // matched rowids WITHOUT `ORDER BY` (FTS5 returns them in docid order
         // and early-terminates at `cap`, scoring only those), then rank that
         // bounded candidate set in Rust. Cost becomes O(cap), not O(matches).
@@ -6859,7 +6860,7 @@ impl Database {
         // GAUNTLET ladder + the coverage gate; the default is 0 (off) so this
         // is inert until deliberately enabled. `usize::MAX`-safe: 0 short-
         // circuits to today's behavior.
-        let scan_cap = std::env::var("MIMIR_BM25_SCAN_CAP")
+        let scan_cap = std::env::var("PERSEUS_VAULT_BM25_SCAN_CAP")
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
             .unwrap_or(0);
@@ -6905,7 +6906,7 @@ impl Database {
     }
 
     /// #589: the bounded-scan variant of the sparse arm, used when
-    /// `MIMIR_BM25_SCAN_CAP` is set. Enumerates at most `scan_cap` matched
+    /// `PERSEUS_VAULT_BM25_SCAN_CAP` is set. Enumerates at most `scan_cap` matched
     /// rowids in docid order (no `ORDER BY rank`, so FTS5 early-terminates and
     /// scores only what it returns), ranks that bounded candidate set in Rust,
     /// then hydrates + metadata-filters the top `safe_limit` via the same
@@ -7887,7 +7888,7 @@ impl Database {
 
     /// The version of (category, key) that was the live fact at transaction time
     /// `as_of_unix_ms` — recorded at or before T and not yet superseded at T.
-    /// Bi-temporal time-travel: "what did Mneme believe about this at time T?".
+    /// Bi-temporal time-travel: "what did Perseus Vault believe about this at time T?".
     /// Returns None if the fact had not been recorded yet at T. (v2.4.0)
     ///
     /// Versions partition time contiguously: each historical version was live
@@ -8221,8 +8222,8 @@ impl Database {
     /// versions in place — transaction-time `as_of` and/or world-time `valid_at`.
     /// Each body is swapped for the version live at that instant; entities with
     /// no version there are dropped. No-op when both are None. Shared by
-    /// `mimir_ask` so RAG answers are reconstructable at a past instant, matching
-    /// `mimir_recall`'s temporal mode. (`global_recall` intentionally stays
+    /// `perseus_vault_ask` so RAG answers are reconstructable at a past instant, matching
+    /// `perseus_vault_recall`'s temporal mode. (`global_recall` intentionally stays
     /// current-view: its community summaries are recomputed artifacts, not
     /// versioned facts, so a point-in-time reconstruction there is ill-defined.)
     pub(crate) fn resolve_temporal_versions(
@@ -9411,7 +9412,7 @@ impl Database {
     }
 
     /// Close an entity's application-time period (#363): record when the fact
-    /// stopped being true in the world. Used by mimir_supersede — superseding
+    /// stopped being true in the world. Used by perseus_vault_supersede — superseding
     /// a fact ends its validity (at transaction time unless the caller says
     /// when).
     ///
@@ -9509,7 +9510,7 @@ impl Database {
             let (id, category, key) = row?;
             ids_to_archive.push(id);
             eprintln!(
-                "mimir: deduplicate_entities: found duplicate {}/{} (will archive oldest)",
+                "perseus-vault: deduplicate_entities: found duplicate {}/{} (will archive oldest)",
                 category, key
             );
         }
@@ -11593,7 +11594,7 @@ impl Database {
                         })
                         .collect(),
                     verified: false,
-                    source: "mimir_consolidate".to_string(),
+                    source: "perseus_vault_consolidate".to_string(),
                     always_on: false,
                     certainty: avg_certainty,
                     workspace_hash: scope_ws.clone().unwrap_or_default(),
@@ -11722,16 +11723,16 @@ impl Database {
     ///
     /// Requires `--llm-endpoint` (fully local via Ollama). Returns a clean
     /// error — never a crash — when no endpoint is configured; the non-LLM
-    /// alternative is `mimir_consolidate`.
+    /// alternative is `perseus_vault_consolidate`.
     pub fn dream(
         &self,
         params: &crate::models::DreamParams,
     ) -> Result<crate::models::DreamReport, Box<dyn std::error::Error>> {
         if !self.llm_config.enabled {
             return Err(
-                "LLM is not enabled. Set --llm-endpoint to enable mimir_dream \
+                "LLM is not enabled. Set --llm-endpoint to enable perseus_vault_dream \
                  (fully local via Ollama). For non-LLM consolidation, use \
-                 mimir_consolidate."
+                 perseus_vault_consolidate."
                     .into(),
             );
         }
@@ -12044,7 +12045,7 @@ impl Database {
                                 })
                                 .collect(),
                             verified: false,
-                            source: "mimir_dream".to_string(),
+                            source: "perseus_vault_dream".to_string(),
                             always_on: false,
                             certainty,
                             workspace_hash: scope_ws.clone().unwrap_or_default(),
@@ -12448,7 +12449,7 @@ Return a JSON object with an "insights" array. Each insight has:
     ///     matched by live id AND by (category, key, workspace_hash), so
     ///     versions written under earlier ids of the same key are erased too —
     ///     is DELETEd. A GDPR-style forget-then-purge no longer leaves the
-    ///     historical bodies readable via mimir_history / mimir_as_of.
+    ///     historical bodies readable via perseus_vault_history / perseus_vault_as_of.
     ///   * `journal`: rows referencing a purged entity (by entity_id or by its
     ///     category/key) are REDACTED IN PLACE, not deleted. The audit chain
     ///     hashes (prev_hash, id, created_at_unix_ms, workspace_hash) — see
@@ -13017,7 +13018,7 @@ Return a JSON object with an "insights" array. Each insight has:
     /// #398 — enforce the entity_history retention policy (see
     /// `HistoryRetentionPolicy`). Mechanism only: with no knobs set this is a
     /// no-op, so the default behavior stays "keep everything". Runs only from
-    /// maintenance paths (mimir_maintenance, mimir_autocohere, mimir_prune
+    /// maintenance paths (perseus_vault_maintenance, perseus_vault_autocohere, perseus_vault_prune
     /// scope=history) — never on the write path.
     ///
     /// Eviction is strictly oldest-first along the transaction-time axis, so
@@ -13046,7 +13047,7 @@ Return a JSON object with an "insights" array. Each insight has:
     /// valid_from (not first_recorded_at), so a retroactively-valid version's
     /// window keeps answering `valid_at`/`bitemporal_at` with the marker
     /// after compaction. With tombstones disabled
-    /// (`MIMIR_HISTORY_TOMBSTONES=0`) the prefix is hard-deleted and as_of
+    /// (`PERSEUS_VAULT_HISTORY_TOMBSTONES=0`) the prefix is hard-deleted and as_of
     /// inside the window finds nothing — the degenerate option-1 mode.
     ///
     /// dry_run computes the identical eviction set and reports counts/bytes
@@ -13774,7 +13775,7 @@ last_accessed: {}
     /// budget clamping, so existing consumers keep the legacy behavior (the
     /// only addition is the one-line informational framing note, #356).
     /// New callers should use `context_block` with `ContextMode::OnDemand`
-    /// (the recall-first default of `mimir_context` and `prepare`).
+    /// (the recall-first default of `perseus_vault_context` and `prepare`).
     // Only the feature-gated gRPC surface (and tests) still call this wrapper.
     #[cfg_attr(not(feature = "grpc"), allow(dead_code))]
     pub fn context(
@@ -14000,7 +14001,7 @@ last_accessed: {}
                 ctx.push_str(
                     "> Recall-first mode: no `query` supplied, so no topical memories were injected. \
                      Pass `query` (the current task/message) to surface relevant memories, or call \
-                     `mimir_recall` / `mimir_recall_when` on demand. Legacy full dump: `mode: \"always_inject\"`.\n\n",
+                     `perseus_vault_recall` / `perseus_vault_recall_when` on demand. Legacy full dump: `mode: \"always_inject\"`.\n\n",
                 );
             }
         } else {
@@ -14690,7 +14691,7 @@ last_accessed: {}
         // #300: auto-link same-category pairs, but gate on real content
         // similarity so we create *meaningful* edges instead of stamping a
         // blanket "auto-related" on every same-category pair (which made
-        // `mimir_traverse` noise). Over-fetch a bounded candidate pool, score
+        // `perseus_vault_traverse` noise). Over-fetch a bounded candidate pool, score
         // each pair by trigram similarity (the dependency-free measure already
         // used for dedup/conflict detection), and link only pairs at or above
         // AUTO_LINK_SIM_THRESHOLD — weighting the edge by the actual similarity —
@@ -14881,7 +14882,7 @@ last_accessed: {}
             archive_reason: String::new(),
             links: Vec::new(),
             verified: false,
-            source: "mimir_correct".to_string(),
+            source: "perseus_vault_correct".to_string(),
             always_on: false,
             certainty: 1.0,
             workspace_hash: params.workspace_hash.clone(),
@@ -14971,7 +14972,7 @@ last_accessed: {}
     /// Creates entities for each lesson found.
     pub fn synthesize(&self, params: &crate::models::SynthesizeParams) -> Result<crate::models::SynthesizeResult, Box<dyn std::error::Error>> {
         if !self.llm_config.enabled {
-            return Err("LLM is not enabled. Set --llm-endpoint to enable mimir_synthesize.".into());
+            return Err("LLM is not enabled. Set --llm-endpoint to enable perseus_vault_synthesize.".into());
         }
         
         let prompt = format!(
@@ -15053,7 +15054,7 @@ If no clear lessons found, return: {{"lessons": []}}"#,
                 "evidence": lesson.evidence,
                 "confidence": lesson.confidence,
                 "session_id": params.session_id,
-                "source": "mimir_synthesize",
+                "source": "perseus_vault_synthesize",
             });
             body["evidence"] = serde_json::to_value(params.evidence.as_ref().unwrap_or(&crate::models::EvidenceEnvelope {
                 capture_mode: "legacy_unknown".to_string(),
@@ -15081,7 +15082,7 @@ If no clear lessons found, return: {{"lessons": []}}"#,
                 archive_reason: String::new(),
                 links: Vec::new(),
                 verified: false,
-                source: "mimir_synthesize".to_string(),
+                source: "perseus_vault_synthesize".to_string(),
                 always_on: false,
                 certainty: lesson.confidence,
                 workspace_hash: String::new(),
@@ -15160,7 +15161,7 @@ If no clear lessons found, return: {{"lessons": []}}"#,
             archive_reason: String::new(),
             links: Vec::new(),
             verified: false,
-            source: "mimir_bench".to_string(),
+            source: "perseus_vault_bench".to_string(),
             always_on: false,
             certainty: 0.5,
             workspace_hash: String::new(),
@@ -15194,7 +15195,7 @@ If no clear lessons found, return: {{"lessons": []}}"#,
 /// than blocking Drop: it keeps draining best-effort and exits on its own
 /// when the queue empties or the process does. Rows whose jobs never ran have
 /// a NULL embedding (cleared at write time on content change), so they are
-/// recoverable via `mimir_embed` batch mode or their next change.
+/// recoverable via `perseus_vault_embed` batch mode or their next change.
 impl Drop for Database {
     fn drop(&mut self) {
         if let Some(worker) = self.embed_worker.take() {
@@ -15566,7 +15567,7 @@ pub(crate) fn usefulness_weight(usefulness_count: i64) -> f64 {
 }
 
 /// #681: outcome-weighted recall — the honest follow-rate efficacy signal
-/// (`mimir_follow`) as a rank multiplier. It mirrors the "useful" arm of
+/// (`perseus_vault_follow`) as a rank multiplier. It mirrors the "useful" arm of
 /// `decay_tick`'s efficacy composite (`1.0 + follow_rate * 0.3`) so the two
 /// honest-usage signals never drift: a lesson that gets FOLLOWED floats above
 /// an equally-relevant one that gets ignored. A 'dead' lesson (ignored despite
@@ -16892,11 +16893,11 @@ fn entity_from_row(
             // and warn instead.
             crate::encryption::BodyDecrypt::AuthFailed(e) => {
                 eprintln!(
-                    "mimir: refusing to return body for {}:{} — decryption {}. \
+                    "perseus-vault: refusing to return body for {}:{} — decryption {}. \
                      Wrong key or tampered ciphertext.",
                     cat, k, e
                 );
-                "{\"error\":\"mimir: body decryption failed (wrong key or tampered ciphertext)\"}"
+                "{\"error\":\"perseus-vault: body decryption failed (wrong key or tampered ciphertext)\"}"
                     .to_string()
             }
         }
@@ -17012,7 +17013,7 @@ mod tests {
     use std::fs;
 
     fn temp_db() -> (TestDatabase, String) {
-        let db = TestDatabase::new("mimir-test-db");
+        let db = TestDatabase::new("perseus_vault-test-db");
         let path = db.path().to_string();
         (db, path)
     }
@@ -17020,7 +17021,7 @@ mod tests {
     #[test]
     fn test_database_fixture_removes_sqlite_sidecars_on_drop() {
         let path = {
-            let db = TestDatabase::new("mimir-test-cleanup");
+            let db = TestDatabase::new("perseus_vault-test-cleanup");
             let path = db.path().to_string();
             db.remember_skip_dedup(&make_entity(
                 "fixture-cleanup", "test", "fixture", "{\"content\":\"fixture cleanup\"}",
@@ -18667,14 +18668,14 @@ mod tests {
     /// pooled connection while get_entity/store_embedding draw another. With a
     /// ONE-connection pool and a short checkout timeout, any nested draw
     /// deadlocks-then-times-out — exactly the reviewer's repro (pool=1,
-    /// MIMIR_POOL_TIMEOUT_MS=700 -> single-mode embed timed out in ~714ms).
+    /// PERSEUS_VAULT_POOL_TIMEOUT_MS=700 -> single-mode embed timed out in ~714ms).
     /// The pool is built directly (not via env) so parallel tests are
     /// unaffected. A missing embedding backend (lean builds) is an acceptable
     /// error; a pool checkout timeout is the regression.
     #[test]
     fn single_mode_embed_entity_does_not_nest_pool_draws() {
         let dir = std::env::temp_dir();
-        let path = dir.join(format!("mimir-test-pool1-{}.db", uuid::Uuid::new_v4()));
+        let path = dir.join(format!("perseus_vault-test-pool1-{}.db", uuid::Uuid::new_v4()));
         let path_str = path.to_str().unwrap().to_string();
         let manager = SqliteConnectionManager::file(&path_str).with_init(|c| {
             c.execute_batch(
@@ -18754,7 +18755,7 @@ mod tests {
     #[test]
     fn context_escapes_hostile_body_content() {
         // A stored entity whose body tries to break out of the context block
-        // is rendered inert by context() (feeds both mimir_context and prepare).
+        // is rendered inert by context() (feeds both perseus_vault_context and prepare).
         let (db, path) = temp_db();
         db.remember(&make_entity(
             "e-evil",
@@ -18802,7 +18803,7 @@ mod tests {
 
     #[test]
     fn importance_floor_survives_decay_tick_and_cohere() {
-        // v2.13.0 (fidelity > recency): an explicit mimir_score used to be
+        // v2.13.0 (fidelity > recency): an explicit perseus_vault_score used to be
         // erased by the next decay_tick, which recomputes decay_score purely
         // from last_accessed. The score now persists as an importance floor
         // in BOTH recompute paths, and clears when re-scored to 0.0.
@@ -19215,7 +19216,7 @@ mod tests {
     /// the field). Run explicitly:
     ///
     /// ```text
-    /// MIMIR_COHERE_MEASURE_ROWS=100000 \
+    /// PERSEUS_VAULT_COHERE_MEASURE_ROWS=100000 \
     ///   cargo test --release cohere_lock_window_measurement -- --ignored --nocapture
     /// ```
     #[test]
@@ -19225,7 +19226,7 @@ mod tests {
         use std::sync::Arc;
         use std::time::{Duration, Instant};
 
-        let rows: usize = std::env::var("MIMIR_COHERE_MEASURE_ROWS")
+        let rows: usize = std::env::var("PERSEUS_VAULT_COHERE_MEASURE_ROWS")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(100_000);
@@ -19399,7 +19400,7 @@ mod tests {
     #[ignore = "perf gate (#404): run in release via perf-gate.yml or locally with --ignored"]
     fn perf_gate_reads_at_100k() {
         use std::time::Instant;
-        let n = gate_env_usize("MIMIR_PERF_ROWS", 100_000);
+        let n = gate_env_usize("PERSEUS_VAULT_PERF_ROWS", 100_000);
         let (db, path) = temp_db();
         let seed_start = Instant::now();
         seed_perf_corpus(&db, n, now_ms());
@@ -19424,14 +19425,14 @@ mod tests {
             &mut failures,
             "recall FTS rare-term @100k p50",
             recall_p50("raretoken"),
-            gate_env_f64("MIMIR_PERF_BUDGET_RECALL_RARE_MS", 30.0),
+            gate_env_f64("PERSEUS_VAULT_PERF_BUDGET_RECALL_RARE_MS", 30.0),
             "ms",
         );
         gate_check(
             &mut failures,
             "recall browse (empty query) @100k p50",
             recall_p50(""),
-            gate_env_f64("MIMIR_PERF_BUDGET_BROWSE_MS", 5.0),
+            gate_env_f64("PERSEUS_VAULT_PERF_BUDGET_BROWSE_MS", 5.0),
             "ms",
         );
         gate_check(
@@ -19444,7 +19445,7 @@ mod tests {
                     "seeded entity {key} must resolve"
                 );
             }),
-            gate_env_f64("MIMIR_PERF_BUDGET_GET_ENTITY_MS", 1.0),
+            gate_env_f64("PERSEUS_VAULT_PERF_BUDGET_GET_ENTITY_MS", 1.0),
             "ms",
         );
         let _ = fs::remove_file(&path);
@@ -19458,7 +19459,7 @@ mod tests {
     #[ignore = "perf gate (#404): run in release via perf-gate.yml or locally with --ignored"]
     fn perf_gate_as_of_at_50k_history() {
         use std::time::Instant;
-        let n = gate_env_usize("MIMIR_PERF_HISTORY_ROWS", 50_000);
+        let n = gate_env_usize("PERSEUS_VAULT_PERF_HISTORY_ROWS", 50_000);
         let (db, path) = temp_db();
 
         // One live row + n history versions, version i live during
@@ -19512,7 +19513,7 @@ mod tests {
                 let hit = db.as_of("bench", "asof-key", t_mid).unwrap();
                 assert!(hit.is_some(), "as_of must resolve a mid-chain version");
             }),
-            gate_env_f64("MIMIR_PERF_BUDGET_AS_OF_MS", 1.0),
+            gate_env_f64("PERSEUS_VAULT_PERF_BUDGET_AS_OF_MS", 1.0),
             "ms",
         );
         let _ = fs::remove_file(&path);
@@ -19529,7 +19530,7 @@ mod tests {
     #[ignore = "perf gate (#404): run in release via perf-gate.yml or locally with --ignored"]
     fn perf_gate_decay_tick_at_100k() {
         use std::time::Instant;
-        let n = gate_env_usize("MIMIR_PERF_ROWS", 100_000);
+        let n = gate_env_usize("PERSEUS_VAULT_PERF_ROWS", 100_000);
         let (db, path) = temp_db();
         let seed_start = Instant::now();
         seed_perf_corpus(&db, n, now_ms());
@@ -19545,7 +19546,7 @@ mod tests {
             &mut failures,
             "decay_tick @100k wall (full rewrite)",
             wall1,
-            gate_env_f64("MIMIR_PERF_BUDGET_DECAY_WALL_S", 10.0),
+            gate_env_f64("PERSEUS_VAULT_PERF_BUDGET_DECAY_WALL_S", 10.0),
             "s",
         );
 
@@ -19570,14 +19571,14 @@ mod tests {
             &mut failures,
             "decay_tick second-consecutive updated rows",
             rep2.entities_updated as f64 * 100.0 / n as f64,
-            gate_env_f64("MIMIR_PERF_BUDGET_DECAY_SECOND_TICK_PCT", 1.0),
+            gate_env_f64("PERSEUS_VAULT_PERF_BUDGET_DECAY_SECOND_TICK_PCT", 1.0),
             "%",
         );
         gate_check(
             &mut failures,
             "decay_tick second-tick WAL growth / DB size",
             wal_size as f64 / db_size as f64,
-            gate_env_f64("MIMIR_PERF_BUDGET_DECAY_WAL_RATIO", 2.0),
+            gate_env_f64("PERSEUS_VAULT_PERF_BUDGET_DECAY_WAL_RATIO", 2.0),
             "x",
         );
         let _ = fs::remove_file(&path);
@@ -19595,7 +19596,7 @@ mod tests {
         use std::sync::Arc;
         use std::time::Instant;
 
-        let n = gate_env_usize("MIMIR_PERF_ROWS", 100_000);
+        let n = gate_env_usize("PERSEUS_VAULT_PERF_ROWS", 100_000);
         let (db, path) = temp_db();
         let seed_start = Instant::now();
         {
@@ -19629,14 +19630,14 @@ mod tests {
             &mut failures,
             "cohere @100k wall",
             wall,
-            gate_env_f64("MIMIR_PERF_BUDGET_COHERE_WALL_S", 5.0),
+            gate_env_f64("PERSEUS_VAULT_PERF_BUDGET_COHERE_WALL_S", 5.0),
             "s",
         );
         gate_check(
             &mut failures,
             "cohere @100k longest writer-lock hold",
             max_hold.as_secs_f64() * 1000.0,
-            gate_env_f64("MIMIR_PERF_BUDGET_COHERE_HOLD_MS", 1000.0),
+            gate_env_f64("PERSEUS_VAULT_PERF_BUDGET_COHERE_HOLD_MS", 1000.0),
             "ms",
         );
         let _ = fs::remove_file(&path);
@@ -19652,7 +19653,7 @@ mod tests {
     #[test]
     #[ignore = "perf gate (#404): run in release via perf-gate.yml or locally with --ignored"]
     fn perf_gate_history_bytes_per_row() {
-        let versions = gate_env_usize("MIMIR_PERF_HISTORY_VERSIONS", 200);
+        let versions = gate_env_usize("PERSEUS_VAULT_PERF_HISTORY_VERSIONS", 200);
         let (db, path) = temp_db();
 
         // ~1KB body, unique per version so every remember() supersedes.
@@ -19708,7 +19709,7 @@ mod tests {
             &mut failures,
             "history bytes/row @1KB body",
             bytes_per_row,
-            gate_env_f64("MIMIR_PERF_BUDGET_HISTORY_BYTES_PER_ROW", 2048.0),
+            gate_env_f64("PERSEUS_VAULT_PERF_BUDGET_HISTORY_BYTES_PER_ROW", 2048.0),
             "B",
         );
         let _ = fs::remove_file(&path);
@@ -20113,7 +20114,7 @@ mod tests {
     fn invalidate_entity_same_millisecond_create_stays_reconstructable() {
         // #381 failure mode (b): create + invalidate inside one millisecond
         // (the common case under Windows' ~16ms clock granularity) must not
-        // produce a zero-width window that mimir_history lists but as_of can
+        // produce a zero-width window that perseus_vault_history lists but as_of can
         // never match.
         let (db, path) = temp_db();
         // Winner first, so create → invalidate on the loser is back-to-back
@@ -20475,7 +20476,7 @@ mod tests {
     }
 
     // #472: resolve_temporal_versions is the shared reconstruction used by
-    // mimir_ask (and mirrors mimir_recall's temporal mode). Given a recall hit
+    // perseus_vault_ask (and mirrors perseus_vault_recall's temporal mode). Given a recall hit
     // set, it must swap each body for the version live at the instant and drop
     // hits with no version there.
     #[test]
@@ -21446,8 +21447,8 @@ mod tests {
         let mut boundary_hits = 0usize;
 
         // Seed count is env-tunable so review/CI can run a wider sweep
-        // (e.g. MIMIR_DEDUP_PROP_SEEDS=50) without slowing the default suite.
-        let seeds: u64 = std::env::var("MIMIR_DEDUP_PROP_SEEDS")
+        // (e.g. PERSEUS_VAULT_DEDUP_PROP_SEEDS=50) without slowing the default suite.
+        let seeds: u64 = std::env::var("PERSEUS_VAULT_DEDUP_PROP_SEEDS")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(8);
@@ -21863,7 +21864,7 @@ mod tests {
 
         let (mut db, path) = temp_db();
         let key = EncryptionManager::generate_key();
-        let key_path = std::env::temp_dir().join(format!("mimir-test-key-{}.key", uuid::Uuid::new_v4()));
+        let key_path = std::env::temp_dir().join(format!("perseus_vault-test-key-{}.key", uuid::Uuid::new_v4()));
         let mut f = std::fs::File::create(&key_path).unwrap();
         f.write_all(key.as_bytes()).unwrap();
         drop(f);
@@ -21911,7 +21912,7 @@ mod tests {
         use std::io::Write;
         let key = EncryptionManager::generate_key();
         let path = std::env::temp_dir()
-            .join(format!("mimir-canary-key-{}.key", uuid::Uuid::new_v4()));
+            .join(format!("perseus_vault-canary-key-{}.key", uuid::Uuid::new_v4()));
         let mut f = std::fs::File::create(&path).unwrap();
         f.write_all(key.as_bytes()).unwrap();
         drop(f);
@@ -22378,19 +22379,19 @@ mod tests {
     // #392 perf regression bench (ignored; run explicitly). Compares the
     // stored-signature scan against the pre-#392 exhaustive reference on the
     // SAME store — same harness, same probes — and times the issue's
-    // bulk-import scenario on the new path. Scale via MIMIR_DEDUP_BENCH_N /
-    // MIMIR_DEDUP_BENCH_BULK. Numbers are medians over the probe set;
+    // bulk-import scenario on the new path. Scale via PERSEUS_VAULT_DEDUP_BENCH_N /
+    // PERSEUS_VAULT_DEDUP_BENCH_BULK. Numbers are medians over the probe set;
     // concurrent load on the host makes single runs noisy.
     #[test]
     #[ignore]
     fn bench_dedup_scan_stored_signatures_vs_exhaustive() {
         use std::time::Instant;
 
-        let n: usize = std::env::var("MIMIR_DEDUP_BENCH_N")
+        let n: usize = std::env::var("PERSEUS_VAULT_DEDUP_BENCH_N")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(10_000);
-        let bulk: usize = std::env::var("MIMIR_DEDUP_BENCH_BULK")
+        let bulk: usize = std::env::var("PERSEUS_VAULT_DEDUP_BENCH_BULK")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(1_000);
@@ -23045,7 +23046,7 @@ mod tests {
     #[test]
     fn vault_export_emits_wikilink_backlinks() {
         let (db, path) = temp_db();
-        let vault = std::env::temp_dir().join(format!("mimir-vault-{}", uuid::Uuid::new_v4()));
+        let vault = std::env::temp_dir().join(format!("perseus_vault-vault-{}", uuid::Uuid::new_v4()));
         let vault_str = vault.to_str().unwrap().to_string();
 
         // Two entities; the dependent links to the dependency.
@@ -23098,7 +23099,7 @@ mod tests {
     #[test]
     fn vault_export_unchanged_is_noop() {
         let (db, path) = temp_db();
-        let vault = std::env::temp_dir().join(format!("mimir-vault-{}", uuid::Uuid::new_v4()));
+        let vault = std::env::temp_dir().join(format!("perseus_vault-vault-{}", uuid::Uuid::new_v4()));
         let vault_str = vault.to_str().unwrap().to_string();
 
         db.remember(&make_entity(
@@ -23132,7 +23133,7 @@ mod tests {
     #[test]
     fn vault_export_dangling_link_does_not_crash() {
         let (db, path) = temp_db();
-        let vault = std::env::temp_dir().join(format!("mimir-vault-{}", uuid::Uuid::new_v4()));
+        let vault = std::env::temp_dir().join(format!("perseus_vault-vault-{}", uuid::Uuid::new_v4()));
         let vault_str = vault.to_str().unwrap().to_string();
 
         db.remember(&make_entity("keep", "architecture", "api", r#"{"c":"axum"}"#))
@@ -23603,7 +23604,7 @@ mod tests {
 
     #[test]
     fn context_scopes_to_workspace_including_always_on() {
-        // context() feeds mimir_context and `prepare` — a scoped call must not
+        // context() feeds perseus_vault_context and `prepare` — a scoped call must not
         // leak another workspace's entities, INCLUDING its always-on ones
         // (always-on is the easiest cross-tenant exfiltration channel since it
         // injects unconditionally).
@@ -24666,7 +24667,7 @@ mod tests {
         );
         assert!(capped.len() <= 5 && !capped.is_empty());
 
-        // Unbounded (what MIMIR_DENSE_MAX_SCAN=0 resolves to): exact recall.
+        // Unbounded (what PERSEUS_VAULT_DENSE_MAX_SCAN=0 resolves to): exact recall.
         let exact = db
             .dense_search_scan_bounded(&query, 5, i64::MAX as usize)
             .unwrap();
@@ -25029,7 +25030,7 @@ mod tests {
 
     #[test]
     fn pure_1bit_no_rerank_returns_hamming_order() {
-        // #630: DenseOpts.rerank = Some(false) (env MIMIR_DENSE_SIG_RERANK=0)
+        // #630: DenseOpts.rerank = Some(false) (env PERSEUS_VAULT_DENSE_SIG_RERANK=0)
         // must return the 1-bit Hamming-pool order directly — no exact-cosine
         // rerank. Defining property: results are ordered by NON-DECREASING
         // Hamming distance from the query signature. The default (rerank on)
@@ -25340,7 +25341,7 @@ mod tests {
         // Create a temp key file with a generated key
         let key = EncryptionManager::generate_key();
         let key_dir = std::env::temp_dir();
-        let key_path = key_dir.join(format!("mimir-test-key-{}.key", uuid::Uuid::new_v4()));
+        let key_path = key_dir.join(format!("perseus_vault-test-key-{}.key", uuid::Uuid::new_v4()));
         let key_path_str = key_path.to_str().unwrap().to_string();
 
         let mut f = std::fs::File::create(&key_path).unwrap();
@@ -25460,7 +25461,7 @@ mod tests {
         let (mut db, path) = temp_db();
         let key = EncryptionManager::generate_key();
         let key_path =
-            std::env::temp_dir().join(format!("mimir-test-key-{}.key", uuid::Uuid::new_v4()));
+            std::env::temp_dir().join(format!("perseus_vault-test-key-{}.key", uuid::Uuid::new_v4()));
         let mut f = std::fs::File::create(&key_path).unwrap();
         f.write_all(key.as_bytes()).unwrap();
         drop(f);
@@ -25533,7 +25534,7 @@ mod tests {
 
     #[test]
     fn reindex_fts_indexes_plaintext_under_encryption() {
-        // Regression: reindex_fts (the mimir_reindex recovery tool) must repopulate
+        // Regression: reindex_fts (the perseus_vault_reindex recovery tool) must repopulate
         // the FTS5 index with PLAINTEXT even on an encrypted DB. Previously it did a
         // raw INSERT … SELECT body_json, copying ciphertext into FTS and silently
         // breaking all keyword/hybrid search until re-ingest.
@@ -25543,7 +25544,7 @@ mod tests {
         let (mut db, path) = temp_db();
         let key = EncryptionManager::generate_key();
         let key_path = std::env::temp_dir()
-            .join(format!("mimir-test-key-{}.key", uuid::Uuid::new_v4()));
+            .join(format!("perseus_vault-test-key-{}.key", uuid::Uuid::new_v4()));
         let mut f = std::fs::File::create(&key_path).unwrap();
         f.write_all(key.as_bytes()).unwrap();
         drop(f);
@@ -26671,7 +26672,8 @@ mod tests {
         let _ = fs::remove_file(&path);
     }
 
-    // ─── mimir_dream (#364) ──────────────────────────────────────
+    // ─── perseus_vault_dream (#364) ──────────────────────────────────────
+
     // All dream tests inject a stub at the LLM boundary
     // (dream_with_llm) — deterministic, zero network.
 
@@ -26769,7 +26771,7 @@ mod tests {
             stored.layer, "working",
             "insights live in the canonical 'semantic' storage layer"
         );
-        assert_eq!(stored.source, "mimir_dream");
+        assert_eq!(stored.source, "perseus_vault_dream");
         assert!(stored.tags.contains(&"dream".to_string()));
         assert!(stored.tags.contains(&"derived".to_string()));
         assert_eq!(stored.links.len(), 3, "evidence_for link to EVERY source");
@@ -26989,7 +26991,7 @@ mod tests {
         // both the config flag and the non-LLM alternative.
         let err = db.dream(&dream_params("episodes")).unwrap_err().to_string();
         assert!(err.contains("--llm-endpoint"), "got: {err}");
-        assert!(err.contains("mimir_consolidate"), "got: {err}");
+        assert!(err.contains("perseus_vault_consolidate"), "got: {err}");
         let _ = fs::remove_file(&path);
     }
 
@@ -27402,7 +27404,7 @@ mod tests {
 
     #[test]
     fn fts5_bm25_capped_scan_matches_exact_plan_when_cap_covers_matches() {
-        // #589: the bounded-scan path (MIMIR_BM25_SCAN_CAP) must be an exact
+        // #589: the bounded-scan path (PERSEUS_VAULT_BM25_SCAN_CAP) must be an exact
         // no-op whenever the cap is >= the true match count — same rows, same
         // order, same scores as the exact two-phase plan — and must never
         // mutate access state. It is tested directly (not via the env var,
@@ -27944,7 +27946,7 @@ mod tests {
 
     #[test]
     fn handle_extract_from_text_returns_structured_items() {
-        // #234: the mimir_extract tool runs the local rule-based extractor over
+        // #234: the perseus_vault_extract tool runs the local rule-based extractor over
         // provided text and returns structured items without touching the store.
         let (db, _path) = temp_db();
         let args = serde_json::json!({
@@ -28008,11 +28010,11 @@ mod tests {
 
     #[test]
     fn handle_ingest_file_stores_and_recalls_plaintext_document() {
-        // #236: mimir_ingest_file extracts a document's text locally and stores it
+        // #236: perseus_vault_ingest_file extracts a document's text locally and stores it
         // as a normal, recallable entity. Plaintext works without the multimodal
         // feature.
         let (db, _path) = temp_db();
-        let p = std::env::temp_dir().join(format!("mimir-ingest-{}.md", uuid::Uuid::new_v4()));
+        let p = std::env::temp_dir().join(format!("perseus_vault-ingest-{}.md", uuid::Uuid::new_v4()));
         std::fs::write(&p, "# Notes\n\nThe widget API uses cursor pagination.").unwrap();
 
         let out = crate::tools::handle_ingest_file(
@@ -29070,7 +29072,7 @@ mod tests {
             db.set_embed_queue_cap(cap);
         }
         let missing = std::env::temp_dir()
-            .join(format!("mimir-no-model-{}", uuid::Uuid::new_v4()))
+            .join(format!("perseus_vault-no-model-{}", uuid::Uuid::new_v4()))
             .join("model.onnx");
         db.set_embedding_model(missing.to_str().unwrap());
         let (port, accepted) = spawn_fake_embed_server(delay);
@@ -29318,7 +29320,7 @@ mod tests {
     /// The write transaction clears the stored embedding on content change, so
     /// embed lag/drop means ABSENT (row drops out of dense search; keyword
     /// still finds it), never STALE — and the cleared row is genuinely
-    /// repairable by `mimir_embed` batch mode (`WHERE embedding IS NULL`).
+    /// repairable by `perseus_vault_embed` batch mode (`WHERE embedding IS NULL`).
     /// Pre-fix this failed both ways: the old body's vector survived the
     /// dropped job, and batch mode reported embedded: 0 (nothing was NULL).
     #[test]
@@ -29452,7 +29454,7 @@ mod tests {
         // whole batch (or spinning a caller looping "until 0 embedded").
         let (mut db, path) = temp_db();
         let missing = std::env::temp_dir()
-            .join(format!("mimir-no-model-{}", uuid::Uuid::new_v4()))
+            .join(format!("perseus_vault-no-model-{}", uuid::Uuid::new_v4()))
             .join("model.onnx");
         db.set_embedding_model(missing.to_str().unwrap());
         // A live endpoint that REJECTS every request (HTTP 500). Deterministic:
@@ -30860,7 +30862,7 @@ mod tests {
         let _ = fs::remove_file(&path);
     }
 
-    /// #398: mimir_stats surfaces history growth — rows, stored bytes, and
+    /// #398: perseus_vault_stats surfaces history growth — rows, stored bytes, and
     /// the hot keys by version count.
     #[test]
     fn stats_report_history_rows_bytes_and_top_keys() {
@@ -31511,7 +31513,7 @@ mod tests {
         // erased value — the decoupled governance overlay keeps suppressing.
         let dir = std::env::temp_dir();
         let path = dir
-            .join(format!("mimir-erase-rollback-{}.db", uuid::Uuid::new_v4().simple()))
+            .join(format!("perseus_vault-erase-rollback-{}.db", uuid::Uuid::new_v4().simple()))
             .to_string_lossy()
             .to_string();
         let body = r#"{"content":"erased before rollback"}"#;

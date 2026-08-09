@@ -54,7 +54,7 @@ breaks verification.
      `authority_profile` — signer fingerprint, payload digest, outcome);
   4. any failure returns `SIGNED_PROFILE_REJECTED` and grants **no**
      authority — no manifest row is written, nothing takes effect.
-- MCP surface: `mimir_authority_set_signed` / `perseus_vault_authority_set_signed`.
+- MCP surface: `perseus_vault_authority_set_signed` / `perseus_vault_authority_set_signed`.
 
 ## Scope and non-goals
 

@@ -6,7 +6,7 @@ waiting for a scheduled harvest to notice. This is the capture pipeline:
 one code path exposed two ways —
 
 - **CLI:** `perseus-vault capture` (stdin or `--file`)
-- **MCP:** `perseus_vault_capture` (aliases `mimir_capture`, `mneme_capture`)
+- **MCP:** `perseus_vault_capture` (aliases `perseus_vault_capture`, `perseus_vault_capture`)
 
 **Off by default, local-first.** Nothing captures automatically: no config
 flag turns this on in the background, and the default distiller makes zero
@@ -25,7 +25,7 @@ your local SQLite database.
    recall.
 2. **Classifies** each note by cheap local signals into an entity type:
    `root-cause` (a failure plus its diagnosis), `pitfall` (a failure to
-   avoid — markers aligned with the `mimir_check_failure_pattern` deja-vu
+   avoid — markers aligned with the `perseus_vault_check_failure_pattern` deja-vu
    guard, #521, so captured pitfalls are findable by it), `decision`,
    `pattern`, or `takeaway`.
 3. **Keys** each note with a stable slug of its summary line, and
@@ -56,7 +56,7 @@ some-agent --dump-session | perseus-vault capture
 perseus-vault capture --file transcript.jsonl --workspace-hash ws-myproj --dry-run
 
 # Optional LLM distillation (falls back to the rule-based path on ANY
-# LLM failure or timeout — see MIMIR_LLM_TIMEOUT_SECS, #528)
+# LLM failure or timeout — see PERSEUS_VAULT_LLM_TIMEOUT_SECS, #528)
 perseus-vault capture --file notes.md --llm \
   --llm-endpoint http://localhost:11434/api/generate --llm-model llama3
 ```
@@ -117,11 +117,11 @@ semantics are "persist what was learned, then groom".)
 ## The LLM path is optional, the rule-based path is the floor
 
 The default distiller is pure, deterministic Rust — the same air-gapped
-bar as `mimir_extract` (#234). With `llm: true` / `--llm`, the configured
+bar as `perseus_vault_extract` (#234). With `llm: true` / `--llm`, the configured
 endpoint is asked to distill instead (strict-JSON contract; unknown entity
 types degrade to `takeaway` — model output is untrusted). On **any** LLM
 failure — endpoint not configured, transport error, timeout
-(`MIMIR_LLM_TIMEOUT_SECS`, default 30s), or unparseable output — the
+(`PERSEUS_VAULT_LLM_TIMEOUT_SECS`, default 30s), or unparseable output — the
 pipeline falls back to the rule-based distiller and says so in the
 report's `llm_fallback` field. A capture invocation never comes back
 empty-handed because a model was slow, down, or chatty.

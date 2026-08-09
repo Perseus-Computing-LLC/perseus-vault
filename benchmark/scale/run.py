@@ -8,7 +8,7 @@ and measures, at each size N:
     so non-linear degradation is visible, not averaged away
   - batch embed throughput (bundled ONNX, no network) — the dense-index build cost
   - recall latency p50/p95/p99 for fts5 / dense / hybrid modes
-  - bi-temporal point-lookup latency (`mimir_as_of`) and transaction-time
+  - bi-temporal point-lookup latency (`perseus_vault_as_of`) and transaction-time
     reconstruction recall (`as_of_unix_ms`) — the differentiator must stay fast
   - DB + index size on disk
   - cold start: process spawn + initialize + first recall, on the loaded DB
@@ -54,14 +54,14 @@ WORDS = ("service latency schema deploy index queue worker retry cache shard "
 
 
 def find_binary(explicit):
-    cands = [explicit, os.environ.get("MIMIR_BIN")]
-    for name in ("perseus-vault", "mneme", "mimir"):
+    cands = [explicit, os.environ.get("PERSEUS_VAULT_BIN")]
+    for name in ("perseus-vault",):
         exe = f"{name}.exe" if os.name == "nt" else name
         cands += [str(REPO / "target" / "release" / exe), str(REPO / "target" / "debug" / exe)]
     for c in cands:
         if c and Path(c).exists():
             return str(Path(c).resolve())
-    sys.exit("error: perseus-vault binary not found (build it or pass --bin / set MIMIR_BIN).")
+    sys.exit("error: perseus-vault binary not found (build it or pass --bin / set PERSEUS_VAULT_BIN).")
 
 
 class Vault:
@@ -163,7 +163,7 @@ def run_size(binary, n, queries, skip_embed, keep_db=False):
         t_first = t_last = None
         as_of_probe_ms = None
         for i in range(n):
-            v.call("mimir_remember", {
+            v.call("perseus_vault_remember", {
                 "category": CATEGORIES[i % len(CATEGORIES)],
                 "key": f"scale-{i}",
                 "body_json": body_for(i, rng),
@@ -197,7 +197,7 @@ def run_size(binary, n, queries, skip_embed, keep_db=False):
             embedded = 0
             for cat in CATEGORIES:
                 while True:
-                    rep = v.call("mimir_embed", {"batch_category": cat, "batch_limit": 5000})
+                    rep = v.call("perseus_vault_embed", {"batch_category": cat, "batch_limit": 5000})
                     got = int(rep.get("embedded", 0) or 0) if isinstance(rep, dict) else 0
                     embedded += got
                     if got < 5000:
@@ -211,7 +211,7 @@ def run_size(binary, n, queries, skip_embed, keep_db=False):
                 # (fast machines / small corpora), leaving the batch pass
                 # nothing to do — dense coverage exists even though this
                 # backfill embedded 0. Probe instead of gating on the batch.
-                probe = v.call("mimir_recall", {"query": "entity 1 group 1",
+                probe = v.call("perseus_vault_recall", {"query": "entity 1 group 1",
                                                 "mode": "dense", "limit": 1})
                 if isinstance(probe, dict) and probe.get("items"):
                     embedded = -1  # sentinel: coverage via auto-embed
@@ -225,7 +225,7 @@ def run_size(binary, n, queries, skip_embed, keep_db=False):
             for q in range(queries):
                 term = f"entity {rng.randrange(n)} group {rng.randrange(977)}"
                 t0 = time.perf_counter()
-                v.call("mimir_recall", {"query": term, "mode": mode, "limit": 10})
+                v.call("perseus_vault_recall", {"query": term, "mode": mode, "limit": 10})
                 times.append((time.perf_counter() - t0) * 1000)
             out["recall"][mode] = lat_summary(times)
             print(f"[{n:,}] recall {mode}: p50={out['recall'][mode]['p50_ms']}ms "
@@ -236,7 +236,7 @@ def run_size(binary, n, queries, skip_embed, keep_db=False):
         for q in range(queries):
             i = rng.randrange(n)
             t0 = time.perf_counter()
-            v.call("mimir_as_of", {"category": CATEGORIES[i % len(CATEGORIES)],
+            v.call("perseus_vault_as_of", {"category": CATEGORIES[i % len(CATEGORIES)],
                                    "key": f"scale-{i}",
                                    "as_of_unix_ms": as_of_probe_ms + 10_000_000_000})
             times.append((time.perf_counter() - t0) * 1000)
@@ -245,7 +245,7 @@ def run_size(binary, n, queries, skip_embed, keep_db=False):
         for q in range(queries):
             term = f"entity {rng.randrange(n)}"
             t0 = time.perf_counter()
-            v.call("mimir_recall", {"query": term, "mode": "fts5", "limit": 10,
+            v.call("perseus_vault_recall", {"query": term, "mode": "fts5", "limit": 10,
                                     "as_of_unix_ms": as_of_probe_ms + 10_000_000_000})
             times.append((time.perf_counter() - t0) * 1000)
         out["temporal_recall"] = lat_summary(times)
@@ -253,7 +253,7 @@ def run_size(binary, n, queries, skip_embed, keep_db=False):
               f"temporal recall p50={out['temporal_recall']['p50_ms']}ms", flush=True)
 
         # ── 5. Size + integrity ──
-        stats = v.call("mimir_stats", {})
+        stats = v.call("perseus_vault_stats", {})
         out["db"] = {"file_bytes": stats.get("db_file_size_bytes"),
                      "file_mb": round((stats.get("db_file_size_bytes") or 0) / 1048576, 1),
                      "active_entities": stats.get("active_entities",
@@ -266,7 +266,7 @@ def run_size(binary, n, queries, skip_embed, keep_db=False):
     for _ in range(3):
         t0 = time.perf_counter()
         v2 = Vault(binary, db)
-        v2.call("mimir_recall", {"query": "entity 1 group 1", "mode": "fts5", "limit": 5})
+        v2.call("perseus_vault_recall", {"query": "entity 1 group 1", "mode": "fts5", "limit": 5})
         trials.append((time.perf_counter() - t0) * 1000)
         v2.close()
     out["cold_start"] = {"first_query_ms_min": round(min(trials), 1),

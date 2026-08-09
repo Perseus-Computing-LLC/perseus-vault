@@ -38,7 +38,7 @@ env:
   CARGO_TERM_COLOR: always
   # Same model-cache scheme as test.yml / recall-gate.yml: build.rs copies the
   # bundled embedding model from here instead of hitting HuggingFace.
-  MIMIR_BUNDLED_MODEL_DIR: ${{ github.workspace }}/.model-cache
+  PERSEUS_VAULT_BUNDLED_MODEL_DIR: ${{ github.workspace }}/.model-cache
 
 jobs:
   golden:

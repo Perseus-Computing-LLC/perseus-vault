@@ -21,11 +21,11 @@ them differently on purpose.
 |---|---|---|---|
 | `instruction` | A directive the operator expects the agent to follow. Scoped (global / workspace / repo). | entities with `always_on=true`, `recall_when` triggers, convention category | "Never store secrets in the Vault", "restart gateway via s6-svc" |
 | `preference` | A stable statement about how the user wants things done. Not an order, but a default. | user-profile style entities, preference-tagged insights | "prefers adversarial competitive intel", "concise responses" |
-| `correction` | A record that a prior approach or belief was wrong, with the right behavior. | `correction` category via `mimir_correct` | "BWS short values are stale keys, not truncation" |
-| `episode` | A dated account of what happened in a session or operation. Ephemeral-to-working by nature. | `capture` category, journal entries | "Plutus redeploy 2026-07-20 went 21:55Z→23:19Z" |
-| `observation` | A consolidated, evidence-tracked fact merged from overlapping sources. | `observation` category via `mimir_consolidate` | merged Stripe hygiene facts |
-| `semantic` | A durable fact about the world or the estate, not tied to one episode. | `knowledge`/`operations` categories | "Mneme auth is a single static bearer token" |
-| `insight` | A synthesized higher-order pattern derived from other memories. | `insight` type, `mimir_dream` outputs | "deploy windows drop Stripe webhooks" |
+| `correction` | A record that a prior approach or belief was wrong, with the right behavior. | `correction` category via `perseus_vault_correct` | "BWS short values are stale keys, not truncation" |
+| `episode` | A dated account of what happened in a session or operation. Ephemeral-to-working by nature. | `capture` category, journal entries | "Ledger redeploy 2026-07-20 went 21:55Z→23:19Z" |
+| `observation` | A consolidated, evidence-tracked fact merged from overlapping sources. | `observation` category via `perseus_vault_consolidate` | merged Stripe hygiene facts |
+| `semantic` | A durable fact about the world or the estate, not tied to one episode. | `knowledge`/`operations` categories | "Perseus Vault auth is a single static bearer token" |
+| `insight` | A synthesized higher-order pattern derived from other memories. | `insight` type, `perseus_vault_dream` outputs | "deploy windows drop Stripe webhooks" |
 | `anchor` | A pointer from a memory to an external system of record. | links, `external_refs` (see provenance spec) | Jira key, repo/PR, file path, session id |
 | `belief` *(overlay class)* | A claim plus its evidence, confidence, scope, and supersession state — see §5. | derived over existing entities | "GitHub auth from Cloud works" |
 
@@ -101,13 +101,13 @@ These rules are absolute, not tie-breakers:
 
 ## 4. Interactions with consolidation, correction, and supersession
 
-- **Consolidation** (`mimir_consolidate`, `mimir_dream`) produces
+- **Consolidation** (`perseus_vault_consolidate`, `perseus_vault_dream`) produces
   `observation` / `insight` class entities. Sources keep their class; the
   product's class is the *highest-precedence class among its sources*,
   capped at insight (a consolidation never manufactures a correction or
   instruction).
 - **Correction** creates a tier-1 entity and SHOULD supersede the entity it
-  corrects (`mimir_supersede`), which closes the old entity's valid period
+  corrects (`perseus_vault_supersede`), which closes the old entity's valid period
   and demotes it per R4.
 - **Supersession** changes the *active view* while preserving history:
   superseded entities remain queryable via `as_of`/`valid_at` and appear in
@@ -138,7 +138,7 @@ Derivation rules:
 - Entities linked `evidence_for` / `derived_from` the same subject fold
   into one belief; `support_count` is the cardinality of that set.
 - A `correction` on the subject creates a successor belief and sets
-  `superseded_by` on the old one; `mimir_supersede` provides the storage
+  `superseded_by` on the old one; `perseus_vault_supersede` provides the storage
   primitive.
 - `last_revalidated_at` updates on any retrieval reinforcement of a
   supporting entity.
@@ -155,7 +155,7 @@ precedence model.
 
 - **No storage-engine change and no schema migration.** Classes map onto
   existing `type`/`category`; belief is derived, not stored.
-- `mimir_remember` SHOULD accept an optional `memory_class` hint; absent
+- `perseus_vault_remember` SHOULD accept an optional `memory_class` hint; absent
   that, classifiers map from category/type as in §1.
 - Recall/context tools SHOULD surface `memory_class` and the precedence
   tier actually applied, behind an opt-in explanation flag (see

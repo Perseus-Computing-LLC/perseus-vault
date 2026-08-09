@@ -84,7 +84,7 @@ FP16/BF16 or MiniLM re-run of the ladder is the (pending) model-weight axis.
 ## The rerank does the denoising {#the-rerank-does-the-denoising}
 
 `pure_1bit_hamming_only` is the shipped 1-bit tier with the phase-2 exact-cosine
-rerank turned off (`DenseOpts.rerank` / `MIMIR_DENSE_SIG_RERANK=0`; default ON,
+rerank turned off (`DenseOpts.rerank` / `PERSEUS_VAULT_DENSE_SIG_RERANK=0`; default ON,
 default path byte-identical). Measured on the same 1M corpus/instance:
 
 | | dense r@1 | r@5 | r@10 | p50 |
@@ -125,7 +125,7 @@ pure-prefilter r@5 + 0.2; (4) provenance — every measured tier cites a source
 with a recorded SHA-256.
 
 The `pure_1bit_hamming_only` row is reproduced by rerunning the retrieval harness
-on the embedded corpus with `MIMIR_DENSE_SIG_RERANK=0` (`scale1m_pure1bit.json`).
+on the embedded corpus with `PERSEUS_VAULT_DENSE_SIG_RERANK=0` (`scale1m_pure1bit.json`).
 
 ## Source artifacts
 

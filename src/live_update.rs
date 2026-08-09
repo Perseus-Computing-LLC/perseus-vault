@@ -12,7 +12,7 @@
 //!    mtime) once at startup; compare against the current on-disk file on
 //!    every tool call (one `stat`).
 //! 2. **Fail loud** — when stale, every tool except the handoff tool itself
-//!    and `mimir_health` (which reports the staleness in its payload) returns
+//!    and `perseus_vault_health` (which reports the staleness in its payload) returns
 //!    an explicit `isError` result instead of silently serving stale results.
 //!    Override for one-off diagnostics: `PERSEUS_VAULT_IGNORE_STALE_BINARY=1`.
 //! 3. **Hot-swap handoff** — `perseus_vault_handoff_restart` spawns the
@@ -138,7 +138,7 @@ fn stale_message_for(stale: bool, tool: &str, ignore: bool) -> Option<String> {
     if !stale || ignore {
         return None;
     }
-    if tool == "mimir_handoff_restart" || tool == "mimir_health" {
+    if tool == "perseus_vault_handoff_restart" || tool == "perseus_vault_health" {
         return None;
     }
     let pid = std::process::id();
@@ -155,7 +155,7 @@ fn stale_message_for(stale: bool, tool: &str, ignore: bool) -> Option<String> {
 }
 
 /// Fail-loud gate for the MCP dispatch: when the binary was replaced
-/// mid-session, every tool except the handoff tool itself (and `mimir_health`,
+/// mid-session, every tool except the handoff tool itself (and `perseus_vault_health`,
 /// which reports the staleness in its payload) refuses with an explicit error
 /// — never a silent empty result (#858).
 pub fn stale_error_message(tool: &str) -> Option<String> {
@@ -192,7 +192,7 @@ pub fn perform_handoff() -> Result<(), String> {
         .spawn()
         .map_err(|e| format!("spawn {}: {e}", path.display()))?;
     eprintln!(
-        "mimir: handoff spawned child pid {} ({}) — old process exiting",
+        "perseus-vault: handoff spawned child pid {} ({}) — old process exiting",
         child.id(),
         path.display()
     );
@@ -245,7 +245,7 @@ fn handoff_report_for(stale: bool, dry_run: bool, confirm: bool) -> Value {
     report
 }
 
-/// #858: `mimir_handoff_restart` — explicit session-local reconnect.
+/// #858: `perseus_vault_handoff_restart` — explicit session-local reconnect.
 ///
 /// - binary unchanged → `no_handoff_needed` (identity report included)
 /// - stale + `dry_run` → `dry_run` report of what would happen
@@ -320,14 +320,14 @@ mod tests {
 
     #[test]
     fn stale_gate_blocks_all_but_handoff_and_health() {
-        assert!(stale_message_for(true, "mimir_recall", false).is_some());
+        assert!(stale_message_for(true, "perseus_vault_recall", false).is_some());
         assert!(stale_message_for(true, "perseus_vault_remember", false).is_some());
         // The recovery tools themselves stay callable.
-        assert!(stale_message_for(true, "mimir_handoff_restart", false).is_none());
-        assert!(stale_message_for(true, "mimir_health", false).is_none());
+        assert!(stale_message_for(true, "perseus_vault_handoff_restart", false).is_none());
+        assert!(stale_message_for(true, "perseus_vault_health", false).is_none());
         // Not stale → no gate; ignore override → no gate.
-        assert!(stale_message_for(false, "mimir_recall", false).is_none());
-        assert!(stale_message_for(true, "mimir_recall", true).is_none());
+        assert!(stale_message_for(false, "perseus_vault_recall", false).is_none());
+        assert!(stale_message_for(true, "perseus_vault_recall", true).is_none());
     }
 
     #[test]

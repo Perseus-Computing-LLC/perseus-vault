@@ -25,7 +25,7 @@ perseus-vault --version
 ### 2. Create a data directory
 
 ```bash
-mkdir -p ~/.mimir/data
+mkdir -p ~/.perseus-vault/data
 ```
 
 ### 3. Configure Cursor
@@ -41,7 +41,7 @@ mkdir -p ~/.mimir/data
    - **Name:** `Perseus Vault`
    - **Command:**
      ```
-     perseus-vault --db /home/YOUR_USER/.mimir/data/perseus-vault.db
+     perseus-vault --db /home/YOUR_USER/.perseus-vault/data/perseus-vault.db
      ```
      (Use absolute paths — `~` may not expand correctly)
 6. Click **Save**
@@ -55,7 +55,7 @@ Create or edit `~/.cursor/mcp.json`:
   "mcpServers": {
     "perseus-vault": {
       "command": "perseus-vault",
-      "args": ["--db", "/home/YOUR_USER/.mimir/data/perseus-vault.db"]
+      "args": ["--db", "/home/YOUR_USER/.perseus-vault/data/perseus-vault.db"]
     }
   }
 }
@@ -64,7 +64,7 @@ Create or edit `~/.cursor/mcp.json`:
 ### 4. Verify
 
 1. Open Cursor Settings → Features → MCP
-2. Look for the Mimir entry — it should show a green **"Connected"** indicator
+2. Look for the Perseus Vault entry — it should show a green **"Connected"** indicator
 3. Open a Chat or Composer session and ask:
 
 > Use Perseus Vault to check if you have any stored context for this project.
@@ -83,11 +83,11 @@ copy-paste snippets.
 > Remember that I prefer React Server Components over client-side fetching
 > for this project.
 
-Cursor will call `mimir_remember` via MCP.
+Cursor will call `perseus_vault_remember` via MCP.
 
 > What did I say about data fetching patterns?
 
-Cursor will call `mimir_recall`.
+Cursor will call `perseus_vault_recall`.
 
 ### In Composer / Agent mode
 
@@ -102,25 +102,25 @@ Cursor remembers context within a session. Perseus Vault adds cross-session memo
 
 > Before I start coding today, recall what we were working on last time.
 
-Perseus Vault returns the context block from `mimir_context`, which includes recent
+Perseus Vault returns the context block from `perseus_vault_context`, which includes recent
 entities, decisions, and architecture notes.
 
 ### Project-specific memory
 
-Create a `.mimir/` directory in your project and configure Cursor to use it:
+Create a `.perseus-vault/` directory in your project and configure Cursor to use it:
 
 ```json
 {
   "mcpServers": {
     "perseus-vault": {
       "command": "perseus-vault",
-      "args": ["--db", "/home/YOU/projects/my-app/.mimir/perseus-vault.db"]
+      "args": ["--db", "/home/YOU/projects/my-app/.perseus-vault/perseus-vault.db"]
     }
   }
 }
 ```
 
-This keeps project memories isolated. Add `.mimir/perseus-vault.db` to `.gitignore`.
+This keeps project memories isolated. Add `.perseus-vault/perseus-vault.db` to `.gitignore`.
 
 ## Troubleshooting
 
@@ -136,7 +136,7 @@ This keeps project memories isolated. Add `.mimir/perseus-vault.db` to `.gitigno
 
 1. Run Perseus Vault manually to check for startup errors:
    ```bash
-   perseus-vault --db ~/.mimir/data/perseus-vault.db
+   perseus-vault --db ~/.perseus-vault/data/perseus-vault.db
    ```
    It should hang waiting for stdin. If it exits, there's a startup error.
 
@@ -160,7 +160,7 @@ Cursor's agent discovers tools on session start. After connecting Perseus Vault:
 
 1. Start a new Chat or Composer session
 2. Ask: "List all available tools"
-3. Verify `mimir_remember`, `mimir_recall`, etc. appear
+3. Verify `perseus_vault_remember`, `perseus_vault_recall`, etc. appear
 
 If they don't appear, reload the window (`Cmd+Shift+P` → "Developer: Reload Window").
 
@@ -169,7 +169,7 @@ If they don't appear, reload the window (`Cmd+Shift+P` → "Developer: Reload Wi
 ### Encryption at rest
 
 ```bash
-perseus-vault keygen --key-file ~/.mimir/secret.key
+perseus-vault keygen --key-file ~/.perseus-vault/secret.key
 ```
 
 Then configure Cursor to use the encrypted database:
@@ -180,8 +180,8 @@ Then configure Cursor to use the encrypted database:
     "perseus-vault": {
       "command": "perseus-vault",
       "args": [
-        "--db", "/home/YOU/.mimir/data/perseus-vault.db",
-        "--encryption-key", "/home/YOU/.mimir/secret.key"
+        "--db", "/home/YOU/.perseus-vault/data/perseus-vault.db",
+        "--encryption-key", "/home/YOU/.perseus-vault/secret.key"
       ]
     }
   }
@@ -193,7 +193,7 @@ Then configure Cursor to use the encrypted database:
 Perseus Vault includes a web dashboard. Run it alongside Cursor:
 
 ```bash
-perseus-vault --db ~/.mimir/data/perseus-vault.db --web --port 8767
+perseus-vault --db ~/.perseus-vault/data/perseus-vault.db --web --port 8767
 ```
 
 Open `http://localhost:8767` to browse entities, search, view journal events,
@@ -216,7 +216,7 @@ Then in your Perseus Vault config, configure the LLM endpoint and model:
     "perseus-vault": {
       "command": "perseus-vault",
       "args": [
-        "--db", "/home/YOU/.mimir/data/perseus-vault.db",
+        "--db", "/home/YOU/.perseus-vault/data/perseus-vault.db",
         "--llm-endpoint", "http://localhost:11434/api/generate",
         "--llm-model", "nomic-embed-text"
       ]
@@ -225,9 +225,9 @@ Then in your Perseus Vault config, configure the LLM endpoint and model:
 }
 ```
 
-> **Note:** `--llm-model` sets the model for BOTH embeddings and `mimir_ask`
-> (RAG). If you use `mimir_ask`, choose a model that supports both chat and
+> **Note:** `--llm-model` sets the model for BOTH embeddings and `perseus_vault_ask`
+> (RAG). If you use `perseus_vault_ask`, choose a model that supports both chat and
 > embeddings, or run a separate Perseus Vault instance for each.
 
-With embeddings enabled, `mimir_recall` with `mode: "hybrid"` combines
+With embeddings enabled, `perseus_vault_recall` with `mode: "hybrid"` combines
 keyword matching with semantic similarity for better recall.

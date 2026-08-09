@@ -6,7 +6,7 @@ enumerates every mode in one place: what it is, when to reach for it, how to
 invoke it, and a minimal example.
 
 > **Tool names.** The canonical MCP tool prefix is `perseus_vault_*` (the legacy
-> `mimir_*` / `mneme_*` aliases remain callable). CLI verbs are shown as
+> `perseus_vault_*` / `perseus_vault_*` aliases remain callable). CLI verbs are shown as
 > `perseus-vault <verb>`.
 
 ## At a glance
@@ -68,7 +68,7 @@ Proactive recall (no query — `recall_when` triggers + context match). Availabl
 as the `perseus_vault_recall_when` tool, and pre-turn via the CLI `prepare` verb:
 
 ```bash
-perseus-vault prepare --db mimir.db "editing the audit-chain module"
+perseus-vault prepare --db perseus_vault.db "editing the audit-chain module"
 ```
 
 Temporal point-in-time (what a fact looked like at an instant):

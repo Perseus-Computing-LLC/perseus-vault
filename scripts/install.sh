@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Perseus Vault (formerly "Mneme"/"Mimir") one-line installer
+# Perseus Vault one-line installer
 # Usage: curl -sSf https://raw.githubusercontent.com/Perseus-Computing-LLC/perseus-vault/main/scripts/install.sh | sh
 #
 # Prebuilt binaries (published as .tar.gz + .sha256):
@@ -18,8 +18,8 @@ RED="\033[31m"
 RESET="\033[0m"
 
 REPO="Perseus-Computing-LLC/perseus-vault"
-BIN_DIR="${MIMIR_INSTALL_DIR:-$HOME/.local/bin}"
-VERSION="${MIMIR_VERSION:-latest}"
+BIN_DIR="${PERSEUS_VAULT_INSTALL_DIR:-$HOME/.local/bin}"
+VERSION="${PERSEUS_VAULT_VERSION:-latest}"
 
 echo -e "${BOLD}Perseus Vault Installer${RESET}"
 echo "Persistent memory for AI agents — MCP-native, local-first, zero dependencies."
@@ -49,10 +49,10 @@ case "${OS}/${ARCH}" in
     *)                           no_prebuilt "${OS}/${ARCH}" ;;
 esac
 
-# Pre-rename asset names for older pinned versions (MIMIR_VERSION=<old tag>),
+# Pre-rename asset names for older pinned versions (PERSEUS_VAULT_VERSION=<old tag>),
 # newest first. Best-effort: tried only if the current name 404s.
 SUFFIX="${ASSET_BASE#perseus-vault-}"
-LEGACY_BASES="mneme-${SUFFIX} mimir-${SUFFIX}"
+LEGACY_BASES="perseus_vault-${SUFFIX} perseus_vault-${SUFFIX}"
 
 release_url() {  # release_url <filename> → full download URL
     if [ "$VERSION" = "latest" ]; then
@@ -153,10 +153,6 @@ fi
 mkdir -p "$BIN_DIR"
 chmod +x "$BIN_SRC"
 mv "$BIN_SRC" "$BIN_DIR/perseus-vault"
-# Perseus Vault rename: keep "mneme" and "mimir" symlinks so existing MCP host
-# configs/scripts that invoke either older command name keep working unchanged.
-ln -sf "$BIN_DIR/perseus-vault" "$BIN_DIR/mneme"
-ln -sf "$BIN_DIR/perseus-vault" "$BIN_DIR/mimir"
 
 # macOS: ad-hoc code-sign so the binary is not killed on launch (#312). On Apple
 # Silicon an unsigned binary is SIGKILLed (Killed: 9) by the OS binary policy —
@@ -219,7 +215,7 @@ echo '  {'
 echo '    "mcpServers": {'
 echo '      "perseus-vault": {'
 echo '        "command": "'"$BIN_DIR"'/perseus-vault",'
-echo '        "args": ["serve", "--db", "~/.mimir/data/perseus-vault.db"]'
+echo '        "args": ["serve", "--db", "~/.perseus-vault/data/perseus-vault.db"]'
 echo '      }'
 echo '    }'
 echo '  }'

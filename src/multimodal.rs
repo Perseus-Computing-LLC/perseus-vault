@@ -1,15 +1,15 @@
 //! Local multimodal document text extraction (#236).
 //!
 //! Turns a document file into plain text for storage in memory, entirely
-//! locally — no cloud parsing API, no network — preserving Mneme's air-gapped
+//! locally — no cloud parsing API, no network — preserving Perseus Vault's air-gapped
 //! ethos. Plaintext / markdown / structured-text formats work in any build;
 //! **DOCX and PDF extraction is behind the optional `multimodal` feature** so the
 //! lean default binary stays dependency-free. Without the feature, requesting a
 //! docx/pdf returns a clear "rebuild with --features multimodal" error rather
 //! than failing opaquely.
 //!
-//! Two size bounds guard against denial-of-service: `MIMIR_MAX_INGEST_BYTES`
-//! caps the on-disk file, and `MIMIR_MAX_DECOMPRESSED_BYTES` caps the bytes read
+//! Two size bounds guard against denial-of-service: `PERSEUS_VAULT_MAX_INGEST_BYTES`
+//! caps the on-disk file, and `PERSEUS_VAULT_MAX_DECOMPRESSED_BYTES` caps the bytes read
 //! out of a DOCX (a DEFLATE zip whose entries can decompress far past the on-disk
 //! cap — a zip bomb). See `extract_docx_limited`.
 
@@ -21,8 +21,8 @@ const PLAINTEXT_EXTS: &[&str] = &[
     "toml", "log", "xml", "htm", "html", "tex", "org",
 ];
 
-/// Default cap on the on-disk size of a file ingested via `mimir_ingest_file`,
-/// overridable with `MIMIR_MAX_INGEST_BYTES` (bytes; 0/invalid → default). The
+/// Default cap on the on-disk size of a file ingested via `perseus_vault_ingest_file`,
+/// overridable with `PERSEUS_VAULT_MAX_INGEST_BYTES` (bytes; 0/invalid → default). The
 /// extracted text is materialized in memory and then copied into a
 /// JSON body and the FTS index, so an unbounded read is an OOM / denial-of-service
 /// vector. Enforced before any file read (and before zip/pdf parsing, which can
@@ -30,7 +30,7 @@ const PLAINTEXT_EXTS: &[&str] = &[
 const DEFAULT_MAX_INGEST_BYTES: u64 = 50 * 1024 * 1024; // 50 MiB
 
 fn max_ingest_bytes() -> u64 {
-    std::env::var("MIMIR_MAX_INGEST_BYTES")
+    std::env::var("PERSEUS_VAULT_MAX_INGEST_BYTES")
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
         .filter(|&n| n > 0)
@@ -38,7 +38,7 @@ fn max_ingest_bytes() -> u64 {
 }
 
 /// Default cap on the DECOMPRESSED size of a container entry (currently a DOCX's
-/// `word/document.xml`), overridable with `MIMIR_MAX_DECOMPRESSED_BYTES`. This is
+/// `word/document.xml`), overridable with `PERSEUS_VAULT_MAX_DECOMPRESSED_BYTES`. This is
 /// a SEPARATE limit from `max_ingest_bytes`: a DOCX is a DEFLATE zip, so a small
 /// on-disk file (within the ingest cap) can decompress to many GB — a classic zip
 /// bomb. The on-disk cap cannot bound that; this one does, by capping the bytes
@@ -49,7 +49,7 @@ const DEFAULT_MAX_DECOMPRESSED_BYTES: u64 = 256 * 1024 * 1024; // 256 MiB
 
 #[cfg(feature = "multimodal")]
 fn max_decompressed_bytes() -> u64 {
-    std::env::var("MIMIR_MAX_DECOMPRESSED_BYTES")
+    std::env::var("PERSEUS_VAULT_MAX_DECOMPRESSED_BYTES")
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
         .filter(|&n| n > 0)
@@ -64,7 +64,7 @@ fn enforce_ingest_size(path: &Path, max_bytes: u64) -> Result<(), String> {
     if len > max_bytes {
         return Err(format!(
             "{}: file is {} bytes, exceeding the {}-byte ingest limit \
-             (raise MIMIR_MAX_INGEST_BYTES to override)",
+             (raise PERSEUS_VAULT_MAX_INGEST_BYTES to override)",
             path.display(),
             len,
             max_bytes
@@ -147,7 +147,7 @@ fn extract_docx_limited(
         if xml.len() as u64 > max_decompressed {
             return Err(format!(
                 "{}: word/document.xml decompresses beyond the {}-byte limit \
-                 (possible zip bomb; raise MIMIR_MAX_DECOMPRESSED_BYTES to override)",
+                 (possible zip bomb; raise PERSEUS_VAULT_MAX_DECOMPRESSED_BYTES to override)",
                 path.display(),
                 max_decompressed
             ));
@@ -166,7 +166,7 @@ fn extract_pdf(path: &Path, max_bytes: u64) -> Result<String, String> {
     // The on-disk cap is the only bound available here: `pdf_extract` owns the
     // parse + FlateDecode decompression internally and exposes no streaming/limit
     // API, so a decompression-amplifying PDF is bounded only by its compressed
-    // input size (max_bytes), not its decompressed size. Lower MIMIR_MAX_INGEST_BYTES
+    // input size (max_bytes), not its decompressed size. Lower PERSEUS_VAULT_MAX_INGEST_BYTES
     // for untrusted PDF sources; a hard decompressed bound would require sandboxing
     // the parse (out of scope). DOCX, whose single entry we read ourselves, IS
     // decompressed-bounded — see extract_docx_limited.
@@ -244,7 +244,7 @@ mod tests {
     #[test]
     fn plaintext_is_read_directly() {
         let dir = std::env::temp_dir();
-        let p = dir.join(format!("mimir-mm-{}.md", uuid::Uuid::new_v4()));
+        let p = dir.join(format!("perseus_vault-mm-{}.md", uuid::Uuid::new_v4()));
         std::fs::File::create(&p)
             .unwrap()
             .write_all(b"# Title\n\nbody text")
@@ -257,7 +257,7 @@ mod tests {
     #[test]
     fn oversized_file_is_rejected_before_read() {
         let dir = std::env::temp_dir();
-        let p = dir.join(format!("mimir-mm-{}.txt", uuid::Uuid::new_v4()));
+        let p = dir.join(format!("perseus_vault-mm-{}.txt", uuid::Uuid::new_v4()));
         std::fs::File::create(&p)
             .unwrap()
             .write_all(b"hello world, this is more than ten bytes of text")
@@ -266,7 +266,7 @@ mod tests {
         // A cap smaller than the file is rejected with a clear, actionable error.
         let err = extract_text_limited(&p, 10).unwrap_err();
         assert!(err.contains("ingest limit"), "got: {err}");
-        assert!(err.contains("MIMIR_MAX_INGEST_BYTES"), "got: {err}");
+        assert!(err.contains("PERSEUS_VAULT_MAX_INGEST_BYTES"), "got: {err}");
 
         // A generous cap reads normally.
         let ok = extract_text_limited(&p, 10_000).unwrap();
@@ -335,7 +335,7 @@ mod tests {
     fn docx_roundtrip_via_zip() {
         use zip::write::SimpleFileOptions;
         let dir = std::env::temp_dir();
-        let p = dir.join(format!("mimir-mm-{}.docx", uuid::Uuid::new_v4()));
+        let p = dir.join(format!("perseus_vault-mm-{}.docx", uuid::Uuid::new_v4()));
         {
             let file = std::fs::File::create(&p).unwrap();
             let mut zw = zip::ZipWriter::new(file);
@@ -356,7 +356,7 @@ mod tests {
     fn docx_decompression_bomb_is_rejected() {
         use zip::write::SimpleFileOptions;
         let dir = std::env::temp_dir();
-        let p = dir.join(format!("mimir-mm-bomb-{}.docx", uuid::Uuid::new_v4()));
+        let p = dir.join(format!("perseus_vault-mm-bomb-{}.docx", uuid::Uuid::new_v4()));
         {
             let file = std::fs::File::create(&p).unwrap();
             let mut zw = zip::ZipWriter::new(file);
@@ -376,7 +376,7 @@ mod tests {
         // entry decompresses past a 64 KiB decompressed cap -> rejected as a bomb.
         let err = extract_docx_limited(&p, 50 * 1024 * 1024, 64 * 1024).unwrap_err();
         assert!(err.contains("decompresses beyond"), "got: {err}");
-        assert!(err.contains("MIMIR_MAX_DECOMPRESSED_BYTES"), "got: {err}");
+        assert!(err.contains("PERSEUS_VAULT_MAX_DECOMPRESSED_BYTES"), "got: {err}");
 
         // A decompressed cap above the entry size extracts without error.
         let ok = extract_docx_limited(&p, 50 * 1024 * 1024, 16 * 1024 * 1024);

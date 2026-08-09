@@ -72,27 +72,27 @@ Rules:
 
 ### 2.1 Actors and primitives
 
-- `mimir_correct` — record that an approach was wrong, with the right
+- `perseus_vault_correct` — record that an approach was wrong, with the right
   behavior. Creates a tier-1 `correction` class entity and a journal entry.
-- `mimir_supersede` — declare that entity B replaces entity A: sets A's
+- `perseus_vault_supersede` — declare that entity B replaces entity A: sets A's
   `status=deprecated`, closes A's valid-time period, and links
-  `B -[supersedes]-> A`. Reversible via history (`mimir_as_of`).
-- `mimir_forget` / `mimir_purge` — soft-archive and (GDPR-grade) erasure.
+  `B -[supersedes]-> A`. Reversible via history (`perseus_vault_as_of`).
+- `perseus_vault_forget` / `perseus_vault_purge` — soft-archive and (GDPR-grade) erasure.
 
 ### 2.2 The canonical correction flow
 
 1. **Detect.** Agent or operator determines a live memory is wrong.
-2. **Record the correction** with `mimir_correct` capturing
+2. **Record the correction** with `perseus_vault_correct` capturing
    `wrong_approach`, `user_correction`, `task_context`. This is what makes
    the correction outrank the old belief at serve time (taxonomy §3 tier 1).
-3. **Supersede the wrong entity** with `mimir_supersede(old → correction
+3. **Supersede the wrong entity** with `perseus_vault_supersede(old → correction
    or replacement fact)`. If the correction introduces a replacement fact,
    write it first and supersede toward it.
 4. **Preserve history.** Never edit the old entity's body to make it look
    right. The superseded entity stays queryable via `as_of`/`valid_at` so
    audit can reconstruct "what did we believe when".
 5. **Proactively re-test.** The deja-vu guard
-   (`mimir_check_failure_pattern`) consults corrections before retrying
+   (`perseus_vault_check_failure_pattern`) consults corrections before retrying
    failed approaches.
 
 ### 2.3 Marking prior memory wrong vs. superseding stale assumptions
@@ -110,15 +110,15 @@ Rules:
 
 Every memory carries an effective retention policy. The policy is
 expressible in existing fields today; this vocabulary makes it explicit and
-gives `mimir_decay`/`mimir_compact`/`mimir_prune` well-defined semantics.
+gives `perseus_vault_decay`/`perseus_vault_compact`/`perseus_vault_prune` well-defined semantics.
 
 | Policy | Meaning | Encoding today |
 |---|---|---|
-| `keep_forever` | Never decayed, never auto-archived, always eligible to serve. | `mimir_score` ≥ 0.7 (verified + importance floor) |
+| `keep_forever` | Never decayed, never auto-archived, always eligible to serve. | `perseus_vault_score` ≥ 0.7 (verified + importance floor) |
 | `decay_unless_reinforced` | Default. Ebbinghaus decay; retrieval/usefulness reinforcement resists it; auto-archives below threshold. | default `decay_score` behavior |
 | `archive_when_superseded` | On supersession, soft-archive instead of retain-as-history. | archive in the supersede flow (opt-in flag) |
 | `retain_no_autoserve` | Kept and queryable, but excluded from context injection/briefings. | status or flag consulted by serving layer |
-| `erase_on` *(GDPR)* | Hard delete including history and journal payload redaction. | `mimir_forget` + `mimir_purge` |
+| `erase_on` *(GDPR)* | Hard delete including history and journal payload redaction. | `perseus_vault_forget` + `perseus_vault_purge` |
 
 Rules:
 
@@ -137,7 +137,7 @@ Rules:
 
 - #721: anchor model (§1), correction/supersession flow improvements (§2),
   retention policy model (§3); follow-on implementation splits: wiring
-  `archive_when_superseded` into `mimir_supersede`, and a
+  `archive_when_superseded` into `perseus_vault_supersede`, and a
   `retain_no_autoserve` serving filter. ✔
 - #725: anchor schema (§1), examples (§1 table), retrieval/synthesis
   implications (§1.1). ✔

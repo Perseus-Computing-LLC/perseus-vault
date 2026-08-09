@@ -25,17 +25,17 @@
 Perseus Vault adapters for popular AI agent frameworks:
 
 ### LangGraph (LangChain)
-- [mimir-langgraph](https://github.com/Perseus-Computing-LLC/perseus-vault/tree/main/integrations/langgraph) — `MimirStore` implementing `BaseStore`
+- [perseus_vault-langgraph](https://github.com/Perseus-Computing-LLC/perseus-vault/tree/main/integrations/langgraph) — `PerseusVaultStore` implementing `BaseStore`
 - Drop-in persistent memory for LangGraph agents
 - `pip install -e integrations/langgraph/`
 
 ### CrewAI
-- [mimir-crewai](https://github.com/Perseus-Computing-LLC/perseus-vault/tree/main/integrations/crewai) — `MimirMemoryTool` as a CrewAI agent tool
+- [perseus_vault-crewai](https://github.com/Perseus-Computing-LLC/perseus-vault/tree/main/integrations/crewai) — `PerseusVaultMemoryTool` as a CrewAI agent tool
 - Agents can remember, recall, journal, and get context
 - `pip install -e integrations/crewai/`
 
 ### AutoGen (AG2 / autogen-core)
-- [mimir-autogen](https://github.com/Perseus-Computing-LLC/perseus-vault/tree/main/integrations/autogen) — `MimirMemory` implementing `autogen_core.memory.Memory`
+- [perseus_vault-autogen](https://github.com/Perseus-Computing-LLC/perseus-vault/tree/main/integrations/autogen) — `PerseusVaultMemory` implementing `autogen_core.memory.Memory`
 - Context injection before each inference turn
 - `pip install -e integrations/autogen/`
 
@@ -55,7 +55,7 @@ Perseus Vault works with any MCP host. Configuration is one line:
   "mcpServers": {
     "perseus-vault": {
       "command": "perseus-vault",
-      "args": ["serve", "--db", "~/.mimir/data/perseus-vault.db"]
+      "args": ["serve", "--db", "~/.perseus-vault/data/perseus-vault.db"]
     }
   }
 }
@@ -75,25 +75,25 @@ Tested and confirmed working with:
 
 | Category | Tools |
 |---|---|
-| **Entity CRUD** | `mimir_remember`, `mimir_recall`, `mimir_recall_when`, `mimir_get_entity`, `mimir_capture`, `mimir_forget` |
-| **Graph** | `mimir_link`, `mimir_unlink`, `mimir_traverse` |
-| **Journal** | `mimir_journal`, `mimir_check_failure_pattern`, `mimir_timeline` |
-| **State** | `mimir_state_set`, `mimir_state_get`, `mimir_state_delete`, `mimir_state_list` |
-| **Search & RAG** | `mimir_ask`, `mimir_embed`, `mimir_context`, `mimir_ingest` |
-| **Lifecycle** | `mimir_decay`, `mimir_prune`, `mimir_purge`, `mimir_cohere`, `mimir_compact`, `mimir_reindex` |
-| **Quality** | `mimir_score`, `mimir_conflicts`, `mimir_correct` |
-| **Vault** | `mimir_vault_export`, `mimir_vault_import` |
-| **Federation** | `mimir_federate`, `mimir_workspace_list` |
-| **Metrics** | `mimir_stats`, `mimir_health`, `mimir_bench`, `mimir_synthesize` |
+| **Entity CRUD** | `perseus_vault_remember`, `perseus_vault_recall`, `perseus_vault_recall_when`, `perseus_vault_get_entity`, `perseus_vault_capture`, `perseus_vault_forget` |
+| **Graph** | `perseus_vault_link`, `perseus_vault_unlink`, `perseus_vault_traverse` |
+| **Journal** | `perseus_vault_journal`, `perseus_vault_check_failure_pattern`, `perseus_vault_timeline` |
+| **State** | `perseus_vault_state_set`, `perseus_vault_state_get`, `perseus_vault_state_delete`, `perseus_vault_state_list` |
+| **Search & RAG** | `perseus_vault_ask`, `perseus_vault_embed`, `perseus_vault_context`, `perseus_vault_ingest` |
+| **Lifecycle** | `perseus_vault_decay`, `perseus_vault_prune`, `perseus_vault_purge`, `perseus_vault_cohere`, `perseus_vault_compact`, `perseus_vault_reindex` |
+| **Quality** | `perseus_vault_score`, `perseus_vault_conflicts`, `perseus_vault_correct` |
+| **Vault** | `perseus_vault_vault_export`, `perseus_vault_vault_import` |
+| **Federation** | `perseus_vault_federate`, `perseus_vault_workspace_list` |
+| **Metrics** | `perseus_vault_stats`, `perseus_vault_health`, `perseus_vault_bench`, `perseus_vault_synthesize` |
 
 ### Plugin Ecosystem
 
-- [hermes-mimir-plugin](https://github.com/Perseus-Computing-LLC/hermes-mimir-plugin) — Native Perseus Vault integration for Hermes Agent
+- [hermes-perseus-vault-plugin](https://github.com/Perseus-Computing-LLC/hermes-perseus-vault-plugin) — Native Perseus Vault integration for Hermes Agent
 - [Perseus Perseus Vault Connector](https://github.com/Perseus-Computing-LLC/perseus) — Perseus live context injection from Perseus Vault
 
 ## Community Projects
 
-*Add your project here! Open a PR to [awesome-mimir.md](https://github.com/Perseus-Computing-LLC/perseus-vault/blob/main/awesome-mimir.md).*
+*Add your project here! Open a PR to [awesome-perseus-vault.md](https://github.com/Perseus-Computing-LLC/perseus-vault/blob/main/awesome-perseus-vault.md).*
 
 ## Articles & Tutorials
 
@@ -101,9 +101,9 @@ Tested and confirmed working with:
 
 ## Comparisons
 
-- [Perseus Vault vs Mem0](https://github.com/Perseus-Computing-LLC/perseus-vault/blob/main/docs/comparison/mimir-vs-mem0.md) — Local-first vs cloud-only
-- [Perseus Vault vs Letta](https://github.com/Perseus-Computing-LLC/perseus-vault/blob/main/docs/comparison/mimir-vs-letta.md) — Memory engine vs agent runtime
-- [Perseus Vault vs Zep](https://github.com/Perseus-Computing-LLC/perseus-vault/blob/main/docs/comparison/mimir-vs-zep.md) — Single binary vs infrastructure
+- [Perseus Vault vs Mem0](https://github.com/Perseus-Computing-LLC/perseus-vault/blob/main/docs/comparison/perseus-vault-vs-mem0.md) — Local-first vs cloud-only
+- [Perseus Vault vs Letta](https://github.com/Perseus-Computing-LLC/perseus-vault/blob/main/docs/comparison/perseus-vault-vs-letta.md) — Memory engine vs agent runtime
+- [Perseus Vault vs Zep](https://github.com/Perseus-Computing-LLC/perseus-vault/blob/main/docs/comparison/perseus-vault-vs-zep.md) — Single binary vs infrastructure
 
 ## Key Differentiators
 
@@ -122,4 +122,4 @@ Why Perseus Vault stands out:
 
 See [CONTRIBUTING.md](https://github.com/Perseus-Computing-LLC/perseus-vault/blob/main/CONTRIBUTING.md).
 
-To add your project/resource to this list, open a PR against the `awesome-mimir.md` file.
+To add your project/resource to this list, open a PR against the `awesome-perseus-vault.md` file.

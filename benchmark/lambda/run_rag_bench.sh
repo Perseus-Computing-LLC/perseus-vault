@@ -4,9 +4,9 @@
 #
 # Unlike Gauntlet v2 (CPU: render + FTS5 + shell directives), this measures the
 # GPU-dependent numbers that are actually citable as "first-party, measured on A100":
-#   1. Embedding throughput + coverage (mimir_embed -> Ollama /api/embed, nomic-embed-text)
+#   1. Embedding throughput + coverage (perseus_vault_embed -> Ollama /api/embed, nomic-embed-text)
 #   2. Dense (vector) recall  vs  FTS5 recall  on the SAME seeded query set (the delta)
-#   3. mimir_ask RAG latency (recall -> assemble -> qwen2.5:14b generate)
+#   3. perseus_vault_ask RAG latency (recall -> assemble -> qwen2.5:14b generate)
 #
 # Prereq: serve.sh endpoint live; perseus-vault release binary built.
 set -euo pipefail
