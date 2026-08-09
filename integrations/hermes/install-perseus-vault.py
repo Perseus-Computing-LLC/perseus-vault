@@ -850,6 +850,8 @@ def main() -> int:
         mcp_url = f"http://{mcp_host_port}/message"
         log_info(f"Non-interactive mode: using MCP_HOST_PORT={mcp_host_port}")
         log_info("Token configured from MCP_TOKEN")
+        # Determine connection type from IP
+        connection_type = "local" if mcp_host_port.startswith(("localhost", "127.0.0.1")) else "remote"
     elif env_host_port and not sys.stdin.isatty():
         # Non-interactive with host but no token - use host, ask for token
         mcp_host_port = env_host_port
@@ -858,6 +860,8 @@ def main() -> int:
         default_token = env_token or "devon-token-2026"
         mcp_token = prompt_with_default("MCP Bearer token (MCP_PERSEUS_VAULT_API_KEY)", default_token)
         log_info("Token configured")
+        # Determine connection type from IP
+        connection_type = "local" if mcp_host_port.startswith(("localhost", "127.0.0.1")) else "remote"
     else:
         # Interactive mode
         print("Enter the IP:port of the machine running Perseus Vault MCP server")
@@ -870,10 +874,12 @@ def main() -> int:
         if location in ("local", "l", "localhost"):
             default_host_port = "localhost:8767"
             mcp_host_port = prompt_with_default("MCP server IP:port", default_host_port)
+            connection_type = "local"
         else:
             # Remote - ask for IP:port
             default_host_port = env_host_port or "192.168.1.54:8767"
             mcp_host_port = prompt_with_default("MCP server IP:port", default_host_port)
+            connection_type = "remote"
 
         mcp_url = f"http://{mcp_host_port}/message"
         log_info(f"MCP URL: {mcp_url}")
@@ -940,6 +946,8 @@ def main() -> int:
     print("  hermes perseus-vault config       # Show config")
     print()
     print("Memory provider is active and will auto-inject context each turn.")
+    print()
+    print(f"Connection: {connection_type}")
     print()
     print("Lifecycle hooks implemented:")
     print("  SessionStart (on_turn_start)   → perseus_vault_context / recall_when")
