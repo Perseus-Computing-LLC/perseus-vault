@@ -19,7 +19,7 @@
 
 Give your agents memory that survives the session, so they stop re-deriving what they
 already learned and stop repeating past mistakes. Hybrid recall (BM25 + dense + RRF),
-bi-temporal history, and **AES-256-GCM** at rest, exposed as **100 canonical MCP tools**
+bi-temporal history, and **AES-256-GCM** at rest, exposed as **102 canonical MCP tools**
 that work with any host. Legacy `mimir_*`/`mneme_*` aliases were removed in the 2026-27
 major release and are
 not counted separately. **73.8% on LongMemEval's official harness** (vs Zep 63.8%, Mem0
@@ -229,7 +229,7 @@ the reference. [Methodology & dataset →](benchmark/temporal/README.md)
 |---|---|---|---|---|
 | **Deployment** | Single binary | Cloud + self-host | Docker/Postgres | Docker/Neo4j |
 | **Dependencies** | None (SQLite embedded) | Python + vector DB | Postgres + Python | Neo4j + Go (Graphiti) |
-| **MCP-Native** | ✅ 100 canonical tools | ❌ Not MCP-native | ❌ Not MCP-native | ❌ Not MCP-native |
+| **MCP-Native** | ✅ 102 canonical tools | ❌ Not MCP-native | ❌ Not MCP-native | ❌ Not MCP-native |
 | **Offline/Local** | ✅ Fully local | Cloud-dependent | Docker needed | Docker needed |
 | **Encryption** | AES-256-GCM ✅ | ❌ | ❌ | ❌ |
 | **Hybrid Search** | BM25 + Dense + RRF | Vector only | Vector only | Vector + Graph |
@@ -237,7 +237,7 @@ the reference. [Methodology & dataset →](benchmark/temporal/README.md)
 | **Entity Graph** | Link + Traverse | ❌ | ❌ | ✅ |
 | **Journal Audit Trail** | ✅ Immutable | ❌ | ❌ | ❌ |
 | **State Management** | ✅ Key-value + TTL | ❌ | ❌ | ❌ |
-| **MCP Tools** | 100 canonical | 5 | 8 | 0 |
+| **MCP Tools** | 102 canonical | 5 | 8 | 0 |
 | **License** | MIT | Apache 2.0 | Apache 2.0 | Apache 2.0 |
 
 [Full comparison: Perseus Vault vs Mem0 →](docs/comparison/perseus-vault-vs-mem0.md)

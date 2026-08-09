@@ -6,6 +6,15 @@ All notable changes to Perseus Vault are documented here. This project adheres t
 ## [Unreleased]
 
 ### Added
+- **Keystone-suggestion instruction extraction (#889).** New
+  `perseus_vault_keystone_suggestions` + `perseus_vault_keystone_suggestion_decide`
+  tools (schema v32): `perseus_vault_correct` captures are scanned with
+  word-boundary-anchored directive patterns (en/de/ru/it/es) and queue
+  candidates (`keystone_suggestions` table) that require an explicit operator
+  `approve` decision — gated by the #683/#684 trust tier — before promotion to
+  the keystones table. Fixes the #507 whenever/never inversion: anchored
+  matching never extracts "never" from "whenever". Pending candidates surface
+  in `perseus_vault_operator_review` with source citations. Registry 100→102.
 - **Retrieval telemetry & trust concentration (#872).** New
   `perseus_vault_retrieval_telemetry` tool (schema v31) reporting
   concentration (HHI, top shares), repeated serving, low-trust fanout,
