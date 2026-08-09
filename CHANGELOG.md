@@ -6,6 +6,21 @@ All notable changes to Perseus Vault are documented here. This project adheres t
 ## [Unreleased]
 
 ### Added
+- **Fused multi-strategy recall (#883, #867).** New `fused` recall mode
+  fusing up to four strategies — `fts5`, `dense`, `graph` (one-hop
+  neighbor expansion), `temporal` (proximity to `query_time`) — via
+  weighted RRF (k=60; empty arms carry weight 0 and degenerate
+  gracefully). Fail-closed keyword arm; dense arm degrades to a
+  `Partial` outcome with `partial_arms` naming instead of failing the
+  recall. New params: `strategies`, `strategy_weights` (validated:
+  unknown/negative/non-finite rejected), `max_tokens` (chars/4 estimate,
+  top entity always delivered), `depth_budget` (low/mid/high →
+  1024/4096/16384), `rerank` (rank-calibrated 1/(1+rank) re-scoring,
+  default off), `query_time_unix_ms` (temporal anchor). Every fused
+  recall returns a full `fused_trace`: verbatim original query, per-arm
+  status/rankings/timing, fusion weights, truncation accounting,
+  rerank decision, final placement and per-entity arm sources. Spec:
+  `docs/specs/fused-multi-strategy-recall.md`.
 - **First-class Hermes profile ↔ Vault workspace binding (#879).** New
   `workspace_bindings` registry (schema v30) + tools
   `perseus_vault_workspace_bind` / `perseus_vault_workspace_unbind` /

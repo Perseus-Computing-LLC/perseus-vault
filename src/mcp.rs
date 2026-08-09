@@ -933,12 +933,41 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
         "mode": {
           "type": "string",
           "default": "fts5",
-          "description": "Search mode: 'fts5' (keyword), 'dense' (vector), or 'hybrid' (fused via RRF)",
+          "description": "Search mode: 'fts5' (keyword), 'dense' (vector), 'hybrid' (fused via RRF), or 'fused' (TEMPR-style multi-strategy: fts5 + dense + graph + temporal with weighted RRF, token-budget truncation, and a full fused_trace, #883)",
           "enum": [
             "fts5",
             "dense",
-            "hybrid"
+            "hybrid",
+            "fused"
           ]
+        },
+        "strategies": {
+          "type": "array",
+          "items": { "type": "string", "enum": ["fts5", "dense", "graph", "temporal"] },
+          "description": "Fused mode only: strategies to engage (2-4). Omit = all four. Unknown names are rejected."
+        },
+        "max_tokens": {
+          "type": "integer",
+          "default": 0,
+          "description": "Fused mode only: token-budget truncation (estimated tokens = chars/4 per body). 0 = derive from depth_budget (mid = 4096)."
+        },
+        "depth_budget": {
+          "type": "string",
+          "enum": ["low", "mid", "high"],
+          "description": "Fused mode only: depth budget -> default token caps 1024 / 4096 / 16384 when max_tokens is unset."
+        },
+        "strategy_weights": {
+          "type": "object",
+          "description": "Fused mode only: per-strategy RRF weight multipliers (default 1.0 each). Arms that find nothing contribute nothing."
+        },
+        "rerank": {
+          "type": "boolean",
+          "default": false,
+          "description": "Fused mode only: optional rerank stage over the fused pool (rank-calibrated dense + BM25 agreement signals; default off, latency-preserving)."
+        },
+        "query_time_unix_ms": {
+          "type": "integer",
+          "description": "Fused mode only: anchor instant for the temporal strategy (unix ms; default now). Accepts a number or numeric string."
         },
         "include_archived": {
           "type": "boolean",

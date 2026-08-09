@@ -417,15 +417,44 @@ pub struct RecallParams {
     /// decay". Ignored when skip_side_effects is set. No effect on the fts5
     /// path, which already reinforces unless skip_side_effects.
     pub reinforce: bool,
+    /// #883 (TEMPR-style fused recall): the strategies to engage when
+    /// `mode == Fused`. Recognized: "fts5", "dense", "graph", "temporal"
+    /// (2–4 strategies). Empty = all four. Unknown names are rejected.
+    pub strategies: Vec<String>,
+    /// #883: token-budget truncation. Results are accumulated in fused rank
+    /// order until their estimated token cost (chars/4 per body) reaches
+    /// `max_tokens`; the remainder is dropped and reported in the trace.
+    /// 0 = derive from `depth_budget`.
+    pub max_tokens: i64,
+    /// #883: depth budget low | mid | high → default token caps
+    /// 1024 / 4096 / 16384 when `max_tokens` is unset. None = mid.
+    pub depth_budget: Option<String>,
+    /// #883: per-strategy RRF weight multipliers (default 1.0 each).
+    /// An arm that found nothing contributes nothing regardless of weight.
+    pub strategy_weights: Option<std::collections::HashMap<String, f64>>,
+    /// #883: optional rerank stage over the fused pool (default off —
+    /// latency-preserving). When enabled, the fused top pool is re-scored
+    /// with rank-calibrated dense + BM25 agreement signals (1/(1+rank),
+    /// scale-free) before truncation; the fused RRF order is kept when no
+    /// score-bearing arm is available.
+    pub rerank: bool,
+    /// #883: anchor instant for the temporal strategy (unix ms; default
+    /// now). Candidates whose created_at is nearest to this instant rank
+    /// first within the temporal arm; bi-temporal semantics keep the
+    /// version current at the instant when a (category, key) has several.
+    pub query_time_unix_ms: Option<i64>,
 }
 
-/// Search mode for recall: FTS5 keyword, dense vector, or hybrid fusion.
+/// Search mode for recall: FTS5 keyword, dense vector, hybrid fusion, or
+/// fused multi-strategy (TEMPR-style: FTS + dense + graph + temporal with
+/// RRF fusion and token-budget truncation, #883).
 #[derive(Debug, Clone, Deserialize, Default, PartialEq)]
 pub enum SearchMode {
     #[default]
     Fts5,
     Dense,
     Hybrid,
+    Fused,
 }
 
 /// #864/#873/#887: explicit recall outcome. Every recall/projection path
@@ -571,6 +600,83 @@ pub struct RecallCompleteness {
     pub scope: Option<CandidateScope>,
 }
 
+/// #883/#867: fused multi-strategy recall trace. Every fused recall reports
+/// how each strategy performed, what was fused at what weights, what the
+/// token budget kept and dropped, whether the optional rerank stage applied,
+/// and the final placement — so an empty or surprising result is never
+/// opaque and retrieval quality is measurable end to end.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct FusedTrace {
+    /// The verbatim caller query. The fused path never rewrites it (#867:
+    /// query preservation — exact identifiers survive untouched).
+    pub original_query: String,
+    /// Query expansions applied (always empty in v1: no rewriting).
+    pub expansions: Vec<String>,
+    /// One entry per engaged strategy, in engagement order, with the
+    /// strategy's own pre-fusion ranking (top entity ids).
+    pub strategies: Vec<FusedStrategyTrace>,
+    pub fusion: FusedFusionTrace,
+    pub truncation: FusedTruncationTrace,
+    pub rerank: FusedRerankTrace,
+    /// Final placement: entity ids in delivered order, after fusion, rerank,
+    /// filters, and token-budget truncation.
+    pub placement: Vec<String>,
+    /// State filters that were active during this recall (workspace,
+    /// epistemic, layer, category, entity_type, agent, archived).
+    pub state_filters: Vec<String>,
+    /// Entity id -> strategies that surfaced it (consensus map). Only for
+    /// entities that survived into the delivered set.
+    pub sources: std::collections::BTreeMap<String, Vec<String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct FusedStrategyTrace {
+    pub strategy: String,
+    /// How many candidates the arm produced (pre-fusion).
+    pub candidates: usize,
+    /// The arm's own ranking (entity ids, best first).
+    pub top: Vec<String>,
+    /// "ok" | "degraded" | "empty" — degraded = the arm could not run
+    /// (e.g. embedding backend down for dense).
+    pub status: String,
+    /// Wall-clock latency of the arm in ms.
+    pub latency_ms: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct FusedFusionTrace {
+    /// The RRF constant k used.
+    pub rrf_k: f64,
+    /// Effective per-strategy RRF weights (after zeroing empty arms).
+    pub weights: std::collections::BTreeMap<String, f64>,
+    /// Pre-truncation fused size (the RRF pool).
+    pub fused_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct FusedTruncationTrace {
+    /// The token budget applied (estimated tokens = chars/4 per body).
+    pub budget_tokens: i64,
+    /// Estimated tokens consumed by the delivered set.
+    pub estimated_tokens_used: i64,
+    pub retained: usize,
+    pub dropped: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct FusedRerankTrace {
+    /// Whether the caller requested the rerank stage.
+    pub enabled: bool,
+    /// Whether the stage actually re-scored the pool (false = fell back to
+    /// RRF order because calibration was impossible).
+    pub applied: bool,
+    /// "rankcal-dense-bm25" (v1 calibrator: rank-derived 1/(1+rank) signals,
+    /// scale-free by construction) — provider cross-encoder is the
+    /// documented extension point.
+    pub method: String,
+    pub note: String,
+}
+
 fn is_false(v: &bool) -> bool {
     !*v
 }
@@ -631,6 +737,12 @@ impl Default for RecallParams {
             visibility: None,
             layer: None,
             reinforce: false,
+            strategies: Vec::new(),
+            max_tokens: 0,
+            depth_budget: None,
+            strategy_weights: None,
+            rerank: false,
+            query_time_unix_ms: None,
         }
     }
 }
