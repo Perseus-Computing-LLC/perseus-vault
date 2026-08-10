@@ -8,14 +8,16 @@
 
 > **Persistent, encrypted memory for AI agents. One Rust binary, one file, no cloud.**
 
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
-[![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](https://rust-lang.org)
-[![Version](https://img.shields.io/badge/version-2.20.2-green.svg)](https://github.com/Perseus-Computing-LLC/perseus-vault/releases)
+[![Build and Test](https://img.shields.io/github/actions/workflow/status/Perseus-Computing-LLC/perseus-vault/test.yml)](https://github.com/Perseus-Computing-LLC/perseus-vault/actions/workflows/test.yml)
+[![License: MIT](https://img.shields.io/github/license/Perseus-Computing-LLC/perseus-vault)](./LICENSE)
+[![Release](https://img.shields.io/github/v/release/Perseus-Computing-LLC/perseus-vault)](https://github.com/Perseus-Computing-LLC/perseus-vault/releases)
+[![Glama](https://glama.ai/mcp/servers/Perseus-Computing-LLC/perseus-vault/badge)](https://glama.ai/mcp/servers/Perseus-Computing-LLC/perseus-vault)
+[![MCP Marketplace](https://img.shields.io/badge/MCP%20Marketplace-Indexed-blueviolet)](https://getlulu.dev/mcps/perseus-vault-formerly-mimir-mneme-persistent-memory-engine)
 [![LangGraph](https://img.shields.io/badge/integrations-LangGraph-blue)](integrations/langgraph/)
 [![CrewAI](https://img.shields.io/badge/integrations-CrewAI-orange)](integrations/crewai/)
 [![AutoGen](https://img.shields.io/badge/integrations-AutoGen-purple)](integrations/autogen/)
-[![MCP Tools](https://img.shields.io/badge/MCP%20tools-99%20canonical-brightgreen)]()
-[![Listed on mcpservers.org](https://img.shields.io/badge/listed-mcpservers.org-blue)](https://mcpservers.org/servers/perseus-computing-llc/perseus-vault)
+
+**Published on** [Official MCP Registry](https://registry.modelcontextprotocol.io/v0/servers?search=io.github.Perseus-Computing-LLC/perseus-vault) · [Glama](https://glama.ai/mcp/servers/Perseus-Computing-LLC/perseus-vault) · [mcpservers.org](https://mcpservers.org/servers/perseus-computing-llc/perseus-vault) · [Lulu MCPs](https://getlulu.dev/mcps/perseus-vault-formerly-mimir-mneme-persistent-memory-engine) · [Docker (GHCR)](https://github.com/Perseus-Computing-LLC/perseus-vault/pkgs/container/perseus-vault)
 
 Give your agents memory that survives the session, so they stop re-deriving what they
 already learned and stop repeating past mistakes. Hybrid recall (BM25 + dense + RRF),
