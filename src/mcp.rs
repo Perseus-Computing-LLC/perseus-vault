@@ -3,10 +3,10 @@ use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
 use std::sync::OnceLock;
 
-use crate::db::Database;
-use crate::tools;
 use crate::beliefs;
 use crate::claim_card;
+use crate::db::Database;
+use crate::tools;
 
 /// The parent PID observed once at process start, before any reparenting can
 /// occur. `is_orphaned_by_ppid()` compares the live ppid against this baseline
@@ -67,8 +67,7 @@ pub fn record_initial_ppid() {
 fn windows_parent_pid() -> Option<i32> {
     use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-        CreateToolhelp32Snapshot, Process32First, Process32Next, PROCESSENTRY32,
-        TH32CS_SNAPPROCESS,
+        CreateToolhelp32Snapshot, Process32First, Process32Next, PROCESSENTRY32, TH32CS_SNAPPROCESS,
     };
     unsafe {
         let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -296,8 +295,11 @@ pub fn run_server(db: std::sync::Arc<Database>) {
     // leak a child's stdin write-end while STAYING ALIVE (the actual #57228
     // Hermes-worker topology) — those hosts set PERSEUS_VAULT_IDLE_TIMEOUT_SECS when
     // spawning. EOF on stdin (well-behaved host shutdown) exits regardless.
-    let idle_timeout: Option<std::time::Duration> =
-        parse_idle_timeout(std::env::var("PERSEUS_VAULT_IDLE_TIMEOUT_SECS").ok().as_deref());
+    let idle_timeout: Option<std::time::Duration> = parse_idle_timeout(
+        std::env::var("PERSEUS_VAULT_IDLE_TIMEOUT_SECS")
+            .ok()
+            .as_deref(),
+    );
 
     // Read stdin on a dedicated thread so the main loop can time out on silence.
     let (tx, rx) = std::sync::mpsc::channel::<std::io::Result<String>>();
@@ -342,7 +344,6 @@ pub fn run_server(db: std::sync::Arc<Database>) {
                 eprintln!("perseus-vault: parent already dead at server start — exiting (orphan-reap race guard, #547)");
                 return;
             }
-
         }
     }
 
@@ -410,7 +411,9 @@ pub fn run_server(db: std::sync::Arc<Database>) {
         // kernels that ignore the signal or on non-Linux platforms this is the
         // deterministic fallback. One getppid() syscall per request is negligible.
         if is_orphaned_by_ppid() {
-            eprintln!("perseus-vault: ppid == 1 detected — parent died, exiting (orphan-reap, #547)");
+            eprintln!(
+                "perseus-vault: ppid == 1 detected — parent died, exiting (orphan-reap, #547)"
+            );
             break;
         }
 
@@ -519,7 +522,9 @@ pub fn handle_request(
                     *slot = sanitized;
                 }
             }
-            state.initialized.store(true, std::sync::atomic::Ordering::Relaxed);
+            state
+                .initialized
+                .store(true, std::sync::atomic::Ordering::Relaxed);
             Some(response)
         }
 
@@ -3822,6 +3827,10 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
         "max_context_chars": {
           "type": "integer",
           "description": "Explicit character budget for the rendered block; overrides the model profile. In always_inject mode output is clamped only when this is set."
+        },
+        "session_id": {
+          "type": "string",
+          "description": "Session id for preload usage telemetry (#875): injected entities are attributed to this session for precision/recall resolution. Omit or leave empty when unknown."
         }
       },
       "required": []
@@ -4526,6 +4535,102 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     }
   },
   {
+    "name": "perseus_vault_preload_resolve",
+    "description": "#875: resolve open preload usage events into per-session precision/recall. Events older than the usage window are marked used/unused from entity read activity (serving itself never counts), then folded into preload_sessions. window_minutes defaults to 30. Telemetry bookkeeping only — never touches entity bodies.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "window_minutes": {
+          "type": "integer",
+          "description": "Session usage window in minutes (default 30)."
+        }
+      }
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "events_resolved": {"type": "integer"},
+        "sessions_written": {"type": "integer"},
+        "window_minutes": {"type": "integer"}
+      }
+    }
+  },
+  {
+    "name": "perseus_vault_preload_stats",
+    "description": "#875: read-only preload usage telemetry — which preloaded memories actually got used. Per-trigger precision/recall (separate from #872 serving-concentration), per-session rows, or overall aggregates. Usage = the entity was touched after serving (read paths only; serving itself never counts). Run this before perseus_vault_preload_propose to see the evidence behind tuning proposals.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "scope": {
+          "type": "string",
+          "enum": ["overall", "trigger", "session"],
+          "default": "overall",
+          "description": "'trigger': per recall_when trigger precision (used/served) + recall (used/(used+missed-by-trigger)); 'session': per-session precision/recall/miss_rate rows; 'overall': aggregate summary."
+        },
+        "limit": {
+          "type": "integer",
+          "default": 50,
+          "description": "Max rows for trigger/session scopes (1-1000)"
+        },
+        "since_days": {
+          "type": "integer",
+          "default": 7,
+          "description": "Only events/sessions at least this recent (0 = all)"
+        }
+      }
+    },
+    "outputSchema": {"type": "object"}
+  },
+  {
+    "name": "perseus_vault_preload_propose",
+    "description": "#875: offline trigger-tuning pass. From resolved usage history, raises PENDING proposals: retire for triggers served >= PERSEUS_VAULT_PRELOAD_MIN_SERVED (3) with precision < PERSEUS_VAULT_PRELOAD_RETIRE_PRECISION (0.25); add_trigger for entities used in >= 2 sessions but never preloaded (word from the sessions' contexts). Proposals write ONLY the proposals table (journaled); entity mutations happen exclusively via perseus_vault_preload_review approve — never silently.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "by": {
+          "type": "string",
+          "default": "operator",
+          "description": "Agent id recorded as the proposal author"
+        }
+      }
+    },
+    "outputSchema": {"type": "object"}
+  },
+  {
+    "name": "perseus_vault_preload_review",
+    "description": "#875: operator review queue for preload trigger tuning — the ONLY mutation surface. 'approve' applies the proposal through the audited remember path (journal preload_tuning_applied + entity_history provenance, revision bump): retire removes the trigger from the entity's recall_when (others untouched); add_trigger appends the proposed word. 'dismiss' records the decision without mutating anything. Both are journaled with the operator id.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "action": {
+          "type": "string",
+          "enum": ["list", "approve", "dismiss"],
+          "default": "list",
+          "description": "'list': pending proposals with rationale; 'approve': apply proposal_id; 'dismiss': decline proposal_id with a reason."
+        },
+        "proposal_id": {
+          "type": "string",
+          "description": "Proposal id (required for approve/dismiss)"
+        },
+        "reason": {
+          "type": "string",
+          "description": "Dismissal reason (dismiss only)"
+        },
+        "by": {
+          "type": "string",
+          "default": "operator",
+          "description": "Agent id recorded as the decision maker"
+        },
+        "limit": {
+          "type": "integer",
+          "default": 50,
+          "description": "Max proposals for list (1-1000)"
+        }
+      }
+    },
+    "outputSchema": {"type": "object"}
+  },
+  {
     "name": "perseus_vault_conflicts",
     "description": "Detect conflicting entities in the same category — pairs with low trigram similarity in their body_json. Flags potential contradictions, duplicate-but-divergent entries, and stale-overwritten facts. Read-only by default. Opt in with resolve=true to actively invalidate the lower-certainty side of clear conflicts (superseding it into history, reversible + time-travelable via perseus_vault_as_of); that path defaults to dry_run=true so you preview first, and never resolves pairs whose certainties are within certainty_margin.",
     "inputSchema": {
@@ -5078,6 +5183,10 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
         "workspace_hash": {
           "type": "string",
           "description": "Workspace scope filter (v1.2.0). When set, only entities with a matching workspace_hash can fire. Omit for no workspace filtering — in a federated vault that lets one workspace's triggers inject into another's turns."
+        },
+        "session_id": {
+          "type": "string",
+          "description": "Session id for preload usage telemetry (#875): served entities are attributed to this session for precision/recall resolution. Omit or leave empty when unknown."
         }
       },
       "required": [
@@ -6229,13 +6338,19 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
     let handler_result: Result<String, String> = match name {
         "perseus_vault_remember" => tools::handle_remember(db, args).map_err(|e| e.to_string()),
 
-        "perseus_vault_reject_value" => tools::handle_reject_value(db, args).map_err(|e| e.to_string()),
+        "perseus_vault_reject_value" => {
+            tools::handle_reject_value(db, args).map_err(|e| e.to_string())
+        }
 
         "perseus_vault_recall" => tools::handle_recall(db, args).map_err(|e| e.to_string()),
 
-        "perseus_vault_recall_batch" => tools::handle_recall_batch(db, args).map_err(|e| e.to_string()),
+        "perseus_vault_recall_batch" => {
+            tools::handle_recall_batch(db, args).map_err(|e| e.to_string())
+        }
 
-        "perseus_vault_recall_layer" => tools::handle_recall_layer(db, args).map_err(|e| e.to_string()),
+        "perseus_vault_recall_layer" => {
+            tools::handle_recall_layer(db, args).map_err(|e| e.to_string())
+        }
 
         "perseus_vault_scan" => tools::handle_scan(db, args).map_err(|e| e.to_string()),
 
@@ -6256,7 +6371,9 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
 
         "perseus_vault_ingest" => tools::handle_ingest(db, args).map_err(|e| e.to_string()),
 
-        "perseus_vault_ingest_file" => tools::handle_ingest_file(db, args).map_err(|e| e.to_string()),
+        "perseus_vault_ingest_file" => {
+            tools::handle_ingest_file(db, args).map_err(|e| e.to_string())
+        }
 
         "perseus_vault_artifact_register" => {
             tools::handle_artifact_register(db, args).map_err(|e| e.to_string())
@@ -6298,7 +6415,9 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
 
         "perseus_vault_state_get" => tools::handle_state_get(db, args).map_err(|e| e.to_string()),
 
-        "perseus_vault_state_delete" => tools::handle_state_delete(db, args).map_err(|e| e.to_string()),
+        "perseus_vault_state_delete" => {
+            tools::handle_state_delete(db, args).map_err(|e| e.to_string())
+        }
 
         "perseus_vault_state_list" => tools::handle_state_list(db, args).map_err(|e| e.to_string()),
 
@@ -6401,10 +6520,28 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
         "perseus_vault_mental_model_review" => tools::handle_mental_model_review(db, args),
         "perseus_vault_write_quarantine" => tools::handle_write_quarantine(db, args),
         "perseus_vault_op_run" => tools::handle_op_run(db, args).map_err(|e| e.to_string()),
-        "perseus_vault_op_run_list" => tools::handle_op_run_list(db, args).map_err(|e| e.to_string()),
+        "perseus_vault_op_run_list" => {
+            tools::handle_op_run_list(db, args).map_err(|e| e.to_string())
+        }
         "perseus_vault_op_run_get" => tools::handle_op_run_get(db, args).map_err(|e| e.to_string()),
-        "perseus_vault_op_run_retry" => tools::handle_op_run_retry(db, args).map_err(|e| e.to_string()),
-        "perseus_vault_op_run_prune" => tools::handle_op_run_prune(db, args).map_err(|e| e.to_string()),
+        "perseus_vault_op_run_retry" => {
+            tools::handle_op_run_retry(db, args).map_err(|e| e.to_string())
+        }
+        "perseus_vault_op_run_prune" => {
+            tools::handle_op_run_prune(db, args).map_err(|e| e.to_string())
+        }
+        "perseus_vault_preload_stats" => {
+            tools::handle_preload_stats(db, args).map_err(|e| e.to_string())
+        }
+        "perseus_vault_preload_resolve" => {
+            tools::handle_preload_resolve(db, args).map_err(|e| e.to_string())
+        }
+        "perseus_vault_preload_propose" => {
+            tools::handle_preload_propose(db, args).map_err(|e| e.to_string())
+        }
+        "perseus_vault_preload_review" => {
+            tools::handle_preload_review(db, args).map_err(|e| e.to_string())
+        }
         "perseus_vault_conflicts" => Ok(tools::handle_conflicts(db, args)),
         "perseus_vault_consolidate" => Ok(tools::handle_consolidate(db, args)),
         "perseus_vault_dream" => tools::handle_dream(db, args),
@@ -6418,21 +6555,29 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
         "perseus_vault_share" => tools::handle_share(db, args).map_err(|e| e.to_string()),
         "perseus_vault_federate" => tools::handle_federate(db, args).map_err(|e| e.to_string()),
         "perseus_vault_workspace_list" => Ok(tools::handle_workspace_list(db)),
-        "perseus_vault_recall_when" => tools::handle_recall_when(db, args).map_err(|e| e.to_string()),
+        "perseus_vault_recall_when" => {
+            tools::handle_recall_when(db, args).map_err(|e| e.to_string())
+        }
         "perseus_vault_cohere" => tools::handle_cohere(db, args).map_err(|e| e.to_string()),
         "perseus_vault_correct" => tools::handle_correct(db, args).map_err(|e| e.to_string()),
         "perseus_vault_synthesize" => tools::handle_synthesize(db, args).map_err(|e| e.to_string()),
         "perseus_vault_bench" => tools::handle_bench(db, args).map_err(|e| e.to_string()),
 
-        "perseus_vault_communities" => tools::handle_communities(db, args).map_err(|e| e.to_string()),
+        "perseus_vault_communities" => {
+            tools::handle_communities(db, args).map_err(|e| e.to_string())
+        }
         "perseus_vault_community_summary" => {
             tools::handle_community_summary(db, args).map_err(|e| e.to_string())
         }
-        "perseus_vault_global_recall" => tools::handle_global_recall(db, args).map_err(|e| e.to_string()),
+        "perseus_vault_global_recall" => {
+            tools::handle_global_recall(db, args).map_err(|e| e.to_string())
+        }
 
         "perseus_vault_autocohere" => tools::handle_autocohere(db, args).map_err(|e| e.to_string()),
         "perseus_vault_supersede" => tools::handle_supersede(db, args).map_err(|e| e.to_string()),
-        "perseus_vault_maintenance" => tools::handle_maintenance(db, args).map_err(|e| e.to_string()),
+        "perseus_vault_maintenance" => {
+            tools::handle_maintenance(db, args).map_err(|e| e.to_string())
+        }
 
         _ => Err(format!("Unknown tool: {}", original_name)),
     };
@@ -6495,7 +6640,7 @@ mod tests {
         );
         assert_eq!(
             registry_names.len(),
-            115,
+            119,
             "update public metadata when adding a tool"
         );
 
@@ -6522,10 +6667,14 @@ mod tests {
                 .find(|tool| tool["name"] == name)
                 .unwrap_or_else(|| panic!("missing {name}"));
             if name.ends_with("journal") {
-                assert_eq!(tool["inputSchema"]["properties"]["workspace_hash"]["type"], "string");
+                assert_eq!(
+                    tool["inputSchema"]["properties"]["workspace_hash"]["type"],
+                    "string"
+                );
             } else {
                 assert_eq!(
-                    tool["outputSchema"]["properties"]["items"]["items"]["properties"]["workspace_hash"]["type"],
+                    tool["outputSchema"]["properties"]["items"]["items"]["properties"]
+                        ["workspace_hash"]["type"],
                     "string"
                 );
             }
@@ -6552,14 +6701,19 @@ mod tests {
     fn dream_is_registered_and_errors_cleanly_without_llm() {
         assert!(advertised_names().contains(&"perseus_vault_dream".to_string()));
 
-        let db_path = std::env::temp_dir()
-            .join(format!("perseus_vault-dream-{}.db", uuid::Uuid::new_v4()));
+        let db_path =
+            std::env::temp_dir().join(format!("perseus_vault-dream-{}.db", uuid::Uuid::new_v4()));
         let db = Database::open(db_path.to_str().expect("temp db path")).expect("open temp db");
 
         // No --llm-endpoint configured: the tool must answer with a clean MCP
         // tool error (isError, spec §3.3) — never a crash or protocol error —
         // and the message must name the flag and the non-LLM alternative.
-        let r = call_tool("perseus_vault_dream", &db, json!({"category": "episodes"}), None);
+        let r = call_tool(
+            "perseus_vault_dream",
+            &db,
+            json!({"category": "episodes"}),
+            None,
+        );
         let v: Value = serde_json::from_str(&r).unwrap();
         assert_eq!(v["isError"], json!(true), "got: {r}");
         let msg = v["content"][0]["text"].as_str().unwrap();
@@ -6586,8 +6740,8 @@ mod tests {
         // #521: tools/list must expose the deja-vu guard under the canonical name.
         assert!(advertised_names().contains(&"perseus_vault_check_failure_pattern".to_string()));
 
-        let db_path = std::env::temp_dir()
-            .join(format!("perseus_vault-fpguard-{}.db", uuid::Uuid::new_v4()));
+        let db_path =
+            std::env::temp_dir().join(format!("perseus_vault-fpguard-{}.db", uuid::Uuid::new_v4()));
         let db = Database::open(db_path.to_str().expect("temp db path")).expect("open temp db");
 
         // Alias prefixes normalize into the same handler; empty store answers
@@ -6622,8 +6776,8 @@ mod tests {
         // canonical name.
         assert!(advertised_names().contains(&"perseus_vault_capture".to_string()));
 
-        let db_path = std::env::temp_dir()
-            .join(format!("perseus_vault-capture-{}.db", uuid::Uuid::new_v4()));
+        let db_path =
+            std::env::temp_dir().join(format!("perseus_vault-capture-{}.db", uuid::Uuid::new_v4()));
         let db = Database::open(db_path.to_str().expect("temp db path")).expect("open temp db");
 
         // A real payload distills and writes through the remember path.
@@ -6652,12 +6806,12 @@ mod tests {
         // create, list, view (numbered), str_replace (unique-match), insert,
         // rename, delete, and recreate-after-delete (revival must also
         // restore the FTS row so the file is searchable again).
-        let db_path = std::env::temp_dir()
-            .join(format!("perseus_vault-memories-{}.db", uuid::Uuid::new_v4()));
+        let db_path = std::env::temp_dir().join(format!(
+            "perseus_vault-memories-{}.db",
+            uuid::Uuid::new_v4()
+        ));
         let db = Database::open(db_path.to_str().expect("temp db path")).expect("open temp db");
-        let call = |args: Value| -> String {
-            call_tool("perseus_vault_memories", &db, args, None)
-        };
+        let call = |args: Value| -> String { call_tool("perseus_vault_memories", &db, args, None) };
 
         // create
         let r = call(json!({"command": "create", "path": "/memories/notes.md",
@@ -6679,11 +6833,15 @@ mod tests {
         );
 
         // str_replace — must reject ambiguous and missing matches
-        let r = call(json!({"command": "str_replace", "path": "/memories/notes.md",
-                            "old_str": "beta", "new_str": "BETA"}));
+        let r = call(
+            json!({"command": "str_replace", "path": "/memories/notes.md",
+                            "old_str": "beta", "new_str": "BETA"}),
+        );
         assert!(r.contains("replaced"), "str_replace failed: {r}");
-        let r = call(json!({"command": "str_replace", "path": "/memories/notes.md",
-                            "old_str": "missing", "new_str": "x"}));
+        let r = call(
+            json!({"command": "str_replace", "path": "/memories/notes.md",
+                            "old_str": "missing", "new_str": "x"}),
+        );
         assert!(r.contains("not found"), "missing old_str must error: {r}");
 
         // insert at line 0
@@ -6698,23 +6856,34 @@ mod tests {
         );
 
         // rename
-        let r = call(json!({"command": "rename", "old_path": "/memories/notes.md",
-                            "new_path": "/memories/archive/notes.md"}));
+        let r = call(
+            json!({"command": "rename", "old_path": "/memories/notes.md",
+                            "new_path": "/memories/archive/notes.md"}),
+        );
         assert!(r.contains("renamed"), "rename failed: {r}");
         let r = call(json!({"command": "view", "path": "/memories"}));
         let v: Value = serde_json::from_str(&r).unwrap();
-        assert_eq!(v["files"], json!(["archive/notes.md"]), "post-rename listing: {r}");
+        assert_eq!(
+            v["files"],
+            json!(["archive/notes.md"]),
+            "post-rename listing: {r}"
+        );
 
         // path traversal is rejected
         let r = call(json!({"command": "view", "path": "/memories/../etc/passwd"}));
-        assert!(r.contains("invalid path") || r.contains("error"), "traversal must be rejected: {r}");
+        assert!(
+            r.contains("invalid path") || r.contains("error"),
+            "traversal must be rejected: {r}"
+        );
 
         // delete, then recreate: revival must restore searchability (the FTS
         // row is deleted by forget; the remember update path must re-insert it).
         let r = call(json!({"command": "delete", "path": "/memories/archive/notes.md"}));
         assert!(r.contains("deleted"), "delete failed: {r}");
-        let r = call(json!({"command": "create", "path": "/memories/archive/notes.md",
-                            "file_text": "reborn searchable zanzibar"}));
+        let r = call(
+            json!({"command": "create", "path": "/memories/archive/notes.md",
+                            "file_text": "reborn searchable zanzibar"}),
+        );
         assert!(r.contains("created"), "recreate failed: {r}");
         let hits = db
             .recall(&crate::models::RecallParams {
@@ -6736,15 +6905,14 @@ mod tests {
     fn bitemporal_tools_are_registered_and_dispatch() {
         // #363: perseus_vault_valid_at / perseus_vault_bitemporal exist in the
         // registry and dispatch through call_tool.
-        let db_path = std::env::temp_dir()
-            .join(format!("perseus_vault-bitemporal-tools-{}.db", uuid::Uuid::new_v4()));
+        let db_path = std::env::temp_dir().join(format!(
+            "perseus_vault-bitemporal-tools-{}.db",
+            uuid::Uuid::new_v4()
+        ));
         let db = Database::open(db_path.to_str().expect("temp db path")).expect("open temp db");
 
         let names = advertised_names();
-        for expect in [
-            "perseus_vault_valid_at",
-            "perseus_vault_bitemporal",
-        ] {
+        for expect in ["perseus_vault_valid_at", "perseus_vault_bitemporal"] {
             assert!(names.contains(&expect.to_string()), "missing tool {expect}");
         }
 
@@ -6790,16 +6958,18 @@ mod tests {
         // #683: keystones are registered, round-trip through
         // call_tool, merge by weight, are updated in place on re-set, gate on
         // trust tier, and every mutation lands on the audit chain.
-        let db_path = std::env::temp_dir()
-            .join(format!("perseus_vault-keystones-{}.db", uuid::Uuid::new_v4()));
+        let db_path = std::env::temp_dir().join(format!(
+            "perseus_vault-keystones-{}.db",
+            uuid::Uuid::new_v4()
+        ));
         let db = Database::open(db_path.to_str().expect("temp db path")).expect("open temp db");
 
         // Registered under the canonical prefix.
-        for expect in [
-            "perseus_vault_keystone_set",
-            "perseus_vault_keystone_get",
-        ] {
-            assert!(advertised_names().contains(&expect.to_string()), "missing tool {expect}");
+        for expect in ["perseus_vault_keystone_set", "perseus_vault_keystone_get"] {
+            assert!(
+                advertised_names().contains(&expect.to_string()),
+                "missing tool {expect}"
+            );
         }
 
         // Author two keystones with different weights (author tier satisfies).
@@ -6826,8 +6996,14 @@ mod tests {
         let got = call_tool("perseus_vault_keystone_get", &db, json!({}), None);
         let v: Value = serde_json::from_str(&got).unwrap();
         assert_eq!(v["count"], json!(2), "{got}");
-        assert_eq!(v["keystones"][0]["content"], json!("PII MUST NOT cross agent boundaries"));
-        assert_eq!(v["keystones"][1]["content"], json!("cite source memory IDs"));
+        assert_eq!(
+            v["keystones"][0]["content"],
+            json!("PII MUST NOT cross agent boundaries")
+        );
+        assert_eq!(
+            v["keystones"][1]["content"],
+            json!("cite source memory IDs")
+        );
 
         // Re-setting the same (scope, scope_id, content) updates in place.
         let again = call_tool(
@@ -6837,7 +7013,10 @@ mod tests {
                    "weight": 5.0, "author_trust_tier": 2}),
             None,
         );
-        assert!(again.contains("\"created\":false"), "re-set must update: {again}");
+        assert!(
+            again.contains("\"created\":false"),
+            "re-set must update: {again}"
+        );
         let got2 = call_tool("perseus_vault_keystone_get", &db, json!({}), None);
         let v2: Value = serde_json::from_str(&got2).unwrap();
         assert_eq!(v2["count"], json!(2), "no duplicate row on re-set: {got2}");
@@ -6857,7 +7036,10 @@ mod tests {
             json!({"content": "unenforced rule", "scope": "agent", "scope_id": "a1"}),
             None,
         );
-        assert!(unenforced.contains("\"trust_enforced\":false"), "{unenforced}");
+        assert!(
+            unenforced.contains("\"trust_enforced\":false"),
+            "{unenforced}"
+        );
 
         // Every keystone_set is crypto-chained (event_type keystone_set) and the
         // chain still verifies.
@@ -6881,8 +7063,8 @@ mod tests {
 
     #[test]
     fn stage_trace_tool_validates_hash_only_replay_contract() {
-        let db_path = std::env::temp_dir()
-            .join(format!("perseus-stage-trace-{}.db", uuid::Uuid::new_v4()));
+        let db_path =
+            std::env::temp_dir().join(format!("perseus-stage-trace-{}.db", uuid::Uuid::new_v4()));
         let db = Database::open(db_path.to_str().expect("temp db path")).expect("open temp db");
         let trace = crate::stage_trace::StageTrace::new("trace-mcp", "workspace-a")
             .seal()
@@ -6905,8 +7087,10 @@ mod tests {
 
     #[test]
     fn rejected_value_tombstones_block_laundering_and_support_audited_override() {
-        let db_path = std::env::temp_dir()
-            .join(format!("perseus_vault-rejected-value-{}.db", uuid::Uuid::new_v4()));
+        let db_path = std::env::temp_dir().join(format!(
+            "perseus_vault-rejected-value-{}.db",
+            uuid::Uuid::new_v4()
+        ));
         let db = Database::open(db_path.to_str().expect("temp db path")).expect("open temp db");
 
         // Reject the value explicitly with the new tool. The value is the
@@ -6925,7 +7109,10 @@ mod tests {
             }),
             None,
         );
-        assert!(reject.contains("\"rejected\":true"), "reject must succeed: {reject}");
+        assert!(
+            reject.contains("\"rejected\":true"),
+            "reject must succeed: {reject}"
+        );
 
         // A normal remember with the same body is blocked, even under a
         // brand-new key and different (subject, predicate) spelling: that is
@@ -6942,7 +7129,10 @@ mod tests {
             }),
             None,
         );
-        assert!(blocked.contains("rejected"), "laundered write must be blocked: {blocked}");
+        assert!(
+            blocked.contains("rejected"),
+            "laundered write must be blocked: {blocked}"
+        );
 
         // Case/whitespace variants of the rejected value are equivalent.
         let blocked_variant = call_tool(
@@ -6973,7 +7163,10 @@ mod tests {
             }),
             None,
         );
-        assert!(fine.contains("\"action\":\"created\""), "unrejected value must write: {fine}");
+        assert!(
+            fine.contains("\"action\":\"created\""),
+            "unrejected value must write: {fine}"
+        );
 
         // Scope isolation: the same value re-ingested in a DIFFERENT workspace
         // is not poisoned by the ws-a tombstone.
@@ -7006,7 +7199,10 @@ mod tests {
             }),
             None,
         );
-        assert!(override_ok.contains("\"action\":\"created\""), "override must write: {override_ok}");
+        assert!(
+            override_ok.contains("\"action\":\"created\""),
+            "override must write: {override_ok}"
+        );
 
         let rejected_events: i64 = {
             let conn = db.conn().expect("db connection");
@@ -7047,9 +7243,15 @@ mod tests {
             }),
             None,
         );
-        assert!(corrected.contains("entity_id"), "correction must write: {corrected}");
+        assert!(
+            corrected.contains("entity_id"),
+            "correction must write: {corrected}"
+        );
         let corr_val: Value = serde_json::from_str(&corrected).expect("correction response JSON");
-        let corr_id = corr_val["entity_id"].as_str().expect("entity_id").to_string();
+        let corr_id = corr_val["entity_id"]
+            .as_str()
+            .expect("entity_id")
+            .to_string();
         let corr_key = format!("correction-{}", &corr_id[4..16]);
         assert!(
             db.is_value_rejected("ws-a", &corr_key, "correction", "Used X everywhere")
@@ -7062,13 +7264,18 @@ mod tests {
 
     #[test]
     fn unknown_tool_error_reports_the_caller_name() {
-        let db_path = std::env::temp_dir()
-            .join(format!("perseus_vault-unknown-tool-{}.db", uuid::Uuid::new_v4()));
+        let db_path = std::env::temp_dir().join(format!(
+            "perseus_vault-unknown-tool-{}.db",
+            uuid::Uuid::new_v4()
+        ));
         let db = Database::open(db_path.to_str().expect("temp db path")).expect("open temp db");
 
         // An unknown tool name is reported verbatim — no prefix normalization.
         let result = call_tool("perseus_vault_bogus", &db, json!({}), None);
-        assert!(result.contains("Unknown tool: perseus_vault_bogus"), "got: {result}");
+        assert!(
+            result.contains("Unknown tool: perseus_vault_bogus"),
+            "got: {result}"
+        );
 
         let other = call_tool("custom_bogus", &db, json!({}), None);
         assert!(other.contains("Unknown tool: custom_bogus"), "got: {other}");
@@ -7078,8 +7285,10 @@ mod tests {
 
     #[test]
     fn rejects_non_json_rpc_2_requests() {
-        let db_path =
-            std::env::temp_dir().join(format!("perseus_vault-jsonrpc-version-{}.db", uuid::Uuid::new_v4()));
+        let db_path = std::env::temp_dir().join(format!(
+            "perseus_vault-jsonrpc-version-{}.db",
+            uuid::Uuid::new_v4()
+        ));
         let db = Database::open(db_path.to_str().expect("temp db path")).expect("open temp db");
         let req = JsonRpcRequest {
             jsonrpc: "1.0".to_string(),
@@ -7101,8 +7310,10 @@ mod tests {
         // Regression: serverInfo.name was a hardcoded literal that went stale
         // across the earlier product renames. It must track Cargo.toml's
         // package name instead.
-        let db_path = std::env::temp_dir()
-            .join(format!("perseus_vault-initialize-name-{}.db", uuid::Uuid::new_v4()));
+        let db_path = std::env::temp_dir().join(format!(
+            "perseus_vault-initialize-name-{}.db",
+            uuid::Uuid::new_v4()
+        ));
         let db = Database::open(db_path.to_str().expect("temp db path")).expect("open temp db");
         let req = JsonRpcRequest {
             jsonrpc: "2.0".to_string(),
@@ -7114,10 +7325,7 @@ mod tests {
 
         let resp = handle_request(&req, &state, &db).expect("initialize response");
         let result = resp.result.expect("initialize result");
-        assert_eq!(
-            result["serverInfo"]["name"],
-            json!(env!("CARGO_PKG_NAME")),
-        );
+        assert_eq!(result["serverInfo"]["name"], json!(env!("CARGO_PKG_NAME")),);
 
         let _ = fs::remove_file(db_path);
     }
@@ -7127,8 +7335,10 @@ mod tests {
         // #684: the initialize handshake's clientInfo.name is captured and
         // stamped onto tool calls as requesting_agent_id, so a private entity is
         // transparently hidden from a different client — no explicit arg needed.
-        let db_path = std::env::temp_dir()
-            .join(format!("perseus_vault-clientinfo-{}.db", uuid::Uuid::new_v4()));
+        let db_path = std::env::temp_dir().join(format!(
+            "perseus_vault-clientinfo-{}.db",
+            uuid::Uuid::new_v4()
+        ));
         let db = Database::open(db_path.to_str().expect("temp db path")).expect("open temp db");
         db.agent_upsert("alice", "Alice", 0, "eng").unwrap();
         db.agent_upsert("bob", "Bob", 0, "eng").unwrap();
@@ -7180,8 +7390,10 @@ mod tests {
         // #855 review: even when the caller forges a requesting_agent_id
         // (or passes an empty one), the transport overwrites it with the
         // captured clientInfo.name — a model cannot claim another identity.
-        let db_path = std::env::temp_dir()
-            .join(format!("perseus_vault-forged-id-{}.db", uuid::Uuid::new_v4()));
+        let db_path = std::env::temp_dir().join(format!(
+            "perseus_vault-forged-id-{}.db",
+            uuid::Uuid::new_v4()
+        ));
         let db = Database::open(db_path.to_str().expect("temp db path")).expect("open temp db");
 
         let state = MCPState::new();
@@ -7222,8 +7434,10 @@ mod tests {
 
     #[test]
     fn recall_confidence_is_opt_in_and_normalized() {
-        let db_path =
-            std::env::temp_dir().join(format!("perseus_vault-confidence-{}.db", uuid::Uuid::new_v4()));
+        let db_path = std::env::temp_dir().join(format!(
+            "perseus_vault-confidence-{}.db",
+            uuid::Uuid::new_v4()
+        ));
         let db = Database::open(db_path.to_str().expect("temp db path")).expect("open temp db");
 
         tools::handle_remember(
@@ -7274,12 +7488,21 @@ mod tests {
         let resp =
             tools::handle_history(&db, json!({"category":"facts","key":"color"})).expect("history");
         let v: Value = serde_json::from_str(&resp).unwrap();
-        assert_eq!(v["total"].as_i64().unwrap(), 1, "one superseded version: {}", resp);
+        assert_eq!(
+            v["total"].as_i64().unwrap(),
+            1,
+            "one superseded version: {}",
+            resp
+        );
         let body = v["versions"][0]["content"]
             .as_str()
             .or_else(|| v["versions"][0]["body_json"].as_str())
             .unwrap_or("");
-        assert!(body.contains("blue"), "history should hold the old 'blue' value: {}", resp);
+        assert!(
+            body.contains("blue"),
+            "history should hold the old 'blue' value: {}",
+            resp
+        );
 
         // Unknown key -> empty trail.
         let empty =
@@ -7295,8 +7518,10 @@ mod tests {
         // #365: the three GraphRAG tools must be dispatchable under the
         // canonical perseus_vault_* name and both rename aliases, and must appear in
         // tools/list.
-        let db_path =
-            std::env::temp_dir().join(format!("perseus_vault-graphrag-{}.db", uuid::Uuid::new_v4()));
+        let db_path = std::env::temp_dir().join(format!(
+            "perseus_vault-graphrag-{}.db",
+            uuid::Uuid::new_v4()
+        ));
         let db = Database::open(db_path.to_str().expect("temp db path")).expect("open temp db");
 
         // Two linked entities so detection has a community to find.
@@ -7315,7 +7540,11 @@ mod tests {
 
         let detect = call_tool("perseus_vault_communities", &db, json!({}), None);
         let v: Value = serde_json::from_str(&detect).expect("valid JSON");
-        assert_eq!(v["communities"].as_array().unwrap().len(), 1, "got: {detect}");
+        assert_eq!(
+            v["communities"].as_array().unwrap().len(),
+            1,
+            "got: {detect}"
+        );
         let cid = v["communities"][0]["id"].as_str().unwrap().to_string();
 
         // Dispatch via the canonical names.
@@ -7329,10 +7558,19 @@ mod tests {
         assert_eq!(sv["community_id"].as_str().unwrap(), cid, "got: {summary}");
         assert!(sv.get("isError").is_none(), "got: {summary}");
 
-        let recall = call_tool("perseus_vault_global_recall", &db, json!({"query": "quasar"}), None);
+        let recall = call_tool(
+            "perseus_vault_global_recall",
+            &db,
+            json!({"query": "quasar"}),
+            None,
+        );
         let rv: Value = serde_json::from_str(&recall).expect("valid JSON");
         assert!(rv.get("isError").is_none(), "got: {recall}");
-        assert_eq!(rv["communities"].as_array().unwrap().len(), 1, "got: {recall}");
+        assert_eq!(
+            rv["communities"].as_array().unwrap().len(),
+            1,
+            "got: {recall}"
+        );
 
         // tools/list advertises the graph tools under the canonical prefix.
         let names = advertised_names();
@@ -7350,8 +7588,10 @@ mod tests {
 
     #[test]
     fn recall_layer_filter_scopes_by_canonical_and_alias() {
-        let db_path =
-            std::env::temp_dir().join(format!("perseus_vault-layerfilter-{}.db", uuid::Uuid::new_v4()));
+        let db_path = std::env::temp_dir().join(format!(
+            "perseus_vault-layerfilter-{}.db",
+            uuid::Uuid::new_v4()
+        ));
         let db = Database::open(db_path.to_str().expect("temp db path")).expect("open temp db");
 
         tools::handle_remember(
@@ -7412,12 +7652,19 @@ mod tests {
             "perseus_vault_artifact_log_digest",
             "perseus_vault_artifact_verify_value",
         ] {
-            assert!(names.contains(&name.to_string()), "canonical list must advertise {name}");
+            assert!(
+                names.contains(&name.to_string()),
+                "canonical list must advertise {name}"
+            );
         }
 
-        let db_path = std::env::temp_dir().join(format!("perseus_vault-artifact-tools-{}.db", uuid::Uuid::new_v4()));
+        let db_path = std::env::temp_dir().join(format!(
+            "perseus_vault-artifact-tools-{}.db",
+            uuid::Uuid::new_v4()
+        ));
         let db = Database::open(db_path.to_str().expect("temp db path")).expect("open temp db");
-        let source = std::env::temp_dir().join(format!("artifact-mcp-{}.txt", uuid::Uuid::new_v4()));
+        let source =
+            std::env::temp_dir().join(format!("artifact-mcp-{}.txt", uuid::Uuid::new_v4()));
         std::fs::write(&source, "artifact via MCP\n").unwrap();
 
         let registered = call_tool(
@@ -7453,7 +7700,10 @@ mod tests {
         assert_eq!(parse_idle_timeout(Some("0")), None);
         // Explicit value -> honored (opt-in aggressive reaping for hosts that
         // leak the stdin write-end while staying alive, the #57228 topology).
-        assert_eq!(parse_idle_timeout(Some("30")), Some(Duration::from_secs(30)));
+        assert_eq!(
+            parse_idle_timeout(Some("30")),
+            Some(Duration::from_secs(30))
+        );
         // Whitespace tolerated.
         assert_eq!(
             parse_idle_timeout(Some(" 120 ")),
@@ -7495,7 +7745,10 @@ mod tests {
         }
 
         // Born under a real parent, later reparented to init => orphaned.
-        assert!(decide(1, 4242), "reparented-to-init must be treated as orphaned");
+        assert!(
+            decide(1, 4242),
+            "reparented-to-init must be treated as orphaned"
+        );
 
         // Born directly under PID 1 (container entrypoint) and still there =>
         // NOT an orphan. This is the demo-container regression case.
@@ -7505,7 +7758,10 @@ mod tests {
         );
 
         // Normal case: real, unchanged parent => not orphaned.
-        assert!(!decide(4242, 4242), "live parent must not be treated as orphaned");
+        assert!(
+            !decide(4242, 4242),
+            "live parent must not be treated as orphaned"
+        );
 
         // Sanity: the live function never fires in a normal test environment
         // (the test runner's parent is never init).
@@ -7534,8 +7790,8 @@ mod tests {
         // profile identity; a read_only binding denies mutations and a bound
         // profile cannot touch another workspace — the denial surfaces as an
         // isError at the tools/call boundary.
-        let db_path = std::env::temp_dir()
-            .join(format!("perseus-vault-binding-{}.db", uuid::Uuid::new_v4()));
+        let db_path =
+            std::env::temp_dir().join(format!("perseus-vault-binding-{}.db", uuid::Uuid::new_v4()));
         let db = Database::open(db_path.to_str().expect("temp db path")).expect("open temp db");
         db.workspace_bind("profile-ro", "ws-own", "read_only", "{}", "operator")
             .unwrap();
@@ -7606,7 +7862,10 @@ mod tests {
             })),
         };
         let resp = handle_request(&call, &state, &db).expect("recall response");
-        assert!(resp.result.expect("result").get("isError").is_none(), "read must pass");
+        assert!(
+            resp.result.expect("result").get("isError").is_none(),
+            "read must pass"
+        );
 
         let _ = std::fs::remove_file(db_path);
     }

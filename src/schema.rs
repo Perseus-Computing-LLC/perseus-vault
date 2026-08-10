@@ -87,7 +87,15 @@ CREATE TABLE IF NOT EXISTS entities (
     -- (unix ms, numeric string, or ISO 8601 UTC); recall excludes rows past
     -- it, and the expire sweep transitions them to status='expired'. NULL =
     -- never expires (the default for every pre-existing row).
-    expires_at_unix_ms INTEGER
+    expires_at_unix_ms INTEGER,
+
+    -- Learned-anticipation tuning marker (#875): set to the apply time of a
+    -- governed preload_review approve on this entity. A tuning write rewrites
+    -- the body (and bumps last_accessed), so usage signal gathered before it
+    -- must not be read as fresh usage: add_trigger proposals skip entities
+    -- whose tuning is newer than their latest preload serve, until the
+    -- entity is re-observed. 0 = never tuned.
+    preload_tuned_unix_ms INTEGER DEFAULT 0
 );
 
 -- Identity index: (category, key, workspace_hash) — #339. Created in
@@ -455,6 +463,67 @@ CREATE TABLE IF NOT EXISTS op_run_items (
 );
 CREATE INDEX IF NOT EXISTS idx_op_run_items_run
  ON op_run_items(run_id, state);
+
+-- ── v36 (#875): learned anticipation — preload usage telemetry + tuning ──
+-- preload_events: one row per preloaded item per serve (recall_when result,
+-- context-block injection). `used` stays NULL until resolution (touch-after-
+-- serve check); trigger_ref is the matched trigger string or a sentinel
+-- (__always_on__ / __keyword__ / __context_block__).
+CREATE TABLE IF NOT EXISTS preload_events (
+    id TEXT PRIMARY KEY,
+    ts INTEGER NOT NULL,
+    context_hash TEXT NOT NULL,
+    context TEXT NOT NULL DEFAULT '',
+    entity_id TEXT NOT NULL,
+    trigger_ref TEXT NOT NULL,
+    workspace_hash TEXT NOT NULL DEFAULT '',
+    session_id TEXT NOT NULL DEFAULT '',
+    la_before INTEGER NOT NULL,
+    used INTEGER,
+    resolved_ts INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_preload_events_resolve
+ ON preload_events(used, ts);
+CREATE INDEX IF NOT EXISTS idx_preload_events_entity
+ ON preload_events(entity_id, ts);
+
+-- preload_sessions: per-session resolution rows (session_id, or a
+-- pseudo-session per context_hash when the caller passed none).
+-- context_words: meaning-bearing words of the session contexts (union);
+-- missed_by_trigger_json: map trigger string -> count of missed entities
+-- whose own recall_when matched the session context but were not served.
+CREATE TABLE IF NOT EXISTS preload_sessions (
+    session_id TEXT PRIMARY KEY,
+    anchor_ts INTEGER NOT NULL,
+    preloaded_n INTEGER NOT NULL,
+    used_n INTEGER NOT NULL,
+    missed_n INTEGER NOT NULL,
+    precision REAL NOT NULL,
+    recall REAL NOT NULL,
+    miss_rate REAL NOT NULL,
+    context_words TEXT NOT NULL DEFAULT '[]',
+    missed_by_trigger_json TEXT NOT NULL DEFAULT '{}',
+    missed_ids_json TEXT NOT NULL DEFAULT '[]',
+    resolved_ts INTEGER NOT NULL
+);
+
+-- preload_proposals: operator review queue for trigger tuning. Mutations
+-- apply ONLY through review approve (journal + audited remember path).
+CREATE TABLE IF NOT EXISTS preload_proposals (
+    id TEXT PRIMARY KEY,
+    entity_id TEXT NOT NULL,
+    trigger_ref TEXT NOT NULL,
+    suggestion TEXT NOT NULL,
+    rationale TEXT NOT NULL DEFAULT '',
+    state TEXT NOT NULL,
+    created_ts INTEGER NOT NULL,
+    decided_ts INTEGER,
+    decided_by TEXT NOT NULL DEFAULT '',
+    applied_ts INTEGER,
+    journal_event_id TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_preload_proposals_state
+ ON preload_proposals(state, created_ts);
 ";
 
 /// Current schema migration level, stamped into `PRAGMA user_version` once all
@@ -530,7 +599,7 @@ CREATE INDEX IF NOT EXISTS idx_op_run_items_run
 /// v34 (#874 activation-gated sparse writes): `write_quarantine` — the
 /// reviewable hold for writes whose measured interference exceeds the
 /// configured bound. New table, idempotent, no backfill.
-pub(crate) const SCHEMA_VERSION: i64 = 35;
+pub(crate) const SCHEMA_VERSION: i64 = 36;
 
 /// Initialize the v0.2.0 schema on a fresh database.
 pub fn initialize_schema(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
@@ -632,7 +701,12 @@ fn apply_migrations(conn: &Connection) -> Result<(), Box<dyn std::error::Error>>
     ensure_column(conn, "entities", "follow_count", "INTEGER DEFAULT 0")?;
     ensure_column(conn, "entities", "miss_count", "INTEGER DEFAULT 0")?;
     ensure_column(conn, "entities", "follow_rate", "REAL DEFAULT 0.0")?;
-    ensure_column(conn, "entities", "efficacy_status", "TEXT DEFAULT 'unverified'")?;
+    ensure_column(
+        conn,
+        "entities",
+        "efficacy_status",
+        "TEXT DEFAULT 'unverified'",
+    )?;
 
     // Add usefulness-tracking columns (#487 — derived_from reinforcement).
     // v16 (#503): these shipped without a SCHEMA_VERSION bump, so v15 stores
@@ -644,6 +718,7 @@ fn apply_migrations(conn: &Connection) -> Result<(), Box<dyn std::error::Error>>
     // v28 (#868): retention expiry on the live row. NULL = never expires
     // (the correct reading for every legacy row), so this is purely additive.
     ensure_column(conn, "entities", "expires_at_unix_ms", "INTEGER")?;
+    ensure_column(conn, "entities", "preload_tuned_unix_ms", "INTEGER DEFAULT 0")?;
 
     // v29 (#876): governed-distillation lifecycle on artifact bindings.
     // A learned artifact (trained weights / distilled cartridge) is bound to
@@ -871,7 +946,12 @@ fn apply_migrations(conn: &Connection) -> Result<(), Box<dyn std::error::Error>>
     // journals (and minimal test fixtures) that predate those columns.
     ensure_column(conn, "journal", "category", "TEXT DEFAULT ''")?;
     ensure_column(conn, "journal", "key", "TEXT DEFAULT ''")?;
-    ensure_column(conn, "journal", "workspace_hash", "TEXT NOT NULL DEFAULT ''")?;
+    ensure_column(
+        conn,
+        "journal",
+        "workspace_hash",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_journal_catkeyws ON journal(category, key, workspace_hash);",
     )?;
@@ -954,8 +1034,18 @@ fn apply_migrations(conn: &Connection) -> Result<(), Box<dyn std::error::Error>>
     //      — the scan's verify-on-hit self-heals any leftovers.)
     // Backfill cost is one pass over unsigned active rows (~30-60s per
     // 100K on desktop hardware), inside the migration transaction, once.
-    ensure_column(conn, "dedup_signatures", "category", "TEXT NOT NULL DEFAULT ''")?;
-    ensure_column(conn, "dedup_signatures", "workspace_hash", "TEXT NOT NULL DEFAULT ''")?;
+    ensure_column(
+        conn,
+        "dedup_signatures",
+        "category",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    ensure_column(
+        conn,
+        "dedup_signatures",
+        "workspace_hash",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
     // Scope-sync signature rows that predate the columns (idempotent: rows
     // already synced match the subquery and are rewritten with equal values).
     conn.execute_batch(
@@ -981,9 +1071,7 @@ fn apply_migrations(conn: &Connection) -> Result<(), Box<dyn std::error::Error>>
              WHERE e.archived = 0 AND s.entity_id IS NULL",
         )?;
         let rows: Vec<(String, String, String, String)> = missing
-            .query_map([], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
-            })?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
             .flatten()
             .collect();
         for (id, body, category, ws) in rows {
@@ -996,8 +1084,15 @@ fn apply_migrations(conn: &Connection) -> Result<(), Box<dyn std::error::Error>>
                 "INSERT OR REPLACE INTO dedup_signatures
                  (entity_id, body_len, body_hash, tg_count, histo, category, workspace_hash)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                rusqlite::params![id, rs.body_len, rs.body_hash, rs.tg_count, rs.histo,
-                                  category, ws],
+                rusqlite::params![
+                    id,
+                    rs.body_len,
+                    rs.body_hash,
+                    rs.tg_count,
+                    rs.histo,
+                    category,
+                    ws
+                ],
             )?;
         }
     }
@@ -1160,15 +1255,60 @@ fn apply_migrations(conn: &Connection) -> Result<(), Box<dyn std::error::Error>>
             released_at_unix_ms INTEGER, created_at_unix_ms INTEGER NOT NULL);
          CREATE INDEX IF NOT EXISTS idx_authorized_action_leases_active ON authorized_action_leases(workspace_hash, action_key, released_at_unix_ms, expires_at_unix_ms);",
     )?;
-    ensure_column(conn, "authority_manifests", "allowed_inbound_principals", "TEXT NOT NULL DEFAULT '[]'")?;
-    ensure_column(conn, "authority_manifests", "permitted_external_ref_prefixes", "TEXT NOT NULL DEFAULT '[]'")?;
-    ensure_column(conn, "authority_manifests", "max_parallel_actions", "INTEGER NOT NULL DEFAULT 1")?;
-    ensure_column(conn, "authorized_actions", "manifest_version", "INTEGER NOT NULL DEFAULT 0")?;
-    ensure_column(conn, "authorized_actions", "external_ref", "TEXT NOT NULL DEFAULT ''")?;
-    ensure_column(conn, "authorized_actions", "outcome_hash", "TEXT NOT NULL DEFAULT ''")?;
-    ensure_column(conn, "authority_manifests", "capability_constraints_json", "TEXT NOT NULL DEFAULT '{}'")?;
-    ensure_column(conn, "authorized_actions", "resource_constraints_json", "TEXT NOT NULL DEFAULT '{}'")?;
-    ensure_column(conn, "authorized_actions", "resource_constraints_hash", "TEXT NOT NULL DEFAULT ''")?;
+    ensure_column(
+        conn,
+        "authority_manifests",
+        "allowed_inbound_principals",
+        "TEXT NOT NULL DEFAULT '[]'",
+    )?;
+    ensure_column(
+        conn,
+        "authority_manifests",
+        "permitted_external_ref_prefixes",
+        "TEXT NOT NULL DEFAULT '[]'",
+    )?;
+    ensure_column(
+        conn,
+        "authority_manifests",
+        "max_parallel_actions",
+        "INTEGER NOT NULL DEFAULT 1",
+    )?;
+    ensure_column(
+        conn,
+        "authorized_actions",
+        "manifest_version",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        conn,
+        "authorized_actions",
+        "external_ref",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    ensure_column(
+        conn,
+        "authorized_actions",
+        "outcome_hash",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    ensure_column(
+        conn,
+        "authority_manifests",
+        "capability_constraints_json",
+        "TEXT NOT NULL DEFAULT '{}'",
+    )?;
+    ensure_column(
+        conn,
+        "authorized_actions",
+        "resource_constraints_json",
+        "TEXT NOT NULL DEFAULT '{}'",
+    )?;
+    ensure_column(
+        conn,
+        "authorized_actions",
+        "resource_constraints_hash",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
     // #10 resource constraints are hash-only lifecycle metadata. Legacy rows
     // remain readable with NULL/empty defaults; opted-in actions populate them.
     // ── end v24 ──────────────────────────────────────────────────────────
@@ -1231,7 +1371,12 @@ fn apply_migrations(conn: &Connection) -> Result<(), Box<dyn std::error::Error>>
     // Trust axis on entities, orthogonal to lifecycle `status`. Default
     // 'candidate' is the fail-closed reading for legacy rows lacking
     // admission evidence; writers set verified/corroborated explicitly.
-    ensure_column(conn, "entities", "epistemic_state", "TEXT DEFAULT 'candidate'")?;
+    ensure_column(
+        conn,
+        "entities",
+        "epistemic_state",
+        "TEXT DEFAULT 'candidate'",
+    )?;
     // ── end v27 ──────────────────────────────────────────────────────────
 
     // ── v31 (#872 retrieval concentration / contamination telemetry) ─────
@@ -1420,6 +1565,58 @@ fn apply_migrations(conn: &Connection) -> Result<(), Box<dyn std::error::Error>>
           ON op_run_items(run_id, state);",
     )?;
     // ── end v35 ──────────────────────────────────────────────────────────
+
+    // ── v36 (#875): learned anticipation — preload usage telemetry ────────
+    // New tables only; no backfill (no preload events existed before v36).
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS preload_events (
+            id TEXT PRIMARY KEY,
+            ts INTEGER NOT NULL,
+            context_hash TEXT NOT NULL,
+            context TEXT NOT NULL DEFAULT '',
+            entity_id TEXT NOT NULL,
+            trigger_ref TEXT NOT NULL,
+            workspace_hash TEXT NOT NULL DEFAULT '',
+            session_id TEXT NOT NULL DEFAULT '',
+            la_before INTEGER NOT NULL,
+            used INTEGER,
+            resolved_ts INTEGER
+         );
+         CREATE INDEX IF NOT EXISTS idx_preload_events_resolve
+          ON preload_events(used, ts);
+         CREATE INDEX IF NOT EXISTS idx_preload_events_entity
+          ON preload_events(entity_id, ts);
+         CREATE TABLE IF NOT EXISTS preload_sessions (
+            session_id TEXT PRIMARY KEY,
+            anchor_ts INTEGER NOT NULL,
+            preloaded_n INTEGER NOT NULL,
+            used_n INTEGER NOT NULL,
+            missed_n INTEGER NOT NULL,
+            precision REAL NOT NULL,
+            recall REAL NOT NULL,
+            miss_rate REAL NOT NULL,
+            context_words TEXT NOT NULL DEFAULT '[]',
+            missed_by_trigger_json TEXT NOT NULL DEFAULT '{}',
+            missed_ids_json TEXT NOT NULL DEFAULT '[]',
+            resolved_ts INTEGER NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS preload_proposals (
+            id TEXT PRIMARY KEY,
+            entity_id TEXT NOT NULL,
+            trigger_ref TEXT NOT NULL,
+            suggestion TEXT NOT NULL,
+            rationale TEXT NOT NULL DEFAULT '',
+            state TEXT NOT NULL,
+            created_ts INTEGER NOT NULL,
+            decided_ts INTEGER,
+            decided_by TEXT NOT NULL DEFAULT '',
+            applied_ts INTEGER,
+            journal_event_id TEXT NOT NULL DEFAULT ''
+         );
+         CREATE INDEX IF NOT EXISTS idx_preload_proposals_state
+          ON preload_proposals(state, created_ts);",
+    )?;
+    // ── end v36 ──────────────────────────────────────────────────────────
 
     // Stamp the migration level so subsequent opens skip the probe block above.
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -1770,7 +1967,10 @@ mod tests {
 
     fn temp_db() -> (Connection, String) {
         let dir = std::env::temp_dir();
-        let path = dir.join(format!("perseus_vault-test-schema-{}.db", uuid::Uuid::new_v4()));
+        let path = dir.join(format!(
+            "perseus_vault-test-schema-{}.db",
+            uuid::Uuid::new_v4()
+        ));
         let path_str = path.to_str().unwrap().to_string();
         let conn = Connection::open(&path_str).expect("open test db");
         (conn, path_str)
@@ -1791,7 +1991,10 @@ mod tests {
         let v: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, SCHEMA_VERSION, "fresh init must stamp the schema version");
+        assert_eq!(
+            v, SCHEMA_VERSION,
+            "fresh init must stamp the schema version"
+        );
 
         // Re-running on an already-current DB is a no-op that preserves data and
         // leaves the version untouched (the probe block is skipped).
@@ -1807,7 +2010,9 @@ mod tests {
             .unwrap();
         assert_eq!(v2, SCHEMA_VERSION);
         let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM entities WHERE id='v-test'", [], |r| r.get(0))
+            .query_row("SELECT COUNT(*) FROM entities WHERE id='v-test'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(count, 1, "re-init must not drop data");
     }
@@ -1835,14 +2040,16 @@ mod tests {
         )
         .unwrap();
         assert!(
-            conn.prepare("SELECT visibility FROM entities LIMIT 1").is_err(),
+            conn.prepare("SELECT visibility FROM entities LIMIT 1")
+                .is_err(),
             "precondition: legacy table lacks visibility"
         );
 
         initialize_schema(&conn).expect("migrate legacy db");
 
         assert!(
-            conn.prepare("SELECT visibility FROM entities LIMIT 1").is_ok(),
+            conn.prepare("SELECT visibility FROM entities LIMIT 1")
+                .is_ok(),
             "visibility column must be added during gated migration"
         );
         let v: i64 = conn
@@ -1912,7 +2119,8 @@ mod tests {
             .unwrap();
         conn.pragma_update(None, "user_version", 26i64).unwrap();
         assert!(
-            conn.prepare("SELECT epistemic_state FROM entities LIMIT 1").is_err(),
+            conn.prepare("SELECT epistemic_state FROM entities LIMIT 1")
+                .is_err(),
             "precondition: v26 store lacks epistemic_state"
         );
         // A legacy row written before the axis existed.
@@ -1929,7 +2137,10 @@ mod tests {
         let v: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, SCHEMA_VERSION, "migration must stamp the current version");
+        assert_eq!(
+            v, SCHEMA_VERSION,
+            "migration must stamp the current version"
+        );
         let state: String = conn
             .query_row(
                 "SELECT epistemic_state FROM entities WHERE id = 'legacy'",
@@ -1963,7 +2174,10 @@ mod tests {
         // could fail with "duplicate column name"; now BEGIN IMMEDIATE
         // serializes them and the loser's post-lock re-check no-ops.
         let dir = std::env::temp_dir();
-        let path = dir.join(format!("perseus_vault-test-race-{}.db", uuid::Uuid::new_v4()));
+        let path = dir.join(format!(
+            "perseus_vault-test-race-{}.db",
+            uuid::Uuid::new_v4()
+        ));
         let path_str = path.to_str().unwrap().to_string();
 
         // Pre-upgrade fixture: legacy tables without the ALTER-added columns,
@@ -2099,7 +2313,9 @@ mod tests {
         initialize_schema(&conn).expect("v5 -> v6 migration");
 
         let sig: Vec<u8> = conn
-            .query_row("SELECT emb_sig FROM entities WHERE id = 'sig-1'", [], |r| r.get(0))
+            .query_row("SELECT emb_sig FROM entities WHERE id = 'sig-1'", [], |r| {
+                r.get(0)
+            })
             .expect("emb_sig must be backfilled");
         assert_eq!(sig, crate::db::embedding_signature(&emb));
     }
@@ -2128,7 +2344,8 @@ mod tests {
         )
         .unwrap();
         assert!(
-            conn.prepare("SELECT recorded_at_unix_ms FROM entities LIMIT 1").is_err(),
+            conn.prepare("SELECT recorded_at_unix_ms FROM entities LIMIT 1")
+                .is_err(),
             "precondition: legacy table lacks the bi-temporal columns"
         );
 
@@ -2144,7 +2361,8 @@ mod tests {
             "superseded_by",
         ] {
             assert!(
-                conn.prepare(&format!("SELECT {col} FROM entities LIMIT 1")).is_ok(),
+                conn.prepare(&format!("SELECT {col} FROM entities LIMIT 1"))
+                    .is_ok(),
                 "column {col} must be added during migration"
             );
         }
@@ -2152,25 +2370,50 @@ mod tests {
         // recorded_at backfilled to created_at; the row is live (not invalidated)
         // and unbounded in valid time — i.e. unchanged in meaning.
         let recorded: i64 = conn
-            .query_row("SELECT recorded_at_unix_ms FROM entities WHERE id='e1'", [], |r| r.get(0))
+            .query_row(
+                "SELECT recorded_at_unix_ms FROM entities WHERE id='e1'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(recorded, 111, "recorded_at must backfill to created_at");
         let invalidated: Option<i64> = conn
-            .query_row("SELECT invalidated_at_unix_ms FROM entities WHERE id='e1'", [], |r| r.get(0))
+            .query_row(
+                "SELECT invalidated_at_unix_ms FROM entities WHERE id='e1'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
-        assert_eq!(invalidated, None, "existing rows must be live (not invalidated)");
+        assert_eq!(
+            invalidated, None,
+            "existing rows must be live (not invalidated)"
+        );
         // v7 (#363): the historical "NULL = valid since recorded" convention is
         // made explicit — valid_from backfills to the transaction time.
         let valid_from: Option<i64> = conn
-            .query_row("SELECT valid_from_unix_ms FROM entities WHERE id='e1'", [], |r| r.get(0))
+            .query_row(
+                "SELECT valid_from_unix_ms FROM entities WHERE id='e1'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
-        assert_eq!(valid_from, Some(111), "v7 must backfill valid_from to recorded_at");
+        assert_eq!(
+            valid_from,
+            Some(111),
+            "v7 must backfill valid_from to recorded_at"
+        );
         let valid_to: Option<i64> = conn
-            .query_row("SELECT valid_to_unix_ms FROM entities WHERE id='e1'", [], |r| r.get(0))
+            .query_row(
+                "SELECT valid_to_unix_ms FROM entities WHERE id='e1'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(valid_to, None, "valid_to must stay NULL (= still true)");
 
-        let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        let v: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(v, SCHEMA_VERSION);
     }
 
@@ -2197,15 +2440,31 @@ mod tests {
         initialize_schema(&conn).expect("v6 -> v7 migration");
 
         let vf_null: Option<i64> = conn
-            .query_row("SELECT valid_from_unix_ms FROM entities WHERE id='v7-null'", [], |r| r.get(0))
+            .query_row(
+                "SELECT valid_from_unix_ms FROM entities WHERE id='v7-null'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
-        assert_eq!(vf_null, Some(500), "NULL valid_from must backfill to recorded_at");
+        assert_eq!(
+            vf_null,
+            Some(500),
+            "NULL valid_from must backfill to recorded_at"
+        );
         let vf_set: Option<i64> = conn
-            .query_row("SELECT valid_from_unix_ms FROM entities WHERE id='v7-set'", [], |r| r.get(0))
+            .query_row(
+                "SELECT valid_from_unix_ms FROM entities WHERE id='v7-set'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(vf_set, Some(42), "explicit valid_from must be preserved");
         let vf_hist: Option<i64> = conn
-            .query_row("SELECT valid_from_unix_ms FROM entity_history WHERE history_id='h1'", [], |r| r.get(0))
+            .query_row(
+                "SELECT valid_from_unix_ms FROM entity_history WHERE history_id='h1'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(vf_hist, Some(300), "history rows must backfill too");
 
@@ -2213,11 +2472,19 @@ mod tests {
         conn.pragma_update(None, "user_version", 6).unwrap();
         initialize_schema(&conn).expect("v7 re-run");
         let vf_again: Option<i64> = conn
-            .query_row("SELECT valid_from_unix_ms FROM entities WHERE id='v7-null'", [], |r| r.get(0))
+            .query_row(
+                "SELECT valid_from_unix_ms FROM entities WHERE id='v7-null'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(vf_again, Some(500));
         let vf_set_again: Option<i64> = conn
-            .query_row("SELECT valid_from_unix_ms FROM entities WHERE id='v7-set'", [], |r| r.get(0))
+            .query_row(
+                "SELECT valid_from_unix_ms FROM entities WHERE id='v7-set'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(vf_set_again, Some(42));
     }
@@ -2226,7 +2493,9 @@ mod tests {
     fn fresh_db_has_bitemporal_columns_and_live_index() {
         let (conn, _path) = temp_db();
         initialize_schema(&conn).expect("init schema");
-        assert!(conn.prepare("SELECT invalidated_at_unix_ms FROM entities LIMIT 1").is_ok());
+        assert!(conn
+            .prepare("SELECT invalidated_at_unix_ms FROM entities LIMIT 1")
+            .is_ok());
         let idx: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_entities_invalidated'",
@@ -2234,7 +2503,10 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(idx, 1, "idx_entities_invalidated should be created on a fresh DB");
+        assert_eq!(
+            idx, 1,
+            "idx_entities_invalidated should be created on a fresh DB"
+        );
     }
 
     #[test]
@@ -2284,10 +2556,12 @@ mod tests {
         let (conn, _path) = temp_db();
         initialize_schema(&conn).expect("init schema");
         assert!(
-            conn.prepare("SELECT id, workspace_hash, member_ids, member_digest, summary, \
+            conn.prepare(
+                "SELECT id, workspace_hash, member_ids, member_digest, summary, \
                           summary_entity_id, algorithm, modularity, member_count, \
-                          generated_at_unix_ms FROM communities LIMIT 1")
-                .is_ok(),
+                          generated_at_unix_ms FROM communities LIMIT 1"
+            )
+            .is_ok(),
             "communities table with all v8 columns must exist on a fresh DB"
         );
         let idx: i64 = conn
@@ -2333,7 +2607,11 @@ mod tests {
             .unwrap();
         assert_eq!(v, SCHEMA_VERSION);
         let kept: i64 = conn
-            .query_row("SELECT COUNT(*) FROM entities WHERE id='v8-keep'", [], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM entities WHERE id='v8-keep'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(kept, 1, "migration must not drop data");
     }
@@ -2360,7 +2638,8 @@ mod tests {
         )
         .unwrap();
         assert!(
-            conn.prepare("SELECT entity_id FROM dedup_signatures LIMIT 1").is_err(),
+            conn.prepare("SELECT entity_id FROM dedup_signatures LIMIT 1")
+                .is_err(),
             "precondition: v9 DB lacks the dedup_signatures table"
         );
 
@@ -2374,7 +2653,8 @@ mod tests {
             "dedup_signatures with all v10 columns must exist"
         );
         assert!(
-            conn.prepare("SELECT entity_id, sig FROM dedup_signature_blobs LIMIT 1").is_ok(),
+            conn.prepare("SELECT entity_id, sig FROM dedup_signature_blobs LIMIT 1")
+                .is_ok(),
             "dedup_signature_blobs must exist"
         );
         let v: i64 = conn
@@ -2382,7 +2662,11 @@ mod tests {
             .unwrap();
         assert_eq!(v, SCHEMA_VERSION);
         let kept: i64 = conn
-            .query_row("SELECT COUNT(*) FROM entities WHERE id='v10-keep'", [], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM entities WHERE id='v10-keep'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(kept, 1, "migration must not drop data");
         // v17 (#476): the migration EAGERLY backfills — "every active row has
@@ -2431,7 +2715,8 @@ mod tests {
         )
         .unwrap();
         assert!(
-            conn.prepare("SELECT workspace_hash FROM journal LIMIT 1").is_err(),
+            conn.prepare("SELECT workspace_hash FROM journal LIMIT 1")
+                .is_err(),
             "precondition: v10 journal lacks workspace_hash"
         );
 
@@ -2439,7 +2724,8 @@ mod tests {
 
         // Column added, index created, version stamped.
         assert!(
-            conn.prepare("SELECT workspace_hash FROM journal LIMIT 1").is_ok(),
+            conn.prepare("SELECT workspace_hash FROM journal LIMIT 1")
+                .is_ok(),
             "workspace_hash column must be added"
         );
         let has_idx: i64 = conn
@@ -2450,7 +2736,9 @@ mod tests {
             )
             .unwrap();
         assert_eq!(has_idx, 1, "purge-match index must be created");
-        let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        let v: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(v, SCHEMA_VERSION);
         // Legacy row preserved, defaulting to empty workspace_hash.
         let (kept, ws): (i64, String) = conn
@@ -2461,7 +2749,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(kept, 1, "migration must not drop journal rows");
-        assert_eq!(ws, "", "legacy journal rows default to empty workspace_hash");
+        assert_eq!(
+            ws, "",
+            "legacy journal rows default to empty workspace_hash"
+        );
     }
 
     #[test]
@@ -2533,7 +2824,10 @@ mod tests {
         // Shorter than the limit: unchanged.
         assert_eq!(truncate_at_char_boundary("abc", 20), "abc");
         // Exactly at the limit: unchanged.
-        assert_eq!(truncate_at_char_boundary("a".repeat(20).as_str(), 20), "a".repeat(20));
+        assert_eq!(
+            truncate_at_char_boundary("a".repeat(20).as_str(), 20),
+            "a".repeat(20)
+        );
         // ASCII over the limit: plain byte cut.
         assert_eq!(truncate_at_char_boundary("abcdef", 3), "abc");
         // Multi-byte char straddling the cut point: back up to the boundary.
@@ -2569,7 +2863,10 @@ mod tests {
 
         // 19 ASCII bytes, then a 2-byte char occupying bytes 19..21.
         let evil_id = format!("{}é-tail", "x".repeat(19));
-        assert!(!evil_id.is_char_boundary(20), "precondition: byte 20 is mid-char");
+        assert!(
+            !evil_id.is_char_boundary(20),
+            "precondition: byte 20 is mid-char"
+        );
         let now = now_ms();
         old_conn
             .execute(
@@ -2671,7 +2968,10 @@ mod tests {
                 .unwrap();
             assert_eq!(exists, 1, "missing table {table}");
         }
-        for index in ["idx_artifact_bindings_scope", "idx_artifact_bindings_derived_from"] {
+        for index in [
+            "idx_artifact_bindings_scope",
+            "idx_artifact_bindings_derived_from",
+        ] {
             let exists: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name=?1",

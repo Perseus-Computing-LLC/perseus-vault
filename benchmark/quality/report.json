@@ -1,9 +1,9 @@
 {
-  "accuracy": 1.0,
+  "accuracy": 0.96,
   "benchmark": "perseus-vault-memory-quality",
   "benchmark_id": "perseus-vault-memory-quality",
   "binary": "perseus-vault",
-  "binary_sha256": "2cc12b85b67f95e3cb0331632e9cdd832936947dfce8b50fbdf8d73445a36262",
+  "binary_sha256": "db468d4b5750b02ea110f926fe78e21d9a065b874c76bd970e4a3698fb50f3b5",
   "capabilities": {
     "action_control_plane": {
       "missing_tools": [],
@@ -33,7 +33,7 @@
       "status": "available"
     },
     "mcp_stdio": {
-      "count": 100,
+      "count": 119,
       "status": "available"
     },
     "stage_trace_validate": {
@@ -45,34 +45,6 @@
     }
   },
   "cases": [
-    {
-      "category": "long_horizon",
-      "checks": {
-        "answer_found": true,
-        "answer_is_current": true
-      },
-      "evidence": {
-        "ranked_key_count": 13,
-        "seed_count": 13,
-        "target_key_present": true
-      },
-      "id": "long-horizon-basic",
-      "status": "passed"
-    },
-    {
-      "category": "contradiction_supersession",
-      "checks": {
-        "current_wins": true,
-        "history_retained": true
-      },
-      "evidence": {
-        "current_key_present": true,
-        "history_total": 1,
-        "superseded_evidence_present": true
-      },
-      "id": "contradiction-supersession-basic",
-      "status": "passed"
-    },
     {
       "category": "shared_memory",
       "checks": {
@@ -208,8 +180,8 @@
         "frozen_recall_replays": true
       },
       "evidence": {
-        "frozen_digest": "3368cf399ff745c612bdebcb4528edef93d707a6cb9749878ff4d106c20420f8",
-        "frozen_key_count": 19,
+        "frozen_digest": "76eedb952a5212b76830cdff4826781266e6df9e7a78c8ebf9ed55c952c2a224",
+        "frozen_key_count": 9,
         "stage_trace_checked": true,
         "temporal_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
       },
@@ -222,8 +194,8 @@
         "temporal_recall_replays": true
       },
       "evidence": {
-        "frozen_digest": "3368cf399ff745c612bdebcb4528edef93d707a6cb9749878ff4d106c20420f8",
-        "frozen_key_count": 19,
+        "frozen_digest": "76eedb952a5212b76830cdff4826781266e6df9e7a78c8ebf9ed55c952c2a224",
+        "frozen_key_count": 9,
         "stage_trace_checked": true,
         "temporal_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
       },
@@ -236,8 +208,8 @@
         "stage_trace_replay_matches": true
       },
       "evidence": {
-        "frozen_digest": "3368cf399ff745c612bdebcb4528edef93d707a6cb9749878ff4d106c20420f8",
-        "frozen_key_count": 19,
+        "frozen_digest": "76eedb952a5212b76830cdff4826781266e6df9e7a78c8ebf9ed55c952c2a224",
+        "frozen_key_count": 9,
         "stage_trace_checked": true,
         "temporal_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
       },
@@ -292,8 +264,8 @@
         "low_decay_compacted": true
       },
       "evidence": {
-        "entities_archived": 2,
-        "entities_examined": 28
+        "entities_archived": 1,
+        "entities_examined": 14
       },
       "id": "compaction-archive",
       "status": "passed"
@@ -404,7 +376,7 @@
       },
       "evidence": {
         "empty_abstained": true,
-        "pending_health_present": false
+        "pending_health_present": true
       },
       "id": "recall-outcome-empty-abstains",
       "status": "passed"
@@ -417,7 +389,7 @@
       },
       "evidence": {
         "empty_abstained": true,
-        "pending_health_present": false
+        "pending_health_present": true
       },
       "id": "recall-outcome-pending-is-stale",
       "status": "passed"
@@ -473,19 +445,325 @@
       },
       "id": "identity-ambiguity-abstains",
       "status": "passed"
+    },
+    {
+      "category": "graph_gate",
+      "checks": {
+        "multi_hop_selected": true,
+        "neighbor_surfaced": true,
+        "route_reason_observable": true
+      },
+      "evidence": {
+        "count": 2,
+        "found": true,
+        "rate": 0.0,
+        "reason": "2438ffd7faf4dee134be6748664ceff256b08e09a5af1938d8e24773b660b585",
+        "total": 2
+      },
+      "id": "graph-gate-multi-hop-routes",
+      "status": "passed"
+    },
+    {
+      "category": "graph_gate",
+      "checks": {
+        "ordinary_skipped": true,
+        "recall_succeeds": true
+      },
+      "evidence": {
+        "count": 2,
+        "found": true,
+        "rate": 0.0,
+        "reason": "2438ffd7faf4dee134be6748664ceff256b08e09a5af1938d8e24773b660b585",
+        "total": 2
+      },
+      "id": "graph-gate-ordinary-falls-back",
+      "status": "passed"
+    },
+    {
+      "category": "graph_gate",
+      "checks": {
+        "temporal_not_routed": true
+      },
+      "evidence": {
+        "count": 2,
+        "found": true,
+        "rate": 0.0,
+        "reason": "2438ffd7faf4dee134be6748664ceff256b08e09a5af1938d8e24773b660b585",
+        "total": 2
+      },
+      "id": "graph-gate-temporal-not-routed",
+      "status": "passed"
+    },
+    {
+      "category": "graph_gate",
+      "checks": {
+        "drift_consistent": true,
+        "no_fabricated_edges_served": true
+      },
+      "evidence": {
+        "count": 2,
+        "found": true,
+        "rate": 0.0,
+        "reason": "2438ffd7faf4dee134be6748664ceff256b08e09a5af1938d8e24773b660b585",
+        "total": 2
+      },
+      "id": "graph-gate-consistency",
+      "status": "passed"
+    },
+    {
+      "category": "validity_recall",
+      "checks": {
+        "current_ranks_first": true,
+        "validity_trace_observable": true
+      },
+      "evidence": {
+        "count": 2,
+        "found": true,
+        "rate": 1.0
+      },
+      "id": "validity-recall-orders-fresh-first",
+      "status": "passed"
+    },
+    {
+      "category": "validity_recall",
+      "checks": {
+        "superseded_not_served": true
+      },
+      "evidence": {
+        "count": 2,
+        "found": true,
+        "rate": 1.0
+      },
+      "id": "validity-recall-excludes-superseded",
+      "status": "passed"
+    },
+    {
+      "category": "validity_recall",
+      "checks": {
+        "expired_not_served": true
+      },
+      "evidence": {
+        "count": 2,
+        "found": true,
+        "rate": 1.0
+      },
+      "id": "validity-recall-excludes-expired",
+      "status": "passed"
+    },
+    {
+      "category": "validity_recall",
+      "checks": {
+        "expiring_graded_stale": true
+      },
+      "evidence": {
+        "count": 2,
+        "found": true,
+        "rate": 1.0
+      },
+      "id": "validity-recall-grades-expiring",
+      "status": "passed"
+    },
+    {
+      "category": "task_projection",
+      "checks": {
+        "live_hint": true,
+        "separated": true
+      },
+      "evidence": {
+        "count": 3,
+        "found": true,
+        "rate": 1.0,
+        "status": "passed"
+      },
+      "id": "task-projection-separates-and-hints",
+      "status": "passed"
+    },
+    {
+      "category": "task_projection",
+      "checks": {
+        "compact": true,
+        "contract_visible": true,
+        "deterministic": true
+      },
+      "evidence": {
+        "count": 3,
+        "found": true,
+        "rate": 1.0,
+        "status": "passed"
+      },
+      "id": "task-projection-contract-compact-replay",
+      "status": "passed"
+    },
+    {
+      "category": "evidence_observations",
+      "checks": {
+        "evidence_refs": true,
+        "single_observation": true,
+        "sources_live": true
+      },
+      "evidence": {
+        "count": 1,
+        "found": true,
+        "rate": 1.0,
+        "status": "passed"
+      },
+      "id": "evidence-observations-merge",
+      "status": "passed"
+    },
+    {
+      "category": "evidence_observations",
+      "checks": {
+        "correction_journey": true,
+        "staleness_refresh": true
+      },
+      "evidence": {
+        "count": 1,
+        "found": true,
+        "rate": 1.0,
+        "status": "passed"
+      },
+      "id": "evidence-observations-correction",
+      "status": "passed"
+    },
+    {
+      "category": "interference_gate",
+      "checks": {
+        "default_quarantines": true,
+        "quarantined_never_served": true
+      },
+      "evidence": {
+        "count": 1,
+        "found": true,
+        "rate": 0.0,
+        "reason": "2f5f7f8d4a1f71a0bc3f270a174667b86c74da6bb8335e90aaaf046b6819671b",
+        "total": 1
+      },
+      "id": "interference-gate-default-quarantine",
+      "status": "passed"
+    },
+    {
+      "category": "interference_gate",
+      "checks": {
+        "refuse_override_errors": true
+      },
+      "evidence": {
+        "count": 1,
+        "found": true,
+        "rate": 0.0,
+        "reason": "2f5f7f8d4a1f71a0bc3f270a174667b86c74da6bb8335e90aaaf046b6819671b",
+        "total": 1
+      },
+      "id": "interference-gate-refuse-override",
+      "status": "passed"
+    },
+    {
+      "category": "interference_gate",
+      "checks": {
+        "sparse_preserves_unrelated_recall": true
+      },
+      "evidence": {
+        "count": 1,
+        "found": true,
+        "rate": 0.0,
+        "reason": "2f5f7f8d4a1f71a0bc3f270a174667b86c74da6bb8335e90aaaf046b6819671b",
+        "total": 1
+      },
+      "id": "interference-gate-sparse-preserves-recall",
+      "status": "passed"
+    },
+    {
+      "category": "interference_gate",
+      "checks": {
+        "release_materializes": true
+      },
+      "evidence": {
+        "count": 1,
+        "found": true,
+        "rate": 0.0,
+        "reason": "2f5f7f8d4a1f71a0bc3f270a174667b86c74da6bb8335e90aaaf046b6819671b",
+        "total": 1
+      },
+      "id": "interference-gate-release-materializes",
+      "status": "passed"
+    },
+    {
+      "category": "learned_anticipation",
+      "checks": {
+        "low_utility_flagged": true,
+        "retire_governed": true,
+        "retired_stops_firing": true
+      },
+      "evidence": {
+        "count": 1,
+        "found": true,
+        "rate": 1.0,
+        "reason": "6580bc77d06b7ed6f86f5345c11dfb34991db5f2eed6fae8cf68682595ab2ee1",
+        "total": 1
+      },
+      "id": "learned-anticipation-low-utility-retire",
+      "status": "passed"
+    },
+    {
+      "category": "learned_anticipation",
+      "checks": {
+        "miss_recorded": true,
+        "recall_measured": true
+      },
+      "evidence": {
+        "count": 1,
+        "found": true,
+        "rate": 1.0,
+        "reason": "6580bc77d06b7ed6f86f5345c11dfb34991db5f2eed6fae8cf68682595ab2ee1",
+        "total": 1
+      },
+      "id": "learned-anticipation-missed-recall",
+      "status": "passed"
+    },
+    {
+      "category": "learned_anticipation",
+      "checks": {
+        "add_proposed": false,
+        "added_trigger_fires": false,
+        "approve_adds_trigger": false
+      },
+      "evidence": {
+        "count": 1,
+        "found": true,
+        "rate": 1.0,
+        "reason": "6580bc77d06b7ed6f86f5345c11dfb34991db5f2eed6fae8cf68682595ab2ee1",
+        "total": 1
+      },
+      "id": "learned-anticipation-add-trigger",
+      "status": "failed"
+    },
+    {
+      "category": "learned_anticipation",
+      "checks": {
+        "propose_readonly": true,
+        "stats_readonly": true
+      },
+      "evidence": {
+        "count": 1,
+        "found": true,
+        "rate": 1.0,
+        "reason": "6580bc77d06b7ed6f86f5345c11dfb34991db5f2eed6fae8cf68682595ab2ee1",
+        "total": 1
+      },
+      "id": "learned-anticipation-no-silent-mutation",
+      "status": "passed"
     }
   ],
-  "checks_passed": 41,
-  "checks_total": 41,
+  "checks_passed": 72,
+  "checks_total": 75,
   "claim_ids": [
     "quality-v1-contract"
   ],
   "claims_sha256": "9361b8ccf4fbd570bc62000f98db10045907667abd053a3b047af6758d44782a",
-  "control_profile_sha256": "e52775af9dd5f74c0ef9f1d38f5874997846230ffc296507fff62ba695282ad3",
+  "control_profile_sha256": "32b27e3be2fda8afdd80f21fa76bfad49bfe973a01d133d9cfd27c3d4900ba6e",
   "dataset": "perseus-vault-memory-quality-v1",
-  "dataset_sha256": "739beed898668642887a0c55485747e1ec5c8d6ff27b9e0cc0f6c0b0909ca249",
+  "dataset_sha256": "03e51038fbec9484b53248c1dae07b02a5367737d70ae6e39d6da867dfbeaacc",
   "excluded": [],
-  "harness_commit": "cc75c0450340287b3a11a3593048f1cd56159a7a",
+  "harness_commit": "61499e09373931c04af4ff908cc6a86592461e3a",
   "harness_version": "perseus-vault-memory-quality/v1",
   "metric_rates": {
     "action_grounding_rate": {
@@ -556,15 +834,40 @@
       "rate": 1.0,
       "status": "available"
     },
+    "evidence_observations": {
+      "denominator": 2,
+      "numerator": 2,
+      "rate": 1.0,
+      "status": "available"
+    },
+    "graph_utility_gate": {
+      "denominator": 4,
+      "numerator": 4,
+      "rate": 1.0,
+      "status": "available"
+    },
     "identity_ambiguity": {
       "denominator": 1,
       "numerator": 1,
       "rate": 1.0,
       "status": "available"
     },
+    "interference_gate": {
+      "denominator": 4,
+      "numerator": 4,
+      "rate": 1.0,
+      "status": "available"
+    },
+    "learned_anticipation": {
+      "denominator": 4,
+      "numerator": 3,
+      "rate": 0.75,
+      "reason": "metric_not_available",
+      "status": "failed"
+    },
     "mutation_supersession": {
-      "denominator": 5,
-      "numerator": 5,
+      "denominator": 3,
+      "numerator": 3,
       "rate": 1.0,
       "status": "available"
     },
@@ -598,9 +901,21 @@
       "rate": 0.0,
       "status": "available"
     },
+    "task_projection": {
+      "denominator": 5,
+      "numerator": 5,
+      "rate": 1.0,
+      "status": "available"
+    },
     "validity": {
-      "denominator": 6,
-      "numerator": 6,
+      "denominator": 4,
+      "numerator": 4,
+      "rate": 1.0,
+      "status": "available"
+    },
+    "validity_recall": {
+      "denominator": 4,
+      "numerator": 4,
       "rate": 1.0,
       "status": "available"
     }
@@ -612,12 +927,10 @@
   "network_calls": 0,
   "not_measured": [],
   "offline": true,
-  "passed": true,
+  "passed": false,
   "public_evidence": "hash-only",
   "raw_inputs_captured": false,
   "required_categories": [
-    "long_horizon",
-    "contradiction_supersession",
     "shared_memory",
     "adversarial",
     "validity",
@@ -630,12 +943,17 @@
     "recall_outcome",
     "admission",
     "prompt_safety",
-    "identity_ambiguity"
+    "identity_ambiguity",
+    "graph_gate",
+    "validity_recall",
+    "task_projection",
+    "evidence_observations",
+    "interference_gate"
   ],
-  "result_signature_sha256": "015e691904b9cfc80139dadebd2bec4d18926d5a84a61be7bcfecf96a8947009",
-  "run_fingerprint_sha256": "3b8d99f9a99afb33cb8ab557c577a0c7c3908d508f31ba22ac22c3cb129460c7",
+  "result_signature_sha256": "7d8026fa2af11b40766d0228229d14a78e8a2a6e20ae7fb07d152303e3eb7960",
+  "run_fingerprint_sha256": "d58f2edf74172dc048086d472c914b97b69cc9bb6971c1b368e2a47775118179",
   "schema_version": "perseus-vault-benchmark-report/v1",
-  "signature_sha256": "da47e190f11c9e5372855597e61154200fd6ec936770362638755f40224078a6",
-  "status": "passed",
+  "signature_sha256": "5d8c5ea330226cc94f75135147e4cd005f749c9c67a08aea62824a9152d99b4d",
+  "status": "partial",
   "suite_version": "v1"
 }

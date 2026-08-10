@@ -1,16 +1,15 @@
+use rusqlite::OptionalExtension;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
-use rusqlite::OptionalExtension;
 
 use crate::db::{now_ms, Database};
-use crate::vector_quant::EmbeddingQuant;
 use crate::log_digest;
 use crate::models::{
-    ArtifactRepresentation, Entity, ExternalRef, JournalEvent, OriginRecord, SearchMode,
-    StateEntry, TimelineParams,
-    AskParams, EmbedParams, IngestParams, PruneParams, RecallParams,
+    ArtifactRepresentation, AskParams, EmbedParams, Entity, ExternalRef, IngestParams,
+    JournalEvent, OriginRecord, PruneParams, RecallParams, SearchMode, StateEntry, TimelineParams,
 };
+use crate::vector_quant::EmbeddingQuant;
 
 // ─── Deserialization structs ────────────────────────────────────
 
@@ -253,10 +252,7 @@ pub struct RecallArgs {
     #[serde(rename = "type")]
     #[serde(default)]
     pub entity_type: Option<String>,
-    #[serde(
-        default = "default_limit",
-        deserialize_with = "null_as_default_limit"
-    )]
+    #[serde(default = "default_limit", deserialize_with = "null_as_default_limit")]
     pub limit: i64,
     #[serde(default, deserialize_with = "null_as_default")]
     pub offset: i64,
@@ -620,7 +616,10 @@ fn apply_confidence(items: &mut [serde_json::Value], entities: &[crate::models::
     let total = entities.len();
     for (i, (item, ent)) in items.iter_mut().zip(entities.iter()).enumerate() {
         if let Some(obj) = item.as_object_mut() {
-            obj.insert("confidence".to_string(), json!(confidence_for(ent, i, total)));
+            obj.insert(
+                "confidence".to_string(),
+                json!(confidence_for(ent, i, total)),
+            );
         }
     }
 }
@@ -800,6 +799,9 @@ pub struct ContextArgs {
     /// Explicit character budget; overrides the model profile (#366).
     #[serde(default)]
     pub max_context_chars: Option<i64>,
+    /// #875: session id for preload usage telemetry ("" when unknown).
+    #[serde(default)]
+    pub session_id: String,
 }
 
 fn default_context_limit() -> i64 {
@@ -845,7 +847,9 @@ fn authoritative_source_is_bound(
     let Some(source_event_id) = request.source_event_id.as_deref() else {
         return Ok(false);
     };
-    let conn = db.conn().map_err(|e| format!("admission source lookup failed: {e}"))?;
+    let conn = db
+        .conn()
+        .map_err(|e| format!("admission source lookup failed: {e}"))?;
     let source: Option<(String, String)> = conn
         .query_row(
             "SELECT workspace_hash, agent_id FROM journal WHERE id=?1",
@@ -854,9 +858,8 @@ fn authoritative_source_is_bound(
         )
         .optional()
         .map_err(|e| format!("admission source lookup failed: {e}"))?;
-    Ok(source.is_some_and(|(workspace, actor)| {
-        workspace == request.workspace_hash && actor == agent_id
-    }))
+    Ok(source
+        .is_some_and(|(workspace, actor)| workspace == request.workspace_hash && actor == agent_id))
 }
 
 pub fn handle_remember(db: &Database, args: Value) -> Result<String, String> {
@@ -997,7 +1000,9 @@ pub fn handle_remember(db: &Database, args: Value) -> Result<String, String> {
                 return Err("evidence.capture_mode=hash_only requires content_sha256".into())
             }
             "capture_failed" if evidence.resolved_value.is_some() => {
-                return Err("evidence.capture_mode=capture_failed cannot carry resolved_value".into())
+                return Err(
+                    "evidence.capture_mode=capture_failed cannot carry resolved_value".into(),
+                )
             }
             _ => {}
         }
@@ -1009,25 +1014,38 @@ pub fn handle_remember(db: &Database, args: Value) -> Result<String, String> {
     }
     let is_imported_provenance = serde_json::from_str::<Value>(&body)
         .ok()
-        .and_then(|value| value["origin"]["memory_kind"].as_str().map(|kind| kind == "imported"))
+        .and_then(|value| {
+            value["origin"]["memory_kind"]
+                .as_str()
+                .map(|kind| kind == "imported")
+        })
         .unwrap_or(false);
     let mut verified_admission = false;
     let (admission_evidence, provenance) = if let Some(ref request) = a.admission {
         if let Some(actor_identity) = request.actor_identity.as_deref() {
             if actor_identity != a.agent_id {
-                return Err("admission actor_identity does not match the writing agent_id".to_string());
+                return Err(
+                    "admission actor_identity does not match the writing agent_id".to_string(),
+                );
             }
         }
         if let Some(actor_kind) = request.actor_kind.as_deref() {
             if !a.actor_kind.is_empty() && actor_kind != a.actor_kind {
-                return Err("admission actor_kind does not match the writing actor_kind".to_string());
+                return Err(
+                    "admission actor_kind does not match the writing actor_kind".to_string()
+                );
             }
         }
         let mut decision = crate::trust_admission::evaluate(request)
             .map_err(|e| format!("admission gate failed: {e}"))?;
         if decision.authoritative {
             if authoritative_source_is_bound(
-                db, request, &body, &a.workspace_hash, &a.agent_id, &a.actor_kind,
+                db,
+                request,
+                &body,
+                &a.workspace_hash,
+                &a.agent_id,
+                &a.actor_kind,
             )? {
                 verified_admission = true;
             } else {
@@ -1037,10 +1055,18 @@ pub fn handle_remember(db: &Database, args: Value) -> Result<String, String> {
             }
         }
         if !a.workspace_hash.is_empty() && request.workspace_hash != a.workspace_hash {
-            return Err("admission workspace scope does not match the requested workspace".to_string());
+            return Err(
+                "admission workspace scope does not match the requested workspace".to_string(),
+            );
         }
-        if decision.reason_codes.iter().any(|reason| reason == "workspace_scope_mismatch") {
-            return Err("admission authorization scope does not match the admission workspace".to_string());
+        if decision
+            .reason_codes
+            .iter()
+            .any(|reason| reason == "workspace_scope_mismatch")
+        {
+            return Err(
+                "admission authorization scope does not match the admission workspace".to_string(),
+            );
         }
         if matches!(decision.outcome.as_str(), "suppressed" | "abstained") {
             return Ok(json!({
@@ -1068,9 +1094,15 @@ pub fn handle_remember(db: &Database, args: Value) -> Result<String, String> {
         });
         (Some(decision), Some(provenance))
     } else if !is_imported_provenance
-        && (!a.agent_id.trim().is_empty() || !a.workspace_hash.trim().is_empty() || !a.actor_kind.trim().is_empty())
+        && (!a.agent_id.trim().is_empty()
+            || !a.workspace_hash.trim().is_empty()
+            || !a.actor_kind.trim().is_empty())
     {
-        let actor_kind = if a.actor_kind.trim().is_empty() { "assistant" } else { a.actor_kind.as_str() };
+        let actor_kind = if a.actor_kind.trim().is_empty() {
+            "assistant"
+        } else {
+            a.actor_kind.as_str()
+        };
         let provenance = json!({
             "state": "proposed",
             "requires_review": true,
@@ -1107,8 +1139,7 @@ pub fn handle_remember(db: &Database, args: Value) -> Result<String, String> {
             if !a.external_refs.is_empty() {
                 map.insert(
                     "external_refs".to_string(),
-                    serde_json::to_value(&a.external_refs)
-                        .unwrap_or(serde_json::json!([])),
+                    serde_json::to_value(&a.external_refs).unwrap_or(serde_json::json!([])),
                 );
             }
             if let Some(ref evidence) = a.evidence {
@@ -1134,12 +1165,15 @@ pub fn handle_remember(db: &Database, args: Value) -> Result<String, String> {
     let id = format!("mem-{}", &raw_id[..12.min(raw_id.len())]);
     let now = now_ms();
 
-    let layer = a.layer.map(|l| match l.as_str() {
-        "world" => "core".to_string(),
-        "episodic" => "buffer".to_string(),
-        "semantic" => "working".to_string(),
-        _ => l,
-    }).unwrap_or_else(|| "buffer".to_string());
+    let layer = a
+        .layer
+        .map(|l| match l.as_str() {
+            "world" => "core".to_string(),
+            "episodic" => "buffer".to_string(),
+            "semantic" => "working".to_string(),
+            _ => l,
+        })
+        .unwrap_or_else(|| "buffer".to_string());
     let entity_workspace_hash = if !a.workspace_hash.is_empty() {
         a.workspace_hash.clone()
     } else {
@@ -1160,7 +1194,13 @@ pub fn handle_remember(db: &Database, args: Value) -> Result<String, String> {
         category: a.category,
         key: a.key,
         body_json: body,
-        status: if proposed { "proposed".to_string() } else if quarantined { "quarantined".to_string() } else { a.status },
+        status: if proposed {
+            "proposed".to_string()
+        } else if quarantined {
+            "quarantined".to_string()
+        } else {
+            a.status
+        },
         entity_type: a.entity_type,
         tags: a.tags,
         decay_score: a.importance,
@@ -1172,7 +1212,11 @@ pub fn handle_remember(db: &Database, args: Value) -> Result<String, String> {
         links: vec![],
         verified: false,
         source: "agent".to_string(),
-        always_on: if proposed || quarantined { false } else { a.always_on },
+        always_on: if proposed || quarantined {
+            false
+        } else {
+            a.always_on
+        },
         certainty: a.certainty,
         workspace_hash: entity_workspace_hash,
         agent_id: a.agent_id.clone(),
@@ -1232,16 +1276,28 @@ pub fn handle_remember(db: &Database, args: Value) -> Result<String, String> {
 
     let (eid, action) = if verified_admission {
         db.remember_verified_with_options(
-            &entity, a.skip_dedup, a.valid_from_unix_ms, a.valid_to_unix_ms, a.allow_rejected,
+            &entity,
+            a.skip_dedup,
+            a.valid_from_unix_ms,
+            a.valid_to_unix_ms,
+            a.allow_rejected,
         )
     } else if gate_opts.sparse_update || mode_override.is_some() || a.interference_bound.is_some() {
         db.remember_with_write_options(
-            &entity, a.skip_dedup, a.valid_from_unix_ms, a.valid_to_unix_ms, a.allow_rejected,
+            &entity,
+            a.skip_dedup,
+            a.valid_from_unix_ms,
+            a.valid_to_unix_ms,
+            a.allow_rejected,
             gate_opts,
         )
     } else {
         db.remember_with_options(
-            &entity, a.skip_dedup, a.valid_from_unix_ms, a.valid_to_unix_ms, a.allow_rejected,
+            &entity,
+            a.skip_dedup,
+            a.valid_from_unix_ms,
+            a.valid_to_unix_ms,
+            a.allow_rejected,
         )
     }
     .map_err(|e| format!("Remember failed: {e}"))?;
@@ -1270,7 +1326,10 @@ pub fn handle_remember(db: &Database, args: Value) -> Result<String, String> {
                         continue;
                     }
                     let hit = db.mark_useful_by_id(id).map_err(|e| {
-                        format!("Remembered {} but derived_from reinforcement failed: {}", eid, e)
+                        format!(
+                            "Remembered {} but derived_from reinforcement failed: {}",
+                            eid, e
+                        )
                     })?;
                     (id.clone(), hit)
                 }
@@ -1279,7 +1338,10 @@ pub fn handle_remember(db: &Database, args: Value) -> Result<String, String> {
                         continue;
                     }
                     let hit = db.mark_useful(category, key, ws).map_err(|e| {
-                        format!("Remembered {} but derived_from reinforcement failed: {}", eid, e)
+                        format!(
+                            "Remembered {} but derived_from reinforcement failed: {}",
+                            eid, e
+                        )
                     })?;
                     (format!("{}/{}", category, key), hit)
                 }
@@ -1392,7 +1454,11 @@ fn empty_recall_diagnostic(db: &Database, mode: &SearchMode) -> serde_json::Valu
 /// optional (ref_type, ref_value) recall filter? ref_type is exact-match;
 /// ref_value matches exactly or as a hierarchical prefix on a '/'
 /// boundary ("github:org" matches "github:org/repo", not "github.com/org").
-fn entity_matches_ref_filter(e: &Entity, want_type: Option<&str>, want_value: Option<&str>) -> bool {
+fn entity_matches_ref_filter(
+    e: &Entity,
+    want_type: Option<&str>,
+    want_value: Option<&str>,
+) -> bool {
     let body: serde_json::Value = match serde_json::from_str(&e.body_json) {
         Ok(v) => v,
         Err(_) => return false,
@@ -1414,16 +1480,24 @@ fn entity_matches_ref_filter(e: &Entity, want_type: Option<&str>, want_value: Op
 
 fn apply_promotion_explanations(items: &mut [Value]) {
     for item in items {
-        let Some(obj) = item.as_object_mut() else { continue };
-        let class = obj.get("category").and_then(Value::as_str).unwrap_or("unknown");
+        let Some(obj) = item.as_object_mut() else {
+            continue;
+        };
+        let class = obj
+            .get("category")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
         let transition = obj.get("promotion_transition");
         let state = transition
             .and_then(|v| v.get("to_state"))
             .and_then(Value::as_str)
             .unwrap_or("unpromoted");
-        let evidence: Vec<Value> = obj.get("promoted_from")
+        let evidence: Vec<Value> = obj
+            .get("promoted_from")
             .and_then(|v| v.get("id"))
-            .cloned().into_iter().collect();
+            .cloned()
+            .into_iter()
+            .collect();
         obj.insert("why_served".to_string(), json!({
             "memory_class": class,
             "promotion_state": state,
@@ -1466,9 +1540,7 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
     // rather than silently no-oping.
     if let Some(w) = a.scope_weight {
         if !w.is_finite() || !(0.0..=1.0).contains(&w) {
-            return Err(format!(
-                "scope_weight must be between 0.0 and 1.0, got {w}"
-            ));
+            return Err(format!("scope_weight must be between 0.0 and 1.0, got {w}"));
         }
         if a.workspace_hash.as_deref().map_or(true, |ws| ws.is_empty()) {
             return Err(
@@ -1547,7 +1619,9 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
     let startup_rank = a.startup;
     let requested_limit = a.limit;
     let effective_limit = if startup_rank && a.offset == 0 {
-        requested_limit.saturating_mul(5).clamp(requested_limit, 200)
+        requested_limit
+            .saturating_mul(5)
+            .clamp(requested_limit, 200)
     } else {
         requested_limit
     };
@@ -1555,7 +1629,10 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
 
     // #784: personal/agent profiles may retrieve global policy records; shared
     // profile stays strictly workspace-scoped.
-    let profile_name = a.retrieval_profile.clone().unwrap_or_else(|| "shared".to_string());
+    let profile_name = a
+        .retrieval_profile
+        .clone()
+        .unwrap_or_else(|| "shared".to_string());
     let profile_workspace = if matches!(profile_name.as_str(), "personal" | "agent") {
         None
     } else {
@@ -1593,7 +1670,11 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
         agent_id: a.agent_id.clone(),
         epistemic_state: a.epistemic_state.clone(),
         visibility: None,
-        layer: a.layer.as_deref().filter(|s| !s.is_empty()).map(canonical_layer),
+        layer: a
+            .layer
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(canonical_layer),
         tier_order: a.tier_order,
         reinforce: a.reinforce,
         strategies: a.strategies,
@@ -1617,16 +1698,16 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
     // standard path returns entities + completeness only.
     let (mut entities, recall_completeness, fused_trace) =
         if mode_for_side_effects == SearchMode::Fused {
-        let (e, c, t) = db
-            .fused_recall(&params)
-            .map_err(|e| format!("Recall failed: {}", e))?;
-        (e, c, Some(t))
-    } else {
-        let (e, c) = db
-            .recall_with_completeness(&params)
-            .map_err(|e| format!("Recall failed: {}", e))?;
-        (e, c, None)
-    };
+            let (e, c, t) = db
+                .fused_recall(&params)
+                .map_err(|e| format!("Recall failed: {}", e))?;
+            (e, c, Some(t))
+        } else {
+            let (e, c) = db
+                .recall_with_completeness(&params)
+                .map_err(|e| format!("Recall failed: {}", e))?;
+            (e, c, None)
+        };
 
     let elapsed_ms = started.elapsed().as_millis() as i64;
     let deadline_elapsed = deadline_ms.is_some_and(|ms| elapsed_ms >= ms);
@@ -1642,7 +1723,12 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
         }
         SearchMode::Fts5 => true,
     };
-    let outcome = db.recall_outcome(&mode_for_side_effects, query_embedding_available, entities.len(), None);
+    let outcome = db.recall_outcome(
+        &mode_for_side_effects,
+        query_embedding_available,
+        entities.len(),
+        None,
+    );
     // #883: a fused recall with a DEGRADED arm (e.g. embedding backend down
     // for the dense strategy) is never silently fresh — report Partial with
     // the reason so an incomplete consensus is distinguishable from a
@@ -1689,13 +1775,25 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
     match profile_name {
         "shared" => {
             entities.retain(|e| {
-                e.category != "preference" && e.category != "personal"
-                    && a.workspace_hash.as_ref().map_or(true, |ws| ws.is_empty() || e.workspace_hash == *ws)
+                e.category != "preference"
+                    && e.category != "personal"
+                    && a.workspace_hash
+                        .as_ref()
+                        .map_or(true, |ws| ws.is_empty() || e.workspace_hash == *ws)
             });
         }
         "personal" => entities.retain(|e| e.category == "preference" || e.category == "personal"),
-        "agent" => entities.retain(|e| matches!(e.category.as_str(), "convention" | "correction" | "keystone")),
-        other => return Err(format!("unknown retrieval_profile '{other}': expected personal, agent, or shared")),
+        "agent" => entities.retain(|e| {
+            matches!(
+                e.category.as_str(),
+                "convention" | "correction" | "keystone"
+            )
+        }),
+        other => {
+            return Err(format!(
+                "unknown retrieval_profile '{other}': expected personal, agent, or shared"
+            ))
+        }
     }
 
     // #728: external-ref post-filter (spec §2.2). Applied after visibility so
@@ -1868,14 +1966,15 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
 }
 
 pub fn handle_recall_batch(db: &Database, args: Value) -> Result<String, String> {
-    let a: RecallBatchArgs =
-        serde_json::from_value(args).map_err(|e| format!("Invalid recall batch arguments: {}", e))?;
+    let a: RecallBatchArgs = serde_json::from_value(args)
+        .map_err(|e| format!("Invalid recall batch arguments: {}", e))?;
 
     if a.queries.is_empty() {
         return Ok(json!({
             "items": Vec::<serde_json::Value>::new(),
             "total": 0,
-        }).to_string());
+        })
+        .to_string());
     }
 
     // Validate valid_op and scope_weight for all queries
@@ -1891,9 +1990,7 @@ pub fn handle_recall_batch(db: &Database, args: Value) -> Result<String, String>
 
         if let Some(w) = q.scope_weight {
             if !w.is_finite() || !(0.0..=1.0).contains(&w) {
-                return Err(format!(
-                    "scope_weight must be between 0.0 and 1.0, got {w}"
-                ));
+                return Err(format!("scope_weight must be between 0.0 and 1.0, got {w}"));
             }
             if q.workspace_hash.as_deref().map_or(true, |ws| ws.is_empty()) {
                 return Err(
@@ -1942,8 +2039,10 @@ pub fn handle_recall_batch(db: &Database, args: Value) -> Result<String, String>
             _ => SearchMode::Fts5,
         };
 
-        let temporal_filtering =
-            q.valid_at.is_some() || q.valid_from_unix_ms.is_some() || q.valid_to_unix_ms.is_some() || q.as_of_unix_ms.is_some();
+        let temporal_filtering = q.valid_at.is_some()
+            || q.valid_from_unix_ms.is_some()
+            || q.valid_to_unix_ms.is_some()
+            || q.as_of_unix_ms.is_some();
 
         let params = RecallParams {
             query: q.query.clone(),
@@ -1969,7 +2068,11 @@ pub fn handle_recall_batch(db: &Database, args: Value) -> Result<String, String>
             agent_id: q.agent_id.clone(),
             epistemic_state: q.epistemic_state.clone(),
             visibility: None,
-            layer: q.layer.as_deref().filter(|s| !s.is_empty()).map(canonical_layer),
+            layer: q
+                .layer
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .map(canonical_layer),
             reinforce: q.reinforce,
             strategies: q.strategies.clone(),
             max_tokens: q.max_tokens,
@@ -1991,7 +2094,14 @@ pub fn handle_recall_batch(db: &Database, args: Value) -> Result<String, String>
             if q.as_of_unix_ms.is_some() || q.valid_at.is_some() {
                 let _ = temporal_resolve(db, q.as_of_unix_ms, q.valid_at, &mut entities)?;
             } else {
-                valid_time_retain(db, None, q.valid_from_unix_ms, q.valid_to_unix_ms, &q.valid_op, &mut entities)?;
+                valid_time_retain(
+                    db,
+                    None,
+                    q.valid_from_unix_ms,
+                    q.valid_to_unix_ms,
+                    &q.valid_op,
+                    &mut entities,
+                )?;
             }
         }
 
@@ -2031,8 +2141,9 @@ pub fn handle_recall_batch(db: &Database, args: Value) -> Result<String, String>
     // mirroring include_confidence). Fused batch queries re-rank inside
     // fused_recall when the profile is "validity"; this block annotates.
     let first = a.queries.first();
-    let annotate_validity =
-        first.map_or(false, |q| q.profile.as_deref() == Some("validity") || q.validity_annotate);
+    let annotate_validity = first.map_or(false, |q| {
+        q.profile.as_deref() == Some("validity") || q.validity_annotate
+    });
     if annotate_validity {
         let now_ms = first
             .and_then(|q| q.query_time_unix_ms)
@@ -2191,7 +2302,13 @@ pub fn handle_hygiene(db: &Database, args: Value) -> Result<String, String> {
         let want = PAGE.min(scan_cap - scanned);
         // Over-fetch one row to learn whether another page exists (mirrors scan).
         let batch = db
-            .scan_entities(a.category.as_deref(), None, false, cursor.as_deref(), want + 1)
+            .scan_entities(
+                a.category.as_deref(),
+                None,
+                false,
+                cursor.as_deref(),
+                want + 1,
+            )
             .map_err(|e| format!("Hygiene scan failed: {}", e))?;
         let has_more = batch.len() as i64 > want;
         let take = if has_more { want as usize } else { batch.len() };
@@ -2231,11 +2348,19 @@ pub fn handle_hygiene(db: &Database, args: Value) -> Result<String, String> {
     flagged.sort_by(|x, y| {
         x.0.partial_cmp(&y.0)
             .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| x.1["id"].as_str().unwrap_or("").cmp(y.1["id"].as_str().unwrap_or("")))
+            .then_with(|| {
+                x.1["id"]
+                    .as_str()
+                    .unwrap_or("")
+                    .cmp(y.1["id"].as_str().unwrap_or(""))
+            })
     });
     let flagged_count = flagged.len();
-    let items: Vec<serde_json::Value> =
-        flagged.into_iter().take(report_cap).map(|(_, v)| v).collect();
+    let items: Vec<serde_json::Value> = flagged
+        .into_iter()
+        .take(report_cap)
+        .map(|(_, v)| v)
+        .collect();
     Ok(json!({
         "scanned": scanned,
         "flagged_count": flagged_count,
@@ -2346,7 +2471,11 @@ fn handle_recall_with_expansion(db: &Database, a: &RecallArgs) -> Result<String,
             agent_id: a.agent_id.clone(),
             epistemic_state: a.epistemic_state.clone(),
             visibility: None,
-            layer: a.layer.as_deref().filter(|s| !s.is_empty()).map(canonical_layer),
+            layer: a
+                .layer
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .map(canonical_layer),
             // Fts5-only path: reinforcement is handled by the batched
             // side-effect below, not the per-variant recalls.
             reinforce: false,
@@ -2376,8 +2505,7 @@ fn handle_recall_with_expansion(db: &Database, a: &RecallArgs) -> Result<String,
     // #363: valid-time filters, before side-effects so filtered-out entities
     // are not reinforced. No-op unless a filter was requested.
     if a.valid_at.is_some() || a.valid_from_unix_ms.is_some() || a.valid_to_unix_ms.is_some() {
-        let mut ents: Vec<crate::models::Entity> =
-            merged.iter().map(|(e, _)| e.clone()).collect();
+        let mut ents: Vec<crate::models::Entity> = merged.iter().map(|(e, _)| e.clone()).collect();
         valid_time_retain(
             db,
             a.valid_at,
@@ -2404,7 +2532,10 @@ fn handle_recall_with_expansion(db: &Database, a: &RecallArgs) -> Result<String,
         let total = merged.len();
         for (i, (item, (entity, _))) in items_expanded.iter_mut().zip(merged.iter()).enumerate() {
             if let Some(obj) = item.as_object_mut() {
-                obj.insert("confidence".to_string(), json!(confidence_for(entity, i, total)));
+                obj.insert(
+                    "confidence".to_string(),
+                    json!(confidence_for(entity, i, total)),
+                );
             }
         }
     }
@@ -2425,8 +2556,8 @@ pub struct RecallLayerArgs {
 }
 
 pub fn handle_recall_layer(db: &Database, args: Value) -> Result<String, String> {
-    let a: RecallLayerArgs =
-        serde_json::from_value(args).map_err(|e| format!("Invalid recall_layer arguments: {}", e))?;
+    let a: RecallLayerArgs = serde_json::from_value(args)
+        .map_err(|e| format!("Invalid recall_layer arguments: {}", e))?;
 
     let layer = match a.layer.as_str() {
         "world" => "core",
@@ -2799,18 +2930,17 @@ fn entity_has_authoritative_admission(entity: &Entity) -> bool {
         Ok(value) => value,
         Err(_) => return false,
     };
-    let admission: crate::trust_admission::AdmissionEvidence = match
-        serde_json::from_value(body.get("admission").cloned().unwrap_or(Value::Null))
-    {
-        Ok(value) => value,
-        Err(_) => return false,
-    };
+    let admission: crate::trust_admission::AdmissionEvidence =
+        match serde_json::from_value(body.get("admission").cloned().unwrap_or(Value::Null)) {
+            Ok(value) => value,
+            Err(_) => return false,
+        };
     admission.validate().is_ok() && admission.authoritative && admission.outcome == "admitted"
 }
 
 pub fn handle_promote(db: &Database, args: Value) -> Result<String, String> {
-    let a: PromoteArgs = serde_json::from_value(args)
-        .map_err(|e| format!("Invalid promote arguments: {}", e))?;
+    let a: PromoteArgs =
+        serde_json::from_value(args).map_err(|e| format!("Invalid promote arguments: {}", e))?;
 
     if a.to_category.is_none() && a.to_workspace_hash.is_none() && a.to_key.is_none() {
         return Err(
@@ -2843,7 +2973,8 @@ pub fn handle_promote(db: &Database, args: Value) -> Result<String, String> {
             return Err("workspace_hash does not match the selected source entity".to_string());
         }
     }
-    let source_body: serde_json::Value = serde_json::from_str(&src.body_json).unwrap_or(serde_json::json!({}));
+    let source_body: serde_json::Value =
+        serde_json::from_str(&src.body_json).unwrap_or(serde_json::json!({}));
     if !src.workspace_hash.is_empty() && a.workspace_hash.is_none() {
         return Err("workspace_hash assertion is required for scoped source promotion".to_string());
     }
@@ -2861,10 +2992,16 @@ pub fn handle_promote(db: &Database, args: Value) -> Result<String, String> {
         source_authorized = true;
     }
     if !source_authorized {
-        return Err("source requires_review: durable authoritative admission is required before promotion".to_string());
+        return Err(
+            "source requires_review: durable authoritative admission is required before promotion"
+                .to_string(),
+        );
     }
 
-    let to_category = a.to_category.clone().unwrap_or_else(|| src.category.clone());
+    let to_category = a
+        .to_category
+        .clone()
+        .unwrap_or_else(|| src.category.clone());
     let to_key = a.to_key.clone().unwrap_or_else(|| src.key.clone());
     let to_scope = a
         .to_workspace_hash
@@ -2877,9 +3014,10 @@ pub fn handle_promote(db: &Database, args: Value) -> Result<String, String> {
     // #781: categories in the durable-knowledge ladder are governed. Generic
     // category/scope promotion remains backward-compatible, but a recognized
     // ladder state cannot skip a rung or move backward.
-    if let (Some(from_state), Some(to_state)) =
-        (promotion_state(&src.category), promotion_state(&to_category))
-    {
+    if let (Some(from_state), Some(to_state)) = (
+        promotion_state(&src.category),
+        promotion_state(&to_category),
+    ) {
         if from_state != to_state && !valid_promotion_transition(from_state, to_state) {
             return Err(format!(
                 "invalid promotion transition: {} ({}) -> {} ({}); allowed: episode -> observation -> convention/belief -> keystone",
@@ -2975,10 +3113,17 @@ pub fn handle_promote(db: &Database, args: Value) -> Result<String, String> {
 
     // Evidence trail: source gains a promoted_to link to the new entity.
     if let Err(error) = db.link(&a.from_category, &a.from_key, &new_id, "promoted_to") {
-        let cleanup = db.forget(&to_category, &to_key, "promotion rollback after link failure");
+        let cleanup = db.forget(
+            &to_category,
+            &to_key,
+            "promotion rollback after link failure",
+        );
         return Err(match cleanup {
             Ok(_) => format!("Promote link failed; target rolled back: {}", error),
-            Err(cleanup_error) => format!("Promote link failed and rollback failed: {}; {}", error, cleanup_error),
+            Err(cleanup_error) => format!(
+                "Promote link failed and rollback failed: {}; {}",
+                error, cleanup_error
+            ),
         });
     }
 
@@ -2999,7 +3144,11 @@ pub fn handle_promote(db: &Database, args: Value) -> Result<String, String> {
     };
     if let Err(error) = db.journal(&event) {
         let unlink = db.unlink(&a.from_category, &a.from_key, &new_id);
-        let cleanup = db.forget(&to_category, &to_key, "promotion rollback after journal failure");
+        let cleanup = db.forget(
+            &to_category,
+            &to_key,
+            "promotion rollback after journal failure",
+        );
         return Err(match (unlink, cleanup) {
             (Ok(_), Ok(_)) => format!("Promotion audit journal failed; target rolled back: {}", error),
             (unlink_result, cleanup_result) => format!("Promotion audit journal failed and rollback was incomplete: {}; unlink={unlink_result:?}; cleanup={cleanup_result:?}", error),
@@ -3037,11 +3186,17 @@ pub struct DemoteArgs {
 }
 
 pub fn handle_demote(db: &Database, args: Value) -> Result<String, String> {
-    let a: DemoteArgs = serde_json::from_value(args)
-        .map_err(|e| format!("Invalid demote arguments: {}", e))?;
-    let src = db.get_entity(&a.from_category, &a.from_key)
+    let a: DemoteArgs =
+        serde_json::from_value(args).map_err(|e| format!("Invalid demote arguments: {}", e))?;
+    let src = db
+        .get_entity(&a.from_category, &a.from_key)
         .map_err(|e| format!("Source entity lookup failed: {}", e))?
-        .ok_or_else(|| format!("Source entity not found: {}/{}", a.from_category, a.from_key))?;
+        .ok_or_else(|| {
+            format!(
+                "Source entity not found: {}/{}",
+                a.from_category, a.from_key
+            )
+        })?;
     if src.archived {
         return Err("source entity is archived; demotion requires a live source".to_string());
     }
@@ -3072,18 +3227,33 @@ pub fn handle_demote(db: &Database, args: Value) -> Result<String, String> {
         source_authorized = true;
     }
     if !source_authorized {
-        return Err("source requires_review: durable authoritative admission is required before demotion".to_string());
+        return Err(
+            "source requires_review: durable authoritative admission is required before demotion"
+                .to_string(),
+        );
     }
-    let from_state = promotion_state(&src.category)
-        .ok_or_else(|| format!("Source category '{}' is not in the promotion ladder", src.category))?;
-    let to_state = promotion_state(&a.to_category)
-        .ok_or_else(|| format!("Target category '{}' is not in the promotion ladder", a.to_category))?;
+    let from_state = promotion_state(&src.category).ok_or_else(|| {
+        format!(
+            "Source category '{}' is not in the promotion ladder",
+            src.category
+        )
+    })?;
+    let to_state = promotion_state(&a.to_category).ok_or_else(|| {
+        format!(
+            "Target category '{}' is not in the promotion ladder",
+            a.to_category
+        )
+    })?;
     if !valid_promotion_transition(to_state, from_state) {
-        return Err(format!("invalid demotion transition: {} -> {}; allowed reverse ladder transitions only", from_state, to_state));
+        return Err(format!(
+            "invalid demotion transition: {} -> {}; allowed reverse ladder transitions only",
+            from_state, to_state
+        ));
     }
     let now = now_ms();
     let to_key = a.to_key.clone().unwrap_or_else(|| src.key.clone());
-    if db.get_entity(&a.to_category, &to_key)
+    if db
+        .get_entity(&a.to_category, &to_key)
         .map_err(|e| format!("Demotion target lookup failed: {e}"))?
         .is_some()
     {
@@ -3092,22 +3262,80 @@ pub fn handle_demote(db: &Database, args: Value) -> Result<String, String> {
     let mut body: Value = serde_json::from_str(&src.body_json).unwrap_or_else(|_| json!({}));
     if let Some(map) = body.as_object_mut() {
         map.insert("demoted_from".into(), json!({"category":src.category,"key":src.key,"id":src.id,"reason":a.reason,"demoted_at_unix_ms":now}));
-        map.insert("promotion_transition".into(), json!({"from_state":from_state,"to_state":to_state,"at_unix_ms":now}));
+        map.insert(
+            "promotion_transition".into(),
+            json!({"from_state":from_state,"to_state":to_state,"at_unix_ms":now}),
+        );
     }
     let raw_id = Uuid::new_v4().to_string().replace('-', "");
-    let entity = Entity { id: format!("mem-{}", &raw_id[..12]), category:a.to_category.clone(), key:to_key.clone(), body_json:body.to_string(), status:src.status.clone(), entity_type:src.entity_type.clone(), tags:src.tags.clone(), decay_score:src.decay_score, retrieval_count:0, layer:src.layer.clone(), topic_path:src.topic_path.clone(), archived:false, archive_reason:String::new(), links:vec![], verified:src.verified, source:"demotion".into(), always_on:src.always_on, certainty:src.certainty, workspace_hash:src.workspace_hash.clone(), agent_id:src.agent_id.clone(), visibility:src.visibility.clone(), created_at_unix_ms:now, last_accessed_unix_ms:now, follow_count:0, miss_count:0, follow_rate:0.0, efficacy_status:"unverified".into(), epistemic_state:"candidate".into(), embedding:None, _parsed_body:None };
-    let (new_id, action) = db.remember_skip_dedup(&entity).map_err(|e| format!("Demote write failed: {}", e))?;
+    let entity = Entity {
+        id: format!("mem-{}", &raw_id[..12]),
+        category: a.to_category.clone(),
+        key: to_key.clone(),
+        body_json: body.to_string(),
+        status: src.status.clone(),
+        entity_type: src.entity_type.clone(),
+        tags: src.tags.clone(),
+        decay_score: src.decay_score,
+        retrieval_count: 0,
+        layer: src.layer.clone(),
+        topic_path: src.topic_path.clone(),
+        archived: false,
+        archive_reason: String::new(),
+        links: vec![],
+        verified: src.verified,
+        source: "demotion".into(),
+        always_on: src.always_on,
+        certainty: src.certainty,
+        workspace_hash: src.workspace_hash.clone(),
+        agent_id: src.agent_id.clone(),
+        visibility: src.visibility.clone(),
+        created_at_unix_ms: now,
+        last_accessed_unix_ms: now,
+        follow_count: 0,
+        miss_count: 0,
+        follow_rate: 0.0,
+        efficacy_status: "unverified".into(),
+        epistemic_state: "candidate".into(),
+        embedding: None,
+        _parsed_body: None,
+    };
+    let (new_id, action) = db
+        .remember_skip_dedup(&entity)
+        .map_err(|e| format!("Demote write failed: {}", e))?;
     if let Err(error) = db.link(&a.from_category, &a.from_key, &new_id, "demoted_to") {
-        let cleanup = db.forget(&a.to_category, &to_key, "demotion rollback after link failure");
+        let cleanup = db.forget(
+            &a.to_category,
+            &to_key,
+            "demotion rollback after link failure",
+        );
         return Err(match cleanup {
             Ok(_) => format!("Demote link failed; target rolled back: {error}"),
-            Err(cleanup_error) => format!("Demote link failed and rollback failed: {error}; {cleanup_error}"),
+            Err(cleanup_error) => {
+                format!("Demote link failed and rollback failed: {error}; {cleanup_error}")
+            }
         });
     }
-    let event = JournalEvent { id:format!("jrn-{}", &Uuid::new_v4().to_string().replace('-', "")[..12]), event_type:"demotion".into(), evaluated_json:json!({"from_state":from_state,"to_state":to_state}).to_string(), acted_json:json!({"reason":a.reason}).to_string(), forward_json:json!({"next":"re-evaluate evidence before promotion"}).to_string(), category:a.to_category.clone(), key:to_key.clone(), entity_id:new_id.clone(), agent_id:src.agent_id.clone(), workspace_hash:src.workspace_hash.clone(), created_at_unix_ms:now };
+    let event = JournalEvent {
+        id: format!("jrn-{}", &Uuid::new_v4().to_string().replace('-', "")[..12]),
+        event_type: "demotion".into(),
+        evaluated_json: json!({"from_state":from_state,"to_state":to_state}).to_string(),
+        acted_json: json!({"reason":a.reason}).to_string(),
+        forward_json: json!({"next":"re-evaluate evidence before promotion"}).to_string(),
+        category: a.to_category.clone(),
+        key: to_key.clone(),
+        entity_id: new_id.clone(),
+        agent_id: src.agent_id.clone(),
+        workspace_hash: src.workspace_hash.clone(),
+        created_at_unix_ms: now,
+    };
     if let Err(error) = db.journal(&event) {
         let unlink = db.unlink(&a.from_category, &a.from_key, &new_id);
-        let cleanup = db.forget(&a.to_category, &to_key, "demotion rollback after journal failure");
+        let cleanup = db.forget(
+            &a.to_category,
+            &to_key,
+            "demotion rollback after journal failure",
+        );
         return Err(match (unlink, cleanup) {
             (Ok(_), Ok(_)) => format!("Demotion audit journal failed; target rolled back: {error}"),
             (unlink_result, cleanup_result) => format!("Demotion audit journal failed and rollback was incomplete: {error}; unlink={unlink_result:?}; cleanup={cleanup_result:?}"),
@@ -3247,9 +3475,8 @@ fn clip_str(s: &str, max: usize) -> &str {
 /// chars, minus a tiny stopword list, sorted + deduplicated.
 fn failure_action_tokens(action_lc: &str) -> Vec<String> {
     const STOP: &[&str] = &[
-        "the", "and", "for", "with", "that", "this", "from", "into", "over", "then", "was",
-        "were", "are", "has", "have", "had", "not", "but", "its", "you", "your", "when", "what",
-        "will",
+        "the", "and", "for", "with", "that", "this", "from", "into", "over", "then", "was", "were",
+        "are", "has", "have", "had", "not", "but", "its", "you", "your", "when", "what", "will",
     ];
     let mut toks: Vec<String> = action_lc
         .split(|c: char| !c.is_alphanumeric())
@@ -3432,7 +3659,16 @@ pub fn handle_check_failure_pattern(db: &Database, args: Value) -> Result<String
         let score = failure_score(relevance, now, ev.created_at_unix_ms, 0.5);
         let what_failed = first_payload_field(
             &[&ev.acted_json, &ev.evaluated_json],
-            &["what_failed", "command", "action", "what", "summary", "content", "text", "description"],
+            &[
+                "what_failed",
+                "command",
+                "action",
+                "what",
+                "summary",
+                "content",
+                "text",
+                "description",
+            ],
         )
         .unwrap_or_else(|| {
             let acted = payload_excerpt(&ev.acted_json);
@@ -3449,7 +3685,15 @@ pub fn handle_check_failure_pattern(db: &Database, args: Value) -> Result<String
         .unwrap_or_default();
         let resolution = first_payload_field(
             &[&ev.forward_json],
-            &["resolution", "fix", "plan", "next", "takeaway", "lesson", "workaround"],
+            &[
+                "resolution",
+                "fix",
+                "plan",
+                "next",
+                "takeaway",
+                "lesson",
+                "workaround",
+            ],
         )
         .unwrap_or_else(|| payload_excerpt(&ev.forward_json));
         scored.push((
@@ -3507,7 +3751,15 @@ pub fn handle_check_failure_pattern(db: &Database, args: Value) -> Result<String
         let score = failure_score(relevance, now, e.created_at_unix_ms, trust);
         let what_failed = first_payload_field(
             &[&e.body_json],
-            &["what_failed", "command", "action", "content", "summary", "title", "text"],
+            &[
+                "what_failed",
+                "command",
+                "action",
+                "content",
+                "summary",
+                "title",
+                "text",
+            ],
         )
         .unwrap_or_else(|| format!("{}/{}", e.category, e.key));
         let cause = first_payload_field(
@@ -3517,7 +3769,14 @@ pub fn handle_check_failure_pattern(db: &Database, args: Value) -> Result<String
         .unwrap_or_default();
         let resolution = first_payload_field(
             &[&e.body_json],
-            &["resolution", "fix", "lesson", "takeaway", "workaround", "recommendation"],
+            &[
+                "resolution",
+                "fix",
+                "lesson",
+                "takeaway",
+                "workaround",
+                "recommendation",
+            ],
         )
         .unwrap_or_default();
         scored.push((
@@ -3708,7 +3967,9 @@ pub fn handle_deployment_profile(db: &Database, _args: Value) -> Result<String, 
     serde_json::to_string(&profile).map_err(|e| format!("Serialization failed: {e}"))
 }
 
-fn default_telemetry_category() -> String { "general".to_string() }
+fn default_telemetry_category() -> String {
+    "general".to_string()
+}
 
 #[derive(Debug, Deserialize)]
 pub struct QualityTelemetryArgs {
@@ -3720,22 +3981,37 @@ pub struct QualityTelemetryArgs {
 pub fn handle_quality_telemetry(db: &Database, args: Value) -> Result<String, String> {
     let a: QualityTelemetryArgs = serde_json::from_value(args)
         .map_err(|e| format!("Invalid quality_telemetry arguments: {e}"))?;
-    let stats = db.stats().map_err(|e| format!("Telemetry stats failed: {e}"))?;
-    let conflicts = db.detect_conflicts(&a.category, default_conflict_threshold(), 1000, 0)
+    let stats = db
+        .stats()
+        .map_err(|e| format!("Telemetry stats failed: {e}"))?;
+    let conflicts = db
+        .detect_conflicts(&a.category, default_conflict_threshold(), 1000, 0)
         .map_err(|e| format!("Telemetry conflict scan failed: {e}"))?;
     let conflict_value = serde_json::to_value(&conflicts).map_err(|e| e.to_string())?;
     let contradiction_count = conflict_value["total"].as_i64().unwrap_or_else(|| {
-        conflict_value["conflicts"].as_array().map(|v| v.len() as i64).unwrap_or(0)
+        conflict_value["conflicts"]
+            .as_array()
+            .map(|v| v.len() as i64)
+            .unwrap_or(0)
     });
     let mut deprecated = 0i64;
     let mut cursor: Option<String> = None;
     loop {
-        let rows = db.scan_entities(None, None, false, cursor.as_deref(), 501)
+        let rows = db
+            .scan_entities(None, None, false, cursor.as_deref(), 501)
             .map_err(|e| format!("Telemetry scan failed: {e}"))?;
-        if rows.is_empty() { break; }
+        if rows.is_empty() {
+            break;
+        }
         let take = rows.len().min(500);
-        deprecated += rows.iter().take(take).filter(|e| e.status == "deprecated").count() as i64;
-        if rows.len() <= 500 { break; }
+        deprecated += rows
+            .iter()
+            .take(take)
+            .filter(|e| e.status == "deprecated")
+            .count() as i64;
+        if rows.len() <= 500 {
+            break;
+        }
         cursor = rows.get(take - 1).map(|e| e.id.clone());
     }
     Ok(json!({
@@ -3832,6 +4108,7 @@ pub fn handle_context(db: &Database, args: Value) -> String {
         max_context_chars: a.max_context_chars,
         model: a.model,
         exclude_ids: Vec::new(),
+        session_id: a.session_id,
     };
 
     match db.context_block(&opts) {
@@ -3909,8 +4186,8 @@ fn default_projection_min_trust() -> String {
 /// permission scope, freshness, provenance, and trust class visible in the
 /// result contract.
 pub fn handle_project_task(db: &Database, args: Value) -> Result<String, String> {
-    let a: ProjectTaskArgs = serde_json::from_value(args)
-        .map_err(|e| format!("Invalid project_task arguments: {e}"))?;
+    let a: ProjectTaskArgs =
+        serde_json::from_value(args).map_err(|e| format!("Invalid project_task arguments: {e}"))?;
     let req = crate::projection::ProjectionRequest::parse(
         a.task_title,
         a.query,
@@ -4058,11 +4335,17 @@ pub fn handle_capture(db: &Database, args: Value) -> Result<String, String> {
             "text is required: pass the transcript or insight payload to distill".to_string(),
         );
     }
-    let max_notes = a.max_entities.clamp(1, crate::capture::MAX_CAPTURE_NOTES as i64) as usize;
+    let max_notes = a
+        .max_entities
+        .clamp(1, crate::capture::MAX_CAPTURE_NOTES as i64) as usize;
 
     if let Some(ref evidence) = a.evidence {
         if !crate::models::EVIDENCE_CAPTURE_MODES.contains(&evidence.capture_mode.as_str()) {
-            return Err(format!("Invalid evidence.capture_mode '{}': expected one of {:?}", evidence.capture_mode, crate::models::EVIDENCE_CAPTURE_MODES));
+            return Err(format!(
+                "Invalid evidence.capture_mode '{}': expected one of {:?}",
+                evidence.capture_mode,
+                crate::models::EVIDENCE_CAPTURE_MODES
+            ));
         }
         if evidence.capture_mode == "snapshot" && evidence.resolved_value.is_none() {
             return Err("evidence.capture_mode=snapshot requires resolved_value".into());
@@ -4197,15 +4480,18 @@ pub fn handle_capture(db: &Database, args: Value) -> Result<String, String> {
         let raw_id = Uuid::new_v4().to_string().replace('-', "");
         let id = format!("mem-{}", &raw_id[..12.min(raw_id.len())]);
         let mut body_value = json!({ "content": note.content, "summary": note.summary });
-        body_value["evidence"] = serde_json::to_value(a.evidence.as_ref().unwrap_or(&crate::models::EvidenceEnvelope {
-            capture_mode: "legacy_unknown".to_string(),
-            resolved_value: None,
-            content_sha256: None,
-            source_system: Some("perseus_vault_capture".to_string()),
-            source_ref: a.source_file.clone(),
-            captured_at_unix_ms: now,
-            replayable: false,
-        })).unwrap_or(json!({"capture_mode":"legacy_unknown","replayable":false}));
+        body_value["evidence"] = serde_json::to_value(a.evidence.as_ref().unwrap_or(
+            &crate::models::EvidenceEnvelope {
+                capture_mode: "legacy_unknown".to_string(),
+                resolved_value: None,
+                content_sha256: None,
+                source_system: Some("perseus_vault_capture".to_string()),
+                source_ref: a.source_file.clone(),
+                captured_at_unix_ms: now,
+                replayable: false,
+            },
+        ))
+        .unwrap_or(json!({"capture_mode":"legacy_unknown","replayable":false}));
         // #888: stamp the minimal source_chunk pointer when the note has a
         // span and the transcript was actually retained. The pointer is fully
         // deterministic (source_key + char span — no random ids, no hashes)
@@ -4299,8 +4585,9 @@ pub fn handle_capture(db: &Database, args: Value) -> Result<String, String> {
         result["llm_fallback"] = json!(reason);
     }
     if report.notes.is_empty() {
-        result["message"] =
-            json!("nothing durable found in the payload (rule-based distiller is precision-over-recall)");
+        result["message"] = json!(
+            "nothing durable found in the payload (rule-based distiller is precision-over-recall)"
+        );
     }
 
     // #563 consume / prune-source: after a SUCCESSFUL non-dry-run capture,
@@ -4679,7 +4966,9 @@ pub fn handle_vault_export(db: &Database, args: Value) -> String {
             Ok(report) => {
                 let receipt = format!(
                     "files_created={} files_updated={} errors={}",
-                    report.files_created, report.files_updated, report.errors.len()
+                    report.files_created,
+                    report.files_updated,
+                    report.errors.len()
                 );
                 // Per-error item receipts identify the failed artifacts.
                 for (i, err) in report.errors.iter().take(50).enumerate() {
@@ -4705,40 +4994,71 @@ pub struct DerivedExportArgs {
 pub fn handle_derived_export(db: &Database, args: Value) -> Result<String, String> {
     let a: DerivedExportArgs = serde_json::from_value(args)
         .map_err(|e| format!("Invalid derived_export arguments: {e}"))?;
-    let entities = db.recall(&crate::models::RecallParams {
-        query: String::new(),
-        limit: 1000,
-        include_archived: false,
-        workspace_hash: a.workspace_hash.clone(),
-        skip_side_effects: true,
-        ..crate::models::RecallParams::default()
-    }).map_err(|e| format!("Derived export recall failed: {e}"))?;
-    let mut selected: Vec<_> = entities.into_iter().filter(|e| matches!(
-        e.category.as_str(), "convention" | "belief" | "keystone" | "correction" | "insight"
-    )).collect();
-    selected.sort_by(|a, b| a.category.cmp(&b.category).then(a.key.cmp(&b.key)).then(a.id.cmp(&b.id)));
-    let labels = [("belief", "Beliefs"), ("convention", "Conventions"), ("correction", "Corrections"),
-        ("insight", "Insights"), ("keystone", "Scoped Operating Rules")];
+    let entities = db
+        .recall(&crate::models::RecallParams {
+            query: String::new(),
+            limit: 1000,
+            include_archived: false,
+            workspace_hash: a.workspace_hash.clone(),
+            skip_side_effects: true,
+            ..crate::models::RecallParams::default()
+        })
+        .map_err(|e| format!("Derived export recall failed: {e}"))?;
+    let mut selected: Vec<_> = entities
+        .into_iter()
+        .filter(|e| {
+            matches!(
+                e.category.as_str(),
+                "convention" | "belief" | "keystone" | "correction" | "insight"
+            )
+        })
+        .collect();
+    selected.sort_by(|a, b| {
+        a.category
+            .cmp(&b.category)
+            .then(a.key.cmp(&b.key))
+            .then(a.id.cmp(&b.id))
+    });
+    let labels = [
+        ("belief", "Beliefs"),
+        ("convention", "Conventions"),
+        ("correction", "Corrections"),
+        ("insight", "Insights"),
+        ("keystone", "Scoped Operating Rules"),
+    ];
     let mut markdown = String::from("# Derived Knowledge Surface\n\n<!-- generated by perseus-vault; do not edit: source of truth is SQLite -->\n<!-- proposed: true; requires_review: true; provenance: hash-only -->\n\n");
     for (category, label) in labels {
         let items: Vec<_> = selected.iter().filter(|e| e.category == category).collect();
-        if items.is_empty() { continue; }
+        if items.is_empty() {
+            continue;
+        }
         markdown.push_str(&format!("## {label}\n\n"));
         for entity in items {
             let expanded = entity.to_json_expanded();
-            let content = expanded.get("summary").or_else(|| expanded.get("content")).or_else(|| expanded.get("text"))
-                .and_then(Value::as_str).unwrap_or(&entity.body_json);
-            markdown.push_str(&format!("### {}\n\n{}\n\n<!-- provenance: category={} key={} id={} workspace={} -->\n\n",
-                entity.key, content, entity.category, entity.key, entity.id, entity.workspace_hash));
+            let content = expanded
+                .get("summary")
+                .or_else(|| expanded.get("content"))
+                .or_else(|| expanded.get("text"))
+                .and_then(Value::as_str)
+                .unwrap_or(&entity.body_json);
+            markdown.push_str(&format!(
+                "### {}\n\n{}\n\n<!-- provenance: category={} key={} id={} workspace={} -->\n\n",
+                entity.key, content, entity.category, entity.key, entity.id, entity.workspace_hash
+            ));
         }
     }
     let path = std::path::PathBuf::from(&a.output_path);
-    if let Some(parent) = path.parent() { std::fs::create_dir_all(parent).map_err(|e| format!("Cannot create export directory: {e}"))?; }
-    std::fs::write(&path, markdown.as_bytes()).map_err(|e| format!("Cannot write derived export: {e}"))?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Cannot create export directory: {e}"))?;
+    }
+    std::fs::write(&path, markdown.as_bytes())
+        .map_err(|e| format!("Cannot write derived export: {e}"))?;
     Ok(reviewable_write_result(
         json!({"output_path": path, "exported": selected.len(), "deterministic": true}),
         "derived_export",
-    ).to_string())
+    )
+    .to_string())
 }
 
 #[derive(Debug, Deserialize)]
@@ -4749,7 +5069,9 @@ pub struct MarkdownImportArgs {
     #[serde(default = "default_import_source_system")]
     pub source_system: String,
 }
-fn default_import_source_system() -> String { "markdown".to_string() }
+fn default_import_source_system() -> String {
+    "markdown".to_string()
+}
 
 /// #788: controlled one-document Markdown import. Imported material is always
 /// draft, low-certainty evidence with explicit provenance; it never masquerades
@@ -4759,29 +5081,48 @@ pub fn handle_markdown_import(db: &Database, args: Value) -> Result<String, Stri
         .map_err(|e| format!("Invalid markdown_import arguments: {e}"))?;
     let content = std::fs::read_to_string(&a.path)
         .map_err(|e| format!("Cannot read Markdown source {}: {e}", a.path))?;
-    let title = content.lines().find_map(|l| l.strip_prefix("# ")).unwrap_or("Imported Markdown").trim();
+    let title = content
+        .lines()
+        .find_map(|l| l.strip_prefix("# "))
+        .unwrap_or("Imported Markdown")
+        .trim();
     let source_hash = {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
-        a.path.hash(&mut h); content.hash(&mut h); format!("{:016x}", h.finish())
+        a.path.hash(&mut h);
+        content.hash(&mut h);
+        format!("{:016x}", h.finish())
     };
     let key = format!("markdown-{}", source_hash);
-    let existing = db.recall(&crate::models::RecallParams { query: String::new(), category: Some("imported_markdown".to_string()), workspace_hash: Some(a.workspace_hash.clone()), limit: 1000, skip_side_effects: true, ..crate::models::RecallParams::default() })
+    let existing = db
+        .recall(&crate::models::RecallParams {
+            query: String::new(),
+            category: Some("imported_markdown".to_string()),
+            workspace_hash: Some(a.workspace_hash.clone()),
+            limit: 1000,
+            skip_side_effects: true,
+            ..crate::models::RecallParams::default()
+        })
         .map_err(|e| format!("Import duplicate scan failed: {e}"))?;
     if existing.iter().any(|e| e.key == key) {
         return Ok(reviewable_write_result(
             json!({"imported":0,"deduped":true,"key":key,"status":"draft"}),
             "markdown_import",
-        ).to_string());
+        )
+        .to_string());
     }
     let body = json!({"title":title,"content":content,"origin": {"memory_kind":"imported","source_system":a.source_system,"capture_method":"import"},"non_authoritative":true,"source_path":a.path});
-    let remembered = handle_remember(db, json!({
-        "category":"imported_markdown", "key":key, "body_json":body.to_string(),
-        "status":"draft", "type":"reference", "tags":["imported","markdown"],
-        "importance":0.2, "certainty":0.2, "workspace_hash":a.workspace_hash,
-        "skip_dedup":true
-    }))?;
-    let result: Value = serde_json::from_str(&remembered).map_err(|e| format!("Markdown import response decode failed: {e}"))?;
+    let remembered = handle_remember(
+        db,
+        json!({
+            "category":"imported_markdown", "key":key, "body_json":body.to_string(),
+            "status":"draft", "type":"reference", "tags":["imported","markdown"],
+            "importance":0.2, "certainty":0.2, "workspace_hash":a.workspace_hash,
+            "skip_dedup":true
+        }),
+    )?;
+    let result: Value = serde_json::from_str(&remembered)
+        .map_err(|e| format!("Markdown import response decode failed: {e}"))?;
     Ok(reviewable_write_result(
         json!({"imported":1,"deduped":false,"id":result["id"],"key":key,"action":result["action"],"status":"draft","non_authoritative":true}),
         "markdown_import",
@@ -4809,7 +5150,9 @@ pub struct StructuredIndexAnchorArgs {
     pub revision: Option<String>,
 }
 
-fn default_anchor_mode() -> String { "reference".to_string() }
+fn default_anchor_mode() -> String {
+    "reference".to_string()
+}
 
 /// #789: stable anchor contract for upstream structured indexes. Reference mode
 /// is deliberately non-mutating; import mode writes an explicitly imported,
@@ -4817,11 +5160,18 @@ fn default_anchor_mode() -> String { "reference".to_string() }
 pub fn handle_structured_index_anchor(db: &Database, args: Value) -> Result<String, String> {
     let a: StructuredIndexAnchorArgs = serde_json::from_value(args)
         .map_err(|e| format!("Invalid structured_index_anchor arguments: {e}"))?;
-    if a.index_type.trim().is_empty() || a.index_uri.trim().is_empty() || a.record_id.trim().is_empty() {
+    if a.index_type.trim().is_empty()
+        || a.index_uri.trim().is_empty()
+        || a.record_id.trim().is_empty()
+    {
         return Err("index_type, index_uri, and record_id are required".to_string());
     }
     let anchor = format!("{}:{}#{}", a.index_type, a.index_uri, a.record_id);
-    let source_system = if a.source_system.is_empty() { format!("structured_index:{}", a.index_type) } else { a.source_system };
+    let source_system = if a.source_system.is_empty() {
+        format!("structured_index:{}", a.index_type)
+    } else {
+        a.source_system
+    };
     let metadata = json!({
         "ref_type":"structured_index", "ref_value":anchor, "source_system":source_system,
         "relationship":"about", "index_type":a.index_type, "index_uri":a.index_uri,
@@ -4881,7 +5231,9 @@ pub fn handle_vault_import(db: &Database, args: Value) -> String {
             Ok(report) => {
                 let receipt = format!(
                     "files_created={} files_updated={} errors={}",
-                    report.files_created, report.files_updated, report.errors.len()
+                    report.files_created,
+                    report.files_updated,
+                    report.errors.len()
                 );
                 for (i, err) in report.errors.iter().take(50).enumerate() {
                     let _ = db.op_run_item_add(run_id, &format!("error-{i}"), "");
@@ -5130,7 +5482,10 @@ pub fn handle_keystone_set(db: &Database, args: Value) -> Result<String, String>
     let registered_tier = if a.agent_id.trim().is_empty() {
         None
     } else {
-        db.agent_get(&a.agent_id).ok().flatten().map(|g| g.trust_tier)
+        db.agent_get(&a.agent_id)
+            .ok()
+            .flatten()
+            .map(|g| g.trust_tier)
     };
     let (effective_tier, trust_enforced) = match registered_tier {
         Some(t) => (Some(t), true),
@@ -5141,7 +5496,11 @@ pub fn handle_keystone_set(db: &Database, args: Value) -> Result<String, String>
             return Err(format!(
                 "insufficient trust tier: authoring this keystone requires tier >= {}, {} has {}",
                 a.trust_tier_required,
-                if trust_enforced { "registered agent" } else { "caller asserted" },
+                if trust_enforced {
+                    "registered agent"
+                } else {
+                    "caller asserted"
+                },
                 t
             ));
         }
@@ -5278,7 +5637,10 @@ pub fn handle_keystone_suggestion_decide(db: &Database, args: Value) -> Result<S
             let registered_tier = if a.agent_id.trim().is_empty() {
                 None
             } else {
-                db.agent_get(&a.agent_id).ok().flatten().map(|g| g.trust_tier)
+                db.agent_get(&a.agent_id)
+                    .ok()
+                    .flatten()
+                    .map(|g| g.trust_tier)
             };
             let (effective_tier, trust_enforced) = match registered_tier {
                 Some(t) => (Some(t), true),
@@ -5356,8 +5718,8 @@ pub struct AgentArgs {
 }
 
 pub fn handle_agent(db: &Database, args: Value) -> Result<String, String> {
-    let a: AgentArgs = serde_json::from_value(args)
-        .map_err(|e| format!("Invalid agent arguments: {}", e))?;
+    let a: AgentArgs =
+        serde_json::from_value(args).map_err(|e| format!("Invalid agent arguments: {}", e))?;
     if a.agent_id.trim().is_empty() {
         return Err("agent_id must not be empty".to_string());
     }
@@ -5388,40 +5750,216 @@ pub fn handle_agent(db: &Database, args: Value) -> Result<String, String> {
 
 #[derive(Debug, Deserialize)]
 pub struct AuthoritySetArgs {
-    pub agent_id: String, pub workspace_hash: String, pub allowed_capabilities: Vec<String>, pub scope_anchors: Vec<String>,
-    #[serde(default)] pub approval_required_capabilities: Vec<String>, #[serde(default)] pub approver_principals: Vec<String>,
-    #[serde(default)] pub allowed_inbound_principals: Vec<String>, #[serde(default)] pub permitted_external_ref_prefixes: Vec<String>,
-    #[serde(default = "authority_default_parallel")] pub max_parallel_actions: i64, #[serde(default = "authority_default_mode")] pub mode: String,
-    #[serde(default)] pub expires_at_unix_ms: Option<i64>, #[serde(default)] pub author_agent_id: String,
-    #[serde(default)] pub capability_constraints_json: String,
+    pub agent_id: String,
+    pub workspace_hash: String,
+    pub allowed_capabilities: Vec<String>,
+    pub scope_anchors: Vec<String>,
+    #[serde(default)]
+    pub approval_required_capabilities: Vec<String>,
+    #[serde(default)]
+    pub approver_principals: Vec<String>,
+    #[serde(default)]
+    pub allowed_inbound_principals: Vec<String>,
+    #[serde(default)]
+    pub permitted_external_ref_prefixes: Vec<String>,
+    #[serde(default = "authority_default_parallel")]
+    pub max_parallel_actions: i64,
+    #[serde(default = "authority_default_mode")]
+    pub mode: String,
+    #[serde(default)]
+    pub expires_at_unix_ms: Option<i64>,
+    #[serde(default)]
+    pub author_agent_id: String,
+    #[serde(default)]
+    pub capability_constraints_json: String,
 }
-fn authority_default_parallel() -> i64 { 1 }
-fn authority_default_mode() -> String { "shadow".to_string() }
+fn authority_default_parallel() -> i64 {
+    1
+}
+fn authority_default_mode() -> String {
+    "shadow".to_string()
+}
 pub fn handle_authority_set(db: &Database, args: Value) -> Result<String, String> {
-    let a: AuthoritySetArgs=serde_json::from_value(args).map_err(|e|format!("Invalid authority_set arguments: {e}"))?;
-    let input=crate::models::AuthorityManifestInput { agent_id:a.agent_id, workspace_hash:a.workspace_hash, allowed_capabilities:a.allowed_capabilities, approval_required_capabilities:a.approval_required_capabilities, scope_anchors:a.scope_anchors, approver_principals:a.approver_principals, allowed_inbound_principals:a.allowed_inbound_principals, permitted_external_ref_prefixes:a.permitted_external_ref_prefixes, max_parallel_actions:a.max_parallel_actions, mode:a.mode, expires_at_unix_ms:a.expires_at_unix_ms, capability_constraints_json:a.capability_constraints_json };
-    serde_json::to_string(&db.authority_set(&input,&a.author_agent_id).map_err(|e|format!("authority_set failed: {e}"))?).map_err(|e|e.to_string())
+    let a: AuthoritySetArgs = serde_json::from_value(args)
+        .map_err(|e| format!("Invalid authority_set arguments: {e}"))?;
+    let input = crate::models::AuthorityManifestInput {
+        agent_id: a.agent_id,
+        workspace_hash: a.workspace_hash,
+        allowed_capabilities: a.allowed_capabilities,
+        approval_required_capabilities: a.approval_required_capabilities,
+        scope_anchors: a.scope_anchors,
+        approver_principals: a.approver_principals,
+        allowed_inbound_principals: a.allowed_inbound_principals,
+        permitted_external_ref_prefixes: a.permitted_external_ref_prefixes,
+        max_parallel_actions: a.max_parallel_actions,
+        mode: a.mode,
+        expires_at_unix_ms: a.expires_at_unix_ms,
+        capability_constraints_json: a.capability_constraints_json,
+    };
+    serde_json::to_string(
+        &db.authority_set(&input, &a.author_agent_id)
+            .map_err(|e| format!("authority_set failed: {e}"))?,
+    )
+    .map_err(|e| e.to_string())
 }
-#[derive(Debug, Deserialize)] pub struct AuthoritySetSignedArgs {pub profile_json:String,pub trusted_public_key_b64:String,pub author_agent_id:String}
-pub fn handle_authority_set_signed(db:&Database,args:Value)->Result<String,String>{let a:AuthoritySetSignedArgs=serde_json::from_value(args).map_err(|e|format!("Invalid authority_set_signed arguments: {e}"))?;serde_json::to_string(&db.authority_set_signed(&a.profile_json,&a.trusted_public_key_b64,&a.author_agent_id).map_err(|e|format!("authority_set_signed failed: {e}"))?).map_err(|e|e.to_string())}
-#[derive(Debug, Deserialize)] pub struct AuthorityGetArgs { pub agent_id:String, pub workspace_hash:String, #[serde(default)] pub include_revoked:bool }
-pub fn handle_authority_get(db:&Database,args:Value)->Result<String,String>{let a:AuthorityGetArgs=serde_json::from_value(args).map_err(|e|format!("Invalid authority_get arguments: {e}"))?;serde_json::to_string(&json!({"authority":db.authority_get(&a.agent_id,&a.workspace_hash,a.include_revoked).map_err(|e|format!("authority_get failed: {e}"))?})).map_err(|e|e.to_string())}
-#[derive(Debug, Deserialize)] pub struct AuthorityRevokeArgs { pub manifest_id:String, #[serde(default)] pub actor_agent_id:String, #[serde(default)] pub reason:String }
-pub fn handle_authority_revoke(db:&Database,args:Value)->Result<String,String>{let a:AuthorityRevokeArgs=serde_json::from_value(args).map_err(|e|format!("Invalid authority_revoke arguments: {e}"))?;db.authority_revoke(&a.manifest_id,&a.actor_agent_id,&a.reason).map_err(|e|format!("authority_revoke failed: {e}"))?;Ok(json!({"revoked":true,"manifest_id":a.manifest_id}).to_string())}
-#[derive(Debug, Deserialize)] pub struct ActionIntentArgs { pub agent_id:String,pub workspace_hash:String,pub scope_anchor:String,pub external_ref:String,pub capability:String,pub action_key:String,pub intent_hash:String, #[serde(default)] pub resource_constraints_json: String }
-pub fn handle_action_intent(db:&Database,args:Value)->Result<String,String>{let a:ActionIntentArgs=serde_json::from_value(args).map_err(|e|format!("Invalid action_intent arguments: {e}"))?;serde_json::to_string(&db.action_intent(&a.agent_id,&a.workspace_hash,&a.scope_anchor,&a.external_ref,&a.capability,&a.action_key,&a.intent_hash,Some(&a.resource_constraints_json)).map_err(|e|format!("action_intent failed: {e}"))?).map_err(|e|e.to_string())}
-#[derive(Debug, Deserialize)] pub struct ActionApproveArgs {pub action_id:String,pub approver_principal:String,pub decision:String}
-pub fn handle_action_approve(db:&Database,args:Value)->Result<String,String>{let a:ActionApproveArgs=serde_json::from_value(args).map_err(|e|format!("Invalid action_approve arguments: {e}"))?;serde_json::to_string(&db.action_approve(&a.action_id,&a.approver_principal,&a.decision).map_err(|e|format!("action_approve failed: {e}"))?).map_err(|e|e.to_string())}
-#[derive(Debug, Deserialize)] pub struct ActionCompleteArgs {pub action_id:String,pub actor_agent_id:String,pub outcome:String,pub outcome_hash:String}
-pub fn handle_action_complete(db:&Database,args:Value)->Result<String,String>{let a:ActionCompleteArgs=serde_json::from_value(args).map_err(|e|format!("Invalid action_complete arguments: {e}"))?;serde_json::to_string(&db.action_complete(&a.action_id,&a.actor_agent_id,&a.outcome,&a.outcome_hash).map_err(|e|format!("action_complete failed: {e}"))?).map_err(|e|e.to_string())}
-#[derive(Debug, Deserialize)] pub struct ActionResolveTimeoutArgs {pub action_id:String,pub approval_timeout_ms:i64}
-pub fn handle_action_resolve_timeout(db:&Database,args:Value)->Result<String,String>{let a:ActionResolveTimeoutArgs=serde_json::from_value(args).map_err(|e|format!("Invalid action_resolve_timeout arguments: {e}"))?;serde_json::to_string(&db.action_resolve_timeout(&a.action_id,a.approval_timeout_ms).map_err(|e|format!("action_resolve_timeout failed: {e}"))?).map_err(|e|e.to_string())}
-#[derive(Debug, Deserialize)] pub struct ActionReceiptGetArgs {pub action_id:String}
-pub fn handle_action_receipt_get(db:&Database,args:Value)->Result<String,String>{let a:ActionReceiptGetArgs=serde_json::from_value(args).map_err(|e|format!("Invalid action_receipt_get arguments: {e}"))?;serde_json::to_string(&json!({"receipt":db.action_receipt_get(&a.action_id).map_err(|e|format!("action_receipt_get failed: {e}"))?})).map_err(|e|e.to_string())}
-#[derive(Debug, Deserialize)] pub struct ActionLeaseArgs {pub action_id:String,pub holder_id:String,#[serde(default="authority_default_parallel")]pub ttl_seconds:i64}
-pub fn handle_action_lease_acquire(db:&Database,args:Value)->Result<String,String>{let a:ActionLeaseArgs=serde_json::from_value(args).map_err(|e|format!("Invalid action_lease_acquire arguments: {e}"))?;serde_json::to_string(&db.action_lease_acquire(&a.action_id,&a.holder_id,a.ttl_seconds).map_err(|e|format!("action_lease_acquire failed: {e}"))?).map_err(|e|e.to_string())}
-#[derive(Debug, Deserialize)] pub struct ActionLeaseReleaseArgs {pub lease_id:String,pub holder_id:String}
-pub fn handle_action_lease_release(db:&Database,args:Value)->Result<String,String>{let a:ActionLeaseReleaseArgs=serde_json::from_value(args).map_err(|e|format!("Invalid action_lease_release arguments: {e}"))?;db.action_lease_release(&a.lease_id,&a.holder_id).map_err(|e|format!("action_lease_release failed: {e}"))?;Ok(json!({"released":true,"lease_id":a.lease_id}).to_string())}
+#[derive(Debug, Deserialize)]
+pub struct AuthoritySetSignedArgs {
+    pub profile_json: String,
+    pub trusted_public_key_b64: String,
+    pub author_agent_id: String,
+}
+pub fn handle_authority_set_signed(db: &Database, args: Value) -> Result<String, String> {
+    let a: AuthoritySetSignedArgs = serde_json::from_value(args)
+        .map_err(|e| format!("Invalid authority_set_signed arguments: {e}"))?;
+    serde_json::to_string(
+        &db.authority_set_signed(
+            &a.profile_json,
+            &a.trusted_public_key_b64,
+            &a.author_agent_id,
+        )
+        .map_err(|e| format!("authority_set_signed failed: {e}"))?,
+    )
+    .map_err(|e| e.to_string())
+}
+#[derive(Debug, Deserialize)]
+pub struct AuthorityGetArgs {
+    pub agent_id: String,
+    pub workspace_hash: String,
+    #[serde(default)]
+    pub include_revoked: bool,
+}
+pub fn handle_authority_get(db: &Database, args: Value) -> Result<String, String> {
+    let a: AuthorityGetArgs = serde_json::from_value(args)
+        .map_err(|e| format!("Invalid authority_get arguments: {e}"))?;
+    serde_json::to_string(&json!({"authority":db.authority_get(&a.agent_id,&a.workspace_hash,a.include_revoked).map_err(|e|format!("authority_get failed: {e}"))?})).map_err(|e|e.to_string())
+}
+#[derive(Debug, Deserialize)]
+pub struct AuthorityRevokeArgs {
+    pub manifest_id: String,
+    #[serde(default)]
+    pub actor_agent_id: String,
+    #[serde(default)]
+    pub reason: String,
+}
+pub fn handle_authority_revoke(db: &Database, args: Value) -> Result<String, String> {
+    let a: AuthorityRevokeArgs = serde_json::from_value(args)
+        .map_err(|e| format!("Invalid authority_revoke arguments: {e}"))?;
+    db.authority_revoke(&a.manifest_id, &a.actor_agent_id, &a.reason)
+        .map_err(|e| format!("authority_revoke failed: {e}"))?;
+    Ok(json!({"revoked":true,"manifest_id":a.manifest_id}).to_string())
+}
+#[derive(Debug, Deserialize)]
+pub struct ActionIntentArgs {
+    pub agent_id: String,
+    pub workspace_hash: String,
+    pub scope_anchor: String,
+    pub external_ref: String,
+    pub capability: String,
+    pub action_key: String,
+    pub intent_hash: String,
+    #[serde(default)]
+    pub resource_constraints_json: String,
+}
+pub fn handle_action_intent(db: &Database, args: Value) -> Result<String, String> {
+    let a: ActionIntentArgs = serde_json::from_value(args)
+        .map_err(|e| format!("Invalid action_intent arguments: {e}"))?;
+    serde_json::to_string(
+        &db.action_intent(
+            &a.agent_id,
+            &a.workspace_hash,
+            &a.scope_anchor,
+            &a.external_ref,
+            &a.capability,
+            &a.action_key,
+            &a.intent_hash,
+            Some(&a.resource_constraints_json),
+        )
+        .map_err(|e| format!("action_intent failed: {e}"))?,
+    )
+    .map_err(|e| e.to_string())
+}
+#[derive(Debug, Deserialize)]
+pub struct ActionApproveArgs {
+    pub action_id: String,
+    pub approver_principal: String,
+    pub decision: String,
+}
+pub fn handle_action_approve(db: &Database, args: Value) -> Result<String, String> {
+    let a: ActionApproveArgs = serde_json::from_value(args)
+        .map_err(|e| format!("Invalid action_approve arguments: {e}"))?;
+    serde_json::to_string(
+        &db.action_approve(&a.action_id, &a.approver_principal, &a.decision)
+            .map_err(|e| format!("action_approve failed: {e}"))?,
+    )
+    .map_err(|e| e.to_string())
+}
+#[derive(Debug, Deserialize)]
+pub struct ActionCompleteArgs {
+    pub action_id: String,
+    pub actor_agent_id: String,
+    pub outcome: String,
+    pub outcome_hash: String,
+}
+pub fn handle_action_complete(db: &Database, args: Value) -> Result<String, String> {
+    let a: ActionCompleteArgs = serde_json::from_value(args)
+        .map_err(|e| format!("Invalid action_complete arguments: {e}"))?;
+    serde_json::to_string(
+        &db.action_complete(&a.action_id, &a.actor_agent_id, &a.outcome, &a.outcome_hash)
+            .map_err(|e| format!("action_complete failed: {e}"))?,
+    )
+    .map_err(|e| e.to_string())
+}
+#[derive(Debug, Deserialize)]
+pub struct ActionResolveTimeoutArgs {
+    pub action_id: String,
+    pub approval_timeout_ms: i64,
+}
+pub fn handle_action_resolve_timeout(db: &Database, args: Value) -> Result<String, String> {
+    let a: ActionResolveTimeoutArgs = serde_json::from_value(args)
+        .map_err(|e| format!("Invalid action_resolve_timeout arguments: {e}"))?;
+    serde_json::to_string(
+        &db.action_resolve_timeout(&a.action_id, a.approval_timeout_ms)
+            .map_err(|e| format!("action_resolve_timeout failed: {e}"))?,
+    )
+    .map_err(|e| e.to_string())
+}
+#[derive(Debug, Deserialize)]
+pub struct ActionReceiptGetArgs {
+    pub action_id: String,
+}
+pub fn handle_action_receipt_get(db: &Database, args: Value) -> Result<String, String> {
+    let a: ActionReceiptGetArgs = serde_json::from_value(args)
+        .map_err(|e| format!("Invalid action_receipt_get arguments: {e}"))?;
+    serde_json::to_string(&json!({"receipt":db.action_receipt_get(&a.action_id).map_err(|e|format!("action_receipt_get failed: {e}"))?})).map_err(|e|e.to_string())
+}
+#[derive(Debug, Deserialize)]
+pub struct ActionLeaseArgs {
+    pub action_id: String,
+    pub holder_id: String,
+    #[serde(default = "authority_default_parallel")]
+    pub ttl_seconds: i64,
+}
+pub fn handle_action_lease_acquire(db: &Database, args: Value) -> Result<String, String> {
+    let a: ActionLeaseArgs = serde_json::from_value(args)
+        .map_err(|e| format!("Invalid action_lease_acquire arguments: {e}"))?;
+    serde_json::to_string(
+        &db.action_lease_acquire(&a.action_id, &a.holder_id, a.ttl_seconds)
+            .map_err(|e| format!("action_lease_acquire failed: {e}"))?,
+    )
+    .map_err(|e| e.to_string())
+}
+#[derive(Debug, Deserialize)]
+pub struct ActionLeaseReleaseArgs {
+    pub lease_id: String,
+    pub holder_id: String,
+}
+pub fn handle_action_lease_release(db: &Database, args: Value) -> Result<String, String> {
+    let a: ActionLeaseReleaseArgs = serde_json::from_value(args)
+        .map_err(|e| format!("Invalid action_lease_release arguments: {e}"))?;
+    db.action_lease_release(&a.lease_id, &a.holder_id)
+        .map_err(|e| format!("action_lease_release failed: {e}"))?;
+    Ok(json!({"released":true,"lease_id":a.lease_id}).to_string())
+}
 
 #[derive(Debug, Deserialize)]
 pub struct ConflictArgs {
@@ -5469,7 +6007,9 @@ pub struct OperatorReviewArgs {
     pub stale_threshold: Option<f64>,
 }
 
-fn default_category() -> String { "general".to_string() }
+fn default_category() -> String {
+    "general".to_string()
+}
 
 /// #786: read-only operator queue. It composes existing conflict detection,
 /// actionability hygiene, and deprecated-state discovery without mutating facts.
@@ -5477,23 +6017,33 @@ pub fn handle_operator_review(db: &Database, args: Value) -> Result<String, Stri
     let a: OperatorReviewArgs = serde_json::from_value(args)
         .map_err(|e| format!("Invalid operator_review arguments: {e}"))?;
     let limit = a.limit.clamp(1, 1000);
-    let contradictions = db.detect_conflicts(&a.category, default_conflict_threshold(), limit, 0)
+    let contradictions = db
+        .detect_conflicts(&a.category, default_conflict_threshold(), limit, 0)
         .map_err(|e| format!("Conflict review failed: {e}"))?;
-    let hygiene = handle_hygiene(db, json!({"category": a.category, "threshold": a.stale_threshold.unwrap_or(0.35), "limit":limit, "scan_limit":10000}))?;
-    let stale: Value = serde_json::from_str(&hygiene).map_err(|e| format!("Stale review decode failed: {e}"))?;
+    let hygiene = handle_hygiene(
+        db,
+        json!({"category": a.category, "threshold": a.stale_threshold.unwrap_or(0.35), "limit":limit, "scan_limit":10000}),
+    )?;
+    let stale: Value =
+        serde_json::from_str(&hygiene).map_err(|e| format!("Stale review decode failed: {e}"))?;
     let mut supersession_lag = Vec::new();
     let mut cursor: Option<String> = None;
     loop {
-        let rows = db.scan_entities(Some(&a.category), None, false, cursor.as_deref(), 501)
+        let rows = db
+            .scan_entities(Some(&a.category), None, false, cursor.as_deref(), 501)
             .map_err(|e| format!("Supersession scan failed: {e}"))?;
-        if rows.is_empty() { break; }
+        if rows.is_empty() {
+            break;
+        }
         let take = rows.len().min(500);
         for entity in rows.iter().take(take) {
             if entity.status == "deprecated" {
                 supersession_lag.push(json!({"id":entity.id,"category":entity.category,"key":entity.key,"status":entity.status,"reason":"deprecated fact requires successor review"}));
             }
         }
-        if rows.len() <= 500 || supersession_lag.len() >= limit as usize { break; }
+        if rows.len() <= 500 || supersession_lag.len() >= limit as usize {
+            break;
+        }
         cursor = rows.get(take - 1).map(|e| e.id.clone());
     }
     supersession_lag.truncate(limit as usize);
@@ -5614,7 +6164,11 @@ pub fn handle_write_quarantine(db: &Database, args: Value) -> Result<String, Str
                 .clamp(1, 10_000);
             let items = db
                 .write_quarantine_list(
-                    if ws.is_empty() { None } else { Some(ws.as_str()) },
+                    if ws.is_empty() {
+                        None
+                    } else {
+                        Some(ws.as_str())
+                    },
                     limit,
                 )
                 .map_err(|e| format!("Write quarantine list failed: {e}"))?;
@@ -5806,7 +6360,9 @@ pub fn handle_dream(db: &Database, args: Value) -> Result<String, String> {
 
 pub fn handle_decay(db: &Database, _args: Value) -> String {
     run_tracked(db, "decay", "", "internal", |_run_id| {
-        let report = db.decay_tick().map_err(|e| format!("Decay tick failed: {e}"))?;
+        let report = db
+            .decay_tick()
+            .map_err(|e| format!("Decay tick failed: {e}"))?;
         let receipt = format!(
             "entities_checked={} entities_updated={} auto_archived={}",
             report.entities_checked, report.entities_updated, report.auto_archived
@@ -5819,7 +6375,9 @@ pub fn handle_decay(db: &Database, _args: Value) -> String {
 
 pub fn handle_reindex(db: &Database, _args: Value) -> String {
     run_tracked(db, "reindex", "", "internal", |_run_id| {
-        let n = db.reindex_fts().map_err(|e| format!("Reindex failed: {e}"))?;
+        let n = db
+            .reindex_fts()
+            .map_err(|e| format!("Reindex failed: {e}"))?;
         Ok((json!({"reindexed": n}), format!("reindexed={n}")))
     })
 }
@@ -5852,39 +6410,58 @@ pub fn handle_op_run(db: &Database, args: Value) -> Result<String, String> {
                 .get("input_digest")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            let max_retries = args.get("max_retries").and_then(|v| v.as_i64()).unwrap_or(2);
+            let max_retries = args
+                .get("max_retries")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(2);
             let created_by = args
                 .get("created_by")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            json!(db.op_run_begin(op_type, scope, input_digest, max_retries, created_by).map_err(|e| e.to_string())?)
+            json!(db
+                .op_run_begin(op_type, scope, input_digest, max_retries, created_by)
+                .map_err(|e| e.to_string())?)
         }
         "start" => json!(db.op_run_start(run_id).map_err(|e| e.to_string())?),
         "progress" => {
             let done = args.get("done").and_then(|v| v.as_i64()).unwrap_or(0);
             let failed = args.get("failed").and_then(|v| v.as_i64()).unwrap_or(0);
             let total = args.get("total").and_then(|v| v.as_i64()).unwrap_or(-1);
-            json!(db.op_run_progress(run_id, done, failed, total).map_err(|e| e.to_string())?)
+            json!(db
+                .op_run_progress(run_id, done, failed, total)
+                .map_err(|e| e.to_string())?)
         }
         "complete" => {
             let receipt = args.get("receipt").and_then(|v| v.as_str()).unwrap_or("");
-            json!(db.op_run_complete(run_id, receipt).map_err(|e| e.to_string())?)
+            json!(db
+                .op_run_complete(run_id, receipt)
+                .map_err(|e| e.to_string())?)
         }
         "fail" => {
             let error_class = args
                 .get("error_class")
                 .and_then(|v| v.as_str())
                 .unwrap_or("operation_failed");
-            let detail = args.get("error_detail").and_then(|v| v.as_str()).unwrap_or("");
-            json!(db.op_run_fail(run_id, error_class, detail).map_err(|e| e.to_string())?)
+            let detail = args
+                .get("error_detail")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            json!(db
+                .op_run_fail(run_id, error_class, detail)
+                .map_err(|e| e.to_string())?)
         }
         "failed_to_start" => {
             let error_class = args
                 .get("error_class")
                 .and_then(|v| v.as_str())
                 .unwrap_or("failed_to_start");
-            let detail = args.get("error_detail").and_then(|v| v.as_str()).unwrap_or("");
-            json!(db.op_run_failed_to_start(run_id, error_class, detail).map_err(|e| e.to_string())?)
+            let detail = args
+                .get("error_detail")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            json!(db
+                .op_run_failed_to_start(run_id, error_class, detail)
+                .map_err(|e| e.to_string())?)
         }
         "cancel" => json!(db.op_run_cancel(run_id).map_err(|e| e.to_string())?),
         "timeout" => json!(db.op_run_timeout(run_id).map_err(|e| e.to_string())?),
@@ -5893,15 +6470,22 @@ pub fn handle_op_run(db: &Database, args: Value) -> Result<String, String> {
                 .get("item_ref")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| "op_run item_add requires item_ref".to_string())?;
-            let digest = args.get("item_digest").and_then(|v| v.as_str()).unwrap_or("");
-            json!(db.op_run_item_add(run_id, item_ref, digest).map_err(|e| e.to_string())?)
+            let digest = args
+                .get("item_digest")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            json!(db
+                .op_run_item_add(run_id, item_ref, digest)
+                .map_err(|e| e.to_string())?)
         }
         "item_start" => {
             let item_ref = args
                 .get("item_ref")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| "op_run item_start requires item_ref".to_string())?;
-            json!(db.op_run_item_start(run_id, item_ref).map_err(|e| e.to_string())?)
+            json!(db
+                .op_run_item_start(run_id, item_ref)
+                .map_err(|e| e.to_string())?)
         }
         "item_complete" => {
             let item_ref = args
@@ -5912,7 +6496,9 @@ pub fn handle_op_run(db: &Database, args: Value) -> Result<String, String> {
                 .get("receipt_ref")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            json!(db.op_run_item_complete(run_id, item_ref, receipt_ref).map_err(|e| e.to_string())?)
+            json!(db
+                .op_run_item_complete(run_id, item_ref, receipt_ref)
+                .map_err(|e| e.to_string())?)
         }
         "item_fail" => {
             let item_ref = args
@@ -5923,15 +6509,22 @@ pub fn handle_op_run(db: &Database, args: Value) -> Result<String, String> {
                 .get("error_class")
                 .and_then(|v| v.as_str())
                 .unwrap_or("item_failed");
-            let detail = args.get("error_detail").and_then(|v| v.as_str()).unwrap_or("");
-            json!(db.op_run_item_fail(run_id, item_ref, error_class, detail).map_err(|e| e.to_string())?)
+            let detail = args
+                .get("error_detail")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            json!(db
+                .op_run_item_fail(run_id, item_ref, error_class, detail)
+                .map_err(|e| e.to_string())?)
         }
         "item_cancel" => {
             let item_ref = args
                 .get("item_ref")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| "op_run item_cancel requires item_ref".to_string())?;
-            json!(db.op_run_item_cancel(run_id, item_ref).map_err(|e| e.to_string())?)
+            json!(db
+                .op_run_item_cancel(run_id, item_ref)
+                .map_err(|e| e.to_string())?)
         }
         other => {
             return Err(format!(
@@ -5951,7 +6544,9 @@ pub fn handle_op_run_list(db: &Database, args: Value) -> Result<String, String> 
         .transpose()?;
     let op_type = args.get("op_type").and_then(|v| v.as_str());
     let limit = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(20);
-    let runs = db.op_run_list(state, op_type, limit).map_err(|e| e.to_string())?;
+    let runs = db
+        .op_run_list(state, op_type, limit)
+        .map_err(|e| e.to_string())?;
     Ok(json!({"count": runs.len(), "runs": runs}).to_string())
 }
 
@@ -5998,12 +6593,122 @@ pub fn handle_op_run_prune(db: &Database, args: Value) -> Result<String, String>
     Ok(json!({"pruned": pruned, "retention_days": retention_days}).to_string())
 }
 
+// ── #875 learned anticipation ──────────────────────────────────────────────
+
+/// Read-only preload usage telemetry: per-trigger precision/recall, per-
+/// session rows, or overall aggregates. Separate from #872 concentration.
+pub fn handle_preload_stats(db: &Database, args: Value) -> Result<String, String> {
+    let scope = args
+        .get("scope")
+        .and_then(|v| v.as_str())
+        .unwrap_or("overall")
+        .to_string();
+    let limit = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(50);
+    let since_days = args.get("since_days").and_then(|v| v.as_i64()).unwrap_or(7);
+    let out = db
+        .preload_stats(&scope, limit, since_days)
+        .map_err(|e| e.to_string())?;
+    Ok(out.to_string())
+}
+
+/// Offline proposal pass: raises PENDING trigger-tuning proposals from
+/// resolved usage history (retire low-precision triggers, add_trigger for
+/// entities used-but-never-preloaded). Writes proposals only — entity
+/// mutations happen exclusively via preload_review approve.
+pub fn handle_preload_propose(db: &Database, args: Value) -> Result<String, String> {
+    let by = args
+        .get("by")
+        .and_then(|v| v.as_str())
+        .unwrap_or("operator")
+        .to_string();
+    let proposals = db
+        .preload_propose(now_ms(), &by)
+        .map_err(|e| e.to_string())?;
+    Ok(json!({"created": proposals.len(), "proposals": proposals}).to_string())
+}
+
+/// Operator review queue for preload trigger tuning: `list` pending
+/// proposals, `approve` (applies the mutation through the audited remember
+/// path + journal), or `dismiss` with a reason. The ONLY mutation surface.
+pub fn handle_preload_review(db: &Database, args: Value) -> Result<String, String> {
+    let action = args
+        .get("action")
+        .and_then(|v| v.as_str())
+        .unwrap_or("list")
+        .to_string();
+    match action.as_str() {
+        "list" => {
+            let limit = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(50);
+            let out = db.preload_review_list(limit).map_err(|e| e.to_string())?;
+            Ok(out.to_string())
+        }
+        "approve" => {
+            let proposal_id = args
+                .get("proposal_id")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "preload_review approve requires proposal_id".to_string())?;
+            let by = args
+                .get("by")
+                .and_then(|v| v.as_str())
+                .unwrap_or("operator")
+                .to_string();
+            let out = db
+                .preload_review_approve(proposal_id, &by, now_ms())
+                .map_err(|e| e.to_string())?;
+            Ok(out.to_string())
+        }
+        "dismiss" => {
+            let proposal_id = args
+                .get("proposal_id")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "preload_review dismiss requires proposal_id".to_string())?;
+            let reason = args
+                .get("reason")
+                .and_then(|v| v.as_str())
+                .unwrap_or("operator decision")
+                .to_string();
+            let by = args
+                .get("by")
+                .and_then(|v| v.as_str())
+                .unwrap_or("operator")
+                .to_string();
+            let out = db
+                .preload_review_dismiss(proposal_id, &reason, &by, now_ms())
+                .map_err(|e| e.to_string())?;
+            Ok(out.to_string())
+        }
+        other => Err(format!("preload_review: unknown action {other:?}")),
+    }
+}
+
+/// Resolve open preload events: mark each served entity used/unused from its
+/// read activity, then fold events into per-session precision/recall rows.
+/// `window_minutes` is the session usage window (default 30); a
+/// PERSEUS_VAULT_PRELOAD_WINDOW_MS env override is honored for harnesses.
+pub fn handle_preload_resolve(db: &Database, args: Value) -> Result<String, String> {
+    let window_minutes = args
+        .get("window_minutes")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(30);
+    let out = db
+        .preload_resolve(window_minutes, now_ms())
+        .map_err(|e| e.to_string())?;
+    Ok(json!({
+        "events_resolved": out.events_resolved,
+        "sessions_written": out.sessions_written,
+        "window_minutes": window_minutes,
+    })
+    .to_string())
+}
+
 pub fn handle_ask(db: &Database, args: Value) -> Result<String, String> {
     let params: AskParams =
         serde_json::from_value(args).map_err(|e| format!("Invalid ask arguments: {}", e))?;
 
     if !db.llm_enabled() {
-        return Err("LLM is not enabled. Set --llm-endpoint to enable perseus_vault_ask.".to_string());
+        return Err(
+            "LLM is not enabled. Set --llm-endpoint to enable perseus_vault_ask.".to_string(),
+        );
     }
 
     match db.ask(&params) {
@@ -6257,7 +6962,8 @@ pub fn handle_ingest_file(db: &Database, args: Value) -> Result<String, String> 
             "chars": char_count,
         }),
         "ingest_file",
-    ).to_string())
+    )
+    .to_string())
 }
 
 const MAX_ARTIFACT_BYTES: usize = 8 * 1024 * 1024;
@@ -6363,7 +7069,10 @@ pub fn handle_artifact_register(db: &Database, args: Value) -> Result<String, St
     let path = std::path::Path::new(&a.path);
     let meta = std::fs::metadata(path).map_err(|e| format!("stat {}: {}", path.display(), e))?;
     if !meta.is_file() {
-        return Err(format!("artifact path must be a regular file: {}", path.display()));
+        return Err(format!(
+            "artifact path must be a regular file: {}",
+            path.display()
+        ));
     }
     if meta.len() as usize > MAX_ARTIFACT_BYTES {
         return Err(format!(
@@ -6458,7 +7167,9 @@ pub fn handle_artifact_register(db: &Database, args: Value) -> Result<String, St
         }
         "derived" => {
             let Some(ref parent) = representation.derived_from_sha256 else {
-                return Err("derived artifacts require representation.derived_from_sha256".to_string());
+                return Err(
+                    "derived artifacts require representation.derived_from_sha256".to_string(),
+                );
             };
             if !is_sha256_hex(parent) {
                 return Err(format!(
@@ -6527,8 +7238,10 @@ pub fn handle_learned_artifact_register(db: &Database, args: Value) -> Result<St
         ));
     }
     if a.source_entities.is_empty() {
-        return Err("learned artifacts require at least one source_entities (category, key) pair"
-            .to_string());
+        return Err(
+            "learned artifacts require at least one source_entities (category, key) pair"
+                .to_string(),
+        );
     }
     if a.external_refs.len() > MAX_ARTIFACT_EXTERNAL_REFS {
         return Err(format!(
@@ -6719,14 +7432,24 @@ pub fn handle_artifact_excerpt(db: &Database, args: Value) -> Result<String, Str
         .ok_or_else(|| "artifact excerpt resolved no visible binding".to_string())?;
 
     let (range_kind, start, end) = if byte_mode {
-        let start = a.byte_start.ok_or_else(|| "byte_start is required".to_string())?;
-        let end = a.byte_end.ok_or_else(|| "byte_end is required".to_string())?;
+        let start = a
+            .byte_start
+            .ok_or_else(|| "byte_start is required".to_string())?;
+        let end = a
+            .byte_end
+            .ok_or_else(|| "byte_end is required".to_string())?;
         if start < 0 || end < 0 || end <= start {
-            return Err("byte ranges are half-open [start,end) and require 0 <= start < end".to_string());
+            return Err(
+                "byte ranges are half-open [start,end) and require 0 <= start < end".to_string(),
+            );
         }
         let (start, end) = (start as usize, end as usize);
         if end > bytes.len() {
-            return Err(format!("byte_end {} exceeds artifact length {}", end, bytes.len()));
+            return Err(format!(
+                "byte_end {} exceeds artifact length {}",
+                end,
+                bytes.len()
+            ));
         }
         if end - start > MAX_ARTIFACT_EXCERPT_BYTES {
             return Err(format!(
@@ -6737,10 +7460,17 @@ pub fn handle_artifact_excerpt(db: &Database, args: Value) -> Result<String, Str
         }
         ("bytes", start, end)
     } else {
-        let start_line = a.line_start.ok_or_else(|| "line_start is required".to_string())?;
-        let end_line = a.line_end.ok_or_else(|| "line_end is required".to_string())?;
+        let start_line = a
+            .line_start
+            .ok_or_else(|| "line_start is required".to_string())?;
+        let end_line = a
+            .line_end
+            .ok_or_else(|| "line_end is required".to_string())?;
         if start_line <= 0 || end_line < start_line {
-            return Err("line ranges are 1-indexed and inclusive: require 1 <= line_start <= line_end".to_string());
+            return Err(
+                "line ranges are 1-indexed and inclusive: require 1 <= line_start <= line_end"
+                    .to_string(),
+            );
         }
         let bounds = artifact_line_bounds(&bytes);
         if bounds.is_empty() && start_line == 1 && end_line == 1 {
@@ -6748,7 +7478,10 @@ pub fn handle_artifact_excerpt(db: &Database, args: Value) -> Result<String, Str
         }
         let total_lines = bounds.len() as i64;
         if end_line > total_lines {
-            return Err(format!("line_end {} exceeds artifact line count {}", end_line, total_lines));
+            return Err(format!(
+                "line_end {} exceeds artifact line count {}",
+                end_line, total_lines
+            ));
         }
         if (end_line - start_line + 1) as usize > MAX_ARTIFACT_EXCERPT_LINES {
             return Err(format!(
@@ -6794,7 +7527,10 @@ pub fn handle_artifact_log_digest(db: &Database, args: Value) -> Result<String, 
     let a: ArtifactDigestArgs = serde_json::from_value(args)
         .map_err(|e| format!("Invalid artifact_log_digest arguments: {}", e))?;
     if !is_sha256_hex(&a.sha256) {
-        return Err(format!("sha256 must be a full 64-hex SHA-256, got '{}'", a.sha256));
+        return Err(format!(
+            "sha256 must be a full 64-hex SHA-256, got '{}'",
+            a.sha256
+        ));
     }
     // Resolve bytes only through the original artifact contract, which applies
     // workspace + visibility filtering before any aggregate count/template is built.
@@ -6811,8 +7547,8 @@ pub fn handle_artifact_log_digest(db: &Database, args: Value) -> Result<String, 
     let digest = log_digest::digest(&a.sha256, &bytes, |start, end| {
         db.artifact_anchor(&a.sha256, &bytes, start, end)
     })?;
-    let digest_bytes = serde_json::to_vec(&digest)
-        .map_err(|e| format!("digest serialization failed: {}", e))?;
+    let digest_bytes =
+        serde_json::to_vec(&digest).map_err(|e| format!("digest serialization failed: {}", e))?;
     // The navigation view is itself versioned derivative data. It never replaces
     // the source artifact and inherits only an already-visible binding's scope.
     let (derived_sha256, _artifact_created, _binding_created) = db
@@ -6921,8 +7657,12 @@ pub fn handle_embed(db: &Database, args: Value) -> Result<String, String> {
     // #885: store-wide reindex / rollback modes — they deliberately ignore
     // the single/batch embedding args (mutually exclusive by contract).
     if let Some(ref mode) = params.quant_mode {
-        let target = EmbeddingQuant::parse(mode)
-            .ok_or_else(|| format!("invalid quant_mode '{}': expected float32 | int8 | bit", mode))?;
+        let target = EmbeddingQuant::parse(mode).ok_or_else(|| {
+            format!(
+                "invalid quant_mode '{}': expected float32 | int8 | bit",
+                mode
+            )
+        })?;
         if target == EmbeddingQuant::F32 {
             return Err(
                 "quant_mode=float32 is refused: quantization is lossy — restore the \
@@ -6933,23 +7673,23 @@ pub fn handle_embed(db: &Database, args: Value) -> Result<String, String> {
         }
         // #871: durable op-state wrap — store-wide reindex is a long-running
         // operation; a crash mid-reindex is recovered as `interrupted`.
-    let run = match db.op_run_begin("embed", "", "", 1, "internal") {
-        Ok(run) => run,
-        Err(e) => return Err(e.to_string()),
-    };
-    let _ = db.op_run_start(&run.id);
-    return match db.reindex_embeddings(target) {
-        Ok(mut v) => {
-            let _ = db.op_run_complete(&run.id, "embedding reindex");
-            v["op_run_id"] = json!(run.id);
-            v["op_run_state"] = json!("completed");
-            Ok(v.to_string())
-        }
-        Err(e) => {
-            let _ = db.op_run_fail(&run.id, "embed_reindex_failed", &e.to_string());
-            Err(format!("Embedding reindex failed: {e}"))
-        }
-    };
+        let run = match db.op_run_begin("embed", "", "", 1, "internal") {
+            Ok(run) => run,
+            Err(e) => return Err(e.to_string()),
+        };
+        let _ = db.op_run_start(&run.id);
+        return match db.reindex_embeddings(target) {
+            Ok(mut v) => {
+                let _ = db.op_run_complete(&run.id, "embedding reindex");
+                v["op_run_id"] = json!(run.id);
+                v["op_run_state"] = json!("completed");
+                Ok(v.to_string())
+            }
+            Err(e) => {
+                let _ = db.op_run_fail(&run.id, "embed_reindex_failed", &e.to_string());
+                Err(format!("Embedding reindex failed: {e}"))
+            }
+        };
     }
     if params.restore_quantized_backup {
         let run = match db.op_run_begin("embed", "", "", 1, "internal") {
@@ -6969,8 +7709,8 @@ pub fn handle_embed(db: &Database, args: Value) -> Result<String, String> {
                 Err(format!("Embedding restore failed: {e}"))
             }
         };
-            }
-            if params.drop_quantized_backup {
+    }
+    if params.drop_quantized_backup {
         let run = match db.op_run_begin("embed", "", "", 1, "internal") {
             Ok(run) => run,
             Err(e) => return Err(e.to_string()),
@@ -6988,8 +7728,8 @@ pub fn handle_embed(db: &Database, args: Value) -> Result<String, String> {
                 Err(format!("Embedding snapshot drop failed: {e}"))
             }
         };
-            }
-            match db.embed_entity(&params) {
+    }
+    match db.embed_entity(&params) {
         Ok(result) => Ok(result.to_string()),
         Err(e) => Err(format!("Embed failed: {}", e)),
     }
@@ -7005,7 +7745,11 @@ pub fn handle_prune(db: &Database, args: Value) -> Result<String, String> {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
         let mut policy = crate::models::HistoryRetentionPolicy::from_env();
-        if let Some(v) = args.get("max_age_days").and_then(|v| v.as_i64()).filter(|v| *v > 0) {
+        if let Some(v) = args
+            .get("max_age_days")
+            .and_then(|v| v.as_i64())
+            .filter(|v| *v > 0)
+        {
             policy.max_age_days = Some(v);
         }
         if let Some(v) = args
@@ -7015,7 +7759,11 @@ pub fn handle_prune(db: &Database, args: Value) -> Result<String, String> {
         {
             policy.max_versions_per_key = Some(v);
         }
-        if let Some(v) = args.get("max_bytes").and_then(|v| v.as_i64()).filter(|v| *v > 0) {
+        if let Some(v) = args
+            .get("max_bytes")
+            .and_then(|v| v.as_i64())
+            .filter(|v| *v > 0)
+        {
             policy.max_bytes = Some(v);
         }
         if policy.is_unlimited() {
@@ -7028,8 +7776,7 @@ pub fn handle_prune(db: &Database, args: Value) -> Result<String, String> {
         let report = db
             .enforce_history_retention(&policy, dry_run)
             .map_err(|e| format!("History prune failed: {}", e))?;
-        return serde_json::to_string(&report)
-            .map_err(|e| format!("Serialization failed: {}", e));
+        return serde_json::to_string(&report).map_err(|e| format!("Serialization failed: {}", e));
     }
 
     let params: PruneParams =
@@ -7060,18 +7807,22 @@ pub fn handle_federate(db: &Database, args: Value) -> Result<String, String> {
         #[serde(default)]
         vault_dir: String,
     }
-    let a: FederateArgs = serde_json::from_value(args)
-        .map_err(|e| format!("Invalid federate arguments: {}", e))?;
+    let a: FederateArgs =
+        serde_json::from_value(args).map_err(|e| format!("Invalid federate arguments: {}", e))?;
     return Err("federate requires an authenticated authoritative admission and rollback-capable transfer boundary".to_string());
 
     let vault_dir = if a.vault_dir.is_empty() {
-        std::env::temp_dir().join("perseus_vault-federate").to_string_lossy().to_string()
+        std::env::temp_dir()
+            .join("perseus_vault-federate")
+            .to_string_lossy()
+            .to_string()
     } else {
         a.vault_dir
     };
 
     // Export from source workspace
-    let export_report = db.vault_export(&vault_dir, Some(&a.from_workspace))
+    let export_report = db
+        .vault_export(&vault_dir, Some(&a.from_workspace))
         .map_err(|e| format!("Federate export failed: {}", e))?;
 
     // Remap entities: overwrite workspace_hash to target
@@ -7084,9 +7835,10 @@ pub fn handle_federate(db: &Database, args: Value) -> Result<String, String> {
         }
         let content = std::fs::read_to_string(&path)
             .map_err(|e| format!("Read {}: {}", path.display(), e))?;
-        let remapped_content =
-            content.replace(&format!("workspace_hash: {}", a.from_workspace),
-                            &format!("workspace_hash: {}", a.to_workspace));
+        let remapped_content = content.replace(
+            &format!("workspace_hash: {}", a.from_workspace),
+            &format!("workspace_hash: {}", a.to_workspace),
+        );
         if remapped_content != content {
             std::fs::write(&path, remapped_content)
                 .map_err(|e| format!("Write {}: {}", path.display(), e))?;
@@ -7095,7 +7847,8 @@ pub fn handle_federate(db: &Database, args: Value) -> Result<String, String> {
     }
 
     // Import into target workspace
-    let import_report = db.vault_import(&vault_dir)
+    let import_report = db
+        .vault_import(&vault_dir)
         .map_err(|e| format!("Federate import failed: {}", e))?;
 
     let result = json!({
@@ -7114,31 +7867,36 @@ pub fn handle_share(db: &Database, args: Value) -> Result<String, String> {
         key: String,
         to_workspace: String,
     }
-    let a: ShareArgs = serde_json::from_value(args)
-        .map_err(|e| format!("Invalid share arguments: {}", e))?;
+    let a: ShareArgs =
+        serde_json::from_value(args).map_err(|e| format!("Invalid share arguments: {}", e))?;
 
     // Find the entity
     // Recall by category first, then filter by key (FTS5 searches body_json,
     // not the key column, so we can't use key as a query term reliably).
-    let entities = db.recall(&crate::models::RecallParams {
-        query: String::new(),
-        category: Some(a.category.clone()),
-        entity_type: None,
-        limit: 100,
-        offset: 0,
-        min_decay: 0.0,
-        topic_path: None,
-        include_archived: false,
-        skip_side_effects: true,
-        ..crate::models::RecallParams::default()
-    }).map_err(|e| format!("Recall failed: {}", e))?;
+    let entities = db
+        .recall(&crate::models::RecallParams {
+            query: String::new(),
+            category: Some(a.category.clone()),
+            entity_type: None,
+            limit: 100,
+            offset: 0,
+            min_decay: 0.0,
+            topic_path: None,
+            include_archived: false,
+            skip_side_effects: true,
+            ..crate::models::RecallParams::default()
+        })
+        .map_err(|e| format!("Recall failed: {}", e))?;
 
-    let src = entities.iter()
+    let src = entities
+        .iter()
         .find(|e| e.key == a.key)
         .ok_or_else(|| format!("Entity not found: {}/{}", a.category, a.key))?;
 
     if !entity_has_authoritative_admission(src) {
-        return Err("source requires_review: share requires durable authoritative admission".to_string());
+        return Err(
+            "source requires_review: share requires durable authoritative admission".to_string(),
+        );
     }
     if src.workspace_hash != a.to_workspace {
         return Err("share target workspace must match the source workspace assertion".to_string());
@@ -7154,7 +7912,8 @@ pub fn handle_share(db: &Database, args: Value) -> Result<String, String> {
     clone.retrieval_count = 0;
     clone.layer = "buffer".to_string();
 
-    let (eid, action) = db.remember(&clone)
+    let (eid, action) = db
+        .remember(&clone)
         .map_err(|e| format!("Share failed: {}", e))?;
 
     Ok(reviewable_write_result(
@@ -7211,6 +7970,9 @@ pub struct RecallWhenArgs {
     pub limit: i64,
     #[serde(default)]
     pub workspace_hash: Option<String>,
+    /// #875: session id for preload usage telemetry ("" when unknown).
+    #[serde(default)]
+    pub session_id: String,
 }
 
 fn default_rw_limit() -> i64 {
@@ -7234,8 +7996,13 @@ pub fn handle_recall_when(db: &Database, args: Value) -> Result<String, String> 
         .map_err(|e| format!("Invalid recall_when arguments: {}", e))?;
 
     let entities = db
-        .recall_when(&a.context, a.limit, a.workspace_hash.as_deref())
-        .map_err(|e| format!("Recall_when failed: {}", e))?;
+        .recall_when_with_session(
+            &a.context,
+            a.limit,
+            a.workspace_hash.as_deref(),
+            &a.session_id,
+        )
+        .map_err(|e| format!("Recall_when failed: {e}"))?;
 
     let items_expanded: Vec<serde_json::Value> =
         entities.iter().map(|e| e.to_json_expanded()).collect();
@@ -7249,8 +8016,8 @@ pub fn handle_recall_when(db: &Database, args: Value) -> Result<String, String> 
 }
 
 pub fn handle_autocohere(db: &Database, args: Value) -> Result<String, String> {
-    let a: AutocohereArgs = serde_json::from_value(args)
-        .map_err(|e| format!("Invalid autocohere arguments: {}", e))?;
+    let a: AutocohereArgs =
+        serde_json::from_value(args).map_err(|e| format!("Invalid autocohere arguments: {}", e))?;
 
     let mut total_promoted = 0i64;
     let mut total_links = 0i64;
@@ -7274,8 +8041,12 @@ pub fn handle_autocohere(db: &Database, args: Value) -> Result<String, String> {
             }
             let raw = handle_capture(db, capture_args)
                 .map_err(|e| format!("Autocohere pre-compaction capture failed: {}", e))?;
-            let report: Value = serde_json::from_str(&raw)
-                .map_err(|e| format!("Autocohere pre-compaction capture report parse failed: {}", e))?;
+            let report: Value = serde_json::from_str(&raw).map_err(|e| {
+                format!(
+                    "Autocohere pre-compaction capture report parse failed: {}",
+                    e
+                )
+            })?;
             json!({ "stage": "completed", "report": report })
         }
         _ => json!({ "stage": "skipped", "reason": "no capture_text provided" }),
@@ -7363,7 +8134,10 @@ pub fn handle_autocohere(db: &Database, args: Value) -> Result<String, String> {
     // knob set this is a guaranteed no-op, so autocohere's default behavior
     // is unchanged.
     let retention_report = db
-        .enforce_history_retention(&crate::models::HistoryRetentionPolicy::from_env(), a.dry_run)
+        .enforce_history_retention(
+            &crate::models::HistoryRetentionPolicy::from_env(),
+            a.dry_run,
+        )
         .map_err(|e| format!("Autocohere step (history retention) failed: {}", e))?;
 
     let final_db_size = if a.dry_run {
@@ -7396,7 +8170,8 @@ pub fn handle_autocohere(db: &Database, args: Value) -> Result<String, String> {
 }
 
 pub fn handle_cohere(db: &Database, args: Value) -> Result<String, String> {
-    let a: CohereArgs = serde_json::from_value(args).map_err(|e| format!("Invalid cohere arguments: {}", e))?;
+    let a: CohereArgs =
+        serde_json::from_value(args).map_err(|e| format!("Invalid cohere arguments: {}", e))?;
     let params = crate::models::CohereParams {
         dry_run: a.dry_run,
         max_links: a.max_links,
@@ -7432,14 +8207,19 @@ fn default_relationship() -> String {
 }
 
 pub fn handle_supersede(db: &Database, args: Value) -> Result<String, String> {
-    let a: SupersedeArgs = serde_json::from_value(args)
-        .map_err(|e| format!("Invalid supersede arguments: {}", e))?;
+    let a: SupersedeArgs =
+        serde_json::from_value(args).map_err(|e| format!("Invalid supersede arguments: {}", e))?;
 
     // Find the 'from' entity
     let from_entity = db
         .get_entity(&a.from_category, &a.from_key)
         .map_err(|e| format!("'From' entity lookup failed: {}", e))?
-        .ok_or_else(|| format!("'From' entity not found: {}/{}", a.from_category, a.from_key))?;
+        .ok_or_else(|| {
+            format!(
+                "'From' entity not found: {}/{}",
+                a.from_category, a.from_key
+            )
+        })?;
 
     // Find the 'to' entity
     let to_entity = db
@@ -7642,7 +8422,8 @@ pub fn handle_maintenance(db: &Database, args: Value) -> Result<String, String> 
                     let after_vacuum_db_size = db
                         .file_size_bytes()
                         .map_err(|e| format!("Failed to get DB size after vacuum: {}", e))?;
-                    report["vacuum_reclaimed_bytes"] = json!(current_db_size as i64 - after_vacuum_db_size as i64);
+                    report["vacuum_reclaimed_bytes"] =
+                        json!(current_db_size as i64 - after_vacuum_db_size as i64);
                 }
                 Err(e) => report["errors"]
                     .as_array_mut()
@@ -7803,7 +8584,6 @@ pub struct CorrectArgs {
     pub requesting_agent_id: String,
 }
 
-
 #[derive(Debug, Deserialize)]
 pub struct RejectValueArgs {
     pub workspace_hash: String,
@@ -7821,8 +8601,8 @@ pub struct RejectValueArgs {
 }
 
 pub fn handle_reject_value(db: &Database, args: Value) -> Result<String, String> {
-    let a: RejectValueArgs = serde_json::from_value(args)
-        .map_err(|e| format!("Invalid reject_value arguments: {e}"))?;
+    let a: RejectValueArgs =
+        serde_json::from_value(args).map_err(|e| format!("Invalid reject_value arguments: {e}"))?;
     if a.subject.trim().is_empty() || a.predicate.trim().is_empty() || a.value.trim().is_empty() {
         return Err("workspace_hash, subject, predicate, and value are required".to_string());
     }
@@ -7843,8 +8623,8 @@ pub fn handle_reject_value(db: &Database, args: Value) -> Result<String, String>
 }
 
 pub fn handle_correct(db: &Database, args: Value) -> Result<String, String> {
-    let a: CorrectArgs = serde_json::from_value(args)
-        .map_err(|e| format!("Invalid correct arguments: {}", e))?;
+    let a: CorrectArgs =
+        serde_json::from_value(args).map_err(|e| format!("Invalid correct arguments: {}", e))?;
 
     // #363 review: same inverted-period rejection as perseus_vault_remember — an
     // inverted period would shadow older versions in bitemporal_at while
@@ -7893,7 +8673,8 @@ pub fn handle_correct(db: &Database, args: Value) -> Result<String, String> {
         agent_id: author_agent_id,
     };
 
-    let result = db.correct(&params)
+    let result = db
+        .correct(&params)
         .map_err(|e| format!("Correct failed: {}", e))?;
 
     // #889: anchored instruction extraction -> suggestion queue. Extraction
@@ -7923,14 +8704,14 @@ pub fn handle_correct(db: &Database, args: Value) -> Result<String, String> {
             }
         }
     }
-    let mut out = serde_json::to_value(&result)
-        .map_err(|e| format!("Serialization failed: {e}"))?;
+    let mut out =
+        serde_json::to_value(&result).map_err(|e| format!("Serialization failed: {e}"))?;
     if let Some(obj) = out.as_object_mut() {
+        obj.insert("keystone_suggestions".to_string(), json!(suggestions));
         obj.insert(
-            "keystone_suggestions".to_string(),
-            json!(suggestions),
+            "keystone_suggestions_count".to_string(),
+            json!(suggestions.len()),
         );
-        obj.insert("keystone_suggestions_count".to_string(), json!(suggestions.len()));
         if !extraction_errors.is_empty() {
             obj.insert("extraction_errors".to_string(), json!(extraction_errors));
         }
@@ -7954,8 +8735,8 @@ pub struct SynthesizeArgs {
 }
 
 pub fn handle_synthesize(db: &Database, args: Value) -> Result<String, String> {
-    let a: SynthesizeArgs = serde_json::from_value(args)
-        .map_err(|e| format!("Invalid synthesize arguments: {}", e))?;
+    let a: SynthesizeArgs =
+        serde_json::from_value(args).map_err(|e| format!("Invalid synthesize arguments: {}", e))?;
 
     let params = crate::models::SynthesizeParams {
         session_content: a.session_content,
@@ -7965,12 +8746,12 @@ pub fn handle_synthesize(db: &Database, args: Value) -> Result<String, String> {
         evidence: a.evidence,
     };
 
-    let result = db.synthesize(&params)
+    let result = db
+        .synthesize(&params)
         .map_err(|e| format!("Synthesize failed: {}", e))?;
 
     serde_json::to_string(&result).map_err(|e| format!("Serialization failed: {}", e))
 }
-
 
 // ─── perseus_vault_bench handler ─────────────────────────────────────────
 
@@ -7991,8 +8772,8 @@ pub struct BenchArgs {
 }
 
 pub fn handle_bench(db: &Database, args: Value) -> Result<String, String> {
-    let a: BenchArgs = serde_json::from_value(args)
-        .map_err(|e| format!("Invalid bench arguments: {}", e))?;
+    let a: BenchArgs =
+        serde_json::from_value(args).map_err(|e| format!("Invalid bench arguments: {}", e))?;
 
     let params = crate::models::BenchParams {
         task_description: a.task_description,
@@ -8005,7 +8786,8 @@ pub fn handle_bench(db: &Database, args: Value) -> Result<String, String> {
         tags: a.tags,
     };
 
-    let result = db.bench(&params)
+    let result = db
+        .bench(&params)
         .map_err(|e| format!("Bench failed: {}", e))?;
 
     serde_json::to_string(&result).map_err(|e| format!("Serialization failed: {}", e))
@@ -8019,9 +8801,10 @@ pub struct PurgeArgs {
 }
 
 pub fn handle_purge(db: &Database, args: Value) -> Result<String, String> {
-    let a: PurgeArgs = serde_json::from_value(args)
-        .map_err(|e| format!("Invalid purge arguments: {}", e))?;
-    let report = db.purge(a.dry_run)
+    let a: PurgeArgs =
+        serde_json::from_value(args).map_err(|e| format!("Invalid purge arguments: {}", e))?;
+    let report = db
+        .purge(a.dry_run)
         .map_err(|e| format!("Purge failed: {}", e))?;
     serde_json::to_string(&report).map_err(|e| format!("Serialization failed: {}", e))
 }
@@ -8071,8 +8854,8 @@ pub struct EraseArgs {
 }
 
 pub fn handle_expire(db: &Database, args: Value) -> Result<String, String> {
-    let a: ExpireArgs = serde_json::from_value(args)
-        .map_err(|e| format!("Invalid expire arguments: {}", e))?;
+    let a: ExpireArgs =
+        serde_json::from_value(args).map_err(|e| format!("Invalid expire arguments: {}", e))?;
     let report = db
         .expire_due(
             a.dry_run,
@@ -8087,8 +8870,8 @@ pub fn handle_expire(db: &Database, args: Value) -> Result<String, String> {
 }
 
 pub fn handle_redact(db: &Database, args: Value) -> Result<String, String> {
-    let a: RedactArgs = serde_json::from_value(args)
-        .map_err(|e| format!("Invalid redact arguments: {}", e))?;
+    let a: RedactArgs =
+        serde_json::from_value(args).map_err(|e| format!("Invalid redact arguments: {}", e))?;
     if a.workspace_hash.is_empty() {
         return Err("redact requires an explicit workspace_hash (fail-closed: a bare category/key is ambiguous across workspaces, #854)".to_string());
     }
@@ -8100,8 +8883,8 @@ pub fn handle_redact(db: &Database, args: Value) -> Result<String, String> {
 }
 
 pub fn handle_erase(db: &Database, args: Value) -> Result<String, String> {
-    let a: EraseArgs = serde_json::from_value(args)
-        .map_err(|e| format!("Invalid erase arguments: {}", e))?;
+    let a: EraseArgs =
+        serde_json::from_value(args).map_err(|e| format!("Invalid erase arguments: {}", e))?;
     if a.workspace_hash.is_empty() {
         return Err("erase requires an explicit workspace_hash (fail-closed: a bare category/key is ambiguous across workspaces, #854)".to_string());
     }
@@ -8162,7 +8945,10 @@ fn memories_key(path: &str) -> Result<String, String> {
     if rel.is_empty() {
         return Err("path must name a file under /memories".to_string());
     }
-    if rel.split('/').any(|seg| seg == "." || seg == ".." || seg.is_empty()) {
+    if rel
+        .split('/')
+        .any(|seg| seg == "." || seg == ".." || seg.is_empty())
+    {
         return Err(format!("invalid path: {}", path));
     }
     Ok(rel.to_string())
@@ -8268,8 +9054,8 @@ fn memories_write(
 }
 
 pub fn handle_memories(db: &Database, args: Value) -> Result<String, String> {
-    let a: MemoriesArgs = serde_json::from_value(args)
-        .map_err(|e| format!("Invalid memories arguments: {}", e))?;
+    let a: MemoriesArgs =
+        serde_json::from_value(args).map_err(|e| format!("Invalid memories arguments: {}", e))?;
 
     match a.command.as_str() {
         "view" => {
@@ -8322,7 +9108,8 @@ pub fn handle_memories(db: &Database, args: Value) -> Result<String, String> {
             Ok(reviewable_write_result(
                 json!({"path": format!("/memories/{}", key), "action": "created"}),
                 "memories_create",
-            ).to_string())
+            )
+            .to_string())
         }
         "str_replace" => {
             let key = memories_key(&a.path)?;
@@ -8346,7 +9133,8 @@ pub fn handle_memories(db: &Database, args: Value) -> Result<String, String> {
             Ok(reviewable_write_result(
                 json!({"path": format!("/memories/{}", key), "action": "replaced"}),
                 "memories_replace",
-            ).to_string())
+            )
+            .to_string())
         }
         "insert" => {
             let key = memories_key(&a.path)?;
@@ -8364,7 +9152,8 @@ pub fn handle_memories(db: &Database, args: Value) -> Result<String, String> {
                     "at_line": at,
                 }),
                 "memories_insert",
-            ).to_string())
+            )
+            .to_string())
         }
         "delete" => {
             let key = memories_key(&a.path)?;
@@ -8379,7 +9168,8 @@ pub fn handle_memories(db: &Database, args: Value) -> Result<String, String> {
             Ok(reviewable_write_result(
                 json!({"path": format!("/memories/{}", key), "action": "deleted"}),
                 "memories_delete",
-            ).to_string())
+            )
+            .to_string())
         }
         "rename" => {
             let old_key = memories_key(&a.old_path)?;
@@ -8399,7 +9189,8 @@ pub fn handle_memories(db: &Database, args: Value) -> Result<String, String> {
                     "action": "renamed",
                 }),
                 "memories_rename",
-            ).to_string())
+            )
+            .to_string())
         }
         other => Err(format!(
             "unknown command '{}' (expected view/create/str_replace/insert/delete/rename)",
@@ -8456,32 +9247,49 @@ mod tests {
         };
         db.remember_skip_dedup(&private).unwrap();
 
-        let alice: Value = serde_json::from_str(&handle_memories(
-            &db,
-            json!({"command": "view", "path": "/memories", "requesting_agent_id": "alice"}),
-        ).unwrap()).unwrap();
+        let alice: Value = serde_json::from_str(
+            &handle_memories(
+                &db,
+                json!({"command": "view", "path": "/memories", "requesting_agent_id": "alice"}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
         assert_eq!(alice["files"], json!(["private.md"]), "{alice}");
 
-        let bob: Value = serde_json::from_str(&handle_memories(
-            &db,
-            json!({"command": "view", "path": "/memories", "requesting_agent_id": "bob"}),
-        ).unwrap()).unwrap();
+        let bob: Value = serde_json::from_str(
+            &handle_memories(
+                &db,
+                json!({"command": "view", "path": "/memories", "requesting_agent_id": "bob"}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
         assert_eq!(bob["files"], json!([]), "{bob}");
         let err = handle_memories(
             &db,
             json!({"command": "view", "path": "/memories/private.md", "requesting_agent_id": "bob"}),
         ).expect_err("private file must not be readable by another agent");
-        assert!(err.contains("file not found"), "must not disclose private existence: {err}");
+        assert!(
+            err.contains("file not found"),
+            "must not disclose private existence: {err}"
+        );
         let err = handle_memories(
             &db,
             json!({"command": "delete", "path": "/memories/private.md", "requesting_agent_id": "bob"}),
         ).expect_err("private file must not be deletable by another agent");
-        assert!(err.contains("file not found"), "must not disclose private existence: {err}");
+        assert!(
+            err.contains("file not found"),
+            "must not disclose private existence: {err}"
+        );
         let alice_after: Value = serde_json::from_str(&handle_memories(
             &db,
             json!({"command": "view", "path": "/memories/private.md", "requesting_agent_id": "alice"}),
         ).unwrap()).unwrap();
-        assert!(alice_after["content"].as_str().unwrap().contains("private contents"));
+        assert!(alice_after["content"]
+            .as_str()
+            .unwrap()
+            .contains("private contents"));
         let _ = std::fs::remove_file(path);
     }
 
@@ -8514,7 +9322,11 @@ mod tests {
         )
         .unwrap();
         let items = scoped["items"].as_array().unwrap();
-        assert_eq!(items.len(), 2, "timeline must include global and exclude other workspaces: {scoped}");
+        assert_eq!(
+            items.len(),
+            2,
+            "timeline must include global and exclude other workspaces: {scoped}"
+        );
         assert_eq!(items[0]["id"], "timeline-global");
         assert_eq!(items[0]["workspace_hash"], "");
         assert_eq!(items[1]["id"], "timeline-alpha");
@@ -8528,11 +9340,19 @@ mod tests {
         assert_eq!(limited["items"][0]["id"], "timeline-global");
 
         let recent = db.get_recent_journal("alpha", 2).unwrap();
-        assert_eq!(recent.iter().map(|event| event.id.as_str()).collect::<Vec<_>>(),
-            vec!["timeline-global", "timeline-alpha"]);
+        assert_eq!(
+            recent
+                .iter()
+                .map(|event| event.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["timeline-global", "timeline-alpha"]
+        );
 
         let missing = handle_timeline(&db, json!({}));
-        assert!(missing.is_err(), "timeline must reject omitted workspace scope");
+        assert!(
+            missing.is_err(),
+            "timeline must reject omitted workspace scope"
+        );
         let _ = std::fs::remove_file(path);
     }
 
@@ -8552,8 +9372,14 @@ mod tests {
 
         // Transcript retained as a durable entity.
         assert_eq!(v["transcript"]["retained"], json!(true), "{r}");
-        let t_key = v["transcript"]["key"].as_str().expect("transcript key").to_string();
-        let t_id = v["transcript"]["id"].as_str().expect("transcript id").to_string();
+        let t_key = v["transcript"]["key"]
+            .as_str()
+            .expect("transcript key")
+            .to_string();
+        let t_id = v["transcript"]["id"]
+            .as_str()
+            .expect("transcript id")
+            .to_string();
         let t_ent = db
             .get_entity("transcript", &t_key)
             .expect("get_entity")
@@ -8576,9 +9402,17 @@ mod tests {
             .expect("get_entity")
             .expect("note exists");
         let body: Value = serde_json::from_str(&ent.body_json).unwrap();
-        let chunk = body.get("source_chunk").expect("note must carry source_chunk");
-        assert!(chunk.get("source_id").is_none(), "no random ids in the chunk: {chunk}");
-        assert!(chunk.get("span_sha256").is_none(), "no hashes in the chunk: {chunk}");
+        let chunk = body
+            .get("source_chunk")
+            .expect("note must carry source_chunk");
+        assert!(
+            chunk.get("source_id").is_none(),
+            "no random ids in the chunk: {chunk}"
+        );
+        assert!(
+            chunk.get("span_sha256").is_none(),
+            "no hashes in the chunk: {chunk}"
+        );
         assert_eq!(chunk["source_category"], json!("transcript"));
         assert_eq!(chunk["source_key"], json!(t_key));
         let span = &chunk["span"];
@@ -8613,7 +9447,11 @@ mod tests {
         assert_eq!(x["truncated"], json!(false), "{out}");
         assert_eq!(x["span"]["chars"], json!(section1.chars().count()), "{out}");
         assert_eq!(x["span_sha256"], json!(sha), "{out}");
-        assert_eq!(x["budget"]["chars"], json!(section1.chars().count()), "{out}");
+        assert_eq!(
+            x["budget"]["chars"],
+            json!(section1.chars().count()),
+            "{out}"
+        );
         assert_eq!(x["fact"]["category"], json!("capture"), "{out}");
 
         // Explicit mode: same span via source_category+key+offsets, hash verified.
@@ -8670,7 +9508,10 @@ mod tests {
                       We decided to standardize on Postgres with the logical replication \
                       extension for the vault backend.";
         let orig_body: Value = serde_json::from_str(
-            &db.get_entity("transcript", &t_key).unwrap().unwrap().body_json,
+            &db.get_entity("transcript", &t_key)
+                .unwrap()
+                .unwrap()
+                .body_json,
         )
         .unwrap();
         let edited_body = json!({
@@ -8717,7 +9558,10 @@ mod tests {
         .unwrap();
         assert_eq!(x2["status"], json!("span_invalid"), "{x2}");
         assert_eq!(x2["verification"], json!("hash_mismatch"), "{x2}");
-        assert!(x2.get("text").is_none(), "fail-closed: no text on mismatch: {x2}");
+        assert!(
+            x2.get("text").is_none(),
+            "fail-closed: no text on mismatch: {x2}"
+        );
         assert!(
             x2["excluded"]
                 .as_array()
@@ -8774,8 +9618,8 @@ mod tests {
         assert_eq!(v2["status"], json!("fact_not_found"), "{out2}");
 
         // No mode args at all → fail-closed argument error.
-        let err = handle_expand_source(&db, json!({}))
-            .expect_err("missing mode args must be rejected");
+        let err =
+            handle_expand_source(&db, json!({})).expect_err("missing mode args must be rejected");
         assert!(err.contains("requires category+key"), "{err}");
 
         let _ = std::fs::remove_file(&path);
@@ -8890,8 +9734,8 @@ mod tests {
         );
 
         // Expand degrades gracefully to no_source_ref.
-        let out = handle_expand_source(&db, json!({"category": "capture", "key": note_key}))
-            .unwrap();
+        let out =
+            handle_expand_source(&db, json!({"category": "capture", "key": note_key})).unwrap();
         let x: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(x["status"], json!("no_source_ref"), "{out}");
 
@@ -8919,7 +9763,10 @@ mod tests {
         let ent2 = db.get_entity("capture", &key2).unwrap().unwrap();
         let b2: Value = serde_json::from_str(&ent2.body_json).unwrap();
         let chunk2 = b2["source_chunk"].clone();
-        assert_eq!(chunk1["span"], chunk2["span"], "spans must be deterministic");
+        assert_eq!(
+            chunk1["span"], chunk2["span"],
+            "spans must be deterministic"
+        );
         // The transcript manifest is deterministic too (same payload → same
         // hashes), and the re-captured note points at the same transcript.
         let t2 = db
@@ -9008,9 +9855,8 @@ mod tests {
         let mut times: Vec<f64> = Vec::new();
         for _ in 0..500 {
             let t0 = std::time::Instant::now();
-            let out =
-                handle_expand_source(&db, json!({"category": "capture", "key": note_key}))
-                    .expect("expand");
+            let out = handle_expand_source(&db, json!({"category": "capture", "key": note_key}))
+                .expect("expand");
             let x: Value = serde_json::from_str(&out).unwrap();
             assert_eq!(x["status"], "expanded", "{x}");
             assert_eq!(x["verification"], "ok", "{x}");
@@ -9020,10 +9866,15 @@ mod tests {
         let p50_big = times[times.len() / 2];
 
         // Small transcript: ~4 KiB, one note.
-        let small = "# Small decision\nWe decided to standardize on the WAL mode for the vault backend, \
+        let small =
+            "# Small decision\nWe decided to standardize on the WAL mode for the vault backend, \
                      and to rerun flaky suites once before investigating further."
-            .repeat(30);
-        assert!(small.len() > 3_000 && small.len() < 6_000, "{}", small.len());
+                .repeat(30);
+        assert!(
+            small.len() > 3_000 && small.len() < 6_000,
+            "{}",
+            small.len()
+        );
         let r2 = handle_capture(&db, json!({"text": small})).expect("capture small");
         let v2: Value = serde_json::from_str(&r2).unwrap();
         let note2 = v2["notes"][0]["key"].as_str().unwrap().to_string();
@@ -9072,16 +9923,24 @@ mod tests {
         let (db, path) = temp_db();
         let v: Value = serde_json::from_str(&handle_health(&db)).unwrap();
         assert_eq!(v["status"], json!("healthy"), "{v}");
-        assert_eq!(v["ready"], json!(false), "empty store is not recall-ready: {v}");
+        assert_eq!(
+            v["ready"],
+            json!(false),
+            "empty store is not recall-ready: {v}"
+        );
         assert_eq!(v["active_memories"], json!(0), "{v}");
-        let sem = v["semantic_recall"].as_str().expect("semantic_recall present");
+        let sem = v["semantic_recall"]
+            .as_str()
+            .expect("semantic_recall present");
         assert!(
             matches!(sem, "available" | "no_coverage" | "disabled"),
             "unexpected semantic_recall {sem}: {v}"
         );
         let warnings = v["warnings"].as_array().expect("warnings present");
         assert!(
-            warnings.iter().any(|w| w.as_str().unwrap_or("").contains("0 active memories")),
+            warnings
+                .iter()
+                .any(|w| w.as_str().unwrap_or("").contains("0 active memories")),
             "empty store must warn about 0 active memories: {v}"
         );
         let _ = std::fs::remove_file(&path);
@@ -9187,8 +10046,7 @@ mod tests {
             if let Some(c) = &cursor {
                 args["cursor"] = json!(c);
             }
-            let page: Value =
-                serde_json::from_str(&handle_scan(&db, args).expect("scan")).unwrap();
+            let page: Value = serde_json::from_str(&handle_scan(&db, args).expect("scan")).unwrap();
             pages += 1;
             // A reinforcing recall between pages mutates the ranking keys that
             // break offset paging — the keyset walk must be unaffected.
@@ -9240,18 +10098,32 @@ mod tests {
         }
 
         let all: Value = serde_json::from_str(
-            &handle_recall(&db, json!({"query": "", "category": "enum-cat", "limit": 10}))
-                .expect("recall"),
+            &handle_recall(
+                &db,
+                json!({"query": "", "category": "enum-cat", "limit": 10}),
+            )
+            .expect("recall"),
         )
         .unwrap();
-        assert_eq!(all["total"], json!(3), "empty query = match-all enumeration: {all}");
+        assert_eq!(
+            all["total"],
+            json!(3),
+            "empty query = match-all enumeration: {all}"
+        );
 
         let star: Value = serde_json::from_str(
-            &handle_recall(&db, json!({"query": "*", "category": "enum-cat", "limit": 10}))
-                .expect("recall"),
+            &handle_recall(
+                &db,
+                json!({"query": "*", "category": "enum-cat", "limit": 10}),
+            )
+            .expect("recall"),
         )
         .unwrap();
-        assert_eq!(star["total"], json!(0), "'*' is a literal term, not a glob: {star}");
+        assert_eq!(
+            star["total"],
+            json!(0),
+            "'*' is a literal term, not a glob: {star}"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -9283,7 +10155,11 @@ mod tests {
         assert_eq!(ent.source, "capture");
         assert_eq!(ent.layer, "buffer");
         assert_eq!(ent.workspace_hash, "ws-cap");
-        assert!(ent.body_json.contains("schema version"), "{}", ent.body_json);
+        assert!(
+            ent.body_json.contains("schema version"),
+            "{}",
+            ent.body_json
+        );
         let captured_body: Value = serde_json::from_str(&ent.body_json).unwrap();
         assert_eq!(captured_body["evidence"]["capture_mode"], "legacy_unknown");
 
@@ -9305,7 +10181,8 @@ mod tests {
                     "replayable": false
                 }
             }),
-        ).expect("capture with hash-only evidence");
+        )
+        .expect("capture with hash-only evidence");
         let report: Value = serde_json::from_str(&raw).unwrap();
         let key = report["notes"][0]["key"].as_str().unwrap();
         let entity = db.get_entity("capture", key).unwrap().unwrap();
@@ -9339,7 +10216,10 @@ mod tests {
         assert_eq!(v["created"], json!(0), "near-dup must not create: {r}");
         assert_eq!(v["merged"], json!(1), "near-dup must merge: {r}");
         assert!(
-            v["notes"][0]["action"].as_str().unwrap().starts_with("deduped"),
+            v["notes"][0]["action"]
+                .as_str()
+                .unwrap()
+                .starts_with("deduped"),
             "{r}"
         );
 
@@ -9347,7 +10227,11 @@ mod tests {
         let r = handle_capture(&db, json!({"text": first})).expect("re-capture");
         let v: Value = serde_json::from_str(&r).unwrap();
         assert_eq!(v["created"], json!(0), "{r}");
-        assert_eq!(v["updated"].as_i64().unwrap() + v["merged"].as_i64().unwrap(), 1, "{r}");
+        assert_eq!(
+            v["updated"].as_i64().unwrap() + v["merged"].as_i64().unwrap(),
+            1,
+            "{r}"
+        );
 
         let _ = std::fs::remove_file(&path);
     }
@@ -9361,11 +10245,18 @@ mod tests {
             .join("\n\n");
 
         // dry_run: full report, zero writes.
-        let r = handle_capture(&db, json!({"text": payload, "dry_run": true, "max_entities": 100}))
-            .expect("dry-run capture");
+        let r = handle_capture(
+            &db,
+            json!({"text": payload, "dry_run": true, "max_entities": 100}),
+        )
+        .expect("dry-run capture");
         let v: Value = serde_json::from_str(&r).unwrap();
         assert_eq!(v["dry_run"], json!(true));
-        assert_eq!(v["captured"], json!(20), "hard cap even when asked for 100: {r}");
+        assert_eq!(
+            v["captured"],
+            json!(20),
+            "hard cap even when asked for 100: {r}"
+        );
         assert_eq!(v["dropped"], json!(10), "{r}");
         assert_eq!(v["created"], json!(0), "{r}");
         let stats = db.stats().expect("stats");
@@ -9477,17 +10368,21 @@ mod tests {
         let resp = handle_remember(
             &db,
             json!({"category": "insight", "key": "self-citer",
-                   "body_json": "{\"content\":\"a fact that tries to vouch for itself\"}",
-                   "derived_from": [
-                       {"category": "insight", "key": "self-citer"},
-                       {"category": "insight", "key": "does-not-exist"}
-                   ]}),
+            "body_json": "{\"content\":\"a fact that tries to vouch for itself\"}",
+            "derived_from": [
+                {"category": "insight", "key": "self-citer"},
+                {"category": "insight", "key": "does-not-exist"}
+            ]}),
         )
         .expect("remember must succeed despite unresolved citations");
         let v: Value = serde_json::from_str(&resp).unwrap();
         assert_eq!(v["derived_from"]["reinforced"].as_i64(), Some(0), "{resp}");
         let nf = v["derived_from"]["not_found"].as_array().unwrap();
-        assert_eq!(nf.len(), 1, "self-citation must be skipped, not reported: {resp}");
+        assert_eq!(
+            nf.len(),
+            1,
+            "self-citation must be skipped, not reported: {resp}"
+        );
         assert_eq!(nf[0].as_str(), Some("insight/does-not-exist"));
 
         // The self-citation must not have bumped the entity's own counter.
@@ -9569,7 +10464,11 @@ mod tests {
             .unwrap()
         };
         assert_eq!(get("ws-a"), 1, "the ws-a row the agent saw gets the credit");
-        assert_eq!(get(""), 0, "the global row must NOT be stamped by a ws-scoped write");
+        assert_eq!(
+            get(""),
+            0,
+            "the global row must NOT be stamped by a ws-scoped write"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -9601,8 +10500,16 @@ mod tests {
             // the auto-link threshold.
             db.remember_skip_dedup(&e).unwrap();
         };
-        mk("ac-a", "alpha", "the payment service database migration plan for the Q3 rollout");
-        mk("ac-b", "beta", "the payment service database migration plan for the Q4 rollout");
+        mk(
+            "ac-a",
+            "alpha",
+            "the payment service database migration plan for the Q3 rollout",
+        );
+        mk(
+            "ac-b",
+            "beta",
+            "the payment service database migration plan for the Q4 rollout",
+        );
 
         let resp = handle_autocohere(&db, json!({ "dry_run": false })).expect("autocohere");
         let v: Value = serde_json::from_str(&resp).unwrap();
@@ -9626,8 +10533,18 @@ mod tests {
         )
         .expect("autocohere with pre-compaction capture");
         let report: Value = serde_json::from_str(&response).unwrap();
-        assert_eq!(report["precompact_capture"]["stage"], json!("completed"), "{response}");
-        assert!(report["precompact_capture"]["report"]["captured"].as_i64().unwrap() >= 1, "{response}");
+        assert_eq!(
+            report["precompact_capture"]["stage"],
+            json!("completed"),
+            "{response}"
+        );
+        assert!(
+            report["precompact_capture"]["report"]["captured"]
+                .as_i64()
+                .unwrap()
+                >= 1,
+            "{response}"
+        );
         let captured = db
             .get_entity("capture", "deployment-decision")
             .unwrap()
@@ -9650,8 +10567,14 @@ mod tests {
         .expect("dry-run autocohere");
         let report: Value = serde_json::from_str(&response).unwrap();
         assert_eq!(report["precompact_capture"]["stage"], json!("completed"));
-        assert_eq!(report["precompact_capture"]["report"]["dry_run"], json!(true));
-        assert!(db.get_entity("capture", "preview-decision").unwrap().is_none());
+        assert_eq!(
+            report["precompact_capture"]["report"]["dry_run"],
+            json!(true)
+        );
+        assert!(db
+            .get_entity("capture", "preview-decision")
+            .unwrap()
+            .is_none());
         let _ = std::fs::remove_file(&path);
     }
 
@@ -9707,7 +10630,10 @@ mod tests {
         assert!(report["maintenance"].is_object(), "{report}");
         // The preview names the would-be forgetting...
         assert!(
-            report["autocohere"]["decay_auto_archived"].as_i64().unwrap() >= 1,
+            report["autocohere"]["decay_auto_archived"]
+                .as_i64()
+                .unwrap()
+                >= 1,
             "preview must report the cold entity as would-archive: {report}"
         );
         // ...but must not change anything.
@@ -9716,10 +10642,17 @@ mod tests {
         // The live pass then actually forgets it.
         let report = run_maintenance_pass(&db, false, false).expect("live pass");
         assert!(
-            report["autocohere"]["decay_auto_archived"].as_i64().unwrap() >= 1,
+            report["autocohere"]["decay_auto_archived"]
+                .as_i64()
+                .unwrap()
+                >= 1,
             "{report}"
         );
-        assert_eq!(count_active(&db), before - 1, "live pass must archive the cold entity");
+        assert_eq!(
+            count_active(&db),
+            before - 1,
+            "live pass must archive the cold entity"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -9737,7 +10670,11 @@ mod tests {
         // scheduler's call, not every run's.
         let report = run_maintenance_pass(&db, false, false).expect("live pass");
         assert_eq!(report["dry_run"], json!(false), "{report}");
-        assert_eq!(report["maintenance"]["vacuum_reclaimed_bytes"], json!(0), "{report}");
+        assert_eq!(
+            report["maintenance"]["vacuum_reclaimed_bytes"],
+            json!(0),
+            "{report}"
+        );
         assert_eq!(
             report["maintenance"]["errors"].as_array().map(Vec::len),
             Some(0),
@@ -9827,7 +10764,11 @@ mod tests {
         // Default: the 20 NEWEST versions, with total = full trail size.
         let resp = handle_history(&db, json!({"category":"facts","key":"hot"})).expect("history");
         let v: Value = serde_json::from_str(&resp).unwrap();
-        assert_eq!(v["total"].as_i64().unwrap(), 50, "total is the FULL trail: {resp}");
+        assert_eq!(
+            v["total"].as_i64().unwrap(),
+            50,
+            "total is the FULL trail: {resp}"
+        );
         assert_eq!(v["returned"].as_i64().unwrap(), 20);
         assert_eq!(v["versions"].as_array().unwrap().len(), 20);
         assert!(
@@ -9959,8 +10900,15 @@ mod tests {
         .expect_err("one-sided past valid_to on a content change must be rejected");
         assert!(err.contains("valid_to_unix_ms"), "got: {err}");
         // Rejected BEFORE mutation: v1 is still the live body.
-        let body = db.get_entity("facts", "one-sided").unwrap().unwrap().body_json;
-        assert!(body.contains("v1"), "rejected write must not update the entity: {body}");
+        let body = db
+            .get_entity("facts", "one-sided")
+            .unwrap()
+            .unwrap()
+            .body_json;
+        assert!(
+            body.contains("v1"),
+            "rejected write must not update the entity: {body}"
+        );
 
         // (c) Existing entity, identical body (COALESCE re-assert path):
         // valid_to is validated against the STORED valid_from — and the
@@ -9973,7 +10921,10 @@ mod tests {
             .expect("valid_at");
             let v: Value = serde_json::from_str(&r).unwrap();
             assert_eq!(v["found"], json!(true), "{r}");
-            (v["valid_from_unix_ms"].clone(), v["valid_to_unix_ms"].clone())
+            (
+                v["valid_from_unix_ms"].clone(),
+                v["valid_to_unix_ms"].clone(),
+            )
         };
         let before = stored_period(&db);
         let err = handle_remember(
@@ -10020,7 +10971,10 @@ mod tests {
             .expect("valid_at");
             let v: Value = serde_json::from_str(&r).unwrap();
             assert_eq!(v["found"], json!(true), "{r}");
-            (v["valid_from_unix_ms"].clone(), v["valid_to_unix_ms"].clone())
+            (
+                v["valid_from_unix_ms"].clone(),
+                v["valid_to_unix_ms"].clone(),
+            )
         };
         assert_eq!(stored_period(&db), (json!(vf), json!(vt)));
 
@@ -10180,7 +11134,11 @@ mod tests {
         )
         .expect("bitemporal old-knowledge cell");
         let v: Value = serde_json::from_str(&r).unwrap();
-        assert_eq!(v["found"], json!(false), "pre-extension knowledge must keep the close: {r}");
+        assert_eq!(
+            v["found"],
+            json!(false),
+            "pre-extension knowledge must keep the close: {r}"
+        );
         let r = handle_bitemporal(
             &db,
             json!({"category": "facts", "key": "audited",
@@ -10290,9 +11248,16 @@ mod tests {
         )
         .expect("first write");
         let v: Value = serde_json::from_str(&r).unwrap();
-        assert_eq!(v["ok"], json!(true), "#657: committed write must carry ok:true: {r}");
+        assert_eq!(
+            v["ok"],
+            json!(true),
+            "#657: committed write must carry ok:true: {r}"
+        );
         assert_eq!(v["action"], json!("created"), "{r}");
-        assert!(v.get("deduped").is_none(), "created write must not carry dedup fields: {r}");
+        assert!(
+            v.get("deduped").is_none(),
+            "created write must not carry dedup fields: {r}"
+        );
         let first_id = v["id"].as_str().unwrap().to_string();
 
         // Same template, new key, no skip_dedup: merged — and says so.
@@ -10303,7 +11268,11 @@ mod tests {
         )
         .expect("near-dup write");
         let v: Value = serde_json::from_str(&r).unwrap();
-        assert_eq!(v["ok"], json!(true), "#657: a dedup merge is still an accepted write: {r}");
+        assert_eq!(
+            v["ok"],
+            json!(true),
+            "#657: a dedup merge is still an accepted write: {r}"
+        );
         assert_eq!(v["deduped"], json!(true), "{r}");
         assert_eq!(v["merged_into"], json!(first_id), "{r}");
         assert!(v["hint"].as_str().unwrap().contains("skip_dedup"), "{r}");
@@ -10413,7 +11382,11 @@ mod tests {
         )
         .expect("bitemporal pre-close knowledge");
         let v: Value = serde_json::from_str(&r).unwrap();
-        assert_eq!(v["found"], json!(true), "pre-close knowledge must not show the close: {r}");
+        assert_eq!(
+            v["found"],
+            json!(true),
+            "pre-close knowledge must not show the close: {r}"
+        );
         assert_eq!(v["valid_to_unix_ms"], Value::Null, "{r}");
         assert_eq!(v["is_live_version"], json!(false), "{r}");
         // …while current knowledge shows the close: same instant unanswerable,
@@ -10438,9 +11411,13 @@ mod tests {
 
         // No-op calls (same value, or a later one — the earlier close is
         // kept) write NO snapshot.
-        assert_eq!(db.set_valid_to(&ent.id, closed).expect("same-value no-op"), closed);
         assert_eq!(
-            db.set_valid_to(&ent.id, closed + 10_000).expect("would-extend no-op"),
+            db.set_valid_to(&ent.id, closed).expect("same-value no-op"),
+            closed
+        );
+        assert_eq!(
+            db.set_valid_to(&ent.id, closed + 10_000)
+                .expect("would-extend no-op"),
             closed
         );
         assert_eq!(
@@ -10554,10 +11531,10 @@ mod tests {
 
         sleep(Duration::from_millis(5));
         let tx_mid = now_ms(); // pre-supersede transaction instant
-        // The supersede must land on a strictly later clock tick than tx_mid,
-        // or its snapshots' recorded_at collides with tx_mid and the
-        // reconstruction below matches the wrong version (Windows now_ms
-        // granularity can exceed a small sleep).
+                               // The supersede must land on a strictly later clock tick than tx_mid,
+                               // or its snapshots' recorded_at collides with tx_mid and the
+                               // reconstruction below matches the wrong version (Windows now_ms
+                               // granularity can exceed a small sleep).
         while now_ms() <= tx_mid {
             sleep(Duration::from_millis(1));
         }
@@ -10581,7 +11558,10 @@ mod tests {
             hist.iter().all(|v| v.status == "active"),
             "no history snapshot may bake in the later deprecation"
         );
-        assert!(db.history_versions("facts", "anachron-new").unwrap().is_empty());
+        assert!(db
+            .history_versions("facts", "anachron-new")
+            .unwrap()
+            .is_empty());
 
         // Pre-supersede reconstruction: ACTIVE and open.
         let r = handle_bitemporal(
@@ -10652,14 +11632,20 @@ mod tests {
             sleep(Duration::from_millis(5));
         }
         assert_eq!(
-            db.get_entity("facts", "expired-old").unwrap().unwrap().status,
+            db.get_entity("facts", "expired-old")
+                .unwrap()
+                .unwrap()
+                .status,
             "active"
         );
-        assert!(db.history_versions("facts", "expired-old").unwrap().is_empty());
+        assert!(db
+            .history_versions("facts", "expired-old")
+            .unwrap()
+            .is_empty());
 
         let tx_mid = now_ms(); // pre-supersede transaction instant
-        // Strictly later clock tick — see the granularity note in
-        // supersede_snapshot_preserves_the_pre_supersede_status.
+                               // Strictly later clock tick — see the granularity note in
+                               // supersede_snapshot_preserves_the_pre_supersede_status.
         while now_ms() <= tx_mid {
             sleep(Duration::from_millis(1));
         }
@@ -10911,7 +11897,9 @@ mod tests {
         )
         .expect("supersede");
         let v: Value = serde_json::from_str(&r).unwrap();
-        let closed_at = v["from_valid_to_unix_ms"].as_i64().expect("close instant reported");
+        let closed_at = v["from_valid_to_unix_ms"]
+            .as_i64()
+            .expect("close instant reported");
 
         // The old fact is no longer "true in the world" from the close on.
         let after = handle_valid_at(
@@ -10956,9 +11944,8 @@ mod tests {
         )
         .expect("B");
 
-        let count_of = |key: &str| -> i64 {
-            db.get_entity("ops", key).unwrap().unwrap().retrieval_count
-        };
+        let count_of =
+            |key: &str| -> i64 { db.get_entity("ops", key).unwrap().unwrap().retrieval_count };
         assert_eq!(count_of("hidden-a"), 0);
         assert_eq!(count_of("visible-b"), 0);
 
@@ -11013,7 +12000,11 @@ mod tests {
         // the live body is now "Bob Bravo".
         let live = handle_recall(&db, json!({"query": "Alpha", "mode": "fts5"})).expect("live");
         let lv: Value = serde_json::from_str(&live).unwrap();
-        assert_eq!(lv["total"], json!(0), "live recall must miss the old term: {live}");
+        assert_eq!(
+            lv["total"],
+            json!(0),
+            "live recall must miss the old term: {live}"
+        );
 
         // Alice's transaction window, read straight from history.
         let (rec, inv): (i64, i64) = {
@@ -11026,7 +12017,10 @@ mod tests {
             )
             .unwrap()
         };
-        assert!(rec < inv, "sleep must yield a non-empty tx window ({rec} < {inv})");
+        assert!(
+            rec < inv,
+            "sleep must yield a non-empty tx window ({rec} < {inv})"
+        );
 
         // Temporal recall AS OF that window surfaces the superseded Alice body.
         let r = handle_recall(
@@ -11105,21 +12099,18 @@ mod tests {
         db.agent_upsert("high", "High", 2, "").unwrap();
 
         // Registered tier-1 agent is rejected even without asserting a tier.
-        let denied = handle_keystone_set(
-            &db,
-            json!({"content": "rule x", "agent_id": "low"}),
-        );
+        let denied = handle_keystone_set(&db, json!({"content": "rule x", "agent_id": "low"}));
         assert!(
             denied.is_err() && denied.unwrap_err().contains("registered agent"),
             "tier-1 registered agent must be denied by the registry"
         );
         // Registered tier-2 agent succeeds, and it is registry-enforced.
-        let ok = handle_keystone_set(
-            &db,
-            json!({"content": "rule x", "agent_id": "high"}),
-        )
-        .expect("tier-2 allowed");
-        assert!(ok.contains("\"trust_enforced\":true"), "registry-enforced: {ok}");
+        let ok = handle_keystone_set(&db, json!({"content": "rule x", "agent_id": "high"}))
+            .expect("tier-2 allowed");
+        assert!(
+            ok.contains("\"trust_enforced\":true"),
+            "registry-enforced: {ok}"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -11146,7 +12137,8 @@ mod tests {
             "whenever directive must be extracted: {response}"
         );
         assert!(
-            sugs.iter().all(|s| !s["instruction"].as_str().unwrap().starts_with("never")),
+            sugs.iter()
+                .all(|s| !s["instruction"].as_str().unwrap().starts_with("never")),
             "inversion regression: no 'never' suggestion from a 'whenever' text: {response}"
         );
         assert_eq!(v["keystone_suggestions_count"], json!(sugs.len()));
@@ -11210,7 +12202,9 @@ mod tests {
             "tier-1 registered agent must be denied"
         );
         assert_eq!(
-            db.keystone_suggestions_list("pending", None, 10).unwrap().len(),
+            db.keystone_suggestions_list("pending", None, 10)
+                .unwrap()
+                .len(),
             1,
             "denied approval must leave the suggestion pending"
         );
@@ -11238,7 +12232,10 @@ mod tests {
             &db,
             json!({"id": sug.id, "action": "approve", "agent_id": "high"}),
         );
-        assert!(again.is_err(), "already-decided suggestion must be immutable");
+        assert!(
+            again.is_err(),
+            "already-decided suggestion must be immutable"
+        );
 
         let _ = std::fs::remove_file(&path);
     }
@@ -11263,7 +12260,12 @@ mod tests {
         .expect("reject");
         assert!(ok.contains("\"keystone_promoted\":false"), "{ok}");
         assert!(db.keystone_get(None, None, None).unwrap().is_empty());
-        assert_eq!(db.keystone_suggestions_list("rejected", None, 10).unwrap().len(), 1);
+        assert_eq!(
+            db.keystone_suggestions_list("rejected", None, 10)
+                .unwrap()
+                .len(),
+            1
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -11282,9 +12284,15 @@ mod tests {
         let raw = handle_operator_review(&db, json!({"category":"facts", "limit":20})).unwrap();
         let v: Value = serde_json::from_str(&raw).unwrap();
         let sugs = v["keystone_suggestions"].as_array().unwrap();
-        assert!(!sugs.is_empty(), "operator review must surface suggestions: {raw}");
+        assert!(
+            !sugs.is_empty(),
+            "operator review must surface suggestions: {raw}"
+        );
         assert_eq!(sugs[0]["status"], "pending");
-        assert!(sugs[0]["source_entity_id"].as_str().unwrap().starts_with("cor-"));
+        assert!(sugs[0]["source_entity_id"]
+            .as_str()
+            .unwrap()
+            .starts_with("cor-"));
         let _ = std::fs::remove_file(&path);
     }
 
@@ -11340,7 +12348,11 @@ mod tests {
             k.sort();
             k
         };
-        assert_eq!(keys(&uv), keys(&fv), "always-true filter must not change the result set");
+        assert_eq!(
+            keys(&uv),
+            keys(&fv),
+            "always-true filter must not change the result set"
+        );
 
         let _ = std::fs::remove_file(&path);
     }
@@ -11353,7 +12365,10 @@ mod tests {
             json!({"query": "x", "valid_from_unix_ms": 1, "valid_op": "during"}),
         )
         .expect_err("unknown valid_op must be rejected");
-        assert!(err.contains("valid_op") && err.contains("during"), "got: {err}");
+        assert!(
+            err.contains("valid_op") && err.contains("during"),
+            "got: {err}"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -11368,10 +12383,17 @@ mod tests {
         .expect_err("inverted period must be rejected on correct");
         assert!(err.contains("valid_to_unix_ms"), "got: {err}");
         // Nothing was written.
-        let r = handle_recall(&db, json!({"query": "", "category": "correction", "mode": "fts5"}))
-            .unwrap_or_else(|_| "{\"total\":0}".to_string());
+        let r = handle_recall(
+            &db,
+            json!({"query": "", "category": "correction", "mode": "fts5"}),
+        )
+        .unwrap_or_else(|_| "{\"total\":0}".to_string());
         let v: Value = serde_json::from_str(&r).unwrap();
-        assert_eq!(v["total"], json!(0), "rejected correct must not create an entity: {r}");
+        assert_eq!(
+            v["total"],
+            json!(0),
+            "rejected correct must not create an entity: {r}"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -11388,10 +12410,17 @@ mod tests {
         .expect_err("one-sided past valid_to must be rejected on correct");
         assert!(err.contains("valid_to_unix_ms"), "got: {err}");
         // Nothing was written.
-        let r = handle_recall(&db, json!({"query": "", "category": "correction", "mode": "fts5"}))
-            .unwrap_or_else(|_| "{\"total\":0}".to_string());
+        let r = handle_recall(
+            &db,
+            json!({"query": "", "category": "correction", "mode": "fts5"}),
+        )
+        .unwrap_or_else(|_| "{\"total\":0}".to_string());
         let v: Value = serde_json::from_str(&r).unwrap();
-        assert_eq!(v["total"], json!(0), "rejected correct must not create an entity: {r}");
+        assert_eq!(
+            v["total"],
+            json!(0),
+            "rejected correct must not create an entity: {r}"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -11428,7 +12457,10 @@ mod tests {
         assert!(err.contains("valid_from"), "got: {err}");
         // Rejected BEFORE mutation: the old fact is not deprecated.
         let status = db.get_entity("facts", "ended").unwrap().unwrap().status;
-        assert_eq!(status, "active", "rejected supersede must not mutate status");
+        assert_eq!(
+            status, "active",
+            "rejected supersede must not mutate status"
+        );
 
         // (b) Extension: valid_to after the already-stored close.
         let err = handle_supersede(
@@ -11566,30 +12598,52 @@ mod tests {
         assert_eq!(v["matches"][0]["ref"], json!("jrn-fp-1"), "{r}");
         assert_eq!(v["matches"][0]["workspace_hash"], json!(""), "{r}");
         assert!(
-            v["matches"][0]["what_failed"].as_str().unwrap().contains("cargo build"),
+            v["matches"][0]["what_failed"]
+                .as_str()
+                .unwrap()
+                .contains("cargo build"),
             "{r}"
         );
         assert!(
-            v["matches"][0]["cause"].as_str().unwrap().contains("LNK1120"),
+            v["matches"][0]["cause"]
+                .as_str()
+                .unwrap()
+                .contains("LNK1120"),
             "{r}"
         );
         assert!(
-            v["matches"][0]["resolution"].as_str().unwrap().contains("vcvars64"),
+            v["matches"][0]["resolution"]
+                .as_str()
+                .unwrap()
+                .contains("vcvars64"),
             "{r}"
         );
         let warning = v["warning"].as_str().expect("warning present");
         assert!(warning.contains("deja-vu"), "{warning}");
-        assert!(!warning.contains('\n'), "warning must be one line: {warning}");
+        assert!(
+            !warning.contains('\n'),
+            "warning must be one line: {warning}"
+        );
 
         // Retry of the remembered pitfall → entity match with cause/resolution.
-        let r = handle_check_failure_pattern(&db, json!({"action": "npm publish", "workspace_hash": ""}))
-            .expect("check entity arm");
+        let r = handle_check_failure_pattern(
+            &db,
+            json!({"action": "npm publish", "workspace_hash": ""}),
+        )
+        .expect("check entity arm");
         let v: Value = serde_json::from_str(&r).unwrap();
         assert_eq!(v["deja_vu"], json!(true), "{r}");
         assert_eq!(v["matches"][0]["source"], json!("entity"), "{r}");
-        assert_eq!(v["matches"][0]["ref"], json!("pitfall/npm-publish-otp"), "{r}");
+        assert_eq!(
+            v["matches"][0]["ref"],
+            json!("pitfall/npm-publish-otp"),
+            "{r}"
+        );
         assert!(
-            v["matches"][0]["resolution"].as_str().unwrap().contains("--otp"),
+            v["matches"][0]["resolution"]
+                .as_str()
+                .unwrap()
+                .contains("--otp"),
             "{r}"
         );
 
@@ -11616,8 +12670,11 @@ mod tests {
         )
         .expect("non-failure entity");
 
-        let r = handle_check_failure_pattern(&db, json!({"action": "git push origin main", "workspace_hash": ""}))
-            .expect("check empty state");
+        let r = handle_check_failure_pattern(
+            &db,
+            json!({"action": "git push origin main", "workspace_hash": ""}),
+        )
+        .expect("check empty state");
         let v: Value = serde_json::from_str(&r).unwrap();
         assert_eq!(v["deja_vu"], json!(false), "{r}");
         assert_eq!(v["matches"], json!([]), "{r}");
@@ -11653,8 +12710,11 @@ mod tests {
             now,
         );
 
-        let r = handle_check_failure_pattern(&db, json!({"action": "docker compose up vault", "workspace_hash": ""}))
-            .expect("check ranking");
+        let r = handle_check_failure_pattern(
+            &db,
+            json!({"action": "docker compose up vault", "workspace_hash": ""}),
+        )
+        .expect("check ranking");
         let v: Value = serde_json::from_str(&r).unwrap();
         assert_eq!(v["deja_vu"], json!(true), "{r}");
         let matches = v["matches"].as_array().unwrap();
@@ -11740,7 +12800,11 @@ mod tests {
             .iter()
             .map(|m| m["ref"].as_str().unwrap())
             .collect();
-        for expected in ["jrn-fp-wsa", "pitfall/tf-apply-lock", "pitfall/tf-apply-global"] {
+        for expected in [
+            "jrn-fp-wsa",
+            "pitfall/tf-apply-lock",
+            "pitfall/tf-apply-global",
+        ] {
             assert!(refs.contains(&expected), "missing {expected}: {r}");
         }
 
@@ -11799,8 +12863,11 @@ mod tests {
         assert!(err.contains("workspace_hash too long"), "{err}");
 
         // Explicit null limit falls back to the default instead of erroring (#330).
-        let r = handle_check_failure_pattern(&db, json!({"action": "ls -la", "workspace_hash": "", "limit": null}))
-            .expect("null limit uses the default");
+        let r = handle_check_failure_pattern(
+            &db,
+            json!({"action": "ls -la", "workspace_hash": "", "limit": null}),
+        )
+        .expect("null limit uses the default");
         let v: Value = serde_json::from_str(&r).unwrap();
         assert_eq!(v["deja_vu"], json!(false), "{r}");
 
@@ -11918,12 +12985,13 @@ mod tests {
             "valid_from_unix_ms": 1600000000000i64,
             "valid_to_unix_ms": ""
         });
-        let a: RecallArgs = serde_json::from_value(v).expect("stringified temporal ints must parse");
+        let a: RecallArgs =
+            serde_json::from_value(v).expect("stringified temporal ints must parse");
         assert_eq!(a.as_of_unix_ms, Some(1783400000000));
         assert_eq!(a.valid_at, Some(1700000000000));
         assert_eq!(a.valid_from_unix_ms, Some(1600000000000)); // bare number still works
         assert_eq!(a.valid_to_unix_ms, None); // empty string → None
-        // Non-numeric string is a clear error, not silently dropped.
+                                              // Non-numeric string is a clear error, not silently dropped.
         let bad = json!({ "query": "t", "as_of_unix_ms": "notanumber" });
         assert!(serde_json::from_value::<RecallArgs>(bad).is_err());
     }
@@ -11945,7 +13013,8 @@ mod tests {
             "followed": true,
             "workspace_hash": null
         });
-        let a: FollowArgs = serde_json::from_value(v).expect("null workspace_hash must deserialize");
+        let a: FollowArgs =
+            serde_json::from_value(v).expect("null workspace_hash must deserialize");
         assert!(a.workspace_hash.is_none());
     }
 
@@ -11953,7 +13022,14 @@ mod tests {
     fn context_args_accept_null_for_new_optional_fields() {
         // #356/#366 args must follow the same explicit-null tolerance rule
         // as the rest of the tool surface (#330).
-        for field in ["query", "mode", "model", "max_context_chars", "workspace_hash", "categories"] {
+        for field in [
+            "query",
+            "mode",
+            "model",
+            "max_context_chars",
+            "workspace_hash",
+            "categories",
+        ] {
             let mut v = json!({});
             v.as_object_mut()
                 .unwrap()
@@ -11970,7 +13046,10 @@ mod tests {
 
     fn temp_tool_db() -> (Database, String) {
         let dir = std::env::temp_dir();
-        let path = dir.join(format!("perseus_vault-tools-test-{}.db", uuid::Uuid::new_v4()));
+        let path = dir.join(format!(
+            "perseus_vault-tools-test-{}.db",
+            uuid::Uuid::new_v4()
+        ));
         let path_str = path.to_str().unwrap().to_string();
         let db = Database::open(&path_str).expect("open test db");
         (db, path_str)
@@ -11981,10 +13060,16 @@ mod tests {
         let (db, path) = temp_tool_db();
         let out = handle_context(&db, json!({}));
         let v: Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(v["mode"], "on_demand", "recall-first must be the default: {out}");
+        assert_eq!(
+            v["mode"], "on_demand",
+            "recall-first must be the default: {out}"
+        );
         assert_eq!(v["budget_chars"], 1500);
         assert!(
-            v["markdown"].as_str().unwrap().contains("Recall-first mode"),
+            v["markdown"]
+                .as_str()
+                .unwrap()
+                .contains("Recall-first mode"),
             "no-query default output must be the retrieval pointer: {out}"
         );
         let _ = std::fs::remove_file(&path);
@@ -11996,7 +13081,10 @@ mod tests {
         let out = handle_context(&db, json!({"mode": "firehose"}));
         let v: Value = serde_json::from_str(&out).unwrap();
         assert!(
-            v["error"].as_str().unwrap().contains("Invalid context mode"),
+            v["error"]
+                .as_str()
+                .unwrap()
+                .contains("Invalid context mode"),
             "unknown mode must be rejected: {out}"
         );
         // The legacy opt-in spelling still parses.
@@ -12136,14 +13224,16 @@ mod tests {
         assert_eq!(item["trust_class"], "candidate");
         assert_eq!(item["freshness"]["grade"], "valid");
         assert!(item["freshness"]["value"].as_f64().unwrap() > 0.0);
-        assert_eq!(item["provenance"]["external_refs"][0]["ref_value"], "PLT-901");
+        assert_eq!(
+            item["provenance"]["external_refs"][0]["ref_value"],
+            "PLT-901"
+        );
         assert_eq!(item["source_of_truth_hint"], "live_external");
         assert_eq!(item["summary"], "delta live incident tracker");
         assert!(item.get("body").is_none(), "no raw body dump: {item}");
         assert_eq!(derived[0]["source_of_truth_hint"], "memory_internal");
         assert_eq!(
-            derived[0]["provenance"]["memory_kind"],
-            "inferred",
+            derived[0]["provenance"]["memory_kind"], "inferred",
             "provenance digest must be visible: {out}"
         );
         let _ = std::fs::remove_file(&path);
@@ -12154,7 +13244,11 @@ mod tests {
         let (db, path) = temp_tool_db();
         let ws = "ws-b";
         let cat = "quality_projection_trust";
-        for (id, key) in [("mem-t1", "t-rejected"), ("mem-t2", "t-defensive"), ("mem-t3", "t-verified")] {
+        for (id, key) in [
+            ("mem-t1", "t-rejected"),
+            ("mem-t2", "t-defensive"),
+            ("mem-t3", "t-verified"),
+        ] {
             db.remember_skip_dedup(&projection_entity(
                 id,
                 cat,
@@ -12186,8 +13280,14 @@ mod tests {
             .iter()
             .filter_map(|i| i["key"].as_str())
             .collect();
-        assert!(!keys.contains(&"t-rejected"), "rejected must never project: {out}");
-        assert!(!keys.contains(&"t-defensive"), "defensively_recalled below default min_trust: {out}");
+        assert!(
+            !keys.contains(&"t-rejected"),
+            "rejected must never project: {out}"
+        );
+        assert!(
+            !keys.contains(&"t-defensive"),
+            "defensively_recalled below default min_trust: {out}"
+        );
         assert!(keys.contains(&"t-verified"));
         assert_eq!(v["contract"]["excluded"]["rejected"], 1);
         assert_eq!(v["contract"]["excluded"]["below_min_trust"], 1);
@@ -12268,7 +13368,10 @@ mod tests {
         assert_eq!(keys, vec!["f-fresh"], "window must drop the old hit: {out}");
         assert_eq!(v["contract"]["excluded"]["outside_freshness_window"], 1);
         // The surviving item still carries its freshness grade annotation.
-        assert_eq!(v["sections"]["durable_memories"][0]["freshness"]["grade"], "valid");
+        assert_eq!(
+            v["sections"]["durable_memories"][0]["freshness"]["grade"],
+            "valid"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -12276,11 +13379,23 @@ mod tests {
     fn handle_project_task_rejects_invalid_args_fail_closed() {
         let (db, path) = temp_tool_db();
         assert!(handle_project_task(&db, json!({"task_title": "  "})).is_err());
-        assert!(handle_project_task(&db, json!({})).is_err(), "missing task_title");
-        assert!(handle_project_task(&db, json!({"task_title": "t", "min_trust": "bogus"})).is_err());
-        assert!(handle_project_task(&db, json!({"task_title": "t", "include_sections": ["nope"]})).is_err());
+        assert!(
+            handle_project_task(&db, json!({})).is_err(),
+            "missing task_title"
+        );
+        assert!(
+            handle_project_task(&db, json!({"task_title": "t", "min_trust": "bogus"})).is_err()
+        );
+        assert!(handle_project_task(
+            &db,
+            json!({"task_title": "t", "include_sections": ["nope"]})
+        )
+        .is_err());
         assert!(handle_project_task(&db, json!({"task_title": "t", "limit": 0})).is_err());
-        assert!(handle_project_task(&db, json!({"task_title": "t", "freshness_window_days": 0})).is_err());
+        assert!(
+            handle_project_task(&db, json!({"task_title": "t", "freshness_window_days": 0}))
+                .is_err()
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -12321,24 +13436,33 @@ mod tests {
     fn handle_consolidate_rejects_bad_quote_cap_fail_closed() {
         let (db, path) = temp_tool_db();
         for bad in [10i64, 63, 4097, 5000] {
-            let out = handle_consolidate(&db, json!({
-                "category": "facts",
-                "workspace_hash": "ws-x",
-                "quote_cap_chars": bad,
-            }));
+            let out = handle_consolidate(
+                &db,
+                json!({
+                    "category": "facts",
+                    "workspace_hash": "ws-x",
+                    "quote_cap_chars": bad,
+                }),
+            );
             let v: Value = serde_json::from_str(&out).unwrap();
             assert!(
-                v["error"].as_str().unwrap_or("").contains("quote_cap_chars"),
+                v["error"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("quote_cap_chars"),
                 "quote_cap {bad} must be rejected: {out}"
             );
         }
         // Boundary values pass validation (and run cleanly on an empty store).
         for ok in [64i64, 4096] {
-            let out = handle_consolidate(&db, json!({
-                "category": "facts",
-                "workspace_hash": "ws-x",
-                "quote_cap_chars": ok,
-            }));
+            let out = handle_consolidate(
+                &db,
+                json!({
+                    "category": "facts",
+                    "workspace_hash": "ws-x",
+                    "quote_cap_chars": ok,
+                }),
+            );
             let v: Value = serde_json::from_str(&out).unwrap();
             assert!(
                 v.get("error").is_none(),
@@ -12361,7 +13485,10 @@ mod tests {
     fn ask_args_default_verify_stale_observations_on() {
         let v = json!({"query": "q"});
         let a: AskParams = serde_json::from_value(v).unwrap();
-        assert!(a.verify_stale_observations, "fail-closed: gate on by default");
+        assert!(
+            a.verify_stale_observations,
+            "fail-closed: gate on by default"
+        );
         let v3 = json!({"query": "q", "verify_stale_observations": false});
         let a3: AskParams = serde_json::from_value(v3).unwrap();
         assert!(!a3.verify_stale_observations);
@@ -12402,13 +13529,13 @@ mod tests {
             "dry_run must not evict"
         );
 
-        let real = handle_prune(
-            &db,
-            json!({"scope": "history", "max_versions_per_key": 2}),
-        )
-        .expect("real run");
+        let real = handle_prune(&db, json!({"scope": "history", "max_versions_per_key": 2}))
+            .expect("real run");
         let rv: Value = serde_json::from_str(&real).unwrap();
-        assert_eq!(rv["rows_evicted"], dv["rows_evicted"], "preview must match actual");
+        assert_eq!(
+            rv["rows_evicted"], dv["rows_evicted"],
+            "preview must match actual"
+        );
         assert_eq!(rv["bytes_evicted"], dv["bytes_evicted"]);
         assert_eq!(rv["tombstones_written"].as_i64().unwrap(), 1);
         let _ = std::fs::remove_file(&path);
@@ -12438,11 +13565,7 @@ mod tests {
             )
             .unwrap()
         };
-        handle_prune(
-            &db,
-            json!({"scope": "history", "max_versions_per_key": 1}),
-        )
-        .expect("evict");
+        handle_prune(&db, json!({"scope": "history", "max_versions_per_key": 1})).expect("evict");
 
         let resp = handle_as_of(
             &db,
@@ -12451,7 +13574,11 @@ mod tests {
         .expect("as_of");
         let v: Value = serde_json::from_str(&resp).unwrap();
         assert_eq!(v["found"], json!(true));
-        assert_eq!(v["compacted"], json!(true), "marker must be explicit: {resp}");
+        assert_eq!(
+            v["compacted"],
+            json!(true),
+            "marker must be explicit: {resp}"
+        );
         assert_eq!(v["status"], json!("compacted"));
         assert_eq!(v["versions_compacted"].as_i64().unwrap(), 2);
         assert_eq!(v["digest"].as_str().unwrap().len(), 16);
@@ -12481,11 +13608,7 @@ mod tests {
             )
             .expect("supersede");
         }
-        handle_prune(
-            &db,
-            json!({"scope": "history", "max_versions_per_key": 1}),
-        )
-        .expect("compact");
+        handle_prune(&db, json!({"scope": "history", "max_versions_per_key": 1})).expect("compact");
 
         let resp = handle_valid_at(
             &db,
@@ -12493,7 +13616,11 @@ mod tests {
         )
         .expect("valid_at");
         let v: Value = serde_json::from_str(&resp).unwrap();
-        assert_eq!(v["found"], json!(true), "compacted window must answer: {resp}");
+        assert_eq!(
+            v["found"],
+            json!(true),
+            "compacted window must answer: {resp}"
+        );
         assert_eq!(v["compacted"], json!(true));
         assert_eq!(v["status"], json!("compacted"));
         assert!(v["versions_compacted"].as_i64().unwrap() >= 1);
@@ -12600,11 +13727,13 @@ mod tests {
         assert_eq!(report["reindexed"], 1);
         let b = get_blob(&db, "vq-1");
         assert_eq!(b.len(), 1 + 32 / 8);
-        assert_eq!(db.embedding_quant(), crate::vector_quant::EmbeddingQuant::Bit);
+        assert_eq!(
+            db.embedding_quant(),
+            crate::vector_quant::EmbeddingQuant::Bit
+        );
 
         // Rollback via restore_quantized_backup.
-        let resp = handle_embed(&db, json!({"restore_quantized_backup": true}))
-            .expect("restore");
+        let resp = handle_embed(&db, json!({"restore_quantized_backup": true})).expect("restore");
         let report: Value = serde_json::from_str(&resp).unwrap();
         assert_eq!(report["restored"], 1);
         assert_eq!(report["format_after"], "float32");
@@ -12616,7 +13745,10 @@ mod tests {
         assert_eq!(report["snapshot_dropped"], 1);
         let err = handle_embed(&db, json!({"restore_quantized_backup": true}))
             .expect_err("restore without snapshot must fail");
-        assert!(err.contains("no embedding snapshot"), "unexpected error: {err}");
+        assert!(
+            err.contains("no embedding snapshot"),
+            "unexpected error: {err}"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -12663,7 +13795,8 @@ mod tests {
                     {"query": "sccache", "category": "facts", "limit": 10}
                 ]
             }),
-        ).unwrap();
+        )
+        .unwrap();
 
         let val: Value = serde_json::from_str(&res).unwrap();
         assert!(val["total"].as_i64().unwrap() >= 2);
@@ -12719,10 +13852,7 @@ mod tests {
             .find(|h| h["id"] == id)
             .expect("recall hit");
         assert_eq!(hit["origin"]["memory_kind"], json!("observed"));
-        assert_eq!(
-            hit["external_refs"][0]["ref_type"],
-            json!("pull_request")
-        );
+        assert_eq!(hit["external_refs"][0]["ref_type"], json!("pull_request"));
         let _ = std::fs::remove_file(&path);
     }
 
@@ -12791,11 +13921,7 @@ mod tests {
         )
         .unwrap();
 
-        let out = handle_recall(
-            &db,
-            json!({"query": "deployment", "ref_type": "repo"}),
-        )
-        .unwrap();
+        let out = handle_recall(&db, json!({"query": "deployment", "ref_type": "repo"})).unwrap();
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["items"].as_array().unwrap().len(), 2, "{v}");
 
@@ -12828,20 +13954,40 @@ mod tests {
 
     #[test]
     fn cross_product_served_memory_fixture_is_canonical_hash_only_and_provenance_consistent() {
-        let fixture: Value = serde_json::from_str(include_str!("../tests/fixtures/cross_product_served_memory_contract.json")).unwrap();
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/cross_product_served_memory_contract.json"
+        ))
+        .unwrap();
         assert_eq!(fixture["producer_tool"], json!("perseus_vault_recall"));
-        assert!(fixture["producer_tool"].as_str().unwrap().starts_with("perseus_vault_"));
+        assert!(fixture["producer_tool"]
+            .as_str()
+            .unwrap()
+            .starts_with("perseus_vault_"));
 
         let item = &fixture["items"][0];
         let why = &item["why_served"];
         assert_eq!(why["memory_class"], item["category"]);
-        assert_eq!(why["promotion_state"], item["promotion_transition"]["to_state"]);
-        assert!(why["source_evidence_ids"].as_array().unwrap().contains(&item["promoted_from"]["id"]));
+        assert_eq!(
+            why["promotion_state"],
+            item["promotion_transition"]["to_state"]
+        );
+        assert!(why["source_evidence_ids"]
+            .as_array()
+            .unwrap()
+            .contains(&item["promoted_from"]["id"]));
         assert_eq!(why["promoted_scope"], item["workspace_hash"]);
 
         let binding = &item["action_receipt_binding"];
-        for field in ["action_id", "authority_manifest_ref", "approval_ref", "outcome_hash"] {
-            assert!(binding[field].is_string() && !binding[field].as_str().unwrap().is_empty(), "missing {field}");
+        for field in [
+            "action_id",
+            "authority_manifest_ref",
+            "approval_ref",
+            "outcome_hash",
+        ] {
+            assert!(
+                binding[field].is_string() && !binding[field].as_str().unwrap().is_empty(),
+                "missing {field}"
+            );
         }
         let outcome_hash = binding["outcome_hash"].as_str().unwrap();
         assert_eq!(outcome_hash.len(), 64);
@@ -12849,9 +13995,13 @@ mod tests {
 
         let raw = fixture.to_string();
         for forbidden in ["content", "body_json", "secret", "prompt"] {
-            assert!(!raw.contains(&format!("\"{forbidden}\"")), "fixture leaks {forbidden}");
+            assert!(
+                !raw.contains(&format!("\"{forbidden}\"")),
+                "fixture leaks {forbidden}"
+            );
         }
-        assert!(include_str!("../docs/cross-product-acceptance-contract.md").contains("perseus_vault_recall"));
+        assert!(include_str!("../docs/cross-product-acceptance-contract.md")
+            .contains("perseus_vault_recall"));
     }
 
     #[test]
@@ -12862,7 +14012,10 @@ mod tests {
         let raw = handle_quality_telemetry(&db, json!({"category":"facts"})).unwrap();
         let report: Value = serde_json::from_str(&raw).unwrap();
         assert!(report["active_entities"].as_i64().unwrap() >= 2, "{raw}");
-        assert!(report["contradiction_count"].as_i64().unwrap() >= 1, "{raw}");
+        assert!(
+            report["contradiction_count"].as_i64().unwrap() >= 1,
+            "{raw}"
+        );
         assert!(report["class_distribution"].is_object(), "{raw}");
         assert!(report["promotion_flow"].is_object(), "{raw}");
         let _ = std::fs::remove_file(&path);
@@ -12873,7 +14026,11 @@ mod tests {
         let (db, path) = temp_db();
         handle_remember(&db, json!({"category":"facts","key":"policy","body_json":"{\"content\":\"allow red\"}","certainty":0.9})).unwrap();
         handle_remember(&db, json!({"category":"facts","key":"policy-two","body_json":"{\"content\":\"deny blue\"}","certainty":0.1})).unwrap();
-        handle_remember(&db, json!({"category":"convention","key":"vague","body_json":"{\"content\":\"ok\"}"})).unwrap();
+        handle_remember(
+            &db,
+            json!({"category":"convention","key":"vague","body_json":"{\"content\":\"ok\"}"}),
+        )
+        .unwrap();
         let raw = handle_operator_review(&db, json!({"category":"facts", "limit":20})).unwrap();
         let report: Value = serde_json::from_str(&raw).unwrap();
         assert!(report["contradictions"]["conflicts"].is_array(), "{raw}");
@@ -12896,11 +14053,18 @@ mod tests {
             "mode":"import", "content":"parse converts input", "workspace_hash":"ws"
         })).unwrap()).unwrap();
         assert_eq!(imported["mode"], "import");
-        let raw = handle_recall(&db, json!({"query":"parse converts", "workspace_hash":"ws"})).unwrap();
+        let raw = handle_recall(
+            &db,
+            json!({"query":"parse converts", "workspace_hash":"ws"}),
+        )
+        .unwrap();
         let item = &serde_json::from_str::<Value>(&raw).unwrap()["items"][0];
         assert_eq!(item["origin"]["memory_kind"], "imported");
         assert_eq!(item["external_refs"][0]["ref_type"], "structured_index");
-        assert_eq!(item["external_refs"][0]["ref_value"], "ide_symbol:ide://repo/src/lib.rs#symbol:parse");
+        assert_eq!(
+            item["external_refs"][0]["ref_value"],
+            "ide_symbol:ide://repo/src/lib.rs#symbol:parse"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -12909,16 +14073,24 @@ mod tests {
         let (db, path) = temp_db();
         let source = std::env::temp_dir().join(format!("import-{}.md", uuid::Uuid::new_v4()));
         std::fs::write(&source, "# Team Policy\n\nImported procedures apply here.").unwrap();
-        let args = json!({"path":source.to_string_lossy(), "workspace_hash":"ws", "source_system":"wiki"});
-        let first: Value = serde_json::from_str(&handle_markdown_import(&db, args.clone()).unwrap()).unwrap();
+        let args =
+            json!({"path":source.to_string_lossy(), "workspace_hash":"ws", "source_system":"wiki"});
+        let first: Value =
+            serde_json::from_str(&handle_markdown_import(&db, args.clone()).unwrap()).unwrap();
         assert_eq!(first["imported"], 1, "{first}");
-        let second: Value = serde_json::from_str(&handle_markdown_import(&db, args).unwrap()).unwrap();
+        let second: Value =
+            serde_json::from_str(&handle_markdown_import(&db, args).unwrap()).unwrap();
         assert_eq!(second["imported"], 0, "{second}");
-        let raw = handle_recall(&db, json!({"query":"Imported procedures", "workspace_hash":"ws"})).unwrap();
+        let raw = handle_recall(
+            &db,
+            json!({"query":"Imported procedures", "workspace_hash":"ws"}),
+        )
+        .unwrap();
         let item = &serde_json::from_str::<Value>(&raw).unwrap()["items"][0];
         assert_eq!(item["origin"]["memory_kind"], "imported");
         assert_eq!(item["status"], "draft");
-        let _ = std::fs::remove_file(&path); let _ = std::fs::remove_file(&source);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&source);
     }
 
     #[test]
@@ -12926,7 +14098,8 @@ mod tests {
         let (db, path) = temp_db();
         handle_remember(&db, json!({"category":"convention","key":"format","body_json":"{\"content\":\"Use stable markdown\"}"})).unwrap();
         let output = std::env::temp_dir().join(format!("derived-{}.md", uuid::Uuid::new_v4()));
-        let response = handle_derived_export(&db, json!({"output_path":output.to_string_lossy()})).unwrap();
+        let response =
+            handle_derived_export(&db, json!({"output_path":output.to_string_lossy()})).unwrap();
         let result: Value = serde_json::from_str(&response).unwrap();
         assert_eq!(result["exported"], 1);
         let markdown = std::fs::read_to_string(&output).unwrap();
@@ -12953,17 +14126,29 @@ mod tests {
                 "skip_dedup":true})).unwrap();
         }
         let ids = |profile: &str, ws: &str| -> Vec<String> {
-            let raw = handle_recall(&db, json!({"query":"profile token", "retrieval_profile":profile,
-                "workspace_hash":ws, "limit":10})).unwrap();
-            let mut keys: Vec<String> = serde_json::from_str::<Value>(&raw).unwrap()["items"].as_array().unwrap()
-                .iter().map(|x| x["key"].as_str().unwrap().to_string()).collect();
+            let raw = handle_recall(
+                &db,
+                json!({"query":"profile token", "retrieval_profile":profile,
+                "workspace_hash":ws, "limit":10}),
+            )
+            .unwrap();
+            let mut keys: Vec<String> = serde_json::from_str::<Value>(&raw).unwrap()["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x["key"].as_str().unwrap().to_string())
+                .collect();
             keys.sort();
             keys
         };
         assert_eq!(ids("personal", "ws-a"), vec!["pref"]);
         assert_eq!(ids("agent", "ws-a"), vec!["fix", "rule"]);
         assert_eq!(ids("shared", "ws-a"), vec!["shared"]);
-        let err = handle_recall(&db, json!({"query":"profile token", "retrieval_profile":"bad"})).unwrap_err();
+        let err = handle_recall(
+            &db,
+            json!({"query":"profile token", "retrieval_profile":"bad"}),
+        )
+        .unwrap_err();
         assert!(err.contains("unknown retrieval_profile"));
         let _ = std::fs::remove_file(&path);
     }
@@ -12992,12 +14177,21 @@ mod tests {
         assert_eq!(v["promoted"], json!(true));
         let new_id = v["to_id"].as_str().unwrap();
 
-        let promoted = db.get_entity("observation", "incident-42").unwrap().expect("copy");
+        let promoted = db
+            .get_entity("observation", "incident-42")
+            .unwrap()
+            .expect("copy");
         let body: Value = serde_json::from_str(&promoted.body_json).unwrap();
         assert_eq!(body["promoted_from"]["category"], json!("episodes"));
-        assert_eq!(body["promoted_from"]["reason"], json!("recurred three times"));
+        assert_eq!(
+            body["promoted_from"]["reason"],
+            json!("recurred three times")
+        );
 
-        let source = db.get_entity("episodes", "incident-42").unwrap().expect("source");
+        let source = db
+            .get_entity("episodes", "incident-42")
+            .unwrap()
+            .expect("source");
         assert!(source
             .links
             .iter()
@@ -13011,7 +14205,10 @@ mod tests {
         handle_remember(&db, json!({"category":"convention", "key":"rollout", "body_json":"{\"content\":\"canary deploy first\"}"})).unwrap();
         let out = handle_demote(&db, json!({"from_category":"convention", "from_key":"rollout", "to_category":"observation", "reason":"not yet durable"})).unwrap();
         let v: Value = serde_json::from_str(&out).unwrap();
-        let demoted = db.get_entity("observation", "rollout").unwrap().expect("copy");
+        let demoted = db
+            .get_entity("observation", "rollout")
+            .unwrap()
+            .expect("copy");
         let body: Value = serde_json::from_str(&demoted.body_json).unwrap();
         assert_eq!(body["demoted_from"]["category"], json!("convention"));
         assert!(v["demoted"].as_bool().unwrap());
@@ -13030,7 +14227,11 @@ mod tests {
     fn promote_rejects_ladder_skips() {
         let (db, path) = temp_db();
         handle_remember(&db, json!({"category":"episodes", "key":"skip", "body_json":"{\"content\":\"repeated deploy failure\"}"})).unwrap();
-        let err = handle_promote(&db, json!({"from_category":"episodes", "from_key":"skip", "to_category":"convention"})).unwrap_err();
+        let err = handle_promote(
+            &db,
+            json!({"from_category":"episodes", "from_key":"skip", "to_category":"convention"}),
+        )
+        .unwrap_err();
         assert!(err.contains("invalid promotion transition"), "{err}");
         assert!(db.get_entity("convention", "skip").unwrap().is_none());
         let _ = std::fs::remove_file(&path);
@@ -13046,11 +14247,8 @@ mod tests {
         )
         .unwrap();
 
-        let err = handle_promote(
-            &db,
-            json!({"from_category": "episodes", "from_key": "e1"}),
-        )
-        .unwrap_err();
+        let err = handle_promote(&db, json!({"from_category": "episodes", "from_key": "e1"}))
+            .unwrap_err();
         assert!(err.contains("Nothing to promote"), "{err}");
 
         let err = handle_promote(
@@ -13092,7 +14290,10 @@ mod tests {
         let sha = registered["sha256"].as_str().unwrap();
         assert_eq!(registered["artifact_action"], json!("created"));
         assert_eq!(registered["binding_action"], json!("created"));
-        assert_eq!(registered["manifest"]["structure"]["utf8_text"], json!(true));
+        assert_eq!(
+            registered["manifest"]["structure"]["utf8_text"],
+            json!(true)
+        );
         assert_eq!(registered["manifest"]["visible_binding_count"], json!(1));
 
         let excerpt: Value = serde_json::from_str(
@@ -13154,10 +14355,16 @@ mod tests {
         let b: Value = serde_json::from_str(&second).unwrap();
         assert_eq!(a, b, "same input + config must be byte-stable in content");
         assert_eq!(a["digest"]["protected_line_count"], json!(1));
-        assert_eq!(a["digest"]["protected_lines"][0][0], json!("ERROR deploy timeout id=22"));
+        assert_eq!(
+            a["digest"]["protected_lines"][0][0],
+            json!("ERROR deploy timeout id=22")
+        );
         assert_eq!(a["digest"]["sections"][0]["count"], json!(3));
         assert_eq!(a["representation"]["kind"], json!("derived"));
-        assert_eq!(a["representation"]["derived_from_sha256"], json!(source_sha));
+        assert_eq!(
+            a["representation"]["derived_from_sha256"],
+            json!(source_sha)
+        );
         assert_ne!(a["derived_artifact_sha256"], json!(source_sha));
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&source);
@@ -13228,7 +14435,8 @@ mod tests {
     #[test]
     fn artifact_manifest_and_excerpt_enforce_visibility_before_serving() {
         let (db, path) = temp_db();
-        let source = std::env::temp_dir().join(format!("artifact-private-{}.txt", uuid::Uuid::new_v4()));
+        let source =
+            std::env::temp_dir().join(format!("artifact-private-{}.txt", uuid::Uuid::new_v4()));
         std::fs::write(&source, "secret line\n").unwrap();
 
         let registered: Value = serde_json::from_str(
@@ -13278,11 +14486,8 @@ mod tests {
         let (db, path) = temp_db();
         let source = std::env::temp_dir().join(format!("artifact-{}.gz", uuid::Uuid::new_v4()));
         std::fs::write(&source, b"pretend gzip").unwrap();
-        let err = handle_artifact_register(
-            &db,
-            json!({"path": source.to_string_lossy()}),
-        )
-        .unwrap_err();
+        let err =
+            handle_artifact_register(&db, json!({"path": source.to_string_lossy()})).unwrap_err();
         assert!(err.contains("uncompressed"), "{err}");
 
         let plain = std::env::temp_dir().join(format!("artifact-{}.txt", uuid::Uuid::new_v4()));
@@ -13305,7 +14510,8 @@ mod tests {
     #[test]
     fn artifact_register_detects_hash_collision_or_corrupted_stored_bytes() {
         let (db, path) = temp_db();
-        let source = std::env::temp_dir().join(format!("artifact-collision-{}.txt", uuid::Uuid::new_v4()));
+        let source =
+            std::env::temp_dir().join(format!("artifact-collision-{}.txt", uuid::Uuid::new_v4()));
         std::fs::write(&source, b"true bytes").unwrap();
         use base64::Engine as _;
         let good_sha = {
@@ -13327,7 +14533,10 @@ mod tests {
             json!({"path": source.to_string_lossy(), "workspace_hash": "ws-collision"}),
         )
         .unwrap_err();
-        assert!(err.contains("collision") || err.contains("corrupted"), "{err}");
+        assert!(
+            err.contains("collision") || err.contains("corrupted"),
+            "{err}"
+        );
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&source);
@@ -13349,7 +14558,10 @@ mod tests {
         });
         let response = handle_remember(&db, base).expect("snapshot evidence should write");
         let id = serde_json::from_str::<Value>(&response).unwrap()["id"].clone();
-        let entity = db.get_entity_by_id_public(id.as_str().unwrap()).unwrap().unwrap();
+        let entity = db
+            .get_entity_by_id_public(id.as_str().unwrap())
+            .unwrap()
+            .unwrap();
         let body: Value = serde_json::from_str(&entity.body_json).unwrap();
         assert_eq!(body["evidence"]["capture_mode"], "snapshot");
         assert_eq!(body["evidence"]["resolved_value"]["port"], 3001);
@@ -13436,7 +14648,10 @@ mod tests {
         let value: Value = serde_json::from_str(&response).unwrap();
         assert_eq!(value["ok"], false);
         assert_eq!(value["remembered"], false);
-        assert!(db.get_entity("security", "irrelevant-record").unwrap().is_none());
+        assert!(db
+            .get_entity("security", "irrelevant-record")
+            .unwrap()
+            .is_none());
         let _ = std::fs::remove_file(path);
     }
 
@@ -13460,12 +14675,27 @@ mod tests {
         let value: Value = serde_json::from_str(&response).unwrap();
         assert_eq!(value["proposed"], json!(true), "{response}");
         assert_eq!(value["requires_review"], json!(true), "{response}");
-        assert_eq!(value["provenance"]["state"], json!("proposed"), "{response}");
-        assert_eq!(value["provenance"]["actor"]["kind"], json!("assistant"), "{response}");
-        assert_eq!(value["provenance"]["workspace_hash"], json!("ws-proposal"), "{response}");
+        assert_eq!(
+            value["provenance"]["state"],
+            json!("proposed"),
+            "{response}"
+        );
+        assert_eq!(
+            value["provenance"]["actor"]["kind"],
+            json!("assistant"),
+            "{response}"
+        );
+        assert_eq!(
+            value["provenance"]["workspace_hash"],
+            json!("ws-proposal"),
+            "{response}"
+        );
         let digest = value["provenance"]["record_digest"].as_str().unwrap();
         assert_eq!(digest.len(), 64, "{response}");
-        assert!(!value["provenance"].to_string().contains(secret), "{response}");
+        assert!(
+            !value["provenance"].to_string().contains(secret),
+            "{response}"
+        );
 
         let entity = db
             .get_entity("decision", "proposal-without-admission")
@@ -13507,8 +14737,16 @@ mod tests {
         let value: Value = serde_json::from_str(&response).unwrap();
         assert_eq!(value["proposed"], json!(true), "{response}");
         assert_eq!(value["requires_review"], json!(true), "{response}");
-        assert_eq!(value["provenance"]["state"], json!("proposed"), "{response}");
-        assert_eq!(value["admission"]["authoritative"], json!(false), "{response}");
+        assert_eq!(
+            value["provenance"]["state"],
+            json!("proposed"),
+            "{response}"
+        );
+        assert_eq!(
+            value["admission"]["authoritative"],
+            json!(false),
+            "{response}"
+        );
         assert_eq!(
             db.get_entity("decision", "missing-source-validation")
                 .unwrap()
@@ -13551,10 +14789,17 @@ mod tests {
         )
         .expect("forged admission is retained for review");
         let value: Value = serde_json::from_str(&response).unwrap();
-        assert_eq!(value["admission"]["authoritative"], json!(false), "{response}");
+        assert_eq!(
+            value["admission"]["authoritative"],
+            json!(false),
+            "{response}"
+        );
         assert_eq!(value["proposed"], json!(true), "{response}");
         assert_eq!(
-            db.get_entity("decision", "forged-authority").unwrap().unwrap().status,
+            db.get_entity("decision", "forged-authority")
+                .unwrap()
+                .unwrap()
+                .status,
             "proposed"
         );
         let _ = std::fs::remove_file(path);
@@ -13631,10 +14876,22 @@ mod tests {
             }),
         )
         .expect_err("forged source identity/scope must be rejected before mutation");
-        assert!(err.contains("source_id") || err.contains("workspace") || err.contains("owner"), "{err}");
-        assert!(db.get_entity("observation", "verified-source").unwrap().is_none());
-        let source = db.get_entity("episodes", "verified-source").unwrap().unwrap();
-        assert!(source.links.is_empty(), "rejected promotion must not leave a link");
+        assert!(
+            err.contains("source_id") || err.contains("workspace") || err.contains("owner"),
+            "{err}"
+        );
+        assert!(db
+            .get_entity("observation", "verified-source")
+            .unwrap()
+            .is_none());
+        let source = db
+            .get_entity("episodes", "verified-source")
+            .unwrap()
+            .unwrap();
+        assert!(
+            source.links.is_empty(),
+            "rejected promotion must not leave a link"
+        );
         let _ = std::fs::remove_file(path);
     }
 
@@ -13663,12 +14920,23 @@ mod tests {
         )
         .expect_err("unverified proposal must not be promoted");
         assert!(
-            err.contains("requires_review") || err.contains("unverified") || err.contains("workspace_hash"),
+            err.contains("requires_review")
+                || err.contains("unverified")
+                || err.contains("workspace_hash"),
             "{err}"
         );
-        assert!(db.get_entity("observation", "unverified-proposal").unwrap().is_none());
-        let source = db.get_entity("episodes", "unverified-proposal").unwrap().unwrap();
-        assert!(source.links.is_empty(), "review-gated promotion must be inert");
+        assert!(db
+            .get_entity("observation", "unverified-proposal")
+            .unwrap()
+            .is_none());
+        let source = db
+            .get_entity("episodes", "unverified-proposal")
+            .unwrap()
+            .unwrap();
+        assert!(
+            source.links.is_empty(),
+            "review-gated promotion must be inert"
+        );
         let _ = std::fs::remove_file(path);
     }
 
@@ -13691,32 +14959,56 @@ mod tests {
                 }
             }),
         ).unwrap();
-        let source_id = serde_json::from_str::<Value>(&remembered).unwrap()["id"].as_str().unwrap().to_string();
-        let err = handle_promote(&db, json!({
-            "from_category":"episodes", "from_key":"quarantined-source",
-            "to_category":"observation", "workspace_hash":"ws-quarantine",
-            "agent_id":"connector-1", "source_id":source_id
-        })).unwrap_err();
-        assert!(err.contains("review") || err.contains("authoritative"), "{err}");
-        assert!(db.get_entity("observation", "quarantined-source").unwrap().is_none());
+        let source_id = serde_json::from_str::<Value>(&remembered).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let err = handle_promote(
+            &db,
+            json!({
+                "from_category":"episodes", "from_key":"quarantined-source",
+                "to_category":"observation", "workspace_hash":"ws-quarantine",
+                "agent_id":"connector-1", "source_id":source_id
+            }),
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("review") || err.contains("authoritative"),
+            "{err}"
+        );
+        assert!(db
+            .get_entity("observation", "quarantined-source")
+            .unwrap()
+            .is_none());
         let _ = std::fs::remove_file(path);
     }
 
     #[test]
     fn demotion_requires_reviewable_source_assertions_and_target_preflight() {
         let (db, path) = temp_db();
-        handle_remember(&db, json!({
-            "category":"convention", "key":"draft-rule",
-            "workspace_hash":"ws-draft", "agent_id":"agent-draft",
-            "body_json":"{\"content\":\"draft\"}"
-        })).unwrap();
-        let err = handle_demote(&db, json!({
-            "from_category":"convention", "from_key":"draft-rule",
-            "to_category":"observation", "workspace_hash":"ws-draft",
-            "agent_id":"agent-draft"
-        })).unwrap_err();
+        handle_remember(
+            &db,
+            json!({
+                "category":"convention", "key":"draft-rule",
+                "workspace_hash":"ws-draft", "agent_id":"agent-draft",
+                "body_json":"{\"content\":\"draft\"}"
+            }),
+        )
+        .unwrap();
+        let err = handle_demote(
+            &db,
+            json!({
+                "from_category":"convention", "from_key":"draft-rule",
+                "to_category":"observation", "workspace_hash":"ws-draft",
+                "agent_id":"agent-draft"
+            }),
+        )
+        .unwrap_err();
         assert!(err.contains("review") || err.contains("assertion"), "{err}");
-        assert!(db.get_entity("observation", "draft-rule").unwrap().is_none());
+        assert!(db
+            .get_entity("observation", "draft-rule")
+            .unwrap()
+            .is_none());
         let _ = std::fs::remove_file(path);
     }
 
@@ -13756,22 +15048,29 @@ mod tests {
     #[test]
     fn admission_actor_identity_and_kind_mismatch_is_rejected() {
         let (db, path) = temp_db();
-        let err = handle_remember(&db, json!({
-            "category":"decision", "key":"actor-mismatch",
-            "workspace_hash":"ws-actor", "agent_id":"assistant-1",
-            "actor_kind":"assistant", "body_json":"{\"content\":\"x\"}",
-            "admission": {
-                "record_digest": crate::trust_admission::digest_text("{\"content\":\"x\"}"),
-                "source_identity":"source-1", "source_event_id":"event-1",
-                "authorization_scope":"ws-actor", "ingestion_channel":"connector",
-                "workspace_hash":"ws-actor", "source_trust":"authoritative",
-                "actor_kind":"user", "actor_identity":"user-1",
-                "validated":true, "valid_from_unix_ms":1,
-                "recorded_at_unix_ms":2, "task_relevance_bps":9000
-            }
-        })).unwrap_err();
+        let err = handle_remember(
+            &db,
+            json!({
+                "category":"decision", "key":"actor-mismatch",
+                "workspace_hash":"ws-actor", "agent_id":"assistant-1",
+                "actor_kind":"assistant", "body_json":"{\"content\":\"x\"}",
+                "admission": {
+                    "record_digest": crate::trust_admission::digest_text("{\"content\":\"x\"}"),
+                    "source_identity":"source-1", "source_event_id":"event-1",
+                    "authorization_scope":"ws-actor", "ingestion_channel":"connector",
+                    "workspace_hash":"ws-actor", "source_trust":"authoritative",
+                    "actor_kind":"user", "actor_identity":"user-1",
+                    "validated":true, "valid_from_unix_ms":1,
+                    "recorded_at_unix_ms":2, "task_relevance_bps":9000
+                }
+            }),
+        )
+        .unwrap_err();
         assert!(err.contains("actor"), "{err}");
-        assert!(db.get_entity("decision", "actor-mismatch").unwrap().is_none());
+        assert!(db
+            .get_entity("decision", "actor-mismatch")
+            .unwrap()
+            .is_none());
         let _ = std::fs::remove_file(path);
     }
 
@@ -13828,8 +15127,14 @@ mod tests {
             json!({"from_category":"episodes", "from_key":"owned-source", "to_category":"observation"}),
         )
         .expect_err("scoped owned promotion must require binding assertions");
-        assert!(err.contains("workspace_hash") || err.contains("agent_id"), "{err}");
-        assert!(db.get_entity("observation", "owned-source").unwrap().is_none());
+        assert!(
+            err.contains("workspace_hash") || err.contains("agent_id"),
+            "{err}"
+        );
+        assert!(db
+            .get_entity("observation", "owned-source")
+            .unwrap()
+            .is_none());
         let _ = std::fs::remove_file(path);
     }
 
@@ -13848,9 +15153,13 @@ mod tests {
                 "user_correction":correction,
                 "task_context":context
             }),
-        ).unwrap();
+        )
+        .unwrap();
         let result: Value = serde_json::from_str(&response).unwrap();
-        let entity = db.get_entity("correction", result["key"].as_str().unwrap()).unwrap().unwrap();
+        let entity = db
+            .get_entity("correction", result["key"].as_str().unwrap())
+            .unwrap()
+            .unwrap();
         assert!(!entity.body_json.contains(wrong));
         assert!(!entity.body_json.contains(correction));
         assert!(!entity.body_json.contains(context));
@@ -14023,7 +15332,8 @@ mod tests {
         let v: Value = serde_json::from_str(&response).unwrap();
         assert_eq!(v["fallback"], json!("consolidate"));
         assert_eq!(
-            v["entities_examined"], json!(2),
+            v["entities_examined"],
+            json!(2),
             "scoped fallback must only examine ws-fb: {v}"
         );
         assert_eq!(v["observations_created"], json!(1));
@@ -14038,9 +15348,10 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(obs_ws, "ws-fb", "fallback observation must inherit the scope");
+        assert_eq!(
+            obs_ws, "ws-fb",
+            "fallback observation must inherit the scope"
+        );
         let _ = std::fs::remove_file(path);
     }
 }
-
-
