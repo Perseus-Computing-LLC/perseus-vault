@@ -2585,6 +2585,86 @@ def run_learned_anticipation(client, **_):
     return output(checks, evidence, metric_events)
 
 
+def run_guide_service(client, **_):
+    # #924: the operating guide is a discoverable service, not inlined
+    # context. The context block emits a one-line pointer only after a guide
+    # entity exists; the full manual is never injected; the guide surfaces
+    # through its recall_when triggers; re-seeding is idempotent.
+    ws = "quality-guide-service-workspace"
+    manual_title = "# Perseus Vault Operating Guide"
+
+    def ctx_block():
+        # Standing context block (no query): the pointer must appear here
+        # without the manual. With a matching query the guide SHOULD surface
+        # as a normal recall hit — that is the on-demand retrieval path.
+        return str(
+            client.call(
+                "perseus_vault_context",
+                {"workspace_hash": ws, "mode": "on_demand"},
+            )
+        )
+
+    # 1. Fallback intact: no guide entity, no pointer section.
+    before = ctx_block()
+    fallback_intact = "Vault Guide" not in before
+
+    # 2. Seed → pointer emitted, manual never inlined.
+    seeded = client.call("perseus_vault_guide_seed", {"workspace_hash": ws})
+    seeded_ok = (
+        isinstance(seeded, dict)
+        and seeded.get("category") == "guide"
+        and seeded.get("key") == "vault-operating-guide"
+        and seeded.get("action") in ("created", "updated")
+        and bool(seeded.get("id"))
+    )
+    after = ctx_block()
+    pointer_emitted = "Vault Guide" in after and "operating guide" in after
+    not_inlined = manual_title not in after and "## Recall" not in after
+
+    # 3. Discoverable via recall_when trigger.
+    hits = client.call(
+        "perseus_vault_recall_when",
+        {"context": "operating guide", "limit": 10, "workspace_hash": ws},
+    )
+    discoverable = "vault-operating-guide" in str(hits)
+
+    # 4. Idempotent: re-seed updates the same entity, never duplicates.
+    again = client.call("perseus_vault_guide_seed", {"workspace_hash": ws})
+    idempotent = (
+        isinstance(again, dict)
+        and again.get("action") == "updated"
+        and bool(seeded) and bool(again)
+        and again.get("id") == seeded.get("id")
+    )
+
+    checks = {
+        "fallback_intact": fallback_intact,
+        "seeded_ok": seeded_ok,
+        "pointer_emitted": pointer_emitted,
+        "not_inlined": not_inlined,
+        "discoverable": discoverable,
+        "idempotent": idempotent,
+    }
+    evidence = {
+        "found": bool(seeded_ok),
+        "count": int(pointer_emitted) + int(not_inlined),
+        "total": 2,
+        "rate": 1.0 if (pointer_emitted and not_inlined) else 0.0,
+        "reason": "guide-service",
+        "workspace_hash": ws,
+    }
+    metric_events = {
+        "guide-service": {
+            "numerator": int(
+                fallback_intact and seeded_ok and pointer_emitted and not_inlined
+                and discoverable and idempotent
+            ),
+            "denominator": 1,
+        },
+    }
+    return output(checks, evidence, metric_events)
+
+
 SCENARIO_RUNNERS = {
     "long_horizon": run_long_horizon,
     "contradiction_supersession": run_contradiction,
@@ -2605,6 +2685,7 @@ SCENARIO_RUNNERS = {
     "evidence_observations": run_evidence_observations,
     "interference_gate": run_interference_gate,
     "learned_anticipation": run_learned_anticipation,
+    "guide_service": run_guide_service,
     "admission": run_admission,
     "prompt_safety": run_prompt_safety,
     "identity_ambiguity": run_identity_ambiguity,

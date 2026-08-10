@@ -6627,6 +6627,17 @@ pub fn handle_preload_propose(db: &Database, args: Value) -> Result<String, Stri
     Ok(json!({"created": proposals.len(), "proposals": proposals}).to_string())
 }
 
+/// #924: seed the vault operating guide (idempotent upsert in a workspace).
+pub fn handle_guide_seed(db: &Database, args: Value) -> Result<String, String> {
+    let workspace_hash = args
+        .get("workspace_hash")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let out = crate::guide::seed_guide(db, &workspace_hash)?;
+    Ok(out.to_string())
+}
+
 /// Operator review queue for preload trigger tuning: `list` pending
 /// proposals, `approve` (applies the mutation through the audited remember
 /// path + journal), or `dismiss` with a reason. The ONLY mutation surface.
