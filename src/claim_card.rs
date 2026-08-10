@@ -286,6 +286,7 @@ fn scan_live_rows(db: &Database) -> Result<Vec<CardRow>, String> {
                 follow_rate: 0.0,
                 efficacy_status: String::new(),
                 epistemic_state: String::new(),
+                hints: vec![],
                 embedding: None,
                 _parsed_body: None,
             };
@@ -691,6 +692,7 @@ mod tests {
             follow_rate: 0.0,
             efficacy_status: "unverified".to_string(),
             epistemic_state: "candidate".to_string(),
+            hints: vec![],
             embedding: None,
             _parsed_body: None,
         }

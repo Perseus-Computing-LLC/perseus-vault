@@ -645,6 +645,7 @@ You can interact with these layers directly using the `perseus_vault_recall_laye
 - **Layer promotion** — buffer → working → core based on access frequency
 - **Automatic archival** — stale entities archive; purge to permanently delete + VACUUM
 - **Always-on entities** — pin identity-critical memories for session injection (hard-capped under recall-first; prefer `recall_when` triggers)
+- **Prospective query hints (#919)** — optional 1–3 natural-language phrasings per entity (`hints` on `perseus_vault_remember`) that are indexed into FTS5 alongside the body, bridging vocabulary gaps between plain-language queries and stored wording. Default-off (`PERSEUS_VAULT_HINTS_ENABLED=1`); rejected while disabled. See [docs/specs/prospective-query-hints.md](docs/specs/prospective-query-hints.md).
 
 ### Recall-First Context Injection
 

@@ -696,7 +696,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
         r###"[
   {
     "name": "perseus_vault_remember",
-    "description": "Store or update an entity by (category, key). Idempotent — call as often as you want, same key returns an update. NEAR-DUPLICATE MERGING (#531): a NEW key whose body is >=70% trigram-similar to an existing entity in the same category+workspace does NOT create a new entity — the write is folded into the existing one (result: action='deduped', deduped=true, merged_into=<id>). Right for conversational memory; wrong for bulk ingest of templated records, which are similar by construction and will silently collapse to a handful of rows. For bulk ingest pass skip_dedup=true (or use perseus_vault_ingest_file), and check the returned action. Prefer recall_when triggers (retrieve when relevant) over always_on=true (inject unconditionally): the recall-first perseus_vault_context hard-caps the always-on set and warns when it overflows, so reserve always_on for genuinely identity-critical facts. Optional certainty (0.0-1.0) is used by perseus_vault_conflicts for typed-entity conflict detection. Pass derived_from (ids or {category,key} pairs of the memories you recalled) to auto-mark those sources useful — cited memories rank higher and decay slower. Use this for saving facts, decisions, architecture notes, and conventions. When encryption is enabled, body_json is encrypted at rest with AES-256-GCM.",
+    "description": "Store or update an entity by (category, key). Idempotent — call as often as you want, same key returns an update. NEAR-DUPLICATE MERGING (#531): a NEW key whose body is >=70% trigram-similar to an existing entity in the same category+workspace does NOT create a new entity — the write is folded into the existing one (result: action='deduped', deduped=true, merged_into=<id>). Right for conversational memory; wrong for bulk ingest of templated records, which are similar by construction and will silently collapse to a handful of rows. For bulk ingest pass skip_dedup=true (or use perseus_vault_ingest_file), and check the returned action. Prefer recall_when triggers (retrieve when relevant) over always_on=true (inject unconditionally): the recall-first perseus_vault_context hard-caps the always-on set and warns when it overflows, so reserve always_on for genuinely identity-critical facts. Optional certainty (0.0-1.0) is used by perseus_vault_conflicts for typed-entity conflict detection. Pass derived_from (ids or {category,key} pairs of the memories you recalled) to auto-mark those sources useful — cited memories rank higher and decay slower. Use this for saving facts, decisions, architecture notes, and conventions. Optional hints (#919): 1-3 prospective query phrasings that should retrieve this entity (vocabulary-gap recall) — indexed into FTS5 alongside the body, default-off (PERSEUS_VAULT_HINTS_ENABLED=1 to enable), replaced wholesale on update. When encryption is enabled, body_json is encrypted at rest with AES-256-GCM.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -868,6 +868,14 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
           "type": "boolean",
           "default": false,
           "description": "#874: sparse update mode — touches only the activated subset of state (body slot, activated links), never disturbs neighbors: no salience inflation on re-assert, caller links admitted only when their target is activated by the new body, no near-duplicate absorption on insert."
+        },
+        "hints": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 3,
+          "description": "#919: optional 1-3 prospective query hints — natural-language phrasings that should retrieve this entity, indexed into FTS5 alongside the body (vocabulary-gap recall). Default-off: hints are rejected unless the server runs with PERSEUS_VAULT_HINTS_ENABLED=1. Hints replace any previously stored hints on update (omit to clear)."
         }
       },
       "required": [

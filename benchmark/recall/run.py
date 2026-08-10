@@ -53,14 +53,15 @@ class PerseusVault:
     State persists because every call points at the same --db file.
     """
 
-    def __init__(self, binary: str, db: str):
+    def __init__(self, binary: str, db: str, env: "dict | None" = None):
         self.binary = binary
         self.db = db
+        self.env = env
 
     def call(self, name: str, args: dict):
         p = subprocess.Popen([self.binary, "--db", self.db],
                              stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                             stderr=subprocess.DEVNULL, text=True)
+                             stderr=subprocess.DEVNULL, text=True, env=self.env)
         w = p.stdin.write
         w(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize",
                       "params": {"protocolVersion": "2025-06-18", "capabilities": {},
@@ -106,6 +107,11 @@ def main():
     ap.add_argument("--modes", nargs="+", default=["fts5", "dense", "hybrid"])
     ap.add_argument("--out", default=str(HERE / "report.json"))
     ap.add_argument("--limit", type=int, default=10, help="Results requested per query")
+    ap.add_argument("--hints", action="store_true",
+                    help="#919: ingest prospective query hints from memories[].hints "
+                         "(server runs with PERSEUS_VAULT_HINTS_ENABLED=1) and record "
+                         "the gate in the report. Run once with and once without and "
+                         "compare fts5 recall to measure the vocabulary-gap delta.")
     args = ap.parse_args()
 
     binary = find_binary(args.bin)
@@ -121,15 +127,19 @@ def main():
         except OSError:
             pass
 
-    m = PerseusVault(binary, db)
+    m = PerseusVault(binary, db, env=(dict(os.environ, PERSEUS_VAULT_HINTS_ENABLED="1")
+                                      if args.hints else None))
 
     # 1. Ingest.
     print(f"Ingesting {len(memories)} memories...", flush=True)
     for mem in memories:
-        m.call("perseus_vault_remember", {
+        remember_args = {
             "category": mem["category"], "key": mem["key"],
             "body_json": json.dumps({"note": mem["note"]}), "type": "fact",
-        })
+        }
+        if args.hints and mem.get("hints"):
+            remember_args["hints"] = mem["hints"]
+        m.call("perseus_vault_remember", remember_args)
 
     # 2. Populate dense vectors with the bundled local model (no network).
     cats = sorted({mem["category"] for mem in memories})
@@ -175,6 +185,7 @@ def main():
     repro_modes = [m for m in args.modes if m not in NONDETERMINISTIC]
     sig_payload = json.dumps({
         "dataset": data.get("name"), "k": ks, "modes": repro_modes,
+        "hints": args.hints,
         "metrics": {m: agg[m] for m in repro_modes},
     }, sort_keys=True)
     signature = hashlib.sha256(sig_payload.encode("utf-8")).hexdigest()
@@ -186,6 +197,7 @@ def main():
         "n_queries": n,
         "k": ks,
         "modes": args.modes,
+        "hints_enabled": args.hints,
         "metrics": agg,
         "binary": Path(binary).name,
         "platform": platform.platform(),
