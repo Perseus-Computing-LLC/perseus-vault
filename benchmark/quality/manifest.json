@@ -536,27 +536,66 @@
         "idempotent"
       ],
       "description": "#924: operating guide is a discoverable service \u2014 context block emits pointer-not-inline only after seeding, manual never inlined, recall_when-discoverable, idempotent re-seed."
+    },
+    {
+      "category": "declared",
+      "checks": [
+        "schema_declared",
+        "version_bumped",
+        "invalid_schema_rejected",
+        "exact_scalar_match",
+        "string_list_membership",
+        "and_semantics"
+      ],
+      "description": "Declared contracts validate fail-closed; exact queries return only exact matches in deterministic order.",
+      "id": "declared-exact-schema-and-filters",
+      "metric": "declared",
+      "scenario": "declared_exact"
+    },
+    {
+      "category": "declared",
+      "checks": [
+        "facet_counts_truthful",
+        "unknown_field_rejected",
+        "nonfacet_rejected",
+        "undeclared_category_rejected"
+      ],
+      "description": "Facet counts are truthful; unknown fields, non-facet facets, and undeclared categories are rejected.",
+      "id": "declared-facets-failclosed",
+      "metric": "declared",
+      "scenario": "declared_exact"
+    },
+    {
+      "category": "declared",
+      "checks": [
+        "fused_pins_exact"
+      ],
+      "description": "Fused recall pins the declared exact match ahead of the fuzzy pool.",
+      "id": "declared-fused-pinning",
+      "metric": "declared",
+      "scenario": "declared_exact"
     }
   ],
   "description": "Bounded offline quality-contract manifest for retrieval, temporal validity, scope validity, provenance, replay, mutation/supersession, compaction/projection, action grounding, recall outcomes, admission, poisoning, identity ambiguity, and the graph utility gate (#869).",
   "metrics": [
-    "validity",
-    "scope_invalid_recall",
-    "provenance",
-    "replay_fidelity",
-    "mutation_supersession",
-    "compaction_projection",
     "action_grounding",
-    "recall_outcome",
     "admission",
-    "prompt_safety",
-    "identity_ambiguity",
-    "graph_utility_gate",
-    "validity_recall",
-    "task_projection",
+    "compaction_projection",
+    "declared",
     "evidence_observations",
+    "graph_utility_gate",
+    "identity_ambiguity",
     "interference_gate",
-    "learned_anticipation"
+    "learned_anticipation",
+    "mutation_supersession",
+    "prompt_safety",
+    "provenance",
+    "recall_outcome",
+    "replay_fidelity",
+    "scope_invalid_recall",
+    "task_projection",
+    "validity",
+    "validity_recall"
   ],
   "name": "perseus-vault-memory-quality-v1",
   "required_categories": [

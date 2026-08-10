@@ -507,6 +507,17 @@ pub struct RecallParams {
     /// default behavior (false) is byte-identical. The ask path enables it
     /// internally so curated summaries are consulted before raw facts.
     pub tier_order: bool,
+    /// #923: declared exact-match arm. When the "declared" strategy is
+    /// engaged, `declared_category` + `declared_filters` must be present and
+    /// the filters must be declared by the category's contract (fail-closed).
+    /// Exact matches are pinned ahead of the fused pool; semantic arms fill
+    /// the remaining budget. Undeclared categories or unknown fields are
+    /// errors, never a silent fallback to fuzzy recall.
+    pub declared_category: Option<String>,
+    /// #923: exact-equality filters (AND-combined). Scalar fields expect a
+    /// string value; string_list fields expect an array of strings
+    /// (membership). Validated against the category's declared schema.
+    pub declared_filters: Option<std::collections::HashMap<String, serde_json::Value>>,
 }
 
 /// Search mode for recall: FTS5 keyword, dense vector, hybrid fusion, or
@@ -865,6 +876,8 @@ impl Default for RecallParams {
             profile: None,
             validity_annotate: false,
             tier_order: false,
+            declared_category: None,
+            declared_filters: None,
         }
     }
 }

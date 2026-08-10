@@ -7463,7 +7463,7 @@ impl Database {
         ),
         Box<dyn std::error::Error>,
     > {
-        const ALL: [&str; 4] = ["fts5", "dense", "graph", "temporal"];
+        const ALL: [&str; 5] = ["declared", "fts5", "dense", "graph", "temporal"];
         let started = std::time::Instant::now();
 
         // ── strategy selection & validation ─────────────────────────────
@@ -7494,6 +7494,44 @@ impl Database {
                 .cmp(&ALL.iter().position(|x| x == b).unwrap_or(99))
         });
         let wants = |s: &str| strategies.contains(&s);
+
+        // ── #923: declared arm validation (fail-closed) ─────────────────
+        // The exact arm is opt-in and never silently degrades: filters
+        // without the strategy, or the strategy without filters, are caller
+        // errors; category mismatch is a caller error; an undeclared
+        // category is an error at arm time. When the strategy list was NOT
+        // explicit (default = all arms) and no declared inputs were passed,
+        // the arm simply skips — ordinary fused recalls are unchanged.
+        let explicit_strategies = !params.strategies.is_empty();
+        let wants_declared = strategies.iter().any(|s| *s == "declared");
+        let has_declared_input = params.declared_category.is_some()
+            && params
+                .declared_filters
+                .as_ref()
+                .is_some_and(|m| !m.is_empty());
+        let run_declared = wants_declared && has_declared_input;
+        if explicit_strategies && wants_declared && !has_declared_input {
+            return Err(
+                "fused recall: strategy 'declared' requires declared_category and non-empty declared_filters"
+                    .into(),
+            );
+        }
+        if has_declared_input && !wants_declared {
+            return Err(
+                "fused recall: declared_filters provided without the 'declared' strategy".into(),
+            );
+        }
+        if let (Some(cat), Some(dcat)) = (
+            params.category.as_deref(),
+            params.declared_category.as_deref(),
+        ) {
+            if !cat.is_empty() && cat != dcat {
+                return Err(format!(
+                    "fused recall: declared_category '{dcat}' must match recall category '{cat}'"
+                )
+                .into());
+            }
+        }
 
         // ── per-strategy weights (validated, fail-closed) ───────────────
         let mut base_weights: std::collections::HashMap<String, f64> =
@@ -7554,6 +7592,55 @@ impl Database {
         }
         if params.include_archived {
             trace.state_filters.push("archived:include".to_string());
+        }
+
+        // ── #923 wave 0: declared exact-match arm ──────────────────────
+        // Runs before every ranked arm: its matches are exact answers and
+        // are pinned ahead of the fused pool at the end. Fail-closed:
+        // undeclared category, unknown field, or malformed filter is an
+        // error — never a silent fallback to fuzzy recall.
+        let mut declared_scored: Vec<(Entity, f64)> = Vec::new();
+        if run_declared {
+            let t0 = std::time::Instant::now();
+            let dcat = params.declared_category.as_deref().unwrap_or_default();
+            let schema = crate::declared::load_declared_schema(self, dcat)
+                .map_err(|e| format!("fused recall declared arm: {e}"))?
+                .ok_or_else(|| {
+                    format!(
+                        "fused recall declared arm: category '{dcat}' has no declared schema \
+                         (declare one via perseus_vault_declared_schema_set)"
+                    )
+                })?;
+            let filters: Vec<crate::declared::DeclaredFilter> = params
+                .declared_filters
+                .as_ref()
+                .map(|m| {
+                    m.iter()
+                        .map(|(k, v)| crate::declared::DeclaredFilter {
+                            field: k.clone(),
+                            value: v.clone(),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let candidates = crate::declared::declared_candidates(
+                self,
+                &schema,
+                &filters,
+                params.workspace_hash.as_deref(),
+            )?;
+            declared_scored = candidates.into_iter().map(|e| (e, 1.0)).collect();
+            trace.strategies.push(crate::models::FusedStrategyTrace {
+                strategy: "declared".to_string(),
+                candidates: declared_scored.len(),
+                top: declared_scored.iter().map(|(e, _)| e.id.clone()).collect(),
+                status: if declared_scored.is_empty() {
+                    "empty".to_string()
+                } else {
+                    "ok".to_string()
+                },
+                latency_ms: t0.elapsed().as_secs_f64() * 1000.0,
+            });
         }
 
         // ── wave 1: fts5 + dense arms in parallel (independent, read-only) ─
@@ -7751,8 +7838,11 @@ impl Database {
         }
 
         // ── weighted RRF fusion (rank-based; no raw score sum) ──────────
+        // The declared arm is exact, not ranked: it is excluded from RRF and
+        // pinned ahead of the fused pool later.
         let arms: Vec<(Vec<String>, f64)> = strategies
             .iter()
+            .filter(|name| **name != "declared")
             .map(|name| {
                 let scored = match *name {
                     "fts5" => &fts5_scored,
@@ -7781,6 +7871,12 @@ impl Database {
         let mut fused = crate::db::flat_rrf(&arms, &by_id, candidate_k);
         trace.fusion.rrf_k = 60.0;
         trace.fusion.fused_count = fused.len();
+        if run_declared {
+            trace.fusion.weights.insert(
+                "declared".to_string(),
+                if declared_scored.is_empty() { 0.0 } else { 1.0 },
+            );
+        }
 
         // Post-fusion pipeline mirrors the hybrid path (honest-usage boost,
         // scope preference, supersede recency, then layer + metadata
@@ -7915,6 +8011,31 @@ impl Database {
             ranked = validity_scored;
         }
 
+        // ── #923: declared exact matches are pinned first ───────────────
+        // Exact answers precede every ranked arm; the fused pool fills the
+        // remaining limit/budget slots (so semantic arms act as fallback
+        // under the caller's token budget).
+        let mut declared_ids_for_sources: Vec<String> = Vec::new();
+        if !declared_scored.is_empty() {
+            let declared_ids: std::collections::HashSet<String> =
+                declared_scored.iter().map(|(e, _)| e.id.clone()).collect();
+            // Keep a live id list for the consensus-sources trace (the
+            // scored vec itself is moved into the pinned order).
+            declared_ids_for_sources =
+                declared_scored.iter().map(|(e, _)| e.id.clone()).collect();
+            let pinned_len = declared_scored.len();
+            let mut pinned: Vec<(Entity, f64)> = declared_scored;
+            pinned.extend(ranked.into_iter().filter(|(e, _)| !declared_ids.contains(&e.id)));
+            for (e, _) in pinned.iter().take(pinned_len) {
+                trace
+                    .sources
+                    .entry(e.id.clone())
+                    .or_insert_with(Vec::new)
+                    .push("declared".to_string());
+            }
+            ranked = pinned;
+        }
+
         // ── caller limit, then token-budget truncation ──────────────────
         ranked.truncate(limit);
         let mut retained: Vec<Entity> = Vec::new();
@@ -7949,6 +8070,9 @@ impl Database {
                 if list.iter().any(|(c, _)| c.id == e.id) {
                     srcs.push(name.to_string());
                 }
+            }
+            if declared_ids_for_sources.iter().any(|id| id == &e.id) {
+                srcs.push("declared".to_string());
             }
             trace.sources.insert(e.id.clone(), srcs);
         }
@@ -45412,6 +45536,392 @@ mod tests {
         );
 
         std::env::remove_var("PERSEUS_VAULT_HINTS_ENABLED");
+        let _ = std::fs::remove_file(path);
+    }
+
+    // ── #923: declared exact-match retrieval arm ───────────────────────
+
+    fn declared_field(name: &str, ty: &str, facet: bool) -> crate::declared::DeclaredField {
+        crate::declared::DeclaredField {
+            name: name.to_string(),
+            field_type: if ty == "scalar" {
+                crate::declared::DeclaredFieldType::Scalar
+            } else {
+                crate::declared::DeclaredFieldType::StringList
+            },
+            facet,
+        }
+    }
+
+    fn seed_declared_schema(
+        db: &Database,
+        category: &str,
+        fields: Vec<crate::declared::DeclaredField>,
+    ) -> crate::declared::DeclaredSchema {
+        crate::declared::declared_schema_set(db, category, &fields, "guidance").unwrap()
+    }
+
+    fn seed_typed(db: &Database, category: &str, key: &str, body: serde_json::Value) {
+        // skip_dedup: fixture bodies are templated by construction; without
+        // it the dedup fold merges same-tier twins (and the interference
+        // gate would quarantine near-duplicates). Bodies themselves are
+        // kept textually distinct so the gate's token-containment stays
+        // well under the default 0.9 bound.
+        db.remember_with_options(&make_entity(key, category, key, &body.to_string()), true, None, None, false)
+            .unwrap();
+    }
+
+    #[test]
+    fn declared_schema_validation_is_fail_closed() {
+        let (db, path) = temp_db();
+        let base = vec![declared_field("x", "scalar", false)];
+
+        // Reserved category cannot be declared.
+        assert!(
+            crate::declared::declared_schema_set(&db, "declared_schema", &base, "").is_err()
+        );
+        // Duplicate field names.
+        let dup = vec![
+            declared_field("a", "scalar", false),
+            declared_field("a", "string_list", false),
+        ];
+        assert!(crate::declared::declared_schema_set(&db, "cat", &dup, "").is_err());
+        // Empty field name.
+        let empty = vec![declared_field("", "scalar", false)];
+        assert!(crate::declared::declared_schema_set(&db, "cat", &empty, "").is_err());
+        // Vault-reserved field names.
+        for reserved in ["id", "category", "key", "recall_when", "origin", "external_refs"] {
+            let bad = vec![declared_field(reserved, "scalar", false)];
+            assert!(
+                crate::declared::declared_schema_set(&db, "cat", &bad, "").is_err(),
+                "reserved name {reserved} must be refused"
+            );
+        }
+        // Field cap.
+        let many: Vec<_> = (0..33)
+            .map(|i| declared_field(&format!("f{i}"), "scalar", false))
+            .collect();
+        assert!(crate::declared::declared_schema_set(&db, "cat", &many, "").is_err());
+        // Facet cap.
+        let facets: Vec<_> = (0..17)
+            .map(|i| declared_field(&format!("f{i}"), "scalar", true))
+            .collect();
+        assert!(crate::declared::declared_schema_set(&db, "cat", &facets, "").is_err());
+        // Guidance cap.
+        assert!(
+            crate::declared::declared_schema_set(&db, "cat", &base, &"x".repeat(501)).is_err()
+        );
+
+        // Valid declaration + idempotent version bump + load round trip.
+        let s1 = seed_declared_schema(&db, "cat", base.clone());
+        assert_eq!(s1.version, 1);
+        let s2 = seed_declared_schema(&db, "cat", base);
+        assert_eq!(s2.version, 2);
+        let loaded = crate::declared::load_declared_schema(&db, "cat")
+            .unwrap()
+            .expect("schema loads");
+        assert_eq!(loaded.query_guidance, "guidance");
+        assert_eq!(loaded.fields.len(), 1);
+        assert!(crate::declared::load_declared_schema(&db, "absent").unwrap().is_none());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn declared_query_exact_match_no_ranking_and_fail_closed() {
+        let (db, path) = temp_db();
+        seed_declared_schema(
+            &db,
+            "deals",
+            vec![
+                declared_field("tier", "scalar", true),
+                declared_field("region", "scalar", false),
+                declared_field("tags", "string_list", true),
+            ],
+        );
+        // Same-tier entities with distinct bodies (no ranking — order is
+        // created_at ASC, id ASC).
+        seed_typed(
+            &db,
+            "deals",
+            "deal-a",
+            serde_json::json!({"tier": "gold", "region": "fra", "tags": ["eu", "prod"], "note": "premium flagship european deal"}),
+        );
+        seed_typed(
+            &db,
+            "deals",
+            "deal-b",
+            serde_json::json!({"tier": "gold", "region": "iad", "tags": ["us", "prod"], "note": "gold domestic west coast deal"}),
+        );
+        seed_typed(
+            &db,
+            "deals",
+            "deal-c",
+            serde_json::json!({"tier": "silver", "region": "fra", "tags": ["eu", "staging"], "note": "silver european staging entry"}),
+        );
+        // Non-conforming value (number where scalar expected): never matches.
+        seed_typed(
+            &db,
+            "deals",
+            "deal-d",
+            serde_json::json!({"tier": 7, "region": "fra", "tags": ["eu"], "note": "anomalous numeric tier row"}),
+        );
+
+        // Exact scalar equality: only gold, deterministic order, no ranking.
+        let gold = crate::declared::declared_candidates(
+            &db,
+            &crate::declared::load_declared_schema(&db, "deals").unwrap().unwrap(),
+            &[crate::declared::DeclaredFilter {
+                field: "tier".into(),
+                value: serde_json::json!("gold"),
+            }],
+            None,
+        )
+        .unwrap();
+        assert_eq!(gold.len(), 2);
+        assert_eq!(gold[0].key, "deal-a");
+        assert_eq!(gold[1].key, "deal-b");
+        // Non-conforming entity is skipped, not an error.
+        assert!(gold.iter().all(|e| e.key != "deal-d"));
+
+        // String-list membership (any-of).
+        let eu = crate::declared::declared_candidates(
+            &db,
+            &crate::declared::load_declared_schema(&db, "deals").unwrap().unwrap(),
+            &[crate::declared::DeclaredFilter {
+                field: "tags".into(),
+                value: serde_json::json!(["eu"]),
+            }],
+            None,
+        )
+        .unwrap();
+        // deal-a (eu,prod), deal-c (eu,staging), deal-d (eu): membership is
+        // satisfied regardless of the non-conforming tier value.
+        assert_eq!(eu.len(), 3);
+        assert!(eu.iter().any(|e| e.key == "deal-d"));
+
+        // AND semantics.
+        let anded = crate::declared::declared_candidates(
+            &db,
+            &crate::declared::load_declared_schema(&db, "deals").unwrap().unwrap(),
+            &[
+                crate::declared::DeclaredFilter {
+                    field: "tier".into(),
+                    value: serde_json::json!("gold"),
+                },
+                crate::declared::DeclaredFilter {
+                    field: "region".into(),
+                    value: serde_json::json!("fra"),
+                },
+            ],
+            None,
+        )
+        .unwrap();
+        assert_eq!(anded.len(), 1);
+        assert_eq!(anded[0].key, "deal-a");
+
+        // Fail-closed rejections via the tool surface.
+        assert!(
+            crate::tools::handle_declared_query(
+                &db,
+                serde_json::json!({"category": "deals", "filters": {"owner": "x"}})
+            )
+            .is_err(),
+            "unknown field must be rejected"
+        );
+        assert!(
+            crate::tools::handle_declared_query(
+                &db,
+                serde_json::json!({"category": "deals", "filters": {"tags": "eu"}})
+            )
+            .is_err(),
+            "scalar-shaped filter on a string_list field must be rejected"
+        );
+        assert!(
+            crate::tools::handle_declared_query(
+                &db,
+                serde_json::json!({"category": "deals", "filters": {"tier": ["gold"]}})
+            )
+            .is_err(),
+            "array-shaped filter on a scalar field must be rejected"
+        );
+        assert!(
+            crate::tools::handle_declared_query(
+                &db,
+                serde_json::json!({"category": "deals", "facets": ["region"]})
+            )
+            .is_err(),
+            "non-facet facet request must be rejected"
+        );
+        assert!(
+            crate::tools::handle_declared_query(
+                &db,
+                serde_json::json!({"category": "undeclared"})
+            )
+            .is_err(),
+            "undeclared category must be rejected"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn declared_facet_counts_are_truthful_and_bounded() {
+        let (db, path) = temp_db();
+        seed_declared_schema(
+            &db,
+            "facets",
+            vec![
+                declared_field("tier", "scalar", true),
+                declared_field("owner", "scalar", true),
+            ],
+        );
+        // 55 distinct owners: top 50 + "other" roll-up.
+        for i in 0..55 {
+            seed_typed(
+                &db,
+                "facets",
+                &format!("f-{i:02}"),
+                serde_json::json!({"tier": "gold", "owner": format!("owner-{i:03}")}),
+            );
+        }
+        // 3 silver rows whose owner facet must NOT leak into the gold facet
+        // counts (counts computed over rows passing the OTHER filters).
+        for i in 0..3 {
+            seed_typed(
+                &db,
+                "facets",
+                &format!("s-{i}"),
+                serde_json::json!({"tier": "silver", "owner": format!("owner-{i:03}")}),
+            );
+        }
+        let schema = crate::declared::load_declared_schema(&db, "facets").unwrap().unwrap();
+        let counts = crate::declared::facet_counts(
+            &db,
+            &schema,
+            &[crate::declared::DeclaredFilter {
+                field: "tier".into(),
+                value: serde_json::json!("gold"),
+            }],
+            &["owner".to_string()],
+            None,
+        )
+        .unwrap();
+        let owner = counts.get("owner").expect("owner facet present");
+        assert_eq!(owner.len(), 51, "top 50 + other bucket");
+        assert_eq!(owner.iter().filter(|f| f.value == "other").count(), 1);
+        assert_eq!(
+            owner.iter().find(|f| f.value == "other").map(|f| f.count),
+            Some(5),
+            "55 distinct owners, 50 shown, 5 rolled into other"
+        );
+        assert_eq!(
+            owner.iter().filter(|f| f.value != "other").map(|f| f.count).sum::<i64>(),
+            50
+        );
+        // Silver rows never inflate gold counts: owner-000 appears exactly
+        // once (the gold f-00 row), not twice (s-0's silver row excluded).
+        assert_eq!(
+            owner.iter().find(|f| f.value == "owner-000").map(|f| f.count),
+            Some(1)
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn fused_declared_arm_pins_exact_matches_and_validates_fail_closed() {
+        let (db, path) = temp_db();
+        seed_declared_schema(
+            &db,
+            "declared_cat",
+            vec![declared_field("tier", "scalar", false)],
+        );
+        seed_typed(
+            &db,
+            "declared_cat",
+            "d1",
+            serde_json::json!({"tier": "gold", "note": "flagship zeppelin airship program"}),
+        );
+        seed_typed(
+            &db,
+            "declared_cat",
+            "d2",
+            serde_json::json!({"tier": "silver", "note": "backup submersible exploration program"}),
+        );
+
+        // Pinning: exact match first, semantic arms as fallback.
+        let mut params = fused_params("airship exploration program");
+        params.declared_category = Some("declared_cat".into());
+        params.declared_filters = Some(
+            [(
+                "tier".to_string(),
+                serde_json::json!("silver"),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        let (entities, _c, trace) = db.fused_recall(&params).unwrap();
+        assert_eq!(
+            entities.first().map(|e| e.id.as_str()),
+            Some("d2"),
+            "exact match pinned ahead of the fused pool"
+        );
+        assert!(entities.iter().any(|e| e.id == "d1"), "fuzzy fallback still serves");
+        assert!(
+            trace.strategies.iter().any(|s| s.strategy == "declared" && s.candidates == 1),
+            "declared strategy trace present"
+        );
+        assert!(
+            trace.sources.get("d2").map(|s| s.contains(&"declared".to_string())).unwrap_or(false),
+            "declared consensus source recorded"
+        );
+        assert_eq!(trace.fusion.weights.get("declared"), Some(&1.0));
+
+        // Explicit "declared" without inputs: caller error.
+        let mut explicit = fused_params("anything");
+        explicit.strategies = vec!["declared".into()];
+        assert!(db.fused_recall(&explicit).is_err());
+
+        // Filters without the strategy: caller error.
+        let mut no_strat = fused_params("anything");
+        no_strat.strategies = vec!["fts5".into()];
+        no_strat.declared_filters = Some(
+            [("tier".to_string(), serde_json::json!("gold"))].into_iter().collect(),
+        );
+        assert!(db.fused_recall(&no_strat).is_err());
+
+        // Category mismatch: caller error.
+        let mut mismatch = fused_params("anything");
+        mismatch.category = Some("other".into());
+        mismatch.declared_category = Some("declared_cat".into());
+        mismatch.declared_filters = Some(
+            [("tier".to_string(), serde_json::json!("gold"))].into_iter().collect(),
+        );
+        assert!(db.fused_recall(&mismatch).is_err());
+
+        // Undeclared category: arm-time error.
+        let mut undeclared = fused_params("anything");
+        undeclared.declared_category = Some("nope".into());
+        undeclared.declared_filters = Some(
+            [("tier".to_string(), serde_json::json!("gold"))].into_iter().collect(),
+        );
+        assert!(db.fused_recall(&undeclared).is_err());
+
+        // Unknown filter field: arm-time error.
+        let mut unknown = fused_params("anything");
+        unknown.declared_category = Some("declared_cat".into());
+        unknown.declared_filters = Some(
+            [("owner".to_string(), serde_json::json!("x"))].into_iter().collect(),
+        );
+        assert!(db.fused_recall(&unknown).is_err());
+
+        // Default all-arms WITHOUT declared inputs: ordinary fused recall,
+        // unchanged (arm skips, no trace entry, no error).
+        let plain = fused_params("airship exploration program");
+        let (entities, _c, trace) = db.fused_recall(&plain).unwrap();
+        assert!(entities.iter().any(|e| e.id == "d1"));
+        assert!(
+            !trace.strategies.iter().any(|s| s.strategy == "declared"),
+            "declared arm must skip when not engaged"
+        );
         let _ = std::fs::remove_file(path);
     }
 }
