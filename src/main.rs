@@ -4,18 +4,25 @@ mod claim_card;
 mod communities;
 mod connectors;
 mod db;
-mod live_update;
 mod dedup;
 mod embedding;
 mod encryption;
 mod extraction;
+mod live_update;
 // __isoc23_strto* link shims so the default (bundled-embeddings) build links
 // against the prebuilt ONNX Runtime on glibc < 2.38 hosts, e.g. Ubuntu 22.04
 // — the dominant cloud/CI base image (#526).
-#[cfg(all(feature = "bundled-embeddings", target_os = "linux", target_env = "gnu"))]
+mod deployment_profile;
+#[cfg(all(
+    feature = "bundled-embeddings",
+    target_os = "linux",
+    target_env = "gnu"
+))]
 mod glibc_compat;
 mod graph_route;
+mod grpc;
 mod httplimit;
+mod instruction_extraction;
 mod interference;
 mod log_digest;
 mod mcp;
@@ -24,17 +31,15 @@ mod models;
 mod multimodal;
 mod observations;
 mod op_runs;
+mod preload;
 mod projection;
 mod retrieval_telemetry;
-mod instruction_extraction;
-mod deployment_profile;
 mod schema;
 mod signed_profile;
 pub(crate) mod stage_trace;
-mod trust_admission;
 mod tools;
 mod transport;
-mod grpc;
+mod trust_admission;
 mod util;
 mod validity;
 mod vector_quant;
@@ -144,7 +149,6 @@ struct Cli {
     // Serve handler destructured it away), so it was a security control that looked
     // active and wasn't. Transport auth is `--mcp-token`; workspace scoping is a
     // routing control, not an enforced boundary (see docs/THREAT-MODEL.md).
-
     /// Enable offline / air-gapped mode. Disables the web dashboard, LLM endpoint,
     /// embedding endpoint, and external connectors. All core tools (remember, recall,
     /// search, journal, encryption) continue to function with zero network calls.
@@ -278,7 +282,6 @@ enum Commands {
         // 2026-07-05 security review: `--workspace-token` removed — it was a
         // documented auth flag that no code read (destructured away below). Use
         // `--mcp-token` for transport auth.
-
         /// Enable offline / air-gapped mode. Disables web dashboard, LLM,
         /// embedding, and connectors. NIST SP 800-53 SC-7 / DoD IL5+ support.
         #[arg(long, default_value_t = false, hide = true)]
@@ -921,8 +924,12 @@ fn ensure_default_encryption_key(explicit_key: Option<&str>) -> Result<Option<St
     }
     let path = std::path::Path::new(&key_path);
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("cannot create encryption-key directory {}: {e}", parent.display()))?;
+        std::fs::create_dir_all(parent).map_err(|e| {
+            format!(
+                "cannot create encryption-key directory {}: {e}",
+                parent.display()
+            )
+        })?;
     }
     let key = crate::encryption::EncryptionManager::generate_key();
     #[cfg(unix)]
@@ -935,18 +942,34 @@ fn ensure_default_encryption_key(explicit_key: Option<&str>) -> Result<Option<St
             .mode(0o600)
             .open(path)
             .and_then(|mut file| file.write_all(key.as_bytes()))
-            .map_err(|e| format!("cannot create default encryption key {}: {e}", path.display()))?;
+            .map_err(|e| {
+                format!(
+                    "cannot create default encryption key {}: {e}",
+                    path.display()
+                )
+            })?;
     }
     #[cfg(not(unix))]
-    std::fs::write(path, key.as_bytes())
-        .map_err(|e| format!("cannot create default encryption key {}: {e}", path.display()))?;
+    std::fs::write(path, key.as_bytes()).map_err(|e| {
+        format!(
+            "cannot create default encryption key {}: {e}",
+            path.display()
+        )
+    })?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-            .map_err(|e| format!("cannot restrict default encryption key {}: {e}", path.display()))?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(|e| {
+            format!(
+                "cannot restrict default encryption key {}: {e}",
+                path.display()
+            )
+        })?;
     }
-    eprintln!("perseus-vault: generated default encryption key at {} — back it up", path.display());
+    eprintln!(
+        "perseus-vault: generated default encryption key at {} — back it up",
+        path.display()
+    );
     Ok(Some(key_path))
 }
 
@@ -981,7 +1004,11 @@ fn configured_encryption_key_for_database(
         .map(|stats| stats.total_entities)
         .unwrap_or(1);
     if entity_count == 0 {
-        if std::env::var("PERSEUS_VAULT_ALLOW_PLAINTEXT").ok().as_deref() == Some("1") {
+        if std::env::var("PERSEUS_VAULT_ALLOW_PLAINTEXT")
+            .ok()
+            .as_deref()
+            == Some("1")
+        {
             eprintln!(
                 "perseus-vault: WARNING — PERSEUS_VAULT_ALLOW_PLAINTEXT=1 disables default encryption"
             );
@@ -1005,7 +1032,11 @@ fn configured_encryption_key_for_database(
         return Some(key_file);
     }
 
-    if std::env::var("PERSEUS_VAULT_ALLOW_PLAINTEXT").ok().as_deref() == Some("1") {
+    if std::env::var("PERSEUS_VAULT_ALLOW_PLAINTEXT")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
         eprintln!(
             "perseus-vault: WARNING — existing plaintext database; \
              PERSEUS_VAULT_ALLOW_PLAINTEXT=1 permits plaintext writes. Run `init --rekey`."
@@ -1067,7 +1098,11 @@ fn guard_bind(surface: &str, bind_host: &str, has_token: bool) {
     if has_token || crate::util::host_is_loopback(bind_host) {
         return;
     }
-    if std::env::var("PERSEUS_VAULT_ALLOW_INSECURE_BIND").ok().as_deref() == Some("1") {
+    if std::env::var("PERSEUS_VAULT_ALLOW_INSECURE_BIND")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
         eprintln!(
             "perseus-vault: WARNING: {surface} is bound to non-loopback {bind_host} with NO auth token \
              (PERSEUS_VAULT_ALLOW_INSECURE_BIND=1 set — proceeding). Anyone who can reach this port has \
@@ -1095,7 +1130,10 @@ fn open_db_or_exit(db_path: &str) -> db::Database {
     match db::Database::open(db_path) {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("perseus-vault: failed to open database at {}: {}", db_path, e);
+            eprintln!(
+                "perseus-vault: failed to open database at {}: {}",
+                db_path, e
+            );
             std::process::exit(1);
         }
     }
@@ -1127,18 +1165,15 @@ fn print_json<T: serde::Serialize>(value: &T) {
 /// when the DB is empty or unreadable. Uses a read-only connection and
 /// plaintext timestamp columns, so it needs no encryption key.
 fn latest_write_age_days(db_path: &str) -> Option<f64> {
-    let conn = rusqlite::Connection::open_with_flags(
-        db_path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .ok()?;
+    let conn =
+        rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .ok()?;
     let max_of = |sql: &str| -> Option<i64> {
         conn.query_row(sql, [], |r| r.get::<_, Option<i64>>(0))
             .ok()
             .flatten()
     };
-    let ent =
-        max_of("SELECT MAX(COALESCE(recorded_at_unix_ms, created_at_unix_ms)) FROM entities");
+    let ent = max_of("SELECT MAX(COALESCE(recorded_at_unix_ms, created_at_unix_ms)) FROM entities");
     let jrn = max_of("SELECT MAX(created_at_unix_ms) FROM journal");
     let latest = [ent, jrn].into_iter().flatten().max()?;
     let now = std::time::SystemTime::now()
@@ -1215,7 +1250,8 @@ fn run_doctor(db_path: &str) {
     if dbp.exists() {
         match db::Database::open(db_path) {
             Ok(database) => {
-                let p = crate::deployment_profile::resolve(&database, database.deployment_context());
+                let p =
+                    crate::deployment_profile::resolve(&database, database.deployment_context());
                 println!("  profile:    {}", p.profile);
                 println!(
                     "  model:      {} ({}), available={}",
@@ -1224,7 +1260,11 @@ fn run_doctor(db_path: &str) {
                 println!(
                     "  embedding:  {} ({}), available={}, degraded={}, semantic_recall={}",
                     p.embedding_backend.kind,
-                    if p.embedding_backend.degraded { "DEGRADED" } else { "ok" },
+                    if p.embedding_backend.degraded {
+                        "DEGRADED"
+                    } else {
+                        "ok"
+                    },
                     p.embedding_backend.available,
                     p.embedding_backend.degraded,
                     p.embedding_backend.semantic_recall
@@ -1273,9 +1313,13 @@ fn run_doctor(db_path: &str) {
     }
     println!("\nPer-client copy-paste snippets: docs/clients/");
     println!("Tip: run `perseus-vault install-client --hooks --rules` to auto-wire a client's");
-    println!("     config plus the full recall/capture loop (autodetects claude-code/codex/cursor)");
+    println!(
+        "     config plus the full recall/capture loop (autodetects claude-code/codex/cursor)"
+    );
     println!("     (supported: claude-desktop, claude-code, hermes, cursor, windsurf, vscode, zed, codex)");
-    println!("Tip: run `perseus-vault prepare --task \"<what you're about to do>\"` for a pre-turn");
+    println!(
+        "Tip: run `perseus-vault prepare --task \"<what you're about to do>\"` for a pre-turn"
+    );
     println!("     memory-prep block (recall_when triggers + always-on context), zero LLM calls.");
     println!("All checks passed: Perseus Vault speaks MCP stdio, so any MCP client works.");
 }
@@ -1540,7 +1584,10 @@ fn merge_mcp_json(
         .entry(servers_key.to_string())
         .or_insert_with(|| serde_json::json!({}));
     if !servers.is_object() {
-        return Err(format!("{} is not an object; refusing to merge", servers_key));
+        return Err(format!(
+            "{} is not an object; refusing to merge",
+            servers_key
+        ));
     }
     let servers = servers.as_object_mut().unwrap();
     // Replacing the same key updates the entry in place; no legacy keys exist.
@@ -1579,7 +1626,10 @@ fn merge_hermes_yaml(
     }))
     .unwrap();
     let servers = servers.as_mapping_mut().unwrap();
-    servers.insert(serde_yaml::Value::String("perseus-vault".to_string()), entry);
+    servers.insert(
+        serde_yaml::Value::String("perseus-vault".to_string()),
+        entry,
+    );
     Ok(serde_yaml::to_string(&root).unwrap_or_default())
 }
 
@@ -1627,7 +1677,12 @@ fn merge_codex_toml(
             .find("\n[")
             .map(|i| start + header.len() + i + 1)
             .unwrap_or(existing.len());
-        format!("{}{}{}", &existing[..start], stanza, &existing[end_offset..])
+        format!(
+            "{}{}{}",
+            &existing[..start],
+            stanza,
+            &existing[end_offset..]
+        )
     } else if existing.trim().is_empty() {
         stanza
     } else {
@@ -1686,13 +1741,18 @@ fn merge_lifecycle_hooks_json(
             .entry(spec.event.to_string())
             .or_insert_with(|| serde_json::json!([]));
         if !arr.is_array() {
-            return Err(format!("hooks.{} is not an array; refusing to merge", spec.event));
+            return Err(format!(
+                "hooks.{} is not an array; refusing to merge",
+                spec.event
+            ));
         }
         // Already wired (by us, or hand-edited to taste)? A perseus-vault
         // invocation of the same verb under this event counts.
         let present = arr.as_array().unwrap().iter().any(|e| {
             let s = e.to_string();
-            (s.contains("perseus-vault") || s.contains("perseus-vault") || s.contains("perseus_vault"))
+            (s.contains("perseus-vault")
+                || s.contains("perseus-vault")
+                || s.contains("perseus_vault"))
                 && s.contains(spec.verb_marker)
         });
         if !present {
@@ -1733,11 +1793,7 @@ fn append_rules_block(existing: &str) -> Option<String> {
 /// the absolute binary and DB paths, so it embeds both (explicitly sanctioned
 /// by the contract doc). Paths are forward-slashed so the strings survive
 /// POSIX-shell quoting on every platform.
-fn hook_commands(
-    bin: &str,
-    db_path: &str,
-    encryption_key: Option<&str>,
-) -> (String, String) {
+fn hook_commands(bin: &str, db_path: &str, encryption_key: Option<&str>) -> (String, String) {
     let b = bin.replace('\\', "/");
     let d = db_path.replace('\\', "/");
     let key_arg = encryption_key
@@ -1759,11 +1815,7 @@ fn hook_commands(
 /// Claude Code hooks (.claude/settings.json): SessionStart (matcher
 /// startup|resume — stdout becomes context) + SessionEnd hygiene. NOT `Stop`,
 /// which fires per turn. Exactly the docs/lifecycle-hooks.md contract.
-fn claude_code_hook_specs(
-    bin: &str,
-    db_path: &str,
-    encryption_key: Option<&str>,
-) -> Vec<HookSpec> {
+fn claude_code_hook_specs(bin: &str, db_path: &str, encryption_key: Option<&str>) -> Vec<HookSpec> {
     let (prepare, maintain) = hook_commands(bin, db_path, encryption_key);
     vec![
         HookSpec {
@@ -1797,11 +1849,7 @@ fn claude_code_hook_specs(
 /// Codex hooks (~/.codex/hooks.json, Claude-Code-compatible schema): Codex
 /// has no SessionEnd, so hygiene rides `Stop` behind the once-per-day stamp
 /// guard from the contract doc.
-fn codex_hook_specs(
-    bin: &str,
-    db_path: &str,
-    encryption_key: Option<&str>,
-) -> Vec<HookSpec> {
+fn codex_hook_specs(bin: &str, db_path: &str, encryption_key: Option<&str>) -> Vec<HookSpec> {
     let (prepare, guarded_maintain) = hook_commands(bin, db_path, encryption_key);
     vec![
         HookSpec {
@@ -1833,11 +1881,7 @@ fn codex_hook_specs(
 /// Cursor hooks (.cursor/hooks.json v1): sessionStart must inject context as
 /// JSON `additional_context` (not plain stdout), so it runs a wrapper script;
 /// `stop` fires per agent loop and reuses the once-per-day guard.
-fn cursor_hook_specs(
-    bin: &str,
-    db_path: &str,
-    encryption_key: Option<&str>,
-) -> Vec<HookSpec> {
+fn cursor_hook_specs(bin: &str, db_path: &str, encryption_key: Option<&str>) -> Vec<HookSpec> {
     let (_, guarded_maintain) = hook_commands(bin, db_path, encryption_key);
     vec![
         HookSpec {
@@ -1855,11 +1899,7 @@ fn cursor_hook_specs(
 
 /// The Cursor sessionStart wrapper script (verbatim from the contract doc,
 /// with the absolute binary/db paths substituted).
-fn cursor_recall_script(
-    bin: &str,
-    db_path: &str,
-    encryption_key: Option<&str>,
-) -> String {
+fn cursor_recall_script(bin: &str, db_path: &str, encryption_key: Option<&str>) -> String {
     let key_arg = encryption_key
         .map(|key| format!(" --encryption-key \"{}\"", key.replace('"', "\\\"")))
         .unwrap_or_default();
@@ -1906,7 +1946,10 @@ fn connect_one(ctx: &ConnectCtx, client: &str) -> Result<usize, String> {
             "json_mcpServers",
         )),
         "vscode" => Some((over(proj.join(".vscode/mcp.json")), "json_mcpServers")),
-        "zed" => Some((over(home.join(".config/zed/settings.json")), "json_contextServers")),
+        "zed" => Some((
+            over(home.join(".config/zed/settings.json")),
+            "json_contextServers",
+        )),
         "codex" => Some((over(home.join(".codex/config.toml")), "toml_codex")),
         "generic" => None,
         other => {
@@ -1931,26 +1974,22 @@ fn connect_one(ctx: &ConnectCtx, client: &str) -> Result<usize, String> {
         Some((path, kind)) => {
             let existing = std::fs::read_to_string(&path).unwrap_or_default();
             let merged = match kind {
-                "json_mcpServers" => {
-                    merge_mcp_json(
-                        &existing,
-                        "mcpServers",
-                        false,
-                        &ctx.bin,
-                        &ctx.db_path,
-                        ctx.encryption_key.as_deref(),
-                    )
-                }
-                "json_contextServers" => {
-                    merge_mcp_json(
-                        &existing,
-                        "context_servers",
-                        true,
-                        &ctx.bin,
-                        &ctx.db_path,
-                        ctx.encryption_key.as_deref(),
-                    )
-                }
+                "json_mcpServers" => merge_mcp_json(
+                    &existing,
+                    "mcpServers",
+                    false,
+                    &ctx.bin,
+                    &ctx.db_path,
+                    ctx.encryption_key.as_deref(),
+                ),
+                "json_contextServers" => merge_mcp_json(
+                    &existing,
+                    "context_servers",
+                    true,
+                    &ctx.bin,
+                    &ctx.db_path,
+                    ctx.encryption_key.as_deref(),
+                ),
                 "yaml_hermes" => merge_hermes_yaml(
                     &existing,
                     &ctx.bin,
@@ -2104,10 +2143,7 @@ fn run_connect(
             );
             std::process::exit(1);
         }
-        println!(
-            "Detected clients: {}",
-            detected.join(", ")
-        );
+        println!("Detected clients: {}", detected.join(", "));
         detected.iter().map(|s| s.to_string()).collect()
     } else if let Some(c) = client {
         vec![c.to_string()]
@@ -2167,7 +2203,10 @@ fn run_connect(
     } else if changed == 0 {
         println!("Everything already wired — no files changed.");
     } else {
-        println!("Done — {} file(s) updated. Restart the client(s) to pick up the MCP server.", changed);
+        println!(
+            "Done — {} file(s) updated. Restart the client(s) to pick up the MCP server.",
+            changed
+        );
     }
     println!();
     println!("Shared memory root: {}", ctx.db_path);
@@ -2257,6 +2296,7 @@ fn run_prepare(
         max_context_chars,
         model: model.map(str::to_string),
         exclude_ids: recall_when_hits.iter().map(|e| e.id.clone()).collect(),
+        session_id: String::new(),
     };
 
     let context_block = match db.context_block(&opts) {
@@ -2292,11 +2332,17 @@ fn run_prepare(
             "corpus_chars": context_block.corpus_chars,
             "estimated_corpus_tokens": context_block.estimated_corpus_tokens,
         });
-        println!("{}", serde_json::to_string_pretty(&result).unwrap_or_default());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&result).unwrap_or_default()
+        );
         return;
     }
 
-    println!("{}", render_prepare_block(&recall_when_hits, &context_block.markdown));
+    println!(
+        "{}",
+        render_prepare_block(&recall_when_hits, &context_block.markdown)
+    );
 }
 
 /// #520: `perseus-vault capture` — the CLI face of the shared capture
@@ -2468,7 +2514,10 @@ fn run() {
                     );
                 }
                 Err(e) => {
-                    eprintln!("perseus-vault: failed to write key file {}: {}", expanded, e);
+                    eprintln!(
+                        "perseus-vault: failed to write key file {}: {}",
+                        expanded, e
+                    );
                     std::process::exit(1);
                 }
             }
@@ -2539,7 +2588,10 @@ fn run() {
                     }
                 }
                 Err(e) => {
-                    eprintln!("perseus-vault: failed to write key file {}: {}", expanded, e);
+                    eprintln!(
+                        "perseus-vault: failed to write key file {}: {}",
+                        expanded, e
+                    );
                     std::process::exit(1);
                 }
             }
@@ -2548,7 +2600,10 @@ fn run() {
             let mut database = match db::Database::open(db_path) {
                 Ok(d) => d,
                 Err(e) => {
-                    eprintln!("perseus-vault: failed to open database at {}: {}", db_path, e);
+                    eprintln!(
+                        "perseus-vault: failed to open database at {}: {}",
+                        db_path, e
+                    );
                     std::process::exit(1);
                 }
             };
@@ -2582,11 +2637,11 @@ fn run() {
                 }
             }
 
+            println!("Database initialized with encryption at {}", db_path);
             println!(
-                "Database initialized with encryption at {}",
-                db_path
+                "Encryption key: {} (back this file up — it cannot be recovered)",
+                expanded
             );
-            println!("Encryption key: {} (back this file up — it cannot be recovered)", expanded);
             println!(
                 "Run: perseus-vault serve --db {} --encryption-key {}",
                 db_path, expanded
@@ -2635,7 +2690,8 @@ fn run() {
             ref encryption_key,
         }) => {
             let mut database = open_db_or_exit(db_path);
-            let encryption_key = configured_encryption_key_for_database(&mut database, encryption_key.as_deref());
+            let encryption_key =
+                configured_encryption_key_for_database(&mut database, encryption_key.as_deref());
             if let Some(ref key_file) = encryption_key {
                 if let Err(e) = database.set_encryption(key_file) {
                     eprintln!("perseus-vault: encryption setup failed: {}", e);
@@ -2647,7 +2703,10 @@ fn run() {
             match database.forget(category, key, reason) {
                 Ok(true) => println!("Archived {}/{}", category, key),
                 Ok(false) => {
-                    eprintln!("perseus-vault: no active entity found for {}/{}", category, key);
+                    eprintln!(
+                        "perseus-vault: no active entity found for {}/{}",
+                        category, key
+                    );
                     std::process::exit(1);
                 }
                 Err(e) => {
@@ -2666,7 +2725,8 @@ fn run() {
             ref encryption_key,
         }) => {
             let mut database = open_db_or_exit(db_path);
-            let encryption_key = configured_encryption_key_for_database(&mut database, encryption_key.as_deref());
+            let encryption_key =
+                configured_encryption_key_for_database(&mut database, encryption_key.as_deref());
             if let Some(ref key_file) = encryption_key {
                 if let Err(e) = database.set_encryption(key_file) {
                     eprintln!("perseus-vault: encryption setup failed: {}", e);
@@ -2696,7 +2756,8 @@ fn run() {
             ref encryption_key,
         }) => {
             let mut database = open_db_or_exit(db_path);
-            let encryption_key = configured_encryption_key_for_database(&mut database, encryption_key.as_deref());
+            let encryption_key =
+                configured_encryption_key_for_database(&mut database, encryption_key.as_deref());
             if let Some(ref key_file) = encryption_key {
                 if let Err(e) = database.set_encryption(key_file) {
                     eprintln!("perseus-vault: encryption setup failed: {}", e);
@@ -2735,7 +2796,8 @@ fn run() {
             vacuum,
         }) => {
             let mut database = open_db_or_exit(db_path);
-            let encryption_key = configured_encryption_key_for_database(&mut database, encryption_key.as_deref());
+            let encryption_key =
+                configured_encryption_key_for_database(&mut database, encryption_key.as_deref());
             if let Some(ref key_file) = encryption_key {
                 if let Err(e) = database.set_encryption(key_file) {
                     eprintln!("perseus-vault: encryption setup failed: {}", e);
@@ -2757,7 +2819,8 @@ fn run() {
             ref encryption_key,
         }) => {
             let mut database = open_db_or_exit(db_path);
-            let encryption_key = configured_encryption_key_for_database(&mut database, encryption_key.as_deref());
+            let encryption_key =
+                configured_encryption_key_for_database(&mut database, encryption_key.as_deref());
             if let Some(ref key_file) = encryption_key {
                 if let Err(e) = database.set_encryption(key_file) {
                     eprintln!("perseus-vault: encryption setup failed: {}", e);
@@ -2804,7 +2867,8 @@ fn run() {
             retention_days,
         }) => {
             let mut database = open_db_or_exit(db_path);
-            let encryption_key = configured_encryption_key_for_database(&mut database, encryption_key.as_deref());
+            let encryption_key =
+                configured_encryption_key_for_database(&mut database, encryption_key.as_deref());
             if let Some(ref key_file) = encryption_key {
                 if let Err(e) = database.set_encryption(key_file) {
                     eprintln!("perseus-vault: encryption setup failed: {}", e);
@@ -2917,7 +2981,8 @@ fn run() {
             ref encryption_key,
         }) => {
             let mut database = open_db_or_exit(db_path);
-            let encryption_key = configured_encryption_key_for_database(&mut database, encryption_key.as_deref());
+            let encryption_key =
+                configured_encryption_key_for_database(&mut database, encryption_key.as_deref());
             if let Some(ref key_file) = encryption_key {
                 if let Err(e) = database.set_encryption(key_file) {
                     eprintln!("perseus-vault: encryption setup failed: {}", e);
@@ -2984,7 +3049,8 @@ fn run() {
             };
 
             let mut database = open_db_or_exit(db_path);
-            let encryption_key = configured_encryption_key_for_database(&mut database, encryption_key.as_deref());
+            let encryption_key =
+                configured_encryption_key_for_database(&mut database, encryption_key.as_deref());
             if let Some(ref key_file) = encryption_key {
                 if let Err(e) = database.set_encryption(key_file) {
                     eprintln!("perseus-vault: capture: encryption setup failed: {}", e);
@@ -2997,7 +3063,14 @@ fn run() {
             // gracefully to the rule-based distiller (and says so).
             if llm {
                 if let Some(ref endpoint) = llm_endpoint {
-                    database.set_llm(true, endpoint, llm_model, llm_api_key.as_deref(), None, None);
+                    database.set_llm(
+                        true,
+                        endpoint,
+                        llm_model,
+                        llm_api_key.as_deref(),
+                        None,
+                        None,
+                    );
                 }
             }
 
@@ -3038,7 +3111,8 @@ fn run() {
             ref encryption_key,
         }) => {
             let mut database = open_db_or_exit(db_path);
-            let encryption_key = configured_encryption_key_for_database(&mut database, encryption_key.as_deref());
+            let encryption_key =
+                configured_encryption_key_for_database(&mut database, encryption_key.as_deref());
             if let Some(ref key_file) = encryption_key {
                 if let Err(e) = database.set_encryption(key_file) {
                     eprintln!("perseus-vault: encryption setup failed: {}", e);
@@ -3127,7 +3201,8 @@ fn run() {
             ref encryption_key,
         }) => {
             let mut database = open_db_or_exit(db_path);
-            let encryption_key = configured_encryption_key_for_database(&mut database, encryption_key.as_deref());
+            let encryption_key =
+                configured_encryption_key_for_database(&mut database, encryption_key.as_deref());
             if let Some(ref key_file) = encryption_key {
                 if let Err(e) = database.set_encryption(key_file) {
                     eprintln!("perseus-vault: encryption setup failed: {}", e);
@@ -3158,7 +3233,8 @@ fn run() {
             ref encryption_key,
         }) => {
             let mut database = open_db_or_exit(db_path);
-            let encryption_key = configured_encryption_key_for_database(&mut database, encryption_key.as_deref());
+            let encryption_key =
+                configured_encryption_key_for_database(&mut database, encryption_key.as_deref());
             if let Some(ref key_file) = encryption_key {
                 if let Err(e) = database.set_encryption(key_file) {
                     eprintln!("perseus-vault: encryption setup failed: {}", e);
@@ -3233,7 +3309,10 @@ fn run() {
                         .filter(|&n| n > 0)
                         .unwrap_or(2),
                 );
-                let mut last = database.state_digest().map(|d| d.digest).unwrap_or_default();
+                let mut last = database
+                    .state_digest()
+                    .map(|d| d.digest)
+                    .unwrap_or_default();
                 loop {
                     std::thread::sleep(poll);
                     let current = match database.state_digest() {
@@ -3260,7 +3339,8 @@ fn run() {
             ref encryption_key,
         }) => {
             let mut database = open_db_or_exit(db_path);
-            let encryption_key = configured_encryption_key_for_database(&mut database, encryption_key.as_deref());
+            let encryption_key =
+                configured_encryption_key_for_database(&mut database, encryption_key.as_deref());
             if let Some(ref key_file) = encryption_key {
                 if let Err(e) = database.set_encryption(key_file) {
                     eprintln!("perseus-vault: encryption setup failed: {}", e);
@@ -3284,7 +3364,8 @@ fn run() {
             ref encryption_key,
         }) => {
             let mut database = open_db_or_exit(db_path);
-            let encryption_key = configured_encryption_key_for_database(&mut database, encryption_key.as_deref());
+            let encryption_key =
+                configured_encryption_key_for_database(&mut database, encryption_key.as_deref());
             if let Some(ref key_file) = encryption_key {
                 if let Err(e) = database.set_encryption(key_file) {
                     eprintln!("perseus-vault: encryption setup failed: {}", e);
@@ -3315,7 +3396,8 @@ fn run() {
             ref encryption_key,
         }) => {
             let mut database = open_db_or_exit(db_path);
-            let encryption_key = configured_encryption_key_for_database(&mut database, encryption_key.as_deref());
+            let encryption_key =
+                configured_encryption_key_for_database(&mut database, encryption_key.as_deref());
             if let Some(ref key_file) = encryption_key {
                 if let Err(e) = database.set_encryption(key_file) {
                     eprintln!("perseus-vault: encryption setup failed: {}", e);
@@ -3346,7 +3428,8 @@ fn run() {
             ref encryption_key,
         }) => {
             let mut database = open_db_or_exit(db_path);
-            let encryption_key = configured_encryption_key_for_database(&mut database, encryption_key.as_deref());
+            let encryption_key =
+                configured_encryption_key_for_database(&mut database, encryption_key.as_deref());
             if let Some(ref key_file) = encryption_key {
                 if let Err(e) = database.set_encryption(key_file) {
                     eprintln!("perseus-vault: encryption setup failed: {}", e);
@@ -3371,7 +3454,10 @@ fn run() {
             let target_db = match db::Database::open(&to) {
                 Ok(db) => db,
                 Err(e) => {
-                    eprintln!("perseus-vault: failed to open target database at {}: {}", to, e);
+                    eprintln!(
+                        "perseus-vault: failed to open target database at {}: {}",
+                        to, e
+                    );
                     std::process::exit(1);
                 }
             };
@@ -3416,9 +3502,21 @@ fn run() {
             // Offline mode: disable network-dependent features
             let offline = cli.offline;
             let effective_web = if offline { false } else { *web };
-            let effective_llm = if offline { None } else { llm_endpoint.as_deref() };
-            let effective_embedding = if offline { None } else { embedding_endpoint.as_deref() };
-            let effective_connectors = if offline { None } else { connectors_config.as_deref() };
+            let effective_llm = if offline {
+                None
+            } else {
+                llm_endpoint.as_deref()
+            };
+            let effective_embedding = if offline {
+                None
+            } else {
+                embedding_endpoint.as_deref()
+            };
+            let effective_connectors = if offline {
+                None
+            } else {
+                connectors_config.as_deref()
+            };
 
             if offline {
                 eprintln!("perseus-vault: running in offline / air-gapped mode");
@@ -3428,14 +3526,15 @@ fn run() {
             let mut database = match db::Database::open(&db_path) {
                 Ok(db) => db,
                 Err(e) => {
-                    eprintln!("perseus-vault: failed to open database at {}: {}", db_path, e);
+                    eprintln!(
+                        "perseus-vault: failed to open database at {}: {}",
+                        db_path, e
+                    );
                     std::process::exit(1);
                 }
             };
-            let encryption_key = configured_encryption_key_for_database(
-                &mut database,
-                encryption_key.as_deref(),
-            );
+            let encryption_key =
+                configured_encryption_key_for_database(&mut database, encryption_key.as_deref());
             if let Some(ref key_file) = encryption_key {
                 eprintln!("perseus-vault: encryption enabled (key: {})", key_file);
                 warn_key_acls_on_windows(key_file);
@@ -3460,7 +3559,10 @@ fn run() {
             // Configure local ONNX embeddings if --embedding-model is set
             if let Some(ref model_path) = embedding_model_path {
                 database.set_embedding_model(model_path);
-                eprintln!("perseus-vault: local ONNX embedding enabled (model: {})", model_path);
+                eprintln!(
+                    "perseus-vault: local ONNX embedding enabled (model: {})",
+                    model_path
+                );
             }
 
             // #885: declare the embedding storage format (fresh stores only;
@@ -3493,7 +3595,10 @@ fn run() {
                     Ok(connectors) => {
                         let count = connectors.len();
                         database.set_connectors(connectors);
-                        eprintln!("perseus-vault: loaded {} connector(s) from {}", count, config_path);
+                        eprintln!(
+                            "perseus-vault: loaded {} connector(s) from {}",
+                            count, config_path
+                        );
                     }
                     Err(e) => {
                         eprintln!("perseus-vault: fatal — failed to load connectors: {}", e);
@@ -3512,7 +3617,13 @@ fn run() {
                 .ok()
                 .as_deref()
                 == Some("1");
-            database.set_deployment_context(offline, effective_web, web_bind, false, external_actions);
+            database.set_deployment_context(
+                offline,
+                effective_web,
+                web_bind,
+                false,
+                external_actions,
+            );
 
             // One Database (one connection pool) per process (#402): every
             // surface — web dashboard, MCP transport, stdio server — shares
@@ -3606,7 +3717,10 @@ fn run() {
                 let rt = match tokio::runtime::Runtime::new() {
                     Ok(rt) => rt,
                     Err(e) => {
-                        eprintln!("perseus-vault: fatal: transport runtime creation failed: {}", e);
+                        eprintln!(
+                            "perseus-vault: fatal: transport runtime creation failed: {}",
+                            e
+                        );
                         std::process::exit(1);
                     }
                 };
@@ -3639,7 +3753,10 @@ fn run() {
             let mut database = match db::Database::open(&db_path) {
                 Ok(db) => db,
                 Err(e) => {
-                    eprintln!("perseus-vault: failed to open database at {}: {}", db_path, e);
+                    eprintln!(
+                        "perseus-vault: failed to open database at {}: {}",
+                        db_path, e
+                    );
                     std::process::exit(1);
                 }
             };
@@ -3672,7 +3789,10 @@ fn run() {
                     Ok(connectors) => {
                         let count = connectors.len();
                         database.set_connectors(connectors);
-                        eprintln!("perseus-vault: loaded {} connector(s) from {}", count, config_path);
+                        eprintln!(
+                            "perseus-vault: loaded {} connector(s) from {}",
+                            count, config_path
+                        );
                     }
                     Err(e) => {
                         eprintln!("perseus-vault: fatal — failed to load connectors: {}", e);
@@ -3689,7 +3809,11 @@ fn run() {
                 let web_port = cli.port;
                 let web_bind_addr = cli.web_bind.clone();
                 let web_db = std::sync::Arc::clone(&database);
-                guard_bind("web dashboard", &web_bind_addr, cli.web_auth_token.is_some());
+                guard_bind(
+                    "web dashboard",
+                    &web_bind_addr,
+                    cli.web_auth_token.is_some(),
+                );
                 let router = crate::web::build_router(web_db, cli.web_auth_token.clone());
                 let addr = format!("{}:{}", web_bind_addr, web_port);
                 eprintln!("perseus-vault: web dashboard starting on http://{}", addr);
@@ -3745,7 +3869,10 @@ fn run() {
                 let rt = match tokio::runtime::Runtime::new() {
                     Ok(rt) => rt,
                     Err(e) => {
-                        eprintln!("perseus-vault: fatal: transport runtime creation failed: {}", e);
+                        eprintln!(
+                            "perseus-vault: fatal: transport runtime creation failed: {}",
+                            e
+                        );
                         std::process::exit(1);
                     }
                 };
@@ -3894,7 +4021,12 @@ mod tests {
 
     #[test]
     fn parses_serve_with_db() {
-        let cli = Cli::parse_from(["perseus-vault", "serve", "--db", "/tmp/perseus-vault-serve.db"]);
+        let cli = Cli::parse_from([
+            "perseus-vault",
+            "serve",
+            "--db",
+            "/tmp/perseus-vault-serve.db",
+        ]);
         match cli.command {
             Some(Commands::Serve { db, .. }) => assert_eq!(db, "/tmp/perseus-vault-serve.db"),
             _ => panic!("expected serve subcommand"),
@@ -3908,14 +4040,25 @@ mod tests {
         // kept as clap aliases so stale scripts don't fail with a cryptic
         // "unexpected argument" (the false-negative that polluted #657 triage).
         let cli = Cli::parse_from([
-            "perseus-vault", "write",
-            "--category", "smoke_test",
-            "--key", "k1",
-            "--type", "reference",
-            "--body-json", r#"{"note":"x"}"#,
+            "perseus-vault",
+            "write",
+            "--category",
+            "smoke_test",
+            "--key",
+            "k1",
+            "--type",
+            "reference",
+            "--body-json",
+            r#"{"note":"x"}"#,
         ]);
         match cli.command {
-            Some(Commands::Write { category, key, entity_type, body, .. }) => {
+            Some(Commands::Write {
+                category,
+                key,
+                entity_type,
+                body,
+                ..
+            }) => {
                 assert_eq!(category, "smoke_test");
                 assert_eq!(key, "k1");
                 assert_eq!(entity_type, "reference", "--type must alias --entity-type");
@@ -4010,7 +4153,10 @@ mod tests {
         // end to end on a temp database: distill, write, then re-capture and
         // watch the flood control (same key → update, not a sibling row).
         let dir = std::env::temp_dir();
-        let path = dir.join(format!("perseus_vault-test-capture-cli-{}.db", uuid::Uuid::new_v4()));
+        let path = dir.join(format!(
+            "perseus_vault-test-capture-cli-{}.db",
+            uuid::Uuid::new_v4()
+        ));
         let path_str = path.to_str().unwrap().to_string();
         let database = db::Database::open(&path_str).expect("open temp db");
 
@@ -4018,14 +4164,34 @@ mod tests {
                        The recall-gate test failed because the dense model cache was cold.\n\n\
                        # Standing decision\n\
                        We decided to rerun flaky suites once before investigating.";
-        let v = run_capture(&database, payload, Some("ws-cli"), Some("cli-agent"), 20, false, false, false, None)
-            .expect("capture must succeed");
+        let v = run_capture(
+            &database,
+            payload,
+            Some("ws-cli"),
+            Some("cli-agent"),
+            20,
+            false,
+            false,
+            false,
+            None,
+        )
+        .expect("capture must succeed");
         assert_eq!(v["captured"], serde_json::json!(2), "{v}");
         assert_eq!(v["created"], serde_json::json!(2), "{v}");
 
         // Re-capturing the identical payload must not flood the store.
-        let v = run_capture(&database, payload, Some("ws-cli"), None, 20, false, false, false, None)
-            .expect("re-capture must succeed");
+        let v = run_capture(
+            &database,
+            payload,
+            Some("ws-cli"),
+            None,
+            20,
+            false,
+            false,
+            false,
+            None,
+        )
+        .expect("re-capture must succeed");
         assert_eq!(v["created"], serde_json::json!(0), "{v}");
         let stats = database.stats().expect("stats");
         // 2 notes + 1 retained transcript (the #888 durable source). The
@@ -4035,8 +4201,18 @@ mod tests {
         assert_eq!(stats.total_entities, 3, "re-capture must not add rows");
 
         // dry_run distills but writes nothing.
-        let v = run_capture(&database, "A brand new durable takeaway about caching.", None, None, 20, true, false, false, None)
-            .expect("dry-run capture");
+        let v = run_capture(
+            &database,
+            "A brand new durable takeaway about caching.",
+            None,
+            None,
+            20,
+            true,
+            false,
+            false,
+            None,
+        )
+        .expect("dry-run capture");
         assert_eq!(v["dry_run"], serde_json::json!(true));
         let stats = database.stats().expect("stats");
         assert_eq!(stats.total_entities, 3);
@@ -4056,9 +4232,12 @@ mod tests {
         // no dry-run, no vacuum unless asked.
         let cli = Cli::parse_from(["perseus-vault", "maintain", "--db", "/tmp/maintain.db"]);
         match cli.command {
-            Some(Commands::Maintain {db,
+            Some(Commands::Maintain {
+                db,
                 dry_run,
-                vacuum, .. }) => {
+                vacuum,
+                ..
+            }) => {
                 assert_eq!(db, "/tmp/maintain.db");
                 assert!(!dry_run);
                 assert!(!vacuum);
@@ -4078,7 +4257,8 @@ mod tests {
         }
 
         // Top-level --db must propagate like the other db-carrying verbs.
-        let mut cli = Cli::parse_from(["perseus-vault", "--db", "/tmp/top-maintain.db", "maintain"]);
+        let mut cli =
+            Cli::parse_from(["perseus-vault", "--db", "/tmp/top-maintain.db", "maintain"]);
         apply_top_level_db(&mut cli);
         match cli.command {
             Some(Commands::Maintain { db, .. }) => assert_eq!(db, "/tmp/top-maintain.db"),
@@ -4110,11 +4290,25 @@ mod tests {
 
     #[test]
     fn warns_only_for_encrypted_storage_without_an_explicit_key() {
-        assert!(should_warn_plaintext_writes_to_encrypted_db("encrypted", false));
-        assert!(!should_warn_plaintext_writes_to_encrypted_db("encrypted", true));
-        assert!(!should_warn_plaintext_writes_to_encrypted_db("plaintext", false));
-        assert!(!should_warn_plaintext_writes_to_encrypted_db("mixed-legacy", false));
-        assert!(!should_warn_plaintext_writes_to_encrypted_db("unknown", false));
+        assert!(should_warn_plaintext_writes_to_encrypted_db(
+            "encrypted",
+            false
+        ));
+        assert!(!should_warn_plaintext_writes_to_encrypted_db(
+            "encrypted",
+            true
+        ));
+        assert!(!should_warn_plaintext_writes_to_encrypted_db(
+            "plaintext",
+            false
+        ));
+        assert!(!should_warn_plaintext_writes_to_encrypted_db(
+            "mixed-legacy",
+            false
+        ));
+        assert!(!should_warn_plaintext_writes_to_encrypted_db(
+            "unknown", false
+        ));
     }
 
     #[test]
@@ -4228,15 +4422,23 @@ mod tests {
     #[test]
     fn parses_connect_with_client_and_db() {
         let cli = Cli::parse_from([
-            "perseus-vault", "connect", "--client", "claude-code", "--db", "/tmp/connect.db",
+            "perseus-vault",
+            "connect",
+            "--client",
+            "claude-code",
+            "--db",
+            "/tmp/connect.db",
         ]);
         match cli.command {
-            Some(Commands::Connect {client,
+            Some(Commands::Connect {
+                client,
                 db,
                 dry_run,
                 hooks,
                 rules,
-                all_detected, .. }) => {
+                all_detected,
+                ..
+            }) => {
                 assert_eq!(client.as_deref(), Some("claude-code"));
                 assert_eq!(db, "/tmp/connect.db");
                 assert!(!dry_run && !hooks && !rules && !all_detected);
@@ -4247,7 +4449,13 @@ mod tests {
 
     #[test]
     fn parses_connect_dry_run_flag() {
-        let cli = Cli::parse_from(["perseus-vault", "connect", "--client", "cursor", "--dry-run"]);
+        let cli = Cli::parse_from([
+            "perseus-vault",
+            "connect",
+            "--client",
+            "cursor",
+            "--dry-run",
+        ]);
         match cli.command {
             Some(Commands::Connect { dry_run, .. }) => assert!(dry_run),
             _ => panic!("expected connect subcommand"),
@@ -4297,7 +4505,8 @@ mod tests {
             "3",
         ]);
         match cli.command {
-            Some(Commands::Prepare {db,
+            Some(Commands::Prepare {
+                db,
                 task,
                 recall_when_limit,
                 context_limit,
@@ -4305,7 +4514,9 @@ mod tests {
                 json,
                 max_context_chars,
                 model,
-                legacy_context, .. }) => {
+                legacy_context,
+                ..
+            }) => {
                 assert_eq!(db, "/tmp/prep.db");
                 assert_eq!(task, "deploying the service");
                 assert_eq!(recall_when_limit, 5);
@@ -4469,7 +4680,8 @@ mod tests {
 
     /// Fresh ConnectCtx rooted in a unique temp dir: home + project subdirs.
     fn test_ctx(hooks: bool, rules: bool, dry_run: bool) -> (std::path::PathBuf, ConnectCtx) {
-        let tmp = std::env::temp_dir().join(format!("perseus_vault-connect-{}", uuid::Uuid::new_v4()));
+        let tmp =
+            std::env::temp_dir().join(format!("perseus_vault-connect-{}", uuid::Uuid::new_v4()));
         let home = tmp.join("home");
         let project = tmp.join("project");
         std::fs::create_dir_all(&home).unwrap();
@@ -4520,7 +4732,10 @@ mod tests {
         let content = std::fs::read_to_string(ctx.project_dir.join(".mcp.json")).unwrap();
         let v: serde_json::Value = serde_json::from_str(&content).unwrap();
         assert_eq!(v["mcpServers"]["perseus-vault"]["args"][1], "--db");
-        assert_eq!(v["mcpServers"]["perseus-vault"]["args"][2], "/tmp/shared-brain.db");
+        assert_eq!(
+            v["mcpServers"]["perseus-vault"]["args"][2],
+            "/tmp/shared-brain.db"
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -4538,19 +4753,34 @@ mod tests {
 
         let content = std::fs::read_to_string(&cfg).unwrap();
         let v: serde_json::Value = serde_json::from_str(&content).unwrap();
-        assert!(v["mcpServers"]["perseus-vault"].is_object(), "stanza missing: {}", content);
-        assert_eq!(v["mcpServers"]["other-tool"]["command"], "foo", "unrelated server dropped: {}", content);
-        assert_eq!(v["unrelatedTopLevelKey"], true, "unrelated top-level key dropped: {}", content);
+        assert!(
+            v["mcpServers"]["perseus-vault"].is_object(),
+            "stanza missing: {}",
+            content
+        );
+        assert_eq!(
+            v["mcpServers"]["other-tool"]["command"], "foo",
+            "unrelated server dropped: {}",
+            content
+        );
+        assert_eq!(
+            v["unrelatedTopLevelKey"], true,
+            "unrelated top-level key dropped: {}",
+            content
+        );
         // The existing entry is updated in place, not duplicated or nulled.
         assert_eq!(
             v["mcpServers"]["perseus-vault"]["command"], "/opt/perseus-vault",
-            "stale command should be replaced: {}", content
+            "stale command should be replaced: {}",
+            content
         );
 
         // A `.bak-perseus` backup of the pre-merge file must exist.
         let backup = ctx.project_dir.join(".mcp.json.bak-perseus");
         assert!(backup.exists(), "expected {} to exist", backup.display());
-        assert!(std::fs::read_to_string(&backup).unwrap().contains("old-perseus-vault"));
+        assert!(std::fs::read_to_string(&backup)
+            .unwrap()
+            .contains("old-perseus-vault"));
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -4584,11 +4814,27 @@ mod tests {
         ctx.db_path = "/tmp/codex1.db".to_string();
         connect_one(&ctx, "codex").unwrap();
         let first = std::fs::read_to_string(&config_path).unwrap();
-        assert!(first.contains("# my codex config"), "comment dropped:\n{}", first);
-        assert!(first.contains("model = \"o4\""), "unknown key dropped:\n{}", first);
-        assert!(first.contains("[mcp_servers.other]"), "unrelated table dropped:\n{}", first);
+        assert!(
+            first.contains("# my codex config"),
+            "comment dropped:\n{}",
+            first
+        );
+        assert!(
+            first.contains("model = \"o4\""),
+            "unknown key dropped:\n{}",
+            first
+        );
+        assert!(
+            first.contains("[mcp_servers.other]"),
+            "unrelated table dropped:\n{}",
+            first
+        );
         assert!(first.contains("[mcp_servers.perseus-vault]"));
-        assert!(!first.contains("command = \"old\""), "stale command should be replaced:\n{}", first);
+        assert!(
+            !first.contains("command = \"old\""),
+            "stale command should be replaced:\n{}",
+            first
+        );
         assert!(first.contains("/tmp/codex1.db"));
 
         // Re-running with a different db must REPLACE the stanza in place.
@@ -4602,7 +4848,11 @@ mod tests {
             second
         );
         assert!(second.contains("/tmp/codex2.db"));
-        assert!(!second.contains("/tmp/codex1.db"), "stale db path should be gone:\n{}", second);
+        assert!(
+            !second.contains("/tmp/codex1.db"),
+            "stale db path should be gone:\n{}",
+            second
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -4630,7 +4880,8 @@ mod tests {
 
     #[test]
     fn detect_clients_by_config_dir_presence() {
-        let tmp = std::env::temp_dir().join(format!("perseus_vault-detect-{}", uuid::Uuid::new_v4()));
+        let tmp =
+            std::env::temp_dir().join(format!("perseus_vault-detect-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(tmp.join(".claude")).unwrap();
         std::fs::create_dir_all(tmp.join(".cursor")).unwrap();
         // A FILE named .codex must not count as a config dir.
@@ -4654,7 +4905,10 @@ mod tests {
             &std::fs::read_to_string(ctx.project_dir.join(".claude/settings.json")).unwrap(),
         )
         .unwrap();
-        assert_eq!(settings["hooks"]["SessionStart"][0]["matcher"], "startup|resume");
+        assert_eq!(
+            settings["hooks"]["SessionStart"][0]["matcher"],
+            "startup|resume"
+        );
         assert!(settings["hooks"]["SessionStart"][0]["hooks"][0]["command"]
             .as_str()
             .unwrap()
@@ -4694,7 +4948,11 @@ mod tests {
         let stop_cmd = codex_hooks["hooks"]["Stop"][0]["hooks"][0]["command"]
             .as_str()
             .unwrap();
-        assert!(stop_cmd.contains(".maintain-$(date +%F)"), "missing daily guard: {}", stop_cmd);
+        assert!(
+            stop_cmd.contains(".maintain-$(date +%F)"),
+            "missing daily guard: {}",
+            stop_cmd
+        );
         assert!(std::fs::read_to_string(ctx.home.join(".codex/AGENTS.md"))
             .unwrap()
             .contains("## Memory (Perseus Vault)"));
@@ -4711,16 +4969,26 @@ mod tests {
             "./.cursor/hooks/perseus-vault-recall.sh"
         );
         let script = std::fs::read_to_string(
-            ctx.project_dir.join(".cursor/hooks/perseus-vault-recall.sh"),
+            ctx.project_dir
+                .join(".cursor/hooks/perseus-vault-recall.sh"),
         )
         .unwrap();
         assert!(script.contains("additional_context"));
 
         let after_first = snapshot_tree(&tmp);
         for client in ["codex", "cursor"] {
-            assert_eq!(connect_one(&ctx, client).unwrap(), 0, "{} re-run must be a no-op", client);
+            assert_eq!(
+                connect_one(&ctx, client).unwrap(),
+                0,
+                "{} re-run must be a no-op",
+                client
+            );
         }
-        assert_eq!(snapshot_tree(&tmp), after_first, "re-runs must not change any file");
+        assert_eq!(
+            snapshot_tree(&tmp),
+            after_first,
+            "re-runs must not change any file"
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -4740,15 +5008,23 @@ mod tests {
             .unwrap()
             .expect("first merge must change the doc");
         let v: serde_json::Value = serde_json::from_str(&merged).unwrap();
-        assert_eq!(v["permissions"]["allow"][0], "Bash(ls:*)", "unknown key dropped");
+        assert_eq!(
+            v["permissions"]["allow"][0], "Bash(ls:*)",
+            "unknown key dropped"
+        );
         assert_eq!(v["model"], "opus");
-        assert_eq!(v["hooks"]["SessionStart"][0]["hooks"][0]["command"], "echo unrelated");
+        assert_eq!(
+            v["hooks"]["SessionStart"][0]["hooks"][0]["command"],
+            "echo unrelated"
+        );
         assert_eq!(v["hooks"]["SessionStart"][1]["matcher"], "startup|resume");
         assert_eq!(v["hooks"]["SessionEnd"][0]["matcher"], "*");
 
         // Idempotent: merging into the merged doc is a no-op (None).
         assert!(
-            merge_lifecycle_hooks_json(&merged, &specs, false).unwrap().is_none(),
+            merge_lifecycle_hooks_json(&merged, &specs, false)
+                .unwrap()
+                .is_none(),
             "second merge must report no change"
         );
     }
@@ -4776,25 +5052,41 @@ mod tests {
 
     #[test]
     fn plan_write_backs_up_and_skips_unchanged() {
-        let tmp = std::env::temp_dir().join(format!("perseus_vault-planwrite-{}", uuid::Uuid::new_v4()));
+        let tmp =
+            std::env::temp_dir().join(format!("perseus_vault-planwrite-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).unwrap();
         let f = tmp.join("cfg.json");
 
         // Fresh file: written, no backup (nothing to back up).
-        assert_eq!(plan_write(&f, "v1\n", false, "[t]").unwrap(), WriteOutcome::Wrote);
+        assert_eq!(
+            plan_write(&f, "v1\n", false, "[t]").unwrap(),
+            WriteOutcome::Wrote
+        );
         assert!(!tmp.join("cfg.json.bak-perseus").exists());
 
         // Unchanged content: no-op, still no backup.
-        assert_eq!(plan_write(&f, "v1\n", false, "[t]").unwrap(), WriteOutcome::Unchanged);
+        assert_eq!(
+            plan_write(&f, "v1\n", false, "[t]").unwrap(),
+            WriteOutcome::Unchanged
+        );
         assert!(!tmp.join("cfg.json.bak-perseus").exists());
 
         // Changed content: backup holds the pre-change bytes.
-        assert_eq!(plan_write(&f, "v2\n", false, "[t]").unwrap(), WriteOutcome::Wrote);
-        assert_eq!(std::fs::read_to_string(tmp.join("cfg.json.bak-perseus")).unwrap(), "v1\n");
+        assert_eq!(
+            plan_write(&f, "v2\n", false, "[t]").unwrap(),
+            WriteOutcome::Wrote
+        );
+        assert_eq!(
+            std::fs::read_to_string(tmp.join("cfg.json.bak-perseus")).unwrap(),
+            "v1\n"
+        );
         assert_eq!(std::fs::read_to_string(&f).unwrap(), "v2\n");
 
         // Dry run: reports, writes nothing.
-        assert_eq!(plan_write(&f, "v3\n", true, "[t]").unwrap(), WriteOutcome::WouldWrite);
+        assert_eq!(
+            plan_write(&f, "v3\n", true, "[t]").unwrap(),
+            WriteOutcome::WouldWrite
+        );
         assert_eq!(std::fs::read_to_string(&f).unwrap(), "v2\n");
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -4810,8 +5102,14 @@ mod tests {
     #[test]
     fn explicit_subcommand_db_wins_over_top_level() {
         // #313: an explicit subcommand-level `--db` always beats the top-level one.
-        let mut cli =
-            Cli::parse_from(["perseus-vault", "--db", "/tmp/top.db", "serve", "--db", "/tmp/sub.db"]);
+        let mut cli = Cli::parse_from([
+            "perseus-vault",
+            "--db",
+            "/tmp/top.db",
+            "serve",
+            "--db",
+            "/tmp/sub.db",
+        ]);
         apply_top_level_db(&mut cli);
         match cli.command {
             Some(Commands::Serve { db, .. }) => assert_eq!(db, "/tmp/sub.db"),
@@ -4822,10 +5120,18 @@ mod tests {
     #[test]
     fn top_level_db_propagates_to_obsidian_sync() {
         // #313: ObsidianSync uses an Option<String> db; the top-level flag fills it.
-        let mut cli = Cli::parse_from(["perseus-vault", "--db", "/tmp/top.db", "obsidian-sync", "/tmp/v"]);
+        let mut cli = Cli::parse_from([
+            "perseus-vault",
+            "--db",
+            "/tmp/top.db",
+            "obsidian-sync",
+            "/tmp/v",
+        ]);
         apply_top_level_db(&mut cli);
         match cli.command {
-            Some(Commands::ObsidianSync { db, .. }) => assert_eq!(db.as_deref(), Some("/tmp/top.db")),
+            Some(Commands::ObsidianSync { db, .. }) => {
+                assert_eq!(db.as_deref(), Some("/tmp/top.db"))
+            }
             _ => panic!("expected obsidian-sync subcommand"),
         }
     }
@@ -4841,7 +5147,7 @@ mod tests {
             "/tmp/new.db",
         ]);
         match cli.command {
-            Some(Commands::Migrate {from, to, .. }) => {
+            Some(Commands::Migrate { from, to, .. }) => {
                 assert_eq!(from, "/tmp/old.db");
                 assert_eq!(to, "/tmp/new.db");
             }
@@ -4855,9 +5161,12 @@ mod tests {
         // watch off by default.
         let cli = Cli::parse_from(["perseus-vault", "obsidian-sync", "/tmp/vault"]);
         match cli.command {
-            Some(Commands::ObsidianSync {vault_path,
+            Some(Commands::ObsidianSync {
+                vault_path,
                 db,
-                watch, .. }) => {
+                watch,
+                ..
+            }) => {
                 assert_eq!(vault_path, "/tmp/vault");
                 assert_eq!(db, None);
                 assert!(!watch);
@@ -4877,9 +5186,12 @@ mod tests {
             "--watch",
         ]);
         match cli.command {
-            Some(Commands::ObsidianSync {vault_path,
+            Some(Commands::ObsidianSync {
+                vault_path,
                 db,
-                watch, .. }) => {
+                watch,
+                ..
+            }) => {
                 assert_eq!(vault_path, "/tmp/vault");
                 assert_eq!(db.as_deref(), Some("/tmp/m.db"));
                 assert!(watch);

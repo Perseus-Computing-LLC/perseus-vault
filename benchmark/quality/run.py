@@ -502,6 +502,12 @@ class VaultClient:
         self.binary = str(binary)
         self.db = str(db)
         self.client_name = client_name
+        # #875: the learned-anticipation scenario resolves preload events
+        # within the run (no wall-clock waiting). The env override shortens
+        # the resolution window for the telemetry pass only; entity semantics
+        # are unaffected.
+        env = dict(os.environ)
+        env["PERSEUS_VAULT_PRELOAD_WINDOW_MS"] = "1"
         self.p = subprocess.Popen(
             [self.binary, "--db", self.db],
             stdin=subprocess.PIPE,
@@ -511,6 +517,7 @@ class VaultClient:
             encoding="utf-8",
             errors="replace",
             start_new_session=(os.name != "nt"),
+            env=env,
         )
         try:
             self.response_timeout_seconds = MCP_RESPONSE_TIMEOUT_SECONDS
@@ -2357,6 +2364,227 @@ def run_interference_gate(client, **_):
     return output(checks, evidence, metric_events)
 
 
+def run_learned_anticipation(client, **_):
+    # #875: learned anticipation over the MCP surface. The harness binary
+    # runs with PERSEUS_VAULT_PRELOAD_WINDOW_MS=1 (see VaultClient), so
+    # preload_resolve folds fresh events immediately and the usage period is
+    # [session start, resolution sweep]. Fixtures use unique tokens
+    # ("antineutrino beam calibration" family) to avoid cross-case recall.
+    ws = "quality-learned-anticipation-workspace"
+    cat = "quality_learned_anticipation"
+
+    # Drain pre-existing (other scenarios') unresolved preload events into
+    # their sessions BEFORE this scenario's timeline starts. Without this,
+    # their pseudo-session windows stay open across the whole harness run:
+    # entities created/read by THIS scenario fall inside them, get counted
+    # as missed there, and collect premature add_trigger proposals (wrong
+    # word, wrong timing) that the pending-dedup then blocks later.
+    for _ in range(6):
+        drained = client.call("perseus_vault_preload_resolve", {"window_minutes": 30})
+        if drained.get("events_resolved", 0) == 0:
+            break
+        time.sleep(0.01)
+    noisy_note = "quality-fixture-anticipation-antineutrino-flux-notes"
+    good_note = "quality-fixture-anticipation-beam-calibration-notes"
+    beam_note = "quality-fixture-anticipation-beam-steering-notes"
+    det_note = "quality-fixture-anticipation-neutrino-detector-wiring-notes"
+    cand_note = "quality-fixture-anticipation-neutrino-detector-readout-notes"
+
+    def body_with(note, triggers=None):
+        body = {"note": note}
+        if triggers:
+            body["recall_when"] = triggers
+        return stable_json(body)
+
+    def remember_body(key, note, triggers=None):
+        return client.call(
+            "perseus_vault_remember",
+            {
+                "category": cat,
+                "key": key,
+                "body_json": body_with(note, triggers),
+                "skip_dedup": True,
+                "workspace_hash": ws,
+            },
+        )
+
+    noisy = remember_body("noisy", noisy_note, ["antineutrino"])
+    good = remember_body("good", good_note, ["calibration"])
+    remember_body("beam", beam_note, ["beam"])
+    # "detector" gives the la-a1/la-a2 sessions a served entity (their
+    # contexts are "neutrino detector wiring ..."); the candidate entity
+    # deliberately has NO trigger, so it is never preloaded.
+    remember_body("detector", det_note, ["detector"])
+    cand = remember_body("cand", cand_note)
+    noisy_id = noisy.get("id") if isinstance(noisy, dict) else None
+    cand_id = cand.get("id") if isinstance(cand, dict) else None
+
+    # ── 1. low-utility retire: 4 serves unused, then 1 serve used ────────
+    # NOTE: the harness binary runs with PERSEUS_VAULT_PRELOAD_WINDOW_MS=1
+    # (see VaultClient), so an event is resolvable ~1ms after serving. The
+    # serve->resolve round trips race that budget, so each resolve is
+    # preceded by a settle sleep: events are then guaranteed older than the
+    # window and resolution crediting is deterministic (no flaky
+    # late-resolve credit).
+    for i in range(4):
+        client.call(
+            "perseus_vault_recall_when",
+            {"context": "antineutrino flux report", "limit": 10, "session_id": f"la-n{i}", "workspace_hash": ws},
+        )
+    time.sleep(0.01)
+    client.call("perseus_vault_preload_resolve", {"window_minutes": 30})
+    client.call(
+        "perseus_vault_recall_when",
+        {"context": "antineutrino flux report", "limit": 10, "session_id": "la-n4", "workspace_hash": ws},
+    )
+    # Touch the noisy entity: recall hits it and bumps last_accessed.
+    client.call(
+        "perseus_vault_recall",
+        {"query": "antineutrino flux calibration notes", "limit": 20, "mode": "fts5", "workspace_hash": ws},
+    )
+    time.sleep(0.01)
+    client.call("perseus_vault_preload_resolve", {"window_minutes": 30})
+
+    stats = client.call("perseus_vault_preload_stats", {"scope": "trigger", "limit": 50, "since_days": 7})
+    noisy_trig = next(
+        (t for t in (stats.get("triggers") or []) if t.get("trigger_ref") == "antineutrino"),
+        None,
+    )
+    flagged = bool(noisy_trig) and noisy_trig.get("served", 0) >= 3 and noisy_trig.get("precision", 1.0) < 0.25
+
+    proposals = client.call("perseus_vault_preload_propose", {"by": "quality-harness"})
+    retires = [p for p in (proposals or {}).get("proposals", []) if p.get("suggestion") == "retire"]
+    retire_for_noisy = any(p.get("entity_id") == noisy_id for p in retires)
+
+    # Governed approval: review approve is the ONLY mutation path.
+    applied = False
+    if noisy_id:
+        pid = next((p.get("id") for p in retires if p.get("entity_id") == noisy_id), None)
+        if pid:
+            approve = client.call(
+                "perseus_vault_preload_review",
+                {"action": "approve", "proposal_id": pid, "by": "quality-harness"},
+            )
+            applied = isinstance(approve, dict) and approve.get("state") == "applied"
+    body = client.call("perseus_vault_get_entity", {"id": noisy_id})
+    body_text = str(body)
+    trigger_removed = applied and '"antineutrino"' not in body_text
+    # The retired trigger must stop firing through recall_when (keyword
+    # recall still matches content by design — that path is not trigger-gated).
+    rw_after = client.call(
+        "perseus_vault_recall_when",
+        {"context": "antineutrino flux report", "limit": 10, "workspace_hash": ws},
+    )
+    rw_keys = [i.get("key") for i in (rw_after or {}).get("items", [])]
+    stops_firing = "noisy" not in rw_keys
+
+    # ── 2. missed recall: entity read but never preloaded ────────────────
+    # Session "la-m" preloads the beam entity; the cand entity is read but
+    # has no trigger, so it is never preloaded -> session miss.
+    client.call(
+        "perseus_vault_recall_when",
+        {"context": "beam steering", "limit": 10, "session_id": "la-m", "workspace_hash": ws},
+    )
+    r2 = client.call(
+        "perseus_vault_recall",
+        {"query": "neutrino detector wiring notes", "limit": 20, "mode": "fts5", "workspace_hash": ws},
+    )
+    time.sleep(0.01)
+    client.call("perseus_vault_preload_resolve", {"window_minutes": 30})
+    sess_stats = client.call("perseus_vault_preload_stats", {"scope": "session", "limit": 50, "since_days": 7})
+    miss_recorded = any(
+        s.get("missed", 0) >= 1 for s in (sess_stats.get("sessions") or [])
+    )
+    recall_measured = any(
+        s.get("recall", 1.0) < 1.0 for s in (sess_stats.get("sessions") or [])
+    )
+
+    # ── 3. add_trigger: used in 2 sessions, never preloaded ──────────────
+    for i in (1, 2):
+        client.call(
+            "perseus_vault_recall_when",
+            {"context": f"neutrino detector wiring {i}", "limit": 10, "session_id": f"la-a{i}", "workspace_hash": ws},
+        )
+    # One read inside both sessions' usage periods (resolution bounds them).
+    client.call(
+        "perseus_vault_recall",
+        {"query": "neutrino detector wiring notes", "limit": 20, "mode": "fts5", "workspace_hash": ws},
+    )
+    time.sleep(0.01)
+    client.call("perseus_vault_preload_resolve", {"window_minutes": 30})
+    proposals2 = client.call("perseus_vault_preload_propose", {"by": "quality-harness"})
+    adds = [p for p in (proposals2 or {}).get("proposals", []) if p.get("suggestion") == "add_trigger"]
+    add_for_cand = any(p.get("entity_id") == cand_id for p in adds)
+    added_word = next((p.get("trigger_ref") for p in adds if p.get("entity_id") == cand_id), None)
+
+    added_trigger_fires = False
+    if add_for_cand and cand_id and added_word:
+        pid = next((p.get("id") for p in adds if p.get("entity_id") == cand_id), None)
+        approve = client.call(
+            "perseus_vault_preload_review",
+            {"action": "approve", "proposal_id": pid, "by": "quality-harness"},
+        )
+        if isinstance(approve, dict) and approve.get("state") == "applied":
+            # The added trigger must fire through recall_when (not merely
+            # keyword-match the content).
+            rw3 = client.call(
+                "perseus_vault_recall_when",
+                {"context": f"{added_word} wiring", "limit": 10, "workspace_hash": ws},
+            )
+            added_trigger_fires = "cand" in [i.get("key") for i in (rw3 or {}).get("items", [])]
+    body2 = client.call("perseus_vault_get_entity", {"id": cand_id})
+    approve_adds_trigger = add_for_cand and isinstance(body2, dict) and '"recall_when"' in str(body2)
+
+    good_id = good.get("id") if isinstance(good, dict) else None
+    # ── 4. no silent mutation: stats/propose never touch entity bodies ───
+    before = str(client.call("perseus_vault_get_entity", {"id": good_id}))
+    client.call("perseus_vault_preload_stats", {"scope": "overall", "limit": 50, "since_days": 7})
+    client.call("perseus_vault_preload_propose", {"by": "quality-harness"})
+    after = str(client.call("perseus_vault_get_entity", {"id": good_id}))
+    readonly = before == after
+
+    checks = {
+        "low_utility_flagged": flagged and retire_for_noisy,
+        "retire_governed": applied and trigger_removed,
+        "retired_stops_firing": stops_firing,
+        "miss_recorded": miss_recorded,
+        "recall_measured": recall_measured,
+        "add_proposed": add_for_cand,
+        "approve_adds_trigger": approve_adds_trigger,
+        "added_trigger_fires": added_trigger_fires,
+        "stats_readonly": readonly,
+        "propose_readonly": readonly,
+    }
+    evidence = {
+        "found": bool(flagged),
+        "count": int(retire_for_noisy),
+        "total": 1,
+        "rate": 0.0 if not miss_recorded else 1.0,
+        "reason": "learned-anticipation",
+        "status": "applied" if applied else "pending",
+        "workspace_hash": ws,
+    }
+    metric_events = {
+        "learned-anticipation-low-utility-retire": {
+            "numerator": int(flagged and retire_for_noisy and applied and stops_firing),
+            "denominator": 1,
+        },
+        "learned-anticipation-missed-recall": {
+            "numerator": int(miss_recorded and recall_measured),
+            "denominator": 1,
+        },
+        "learned-anticipation-add-trigger": {
+            "numerator": int(add_for_cand and approve_adds_trigger and added_trigger_fires),
+            "denominator": 1,
+        },
+        "learned-anticipation-no-silent-mutation": {
+            "numerator": int(readonly),
+            "denominator": 1,
+        },
+    }
+    return output(checks, evidence, metric_events)
+
+
 SCENARIO_RUNNERS = {
     "long_horizon": run_long_horizon,
     "contradiction_supersession": run_contradiction,
@@ -2376,6 +2604,7 @@ SCENARIO_RUNNERS = {
     "task_projection": run_task_projection,
     "evidence_observations": run_evidence_observations,
     "interference_gate": run_interference_gate,
+    "learned_anticipation": run_learned_anticipation,
     "admission": run_admission,
     "prompt_safety": run_prompt_safety,
     "identity_ambiguity": run_identity_ambiguity,

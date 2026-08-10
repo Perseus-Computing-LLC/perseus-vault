@@ -81,9 +81,11 @@ pub struct Entity {
 impl Entity {
     pub fn to_json_expanded(&self) -> serde_json::Value {
         let mut val = serde_json::to_value(self).unwrap_or_else(|_| serde_json::json!({}));
-        let body_val = self._parsed_body.as_ref().cloned().or_else(|| {
-            serde_json::from_str::<serde_json::Value>(&self.body_json).ok()
-        });
+        let body_val = self
+            ._parsed_body
+            .as_ref()
+            .cloned()
+            .or_else(|| serde_json::from_str::<serde_json::Value>(&self.body_json).ok());
         if let Some(serde_json::Value::Object(map)) = body_val {
             if let Some(obj) = val.as_object_mut() {
                 for (k, v) in map {
@@ -913,6 +915,9 @@ pub struct ContextOptions {
     /// which renders recall_when hits in its own section and must not show
     /// them twice).
     pub exclude_ids: Vec<String>,
+    /// #875: caller session id for preload usage telemetry. Empty when
+    /// unknown — events then group into a pseudo-session per context hash.
+    pub session_id: String,
 }
 
 /// A rendered context block plus injection metadata (#366).
@@ -1716,7 +1721,7 @@ pub struct SynthesizeParams {
 /// A single synthesized lesson from session content.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SynthesizedLesson {
-    pub lesson_type: String,  // "success", "failure", "correction", "dead_end", "decision", "insight"
+    pub lesson_type: String, // "success", "failure", "correction", "dead_end", "decision", "insight"
     pub summary: String,
     pub evidence: String,
     pub confidence: f64,
@@ -2032,8 +2037,13 @@ pub struct ConsolidateReport {
 pub const MEMORY_KINDS: [&str; 5] = ["asserted", "extracted", "inferred", "imported", "observed"];
 
 /// Canonical external-ref relationship values (spec §2.1).
-pub const REF_RELATIONSHIPS: [&str; 5] =
-    ["about", "derived_from", "mentions", "applies_to", "supersedes"];
+pub const REF_RELATIONSHIPS: [&str; 5] = [
+    "about",
+    "derived_from",
+    "mentions",
+    "applies_to",
+    "supersedes",
+];
 
 /// How a memory came to exist. All fields optional — never guessed when
 /// unknown (spec §1.2: absent means unlabeled, not defaulted).
@@ -2256,4 +2266,3 @@ pub struct ArtifactAnchor {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub line_end: Option<i64>,
 }
-

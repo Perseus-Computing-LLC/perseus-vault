@@ -1,7 +1,7 @@
 {
   "case_count": {
     "min": 20,
-    "max": 44
+    "max": 48
   },
   "cases": [
     {
@@ -475,6 +475,52 @@
       "id": "interference-gate-release-materializes",
       "metric": "interference_gate",
       "scenario": "interference_gate"
+    },
+    {
+      "category": "learned_anticipation",
+      "checks": [
+        "low_utility_flagged",
+        "retire_governed",
+        "retired_stops_firing"
+      ],
+      "description": "A low-utility recall_when trigger (served >= 3, precision < 0.25) is flagged by the offline propose pass, retired only through governed review approve (journaled), and stops firing (#875).",
+      "id": "learned-anticipation-low-utility-retire",
+      "metric": "learned_anticipation",
+      "scenario": "learned_anticipation"
+    },
+    {
+      "category": "learned_anticipation",
+      "checks": [
+        "miss_recorded",
+        "recall_measured"
+      ],
+      "description": "Entities read but never preloaded are recorded as session misses and per-session recall/miss-rate is reported, separate from #872 serving-concentration telemetry (#875).",
+      "id": "learned-anticipation-missed-recall",
+      "metric": "learned_anticipation",
+      "scenario": "learned_anticipation"
+    },
+    {
+      "category": "learned_anticipation",
+      "checks": [
+        "add_proposed",
+        "approve_adds_trigger",
+        "added_trigger_fires"
+      ],
+      "description": "An entity used in two sessions but never preloaded gets an add_trigger proposal (word from session contexts); approving it adds the trigger and it serves on the next matching context (#875).",
+      "id": "learned-anticipation-add-trigger",
+      "metric": "learned_anticipation",
+      "scenario": "learned_anticipation"
+    },
+    {
+      "category": "learned_anticipation",
+      "checks": [
+        "stats_readonly",
+        "propose_readonly"
+      ],
+      "description": "Stats and the propose pass never mutate entity bodies — trigger changes happen exclusively through review approve (#875).",
+      "id": "learned-anticipation-no-silent-mutation",
+      "metric": "learned_anticipation",
+      "scenario": "learned_anticipation"
     }
   ],
   "description": "Bounded offline quality-contract manifest for retrieval, temporal validity, scope validity, provenance, replay, mutation/supersession, compaction/projection, action grounding, recall outcomes, admission, poisoning, identity ambiguity, and the graph utility gate (#869).",
@@ -493,7 +539,9 @@
     "graph_utility_gate",
     "validity_recall",
     "task_projection",
-    "evidence_observations"
+    "evidence_observations",
+    "interference_gate",
+    "learned_anticipation"
   ],
   "name": "perseus-vault-memory-quality-v1",
   "required_categories": [
@@ -513,7 +561,9 @@
     "graph_gate",
     "validity_recall",
     "task_projection",
-    "evidence_observations"
+    "evidence_observations",
+    "interference_gate",
+    "learned_anticipation"
   ],
-  "version": 9
+  "version": 10
 }
