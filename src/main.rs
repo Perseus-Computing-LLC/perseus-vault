@@ -16,6 +16,7 @@ mod extraction;
 mod glibc_compat;
 mod graph_route;
 mod httplimit;
+mod interference;
 mod log_digest;
 mod mcp;
 mod mental_model;

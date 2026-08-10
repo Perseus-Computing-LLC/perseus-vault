@@ -368,6 +368,41 @@ CREATE TABLE IF NOT EXISTS entities_embedding_snapshot (
     embedding BLOB NOT NULL,
     created_at_unix_ms INTEGER NOT NULL
 );
+
+-- #874 Activation-gated sparse writes: the reviewable write-quarantine hold.
+-- A write whose measured interference exceeds the configured bound is
+-- staged here (body encrypted like entities when encryption is on) instead
+-- of committing to memory — never served by any read surface, listed via
+-- `perseus_vault_write_quarantine` for operator review (release materializes
+-- the write through the audited remember path; delete drops it). The full
+-- interference report rides in `interference_json`; the journal carries the
+-- audit trail (`interference_quarantined` / `interference_released` /
+-- `interference_deleted`).
+CREATE TABLE IF NOT EXISTS write_quarantine (
+    id TEXT PRIMARY KEY,
+    category TEXT NOT NULL,
+    key TEXT NOT NULL,
+    body_json TEXT NOT NULL,
+    links TEXT NOT NULL DEFAULT '[]',
+    tags TEXT NOT NULL DEFAULT '[]',
+    status TEXT NOT NULL DEFAULT 'active',
+    entity_type TEXT NOT NULL DEFAULT 'insight',
+    importance REAL NOT NULL DEFAULT 0.5,
+    certainty REAL NOT NULL DEFAULT 0.5,
+    visibility TEXT NOT NULL DEFAULT 'workspace',
+    topic_path TEXT NOT NULL DEFAULT '',
+    always_on INTEGER NOT NULL DEFAULT 0,
+    agent_id TEXT NOT NULL DEFAULT '',
+    workspace_hash TEXT NOT NULL DEFAULT '',
+    valid_from_unix_ms INTEGER,
+    valid_to_unix_ms INTEGER,
+    interference_score REAL NOT NULL,
+    interference_json TEXT NOT NULL,
+    reason TEXT NOT NULL DEFAULT 'interference',
+    created_at_unix_ms INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_write_quarantine_ws
+ ON write_quarantine(workspace_hash, created_at_unix_ms);
 ";
 
 /// Current schema migration level, stamped into `PRAGMA user_version` once all
@@ -440,7 +475,10 @@ CREATE TABLE IF NOT EXISTS entities_embedding_snapshot (
 /// the documented rollback path). New tables, idempotent, no backfill — the
 /// format record is written by the reindex path / fresh-store open, and the
 /// snapshot only by the quantization step.
-pub(crate) const SCHEMA_VERSION: i64 = 33;
+/// v34 (#874 activation-gated sparse writes): `write_quarantine` — the
+/// reviewable hold for writes whose measured interference exceeds the
+/// configured bound. New table, idempotent, no backfill.
+pub(crate) const SCHEMA_VERSION: i64 = 34;
 
 /// Initialize the v0.2.0 schema on a fresh database.
 pub fn initialize_schema(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
@@ -1245,6 +1283,38 @@ fn apply_migrations(conn: &Connection) -> Result<(), Box<dyn std::error::Error>>
          );",
     )?;
     // ── end v33 ──────────────────────────────────────────────────────────
+
+    // ── v34 (#874): reviewable write-quarantine hold ─────────────────────
+    // New table only (base DDL also creates it for fresh DBs); no backfill —
+    // nothing existed before v34 to migrate.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS write_quarantine (
+            id TEXT PRIMARY KEY,
+            category TEXT NOT NULL,
+            key TEXT NOT NULL,
+            body_json TEXT NOT NULL,
+            links TEXT NOT NULL DEFAULT '[]',
+            tags TEXT NOT NULL DEFAULT '[]',
+            status TEXT NOT NULL DEFAULT 'active',
+            entity_type TEXT NOT NULL DEFAULT 'insight',
+            importance REAL NOT NULL DEFAULT 0.5,
+            certainty REAL NOT NULL DEFAULT 0.5,
+            visibility TEXT NOT NULL DEFAULT 'workspace',
+            topic_path TEXT NOT NULL DEFAULT '',
+            always_on INTEGER NOT NULL DEFAULT 0,
+            agent_id TEXT NOT NULL DEFAULT '',
+            workspace_hash TEXT NOT NULL DEFAULT '',
+            valid_from_unix_ms INTEGER,
+            valid_to_unix_ms INTEGER,
+            interference_score REAL NOT NULL,
+            interference_json TEXT NOT NULL,
+            reason TEXT NOT NULL DEFAULT 'interference',
+            created_at_unix_ms INTEGER NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS idx_write_quarantine_ws
+          ON write_quarantine(workspace_hash, created_at_unix_ms);",
+    )?;
+    // ── end v34 ──────────────────────────────────────────────────────────
 
     // Stamp the migration level so subsequent opens skip the probe block above.
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;

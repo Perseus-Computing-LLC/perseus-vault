@@ -1,7 +1,7 @@
 {
   "case_count": {
     "min": 20,
-    "max": 40
+    "max": 44
   },
   "cases": [
     {
@@ -434,6 +434,47 @@
       "id": "evidence-observations-correction",
       "metric": "evidence_observations",
       "scenario": "evidence_observations"
+    },
+    {
+      "category": "interference_gate",
+      "checks": [
+        "default_quarantines",
+        "quarantined_never_served"
+      ],
+      "description": "A near-verbatim skip_dedup write is quarantined by default (fail-closed) and never served by recall (#874).",
+      "id": "interference-gate-default-quarantine",
+      "metric": "interference_gate",
+      "scenario": "interference_gate"
+    },
+    {
+      "category": "interference_gate",
+      "checks": [
+        "refuse_override_errors"
+      ],
+      "description": "The per-write refuse override errors out instead of silently merging a high-interference write (#874).",
+      "id": "interference-gate-refuse-override",
+      "metric": "interference_gate",
+      "scenario": "interference_gate"
+    },
+    {
+      "category": "interference_gate",
+      "checks": [
+        "sparse_preserves_unrelated_recall"
+      ],
+      "description": "Sparse updates on an unrelated topic preserve recall of existing fixtures (no measurable regression vs the dense path) (#874).",
+      "id": "interference-gate-sparse-preserves-recall",
+      "metric": "interference_gate",
+      "scenario": "interference_gate"
+    },
+    {
+      "category": "interference_gate",
+      "checks": [
+        "release_materializes"
+      ],
+      "description": "Operator release materializes a quarantined write through the audited remember path (#874).",
+      "id": "interference-gate-release-materializes",
+      "metric": "interference_gate",
+      "scenario": "interference_gate"
     }
   ],
   "description": "Bounded offline quality-contract manifest for retrieval, temporal validity, scope validity, provenance, replay, mutation/supersession, compaction/projection, action grounding, recall outcomes, admission, poisoning, identity ambiguity, and the graph utility gate (#869).",
@@ -474,5 +515,5 @@
     "task_projection",
     "evidence_observations"
   ],
-  "version": 8
+  "version": 9
 }
