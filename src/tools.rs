@@ -4615,6 +4615,40 @@ pub fn handle_expand_source(db: &Database, args: Value) -> Result<String, String
     Ok(out.to_string())
 }
 
+// ─── perseus_vault_export handler ───────────────────────────────────────
+
+/// #871: durable op-state wrap for single-shot operation handlers. Creates a
+/// run (`queued` → `running`), executes `f(run_id)`, then `completed` (with
+/// the receipt string) or `failed` (sanitized detail). The response always
+/// carries `op_run_id`/`op_run_state` so a launched-but-failed operation is
+/// never indistinguishable from a no-op. Op-state writes are best-effort —
+/// they never mask the operation's own result.
+fn run_tracked<F>(db: &Database, op_type: &str, scope: &str, created_by: &str, f: F) -> String
+where
+    F: FnOnce(&str) -> Result<(serde_json::Value, String), String>,
+{
+    let run = match db.op_run_begin(op_type, scope, "", 2, created_by) {
+        Ok(run) => run,
+        Err(e) => {
+            return json!({"error": format!("{op_type} failed: {e}")}).to_string();
+        }
+    };
+    let _ = db.op_run_start(&run.id);
+    match f(&run.id) {
+        Ok((mut value, receipt)) => {
+            let _ = db.op_run_progress(&run.id, 0, 0, 0);
+            let _ = db.op_run_complete(&run.id, &receipt);
+            value["op_run_id"] = json!(run.id);
+            value["op_run_state"] = json!("completed");
+            value.to_string()
+        }
+        Err(e) => {
+            let _ = db.op_run_fail(&run.id, "operation_failed", &e);
+            json!({"error": e, "op_run_id": run.id, "op_run_state": "failed"}).to_string()
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct VaultExportArgs {
     pub vault_dir: String,
@@ -4637,12 +4671,28 @@ pub fn handle_vault_export(db: &Database, args: Value) -> String {
     } else {
         a.vault_dir.clone()
     };
-    match db.vault_export(&dir, a.workspace_hash.as_deref()) {
-        Ok(report) => serde_json::to_value(&report)
-            .map(|value| reviewable_write_result(value, "vault_export").to_string())
-            .unwrap_or_else(|e| json!({"error": format!("Serialization failed: {}", e)}).to_string()),
-        Err(e) => json!({"error": format!("Vault export failed: {}", e)}).to_string(),
-    }
+    let scope = a.workspace_hash.clone().unwrap_or_default();
+    // #871: durable op-state wrap — the export run stays observable even if
+    // the process dies mid-write (recovered as `interrupted` on restart).
+    run_tracked(db, "export", &scope, "internal", move |run_id| {
+        match db.vault_export(&dir, a.workspace_hash.as_deref()) {
+            Ok(report) => {
+                let receipt = format!(
+                    "files_created={} files_updated={} errors={}",
+                    report.files_created, report.files_updated, report.errors.len()
+                );
+                // Per-error item receipts identify the failed artifacts.
+                for (i, err) in report.errors.iter().take(50).enumerate() {
+                    let _ = db.op_run_item_add(run_id, &format!("error-{i}"), "");
+                    let _ = db.op_run_item_fail(run_id, &format!("error-{i}"), "export_error", err);
+                }
+                let v = serde_json::to_value(&report)
+                    .map_err(|e| format!("Serialization failed: {e}"))?;
+                Ok((reviewable_write_result(v, "vault_export"), receipt))
+            }
+            Err(e) => Err(format!("Vault export failed: {e}")),
+        }
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -4824,12 +4874,26 @@ pub fn handle_vault_import(db: &Database, args: Value) -> String {
     } else {
         a.vault_dir.clone()
     };
-    match db.vault_import(&dir) {
-        Ok(report) => serde_json::to_value(&report)
-            .map(|value| reviewable_write_result(value, "vault_import").to_string())
-            .unwrap_or_else(|e| json!({"error": format!("Serialization failed: {}", e)}).to_string()),
-        Err(e) => json!({"error": format!("Vault import failed: {}", e)}).to_string(),
-    }
+    // #871: durable op-state wrap — the import run stays observable even if
+    // the process dies mid-write (recovered as `interrupted` on restart).
+    run_tracked(db, "import", "", "internal", move |run_id| {
+        match db.vault_import(&dir) {
+            Ok(report) => {
+                let receipt = format!(
+                    "files_created={} files_updated={} errors={}",
+                    report.files_created, report.files_updated, report.errors.len()
+                );
+                for (i, err) in report.errors.iter().take(50).enumerate() {
+                    let _ = db.op_run_item_add(run_id, &format!("error-{i}"), "");
+                    let _ = db.op_run_item_fail(run_id, &format!("error-{i}"), "import_error", err);
+                }
+                let v = serde_json::to_value(&report)
+                    .map_err(|e| format!("Serialization failed: {e}"))?;
+                Ok((reviewable_write_result(v, "vault_import"), receipt))
+            }
+            Err(e) => Err(format!("Vault import failed: {e}")),
+        }
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -5644,11 +5708,22 @@ pub fn handle_consolidate(db: &Database, args: Value) -> String {
     if params.quote_cap_chars < 64 || params.quote_cap_chars > 4096 {
         return json!({"error": "Invalid consolidate arguments: quote_cap_chars must be in 64..=4096"}).to_string();
     }
-    match db.consolidate(&params) {
-        Ok(report) => serde_json::to_string(&report)
-            .unwrap_or_else(|e| json!({"error": format!("{}", e)}).to_string()),
-        Err(e) => json!({"error": format!("Consolidation failed: {}", e)}).to_string(),
-    }
+    // #871: durable op-state wrap — terminal state + bounded progress are
+    // observable via perseus_vault_op_run_* even when the call itself fails.
+    let scope = params.workspace_hash.clone().unwrap_or_default();
+    let created_by = params.requesting_agent_id.clone();
+    run_tracked(db, "consolidate", &scope, &created_by, move |_run_id| {
+        let report = db
+            .consolidate(&params)
+            .map_err(|e| format!("Consolidation failed: {e}"))?;
+        let receipt = format!(
+            "entities_examined={} observations_created={} sources_archived={}",
+            report.entities_examined, report.observations_created, report.sources_archived
+        );
+        serde_json::to_value(&report)
+            .map(|v| (v, receipt))
+            .map_err(|e| format!("Serialization failed: {e}"))
+    })
 }
 
 // ─── perseus_vault_dream handler ─────────────────────────────────────────
@@ -5730,19 +5805,197 @@ pub fn handle_dream(db: &Database, args: Value) -> Result<String, String> {
 }
 
 pub fn handle_decay(db: &Database, _args: Value) -> String {
-    match db.decay_tick() {
-        Ok(report) => serde_json::to_string(&report).unwrap_or_else(|e| {
-            json!({"error": format!("Decay report serialization failed: {}", e)}).to_string()
-        }),
-        Err(e) => json!({"error": format!("Decay tick failed: {}", e)}).to_string(),
-    }
+    run_tracked(db, "decay", "", "internal", |_run_id| {
+        let report = db.decay_tick().map_err(|e| format!("Decay tick failed: {e}"))?;
+        let receipt = format!(
+            "entities_checked={} entities_updated={} auto_archived={}",
+            report.entities_checked, report.entities_updated, report.auto_archived
+        );
+        serde_json::to_value(&report)
+            .map(|v| (v, receipt))
+            .map_err(|e| format!("Decay report serialization failed: {e}"))
+    })
 }
 
 pub fn handle_reindex(db: &Database, _args: Value) -> String {
-    match db.reindex_fts() {
-        Ok(n) => json!({"reindexed": n}).to_string(),
-        Err(e) => json!({"error": format!("Reindex failed: {}", e)}).to_string(),
+    run_tracked(db, "reindex", "", "internal", |_run_id| {
+        let n = db.reindex_fts().map_err(|e| format!("Reindex failed: {e}"))?;
+        Ok((json!({"reindexed": n}), format!("reindexed={n}")))
+    })
+}
+
+// ─── #871: durable operation states (perseus_vault_op_run_*) ─────────────
+
+fn parse_run_state(s: &str) -> Result<crate::op_runs::OpRunState, String> {
+    crate::op_runs::OpRunState::parse(s)
+        .ok_or_else(|| format!("invalid op_run state '{s}': expected queued|running|completed|failed|cancelled|interrupted|failed_to_start"))
+}
+
+/// Lifecycle tool: begin | start | progress | complete | fail |
+/// failed_to_start | cancel | timeout | item_add | item_start |
+/// item_complete | item_fail | item_cancel.
+pub fn handle_op_run(db: &Database, args: Value) -> Result<String, String> {
+    let action = args
+        .get("action")
+        .and_then(|v| v.as_str())
+        .unwrap_or("begin")
+        .to_string();
+    let run_id = args.get("run_id").and_then(|v| v.as_str()).unwrap_or("");
+    let out = match action.as_str() {
+        "begin" => {
+            let op_type = args
+                .get("op_type")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "op_run begin requires op_type".to_string())?;
+            let scope = args.get("scope").and_then(|v| v.as_str()).unwrap_or("");
+            let input_digest = args
+                .get("input_digest")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let max_retries = args.get("max_retries").and_then(|v| v.as_i64()).unwrap_or(2);
+            let created_by = args
+                .get("created_by")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            json!(db.op_run_begin(op_type, scope, input_digest, max_retries, created_by).map_err(|e| e.to_string())?)
+        }
+        "start" => json!(db.op_run_start(run_id).map_err(|e| e.to_string())?),
+        "progress" => {
+            let done = args.get("done").and_then(|v| v.as_i64()).unwrap_or(0);
+            let failed = args.get("failed").and_then(|v| v.as_i64()).unwrap_or(0);
+            let total = args.get("total").and_then(|v| v.as_i64()).unwrap_or(-1);
+            json!(db.op_run_progress(run_id, done, failed, total).map_err(|e| e.to_string())?)
+        }
+        "complete" => {
+            let receipt = args.get("receipt").and_then(|v| v.as_str()).unwrap_or("");
+            json!(db.op_run_complete(run_id, receipt).map_err(|e| e.to_string())?)
+        }
+        "fail" => {
+            let error_class = args
+                .get("error_class")
+                .and_then(|v| v.as_str())
+                .unwrap_or("operation_failed");
+            let detail = args.get("error_detail").and_then(|v| v.as_str()).unwrap_or("");
+            json!(db.op_run_fail(run_id, error_class, detail).map_err(|e| e.to_string())?)
+        }
+        "failed_to_start" => {
+            let error_class = args
+                .get("error_class")
+                .and_then(|v| v.as_str())
+                .unwrap_or("failed_to_start");
+            let detail = args.get("error_detail").and_then(|v| v.as_str()).unwrap_or("");
+            json!(db.op_run_failed_to_start(run_id, error_class, detail).map_err(|e| e.to_string())?)
+        }
+        "cancel" => json!(db.op_run_cancel(run_id).map_err(|e| e.to_string())?),
+        "timeout" => json!(db.op_run_timeout(run_id).map_err(|e| e.to_string())?),
+        "item_add" => {
+            let item_ref = args
+                .get("item_ref")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "op_run item_add requires item_ref".to_string())?;
+            let digest = args.get("item_digest").and_then(|v| v.as_str()).unwrap_or("");
+            json!(db.op_run_item_add(run_id, item_ref, digest).map_err(|e| e.to_string())?)
+        }
+        "item_start" => {
+            let item_ref = args
+                .get("item_ref")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "op_run item_start requires item_ref".to_string())?;
+            json!(db.op_run_item_start(run_id, item_ref).map_err(|e| e.to_string())?)
+        }
+        "item_complete" => {
+            let item_ref = args
+                .get("item_ref")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "op_run item_complete requires item_ref".to_string())?;
+            let receipt_ref = args
+                .get("receipt_ref")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            json!(db.op_run_item_complete(run_id, item_ref, receipt_ref).map_err(|e| e.to_string())?)
+        }
+        "item_fail" => {
+            let item_ref = args
+                .get("item_ref")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "op_run item_fail requires item_ref".to_string())?;
+            let error_class = args
+                .get("error_class")
+                .and_then(|v| v.as_str())
+                .unwrap_or("item_failed");
+            let detail = args.get("error_detail").and_then(|v| v.as_str()).unwrap_or("");
+            json!(db.op_run_item_fail(run_id, item_ref, error_class, detail).map_err(|e| e.to_string())?)
+        }
+        "item_cancel" => {
+            let item_ref = args
+                .get("item_ref")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "op_run item_cancel requires item_ref".to_string())?;
+            json!(db.op_run_item_cancel(run_id, item_ref).map_err(|e| e.to_string())?)
+        }
+        other => {
+            return Err(format!(
+                "invalid op_run action '{other}': expected begin|start|progress|complete|fail|failed_to_start|cancel|timeout|item_add|item_start|item_complete|item_fail|item_cancel"
+            ));
+        }
+    };
+    Ok(out.to_string())
+}
+
+/// List runs (filter by state/op_type, newest first, bounded limit).
+pub fn handle_op_run_list(db: &Database, args: Value) -> Result<String, String> {
+    let state = args
+        .get("state")
+        .and_then(|v| v.as_str())
+        .map(parse_run_state)
+        .transpose()?;
+    let op_type = args.get("op_type").and_then(|v| v.as_str());
+    let limit = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(20);
+    let runs = db.op_run_list(state, op_type, limit).map_err(|e| e.to_string())?;
+    Ok(json!({"count": runs.len(), "runs": runs}).to_string())
+}
+
+/// Fetch one run with its items.
+pub fn handle_op_run_get(db: &Database, args: Value) -> Result<String, String> {
+    let run_id = args
+        .get("run_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "op_run_get requires run_id".to_string())?;
+    match db.op_run_get(run_id).map_err(|e| e.to_string())? {
+        Some((run, items)) => Ok(json!({"run": run, "items": items}).to_string()),
+        None => Err(format!("unknown op run: {run_id}")),
     }
+}
+
+/// Bounded, scoped, idempotent retry (forks a new child run).
+pub fn handle_op_run_retry(db: &Database, args: Value) -> Result<String, String> {
+    let run_id = args
+        .get("run_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "op_run_retry requires run_id".to_string())?;
+    let child = db.op_run_retry(run_id).map_err(|e| e.to_string())?;
+    Ok(json!({
+        "retried_from": run_id,
+        "child_run_id": child.id,
+        "state": child.state.as_str(),
+        "retry_count": child.retry_count,
+    })
+    .to_string())
+}
+
+/// Retention prune of terminal runs older than `retention_days` (min 1).
+pub fn handle_op_run_prune(db: &Database, args: Value) -> Result<String, String> {
+    let retention_days = args
+        .get("retention_days")
+        .and_then(|v| v.as_i64())
+        .unwrap_or_else(|| {
+            std::env::var("PERSEUS_VAULT_OP_RETENTION_DAYS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(30)
+        });
+    let pruned = db.op_run_prune(retention_days).map_err(|e| e.to_string())?;
+    Ok(json!({"pruned": pruned, "retention_days": retention_days}).to_string())
 }
 
 pub fn handle_ask(db: &Database, args: Value) -> Result<String, String> {
@@ -6678,24 +6931,65 @@ pub fn handle_embed(db: &Database, args: Value) -> Result<String, String> {
                     .to_string(),
             );
         }
-        return db
-            .reindex_embeddings(target)
-            .map(|v| v.to_string())
-            .map_err(|e| format!("Embedding reindex failed: {}", e));
+        // #871: durable op-state wrap — store-wide reindex is a long-running
+        // operation; a crash mid-reindex is recovered as `interrupted`.
+    let run = match db.op_run_begin("embed", "", "", 1, "internal") {
+        Ok(run) => run,
+        Err(e) => return Err(e.to_string()),
+    };
+    let _ = db.op_run_start(&run.id);
+    return match db.reindex_embeddings(target) {
+        Ok(mut v) => {
+            let _ = db.op_run_complete(&run.id, "embedding reindex");
+            v["op_run_id"] = json!(run.id);
+            v["op_run_state"] = json!("completed");
+            Ok(v.to_string())
+        }
+        Err(e) => {
+            let _ = db.op_run_fail(&run.id, "embed_reindex_failed", &e.to_string());
+            Err(format!("Embedding reindex failed: {e}"))
+        }
+    };
     }
     if params.restore_quantized_backup {
-        return db
-            .restore_embeddings_snapshot()
-            .map(|v| v.to_string())
-            .map_err(|e| format!("Embedding restore failed: {}", e));
-    }
-    if params.drop_quantized_backup {
-        return db
-            .drop_embeddings_snapshot()
-            .map(|v| v.to_string())
-            .map_err(|e| format!("Embedding snapshot drop failed: {}", e));
-    }
-    match db.embed_entity(&params) {
+        let run = match db.op_run_begin("embed", "", "", 1, "internal") {
+            Ok(run) => run,
+            Err(e) => return Err(e.to_string()),
+        };
+        let _ = db.op_run_start(&run.id);
+        return match db.restore_embeddings_snapshot() {
+            Ok(mut v) => {
+                let _ = db.op_run_complete(&run.id, "embedding snapshot restore");
+                v["op_run_id"] = json!(run.id);
+                v["op_run_state"] = json!("completed");
+                Ok(v.to_string())
+            }
+            Err(e) => {
+                let _ = db.op_run_fail(&run.id, "embed_restore_failed", &e.to_string());
+                Err(format!("Embedding restore failed: {e}"))
+            }
+        };
+            }
+            if params.drop_quantized_backup {
+        let run = match db.op_run_begin("embed", "", "", 1, "internal") {
+            Ok(run) => run,
+            Err(e) => return Err(e.to_string()),
+        };
+        let _ = db.op_run_start(&run.id);
+        return match db.drop_embeddings_snapshot() {
+            Ok(mut v) => {
+                let _ = db.op_run_complete(&run.id, "embedding snapshot drop");
+                v["op_run_id"] = json!(run.id);
+                v["op_run_state"] = json!("completed");
+                Ok(v.to_string())
+            }
+            Err(e) => {
+                let _ = db.op_run_fail(&run.id, "embed_snapshot_drop_failed", &e.to_string());
+                Err(format!("Embedding snapshot drop failed: {e}"))
+            }
+        };
+            }
+            match db.embed_entity(&params) {
         Ok(result) => Ok(result.to_string()),
         Err(e) => Err(format!("Embed failed: {}", e)),
     }
@@ -7421,13 +7715,27 @@ pub fn handle_maintenance(db: &Database, args: Value) -> Result<String, String> 
 /// `PERSEUS_VAULT_HISTORY_*` env knobs opt in; it runs inside the autocohere step,
 /// so it is deliberately NOT requested again from maintenance.
 pub fn run_maintenance_pass(db: &Database, dry_run: bool, vacuum: bool) -> Result<Value, String> {
-    let autocohere: Value = handle_autocohere(db, json!({ "dry_run": dry_run }))
+    // #871: durable op-state wrap — a crash mid-pass is recovered as
+    // `interrupted` on the next open; per-phase progress is observable.
+    let run = db
+        .op_run_begin("maintain", "", "", 2, "cli")
+        .map_err(|e| format!("Maintenance op-run begin failed: {e}"))?;
+    let _ = db.op_run_start(&run.id);
+    let autocohere: Value = match handle_autocohere(db, json!({ "dry_run": dry_run }))
         .and_then(|s| {
             serde_json::from_str(&s).map_err(|e| format!("autocohere report parse failed: {}", e))
         })
-        .map_err(|e| format!("Maintenance pass (autocohere) failed: {}", e))?;
+        .map_err(|e| format!("Maintenance pass (autocohere) failed: {}", e))
+    {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = db.op_run_fail(&run.id, "maintenance_phase_failed", &e);
+            return Err(e);
+        }
+    };
+    let _ = db.op_run_progress(&run.id, 1, 0, 2);
 
-    let maintenance: Value = handle_maintenance(
+    let maintenance: Value = match handle_maintenance(
         db,
         json!({
             "dedup": true,
@@ -7440,13 +7748,24 @@ pub fn run_maintenance_pass(db: &Database, dry_run: bool, vacuum: bool) -> Resul
     .and_then(|s| {
         serde_json::from_str(&s).map_err(|e| format!("maintenance report parse failed: {}", e))
     })
-    .map_err(|e| format!("Maintenance pass (maintenance) failed: {}", e))?;
+    .map_err(|e| format!("Maintenance pass (maintenance) failed: {}", e))
+    {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = db.op_run_fail(&run.id, "maintenance_phase_failed", &e);
+            return Err(e);
+        }
+    };
+    let _ = db.op_run_progress(&run.id, 2, 0, 2);
+    let _ = db.op_run_complete(&run.id, "phases=2 autocohere+maintenance");
 
     Ok(json!({
         "autocohere": autocohere,
         "maintenance": maintenance,
         "dry_run": dry_run,
         "vacuum_requested": vacuum,
+        "op_run_id": run.id,
+        "op_run_state": "completed",
     }))
 }
 

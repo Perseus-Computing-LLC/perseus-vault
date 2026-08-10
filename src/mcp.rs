@@ -4415,6 +4415,117 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     }
   },
   {
+    "name": "perseus_vault_op_run",
+    "description": "#871: durable long-running operation states. Lifecycle tool for the shared run/run-item contract (maintenance, embed, consolidation, export/import, reindex). Actions: begin (queued; requires op_type, optional scope/input_digest/max_retries 0..10/created_by), start (queued->running), progress (done/failed/total counters; partial derived), complete (running->completed with receipt linkage), fail (running->failed; error_detail is sanitized at rest — secrets masked, length capped), failed_to_start (queued->failed_to_start), cancel (queued|running->cancelled), timeout (running->failed with timeout flag), item_add/item_start/item_complete/item_fail/item_cancel (per-item receipts; UNIQUE(run_id, item_ref)). Terminal states accept no further transitions. Restart recovery marks in-flight runs interrupted (mark-only); resume only via perseus_vault_op_run_retry.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "action": {
+          "type": "string",
+          "enum": ["begin", "start", "progress", "complete", "fail", "failed_to_start", "cancel", "timeout", "item_add", "item_start", "item_complete", "item_fail", "item_cancel"],
+          "default": "begin",
+          "description": "Lifecycle action"
+        },
+        "run_id": {"type": "string", "description": "Run id (opr-...) for all actions except begin"},
+        "op_type": {"type": "string", "description": "Operation kind for begin: consolidate|embed_flush|export|import|decay|maintain|reindex|cohere|compact|custom"},
+        "scope": {"type": "string", "description": "Workspace hash or empty for global"},
+        "input_digest": {"type": "string", "description": "sha256 of the input reference set (idempotency anchor)"},
+        "max_retries": {"type": "integer", "default": 2, "minimum": 0, "maximum": 10},
+        "created_by": {"type": "string", "description": "Caller identity for begin"},
+        "done": {"type": "integer", "description": "progress: items completed"},
+        "failed": {"type": "integer", "description": "progress: items failed"},
+        "total": {"type": "integer", "description": "progress: expected items (omit to keep stored total)"},
+        "receipt": {"type": "string", "description": "complete: terminal receipt linkage (journal event id / artifact ref)"},
+        "error_class": {"type": "string", "description": "fail/item_fail: error class"},
+        "error_detail": {"type": "string", "description": "fail/item_fail: detail (sanitized at rest)"},
+        "item_ref": {"type": "string", "description": "item ops: item reference (entity id / file path / ordinal)"},
+        "item_digest": {"type": "string", "description": "item_add: item digest"},
+        "receipt_ref": {"type": "string", "description": "item_complete: per-item receipt linkage"}
+      }
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "id": {"type": "string"},
+        "state": {"type": "string"}
+      }
+    }
+  },
+  {
+    "name": "perseus_vault_op_run_list",
+    "description": "#871: list durable operation runs, newest first. Optional state filter (queued|running|completed|failed|cancelled|interrupted|failed_to_start) and op_type filter; bounded limit (1..=100, default 20).",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "state": {"type": "string", "description": "Optional terminal-state filter"},
+        "op_type": {"type": "string", "description": "Optional operation-kind filter"},
+        "limit": {"type": "integer", "default": 20, "minimum": 1, "maximum": 100}
+      }
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "count": {"type": "integer"},
+        "runs": {"type": "array", "items": {"type": "object"}}
+      }
+    }
+  },
+  {
+    "name": "perseus_vault_op_run_get",
+    "description": "#871: fetch one durable operation run with its per-item receipts.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "run_id": {"type": "string", "description": "Run id (opr-...)"}
+      },
+      "required": ["run_id"]
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "run": {"type": "object"},
+        "items": {"type": "array", "items": {"type": "object"}}
+      }
+    }
+  },
+  {
+    "name": "perseus_vault_op_run_retry",
+    "description": "#871: bounded, scoped, idempotent retry of a TERMINAL run. Forks a NEW child run re-queuing only failed/cancelled/interrupted/unattempted items; completed items are carried into the child with their receipts (never re-executed — retry cannot duplicate writes or receipts). Refused fail-closed on retry exhaustion (retry_count >= max_retries) or when nothing is recoverable.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "run_id": {"type": "string", "description": "Terminal run id to retry"}
+      },
+      "required": ["run_id"]
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "retried_from": {"type": "string"},
+        "child_run_id": {"type": "string"},
+        "state": {"type": "string"},
+        "retry_count": {"type": "integer"}
+      }
+    }
+  },
+  {
+    "name": "perseus_vault_op_run_prune",
+    "description": "#871: retention prune of TERMINAL runs older than retention_days (min 1, default PERSEUS_VAULT_OP_RETENTION_DAYS=30) plus their items. In-flight runs are never pruned. maintain runs a prune pass each cycle.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "retention_days": {"type": "integer", "minimum": 1, "description": "Retention bound (default env PERSEUS_VAULT_OP_RETENTION_DAYS, 30)"}
+      }
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "pruned": {"type": "integer"},
+        "retention_days": {"type": "integer"}
+      }
+    }
+  },
+  {
     "name": "perseus_vault_conflicts",
     "description": "Detect conflicting entities in the same category — pairs with low trigram similarity in their body_json. Flags potential contradictions, duplicate-but-divergent entries, and stale-overwritten facts. Read-only by default. Opt in with resolve=true to actively invalidate the lower-certainty side of clear conflicts (superseding it into history, reversible + time-travelable via perseus_vault_as_of); that path defaults to dry_run=true so you preview first, and never resolves pairs whose certainties are within certainty_margin.",
     "inputSchema": {
@@ -6289,6 +6400,11 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
         "perseus_vault_mental_model_set" => tools::handle_mental_model_set(db, args),
         "perseus_vault_mental_model_review" => tools::handle_mental_model_review(db, args),
         "perseus_vault_write_quarantine" => tools::handle_write_quarantine(db, args),
+        "perseus_vault_op_run" => tools::handle_op_run(db, args).map_err(|e| e.to_string()),
+        "perseus_vault_op_run_list" => tools::handle_op_run_list(db, args).map_err(|e| e.to_string()),
+        "perseus_vault_op_run_get" => tools::handle_op_run_get(db, args).map_err(|e| e.to_string()),
+        "perseus_vault_op_run_retry" => tools::handle_op_run_retry(db, args).map_err(|e| e.to_string()),
+        "perseus_vault_op_run_prune" => tools::handle_op_run_prune(db, args).map_err(|e| e.to_string()),
         "perseus_vault_conflicts" => Ok(tools::handle_conflicts(db, args)),
         "perseus_vault_consolidate" => Ok(tools::handle_consolidate(db, args)),
         "perseus_vault_dream" => tools::handle_dream(db, args),
@@ -6379,7 +6495,7 @@ mod tests {
         );
         assert_eq!(
             registry_names.len(),
-            110,
+            115,
             "update public metadata when adding a tool"
         );
 
