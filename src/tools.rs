@@ -168,6 +168,21 @@ pub struct RememberArgs {
     /// Journaled as an audited override; never set automatically.
     #[serde(default, deserialize_with = "null_as_default")]
     pub allow_rejected: bool,
+    /// #874: per-write interference-gate mode override. `auto` (default)
+    /// uses the operator-configured mode; `refuse` / `quarantine` tighten
+    /// it per-write. Per-write `off` is refused fail-closed — only the
+    /// operator can disable the gate (PERSEUS_VAULT_INTERFERENCE_MODE=off).
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub interference_mode: String,
+    /// #874: per-write interference bound override — may only TIGHTEN the
+    /// configured bound (a looser bound is refused fail-closed).
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub interference_bound: Option<f64>,
+    /// #874: sparse update mode — touches only the activated subset of
+    /// state (body slot, activated links), never disturbs neighbors (no
+    /// salience inflation, no near-duplicate absorption on insert).
+    #[serde(default)]
+    pub sparse_update: bool,
 }
 
 /// #487: a `derived_from` citation — either an entity id (`"mem-..."`, as
@@ -1190,16 +1205,46 @@ pub fn handle_remember(db: &Database, args: Value) -> Result<String, String> {
         verified_admission = true;
     }
 
+    // #874: per-write interference-gate options (fail-closed override
+    // validation happens here, at the MCP surface — internal callers are
+    // trusted code and pass WriteGateOptions directly).
+    let mode_override = match a.interference_mode.trim().to_ascii_lowercase().as_str() {
+        "" | "auto" => None,
+        "refuse" => Some(crate::interference::InterferenceMode::Refuse),
+        "quarantine" => Some(crate::interference::InterferenceMode::Quarantine),
+        other => {
+            return Err(format!(
+                "invalid interference_mode '{other}': expected auto | refuse | quarantine \
+                 (per-write 'off' is not allowed — operator-only via \
+                 PERSEUS_VAULT_INTERFERENCE_MODE=off)"
+            ))
+        }
+    };
+    let gate_cfg = crate::interference::InterferenceConfig::from_env();
+    crate::interference::validate_overrides(&gate_cfg, mode_override, a.interference_bound)
+        .map_err(|e| format!("interference override refused: {e}"))?;
+    let gate_opts = crate::interference::WriteGateOptions {
+        sparse_update: a.sparse_update,
+        mode_override,
+        bound_override: a.interference_bound,
+        exclude_ids: Vec::new(),
+    };
+
     let (eid, action) = if verified_admission {
         db.remember_verified_with_options(
             &entity, a.skip_dedup, a.valid_from_unix_ms, a.valid_to_unix_ms, a.allow_rejected,
+        )
+    } else if gate_opts.sparse_update || mode_override.is_some() || a.interference_bound.is_some() {
+        db.remember_with_write_options(
+            &entity, a.skip_dedup, a.valid_from_unix_ms, a.valid_to_unix_ms, a.allow_rejected,
+            gate_opts,
         )
     } else {
         db.remember_with_options(
             &entity, a.skip_dedup, a.valid_from_unix_ms, a.valid_to_unix_ms, a.allow_rejected,
         )
     }
-    .map_err(|e| format!("Remember failed: {}", e))?;
+    .map_err(|e| format!("Remember failed: {e}"))?;
 
     // #487: auto-reinforce the cited sources. Runs AFTER the write succeeded
     // — a rejected remember must not reinforce anything. Self-citations are
@@ -1270,6 +1315,16 @@ pub fn handle_remember(db: &Database, args: Value) -> Result<String, String> {
             "body was >=70% trigram-similar to an existing entity in this \
              category+workspace, so no new entity was created; pass \
              skip_dedup=true to force a distinct write"
+        );
+    }
+    // #874: a quarantined write is accepted-but-held — make it impossible
+    // to miss for callers that don't parse the action string.
+    if action.starts_with("quarantined") {
+        result["quarantined"] = json!(true);
+        result["hint"] = json!(
+            "interference score exceeded the configured bound; the write was \
+             staged in write_quarantine (never served) — release or delete \
+             via perseus_vault_write_quarantine"
         );
     }
     if let Some(dr) = derived_report {
@@ -5394,6 +5449,11 @@ pub fn handle_operator_review(db: &Database, args: Value) -> Result<String, Stri
         "mental_models": db
             .mental_model_review_list(limit, None)
             .unwrap_or_default(),
+        // #874: pending write-quarantine items (interference gate holds).
+        // Read-only listing; decisions go through perseus_vault_write_quarantine.
+        "write_quarantine": db
+            .write_quarantine_list(None, limit)
+            .unwrap_or_default(),
         "read_only":true}).to_string())
 }
 
@@ -5455,6 +5515,92 @@ pub fn handle_mental_model_review(db: &Database, args: Value) -> Result<String, 
         }
         other => Err(format!(
             "invalid mental_model_review action '{other}': expected list | approve | dismiss"
+        )),
+    }
+}
+
+/// #874: review the write-quarantine hold — `list` pending interference-gate
+/// holds (never served by any read surface), `show` a full record (body +
+/// interference report), `release` materialize one through the audited
+/// remember path (the operator review IS the approval; refused into a live
+/// identity), `delete` drop one without materialization. Every decision is
+/// journaled (`interference_released` / `interference_deleted`).
+pub fn handle_write_quarantine(db: &Database, args: Value) -> Result<String, String> {
+    let action = args
+        .get("action")
+        .and_then(|v| v.as_str())
+        .unwrap_or("list")
+        .to_ascii_lowercase();
+    let actor = args
+        .get("requesting_agent_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    match action.as_str() {
+        "list" | "" => {
+            let ws = args
+                .get("workspace_hash")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let limit = args
+                .get("limit")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(50)
+                .clamp(1, 10_000);
+            let items = db
+                .write_quarantine_list(
+                    if ws.is_empty() { None } else { Some(ws.as_str()) },
+                    limit,
+                )
+                .map_err(|e| format!("Write quarantine list failed: {e}"))?;
+            Ok(json!({
+                "count": items.len(),
+                "items": items,
+                "note": "quarantined writes are never served; release materializes them \
+                         through the audited remember path (refused into a live identity), \
+                         delete drops them",
+            })
+            .to_string())
+        }
+        "show" => {
+            let id = args
+                .get("id")
+                .and_then(|v| v.as_str())
+                .ok_or("write_quarantine show requires an id")?
+                .to_string();
+            match db
+                .write_quarantine_show(&id)
+                .map_err(|e| format!("Write quarantine show failed: {e}"))?
+            {
+                Some(rec) => Ok(rec.to_string()),
+                None => Err(format!("no quarantined write with id {id}")),
+            }
+        }
+        "release" => {
+            let id = args
+                .get("id")
+                .and_then(|v| v.as_str())
+                .ok_or("write_quarantine release requires an id")?
+                .to_string();
+            let out = db
+                .release_write_quarantine(&id, &actor)
+                .map_err(|e| format!("Write quarantine release failed: {e}"))?;
+            Ok(json!({"released": true, "detail": out}).to_string())
+        }
+        "delete" => {
+            let id = args
+                .get("id")
+                .and_then(|v| v.as_str())
+                .ok_or("write_quarantine delete requires an id")?
+                .to_string();
+            let out = db
+                .delete_write_quarantine(&id, &actor)
+                .map_err(|e| format!("Write quarantine delete failed: {e}"))?;
+            Ok(json!({"deleted": true, "detail": out}).to_string())
+        }
+        other => Err(format!(
+            "invalid write_quarantine action '{other}': expected list | show | release | delete"
         )),
     }
 }
@@ -7781,9 +7927,25 @@ fn memories_write(
     };
     // skip_dedup: a deliberate file write must create THIS path even when a
     // similar file already exists under another path.
-    db.remember_skip_dedup(&entity)
-        .map(|_| ())
-        .map_err(|e| format!("write failed: {}", e))
+    // #874: file-semantics writes bypass the interference gate. A file
+    // rename/rewrite legitimately re-creates identical content at a new
+    // path — it is a file operation, not a memory-slot update; gating it
+    // would hold every relocated file (near-verbatim by construction).
+    // Memory-writer interference discipline applies to remember/capture
+    // surfaces, not the file facade.
+    db.remember_with_write_options(
+        &entity,
+        true,
+        None,
+        None,
+        false,
+        crate::interference::WriteGateOptions {
+            mode_override: Some(crate::interference::InterferenceMode::Off),
+            ..Default::default()
+        },
+    )
+    .map(|_| ())
+    .map_err(|e| format!("write failed: {}", e))
 }
 
 pub fn handle_memories(db: &Database, args: Value) -> Result<String, String> {

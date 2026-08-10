@@ -591,6 +591,7 @@ pub fn handle_request(
                     "perseus_vault_erase",
                     "perseus_vault_correct",
                     "perseus_vault_follow",
+                    "perseus_vault_write_quarantine",
                 ];
                 const SCOPE_READ_TOOLS: &[&str] = &[
                     "perseus_vault_recall",
@@ -845,6 +846,23 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
             "replayable": { "type": "boolean" }
           },
           "required": ["capture_mode", "captured_at_unix_ms", "replayable"]
+        },
+        "interference_mode": {
+          "type": "string",
+          "enum": ["auto", "refuse", "quarantine"],
+          "default": "auto",
+          "description": "#874: per-write interference-gate mode override. auto (default) uses the operator-configured mode (PERSEUS_VAULT_INTERFERENCE_MODE); refuse/quarantine tighten it per-write. Per-write 'off' is refused fail-closed — only the operator can disable the gate."
+        },
+        "interference_bound": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "#874: per-write interference bound override — may only TIGHTEN the configured bound (PERSEUS_VAULT_INTERFERENCE_BOUND); a looser bound is refused fail-closed. Writes whose activation overlap with existing memory exceeds the bound are quarantined (default) or refused."
+        },
+        "sparse_update": {
+          "type": "boolean",
+          "default": false,
+          "description": "#874: sparse update mode — touches only the activated subset of state (body slot, activated links), never disturbs neighbors: no salience inflation on re-assert, caller links admitted only when their target is activated by the new body, no near-duplicate absorption on insert."
         }
       },
       "required": [
@@ -4369,6 +4387,34 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     }
   },
   {
+    "name": "perseus_vault_write_quarantine",
+    "description": "#874: review the write-quarantine hold — writes whose measured interference exceeded the configured bound are staged here (never served by any read surface) instead of committing to memory. list (default): pending holds with scores; show: full record incl. decrypted body + interference report; release: materialize one through the audited remember path (the operator review IS the approval; refused when the identity is already live); delete: drop one without materialization. Every decision is journaled (interference_released / interference_deleted). Pending items also surface in perseus_vault_operator_review.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "action": {
+          "type": "string",
+          "enum": ["list", "show", "release", "delete"],
+          "default": "list",
+          "description": "list (default) | show | release | delete"
+        },
+        "id": {"type": "string", "description": "Quarantine id (required for show/release/delete)"},
+        "workspace_hash": {"type": "string", "description": "Workspace scope for list (default all)"},
+        "limit": {"type": "integer", "default": 50, "maximum": 10000},
+        "requesting_agent_id": {"type": "string", "description": "Reviewer identity stamped into the journal (default empty)"}
+      }
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "count": {"type": "integer"},
+        "items": {"type": "array", "items": {"type": "object"}},
+        "released": {"type": "boolean"},
+        "deleted": {"type": "boolean"}
+      }
+    }
+  },
+  {
     "name": "perseus_vault_conflicts",
     "description": "Detect conflicting entities in the same category — pairs with low trigram similarity in their body_json. Flags potential contradictions, duplicate-but-divergent entries, and stale-overwritten facts. Read-only by default. Opt in with resolve=true to actively invalidate the lower-certainty side of clear conflicts (superseding it into history, reversible + time-travelable via perseus_vault_as_of); that path defaults to dry_run=true so you preview first, and never resolves pairs whose certainties are within certainty_margin.",
     "inputSchema": {
@@ -6242,6 +6288,7 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
         "perseus_vault_operator_review" => tools::handle_operator_review(db, args),
         "perseus_vault_mental_model_set" => tools::handle_mental_model_set(db, args),
         "perseus_vault_mental_model_review" => tools::handle_mental_model_review(db, args),
+        "perseus_vault_write_quarantine" => tools::handle_write_quarantine(db, args),
         "perseus_vault_conflicts" => Ok(tools::handle_conflicts(db, args)),
         "perseus_vault_consolidate" => Ok(tools::handle_consolidate(db, args)),
         "perseus_vault_dream" => tools::handle_dream(db, args),
@@ -6332,7 +6379,7 @@ mod tests {
         );
         assert_eq!(
             registry_names.len(),
-            109,
+            110,
             "update public metadata when adding a tool"
         );
 

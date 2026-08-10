@@ -4,6 +4,7 @@ use serde_json::json;
 use r2d2_sqlite::SqliteConnectionManager;
 use sha2::{Digest, Sha256};
 use std::time::{SystemTime, UNIX_EPOCH};
+use crate::interference::GateVerdict;
 
 /// Deterministic canonicalization for rejected-value matching (#849):
 /// 1. If the value is valid JSON, re-serialize it compactly with serde_json so
@@ -5670,7 +5671,37 @@ impl Database {
         valid_to: Option<i64>,
         allow_rejected: bool,
     ) -> Result<(String, String), Box<dyn std::error::Error>> {
-        self.remember_impl_with_admission(entity, skip_dedup, valid_from, valid_to, allow_rejected, false)
+        self.remember_impl_with_admission(
+            entity,
+            skip_dedup,
+            valid_from,
+            valid_to,
+            allow_rejected,
+            false,
+            &crate::interference::WriteGateOptions::none(),
+        )
+    }
+
+    /// #874: governed write with per-write interference-gate and sparse-update
+    /// options (used by the MCP remember tool and trusted internal writers).
+    pub fn remember_with_write_options(
+        &self,
+        entity: &Entity,
+        skip_dedup: bool,
+        valid_from: Option<i64>,
+        valid_to: Option<i64>,
+        allow_rejected: bool,
+        opts: crate::interference::WriteGateOptions,
+    ) -> Result<(String, String), Box<dyn std::error::Error>> {
+        self.remember_impl_with_admission(
+            entity,
+            skip_dedup,
+            valid_from,
+            valid_to,
+            allow_rejected,
+            false,
+            &opts,
+        )
     }
 
     pub(crate) fn remember_verified_with_options(
@@ -5681,7 +5712,15 @@ impl Database {
         valid_to: Option<i64>,
         allow_rejected: bool,
     ) -> Result<(String, String), Box<dyn std::error::Error>> {
-        self.remember_impl_with_admission(entity, skip_dedup, valid_from, valid_to, allow_rejected, true)
+        self.remember_impl_with_admission(
+            entity,
+            skip_dedup,
+            valid_from,
+            valid_to,
+            allow_rejected,
+            true,
+            &crate::interference::WriteGateOptions::none(),
+        )
     }
 
     fn remember_impl_with_admission(
@@ -5692,6 +5731,7 @@ impl Database {
         valid_to: Option<i64>,
         allow_rejected: bool,
         verified_admission: bool,
+        gate_opts: &crate::interference::WriteGateOptions,
     ) -> Result<(String, String), Box<dyn std::error::Error>> {
         let enriched_entity = ensure_durable_write_provenance(entity, verified_admission);
         let entity = &enriched_entity;
@@ -5808,6 +5848,61 @@ impl Database {
         if let Some(ex_id) = existing_id {
             // Update existing entity — compute decay + boost (it's being remembered)
             id = ex_id;
+
+            // #874: interference gate — a content-changing update that would
+            // rewrite this slot to content already covered by a DIFFERENT
+            // entity is held (quarantine) / refused before any mutation.
+            // Identical re-asserts change nothing and skip the gate. The
+            // stored body is pre-read WITHOUT the writer lock (advisory):
+            // the tx below re-reads under the lock for the history snapshot,
+            // so commit correctness is unaffected by a concurrent writer.
+            let gate_verdict = {
+                let old_raw_for_gate: String = conn
+                    .query_row(
+                        "SELECT body_json FROM entities WHERE id = ?1",
+                        params![id],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or_default();
+                let old_plain_for_gate = if let Some(ref enc) = self.encryption {
+                    match Self::decrypt_body_with_aad_fallback(
+                        enc,
+                        &old_raw_for_gate,
+                        &entity.category,
+                        &entity.key,
+                    ) {
+                        crate::encryption::BodyDecrypt::Plaintext(s)
+                        | crate::encryption::BodyDecrypt::LegacyPlaintext(s) => s,
+                        crate::encryption::BodyDecrypt::AuthFailed(_) => {
+                            "\u{0}__perseus_vault_undecryptable__".to_string()
+                        }
+                    }
+                } else {
+                    old_raw_for_gate
+                };
+                if old_plain_for_gate != entity.body_json {
+                    let mut exclude: Vec<String> = vec![id.clone()];
+                    exclude.extend(gate_opts.exclude_ids.iter().cloned());
+                    self.run_interference_gate(
+                        &conn, entity, &exclude, valid_from, valid_to, gate_opts,
+                    )?
+                } else {
+                    GateVerdict::Proceed(None)
+                }
+            };
+            match gate_verdict {
+                GateVerdict::Proceed(_) => {}
+                GateVerdict::Quarantined(qid, action) => return Ok((qid, action)),
+                GateVerdict::Refused => {
+                    return Err(format!(
+                        "write refused: interference score exceeds the configured bound \
+                         (subject={}, predicate={})",
+                        entity.key, entity.category
+                    )
+                    .into())
+                }
+            }
+
             // #379: this branch is an audited read-decide-write (the #371
             // re-assert audit below) — take the writer lock BEFORE the reads
             // so a concurrent set_valid_to/status flip/re-assert can't
@@ -5830,7 +5925,16 @@ impl Database {
                     |r| r.get(0),
                 )
                 .unwrap_or(0);
-            let boosted = Self::boost_decay(old_decay);
+            // #874 sparse mode: a sparse re-assert touches ONLY the body
+            // slot — no salience inflation (no decay boost, no retrieval
+            // count increment). The dense path keeps today's "being
+            // remembered" semantics.
+            let boosted = if gate_opts.sparse_update {
+                old_decay
+            } else {
+                Self::boost_decay(old_decay)
+            };
+            let retrieval_delta: i64 = if gate_opts.sparse_update { 0 } else { 1 };
             let new_layer = Self::compute_layer(old_count + 1);
 
             // Bi-temporal supersession (v2.4.0): if this remember() changes the
@@ -6005,6 +6109,11 @@ impl Database {
             // every edge on each re-assert — and even a caller that read
             // first could lose a concurrently added edge. Union stored ∪
             // caller under the writer lock; unlink is the only removal path.
+            // #874 sparse mode: caller links are ADMITTED only when their
+            // target is activated by the new body (token containment ≥
+            // sparse_activation); non-activated caller links are journaled
+            // as dropped instead of stored.
+            let mut sparse_dropped_links: Vec<String> = Vec::new();
             let links_json = {
                 let stored: String = tx
                     .query_row(
@@ -6015,8 +6124,54 @@ impl Database {
                     .unwrap_or_else(|_| "[]".to_string());
                 let mut merged: Vec<MemoryLink> =
                     serde_json::from_str(&stored).unwrap_or_default();
+                let incoming_tokens = crate::interference::body_tokens(&entity.body_json);
                 for l in &entity.links {
-                    if !merged.iter().any(|m| m.target_id == l.target_id) {
+                    if merged.iter().any(|m| m.target_id == l.target_id) {
+                        continue;
+                    }
+                    let mut admit = true;
+                    if gate_opts.sparse_update && !incoming_tokens.is_empty() {
+                        // Decrypt AES-GCM at-rest target bodies before
+                        // measuring activation (ciphertext scores 0.0 —
+                        // #884-class). Missing/tampered targets resolve to
+                        // empty tokens → not activated → dropped.
+                        let target_tokens: Vec<String> = tx
+                            .query_row(
+                                "SELECT body_json, category, key FROM entities WHERE id = ?1",
+                                params![l.target_id],
+                                |r| {
+                                    Ok((
+                                        r.get::<_, String>(0)?,
+                                        r.get::<_, String>(1)?,
+                                        r.get::<_, String>(2)?,
+                                    ))
+                                },
+                            )
+                            .ok()
+                            .map(|(b, cat, key)| {
+                                let plain = match &self.encryption {
+                                    Some(enc) => match Self::decrypt_body_with_aad_fallback(
+                                        enc, &b, &cat, &key,
+                                    ) {
+                                        crate::encryption::BodyDecrypt::Plaintext(p)
+                                        | crate::encryption::BodyDecrypt::LegacyPlaintext(p) => p,
+                                        crate::encryption::BodyDecrypt::AuthFailed(_) => {
+                                            String::new()
+                                        }
+                                    },
+                                    None => b,
+                                };
+                                crate::interference::body_tokens(&plain)
+                            })
+                            .unwrap_or_default();
+                        let activation =
+                            crate::interference::containment(&incoming_tokens, &target_tokens);
+                        if activation < gate_opts.sparse_activation_param() {
+                            admit = false;
+                            sparse_dropped_links.push(l.target_id.clone());
+                        }
+                    }
+                    if admit {
                         // #869: caller-supplied edges are attested with the
                         // re-asserting entity as the default anchor.
                         let mut l = l.clone();
@@ -6040,7 +6195,7 @@ impl Database {
                     valid_from_unix_ms = COALESCE(?20, valid_from_unix_ms),
                     valid_to_unix_ms = COALESCE(?21, valid_to_unix_ms),
                     expires_at_unix_ms = ?23,
-                    retrieval_count = retrieval_count + 1
+                    retrieval_count = retrieval_count + ?24
                  WHERE id = ?19",
                 params![
                     body_encrypted,
@@ -6084,6 +6239,8 @@ impl Database {
                     // convention (None clears a prior expiry — the body is
                     // the source of truth for the fact, expiry included).
                     entity_expiry_ms(&entity.body_json),
+                    // #874 sparse mode: 0 = no salience inflation.
+                    retrieval_delta,
                 ],
             )?;
 
@@ -6164,6 +6321,31 @@ impl Database {
             Self::upsert_dedup_signature(&tx, &id, &body_encrypted)?;
             tx.commit()?;
 
+            // #874 sparse mode: journal the applied sparse discipline
+            // (dropped non-activated caller links) AFTER the commit — the
+            // journal draws its own connection and must not nest inside the
+            // write transaction.
+            if gate_opts.sparse_update && !sparse_dropped_links.is_empty() {
+                self.journal_with_conn(&conn, &JournalEvent {
+                    id: format!("jrn-{}", uuid::Uuid::new_v4().simple()),
+                    event_type: "sparse_update_applied".to_string(),
+                    evaluated_json: serde_json::to_string(&serde_json::json!({
+                        "entity_id": id,
+                        "dropped_links": sparse_dropped_links,
+                    }))?,
+                    acted_json: "{\"stored\":true,\"mode\":\"sparse\"}".to_string(),
+                    forward_json: "{\"note\":\"non-activated caller links were not stored; \
+                        re-link via perseus_vault_link or use a dense update\"}"
+                        .to_string(),
+                    category: entity.category.clone(),
+                    key: entity.key.clone(),
+                    entity_id: id.clone(),
+                    agent_id: entity.agent_id.clone(),
+                    workspace_hash: entity.workspace_hash.clone(),
+                    created_at_unix_ms: now_ms(),
+                })?;
+            }
+
             action = "updated".to_string();
             should_embed = content_changed;
         } else {
@@ -6184,14 +6366,15 @@ impl Database {
             }
 
             // Check for near-duplicates before inserting (unless the caller is
-            // a file-semantics writer — see remember_skip_dedup).
+            // a file-semantics writer — see remember_skip_dedup — or the
+            // write is a #874 sparse update, which never disturbs neighbors).
             let dup_threshold = 0.7; // 70% trigram similarity
             // v17 (#476): PERSEUS_VAULT_DEDUP_FTS_PREFILTER is retired. The lossy #228
             // prefilter existed to collapse the entities-walk cost; the scan
             // is now signature-driven + band-indexed (exact, and faster than
             // the prefilter ever was — the 64-term MATCH per write measured
             // SLOWER than the scan it pruned, see #476's A/B).
-            if !skip_dedup {
+            if !skip_dedup && !gate_opts.sparse_update {
                 // #397: run the dedup scan on the connection this remember()
                 // already holds — a nested self.conn() here held TWO pooled
                 // connections per create and collapsed the pool under load.
@@ -6210,6 +6393,27 @@ impl Database {
                         params![now_ms(), dup_id],
                     );
                     return Ok((dup_id, "deduped (new key not created)".to_string()));
+                }
+            }
+
+            // #874: interference gate — a fresh insert whose content heavily
+            // activates an existing entity (and was NOT resolved by the
+            // near-duplicate merge above — e.g. skip_dedup writes, or
+            // sub-threshold-but-high-activation overlaps) is held
+            // (quarantine) / refused before any mutation.
+            let gate_verdict = self.run_interference_gate(
+                &conn, entity, &gate_opts.exclude_ids, valid_from, valid_to, gate_opts,
+            )?;
+            match gate_verdict {
+                GateVerdict::Proceed(_) => {}
+                GateVerdict::Quarantined(qid, action) => return Ok((qid, action)),
+                GateVerdict::Refused => {
+                    return Err(format!(
+                        "write refused: interference score exceeds the configured bound \
+                         (subject={}, predicate={})",
+                        entity.key, entity.category
+                    )
+                    .into())
                 }
             }
 
@@ -8880,6 +9084,46 @@ impl Database {
         )?;
         tx.commit()?;
 
+        // #874: link-write interference telemetry — the edge's coherence
+        // (max token containment between the endpoint bodies). Edges are
+        // explicit caller intent and unlink is the correction path, so this
+        // is telemetry, not a gate: a low-coherence edge activates two
+        // unrelated slots and shows up in the journal as drift.
+        let (from_body, to_body): (String, String) = conn
+            .query_row(
+                "SELECT a.body_json, b.body_json FROM entities a, entities b \
+                 WHERE a.id = ?1 AND b.id = ?2",
+                params![from_id, to_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap_or_default();
+        let (from_tokens, to_tokens) = (
+            crate::interference::body_tokens(&from_body),
+            crate::interference::body_tokens(&to_body),
+        );
+        let coherence = crate::interference::containment(&from_tokens, &to_tokens)
+            .max(crate::interference::containment(&to_tokens, &from_tokens));
+        self.journal_with_conn(&conn, &JournalEvent {
+            id: format!("jrn-{}", uuid::Uuid::new_v4().simple()),
+            event_type: "link_interference_scored".to_string(),
+            evaluated_json: serde_json::to_string(&serde_json::json!({
+                "from_id": from_id,
+                "to_id": to_id,
+                "relationship": relationship,
+                "coherence": coherence,
+            }))?,
+            acted_json: "{\"stored\":true,\"surface\":\"entities.links\"}".to_string(),
+            forward_json: "{\"note\":\"edge coherence telemetry; low coherence = edge \
+                activates two unrelated slots\"}"
+                .to_string(),
+            category: String::new(),
+            key: String::new(),
+            entity_id: from_id.clone(),
+            agent_id: String::new(),
+            workspace_hash: String::new(),
+            created_at_unix_ms: now_ms(),
+        })?;
+
         Ok(())
     }
 
@@ -8928,7 +9172,18 @@ impl Database {
     /// Append a journal event.
     pub fn journal(&self, event: &JournalEvent) -> Result<(), Box<dyn std::error::Error>> {
         let conn = self.conn()?;
+        self.journal_with_conn(&conn, event)
+    }
 
+    /// Append a journal event on a caller-held connection. Write paths that
+    /// already hold a pooled connection MUST use this: `journal()` would
+    /// draw a SECOND connection while the first is held — the #387 nested
+    /// pool-draw class (link/remember under concurrency starve the pool).
+    fn journal_with_conn(
+        &self,
+        conn: &rusqlite::Connection,
+        event: &JournalEvent,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         // #417: stamp the workspace of the referenced entity so purge can scope
         // journal redaction per-workspace. Prefer an explicit value on the
         // event; otherwise derive it from the referenced entity (the live row,
@@ -9018,6 +9273,589 @@ impl Database {
             ],
         )?;
         Ok(())
+    }
+
+    // ─── #874: activation-gated sparse writes ────────────────────────────
+    // Interference scoring, the write gate, the reviewable quarantine hold,
+    // and sparse-update mechanics. Grounding: sparse memory finetuning
+    // (arXiv:2510.15103) — updating only the memory slots highly activated
+    // by new knowledge cuts catastrophic forgetting (NQ F1 drop 89% full-FT
+    // / 71% LoRA / 11% sparse). Spec: docs/specs/activation-gated-sparse-writes.md.
+
+    /// Run the interference gate for a write that is about to land. Always
+    /// journals `interference_scored` (telemetry), then enforces the
+    /// effective mode: quarantine stages the write in `write_quarantine`
+    /// (never served, operator-reviewable), refuse errors out. `exclude_ids`
+    /// are the memory slots this write intentionally updates (own identity,
+    /// cited sources) — activation overlap is measured against the rest.
+    fn run_interference_gate(
+        &self,
+        conn: &rusqlite::Connection,
+        entity: &Entity,
+        exclude_ids: &[String],
+        valid_from: Option<i64>,
+        valid_to: Option<i64>,
+        gate_opts: &crate::interference::WriteGateOptions,
+    ) -> Result<GateVerdict, Box<dyn std::error::Error>> {
+        let cfg = crate::interference::InterferenceConfig::from_env();
+        // The incoming fact's embedding, only when the operator opted into
+        // synchronous compute (#271 kept ONNX inference off the default
+        // write path). Backend failure degrades the measurement (journaled
+        // via the report's components) rather than blocking the write.
+        let incoming_vec = if cfg.embed && self.embedding_config.enabled {
+            Self::generate_embedding_backend(
+                &self.embedding_config,
+                &self.llm_config,
+                &entity.body_json,
+            )
+            .ok()
+        } else {
+            None
+        };
+        // #874/#884-class: candidate bodies are AES-GCM ciphertext at rest
+        // on encrypted deployments — decrypt (with AAD fallback) before
+        // measuring containment. Auth failures resolve to empty (fail
+        // closed: tampered content is never treated as evidence).
+        let decrypt = |raw: &str, category: &str, key: &str| -> String {
+            match &self.encryption {
+                Some(enc) => match Self::decrypt_body_with_aad_fallback(enc, raw, category, key) {
+                    crate::encryption::BodyDecrypt::Plaintext(p)
+                    | crate::encryption::BodyDecrypt::LegacyPlaintext(p) => p,
+                    crate::encryption::BodyDecrypt::AuthFailed(_) => String::new(),
+                },
+                None => raw.to_string(),
+            }
+        };
+        let mut report = crate::interference::compute_activation_overlap(
+            conn,
+            entity,
+            incoming_vec.as_deref(),
+            exclude_ids,
+            &cfg,
+            &decrypt,
+        )?;
+        let decision = crate::interference::evaluate(
+            &cfg,
+            gate_opts.mode_override,
+            gate_opts.bound_override,
+            &mut report,
+        );
+        let acted = match decision {
+            crate::interference::InterferenceDecision::Allow => {
+                serde_json::json!({"decision": "allowed", "stored": true})
+            }
+            crate::interference::InterferenceDecision::Quarantine => serde_json::json!({
+                "decision": "quarantined", "stored": false, "surface": "write_quarantine"
+            }),
+            crate::interference::InterferenceDecision::Refuse => {
+                serde_json::json!({"decision": "refused", "stored": false})
+            }
+        };
+        self.journal_with_conn(conn, &JournalEvent {
+            id: format!("jrn-{}", uuid::Uuid::new_v4().simple()),
+            event_type: "interference_scored".to_string(),
+            evaluated_json: serde_json::to_string(&report)?,
+            acted_json: serde_json::to_string(&acted)?,
+            forward_json: "{\"note\":\"per-write interference score; drift observable via timeline\"}"
+                .to_string(),
+            category: entity.category.clone(),
+            key: entity.key.clone(),
+            entity_id: entity.id.clone(),
+            agent_id: entity.agent_id.clone(),
+            workspace_hash: entity.workspace_hash.clone(),
+            created_at_unix_ms: now_ms(),
+        })?;
+        match decision {
+            crate::interference::InterferenceDecision::Allow => {
+                Ok(GateVerdict::Proceed(Some(report)))
+            }
+            crate::interference::InterferenceDecision::Quarantine => {
+                let qid = self.quarantine_write(conn, entity, &report, valid_from, valid_to)?;
+                self.journal_with_conn(conn, &JournalEvent {
+                    id: format!("jrn-{}", uuid::Uuid::new_v4().simple()),
+                    event_type: "interference_quarantined".to_string(),
+                    evaluated_json: serde_json::to_string(&report)?,
+                    acted_json: serde_json::to_string(&serde_json::json!({
+                        "stored": false,
+                        "quarantine_id": qid,
+                        "hint": format!(
+                            "interference score {:.3} exceeded bound {:.3}; write staged in \
+                             write_quarantine — release or delete via perseus_vault_write_quarantine",
+                            report.score, report.bound
+                        ),
+                    }))?,
+                    forward_json: "{\"note\":\"quarantined writes are never served; operator review required\"}"
+                        .to_string(),
+                    category: entity.category.clone(),
+                    key: entity.key.clone(),
+                    entity_id: qid.clone(),
+                    agent_id: entity.agent_id.clone(),
+                    workspace_hash: entity.workspace_hash.clone(),
+                    created_at_unix_ms: now_ms(),
+                })?;
+                Ok(GateVerdict::Quarantined(
+                    qid,
+                    format!(
+                        "quarantined (interference score {:.3} > bound {:.3})",
+                        report.score, report.bound
+                    ),
+                ))
+            }
+            crate::interference::InterferenceDecision::Refuse => {
+                self.journal_with_conn(conn, &JournalEvent {
+                    id: format!("jrn-{}", uuid::Uuid::new_v4().simple()),
+                    event_type: "interference_refused".to_string(),
+                    evaluated_json: serde_json::to_string(&report)?,
+                    acted_json: "{\"stored\":false,\"reason\":\"interference bound exceeded\"}"
+                        .to_string(),
+                    forward_json:
+                        "{\"note\":\"raise PERSEUS_VAULT_INTERFERENCE_BOUND or set mode=quarantine to stage instead\"}"
+                            .to_string(),
+                    category: entity.category.clone(),
+                    key: entity.key.clone(),
+                    entity_id: entity.id.clone(),
+                    agent_id: entity.agent_id.clone(),
+                    workspace_hash: entity.workspace_hash.clone(),
+                    created_at_unix_ms: now_ms(),
+                })?;
+                Ok(GateVerdict::Refused)
+            }
+        }
+    }
+
+    /// Stage a gate-fired write in `write_quarantine` (body encrypted like
+    /// entities when encryption is on; AAD bound to category+key). Returns
+    /// the quarantine id. The row is never served by any read surface —
+    /// only `perseus_vault_write_quarantine` list/show expose it.
+    fn quarantine_write(
+        &self,
+        conn: &rusqlite::Connection,
+        entity: &Entity,
+        report: &crate::interference::InterferenceReport,
+        valid_from: Option<i64>,
+        valid_to: Option<i64>,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let qid = format!("qrn-{}", uuid::Uuid::new_v4().simple());
+        let body_encrypted = if let Some(ref enc) = self.encryption {
+            let aad = Self::build_aad(&entity.category, &entity.key);
+            enc.encrypt(&entity.body_json, aad.as_bytes())
+                .map_err(|e| format!("Encryption error in write quarantine: {e}"))?
+        } else {
+            entity.body_json.clone()
+        };
+        let links_json = serde_json::to_string(&entity.links)?;
+        let tags_json = serde_json::to_string(&entity.tags)?;
+        conn.execute(
+            "INSERT INTO write_quarantine
+             (id, category, key, body_json, links, tags, status, entity_type,
+              importance, certainty, visibility, topic_path, always_on,
+              agent_id, workspace_hash, valid_from_unix_ms, valid_to_unix_ms,
+              interference_score, interference_json, reason, created_at_unix_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                     ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
+            params![
+                qid,
+                entity.category,
+                entity.key,
+                body_encrypted,
+                links_json,
+                tags_json,
+                entity.status,
+                entity.entity_type,
+                entity.decay_score,
+                entity.certainty,
+                entity.visibility,
+                entity.topic_path,
+                entity.always_on as i32,
+                entity.agent_id,
+                entity.workspace_hash,
+                valid_from,
+                valid_to,
+                report.score,
+                serde_json::to_string(report)?,
+                "interference",
+                now_ms(),
+            ],
+        )?;
+        Ok(qid)
+    }
+
+    /// List pending quarantined writes (no bodies — review list; use
+    /// `show` for the full record). Scoped like other review surfaces:
+    /// empty workspace filter matches everything.
+    pub fn write_quarantine_list(
+        &self,
+        workspace_hash: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, category, key, workspace_hash, agent_id,
+                    interference_score, reason, created_at_unix_ms
+             FROM write_quarantine
+             WHERE (?1 = '' OR workspace_hash = ?1)
+             ORDER BY created_at_unix_ms DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(
+            rusqlite::params![workspace_hash.unwrap_or(""), limit.clamp(1, 10_000)],
+            |r| {
+                Ok(serde_json::json!({
+                    "id": r.get::<_, String>(0)?,
+                    "category": r.get::<_, String>(1)?,
+                    "key": r.get::<_, String>(2)?,
+                    "workspace_hash": r.get::<_, String>(3)?,
+                    "agent_id": r.get::<_, String>(4)?,
+                    "interference_score": r.get::<_, f64>(5)?,
+                    "reason": r.get::<_, String>(6)?,
+                    "created_at_unix_ms": r.get::<_, i64>(7)?,
+                }))
+            },
+        )?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Full record of one quarantined write, including the (decrypted)
+    /// body and the interference report that fired the gate. `None` when
+    /// the id is unknown.
+    pub fn write_quarantine_show(
+        &self,
+        id: &str,
+    ) -> Result<Option<serde_json::Value>, Box<dyn std::error::Error>> {
+        let conn = self.conn()?;
+        let row = conn
+            .query_row(
+                "SELECT id, category, key, body_json, links, tags, status, entity_type,
+                        importance, certainty, visibility, topic_path, always_on,
+                        agent_id, workspace_hash, valid_from_unix_ms, valid_to_unix_ms,
+                        interference_score, interference_json, reason, created_at_unix_ms
+                 FROM write_quarantine WHERE id = ?1",
+                params![id],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, String>(4)?,
+                        r.get::<_, String>(5)?,
+                        r.get::<_, String>(6)?,
+                        r.get::<_, String>(7)?,
+                        r.get::<_, f64>(8)?,
+                        r.get::<_, f64>(9)?,
+                        r.get::<_, String>(10)?,
+                        r.get::<_, String>(11)?,
+                        r.get::<_, i64>(12)?,
+                        r.get::<_, String>(13)?,
+                        r.get::<_, String>(14)?,
+                        r.get::<_, Option<i64>>(15)?,
+                        r.get::<_, Option<i64>>(16)?,
+                        r.get::<_, f64>(17)?,
+                        r.get::<_, String>(18)?,
+                        r.get::<_, String>(19)?,
+                        r.get::<_, i64>(20)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let (qid, category, key, body_encrypted, links, tags, status, entity_type, importance,
+             certainty, visibility, topic_path, always_on, agent_id, workspace_hash,
+             valid_from, valid_to, score, report_json, reason, created_at) = row;
+        let body_plain = if let Some(ref enc) = self.encryption {
+            match Self::decrypt_body_with_aad_fallback(
+                enc,
+                &body_encrypted,
+                &category,
+                &key,
+            ) {
+                crate::encryption::BodyDecrypt::Plaintext(s)
+                | crate::encryption::BodyDecrypt::LegacyPlaintext(s) => s,
+                crate::encryption::BodyDecrypt::AuthFailed(_) => {
+                    return Err("write_quarantine_show: stored body failed authentication".into())
+                }
+            }
+        } else {
+            body_encrypted
+        };
+        Ok(Some(serde_json::json!({
+            "id": qid,
+            "category": category,
+            "key": key,
+            "body_json": body_plain,
+            "links": serde_json::from_str::<serde_json::Value>(&links).unwrap_or(serde_json::json!([])),
+            "tags": serde_json::from_str::<serde_json::Value>(&tags).unwrap_or(serde_json::json!([])),
+            "status": status,
+            "type": entity_type,
+            "importance": importance,
+            "certainty": certainty,
+            "visibility": visibility,
+            "topic_path": topic_path,
+            "always_on": always_on != 0,
+            "agent_id": agent_id,
+            "workspace_hash": workspace_hash,
+            "valid_from_unix_ms": valid_from,
+            "valid_to_unix_ms": valid_to,
+            "interference_score": score,
+            "interference_report": serde_json::from_str::<serde_json::Value>(&report_json)
+                .unwrap_or(serde_json::json!({})),
+            "reason": reason,
+            "created_at_unix_ms": created_at,
+        })))
+    }
+
+    /// Operator release: materialize a quarantined write through the audited
+    /// remember path with the gate bypassed (the review IS the approval;
+    /// journaled as `interference_released`). Fail-closed: release into an
+    /// already-live identity is refused.
+    pub fn release_write_quarantine(
+        &self,
+        id: &str,
+        actor: &str,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let Some(rec) = self.write_quarantine_show(id)? else {
+            return Err(format!("no quarantined write with id {id}").into());
+        };
+        let category = rec["category"].as_str().unwrap_or_default().to_string();
+        let key = rec["key"].as_str().unwrap_or_default().to_string();
+        let workspace_hash = rec["workspace_hash"].as_str().unwrap_or_default().to_string();
+        let conn = self.conn()?;
+        let live: Option<String> = conn
+            .query_row(
+                "SELECT id FROM entities WHERE category = ?1 AND key = ?2 AND workspace_hash = ?3",
+                params![category, key, workspace_hash],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(live_id) = live {
+            return Err(format!(
+                "release refused: identity {category}/{key} is already live as {live_id} — \
+                 delete the quarantined row instead, or update the live entity"
+            )
+            .into());
+        }
+        drop(conn);
+        let mut entity = Entity {
+            id: format!("mem-{}", uuid::Uuid::new_v4().simple()),
+            category,
+            key,
+            body_json: rec["body_json"].as_str().unwrap_or_default().to_string(),
+            status: rec["status"].as_str().unwrap_or("active").to_string(),
+            entity_type: rec["type"].as_str().unwrap_or("insight").to_string(),
+            tags: rec["tags"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            decay_score: rec["importance"].as_f64().unwrap_or(1.0),
+            retrieval_count: 0,
+            layer: "working".to_string(),
+            topic_path: rec["topic_path"].as_str().unwrap_or_default().to_string(),
+            archived: false,
+            archive_reason: String::new(),
+            links: rec["links"]
+                .as_array()
+                .map(|a| {
+                    serde_json::from_value::<Vec<MemoryLink>>(serde_json::Value::Array(a.clone()))
+                        .unwrap_or_default()
+                })
+                .unwrap_or_default(),
+            verified: false,
+            source: "write_quarantine_release".to_string(),
+            always_on: rec["always_on"].as_bool().unwrap_or(false),
+            certainty: rec["certainty"].as_f64().unwrap_or(0.5),
+            workspace_hash,
+            agent_id: rec["agent_id"].as_str().unwrap_or_default().to_string(),
+            visibility: rec["visibility"].as_str().unwrap_or("workspace").to_string(),
+            created_at_unix_ms: now_ms(),
+            last_accessed_unix_ms: now_ms(),
+            follow_count: 0,
+            miss_count: 0,
+            follow_rate: 0.0,
+            efficacy_status: "unverified".to_string(),
+            epistemic_state: crate::models::default_epistemic_state(),
+            embedding: None,
+            _parsed_body: None,
+        };
+        if entity.agent_id.is_empty() {
+            entity.agent_id = actor.to_string();
+        }
+        // The operator review is the approval: gate bypassed, write audited.
+        let opts = crate::interference::WriteGateOptions {
+            mode_override: Some(crate::interference::InterferenceMode::Off),
+            ..Default::default()
+        };
+        let (eid, action) = self.remember_impl_with_admission(
+            &entity, true, rec["valid_from_unix_ms"].as_i64(), rec["valid_to_unix_ms"].as_i64(),
+            false, false, &opts,
+        )?;
+        let conn = self.conn()?;
+        conn.execute("DELETE FROM write_quarantine WHERE id = ?1", params![id])?;
+        drop(conn);
+        self.journal(&JournalEvent {
+            id: format!("jrn-{}", uuid::Uuid::new_v4().simple()),
+            event_type: "interference_released".to_string(),
+            evaluated_json: serde_json::to_string(&serde_json::json!({
+                "quarantine_id": id,
+                "released_by": actor,
+                "entity_id": eid,
+                "action": action,
+            }))?,
+            acted_json: "{\"stored\":true,\"surface\":\"entities\"}".to_string(),
+            forward_json: "{\"note\":\"operator-approved materialization; interference gate bypassed for this write\"}"
+                .to_string(),
+            category: entity.category.clone(),
+            key: entity.key.clone(),
+            entity_id: eid,
+            agent_id: actor.to_string(),
+            workspace_hash: entity.workspace_hash.clone(),
+            created_at_unix_ms: now_ms(),
+        })?;
+        Ok(format!("released {id} as {} ({action})", entity.id))
+    }
+
+    /// Operator delete: drop a quarantined write without materializing it.
+    pub fn delete_write_quarantine(
+        &self,
+        id: &str,
+        actor: &str,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let conn = self.conn()?;
+        let rec: Option<(String, String, String, String)> = conn
+            .query_row(
+                "SELECT category, key, workspace_hash, agent_id FROM write_quarantine WHERE id = ?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?;
+        let Some((category, key, workspace_hash, agent_id)) = rec else {
+            return Err(format!("no quarantined write with id {id}").into());
+        };
+        conn.execute("DELETE FROM write_quarantine WHERE id = ?1", params![id])?;
+        drop(conn);
+        self.journal(&JournalEvent {
+            id: format!("jrn-{}", uuid::Uuid::new_v4().simple()),
+            event_type: "interference_deleted".to_string(),
+            evaluated_json: serde_json::to_string(&serde_json::json!({
+                "quarantine_id": id,
+                "deleted_by": actor,
+                "category": category,
+                "key": key,
+            }))?,
+            acted_json: "{\"stored\":false,\"surface\":\"none\"}".to_string(),
+            forward_json: "{\"note\":\"quarantined write dropped without materialization\"}"
+                .to_string(),
+            category: category.clone(),
+            key: key.clone(),
+            entity_id: id.to_string(),
+            agent_id: actor.to_string(),
+            workspace_hash: workspace_hash.clone(),
+            created_at_unix_ms: now_ms(),
+        })?;
+        let _ = agent_id;
+        Ok(format!("deleted quarantined write {id}"))
+    }
+
+    /// Token-only interference probe used by consolidation before a fold:
+    /// is the merged body heavily covered by an entity OUTSIDE the fold's
+    /// source set? Returns (top_entity_id, score) when the configured bound
+    /// is exceeded, else None. Mirrors the write gate's token component.
+    fn consolidate_interference_hit(
+        &self,
+        body: &str,
+        exclude_ids: &[String],
+        workspace: Option<&str>,
+    ) -> Result<Option<(String, f64)>, Box<dyn std::error::Error>> {
+        let cfg = crate::interference::InterferenceConfig::from_env();
+        if cfg.mode == crate::interference::InterferenceMode::Off {
+            return Ok(None);
+        }
+        let tokens = crate::interference::body_tokens(body);
+        if tokens.is_empty() {
+            return Ok(None);
+        }
+        // Exclusion placeholders start at ?3 — ?1 (MATCH) and ?2 (workspace)
+        // are fixed.
+        let excl_clause = if exclude_ids.is_empty() {
+            String::new()
+        } else {
+            let ph = (3..3 + exclude_ids.len())
+                .map(|i| format!("?{i}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            format!(" AND e.id NOT IN ({ph})")
+        };
+        let excl_params: Vec<&str> = exclude_ids.iter().map(String::as_str).collect();
+        let conn = self.conn()?;
+        let limit_ph = 3 + excl_params.len();
+        let sql = format!(
+            "SELECT e.id, e.body_json, e.category, e.key FROM entities_fts f JOIN entities e ON e.rowid = f.rowid \
+             WHERE entities_fts MATCH ?1 AND e.workspace_hash = ?2 AND e.archived = 0 \
+             {excl_clause} ORDER BY rank LIMIT ?{limit_ph}"
+        );
+        let expr = tokens
+            .iter()
+            .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        let ws = workspace.unwrap_or("");
+        let top_k = cfg.top_k as i64;
+        let mut params: Vec<&dyn rusqlite::ToSql> = vec![
+            &expr as &dyn rusqlite::ToSql,
+            &ws as &dyn rusqlite::ToSql,
+        ];
+        for p in &excl_params {
+            params.push(p as &dyn rusqlite::ToSql);
+        }
+        params.push(&top_k as &dyn rusqlite::ToSql);
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(params.iter().copied()), |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        })?;
+        let mut best: Option<(String, f64)> = None;
+        for row in rows {
+            let (id, cand_body, cand_cat, cand_key) = row?;
+            // Decrypt AES-GCM at-rest bodies before measuring containment —
+            // the FTS index holds plaintext but the entities row stores
+            // ciphertext on encrypted deployments (same class as the #884
+            // consolidate scan fix: clustering on ciphertext scores 0.0).
+            let cand_plain = match &self.encryption {
+                Some(enc) => match Self::decrypt_body_with_aad_fallback(
+                    enc,
+                    &cand_body,
+                    &cand_cat,
+                    &cand_key,
+                ) {
+                    crate::encryption::BodyDecrypt::Plaintext(p)
+                    | crate::encryption::BodyDecrypt::LegacyPlaintext(p) => p,
+                    // Fail closed: tampered/unauthenticated bodies are never
+                    // treated as content evidence.
+                    crate::encryption::BodyDecrypt::AuthFailed(_) => String::new(),
+                },
+                None => cand_body,
+            };
+            let t = crate::interference::containment(
+                &tokens,
+                &crate::interference::body_tokens(&cand_plain),
+            );
+            if t > best.as_ref().map(|(_, b)| *b).unwrap_or(0.0) {
+                best = Some((id, t));
+            }
+        }
+        match best {
+            Some((id, score)) if score > cfg.bound => Ok(Some((id, score))),
+            _ => Ok(None),
+        }
     }
 
     /// The audit-chain HMAC key derived from the loaded encryption key, if any.
@@ -14048,6 +14886,9 @@ impl Database {
         let mut observations_refreshed: i64 = 0;
         let mut observations_stale: i64 = 0;
         let mut quotes_captured: i64 = 0;
+        // #874: folds skipped because the merged body would heavily activate
+        // an entity outside the fold's source set (interference discipline).
+        let mut interference_skips: i64 = 0;
         let now = now_ms();
 
         // #884: load existing live observations in scope once — they are the
@@ -14191,17 +15032,27 @@ impl Database {
         // #884: apply a refined observation back to storage via the audited
         // re-assert path (remember snapshots the prior row into
         // entity_history, #371) — refinement is never a silent overwrite.
+        // #884: write a refined observation. #874: the fold's own identity
+        // plus its source entities are the intentionally-updated slots — the
+        // interference gate must measure the merged body against the REST of
+        // the corpus (the folded body quotes its sources by construction, so
+        // without the exclusion every refine would self-trigger).
         let write_refined = |obs: &ExistingObs,
                              meta: &crate::observations::ObservationMeta,
                              entity_id: &str,
-                             key: &str|
+                             key: &str,
+                             exclude: Vec<String>|
          -> Result<(), Box<dyn std::error::Error>> {
             let mut entity = obs.entity.clone();
             entity.id = entity_id.to_string();
             entity.key = key.to_string();
             entity.body_json = crate::observations::observation_body(meta);
             entity.last_accessed_unix_ms = now;
-            self.remember_skip_dedup(&entity)?;
+            let opts = crate::interference::WriteGateOptions {
+                exclude_ids: exclude,
+                ..Default::default()
+            };
+            self.remember_with_write_options(&entity, true, None, None, false, opts)?;
             Ok(())
         };
 
@@ -14286,7 +15137,62 @@ impl Database {
                 refined_entity_id = target.entity.id.clone();
                 touched_obs.insert(target.entity.id.clone());
                 if !params.dry_run {
-                    write_refined(target, &meta, &refined_entity_id, &target.entity.key)?;
+                    // #874: interference discipline — skip the fold when the
+                    // merged body would heavily activate a THIRD entity
+                    // outside the fold's source set. The fold's own slots
+                    // (target observation + sources) are excluded: the body
+                    // quotes its sources by construction.
+                    // The guard measures the merged CONTENT (the summary
+                    // text), not the observation envelope — quotes,
+                    // source_ids and proof_count are structural fields that
+                    // would dilute the activation overlap.
+                    let merged_body = crate::observations::observation_body(&meta);
+                    let merged_text =
+                        crate::observations::body_text(&merged_body);
+                    // The fold's own slots are the ENTIRE evidence set —
+                    // new sources AND the target observation's existing
+                    // sources (refine() preserves them in meta.source_ids).
+                    // They activated the target by construction; only
+                    // activation of a THIRD entity is interference.
+                    let mut fold_exclude: Vec<String> = meta.source_ids.clone();
+                    fold_exclude.push(target.entity.id.clone());
+                    if let Some((top_id, score)) = self.consolidate_interference_hit(
+                        &merged_text,
+                        &fold_exclude,
+                        scope_ws.as_deref(),
+                    )? {
+                        interference_skips += 1;
+                        self.journal(&JournalEvent {
+                            id: format!("jrn-{}", uuid::Uuid::new_v4().simple()),
+                            event_type: "consolidate_interference_skip".to_string(),
+                            evaluated_json: serde_json::to_string(&serde_json::json!({
+                                "score": score,
+                                "top_entity_id": top_id,
+                                "target_observation": target.entity.id,
+                                "category": params.category,
+                                "merged_body": merged_body,
+                            }))?,
+                            acted_json: "{\"folded\":false,\"reason\":\"interference bound exceeded\"}"
+                                .to_string(),
+                            forward_json: "{\"note\":\"fold skipped; sources left untouched; \
+                                review the interfering entity before re-running\"}"
+                                .to_string(),
+                            category: crate::observations::OBSERVATION_CATEGORY.to_string(),
+                            key: String::new(),
+                            entity_id: target.entity.id.clone(),
+                            agent_id: params.requesting_agent_id.clone(),
+                            workspace_hash: scope_ws.clone().unwrap_or_default(),
+                            created_at_unix_ms: now,
+                        })?;
+                        continue;
+                    }
+                    write_refined(
+                        target,
+                        &meta,
+                        &refined_entity_id,
+                        &target.entity.key,
+                        fold_exclude,
+                    )?;
                 }
                 quotes_captured += new_sources.len() as i64;
                 observations_refined += 1;
@@ -14362,7 +15268,55 @@ impl Database {
                         created_at_unix_ms: now,
                         last_accessed_unix_ms: now,
                     };
-                    self.remember(&entity)?;
+                    // #874: interference discipline on fresh observations —
+                    // same guard as the refine path: skip the creation when
+                    // the merged body would heavily activate an entity
+                    // outside the fold's source set (sources are excluded:
+                    // quotes make the body near-identical to them by
+                    // construction). Skipping keeps the sources intact and
+                    // journals the reason; the alternative (letting the
+                    // write gate quarantine the observation) leaves a stray
+                    // held row the operator must clear.
+                    let obs_exclude: Vec<String> = meta.source_ids.clone();
+                    let merged_body = crate::observations::observation_body(&meta);
+                    let merged_text =
+                        crate::observations::body_text(&merged_body);
+                    if let Some((top_id, score)) = self.consolidate_interference_hit(
+                        &merged_text,
+                        &obs_exclude,
+                        scope_ws.as_deref(),
+                    )? {
+                        interference_skips += 1;
+                        self.journal(&JournalEvent {
+                            id: format!("jrn-{}", uuid::Uuid::new_v4().simple()),
+                            event_type: "consolidate_interference_skip".to_string(),
+                            evaluated_json: serde_json::to_string(&serde_json::json!({
+                                "score": score,
+                                "top_entity_id": top_id,
+                                "category": params.category,
+                                "merged_body": merged_body,
+                            }))?,
+                            acted_json: "{\"folded\":false,\"reason\":\"interference bound exceeded\"}"
+                                .to_string(),
+                            forward_json: "{\"note\":\"fresh observation skipped; sources left \
+                                untouched; review the interfering entity before re-running\"}"
+                                .to_string(),
+                            category: crate::observations::OBSERVATION_CATEGORY.to_string(),
+                            key: String::new(),
+                            entity_id: entity_id.clone(),
+                            agent_id: params.requesting_agent_id.clone(),
+                            workspace_hash: scope_ws.clone().unwrap_or_default(),
+                            created_at_unix_ms: now,
+                        })?;
+                        continue;
+                    }
+                    let obs_opts = crate::interference::WriteGateOptions {
+                        exclude_ids: obs_exclude,
+                        ..Default::default()
+                    };
+                    self.remember_with_write_options(
+                        &entity, false, None, None, false, obs_opts,
+                    )?;
                 }
             }
 
@@ -14473,7 +15427,29 @@ impl Database {
                 );
                 meta.merged_from_category = params.category.clone();
                 touched_obs.insert(target.entity.id.clone());
-                write_refined(target, &meta, &target.entity.id, &target.entity.key)?;
+                // #874: same interference discipline on the reconcile path —
+                // the refined observation's own slots are excluded, a
+                // third-entity collision skips the fold.
+                let mut reconcile_exclude: Vec<String> =
+                    meta.source_ids.clone();
+                reconcile_exclude.push(target.entity.id.clone());
+                if let Some((_top_id, _score)) = self.consolidate_interference_hit(
+                    &crate::observations::body_text(
+                        &crate::observations::observation_body(&meta),
+                    ),
+                    &reconcile_exclude,
+                    scope_ws.as_deref(),
+                )? {
+                    interference_skips += 1;
+                    continue;
+                }
+                write_refined(
+                    target,
+                    &meta,
+                    &target.entity.id,
+                    &target.entity.key,
+                    reconcile_exclude,
+                )?;
                 folded_ids.insert(entities[i].0.clone());
                 source_entities_merged += 1;
                 quotes_captured += 1;
@@ -14601,6 +15577,7 @@ impl Database {
             observations_refreshed,
             observations_stale,
             quotes_captured,
+            interference_skips,
             dry_run: params.dry_run,
             observations,
             workspace_hash: scope_ws,
@@ -21323,7 +22300,7 @@ mod tests {
                 epistemic_state: "candidate".to_string(),
                 embedding: None, _parsed_body: None,
             };
-            db.remember_skip_dedup(&entity).unwrap();
+            remember_fixture(&db, &entity).unwrap();
         }
         let bob = db.ask_sources(&AskParams {
             query: "aurora launch plan".to_string(), top_k: 10,
@@ -24630,7 +25607,7 @@ mod tests {
             r#"{"note":"the moon orbits the earth roughly monthly"}"#,
         );
         keep.certainty = 0.9;
-        db.remember(&keep).unwrap();
+        remember_fixture(&db, &keep).unwrap();
         let mut drop_e = make_entity(
             "drop-id",
             "beliefs",
@@ -26847,7 +27824,10 @@ mod tests {
         let junk = make_entity("j1", "junk", "throwaway", "{\"body\":\"prunable widget\"}");
         let keep = make_entity("k1", "keep", "important", "{\"body\":\"prunable widget\"}");
         db.remember(&junk).unwrap();
-        db.remember(&keep).unwrap();
+        // Gate bypass: the keep body is intentionally identical to junk's —
+        // this test targets FTS pruning, not the interference gate (the
+        // second near-verbatim write would otherwise be held).
+        remember_fixture(&db, &keep).unwrap();
 
         // helper: is a given entity id present in the FTS index?
         let in_fts = |id: &str| -> bool {
@@ -28092,6 +29072,17 @@ mod tests {
             )
             .unwrap();
         assert_eq!(n, 2, "v33 tables must exist on a fresh store");
+        let n: i64 = db
+            .conn()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type='table' AND name = 'write_quarantine'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1, "v34 write_quarantine table must exist on a fresh store");
         let _ = fs::remove_file(&path);
     }
 
@@ -30896,13 +31887,13 @@ mod tests {
         let (db, path) = temp_db();
         let ws = "ws-g2";
         let cat = "fact884h";
-        db.remember_skip_dedup(&cons_entity("h884-1", cat, "h1", "stack uses react", ws)).unwrap();
-        db.remember_skip_dedup(&cons_entity("h884-2", cat, "h2", "stack uses react with hooks", ws)).unwrap();
+        remember_fixture(&db, &cons_entity("h884-1", cat, "h1", "stack uses react", ws)).unwrap();
+        remember_fixture(&db, &cons_entity("h884-2", cat, "h2", "stack uses react with hooks", ws)).unwrap();
         let r1 = db.consolidate(&cons_params(cat, ws)).unwrap();
         let obs_key = r1.observations[0].key.clone();
         // Consistent newer fact (would fold, sim >= threshold) → cited with
         // verification note.
-        db.remember_skip_dedup(&cons_entity("h884-3", cat, "h3", "stack uses react hooks", ws)).unwrap();
+        remember_fixture(&db, &cons_entity("h884-3", cat, "h3", "stack uses react hooks", ws)).unwrap();
         let obs = db.get_entity("observation", &obs_key).unwrap().unwrap();
         let (kept, refused) = db
             .gate_stale_observations(vec![obs.clone()], crate::observations::OBSERVATION_VERIFY_THRESHOLD)
@@ -35245,8 +36236,8 @@ mod tests {
         let dry = db.purge(true).unwrap();
         assert_eq!(dry.entities_deleted, 2);
         assert_eq!(
-            dry.journal_rows_redacted, 1,
-            "the shared journal row must be counted once, not once per entity"
+            dry.journal_rows_redacted, 3,
+            "the shared row once, plus one interference telemetry row per entity"
         );
         let actual = db.purge(false).unwrap();
         assert_eq!(dry.journal_rows_redacted, actual.journal_rows_redacted);
@@ -35325,8 +36316,8 @@ mod tests {
         let report = db.purge(false).unwrap();
         assert_eq!(report.entities_deleted, 1);
         assert_eq!(
-            report.journal_rows_redacted, 1,
-            "only workspace A's journal row should be redacted"
+            report.journal_rows_redacted, 2,
+            "workspace A's journal row AND its interference_scored telemetry row redacted"
         );
 
         let conn = db.conn().unwrap();
@@ -36868,7 +37859,7 @@ mod tests {
         // Stale but lexically strong match (repeated terms beat BM25 length
         // normalization). remember_skip_dedup: the repeated-token body and
         // the thin body would otherwise be near-dup merged.
-        db.remember_skip_dedup(&make_entity(
+        remember_fixture(&db, &make_entity(
             "v-stale",
             "insight",
             "v-stale",
@@ -36876,7 +37867,7 @@ mod tests {
         ))
         .unwrap();
         // Fresh but thinner lexical match.
-        db.remember_skip_dedup(&make_entity(
+        remember_fixture(&db, &make_entity(
             "v-fresh",
             "insight",
             "v-fresh",
@@ -37339,7 +38330,7 @@ mod tests {
         low_trust.verified = false;
         low_trust.certainty = 0.1;
         low_trust.source = "agent".to_string();
-        db.remember(&low_trust).unwrap();
+        remember_fixture(&db, &low_trust).unwrap();
 
         let params = crate::models::RecallParams {
             query: "quark fusion reactor".to_string(),
@@ -37599,7 +38590,7 @@ mod tests {
         // Report carries denominator + artifact hash (acceptance #5).
         assert!(rep["denominator"]["slots"].as_i64().unwrap() >= 3);
         assert!(rep["artifact"]["git_hash"].as_str().unwrap().len() >= 7);
-        assert_eq!(rep["artifact"]["schema_version"], 33);
+        assert_eq!(rep["artifact"]["schema_version"], 34);
         let _ = std::fs::remove_file(path);
     }
 
@@ -37651,5 +38642,860 @@ mod tests {
         assert_eq!(rep["state"], "empty");
         let _ = std::fs::remove_file(path);
     }
+
+    // ─── #874: activation-gated sparse writes ────────────────────────────
+
+    /// Run a write with explicit gate options (internal trusted path).
+    /// skip_dedup=true so high-overlap fixtures reach the gate instead of
+    /// being absorbed by the near-duplicate merge first.
+    fn remember_gated(
+        db: &Database,
+        id: &str,
+        category: &str,
+        key: &str,
+        body: &str,
+        opts: crate::interference::WriteGateOptions,
+    ) -> Result<(String, String), Box<dyn std::error::Error>> {
+        db.remember_with_write_options(&make_entity(id, category, key, body), true, None, None, false, opts)
+    }
+
+    /// Fixture writer that BYPASSES the interference gate (internal trusted
+    /// path). Tests exercising OTHER mechanisms (staleness gates, FTS
+    /// pruning, trust ranking, visibility, fused recall) intentionally write
+    /// near-verbatim fixture bodies — exactly what the gate is built to
+    /// hold; the gate's own behavior is covered by the interference_* tests.
+    fn remember_fixture(
+        db: &Database,
+        e: &crate::models::Entity,
+    ) -> Result<(String, String), Box<dyn std::error::Error>> {
+        db.remember_with_write_options(
+            e,
+            true, // preserve remember_skip_dedup fixture semantics
+            None,
+            None,
+            false,
+            crate::interference::WriteGateOptions {
+                mode_override: Some(crate::interference::InterferenceMode::Off),
+                ..Default::default()
+            },
+        )
+    }
+
+    #[test]
+    fn interference_gate_quarantines_high_overlap_skip_dedup_write_by_default() {
+        // Success criterion: a high-interference write is quarantined by
+        // default (fail-closed), not silently merged. skip_dedup prevents
+        // the near-duplicate merge from absorbing the write first.
+        let (db, path) = temp_db();
+        db.remember(&make_entity(
+            "base-1", "facts", "base-1",
+            "{\"content\":\"the hyperion observatory tracks comet trajectories each spring\"}",
+        ))
+        .unwrap();
+        // Near-verbatim content under a DIFFERENT key, deliberately not
+        // deduped: token containment ≈ 1.0 → the gate must hold it.
+        let (qid, action) = remember_gated(
+            &db,
+            "dup-1", "facts", "dup-1",
+            "{\"content\":\"the hyperion observatory tracks comet trajectories each spring\"}",
+            crate::interference::WriteGateOptions {
+                exclude_ids: vec![],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            action.starts_with("quarantined"),
+            "default mode must quarantine, got: {action}"
+        );
+        assert!(qid.starts_with("qrn-"));
+        // Not stored in entities (never served), staged in quarantine.
+        assert!(db.get_entity("facts", "dup-1").unwrap().is_none());
+        let listed = db.write_quarantine_list(None, 50).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0]["id"], qid);
+        assert!(listed[0]["interference_score"].as_f64().unwrap() > 0.9);
+        // Journal carries the scored report + the quarantine event.
+        let conn = db.conn().unwrap();
+        let scored: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM journal WHERE event_type = 'interference_scored'",
+                [], |r| r.get(0),
+            )
+            .unwrap();
+        let quarantined: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM journal WHERE event_type = 'interference_quarantined'",
+                [], |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(scored, 2, "seed write + gated write both scored");
+        assert_eq!(quarantined, 1);
+        drop(conn);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn interference_refuse_mode_errors_and_off_mode_allows() {
+        let (db, path) = temp_db();
+        db.remember(&make_entity(
+            "base-1", "facts", "base-1",
+            "{\"content\":\"quantum lattice simulations converge below three kelvin\"}",
+        ))
+        .unwrap();
+        // refuse: the same near-verbatim write errors, nothing staged.
+        let err = remember_gated(
+            &db,
+            "dup-1", "facts", "dup-1",
+            "{\"content\":\"quantum lattice simulations converge below three kelvin\"}",
+            crate::interference::WriteGateOptions {
+                mode_override: Some(crate::interference::InterferenceMode::Refuse),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("interference score"), "{err}");
+        assert!(db.write_quarantine_list(None, 10).unwrap().is_empty());
+        let conn = db.conn().unwrap();
+        let refused: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM journal WHERE event_type = 'interference_refused'",
+                [], |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(refused, 1);
+        drop(conn);
+        // off (internal trusted caller): the write lands normally.
+        let (id, action) = remember_gated(
+            &db,
+            "dup-2", "facts", "dup-2",
+            "{\"content\":\"quantum lattice simulations converge below three kelvin\"}",
+            crate::interference::WriteGateOptions {
+                mode_override: Some(crate::interference::InterferenceMode::Off),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(action, "created");
+        assert!(db.get_entity("facts", "dup-2").unwrap().is_some());
+        assert_eq!(id, "dup-2");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn interference_update_gate_holds_content_changing_updates_only() {
+        let (db, path) = temp_db();
+        db.remember(&make_entity(
+            "slot-a", "facts", "slot-a",
+            "{\"content\":\"deep sea hydrothermal vents host chemosynthetic tube worms\"}",
+        ))
+        .unwrap();
+        db.remember(&make_entity(
+            "slot-b", "facts", "slot-b",
+            "{\"content\":\"venusian cloud decks exhibit sulfuric acid aerosols\"}",
+        ))
+        .unwrap();
+        // Unrelated update of slot-a: allowed.
+        let (_, action) = remember_gated(
+            &db,
+            "slot-a", "facts", "slot-a",
+            "{\"content\":\"deep sea vents also host yeti crabs and anemones\"}",
+            crate::interference::WriteGateOptions::none(),
+        )
+        .unwrap();
+        assert_eq!(action, "updated");
+        // Identical re-assert: no gate (nothing changes), still updated.
+        let (_, action) = remember_gated(
+            &db,
+            "slot-a", "facts", "slot-a",
+            "{\"content\":\"deep sea vents also host yeti crabs and anemones\"}",
+            crate::interference::WriteGateOptions::none(),
+        )
+        .unwrap();
+        assert_eq!(action, "updated");
+        // Retarget slot-a to slot-b's content: held.
+        let (qid, action) = remember_gated(
+            &db,
+            "slot-a", "facts", "slot-a",
+            "{\"content\":\"venusian cloud decks exhibit sulfuric acid aerosols\"}",
+            crate::interference::WriteGateOptions::none(),
+        )
+        .unwrap();
+        assert!(action.starts_with("quarantined"), "{action}");
+        assert!(qid.starts_with("qrn-"));
+        // The live row still holds the pre-retarget content.
+        let stored = db.get_entity("facts", "slot-a").unwrap().unwrap();
+        assert!(stored.body_json.contains("yeti crabs"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn interference_score_journaled_with_components_on_every_landing_write() {
+        let (db, path) = temp_db();
+        db.remember(&make_entity(
+            "seed", "facts", "seed",
+            "{\"content\":\"orbital refueling stations service ion thruster tugs\"}",
+        ))
+        .unwrap();
+        let conn = db.conn().unwrap();
+        let ev: String = conn
+            .query_row(
+                "SELECT evaluated_json FROM journal \
+                 WHERE event_type = 'interference_scored' ORDER BY created_at_unix_ms DESC LIMIT 1",
+                [], |r| r.get(0),
+            )
+            .unwrap();
+        drop(conn);
+        let v: serde_json::Value = serde_json::from_str(&ev).unwrap();
+        // First write in an empty corpus: no candidates, score 0, no token
+        // component — the gate degrades gracefully instead of erroring.
+        assert_eq!(v["score"].as_f64().unwrap(), 0.0);
+        assert!(v["components"].as_array().unwrap().is_empty());
+        assert_eq!(v["mode"], "quarantine");
+        assert_eq!(v["bound"], 0.90);
+        // An unrelated fresh write scores low and is allowed.
+        let (id, action) = remember_gated(
+            &db,
+            "unrelated", "facts", "unrelated",
+            "{\"content\":\"pottery kiln temperatures peak during raku firings\"}",
+            crate::interference::WriteGateOptions::none(),
+        )
+        .unwrap();
+        assert_eq!(action, "created");
+        let conn = db.conn().unwrap();
+        let ev: String = conn
+            .query_row(
+                "SELECT evaluated_json FROM journal \
+                 WHERE event_type = 'interference_scored' AND entity_id = ?1 ORDER BY created_at_unix_ms DESC LIMIT 1",
+                params![id], |r| r.get(0),
+            )
+            .unwrap();
+        drop(conn);
+        let v: serde_json::Value = serde_json::from_str(&ev).unwrap();
+        assert!(v["score"].as_f64().unwrap() < 0.5, "unrelated write must score low: {v}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sparse_update_preserves_unrelated_recall_and_skips_salience_inflation() {
+        // Success criterion: sparse updates preserve recall on unrelated
+        // fixtures (no measurable regression vs the current write path).
+        let (db, path) = temp_db();
+        db.remember(&make_entity(
+            "fx-1", "facts", "fx-1",
+            "{\"content\":\"the mariana trench floor accumulates diatomaceous ooze\"}",
+        ))
+        .unwrap();
+        db.remember(&make_entity(
+            "fx-2", "facts", "fx-2",
+            "{\"content\":\"svalbard seed vault duplicates global crop collections\"}",
+        ))
+        .unwrap();
+        let baseline = db
+            .recall(&crate::models::RecallParams {
+                query: "diatomaceous ooze".to_string(),
+                limit: 5,
+                ..Default::default()
+            })
+            .unwrap()
+            .into_iter()
+            .map(|e| e.key)
+            .collect::<Vec<_>>();
+        assert!(baseline.contains(&"fx-1".to_string()));
+
+        // Sparse-update an unrelated topic 3 times.
+        for i in 0..3 {
+            remember_gated(
+                &db,
+                "hot-topic", "facts", "hot-topic",
+                &format!("{{\"content\":\"camera trap grid {i} logs snow leopard paw prints\"}}"),
+                crate::interference::WriteGateOptions {
+                    sparse_update: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        }
+        // Unrelated recall unchanged.
+        let after = db
+            .recall(&crate::models::RecallParams {
+                query: "diatomaceous ooze".to_string(),
+                limit: 5,
+                ..Default::default()
+            })
+            .unwrap()
+            .into_iter()
+            .map(|e| e.key)
+            .collect::<Vec<_>>();
+        assert!(after.contains(&"fx-1".to_string()), "sparse writes must not regress unrelated recall");
+        // Sparse re-assert: no salience inflation (retrieval_count stays 0).
+        let conn = db.conn().unwrap();
+        let (rc, decay): (i64, f64) = conn
+            .query_row(
+                "SELECT retrieval_count, decay_score FROM entities WHERE id = 'hot-topic'",
+                [], |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(rc, 0, "sparse re-asserts must not inflate retrieval_count");
+        assert!((decay - 1.0).abs() < 1e-9, "sparse re-asserts must not decay-boost");
+        drop(conn);
+        // Dense re-assert still bumps (existing behavior unchanged).
+        remember_gated(
+            &db,
+            "hot-topic", "facts", "hot-topic",
+            "{\"content\":\"camera trap grid logs snow leopard paw prints at dusk\"}",
+            crate::interference::WriteGateOptions::none(),
+        )
+        .unwrap();
+        let conn = db.conn().unwrap();
+        let rc: i64 = conn
+            .query_row(
+                "SELECT retrieval_count FROM entities WHERE id = 'hot-topic'",
+                [], |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rc, 1);
+        drop(conn);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sparse_update_activation_filters_caller_links_and_journals_drops() {
+        let (db, path) = temp_db();
+        db.remember(&make_entity(
+            "target", "facts", "target",
+            "{\"content\":\"the observatory dome tracks the rising nebula\"}",
+        ))
+        .unwrap();
+        db.remember(&make_entity(
+            "unrelated", "facts", "unrelated",
+            "{\"content\":\"the bakery downtown bakes sourdough on tuesdays\"}",
+        ))
+        .unwrap();
+        // Land the hot entity with a dense insert FIRST, then sparse-update
+        // it with two caller links: one activated target (shared
+        // vocabulary), one unrelated (must be dropped). Sparse link
+        // filtering applies on the UPDATE path (an insert has no stored
+        // state to disturb).
+        db.remember(&make_entity(
+            "hot", "facts", "hot",
+            "{\"content\":\"the observatory dome hosts a new spectrograph\"}",
+        ))
+        .unwrap();
+        let mut e = make_entity(
+            "hot", "facts", "hot",
+            "{\"content\":\"the observatory dome hosts a new spectrograph\"}",
+        );
+        e.links = vec![
+            crate::models::MemoryLink {
+                target_id: "target".to_string(),
+                relationship: "related_to".to_string(),
+                weight: 0.5,
+                source: None,
+            },
+            crate::models::MemoryLink {
+                target_id: "unrelated".to_string(),
+                relationship: "related_to".to_string(),
+                weight: 0.5,
+                source: None,
+            },
+        ];
+        db.remember_with_write_options(
+            &e, false, None, None, false,
+            crate::interference::WriteGateOptions {
+                sparse_update: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let stored = db.get_entity("facts", "hot").unwrap().unwrap();
+        let targets: Vec<&str> = stored.links.iter().map(|l| l.target_id.as_str()).collect();
+        assert!(targets.contains(&"target"), "activated link admitted");
+        assert!(!targets.contains(&"unrelated"), "non-activated link dropped in sparse mode");
+        // Journal records the drop.
+        let conn = db.conn().unwrap();
+        let ev: String = conn
+            .query_row(
+                "SELECT evaluated_json FROM journal \
+                 WHERE event_type = 'sparse_update_applied' ORDER BY created_at_unix_ms DESC LIMIT 1",
+                [], |r| r.get(0),
+            )
+            .unwrap();
+        drop(conn);
+        let v: serde_json::Value = serde_json::from_str(&ev).unwrap();
+        assert_eq!(v["dropped_links"], serde_json::json!(["unrelated"]));
+        // Dense mode keeps the union (existing behavior).
+        let mut e2 = make_entity(
+            "hot", "facts", "hot",
+            "{\"content\":\"the observatory dome hosts a new spectrograph\"}",
+        );
+        e2.links = vec![crate::models::MemoryLink {
+            target_id: "unrelated".to_string(),
+            relationship: "related_to".to_string(),
+            weight: 0.5,
+            source: None,
+        }];
+        db.remember_with_write_options(
+            &e2, false, None, None, false,
+            crate::interference::WriteGateOptions::none(),
+        )
+        .unwrap();
+        let stored = db.get_entity("facts", "hot").unwrap().unwrap();
+        let targets: Vec<&str> = stored.links.iter().map(|l| l.target_id.as_str()).collect();
+        assert!(targets.contains(&"unrelated"), "dense mode unions all caller links");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sparse_insert_never_absorbs_near_duplicates() {
+        let (db, path) = temp_db();
+        db.remember(&make_entity(
+            "orig", "facts", "orig",
+            "{\"content\":\"the coastal ferry timetable shifts at high tide\"}",
+        ))
+        .unwrap();
+        // A sparse insert of a near-verbatim body: dedup is skipped, so the
+        // gate holds it (quarantine) instead of either merging or landing.
+        let (qid, action) = remember_gated(
+            &db,
+            "sparse-dup", "facts", "sparse-dup",
+            "{\"content\":\"the coastal ferry timetable shifts at high tide\"}",
+            crate::interference::WriteGateOptions {
+                sparse_update: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(action.starts_with("quarantined"), "{action}");
+        assert!(qid.starts_with("qrn-"));
+        assert!(db.get_entity("facts", "sparse-dup").unwrap().is_none());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn write_quarantine_review_release_materializes_and_delete_drops() {
+        let (db, path) = temp_db();
+        db.remember(&make_entity(
+            "base", "facts", "base",
+            "{\"content\":\"polar ice cores preserve millennial methane records\"}",
+        ))
+        .unwrap();
+        let (qid, _) = remember_gated(
+            &db,
+            "held", "facts", "held",
+            "{\"content\":\"polar ice cores preserve millennial methane records\"}",
+            crate::interference::WriteGateOptions::none(),
+        )
+        .unwrap();
+        // show: full record with body + report.
+        let rec = db.write_quarantine_show(&qid).unwrap().unwrap();
+        assert_eq!(rec["key"], "held");
+        assert!(rec["body_json"].as_str().unwrap().contains("ice cores"));
+        assert!(rec["interference_report"]["score"].as_f64().unwrap() > 0.9);
+        // release: materializes through the audited path.
+        let out = db.release_write_quarantine(&qid, "operator").unwrap();
+        assert!(out.contains("released"), "{out}");
+        let live = db.get_entity("facts", "held").unwrap().unwrap();
+        assert!(live.body_json.contains("ice cores"));
+        assert!(db.write_quarantine_list(None, 10).unwrap().is_empty());
+        // release into a now-live identity is refused fail-closed.
+        let err = db.release_write_quarantine(&qid, "operator").unwrap_err();
+        assert!(err.to_string().contains("no quarantined write"));
+        // Journal carries the release.
+        let conn = db.conn().unwrap();
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM journal WHERE event_type = 'interference_released'",
+                [], |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1);
+        drop(conn);
+
+        // delete path: stage another, delete it, nothing lands.
+        let (qid2, _) = remember_gated(
+            &db,
+            "held2", "facts", "held2",
+            "{\"content\":\"polar ice cores preserve millennial methane records\"}",
+            crate::interference::WriteGateOptions::none(),
+        )
+        .unwrap();
+        let out = db.delete_write_quarantine(&qid2, "operator").unwrap();
+        assert!(out.contains("deleted"), "{out}");
+        assert!(db.get_entity("facts", "held2").unwrap().is_none());
+        let conn = db.conn().unwrap();
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM journal WHERE event_type = 'interference_deleted'",
+                [], |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1);
+        drop(conn);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn write_quarantine_is_workspace_scoped_and_invisible_to_recall() {
+        let (db, path) = temp_db();
+        db.remember(&make_entity(
+            "base", "facts", "base",
+            "{\"content\":\"lunar gateway orbit insertion burns use hall thrusters\"}",
+        ))
+        .unwrap();
+        let (qid, _) = remember_gated(
+            &db,
+            "held", "facts", "held",
+            "{\"content\":\"lunar gateway orbit insertion burns use hall thrusters\"}",
+            crate::interference::WriteGateOptions::none(),
+        )
+        .unwrap();
+        // Never served by recall (quarantine table is not in the search pool).
+        let hits = db
+            .recall(&crate::models::RecallParams {
+                query: "lunar gateway orbit insertion".to_string(),
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap()
+            .into_iter()
+            .map(|e| e.key)
+            .collect::<Vec<_>>();
+        assert!(hits.contains(&"base".to_string()));
+        assert!(!hits.contains(&"held".to_string()));
+        // Scoped list hides it from other workspaces.
+        assert!(db.write_quarantine_list(Some("ws-other"), 10).unwrap().is_empty());
+        assert_eq!(db.write_quarantine_list(None, 10).unwrap()[0]["id"], qid);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn interference_gate_decrypts_at_rest_candidates_on_encrypted_db() {
+        // #884-class regression: the gate's candidate bodies are AES-GCM
+        // ciphertext in the entities row on encrypted deployments (the FTS
+        // index holds plaintext). Measuring ciphertext scores 0.0 and the
+        // gate silently passes near-verbatim writes. The candidate query
+        // must decrypt (AAD fallback) before containment.
+        use crate::encryption::EncryptionManager;
+        use std::io::Write;
+        let (mut db, path) = temp_db();
+        let key = EncryptionManager::generate_key();
+        let key_path = std::env::temp_dir()
+            .join(format!("perseus_vault-test-key-{}.key", uuid::Uuid::new_v4()));
+        let key_path_str = key_path.to_str().unwrap().to_string();
+        let mut f = std::fs::File::create(&key_path).unwrap();
+        f.write_all(key.as_bytes()).unwrap();
+        drop(f);
+        db.set_encryption(&key_path_str).unwrap();
+
+        let body = r#"{"content":"the hyperion observatory tracks comet trajectories each spring"}"#;
+        db.remember(&make_entity("ig-enc-seed", "facts", "ig-enc-seed", body))
+            .unwrap();
+        // Prove the fixture is genuinely at-rest encrypted: the raw column
+        // must NOT contain the plaintext.
+        let raw: String = db
+            .conn()
+            .unwrap()
+            .query_row(
+                "SELECT body_json FROM entities WHERE id = 'ig-enc-seed'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(!raw.contains("hyperion"), "body must be ciphertext at rest");
+
+        // Near-verbatim skip_dedup write: the gate must measure the
+        // DECRYPTED seed and quarantine (containment 1.0 > 0.9).
+        let (qid, action) = remember_gated(
+            &db,
+            "ig-enc-held", "facts", "ig-enc-held", body,
+            crate::interference::WriteGateOptions::none(),
+        )
+        .unwrap();
+        assert!(
+            action.starts_with("quarantined"),
+            "encrypted-DB gate must score decrypted bodies, got: {action}"
+        );
+        assert!(qid.starts_with("qrn-"));
+        assert!(db.get_entity("facts", "ig-enc-held").unwrap().is_none());
+
+        // Sparse link filter has the same at-rest trap: a sparse update's
+        // caller links are admitted by target-body activation — ciphertext
+        // targets score 0 and EVERY link gets dropped. The filter must
+        // decrypt before measuring.
+        let mut e = make_entity(
+            "ig-enc-seed", "facts", "ig-enc-seed",
+            r#"{"content":"the hyperion observatory tracks comet trajectories each spring"}"#,
+        );
+        e.links = vec![crate::models::MemoryLink {
+            target_id: "ig-enc-seed".to_string(),
+            relationship: "related_to".to_string(),
+            weight: 0.5,
+            source: None,
+        }];
+        db.remember_with_write_options(
+            &e, false, None, None, false,
+            crate::interference::WriteGateOptions {
+                sparse_update: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let stored = db.get_entity("facts", "ig-enc-seed").unwrap().unwrap();
+        let targets: Vec<&str> = stored.links.iter().map(|l| l.target_id.as_str()).collect();
+        assert!(
+            targets.contains(&"ig-enc-seed"),
+            "sparse link activation must decrypt at-rest targets"
+        );
+        let _ = std::fs::remove_file(key_path);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn operator_review_surfaces_write_quarantine_section() {
+        let (db, path) = temp_db();
+        db.remember(&make_entity(
+            "base", "facts", "base",
+            "{\"content\":\"ferrofluid cooling loops stabilize fusion reactor magnets\"}",
+        ))
+        .unwrap();
+        let (qid, _) = remember_gated(
+            &db,
+            "held", "facts", "held",
+            "{\"content\":\"ferrofluid cooling loops stabilize fusion reactor magnets\"}",
+            crate::interference::WriteGateOptions::none(),
+        )
+        .unwrap();
+        let out = crate::tools::handle_operator_review(
+            &db,
+            serde_json::json!({"category": "facts", "limit": 20}),
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let wq = v["write_quarantine"].as_array().unwrap();
+        assert!(!wq.is_empty());
+        assert_eq!(wq[0]["id"], qid);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn interference_gate_respects_exclude_ids_sources() {
+        // The intentional-update-slot exclusion: a write whose content is
+        // derived from its cited sources passes even at containment 1.0.
+        let (db, path) = temp_db();
+        let (src_id, _) = db
+            .remember(&make_entity(
+                "src-1", "facts", "src-1",
+                "{\"content\":\"the kuiper belt census counts frozen volatiles\"}",
+            ))
+            .unwrap();
+        let (id, action) = remember_gated(
+            &db,
+            "sum-1", "notes", "sum-1",
+            "{\"content\":\"the kuiper belt census counts frozen volatiles\"}",
+            crate::interference::WriteGateOptions {
+                exclude_ids: vec![src_id],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(action, "created", "excluded source slot must not trip the gate");
+        assert_eq!(id, "sum-1");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn tool_surface_rejects_off_mode_and_loosening_bound_overrides() {
+        // MCP-surface fail-closed override validation (handle_remember).
+        let (db, path) = temp_db();
+        let err = crate::tools::handle_remember(
+            &db,
+            serde_json::json!({
+                "category": "facts", "key": "k1",
+                "body_json": "{\"content\":\"x\"}",
+                "interference_mode": "off",
+            }),
+        )
+        .unwrap_err();
+        assert!(err.contains("'off' is not allowed"), "{err}");
+        let err = crate::tools::handle_remember(
+            &db,
+            serde_json::json!({
+                "category": "facts", "key": "k1",
+                "body_json": "{\"content\":\"x\"}",
+                "interference_bound": 0.99,
+            }),
+        )
+        .unwrap_err();
+        assert!(err.contains("LOOSEN"), "{err}");
+        // A tightening override is accepted.
+        let out = crate::tools::handle_remember(
+            &db,
+            serde_json::json!({
+                "category": "facts", "key": "k1",
+                "body_json": "{\"content\":\"x\"}",
+                "interference_mode": "refuse",
+                "interference_bound": 0.5,
+            }),
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["ok"], serde_json::json!(true), "{out}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn tool_surface_quarantine_response_is_explicit() {
+        let (db, path) = temp_db();
+        crate::tools::handle_remember(
+            &db,
+            serde_json::json!({
+                "category": "facts", "key": "base",
+                "body_json": "{\"content\":\"the atlas mountains host barbary macaque troops\"}",
+            }),
+        )
+        .unwrap();
+        let out = crate::tools::handle_remember(
+            &db,
+            serde_json::json!({
+                "category": "facts", "key": "held",
+                "body_json": "{\"content\":\"the atlas mountains host barbary macaque troops\"}",
+                "skip_dedup": true,
+            }),
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["quarantined"], serde_json::json!(true));
+        assert!(v["action"].as_str().unwrap().starts_with("quarantined"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn link_writes_journal_edge_coherence_telemetry() {
+        let (db, path) = temp_db();
+        let (_, _) = db
+            .remember(&make_entity(
+                "a", "facts", "a",
+                "{\"content\":\"the ion thruster prototype passed vacuum endurance tests\"}",
+            ))
+            .unwrap();
+        let (to_id, _) = db
+            .remember(&make_entity(
+                "b", "facts", "b",
+                "{\"content\":\"the ion thruster prototype passed vacuum endurance tests\"}",
+            ))
+            .unwrap();
+        let (c_id, _) = db
+            .remember(&make_entity(
+                "c", "facts", "c",
+                "{\"content\":\"hand thrown pottery glazes crack in rapid cooling\"}",
+            ))
+            .unwrap();
+        db.link("facts", "a", &to_id, "related_to").unwrap();
+        db.link("facts", "a", &c_id, "related_to").unwrap();
+        let conn = db.conn().unwrap();
+        let ev: String = conn
+            .query_row(
+                "SELECT evaluated_json FROM journal \
+                 WHERE event_type = 'link_interference_scored' ORDER BY created_at_unix_ms DESC LIMIT 1",
+                [], |r| r.get(0),
+            )
+            .unwrap();
+        drop(conn);
+        let v: serde_json::Value = serde_json::from_str(&ev).unwrap();
+        assert_eq!(v["to_id"], c_id);
+        assert!(
+            v["coherence"].as_f64().unwrap() < 0.3,
+            "unrelated edge must score low coherence: {v}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn consolidate_skips_fold_with_high_third_entity_interference() {
+        // A cluster whose merged observation would heavily activate an
+        // UNRELATED entity (outside the fold's source set) is skipped
+        // (interference discipline), and the skip is journaled + counted.
+        // Fixture: a near-verbatim note in ANOTHER category is the
+        // interferer; the two facts (which would fold into a fresh
+        // observation whose summary is the same text) must land, so they
+        // are written with the gate bypassed (internal trusted path).
+        let (db, path) = temp_db();
+        let body = "the satellite constellation relays quantum key material";
+        // Interferer (different category, so no dedup cross-talk) — written
+        // first, allowed by default (empty corpus).
+        let mut ent_x = make_entity("x-notes", "notes", "x-notes", &format!("{{\"content\":\"{body}\"}}"));
+        ent_x.workspace_hash = String::new();
+        db.remember(&ent_x).unwrap();
+        // The cluster members: near-duplicates of each other (and of ent_x),
+        // so both need the gate bypassed and skip_dedup to land separately.
+        let mut e1 = make_entity("f1", "facts", "f1", &format!("{{\"content\":\"{body}\"}}"));
+        e1.workspace_hash = String::new();
+        db.remember_with_write_options(
+            &e1, false, None, None, false,
+            crate::interference::WriteGateOptions {
+                mode_override: Some(crate::interference::InterferenceMode::Off),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut e2 = make_entity("f2", "facts", "f2", &format!("{{\"content\":\"{body} today\"}}"));
+        e2.workspace_hash = String::new();
+        db.remember_with_write_options(
+            &e2, true, None, None, false,
+            crate::interference::WriteGateOptions {
+                mode_override: Some(crate::interference::InterferenceMode::Off),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let out = db
+            .consolidate(
+                &crate::models::ConsolidateParams {
+                    category: "facts".to_string(),
+                    limit: 50,
+                    dry_run: false,
+                    refine_existing: true,
+                    similarity_threshold: 0.7,
+                    archive_sources: false,
+                    quote_cap_chars: 200,
+                    requesting_agent_id: "test".to_string(),
+                    workspace_hash: Some(String::new()),
+                    cold_first: false,
+                    offset: 0,
+                    global: false,
+                },
+            )
+            .unwrap();
+        assert!(
+            out.interference_skips >= 1,
+            "fold must be skipped when the merged body activates a third entity: {out:?}"
+        );
+        // No new observation was created for the cluster.
+        let hits = db
+            .recall(&crate::models::RecallParams {
+                query: "satellite constellation relays quantum key".to_string(),
+                limit: 20,
+                ..Default::default()
+            })
+            .unwrap();
+        let obs_keys: Vec<String> = hits
+            .iter()
+            .filter(|e| e.category == crate::observations::OBSERVATION_CATEGORY)
+            .map(|e| e.key.clone())
+            .collect();
+        assert!(obs_keys.is_empty(), "no observation may be created: {obs_keys:?}");
+        let conn = db.conn().unwrap();
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM journal WHERE event_type = 'consolidate_interference_skip'",
+                [], |r| r.get(0),
+            )
+            .unwrap();
+        assert!(n >= 1);
+        drop(conn);
+        let _ = std::fs::remove_file(path);
+    }
+
 }
 

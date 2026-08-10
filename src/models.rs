@@ -2004,6 +2004,9 @@ pub struct ConsolidateReport {
     /// #884: observations updated by folding/reconciling new evidence into
     /// an existing observation (never a blind overwrite; journey preserved).
     pub observations_refined: i64,
+    /// #874: folds skipped because the merged body would heavily activate an
+    /// entity outside the fold's source set (interference discipline).
+    pub interference_skips: i64,
     /// #884: observations whose stored stale flag was recomputed this run.
     pub observations_refreshed: i64,
     /// #884: observations stale after this run (newer unconsolidated facts

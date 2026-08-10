@@ -58,6 +58,7 @@ V1_REQUIRED_CATEGORIES = V0_REQUIRED_CATEGORIES + (
     "validity_recall",
     "task_projection",
     "evidence_observations",
+    "interference_gate",
 )
 
 CAPABILITY_TOOLS = {
@@ -2231,6 +2232,131 @@ def run_identity_ambiguity(client, **_):
     )
 
 
+def run_interference_gate(client, **_):
+    # #874: activation-gated sparse writes, measured over the MCP surface.
+    # The harness binary runs with PERSEUS_VAULT_INTERFERENCE_MODE=off (see
+    # run_benchmark: its templated fixtures are near-duplicates BY DESIGN,
+    # which the gate is built to hold), so this scenario opts in per-write:
+    # the default fail-closed posture (mode=quarantine, bound 0.90) is
+    # covered by the unit suite; here we prove the MCP mechanics — a
+    # near-verbatim skip_dedup write is quarantined (never served), the
+    # per-write refuse override errors, sparse updates do not regress
+    # recall of unrelated fixtures, and the operator release path
+    # materializes the held write.
+    ws = "quality-interference-gate-workspace"
+    cat = "quality_interference_gate"
+    note = "quality-fixture-interference-voyager-probe-trajectory"
+    remember(client, cat, "seed-1", note, workspace_hash=ws)
+
+    # 1. Default fail-closed quarantine (per-write explicit): near-verbatim
+    #    skip_dedup write returns quarantined:true, is NOT served, and is
+    #    listed in the write_quarantine review surface.
+    held = client.call(
+        "perseus_vault_remember",
+        {
+            "category": cat,
+            "key": "held-1",
+            "body_json": stable_json({"note": note}),
+            "skip_dedup": True,
+            "workspace_hash": ws,
+            "interference_mode": "quarantine",
+        },
+    )
+    quarantined_flag = isinstance(held, dict) and held.get("quarantined") is True
+    held_id = held.get("id") if isinstance(held, dict) else None
+    held_not_served = "held-1" not in recall_keys(
+        client, "voyager probe trajectory", workspace_hash=ws
+    )
+    qlist = client.call("perseus_vault_write_quarantine", {"workspace_hash": ws})
+    qlist_has_held = isinstance(qlist, dict) and any(
+        item.get("id") == held_id for item in (qlist.get("items") or [])
+    )
+
+    # 2. Per-write refuse override: the same duplicate errors out and
+    #    nothing is staged.
+    refused = client.call_allow_error(
+        "perseus_vault_remember",
+        {
+            "category": cat,
+            "key": "refused-1",
+            "body_json": stable_json({"note": note}),
+            "skip_dedup": True,
+            "workspace_hash": ws,
+            "interference_mode": "refuse",
+        },
+    )
+    refused_is_error = isinstance(refused, dict) and refused.get("isError") is True
+
+    # 3. Sparse updates on an unrelated topic do not regress seed recall.
+    for i in range(3):
+        remember(
+            client,
+            cat,
+            f"sparse-{i}",
+            f"quality-fixture-interference-camera-grid-{i}",
+            workspace_hash=ws,
+            sparse_update=True,
+        )
+    seed_still_recalled = "seed-1" in recall_keys(
+        client, "voyager probe trajectory", workspace_hash=ws
+    )
+
+    # 4. Operator release materializes the held write through the audited
+    #    path (the review IS the approval; journaled).
+    released = False
+    released_served = False
+    if held_id:
+        release = client.call(
+            "perseus_vault_write_quarantine",
+            {
+                "action": "release",
+                "id": held_id,
+                "requesting_agent_id": "quality-harness",
+            },
+        )
+        released = isinstance(release, dict) and release.get("released") is True
+        released_served = any(
+            item.get("key") == "held-1"
+            for item in scan_items(client, cat, workspace_hash=ws)
+        )
+
+    checks = {
+        "default_quarantines": quarantined_flag and qlist_has_held,
+        "quarantined_never_served": held_not_served,
+        "refuse_override_errors": refused_is_error,
+        "sparse_preserves_unrelated_recall": seed_still_recalled,
+        "release_materializes": released and released_served,
+    }
+    evidence = {
+        "found": quarantined_flag,
+        "count": int(qlist_has_held),
+        "total": 1,
+        "rate": 0.0 if held_not_served else 1.0,
+        "reason": "interference",
+        "status": "quarantined" if quarantined_flag else "none",
+        "workspace_hash": ws,
+    }
+    metric_events = {
+        "interference-gate-default-quarantine": {
+            "numerator": int(quarantined_flag and held_not_served and qlist_has_held),
+            "denominator": 1,
+        },
+        "interference-gate-refuse-override": {
+            "numerator": int(refused_is_error),
+            "denominator": 1,
+        },
+        "interference-gate-sparse-preserves-recall": {
+            "numerator": int(seed_still_recalled),
+            "denominator": 1,
+        },
+        "interference-gate-release-materializes": {
+            "numerator": int(released and released_served),
+            "denominator": 1,
+        },
+    }
+    return output(checks, evidence, metric_events)
+
+
 SCENARIO_RUNNERS = {
     "long_horizon": run_long_horizon,
     "contradiction_supersession": run_contradiction,
@@ -2249,6 +2375,7 @@ SCENARIO_RUNNERS = {
     "validity_recall": run_validity_recall,
     "task_projection": run_task_projection,
     "evidence_observations": run_evidence_observations,
+    "interference_gate": run_interference_gate,
     "admission": run_admission,
     "prompt_safety": run_prompt_safety,
     "identity_ambiguity": run_identity_ambiguity,
@@ -2401,6 +2528,14 @@ def _failed_scenario(case_specs, exc):
 
 
 def run_benchmark(manifest_path, binary=None, out=None):
+    # #874: the quality harness writes templated fixtures that are
+    # near-duplicates BY DESIGN (skip_dedup=true, shared vocabularies) —
+    # exactly what the interference gate is built to hold. The harness
+    # measures recall/consolidation behavior, not the write gate, so the
+    # binary runs with the gate's enforcement OFF by default; the
+    # interference_gate scenario opts in per-write (mode=quarantine/refuse)
+    # to exercise the full MCP surface deterministically.
+    os.environ.setdefault("PERSEUS_VAULT_INTERFERENCE_MODE", "off")
     manifest = load_manifest(manifest_path)
     binary = find_binary(binary)
     tmpdir = Path(tempfile.mkdtemp(prefix="perseus-vault-quality-v0-"))
