@@ -4662,6 +4662,89 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     }
   },
   {
+    "name": "perseus_vault_declared_schema_set",
+    "description": "#923: declare (or replace) the typed retrieval contract for a category — the deterministic exact-match arm. Fields are typed ('scalar' = exact string equality, 'string_list' = array membership) and may be facet-eligible. Advisory retrieval metadata only: never gates writes. Fail-closed validation: unknown field types, duplicate/empty names, reserved names (id/category/key/recall_when/origin/external_refs/expires_at), >32 fields, >16 facets, or >500-byte query_guidance are errors. Re-declaring bumps the schema version; exact-match queries then follow the new contract.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "category": {
+          "type": "string",
+          "description": "Category this contract describes (may not be a reserved category)"
+        },
+        "fields": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": {"type": "string"},
+              "type": {"type": "string", "enum": ["scalar", "string_list"]},
+              "facet": {"type": "boolean", "default": false}
+            },
+            "required": ["name", "type"]
+          },
+          "description": "1-32 typed fields. Values are read from each entity's top-level body_json keys at query time."
+        },
+        "query_guidance": {
+          "type": "string",
+          "default": "",
+          "description": "Advisory: how agents should query this category (returned by declared_query). Max 500 bytes."
+        }
+      },
+      "required": ["category", "fields"]
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "ok": {"type": "boolean"},
+        "category": {"type": "string"},
+        "version": {"type": "integer"},
+        "fields": {"type": "array"},
+        "query_guidance": {"type": "string"}
+      }
+    },
+    "title": "Declare Category Retrieval Contract"
+  },
+  {
+    "name": "perseus_vault_declared_query",
+    "description": "#923: deterministic exact-match retrieval over a declared category — the no-ranking arm. Filters are AND-combined exact-equality checks against the category's declared schema: scalar fields match by exact string equality, string_list fields by array membership. Results come back in deterministic order (created_at ASC, id ASC). Facet counts are truthful and bounded (top 50 distinct values per facet, remainder rolled into 'other'). Fail-closed: undeclared categories, unknown fields, malformed filters, or non-facet facet requests are errors — never degraded to fuzzy recall.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "category": {
+          "type": "string",
+          "description": "Category with a declared schema (perseus_vault_declared_schema_set)"
+        },
+        "filters": {
+          "type": "object",
+          "additionalProperties": true,
+          "description": "Exact-equality filters (AND-combined). Scalar field: string value to equal. String-list field: array of strings, any of which must be present."
+        },
+        "facets": {
+          "type": "array",
+          "items": {"type": "string"},
+          "description": "Facet-eligible fields to count (top 50 distinct values + 'other' bucket)"
+        },
+        "limit": {"type": "integer", "default": 10},
+        "offset": {"type": "integer", "default": 0},
+        "workspace_hash": {"type": "string", "default": ""}
+      },
+      "required": ["category"]
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "ok": {"type": "boolean"},
+        "category": {"type": "string"},
+        "schema": {"type": "object"},
+        "total_matches": {"type": "integer"},
+        "truncated": {"type": "boolean"},
+        "items": {"type": "array"},
+        "facet_counts": {"type": "object"}
+      }
+    },
+    "title": "Declared Exact-Match Query"
+  },
+  {
     "name": "perseus_vault_conflicts",
     "description": "Detect conflicting entities in the same category — pairs with low trigram similarity in their body_json. Flags potential contradictions, duplicate-but-divergent entries, and stale-overwritten facts. Read-only by default. Opt in with resolve=true to actively invalidate the lower-certainty side of clear conflicts (superseding it into history, reversible + time-travelable via perseus_vault_as_of); that path defaults to dry_run=true so you preview first, and never resolves pairs whose certainties are within certainty_margin.",
     "inputSchema": {
@@ -6574,6 +6657,8 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
             tools::handle_preload_review(db, args).map_err(|e| e.to_string())
         }
         "perseus_vault_guide_seed" => tools::handle_guide_seed(db, args).map_err(|e| e.to_string()),
+        "perseus_vault_declared_schema_set" => tools::handle_declared_schema_set(db, args).map_err(|e| e.to_string()),
+        "perseus_vault_declared_query" => tools::handle_declared_query(db, args).map_err(|e| e.to_string()),
         "perseus_vault_conflicts" => Ok(tools::handle_conflicts(db, args)),
         "perseus_vault_consolidate" => Ok(tools::handle_consolidate(db, args)),
         "perseus_vault_dream" => tools::handle_dream(db, args),
@@ -6672,7 +6757,7 @@ mod tests {
         );
         assert_eq!(
             registry_names.len(),
-            120,
+            122,
             "update public metadata when adding a tool"
         );
 

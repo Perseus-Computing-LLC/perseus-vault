@@ -433,6 +433,17 @@ pub struct RecallArgs {
     /// freshness, scope match, provenance, superseded, expiry, multiplier).
     #[serde(default)]
     pub validity_annotate: bool,
+    /// #923: declared exact-match arm (fused mode). Category whose declared
+    /// contract governs the filters; must match `category` when both set.
+    #[serde(default)]
+    pub declared_category: Option<String>,
+    /// #923: exact-equality filters (AND-combined), validated against the
+    /// category's declared schema. Scalar fields expect a string value;
+    /// string_list fields expect an array of strings (membership). Unknown
+    /// fields, undeclared categories, or malformed filters are errors —
+    /// never a silent fallback to fuzzy recall.
+    #[serde(default)]
+    pub declared_filters: Option<std::collections::HashMap<String, serde_json::Value>>,
 }
 
 pub type BatchQuery = RecallArgs;
@@ -1720,6 +1731,8 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
             .filter(|s| !s.is_empty())
             .map(canonical_layer),
         tier_order: a.tier_order,
+        declared_category: a.declared_category.clone(),
+        declared_filters: a.declared_filters.clone(),
         reinforce: a.reinforce,
         strategies: a.strategies,
         max_tokens: a.max_tokens,
@@ -2128,6 +2141,8 @@ pub fn handle_recall_batch(db: &Database, args: Value) -> Result<String, String>
             query_time_unix_ms: q.query_time_unix_ms,
             graph_utility_threshold: q.graph_utility_threshold,
             tier_order: q.tier_order,
+            declared_category: q.declared_category.clone(),
+            declared_filters: q.declared_filters.clone(),
         };
 
         let mut entities = db
@@ -6684,6 +6699,140 @@ pub fn handle_guide_seed(db: &Database, args: Value) -> Result<String, String> {
         .to_string();
     let out = crate::guide::seed_guide(db, &workspace_hash)?;
     Ok(out.to_string())
+}
+
+/// #923: declare (or replace) the typed retrieval contract for a category.
+/// Fail-closed validation: unknown field types, duplicate/empty names,
+/// reserved names, too many fields/facets, or oversized guidance are errors.
+pub fn handle_declared_schema_set(db: &Database, args: Value) -> Result<String, String> {
+    #[derive(Deserialize)]
+    struct DeclaredFieldArg {
+        name: String,
+        #[serde(rename = "type", default)]
+        field_type: String,
+        #[serde(default)]
+        facet: bool,
+    }
+    #[derive(Deserialize)]
+    struct DeclaredSchemaSetArgs {
+        category: String,
+        #[serde(default)]
+        fields: Vec<DeclaredFieldArg>,
+        #[serde(default)]
+        query_guidance: String,
+        #[serde(default)]
+        requesting_agent_id: String,
+        #[serde(default)]
+        workspace_hash: String,
+    }
+    let a: DeclaredSchemaSetArgs = serde_json::from_value(args)
+        .map_err(|e| format!("Invalid declared_schema_set arguments: {e}"))?;
+
+    // Governed like any write: without a validated admission envelope the
+    // caller holds the propose capability only (reviewable candidate).
+    db.require_memory_capability(&a.requesting_agent_id, &a.workspace_hash, "memory.propose")
+        .map_err(|e| format!("write denied: {e}"))?;
+
+    let mut fields = Vec::with_capacity(a.fields.len());
+    for f in &a.fields {
+        let field_type = match f.field_type.trim().to_ascii_lowercase().as_str() {
+            "scalar" => crate::declared::DeclaredFieldType::Scalar,
+            "string_list" => crate::declared::DeclaredFieldType::StringList,
+            other => {
+                return Err(format!(
+                    "declared schema: unknown field type '{other}' \
+                     (expected 'scalar' or 'string_list')"
+                ))
+            }
+        };
+        fields.push(crate::declared::DeclaredField {
+            name: f.name.clone(),
+            field_type,
+            facet: f.facet,
+        });
+    }
+    let schema =
+        crate::declared::declared_schema_set(db, &a.category, &fields, &a.query_guidance)?;
+    Ok(json!({
+        "ok": true,
+        "category": schema.category,
+        "version": schema.version,
+        "fields": schema.fields,
+        "query_guidance": schema.query_guidance,
+    })
+    .to_string())
+}
+
+/// #923: deterministic exact-match retrieval over a declared category.
+/// Filters are AND-combined exact-equality checks (scalar equality /
+/// string_list membership); results are returned in deterministic order
+/// with NO ranking. Facet counts are truthful and bounded. Undeclared
+/// categories, unknown fields, non-facet facet requests, and malformed
+/// filters are rejected — never degraded to fuzzy recall.
+pub fn handle_declared_query(db: &Database, args: Value) -> Result<String, String> {
+    #[derive(Deserialize)]
+    struct DeclaredQueryArgs {
+        category: String,
+        #[serde(default)]
+        filters: std::collections::HashMap<String, serde_json::Value>,
+        #[serde(default)]
+        facets: Vec<String>,
+        #[serde(default = "default_limit", deserialize_with = "null_as_default_limit")]
+        limit: i64,
+        #[serde(default, deserialize_with = "null_as_default")]
+        offset: i64,
+        #[serde(default)]
+        workspace_hash: Option<String>,
+    }
+    let a: DeclaredQueryArgs = serde_json::from_value(args)
+        .map_err(|e| format!("Invalid declared_query arguments: {e}"))?;
+
+    let schema = crate::declared::load_declared_schema(db, &a.category)?.ok_or_else(|| {
+        format!(
+            "declared query: category '{}' has no declared schema \
+             (declare one via perseus_vault_declared_schema_set)",
+            a.category
+        )
+    })?;
+    let filters: Vec<crate::declared::DeclaredFilter> = a
+        .filters
+        .iter()
+        .map(|(k, v)| crate::declared::DeclaredFilter {
+            field: k.clone(),
+            value: v.clone(),
+        })
+        .collect();
+    let mut entities = crate::declared::declared_candidates(
+        db,
+        &schema,
+        &filters,
+        a.workspace_hash.as_deref(),
+    )?;
+    let total = entities.len();
+    let offset = a.offset.max(0) as usize;
+    let limit = if a.limit < 0 { entities.len() } else { a.limit as usize };
+    let end = (offset + limit).min(entities.len());
+    let truncated = end < total;
+    let page: Vec<serde_json::Value> = entities
+        .drain(offset..end)
+        .map(|e| e.to_json_expanded())
+        .collect();
+    let facet_counts =
+        crate::declared::facet_counts(db, &schema, &filters, &a.facets, a.workspace_hash.as_deref())?;
+    Ok(json!({
+        "ok": true,
+        "category": schema.category,
+        "schema": {
+            "fields": schema.fields,
+            "query_guidance": schema.query_guidance,
+            "version": schema.version,
+        },
+        "total_matches": total,
+        "truncated": truncated,
+        "items": page,
+        "facet_counts": facet_counts,
+    })
+    .to_string())
 }
 
 /// Operator review queue for preload trigger tuning: `list` pending

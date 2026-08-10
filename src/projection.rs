@@ -380,6 +380,8 @@ pub fn build_projection(db: &Database, req: &ProjectionRequest) -> Result<Projec
         query_time_unix_ms: req.query_time_unix_ms,
         graph_utility_threshold: None,
         tier_order: false,
+        declared_category: None,
+        declared_filters: None,
     };
     let (entities, _count, _trace) = db
         .fused_recall(&params)

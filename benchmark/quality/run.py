@@ -2665,6 +2665,179 @@ def run_guide_service(client, **_):
     return output(checks, evidence, metric_events)
 
 
+def run_declared_exact(client, **_):
+    # #923: the declared exact-match arm. Declared contracts validate
+    # fail-closed; exact queries return deterministic no-ranking matches;
+    # facet counts are truthful; unknown fields and undeclared categories
+    # are errors; the fused arm pins exact matches ahead of the fuzzy pool.
+    ws = "quality-declared-workspace"
+    cat = "quality_declared"
+    fields = [
+        {"name": "tier", "type": "scalar", "facet": True},
+        {"name": "tags", "type": "string_list", "facet": True},
+        {"name": "region", "type": "scalar", "facet": False},
+    ]
+
+    # 1. Declare the contract; re-declaration bumps version (idempotent upsert).
+    declared = client.call(
+        "perseus_vault_declared_schema_set",
+        {"category": cat, "fields": fields, "query_guidance": "filter by tier"},
+    )
+    schema_declared = (
+        isinstance(declared, dict)
+        and declared.get("ok") is True
+        and declared.get("category") == cat
+        and declared.get("version") == 1
+        and len(declared.get("fields") or []) == 3
+    )
+    redeclared = client.call(
+        "perseus_vault_declared_schema_set",
+        {"category": cat, "fields": fields},
+    )
+    version_bumped = isinstance(redeclared, dict) and redeclared.get("version") == 2
+
+    # 2. Invalid declarations are rejected, never stored.
+    bad = client.call_allow_error(
+        "perseus_vault_declared_schema_set",
+        {"category": "quality_declared_bad", "fields": [{"name": "x", "type": "fuzzy"}]},
+    )
+    invalid_schema_rejected = isinstance(bad, dict) and bad.get("isError") is True
+
+    # 3. Seed entities with typed top-level body values.
+    seed_bodies = [
+        ("decl-a1", {"tier": "gold", "tags": ["eu", "prod"], "region": "fra"}),
+        ("decl-a2", {"tier": "gold", "tags": ["eu", "staging"], "region": "fra"}),
+        ("decl-b1", {"tier": "silver", "tags": ["us", "prod"], "region": "iad"}),
+    ]
+    for key, body in seed_bodies:
+        merged = {"note": "quality-fixture-declared-" + key, **body}
+        client.call(
+            "perseus_vault_remember",
+            {
+                "category": cat,
+                "key": key,
+                "body_json": stable_json(merged),
+                "skip_dedup": True,
+                "workspace_hash": ws,
+            },
+        )
+
+    # 4. Exact scalar equality: only the gold entities, deterministic order.
+    gold = client.call(
+        "perseus_vault_declared_query",
+        {"category": cat, "filters": {"tier": "gold"}, "workspace_hash": ws},
+    )
+    gold_again = client.call(
+        "perseus_vault_declared_query",
+        {"category": cat, "filters": {"tier": "gold"}, "workspace_hash": ws},
+    )
+    exact_scalar_match = (
+        isinstance(gold, dict)
+        and gold.get("total_matches") == 2
+        and {i.get("key") for i in (gold.get("items") or [])} == {"decl-a1", "decl-a2"}
+        and [i.get("key") for i in (gold.get("items") or [])]
+        == [i.get("key") for i in (gold_again.get("items") or [])]
+    )
+
+    # 5. String-list membership.
+    eu = client.call(
+        "perseus_vault_declared_query",
+        {"category": cat, "filters": {"tags": ["prod"]}, "workspace_hash": ws},
+    )
+    string_list_membership = (
+        isinstance(eu, dict)
+        and eu.get("total_matches") == 2
+        and {i.get("key") for i in (eu.get("items") or [])} == {"decl-a1", "decl-b1"}
+    )
+
+    # 6. AND semantics across typed fields.
+    anded = client.call(
+        "perseus_vault_declared_query",
+        {"category": cat, "filters": {"tier": "gold", "region": "fra"}, "workspace_hash": ws},
+    )
+    and_semantics = isinstance(anded, dict) and anded.get("total_matches") == 2
+
+    # 7. Facet counts truthful (computed over other-filter rows) + bounded.
+    facets = client.call(
+        "perseus_vault_declared_query",
+        {"category": cat, "filters": {"tier": "gold"}, "facets": ["tags"], "workspace_hash": ws},
+    )
+    facet_counts_truthful = (
+        isinstance(facets, dict)
+        and isinstance(facets.get("facet_counts"), dict)
+        and {f["value"]: f["count"] for f in (facets["facet_counts"].get("tags") or [])}
+        == {"eu": 2, "prod": 1, "staging": 1}
+    )
+
+    # 8. Fail-closed: unknown field, non-facet facet request, undeclared category.
+    unknown = client.call_allow_error(
+        "perseus_vault_declared_query",
+        {"category": cat, "filters": {"owner": "x"}, "workspace_hash": ws},
+    )
+    unknown_field_rejected = isinstance(unknown, dict) and unknown.get("isError") is True
+    nonfacet = client.call_allow_error(
+        "perseus_vault_declared_query",
+        {"category": cat, "facets": ["region"], "workspace_hash": ws},
+    )
+    nonfacet_rejected = isinstance(nonfacet, dict) and nonfacet.get("isError") is True
+    undeclared = client.call_allow_error(
+        "perseus_vault_declared_query",
+        {"category": "quality_no_schema", "workspace_hash": ws},
+    )
+    undeclared_category_rejected = (
+        isinstance(undeclared, dict) and undeclared.get("isError") is True
+    )
+
+    # 9. Fused recall pins the exact match ahead of the fuzzy pool.
+    fused = client.call(
+        "perseus_vault_recall",
+        {
+            "query": "quality-fixture-declared tier metal",
+            "category": cat,
+            "mode": "fused",
+            "declared_category": cat,
+            "declared_filters": {"tier": "silver"},
+            "workspace_hash": ws,
+        },
+    )
+    fused_items = fused.get("items") or [] if isinstance(fused, dict) else []
+    fused_pins_exact = (
+        isinstance(fused, dict)
+        and bool(fused_items)
+        and fused_items[0].get("key") == "decl-b1"
+        and "declared" in str(fused.get("fused_trace") or {})
+    )
+
+    checks = {
+        "schema_declared": schema_declared,
+        "version_bumped": version_bumped,
+        "invalid_schema_rejected": invalid_schema_rejected,
+        "exact_scalar_match": exact_scalar_match,
+        "string_list_membership": string_list_membership,
+        "and_semantics": and_semantics,
+        "facet_counts_truthful": facet_counts_truthful,
+        "unknown_field_rejected": unknown_field_rejected,
+        "nonfacet_rejected": nonfacet_rejected,
+        "undeclared_category_rejected": undeclared_category_rejected,
+        "fused_pins_exact": fused_pins_exact,
+    }
+    evidence = {
+        "found": bool(schema_declared),
+        "count": int(schema_declared and exact_scalar_match and string_list_membership),
+        "total": 3,
+        "rate": 1.0 if (schema_declared and exact_scalar_match and string_list_membership) else 0.0,
+        "reason": "declared-exact-match",
+        "workspace_hash": ws,
+    }
+    metric_events = {
+        "declared": {
+            "numerator": int(all(checks.values())),
+            "denominator": 1,
+        },
+    }
+    return output(checks, evidence, metric_events)
+
+
 SCENARIO_RUNNERS = {
     "long_horizon": run_long_horizon,
     "contradiction_supersession": run_contradiction,
@@ -2686,6 +2859,7 @@ SCENARIO_RUNNERS = {
     "interference_gate": run_interference_gate,
     "learned_anticipation": run_learned_anticipation,
     "guide_service": run_guide_service,
+    "declared_exact": run_declared_exact,
     "admission": run_admission,
     "prompt_safety": run_prompt_safety,
     "identity_ambiguity": run_identity_ambiguity,
