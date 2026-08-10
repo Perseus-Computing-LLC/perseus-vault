@@ -1,7 +1,7 @@
 {
   "case_count": {
     "min": 20,
-    "max": 48
+    "max": 52
   },
   "cases": [
     {
@@ -517,10 +517,25 @@
         "stats_readonly",
         "propose_readonly"
       ],
-      "description": "Stats and the propose pass never mutate entity bodies — trigger changes happen exclusively through review approve (#875).",
+      "description": "Stats and the propose pass never mutate entity bodies \u2014 trigger changes happen exclusively through review approve (#875).",
       "id": "learned-anticipation-no-silent-mutation",
       "metric": "learned_anticipation",
       "scenario": "learned_anticipation"
+    },
+    {
+      "id": "guide-service",
+      "category": "guide_service",
+      "metric": "guide_service",
+      "scenario": "guide_service",
+      "checks": [
+        "fallback_intact",
+        "seeded_ok",
+        "pointer_emitted",
+        "not_inlined",
+        "discoverable",
+        "idempotent"
+      ],
+      "description": "#924: operating guide is a discoverable service \u2014 context block emits pointer-not-inline only after seeding, manual never inlined, recall_when-discoverable, idempotent re-seed."
     }
   ],
   "description": "Bounded offline quality-contract manifest for retrieval, temporal validity, scope validity, provenance, replay, mutation/supersession, compaction/projection, action grounding, recall outcomes, admission, poisoning, identity ambiguity, and the graph utility gate (#869).",

@@ -4631,6 +4631,29 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "outputSchema": {"type": "object"}
   },
   {
+    "name": "perseus_vault_guide_seed",
+    "description": "#924: seed (create or refresh) the vault operating guide — a 'how to use this vault' manual living as a discoverable entity (category 'guide', key 'vault-operating-guide') with recall_when triggers ('operating guide', ...). Session context blocks then emit a one-line pointer instead of inlining operating instructions; agents retrieve the full guide on demand via normal recall. Idempotent: re-seeding updates in place, never duplicates. Advisory metadata only — never gates writes.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "workspace_hash": {
+          "type": "string",
+          "default": "",
+          "description": "Workspace scope for the guide entity (empty = global)."
+        }
+      }
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "id": {"type": "string"},
+        "category": {"type": "string"},
+        "key": {"type": "string"},
+        "action": {"type": "string"}
+      }
+    }
+  },
+  {
     "name": "perseus_vault_conflicts",
     "description": "Detect conflicting entities in the same category — pairs with low trigram similarity in their body_json. Flags potential contradictions, duplicate-but-divergent entries, and stale-overwritten facts. Read-only by default. Opt in with resolve=true to actively invalidate the lower-certainty side of clear conflicts (superseding it into history, reversible + time-travelable via perseus_vault_as_of); that path defaults to dry_run=true so you preview first, and never resolves pairs whose certainties are within certainty_margin.",
     "inputSchema": {
@@ -6542,6 +6565,7 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
         "perseus_vault_preload_review" => {
             tools::handle_preload_review(db, args).map_err(|e| e.to_string())
         }
+        "perseus_vault_guide_seed" => tools::handle_guide_seed(db, args).map_err(|e| e.to_string()),
         "perseus_vault_conflicts" => Ok(tools::handle_conflicts(db, args)),
         "perseus_vault_consolidate" => Ok(tools::handle_consolidate(db, args)),
         "perseus_vault_dream" => tools::handle_dream(db, args),
@@ -6640,7 +6664,7 @@ mod tests {
         );
         assert_eq!(
             registry_names.len(),
-            119,
+            120,
             "update public metadata when adding a tool"
         );
 

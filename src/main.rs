@@ -21,6 +21,7 @@ mod deployment_profile;
 mod glibc_compat;
 mod graph_route;
 mod grpc;
+mod guide;
 mod httplimit;
 mod instruction_extraction;
 mod interference;
