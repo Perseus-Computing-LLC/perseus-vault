@@ -261,7 +261,7 @@ def main() -> int:
                 assert m in modes, f"{m} exercised but not audited: {modes}"
         assert rep["displacement"]["count"] >= 1, rep["displacement"]
         art = rep["artifact"]
-        assert art.get("schema_version") == 34 and art.get("content_hash"), art
+        assert art.get("schema_version") == 35 and art.get("content_hash"), art
 
         # 6) #870: deployment profile joins the run manifest — the runtime
         # posture the results were produced under (sanitized: hosts only).

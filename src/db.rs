@@ -1023,6 +1023,13 @@ impl Database {
         // Initialize schema once if this is a new database.
         let setup_conn = pool.get()?;
         schema::initialize_schema(&setup_conn)?;
+        // #871: restart recovery — every run still queued/running (and its
+        // in-flight items) becomes `interrupted` (mark-only; resume happens
+        // only through an explicit op_run_retry). Best-effort: a failure
+        // leaves runs visibly `running` instead of aborting startup.
+        if let Err(e) = crate::op_runs::recover(&setup_conn) {
+            eprintln!("perseus-vault: op_runs restart recovery failed: {e}");
+        }
         // #885: resolve the stored embedding format BEFORE any embedding
         // write or dense read. Fail-closed: a declared format that disagrees
         // with the store record (or with an existing f32 corpus) aborts
@@ -9862,6 +9869,182 @@ impl Database {
     /// `None` → the chain is unkeyed (no secret available); see the design doc.
     pub(crate) fn audit_key(&self) -> Option<[u8; 32]> {
         self.encryption.as_ref().map(|e| *e.audit_key())
+    }
+
+    // ── #871: durable long-running operation states ─────────────────────
+    // Thin wrappers over crate::op_runs (state machine + per-item receipts
+    // + bounded scoped retry + restart recovery + retention prune). See
+    // docs/specs/durable-op-states.md.
+
+    /// Create a run in `queued` state.
+    pub fn op_run_begin(
+        &self,
+        op_type: &str,
+        scope: &str,
+        input_digest: &str,
+        max_retries: i64,
+        created_by: &str,
+    ) -> Result<crate::op_runs::OpRun, Box<dyn std::error::Error>> {
+        let conn = self.conn()?;
+        Ok(crate::op_runs::begin(
+            &conn, op_type, scope, input_digest, max_retries, created_by,
+        )?)
+    }
+
+    /// `queued → running`.
+    pub fn op_run_start(&self, id: &str) -> Result<crate::op_runs::OpRun, Box<dyn std::error::Error>> {
+        let conn = self.conn()?;
+        Ok(crate::op_runs::start(&conn, id)?)
+    }
+
+    /// Bounded progress update (counters; `total < 0` keeps the stored total).
+    pub fn op_run_progress(
+        &self,
+        id: &str,
+        done: i64,
+        failed: i64,
+        total: i64,
+    ) -> Result<crate::op_runs::OpRun, Box<dyn std::error::Error>> {
+        let conn = self.conn()?;
+        Ok(crate::op_runs::progress(&conn, id, done, failed, total)?)
+    }
+
+    /// `running → completed` with terminal receipt linkage.
+    pub fn op_run_complete(&self, id: &str, receipt: &str) -> Result<crate::op_runs::OpRun, Box<dyn std::error::Error>> {
+        let conn = self.conn()?;
+        Ok(crate::op_runs::complete(&conn, id, receipt)?)
+    }
+
+    /// `running → failed` (detail sanitized at rest).
+    pub fn op_run_fail(
+        &self,
+        id: &str,
+        error_class: &str,
+        detail: &str,
+    ) -> Result<crate::op_runs::OpRun, Box<dyn std::error::Error>> {
+        let conn = self.conn()?;
+        Ok(crate::op_runs::fail(&conn, id, error_class, detail, false)?)
+    }
+
+    /// `queued → failed_to_start` (operation could not launch).
+    pub fn op_run_failed_to_start(
+        &self,
+        id: &str,
+        error_class: &str,
+        detail: &str,
+    ) -> Result<crate::op_runs::OpRun, Box<dyn std::error::Error>> {
+        let conn = self.conn()?;
+        Ok(crate::op_runs::fail(&conn, id, error_class, detail, true)?)
+    }
+
+    /// `queued|running → cancelled`.
+    pub fn op_run_cancel(&self, id: &str) -> Result<crate::op_runs::OpRun, Box<dyn std::error::Error>> {
+        let conn = self.conn()?;
+        Ok(crate::op_runs::cancel(&conn, id)?)
+    }
+
+    /// `running → failed` with the `timeout` flag set.
+    pub fn op_run_timeout(&self, id: &str) -> Result<crate::op_runs::OpRun, Box<dyn std::error::Error>> {
+        let conn = self.conn()?;
+        Ok(crate::op_runs::timeout(&conn, id)?)
+    }
+
+    /// Add a per-item receipt (`queued`) to a running run.
+    pub fn op_run_item_add(
+        &self,
+        run_id: &str,
+        item_ref: &str,
+        item_digest: &str,
+    ) -> Result<crate::op_runs::OpRunItem, Box<dyn std::error::Error>> {
+        let conn = self.conn()?;
+        Ok(crate::op_runs::item_add(&conn, run_id, item_ref, item_digest)?)
+    }
+
+    /// Per-item `queued → running`.
+    pub fn op_run_item_start(
+        &self,
+        run_id: &str,
+        item_ref: &str,
+    ) -> Result<crate::op_runs::OpRunItem, Box<dyn std::error::Error>> {
+        let conn = self.conn()?;
+        Ok(crate::op_runs::item_start(&conn, run_id, item_ref)?)
+    }
+
+    /// Per-item `running → completed` with receipt linkage.
+    pub fn op_run_item_complete(
+        &self,
+        run_id: &str,
+        item_ref: &str,
+        receipt_ref: &str,
+    ) -> Result<crate::op_runs::OpRunItem, Box<dyn std::error::Error>> {
+        let conn = self.conn()?;
+        Ok(crate::op_runs::item_complete(&conn, run_id, item_ref, receipt_ref)?)
+    }
+
+    /// Per-item `running → failed` (detail sanitized at rest).
+    pub fn op_run_item_fail(
+        &self,
+        run_id: &str,
+        item_ref: &str,
+        error_class: &str,
+        detail: &str,
+    ) -> Result<crate::op_runs::OpRunItem, Box<dyn std::error::Error>> {
+        let conn = self.conn()?;
+        Ok(crate::op_runs::item_fail(&conn, run_id, item_ref, error_class, detail)?)
+    }
+
+    /// Per-item `queued|running → cancelled`.
+    pub fn op_run_item_cancel(
+        &self,
+        run_id: &str,
+        item_ref: &str,
+    ) -> Result<crate::op_runs::OpRunItem, Box<dyn std::error::Error>> {
+        let conn = self.conn()?;
+        Ok(crate::op_runs::item_cancel(&conn, run_id, item_ref)?)
+    }
+
+    /// Bounded, scoped, idempotent retry: forks a NEW child run re-queuing
+    /// only failed/unattempted items; completed items are carried with their
+    /// receipts (never re-executed).
+    pub fn op_run_retry(&self, id: &str) -> Result<crate::op_runs::OpRun, Box<dyn std::error::Error>> {
+        let conn = self.conn()?;
+        Ok(crate::op_runs::retry(&conn, id)?)
+    }
+
+    /// Retention prune: delete terminal runs older than `retention_days`
+    /// (min 1) plus their items. In-flight runs are never pruned.
+    pub fn op_run_prune(&self, retention_days: i64) -> Result<i64, Box<dyn std::error::Error>> {
+        let conn = self.conn()?;
+        Ok(crate::op_runs::prune(&conn, retention_days)?)
+    }
+
+    /// List runs (filter by state/op_type, newest first, `limit` 1..=100).
+    pub fn op_run_list(
+        &self,
+        state_filter: Option<crate::op_runs::OpRunState>,
+        op_type_filter: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<crate::op_runs::OpRun>, Box<dyn std::error::Error>> {
+        let conn = self.conn()?;
+        Ok(crate::op_runs::list(&conn, state_filter, op_type_filter, limit)?)
+    }
+
+    /// Fetch one run with its items.
+    pub fn op_run_get(
+        &self,
+        id: &str,
+    ) -> Result<Option<(crate::op_runs::OpRun, Vec<crate::op_runs::OpRunItem>)>, Box<dyn std::error::Error>> {
+        let conn = self.conn()?;
+        Ok(crate::op_runs::get_with_items(&conn, id)?)
+    }
+
+    /// #871 restart recovery: mark `queued|running` runs (and their in-flight
+    /// items) `interrupted`. Mark-only — resume happens only through an
+    /// explicit `op_run_retry`. Best-effort on open: a failure leaves runs
+    /// visibly `running` rather than aborting startup.
+    pub(crate) fn recover_op_runs(&self) -> Result<i64, Box<dyn std::error::Error>> {
+        let conn = self.conn()?;
+        Ok(crate::op_runs::recover(&conn)?)
     }
 
     /// #683: author or update a Keystone (mandatory policy rule). Upsert by
@@ -21452,7 +21635,7 @@ mod tests {
             }),
         )
         .unwrap_err();
-        assert!(err.contains("write denied") && err.contains("memory.commit"), "{err}");
+        assert!(err.to_string().contains("write denied") && err.contains("memory.commit"), "{err}");
         assert!(db.get_entity("decision", "commit-attempt").unwrap().is_none());
         let _ = std::fs::remove_file(path);
     }
@@ -21489,7 +21672,7 @@ mod tests {
             }),
         )
         .unwrap_err();
-        assert!(err.contains("recall denied") && err.contains("memory.read"), "{err}");
+        assert!(err.to_string().contains("recall denied") && err.contains("memory.read"), "{err}");
         let _ = std::fs::remove_file(path);
     }
 
@@ -21993,8 +22176,8 @@ mod tests {
             )
             .unwrap_err()
             .to_string();
-        assert!(err.contains("deploy"), "denial should name the capability: {err}");
-        assert!(err.contains("git_push"), "denial should list allowed capabilities: {err}");
+        assert!(err.to_string().contains("deploy"), "denial should name the capability: {err}");
+        assert!(err.to_string().contains("git_push"), "denial should list allowed capabilities: {err}");
 
         // Anchor denial names the offending anchor, states exact-match
         // semantics, and lists the allowed anchors.
@@ -22007,9 +22190,9 @@ mod tests {
             )
             .unwrap_err()
             .to_string();
-        assert!(err.contains("branch feat/x"), "denial should name the anchor: {err}");
-        assert!(err.contains("exactly"), "denial should state exact-match semantics: {err}");
-        assert!(err.contains("Perseus-Computing-LLC/perseus"), "denial should list allowed anchors: {err}");
+        assert!(err.to_string().contains("branch feat/x"), "denial should name the anchor: {err}");
+        assert!(err.to_string().contains("exactly"), "denial should state exact-match semantics: {err}");
+        assert!(err.to_string().contains("Perseus-Computing-LLC/perseus"), "denial should list allowed anchors: {err}");
 
         // External-ref denial names the reference and lists the prefixes.
         let err = db
@@ -22021,8 +22204,8 @@ mod tests {
             )
             .unwrap_err()
             .to_string();
-        assert!(err.contains("Other-Org"), "denial should name the reference: {err}");
-        assert!(err.contains("https://github.com/Perseus-Computing-LLC/perseus"), "denial should list permitted prefixes: {err}");
+        assert!(err.to_string().contains("Other-Org"), "denial should name the reference: {err}");
+        assert!(err.to_string().contains("https://github.com/Perseus-Computing-LLC/perseus"), "denial should list permitted prefixes: {err}");
 
         // Exact anchor + permitted prefix passes without approval required.
         let ok = db
@@ -22059,12 +22242,12 @@ mod tests {
         };
         base.agent_id = "   ".to_string();
         let err = db.authority_set(&base, "admin").unwrap_err().to_string();
-        assert!(err.contains("agent_id"), "should name agent_id: {err}");
+        assert!(err.to_string().contains("agent_id"), "should name agent_id: {err}");
         base.agent_id = "agent-aar-set".to_string();
         base.workspace_hash = "".to_string();
         let err = db.authority_set(&base, "admin").unwrap_err().to_string();
-        assert!(err.contains("workspace_hash"), "should name workspace_hash: {err}");
-        assert!(err.contains("per-workspace"), "should explain the per-workspace regime: {err}");
+        assert!(err.to_string().contains("workspace_hash"), "should name workspace_hash: {err}");
+        assert!(err.to_string().contains("per-workspace"), "should explain the per-workspace regime: {err}");
         let _ = std::fs::remove_file(&path);
     }
 
@@ -32345,7 +32528,7 @@ mod tests {
         // And a transport failure surfaces as a clean error, not a panic.
         let stub = |_: &str| -> Result<String, String> { Err("connection refused".to_string()) };
         let err = db.dream_with_llm(&params, &stub).unwrap_err().to_string();
-        assert!(err.contains("Dream LLM call failed"), "got: {err}");
+        assert!(err.to_string().contains("Dream LLM call failed"), "got: {err}");
 
         let _ = fs::remove_file(&path);
     }
@@ -32429,8 +32612,8 @@ mod tests {
         // No set_llm() → dreaming must fail cleanly (not crash) and point at
         // both the config flag and the non-LLM alternative.
         let err = db.dream(&dream_params("episodes")).unwrap_err().to_string();
-        assert!(err.contains("--llm-endpoint"), "got: {err}");
-        assert!(err.contains("perseus_vault_consolidate"), "got: {err}");
+        assert!(err.to_string().contains("--llm-endpoint"), "got: {err}");
+        assert!(err.to_string().contains("perseus_vault_consolidate"), "got: {err}");
         let _ = fs::remove_file(&path);
     }
 
@@ -32472,7 +32655,7 @@ mod tests {
         // No meta-insights: dreaming over dream output is refused.
         let stub = |_: &str| -> Result<String, String> { Ok(r#"{"insights":[]}"#.to_string()) };
         let err = db.dream_with_llm(&dream_params("insight"), &stub).unwrap_err().to_string();
-        assert!(err.contains("derived category"), "got: {err}");
+        assert!(err.to_string().contains("derived category"), "got: {err}");
 
         // Two distinct clusters, max_clusters = 1 → exactly one LLM call.
         dream_ins(&db, "b1", "k1", "episodes",
@@ -33013,7 +33196,7 @@ mod tests {
             }),
         )
         .unwrap_err();
-        assert!(err.contains("graph_utility_threshold"), "{err}");
+        assert!(err.to_string().contains("graph_utility_threshold"), "{err}");
         let _ = std::fs::remove_file(&path);
     }
 
@@ -37342,7 +37525,7 @@ mod tests {
         let (db, _path) = temp_db();
         let err = crate::tools::handle_erase(&db, serde_json::json!({"category": "general", "key": "k"}))
             .unwrap_err();
-        assert!(err.contains("workspace_hash"), "{err}");
+        assert!(err.to_string().contains("workspace_hash"), "{err}");
         let err2 = crate::tools::handle_redact(&db, serde_json::json!({"category": "general", "key": "k"}))
             .unwrap_err();
         assert!(err2.contains("workspace_hash"), "{err2}");
@@ -37433,7 +37616,7 @@ mod tests {
             .learned_artifact_register(artifact, "application/octet-stream", ws, "agent-lm", "workspace", "no-such-action", &sources, vec![], None, Some("v1".to_string()))
             .unwrap_err()
             .to_string();
-        assert!(err.contains("no action receipt"), "{err}");
+        assert!(err.to_string().contains("no action receipt"), "{err}");
 
         // 2. Completed receipt with the WRONG capability.
         let action = db
@@ -37444,7 +37627,7 @@ mod tests {
             .learned_artifact_register(artifact, "application/octet-stream", ws, "agent-lm", "workspace", &action.id, &sources, vec![], None, Some("v1".to_string()))
             .unwrap_err()
             .to_string();
-        assert!(err.contains("capability is 'git_push'"), "{err}");
+        assert!(err.to_string().contains("capability is 'git_push'"), "{err}");
 
         // 3. Learned_memory receipt whose outcome_hash does not match bytes.
         let action = db
@@ -37455,7 +37638,7 @@ mod tests {
             .learned_artifact_register(artifact, "application/octet-stream", ws, "agent-lm", "workspace", &action.id, &sources, vec![], None, Some("v1".to_string()))
             .unwrap_err()
             .to_string();
-        assert!(err.contains("outcome_hash"), "{err}");
+        assert!(err.to_string().contains("outcome_hash"), "{err}");
 
         // 4. Actor mismatch: a different agent's completed receipt.
         let action = db
@@ -37466,7 +37649,7 @@ mod tests {
             .learned_artifact_register(artifact, "application/octet-stream", ws, "other-agent", "workspace", &action.id, &sources, vec![], None, Some("v1".to_string()))
             .unwrap_err()
             .to_string();
-        assert!(err.contains("actor/workspace mismatch"), "{err}");
+        assert!(err.to_string().contains("actor/workspace mismatch"), "{err}");
 
         // 5. Missing source entity in the workspace is refused.
         let action = db
@@ -37478,7 +37661,7 @@ mod tests {
             .learned_artifact_register(artifact, "application/octet-stream", ws, "agent-lm", "workspace", &action.id, &ghost, vec![], None, Some("v1".to_string()))
             .unwrap_err()
             .to_string();
-        assert!(err.contains("source not found"), "{err}");
+        assert!(err.to_string().contains("source not found"), "{err}");
 
         let _ = std::fs::remove_file(path);
     }
@@ -37582,7 +37765,7 @@ mod tests {
 
         // Fail-closed serve: the artifact is now unreachable.
         let err = db.artifact_manifest(&sha, Some(ws), None).unwrap_err().to_string();
-        assert!(err.contains("not found") || err.contains("not visible"), "{err}");
+        assert!(err.to_string().contains("not found") || err.contains("not visible"), "{err}");
 
         // Journal carries hash-only evidence (entity id + count, no content).
         let conn = db.conn().unwrap();
@@ -37680,12 +37863,12 @@ mod tests {
             .enforce_workspace_binding(Some("profile-a"), Some("ws-other"), true)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("cross-workspace"), "{err}");
+        assert!(err.to_string().contains("cross-workspace"), "{err}");
         let err = db
             .enforce_workspace_binding(Some("profile-a"), Some("ws-other"), false)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("cross-workspace"), "{err}");
+        assert!(err.to_string().contains("cross-workspace"), "{err}");
 
         // Own workspace: read_write profile may mutate; read_only may not.
         db.enforce_workspace_binding(Some("profile-a"), Some("ws-shared"), true)
@@ -37694,7 +37877,7 @@ mod tests {
             .enforce_workspace_binding(Some("profile-b"), Some("ws-shared"), true)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("read_only"), "{err}");
+        assert!(err.to_string().contains("read_only"), "{err}");
         db.enforce_workspace_binding(Some("profile-b"), Some("ws-shared"), false)
             .unwrap();
 
@@ -37716,12 +37899,12 @@ mod tests {
             .enforce_workspace_binding(Some("profile-a"), Some("ws-shared"), false)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("quarantined"), "{err}");
+        assert!(err.to_string().contains("quarantined"), "{err}");
         let err = db
             .enforce_workspace_binding(Some("profile-a"), Some("ws-shared"), true)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("quarantined"), "{err}");
+        assert!(err.to_string().contains("quarantined"), "{err}");
         db.workspace_reactivate("profile-a", "operator").unwrap();
         db.enforce_workspace_binding(Some("profile-a"), Some("ws-shared"), true)
             .unwrap();
@@ -37740,7 +37923,7 @@ mod tests {
             .enforce_workspace_binding(Some("profile-a"), Some("ws-other"), false)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("unbound"), "{err}");
+        assert!(err.to_string().contains("unbound"), "{err}");
         assert!(db.workspace_unbind("profile-a", "again", "operator").is_err());
 
         // Journal evidence for every transition.
@@ -38043,7 +38226,7 @@ mod tests {
             serde_json::json!({"query": "annotated recall target", "profile": "bogus"}),
         )
         .unwrap_err();
-        assert!(err.contains("invalid profile 'bogus'"), "{err}");
+        assert!(err.to_string().contains("invalid profile 'bogus'"), "{err}");
         let _ = std::fs::remove_file(&path);
     }
 
@@ -38590,7 +38773,7 @@ mod tests {
         // Report carries denominator + artifact hash (acceptance #5).
         assert!(rep["denominator"]["slots"].as_i64().unwrap() >= 3);
         assert!(rep["artifact"]["git_hash"].as_str().unwrap().len() >= 7);
-        assert_eq!(rep["artifact"]["schema_version"], 34);
+        assert_eq!(rep["artifact"]["schema_version"], 35);
         let _ = std::fs::remove_file(path);
     }
 
@@ -39251,6 +39434,383 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    // ── #871: durable long-running operation states ─────────────────────
+
+    #[test]
+    fn op_run_lifecycle_and_illegal_transitions_are_fail_closed() {
+        let (db, _path) = temp_db();
+        let run = db
+            .op_run_begin("consolidate", "ws-a", "digest-1", 2, "test-agent")
+            .expect("begin");
+        assert_eq!(run.state, crate::op_runs::OpRunState::Queued);
+        assert_eq!(run.retry_count, 0);
+        // Terminal actions from queued are refused.
+        assert!(db.op_run_complete(&run.id, "r").is_err());
+        assert!(db.op_run_fail(&run.id, "e", "d").is_err());
+        // start: queued -> running
+        let started = db.op_run_start(&run.id).expect("start");
+        assert_eq!(started.state, crate::op_runs::OpRunState::Running);
+        assert!(started.started_at_unix_ms.is_some());
+        // start twice refused
+        assert!(db.op_run_start(&run.id).is_err());
+        // progress derives partial
+        let p = db.op_run_progress(&run.id, 2, 1, 5).expect("progress");
+        assert!(p.partial);
+        assert_eq!(p.items_done, 2);
+        assert_eq!(p.items_failed, 1);
+        assert_eq!(p.items_unattempted, 2);
+        // complete: running -> completed
+        let done = db.op_run_complete(&run.id, "receipt-j").expect("complete");
+        assert_eq!(done.state, crate::op_runs::OpRunState::Completed);
+        assert!(done.finished_at_unix_ms.is_some());
+        // terminal is terminal
+        assert!(db.op_run_cancel(&run.id).is_err());
+        assert!(db.op_run_fail(&run.id, "e", "d").is_err());
+        assert!(db.op_run_timeout(&run.id).is_err());
+        assert!(db.op_run_progress(&run.id, 3, 0, 5).is_err());
+    }
+
+    #[test]
+    fn op_run_failed_to_start_and_cancel_transitions() {
+        let (db, _path) = temp_db();
+        // queued -> failed_to_start (spawn error before any work)
+        let run = db.op_run_begin("export", "", "", 1, "").expect("begin");
+        let fts = db
+            .op_run_failed_to_start(&run.id, "spawn_failed", "no such worker")
+            .expect("failed_to_start");
+        assert_eq!(fts.state, crate::op_runs::OpRunState::FailedToStart);
+        assert!(fts.error_detail.contains("no such worker"));
+        assert!(db.op_run_start(&run.id).is_err(), "terminal is terminal");
+
+        // queued -> cancelled
+        let run2 = db.op_run_begin("export", "", "", 1, "").expect("begin");
+        let c = db.op_run_cancel(&run2.id).expect("cancel");
+        assert_eq!(c.state, crate::op_runs::OpRunState::Cancelled);
+        assert!(db.op_run_cancel(&run2.id).is_err());
+
+        // running -> cancelled
+        let run3 = db.op_run_begin("export", "", "", 1, "").expect("begin");
+        let _ = db.op_run_start(&run3.id).expect("start");
+        let c3 = db.op_run_cancel(&run3.id).expect("cancel running");
+        assert_eq!(c3.state, crate::op_runs::OpRunState::Cancelled);
+    }
+
+    #[test]
+    fn op_run_timeout_sets_timeout_flag_and_fails() {
+        let (db, _path) = temp_db();
+        let run = db.op_run_begin("embed_flush", "", "", 2, "").expect("begin");
+        let _ = db.op_run_start(&run.id).expect("start");
+        let t = db.op_run_timeout(&run.id).expect("timeout");
+        assert!(t.timeout);
+        assert_eq!(t.state, crate::op_runs::OpRunState::Failed);
+        assert_eq!(t.error_class, "timeout");
+        // timeout from queued refused
+        let run2 = db.op_run_begin("embed_flush", "", "", 2, "").expect("begin");
+        assert!(db.op_run_timeout(&run2.id).is_err());
+    }
+
+    #[test]
+    fn op_run_crash_recovery_marks_inflight_interrupted_on_reopen() {
+        // Simulated crash: begin+start, drop the handle, reopen the same file.
+        let path = std::env::temp_dir().join(format!(
+            "oprun-recover-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        {
+            let db = Database::open(path.to_str().unwrap()).expect("open");
+            let run = db.op_run_begin("maintain", "", "", 2, "").expect("begin");
+            let _ = db.op_run_start(&run.id).expect("start");
+            let _ = db.op_run_item_add(&run.id, "phase-1", "").expect("item");
+            let _ = db.op_run_item_start(&run.id, "phase-1").expect("item start");
+            let run2 = db.op_run_begin("maintain", "", "", 2, "").expect("begin"); // still queued
+            let id = run.id.clone();
+            let id2 = run2.id.clone();
+            // drop handle -> "crash" without completing
+            drop(db);
+            let db = Database::open(path.to_str().unwrap()).expect("reopen");
+            let r1 = db.op_run_get(&id).expect("get").expect("run1 exists");
+            assert_eq!(r1.0.state, crate::op_runs::OpRunState::Interrupted);
+            assert_eq!(
+                r1.1[0].state,
+                crate::op_runs::OpRunState::Interrupted,
+                "in-flight items mark interrupted too"
+            );
+            let r2 = db.op_run_get(&id2).expect("get").expect("run2 exists");
+            assert_eq!(r2.0.state, crate::op_runs::OpRunState::Interrupted);
+            // mark-only: never auto-resumed
+            assert_ne!(r1.0.state, crate::op_runs::OpRunState::Running);
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn op_run_retry_is_bounded_scoped_and_idempotent() {
+        let (db, _path) = temp_db();
+        let run = db.op_run_begin("export", "", "", 1, "").expect("begin");
+        let _ = db.op_run_start(&run.id).expect("start");
+        let _ = db.op_run_item_add(&run.id, "file-a.md", "da").expect("a");
+        let _ = db.op_run_item_add(&run.id, "file-b.md", "db").expect("b");
+        let _ = db.op_run_item_add(&run.id, "file-c.md", "dc").expect("c");
+        let _ = db.op_run_item_start(&run.id, "file-a.md").expect("sa");
+        let _ = db.op_run_item_complete(&run.id, "file-a.md", "receipt-a").expect("ca");
+        let _ = db.op_run_item_start(&run.id, "file-b.md").expect("sb");
+        let _ = db.op_run_item_complete(&run.id, "file-b.md", "receipt-b").expect("cb");
+        let _ = db.op_run_item_start(&run.id, "file-c.md").expect("sc");
+        let _ = db.op_run_item_fail(&run.id, "file-c.md", "malformed_provider_output", "bad payload").expect("fc");
+        let _ = db.op_run_complete(&run.id, "partial").expect("complete");
+
+        // Retry forks a child re-queuing ONLY the failed item; completed items
+        // carry their receipts (never re-executed => no duplicate writes).
+        let child = db.op_run_retry(&run.id).expect("retry");
+        assert_eq!(child.parent_run_id, run.id);
+        assert_eq!(child.retry_count, 1);
+        assert_eq!(child.state, crate::op_runs::OpRunState::Queued);
+        let (_, items) = db.op_run_get(&child.id).expect("child").expect("exists");
+        assert_eq!(items.len(), 3);
+        let mut by_ref = std::collections::HashMap::new();
+        for it in &items {
+            by_ref.insert(it.item_ref.clone(), it.clone());
+        }
+        assert_eq!(by_ref["file-a.md"].state, crate::op_runs::OpRunState::Completed);
+        assert_eq!(by_ref["file-a.md"].receipt_ref, "receipt-a", "receipt carried");
+        assert_eq!(by_ref["file-b.md"].receipt_ref, "receipt-b");
+        assert_eq!(by_ref["file-c.md"].state, crate::op_runs::OpRunState::Queued, "only failed re-queued");
+        assert_eq!(by_ref["file-c.md"].retry_count, 1);
+
+        // Retry exhaustion: max_retries=1, child fails again -> refused.
+        let _ = db.op_run_start(&child.id).expect("child start");
+        let _ = db.op_run_fail(&child.id, "export_error", "again").expect("child fail");
+        let err = db.op_run_retry(&child.id).expect_err("retry exhausted");
+        assert!(err.to_string().contains("retry_exhausted"), "{err}");
+    }
+
+    #[test]
+    fn op_run_retry_refused_on_inflight_and_unrecoverable() {
+        let (db, _path) = temp_db();
+        // In-flight run: retry refused.
+        let run = db.op_run_begin("consolidate", "", "", 2, "").expect("begin");
+        let _ = db.op_run_start(&run.id).expect("start");
+        let err = db.op_run_retry(&run.id).expect_err("inflight retry refused");
+        assert!(err.to_string().contains("not terminal"), "{err}");
+        // Fully completed run with nothing recoverable: refused.
+        let _ = db.op_run_complete(&run.id, "ok").expect("complete");
+        let err = db.op_run_retry(&run.id).expect_err("nothing recoverable");
+        assert!(err.to_string().contains("nothing"), "{err}");
+    }
+
+    #[test]
+    fn op_run_noop_completes_distinct_from_failure() {
+        let (db, _path) = temp_db();
+        // No-op empty input: completed with zero items — never a failure.
+        let run = db.op_run_begin("maintain", "", "", 2, "").expect("begin");
+        let _ = db.op_run_start(&run.id).expect("start");
+        let done = db.op_run_complete(&run.id, "empty input").expect("complete");
+        assert_eq!(done.state, crate::op_runs::OpRunState::Completed);
+        assert_eq!(done.items_total, 0);
+        assert!(!done.partial);
+        let listed = db.op_run_list(None, None, 10).expect("list");
+        assert!(listed.iter().any(|r| r.id == run.id));
+        let failed = db
+            .op_run_list(Some(crate::op_runs::OpRunState::Failed), None, 10)
+            .expect("list failed");
+        assert!(!failed.iter().any(|r| r.id == run.id), "no-op is not a failure");
+    }
+
+    #[test]
+    fn op_run_error_detail_is_sanitized_at_rest() {
+        let (db, _path) = temp_db();
+        let run = db.op_run_begin("export", "", "", 2, "").expect("begin");
+        let _ = db.op_run_start(&run.id).expect("start");
+        let detail = format!(
+            "provider returned sk-proj-AbCdEf1234567890ghijkl for API_KEY=supersecretvalue, request failed"
+        );
+        let _ = db.op_run_fail(&run.id, "provider_error", &detail).expect("fail");
+        let got = db.op_run_get(&run.id).expect("get").expect("run");
+        assert!(!got.0.error_detail.contains("sk-proj"), "secret must be masked");
+        assert!(!got.0.error_detail.contains("supersecretvalue"), "KEY=value must be masked");
+        assert!(got.0.error_detail.contains("[REDACTED]"), "mask marker present");
+        // List surface also sanitized (it reads the same stored value).
+        let listed = db.op_run_list(None, None, 10).expect("list");
+        let lr = listed.iter().find(|r| r.id == run.id).expect("listed");
+        assert!(!lr.error_detail.contains("sk-proj"));
+    }
+
+    #[test]
+    fn op_run_error_detail_is_length_capped() {
+        let (db, _path) = temp_db();
+        let run = db.op_run_begin("import", "", "", 2, "").expect("begin");
+        let _ = db.op_run_start(&run.id).expect("start");
+        let long = "x".repeat(5000);
+        let _ = db.op_run_fail(&run.id, "import_error", &long).expect("fail");
+        let got = db.op_run_get(&run.id).expect("get").expect("run");
+        assert!(got.0.error_detail.len() <= 505, "detail capped: {}", got.0.error_detail.len());
+        assert!(got.0.error_detail.ends_with("…[truncated]"));
+    }
+
+    #[test]
+    fn op_run_item_transitions_are_fail_closed() {
+        let (db, _path) = temp_db();
+        let run = db.op_run_begin("export", "", "", 2, "").expect("begin");
+        let _ = db.op_run_start(&run.id).expect("start");
+        let _ = db.op_run_item_add(&run.id, "f1", "").expect("add");
+        // duplicate item_ref refused (UNIQUE(run_id, item_ref))
+        assert!(db.op_run_item_add(&run.id, "f1", "").is_err());
+        // item_complete from queued refused
+        assert!(db.op_run_item_complete(&run.id, "f1", "r").is_err());
+        let _ = db.op_run_item_start(&run.id, "f1").expect("start");
+        let _ = db.op_run_item_complete(&run.id, "f1", "receipt-1").expect("complete");
+        assert!(db.op_run_item_cancel(&run.id, "f1").is_err(), "terminal item is terminal");
+        // items only attach to known runs
+        assert!(db.op_run_item_add("opr-nope", "f2", "").is_err());
+    }
+
+    #[test]
+    fn op_run_prune_respects_retention_and_never_touches_inflight() {
+        let (db, _path) = temp_db();
+        // Old terminal run (backdated).
+        let old = db.op_run_begin("decay", "", "", 2, "").expect("begin");
+        let _ = db.op_run_start(&old.id).expect("start");
+        let _ = db.op_run_item_add(&old.id, "i1", "").expect("item");
+        let _ = db.op_run_complete(&old.id, "old").expect("complete");
+        db.conn()
+            .expect("conn")
+            .execute(
+                "UPDATE op_runs SET updated_at_unix_ms = ?1 WHERE id = ?2",
+                rusqlite::params![
+                    crate::op_runs::now_ms() - 90 * 24 * 3600 * 1000,
+                    old.id
+                ],
+            )
+            .expect("backdate");
+        // Recent terminal run stays.
+        let recent = db.op_run_begin("decay", "", "", 2, "").expect("begin");
+        let _ = db.op_run_start(&recent.id).expect("start");
+        let _ = db.op_run_complete(&recent.id, "recent").expect("complete");
+        // In-flight run stays even if old.
+        let inflight = db.op_run_begin("maintain", "", "", 2, "").expect("begin");
+        let _ = db.op_run_start(&inflight.id).expect("start");
+        db.conn()
+            .expect("conn")
+            .execute(
+                "UPDATE op_runs SET updated_at_unix_ms = ?1 WHERE id = ?2",
+                rusqlite::params![
+                    crate::op_runs::now_ms() - 90 * 24 * 3600 * 1000,
+                    inflight.id
+                ],
+            )
+            .expect("backdate");
+
+        let pruned = db.op_run_prune(30).expect("prune");
+        assert_eq!(pruned, 1, "only the old terminal run pruned");
+        let runs = db.op_run_list(None, None, 10).expect("list");
+        let ids: Vec<&str> = runs.iter().map(|r| r.id.as_str()).collect();
+        assert!(ids.contains(&recent.id.as_str()), "recent kept");
+        assert!(ids.contains(&inflight.id.as_str()), "inflight never pruned");
+        assert!(!ids.contains(&old.id.as_str()), "old terminal pruned");
+        // Items cascade with the run.
+        let items_left = db
+            .conn()
+            .expect("conn")
+            .query_row(
+                "SELECT COUNT(*) FROM op_run_items WHERE run_id = ?1",
+                rusqlite::params![old.id],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("count");
+        assert_eq!(items_left, 0);
+    }
+
+    #[test]
+    fn op_run_list_filters_by_state_and_type() {
+        let (db, _path) = temp_db();
+        let a = db.op_run_begin("consolidate", "", "", 2, "").expect("a");
+        let _ = db.op_run_start(&a.id).expect("sa");
+        let _ = db.op_run_complete(&a.id, "ok").expect("ca");
+        let b = db.op_run_begin("export", "", "", 2, "").expect("b");
+        let _ = db.op_run_start(&b.id).expect("sb");
+        let _ = db.op_run_fail(&b.id, "export_error", "boom").expect("fb");
+        let completed = db
+            .op_run_list(Some(crate::op_runs::OpRunState::Completed), None, 10)
+            .expect("list completed");
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].id, a.id);
+        let exports = db.op_run_list(None, Some("export"), 10).expect("list type");
+        assert_eq!(exports.len(), 1);
+        assert_eq!(exports[0].id, b.id);
+    }
+
+    #[test]
+    fn op_run_retry_chain_is_observable_via_parent_link() {
+        let (db, _path) = temp_db();
+        let run = db.op_run_begin("import", "ws-1", "digest-x", 3, "scheduler").expect("begin");
+        let _ = db.op_run_start(&run.id).expect("start");
+        let _ = db.op_run_item_add(&run.id, "f", "").expect("item");
+        let _ = db.op_run_item_start(&run.id, "f").expect("istart");
+        let _ = db.op_run_item_fail(&run.id, "f", "import_error", "nope").expect("ifail");
+        let _ = db.op_run_fail(&run.id, "import_error", "nope").expect("fail");
+        let c1 = db.op_run_retry(&run.id).expect("retry1");
+        assert_eq!(c1.parent_run_id, run.id);
+        assert_eq!(c1.input_digest, "digest-x", "scope/digest carried");
+        assert_eq!(c1.scope, "ws-1");
+        assert_eq!(c1.max_retries, 3);
+        let _ = db.op_run_start(&c1.id).expect("c1 start");
+        let _ = db.op_run_item_start(&c1.id, "f").expect("c1 istart");
+        let _ = db.op_run_item_fail(&c1.id, "f", "import_error", "nope2").expect("c1 ifail");
+        let _ = db.op_run_fail(&c1.id, "import_error", "nope2").expect("c1 fail");
+        let c2 = db.op_run_retry(&c1.id).expect("retry2");
+        assert_eq!(c2.parent_run_id, c1.id);
+        assert_eq!(c2.retry_count, 2);
+        assert_eq!(c2.retry_count, run.retry_count + 2);
+    }
+
+    #[test]
+    fn op_run_max_retries_zero_refuses_retry_immediately() {
+        let (db, _path) = temp_db();
+        let run = db.op_run_begin("reindex", "", "", 0, "").expect("begin");
+        let _ = db.op_run_start(&run.id).expect("start");
+        let _ = db.op_run_fail(&run.id, "reindex_failed", "x").expect("fail");
+        let err = db.op_run_retry(&run.id).expect_err("max_retries=0");
+        assert!(err.to_string().contains("retry_exhausted"), "{err}");
+    }
+
+    #[test]
+    fn op_run_begin_clamps_max_retries() {
+        let (db, _path) = temp_db();
+        let high = db.op_run_begin("x", "", "", 99, "").expect("begin");
+        assert_eq!(high.max_retries, 10, "clamped to ceiling");
+        let neg = db.op_run_begin("x", "", "", -1, "").expect("begin");
+        assert_eq!(neg.max_retries, 0, "negative clamped to 0");
+        let zero = db.op_run_begin("x", "", "", 0, "").expect("begin");
+        assert_eq!(zero.max_retries, 0);
+    }
+
+    #[test]
+    fn op_run_saturation_embeds_survive_as_timeout_run() {
+        // Queue saturation analog: flush with a bounded deadline that cannot
+        // drain in time surfaces a timeout run with the queue still bounded.
+        let (db, _path) = temp_db();
+        let run = db.op_run_begin("embed_flush", "", "", 1, "").expect("begin");
+        let _ = db.op_run_start(&run.id).expect("start");
+        // Saturation: pending remains above the drain bound.
+        let _ = db.op_run_item_add(&run.id, "ent-1", "").expect("i1");
+        let _ = db.op_run_item_add(&run.id, "ent-2", "").expect("i2");
+        let _ = db.op_run_item_add(&run.id, "ent-3", "").expect("i3");
+        let _ = db.op_run_item_start(&run.id, "ent-1").expect("s1");
+        let _ = db.op_run_item_complete(&run.id, "ent-1", "r1").expect("c1");
+        let t = db.op_run_timeout(&run.id).expect("timeout");
+        assert!(t.timeout);
+        assert_eq!(t.items_done, 1, "partial progress preserved");
+        assert_eq!(t.items_unattempted, 2, "unattempted identified");        // Retry re-queues only the unattempted/failed items.
+        let child = db.op_run_retry(&run.id).expect("retry");
+        let (_, items) = db.op_run_get(&child.id).expect("get").expect("exists");
+        let states: Vec<_> = items.iter().map(|i| i.state.as_str()).collect();
+        assert!(states.contains(&"queued"));
+        let done_item = items.iter().find(|i| i.item_ref == "ent-1").expect("ent-1");
+        assert_eq!(done_item.state, crate::op_runs::OpRunState::Completed);
+        assert_eq!(done_item.receipt_ref, "r1");
+    }
+
     #[test]
     fn operator_review_surfaces_write_quarantine_section() {
         let (db, path) = temp_db();
@@ -39317,7 +39877,7 @@ mod tests {
             }),
         )
         .unwrap_err();
-        assert!(err.contains("'off' is not allowed"), "{err}");
+        assert!(err.to_string().contains("'off' is not allowed"), "{err}");
         let err = crate::tools::handle_remember(
             &db,
             serde_json::json!({
@@ -39327,7 +39887,7 @@ mod tests {
             }),
         )
         .unwrap_err();
-        assert!(err.contains("LOOSEN"), "{err}");
+        assert!(err.to_string().contains("LOOSEN"), "{err}");
         // A tightening override is accepted.
         let out = crate::tools::handle_remember(
             &db,

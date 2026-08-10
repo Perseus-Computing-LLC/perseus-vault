@@ -403,6 +403,58 @@ CREATE TABLE IF NOT EXISTS write_quarantine (
 );
 CREATE INDEX IF NOT EXISTS idx_write_quarantine_ws
  ON write_quarantine(workspace_hash, created_at_unix_ms);
+
+-- #871: durable long-running operation states — shared run/run-item contract
+-- for maintenance, embed, consolidation, export/import, and reindex
+-- operations. Terminal states: completed | failed | cancelled | interrupted |
+-- failed_to_start; orthogonal partial/timeout/stale flags; per-item receipts
+-- for fan-out isolation and bounded scoped retry.
+CREATE TABLE IF NOT EXISTS op_runs (
+    id TEXT PRIMARY KEY,
+    op_type TEXT NOT NULL,
+    state TEXT NOT NULL,
+    partial INTEGER NOT NULL DEFAULT 0,
+    timeout INTEGER NOT NULL DEFAULT 0,
+    stale INTEGER NOT NULL DEFAULT 0,
+    scope TEXT NOT NULL DEFAULT '',
+    input_digest TEXT NOT NULL DEFAULT '',
+    items_total INTEGER NOT NULL DEFAULT 0,
+    items_done INTEGER NOT NULL DEFAULT 0,
+    items_failed INTEGER NOT NULL DEFAULT 0,
+    items_unattempted INTEGER NOT NULL DEFAULT 0,
+    error_class TEXT NOT NULL DEFAULT '',
+    error_detail TEXT NOT NULL DEFAULT '',
+    receipt TEXT NOT NULL DEFAULT '',
+    retry_count INTEGER NOT NULL DEFAULT 0,
+    max_retries INTEGER NOT NULL DEFAULT 2,
+    parent_run_id TEXT NOT NULL DEFAULT '',
+    created_by TEXT NOT NULL DEFAULT '',
+    created_at_unix_ms INTEGER NOT NULL,
+    started_at_unix_ms INTEGER,
+    updated_at_unix_ms INTEGER NOT NULL,
+    finished_at_unix_ms INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_op_runs_state
+ ON op_runs(state, updated_at_unix_ms);
+CREATE INDEX IF NOT EXISTS idx_op_runs_type
+ ON op_runs(op_type, created_at_unix_ms);
+CREATE TABLE IF NOT EXISTS op_run_items (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    item_ref TEXT NOT NULL,
+    item_digest TEXT NOT NULL DEFAULT '',
+    state TEXT NOT NULL,
+    receipt_ref TEXT NOT NULL DEFAULT '',
+    error_class TEXT NOT NULL DEFAULT '',
+    error_detail TEXT NOT NULL DEFAULT '',
+    retry_count INTEGER NOT NULL DEFAULT 0,
+    created_at_unix_ms INTEGER NOT NULL,
+    updated_at_unix_ms INTEGER NOT NULL,
+    finished_at_unix_ms INTEGER,
+    UNIQUE(run_id, item_ref)
+);
+CREATE INDEX IF NOT EXISTS idx_op_run_items_run
+ ON op_run_items(run_id, state);
 ";
 
 /// Current schema migration level, stamped into `PRAGMA user_version` once all
@@ -478,7 +530,7 @@ CREATE INDEX IF NOT EXISTS idx_write_quarantine_ws
 /// v34 (#874 activation-gated sparse writes): `write_quarantine` — the
 /// reviewable hold for writes whose measured interference exceeds the
 /// configured bound. New table, idempotent, no backfill.
-pub(crate) const SCHEMA_VERSION: i64 = 34;
+pub(crate) const SCHEMA_VERSION: i64 = 35;
 
 /// Initialize the v0.2.0 schema on a fresh database.
 pub fn initialize_schema(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
@@ -1315,6 +1367,59 @@ fn apply_migrations(conn: &Connection) -> Result<(), Box<dyn std::error::Error>>
           ON write_quarantine(workspace_hash, created_at_unix_ms);",
     )?;
     // ── end v34 ──────────────────────────────────────────────────────────
+
+    // ── v35 (#871): durable long-running operation states ────────────────
+    // New tables only (base DDL also creates them for fresh DBs); no
+    // backfill — nothing existed before v35 to migrate.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS op_runs (
+            id TEXT PRIMARY KEY,
+            op_type TEXT NOT NULL,
+            state TEXT NOT NULL,
+            partial INTEGER NOT NULL DEFAULT 0,
+            timeout INTEGER NOT NULL DEFAULT 0,
+            stale INTEGER NOT NULL DEFAULT 0,
+            scope TEXT NOT NULL DEFAULT '',
+            input_digest TEXT NOT NULL DEFAULT '',
+            items_total INTEGER NOT NULL DEFAULT 0,
+            items_done INTEGER NOT NULL DEFAULT 0,
+            items_failed INTEGER NOT NULL DEFAULT 0,
+            items_unattempted INTEGER NOT NULL DEFAULT 0,
+            error_class TEXT NOT NULL DEFAULT '',
+            error_detail TEXT NOT NULL DEFAULT '',
+            receipt TEXT NOT NULL DEFAULT '',
+            retry_count INTEGER NOT NULL DEFAULT 0,
+            max_retries INTEGER NOT NULL DEFAULT 2,
+            parent_run_id TEXT NOT NULL DEFAULT '',
+            created_by TEXT NOT NULL DEFAULT '',
+            created_at_unix_ms INTEGER NOT NULL,
+            started_at_unix_ms INTEGER,
+            updated_at_unix_ms INTEGER NOT NULL,
+            finished_at_unix_ms INTEGER
+         );
+         CREATE INDEX IF NOT EXISTS idx_op_runs_state
+          ON op_runs(state, updated_at_unix_ms);
+         CREATE INDEX IF NOT EXISTS idx_op_runs_type
+          ON op_runs(op_type, created_at_unix_ms);
+         CREATE TABLE IF NOT EXISTS op_run_items (
+            id TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL,
+            item_ref TEXT NOT NULL,
+            item_digest TEXT NOT NULL DEFAULT '',
+            state TEXT NOT NULL,
+            receipt_ref TEXT NOT NULL DEFAULT '',
+            error_class TEXT NOT NULL DEFAULT '',
+            error_detail TEXT NOT NULL DEFAULT '',
+            retry_count INTEGER NOT NULL DEFAULT 0,
+            created_at_unix_ms INTEGER NOT NULL,
+            updated_at_unix_ms INTEGER NOT NULL,
+            finished_at_unix_ms INTEGER,
+            UNIQUE(run_id, item_ref)
+         );
+         CREATE INDEX IF NOT EXISTS idx_op_run_items_run
+          ON op_run_items(run_id, state);",
+    )?;
+    // ── end v35 ──────────────────────────────────────────────────────────
 
     // Stamp the migration level so subsequent opens skip the probe block above.
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;

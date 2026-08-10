@@ -23,6 +23,7 @@ mod mental_model;
 mod models;
 mod multimodal;
 mod observations;
+mod op_runs;
 mod projection;
 mod retrieval_telemetry;
 mod instruction_extraction;
@@ -444,6 +445,37 @@ enum Commands {
         db: String,
     },
 
+    /// #871: durable long-running operation states. Subcommands:
+    /// list (default; optional --state/--op_type filters, --limit),
+    /// show (--run-id), retry (--run-id), prune (--retention-days).
+    OpRuns {
+        /// SQLite database path
+        #[arg(long, default_value_t = default_db_path())]
+        db: String,
+        /// Path to AES-256-GCM encryption key file; falls back to the standard
+        /// key path when one exists.
+        #[arg(long)]
+        encryption_key: Option<String>,
+        /// Subcommand: list | show | retry | prune
+        #[arg(long, default_value_t = String::from("list"))]
+        action: String,
+        /// Run id (opr-...) for show / retry
+        #[arg(long)]
+        run_id: Option<String>,
+        /// Optional state filter for list
+        #[arg(long)]
+        state: Option<String>,
+        /// Optional op_type filter for list
+        #[arg(long)]
+        op_type: Option<String>,
+        /// List limit (1..=100)
+        #[arg(long, default_value_t = 20)]
+        limit: i64,
+        /// Retention days for prune (min 1)
+        #[arg(long)]
+        retention_days: Option<i64>,
+    },
+
     /// Print a cheap, deterministic content digest of the recall-visible
     /// entity set as JSON (#256). Use as a cache key for resolved @memory
     /// outputs: stable while DB state is unchanged, changes iff it changes.
@@ -755,6 +787,7 @@ impl Commands {
             | Commands::Maintain { db, .. }
             | Commands::Reindex { db, .. }
             | Commands::Stats { db, .. }
+            | Commands::OpRuns { db, .. }
             | Commands::StateDigest { db, .. }
             | Commands::VaultExport { db, .. }
             | Commands::VaultImport { db, .. }
@@ -2672,9 +2705,24 @@ fn run() {
             } else {
                 warn_plaintext_writes_to_encrypted_db(&database);
             }
+            // #871: durable op-state wrap for the CLI decay path.
+            let run = database
+                .op_run_begin("decay", "", "", 2, "cli")
+                .unwrap_or_else(|e| panic!("op_run begin failed: {e}"));
+            let _ = database.op_run_start(&run.id);
             match database.decay_tick() {
-                Ok(report) => print_json(&report),
+                Ok(report) => {
+                    let _ = database.op_run_complete(
+                        &run.id,
+                        &format!(
+                            "entities_checked={} entities_updated={} auto_archived={}",
+                            report.entities_checked, report.entities_updated, report.auto_archived
+                        ),
+                    );
+                    print_json(&report)
+                }
                 Err(e) => {
+                    let _ = database.op_run_fail(&run.id, "decay_failed", &e.to_string());
                     eprintln!("perseus-vault: decay failed: {}", e);
                     std::process::exit(1);
                 }
@@ -2718,9 +2766,18 @@ fn run() {
             } else {
                 warn_plaintext_writes_to_encrypted_db(&database);
             }
+            // #871: durable op-state wrap for the CLI reindex path.
+            let run = database
+                .op_run_begin("reindex", "", "", 2, "cli")
+                .unwrap_or_else(|e| panic!("op_run begin failed: {e}"));
+            let _ = database.op_run_start(&run.id);
             match database.reindex_fts() {
-                Ok(n) => println!("Reindexed {} entities into FTS5", n),
+                Ok(n) => {
+                    let _ = database.op_run_complete(&run.id, &format!("reindexed={n}"));
+                    println!("Reindexed {} entities into FTS5", n);
+                }
                 Err(e) => {
+                    let _ = database.op_run_fail(&run.id, "reindex_failed", &e.to_string());
                     eprintln!("perseus-vault: reindex failed: {}", e);
                     std::process::exit(1);
                 }
@@ -2735,6 +2792,95 @@ fn run() {
                     std::process::exit(1);
                 }
             }
+        }
+        Some(Commands::OpRuns {
+            db: ref db_path,
+            ref encryption_key,
+            action,
+            run_id,
+            state,
+            op_type,
+            limit,
+            retention_days,
+        }) => {
+            let mut database = open_db_or_exit(db_path);
+            let encryption_key = configured_encryption_key_for_database(&mut database, encryption_key.as_deref());
+            if let Some(ref key_file) = encryption_key {
+                if let Err(e) = database.set_encryption(key_file) {
+                    eprintln!("perseus-vault: encryption setup failed: {}", e);
+                    std::process::exit(1);
+                }
+            }
+            let out = match action.as_str() {
+                "show" => {
+                    let Some(run_id) = run_id else {
+                        eprintln!("perseus-vault: op-runs show requires --run-id");
+                        std::process::exit(1);
+                    };
+                    match database.op_run_get(&run_id) {
+                        Ok(Some((run, items))) => serde_json::json!({"run": run, "items": items}),
+                        Ok(None) => {
+                            eprintln!("perseus-vault: unknown op run: {run_id}");
+                            std::process::exit(1);
+                        }
+                        Err(e) => {
+                            eprintln!("perseus-vault: op-runs show failed: {}", e);
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                "retry" => {
+                    let Some(run_id) = run_id else {
+                        eprintln!("perseus-vault: op-runs retry requires --run-id");
+                        std::process::exit(1);
+                    };
+                    match database.op_run_retry(&run_id) {
+                        Ok(child) => serde_json::json!({
+                            "retried_from": run_id,
+                            "child_run_id": child.id,
+                            "state": child.state.as_str(),
+                            "retry_count": child.retry_count,
+                        }),
+                        Err(e) => {
+                            eprintln!("perseus-vault: op-runs retry failed: {}", e);
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                "prune" => {
+                    let days = retention_days.unwrap_or_else(|| {
+                        std::env::var("PERSEUS_VAULT_OP_RETENTION_DAYS")
+                            .ok()
+                            .and_then(|v| v.parse().ok())
+                            .unwrap_or(30)
+                    });
+                    match database.op_run_prune(days) {
+                        Ok(pruned) => serde_json::json!({"pruned": pruned, "retention_days": days}),
+                        Err(e) => {
+                            eprintln!("perseus-vault: op-runs prune failed: {}", e);
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                "list" | _ => {
+                    let state_filter = state
+                        .as_deref()
+                        .map(crate::op_runs::OpRunState::parse)
+                        .flatten();
+                    if state.is_some() && state_filter.is_none() {
+                        eprintln!("perseus-vault: invalid --state filter");
+                        std::process::exit(1);
+                    }
+                    match database.op_run_list(state_filter, op_type.as_deref(), limit) {
+                        Ok(runs) => serde_json::json!({"count": runs.len(), "runs": runs}),
+                        Err(e) => {
+                            eprintln!("perseus-vault: op-runs list failed: {}", e);
+                            std::process::exit(1);
+                        }
+                    }
+                }
+            };
+            print_json(&out);
         }
         Some(Commands::Doctor { db: ref db_path }) => {
             run_doctor(db_path);
