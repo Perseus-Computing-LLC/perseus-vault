@@ -24,6 +24,7 @@ mod graph_route;
 mod grpc;
 mod guide;
 mod httplimit;
+mod inspect;
 mod instruction_extraction;
 mod interference;
 mod log_digest;
@@ -41,6 +42,8 @@ mod signed_profile;
 pub(crate) mod stage_trace;
 mod tools;
 mod transport;
+#[cfg(feature = "tui")]
+mod tui;
 mod trust_admission;
 mod util;
 mod validity;
@@ -313,6 +316,22 @@ enum Commands {
         /// Path to write the key file (default: ~/.perseus-vault/secret.key)
         #[arg(long, default_value_t = default_key_file())]
         key_file: String,
+    },
+
+    /// #918: read-only TUI inspector over retrieval telemetry, claim cards,
+    /// entity state, decay, and bi-temporal history. Opens the database
+    /// strictly read-only (no migrations, no writes); repair actions are
+    /// deliberately out of scope (use the governed MCP tools instead).
+    /// Requires the `tui` feature (default ON).
+    Inspect {
+        /// SQLite database path
+        #[arg(long, default_value_t = default_db_path())]
+        db: String,
+        /// Path to AES-256-GCM encryption key file (falls back to
+        /// $PERSEUS_VAULT_KEY_FILE). Without a key, ciphertext-at-rest
+        /// bodies are flagged rather than surfaced.
+        #[arg(long)]
+        key_file: Option<String>,
     },
 
     /// Initialize a database with encryption. Generates a key (if none exists),
@@ -803,7 +822,8 @@ impl Commands {
             | Commands::Doctor { db, .. }
             | Commands::Connect { db, .. }
             | Commands::Prepare { db, .. }
-            | Commands::Capture { db, .. } => Some(db),
+            | Commands::Capture { db, .. }
+            | Commands::Inspect { db, .. } => Some(db),
             Commands::ObsidianSync { .. } | Commands::Migrate { .. } | Commands::Keygen { .. } => {
                 None
             }
@@ -3478,6 +3498,26 @@ fn run() {
                     eprintln!("perseus-vault: migration failed: {}", e);
                     std::process::exit(1);
                 }
+            }
+        }
+        Some(Commands::Inspect {
+            ref db,
+            ref key_file,
+        }) => {
+            #[cfg(feature = "tui")]
+            {
+                if let Err(e) = crate::tui::run_tui(db, key_file.as_deref()) {
+                    eprintln!("perseus-vault-inspect: {e}");
+                    std::process::exit(1);
+                }
+            }
+            #[cfg(not(feature = "tui"))]
+            {
+                eprintln!(
+                    "perseus-vault: this binary was built without the `tui` feature \
+                     (--no-default-features); rebuild with default features to use `inspect`"
+                );
+                std::process::exit(1);
             }
         }
         Some(Commands::Serve {

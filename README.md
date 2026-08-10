@@ -490,6 +490,11 @@ perseus-vault obsidian-sync  ~/obsidian-vault/Perseus Vault/ --watch  # continuo
 
 # Key management
 perseus-vault keygen --key-file ~/.perseus-vault/secret.key
+
+# #918: read-only TUI inspector (retrieval telemetry, claim cards, entity
+# state, decay, bi-temporal history). Never writes; repairs go through the
+# governed MCP tools. Requires the default `tui` feature.
+perseus-vault inspect --db /data/perseus-vault.db --key-file ~/.perseus-vault/secret.key
 ```
 
 > **Manual DB edits.** The maintenance verbs above and the normal MCP write path

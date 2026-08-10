@@ -71,6 +71,14 @@ zip = { version = "2", optional = true, default-features = false, features = ["d
 pdf-extract = { version = "0.12", optional = true }
 ed25519-dalek = { version = "2", features = ["std"] }
 
+# #918: read-only TUI inspector (perseus-vault inspect subcommand). Gated
+# behind the `tui` feature (default ON) so the lean no-default-features
+# build stays dependency-light. ratatui 0.30 (not 0.29) — 0.29 pins
+# lru ^0.12 which has RUSTSEC-2026-0002 (unsound IterMut, no fix within ^0.12);
+# 0.30 dropped the lru dependency entirely.
+ratatui = { version = "0.30", optional = true, default-features = false, features = ["crossterm"] }
+crossterm = { version = "0.28", optional = true }
+
 # Target-specific deps must live AFTER every general [dependencies] entry —
 # a [target.*] table header captures everything below it into that target's
 # section. (First #751 commit put this block mid-list and silently demoted
@@ -92,8 +100,11 @@ windows-sys = { version = "0.52", features = [
 # hybrid semantic search out of the box. The quantized all-MiniLM-L6-v2 model is
 # fetched once by build.rs and compiled into the binary (no first-run download).
 # Build a lean binary without it via `cargo build --no-default-features`.
-default = ["bundled-embeddings"]
+default = ["bundled-embeddings", "tui"]
 bundled-embeddings = ["ort", "tokenizers", "ndarray"]
+# #918: read-only TUI inspector (perseus-vault-inspect). Default ON; the
+# lean `--no-default-features` build drops it (and the inspect bin) entirely.
+tui = ["dep:ratatui", "dep:crossterm"]
 # tokio-stream must be in this list: src/grpc.rs names it for the server
 # streaming types (WatchJournalStream/StreamContextStream). It was optional
 # but never wired to the feature, so the grpc build failed with
