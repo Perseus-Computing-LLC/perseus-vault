@@ -5,7 +5,20 @@ All notable changes to Perseus Vault are documented here. This project adheres t
 
 ## [Unreleased]
 
+## [2.23.0] - 2026-08-10
+
+### Fixed
+- **Registry metadata consistency.** `server.json` description shortened under
+  the 100-character official-registry limit (the previous description was
+  rejected with 422 on publish, leaving the live entry stale at "55 tools");
+  the count is now synced to 122 canonical tools across README, server.json,
+  manifest.json, glama.json, and the GitHub repository description.
+
 ### Added
+- **Hermes native MemoryProvider integration.** Originally contributed by
+  [@sowerkoku](https://github.com/sowerkoku) in
+  [#908](https://github.com/Perseus-Computing-LLC/perseus-vault/pull/908),
+  overhauled in [#911](https://github.com/Perseus-Computing-LLC/perseus-vault/pull/911).
 - **Deployment profiles (#870).** New `perseus_vault_deployment_profile` tool
   (registry 102→103): one machine-readable, runtime-derived answer to "what
   is this vault actually connected to?" — `offline` | `local_only` |

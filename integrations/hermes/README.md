@@ -3,6 +3,11 @@
 > **This is a native Hermes MemoryProvider plugin**, not an MCP tool integration.
 > It implements the `MemoryProvider` ABC from Hermes core, so the agent calls it
 > automatically via lifecycle hooks — no manual tool invocation required.
+>
+> **Origin:** The native Hermes MemoryProvider integration was originally
+> contributed by [sowerkoku](https://github.com/sowerkoku) in
+> [#908](https://github.com/Perseus-Computing-LLC/perseus-vault/pull/908);
+> the integration is maintained by Perseus Computing.
 
 ## Repository Structure
 
