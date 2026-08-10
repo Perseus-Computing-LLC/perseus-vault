@@ -71,10 +71,12 @@ zip = { version = "2", optional = true, default-features = false, features = ["d
 pdf-extract = { version = "0.12", optional = true }
 ed25519-dalek = { version = "2", features = ["std"] }
 
-# #918: read-only TUI inspector (perseus-vault-inspect). Gated behind the
-# `tui` feature (default ON) so the lean no-default-features build stays
-# dependency-light; the inspect BIN requires the feature (required-features).
-ratatui = { version = "0.29", optional = true, default-features = false, features = ["crossterm"] }
+# #918: read-only TUI inspector (perseus-vault inspect subcommand). Gated
+# behind the `tui` feature (default ON) so the lean no-default-features
+# build stays dependency-light. ratatui 0.30 (not 0.29) — 0.29 pins
+# lru ^0.12 which has RUSTSEC-2026-0002 (unsound IterMut, no fix within ^0.12);
+# 0.30 dropped the lru dependency entirely.
+ratatui = { version = "0.30", optional = true, default-features = false, features = ["crossterm"] }
 crossterm = { version = "0.28", optional = true }
 
 # Target-specific deps must live AFTER every general [dependencies] entry —
