@@ -71,6 +71,15 @@ pub struct Entity {
     /// admission evidence or operator promotion.
     #[serde(default = "default_epistemic_state")]
     pub epistemic_state: String,
+    /// #919: prospective query hints — 1-3 natural-language phrasings that
+    /// should retrieve this entity, indexed into FTS5 alongside the canonical
+    /// body. Advisory retrieval metadata only: never gates writes, not part of
+    /// dedup/interference identity, not versioned in entity_history. Written
+    /// only when the server enables the feature (PERSEUS_VAULT_HINTS_ENABLED);
+    /// replaced wholesale on update (an update without hints clears them),
+    /// matching the existing remember reset semantics for tags/status.
+    #[serde(default)]
+    pub hints: Vec<String>,
     #[serde(skip)]
     #[allow(dead_code)]
     pub embedding: Option<Vec<f32>>,

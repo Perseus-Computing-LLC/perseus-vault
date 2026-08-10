@@ -182,6 +182,14 @@ pub struct RememberArgs {
     /// salience inflation, no near-duplicate absorption on insert).
     #[serde(default)]
     pub sparse_update: bool,
+    /// #919: optional 1-3 prospective query hints — natural-language
+    /// phrasings that should retrieve this entity, indexed into FTS5
+    /// alongside the body. Default-off feature: hints are rejected unless
+    /// the server runs with PERSEUS_VAULT_HINTS_ENABLED=1. On update, hints
+    /// replace any previously stored hints (an update without hints clears
+    /// them) — matching the remember reset semantics for tags/status.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub hints: Vec<String>,
 }
 
 /// #487: a `derived_from` citation — either an entity id (`"mem-..."`, as
@@ -928,6 +936,41 @@ pub fn handle_remember(db: &Database, args: Value) -> Result<String, String> {
         ));
     }
 
+    // #919: prospective query hints — default-off feature gate at the write
+    // surface. While disabled, hints are rejected outright (never silently
+    // dropped: an agent that believes its hints are stored would mis-query
+    // later). Validation is fail-closed and independent of the gate, so a
+    // malformed hints payload is an error in every configuration.
+    const MAX_HINTS: usize = 3;
+    const MAX_HINT_LEN: usize = 200;
+    let hints: Vec<String> = a.hints.iter().map(|h| h.trim().to_string()).collect();
+    if !hints.is_empty() && !Database::hints_enabled() {
+        return Err(
+            "hints are disabled: this vault runs without PERSEUS_VAULT_HINTS_ENABLED, \
+             so prospective query hints are not stored (rejected, not dropped)"
+                .to_string(),
+        );
+    }
+    if hints.len() > MAX_HINTS {
+        return Err(format!(
+            "hints too long: {} hints (max {})",
+            hints.len(),
+            MAX_HINTS
+        ));
+    }
+    for h in &hints {
+        if h.is_empty() {
+            return Err("hints must be non-empty (trimmed)".to_string());
+        }
+        if h.len() > MAX_HINT_LEN {
+            return Err(format!(
+                "hint too long: {} bytes (max {})",
+                h.len(),
+                MAX_HINT_LEN
+            ));
+        }
+    }
+
     // Merge recall_when into body_json if provided
     let body = if a.recall_when.is_empty() {
         a.body_json
@@ -1228,6 +1271,7 @@ pub fn handle_remember(db: &Database, args: Value) -> Result<String, String> {
         follow_rate: 0.0,
         efficacy_status: "unverified".to_string(),
         epistemic_state: crate::models::default_epistemic_state(),
+        hints,
         embedding: None,
         _parsed_body: None,
     };
@@ -3095,6 +3139,7 @@ pub fn handle_promote(db: &Database, args: Value) -> Result<String, String> {
         follow_rate: 0.0,
         efficacy_status: "unverified".to_string(),
         epistemic_state: crate::models::default_epistemic_state(),
+        hints: vec![],
         embedding: None,
         _parsed_body: None,
     };
@@ -3297,6 +3342,7 @@ pub fn handle_demote(db: &Database, args: Value) -> Result<String, String> {
         follow_rate: 0.0,
         efficacy_status: "unverified".into(),
         epistemic_state: "candidate".into(),
+        hints: vec![],
         embedding: None,
         _parsed_body: None,
     };
@@ -4465,6 +4511,7 @@ pub fn handle_capture(db: &Database, args: Value) -> Result<String, String> {
             follow_rate: 0.0,
             efficacy_status: "unverified".to_string(),
             epistemic_state: crate::models::default_epistemic_state(),
+            hints: vec![],
             embedding: None,
             _parsed_body: None,
         };
@@ -4537,6 +4584,7 @@ pub fn handle_capture(db: &Database, args: Value) -> Result<String, String> {
             follow_rate: 0.0,
             efficacy_status: "unverified".to_string(),
             epistemic_state: crate::models::default_epistemic_state(),
+            hints: vec![],
             embedding: None,
             _parsed_body: None,
         };
@@ -6958,6 +7006,7 @@ pub fn handle_ingest_file(db: &Database, args: Value) -> Result<String, String> 
         follow_rate: 0.0,
         efficacy_status: "unverified".to_string(),
         epistemic_state: crate::models::default_epistemic_state(),
+        hints: vec![],
         embedding: None,
         _parsed_body: None,
     };
@@ -9036,6 +9085,7 @@ fn memories_write(
                 follow_rate: 0.0,
                 efficacy_status: "unverified".to_string(),
                 epistemic_state: "candidate".to_string(),
+                hints: vec![],
                 embedding: None,
                 _parsed_body: None,
             }
@@ -9253,6 +9303,7 @@ mod tests {
             follow_rate: 0.0,
             efficacy_status: "unverified".to_string(),
             epistemic_state: "candidate".to_string(),
+            hints: vec![],
             embedding: None,
             _parsed_body: None,
         };
@@ -13139,6 +13190,7 @@ mod tests {
             follow_rate: 0.0,
             efficacy_status: "unverified".to_string(),
             epistemic_state: "candidate".to_string(),
+            hints: vec![],
             embedding: None,
             _parsed_body: None,
         }
@@ -15363,6 +15415,72 @@ mod tests {
             obs_ws, "ws-fb",
             "fallback observation must inherit the scope"
         );
+        let _ = std::fs::remove_file(path);
+    }
+
+    // ── #919: prospective query hints — tool-surface gate + validation ──
+    // Shared with the db.rs hints tests (crate::db::HINTS_ENV_LOCK) — the env
+    // var is process-global and the two modules run in parallel.
+
+    fn remember_with_hints(db: &Database, hints: &serde_json::Value) -> Result<String, String> {
+        handle_remember(
+            db,
+            json!({
+                "category": "note",
+                "key": "hinted-key",
+                "body_json": "{\"note\":\"hinted body\"}",
+                "hints": hints,
+            }),
+        )
+    }
+
+    #[test]
+    fn remember_rejects_hints_when_feature_disabled() {
+        let _guard = crate::db::HINTS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var("PERSEUS_VAULT_HINTS_ENABLED");
+        let (db, path) = temp_db();
+        let err =
+            remember_with_hints(&db, &json!(["what port does the api listen on"])).unwrap_err();
+        assert!(
+            err.contains("hints are disabled"),
+            "disabled gate must reject with a clear error: {err}"
+        );
+        // Nothing was stored.
+        assert!(db.get_entity("note", "hinted-key").unwrap().is_none());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn remember_validates_hints_fail_closed() {
+        let _guard = crate::db::HINTS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        std::env::set_var("PERSEUS_VAULT_HINTS_ENABLED", "1");
+        let (db, path) = temp_db();
+
+        // More than 3 hints.
+        let err = remember_with_hints(&db, &json!(["a", "b", "c", "d"])).unwrap_err();
+        assert!(err.contains("at most 3") || err.contains("max 3"), "{err}");
+
+        // Whitespace-only hint (trimmed to empty).
+        let err = remember_with_hints(&db, &json!(["   "])).unwrap_err();
+        assert!(err.contains("non-empty"), "{err}");
+
+        // Over-long hint.
+        let long = "x".repeat(201);
+        let err = remember_with_hints(&db, &json!([long])).unwrap_err();
+        assert!(err.contains("too long"), "{err}");
+
+        // Valid hints store cleanly.
+        let ok = remember_with_hints(&db, &json!(["how to reach the api", "port config"])).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&ok).unwrap();
+        assert_eq!(v["ok"], true);
+        let e = db.get_entity("note", "hinted-key").unwrap().unwrap();
+        assert_eq!(e.hints, vec!["how to reach the api", "port config"]);
+
+        std::env::remove_var("PERSEUS_VAULT_HINTS_ENABLED");
         let _ = std::fs::remove_file(path);
     }
 }

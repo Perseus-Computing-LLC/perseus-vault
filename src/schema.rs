@@ -599,7 +599,7 @@ CREATE INDEX IF NOT EXISTS idx_preload_proposals_state
 /// v34 (#874 activation-gated sparse writes): `write_quarantine` — the
 /// reviewable hold for writes whose measured interference exceeds the
 /// configured bound. New table, idempotent, no backfill.
-pub(crate) const SCHEMA_VERSION: i64 = 36;
+pub(crate) const SCHEMA_VERSION: i64 = 37;
 
 /// Initialize the v0.2.0 schema on a fresh database.
 pub fn initialize_schema(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
@@ -718,7 +718,12 @@ fn apply_migrations(conn: &Connection) -> Result<(), Box<dyn std::error::Error>>
     // v28 (#868): retention expiry on the live row. NULL = never expires
     // (the correct reading for every legacy row), so this is purely additive.
     ensure_column(conn, "entities", "expires_at_unix_ms", "INTEGER")?;
-    ensure_column(conn, "entities", "preload_tuned_unix_ms", "INTEGER DEFAULT 0")?;
+    ensure_column(
+        conn,
+        "entities",
+        "preload_tuned_unix_ms",
+        "INTEGER DEFAULT 0",
+    )?;
 
     // v29 (#876): governed-distillation lifecycle on artifact bindings.
     // A learned artifact (trained weights / distilled cartridge) is bound to
@@ -1617,6 +1622,15 @@ fn apply_migrations(conn: &Connection) -> Result<(), Box<dyn std::error::Error>>
           ON preload_proposals(state, created_ts);",
     )?;
     // ── end v36 ──────────────────────────────────────────────────────────
+
+    // ── v37 (#919): prospective query hints ────────────────────────────
+    // Advisory retrieval metadata column on entities (JSON array of hint
+    // strings, default no hints). New column only; every existing row keeps
+    // an empty hints array. FTS5 indexing appends hints to the indexed text
+    // when present (db.rs::fts_indexed_text) — the column itself is opaque
+    // to recall until then. Idempotent via ensure_column.
+    ensure_column(conn, "entities", "hints", "TEXT NOT NULL DEFAULT '[]'")?;
+    // ── end v37 ────────────────────────────────────────────────────────
 
     // Stamp the migration level so subsequent opens skip the probe block above.
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;

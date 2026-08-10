@@ -792,6 +792,40 @@ impl RecallTimer {
 }
 
 impl Database {
+    /// #919: prospective query hints — default-off feature gate.
+    ///
+    /// The env var governs WRITE acceptance only: hints are rejected while
+    /// disabled, so a default deployment behaves byte-identically to before
+    /// the feature existed. Indexing (see `fts_indexed_text`) is a pure
+    /// function of stored data and never consults this flag — the write path
+    /// and `reindex_fts` must agree regardless of the gate, so toggling the
+    /// env mid-lifecycle cannot silently change recall results.
+    pub fn hints_enabled() -> bool {
+        matches!(
+            std::env::var("PERSEUS_VAULT_HINTS_ENABLED").as_deref(),
+            Ok("1") | Ok("true") | Ok("TRUE") | Ok("True") | Ok("yes") | Ok("YES")
+        )
+    }
+
+    /// #919: the text stored in the FTS5 index for an entity — the plaintext
+    /// body plus each prospective query hint on its own line. Empty hints
+    /// return the body unchanged (byte-identical to pre-hints indexing).
+    /// Every FTS write site that can carry hints must route through this.
+    fn fts_indexed_text(body_plaintext: &str, hints: &[String]) -> String {
+        if hints.is_empty() {
+            return body_plaintext.to_string();
+        }
+        let mut text = String::with_capacity(
+            body_plaintext.len() + hints.iter().map(String::len).sum::<usize>() + hints.len(),
+        );
+        text.push_str(body_plaintext);
+        for hint in hints {
+            text.push('\n');
+            text.push_str(hint);
+        }
+        text
+    }
+
     /// Canonical AAD (additional authenticated data) binding ciphertext to its
     /// (category, key) identity. Length-prefixed so the encoding is
     /// unambiguous even if `category` or `key` contain ':' -- a bare
@@ -1977,6 +2011,7 @@ impl Database {
                             follow_rate: 0.0,
                             efficacy_status: "unverified".to_string(),
                             epistemic_state: crate::models::default_epistemic_state(),
+                            hints: vec![],
                             embedding: None,
                             _parsed_body: None,
                         };
@@ -3244,10 +3279,12 @@ impl Database {
             // silently break all keyword search until re-ingest. Decrypt each row
             // (AAD from build_aad(), with a legacy-scheme fallback for rows not
             // yet migrated by rekey_aad() -- matching remember()/entity_from_row)
-            // first.
-            let rows: Vec<(i64, String, String, String)> = {
+            // first. #919: the hints column is ciphertext too (same AAD); decrypt
+            // and append via fts_indexed_text so reindex reproduces exactly what
+            // the write path indexed.
+            let rows: Vec<(i64, String, String, String, String)> = {
                 let mut stmt = tx.prepare(
-                    "SELECT rowid, category, key, body_json FROM entities WHERE archived = 0",
+                    "SELECT rowid, category, key, body_json, hints FROM entities WHERE archived = 0",
                 )?;
                 let mapped = stmt.query_map([], |row| {
                     Ok((
@@ -3255,6 +3292,7 @@ impl Database {
                         row.get::<_, String>(1)?,
                         row.get::<_, String>(2)?,
                         row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
                     ))
                 })?;
                 mapped.collect::<rusqlite::Result<Vec<_>>>()?
@@ -3262,7 +3300,7 @@ impl Database {
             let mut insert =
                 tx.prepare("INSERT INTO entities_fts (rowid, body_json) VALUES (?1, ?2)")?;
             let mut count = 0usize;
-            for (rowid, category, key, raw_body) in rows {
+            for (rowid, category, key, raw_body, raw_hints) in rows {
                 // Index decrypted text, or a legacy plaintext row. On an
                 // authentication failure (wrong key / tampered / neither AAD
                 // scheme matches), index an empty body rather than the
@@ -3277,20 +3315,69 @@ impl Database {
                             "perseus-vault: reindex skipping body text for {}:{} — decryption {}.",
                             category, key, e
                         );
-                            "{}".to_string()
+                            "{}\n".to_string()
                         }
                     };
-                insert.execute(params![rowid, plain])?;
+                // #919: hints ciphertext decrypts with the same AAD scheme;
+                // auth failure degrades to no hints (never index ciphertext).
+                let hints: Vec<String> =
+                    match Self::decrypt_body_with_aad_fallback(enc, &raw_hints, &category, &key) {
+                        crate::encryption::BodyDecrypt::Plaintext(s)
+                        | crate::encryption::BodyDecrypt::LegacyPlaintext(s) => {
+                            serde_json::from_str(&s).unwrap_or_default()
+                        }
+                        crate::encryption::BodyDecrypt::AuthFailed(e) => {
+                            eprintln!(
+                                "perseus-vault: reindex skipping hints for {}:{} — decryption {}.",
+                                category, key, e
+                            );
+                            Vec::new()
+                        }
+                    };
+                insert.execute(params![rowid, Self::fts_indexed_text(&plain, &hints)])?;
                 count += 1;
             }
             count
         } else {
-            // No encryption: body_json is already plaintext — fast bulk copy.
-            tx.execute(
-                "INSERT INTO entities_fts (rowid, body_json)
-                 SELECT rowid, body_json FROM entities WHERE archived = 0",
+            // No encryption: body_json is already plaintext. Fast bulk copy
+            // when no entity carries hints (#919); once any hints exist, the
+            // per-row path appends them so the rebuilt index matches what the
+            // write path produced.
+            let has_hints: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM entities WHERE archived = 0 AND hints != '[]')",
                 [],
-            )?
+                |row| row.get(0),
+            )?;
+            if has_hints {
+                let rows: Vec<(i64, String, String)> = {
+                    let mut stmt = tx.prepare(
+                        "SELECT rowid, body_json, hints FROM entities WHERE archived = 0",
+                    )?;
+                    let mapped = stmt.query_map([], |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    })?;
+                    mapped.collect::<rusqlite::Result<Vec<_>>>()?
+                };
+                let mut insert =
+                    tx.prepare("INSERT INTO entities_fts (rowid, body_json) VALUES (?1, ?2)")?;
+                let mut count = 0usize;
+                for (rowid, raw_body, raw_hints) in rows {
+                    let hints: Vec<String> = serde_json::from_str(&raw_hints).unwrap_or_default();
+                    insert.execute(params![rowid, Self::fts_indexed_text(&raw_body, &hints)])?;
+                    count += 1;
+                }
+                count
+            } else {
+                tx.execute(
+                    "INSERT INTO entities_fts (rowid, body_json)
+                     SELECT rowid, body_json FROM entities WHERE archived = 0",
+                    [],
+                )?
+            }
         };
         // #682: rebuild the standalone history FTS from every entity_history row
         // in the same transaction. This is the backfill path for stores upgraded
@@ -4242,7 +4329,7 @@ impl Database {
                     created_at_unix_ms, last_accessed_unix_ms, NULL as embedding,
                     always_on, certainty, workspace_hash, agent_id, visibility,
                     follow_count, miss_count, follow_rate, efficacy_status,
-                    epistemic_state
+                    epistemic_state, hints
              FROM entities WHERE id IN ({})",
             placeholders
         );
@@ -5962,6 +6049,21 @@ impl Database {
             entity.body_json.clone()
         };
 
+        // #919: prospective query hints — advisory retrieval metadata stored
+        // in its own column (never merged into body_json, so dedup identity,
+        // interference scoring, history snapshots and body-based features are
+        // untouched). Same at-rest treatment as the body: AES-GCM ciphertext
+        // with the identical (category, key) AAD when encryption is on, so
+        // the hints column never leaks plaintext on an encrypted deployment.
+        let hints_json = serde_json::to_string(&entity.hints)?;
+        let hints_encrypted = if let Some(ref enc) = self.encryption {
+            let aad = Self::build_aad(&entity.category, &entity.key);
+            enc.encrypt(&hints_json, aad.as_bytes())
+                .map_err(|e| format!("Encryption error in remember (hints): {}", e))?
+        } else {
+            hints_json
+        };
+
         // Identity is (category, key, workspace_hash) — #339. Matching on
         // (category, key) alone made a cross-workspace write with a colliding
         // key take the UPDATE path and overwrite the other workspace's row in
@@ -6340,7 +6442,8 @@ impl Database {
                     valid_from_unix_ms = COALESCE(?20, valid_from_unix_ms),
                     valid_to_unix_ms = COALESCE(?21, valid_to_unix_ms),
                     expires_at_unix_ms = ?23,
-                    retrieval_count = retrieval_count + ?24
+                    retrieval_count = retrieval_count + ?24,
+                    hints = ?25
                  WHERE id = ?19",
                 params![
                     body_encrypted,
@@ -6386,6 +6489,10 @@ impl Database {
                     entity_expiry_ms(&entity.body_json),
                     // #874 sparse mode: 0 = no salience inflation.
                     retrieval_delta,
+                    // #919: hints replace any previously stored hints on
+                    // update (matching the remember reset semantics for
+                    // tags/status); an update without hints clears them.
+                    hints_encrypted,
                 ],
             )?;
 
@@ -6446,7 +6553,7 @@ impl Database {
             // that case.
             let fts_rows = tx.execute(
                 "UPDATE entities_fts SET body_json = ?1 WHERE rowid = (SELECT rowid FROM entities WHERE id = ?2)",
-                params![entity.body_json, id],
+                params![Self::fts_indexed_text(&entity.body_json, &entity.hints), id],
             )?;
             if fts_rows == 0 {
                 // OR REPLACE (#517): same self-heal as the insert path — the
@@ -6455,7 +6562,7 @@ impl Database {
                 tx.execute(
                     "INSERT OR REPLACE INTO entities_fts (rowid, body_json)
                      VALUES ((SELECT rowid FROM entities WHERE id = ?2), ?1)",
-                    params![entity.body_json, id],
+                    params![Self::fts_indexed_text(&entity.body_json, &entity.hints), id],
                 )?;
             }
             // #392: keep the stored dedup signature in step with the stored
@@ -6585,12 +6692,12 @@ impl Database {
                   always_on, certainty, created_at_unix_ms, last_accessed_unix_ms,
                   workspace_hash, agent_id, visibility, recorded_at_unix_ms,
                   valid_from_unix_ms, valid_to_unix_ms, epistemic_state,
-                  expires_at_unix_ms)
+                  expires_at_unix_ms, hints)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7,
                          ?8, ?9, ?10, ?11,
                          ?12, ?13, ?14, ?15, ?16,
                          ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27,
-                         ?28)",
+                         ?28, ?29)",
                 params![
                     id,
                     entity.category,
@@ -6631,6 +6738,8 @@ impl Database {
                     // #868: retention expiry from the body `expires_at`
                     // convention (unix ms, numeric string, or ISO 8601 UTC).
                     entity_expiry_ms(&entity.body_json),
+                    // #919: advisory prospective query hints (JSON array).
+                    hints_encrypted,
                 ],
             )?;
 
@@ -6643,7 +6752,7 @@ impl Database {
             // and self-heals that drift per-write.
             tx.execute(
                 "INSERT OR REPLACE INTO entities_fts (rowid, body_json) VALUES (last_insert_rowid(), ?1)",
-                params![entity.body_json],
+                params![Self::fts_indexed_text(&entity.body_json, &entity.hints)],
             )?;
             // #392: store the row's dedup signature (derived from the STORED
             // body value — ciphertext when encryption is on) in the same
@@ -8403,7 +8512,7 @@ impl Database {
                     created_at_unix_ms, last_accessed_unix_ms, NULL as embedding,
                     always_on, certainty, workspace_hash, agent_id, visibility,
                     follow_count, miss_count, follow_rate, efficacy_status,
-                    epistemic_state
+                    epistemic_state, hints
              FROM entities",
         );
 
@@ -9076,7 +9185,7 @@ impl Database {
                     created_at_unix_ms, last_accessed_unix_ms, NULL as embedding,
                     always_on, certainty, workspace_hash, agent_id, visibility,
                     follow_count, miss_count, follow_rate, efficacy_status,
-                    epistemic_state
+                    epistemic_state, hints
              FROM entities WHERE category = ?1 AND key = ?2
              ORDER BY workspace_hash ASC, id ASC LIMIT 1",
         )?;
@@ -9894,6 +10003,7 @@ impl Database {
             follow_rate: 0.0,
             efficacy_status: "unverified".to_string(),
             epistemic_state: crate::models::default_epistemic_state(),
+            hints: vec![],
             embedding: None,
             _parsed_body: None,
         };
@@ -12530,7 +12640,7 @@ impl Database {
                             created_at_unix_ms, last_accessed_unix_ms, NULL as embedding,
                             always_on, certainty, workspace_hash, agent_id, visibility,
                             follow_count, miss_count, follow_rate, efficacy_status,
-                            epistemic_state
+                            epistemic_state, hints
                      FROM entities WHERE id = ?1",
                     params![link.target_id],
                     |row| entity_from_row(row, self.encryption.as_ref()),
@@ -13264,7 +13374,7 @@ impl Database {
                     created_at_unix_ms, last_accessed_unix_ms, NULL as embedding,
                     always_on, certainty, workspace_hash, agent_id, visibility,
                     follow_count, miss_count, follow_rate, efficacy_status,
-                    epistemic_state
+                    epistemic_state, hints
              FROM entities WHERE id = ?1",
         )?;
         let entity = {
@@ -14303,7 +14413,7 @@ impl Database {
                     created_at_unix_ms, last_accessed_unix_ms, NULL as embedding,
                     always_on, certainty, workspace_hash, agent_id, visibility,
                     follow_count, miss_count, follow_rate, efficacy_status,
-                    epistemic_state
+                    epistemic_state, hints
              FROM entities WHERE archived = 0",
         );
         let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
@@ -14374,7 +14484,7 @@ impl Database {
                     created_at_unix_ms, last_accessed_unix_ms, NULL as embedding,
                     always_on, certainty, workspace_hash, agent_id, visibility,
                     follow_count, miss_count, follow_rate, efficacy_status,
-                    epistemic_state
+                    epistemic_state, hints
              FROM entities WHERE archived = 0",
         );
         let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
@@ -14442,7 +14552,7 @@ impl Database {
                     created_at_unix_ms, last_accessed_unix_ms, NULL as embedding,
                     always_on, certainty, workspace_hash, agent_id, visibility,
                     follow_count, miss_count, follow_rate, efficacy_status,
-                    epistemic_state
+                    epistemic_state, hints
              FROM entities WHERE 1=1",
         );
         let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
@@ -15266,6 +15376,7 @@ impl Database {
             follow_rate: 0.0,
             efficacy_status: "active".to_string(),
             epistemic_state: "verified".to_string(),
+            hints: vec![],
             embedding: None,
             _parsed_body: None,
         };
@@ -15841,6 +15952,7 @@ impl Database {
                                 follow_rate: 0.0,
                                 efficacy_status: "unverified".to_string(),
                                 epistemic_state: crate::models::default_epistemic_state(),
+                                hints: vec![],
                                 embedding: None,
                                 _parsed_body: None,
                                 created_at_unix_ms: created_at,
@@ -16123,6 +16235,7 @@ impl Database {
                         follow_rate: 0.0,
                         efficacy_status: "unverified".to_string(),
                         epistemic_state: crate::models::default_epistemic_state(),
+                        hints: vec![],
                         embedding: None,
                         _parsed_body: None,
                         created_at_unix_ms: now,
@@ -16798,6 +16911,7 @@ impl Database {
                             follow_rate: 0.0,
                             efficacy_status: "unverified".to_string(),
                             epistemic_state: crate::models::default_epistemic_state(),
+                            hints: vec![],
                             embedding: None,
                             _parsed_body: None,
                             created_at_unix_ms: now,
@@ -18490,6 +18604,7 @@ last_accessed: {}
                 follow_rate: 0.0,
                 efficacy_status: "unverified".to_string(),
                 epistemic_state: crate::models::default_epistemic_state(),
+                hints: vec![],
                 embedding: None,
                 _parsed_body: None,
             };
@@ -18991,7 +19106,7 @@ last_accessed: {}
                     created_at_unix_ms, last_accessed_unix_ms, NULL as embedding,
                     always_on, certainty, workspace_hash, agent_id, visibility,
                     follow_count, miss_count, follow_rate, efficacy_status,
-                    epistemic_state
+                    epistemic_state, hints
              FROM entities
              WHERE archived = 0
                AND (status IS NULL OR status = '' OR status NOT IN
@@ -19470,6 +19585,7 @@ last_accessed: {}
                 follow_rate: 0.0,
                 efficacy_status: "unverified".to_string(),
                 epistemic_state: crate::models::default_epistemic_state(),
+                hints: vec![],
                 embedding: None,
                 _parsed_body: None,
                 created_at_unix_ms: now,
@@ -19819,6 +19935,7 @@ last_accessed: {}
             follow_rate: 0.0,
             efficacy_status: "unverified".to_string(),
             epistemic_state: crate::models::default_epistemic_state(),
+            hints: vec![],
             embedding: None,
             _parsed_body: None,
             created_at_unix_ms: now,
@@ -20046,6 +20163,7 @@ If no clear lessons found, return: {{"lessons": []}}"#,
                 follow_rate: 0.0,
                 efficacy_status: "unverified".to_string(),
                 epistemic_state: "candidate".to_string(),
+                hints: vec![],
                 embedding: None,
                 _parsed_body: None,
                 created_at_unix_ms: now,
@@ -20140,6 +20258,7 @@ If no clear lessons found, return: {{"lessons": []}}"#,
             follow_rate: 0.0,
             efficacy_status: "unverified".to_string(),
             epistemic_state: "candidate".to_string(),
+            hints: vec![],
             embedding: None,
             _parsed_body: None,
             created_at_unix_ms: now,
@@ -21722,7 +21841,7 @@ impl Database {
                         created_at_unix_ms, last_accessed_unix_ms, NULL as embedding,
                         always_on, certainty, workspace_hash, agent_id, visibility,
                         follow_count, miss_count, follow_rate, efficacy_status,
-                    epistemic_state
+                    epistemic_state, hints
                  FROM entities WHERE archived = 0 AND id IN ({})",
                 placeholders
             );
@@ -22110,6 +22229,41 @@ pub(crate) fn entity_from_row(
             .get::<_, Option<String>>(28)
             .unwrap_or(None)
             .unwrap_or_else(crate::models::default_epistemic_state),
+        // #919: prospective query hints, read tolerantly — SELECTs that do not
+        // include the column (entity_history snapshots, pre-v37 rows) resolve
+        // to no hints, which is correct: hints are current-state advisory
+        // metadata, never versioned. When encryption is on the stored value
+        // is ciphertext (same AAD as the body); decrypt with the standard
+        // fallback so legacy-scheme rows keep working. Auth failures degrade
+        // to no hints (never surface ciphertext).
+        hints: {
+            let raw: Option<String> = row.get::<_, Option<String>>(29).ok().flatten();
+            match raw {
+                Some(raw) if !raw.is_empty() && raw != "[]" => {
+                    if let Some(enc) = encryption {
+                        let cat: String = row.get(1)?;
+                        let k: String = row.get(2)?;
+                        match Database::decrypt_body_with_aad_fallback(enc, &raw, &cat, &k) {
+                            crate::encryption::BodyDecrypt::Plaintext(s)
+                            | crate::encryption::BodyDecrypt::LegacyPlaintext(s) => {
+                                serde_json::from_str(&s).unwrap_or_default()
+                            }
+                            crate::encryption::BodyDecrypt::AuthFailed(e) => {
+                                eprintln!(
+                                    "perseus-vault: refusing to return hints for {}:{} — \
+                                     decryption {}. Wrong key or tampered ciphertext.",
+                                    cat, k, e
+                                );
+                                Vec::new()
+                            }
+                        }
+                    } else {
+                        serde_json::from_str(&raw).unwrap_or_default()
+                    }
+                }
+                _ => Vec::new(),
+            }
+        },
         embedding: None,
         _parsed_body: parsed_body,
     })
@@ -22173,6 +22327,12 @@ impl Drop for TestDatabase {
         }
     }
 }
+
+// #919: tests toggle PERSEUS_VAULT_HINTS_ENABLED, which is process-global.
+// One shared lock (used by the db.rs and tools.rs test modules) serializes
+// every hints test so parallel runs cannot race the env var.
+#[cfg(test)]
+pub(crate) static HINTS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
 mod tests {
@@ -22248,6 +22408,7 @@ mod tests {
             follow_rate: 0.0,
             efficacy_status: "unverified".to_string(),
             epistemic_state: crate::models::default_epistemic_state(),
+            hints: vec![],
             embedding: None,
             _parsed_body: None,
         }
@@ -23864,6 +24025,7 @@ mod tests {
                 follow_rate: 0.0,
                 efficacy_status: "unverified".to_string(),
                 epistemic_state: "candidate".to_string(),
+                hints: vec![],
                 embedding: None,
                 _parsed_body: None,
             };
@@ -24078,6 +24240,7 @@ mod tests {
             follow_rate: 0.0,
             efficacy_status: "unverified".to_string(),
             epistemic_state: "candidate".to_string(),
+            hints: vec![],
             embedding: None,
             _parsed_body: None,
         };
@@ -24291,6 +24454,7 @@ mod tests {
             follow_rate: 0.0,
             efficacy_status: "unverified".to_string(),
             epistemic_state: "candidate".to_string(),
+            hints: vec![],
             embedding: None,
             _parsed_body: None,
         })
@@ -24376,6 +24540,7 @@ mod tests {
             follow_rate: 0.0,
             efficacy_status: "unverified".to_string(),
             epistemic_state: "candidate".to_string(),
+            hints: vec![],
             embedding: None,
             _parsed_body: None,
         };
@@ -42595,7 +42760,7 @@ mod tests {
         // Report carries denominator + artifact hash (acceptance #5).
         assert!(rep["denominator"]["slots"].as_i64().unwrap() >= 3);
         assert!(rep["artifact"]["git_hash"].as_str().unwrap().len() >= 7);
-        assert_eq!(rep["artifact"]["schema_version"], 36);
+        assert_eq!(rep["artifact"]["schema_version"], 37);
         let _ = std::fs::remove_file(path);
     }
 
@@ -45032,6 +45197,221 @@ mod tests {
         let overall = db.preload_stats("overall", 50, 7).unwrap();
         assert_eq!(overall["events_resolved"], 1);
         assert_eq!(overall["sessions"], 1);
+        let _ = std::fs::remove_file(path);
+    }
+
+    fn entity_with_hints(id: &str, key: &str, body: &str, hints: &[&str]) -> Entity {
+        let mut e = make_entity(id, "note", key, body);
+        e.hints = hints.iter().map(|h| h.to_string()).collect();
+        e
+    }
+
+    fn recall_ids(db: &Database, query: &str) -> Vec<String> {
+        db.recall(&crate::models::RecallParams {
+            query: query.to_string(),
+            limit: 10,
+            offset: 0,
+            skip_side_effects: true,
+            ..crate::models::RecallParams::default()
+        })
+        .unwrap()
+        .into_iter()
+        .map(|e| e.id)
+        .collect()
+    }
+
+    #[test]
+    fn hints_are_indexed_and_retrievable_via_prospective_query() {
+        let _guard = HINTS_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::set_var("PERSEUS_VAULT_HINTS_ENABLED", "1");
+        let (db, path) = temp_db();
+        let id = db
+            .remember(&entity_with_hints(
+                "hint-1",
+                "api-port",
+                r#"{"note":"the api binds to the documented endpoint"}"#,
+                &["what port does the api listen on", "port 8768 config"],
+            ))
+            .unwrap()
+            .0;
+
+        // The body does not contain the hint vocabulary; only the indexed
+        // hints can satisfy this query.
+        let ids = recall_ids(&db, "port 8768");
+        assert!(
+            ids.contains(&id),
+            "hint vocabulary must retrieve the entity: {ids:?}"
+        );
+
+        // Read surface: get_entity surfaces the stored hints.
+        let e = db.get_entity("note", "api-port").unwrap().unwrap();
+        assert_eq!(
+            e.hints,
+            vec!["what port does the api listen on", "port 8768 config"]
+        );
+
+        std::env::remove_var("PERSEUS_VAULT_HINTS_ENABLED");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn hints_update_replaces_and_clears() {
+        let _guard = HINTS_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::set_var("PERSEUS_VAULT_HINTS_ENABLED", "1");
+        let (db, path) = temp_db();
+        db.remember(&entity_with_hints(
+            "hint-2",
+            "k",
+            r#"{"note":"v1"}"#,
+            &["first phrasing"],
+        ))
+        .unwrap();
+
+        // Update with new hints: replaced wholesale.
+        db.remember(&entity_with_hints(
+            "hint-2",
+            "k",
+            r#"{"note":"v2"}"#,
+            &["second phrasing"],
+        ))
+        .unwrap();
+        assert_eq!(
+            db.get_entity("note", "k").unwrap().unwrap().hints,
+            vec!["second phrasing"]
+        );
+
+        // Update without hints: cleared (remember reset semantics).
+        db.remember(&make_entity("hint-2", "note", "k", r#"{"note":"v3"}"#))
+            .unwrap();
+        assert!(db
+            .get_entity("note", "k")
+            .unwrap()
+            .unwrap()
+            .hints
+            .is_empty());
+
+        std::env::remove_var("PERSEUS_VAULT_HINTS_ENABLED");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn hints_encrypted_at_rest_but_indexed_as_plaintext() {
+        use crate::encryption::EncryptionManager;
+        use std::io::Write;
+
+        let _guard = HINTS_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::set_var("PERSEUS_VAULT_HINTS_ENABLED", "1");
+        let (mut db, path) = temp_db();
+        let key = EncryptionManager::generate_key();
+        let key_path = std::env::temp_dir().join(format!(
+            "perseus_vault-hints-key-{}.key",
+            uuid::Uuid::new_v4()
+        ));
+        let mut f = std::fs::File::create(&key_path).unwrap();
+        f.write_all(key.as_bytes()).unwrap();
+        drop(f);
+        db.set_encryption(key_path.to_str().unwrap()).unwrap();
+
+        let plain_hints = r#"["secret hint phrasing"]"#;
+        let id = db
+            .remember(&entity_with_hints(
+                "hint-3",
+                "enc-hinted",
+                r#"{"note":"encrypted body"}"#,
+                &["secret hint phrasing"],
+            ))
+            .unwrap()
+            .0;
+
+        // #874-class: the at-rest column must NOT be plaintext.
+        let conn = db.conn().unwrap();
+        let stored: String = conn
+            .query_row("SELECT hints FROM entities WHERE id='hint-3'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_ne!(stored, plain_hints, "hints must be encrypted at rest");
+        assert_ne!(stored, r#"["secret hint phrasing"]"#);
+
+        // The FTS index holds the plaintext hint (recall works)…
+        let ids = recall_ids(&db, "secret hint phrasing");
+        assert!(
+            ids.contains(&id),
+            "hint recall must work on encrypted deployments"
+        );
+
+        // …and reindex (encrypted arm) reproduces it.
+        db.reindex_fts().unwrap();
+        let ids = recall_ids(&db, "secret hint phrasing");
+        assert!(
+            ids.contains(&id),
+            "reindex must preserve hint indexing under encryption"
+        );
+
+        let _ = std::fs::remove_file(key_path);
+        std::env::remove_var("PERSEUS_VAULT_HINTS_ENABLED");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn reindex_plaintext_arm_preserves_hint_indexing() {
+        let _guard = HINTS_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::set_var("PERSEUS_VAULT_HINTS_ENABLED", "1");
+        let (db, path) = temp_db();
+        let id = db
+            .remember(&entity_with_hints(
+                "hint-4",
+                "reindex-me",
+                r#"{"note":"plaintext body"}"#,
+                &["frobnicate the widget"],
+            ))
+            .unwrap()
+            .0;
+
+        // Plaintext arm switches from bulk copy to the per-row path once any
+        // hints exist — the rebuilt index must still match on hint vocabulary.
+        db.reindex_fts().unwrap();
+        let ids = recall_ids(&db, "frobnicate the widget");
+        assert!(
+            ids.contains(&id),
+            "reindex must preserve hint indexing: {ids:?}"
+        );
+
+        std::env::remove_var("PERSEUS_VAULT_HINTS_ENABLED");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn hints_do_not_join_dedup_identity() {
+        let _guard = HINTS_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::set_var("PERSEUS_VAULT_HINTS_ENABLED", "1");
+        let (db, path) = temp_db();
+        let (id_a, _) = db
+            .remember(&entity_with_hints(
+                "hint-5",
+                "alpha",
+                r#"{"note":"identical body text for dedup"}"#,
+                &["phrasing a"],
+            ))
+            .unwrap();
+
+        // Same body, different hints, different key: still a near-duplicate
+        // merge — hints are advisory retrieval metadata, not identity.
+        let (id_b, action) = db
+            .remember(&entity_with_hints(
+                "hint-6",
+                "beta",
+                r#"{"note":"identical body text for dedup"}"#,
+                &["phrasing b"],
+            ))
+            .unwrap();
+        assert!(action.starts_with("deduped"), "action was: {action}");
+        assert_eq!(
+            id_b, id_a,
+            "dedup must fold the hint-carrying twin into the original"
+        );
+
+        std::env::remove_var("PERSEUS_VAULT_HINTS_ENABLED");
         let _ = std::fs::remove_file(path);
     }
 }

@@ -899,6 +899,7 @@ impl Database {
             follow_rate: 0.0,
             efficacy_status: "unverified".to_string(),
             epistemic_state: crate::models::default_epistemic_state(),
+            hints: vec![],
             embedding: None,
             _parsed_body: None,
         };
@@ -1161,6 +1162,7 @@ mod tests {
             follow_rate: 0.0,
             efficacy_status: "unverified".to_string(),
             epistemic_state: crate::models::default_epistemic_state(),
+            hints: vec![],
             embedding: None,
             _parsed_body: None,
         };

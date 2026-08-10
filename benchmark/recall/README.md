@@ -112,3 +112,19 @@ dataset + binary + platform; re-running yields an identical `signature_sha256`.
 Exact dense rankings can vary marginally across CPU architectures (ONNX
 floating-point), so treat the committed `report.json` as the reference for *this*
 platform; CI (Linux) is the canonical re-run when wired up.
+
+## Prospective query hints (#919)
+
+`--hints` ingests `memories[].hints` (server runs with
+`PERSEUS_VAULT_HINTS_ENABLED=1`) and records `hints_enabled` in the report
+and signature. `dataset_hints.json` is a vocabulary-gap set whose query
+tokens appear only in the relevant entity's hints; the fts5 arm is the
+measure. Reference delta on this dataset (Linux, bundled ONNX):
+
+| run | fts5 R@1 | fts5 MRR |
+|-----|----------|----------|
+| hints off | 0.0 | 0.000 |
+| hints on  | 100.0 | 1.000 |
+
+Run both variants (`--hints` and without) before any default-on flip; dense
+arm values are reference-only (embed step is per-process and noisy).

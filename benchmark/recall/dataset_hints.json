@@ -1,0 +1,39 @@
+{
+  "name": "perseus-vault-hints-vocab-gap",
+  "description": "#919 recall-delta set: memories stored with terse technical wording; each query is composed ONLY of distinctive tokens that appear exclusively in the relevant entity's prospective query hint (never in any body, no overlap between hints). With the fts5 arm's OR semantics this makes the match set a singleton when hints are indexed and empty when they are not — the delta isolates hint indexing from ranking noise. Run the harness with --hints (gate on) and without (gate off); the fts5 arm is the measure.",
+  "version": 2,
+  "memories": [
+    {"category": "infra", "key": "api-port", "note": "The gateway binds to port 8768 on all interfaces.",
+     "hints": ["reach the server endpoint", "how to find the listening socket"]},
+    {"category": "infra", "key": "storage-loc", "note": "Persistent state resides under the appdata bind mount on the cache pool.",
+     "hints": ["records live on disk", "where the durable filesystem root sits"]},
+    {"category": "infra", "key": "backup-cadence", "note": "The nightly replication job runs at 02:30 UTC.",
+     "hints": ["backups happen then", "the scheduled copy moment"]},
+    {"category": "infra", "key": "auth-method", "note": "Bearer tokens are refused; the key header is used for control-plane calls.",
+     "hints": ["authenticate via the header key", "credential exchange mechanism"]},
+    {"category": "pref", "key": "editor", "note": "Settings are modified with surgical diffs, never wholesale replacement.",
+     "hints": ["change config files", "preferred edit discipline"]},
+    {"category": "pref", "key": "output-style", "note": "Landing surfaces show only actions and high-signal state; detail is one level deeper.",
+     "hints": ["dashboard layout preference", "main page composition"]},
+    {"category": "ops", "key": "deploy-path", "note": "Containers are recreated from a locally tagged image after the update run succeeds.",
+     "hints": ["deploy new version", "ship a fresh release"]},
+    {"category": "ops", "key": "gate-restart", "note": "The supervised service must be restarted from an external shell, not inside the process.",
+     "hints": ["restart messaging daemon", "revive the supervised process"]},
+    {"category": "ops", "key": "token-source", "note": "The canonical value is read from the secrets binary, not the dotenv file.",
+     "hints": ["script fetches the token value", "where the raw value originates"]},
+    {"category": "ops", "key": "ci-flakes", "note": "Two documented Windows-only failures are treated as known until fresh evidence appears.",
+     "hints": ["flaky checks expected", "known test instability roster"]}
+  ],
+  "queries": [
+    {"q": "reach server endpoint", "relevant": ["api-port"]},
+    {"q": "records disk", "relevant": ["storage-loc"]},
+    {"q": "backups happen", "relevant": ["backup-cadence"]},
+    {"q": "authenticate credential", "relevant": ["auth-method"]},
+    {"q": "change config", "relevant": ["editor"]},
+    {"q": "dashboard layout", "relevant": ["output-style"]},
+    {"q": "deploy release", "relevant": ["deploy-path"]},
+    {"q": "revive daemon", "relevant": ["gate-restart"]},
+    {"q": "script fetches", "relevant": ["token-source"]},
+    {"q": "flaky roster", "relevant": ["ci-flakes"]}
+  ]
+}
