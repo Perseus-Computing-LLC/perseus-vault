@@ -168,6 +168,31 @@ Auditing what the Vault remembers, from where, and under which authority:
 **[docs/evidence-chain-guidance.md](docs/evidence-chain-guidance.md)** — evidence chains,
 write-time provenance tags, and continuous attestation for durable memory.
 
+## Memory banks (per-client isolation, one profile)
+
+Agency running 50 clients with the same playbook? Don't duplicate profiles —
+designate the **memory bank** per project and keep one Hermes profile, one
+Vault, and one shared skill library:
+
+```markdown
+# .hermes.md
+memory_bank: acme-seo            # name → deterministic workspace hash
+memory_bank_workspace: <64-hex>  # optional explicit workspace override
+```
+
+The [Hermes memory provider](https://github.com/Perseus-Computing-LLC/hermes-plugin-perseus-vault)
+(`hermes plugins install Perseus-Computing-LLC/hermes-plugin-perseus-vault`)
+resolves the bank once per session and scopes every Vault read and write —
+prefetch recall, `perseus_recall` / `perseus_remember` / `perseus_forget`,
+session-end capture — to a dedicated workspace. Bank names map
+deterministically (`sha256("memory-bank:" + name)`), so every instance
+pointing at the same name addresses the same workspace with no registry to
+maintain. Workspaces are first-class on the server: scoped maintenance, dedup
+isolation between banks, and per-workspace authority manifests. Discovery
+mirrors Hermes project-context rules (nearest `.hermes.md` wins, bounded at
+the git root); a context file without a directive means no bank — the
+configured workspace stays in effect.
+
 ## Why Perseus Vault
 
 Perseus Vault is the **only** memory engine that is simultaneously MCP-native,
