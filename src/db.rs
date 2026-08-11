@@ -22970,13 +22970,31 @@ pub(crate) struct TestDatabase {
 #[cfg(test)]
 impl TestDatabase {
     pub(crate) fn new(prefix: &str) -> Self {
+        // #950: test fixtures must use test-mode DELETE journaling. Hundreds
+        // of short-lived isolated databases each hold a 16-connection pool;
+        // WAL keeps -wal/-shm fds open per connection and blew past the macOS
+        // soft fd limit of 256 ("unable to open database file"). Production
+        // WAL behavior is untouched — open_inner(&path, cfg!(test)) keeps
+        // WAL for non-test builds.
+        Self::with_journal_mode(prefix, true)
+    }
+
+    /// WAL-mode variant: used only where WAL sidecar behavior itself is under
+    /// test (e.g. Drop cleanup of -wal/-shm files), so that coverage survives
+    /// the DELETE-journaling default above.
+    pub(crate) fn new_wal(prefix: &str) -> Self {
+        Self::with_journal_mode(prefix, false)
+    }
+
+    fn with_journal_mode(prefix: &str, test_mode: bool) -> Self {
         let path = std::env::temp_dir()
             .join(format!("{prefix}-{}.db", uuid::Uuid::new_v4()))
             .to_string_lossy()
             .into_owned();
-        // This fixture deliberately uses WAL so Drop's sidecar cleanup stays
-        // covered even though ordinary unit-test opens use DELETE journaling.
-        let db = Database::open_inner(&path, false).expect("open test database");
+        // #950: the fixture deliberately used WAL so Drop's sidecar cleanup
+        // stayed covered; that coverage now lives on new_wal() so the default
+        // fixture can use DELETE journaling and stay within macOS fd limits.
+        let db = Database::open_inner(&path, test_mode).expect("open test database");
         Self { db: Some(db), path }
     }
 
@@ -23033,10 +23051,22 @@ mod tests {
         (db, path)
     }
 
+    /// WAL-mode fixture for tests whose semantics require WAL (concurrent
+    /// raw connections issuing `PRAGMA journal_mode=WAL`, #400/#404 writer
+    /// starvation probes). The default fixture is DELETE-journaling (#950).
+    fn temp_db_wal() -> (TestDatabase, String) {
+        let db = TestDatabase::new_wal("perseus_vault-test-db-wal");
+        let path = db.path().to_string();
+        (db, path)
+    }
+
     #[test]
     fn test_database_fixture_removes_sqlite_sidecars_on_drop() {
         let path = {
-            let db = TestDatabase::new("perseus_vault-test-cleanup");
+            // WAL-mode fixture: the default TestDatabase uses DELETE
+            // journaling (#950), so sidecar cleanup coverage must use the
+            // explicit WAL variant to stay meaningful.
+            let db = TestDatabase::new_wal("perseus_vault-test-cleanup");
             let path = db.path().to_string();
             db.remember_skip_dedup(&make_entity(
                 "fixture-cleanup",
@@ -26236,7 +26266,7 @@ mod tests {
             true
         }
 
-        let (db, path) = temp_db();
+        let (db, path) = temp_db_wal();
         {
             let conn = db.conn().unwrap();
             seed_bulk_entities(&conn, 150_000, "starve");
@@ -26406,7 +26436,7 @@ mod tests {
             .and_then(|v| v.parse().ok())
             .unwrap_or(100_000);
 
-        let (db, path) = temp_db();
+        let (db, path) = temp_db_wal();
         let seed_start = Instant::now();
         {
             let conn = db.conn().unwrap();
@@ -26784,7 +26814,7 @@ mod tests {
         use std::time::Instant;
 
         let n = gate_env_usize("PERSEUS_VAULT_PERF_ROWS", 100_000);
-        let (db, path) = temp_db();
+        let (db, path) = temp_db_wal();
         let seed_start = Instant::now();
         {
             let conn = db.conn().unwrap();
