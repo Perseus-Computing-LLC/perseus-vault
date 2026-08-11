@@ -4,6 +4,8 @@
 
 # Perseus Vault
 
+[![MCP Toplist](https://mcptoplist.com/badge/io.github.Perseus-Computing-LLC%2Fperseus-vault.svg)](https://mcptoplist.com/server/io.github.Perseus-Computing-LLC%2Fperseus-vault)
+
 <!-- mcp-name: io.github.Perseus-Computing-LLC/perseus-vault -->
 
 > **Persistent, encrypted memory for AI agents. One Rust binary, one file, no cloud.**
