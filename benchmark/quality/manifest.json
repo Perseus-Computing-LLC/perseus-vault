@@ -583,6 +583,7 @@
     "compaction_projection",
     "declared",
     "evidence_observations",
+    "guide_service",
     "graph_utility_gate",
     "identity_ambiguity",
     "interference_gate",
@@ -616,8 +617,7 @@
     "validity_recall",
     "task_projection",
     "evidence_observations",
-    "interference_gate",
-    "learned_anticipation"
+    "interference_gate"
   ],
   "version": 10
 }

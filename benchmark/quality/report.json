@@ -1,9 +1,9 @@
 {
-  "accuracy": 0.96,
+  "accuracy": 1.0,
   "benchmark": "perseus-vault-memory-quality",
   "benchmark_id": "perseus-vault-memory-quality",
   "binary": "perseus-vault",
-  "binary_sha256": "db468d4b5750b02ea110f926fe78e21d9a065b874c76bd970e4a3698fb50f3b5",
+  "binary_sha256": "e1f990452e8a18aca713214ce5cae9e6b85557a31d47d5a56da6e5ade3ad4a26",
   "capabilities": {
     "action_control_plane": {
       "missing_tools": [],
@@ -33,7 +33,7 @@
       "status": "available"
     },
     "mcp_stdio": {
-      "count": 119,
+      "count": 122,
       "status": "available"
     },
     "stage_trace_validate": {
@@ -722,9 +722,9 @@
     {
       "category": "learned_anticipation",
       "checks": {
-        "add_proposed": false,
-        "added_trigger_fires": false,
-        "approve_adds_trigger": false
+        "add_proposed": true,
+        "added_trigger_fires": true,
+        "approve_adds_trigger": true
       },
       "evidence": {
         "count": 1,
@@ -734,7 +734,7 @@
         "total": 1
       },
       "id": "learned-anticipation-add-trigger",
-      "status": "failed"
+      "status": "passed"
     },
     {
       "category": "learned_anticipation",
@@ -751,19 +751,92 @@
       },
       "id": "learned-anticipation-no-silent-mutation",
       "status": "passed"
+    },
+    {
+      "category": "guide_service",
+      "checks": {
+        "discoverable": true,
+        "fallback_intact": true,
+        "idempotent": true,
+        "not_inlined": true,
+        "pointer_emitted": true,
+        "seeded_ok": true
+      },
+      "evidence": {
+        "count": 2,
+        "found": true,
+        "rate": 1.0,
+        "reason": "b37d905f79a64aeee81f951ff30263a277a37c315cef12306b70ec85efaba4e9",
+        "total": 2
+      },
+      "id": "guide-service",
+      "status": "passed"
+    },
+    {
+      "category": "declared",
+      "checks": {
+        "and_semantics": true,
+        "exact_scalar_match": true,
+        "invalid_schema_rejected": true,
+        "schema_declared": true,
+        "string_list_membership": true,
+        "version_bumped": true
+      },
+      "evidence": {
+        "count": 1,
+        "found": true,
+        "rate": 1.0,
+        "reason": "ba5c2453a5c0c2ada1d41af9f47f4582a7046f31b02e54f1202fef6f3fa27bb2",
+        "total": 3
+      },
+      "id": "declared-exact-schema-and-filters",
+      "status": "passed"
+    },
+    {
+      "category": "declared",
+      "checks": {
+        "facet_counts_truthful": true,
+        "nonfacet_rejected": true,
+        "undeclared_category_rejected": true,
+        "unknown_field_rejected": true
+      },
+      "evidence": {
+        "count": 1,
+        "found": true,
+        "rate": 1.0,
+        "reason": "ba5c2453a5c0c2ada1d41af9f47f4582a7046f31b02e54f1202fef6f3fa27bb2",
+        "total": 3
+      },
+      "id": "declared-facets-failclosed",
+      "status": "passed"
+    },
+    {
+      "category": "declared",
+      "checks": {
+        "fused_pins_exact": true
+      },
+      "evidence": {
+        "count": 1,
+        "found": true,
+        "rate": 1.0,
+        "reason": "ba5c2453a5c0c2ada1d41af9f47f4582a7046f31b02e54f1202fef6f3fa27bb2",
+        "total": 3
+      },
+      "id": "declared-fused-pinning",
+      "status": "passed"
     }
   ],
-  "checks_passed": 72,
-  "checks_total": 75,
+  "checks_passed": 92,
+  "checks_total": 92,
   "claim_ids": [
     "quality-v1-contract"
   ],
   "claims_sha256": "9361b8ccf4fbd570bc62000f98db10045907667abd053a3b047af6758d44782a",
-  "control_profile_sha256": "32b27e3be2fda8afdd80f21fa76bfad49bfe973a01d133d9cfd27c3d4900ba6e",
+  "control_profile_sha256": "9690d3c59198e636c5d57f0b7d6d159fe17ed1155be60b6bb5da038cc19677cc",
   "dataset": "perseus-vault-memory-quality-v1",
-  "dataset_sha256": "03e51038fbec9484b53248c1dae07b02a5367737d70ae6e39d6da867dfbeaacc",
+  "dataset_sha256": "4242b33f03d18b35d2f1437b41cff981487a076ae7880a14b4fcd626adc14623",
   "excluded": [],
-  "harness_commit": "61499e09373931c04af4ff908cc6a86592461e3a",
+  "harness_commit": "07eaaa042f1762beb255694250bac220972f6007",
   "harness_version": "perseus-vault-memory-quality/v1",
   "metric_rates": {
     "action_grounding_rate": {
@@ -834,6 +907,12 @@
       "rate": 1.0,
       "status": "available"
     },
+    "declared": {
+      "denominator": 11,
+      "numerator": 11,
+      "rate": 1.0,
+      "status": "available"
+    },
     "evidence_observations": {
       "denominator": 2,
       "numerator": 2,
@@ -843,6 +922,12 @@
     "graph_utility_gate": {
       "denominator": 4,
       "numerator": 4,
+      "rate": 1.0,
+      "status": "available"
+    },
+    "guide_service": {
+      "denominator": 1,
+      "numerator": 1,
       "rate": 1.0,
       "status": "available"
     },
@@ -860,10 +945,9 @@
     },
     "learned_anticipation": {
       "denominator": 4,
-      "numerator": 3,
-      "rate": 0.75,
-      "reason": "metric_not_available",
-      "status": "failed"
+      "numerator": 4,
+      "rate": 1.0,
+      "status": "available"
     },
     "mutation_supersession": {
       "denominator": 3,
@@ -927,7 +1011,7 @@
   "network_calls": 0,
   "not_measured": [],
   "offline": true,
-  "passed": false,
+  "passed": true,
   "public_evidence": "hash-only",
   "raw_inputs_captured": false,
   "required_categories": [
@@ -950,10 +1034,10 @@
     "evidence_observations",
     "interference_gate"
   ],
-  "result_signature_sha256": "7d8026fa2af11b40766d0228229d14a78e8a2a6e20ae7fb07d152303e3eb7960",
-  "run_fingerprint_sha256": "d58f2edf74172dc048086d472c914b97b69cc9bb6971c1b368e2a47775118179",
+  "result_signature_sha256": "cdc052497e62698fa97614092552c0c9ddeb2222b15638dcf3985642ce049b69",
+  "run_fingerprint_sha256": "b63a3b4fbc8661a711741de358392fb16d64e302f3ffa47d3775d59690b085be",
   "schema_version": "perseus-vault-benchmark-report/v1",
-  "signature_sha256": "5d8c5ea330226cc94f75135147e4cd005f749c9c67a08aea62824a9152d99b4d",
-  "status": "partial",
+  "signature_sha256": "531153355b979c83e4de4c36cf145668ce44d26b8e238d346c6b726de2aeaf45",
+  "status": "passed",
   "suite_version": "v1"
 }

@@ -2445,11 +2445,21 @@ def run_learned_anticipation(client, **_):
     time.sleep(0.01)
     client.call("perseus_vault_preload_resolve", {"window_minutes": 30})
 
-    stats = client.call("perseus_vault_preload_stats", {"scope": "trigger", "limit": 50, "since_days": 7})
-    noisy_trig = next(
-        (t for t in (stats.get("triggers") or []) if t.get("trigger_ref") == "antineutrino"),
-        None,
-    )
+    # Bounded wait: the serve events must be folded into trigger telemetry
+    # before the precision/used check is meaningful. The settle sleeps above
+    # guarantee event age but not telemetry visibility under load — the gate
+    # is deterministic by contract, so poll until the expected state is
+    # observable (or fail loudly on timeout).
+    noisy_trig = None
+    for _ in range(200):
+        stats = client.call("perseus_vault_preload_stats", {"scope": "trigger", "limit": 50, "since_days": 7})
+        noisy_trig = next(
+            (t for t in (stats.get("triggers") or []) if t.get("trigger_ref") == "antineutrino"),
+            None,
+        )
+        if noisy_trig and noisy_trig.get("served", 0) >= 3 and noisy_trig.get("precision", 1.0) < 0.25:
+            break
+        time.sleep(0.01)
     flagged = bool(noisy_trig) and noisy_trig.get("served", 0) >= 3 and noisy_trig.get("precision", 1.0) < 0.25
 
     proposals = client.call("perseus_vault_preload_propose", {"by": "quality-harness"})
@@ -2485,13 +2495,27 @@ def run_learned_anticipation(client, **_):
         "perseus_vault_recall_when",
         {"context": "beam steering", "limit": 10, "session_id": "la-m", "workspace_hash": ws},
     )
+    # Settle sleep: missed-attribution compares last_accessed (ms) against
+    # the session anchor with a strict >, so the read MUST land in a later
+    # millisecond than the anchor call. Without the gap, fast MCP round
+    # trips collapse anchor + read into the same ms and the read is never
+    # counted (observed as intermittent add_trigger misses under load).
+    time.sleep(0.01)
     r2 = client.call(
         "perseus_vault_recall",
         {"query": "neutrino detector wiring notes", "limit": 20, "mode": "fts5", "workspace_hash": ws},
     )
     time.sleep(0.01)
     client.call("perseus_vault_preload_resolve", {"window_minutes": 30})
-    sess_stats = client.call("perseus_vault_preload_stats", {"scope": "session", "limit": 50, "since_days": 7})
+    # Bounded wait for the la-m session miss to be observable in telemetry
+    # (see the trigger-stats poll above for the determinism rationale).
+    sess_stats = {"sessions": []}
+    for _ in range(200):
+        sess_stats = client.call("perseus_vault_preload_stats", {"scope": "session", "limit": 50, "since_days": 7})
+        la_m = next((s for s in (sess_stats.get("sessions") or []) if s.get("session_id") == "la-m"), None)
+        if la_m and la_m.get("missed", 0) >= 1:
+            break
+        time.sleep(0.01)
     miss_recorded = any(
         s.get("missed", 0) >= 1 for s in (sess_stats.get("sessions") or [])
     )
@@ -2500,11 +2524,16 @@ def run_learned_anticipation(client, **_):
     )
 
     # ── 3. add_trigger: used in 2 sessions, never preloaded ──────────────
+    # Settle sleeps between the anchors and the read: the strict->
+    # last_accessed vs anchor comparison (see phase 2 note) requires each
+    # anchor and the read to land in distinct milliseconds, else the read
+    # is not counted as a miss for the later session(s).
     for i in (1, 2):
         client.call(
             "perseus_vault_recall_when",
             {"context": f"neutrino detector wiring {i}", "limit": 10, "session_id": f"la-a{i}", "workspace_hash": ws},
         )
+        time.sleep(0.01)
     # One read inside both sessions' usage periods (resolution bounds them).
     client.call(
         "perseus_vault_recall",
@@ -2512,6 +2541,14 @@ def run_learned_anticipation(client, **_):
     )
     time.sleep(0.01)
     client.call("perseus_vault_preload_resolve", {"window_minutes": 30})
+    # Bounded wait: both la-a sessions must show the cand read as a miss
+    # before propose can be expected to emit the add_trigger suggestion.
+    for _ in range(200):
+        sess_stats3 = client.call("perseus_vault_preload_stats", {"scope": "session", "limit": 50, "since_days": 7})
+        by_id = {s.get("session_id"): s for s in (sess_stats3.get("sessions") or [])}
+        if by_id.get("la-a1", {}).get("missed", 0) >= 1 and by_id.get("la-a2", {}).get("missed", 0) >= 1:
+            break
+        time.sleep(0.01)
     proposals2 = client.call("perseus_vault_preload_propose", {"by": "quality-harness"})
     adds = [p for p in (proposals2 or {}).get("proposals", []) if p.get("suggestion") == "add_trigger"]
     add_for_cand = any(p.get("entity_id") == cand_id for p in adds)

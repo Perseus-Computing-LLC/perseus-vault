@@ -264,7 +264,10 @@ def build_scorecard(report):
     )
     exact_accuracy = accuracy is not None and math.isfinite(accuracy) and accuracy == MINIMUM_ACCURACY
     case_count = len(report.get("cases", []))
-    case_count_valid = 20 <= case_count <= 40 if _is_v1_report(report) else (20 <= case_count <= 30 if _is_v0_report(report) else case_count == 4)
+    # V1 envelope: the manifest's case_count.max is the authoritative ceiling
+    # (currently 52 after the #921-#928 feature families); the gate cap must
+    # stay above it (64 leaves headroom for near-term additions).
+    case_count_valid = 20 <= case_count <= 64 if _is_v1_report(report) else (20 <= case_count <= 30 if _is_v0_report(report) else case_count == 4)
     # V1 categories (recall_outcome, admission, prompt_safety, identity_ambiguity)
     # are new and advisory during rollout: their failure alone must not block
     # a release when all baseline categories pass.
@@ -329,7 +332,7 @@ def build_scorecard(report):
             "exact_accuracy": True,
             "consistent_check_counts": True,
             "counts_match_cases": True,
-            "case_count_20_to_40_for_v1": True,
+            "case_count_20_to_64_for_v1": True,
         },
         "override_policy": {
             "allowed": True,
