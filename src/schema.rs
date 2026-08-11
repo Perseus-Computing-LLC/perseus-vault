@@ -599,7 +599,7 @@ CREATE INDEX IF NOT EXISTS idx_preload_proposals_state
 /// v34 (#874 activation-gated sparse writes): `write_quarantine` — the
 /// reviewable hold for writes whose measured interference exceeds the
 /// configured bound. New table, idempotent, no backfill.
-pub(crate) const SCHEMA_VERSION: i64 = 37;
+pub(crate) const SCHEMA_VERSION: i64 = 38;
 
 /// Initialize the v0.2.0 schema on a fresh database.
 pub fn initialize_schema(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
@@ -1631,6 +1631,40 @@ fn apply_migrations(conn: &Connection) -> Result<(), Box<dyn std::error::Error>>
     // to recall until then. Idempotent via ensure_column.
     ensure_column(conn, "entities", "hints", "TEXT NOT NULL DEFAULT '[]'")?;
     // ── end v37 ────────────────────────────────────────────────────────
+
+    // ── v38 (#930): scheduled recall evaluation ────────────────────────
+    // Durable eval history: bounded metric snapshots of quality runs
+    // (nightly curation + midday eval), regression breach records, and the
+    // nightly after-action summary. Booleans/counters/digests/rates only —
+    // raw prompts, bodies, tool arguments, and credentials never land here
+    // (the harness report already excludes them; record validates).
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS eval_runs (
+            id TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL DEFAULT '',
+            eval_kind TEXT NOT NULL,
+            suite TEXT NOT NULL DEFAULT 'memory-quality-v1',
+            status TEXT NOT NULL,
+            run_at_unix_ms INTEGER NOT NULL,
+            duration_ms INTEGER NOT NULL DEFAULT 0,
+            manifest_digest TEXT NOT NULL DEFAULT '',
+            binary_digest TEXT NOT NULL DEFAULT '',
+            harness_version TEXT NOT NULL DEFAULT '',
+            checks_passed INTEGER NOT NULL DEFAULT 0,
+            checks_total INTEGER NOT NULL DEFAULT 0,
+            accuracy REAL NOT NULL DEFAULT 0,
+            metrics_json TEXT NOT NULL DEFAULT '{}',
+            maintain_summary_json TEXT NOT NULL DEFAULT '',
+            breaches_json TEXT NOT NULL DEFAULT '[]',
+            regressed INTEGER NOT NULL DEFAULT 0,
+            created_by TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_eval_runs_kind
+            ON eval_runs(eval_kind, run_at_unix_ms);
+        CREATE INDEX IF NOT EXISTS idx_eval_runs_regressed
+            ON eval_runs(regressed, run_at_unix_ms);",
+    )?;
+    // ── end v38 ────────────────────────────────────────────────────────
 
     // Stamp the migration level so subsequent opens skip the probe block above.
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;

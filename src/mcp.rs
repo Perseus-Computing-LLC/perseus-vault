@@ -4328,6 +4328,18 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     }
   },
   {
+    "name": "perseus_vault_eval_history",
+    "description": "#930: read-only scheduled-recall evaluation history — bounded quality-run snapshots (nightly curation + midday eval) with per-metric trend and regression breach records. Never mutates.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "kind": {"type": "string", "description": "Cadence filter: nightly | midday | manual (default all)."},
+        "limit": {"type": "integer", "minimum": 1, "maximum": 100, "description": "Max runs (default 20)."},
+        "regressed_only": {"type": "boolean", "description": "Only runs with regression breaches (default false)."}
+      }
+    }
+  },
+  {
     "name": "perseus_vault_mental_model_set",
     "description": "#886: create or refresh a curated mental model — the ONLY sanctioned write path for the mental_model category (auto-generated passes refuse it). Versioned via the audited remember path (entity_history); provenance stamped (curated_by/curated_at); revision bumps on every re-assert; review clock resets. recall_when triggers attach for scheduled re-verification.",
     "inputSchema": {
@@ -6630,6 +6642,7 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
         "perseus_vault_beliefs" => beliefs::handle_beliefs(db, args),
         "perseus_vault_claim_card" => claim_card::handle_claim_card(db, args),
         "perseus_vault_operator_review" => tools::handle_operator_review(db, args),
+        "perseus_vault_eval_history" => tools::handle_eval_history(db, args),
         "perseus_vault_mental_model_set" => tools::handle_mental_model_set(db, args),
         "perseus_vault_mental_model_review" => tools::handle_mental_model_review(db, args),
         "perseus_vault_write_quarantine" => tools::handle_write_quarantine(db, args),
@@ -6757,7 +6770,7 @@ mod tests {
         );
         assert_eq!(
             registry_names.len(),
-            122,
+            123,
             "update public metadata when adding a tool"
         );
 

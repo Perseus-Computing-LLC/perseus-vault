@@ -5,6 +5,17 @@ All notable changes to Perseus Vault are documented here. This project adheres t
 
 ## [Unreleased]
 
+### Added
+- **Scheduled recall evaluation with regression alerts (#930).** New
+  `perseus-vault eval` CLI (record | history | alerts) and
+  `perseus_vault_eval_history` MCP tool (registry 122→123): durable
+  `eval_runs` history (schema v38) for nightly-curation + midday-eval
+  cadences, deterministic floor/cap + trailing-mean regression detection
+  with per-metric thresholds, and an `eval_regressions` lane in
+  `perseus_vault_operator_review`. The nightly `maintain` after-action
+  summary attaches to the eval record. Docs: `docs/scheduled-recall-eval.md`
+  (ops + cron pattern), `docs/specs/scheduled-recall-eval.md` (design spec).
+
 ## [2.23.0] - 2026-08-10
 
 ### Fixed
