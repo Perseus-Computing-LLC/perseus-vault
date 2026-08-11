@@ -37,7 +37,7 @@ jobs:
     name: release metadata
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Verify Cargo and MCP bundle versions agree
         run: python3 scripts/check-release-metadata.py
 
@@ -78,9 +78,9 @@ jobs:
           - x86_64-unknown-linux-musl
           - aarch64-unknown-linux-musl
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Upload lite binary
-        uses: taiki-e/upload-rust-binary-action@v1
+        uses: taiki-e/upload-rust-binary-action@f0d45ae91ee7b8ee928de7a9d04d893a08bcbec6 # v1
         with:
           bin: perseus-vault
           # Distinguish the lean asset from the full one on the release page.
@@ -127,7 +127,7 @@ jobs:
           - target: x86_64-pc-windows-msvc
             os: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       # bundled-embeddings pulls ort's download path which links openssl-sys on
       # Linux; provide the system dev libs the source build needs.
       - name: Install Linux build deps
@@ -171,7 +171,7 @@ jobs:
             --repo "$GITHUB_REPOSITORY" --clobber
       - name: Upload full binary (Linux/Windows)
         if: runner.os != 'macOS'
-        uses: taiki-e/upload-rust-binary-action@v1
+        uses: taiki-e/upload-rust-binary-action@f0d45ae91ee7b8ee928de7a9d04d893a08bcbec6 # v1
         with:
           bin: perseus-vault
           archive: perseus-vault-$target
@@ -219,6 +219,6 @@ jobs:
             --pattern '*.tar.gz' --pattern '*.zip' --dir artifacts
           ls -l artifacts
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@v1
+        uses: actions/attest-build-provenance@ef244123eb79f2f7a7e75d99086184180e6d0018 # v1
         with:
           subject-path: 'artifacts/*'
