@@ -39230,6 +39230,12 @@ mod tests {
     /// temp_db wired to the fake embed server: the local-ONNX config points at
     /// a path that cannot exist, so the backend chain deterministically falls
     /// through to the remote endpoint in BOTH the default and lite builds.
+    /// WAL fixture (#950): the #393 write-path latency contract
+    /// (write returns <400ms while the backend delays 500ms) only holds
+    /// stably under WAL — DELETE journaling creates/deletes a rollback
+    /// journal file per transaction, and those file ops on Windows CI
+    /// (Defender scanning fresh temp files) push a cold first-write past
+    /// the bound.
     fn db_with_fake_embed_endpoint(
         delay: std::time::Duration,
         queue_cap: Option<usize>,
@@ -39238,7 +39244,7 @@ mod tests {
         String,
         std::sync::Arc<std::sync::atomic::AtomicUsize>,
     ) {
-        let (mut db, path) = temp_db();
+        let (mut db, path) = temp_db_wal();
         if let Some(cap) = queue_cap {
             db.set_embed_queue_cap(cap);
         }
