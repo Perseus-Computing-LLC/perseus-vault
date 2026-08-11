@@ -1122,7 +1122,14 @@ mod tests {
     use serde_json::json;
 
     fn temp_db() -> (crate::db::TestDatabase, String) {
-        let db = crate::db::TestDatabase::new("perseus_vault-test-communities");
+        // WAL fixture (#971): community detection is write-heavy and runs
+        // repeated passes over the same pool. Under the DELETE-journaling
+        // default, a long write pass holding the lock while a nested pooled
+        // draw wants to write is an unresolvable upgrade deadlock -> immediate
+        // `database is locked` on slow/loaded runners (Windows + macOS CI,
+        // 2026-08-11). WAL removes the deadlock class; the auto-embed worker
+        // (default builds) also stops blocking the test's writers.
+        let db = crate::db::TestDatabase::new_wal("perseus_vault-test-communities");
         let path = db.path().to_string();
         (db, path)
     }
