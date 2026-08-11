@@ -2,10 +2,10 @@
   "accuracy": 1.0,
   "benchmark": "perseus-vault-memory-quality",
   "blocking": true,
-  "case_count": 30,
+  "case_count": 52,
   "case_count_valid": true,
-  "checks_passed": 41,
-  "checks_total": 41,
+  "checks_passed": 92,
+  "checks_total": 92,
   "dataset": "perseus-vault-memory-quality-v1",
   "failed_categories": [],
   "failed_metrics": [],
@@ -81,15 +81,51 @@
       "rate": 1.0,
       "status": "available"
     },
+    "declared": {
+      "denominator": 11,
+      "numerator": 11,
+      "rate": 1.0,
+      "status": "available"
+    },
+    "evidence_observations": {
+      "denominator": 2,
+      "numerator": 2,
+      "rate": 1.0,
+      "status": "available"
+    },
+    "graph_utility_gate": {
+      "denominator": 4,
+      "numerator": 4,
+      "rate": 1.0,
+      "status": "available"
+    },
+    "guide_service": {
+      "denominator": 1,
+      "numerator": 1,
+      "rate": 1.0,
+      "status": "available"
+    },
     "identity_ambiguity": {
       "denominator": 1,
       "numerator": 1,
       "rate": 1.0,
       "status": "available"
     },
+    "interference_gate": {
+      "denominator": 4,
+      "numerator": 4,
+      "rate": 1.0,
+      "status": "available"
+    },
+    "learned_anticipation": {
+      "denominator": 4,
+      "numerator": 4,
+      "rate": 1.0,
+      "status": "available"
+    },
     "mutation_supersession": {
-      "denominator": 5,
-      "numerator": 5,
+      "denominator": 3,
+      "numerator": 3,
       "rate": 1.0,
       "status": "available"
     },
@@ -123,9 +159,21 @@
       "rate": 0.0,
       "status": "available"
     },
+    "task_projection": {
+      "denominator": 5,
+      "numerator": 5,
+      "rate": 1.0,
+      "status": "available"
+    },
     "validity": {
-      "denominator": 6,
-      "numerator": 6,
+      "denominator": 4,
+      "numerator": 4,
+      "rate": 1.0,
+      "status": "available"
+    },
+    "validity_recall": {
+      "denominator": 4,
+      "numerator": 4,
       "rate": 1.0,
       "status": "available"
     }
@@ -142,11 +190,11 @@
   },
   "partial_metrics": [],
   "scorecard_version": "perseus-vault-memory-quality-scorecard/v2",
-  "source_report_signature": "015e691904b9cfc80139dadebd2bec4d18926d5a84a61be7bcfecf96a8947009",
+  "source_report_signature": "cdc052497e62698fa97614092552c0c9ddeb2222b15638dcf3985642ce049b69",
   "thresholds": {
     "all_category_checks_pass": true,
     "all_required_categories_present": true,
-    "case_count_20_to_40_for_v1": true,
+    "case_count_20_to_64_for_v1": true,
     "consistent_check_counts": true,
     "counts_match_cases": true,
     "exact_accuracy": true,

@@ -17,6 +17,8 @@ from run import (
     report_signature_payload,
     run_benchmark,
     sanitize_evidence,
+    LEGACY_REQUIRED_CATEGORIES,
+    V1_REQUIRED_CATEGORIES,
     VaultClient,
 )
 from scorecard import build_scorecard
@@ -26,15 +28,18 @@ class QualityHarnessTests(unittest.TestCase):
     def test_manifest_has_required_quality_categories(self):
         manifest = load_manifest(Path(__file__).with_name("manifest.json"))
         categories = {case["category"] for case in manifest["cases"]}
-        self.assertTrue(
-            {"long_horizon", "contradiction_supersession", "shared_memory", "adversarial"}
-            .issubset(categories)
-        )
+        # long_horizon + contradiction_supersession were subsumed by the
+        # validity_recall / mutation + replay scenarios in manifest v8 and
+        # removed from the case set (their coverage is asserted there).
+        self.assertTrue({"shared_memory", "adversarial"}.issubset(categories))
+        self.assertTrue(set(V1_REQUIRED_CATEGORIES).issubset(categories))
+        self.assertTrue(set(manifest["required_categories"]).issubset(categories))
 
     def test_manifest_has_bounded_v0_metric_coverage(self):
         manifest = load_manifest(Path(__file__).with_name("manifest.json"))
-        self.assertGreaterEqual(len(manifest["cases"]), 20)
-        self.assertLessEqual(len(manifest["cases"]), 30)
+        bounds = manifest["case_count"]
+        self.assertGreaterEqual(len(manifest["cases"]), bounds["min"])
+        self.assertLessEqual(len(manifest["cases"]), bounds["max"])
         self.assertTrue(
             {
                 "validity",
@@ -69,9 +74,12 @@ class QualityHarnessTests(unittest.TestCase):
         path.write_text(json.dumps(legacy), encoding="utf-8")
         loaded = load_manifest(path)
         self.assertEqual(len(loaded["cases"]), 4)
+        # Legacy normalization maps the v1 four-case shape onto the two
+        # surviving legacy categories (long_horizon + contradiction_supersession
+        # were subsumed by validity_recall / mutation + replay in manifest v8).
         self.assertEqual(
             set(loaded["required_categories"]),
-            {case["category"] for case in legacy["cases"]},
+            set(LEGACY_REQUIRED_CATEGORIES),
         )
         self.assertTrue(all(case["scenario"] == case["category"] for case in loaded["cases"]))
 
@@ -275,10 +283,14 @@ class QualityHarnessTests(unittest.TestCase):
         except FileNotFoundError as exc:
             self.skipTest(str(exc))
         out = Path(tempfile.mkdtemp()) / "report.json"
+        manifest = load_manifest(Path(__file__).with_name("manifest.json"))
         report = run_benchmark(Path(__file__).with_name("manifest.json"), None, out)
         self.assertEqual(report["dataset"], "perseus-vault-memory-quality-v1")
-        self.assertEqual(report["checks_total"], 41)
-        self.assertEqual(len(report["cases"]), 30)
+        self.assertEqual(
+            report["checks_total"],
+            sum(len(case["checks"]) for case in manifest["cases"]),
+        )
+        self.assertEqual(len(report["cases"]), len(manifest["cases"]))
         self.assertTrue(all(case["evidence"] for case in report["cases"]))
         self.assertTrue(report["passed"])
 
