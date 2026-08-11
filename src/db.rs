@@ -23053,7 +23053,11 @@ mod tests {
 
     /// WAL-mode fixture for tests whose semantics require WAL (concurrent
     /// raw connections issuing `PRAGMA journal_mode=WAL`, #400/#404 writer
-    /// starvation probes). The default fixture is DELETE-journaling (#950).
+    /// starvation probes, and #210/#382/#387 read+write concurrency
+    /// contracts — with rollback journaling, concurrent readers hold SHARED
+    /// locks that deadlock writer EXCLUSIVE upgrades into immediate
+    /// `database is locked`). The default fixture is DELETE-journaling
+    /// (#950).
     fn temp_db_wal() -> (TestDatabase, String) {
         let db = TestDatabase::new_wal("perseus_vault-test-db-wal");
         let path = db.path().to_string();
@@ -27501,11 +27505,13 @@ mod tests {
         // the first edge; remember's full-row UPDATE clobbered edges added
         // after the caller's read. Hammer one source entity with parallel
         // link() calls AND content-changing re-asserts; every edge must
-        // survive.
+        // survive. WAL fixture (#950): linkers read while the re-assert
+        // writer writes — rollback journaling turns that mix into immediate
+        // `database is locked` (readers block writer lock upgrades).
         use std::sync::Arc;
         use std::thread;
 
-        let (db, path) = temp_db();
+        let (db, path) = temp_db_wal();
         db.remember(&make_entity("e-382c", "facts", "src382c", r#"{"n":"v0"}"#))
             .unwrap();
         const TARGETS: usize = 12;
@@ -27572,10 +27578,13 @@ mod tests {
         // blocked on the nested draw — r2d2 acquire timeout (~30s) and an
         // opaque Error(None) instead of a link. Ids are now resolved on the
         // caller's own connection, so 3x-pool-size linkers must all succeed.
+        // WAL fixture (#950): 48 read-modify-write linkers against pooled
+        // connections deadlock under rollback journaling (SHARED readers
+        // block EXCLUSIVE upgrades → immediate `database is locked`).
         use std::sync::Arc;
         use std::thread;
 
-        let (db, path) = temp_db();
+        let (db, path) = temp_db_wal();
         db.remember(&make_entity("e-387", "facts", "src387", r#"{"n":"v0"}"#))
             .unwrap();
         const LINKERS: usize = 48;
@@ -33812,12 +33821,15 @@ mod tests {
     // #210: a single Database (pooled internally) shared as Arc<Database> across
     // threads must serve concurrent reads + writes without panicking, locking up,
     // or losing writes — the property the transport now relies on (no Mutex).
+    // WAL fixture (#950): 4 writer threads racing 4 reader threads; under
+    // rollback journaling the readers' SHARED locks deadlock the writers'
+    // EXCLUSIVE upgrades into immediate `database is locked` (Windows CI).
     #[test]
     fn pooled_database_shared_across_threads() {
         use std::sync::Arc;
         use std::thread;
 
-        let (db, path) = temp_db();
+        let (db, path) = temp_db_wal();
         let db = Arc::new(db);
 
         // Raw inserts through the pool (each thread checks out its own pooled
