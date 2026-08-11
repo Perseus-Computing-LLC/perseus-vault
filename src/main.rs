@@ -8,6 +8,7 @@ mod declared;
 mod dedup;
 mod embedding;
 mod encryption;
+mod eval_regression;
 mod extraction;
 mod live_update;
 // __isoc23_strto* link shims so the default (bundled-embeddings) build links
@@ -51,6 +52,7 @@ mod vector_quant;
 mod web;
 
 use clap::{Parser, Subcommand};
+use std::collections::BTreeMap;
 
 #[derive(Parser)]
 #[command(name = "perseus-vault")]
@@ -500,6 +502,61 @@ enum Commands {
         retention_days: Option<i64>,
     },
 
+    /// #930: scheduled recall evaluation — durable eval history with
+    /// regression alerts (nightly curation + midday eval). Subcommands:
+    /// record (ingest a quality report + optional scorecard/maintain
+    /// after-action summary), history (list runs with trend), alerts
+    /// (regressed runs for the operator alert channel).
+    Eval {
+        /// SQLite database path
+        #[arg(long, default_value_t = default_db_path())]
+        db: String,
+        /// Path to AES-256-GCM encryption key file; falls back to the standard
+        /// key path when one exists.
+        #[arg(long)]
+        encryption_key: Option<String>,
+        /// Subcommand: record | history | alerts
+        #[arg(long, default_value_t = String::from("history"))]
+        action: String,
+        /// Eval cadence: nightly | midday | manual (record requires it;
+        /// history filters by it)
+        #[arg(long)]
+        kind: Option<String>,
+        /// Path to the quality report JSON (benchmark/quality/run.py output)
+        /// for record
+        #[arg(long)]
+        report: Option<String>,
+        /// Path to the scorecard JSON (scorecard.py output) for record —
+        /// verdict blocked => run status blocked
+        #[arg(long)]
+        scorecard: Option<String>,
+        /// Path to the maintain after-action summary JSON for record
+        #[arg(long)]
+        maintain_report: Option<String>,
+        /// External correlation id (e.g. perseus runtime-eval run_id)
+        #[arg(long)]
+        run_id: Option<String>,
+        /// Regression threshold overrides as JSON:
+        /// {"<metric>": {"floor": 0.9, "regression_delta": 0.05}}
+        #[arg(long)]
+        thresholds: Option<String>,
+        /// Compute breaches without storing anything (record)
+        #[arg(long)]
+        dry_run: bool,
+        /// Only regressed runs (history)
+        #[arg(long)]
+        regressed_only: bool,
+        /// List limit (1..=1000)
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        /// Alert window in hours (alerts; default 24)
+        #[arg(long)]
+        since_hours: Option<i64>,
+        /// Agent label recorded on the run (record)
+        #[arg(long)]
+        created_by: Option<String>,
+    },
+
     /// Print a cheap, deterministic content digest of the recall-visible
     /// entity set as JSON (#256). Use as a cache key for resolved @memory
     /// outputs: stable while DB state is unchanged, changes iff it changes.
@@ -823,7 +880,8 @@ impl Commands {
             | Commands::Connect { db, .. }
             | Commands::Prepare { db, .. }
             | Commands::Capture { db, .. }
-            | Commands::Inspect { db, .. } => Some(db),
+            | Commands::Inspect { db, .. }
+            | Commands::Eval { db, .. } => Some(db),
             Commands::ObsidianSync { .. } | Commands::Migrate { .. } | Commands::Keygen { .. } => {
                 None
             }
@@ -1109,6 +1167,204 @@ fn warn_key_acls_on_windows(key_file: &str) {
              Ensure {key_file} is readable only by your account, e.g.: \
              icacls \"{key_file}\" /inheritance:r /grant:r %USERNAME%:F"
         );
+    }
+}
+
+/// #930: ingest a quality report (benchmark/quality/run.py output) into the
+/// eval history. Bounded: input files are capped at 4 MiB; only
+/// metric_rates / checks / digests / accuracy are retained (never raw
+/// prompts, bodies, or credentials). Regression breaches are computed
+/// against the trailing window of prior runs and stored with the row.
+fn eval_record_command(
+    database: &crate::db::Database,
+    kind: Option<&str>,
+    report_path: Option<&str>,
+    scorecard_path: Option<&str>,
+    maintain_report_path: Option<&str>,
+    run_id: Option<&str>,
+    thresholds_json: Option<&str>,
+    dry_run: bool,
+    created_by: Option<&str>,
+) -> serde_json::Value {
+    let kind = match kind {
+        Some(k) if matches!(k, "nightly" | "midday" | "manual") => k,
+        Some(other) => {
+            eprintln!(
+                "perseus-vault: invalid eval --kind '{other}': expected nightly | midday | manual"
+            );
+            std::process::exit(1);
+        }
+        None => {
+            eprintln!("perseus-vault: eval record requires --kind nightly|midday|manual");
+            std::process::exit(1);
+        }
+    };
+    let Some(report_path) = report_path else {
+        eprintln!("perseus-vault: eval record requires --report <quality-report.json>");
+        std::process::exit(1);
+    };
+    const MAX_REPORT_BYTES: u64 = 4 * 1024 * 1024;
+    let read_bounded = |path: &str, what: &str| -> serde_json::Value {
+        let meta = match std::fs::metadata(path) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("perseus-vault: {what} unreadable at {path}: {e}");
+                std::process::exit(1);
+            }
+        };
+        if meta.len() > MAX_REPORT_BYTES {
+            eprintln!("perseus-vault: {what} exceeds {MAX_REPORT_BYTES} bytes: {path}");
+            std::process::exit(1);
+        }
+        let raw = match std::fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("perseus-vault: {what} read failed at {path}: {e}");
+                std::process::exit(1);
+            }
+        };
+        match serde_json::from_str(&raw) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("perseus-vault: {what} is not valid JSON at {path}: {e}");
+                std::process::exit(1);
+            }
+        }
+    };
+    let report = read_bounded(report_path, "report");
+    let rates_obj = report.get("metric_rates").and_then(|v| v.as_object());
+    let Some(rates_obj) = rates_obj else {
+        eprintln!("perseus-vault: report has no metric_rates object");
+        std::process::exit(1);
+    };
+    let mut metrics: BTreeMap<String, f64> = BTreeMap::new();
+    for (name, v) in rates_obj {
+        let rate = match v {
+            serde_json::Value::Number(n) => n.as_f64(),
+            serde_json::Value::Object(o) => {
+                if o.get("status").and_then(|s| s.as_str()) == Some("available") {
+                    o.get("rate").and_then(|r| r.as_f64())
+                } else {
+                    None // unavailable/blocked metric carries no signal
+                }
+            }
+            _ => None,
+        };
+        if let Some(r) = rate {
+            if r.is_finite() {
+                metrics.insert(name.clone(), r);
+            }
+        }
+    }
+    let checks_total = report.get("checks_total").and_then(|v| v.as_i64()).unwrap_or(0);
+    let checks_passed = report.get("checks_passed").and_then(|v| v.as_i64()).unwrap_or(0);
+    let accuracy = report.get("accuracy").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let manifest_digest = report
+        .get("control_profile_sha256")
+        .and_then(|v| v.as_str())
+        .or_else(|| report.get("signature_sha256").and_then(|v| v.as_str()))
+        .unwrap_or("")
+        .to_string();
+    let binary_digest = report
+        .get("binary_sha256")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let harness_version = report
+        .get("harness_version")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let status: &str = if let Some(sp) = scorecard_path {
+        let sc = read_bounded(sp, "scorecard");
+        match sc.get("verdict").and_then(|v| v.as_str()) {
+            Some("release_ready") => "passed",
+            _ => "blocked",
+        }
+    } else if checks_total > 0 && checks_passed >= checks_total {
+        "passed"
+    } else {
+        "failed"
+    };
+    let maintain_summary = match maintain_report_path {
+        Some(p) => serde_json::to_string(&read_bounded(p, "maintain report")).unwrap_or_default(),
+        None => String::new(),
+    };
+    let mut thresholds: BTreeMap<String, crate::eval_regression::EvalThresholds> = BTreeMap::new();
+    if let Some(tj) = thresholds_json {
+        let parsed: BTreeMap<String, serde_json::Value> = match serde_json::from_str(tj) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("perseus-vault: --thresholds is not valid JSON: {e}");
+                std::process::exit(1);
+            }
+        };
+        for (m, v) in parsed {
+            let floor = v
+                .get("floor")
+                .and_then(|x| x.as_f64())
+                .unwrap_or(crate::eval_regression::EvalThresholds::default().floor);
+            let regression_delta = v
+                .get("regression_delta")
+                .and_then(|x| x.as_f64())
+                .unwrap_or(crate::eval_regression::EvalThresholds::default().regression_delta);
+            thresholds.insert(
+                m,
+                crate::eval_regression::EvalThresholds {
+                    floor,
+                    regression_delta,
+                },
+            );
+        }
+    }
+    let input = crate::db::EvalRunInput {
+        run_id: run_id.unwrap_or(""),
+        eval_kind: kind,
+        suite: "memory-quality-v1",
+        status,
+        run_at_unix_ms: crate::db::now_ms(),
+        duration_ms: 0,
+        manifest_digest: &manifest_digest,
+        binary_digest: &binary_digest,
+        harness_version: &harness_version,
+        checks_passed,
+        checks_total,
+        accuracy,
+        metrics,
+        thresholds,
+        maintain_summary_json: &maintain_summary,
+        created_by: created_by.unwrap_or(""),
+    };
+    if dry_run {
+        let prior = database
+            .eval_run_prior_rates("memory-quality-v1", kind, crate::db::EVAL_TRAILING_WINDOW)
+            .unwrap_or_default();
+        let breaches =
+            crate::eval_regression::compute_regression(&input.metrics, &prior, &input.thresholds);
+        return serde_json::json!({
+            "dry_run": true,
+            "regressed": !breaches.is_empty(),
+            "breaches": breaches,
+            "metrics": input.metrics,
+        });
+    }
+    match database.eval_run_record(&input) {
+        Ok(row) => {
+            let breaches: Vec<serde_json::Value> =
+                serde_json::from_str(&row.breaches_json).unwrap_or_default();
+            serde_json::json!({
+                "recorded": row.id,
+                "run_id": row.run_id,
+                "kind": row.eval_kind,
+                "status": row.status,
+                "regressed": row.regressed,
+                "breaches": breaches,
+            })
+        }
+        Err(e) => {
+            eprintln!("perseus-vault: eval record failed: {e}");
+            std::process::exit(1);
+        }
     }
 }
 
@@ -2968,6 +3224,72 @@ fn run() {
             };
             print_json(&out);
         }
+        Some(Commands::Eval {
+            db: ref db_path,
+            ref encryption_key,
+            action,
+            kind,
+            report,
+            scorecard,
+            maintain_report,
+            run_id,
+            thresholds,
+            dry_run,
+            regressed_only,
+            limit,
+            since_hours,
+            created_by,
+        }) => {
+            let mut database = open_db_or_exit(db_path);
+            let encryption_key =
+                configured_encryption_key_for_database(&mut database, encryption_key.as_deref());
+            if let Some(ref key_file) = encryption_key {
+                if let Err(e) = database.set_encryption(key_file) {
+                    eprintln!("perseus-vault: encryption setup failed: {}", e);
+                    std::process::exit(1);
+                }
+            } else {
+                warn_plaintext_writes_to_encrypted_db(&database);
+            }
+            let out = match action.as_str() {
+                "record" => eval_record_command(
+                    &database,
+                    kind.as_deref(),
+                    report.as_deref(),
+                    scorecard.as_deref(),
+                    maintain_report.as_deref(),
+                    run_id.as_deref(),
+                    thresholds.as_deref(),
+                    dry_run,
+                    created_by.as_deref(),
+                ),
+                "alerts" => {
+                    let hours = since_hours.unwrap_or(24);
+                    match database.eval_run_alerts(hours, limit) {
+                        Ok(alerts) => {
+                            serde_json::json!({"count": alerts.len(), "alerts": alerts, "since_hours": hours})
+                        }
+                        Err(e) => {
+                            eprintln!("perseus-vault: eval alerts failed: {e}");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                "history" | _ => match database.eval_run_history(kind.as_deref(), limit, regressed_only)
+                {
+                    Ok(runs) => {
+                        // Trend over the returned runs (bounded by `limit`).
+                        let trend = crate::db::eval_trend(&runs);
+                        serde_json::json!({"count": runs.len(), "runs": runs, "trend": trend})
+                    }
+                    Err(e) => {
+                        eprintln!("perseus-vault: eval history failed: {e}");
+                        std::process::exit(1);
+                    }
+                },
+            };
+            print_json(&out);
+        }
         Some(Commands::Doctor { db: ref db_path }) => {
             run_doctor(db_path);
         }
@@ -4329,6 +4651,113 @@ mod tests {
         // A 0 would busy-loop; clamp to 1 hour.
         assert_eq!(maintain_loop_interval(0).as_secs(), 3600);
         assert_eq!(maintain_loop_interval(24).as_secs(), 24 * 3600);
+    }
+
+    #[test]
+    fn parses_eval_record_flags() {
+        // #930: record requires kind + report at runtime; parse must carry
+        // all record-specific flags.
+        let cli = Cli::parse_from([
+            "perseus-vault",
+            "eval",
+            "--db",
+            "/tmp/eval.db",
+            "--action",
+            "record",
+            "--kind",
+            "nightly",
+            "--report",
+            "/tmp/quality.json",
+            "--scorecard",
+            "/tmp/scorecard.json",
+            "--maintain-report",
+            "/tmp/maintain.json",
+            "--run-id",
+            "perseus-runtime-eval-42",
+            "--thresholds",
+            "{\"validity_rate\":{\"floor\":0.9}}",
+            "--dry-run",
+            "--created-by",
+            "cron",
+        ]);
+        match cli.command {
+            Some(Commands::Eval {
+                db,
+                action,
+                kind,
+                report,
+                scorecard,
+                maintain_report,
+                run_id,
+                thresholds,
+                dry_run,
+                created_by,
+                ..
+            }) => {
+                assert_eq!(db, "/tmp/eval.db");
+                assert_eq!(action, "record");
+                assert_eq!(kind.as_deref(), Some("nightly"));
+                assert_eq!(report.as_deref(), Some("/tmp/quality.json"));
+                assert_eq!(scorecard.as_deref(), Some("/tmp/scorecard.json"));
+                assert_eq!(maintain_report.as_deref(), Some("/tmp/maintain.json"));
+                assert_eq!(run_id.as_deref(), Some("perseus-runtime-eval-42"));
+                assert!(thresholds.as_deref().unwrap().contains("validity_rate"));
+                assert!(dry_run);
+                assert_eq!(created_by.as_deref(), Some("cron"));
+            }
+            _ => panic!("expected eval subcommand"),
+        }
+    }
+
+    #[test]
+    fn parses_eval_history_and_alerts_flags() {
+        let cli = Cli::parse_from([
+            "perseus-vault",
+            "eval",
+            "--action",
+            "history",
+            "--kind",
+            "midday",
+            "--limit",
+            "5",
+            "--regressed-only",
+        ]);
+        match cli.command {
+            Some(Commands::Eval {
+                action,
+                kind,
+                limit,
+                regressed_only,
+                ..
+            }) => {
+                assert_eq!(action, "history");
+                assert_eq!(kind.as_deref(), Some("midday"));
+                assert_eq!(limit, 5);
+                assert!(regressed_only);
+            }
+            _ => panic!("expected eval subcommand"),
+        }
+        // default action is history
+        let cli = Cli::parse_from(["perseus-vault", "eval"]);
+        match cli.command {
+            Some(Commands::Eval { action, .. }) => assert_eq!(action, "history"),
+            _ => panic!("expected eval subcommand"),
+        }
+        let cli = Cli::parse_from([
+            "perseus-vault",
+            "eval",
+            "--action",
+            "alerts",
+            "--since-hours",
+            "48",
+        ]);
+        match cli.command {
+            Some(Commands::Eval { action, since_hours, .. }) => {
+                assert_eq!(action, "alerts");
+                assert_eq!(since_hours, Some(48));
+            }
+            _ => panic!("expected eval subcommand"),
+        }
     }
 
     #[test]

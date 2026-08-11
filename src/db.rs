@@ -10534,6 +10534,187 @@ impl Database {
         Ok(crate::op_runs::recover(&conn)?)
     }
 
+    // ── #930: scheduled recall evaluation ────────────────────────────────
+    /// Record one eval run. Validates kind/status, computes regression
+    /// breaches against the trailing window of prior runs (same suite +
+    /// eval kind), and stores the bounded projection. Returns the stored row.
+    pub fn eval_run_record(&self, input: &EvalRunInput<'_>) -> Result<EvalRunRow, String> {
+        if !matches!(input.eval_kind, "nightly" | "midday" | "manual") {
+            return Err(format!(
+                "invalid eval_kind '{}': expected 'nightly', 'midday', or 'manual'",
+                input.eval_kind
+            ));
+        }
+        if !matches!(input.status, "passed" | "failed" | "blocked") {
+            return Err(format!(
+                "invalid eval status '{}': expected 'passed', 'failed', or 'blocked'",
+                input.status
+            ));
+        }
+        if input.checks_total <= 0 {
+            return Err("eval_run_record: checks_total must be positive".to_string());
+        }
+        if !input.accuracy.is_finite() || !(0.0..=1.0).contains(&input.accuracy) {
+            return Err(format!(
+                "eval_run_record: accuracy must be finite and in [0,1], got {}",
+                input.accuracy
+            ));
+        }
+        let prior = self.eval_run_prior_rates(input.suite, input.eval_kind, EVAL_TRAILING_WINDOW)?;
+        let breaches =
+            crate::eval_regression::compute_regression(&input.metrics, &prior, &input.thresholds);
+        let breaches_json =
+            serde_json::to_string(&breaches).map_err(|e| format!("breach encode failed: {e}"))?;
+        let metrics_json =
+            serde_json::to_string(&input.metrics).map_err(|e| format!("metrics encode failed: {e}"))?;
+        let regressed = !breaches.is_empty();
+        let id = format!("evr-{}", uuid::Uuid::new_v4().simple());
+        let conn = self.conn().map_err(|e| e.to_string())?;
+        conn.execute(
+            "INSERT INTO eval_runs (id, run_id, eval_kind, suite, status, run_at_unix_ms, \
+             duration_ms, manifest_digest, binary_digest, harness_version, checks_passed, \
+             checks_total, accuracy, metrics_json, maintain_summary_json, breaches_json, \
+             regressed, created_by) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+            params![
+                id,
+                input.run_id,
+                input.eval_kind,
+                input.suite,
+                input.status,
+                input.run_at_unix_ms,
+                input.duration_ms,
+                input.manifest_digest,
+                input.binary_digest,
+                input.harness_version,
+                input.checks_passed,
+                input.checks_total,
+                input.accuracy,
+                metrics_json,
+                input.maintain_summary_json,
+                breaches_json,
+                regressed as i64,
+                input.created_by,
+            ],
+        )
+        .map_err(|e| format!("eval_run_record insert failed: {e}"))?;
+        self.eval_run_get(&id)
+            .map_err(|e| format!("eval_run_record readback failed: {e}"))
+    }
+
+    /// Fetch one eval run by id.
+    pub fn eval_run_get(&self, id: &str) -> Result<EvalRunRow, String> {
+        let conn = self.conn().map_err(|e| e.to_string())?;
+        conn.query_row(
+            "SELECT id, run_id, eval_kind, suite, status, run_at_unix_ms, duration_ms, \
+             manifest_digest, binary_digest, harness_version, checks_passed, checks_total, \
+             accuracy, metrics_json, maintain_summary_json, breaches_json, regressed, created_by \
+             FROM eval_runs WHERE id = ?1",
+            params![id],
+            |r| row_to_eval_run(r),
+        )
+        .map_err(|e| format!("eval_run_get({id}) failed: {e}"))
+    }
+
+    /// List eval runs, newest first. `kind` filters to one cadence;
+    /// `regressed_only` filters to runs with at least one breach.
+    pub fn eval_run_history(
+        &self,
+        kind: Option<&str>,
+        limit: usize,
+        regressed_only: bool,
+    ) -> Result<Vec<EvalRunRow>, String> {
+        let limit = limit.clamp(1, 1000);
+        let conn = self.conn().map_err(|e| e.to_string())?;
+        let mut sql = String::from(
+            "SELECT id, run_id, eval_kind, suite, status, run_at_unix_ms, duration_ms, \
+             manifest_digest, binary_digest, harness_version, checks_passed, checks_total, \
+             accuracy, metrics_json, maintain_summary_json, breaches_json, regressed, created_by \
+             FROM eval_runs WHERE 1=1",
+        );
+        let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        if let Some(k) = kind {
+            sql.push_str(" AND eval_kind = ?");
+            args.push(Box::new(k.to_string()));
+        }
+        if regressed_only {
+            sql.push_str(" AND regressed = 1");
+        }
+        sql.push_str(" ORDER BY run_at_unix_ms DESC, id DESC LIMIT ?");
+        args.push(Box::new(limit as i64));
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| format!("eval_run_history prepare failed: {e}"))?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(args.iter()), |r| row_to_eval_run(r))
+            .map_err(|e| format!("eval_run_history query failed: {e}"))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| format!("eval_run_history row failed: {e}"))?);
+        }
+        Ok(out)
+    }
+
+    /// Prior runs (same suite + kind), oldest first, truncated to `window`.
+    /// Parsed rate maps feed the regression baseline.
+    pub fn eval_run_prior_rates(
+        &self,
+        suite: &str,
+        kind: &str,
+        window: usize,
+    ) -> Result<Vec<std::collections::BTreeMap<String, f64>>, String> {
+        let conn = self.conn().map_err(|e| e.to_string())?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT metrics_json FROM eval_runs WHERE suite = ?1 AND eval_kind = ?2 \
+                 ORDER BY run_at_unix_ms ASC, id ASC LIMIT ?3",
+            )
+            .map_err(|e| format!("eval_run_prior_rates prepare failed: {e}"))?;
+        let rows = stmt
+            .query_map(params![suite, kind, window as i64], |r| {
+                r.get::<_, String>(0)
+            })
+            .map_err(|e| format!("eval_run_prior_rates query failed: {e}"))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let raw = row.map_err(|e| format!("eval_run_prior_rates row failed: {e}"))?;
+            match serde_json::from_str::<std::collections::BTreeMap<String, f64>>(&raw) {
+                Ok(m) => out.push(m),
+                Err(_) => {} // unparseable legacy row: skip, it carries no baseline signal
+            }
+        }
+        Ok(out)
+    }
+
+    /// Regressed runs within the last `since_hours` (0 = all), newest first.
+    /// The alert lane for the operator review queue.
+    pub fn eval_run_alerts(&self, since_hours: i64, limit: usize) -> Result<Vec<EvalRunRow>, String> {
+        let limit = limit.clamp(1, 1000);
+        let conn = self.conn().map_err(|e| e.to_string())?;
+        let cutoff = if since_hours > 0 {
+            now_ms() - since_hours.saturating_mul(3600) * 1000
+        } else {
+            0
+        };
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, run_id, eval_kind, suite, status, run_at_unix_ms, duration_ms, \
+                 manifest_digest, binary_digest, harness_version, checks_passed, checks_total, \
+                 accuracy, metrics_json, maintain_summary_json, breaches_json, regressed, created_by \
+                 FROM eval_runs WHERE regressed = 1 AND run_at_unix_ms >= ?1 \
+                 ORDER BY run_at_unix_ms DESC, id DESC LIMIT ?2",
+            )
+            .map_err(|e| format!("eval_run_alerts prepare failed: {e}"))?;
+        let rows = stmt
+            .query_map(params![cutoff, limit as i64], |r| row_to_eval_run(r))
+            .map_err(|e| format!("eval_run_alerts query failed: {e}"))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| format!("eval_run_alerts row failed: {e}"))?);
+        }
+        Ok(out)
+    }
+
     /// #683: author or update a Keystone (mandatory policy rule). Upsert by
     /// (scope, scope_id, content, workspace_hash) so re-setting the same rule
     /// updates its weight / required tier / author in place instead of
@@ -22391,6 +22572,123 @@ pub(crate) fn entity_from_row(
         embedding: None,
         _parsed_body: parsed_body,
     })
+}
+
+// ── #930: scheduled recall evaluation — eval_runs storage contract ─────
+/// One stored eval run row (bounded projection of the quality report:
+/// booleans, counters, digests, and metric rates only — never raw prompts,
+/// memory bodies, tool arguments, or credentials).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct EvalRunRow {
+    pub id: String,
+    pub run_id: String,
+    pub eval_kind: String,
+    pub suite: String,
+    pub status: String,
+    pub run_at_unix_ms: i64,
+    pub duration_ms: i64,
+    pub manifest_digest: String,
+    pub binary_digest: String,
+    pub harness_version: String,
+    pub checks_passed: i64,
+    pub checks_total: i64,
+    pub accuracy: f64,
+    pub metrics_json: String,
+    pub maintain_summary_json: String,
+    pub breaches_json: String,
+    pub regressed: bool,
+    pub created_by: String,
+}
+
+/// Input to `Database::eval_run_record`.
+pub struct EvalRunInput<'a> {
+    pub run_id: &'a str,
+    pub eval_kind: &'a str,
+    pub suite: &'a str,
+    pub status: &'a str,
+    pub run_at_unix_ms: i64,
+    pub duration_ms: i64,
+    pub manifest_digest: &'a str,
+    pub binary_digest: &'a str,
+    pub harness_version: &'a str,
+    pub checks_passed: i64,
+    pub checks_total: i64,
+    pub accuracy: f64,
+    pub metrics: std::collections::BTreeMap<String, f64>,
+    pub thresholds: std::collections::BTreeMap<String, crate::eval_regression::EvalThresholds>,
+    pub maintain_summary_json: &'a str,
+    pub created_by: &'a str,
+}
+
+/// Trailing window of prior runs used as the regression baseline.
+pub const EVAL_TRAILING_WINDOW: usize = 7;
+
+/// Row mapper for `eval_runs` (column order must match every SELECT above).
+fn row_to_eval_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<EvalRunRow> {
+    Ok(EvalRunRow {
+        id: row.get(0)?,
+        run_id: row.get(1)?,
+        eval_kind: row.get(2)?,
+        suite: row.get(3)?,
+        status: row.get(4)?,
+        run_at_unix_ms: row.get(5)?,
+        duration_ms: row.get(6)?,
+        manifest_digest: row.get(7)?,
+        binary_digest: row.get(8)?,
+        harness_version: row.get(9)?,
+        checks_passed: row.get(10)?,
+        checks_total: row.get(11)?,
+        accuracy: row.get(12)?,
+        metrics_json: row.get(13)?,
+        maintain_summary_json: row.get(14)?,
+        breaches_json: row.get(15)?,
+        regressed: row.get::<_, i64>(16)? != 0,
+        created_by: row.get(17)?,
+    })
+}
+
+/// #930: trend summary over a newest-first run slice (bounded by the caller).
+/// Per metric: latest / min / max / mean over the slice + breach count.
+pub fn eval_trend(runs: &[EvalRunRow]) -> std::collections::BTreeMap<String, serde_json::Value> {
+    let mut per_metric: std::collections::BTreeMap<String, Vec<f64>> =
+        std::collections::BTreeMap::new();
+    let mut breach_counts: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    for r in runs.iter().rev() {
+        if let Ok(metrics) =
+            serde_json::from_str::<std::collections::BTreeMap<String, f64>>(&r.metrics_json)
+        {
+            for (m, v) in metrics {
+                per_metric.entry(m).or_default().push(v);
+            }
+        }
+        if let Ok(breaches) = serde_json::from_str::<Vec<serde_json::Value>>(&r.breaches_json) {
+            for b in breaches {
+                if let Some(m) = b.get("metric").and_then(|x| x.as_str()) {
+                    *breach_counts.entry(m.to_string()).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+    let mut trend = std::collections::BTreeMap::new();
+    for (m, vals) in per_metric {
+        let n = vals.len() as f64;
+        let sum: f64 = vals.iter().sum();
+        let min = vals.iter().cloned().fold(f64::INFINITY, f64::min);
+        let max = vals.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let breaches_n = breach_counts.get(&m).copied().unwrap_or(0);
+        trend.insert(
+            m,
+            serde_json::json!({
+                "latest": vals.last().copied().unwrap_or(0.0),
+                "min": min,
+                "max": max,
+                "trailing_mean": if n > 0.0 { sum / n } else { 0.0 },
+                "breaches_n": breaches_n,
+            }),
+        );
+    }
+    trend
 }
 
 /// Owns a temporary SQLite database and clears SQLite sidecars on test exit.
@@ -42884,7 +43182,7 @@ mod tests {
         // Report carries denominator + artifact hash (acceptance #5).
         assert!(rep["denominator"]["slots"].as_i64().unwrap() >= 3);
         assert!(rep["artifact"]["git_hash"].as_str().unwrap().len() >= 7);
-        assert_eq!(rep["artifact"]["schema_version"], 37);
+        assert_eq!(rep["artifact"]["schema_version"], 38);
         let _ = std::fs::remove_file(path);
     }
 
@@ -43713,6 +44011,190 @@ mod tests {
         let _ = db.op_run_start(&run3.id).expect("start");
         let c3 = db.op_run_cancel(&run3.id).expect("cancel running");
         assert_eq!(c3.state, crate::op_runs::OpRunState::Cancelled);
+    }
+
+    // ── #930: scheduled recall evaluation ─────────────────────────────
+
+    fn eval_input(
+        kind: &'static str,
+        run_at: i64,
+        validity: f64,
+        scope_invalid: f64,
+    ) -> EvalRunInput<'static> {
+        let mut metrics = std::collections::BTreeMap::new();
+        metrics.insert("validity_rate".to_string(), validity);
+        metrics.insert("scope_invalid_recall_rate".to_string(), scope_invalid);
+        let mut thresholds = std::collections::BTreeMap::new();
+        thresholds.insert(
+            "validity_rate".to_string(),
+            crate::eval_regression::EvalThresholds {
+                floor: 0.9,
+                regression_delta: 0.05,
+            },
+        );
+        thresholds.insert(
+            "scope_invalid_recall_rate".to_string(),
+            crate::eval_regression::EvalThresholds {
+                floor: 0.1,
+                regression_delta: 0.05,
+            },
+        );
+        EvalRunInput {
+            run_id: "",
+            eval_kind: kind,
+            suite: "memory-quality-v1",
+            status: "passed",
+            run_at_unix_ms: run_at,
+            duration_ms: 1200,
+            manifest_digest: "digest-ct",
+            binary_digest: "digest-bin",
+            harness_version: "v1",
+            checks_passed: 92,
+            checks_total: 92,
+            accuracy: 1.0,
+            metrics,
+            thresholds,
+            maintain_summary_json: "",
+            created_by: "test",
+        }
+    }
+
+    #[test]
+    fn eval_run_record_roundtrip_and_history_filters() {
+        let (db, _path) = temp_db();
+        let a = db
+            .eval_run_record(&eval_input("nightly", 1000, 1.0, 0.0))
+            .expect("record a");
+        assert!(!a.regressed);
+        assert_eq!(a.eval_kind, "nightly");
+        assert!(a.id.starts_with("evr-"));
+        let b = db
+            .eval_run_record(&eval_input("midday", 2000, 1.0, 0.0))
+            .expect("record b");
+        let c = db
+            .eval_run_record(&eval_input("manual", 3000, 1.0, 0.0))
+            .expect("record c");
+        // history newest first
+        let all = db.eval_run_history(None, 10, false).expect("history");
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[0].id, c.id);
+        assert_eq!(all[1].id, b.id);
+        assert_eq!(all[2].id, a.id);
+        // kind filter
+        let nightly = db.eval_run_history(Some("nightly"), 10, false).expect("kind");
+        assert_eq!(nightly.len(), 1);
+        assert_eq!(nightly[0].id, a.id);
+        // limit
+        let two = db.eval_run_history(None, 2, false).expect("limit");
+        assert_eq!(two.len(), 2);
+    }
+
+    #[test]
+    fn eval_run_record_flags_regression_against_prior_window() {
+        let (db, _path) = temp_db();
+        db.eval_run_record(&eval_input("nightly", 1000, 1.0, 0.0))
+            .expect("baseline 1");
+        db.eval_run_record(&eval_input("nightly", 2000, 0.98, 0.0))
+            .expect("baseline 2");
+        let bad = db
+            .eval_run_record(&eval_input("nightly", 3000, 0.80, 0.0))
+            .expect("bad run");
+        assert!(
+            bad.regressed,
+            "validity drop past delta+floor must flag regression"
+        );
+        let breaches: Vec<crate::eval_regression::Breach> =
+            serde_json::from_str(&bad.breaches_json).expect("breaches decode");
+        assert!(
+            breaches
+                .iter()
+                .any(|b| b.threshold_type == "floor" && b.metric == "validity_rate")
+        );
+        assert!(
+            breaches
+                .iter()
+                .any(|b| b.threshold_type == "regression" && b.metric == "validity_rate")
+        );
+        // different kind: no baseline -> floor check only, still regressed
+        let manual = db
+            .eval_run_record(&eval_input("manual", 3000, 0.80, 0.0))
+            .expect("manual bad");
+        assert!(manual.regressed);
+        let mbreaches: Vec<crate::eval_regression::Breach> =
+            serde_json::from_str(&manual.breaches_json).expect("decode");
+        assert!(mbreaches.iter().all(|b| b.threshold_type == "floor"));
+    }
+
+    #[test]
+    fn eval_run_lower_is_better_cap_triggers_regression() {
+        let (db, _path) = temp_db();
+        db.eval_run_record(&eval_input("midday", 1000, 1.0, 0.0))
+            .expect("ok");
+        let bad = db
+            .eval_run_record(&eval_input("midday", 2000, 1.0, 0.25))
+            .expect("bad");
+        assert!(bad.regressed);
+        let breaches: Vec<crate::eval_regression::Breach> =
+            serde_json::from_str(&bad.breaches_json).expect("decode");
+        assert!(
+            breaches.iter().any(|b| b.metric == "scope_invalid_recall_rate"
+                && b.direction == "lower_better")
+        );
+    }
+
+    #[test]
+    fn eval_run_alerts_return_only_regressed_within_window() {
+        let (db, _path) = temp_db();
+        let now = crate::db::now_ms();
+        db.eval_run_record(&eval_input("nightly", now - 2 * 3600 * 1000, 0.80, 0.0))
+            .expect("old bad");
+        let bad = db
+            .eval_run_record(&eval_input("nightly", now, 0.80, 0.0))
+            .expect("recent bad");
+        let alerts = db.eval_run_alerts(0, 10).expect("all alerts");
+        assert_eq!(alerts.len(), 2);
+        let recent = db.eval_run_alerts(1, 10).expect("recent alerts");
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].id, bad.id);
+    }
+
+    #[test]
+    fn eval_run_prior_rates_are_windowed_and_oldest_first() {
+        let (db, _path) = temp_db();
+        for i in 0..9 {
+            db.eval_run_record(&eval_input("nightly", 1000 + i, 1.0, 0.0))
+                .expect("ok");
+        }
+        let prior = db
+            .eval_run_prior_rates("memory-quality-v1", "nightly", 7)
+            .expect("prior");
+        assert_eq!(prior.len(), 7, "trailing window must truncate the baseline");
+        assert!(prior[0].contains_key("validity_rate"));
+    }
+
+    #[test]
+    fn eval_run_record_rejects_bad_kind_status_and_accuracy() {
+        let (db, _path) = temp_db();
+        let mut input = eval_input("nightly", 1000, 1.0, 0.0);
+        input.eval_kind = "weekly";
+        assert!(db.eval_run_record(&input).is_err(), "unknown kind rejected");
+        input.eval_kind = "nightly";
+        input.status = "pending";
+        assert!(db.eval_run_record(&input).is_err(), "unknown status rejected");
+        input.status = "passed";
+        input.accuracy = 1.5;
+        assert!(db.eval_run_record(&input).is_err(), "accuracy out of range");
+        input.accuracy = 1.0;
+        assert!(db.eval_run_record(&input).is_ok());
+    }
+
+    #[test]
+    fn eval_run_maintain_summary_is_preserved() {
+        let (db, _path) = temp_db();
+        let mut input = eval_input("nightly", 1000, 1.0, 0.0);
+        input.maintain_summary_json = "{\"cohere\":\"ok\",\"decay\":5}";
+        let row = db.eval_run_record(&input).expect("record");
+        assert_eq!(row.maintain_summary_json, "{\"cohere\":\"ok\",\"decay\":5}");
     }
 
     #[test]

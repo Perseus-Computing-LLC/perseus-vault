@@ -6131,7 +6131,66 @@ pub fn handle_operator_review(db: &Database, args: Value) -> Result<String, Stri
         "write_quarantine": db
             .write_quarantine_list(None, limit)
             .unwrap_or_default(),
+        // #930: recent regressed eval runs (nightly/midday/manual scheduled
+        // evaluation) — the regression-alert lane. Read-only; full history
+        // and trend via perseus_vault_eval_history.
+        "eval_regressions": db
+            .eval_run_alerts(24, 10)
+            .unwrap_or_default(),
         "read_only":true}).to_string())
+}
+
+#[derive(Debug, Deserialize)]
+pub struct EvalHistoryArgs {
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default = "default_eval_history_limit")]
+    pub limit: usize,
+    #[serde(default)]
+    pub regressed_only: bool,
+}
+
+fn default_eval_history_limit() -> usize {
+    20
+}
+
+/// #930: read-only eval history with per-metric trend — the telemetry
+/// surface for scheduled recall evaluation (nightly curation + midday eval).
+/// Never mutates; regression alerts surface via perseus_vault_operator_review.
+pub fn handle_eval_history(db: &Database, args: Value) -> Result<String, String> {
+    let a: EvalHistoryArgs = serde_json::from_value(args)
+        .map_err(|e| format!("Invalid eval_history arguments: {e}"))?;
+    let kind = if a.kind.is_empty() {
+        None
+    } else {
+        Some(a.kind.as_str())
+    };
+    let limit = a.limit.clamp(1, 100);
+    let runs = db
+        .eval_run_history(kind, limit, a.regressed_only)
+        .map_err(|e| format!("Eval history failed: {e}"))?;
+    let trend = crate::db::eval_trend(&runs);
+    let latest = runs.first().map(|r| {
+        json!({
+            "id": r.id,
+            "run_id": r.run_id,
+            "kind": r.eval_kind,
+            "status": r.status,
+            "run_at_unix_ms": r.run_at_unix_ms,
+            "regressed": r.regressed,
+            "breaches": serde_json::from_str::<Vec<serde_json::Value>>(&r.breaches_json)
+                .unwrap_or_default(),
+        })
+    });
+    Ok(json!({
+        "count": runs.len(),
+        "runs": runs,
+        "trend": trend,
+        "latest": latest,
+        "note": "read-only eval history; regressed runs also surface in perseus_vault_operator_review",
+        "read_only": true,
+    })
+    .to_string())
 }
 
 /// #886: create or refresh a curated mental model — the ONLY sanctioned
@@ -12504,6 +12563,111 @@ mod tests {
             .as_str()
             .unwrap()
             .starts_with("cor-"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn eval_history_reports_runs_trend_and_never_mutates() {
+        let (db, path) = temp_db();
+        let mut input = crate::db::EvalRunInput {
+            run_id: "perseus-runtime-eval-1",
+            eval_kind: "nightly",
+            suite: "memory-quality-v1",
+            status: "passed",
+            run_at_unix_ms: 1000,
+            duration_ms: 500,
+            manifest_digest: "ctl-digest",
+            binary_digest: "bin-digest",
+            harness_version: "v1",
+            checks_passed: 92,
+            checks_total: 92,
+            accuracy: 1.0,
+            metrics: {
+                let mut m = std::collections::BTreeMap::new();
+                m.insert("validity_rate".to_string(), 1.0);
+                m
+            },
+            thresholds: Default::default(),
+            maintain_summary_json: "",
+            created_by: "cron",
+        };
+        db.eval_run_record(&input).expect("good run");
+        input.run_id = "perseus-runtime-eval-2";
+        input.run_at_unix_ms = 2000;
+        input.metrics = {
+            let mut m = std::collections::BTreeMap::new();
+            m.insert("validity_rate".to_string(), 0.80);
+            m
+        };
+        let bad = db.eval_run_record(&input).expect("regressed run");
+        assert!(bad.regressed);
+
+        let raw = handle_eval_history(&db, json!({"kind": "nightly", "limit": 10})).expect("history");
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["count"], json!(2), "{raw}");
+        assert_eq!(v["runs"][0]["id"], json!(bad.id));
+        assert_eq!(v["runs"][0]["regressed"], json!(true));
+        assert_eq!(v["latest"]["status"], json!("passed"));
+        assert_eq!(v["read_only"], json!(true));
+        let trend = &v["trend"]["validity_rate"];
+        assert_eq!(trend["latest"], json!(0.80));
+        assert_eq!(trend["max"], json!(1.0));
+        // 0.80 breaches floor AND regression delta vs the 1.0 baseline.
+        assert_eq!(trend["breaches_n"], json!(2));
+
+        // kind filter + regressed_only filter
+        let raw2 = handle_eval_history(&db, json!({"kind": "midday"})).expect("midday");
+        let v2: Value = serde_json::from_str(&raw2).unwrap();
+        assert_eq!(v2["count"], json!(0), "{raw2}");
+        let raw3 = handle_eval_history(&db, json!({"regressed_only": true})).expect("regressed");
+        let v3: Value = serde_json::from_str(&raw3).unwrap();
+        assert_eq!(v3["count"], json!(1), "{raw3}");
+
+        // unknown kind is a filter that matches nothing (closed-enum
+        // validation lives on record, not on the read surface)
+        let raw4 = handle_eval_history(&db, json!({"kind": "weekly"})).expect("weekly");
+        let v4: Value = serde_json::from_str(&raw4).unwrap();
+        assert_eq!(v4["count"], json!(0), "{raw4}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn operator_review_surfaces_eval_regression_lane() {
+        let (db, path) = temp_db();
+        let input = crate::db::EvalRunInput {
+            run_id: "",
+            eval_kind: "midday",
+            suite: "memory-quality-v1",
+            status: "passed",
+            run_at_unix_ms: crate::db::now_ms(),
+            duration_ms: 0,
+            manifest_digest: "",
+            binary_digest: "",
+            harness_version: "",
+            checks_passed: 92,
+            checks_total: 92,
+            accuracy: 1.0,
+            metrics: {
+                let mut m = std::collections::BTreeMap::new();
+                m.insert("validity_rate".to_string(), 0.70);
+                m
+            },
+            thresholds: Default::default(),
+            maintain_summary_json: "",
+            created_by: "cron",
+        };
+        let row = db.eval_run_record(&input).expect("regressed run");
+        assert!(row.regressed);
+        let raw = handle_operator_review(&db, json!({"category":"facts", "limit":20})).unwrap();
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        let lane = v["eval_regressions"].as_array().unwrap();
+        assert!(!lane.is_empty(), "operator review must surface eval regressions: {raw}");
+        assert_eq!(lane[0]["id"], json!(row.id));
+        assert_eq!(lane[0]["eval_kind"], json!("midday"));
+        assert!(!lane[0]["breaches_json"]
+            .as_str()
+            .unwrap_or("")
+            .is_empty());
         let _ = std::fs::remove_file(&path);
     }
 
