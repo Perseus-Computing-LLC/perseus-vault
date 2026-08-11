@@ -50,6 +50,7 @@ mod util;
 mod validity;
 mod vector_quant;
 mod web;
+mod web_gap_fill;
 
 use clap::{Parser, Subcommand};
 use std::collections::BTreeMap;

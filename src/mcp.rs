@@ -597,6 +597,7 @@ pub fn handle_request(
                     "perseus_vault_correct",
                     "perseus_vault_follow",
                     "perseus_vault_write_quarantine",
+                    "perseus_vault_web_gap_fill",
                 ];
                 const SCOPE_READ_TOOLS: &[&str] = &[
                     "perseus_vault_recall",
@@ -4340,6 +4341,24 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     }
   },
   {
+    "name": "perseus_vault_web_gap_fill",
+    "description": "#929: OPT-IN live-web gap-fill write-back. The vault never fetches the web; the agent fetches, then reports grounded content + source URLs here for validation (allowlisted hosts, no secrets) and audited storage as unverified-until-confirmed.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "query": {"type": "string", "description": "The recall query that missed."},
+        "content": {"type": "string", "description": "Agent-fetched page content (max 64 KiB)."},
+        "title": {"type": "string", "description": "Page title (max 512 chars)."},
+        "sources": {"type": "array", "items": {"type": "string"}, "description": "1-8 http/https source URLs actually fetched by the agent."},
+        "category": {"type": "string", "description": "Entity category (default \"web\")."},
+        "key": {"type": "string", "description": "Stable key (default: web-<sha256(content)[..16]>)."},
+        "workspace_hash": {"type": "string", "description": "Workspace scope (required; must be allowlisted)."},
+        "agent_id": {"type": "string", "description": "Write attribution."},
+        "relevance_score": {"type": "number", "description": "Agent-judged relevance 0-1 (must clear the configured floor)."}
+      }
+    }
+  },
+  {
     "name": "perseus_vault_mental_model_set",
     "description": "#886: create or refresh a curated mental model — the ONLY sanctioned write path for the mental_model category (auto-generated passes refuse it). Versioned via the audited remember path (entity_history); provenance stamped (curated_by/curated_at); revision bumps on every re-assert; review clock resets. recall_when triggers attach for scheduled re-verification.",
     "inputSchema": {
@@ -6643,6 +6662,7 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
         "perseus_vault_claim_card" => claim_card::handle_claim_card(db, args),
         "perseus_vault_operator_review" => tools::handle_operator_review(db, args),
         "perseus_vault_eval_history" => tools::handle_eval_history(db, args),
+        "perseus_vault_web_gap_fill" => tools::handle_web_gap_fill(db, args),
         "perseus_vault_mental_model_set" => tools::handle_mental_model_set(db, args),
         "perseus_vault_mental_model_review" => tools::handle_mental_model_review(db, args),
         "perseus_vault_write_quarantine" => tools::handle_write_quarantine(db, args),
@@ -6770,7 +6790,7 @@ mod tests {
         );
         assert_eq!(
             registry_names.len(),
-            123,
+            124,
             "update public metadata when adding a tool"
         );
 

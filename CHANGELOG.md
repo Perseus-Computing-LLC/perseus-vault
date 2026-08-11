@@ -15,6 +15,15 @@ All notable changes to Perseus Vault are documented here. This project adheres t
   `perseus_vault_operator_review`. The nightly `maintain` after-action
   summary attaches to the eval record. Docs: `docs/scheduled-recall-eval.md`
   (ops + cron pattern), `docs/specs/scheduled-recall-eval.md` (design spec).
+- **Live-web gap-fill, opt-in (#929).** New `perseus_vault_web_gap_fill`
+  MCP tool (registry 122→123): the agent fetches (the Vault never makes
+  network calls — no SSRF surface), then reports grounded content + source
+  URLs for validated, audited storage as unverified-until-confirmed. Gated
+  by `PERSEUS_VAULT_WEB_GAP_FILL_ENABLED=1`; per-workspace source allowlist
+  (`PERSEUS_VAULT_WEB_ALLOWLIST`), http/https only, private/reserved literal
+  IPs refused, fail-closed secret scan, relevance floor, per-workspace rate
+  limit. Enabled empty recalls emit a `gap` signal (never an implicit
+  fallback). Docs: `docs/web-gap-fill.md`.
 
 ## [2.23.0] - 2026-08-10
 
