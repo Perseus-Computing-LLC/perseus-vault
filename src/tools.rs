@@ -8659,6 +8659,288 @@ fn default_relationship() -> String {
     "supersedes".to_string()
 }
 
+#[derive(Debug, Deserialize)]
+pub struct ConsistencyAuditArgs {
+    #[serde(default = "default_audit_category")]
+    pub category: String,
+    #[serde(default = "default_audit_limit")]
+    pub limit: i64,
+}
+
+fn default_audit_category() -> String {
+    "facts".to_string()
+}
+fn default_audit_limit() -> i64 {
+    50
+}
+
+/// #940: read-only consistency self-audit. Detects contradiction pairs,
+/// recommends a deterministic winner (importance → authority → recency →
+/// id), surfaces already-ruled pairs, lists supersession lag, and reports
+/// pending keystone suggestions. NEVER mutates.
+pub fn handle_consistency_audit(db: &Database, args: Value) -> Result<String, String> {
+    let a: ConsistencyAuditArgs =
+        serde_json::from_value(args).map_err(|e| format!("Invalid consistency_audit arguments: {e}"))?;
+    let limit = a.limit.clamp(1, 200);
+    let conflicts = db
+        .detect_conflicts(&a.category, 0.4, limit, 0)
+        .map_err(|e| format!("Conflict scan failed: {e}"))?;
+    let conflicts = conflicts
+        .get("conflicts")
+        .and_then(|c| c.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let mut findings = Vec::new();
+    for pair in conflicts {
+        let (Some(id_a), Some(id_b)) = (
+            pair.get("entity_a").and_then(|e| e.get("id")).and_then(|v| v.as_str()),
+            pair.get("entity_b").and_then(|e| e.get("id")).and_then(|v| v.as_str()),
+        ) else {
+            continue;
+        };
+        let fp = crate::court_audit::pair_fingerprint(id_a, id_b);
+        if let Some(ruling) = db
+            .court_ruling_find_active(&fp)
+            .map_err(|e| format!("Ruling lookup failed: {e}"))?
+        {
+            findings.push(serde_json::json!({
+                "pair_fingerprint": fp,
+                "entity_a_id": id_a,
+                "entity_b_id": id_b,
+                "similarity": pair.get("similarity"),
+                "already_ruled": {
+                    "ruling_id": ruling["id"],
+                    "winner_id": ruling["winner_id"],
+                    "ruling": ruling["ruling"],
+                },
+            }));
+            continue;
+        }
+        let (Some(a_ent), Some(b_ent)) = (
+            db.get_entity_by_id_public(id_a).map_err(|e| format!("Entity lookup failed: {e}"))?,
+            db.get_entity_by_id_public(id_b).map_err(|e| format!("Entity lookup failed: {e}"))?,
+        ) else {
+            continue;
+        };
+        let ca = crate::court_audit::Candidate {
+            id: a_ent.id.clone(),
+            category: a_ent.category.clone(),
+            key: a_ent.key.clone(),
+            importance: body_importance(&a_ent),
+            source: a_ent.source.clone(),
+            created_at_unix_ms: a_ent.created_at_unix_ms,
+        };
+        let cb = crate::court_audit::Candidate {
+            id: b_ent.id.clone(),
+            category: b_ent.category.clone(),
+            key: b_ent.key.clone(),
+            importance: body_importance(&b_ent),
+            source: b_ent.source.clone(),
+            created_at_unix_ms: b_ent.created_at_unix_ms,
+        };
+        let rec = crate::court_audit::recommend(&ca, &cb);
+        findings.push(serde_json::json!({
+            "pair_fingerprint": fp,
+            "entity_a": {"id": a_ent.id, "key": a_ent.key, "importance": body_importance(&a_ent),
+                         "source": a_ent.source, "created_at_unix_ms": a_ent.created_at_unix_ms},
+            "entity_b": {"id": b_ent.id, "key": b_ent.key, "importance": body_importance(&b_ent),
+                         "source": b_ent.source, "created_at_unix_ms": b_ent.created_at_unix_ms},
+            "similarity": pair.get("similarity"),
+            "conflict_likely": pair.get("conflict_likely"),
+            "recommendation": {
+                "winner_id": rec.winner.id,
+                "winner_category": rec.winner.category,
+                "winner_key": rec.winner.key,
+                "loser_id": rec.loser.id,
+                "decided_by": rec.decided_by,
+            },
+        }));
+    }
+
+    // Supersession lag: entities closed by supersede but never re-litigated.
+    let lag = db
+        .superseded_without_successor(10)
+        .map_err(|e| format!("Supersession lag scan failed: {e}"))?;
+
+    let keystone_pending = db
+        .keystone_suggestions_list("pending", None, 1)
+        .map_err(|e| format!("Keystone suggestion scan failed: {e}"))?
+        .len() as i64;
+
+    Ok(serde_json::json!({
+        "category": a.category,
+        "audited_at_unix_ms": crate::db::now_ms(),
+        "findings": findings,
+        "supersession_lag": lag,
+        "keystone_pending": keystone_pending,
+        "read_only": true,
+    })
+    .to_string())
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AuditRulingArgs {
+    pub action: String,
+    #[serde(default = "default_audit_category")]
+    pub category: String,
+    #[serde(default)]
+    pub entity_a_key: String,
+    #[serde(default)]
+    pub entity_b_key: String,
+    #[serde(default)]
+    pub winner_category: String,
+    #[serde(default)]
+    pub winner_key: String,
+    #[serde(default)]
+    pub ruling_id: String,
+    #[serde(default)]
+    pub rationale: String,
+    #[serde(default = "default_ruling_agent")]
+    pub decided_by: String,
+}
+
+fn default_ruling_agent() -> String {
+    "operator".to_string()
+}
+
+/// Entity.importance is carried in body_json (remember stores it there);
+/// the Entity struct itself has no importance column.
+fn body_importance(ent: &crate::models::Entity) -> f64 {
+    serde_json::from_str::<serde_json::Value>(&ent.body_json)
+        .ok()
+        .and_then(|v| v.get("importance").and_then(|i| i.as_f64()))
+        .unwrap_or(0.5)
+}
+
+/// #940: idempotent operator ruling. `accept` compiles the recommended
+/// winner into the supersede guard; `override` compiles an explicit winner;
+/// `reverse` reopens a ruled pair for re-litigation. Every ruling is
+/// recorded + journaled; an active ruling with a different winner is refused
+/// until reversed.
+pub fn handle_audit_ruling(db: &Database, args: Value) -> Result<String, String> {
+    let a: AuditRulingArgs =
+        serde_json::from_value(args).map_err(|e| format!("Invalid audit_ruling arguments: {e}"))?;
+    match a.action.as_str() {
+        "accept" | "override" => {
+            if a.entity_a_key.is_empty() || a.entity_b_key.is_empty() {
+                return Err("audit_ruling requires entity_a_key and entity_b_key".to_string());
+            }
+            let ent_a = db
+                .get_entity(&a.category, &a.entity_a_key)
+                .map_err(|e| format!("Entity A lookup failed: {e}"))?
+                .ok_or_else(|| format!("Entity A not found: {}/{}", a.category, a.entity_a_key))?;
+            let ent_b = db
+                .get_entity(&a.category, &a.entity_b_key)
+                .map_err(|e| format!("Entity B lookup failed: {e}"))?
+                .ok_or_else(|| format!("Entity B not found: {}/{}", a.category, a.entity_b_key))?;
+            if ent_a.id == ent_b.id {
+                return Err("entity_a and entity_b must differ".to_string());
+            }
+            // Choose the winner: accept = ladder recommendation; override = explicit.
+            let (winner, loser) = if a.action == "accept" {
+                let ca = crate::court_audit::Candidate {
+                    id: ent_a.id.clone(),
+                    category: ent_a.category.clone(),
+                    key: ent_a.key.clone(),
+                    importance: body_importance(&ent_a),
+                    source: ent_a.source.clone(),
+                    created_at_unix_ms: ent_a.created_at_unix_ms,
+                };
+                let cb = crate::court_audit::Candidate {
+                    id: ent_b.id.clone(),
+                    category: ent_b.category.clone(),
+                    key: ent_b.key.clone(),
+                    importance: body_importance(&ent_b),
+                    source: ent_b.source.clone(),
+                    created_at_unix_ms: ent_b.created_at_unix_ms,
+                };
+                let rec = crate::court_audit::recommend(&ca, &cb);
+                let (w, l) = if rec.winner.id == ent_a.id {
+                    (&ent_a, &ent_b)
+                } else {
+                    (&ent_b, &ent_a)
+                };
+                (w.clone(), l.clone())
+            } else {
+                if a.winner_category.is_empty() || a.winner_key.is_empty() {
+                    return Err("override requires winner_category and winner_key".to_string());
+                }
+                let winner_ent = db
+                    .get_entity(&a.winner_category, &a.winner_key)
+                    .map_err(|e| format!("Winner lookup failed: {e}"))?
+                    .ok_or_else(|| format!("Winner not found: {}/{}", a.winner_category, a.winner_key))?;
+                if winner_ent.id == ent_a.id {
+                    (winner_ent, ent_b)
+                } else if winner_ent.id == ent_b.id {
+                    (winner_ent, ent_a)
+                } else {
+                    return Err(format!(
+                        "override winner ({}/{}) is neither entity_a nor entity_b",
+                        a.winner_category, a.winner_key
+                    ));
+                }
+            };
+            let fp = crate::court_audit::pair_fingerprint(&winner.id, &loser.id);
+            // Compile the guard through the existing supersede path.
+            let supersede = handle_supersede(
+                db,
+                serde_json::json!({
+                    "from_category": loser.category,
+                    "from_key": loser.key,
+                    "to_category": winner.category,
+                    "to_key": winner.key,
+                    "relationship": "supersedes",
+                    "reason": if a.rationale.is_empty() { "court of record ruling".to_string() } else { a.rationale.clone() },
+                }),
+            )?;
+            let receipt: String = supersede.chars().take(500).collect();
+            let (ruling, created) = db
+                .court_ruling_record(
+                    &fp,
+                    &winner.id,
+                    &loser.id,
+                    &a.action,
+                    &a.rationale,
+                    "operator",
+                    &receipt,
+                    &a.decided_by,
+                )
+                .map_err(|e| format!("Ruling record failed: {e}"))?;
+            Ok(serde_json::json!({
+                "ok": true,
+                "created": created,
+                "ruling": ruling,
+                "supersede_receipt": receipt,
+                "compiled_guard": {
+                    "relationship": "supersedes",
+                    "winner": {"category": winner.category, "key": winner.key},
+                    "loser": {"category": loser.category, "key": loser.key},
+                },
+                "note": "loser's valid period is closed; it no longer surfaces in recall",
+            })
+            .to_string())
+        }
+        "reverse" => {
+            if a.ruling_id.is_empty() {
+                return Err("reverse requires ruling_id".to_string());
+            }
+            let rev = db
+                .court_ruling_reverse(&a.ruling_id, &a.decided_by)
+                .map_err(|e| format!("Ruling reverse failed: {e}"))?;
+            Ok(serde_json::json!({
+                "ok": true,
+                "reversed": rev,
+                "note": "compiled supersede guard remains; re-assert to re-litigate",
+            })
+            .to_string())
+        }
+        other => Err(format!(
+            "audit_ruling action must be accept|override|reverse, got {other:?}"
+        )),
+    }
+}
+
 pub fn handle_supersede(db: &Database, args: Value) -> Result<String, String> {
     let a: SupersedeArgs =
         serde_json::from_value(args).map_err(|e| format!("Invalid supersede arguments: {}", e))?;
@@ -12798,6 +13080,60 @@ mod tests {
         .expect("recall");
         let v: Value = serde_json::from_str(&raw).unwrap();
         assert!(v.get("gap").is_none(), "{raw}");
+    }
+
+    // ── #940: court-of-record (audit + ruling) ────────────────────────
+
+    fn seed_conflict_pair(db: &Database, a_body: &str, b_body: &str) -> (String, String) {
+        let ra = handle_remember(
+            db,
+            json!({
+                "category": "facts",
+                "key": "audit-a",
+                "body_json": json!({"note": a_body, "importance": 0.9}).to_string(),
+                "agent_id": "smoke",
+            }),
+        )
+        .expect("seed a");
+        let rb = handle_remember(
+            db,
+            json!({
+                "category": "facts",
+                "key": "audit-b",
+                "body_json": json!({"note": b_body, "importance": 0.3}).to_string(),
+                "agent_id": "smoke",
+            }),
+        )
+        .expect("seed b");
+        let va: Value = serde_json::from_str(&ra).unwrap();
+        let vb: Value = serde_json::from_str(&rb).unwrap();
+        (va["id"].as_str().unwrap().to_string(), vb["id"].as_str().unwrap().to_string())
+    }
+
+    #[test]
+    fn consistency_audit_is_read_only_and_recommends_by_importance() {
+        let (db, path) = temp_db();
+        let (id_a, id_b) = seed_conflict_pair(
+            &db,
+            "The moons of Neptune were discovered by the Voyager spacecraft during its 1989 flyby of the ice giant system",
+            "Banana peels biodegrade in about two weeks when composted in a warm dark environment with adequate moisture",
+        );
+        let before = db.count_entities(None, None, None).unwrap();
+        let raw = handle_consistency_audit(&db, json!({"category": "facts"}))
+            .expect("audit");
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["read_only"], json!(true));
+        assert_eq!(db.count_entities(None, None, None).unwrap(), before, "audit must not mutate");
+        let findings = v["findings"].as_array().unwrap();
+        assert!(!findings.is_empty(), "seeded pair must be flagged: {raw}");
+        let finding = findings.iter().find(|f| {
+            f["entity_a"]["id"] == id_a.as_str() && f["entity_b"]["id"] == id_b.as_str()
+                || f["entity_a"]["id"] == id_b.as_str() && f["entity_b"]["id"] == id_a.as_str()
+        });
+        let finding = finding.expect("seeded pair present in findings");
+        assert_eq!(finding["recommendation"]["winner_id"], id_a.as_str(), "higher importance wins");
+        assert_eq!(finding["recommendation"]["decided_by"], "importance");
+        assert!(finding.get("already_ruled").is_none());
         let _ = std::fs::remove_file(path);
     }
 
@@ -12895,6 +13231,65 @@ mod tests {
         std::env::remove_var("PERSEUS_VAULT_WEB_GAP_FILL_ENABLED");
         std::env::remove_var("PERSEUS_VAULT_WEB_ALLOWLIST");
         let _ = std::fs::remove_file(&allow);
+    }
+
+    #[test]
+    fn audit_ruling_accept_compiles_guard_and_is_idempotent() {
+        let (db, path) = temp_db();
+        let (id_a, id_b) = seed_conflict_pair(
+            &db,
+            "The moons of Neptune were discovered by the Voyager spacecraft during its 1989 flyby of the ice giant system",
+            "Banana peels biodegrade in about two weeks when composted in a warm dark environment with adequate moisture",
+        );
+        let raw = handle_audit_ruling(
+            &db,
+            json!({
+                "action": "accept",
+                "category": "facts",
+                "entity_a_key": "audit-a",
+                "entity_b_key": "audit-b",
+                "rationale": "importance ladder",
+                "decided_by": "smoke-op",
+            }),
+        )
+        .expect("accept ruling");
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["ok"], json!(true));
+        assert_eq!(v["created"], json!(true));
+        assert_eq!(v["ruling"]["winner_id"], id_a.as_str());
+        assert_eq!(v["ruling"]["loser_id"], id_b.as_str());
+        assert_eq!(v["ruling"]["status"], "active");
+        assert!(!v["supersede_receipt"].as_str().unwrap().is_empty());
+        assert_eq!(v["compiled_guard"]["relationship"], "supersedes");
+        // guard compiled: loser is deprecated with a CLOSED valid period
+        let loser = db.get_entity("facts", "audit-b").unwrap().unwrap();
+        assert_eq!(loser.status, "deprecated");
+        let periods = db.valid_periods_for_ids(&[id_b.clone()]).unwrap();
+        let (_, cur_to) = periods.get(&id_b).copied().unwrap_or((0, None));
+        assert!(cur_to.is_some(), "loser valid period must be closed");
+        // idempotent re-ruling: same ruling, no new row
+        let raw2 = handle_audit_ruling(
+            &db,
+            json!({
+                "action": "accept",
+                "category": "facts",
+                "entity_a_key": "audit-a",
+                "entity_b_key": "audit-b",
+            }),
+        )
+        .expect("re-accept");
+        let v2: Value = serde_json::from_str(&raw2).unwrap();
+        assert_eq!(v2["created"], json!(false));
+        assert_eq!(v2["ruling"]["id"], v["ruling"]["id"]);
+        // audit now reports already_ruled for the pair
+        let audit: Value = serde_json::from_str(
+            &handle_consistency_audit(&db, json!({"category": "facts"})).unwrap(),
+        )
+        .unwrap();
+        let findings = audit["findings"].as_array().unwrap();
+        let ruled = findings.iter().find(|f| f.get("already_ruled").is_some());
+        assert!(ruled.is_some(), "pair must surface as already_ruled: {audit}");
+        assert_eq!(ruled.unwrap()["already_ruled"]["winner_id"], id_a.as_str());
         let _ = std::fs::remove_file(path);
     }
 
@@ -12923,6 +13318,76 @@ mod tests {
         std::env::remove_var("PERSEUS_VAULT_WEB_RATE_LIMIT");
         let _ = std::fs::remove_file(&allow);
         let _ = std::fs::remove_file(&allow2);
+    }
+
+    #[test]
+    fn audit_ruling_override_and_reverse_reopen() {
+        let (db, path) = temp_db();
+        seed_conflict_pair(
+            &db,
+            "The moons of Neptune were discovered by the Voyager spacecraft during its 1989 flyby of the ice giant system",
+            "Banana peels biodegrade in about two weeks when composted in a warm dark environment with adequate moisture",
+        );
+        // override: b wins despite lower importance
+        let raw = handle_audit_ruling(
+            &db,
+            json!({
+                "action": "override",
+                "category": "facts",
+                "entity_a_key": "audit-a",
+                "entity_b_key": "audit-b",
+                "winner_category": "facts",
+                "winner_key": "audit-b",
+                "rationale": "operator knows better",
+            }),
+        )
+        .expect("override ruling");
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["ruling"]["winner_id"], db.get_entity("facts", "audit-b").unwrap().unwrap().id);
+        // conflicting re-ruling refused while active
+        let err = handle_audit_ruling(
+            &db,
+            json!({
+                "action": "override",
+                "category": "facts",
+                "entity_a_key": "audit-a",
+                "entity_b_key": "audit-b",
+                "winner_category": "facts",
+                "winner_key": "audit-a",
+            }),
+        )
+        .expect_err("conflicting active ruling must be refused");
+        assert!(err.contains("reverse it before re-ruling"), "{err}");
+        // reverse reopens the pair
+        let rid = v["ruling"]["id"].as_str().unwrap().to_string();
+        let rev = handle_audit_ruling(&db, json!({"action": "reverse", "ruling_id": rid}))
+            .expect("reverse");
+        let rv: Value = serde_json::from_str(&rev).unwrap();
+        assert_eq!(rv["reversed"]["status"], "reversed");
+        // audit now recommends again (no already_ruled)
+        let audit: Value = serde_json::from_str(
+            &handle_consistency_audit(&db, json!({"category": "facts"})).unwrap(),
+        )
+        .unwrap();
+        let findings = audit["findings"].as_array().unwrap();
+        let rec = findings.iter().find(|f| f.get("recommendation").is_some());
+        assert!(rec.is_some(), "pair must be re-auditable after reverse: {audit}");
+        // and a different winner can now be ruled
+        let raw2 = handle_audit_ruling(
+            &db,
+            json!({
+                "action": "override",
+                "category": "facts",
+                "entity_a_key": "audit-a",
+                "entity_b_key": "audit-b",
+                "winner_category": "facts",
+                "winner_key": "audit-a",
+            }),
+        )
+        .expect("re-rule with different winner after reverse");
+        let v2: Value = serde_json::from_str(&raw2).unwrap();
+        assert_eq!(v2["created"], json!(true));
+        assert_ne!(v2["ruling"]["id"], rid);
         let _ = std::fs::remove_file(path);
     }
 
@@ -13075,6 +13540,26 @@ mod tests {
             .unwrap_or("")
             .is_empty());
         let _ = std::fs::remove_file(&path);
+    }
+
+    fn audit_ruling_validates_actions_and_keys() {
+        let (db, path) = temp_db();
+        let err = handle_audit_ruling(&db, json!({"action": "burn-it-all"}))
+            .expect_err("unknown action");
+        assert!(err.contains("accept|override|reverse"), "{err}");
+        let err = handle_audit_ruling(
+            &db,
+            json!({"action": "accept", "category": "facts", "entity_a_key": "k"}),
+        )
+        .expect_err("missing entity_b_key");
+        assert!(err.contains("entity_a_key and entity_b_key"), "{err}");
+        let err = handle_audit_ruling(&db, json!({"action": "reverse", "ruling_id": "rul-nope"}))
+            .expect_err("missing ruling");
+        assert!(err.contains("no ruling with id"), "{err}");
+        let err = handle_audit_ruling(&db, json!({"action": "accept", "category": "facts", "entity_a_key": "nope", "entity_b_key": "nope2"}))
+            .expect_err("missing entities");
+        assert!(err.contains("not found"), "{err}");
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

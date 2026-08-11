@@ -15333,6 +15333,272 @@ impl Database {
     /// #107: Also factors in certainty — low-certainty entities on the same topic
     /// amplify the conflict signal. Two entities with certainty < 0.4 on similar
     /// topics are flagged even at higher similarity thresholds.
+    // ── #940: court-of-record rulings ─────────────────────────────────
+
+    /// Find the ACTIVE ruling for a pair fingerprint, if any.
+    pub fn court_ruling_find_active(
+        &self,
+        pair_fingerprint: &str,
+    ) -> Result<Option<serde_json::Value>, Box<dyn std::error::Error>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, pair_fingerprint, winner_id, loser_id, ruling, rationale,
+                    status, decided_by, supersede_receipt, created_at_unix_ms,
+                    reversed_at_unix_ms, reversed_by
+             FROM court_rulings
+             WHERE pair_fingerprint = ?1 AND status = 'active'
+             LIMIT 1",
+        )?;
+        let mut rows = stmt.query_map(params![pair_fingerprint], |r| {
+            Ok(serde_json::json!({
+                "id": r.get::<_, String>(0)?,
+                "pair_fingerprint": r.get::<_, String>(1)?,
+                "winner_id": r.get::<_, String>(2)?,
+                "loser_id": r.get::<_, String>(3)?,
+                "ruling": r.get::<_, String>(4)?,
+                "rationale": r.get::<_, String>(5)?,
+                "status": r.get::<_, String>(6)?,
+                "decided_by": r.get::<_, String>(7)?,
+                "supersede_receipt": r.get::<_, String>(8)?,
+                "created_at_unix_ms": r.get::<_, i64>(9)?,
+                "reversed_at_unix_ms": r.get::<_, Option<i64>>(10)?,
+                "reversed_by": r.get::<_, String>(11)?,
+            }))
+        })?;
+        Ok(rows.next().transpose()?)
+    }
+
+    /// Record a ruling. Idempotent: an ACTIVE ruling with the same pair and
+    /// winner returns unchanged (created=false). An active ruling with a
+    /// DIFFERENT winner is refused — reverse first. Every record is
+    /// journaled (`court_ruling_set`).
+    pub fn court_ruling_record(
+        &self,
+        pair_fingerprint: &str,
+        winner_id: &str,
+        loser_id: &str,
+        ruling: &str,
+        rationale: &str,
+        decided_by: &str,
+        supersede_receipt: &str,
+        agent_id: &str,
+    ) -> Result<(serde_json::Value, bool), Box<dyn std::error::Error>> {
+        if let Some(existing) = self.court_ruling_find_active(pair_fingerprint)? {
+            if existing["winner_id"] == serde_json::Value::String(winner_id.to_string())
+                && existing["ruling"] == serde_json::Value::String(ruling.to_string())
+            {
+                return Ok((existing, false));
+            }
+            return Err(format!(
+                "active ruling {} exists for this pair with a different winner: reverse it before re-ruling",
+                existing["id"]
+            )
+            .into());
+        }
+        let conn = self.conn()?;
+        let id = format!("rul-{}", uuid::Uuid::new_v4().simple());
+        let now = now_ms();
+        let receipt = supersede_receipt.to_string();
+        conn.execute(
+            "INSERT INTO court_rulings
+                (id, pair_fingerprint, winner_id, loser_id, ruling, rationale,
+                 status, decided_by, supersede_receipt, created_at_unix_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7, ?8, ?9)",
+            params![
+                id,
+                pair_fingerprint,
+                winner_id,
+                loser_id,
+                ruling,
+                rationale,
+                decided_by,
+                receipt,
+                now
+            ],
+        )?;
+        let ruling_json = serde_json::json!({
+            "id": id,
+            "pair_fingerprint": pair_fingerprint,
+            "winner_id": winner_id,
+            "loser_id": loser_id,
+            "ruling": ruling,
+            "rationale": rationale,
+            "status": "active",
+            "decided_by": decided_by,
+            "supersede_receipt": receipt,
+            "created_at_unix_ms": now,
+            "reversed_at_unix_ms": serde_json::Value::Null,
+            "reversed_by": "",
+        });
+        // Audit trail: who decided, what was compiled.
+        let event = crate::models::JournalEvent {
+            id: format!("jrn-{}", uuid::Uuid::new_v4().simple()),
+            event_type: "court_ruling_set".to_string(),
+            evaluated_json: serde_json::to_string(&serde_json::json!({
+                "pair_fingerprint": pair_fingerprint,
+                "winner_id": winner_id,
+                "loser_id": loser_id,
+                "ruling": ruling,
+            }))?,
+            acted_json: serde_json::to_string(&serde_json::json!({
+                "ruling_id": id,
+                "decided_by": decided_by,
+                "supersede_receipt": receipt,
+            }))?,
+            forward_json: "{\"reverse\":\"court_ruling_reverse\"}".to_string(),
+            category: "court".to_string(),
+            key: id.clone(),
+            entity_id: String::new(),
+            agent_id: agent_id.to_string(),
+            workspace_hash: String::new(),
+            created_at_unix_ms: now,
+        };
+        self.journal(&event)?;
+        Ok((ruling_json, true))
+    }
+
+    /// Reverse a ruling (idempotent: already-reversed returns unchanged).
+    /// The compiled supersede guard is NOT undone — reversal only reopens
+    /// the pair for re-litigation. Journaled (`court_ruling_reversed`).
+    pub fn court_ruling_reverse(
+        &self,
+        ruling_id: &str,
+        by: &str,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+        let conn = self.conn()?;
+        let now = now_ms();
+        let changed = conn.execute(
+            "UPDATE court_rulings
+                SET status = 'reversed', reversed_at_unix_ms = ?1, reversed_by = ?2
+              WHERE id = ?3 AND status = 'active'",
+            params![now, by, ruling_id],
+        )?;
+        if changed == 0 {
+            // Either missing or already reversed — surface the current row.
+            let mut stmt = conn.prepare(
+                "SELECT id, pair_fingerprint, winner_id, loser_id, ruling, rationale,
+                        status, decided_by, supersede_receipt, created_at_unix_ms,
+                        reversed_at_unix_ms, reversed_by
+                 FROM court_rulings WHERE id = ?1",
+            )?;
+            let mut rows = stmt.query_map(params![ruling_id], |r| {
+                Ok(serde_json::json!({
+                    "id": r.get::<_, String>(0)?,
+                    "pair_fingerprint": r.get::<_, String>(1)?,
+                    "winner_id": r.get::<_, String>(2)?,
+                    "loser_id": r.get::<_, String>(3)?,
+                    "ruling": r.get::<_, String>(4)?,
+                    "rationale": r.get::<_, String>(5)?,
+                    "status": r.get::<_, String>(6)?,
+                    "decided_by": r.get::<_, String>(7)?,
+                    "supersede_receipt": r.get::<_, String>(8)?,
+                    "created_at_unix_ms": r.get::<_, i64>(9)?,
+                    "reversed_at_unix_ms": r.get::<_, Option<i64>>(10)?,
+                    "reversed_by": r.get::<_, String>(11)?,
+                }))
+            })?;
+            let current = rows.next().transpose()?.ok_or_else(
+                || -> Box<dyn std::error::Error> { format!("no ruling with id {ruling_id}").into() },
+            )?;
+            if current["status"] == "reversed" {
+                return Ok(current);
+            }
+            return Err(format!(
+                "ruling {} is {}; only 'active' rulings can be reversed",
+                ruling_id, current["status"]
+            )
+            .into());
+        }
+        let event = crate::models::JournalEvent {
+            id: format!("jrn-{}", uuid::Uuid::new_v4().simple()),
+            event_type: "court_ruling_reversed".to_string(),
+            evaluated_json: serde_json::to_string(&serde_json::json!({
+                "ruling_id": ruling_id,
+                "reversed_by": by,
+            }))?,
+            acted_json: "{\"status\":\"reversed\"}".to_string(),
+            forward_json: "{\"note\":\"compiled supersede guard remains; re-assert to re-litigate\"}"
+                .to_string(),
+            category: "court".to_string(),
+            key: ruling_id.to_string(),
+            entity_id: String::new(),
+            agent_id: by.to_string(),
+            workspace_hash: String::new(),
+            created_at_unix_ms: now,
+        };
+        self.journal(&event)?;
+        Ok(serde_json::json!({
+            "id": ruling_id,
+            "status": "reversed",
+            "reversed_at_unix_ms": now,
+            "reversed_by": by,
+        }))
+    }
+
+    /// List rulings, newest first, optionally filtered by status.
+    pub fn court_ruling_list(
+        &self,
+        status: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, pair_fingerprint, winner_id, loser_id, ruling, rationale,
+                    status, decided_by, supersede_receipt, created_at_unix_ms,
+                    reversed_at_unix_ms, reversed_by
+             FROM court_rulings
+             WHERE (?1 IS NULL OR status = ?1)
+             ORDER BY created_at_unix_ms DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![status, limit], |r| {
+            Ok(serde_json::json!({
+                "id": r.get::<_, String>(0)?,
+                "pair_fingerprint": r.get::<_, String>(1)?,
+                "winner_id": r.get::<_, String>(2)?,
+                "loser_id": r.get::<_, String>(3)?,
+                "ruling": r.get::<_, String>(4)?,
+                "rationale": r.get::<_, String>(5)?,
+                "status": r.get::<_, String>(6)?,
+                "decided_by": r.get::<_, String>(7)?,
+                "supersede_receipt": r.get::<_, String>(8)?,
+                "created_at_unix_ms": r.get::<_, i64>(9)?,
+                "reversed_at_unix_ms": r.get::<_, Option<i64>>(10)?,
+                "reversed_by": r.get::<_, String>(11)?,
+            }))
+        })?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// Deprecated entities (losers of a compiled supersede) whose supersede
+    /// edge's SOURCE (the winner) is missing or archived — i.e., the guard
+    /// compiled but no live successor is linked.
+    pub fn superseded_without_successor(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT e.id, e.category, e.key
+             FROM entities e
+             WHERE e.archived = 0 AND e.status = 'deprecated'
+               AND NOT EXISTS (
+                   SELECT 1 FROM entities w, json_each(w.links) l
+                   WHERE l.value ->> 'target_id' = e.id
+                     AND l.value ->> 'relationship' = 'supersedes'
+                     AND w.archived = 0
+               )
+             ORDER BY e.created_at_unix_ms DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit], |r| {
+            Ok(serde_json::json!({
+                "id": r.get::<_, String>(0)?,
+                "category": r.get::<_, String>(1)?,
+                "key": r.get::<_, String>(2)?,
+            }))
+        })?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
     pub fn detect_conflicts(
         &self,
         category: &str,
@@ -22927,6 +23193,89 @@ mod tests {
             .unwrap()
             .expect("stored entity");
         assert_eq!(stored2.epistemic_state, "corroborated");
+        let _ = std::fs::remove_file(path);
+    }
+
+    // ── #940: court-of-record rulings ─────────────────────────────────
+
+    #[test]
+    fn court_ruling_record_is_idempotent_for_same_winner() {
+        let (db, path) = temp_db();
+        let fp = "deadbeef";
+        let (r1, created1) = db
+            .court_ruling_record(fp, "mem-winner", "mem-loser", "accept", "importance", "importance", "receipt-1", "smoke")
+            .expect("first record");
+        assert!(created1);
+        assert_eq!(r1["status"], "active");
+        let (r2, created2) = db
+            .court_ruling_record(fp, "mem-winner", "mem-loser", "accept", "importance", "importance", "receipt-2", "smoke")
+            .expect("idempotent re-record");
+        assert!(!created2);
+        assert_eq!(r1["id"], r2["id"], "same ruling returned");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn court_ruling_refuses_different_winner_while_active() {
+        let (db, path) = temp_db();
+        let fp = "feedface";
+        db.court_ruling_record(fp, "mem-winner", "mem-loser", "accept", "", "importance", "r", "smoke")
+            .expect("record");
+        let err = db
+            .court_ruling_record(fp, "mem-other", "mem-loser", "accept", "", "importance", "r", "smoke")
+            .expect_err("different winner must be refused while active");
+        assert!(err.to_string().contains("reverse it before re-ruling"), "{err}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn court_ruling_reverse_reopens_the_pair() {
+        let (db, path) = temp_db();
+        let fp = "cafebabe";
+        let (r1, _) = db
+            .court_ruling_record(fp, "mem-winner", "mem-loser", "accept", "", "importance", "r", "smoke")
+            .expect("record");
+        assert!(db.court_ruling_find_active(fp).unwrap().is_some());
+        let rev = db.court_ruling_reverse(&r1["id"].as_str().unwrap(), "operator").expect("reverse");
+        assert_eq!(rev["status"], "reversed");
+        assert!(db.court_ruling_find_active(fp).unwrap().is_none(), "pair reopened");
+        let (r2, created) = db
+            .court_ruling_record(fp, "mem-other", "mem-loser", "accept", "", "importance", "r", "smoke")
+            .expect("re-record after reverse");
+        assert!(created);
+        assert_ne!(r1["id"], r2["id"]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn court_ruling_reverse_is_idempotent_and_rejects_missing() {
+        let (db, path) = temp_db();
+        let (r1, _) = db
+            .court_ruling_record("aa11", "mem-winner", "mem-loser", "accept", "", "importance", "r", "smoke")
+            .expect("record");
+        let rev = db.court_ruling_reverse(&r1["id"].as_str().unwrap(), "op").expect("reverse");
+        let rev2 = db.court_ruling_reverse(&r1["id"].as_str().unwrap(), "op").expect("reverse again");
+        assert_eq!(rev["status"], rev2["status"]);
+        assert_eq!(rev["status"], "reversed");
+        let err = db.court_ruling_reverse("rul-nope", "op").expect_err("missing id");
+        assert!(err.to_string().contains("no ruling with id"), "{err}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn court_ruling_list_filters_by_status() {
+        let (db, path) = temp_db();
+        db.court_ruling_record("fp-1", "mem-a", "mem-b", "accept", "", "importance", "r", "smoke").expect("r1");
+        let (r2, _) = db.court_ruling_record("fp-2", "mem-c", "mem-d", "accept", "", "importance", "r", "smoke").expect("r2");
+        db.court_ruling_reverse(&r2["id"].as_str().unwrap(), "op").expect("rev");
+        let all = db.court_ruling_list(None, 10).expect("list all");
+        assert_eq!(all.len(), 2);
+        let active = db.court_ruling_list(Some("active"), 10).expect("list active");
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0]["pair_fingerprint"], "fp-1");
+        let reversed = db.court_ruling_list(Some("reversed"), 10).expect("list reversed");
+        assert_eq!(reversed.len(), 1);
+        assert_eq!(reversed[0]["pair_fingerprint"], "fp-2");
         let _ = std::fs::remove_file(path);
     }
 

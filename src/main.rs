@@ -3,6 +3,7 @@ mod capture;
 mod claim_card;
 mod communities;
 mod connectors;
+mod court_audit;
 mod db;
 mod declared;
 mod dedup;
