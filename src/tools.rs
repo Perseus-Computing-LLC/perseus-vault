@@ -1990,12 +1990,29 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
     let include_outcome = a.include_outcome || outcome.status != crate::models::RecallStatus::Fresh;
 
     let mut result = if items_expanded.is_empty() {
-        json!({
+        let mut r = json!({
             "items": items_expanded,
             "total": 0,
             // #677: self-describing empty result — see empty_recall_diagnostic.
             "diagnostic": empty_recall_diagnostic(db, &mode_for_side_effects),
-        })
+        });
+        // #929: opt-in live-web gap signal. Only when the feature is enabled
+        // (PERSEUS_VAULT_WEB_GAP_FILL_ENABLED=1); default recalls stay
+        // byte-identical. Never an implicit recall fallback — the agent
+        // decides whether to fetch, via perseus_vault_web_gap_fill.
+        if crate::web_gap_fill::web_gap_fill_enabled() {
+            if let Some(obj) = r.as_object_mut() {
+                obj.insert(
+                    "gap".to_string(),
+                    json!(true),
+                );
+                obj.insert(
+                    "gap_fill".to_string(),
+                    json!("memory missed the relevance bar; use perseus_vault_web_gap_fill with agent-fetched, grounded content"),
+                );
+            }
+        }
+        r
     } else {
         json!({
             "items": items_expanded,
@@ -6189,6 +6206,174 @@ pub fn handle_eval_history(db: &Database, args: Value) -> Result<String, String>
         "latest": latest,
         "note": "read-only eval history; regressed runs also surface in perseus_vault_operator_review",
         "read_only": true,
+    })
+    .to_string())
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WebGapFillArgs {
+    pub query: String,
+    pub content: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub sources: Vec<String>,
+    #[serde(default = "default_web_category")]
+    pub category: String,
+    #[serde(default)]
+    pub key: String,
+    #[serde(default)]
+    pub workspace_hash: String,
+    #[serde(default)]
+    pub agent_id: String,
+    #[serde(default)]
+    pub requesting_agent_id: String,
+    #[serde(default)]
+    pub relevance_score: Option<f64>,
+}
+
+fn default_web_category() -> String {
+    "web".to_string()
+}
+
+/// #929: live-web gap-fill — opt-in write-back of agent-fetched, grounded
+/// content. The Vault NEVER fetches from the network; the agent fetches with
+/// its own tools and reports the content + source URLs here. This handler
+/// validates (opt-in gate, per-workspace host allowlist, http/https only,
+/// no private/reserved literal IPs, bounded sizes, fail-closed secret scan,
+/// relevance floor, per-workspace rate limit) and writes through the normal
+/// audited remember path as unverified-until-confirmed — never auto-promoted.
+pub fn handle_web_gap_fill(db: &Database, args: Value) -> Result<String, String> {
+    use crate::web_gap_fill::{
+        check_and_bump_rate, content_key, host_allowed, host_is_private_literal, load_allowlist,
+        min_relevance, parse_source_url, rate_limit_per_hour, scan_secrets,
+        web_gap_fill_enabled, workspace_allowed_hosts, MAX_CONTENT_CHARS, MAX_QUERY_CHARS,
+        MAX_SOURCES, MAX_TITLE_CHARS,
+    };
+    if !web_gap_fill_enabled() {
+        return Err(
+            "web_gap_fill is disabled (opt-in): set PERSEUS_VAULT_WEB_GAP_FILL_ENABLED=1".to_string(),
+        );
+    }
+    let a: WebGapFillArgs = serde_json::from_value(args)
+        .map_err(|e| format!("Invalid web_gap_fill arguments: {e}"))?;
+    let query = a.query.trim();
+    if query.is_empty() || query.chars().count() > MAX_QUERY_CHARS {
+        return Err(format!(
+            "query must be 1..={MAX_QUERY_CHARS} chars"
+        ));
+    }
+    if a.content.is_empty() || a.content.chars().count() > MAX_CONTENT_CHARS {
+        return Err(format!(
+            "content must be 1..={MAX_CONTENT_CHARS} chars"
+        ));
+    }
+    if a.title.chars().count() > MAX_TITLE_CHARS {
+        return Err(format!("title must be at most {MAX_TITLE_CHARS} chars"));
+    }
+    if a.category.is_empty()
+        || a.category.chars().count() > 64
+        || !a
+            .category
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+    {
+        return Err(format!(
+            "category must be 1..=64 lowercase [a-z0-9_-] chars, got {:?}",
+            a.category
+        ));
+    }
+    if a.key.chars().count() > 128 {
+        return Err("key must be at most 128 chars".to_string());
+    }
+    if a.workspace_hash.trim().is_empty() {
+        return Err("workspace_hash is required for web gap-fill".to_string());
+    }
+    let ws = a.workspace_hash.trim();
+    let score = a.relevance_score.unwrap_or(0.0);
+    if !score.is_finite() || !(0.0..=1.0).contains(&score) {
+        return Err(format!("relevance_score must be in [0,1], got {score}"));
+    }
+    let min = min_relevance();
+    if score < min {
+        return Err(format!(
+            "below relevance bar ({score} < {min}): not written back"
+        ));
+    }
+    let allowlist = load_allowlist()?;
+    let Some(hosts) = workspace_allowed_hosts(&allowlist, ws) else {
+        return Err(format!(
+            "workspace {ws} is not allowlisted for web gap-fill (PERSEUS_VAULT_WEB_ALLOWLIST)"
+        ));
+    };
+    if a.sources.is_empty() || a.sources.len() > MAX_SOURCES {
+        return Err(format!("sources must be 1..={MAX_SOURCES} URLs"));
+    }
+    for src in &a.sources {
+        let host = parse_source_url(src)?;
+        if host_is_private_literal(&host) {
+            return Err(format!(
+                "source host {host} is a private/reserved literal address — refused"
+            ));
+        }
+        if !host_allowed(hosts, &host) {
+            return Err(format!(
+                "source host {host} is not on the workspace allowlist — refused"
+            ));
+        }
+    }
+    if let Some(class) = scan_secrets(&a.content) {
+        return Err(format!(
+            "content contains a secret-like pattern ({class}); refuse to store"
+        ));
+    }
+    check_and_bump_rate(db, ws, rate_limit_per_hour())?;
+    let now = now_ms();
+    let key = if a.key.trim().is_empty() {
+        content_key(&a.content)
+    } else {
+        a.key.trim().to_string()
+    };
+    let body_json = serde_json::json!({
+        "content": a.content,
+        "title": a.title,
+        "query": query,
+        "verification": "unverified_until_confirmed",
+        "fetched_at_unix_ms": now,
+        "sources": a.sources,
+    })
+    .to_string();
+    let origin = OriginRecord {
+        memory_kind: Some("observed".to_string()),
+        source_system: Some("web_gap_fill".to_string()),
+        capture_method: Some("agent_fetch".to_string()),
+        observed_at_unix_ms: Some(now),
+    };
+    let remember = handle_remember(
+        db,
+        json!({
+            "category": a.category,
+            "key": key,
+            "body_json": body_json,
+            "workspace_hash": ws,
+            "agent_id": a.agent_id,
+            "requesting_agent_id": a.requesting_agent_id,
+            "origin": origin,
+            // The content-hash key already dedups identical pages; skip the
+            // trigram near-duplicate merge so distinct pages stay distinct.
+            "skip_dedup": true,
+        }),
+    )?;
+    let rv: Value =
+        serde_json::from_str(&remember).map_err(|e| format!("remember response decode failed: {e}"))?;
+    Ok(json!({
+        "ok": true,
+        "written": rv.get("id").cloned().unwrap_or(Value::Null),
+        "category": a.category,
+        "key": key,
+        "verification": "unverified_until_confirmed",
+        "deduped": rv.get("deduped").cloned().unwrap_or(Value::Bool(false)),
+        "note": "stored unverified until confirmed; never auto-promoted",
     })
     .to_string())
 }
@@ -12564,6 +12749,227 @@ mod tests {
             .unwrap()
             .starts_with("cor-"));
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ── #929: live-web gap-fill (opt-in) ──────────────────────────────
+
+    fn web_allowlist_file(ws: &str, hosts: &[&str]) -> String {
+        let path = std::env::temp_dir().join(format!(
+            "pv-web-allow-{}-{}.json",
+            std::process::id(),
+            Uuid::new_v4().simple()
+        ));
+        let hosts_json = hosts
+            .iter()
+            .map(|h| format!("\"{h}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        std::fs::write(&path, format!("{{\"{ws}\": [{hosts_json}]}}")).unwrap();
+        path.to_string_lossy().to_string()
+    }
+
+    fn web_gap_fill_args(ws: &str, content: &str) -> Value {
+        json!({
+            "query": "perseus vault regression alerts",
+            "content": content,
+            "title": "Vault docs",
+            "sources": ["https://docs.example.com/guide"],
+            "category": "web",
+            "workspace_hash": ws,
+            "agent_id": "smoke",
+            "relevance_score": 0.9,
+        })
+    }
+
+    #[test]
+    fn web_gap_fill_disabled_by_default_fails_closed() {
+        let _guard = crate::web_gap_fill::ENV_LOCK.lock().unwrap();
+        std::env::remove_var("PERSEUS_VAULT_WEB_GAP_FILL_ENABLED");
+        std::env::remove_var("PERSEUS_VAULT_WEB_ALLOWLIST");
+        let (db, path) = temp_db();
+        let err = handle_web_gap_fill(&db, web_gap_fill_args("ws-1", "clean content here"))
+            .expect_err("disabled gate must fail closed");
+        assert!(err.contains("disabled"), "{err}");
+        // Recall must stay byte-identical without the feature: no gap key.
+        let raw = handle_recall(
+            &db,
+            json!({"query": "zzzznonexistent", "mode": "fts5"}),
+        )
+        .expect("recall");
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        assert!(v.get("gap").is_none(), "{raw}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn web_gap_fill_rejects_unallowlisted_workspace_and_bad_sources() {
+        let _guard = crate::web_gap_fill::ENV_LOCK.lock().unwrap();
+        std::env::set_var("PERSEUS_VAULT_WEB_GAP_FILL_ENABLED", "1");
+        let allow = web_allowlist_file("ws-allowed", &["docs.example.com"]);
+        std::env::set_var("PERSEUS_VAULT_WEB_ALLOWLIST", &allow);
+        let (db, path) = temp_db();
+        // workspace not in allowlist -> denied
+        let err = handle_web_gap_fill(&db, web_gap_fill_args("ws-other", "clean content"))
+            .expect_err("unallowlisted workspace");
+        assert!(err.contains("not allowlisted"), "{err}");
+        // non-http scheme -> denied
+        let mut args = web_gap_fill_args("ws-allowed", "clean content");
+        args["sources"] = json!(["ftp://docs.example.com/file"]);
+        let err = handle_web_gap_fill(&db, args).expect_err("ftp scheme");
+        assert!(err.contains("scheme"), "{err}");
+        // private literal IP -> denied even if allowlisted
+        let mut args = web_gap_fill_args("ws-allowed", "clean content");
+        args["sources"] = json!(["https://10.0.0.5/internal"]);
+        let err = handle_web_gap_fill(&db, args).expect_err("private IP");
+        assert!(err.contains("private/reserved"), "{err}");
+        // host not on the workspace allowlist -> denied
+        let mut args = web_gap_fill_args("ws-allowed", "clean content");
+        args["sources"] = json!(["https://en.wikipedia.org/wiki/Perseus"]);
+        let err = handle_web_gap_fill(&db, args).expect_err("host not allowlisted");
+        assert!(err.contains("not on the workspace allowlist"), "{err}");
+        std::env::remove_var("PERSEUS_VAULT_WEB_GAP_FILL_ENABLED");
+        std::env::remove_var("PERSEUS_VAULT_WEB_ALLOWLIST");
+        let _ = std::fs::remove_file(&allow);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn web_gap_fill_rejects_below_relevance_and_secret_content() {
+        let _guard = crate::web_gap_fill::ENV_LOCK.lock().unwrap();
+        std::env::set_var("PERSEUS_VAULT_WEB_GAP_FILL_ENABLED", "1");
+        let allow = web_allowlist_file("ws-a", &["docs.example.com"]);
+        std::env::set_var("PERSEUS_VAULT_WEB_ALLOWLIST", &allow);
+        let (db, path) = temp_db();
+        let mut args = web_gap_fill_args("ws-a", "clean content");
+        args["relevance_score"] = json!(0.1);
+        let err = handle_web_gap_fill(&db, args).expect_err("below relevance");
+        assert!(err.contains("below relevance"), "{err}");
+        let err = handle_web_gap_fill(
+            &db,
+            web_gap_fill_args(
+                "ws-a",
+                &format!("the token is {}{}", "sk", "-abcdefghijklmnopqrstuvwxyz123"),
+            ),
+        )
+        .expect_err("secret content");
+        assert!(err.contains("secret-like"), "{err}");
+        std::env::remove_var("PERSEUS_VAULT_WEB_GAP_FILL_ENABLED");
+        std::env::remove_var("PERSEUS_VAULT_WEB_ALLOWLIST");
+        let _ = std::fs::remove_file(&allow);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn web_gap_fill_writes_unverified_entity_with_provenance() {
+        let _guard = crate::web_gap_fill::ENV_LOCK.lock().unwrap();
+        std::env::set_var("PERSEUS_VAULT_WEB_GAP_FILL_ENABLED", "1");
+        let allow = web_allowlist_file("ws-a", &["docs.example.com"]);
+        std::env::set_var("PERSEUS_VAULT_WEB_ALLOWLIST", &allow);
+        let (db, path) = temp_db();
+        let raw = handle_web_gap_fill(
+            &db,
+            web_gap_fill_args("ws-a", "Perseus Vault ships scheduled recall evaluation."),
+        )
+        .expect("write");
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["ok"], json!(true));
+        assert_eq!(v["verification"], json!("unverified_until_confirmed"));
+        let id = v["written"].as_str().expect("written id");
+        assert!(id.starts_with("mem-"), "{raw}");
+        let ent = db.get_entity("web", &v["key"].as_str().unwrap()).unwrap().unwrap();
+        assert_eq!(ent.id, id);
+        let body: Value = serde_json::from_str(&ent.body_json).unwrap();
+        assert_eq!(body["verification"], json!("unverified_until_confirmed"));
+        assert_eq!(body["sources"][0], json!("https://docs.example.com/guide"));
+        assert_eq!(body["query"], json!("perseus vault regression alerts"));
+        // origin provenance is stored in the body
+        assert_eq!(body["origin"]["source_system"], json!("web_gap_fill"));
+        // same content again -> same key, update-in-place (dedup)
+        let raw2 = handle_web_gap_fill(
+            &db,
+            web_gap_fill_args("ws-a", "Perseus Vault ships scheduled recall evaluation."),
+        )
+        .expect("rewrite");
+        let v2: Value = serde_json::from_str(&raw2).unwrap();
+        assert_eq!(v2["key"], v["key"], "content-hash key dedups identical content");
+        std::env::remove_var("PERSEUS_VAULT_WEB_GAP_FILL_ENABLED");
+        std::env::remove_var("PERSEUS_VAULT_WEB_ALLOWLIST");
+        let _ = std::fs::remove_file(&allow);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn web_gap_fill_rate_limits_per_workspace() {
+        let _guard = crate::web_gap_fill::ENV_LOCK.lock().unwrap();
+        std::env::set_var("PERSEUS_VAULT_WEB_GAP_FILL_ENABLED", "1");
+        std::env::set_var("PERSEUS_VAULT_WEB_RATE_LIMIT", "2");
+        let allow = web_allowlist_file("ws-a", &["docs.example.com"]);
+        std::env::set_var("PERSEUS_VAULT_WEB_ALLOWLIST", &allow);
+        let (db, path) = temp_db();
+        handle_web_gap_fill(&db, web_gap_fill_args("ws-a", "first fetch content"))
+            .expect("first");
+        handle_web_gap_fill(&db, web_gap_fill_args("ws-a", "second fetch content"))
+            .expect("second");
+        let err = handle_web_gap_fill(&db, web_gap_fill_args("ws-a", "third fetch content"))
+            .expect_err("third must hit the cap");
+        assert!(err.contains("rate limit"), "{err}");
+        // another workspace keeps its own budget
+        let allow2 = web_allowlist_file("ws-b", &["docs.example.com"]);
+        std::env::set_var("PERSEUS_VAULT_WEB_ALLOWLIST", &allow2);
+        handle_web_gap_fill(&db, web_gap_fill_args("ws-b", "other workspace content"))
+            .expect("ws-b unaffected");
+        std::env::remove_var("PERSEUS_VAULT_WEB_GAP_FILL_ENABLED");
+        std::env::remove_var("PERSEUS_VAULT_WEB_ALLOWLIST");
+        std::env::remove_var("PERSEUS_VAULT_WEB_RATE_LIMIT");
+        let _ = std::fs::remove_file(&allow);
+        let _ = std::fs::remove_file(&allow2);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn recall_gap_signal_only_when_feature_enabled() {
+        let _guard = crate::web_gap_fill::ENV_LOCK.lock().unwrap();
+        let (db, path) = temp_db();
+        handle_remember(
+            &db,
+            json!({"category": "facts", "key": "k1", "body_json": "{\"note\":\"quorum call\"}"}),
+        )
+        .expect("seed");
+        // disabled baseline FIRST (feature off): the reference shape that
+        // every later disabled call must match byte-for-byte.
+        let baseline = handle_recall(
+            &db,
+            json!({"query": "zzzznonexistent", "mode": "fts5"}),
+        )
+        .expect("baseline");
+        // enabled -> empty recall carries the gap signal
+        std::env::set_var("PERSEUS_VAULT_WEB_GAP_FILL_ENABLED", "1");
+        let raw = handle_recall(
+            &db,
+            json!({"query": "zzzznonexistent", "mode": "fts5"}),
+        )
+        .expect("recall");
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["gap"], json!(true), "{raw}");
+        assert!(v["gap_fill"].as_str().unwrap().contains("web_gap_fill"));
+        // non-empty recall carries no gap key
+        let raw2 = handle_recall(&db, json!({"query": "quorum", "mode": "fts5"})).expect("recall2");
+        let v2: Value = serde_json::from_str(&raw2).unwrap();
+        assert!(v2.get("gap").is_none(), "{raw2}");
+        // disabled -> byte-identical empty recall (no gap key)
+        std::env::remove_var("PERSEUS_VAULT_WEB_GAP_FILL_ENABLED");
+        let raw3 = handle_recall(
+            &db,
+            json!({"query": "zzzznonexistent", "mode": "fts5"}),
+        )
+        .expect("recall3");
+        let v3: Value = serde_json::from_str(&raw3).unwrap();
+        assert!(v3.get("gap").is_none(), "{raw3}");
+        // Byte-identical with the feature off (baseline vs the later
+        // disabled call) — the gap signal must be a strict opt-in addition,
+        // never a mutation of the default recall shape.
+        assert_eq!(baseline, raw3, "disabled recall must be byte-identical");
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
