@@ -73,11 +73,17 @@ jobs:
       # entrypoint/CMD or runtime-only failure sailed through. Smoke it with
       # an MCP stdio handshake against the default serve command.
       - name: Smoke — MCP stdio handshake inside the built image
+        env:
+          IMG_BASE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
         run: |
+          # github.repository is uppercase (Perseus-Computing-LLC/...); docker
+          # requires lowercase repository names, and metadata-action already
+          # lowercases the tag it emits — match it.
+          img="${IMG_BASE,,}:smoke"
           out=$(printf '%s\n' \
             '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"smoke","version":"0"}}}' \
             '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
-            | docker run --rm -i "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:smoke")
+            | docker run --rm -i "$img")
           echo "$out"
           echo "$out" | grep -q '"protocolVersion"' || { echo "initialize failed"; exit 1; }
           echo "$out" | grep -q 'perseus_vault_remember' || { echo "tools/list missing perseus_vault_remember"; exit 1; }
