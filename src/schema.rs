@@ -1638,6 +1638,8 @@ fn apply_migrations(conn: &Connection) -> Result<(), Box<dyn std::error::Error>>
     // nightly after-action summary. Booleans/counters/digests/rates only —
     // raw prompts, bodies, tool arguments, and credentials never land here
     // (the harness report already excludes them; record validates).
+    // Also under v38 (#940): court-of-record rulings (same migration level;
+    // both tables are probed idempotently below).
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS eval_runs (
             id TEXT PRIMARY KEY,
@@ -1662,7 +1664,26 @@ fn apply_migrations(conn: &Connection) -> Result<(), Box<dyn std::error::Error>>
         CREATE INDEX IF NOT EXISTS idx_eval_runs_kind
             ON eval_runs(eval_kind, run_at_unix_ms);
         CREATE INDEX IF NOT EXISTS idx_eval_runs_regressed
-            ON eval_runs(regressed, run_at_unix_ms);",
+            ON eval_runs(regressed, run_at_unix_ms);
+        CREATE TABLE IF NOT EXISTS court_rulings (
+            id TEXT PRIMARY KEY,
+            pair_fingerprint TEXT NOT NULL,
+            winner_id TEXT NOT NULL,
+            loser_id TEXT NOT NULL,
+            ruling TEXT NOT NULL,
+            rationale TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'active',
+            decided_by TEXT NOT NULL DEFAULT '',
+            supersede_receipt TEXT NOT NULL DEFAULT '',
+            created_at_unix_ms INTEGER NOT NULL,
+            reversed_at_unix_ms INTEGER,
+            reversed_by TEXT NOT NULL DEFAULT '',
+            UNIQUE(pair_fingerprint, status)
+        );
+        CREATE INDEX IF NOT EXISTS idx_court_rulings_pair
+            ON court_rulings(pair_fingerprint);
+        CREATE INDEX IF NOT EXISTS idx_court_rulings_status
+            ON court_rulings(status, created_at_unix_ms);",
     )?;
     // ── end v38 ────────────────────────────────────────────────────────
 

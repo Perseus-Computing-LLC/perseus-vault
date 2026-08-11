@@ -6022,6 +6022,100 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Supersede Entity"
   },
   {
+    "name": "perseus_vault_consistency_audit",
+    "description": "Read-only court-of-record self-audit (#940): scans the category for contradiction pairs, recommends a deterministic winner per pair (importance → source-authority → recency → id), surfaces pairs with an existing active ruling, lists supersession lag (deprecated entities without a live successor), and reports the pending keystone suggestion count. NEVER mutates: run before ruling, decide with perseus_vault_audit_ruling.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "category": {
+          "type": "string",
+          "description": "Category to audit (default: facts)",
+          "default": "facts"
+        },
+        "limit": {
+          "type": "integer",
+          "description": "Max contradiction pairs to scan (clamped 1-200, default 50)",
+          "default": 50
+        }
+      }
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "findings": {
+          "type": "array",
+          "description": "Per-pair: recommendation {winner_id, winner_key, decided_by} or already_ruled {ruling_id, winner_id}"
+        },
+        "supersession_lag": {
+          "type": "array"
+        },
+        "keystone_pending": {
+          "type": "integer"
+        },
+        "read_only": {
+          "type": "boolean",
+          "description": "Always true — the audit never mutates"
+        }
+      }
+    },
+    "title": "Consistency Audit (court of record)"
+  },
+  {
+    "name": "perseus_vault_audit_ruling",
+    "description": "Idempotent operator ruling over a consistency finding (#940): accept compiles the recommended winner into the supersede guard (winner→loser link, loser valid-period closed, status deprecated); override compiles an explicit winner; reverse reopens a ruled pair for re-litigation (the compiled guard remains). Rulings are recorded + journaled (court_ruling_set/court_ruling_reversed); an active ruling with a different winner is refused until reversed.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "action": {
+          "type": "string",
+          "enum": ["accept", "override", "reverse"],
+          "description": "accept = compile the ladder-recommended winner; override = compile an explicit winner; reverse = reopen a ruled pair"
+        },
+        "category": {
+          "type": "string",
+          "description": "Category of entity_a/entity_b (default: facts)",
+          "default": "facts"
+        },
+        "entity_a_key": {
+          "type": "string",
+          "description": "Key of the first contested entity (accept/override)"
+        },
+        "entity_b_key": {
+          "type": "string",
+          "description": "Key of the second contested entity (accept/override)"
+        },
+        "winner_category": {
+          "type": "string",
+          "description": "Override only: category of the explicit winner"
+        },
+        "winner_key": {
+          "type": "string",
+          "description": "Override only: key of the explicit winner"
+        },
+        "ruling_id": {
+          "type": "string",
+          "description": "Reverse only: id of the active ruling to reopen"
+        },
+        "rationale": {
+          "type": "string",
+          "description": "Optional ruling rationale (recorded verbatim)",
+          "default": ""
+        },
+        "decided_by": {
+          "type": "string",
+          "description": "Who decided (default: operator)",
+          "default": "operator"
+        }
+      },
+      "required": ["action"]
+    },
+    "annotations": {
+      "destructiveHint": false,
+      "readOnlyHint": false
+    },
+    "title": "Audit Ruling (court of record)"
+  },
+  {
     "name": "perseus_vault_maintenance",
     "description": "Database maintenance operations: deduplicate entities with identical (category, key), detect orphan journal entries and links, vacuum (reclaim disk space), reindex FTS5, and enforce the entity_history retention policy (#398 — no-op unless PERSEUS_VAULT_HISTORY_* env knobs are set). Set dry_run=true to preview. Use 'all' to run everything.",
     "inputSchema": {
@@ -6725,6 +6819,8 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
 
         "perseus_vault_autocohere" => tools::handle_autocohere(db, args).map_err(|e| e.to_string()),
         "perseus_vault_supersede" => tools::handle_supersede(db, args).map_err(|e| e.to_string()),
+        "perseus_vault_consistency_audit" => tools::handle_consistency_audit(db, args),
+        "perseus_vault_audit_ruling" => tools::handle_audit_ruling(db, args),
         "perseus_vault_maintenance" => {
             tools::handle_maintenance(db, args).map_err(|e| e.to_string())
         }
@@ -6790,7 +6886,7 @@ mod tests {
         );
         assert_eq!(
             registry_names.len(),
-            124,
+            126,
             "update public metadata when adding a tool"
         );
 

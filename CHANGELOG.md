@@ -24,6 +24,18 @@ All notable changes to Perseus Vault are documented here. This project adheres t
   IPs refused, fail-closed secret scan, relevance floor, per-workspace rate
   limit. Enabled empty recalls emit a `gap` signal (never an implicit
   fallback). Docs: `docs/web-gap-fill.md`.
+- **Court-of-record governance (#940).** New `perseus_vault_consistency_audit`
+  (read-only: contradiction pairs + deterministic winner recommendation via
+  the importance → source-authority → recency → id ladder, already-ruled
+  pairs, supersession lag, keystone-pending count) and
+  `perseus_vault_audit_ruling` (idempotent accept/override/reverse; accept
+  and override compile the winner into the existing supersede guard — link,
+  valid-period close, status deprecation — and record the ruling +
+  `supersede_receipt`; reverse reopens a pair for re-litigation). New
+  `court_rulings` table (schema v38, bounded id/digest projection), every
+  ruling journaled (`court_ruling_set` / `court_ruling_reversed`). Registry
+  122→124. Docs: `docs/specs/court-of-record.md` (design),
+  `docs/court-of-record.md` (ops).
 
 ## [2.23.0] - 2026-08-10
 
