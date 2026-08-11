@@ -27,7 +27,7 @@ perseus-vault/
 | **Integration type** | Manual MCP tool calls | Native `MemoryProvider` plugin |
 | **Memory injection** | Manual `perseus_vault_context` | Automatic — `prefetch()` recall block injected before each turn |
 | **Capture** | Manual `perseus_vault_remember` | Scoped session-end capture + built-in memory mirroring |
-| **Tool surface** | All 81 MCP tools (incl. admin) | Curated 9-tool allowlist (read + scoped writes only) |
+| **Tool surface** | All MCP tools (incl. admin) | Curated 9-tool allowlist (read + scoped writes only) |
 | **Setup** | `hermes mcp add perseus-vault` | One installer: plugin + `.env` token + `memory.provider` |
 
 ## Architecture
@@ -48,7 +48,7 @@ perseus-vault/
 ┌─────────────────────────────────────────────────────────────┐
 │              PERSEUS VAULT MCP SERVER                       │
 │  (Your server: host:port)                                   │
-│  • 81 MCP tools — provider exposes a curated 9-tool subset  │
+│  • MCP tools — provider exposes a curated 9-tool subset  │
 │  • SQLite + FTS5 + vector embeddings                        │
 │  • Bi-temporal queries, decay, consolidation (nightly cron) │
 └─────────────────────────────────────────────────────────────┘
