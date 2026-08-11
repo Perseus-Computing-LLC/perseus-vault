@@ -3,8 +3,10 @@ name: Scale gate
 # #474: latency budgets enforced by benchmark/scale/gate.py.
 #
 # Two speeds:
-#   - Fast gate at 10K on pushes to main (a 10K load + dense build + query
-#     sweep is a few minutes).
+#   - Fast gate at 10K on pushes to main AND pull requests (a 10K load +
+#     dense build + query sweep is a few minutes; PRs get the dense 10K path
+#     so write/latency regressions surface pre-merge — perf-gate covers the
+#     lean path only).
 #   - Weekly 100K run — a 100K bulk load currently takes ~4h (the O(N)-ish
 #     per-write cost documented in report.json; #476 tracks the fix), which
 #     fits the 6h job limit but has no business on every push.
@@ -13,6 +15,14 @@ name: Scale gate
 
 on:
   push:
+    branches: [main, master]
+    paths:
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "benchmark/scale/**"
+      - ".github/workflows/scale-gate.yml"
+  pull_request:
     branches: [main, master]
     paths:
       - "src/**"
@@ -38,8 +48,9 @@ jobs:
   scale-gate:
     # Default 2-vCPU runner: ubuntu-8core labels do NOT provision on this
     # repository (queued runs sat without a runner for 1h+ — #898). Budgets in
-    # benchmark/scale/gate.py are calibrated to this runner (measured p99s x3
-    # headroom; see the 2026-08-08 recalibration in #898 / #900).
+    # benchmark/scale/gate.py are calibrated to this runner (measured x3
+    # headroom; see the 2026-08-08 recalibration in #898 / #900 and the
+    # 2026-08-11 write-budget re-recalibration note in gate.py).
     runs-on: ubuntu-latest
     timeout-minutes: 350
     steps:
