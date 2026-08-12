@@ -283,6 +283,7 @@ mod tests {
             epistemic_state: crate::models::default_epistemic_state(),
             hints: vec![],
             embedding: None,
+            memory_type: String::new(),
             _parsed_body: None,
         };
         let e1 = make("a-1", "{\"text\":\"mattress warranty coverage details\"}");
