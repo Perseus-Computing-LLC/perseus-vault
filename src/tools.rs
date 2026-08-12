@@ -8941,6 +8941,8 @@ pub fn handle_consistency_audit(db: &Database, args: Value) -> Result<String, St
             importance: body_importance(&a_ent),
             source: a_ent.source.clone(),
             created_at_unix_ms: a_ent.created_at_unix_ms,
+            // #960: source-grounded encoding strength (S1..S5).
+            encoding_strength: crate::models::encoding_strength(&a_ent),
         };
         let cb = crate::court_audit::Candidate {
             id: b_ent.id.clone(),
@@ -8949,14 +8951,19 @@ pub fn handle_consistency_audit(db: &Database, args: Value) -> Result<String, St
             importance: body_importance(&b_ent),
             source: b_ent.source.clone(),
             created_at_unix_ms: b_ent.created_at_unix_ms,
+            encoding_strength: crate::models::encoding_strength(&b_ent),
         };
         let rec = crate::court_audit::recommend(&ca, &cb);
         findings.push(serde_json::json!({
             "pair_fingerprint": fp,
             "entity_a": {"id": a_ent.id, "key": a_ent.key, "importance": body_importance(&a_ent),
-                         "source": a_ent.source, "created_at_unix_ms": a_ent.created_at_unix_ms},
+                         "source": a_ent.source, "created_at_unix_ms": a_ent.created_at_unix_ms,
+                         // #960: source-grounded encoding tier, visible so
+                         // consumers can see why one fact outranked another.
+                         "encoding_strength": crate::models::encoding_strength_label(crate::models::encoding_strength(&a_ent))},
             "entity_b": {"id": b_ent.id, "key": b_ent.key, "importance": body_importance(&b_ent),
-                         "source": b_ent.source, "created_at_unix_ms": b_ent.created_at_unix_ms},
+                         "source": b_ent.source, "created_at_unix_ms": b_ent.created_at_unix_ms,
+                         "encoding_strength": crate::models::encoding_strength_label(crate::models::encoding_strength(&b_ent))},
             "similarity": pair.get("similarity"),
             "conflict_likely": pair.get("conflict_likely"),
             "recommendation": {
@@ -9057,6 +9064,8 @@ pub fn handle_audit_ruling(db: &Database, args: Value) -> Result<String, String>
                     importance: body_importance(&ent_a),
                     source: ent_a.source.clone(),
                     created_at_unix_ms: ent_a.created_at_unix_ms,
+                    // #960: source-grounded encoding strength (S1..S5).
+                    encoding_strength: crate::models::encoding_strength(&ent_a),
                 };
                 let cb = crate::court_audit::Candidate {
                     id: ent_b.id.clone(),
@@ -9065,6 +9074,7 @@ pub fn handle_audit_ruling(db: &Database, args: Value) -> Result<String, String>
                     importance: body_importance(&ent_b),
                     source: ent_b.source.clone(),
                     created_at_unix_ms: ent_b.created_at_unix_ms,
+                    encoding_strength: crate::models::encoding_strength(&ent_b),
                 };
                 let rec = crate::court_audit::recommend(&ca, &cb);
                 let (w, l) = if rec.winner.id == ent_a.id {
@@ -13695,6 +13705,59 @@ mod tests {
         assert_eq!(finding["recommendation"]["winner_id"], id_a.as_str(), "higher importance wins");
         assert_eq!(finding["recommendation"]["decided_by"], "importance");
         assert!(finding.get("already_ruled").is_none());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn encoding_strength_dominates_audit_recommendation_and_surfaces_in_recall() {
+        let (db, path) = temp_db();
+        // Chat inference (S1) with HIGH importance; code-grounded (S5) with
+        // LOW importance. The hard rule must pick code anyway.
+        handle_remember(
+            &db,
+            json!({"category": "facts", "key": "chat-fact",
+                   "body_json": "{\"note\":\"the deployment setup relies on compose definitions for containers\", \"importance\": 0.9}"}),
+        )
+        .unwrap();
+        handle_remember(
+            &db,
+            json!({"category": "facts", "key": "code-fact",
+                   "body_json": "{\"note\":\"alpha deployment pipeline uses docker compose v2 with kubernetes orchestration\", \"index_type\": \"ide_symbol\", \"mode\": \"reference\"}"}),
+        )
+        .unwrap();
+        let raw = handle_consistency_audit(&db, json!({"category": "facts"})).expect("audit");
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        let findings = v["findings"].as_array().unwrap();
+        assert!(!findings.is_empty(), "{raw}");
+        // The tier labels are exposed on both sides of every finding.
+        let mut tiers = std::collections::HashSet::new();
+        for f in findings {
+            tiers.insert(f["entity_a"]["encoding_strength"].as_str().unwrap().to_string());
+            tiers.insert(f["entity_b"]["encoding_strength"].as_str().unwrap().to_string());
+        }
+        assert!(tiers.contains("S5"), "code-grounded tier must be visible: {tiers:?}");
+        assert!(
+            tiers.len() >= 2,
+            "both sides of the pair must carry tiers: {tiers:?}"
+        );
+        // Winner is the code-grounded entity, decided by strength.
+        let code_id = db.get_entity("facts", "code-fact").unwrap().unwrap().id;
+        let f = findings
+            .iter()
+            .find(|f| f["recommendation"]["winner_id"] == code_id.as_str())
+            .expect("code entity must win");
+        assert_eq!(f["recommendation"]["decided_by"], "encoding_strength", "{f}");
+        // Recall items expose the tier.
+        let r = handle_recall(&db, json!({"query": "deployment pipeline", "mode": "fts5", "limit": 10}))
+            .expect("recall");
+        let rv: Value = serde_json::from_str(&r).unwrap();
+        let item = rv["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["id"] == code_id.as_str())
+            .expect("code entity in recall");
+        assert_eq!(item["encoding_strength"], json!("S5"), "{item}");
         let _ = std::fs::remove_file(path);
     }
 
