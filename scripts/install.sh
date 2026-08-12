@@ -101,12 +101,22 @@ trap 'rm -rf "$TMP_DIR"' EXIT
 # ── Download + verify + extract ──────────────────────────────────────
 try_install() {  # try_install <asset_base> → 0 if downloaded/verified/extracted
     local base="$1"
-    local tgz="${base}.tar.gz" sha="${base}.sha256"
+    local tgz="${base}.tar.gz" sha="${base}.sha256" legacy_sha="${base}.tar.gz.sha256"
     if ! fetch "$(release_url "$tgz")" "$TMP_DIR/$tgz"; then
         return 1
     fi
     echo -e "→ Downloaded ${BOLD}${tgz}${RESET}"
-    if fetch "$(release_url "$sha")" "$TMP_DIR/$sha"; then
+    if ! fetch "$(release_url "$sha")" "$TMP_DIR/$sha"; then
+        # #992: releases v2.21.0–v2.23.0 published the Darwin checksum under
+        # '<archive>.tar.gz.sha256' by mistake. Accept the legacy name but
+        # ALWAYS verify — its content is still a real checksum of the same
+        # archive, so the security posture is unchanged (fail closed if the
+        # checksum is missing or fails verification).
+        if fetch "$(release_url "$legacy_sha")" "$TMP_DIR/$sha"; then
+            echo -e "→ Using legacy checksum name ${BOLD}${legacy_sha}${RESET}"
+        fi
+    fi
+    if [ -f "$TMP_DIR/$sha" ]; then
         if ( cd "$TMP_DIR" && verify_sha "$sha" ); then
             echo "→ Checksum verified"
         else
