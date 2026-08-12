@@ -1,0 +1,35 @@
+{
+  "corpus": {
+    "entities": 200,
+    "categories": 20
+  },
+  "ingest": {
+    "seconds": 0.25
+  },
+  "consolidate": {
+    "entities_examined": 20,
+    "elapsed_ms": 6.9,
+    "entities_per_sec": 2905.2,
+    "observations_created": 2,
+    "guard": {
+      "force": false,
+      "slo": {
+        "budget_ms": null,
+        "last_probe_ms": 0
+      },
+      "slo_paused": false,
+      "window": {
+        "configured": null,
+        "open": true
+      }
+    }
+  },
+  "recall": {
+    "p95_pre_ms": 81.86,
+    "p95_post_ms": 3.13,
+    "slo_ratio": 0.04
+  },
+  "environment": {
+    "binary": "/opt/data/work-vault-955/target/release/perseus-vault"
+  }
+}

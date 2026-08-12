@@ -4846,6 +4846,36 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Detect Conflicting Entities"
   },
   {
+    "name": "perseus_vault_maintenance_status",
+    "description": "#952: read-only maintenance/serving isolation observability. Reports the off-peak maintenance window (configured value, whether it is open now, parse errors), the live-recall SLO budget (PERSEUS_VAULT_MAINTENANCE_P95_BUDGET_MS, last probe latency), the execution-slot state (one maintenance run at a time; held = an operator-explicit run is executing), and lifetime counters (runs started / refused by the gate / mid-run SLO pauses). Maintenance is serialized, never reserved (a disabled mode consumes zero capacity), and gated by window+budget unless force:true — see docs/specs/maintenance-serving-isolation.md.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "required": []
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "window": {
+          "type": "object",
+          "description": "Configured off-peak window (PERSEUS_VAULT_MAINTENANCE_WINDOW, UTC HH:MM-HH:MM), whether it is open now, and any parse error (malformed config fails closed)."
+        },
+        "slo": {
+          "type": "object",
+          "description": "Live-recall SLO budget ms (PERSEUS_VAULT_MAINTENANCE_P95_BUDGET_MS; null = guard off) and the last measured recall probe latency."
+        },
+        "lock": {
+          "type": "object",
+          "description": "Execution slot: held (bool) and the operation holding it, if any."
+        },
+        "counters": {
+          "type": "object",
+          "description": "Lifetime counters: runs_started, runs_refused (gate refusals), slo_pauses (mid-run pauses)."
+        }
+      }
+    }
+  },
+  {
     "name": "perseus_vault_consolidate",
     "description": "Merge overlapping/duplicative entities in the same category into durable, evidence-tracked 'observations' — the mirror image of perseus_vault_conflicts, which flags dissimilar (contradictory) pairs. Groups entities whose pairwise trigram similarity meets similarity_threshold, then creates one new entity per group (category='observation') whose body carries a summary (the highest-certainty source's content), exact-quote evidence refs (source id + verbatim quote, capped by quote_cap_chars), the full list of source entity ids as evidence, a proof_count, updated_at, a staleness flag, and (on contradiction) a preserved journey in history. The observation links back to each source (relationship='evidence_for') for full audit. #884: with refine_existing (default true), new evidence FOLDS into the best-matching existing observation (proof_count grows, no duplicates) and contradictions reconcile into its journey — 'was React, switched to Vue' — with raw facts intact for trace-back; fold/refine writes go through the audited re-assert path (entity_history snapshot). A staleness refresh pass marks observations stale when newer unconsolidated facts exist. By default sources stay live; set archive_sources=true to retire merged sources of FRESHLY CREATED observations only ('local dreaming' — verified or importance-floored sources are never archived), and cold_first=true to target the memories decay is about to claim. perseus_vault_autocohere runs a bounded cold_first+archive_sources pass automatically. Read-only preview with dry_run=true.",
     "inputSchema": {
@@ -6788,6 +6818,9 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
         "perseus_vault_declared_query" => tools::handle_declared_query(db, args).map_err(|e| e.to_string()),
         "perseus_vault_conflicts" => Ok(tools::handle_conflicts(db, args)),
         "perseus_vault_consolidate" => Ok(tools::handle_consolidate(db, args)),
+        "perseus_vault_maintenance_status" => {
+            tools::handle_maintenance_status(db, args).map_err(|e| e.to_string())
+        }
         "perseus_vault_dream" => tools::handle_dream(db, args),
         "perseus_vault_vault_export" => Ok(tools::handle_vault_export(db, args)),
         "perseus_vault_derived_export" => tools::handle_derived_export(db, args),
@@ -6886,7 +6919,7 @@ mod tests {
         );
         assert_eq!(
             registry_names.len(),
-            126,
+            127,
             "update public metadata when adding a tool"
         );
 

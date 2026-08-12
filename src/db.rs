@@ -16484,6 +16484,29 @@ impl Database {
         let mut interference_skips: i64 = 0;
         let now = now_ms();
 
+        // #952: maintenance/serving isolation — mid-run SLO probe between
+        // the read-only scan and the write phase. Over budget → pause: a
+        // zero-write partial report; the pause is surfaced via the
+        // maintenance_guard.slo_paused flag stamped by the handler.
+        if crate::maintenance::probe_over_budget(self) {
+            return Ok(crate::models::ConsolidateReport {
+                category: params.category.clone(),
+                entities_examined: n as i64,
+                observations_created: 0,
+                source_entities_merged: 0,
+                sources_archived: 0,
+                observations_refined: 0,
+                interference_skips: 0,
+                observations_refreshed: 0,
+                observations_stale: 0,
+                quotes_captured: 0,
+                dry_run: params.dry_run,
+                observations: Vec::new(),
+                workspace_hash: scope_ws,
+                global,
+            });
+        }
+
         // #884: load existing live observations in scope once — they are the
         // fold targets for refine_existing and the staleness refresh pass.
         // v1 bodies parse tolerantly (fallback updated_at = created_at).
@@ -17407,6 +17430,11 @@ impl Database {
             for cluster in cluster_list {
                 if cluster.len() < min_cluster {
                     continue;
+                }
+                // #952: maintenance/serving isolation — pause mid-run when
+                // the live-recall probe trips the budget.
+                if crate::maintenance::probe_over_budget(self) {
+                    break;
                 }
                 if report.clusters_dreamed >= params.max_clusters {
                     break;
@@ -20418,6 +20446,15 @@ last_accessed: {}
                     }
                 }
             }
+        }
+
+        // #952: maintenance/serving isolation — mid-run SLO probe between
+        // the read-only candidate discovery and the writer phase. Over
+        // budget → pause: drop the pending links (promotion + decay are
+        // already applied and idempotent; the next run completes grooming);
+        // the pause is surfaced via maintenance_guard.slo_paused.
+        if crate::maintenance::probe_over_budget(self) {
+            pending.clear();
         }
 
         // Re-enter the writer transaction only for the bounded read-modify-
@@ -25151,6 +25188,7 @@ mod tests {
                 requesting_agent_id: String::new(),
                 quote_cap_chars: 0,
                 refine_existing: false,
+                force: false,
             })
             .unwrap_err();
         assert!(err.to_string().contains("curated"), "err: {err}");
@@ -34779,6 +34817,7 @@ mod tests {
             requesting_agent_id: String::new(),
             refine_existing: true,
             quote_cap_chars: 512,
+        force: false,
         };
         let report = db.consolidate(&params).unwrap();
 
@@ -34871,6 +34910,7 @@ mod tests {
             requesting_agent_id: String::new(),
             refine_existing: true,
             quote_cap_chars: 512,
+        force: false,
         };
         let report = db.consolidate(&params).unwrap();
         assert_eq!(report.observations_created, 1);
@@ -34913,6 +34953,7 @@ mod tests {
             requesting_agent_id: String::new(),
             refine_existing: true,
             quote_cap_chars: 512,
+        force: false,
         };
         let report = db.consolidate(&params).unwrap();
         assert_eq!(
@@ -34972,6 +35013,7 @@ mod tests {
                 requesting_agent_id: String::new(),
                 refine_existing: true,
                 quote_cap_chars: 512,
+            force: false,
             })
             .unwrap();
         assert_eq!(report.observations_created, 1);
@@ -35087,6 +35129,7 @@ mod tests {
                 requesting_agent_id: String::new(),
                 refine_existing: true,
                 quote_cap_chars: 512,
+            force: false,
             })
             .unwrap();
         assert_eq!(report.observations_created, 1);
@@ -35118,6 +35161,7 @@ mod tests {
             requesting_agent_id: String::new(),
             refine_existing: true,
             quote_cap_chars: 512,
+        force: false,
         };
         let err = db.consolidate(&params).unwrap_err().to_string();
         assert!(
@@ -35147,6 +35191,7 @@ mod tests {
             requesting_agent_id: String::new(),
             refine_existing: true,
             quote_cap_chars: 512,
+        force: false,
         };
         let err3 = db.consolidate(&amb2).unwrap_err().to_string();
         assert!(err3.contains("mutually exclusive"), "{err3}");
@@ -35191,6 +35236,7 @@ mod tests {
                 requesting_agent_id: String::new(),
                 refine_existing: true,
                 quote_cap_chars: 512,
+            force: false,
             })
             .unwrap();
 
@@ -35240,6 +35286,7 @@ mod tests {
                 requesting_agent_id: String::new(),
                 refine_existing: true,
                 quote_cap_chars: 512,
+            force: false,
             })
             .unwrap();
         assert_eq!(report2.entities_examined, 1);
@@ -35285,6 +35332,7 @@ mod tests {
                 requesting_agent_id: String::new(),
                 refine_existing: true,
                 quote_cap_chars: 512,
+            force: false,
             })
             .unwrap();
         assert_eq!(report.observations_created, 1);
@@ -35354,6 +35402,7 @@ mod tests {
                 requesting_agent_id: "sweeper".to_string(),
                 refine_existing: true,
                 quote_cap_chars: 512,
+            force: false,
             })
             .unwrap();
 
@@ -35410,6 +35459,7 @@ mod tests {
                 requesting_agent_id: "ghost".to_string(),
                 refine_existing: true,
                 quote_cap_chars: 512,
+            force: false,
             })
             .unwrap_err()
             .to_string();
@@ -35433,6 +35483,7 @@ mod tests {
                 requesting_agent_id: "ghost".to_string(),
                 refine_existing: true,
                 quote_cap_chars: 512,
+            force: false,
             })
             .is_ok();
         assert!(ok, "scoped runs must not require a manifest");
@@ -35474,6 +35525,7 @@ mod tests {
                 requesting_agent_id: "maintainer".to_string(),
                 refine_existing: true,
                 quote_cap_chars: 512,
+            force: false,
             })
             .unwrap_err()
             .to_string();
@@ -35497,6 +35549,7 @@ mod tests {
                 requesting_agent_id: "maintainer".to_string(),
                 refine_existing: true,
                 quote_cap_chars: 512,
+            force: false,
             })
             .is_ok();
         assert!(ok, "scoped runs must not require the global capability");
@@ -35519,6 +35572,7 @@ mod tests {
             requesting_agent_id: String::new(),
             refine_existing: true,
             quote_cap_chars: 512,
+        force: false,
         }
     }
 
@@ -45573,6 +45627,7 @@ mod tests {
                 cold_first: false,
                 offset: 0,
                 global: false,
+                force: false,
             })
             .unwrap();
         assert!(
