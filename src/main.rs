@@ -52,9 +52,10 @@ mod trust_admission;
 mod util;
 mod validity;
 mod vector_quant;
-mod web;
 mod verify;
+mod web;
 mod web_gap_fill;
+mod write_gate;
 
 use clap::{Parser, Subcommand};
 use std::collections::BTreeMap;
