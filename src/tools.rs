@@ -2663,9 +2663,36 @@ pub fn handle_hygiene(db: &Database, args: Value) -> Result<String, String> {
     .to_string())
 }
 
+/// #996: extract the transport-stamped caller identity (authoritative — the
+/// MCP layer stamps `requesting_agent_id` from the captured session and
+/// overwrites caller-supplied values, see mcp.rs #684/#855). Absent/empty =
+/// unscoped legacy caller (pre-identity clients keep working; enforcement is
+/// a no-op exactly like recall's retain).
+fn stamped_requester(args: &serde_json::Value) -> Option<&str> {
+    args.get("requesting_agent_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+}
+
+/// #996: fail-closed visibility gate for single-entity direct reads. Returns
+/// true when the requester may read the row, or when no identity is stamped
+/// (legacy unscoped path). Handlers over-hide on false — a hidden row is
+/// reported as not-found, never as "exists but denied", so probing cannot
+/// confirm existence.
+fn requester_can_read(
+    db: &Database,
+    requester: Option<&str>,
+    entity: &crate::models::Entity,
+) -> bool {
+    match requester {
+        Some(req) => db.can_read(req, &entity.visibility, &entity.agent_id),
+        None => true,
+    }
+}
+
 pub fn handle_scan(db: &Database, args: Value) -> Result<String, String> {
     let a: ScanArgs =
-        serde_json::from_value(args).map_err(|e| format!("Invalid scan arguments: {}", e))?;
+        serde_json::from_value(args.clone()).map_err(|e| format!("Invalid scan arguments: {}", e))?;
 
     let limit = a.limit.clamp(1, 1000);
     // The DB scan over-fetches and filters governed rows before returning;
@@ -2679,6 +2706,15 @@ pub fn handle_scan(db: &Database, args: Value) -> Result<String, String> {
             limit + 1,
         )
         .map_err(|e| format!("Scan failed: {}", e))?;
+
+    // #996 leak-harness finding: scan was identity-blind. Apply the same
+    // transport-stamped visibility gate recall uses (#684/#855) so a private
+    // or fleet row never surfaces to a caller that may not read it. Applied
+    // BEFORE the page/sentinel split so pagination stays exact over the
+    // visible set (mirrors the recall retain in this file).
+    if let Some(req) = stamped_requester(&args) {
+        entities.retain(|e| db.can_read(req, &e.visibility, &e.agent_id));
+    }
 
     let has_more = entities.len() as i64 > limit;
     if has_more {
@@ -2877,8 +2913,17 @@ pub fn handle_get_entity(db: &Database, args: Value) -> Result<String, String> {
 
     let entity = db
         .get_entity_by_id_public(id)
-        .map_err(|e| format!("Get entity failed: {}", e))?
-        .ok_or_else(|| format!("Entity not found: {}", id))?;
+        .map_err(|e| format!("Get entity failed: {e}"))?
+        .ok_or_else(|| format!("Entity not found: {id}"))?;
+
+    // #996 leak-harness finding: get-by-id was identity-blind — any caller who
+    // knew an id read the full body with zero enforcement (the classic
+    // unguarded get-by-id leak class the SRB harness exists to catch). Gate on
+    // the transport-stamped identity like recall; over-hide as not-found so
+    // probing cannot confirm a hidden row's existence.
+    if !requester_can_read(db, stamped_requester(&args), &entity) {
+        return Err(format!("Entity not found: {id}"));
+    }
 
     let result = json!({
         "id": entity.id,
@@ -2916,6 +2961,13 @@ pub fn handle_as_of(db: &Database, args: Value) -> Result<String, String> {
     let found = db
         .as_of(category, key, as_of)
         .map_err(|e| format!("as_of failed: {}", e))?;
+
+    // #996: temporal direct reads inherit the visibility gate — over-hide as
+    // not-found, never confirm existence of a row the requester may not read.
+    let found = match found {
+        Some(e) if requester_can_read(db, stamped_requester(&args), &e) => Some(e),
+        _ => None,
+    };
 
     let result = match found {
         Some(e) => {
@@ -3003,6 +3055,12 @@ pub fn handle_valid_at(db: &Database, args: Value) -> Result<String, String> {
         .valid_at(category, key, valid_at)
         .map_err(|e| format!("valid_at failed: {}", e))?;
 
+    // #996: visibility gate, over-hide as not-found.
+    let found = match found {
+        Some(v) if requester_can_read(db, stamped_requester(&args), &v.entity) => Some(v),
+        _ => None,
+    };
+
     let result = match found {
         Some(v) => {
             let mut r = temporal_version_json(&v);
@@ -3042,6 +3100,12 @@ pub fn handle_bitemporal(db: &Database, args: Value) -> Result<String, String> {
     let found = db
         .bitemporal_at(category, key, tx_at, valid_at)
         .map_err(|e| format!("bitemporal failed: {}", e))?;
+
+    // #996: visibility gate, over-hide as not-found.
+    let found = match found {
+        Some(v) if requester_can_read(db, stamped_requester(&args), &v.entity) => Some(v),
+        _ => None,
+    };
 
     let result = match found {
         Some(v) => {
@@ -3087,9 +3151,23 @@ pub fn handle_history(db: &Database, args: Value) -> Result<String, String> {
         .unwrap_or(0)
         .max(0);
 
-    let (versions, total) = db
+    let (mut versions, total) = db
         .history_versions_page(category, key, limit, offset)
         .map_err(|e| format!("history failed: {}", e))?;
+
+    // #996: version trails are direct reads too — filter invisible versions
+    // before serialization. `total` is recomputed over the visible page so a
+    // hidden trail's size is never disclosed (over-hide: pagination sees a
+    // narrowing trail, which is the fail-closed reading of the count).
+    let requester = stamped_requester(&args);
+    if requester.is_some() {
+        versions.retain(|e| requester_can_read(db, requester, e));
+    }
+    let total = if requester.is_some() {
+        versions.len() as i64
+    } else {
+        total
+    };
 
     let items: Vec<serde_json::Value> = versions.iter().map(|e| e.to_json_expanded()).collect();
     let result = json!({
@@ -5075,9 +5153,9 @@ struct IntentionArgs {
 }
 
 pub fn handle_context(db: &Database, args: Value) -> String {
-    let a: ContextArgs = match serde_json::from_value(args) {
+    let a: ContextArgs = match serde_json::from_value(args.clone()) {
         Ok(a) => a,
-        Err(e) => return json!({"error": format!("Invalid context arguments: {}", e)}).to_string(),
+        Err(e) => return json!({"error": format!("Invalid context arguments: {e}")}).to_string(),
     };
 
     // #366: recall-first is the default posture; the legacy unconditional
@@ -5104,6 +5182,8 @@ pub fn handle_context(db: &Database, args: Value) -> String {
         model: a.model,
         exclude_ids: Vec::new(),
         session_id: a.session_id,
+        // #996: identity-gated injection (transport-stamped, never caller-trusted).
+        requesting_agent_id: stamped_requester(&args).map(str::to_owned),
     };
 
     match db.context_block(&opts) {
@@ -6366,6 +6446,10 @@ pub struct TraverseArgs {
     pub max_depth: i64,
     #[serde(default = "default_max_nodes")]
     pub max_nodes: i64,
+    /// #996: transport-stamped caller identity (mcp.rs #684/#855); gates
+    /// which chain nodes are visible, never trusted from the caller.
+    #[serde(default)]
+    pub requesting_agent_id: Option<String>,
 }
 
 fn default_depth() -> i64 {
@@ -6376,21 +6460,111 @@ fn default_max_nodes() -> i64 {
     100
 }
 
+/// #996: drop chain nodes the requester may not read; an invisible root is
+/// over-hidden as not-found (probing cannot confirm existence). Node-level
+/// identity checks re-load each entity through the governance-aware public
+/// getter — bounded by `max_nodes` and only run when identity is stamped.
+fn filter_chain_visibility(
+    db: &Database,
+    requester: &str,
+    mut chain: serde_json::Value,
+) -> serde_json::Value {
+    let root_id = chain
+        .get("entity")
+        .and_then(|e| e.get("id"))
+        .and_then(|v| v.as_str())
+        .map(str::to_owned);
+    if let Some(id) = root_id {
+        let visible = db
+            .get_entity_by_id_public(&id)
+            .map(|e| {
+                e.map(|e| db.can_read(requester, &e.visibility, &e.agent_id))
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false);
+        if !visible {
+            return serde_json::json!({"error": "entity not found"});
+        }
+    }
+    if let Some(arr) = chain.get_mut("traversed").and_then(|v| v.as_array_mut()) {
+        arr.retain(|node| {
+            node.get("id")
+                .and_then(|v| v.as_str())
+                .map(|id| {
+                    db.get_entity_by_id_public(id)
+                        .map(|e| {
+                            e.map(|e| db.can_read(requester, &e.visibility, &e.agent_id))
+                                .unwrap_or(false)
+                        })
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false)
+        });
+        // Edge metadata is existence disclosure too: drop link entries whose
+        // target is invisible (or missing) so the chain never names a hidden
+        // row's id. Applies to every node's links and the root's below.
+        for node in arr.iter_mut() {
+            if let Some(links) = node.get_mut("links").and_then(|v| v.as_array_mut()) {
+                links.retain(|l| {
+                    l.get("target_id")
+                        .and_then(|v| v.as_str())
+                        .map(|id| {
+                            db.get_entity_by_id_public(id)
+                                .map(|e| {
+                                    e.map(|e| db.can_read(requester, &e.visibility, &e.agent_id))
+                                        .unwrap_or(false)
+                                })
+                                .unwrap_or(false)
+                        })
+                        .unwrap_or(false)
+                });
+            }
+        }
+    }
+    if let Some(links) = chain
+        .get_mut("entity")
+        .and_then(|e| e.get_mut("links"))
+        .and_then(|v| v.as_array_mut())
+    {
+        links.retain(|l| {
+            l.get("target_id")
+                .and_then(|v| v.as_str())
+                .map(|id| {
+                    db.get_entity_by_id_public(id)
+                        .map(|e| {
+                            e.map(|e| db.can_read(requester, &e.visibility, &e.agent_id))
+                                .unwrap_or(false)
+                        })
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false)
+        });
+    }
+    chain
+}
+
 pub fn handle_traverse(db: &Database, args: Value) -> String {
-    let a: TraverseArgs = match serde_json::from_value(args) {
+    let a: TraverseArgs = match serde_json::from_value(args.clone()) {
         Ok(a) => a,
         Err(e) => {
-            return json!({"error": format!("Invalid traverse arguments: {}", e)}).to_string()
+            return json!({"error": format!("Invalid traverse arguments: {e}")}).to_string()
         }
     };
     // DoS hardening: clamp caller-supplied bounds to sane ceilings so a single
     // request can't be asked to walk an unbounded depth/breadth of the link graph.
     let max_depth = a.max_depth.clamp(0, 64);
     let max_nodes = a.max_nodes.clamp(0, 100_000);
+    let requester = a.requesting_agent_id.as_deref().filter(|s| !s.is_empty());
     match db.traverse_chain(&a.category, &a.key, max_depth, max_nodes) {
-        Ok(chain) => serde_json::to_string(&chain)
-            .unwrap_or_else(|e| json!({"error": format!("{}", e)}).to_string()),
-        Err(e) => json!({"error": format!("Traverse failed: {}", e)}).to_string(),
+        Ok(chain) => {
+            let chain = match requester {
+                Some(req) => filter_chain_visibility(db, req, chain),
+                None => chain,
+            };
+            serde_json::to_string(&chain)
+                .unwrap_or_else(|e| json!({"error": format!("{e}")}).to_string())
+        }
+        Err(e) => json!({"error": format!("Traverse failed: {e}")}).to_string(),
     }
 }
 
@@ -9778,10 +9952,10 @@ fn default_max_links_cohere() -> usize {
 }
 
 pub fn handle_recall_when(db: &Database, args: Value) -> Result<String, String> {
-    let a: RecallWhenArgs = serde_json::from_value(args)
+    let a: RecallWhenArgs = serde_json::from_value(args.clone())
         .map_err(|e| format!("Invalid recall_when arguments: {}", e))?;
 
-    let entities = db
+    let mut entities = db
         .recall_when_with_session(
             &a.context,
             a.limit,
@@ -9789,6 +9963,11 @@ pub fn handle_recall_when(db: &Database, args: Value) -> Result<String, String> 
             &a.session_id,
         )
         .map_err(|e| format!("Recall_when failed: {e}"))?;
+
+    // #996: trigger reads inherit the recall visibility gate.
+    if let Some(req) = stamped_requester(&args) {
+        entities.retain(|e| db.can_read(req, &e.visibility, &e.agent_id));
+    }
 
     let items_expanded: Vec<serde_json::Value> =
         entities.iter().map(|e| e.to_json_expanded()).collect();
