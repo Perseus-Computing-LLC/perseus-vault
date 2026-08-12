@@ -16501,6 +16501,7 @@ impl Database {
                 observations_refreshed: 0,
                 observations_stale: 0,
                 quotes_captured: 0,
+                lint_skips: 0,
                 dry_run: params.dry_run,
                 observations: Vec::new(),
                 workspace_hash: scope_ws,

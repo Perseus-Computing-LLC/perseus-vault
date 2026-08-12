@@ -6134,6 +6134,14 @@ pub struct OperatorReviewArgs {
     pub limit: i64,
     #[serde(default)]
     pub stale_threshold: Option<f64>,
+    /// #959: verdict-table render mode. When true the response carries a
+    /// stable pipe-delimited `table` (one row per candidate), a flat `items`
+    /// array (id, class, title, evidence, conflict flag, freshness, and the
+    /// copy-paste `decision_via` command per row) and a per-lane `summary`.
+    /// The queue stays read-only; decisions go through the existing
+    /// per-item surfaces named by `decision_via`.
+    #[serde(default)]
+    pub table: bool,
 }
 
 fn default_category() -> String {
@@ -6181,7 +6189,11 @@ pub fn handle_operator_review(db: &Database, args: Value) -> Result<String, Stri
     let pending_suggestions = db
         .keystone_suggestions_list("pending", None, limit)
         .map_err(|e| format!("keystone suggestions failed: {e}"))?;
-    Ok(json!({"reviewed_at_unix_ms": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as i64, "category":a.category,
+    let mental_models = db.mental_model_review_list(limit, None).unwrap_or_default();
+    let write_quarantine = db.write_quarantine_list(None, limit).unwrap_or_default();
+    let eval_regressions = db.eval_run_alerts(24, 10).unwrap_or_default();
+    let mut out = json!({
+        "reviewed_at_unix_ms": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as i64, "category":a.category,
         "contradictions":contradictions, "stale_candidates":stale["flagged"],
         "supersession_lag":supersession_lag,
         "keystone_suggestions": pending_suggestions,
@@ -6189,21 +6201,198 @@ pub fn handle_operator_review(db: &Database, args: Value) -> Result<String, Stri
         // #886: the mental-model review queue rides the same operator
         // review surface (read-only listing; decisions go through
         // perseus_vault_mental_model_review).
-        "mental_models": db
-            .mental_model_review_list(limit, None)
-            .unwrap_or_default(),
+        "mental_models": mental_models.clone(),
         // #874: pending write-quarantine items (interference gate holds).
         // Read-only listing; decisions go through perseus_vault_write_quarantine.
-        "write_quarantine": db
-            .write_quarantine_list(None, limit)
-            .unwrap_or_default(),
+        "write_quarantine": write_quarantine.clone(),
         // #930: recent regressed eval runs (nightly/midday/manual scheduled
         // evaluation) — the regression-alert lane. Read-only; full history
         // and trend via perseus_vault_eval_history.
-        "eval_regressions": db
-            .eval_run_alerts(24, 10)
-            .unwrap_or_default(),
-        "read_only":true}).to_string())
+        "eval_regressions": eval_regressions.clone(),
+        "read_only":true
+    });
+    if a.table {
+        // #959: verdict-table render — one stable pipe-delimited row per
+        // candidate across every lane, plus a flat items array and a
+        // per-lane summary. The queue itself stays read-only: each row names
+        // its per-item decision surface in `decision_via` so a partial
+        // decision never blocks the batch.
+        let items = operator_review_table_items(
+            &a.category,
+            &contradictions["conflicts"],
+            &stale["flagged"],
+            &json!(supersession_lag),
+            &json!(pending_suggestions),
+            &json!(mental_models),
+            &json!(write_quarantine),
+            &json!(eval_regressions),
+        );
+        let mut summary = serde_json::Map::new();
+        for it in &items {
+            let lane = it.get("lane").and_then(|v| v.as_str()).unwrap_or("other");
+            *summary.entry(lane.to_string()).or_insert(json!(0)) =
+                json!(summary.get(lane).and_then(|v| v.as_i64()).unwrap_or(0) + 1);
+        }
+        summary.insert("total".to_string(), json!(items.len()));
+        let mut table = String::from("lane|id|class|title|evidence|conflict|freshness|decision_via");
+        for it in &items {
+            table.push('\n');
+            let cells = ["lane", "id", "class", "title", "evidence", "conflict", "freshness", "decision_via"]
+                .iter()
+                .map(|k| it.get(k).and_then(|v| v.as_str()).unwrap_or("n/a").replace(['|', '\n'], " "))
+                .collect::<Vec<_>>()
+                .join("|");
+            table.push_str(&cells);
+        }
+        out["table"] = json!(table);
+        out["items"] = json!(items);
+        out["summary"] = json!(summary);
+        out["table_note"] = json!("stable header: lane|id|class|title|evidence|conflict|freshness|decision_via; decisions via the per-item surfaces named in decision_via");
+    }
+    Ok(out.to_string())
+}
+
+/// #959: flatten every review lane into one verdict-row shape. Defensive
+/// extraction: lanes evolve independently and a missing field degrades to
+/// "n/a" rather than failing the render.
+fn operator_review_table_items(
+    category: &str,
+    contradictions: &Value,
+    stale: &Value,
+    supersession_lag: &Value,
+    keystone: &Value,
+    mental_models: &Value,
+    write_quarantine: &Value,
+    eval_regressions: &Value,
+) -> Vec<Value> {
+    fn cell(v: &Value) -> String {
+        v.as_str().unwrap_or("n/a").to_string()
+    }
+    fn row(lane: &str, id: String, class: String, title: String, evidence: String, conflict: bool, freshness: String, decision_via: String) -> Value {
+        json!({
+            "lane": lane, "id": id, "class": class, "title": title,
+            "evidence": evidence, "conflict": conflict, "freshness": freshness,
+            "decision_via": decision_via,
+        })
+    }
+    let mut items = Vec::new();
+    if let Some(pairs) = contradictions.as_array() {
+        for p in pairs {
+            let a = p.get("entity_a").cloned().unwrap_or(Value::Null);
+            let b = p.get("entity_b").cloned().unwrap_or(Value::Null);
+            let (id_a, key_a) = (cell(&a["id"]), cell(&a["key"]));
+            let (id_b, key_b) = (cell(&b["id"]), cell(&b["key"]));
+            items.push(row(
+                "contradiction",
+                format!("pair:{id_a}:{id_b}"),
+                category.to_string(),
+                format!("{key_a} vs {key_b}"),
+                p.get("similarity").map(|s| format!("similarity {s}")).unwrap_or_else(|| "similarity n/a".into()),
+                true,
+                "n/a".into(),
+                format!("audit_ruling (pair_fingerprint {})", cell(&p["pair_fingerprint"])),
+            ));
+        }
+    }
+    if let Some(flags) = stale.as_array() {
+        for f in flags {
+            let key = cell(&f["key"]);
+            items.push(row(
+                "stale",
+                key.clone(),
+                cell(&f["category"]).if_empty_then(category),
+                key.clone(),
+                format!("decay {}", cell(&f["decay_score"])),
+                false,
+                "stale".into(),
+                format!("forget category={} key={key}", cell(&f["category"])),
+            ));
+        }
+    }
+    if let Some(rows) = supersession_lag.as_array() {
+        for r in rows {
+            items.push(row(
+                "supersession_lag",
+                cell(&r["id"]),
+                cell(&r["category"]).if_empty_then(category),
+                cell(&r["key"]),
+                "deprecated".into(),
+                false,
+                "n/a".into(),
+                format!("supersede id={}", cell(&r["id"])),
+            ));
+        }
+    }
+    if let Some(rows) = keystone.as_array() {
+        for r in rows {
+            let id = cell(&r["id"]);
+            items.push(row(
+                "keystone_suggestion",
+                id.clone(),
+                cell(&r["category"]).if_empty_then(category),
+                cell(&r["key"]),
+                "pending directive".into(),
+                false,
+                "n/a".into(),
+                format!("keystone_suggestion_decide approve|reject {id}"),
+            ));
+        }
+    }
+    if let Some(rows) = mental_models.as_array() {
+        for r in rows {
+            let id = cell(&r["id"]);
+            items.push(row(
+                "mental_model",
+                id.clone(),
+                "mental_model".into(),
+                cell(&r["label"]),
+                "n/a".into(),
+                false,
+                "n/a".into(),
+                format!("mental_model_review {id}"),
+            ));
+        }
+    }
+    if let Some(rows) = write_quarantine.as_array() {
+        for r in rows {
+            let id = cell(&r["id"]);
+            items.push(row(
+                "write_quarantine",
+                id.clone(),
+                cell(&r["category"]).if_empty_then(category),
+                cell(&r["key"]),
+                "interference hold".into(),
+                false,
+                "n/a".into(),
+                format!("write_quarantine decide {id}"),
+            ));
+        }
+    }
+    if let Some(rows) = eval_regressions.as_array() {
+        for r in rows {
+            let id = cell(&r["id"]);
+            items.push(row(
+                "eval_regression",
+                id.clone(),
+                "eval".into(),
+                format!("{} {}", cell(&r["eval_kind"]), cell(&r["suite"])),
+                "regressed".into(),
+                false,
+                "<24h".into(),
+                format!("eval_history id={id}"),
+            ));
+        }
+    }
+    items
+}
+
+trait IfEmptyThen {
+    fn if_empty_then(self, fallback: &str) -> String;
+}
+impl IfEmptyThen for String {
+    fn if_empty_then(self, fallback: &str) -> String {
+        if self.is_empty() || self == "n/a" { fallback.to_string() } else { self }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -10132,6 +10321,7 @@ mod tests {
             cold_first: false,
             archive_sources: false,
             global: false,
+            force: false,
             requesting_agent_id: "test-agent".to_string(),
             quote_cap_chars: 6000,
             refine_existing: true,
@@ -13758,6 +13948,67 @@ mod tests {
             .unwrap_or("")
             .is_empty());
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn operator_review_table_mode_renders_verdict_rows() {
+        let (db, path) = temp_db();
+        // Conflict pair (near-duplicate bodies) + a stale entity (old
+        // updated_at) so the contradiction and stale lanes both populate.
+        let _raw_a = handle_remember(
+            &db,
+            json!({"category": "facts", "key": "tbl-a",
+                   "body_json": "{\"note\":\"Banana peels biodegrade in about two weeks when composted\"}"}),
+        )
+        .expect("seed a");
+        let _raw_b = handle_remember(
+            &db,
+            json!({"category": "facts", "key": "tbl-b",
+                   "body_json": "{\"note\":\"Banana peels biodegrade in about two weeks when composted in a warm bin\"}"}),
+        )
+        .expect("seed b");
+        // Short-body entity: actionability 0.3 < 0.35 threshold -> hygiene
+        // flags it, populating the stale lane deterministically.
+        handle_remember(
+            &db,
+            json!({"category": "facts", "key": "tbl-stale", "body_json": "{\"note\":\"ok\"}"}),
+        )
+        .expect("seed stale");
+        let before = db.count_entities(None, None, None).unwrap();
+        let raw = handle_operator_review(&db, json!({"category": "facts", "limit": 20, "table": true}))
+            .expect("table review");
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["read_only"], json!(true));
+        assert_eq!(db.count_entities(None, None, None).unwrap(), before, "table render must not mutate");
+        let table = v["table"].as_str().expect("table string");
+        let header = table.lines().next().unwrap();
+        assert_eq!(
+            header,
+            "lane|id|class|title|evidence|conflict|freshness|decision_via",
+            "stable header must be parseable by automation"
+        );
+        // Contradiction lane: pair row with conflict flag + decision surface.
+        assert!(table.lines().any(|l| l.starts_with("contradiction|")), "{table}");
+        let items = v["items"].as_array().unwrap();
+        let pair = items.iter().find(|i| i["lane"] == "contradiction").expect("pair row");
+        assert_eq!(pair["conflict"], json!(true));
+        assert!(pair["decision_via"].as_str().unwrap().contains("audit_ruling"), "{pair}");
+        assert_eq!(pair["class"], json!("facts"));
+        // Stale lane: row carries the forget command.
+        let stale_row = items.iter().find(|i| i["lane"] == "stale").expect("stale row");
+        assert!(stale_row["decision_via"].as_str().unwrap().contains("forget"), "{stale_row}");
+        // Summary: per-lane counts + total matching items.
+        let summary = &v["summary"];
+        assert!(summary["contradiction"].as_i64().unwrap() >= 1, "{summary}");
+        assert!(summary["stale"].as_i64().unwrap() >= 1, "{summary}");
+        assert_eq!(summary["total"].as_i64().unwrap(), items.len() as i64, "{summary}");
+        assert!(v.get("table_note").is_some());
+        // Default render stays prose: no table key when table is absent.
+        let raw2 = handle_operator_review(&db, json!({"category": "facts", "limit": 20})).unwrap();
+        let v2: Value = serde_json::from_str(&raw2).unwrap();
+        assert!(v2.get("table").is_none(), "prose mode must not add a table");
+        assert_eq!(v2["read_only"], json!(true));
+        let _ = std::fs::remove_file(path);
     }
 
     fn audit_ruling_validates_actions_and_keys() {
