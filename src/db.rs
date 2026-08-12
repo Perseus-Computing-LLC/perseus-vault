@@ -20171,6 +20171,19 @@ last_accessed: {}
             }
         }
 
+        // #996: identity-gated injection — never render entities the requester
+        // may not read (private/fleet), mirroring recall's retain. Both lists
+        // are filtered BEFORE rendering so hidden rows never influence the
+        // injected counts, warnings, or budget math.
+        if let Some(req) = opts
+            .requesting_agent_id
+            .as_deref()
+            .filter(|s| !s.is_empty())
+        {
+            always_on_entities.retain(|e| self.can_read(req, &e.visibility, &e.agent_id));
+            body_entities.retain(|e| self.can_read(req, &e.visibility, &e.agent_id));
+        }
+
         // Render.
         let entity_line = |entity: &crate::models::Entity, tag: &str| -> String {
             format!(
@@ -23840,7 +23853,7 @@ pub(crate) mod tests {
     use super::*;
     use std::fs;
 
-    fn temp_db() -> (TestDatabase, String) {
+    pub(crate) fn temp_db() -> (TestDatabase, String) {
         let db = TestDatabase::new("perseus_vault-test-db");
         let path = db.path().to_string();
         (db, path)
@@ -23853,7 +23866,7 @@ pub(crate) mod tests {
     /// locks that deadlock writer EXCLUSIVE upgrades into immediate
     /// `database is locked`). The default fixture is DELETE-journaling
     /// (#950).
-    fn temp_db_wal() -> (TestDatabase, String) {
+    pub(crate) fn temp_db_wal() -> (TestDatabase, String) {
         let db = TestDatabase::new_wal("perseus_vault-test-db-wal");
         let path = db.path().to_string();
         (db, path)
@@ -40185,7 +40198,7 @@ pub(crate) mod tests {
     /// distinguishable in assertions (see `expected_fake_vec_first`).
     /// The returned counter increments as each connection is ACCEPTED, letting
     /// tests observe "the worker is now in flight on job N" without sleeps.
-    fn spawn_fake_embed_server(
+    pub(crate) fn spawn_fake_embed_server(
         delay: std::time::Duration,
     ) -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
         use std::io::{Read, Write};
@@ -40256,7 +40269,7 @@ pub(crate) mod tests {
     /// journal file per transaction, and those file ops on Windows CI
     /// (Defender scanning fresh temp files) push a cold first-write past
     /// the bound.
-    fn db_with_fake_embed_endpoint(
+    pub(crate) fn db_with_fake_embed_endpoint(
         delay: std::time::Duration,
         queue_cap: Option<usize>,
     ) -> (
@@ -46689,6 +46702,7 @@ pub(crate) mod tests {
                 model: None,
                 exclude_ids: vec![],
                 session_id: "sess-ctx-1".to_string(),
+                requesting_agent_id: None,
             })
             .unwrap();
         assert!(block.entities_injected >= 1);
