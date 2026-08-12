@@ -80,6 +80,11 @@ pub struct Entity {
     /// matching the existing remember reset semantics for tags/status.
     #[serde(default)]
     pub hints: Vec<String>,
+    /// #1000: typed memory class (CogniCore borrow). '' = legacy row
+    /// (SEMANTIC policy). Validated at write time; never silently rewritten
+    /// on legacy rows.
+    #[serde(default)]
+    pub memory_type: String,
     #[serde(skip)]
     #[allow(dead_code)]
     pub embedding: Option<Vec<f32>>,
@@ -682,6 +687,11 @@ pub struct RecallParams {
     /// string value; string_list fields expect an array of strings
     /// (membership). Validated against the category's declared schema.
     pub declared_filters: Option<std::collections::HashMap<String, serde_json::Value>>,
+    /// #1000: restrict fused candidates to one typed memory class (CogniCore
+    /// borrow). Applied as a POST-FUSE filter (never an arm change), so the
+    /// fused pool is identical and only the returned set narrows. Legacy
+    /// rows ('') satisfy a `semantic` filter. Empty = no filtering.
+    pub type_filter: Option<String>,
 }
 
 /// Search mode for recall: FTS5 keyword, dense vector, hybrid fusion, or
@@ -1008,6 +1018,7 @@ impl Default for RecallParams {
             query: String::new(),
             category: None,
             entity_type: None,
+            type_filter: None,
             limit: 10,
             offset: 0,
             min_decay: 0.0,

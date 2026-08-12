@@ -16,6 +16,18 @@ All notable changes to Perseus Vault are documented here. This project adheres t
   declared by a previous process drifts loudly against this process's
   default. Startup prints one line per stage; drift lines are prefixed
   `CONFIG DRIFT`. Docs: `docs/specs/config-self-report.md`.
+=======
+- **Typed memory classes with per-type policies (#1000).** New
+  `perseus_vault_type_policies` MCP tool (registry 135→136): 8 CogniCore-
+  borrowed MemoryTypes (semantic, episodic, procedural, preference,
+  constraint, failure, reflection, knowledge) with per-type
+  `decay_multiplier` (scales the #941 category half-life at decay tick) and
+  `retrieval_weight` (multiplies the final fused recall score). Schema v41
+  adds `entities.memory_type` (additive; legacy rows = '' = SEMANTIC
+  policy, byte-compatible). `remember` validates `memory_type` fail-closed
+  (unknown = hard write error, never a silent fallback); recall gains
+  `type_filter` (all modes, validated at the public entry). Spec:
+  `docs/specs/typed-memory-classes.md`.
 - **Scheduled recall evaluation with regression alerts (#930).** New
   `perseus-vault eval` CLI (record | history | alerts) and
   `perseus_vault_eval_history` MCP tool (registry 122→123): durable

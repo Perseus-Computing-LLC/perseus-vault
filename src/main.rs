@@ -38,6 +38,7 @@ mod injection_lint;
 mod log_digest;
 mod mcp;
 mod maintenance;
+mod memory_types;
 mod mental_model;
 mod models;
 mod multimodal;
@@ -3578,6 +3579,7 @@ fn run() {
                 efficacy_status: "unverified".to_string(),
                 epistemic_state: crate::models::default_epistemic_state(),
                 hints: vec![],
+                memory_type: String::new(),
                 embedding: None,
                 _parsed_body: None,
             };
