@@ -16880,7 +16880,7 @@ impl Database {
                             .collect::<Vec<_>>()
                             .join("\n")
                     );
-                    if let Some(hit) = crate::injection_lint::first_hit(&lint_haystack) {
+                    if let Some(hit) = crate::injection_lint::first_hit_effective(&lint_haystack) {
                         lint_skips += 1;
                         self.journal(&JournalEvent {
                             id: format!("jrn-{}", uuid::Uuid::new_v4().simple()),
@@ -17053,7 +17053,7 @@ impl Database {
                             .collect::<Vec<_>>()
                             .join("\n")
                     );
-                    if let Some(hit) = crate::injection_lint::first_hit(&lint_haystack) {
+                    if let Some(hit) = crate::injection_lint::first_hit_effective(&lint_haystack) {
                         lint_skips += 1;
                         self.journal(&JournalEvent {
                             id: format!("jrn-{}", uuid::Uuid::new_v4().simple()),
@@ -19371,7 +19371,7 @@ last_accessed: {}
             // #957: admission lint — reject files whose body matches
             // instruction-injection patterns (fail closed; stable reason).
             // Identical table and semantics to remember: no bypass via import.
-            if let Some(hit) = crate::injection_lint::first_hit(&body) {
+            if let Some(hit) = crate::injection_lint::first_hit_effective(&body) {
                 errors.push(format!(
                     "{}: {}",
                     path.display(),

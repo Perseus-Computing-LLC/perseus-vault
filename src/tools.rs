@@ -956,7 +956,7 @@ pub fn handle_remember(db: &Database, args: Value) -> Result<String, String> {
     // reason `admission_lint:rejected:<id>`); soft patterns route to
     // operator review (`admission_lint:review:<id>`) and are equally never
     // stored silently.
-    if let Some(hit) = crate::injection_lint::first_hit(&a.body_json) {
+    if let Some(hit) = crate::injection_lint::first_hit_effective(&a.body_json) {
         return Err(crate::injection_lint::reason_for(&hit));
     }
 

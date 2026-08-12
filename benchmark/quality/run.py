@@ -508,6 +508,12 @@ class VaultClient:
         # are unaffected.
         env = dict(os.environ)
         env["PERSEUS_VAULT_PRELOAD_WINDOW_MS"] = "1"
+        # #958: the prompt_safety case must store a hostile `<system>` fixture
+        # to verify the SERVING layer's sanitization — exactly what the
+        # admission-time injection lint (#978) rejects. The benchmark is a
+        # first-party, operator-owned harness, so it opts the server process
+        # out of the lint via the documented operator escape hatch.
+        env["PERSEUS_VAULT_DISABLE_ADMISSION_LINT"] = "1"
         self.p = subprocess.Popen(
             [self.binary, "--db", self.db],
             stdin=subprocess.PIPE,
