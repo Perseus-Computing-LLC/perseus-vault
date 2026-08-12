@@ -31,6 +31,8 @@ mod httplimit;
 mod inspect;
 mod instruction_extraction;
 mod interference;
+#[cfg(test)]
+mod leak_harness;
 mod injection_lint;
 mod log_digest;
 mod mcp;
@@ -2603,6 +2605,9 @@ fn run_prepare(
         model: model.map(str::to_string),
         exclude_ids: recall_when_hits.iter().map(|e| e.id.clone()).collect(),
         session_id: String::new(),
+        // #996: the CLI context path is an unscoped local operator surface —
+        // identity gating arrives via the MCP tool (handle_context).
+        requesting_agent_id: None,
     };
 
     let context_block = match db.context_block(&opts) {
