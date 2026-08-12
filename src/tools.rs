@@ -7225,8 +7225,50 @@ pub fn handle_dream(db: &Database, args: Value) -> Result<String, String> {
     Ok(v.to_string())
 }
 
-pub fn handle_decay(db: &Database, _args: Value) -> String {
+/// #941: per-kind decay policies. `fit: true` derives per-category
+/// half-lives from the store's own supersession history (median superseded
+/// lifetime, clamped [7d, 10y]) and persists them as state overrides
+/// (`decay_policy.<category>` = days, or "never"); the tick then honors the
+/// effective policies (kind defaults identity 10y / config 30d / event
+/// never, overlaid with overrides). `policies: true` (default) attaches the
+/// effective policy map to the report. Deterministic, offline.
+#[derive(Debug, Deserialize)]
+pub struct DecayArgs {
+    #[serde(default)]
+    pub fit: bool,
+    #[serde(default = "default_true")]
+    pub policies: bool,
+}
+
+pub fn handle_decay(db: &Database, args: Value) -> String {
+    let a: DecayArgs = serde_json::from_value(args)
+        .unwrap_or(DecayArgs { fit: false, policies: true });
     run_tracked(db, "decay", "", "internal", |_run_id| {
+        // Fit first (when requested): writes state overrides, then the tick
+        // below uses the effective policies.
+        let mut fitted: std::collections::BTreeMap<String, i64> =
+            std::collections::BTreeMap::new();
+        if a.fit {
+            let conn = db
+                .conn()
+                .map_err(|e| format!("decay_policy fit: connection failed: {e}"))?;
+            fitted = crate::db::Database::fit_decay_policies(&conn)
+                .map_err(|e| format!("decay_policy fit failed: {e}"))?;
+            let now = crate::db::now_ms();
+            for (category, days) in &fitted {
+                db.state_set(&crate::models::StateEntry {
+                    key: format!("decay_policy.{category}"),
+                    value_json: if *days >= i64::MAX / 86_400_000 {
+                        "\"never\"".to_string()
+                    } else {
+                        format!("{days}")
+                    },
+                    expires_at_unix_ms: None,
+                    created_at_unix_ms: now,
+                })
+                .map_err(|e| format!("decay_policy persist failed: {e}"))?;
+            }
+        }
         let report = db
             .decay_tick()
             .map_err(|e| format!("Decay tick failed: {e}"))?;
@@ -7234,9 +7276,39 @@ pub fn handle_decay(db: &Database, _args: Value) -> String {
             "entities_checked={} entities_updated={} auto_archived={}",
             report.entities_checked, report.entities_updated, report.auto_archived
         );
-        serde_json::to_value(&report)
-            .map(|v| (v, receipt))
-            .map_err(|e| format!("Decay report serialization failed: {e}"))
+        let mut v = serde_json::to_value(&report)
+            .map(|v| v)
+            .map_err(|e| format!("Decay report serialization failed: {e}"))?;
+        if a.policies {
+            let conn = db
+                .conn()
+                .map_err(|e| format!("decay_policy load: connection failed: {e}"))?;
+            let effective =
+                crate::db::Database::load_decay_policies(&conn)
+                    .map_err(|e| format!("decay_policy load failed: {e}"))?;
+            let mut map = serde_json::Map::new();
+            for (category, days) in effective {
+                let source = if fitted.contains_key(&category) {
+                    "fitted"
+                } else if category == "identity" || category == "config" || category == "event" {
+                    "default"
+                } else {
+                    "state"
+                };
+                map.insert(
+                    category,
+                    serde_json::json!({
+                        "half_life_days": days,
+                        "source": source,
+                    }),
+                );
+            }
+            v["decay_policies"] = serde_json::Value::Object(map);
+            v["decay_policy_note"] = serde_json::json!(
+                "per-kind half-lives (#941): identity 10y / config 30d / event never by default; state key decay_policy.<category> overrides (days or 'never'); fit:true derives from supersession history"
+            );
+        }
+        Ok((v, receipt))
     })
 }
 
@@ -14749,6 +14821,108 @@ mod tests {
         let gate2 = &v2["freshness_gate"];
         assert_eq!(gate2["proceed"], json!(true), "{raw2}");
         assert_eq!(gate2["verdict"], json!("proceed"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn decay_tick_honors_per_kind_half_lives() {
+        let (db, path) = temp_db();
+        // Four entities, last accessed 100 days ago, unverified, no boosts.
+        // Distinct bodies: the content-hash dedup is store-global.
+        for (key, category, note) in [
+            ("id-fact", "identity", "alpha deployment pipeline uses docker compose v2 with kubernetes orchestration"),
+            ("cfg-fact", "config", "beta staging environment runs podman with a traefik reverse proxy"),
+            ("evt-fact", "event", "gamma rollout completed at midnight on the third of august"),
+            ("plain-fact", "general", "delta observability stack ships metrics to a central prometheus"),
+        ] {
+            db.remember_with_options(
+                &crate::db::tests::make_entity(
+                    key, category, key,
+                    &format!("{{\"note\":\"{note}\"}}"),
+                ),
+                false, None, None, false,
+            )
+            .unwrap();
+        }
+        let old = crate::db::now_ms() - 100 * 86_400_000;
+        {
+            let conn = db.conn().unwrap();
+            conn.execute("UPDATE entities SET last_accessed_unix_ms = ?1", [old]).unwrap();
+        }
+        let report = db.decay_tick().unwrap();
+        // Archive-aware lookup: the default-category fact decays below the
+        // archive threshold and is auto-archived by the tick itself.
+        let get = |key: &str| -> f64 {
+            let category = match key {
+                "id-fact" => "identity",
+                "cfg-fact" => "config",
+                "evt-fact" => "event",
+                _ => "general",
+            };
+            db.scan_entities(Some(category), None, true, None, 50)
+                .unwrap()
+                .into_iter()
+                .find(|e| e.key == key)
+                .unwrap()
+                .decay_score
+        };
+        // identity: e^(-100/3650) ~ 0.973
+        assert!(get("id-fact") > 0.9, "identity fact must barely decay");
+        // event: never decays in practice
+        assert!(get("evt-fact") > 0.999, "event fact must not decay");
+        // config: e^(-100/30) ~ 0.036 — decayed but not archived
+        assert!(get("cfg-fact") > 0.01 && get("cfg-fact") < 0.1, "config decays on the 30d half-life");
+        // default category keeps the 7-day half-life: e^(-100/7) ~ 6e-7
+        assert!(get("plain-fact") < 0.01, "default category keeps 7-day decay");
+        // At least the decayed kinds were rewritten (the archived one counts
+        // as archived, not updated).
+        assert!(report.entities_updated + report.auto_archived >= 4, "{report:?}");
+        assert!(report.auto_archived >= 1, "default-category fact must archive: {report:?}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn decay_policy_fit_derives_half_life_from_supersession_history() {
+        let (db, path) = temp_db();
+        let now = crate::db::now_ms();
+        // Superseded fact A (created 105 days ago) replaced by B (created
+        // 90 days ago, supersedes = A) -> implied lifetime 15 days.
+        db.remember_with_options(
+            &crate::db::tests::make_entity(
+                "facts-a", "facts", "facts-a",
+                "{\"note\":\"rate limiter caps at 200 requests per hour\"}",
+            ),
+            false, None, None, false,
+        )
+        .unwrap();
+        db.remember_with_options(
+            &crate::db::tests::make_entity(
+                "facts-b", "facts", "facts-b",
+                "{\"note\":\"prometheus scrapes the gateway every fifteen seconds\"}",
+            ),
+            false, None, None, false,
+        )
+        .unwrap();
+        {
+            let conn = db.conn().unwrap();
+            conn.execute("UPDATE entities SET created_at_unix_ms = ?1 WHERE key = 'facts-a'", [now - 105 * 86_400_000]).unwrap();
+            conn.execute("UPDATE entities SET created_at_unix_ms = ?1 WHERE key = 'facts-b'", [now - 90 * 86_400_000]).unwrap();
+            let b_id: String = conn.query_row("SELECT id FROM entities WHERE key = 'facts-b'", [], |r| r.get(0)).unwrap();
+            conn.execute("UPDATE entities SET supersedes = ?1 WHERE key = 'facts-a'", [&b_id]).unwrap();
+        }
+        // Fit derives facts -> 15 days and persists the override.
+        let raw = handle_decay(&db, json!({"fit": true, "policies": true}));
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        let policies = v["decay_policies"].as_object().unwrap();
+        assert_eq!(policies["facts"]["half_life_days"], json!(15), "{raw}");
+        assert_eq!(policies["facts"]["source"], json!("fitted"));
+        assert_eq!(policies["identity"]["half_life_days"], json!(3650));
+        assert_eq!(policies["identity"]["source"], json!("default"));
+        // State override persisted; a second run reports it from state.
+        let raw2 = handle_decay(&db, json!({"policies": true}));
+        let v2: Value = serde_json::from_str(&raw2).unwrap();
+        assert_eq!(v2["decay_policies"]["facts"]["half_life_days"], json!(15), "{raw2}");
+        assert_eq!(v2["decay_policies"]["facts"]["source"], json!("state"));
         let _ = std::fs::remove_file(path);
     }
 
