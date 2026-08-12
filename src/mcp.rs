@@ -3389,14 +3389,19 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
   },
   {
     "name": "perseus_vault_purge",
-    "description": "Permanently delete all archived entities and run VACUUM to reclaim disk space. This is the only operation that actually removes entities — prune/forget only soft-archive. Erasure is complete (#398): every superseded version of a purged entity is deleted from entity_history, and journal rows referencing it are redacted in place (payloads scrubbed; rows kept so the audit hash chain stays verifiable). Purged data is DELETED and NOT RECOVERABLE — this forget-then-purge path is the GDPR-style erasure mechanism. Supports dry_run=true to preview first.",
+    "description": "Permanently delete all archived entities and run VACUUM to reclaim disk space. This is the only operation that actually removes entities — prune/forget only soft-archive. Erasure is complete (#398): every superseded version of a purged entity is deleted from entity_history, and journal rows referencing it are redacted in place (payloads scrubbed; rows kept so the audit hash chain stays verifiable). Purged data is DELETED and NOT RECOVERABLE — this forget-then-purge path is the GDPR-style erasure mechanism. Supports dry_run=true to preview first. Deletion-residue accounting (#990): the report carries a four-way residue partition (purged / declared_residual_controlled / declared_residual_uncontrollable / undeclared_residual), and purge REFUSES to complete while the independent sweep observes undeclared residual state (embedding-snapshot rows, projection-basis rows, or unrevoked artifact bindings whose sources are gone). Use sweep_only=true to run just the sweep and enumerate any orphans.",
     "inputSchema": {
       "type": "object",
       "properties": {
         "dry_run": {
           "type": "boolean",
           "default": false,
-          "description": "If true, report what would be deleted without making changes"
+          "description": "If true, report what would be deleted (with the residue partition and gate preview) without making changes"
+        },
+        "sweep_only": {
+          "type": "boolean",
+          "default": false,
+          "description": "If true, run only the independent residue sweep (#990): enumerate undeclared residual state and report the hard-gate status without deleting anything"
         }
       },
       "required": []
@@ -3420,6 +3425,14 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
           "type": "integer",
           "description": "Learned-artifact bindings revoked because their source entity was physically removed; serve paths refuse revoked bindings (#876)"
         },
+        "embeddings_snapshot_deleted": {
+          "type": "integer",
+          "description": "Pre-quantization float32 snapshot rows removed with their purged source (#990)"
+        },
+        "projection_basis_deleted": {
+          "type": "integer",
+          "description": "Declared embedding-basis rows removed with their purged source (#990)"
+        },
         "bytes_freed": {
           "type": "integer",
           "description": "Bytes reclaimed after VACUUM (0 in dry-run mode)"
@@ -3431,6 +3444,18 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
         "completed_at_unix_ms": {
           "type": "integer",
           "description": "Completion timestamp"
+        },
+        "residue": {
+          "type": "object",
+          "description": "Four-way residue partition of everything derived from the purged set (#990). undeclared_residual is empty for any completed purge (hard gate).",
+          "properties": {
+            "purged": {"type": "object"},
+            "declared_residual_controlled": {"type": "object"},
+            "declared_residual_uncontrollable": {"type": "object"},
+            "undeclared_residual": {"type": "object"},
+            "undeclared_residual_items": {"type": "array", "items": {"type": "string"}},
+            "hard_gate_passed": {"type": "boolean"}
+          }
         }
       }
     },

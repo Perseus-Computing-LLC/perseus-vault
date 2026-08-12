@@ -377,6 +377,27 @@ CREATE TABLE IF NOT EXISTS entities_embedding_snapshot (
     created_at_unix_ms INTEGER NOT NULL
 );
 
+-- #990 Deletion-residue accounting: declared basis for tier-3 projections
+-- (embeddings first). Each row declares what a derived surface was built
+-- from, so purge can classify residue and the independent sweep can verify
+-- that the undeclared-residual cell stays empty. `source_entity_id = ''`
+-- marks a bulk projection (e.g. the quantization snapshot), which is exempt
+-- from the orphan sweep. See docs/specs/deletion-residue-accounting.md.
+CREATE TABLE IF NOT EXISTS projection_basis (
+    projection_kind            TEXT NOT NULL,
+    projection_id              TEXT NOT NULL,
+    source_entity_id           TEXT NOT NULL DEFAULT '',
+    source_digest              TEXT NOT NULL DEFAULT '',
+    source_recorded_at_unix_ms INTEGER NOT NULL DEFAULT 0,
+    built_at_unix_ms           INTEGER NOT NULL,
+    content_class              TEXT NOT NULL DEFAULT 'derived_content',
+    transform                  TEXT NOT NULL DEFAULT 'estimator_mediated',
+    reachable                  INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY (projection_kind, projection_id)
+);
+CREATE INDEX IF NOT EXISTS idx_projection_basis_source
+    ON projection_basis(source_entity_id);
+
 -- #874 Activation-gated sparse writes: the reviewable write-quarantine hold.
 -- A write whose measured interference exceeds the configured bound is
 -- staged here (body encrypted like entities when encryption is on) instead
@@ -599,7 +620,11 @@ CREATE INDEX IF NOT EXISTS idx_preload_proposals_state
 /// v34 (#874 activation-gated sparse writes): `write_quarantine` — the
 /// reviewable hold for writes whose measured interference exceeds the
 /// configured bound. New table, idempotent, no backfill.
-pub(crate) const SCHEMA_VERSION: i64 = 38;
+/// v39 (#990 deletion-residue accounting): `projection_basis` — declared
+/// basis for tier-3 projections (embeddings first). New table, idempotent,
+/// no backfill (DDL_V0_2_0 is re-run at every open, so existing stores pick
+/// it up on next open).
+pub(crate) const SCHEMA_VERSION: i64 = 39;
 
 /// Initialize the v0.2.0 schema on a fresh database.
 pub fn initialize_schema(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {

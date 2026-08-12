@@ -1206,6 +1206,58 @@ pub struct CompactReport {
     pub completed_at_unix_ms: i64,
 }
 
+/// #990: one cell of the residue partition — counts per derived surface.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ResidueCounts {
+    pub entities: i64,
+    pub history_rows: i64,
+    pub fts_rows: i64,
+    pub embedding_snapshot_rows: i64,
+    pub projection_basis_rows: i64,
+    pub artifact_bindings: i64,
+    pub journal_rows: i64,
+}
+
+/// #990: the four-way residue partition of everything derived from a purged
+/// source. `undeclared_residual` must be empty for a completed purge (hard
+/// gate, fail-closed): a deletion that leaves recoverable content it did not
+/// report is a failed deletion however much it removed.
+#[derive(Debug, Clone, Serialize)]
+pub struct ResiduePartition {
+    pub purged: ResidueCounts,
+    pub declared_residual_controlled: ResidueCounts,
+    pub declared_residual_uncontrollable: ResidueCounts,
+    pub undeclared_residual: ResidueCounts,
+    pub undeclared_residual_items: Vec<String>,
+    pub hard_gate_passed: bool,
+}
+
+/// #990: independent residue sweep — re-derived undeclared residual state,
+/// without consulting any purge's own accounting.
+#[derive(Debug, Clone, Serialize)]
+pub struct ResidueSweepReport {
+    pub orphan_embedding_snapshot_rows: Vec<String>,
+    pub orphan_projection_basis_rows: Vec<String>,
+    pub unrevoked_bindings_with_missing_source: Vec<String>,
+    /// Informational only — never part of the hard gate (the erase path may
+    /// legitimately leave non-redacted rows referencing removed identities).
+    pub non_redacted_journal_rows_with_missing_entity: Vec<String>,
+    pub undeclared_total: usize,
+    pub hard_gate_passed: bool,
+    pub swept_at_unix_ms: i64,
+}
+
+impl ResidueSweepReport {
+    /// The gate-relevant orphans, in stable order.
+    pub fn undeclared_items(&self) -> Vec<String> {
+        let mut items: Vec<String> = Vec::new();
+        items.extend(self.orphan_embedding_snapshot_rows.iter().cloned());
+        items.extend(self.orphan_projection_basis_rows.iter().cloned());
+        items.extend(self.unrevoked_bindings_with_missing_source.iter().cloned());
+        items
+    }
+}
+
 /// Purge report — permanently deletes archived entities and runs VACUUM.
 #[derive(Debug, Clone, Serialize)]
 pub struct PurgeReport {
@@ -1219,9 +1271,18 @@ pub struct PurgeReport {
     /// #876: learned-artifact bindings revoked because their source entity
     /// was physically removed (serve paths refuse revoked bindings).
     pub artifact_bindings_revoked: i64,
+    /// #990: rows removed from the pre-quantization float32 snapshot whose
+    /// source entity was purged (previously retained forever — a latent
+    /// undeclared residual).
+    pub embeddings_snapshot_deleted: i64,
+    /// #990: declared embedding-basis rows removed with their source.
+    pub projection_basis_deleted: i64,
     pub bytes_freed: i64,
     pub dry_run: bool,
     pub completed_at_unix_ms: i64,
+    /// #990: the four-way residue partition of everything derived from the
+    /// purged set. `undeclared_residual` is empty for any completed purge.
+    pub residue: ResiduePartition,
 }
 
 /// Lifecycle axis vocabulary (#868): the `status` field on entities is the
