@@ -51,6 +51,7 @@ mod util;
 mod validity;
 mod vector_quant;
 mod web;
+mod verify;
 mod web_gap_fill;
 
 use clap::{Parser, Subcommand};
@@ -375,6 +376,25 @@ enum Commands {
         /// SQLite database path
         #[arg(long, default_value_t = default_db_path())]
         db: String,
+    },
+
+    /// #958: runtime self-audit — re-assert the Vault's invariants on the
+    /// operator's own live store. Read-only. Exit: 0 = all PASS, 2 = a
+    /// check could not run (UNVERIFIED, never PASS), 3 = invariant violated.
+    /// Findings print `path:key` only, never values.
+    Verify {
+        /// SQLite database path
+        #[arg(long, default_value_t = default_db_path())]
+        db: String,
+        /// Machine-readable JSON report on stdout
+        #[arg(long, default_value_t = false)]
+        json: bool,
+        /// Run the egress check under an OS-level deny-all network sandbox
+        #[arg(long, default_value_t = false)]
+        strict: bool,
+        /// Skip a check by id (reported UNVERIFIED, never PASS); repeatable
+        #[arg(long = "skip", value_name = "CHECK_ID")]
+        skip: Vec<String>,
     },
 
     /// Archive (soft-delete) a single entity by category + key
@@ -864,6 +884,7 @@ impl Commands {
             | Commands::Init { db, .. }
             | Commands::RekeyAad { db, .. }
             | Commands::VerifyAuditChain { db, .. }
+            | Commands::Verify { db, .. }
             | Commands::Forget { db, .. }
             | Commands::Prune { db, .. }
             | Commands::Decay { db, .. }
@@ -2961,6 +2982,36 @@ fn run() {
                     std::process::exit(1);
                 }
             }
+        }
+        Some(Commands::Verify {
+            db: ref db_path,
+            json,
+            strict,
+            skip,
+        }) => {
+            // #958: strictly read-only open — verify must never touch data.
+            let conn = match rusqlite::Connection::open_with_flags(
+                db_path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                    | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            ) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("perseus-vault: failed to open database read-only at {}: {}", db_path, e);
+                    std::process::exit(1);
+                }
+            };
+            let opts = crate::verify::VerifyOptions {
+                strict,
+                skip: skip.clone(),
+            };
+            let results = crate::verify::run_verify(&conn, &opts);
+            if json {
+                println!("{}", crate::verify::render_json(&results));
+            } else {
+                print!("{}", crate::verify::render_human(&results));
+            }
+            std::process::exit(crate::verify::exit_code(&results));
         }
         Some(Commands::Forget {
             db: ref db_path,

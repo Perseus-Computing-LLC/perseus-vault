@@ -23135,7 +23135,7 @@ impl Drop for TestDatabase {
 pub(crate) static HINTS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::fs;
 
@@ -23194,7 +23194,7 @@ mod tests {
         );
     }
 
-    fn make_entity(id: &str, category: &str, key: &str, body: &str) -> Entity {
+    pub(crate) fn make_entity(id: &str, category: &str, key: &str, body: &str) -> Entity {
         Entity {
             id: id.to_string(),
             category: category.to_string(),
