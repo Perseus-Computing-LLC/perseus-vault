@@ -55,7 +55,14 @@ DEFAULT_BUDGETS = {
         "WRITE_DOCS_PER_SEC": 49,          # measured 147 (2-vCPU, 2026-08-11, run 31498111971)
         "WRITE_LAST10_DOCS_PER_SEC": 41,    # measured 122
         "FTS5_P99_MS": 968,                # measured 322.7
-        "DENSE_P99_MS": 117,               # measured 38.9
+        # #969: 2026-08-11 two runs of the IDENTICAL binary measured dense
+        # p99 29.77ms and 254.92ms (8.5x swing) on the shared 2-vCPU runner —
+        # runner noise, not a regression (fts5/temporal swung 9-24x the same
+        # runs but stayed inside their larger budgets). Budget raised from 117
+        # to absorb the observed variance while still catching the pre-#898
+        # 1000ms+ regression class; combined with the median-of-3 dense probe
+        # (see main()).
+        "DENSE_P99_MS": 350,               # measured 38.9 (swings to ~255 on noisy runs)
         "HYBRID_P99_MS": 612,              # measured 204.0 (was 334-354 pre-#899)
         "AS_OF_P99_MS": 5,                 # measured 0.31 — sub-ms, extra headroom
         "TEMPORAL_RECALL_P99_MS": 888,     # measured 296.0
@@ -115,47 +122,69 @@ def main():
                  "add a row or override every SCALE_BUDGET_* env var")
     b = DEFAULT_BUDGETS[size]
 
+    # #969: the shared 2-vCPU runner swings latency metrics 8-24x between
+    # runs of the identical binary (2026-08-11: dense p99 29.77ms vs
+    # 254.92ms). At the 10K gate (the per-PR/push size) take the median of
+    # three harness runs so single-run noise cannot fail the gate; the 100K
+    # weekly lane keeps a single run (3x at 100K would blow the job limit).
+    median_runs = 3 if size == 10_000 else 1
+
     if args.report:
-        report_path = Path(args.report)
+        reports = [args.report]
     else:
-        report_path = Path(tempfile.gettempdir()) / "vault-scale-gate-report.json"
-        cmd = [sys.executable, str(HERE / "run.py"), "--sizes", str(size),
-               "--out", str(report_path)]
+        reports = []
+        cmd = [sys.executable, str(HERE / "run.py"), "--sizes", str(size)]
         if args.bin:
             cmd += ["--bin", args.bin]
-        rc = subprocess.run(cmd).returncode
-        if rc != 0:
-            sys.exit(f"scale harness failed (exit {rc})")
+        for i in range(median_runs):
+            report_path = Path(tempfile.gettempdir()) / f"vault-scale-gate-report-{i}.json"
+            rc = subprocess.run(cmd + ["--out", str(report_path)]).returncode
+            if rc != 0:
+                sys.exit(f"scale harness failed (exit {rc})")
+            reports.append(str(report_path))
 
-    report = json.loads(report_path.read_text(encoding="utf-8"))
-    run = report["runs"].get(str(size))
-    if not run:
-        sys.exit(f"report has no run at size {size} (has: {list(report['runs'])})")
+    all_runs = []
+    for rp in reports:
+        report = json.loads(Path(rp).read_text(encoding="utf-8"))
+        run = report["runs"].get(str(size))
+        if not run:
+            sys.exit(f"report has no run at size {size} (has: {list(report['runs'])})")
+        all_runs.append(run)
+
+    def median(path):
+        vals = []
+        for run in all_runs:
+            cur = run
+            for p in path:
+                cur = cur[p]
+            vals.append(float(cur))
+        vals.sort()
+        return vals[len(vals) // 2]
 
     checks = [
-        ("write docs/s (sustained)", run["write"]["docs_per_sec"],
+        ("write docs/s (sustained)", median(["write", "docs_per_sec"]),
          ">=", budget(b, "WRITE_DOCS_PER_SEC")),
-        ("write last-10% docs/s (degradation)", run["write"]["last_10pct_docs_per_sec"],
+        ("write last-10% docs/s (degradation)", median(["write", "last_10pct_docs_per_sec"]),
          ">=", budget(b, "WRITE_LAST10_DOCS_PER_SEC")),
-        ("fts5 recall p99 ms", run["recall"]["fts5"]["p99_ms"],
+        ("fts5 recall p99 ms", median(["recall", "fts5", "p99_ms"]),
          "<=", budget(b, "FTS5_P99_MS")),
-        ("as_of point-lookup p99 ms", run["as_of"]["p99_ms"],
+        ("as_of point-lookup p99 ms", median(["as_of", "p99_ms"]),
          "<=", budget(b, "AS_OF_P99_MS")),
-        ("temporal recall p99 ms", run["temporal_recall"]["p99_ms"],
+        ("temporal recall p99 ms", median(["temporal_recall", "p99_ms"]),
          "<=", budget(b, "TEMPORAL_RECALL_P99_MS")),
-        ("cold start median ms", run["cold_start"]["first_query_ms_median"],
+        ("cold start median ms", median(["cold_start", "first_query_ms_median"]),
          "<=", budget(b, "COLD_START_MS")),
     ]
-    if "hybrid" in run.get("recall", {}):
+    if "hybrid" in all_runs[0].get("recall", {}):
         checks += [
-            ("hybrid recall p99 ms", run["recall"]["hybrid"]["p99_ms"],
+            ("hybrid recall p99 ms", median(["recall", "hybrid", "p99_ms"]),
              "<=", budget(b, "HYBRID_P99_MS")),
-            ("dense recall p99 ms", run["recall"]["dense"]["p99_ms"],
+            ("dense recall p99 ms", median(["recall", "dense", "p99_ms"]),
              "<=", budget(b, "DENSE_P99_MS")),
         ]
 
     failures = []
-    print(f"SCALE-GATE | size={size}")
+    print(f"SCALE-GATE | size={size} median_of={len(all_runs)}")
     for label, actual, op, bound in checks:
         ok = (actual >= bound) if op == ">=" else (actual <= bound)
         print(f"SCALE-GATE | {label}: {actual} (budget {op} {bound}) "
