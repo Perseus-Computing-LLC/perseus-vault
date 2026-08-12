@@ -4438,8 +4438,15 @@ impl Database {
     /// decay = e^(-elapsed_ms / half_life_ms)
     /// Returns value in [0.0, 1.0] where 1.0 = just accessed.
     fn compute_decay(last_accessed_ms: i64, now_ms: i64) -> f64 {
+        Self::compute_decay_with_half_life(last_accessed_ms, now_ms, Self::DECAY_HALF_LIFE_MS)
+    }
+
+    /// #941: category-aware half-life variant. Same Ebbinghaus shape with a
+    /// per-kind lifetime; `event`-style categories pass i64::MAX so they
+    /// never decay in practice.
+    fn compute_decay_with_half_life(last_accessed_ms: i64, now_ms: i64, half_life_ms: i64) -> f64 {
         let elapsed = (now_ms - last_accessed_ms).max(0) as f64;
-        let half_life = Self::DECAY_HALF_LIFE_MS as f64;
+        let half_life = half_life_ms as f64;
         if half_life <= 0.0 || elapsed <= 0.0 {
             return 1.0;
         }
@@ -4532,6 +4539,91 @@ impl Database {
         self.decay_tick_with_limit(None, false)
     }
 
+    // ─── #941: per-kind decay policies ────────────────────────────────
+    //
+    // Facts do not rot at one rate (Tenet/Palimpsest borrow): identity facts
+    // persist for years, config facts go stale in weeks, events never become
+    // false. Half-lives are per-category, stored as state keys
+    // `decay_policy.<category>` = half-life in days (or "never"); the fit
+    // pass derives them from the store's OWN supersession history (median
+    // lifetime of superseded facts), so nothing is hardcoded beyond sane
+    // clamps and the kind defaults below. Deterministic, offline, no LLM.
+
+    /// Default per-kind half-lives (days). Palimpsest-style kind lifetimes:
+    /// identity 10y, config 30d, event never; everything else keeps the
+    /// long-standing 7-day default so existing behavior is unchanged.
+    pub(crate) fn default_decay_policies() -> std::collections::BTreeMap<String, i64> {
+        let mut m = std::collections::BTreeMap::new();
+        m.insert("identity".to_string(), 3650);
+        m.insert("config".to_string(), 30);
+        m.insert("event".to_string(), i64::MAX / 86_400_000);
+        m
+    }
+
+    /// Effective policies = kind defaults overlaid with state overrides
+    /// (`decay_policy.<category>` = days, or "never").
+    pub(crate) fn load_decay_policies(
+        conn: &rusqlite::Connection,
+    ) -> Result<std::collections::BTreeMap<String, i64>, Box<dyn std::error::Error>> {
+        let mut policies = Self::default_decay_policies();
+        let mut stmt = conn.prepare(
+            "SELECT key, value_json FROM state WHERE key LIKE 'decay_policy.%'",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        for row in rows {
+            let (key, value) = row?;
+            let category = key.strip_prefix("decay_policy.").unwrap_or(&key).to_string();
+            let days = if value.trim_matches('"') == "never" {
+                i64::MAX / 86_400_000
+            } else {
+                value.trim_matches('"').parse::<i64>().unwrap_or(7)
+            };
+            policies.insert(category, days.max(1));
+        }
+        Ok(policies)
+    }
+
+    /// Fit per-category half-lives from the store's own supersession
+    /// history: for every entity superseded by another, the implied
+    /// lifetime is superseder.created_at - superseded.created_at. Per
+    /// category we take the median, clamped to [7 days, 10 years]. Returns
+    /// only categories with evidence. Deterministic, offline.
+    pub(crate) fn fit_decay_policies(
+        conn: &rusqlite::Connection,
+    ) -> Result<std::collections::BTreeMap<String, i64>, Box<dyn std::error::Error>> {
+        let mut lifetimes: std::collections::BTreeMap<String, Vec<i64>> =
+            std::collections::BTreeMap::new();
+        let mut stmt = conn.prepare(
+            "SELECT s.category, s.created_at_unix_ms, e.created_at_unix_ms
+             FROM entities e
+             JOIN entities s ON s.supersedes = e.id
+             WHERE e.archived = 0 AND e.created_at_unix_ms > s.created_at_unix_ms",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (category, superseded_at, superseded_by_at) = row?;
+            let lifetime_ms = superseded_by_at - superseded_at;
+            if lifetime_ms > 0 {
+                lifetimes.entry(category).or_default().push(lifetime_ms);
+            }
+        }
+        const MS_PER_DAY: i64 = 86_400_000;
+        let mut fitted = std::collections::BTreeMap::new();
+        for (category, mut v) in lifetimes {
+            v.sort_unstable();
+            let median_ms = v[v.len() / 2];
+            let days = (median_ms / MS_PER_DAY).clamp(7, 3650);
+            fitted.insert(category, days);
+        }
+        Ok(fitted)
+    }
+
     /// #490: preview form of decay_tick — computes the same report (rows that
     /// would be rewritten, entities that would auto-archive) without writing
     /// anything. Backs the autocohere/maintain dry-run path, which previously
@@ -4552,6 +4644,9 @@ impl Database {
     ) -> Result<DecayReport, Box<dyn std::error::Error>> {
         let conn = self.conn()?;
         let now = now_ms();
+        // #941: per-kind half-lives resolved once per tick (defaults +
+        // state overrides) — no per-row state reads.
+        let policies = Self::load_decay_policies(&conn)?;
         let total: i64 = conn.query_row(
             "SELECT COUNT(*) FROM entities WHERE archived = 0",
             [],
@@ -4561,11 +4656,11 @@ impl Database {
         // Update decay_score for non-archived entities, optionally capped
         let sql = if let Some(max) = max_entities {
             format!(
-                "SELECT id, last_accessed_unix_ms, verified, efficacy_status, follow_rate, importance, decay_score, usefulness_count FROM entities WHERE archived = 0 LIMIT {}",
+                "SELECT id, last_accessed_unix_ms, verified, efficacy_status, follow_rate, importance, decay_score, usefulness_count, category FROM entities WHERE archived = 0 LIMIT {}",
                 max
             )
         } else {
-            "SELECT id, last_accessed_unix_ms, verified, efficacy_status, follow_rate, importance, decay_score, usefulness_count FROM entities WHERE archived = 0".to_string()
+            "SELECT id, last_accessed_unix_ms, verified, efficacy_status, follow_rate, importance, decay_score, usefulness_count, category FROM entities WHERE archived = 0".to_string()
         };
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map([], |r| {
@@ -4580,17 +4675,18 @@ impl Database {
                 r.get::<_, Option<f64>>(5).unwrap_or(None).unwrap_or(0.0),
                 r.get::<_, f64>(6).unwrap_or(0.0),
                 r.get::<_, Option<i64>>(7).unwrap_or(None).unwrap_or(0),
+                r.get::<_, Option<String>>(8).unwrap_or(None).unwrap_or_default(),
             ))
         })?;
 
         let mut updated = 0i64;
         let mut auto_archived = 0i64;
-        let mut batch: Vec<(String, i64, bool, String, f64, f64, f64, i64)> =
+        let mut batch: Vec<(String, i64, bool, String, f64, f64, f64, i64, String)> =
             Vec::with_capacity(1000);
         let now_val = now;
 
         // Helper: flush the current batch in a transaction.
-        let flush_batch = |batch: &mut Vec<(String, i64, bool, String, f64, f64, f64, i64)>,
+        let flush_batch = |batch: &mut Vec<(String, i64, bool, String, f64, f64, f64, i64, String)>,
                            updated: &mut i64,
                            auto_archived: &mut i64|
          -> Result<(), Box<dyn std::error::Error>> {
@@ -4607,9 +4703,15 @@ impl Database {
                 importance,
                 stored_decay,
                 usefulness,
+                category,
             ) in batch.drain(..)
             {
-                let mut new_decay = Self::compute_decay(last_access, now_val);
+                let half_life = policies
+                    .get(&category)
+                    .copied()
+                    .unwrap_or(7)
+                    .saturating_mul(86_400_000);
+                let mut new_decay = Self::compute_decay_with_half_life(last_access, now_val, half_life);
                 // #298: verified/curated facts get a decay floor so the
                 // forgetting curve can never auto-archive them.
                 if verified {
@@ -4700,6 +4802,7 @@ impl Database {
                 importance,
                 stored_decay,
                 usefulness,
+                category,
             ) = row?;
             batch.push((
                 id,
@@ -4710,6 +4813,7 @@ impl Database {
                 importance,
                 stored_decay,
                 usefulness,
+                category,
             ));
             if batch.len() >= 1000 {
                 flush_batch(&mut batch, &mut updated, &mut auto_archived)?;
