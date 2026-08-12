@@ -257,8 +257,8 @@ use crate::models::{
     CompactReport, DecayReport, EmbedParams, EmbeddingBackendHealth, Entity, EraseReport,
     ExpireReport, ExternalRef, GraphEdge, GraphNode, IngestParams, JournalEvent, MemoryLink,
     OriginRecord, PruneParams, PruneReport, PurgeReport, Readiness, RecallOutcome, RecallParams,
-    RecallStatus, RedactReport, SearchMode, StateEntry, Stats, TimelineParams, VaultReport,
-    WorkspaceBinding,
+    RecallStatus, RedactReport, ResidueCounts, ResiduePartition, ResidueSweepReport, SearchMode,
+    StateEntry, Stats, TimelineParams, VaultReport, WorkspaceBinding,
 };
 
 fn with_legacy_evidence(
@@ -2054,6 +2054,42 @@ impl Database {
         Self::store_embedding_with_conn(&conn, id, embedding, self.embedding_quant())
     }
 
+    /// #990: declare the embedding projection's basis — the entity it was
+    /// computed from plus the plaintext digest at build time (the FTS row is
+    /// the canonical plaintext; `entities.body_json` may be ciphertext).
+    /// Idempotent upsert; a missing FTS row (entity gone) records nothing.
+    fn declare_embedding_basis_with_conn(
+        conn: &rusqlite::Connection,
+        id: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let basis: Option<(String, i64)> = conn
+            .query_row(
+                "SELECT f.body_json, e.recorded_at_unix_ms
+                   FROM entities_fts f JOIN entities e ON e.rowid = f.rowid
+                  WHERE e.id = ?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let Some((plaintext, recorded_at)) = basis else {
+            return Ok(());
+        };
+        conn.execute(
+            "INSERT INTO projection_basis
+                (projection_kind, projection_id, source_entity_id, source_digest,
+                 source_recorded_at_unix_ms, built_at_unix_ms, content_class,
+                 transform, reachable)
+             VALUES ('embedding', ?1, ?1, ?2, ?3, ?4, 'derived_content',
+                     'estimator_mediated', 1)
+             ON CONFLICT(projection_kind, projection_id) DO UPDATE SET
+                 source_digest = excluded.source_digest,
+                 source_recorded_at_unix_ms = excluded.source_recorded_at_unix_ms,
+                 built_at_unix_ms = excluded.built_at_unix_ms",
+            params![id, sha256_hex(&plaintext), recorded_at, now_ms()],
+        )?;
+        Ok(())
+    }
+
     /// #397: `store_embedding` on the CALLER's already-held connection, so hot
     /// paths (remember's auto-embed, embed_entity) use exactly one pooled
     /// connection per request.
@@ -2079,6 +2115,9 @@ impl Database {
             "UPDATE entities SET embedding = ?1, emb_sig = ?2, emb_sig4 = ?3 WHERE id = ?4",
             params![blob, sig, sig4, id],
         )?;
+        // #990: record what this vector was built from so the residue
+        // relation has a declared basis to verify against.
+        Self::declare_embedding_basis_with_conn(conn, id)?;
         SIG_WRITE_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed); // #619
         Ok(())
     }
@@ -2117,6 +2156,8 @@ impl Database {
             params![blob, sig, sig4, id, plaintext],
         )?;
         if changed == 1 {
+            // #990: record the declared basis for the vector that landed.
+            Self::declare_embedding_basis_with_conn(conn, id)?;
             SIG_WRITE_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed); // #619
         }
         Ok(changed == 1)
@@ -18133,6 +18174,83 @@ Return a JSON object with an "insights" array. Each insight has:
         }))
     }
 
+    /// #990: the independent residue sweep — re-derives undeclared residual
+    /// state from the retained projection tables WITHOUT consulting any
+    /// purge's own accounting. Orphans here mean a deletion path left
+    /// recoverable content it did not report; the purge hard gate refuses to
+    /// complete while the undeclared cell is non-empty.
+    pub fn residue_sweep(&self) -> Result<ResidueSweepReport, Box<dyn std::error::Error>> {
+        let conn = self.conn()?;
+        Self::residue_sweep_with_conn(&conn)
+    }
+
+    /// Sweep over an explicit connection (the purge path runs it inside its
+    /// own transaction so the hard gate sees post-delete state).
+    fn residue_sweep_with_conn(
+        conn: &rusqlite::Connection,
+    ) -> Result<ResidueSweepReport, Box<dyn std::error::Error>> {
+        // (a) Quantization-snapshot rows whose source entity is gone.
+        let orphan_snapshot: Vec<String> = {
+            let mut stmt = conn.prepare(
+                "SELECT id FROM entities_embedding_snapshot
+                  WHERE id NOT IN (SELECT id FROM entities) ORDER BY id",
+            )?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        // (b) Declared projection basis whose source entity is gone (bulk
+        // projections carry source_entity_id = '' and are exempt).
+        let orphan_basis: Vec<String> = {
+            let mut stmt = conn.prepare(
+                "SELECT projection_id FROM projection_basis
+                  WHERE source_entity_id != ''
+                    AND source_entity_id NOT IN (SELECT id FROM entities)
+                  ORDER BY projection_id",
+            )?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        // (c) Learned-artifact bindings whose source entities are gone and
+        // that were never revoked — a serve path would still refuse them,
+        // but the residue is unreported.
+        let orphan_bindings: Vec<String> = {
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT s.binding_id FROM learned_artifact_sources s
+                   LEFT JOIN entities e ON e.id = s.entity_id
+                  WHERE e.id IS NULL
+                    AND NOT EXISTS (SELECT 1 FROM artifact_bindings b
+                                     WHERE b.binding_id = s.binding_id
+                                       AND b.revoked_at_unix_ms IS NOT NULL)
+                  ORDER BY s.binding_id",
+            )?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        // (d) Informational only: non-redacted journal rows referencing
+        // missing entities (the erase path may legitimately leave some; the
+        // hard gate never blocks on this bucket).
+        let orphan_journal: Vec<String> = {
+            let mut stmt = conn.prepare(
+                "SELECT id FROM journal
+                  WHERE event_type != 'redacted' AND entity_id != ''
+                    AND entity_id NOT IN (SELECT id FROM entities)
+                  ORDER BY id LIMIT 200",
+            )?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let undeclared_total = orphan_snapshot.len() + orphan_basis.len() + orphan_bindings.len();
+        Ok(ResidueSweepReport {
+            orphan_embedding_snapshot_rows: orphan_snapshot,
+            orphan_projection_basis_rows: orphan_basis,
+            unrevoked_bindings_with_missing_source: orphan_bindings,
+            non_redacted_journal_rows_with_missing_entity: orphan_journal,
+            undeclared_total,
+            hard_gate_passed: undeclared_total == 0,
+            swept_at_unix_ms: now_ms(),
+        })
+    }
+
     /// Permanently delete all archived entities and run VACUUM to reclaim disk space.
     /// This is the only way to actually remove entities; prune/forget only soft-archive.
     /// Deleted entities are NOT recoverable. Use dry_run=true to preview first.
@@ -18154,6 +18272,16 @@ Return a JSON object with an "insights" array. Each insight has:
     ///     verifiability (verify_audit_chain) while removing every purged body
     ///     from the log. Deleting the rows — or scrubbing a hashed field —
     ///     would break every subsequent link of the chain.
+    ///
+    /// #990 — deletion-residue accounting (docs/specs/deletion-residue-accounting.md):
+    /// the report carries a four-way residue partition of everything derived
+    /// from the purged set (purged / declared controlled / declared
+    /// uncontrollable / undeclared), and purge enforces the hard gate: it
+    /// REFUSES to complete while the independent sweep observes undeclared
+    /// residual state (snapshot rows, projection-basis rows, or unrevoked
+    /// artifact bindings whose sources are gone). `dry_run` previews the
+    /// partition and the current gate status; `sweep_only` (via the purge
+    /// tool) runs just the sweep.
     pub fn purge(&self, dry_run: bool) -> Result<PurgeReport, Box<dyn std::error::Error>> {
         let conn = self.conn()?;
         let before_size = match std::fs::metadata(&self.db_path) {
@@ -18230,14 +18358,60 @@ Return a JSON object with an "insights" array. Each insight has:
                     jrn.insert(row?);
                 }
             }
+            // #990: preview the projection surfaces this purge would clean
+            // (snapshot + basis rows for the doomed set) and the current
+            // undeclared-residual state the hard gate would check.
+            let mut snapshot_preview = 0i64;
+            let mut basis_preview = 0i64;
+            for (id, _, _, _) in &doomed {
+                snapshot_preview += conn.query_row(
+                    "SELECT COUNT(*) FROM entities_embedding_snapshot WHERE id = ?1",
+                    params![id],
+                    |r| r.get::<_, i64>(0),
+                )?;
+                basis_preview += conn.query_row(
+                    "SELECT COUNT(*) FROM projection_basis
+                      WHERE projection_kind = 'embedding' AND projection_id = ?1",
+                    params![id],
+                    |r| r.get::<_, i64>(0),
+                )?;
+            }
+            let sweep = Self::residue_sweep_with_conn(&conn)?;
+            let residue = ResiduePartition {
+                purged: ResidueCounts {
+                    entities: count,
+                    history_rows: hist.len() as i64,
+                    fts_rows: count,
+                    embedding_snapshot_rows: snapshot_preview,
+                    projection_basis_rows: basis_preview,
+                    artifact_bindings: learned_revoked,
+                    journal_rows: 0,
+                },
+                declared_residual_controlled: ResidueCounts {
+                    journal_rows: jrn.len() as i64,
+                    ..ResidueCounts::default()
+                },
+                declared_residual_uncontrollable: ResidueCounts::default(),
+                undeclared_residual: ResidueCounts {
+                    embedding_snapshot_rows: sweep.orphan_embedding_snapshot_rows.len() as i64,
+                    projection_basis_rows: sweep.orphan_projection_basis_rows.len() as i64,
+                    artifact_bindings: sweep.unrevoked_bindings_with_missing_source.len() as i64,
+                    ..ResidueCounts::default()
+                },
+                undeclared_residual_items: sweep.undeclared_items(),
+                hard_gate_passed: sweep.hard_gate_passed,
+            };
             return Ok(PurgeReport {
                 entities_deleted: count,
                 history_rows_deleted: hist.len() as i64,
                 journal_rows_redacted: jrn.len() as i64,
                 artifact_bindings_revoked: learned_revoked,
+                embeddings_snapshot_deleted: snapshot_preview,
+                projection_basis_deleted: basis_preview,
                 bytes_freed: 0,
                 dry_run: true,
                 completed_at_unix_ms: now_ms(),
+                residue,
             });
         }
 
@@ -18247,9 +18421,19 @@ Return a JSON object with an "insights" array. Each insight has:
                 history_rows_deleted: 0,
                 journal_rows_redacted: 0,
                 artifact_bindings_revoked: 0,
+                embeddings_snapshot_deleted: 0,
+                projection_basis_deleted: 0,
                 bytes_freed: 0,
                 dry_run: false,
                 completed_at_unix_ms: now_ms(),
+                residue: ResiduePartition {
+                    purged: ResidueCounts::default(),
+                    declared_residual_controlled: ResidueCounts::default(),
+                    declared_residual_uncontrollable: ResidueCounts::default(),
+                    undeclared_residual: ResidueCounts::default(),
+                    undeclared_residual_items: Vec::new(),
+                    hard_gate_passed: true,
+                },
             });
         }
 
@@ -18309,6 +18493,43 @@ Return a JSON object with an "insights" array. Each insight has:
                 params![id, cat, key, ws],
             )? as i64;
         }
+
+        // #990: delete the projection surfaces derived from the doomed set —
+        // the quantization snapshot rows (previously retained forever, a
+        // latent undeclared residual) and the declared embedding-basis rows.
+        let mut snapshot_deleted = 0i64;
+        let mut basis_deleted = 0i64;
+        for (id, _, _, _) in &doomed {
+            snapshot_deleted += tx.execute(
+                "DELETE FROM entities_embedding_snapshot WHERE id = ?1",
+                params![id],
+            )? as i64;
+            basis_deleted += tx.execute(
+                "DELETE FROM projection_basis
+                  WHERE projection_kind = 'embedding' AND projection_id = ?1",
+                params![id],
+            )? as i64;
+        }
+
+        // #990: the hard gate — re-derive undeclared residual state from the
+        // retained projections on THIS transaction (post-delete view). Any
+        // orphan means a deletion left recoverable content it did not
+        // report; refuse to complete (fail closed) so the operator can run
+        // the sweep-only mode and resolve it. Dropping the uncommitted
+        // transaction rolls the entire purge back.
+        let sweep = Self::residue_sweep_with_conn(&tx)?;
+        if !sweep.hard_gate_passed {
+            drop(tx);
+            return Err(format!(
+                "purge refused (hard gate): undeclared residual state present — \
+                 snapshot_orphans={} basis_orphans={} binding_orphans={}; run \
+                 perseus_vault_purge with sweep_only=true to enumerate",
+                sweep.orphan_embedding_snapshot_rows.len(),
+                sweep.orphan_projection_basis_rows.len(),
+                sweep.unrevoked_bindings_with_missing_source.len(),
+            )
+            .into());
+        }
         tx.commit()?;
 
         // #876: journal hash-only revocation evidence for every learned
@@ -18348,14 +18569,36 @@ Return a JSON object with an "insights" array. Each insight has:
             0
         };
 
+        let residue = ResiduePartition {
+            purged: ResidueCounts {
+                entities: count,
+                history_rows: history_deleted,
+                fts_rows: count,
+                embedding_snapshot_rows: snapshot_deleted,
+                projection_basis_rows: basis_deleted,
+                artifact_bindings: artifact_bindings_revoked,
+                journal_rows: 0,
+            },
+            declared_residual_controlled: ResidueCounts {
+                journal_rows: journal_redacted,
+                ..ResidueCounts::default()
+            },
+            declared_residual_uncontrollable: ResidueCounts::default(),
+            undeclared_residual: ResidueCounts::default(),
+            undeclared_residual_items: Vec::new(),
+            hard_gate_passed: true,
+        };
         Ok(PurgeReport {
             entities_deleted: count,
             history_rows_deleted: history_deleted,
             journal_rows_redacted: journal_redacted,
             artifact_bindings_revoked,
+            embeddings_snapshot_deleted: snapshot_deleted,
+            projection_basis_deleted: basis_deleted,
             bytes_freed: freed,
             dry_run: false,
             completed_at_unix_ms: now_ms(),
+            residue,
         })
     }
 
@@ -41440,6 +41683,246 @@ pub(crate) mod tests {
     /// match the SAME journal rows — the dry_run preview must dedupe them
     /// exactly like the real run's `!= 'redacted'` guard does.
     #[test]
+    // ─── #990: deletion-residue accounting ──────────────────────────────
+    // Contract: docs/specs/deletion-residue-accounting.md.
+
+    #[test]
+    fn purge_cleans_embedding_snapshot_and_projection_basis_for_doomed() {
+        let (db, _path) = temp_db();
+        let (id, _) = db
+            .remember(&make_entity(
+                "e-rs1",
+                "insight",
+                "residue-rs1",
+                r#"{"note":"residue snapshot source"}"#,
+            ))
+            .unwrap();
+        {
+            let conn = db.conn().unwrap();
+            Database::store_embedding_with_conn(&conn, &id, &vec![0.25f32; 8], EmbeddingQuant::F32)
+                .unwrap();
+            // A quantization-snapshot row for the same entity (the pre-fix
+            // purge used to leave this behind forever).
+            conn.execute(
+                "INSERT INTO entities_embedding_snapshot (id, embedding, created_at_unix_ms)
+                 VALUES (?1, ?2, ?3)",
+                params![id, vec![0x11u8; 32], now_ms()],
+            )
+            .unwrap();
+        }
+        assert_eq!(db.residue_sweep().unwrap().undeclared_total, 0);
+        db.forget("insight", "residue-rs1", "test").unwrap();
+        let report = db.purge(false).unwrap();
+        assert_eq!(report.embeddings_snapshot_deleted, 1);
+        assert_eq!(report.projection_basis_deleted, 1);
+        assert_eq!(report.residue.purged.embedding_snapshot_rows, 1);
+        assert_eq!(report.residue.purged.projection_basis_rows, 1);
+        assert!(report.residue.hard_gate_passed);
+        assert!(report.residue.undeclared_residual_items.is_empty());
+        assert_eq!(db.residue_sweep().unwrap().undeclared_total, 0);
+    }
+
+    #[test]
+    fn independent_sweep_catches_orphan_snapshot_and_basis_rows() {
+        let (db, _path) = temp_db();
+        let conn = db.conn().unwrap();
+        conn.execute(
+            "INSERT INTO entities_embedding_snapshot (id, embedding, created_at_unix_ms)
+             VALUES ('ghost-990', X'00', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO projection_basis
+                (projection_kind, projection_id, source_entity_id, built_at_unix_ms)
+             VALUES ('embedding', 'ghost-p', 'ghost-src', 1)",
+            [],
+        )
+        .unwrap();
+        let sweep = db.residue_sweep().unwrap();
+        assert_eq!(
+            sweep.orphan_embedding_snapshot_rows,
+            vec!["ghost-990".to_string()]
+        );
+        assert_eq!(sweep.orphan_projection_basis_rows, vec!["ghost-p".to_string()]);
+        assert!(!sweep.hard_gate_passed);
+        assert_eq!(sweep.undeclared_total, 2);
+    }
+
+    #[test]
+    fn purge_fails_closed_on_undeclared_residual_and_rolls_back() {
+        let (db, _path) = temp_db();
+        db.remember(&make_entity("e-rs2", "insight", "residue-rs2", r#"{"v":1}"#))
+            .unwrap();
+        db.forget("insight", "residue-rs2", "test").unwrap();
+        // Pre-existing undeclared residue unrelated to this purge's doomed set.
+        db.conn()
+            .unwrap()
+            .execute(
+                "INSERT INTO entities_embedding_snapshot (id, embedding, created_at_unix_ms)
+                 VALUES ('ghost-991', X'00', 1)",
+                [],
+            )
+            .unwrap();
+        let err = db.purge(false).unwrap_err().to_string();
+        assert!(err.contains("hard gate"), "unexpected error: {err}");
+        // The whole purge rolled back: the archived entity is still present.
+        let count: i64 = db
+            .conn()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM entities WHERE id = 'e-rs2'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn dry_run_previews_residue_partition_without_deleting() {
+        let (db, _path) = temp_db();
+        db.remember(&make_entity("e-rs3", "insight", "residue-rs3", r#"{"v":1}"#))
+            .unwrap();
+        db.forget("insight", "residue-rs3", "test").unwrap();
+        let report = db.purge(true).unwrap();
+        assert!(report.dry_run);
+        assert_eq!(report.residue.purged.entities, 1);
+        assert!(report.residue.hard_gate_passed);
+        let count: i64 = db
+            .conn()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM entities WHERE id = 'e-rs3'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "dry run must not delete");
+    }
+
+    #[test]
+    fn purge_residue_partition_counts_journal_as_declared_controlled() {
+        let (db, _path) = temp_db();
+        db.remember(&make_entity("e-rs4", "insight", "residue-rs4", r#"{"v":1}"#))
+            .unwrap();
+        db.remember(&make_entity("e-rs5", "insight", "residue-rs5", r#"{"v":2}"#))
+            .unwrap();
+        db.forget("insight", "residue-rs4", "test").unwrap();
+        db.forget("insight", "residue-rs5", "test").unwrap();
+        let report = db.purge(false).unwrap();
+        assert!(
+            report.residue.declared_residual_controlled.journal_rows >= 2,
+            "journal redaction must be declared controlled residue"
+        );
+        assert!(report.residue.undeclared_residual_items.is_empty());
+        assert!(report.residue.hard_gate_passed);
+    }
+
+    #[test]
+    fn deletion_residue_trace_corpus_runner() {
+        // #990: runner wiring for the shared authority-trace corpus — the
+        // deletion-residue traces describe states the residue model must
+        // classify exactly; build each state through public surfaces and
+        // assert the model outcome against the corpus contract.
+        let corpus_path = format!(
+            "{}/benchmark/security/traces/authority_traces.json",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let corpus: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&corpus_path).expect("read authority_traces.json"),
+        )
+        .expect("parse authority_traces.json");
+        let traces: Vec<&serde_json::Value> = corpus["traces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|t| t["residue_model"].is_object())
+            .collect();
+        assert!(!traces.is_empty(), "corpus must carry deletion-residue traces");
+        for trace in traces {
+            let trace_id = trace["trace_id"].as_str().unwrap();
+            let (db, _path) = temp_db();
+            let mut supersede_seq = 0usize;
+            for ev in trace["events"].as_array().unwrap() {
+                let op = ev["operation"].as_str().unwrap();
+                match op {
+                    "remember_entity" => {
+                        let entity = make_entity(
+                            ev["entity_id"].as_str().unwrap(),
+                            ev["category"].as_str().unwrap_or("insight"),
+                            ev["key"].as_str().unwrap(),
+                            ev["body"].as_str().unwrap(),
+                        );
+                        db.remember(&entity).unwrap();
+                    }
+                    "supersede_entity" => {
+                        // Same (category, key) under a fresh id accumulates a
+                        // retained superseded version in entity_history.
+                        supersede_seq += 1;
+                        let entity = make_entity(
+                            &format!("{}-sup{}", ev["entity_id"].as_str().unwrap(), supersede_seq),
+                            ev["category"].as_str().unwrap_or("insight"),
+                            ev["key"].as_str().unwrap(),
+                            ev["body"].as_str().unwrap(),
+                        );
+                        db.remember(&entity).unwrap();
+                    }
+                    "embed_entity" => {
+                        let id = ev["target"].as_str().unwrap().trim_start_matches("entity:");
+                        let vec: Vec<f32> = (0..8)
+                            .map(|i| (id.as_bytes().get(i).copied().unwrap_or(0) as f32) / 255.0)
+                            .collect();
+                        let conn = db.conn().unwrap();
+                        Database::store_embedding_with_conn(&conn, id, &vec, EmbeddingQuant::F32)
+                            .unwrap();
+                    }
+                    "snapshot_entity" => {
+                        let id = ev["target"].as_str().unwrap().trim_start_matches("entity:");
+                        let conn = db.conn().unwrap();
+                        conn.execute(
+                            "INSERT INTO entities_embedding_snapshot (id, embedding, created_at_unix_ms)
+                             VALUES (?1, X'00', ?2)",
+                            params![id, now_ms()],
+                        )
+                        .unwrap();
+                    }
+                    "archive_entity" => {
+                        db.forget(
+                            ev["category"].as_str().unwrap_or("insight"),
+                            ev["key"].as_str().unwrap(),
+                            "trace-archive",
+                        )
+                        .unwrap();
+                    }
+                    "purge" => {
+                        let expected = trace["expected_decision"].as_str().unwrap();
+                        match db.purge(false) {
+                            Ok(_) => assert_eq!(
+                                expected,
+                                "accept",
+                                "{trace_id}: purge accepted but corpus expects {expected}"
+                            ),
+                            Err(e) => assert_eq!(
+                                expected,
+                                "reject",
+                                "{trace_id}: purge refused ({e}) but corpus expects {expected}"
+                            ),
+                        }
+                    }
+                    "sweep" => { /* asserted below */ }
+                    other => panic!("{trace_id}: unknown corpus operation {other}"),
+                }
+            }
+            // Final independent sweep must match the corpus contract.
+            let sweep = db.residue_sweep().unwrap();
+            let model = &trace["residue_model"];
+            assert_eq!(
+                sweep.undeclared_total,
+                model["expected_undeclared_total"].as_u64().unwrap() as usize,
+                "{trace_id}: undeclared total mismatch"
+            );
+            assert_eq!(
+                sweep.hard_gate_passed,
+                model["expected_gate"].as_bool().unwrap(),
+                "{trace_id}: hard gate mismatch"
+            );
+        }
+    }
+
+    #[test]
     fn purge_dry_run_dedupes_journal_rows_shared_across_workspaces() {
         let (db, path) = temp_db();
         let mut e1 = make_entity("e-ws-a", "facts", "shared", r#"{"n":"a"}"#);
@@ -44402,7 +44885,7 @@ pub(crate) mod tests {
         // Report carries denominator + artifact hash (acceptance #5).
         assert!(rep["denominator"]["slots"].as_i64().unwrap() >= 3);
         assert!(rep["artifact"]["git_hash"].as_str().unwrap().len() >= 7);
-        assert_eq!(rep["artifact"]["schema_version"], 38);
+        assert_eq!(rep["artifact"]["schema_version"], 39);
         let _ = std::fs::remove_file(path);
     }
 

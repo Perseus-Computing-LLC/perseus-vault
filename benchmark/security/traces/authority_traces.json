@@ -7,7 +7,7 @@
     "blocked"
   ],
   "suite": "perseus-vault-authority-traces-v1",
-  "trace_count": 10,
+  "trace_count": 13,
   "traces": [
     {
       "description": "A user grants permission for action X, later revokes it, and a new agent session retrieves the stale grant and attempts X.",
@@ -583,6 +583,249 @@
       "reason": "identity ambiguity; display-name match does not merge identities; fail closed",
       "title": "Display-name identity collision",
       "trace_id": "authority-identity-collision"
+    },
+    {
+      "description": "An embedding snapshot row exists for an entity that is gone \u2014 a deletion path that forgot the projection. The independent sweep must observe it as undeclared residual, and any purge must refuse to complete (hard gate) while the undeclared cell is non-empty.",
+      "events": [
+        {
+          "actor_id": "system",
+          "effective_time_unix_ms": 1000000,
+          "event_id": "evt-snap-ghost-0001",
+          "observed_time_unix_ms": 1000050,
+          "operation": "snapshot_entity",
+          "payload_digest": "sha256:ff5b4fa8837e162eeb65a53dc1a64f154e0a9427a5a10c2d90f9ab48a570f670",
+          "provenance": "source:entity:ghost-5f1a:embedding_snapshot",
+          "target": "entity:ghost-5f1a"
+        },
+        {
+          "actor_id": "system",
+          "effective_time_unix_ms": 3000000,
+          "event_id": "evt-sweep-0002",
+          "observed_time_unix_ms": 3000050,
+          "operation": "sweep",
+          "payload_digest": "sha256:c4e3e0c5c3463e414cc50c3851386fde7e7fe3d324c7637ec95df8ab928b574a",
+          "provenance": "source:evt-sweep-0002:independent",
+          "target": "store"
+        }
+      ],
+      "expected_decision": "reject",
+      "expected_receipt": "purge refused; sweep-only mode enumerates the orphan",
+      "negative_assertions": [
+        "no_purge_with_undeclared_residue",
+        "no_unreported_residue"
+      ],
+      "postcondition_readback": {
+        "confirmed": false,
+        "kind": "sweep",
+        "performed": true
+      },
+      "reason": "undeclared residual present; hard gate refuses any purge until resolved",
+      "residue_model": {
+        "expected_gate": false,
+        "expected_undeclared_total": 1,
+        "orphan_classes": [
+          "embedding_snapshot"
+        ]
+      },
+      "title": "Undeclared residual: snapshot row outliving its source",
+      "trace_id": "residue-undeclared-snapshot-orphan"
+    },
+    {
+      "description": "An entity with an embedding, an embedding snapshot row, and a declared basis is archived and purged. A compliant purge removes the projections with their source (or declares them), keeps the journal rows redacted for the audit chain (declared residual, controlled), and the independent sweep must observe zero undeclared residue afterwards.",
+      "events": [
+        {
+          "actor_id": "usr-grantor-7f3a",
+          "body": "canary:residue-source-a",
+          "category": "insight",
+          "effective_time_unix_ms": 1000000,
+          "entity_id": "ent-a",
+          "event_id": "evt-rem-a-0001",
+          "key": "residue-a",
+          "observed_time_unix_ms": 1000050,
+          "operation": "remember_entity",
+          "payload_digest": "sha256:e1005b3c04e53a4c41088479dc7d205870be70a7ada8d43b01635098ec8bd708",
+          "provenance": "source:evt-rem-a-0001:admission",
+          "target": "entity:ent-a"
+        },
+        {
+          "actor_id": "system",
+          "effective_time_unix_ms": 1000100,
+          "event_id": "evt-emb-a-0002",
+          "observed_time_unix_ms": 1000150,
+          "operation": "embed_entity",
+          "payload_digest": "sha256:aedf894196e065397241047706151c994e93a3d062ecff3c26e21115f96ba1d6",
+          "provenance": "source:entity:ent-a:embedding",
+          "target": "entity:ent-a"
+        },
+        {
+          "actor_id": "system",
+          "effective_time_unix_ms": 1000200,
+          "event_id": "evt-snap-a-0003",
+          "observed_time_unix_ms": 1000250,
+          "operation": "snapshot_entity",
+          "payload_digest": "sha256:a0f4c12b6d38a07e0df2cf24aab9078cf0704b5a42b65ad9ba2a85806fc6acce",
+          "provenance": "source:entity:ent-a:embedding_snapshot",
+          "target": "entity:ent-a"
+        },
+        {
+          "actor_id": "usr-grantor-7f3a",
+          "category": "insight",
+          "effective_time_unix_ms": 2000000,
+          "entity_id": "ent-a",
+          "event_id": "evt-arch-a-0004",
+          "key": "residue-a",
+          "observed_time_unix_ms": 2000100,
+          "operation": "archive_entity",
+          "payload_digest": "sha256:abc5c5baabebc5730eecd644bd9d8f83171be1827974a323a8da395c5c2bb006",
+          "provenance": "source:evt-arch-a-0004:lifecycle",
+          "target": "entity:ent-a"
+        },
+        {
+          "actor_id": "operator",
+          "effective_time_unix_ms": 3000000,
+          "event_id": "evt-purge-a-0005",
+          "observed_time_unix_ms": 3000050,
+          "operation": "purge",
+          "payload_digest": "sha256:dc50865bf8f2103acd44853594adf6840f61e16b647e8e7959e1f248789e7d0c",
+          "provenance": "source:evt-purge-a-0005:maintenance",
+          "target": "store"
+        },
+        {
+          "actor_id": "system",
+          "effective_time_unix_ms": 3000100,
+          "event_id": "evt-sweep-a-0006",
+          "observed_time_unix_ms": 3000150,
+          "operation": "sweep",
+          "payload_digest": "sha256:7983178e153838131425fedcbd90e4a99f0c57a160a17eda42c7f577bcd03552",
+          "provenance": "source:evt-sweep-a-0006:independent",
+          "target": "store"
+        }
+      ],
+      "expected_decision": "accept",
+      "expected_receipt": "four-way partition: purged counts the projections; undeclared cell empty; gate passed",
+      "negative_assertions": [
+        "no_undeclared_residue",
+        "no_purge_without_gate"
+      ],
+      "postcondition_readback": {
+        "confirmed": true,
+        "kind": "sweep",
+        "performed": true
+      },
+      "reason": "purge removed the projections with their source; journal redaction is declared residual, controlled",
+      "residue_model": {
+        "declared_controlled": [
+          "journal"
+        ],
+        "expected_gate": true,
+        "expected_undeclared_total": 0,
+        "purged_classes": [
+          "entities",
+          "history",
+          "fts",
+          "embedding_snapshot",
+          "projection_basis"
+        ]
+      },
+      "title": "Compliant purge leaves an empty undeclared cell",
+      "trace_id": "residue-compliant-purge-partition"
+    },
+    {
+      "description": "An entity was superseded, so a superseded version is retained for reconstructability. Once the source is purged, that retained version is exactly the recoverable residue the deletion was meant to eliminate: the purge removes it, and the sweep observes zero undeclared residue.",
+      "events": [
+        {
+          "actor_id": "usr-grantor-7f3a",
+          "body": "canary:residue-source-b-v1",
+          "category": "insight",
+          "effective_time_unix_ms": 1000000,
+          "entity_id": "ent-b",
+          "event_id": "evt-rem-b-0001",
+          "key": "residue-b",
+          "observed_time_unix_ms": 1000050,
+          "operation": "remember_entity",
+          "payload_digest": "sha256:ab4b4c6c3d1228a70375f2c6e2d5ac1bd3e425d806b8df6f7c2183f55f50c8b7",
+          "provenance": "source:evt-rem-b-0001:admission",
+          "target": "entity:ent-b"
+        },
+        {
+          "actor_id": "usr-grantor-7f3a",
+          "body": "canary:residue-source-b-v2",
+          "category": "insight",
+          "effective_time_unix_ms": 1000100,
+          "entity_id": "ent-b",
+          "event_id": "evt-sup-b-0002",
+          "key": "residue-b",
+          "observed_time_unix_ms": 1000150,
+          "operation": "supersede_entity",
+          "payload_digest": "sha256:13f0dd1fa6284626c261c07b8b549ca6f001ef3fbd71a71ca0c8f57c45ea1430",
+          "provenance": "source:evt-sup-b-0002:supersession",
+          "target": "entity:ent-b"
+        },
+        {
+          "actor_id": "system",
+          "effective_time_unix_ms": 1000200,
+          "event_id": "evt-emb-b-0003",
+          "observed_time_unix_ms": 1000250,
+          "operation": "embed_entity",
+          "payload_digest": "sha256:5c12787a30c82e0c6e55e2fab6e7a2ee9c1981321ba7a940829c4e14968a3979",
+          "provenance": "source:entity:ent-b:embedding",
+          "target": "entity:ent-b"
+        },
+        {
+          "actor_id": "usr-grantor-7f3a",
+          "category": "insight",
+          "effective_time_unix_ms": 2000000,
+          "entity_id": "ent-b",
+          "event_id": "evt-arch-b-0004",
+          "key": "residue-b",
+          "observed_time_unix_ms": 2000100,
+          "operation": "archive_entity",
+          "payload_digest": "sha256:e8276662428b532f674347612c3a12bb71e7814470f32e2f960b58ff5a7a6402",
+          "provenance": "source:evt-arch-b-0004:lifecycle",
+          "target": "entity:ent-b"
+        },
+        {
+          "actor_id": "operator",
+          "effective_time_unix_ms": 3000000,
+          "event_id": "evt-purge-b-0005",
+          "observed_time_unix_ms": 3000050,
+          "operation": "purge",
+          "payload_digest": "sha256:fbc4f92c001d7abdeb6f05cd69059669dbb11ee43df3e93901b1f0f07f057d68",
+          "provenance": "source:evt-purge-b-0005:maintenance",
+          "target": "store"
+        },
+        {
+          "actor_id": "system",
+          "effective_time_unix_ms": 3000100,
+          "event_id": "evt-sweep-b-0006",
+          "observed_time_unix_ms": 3000150,
+          "operation": "sweep",
+          "payload_digest": "sha256:c2a874dac315061899845a11b80127551dceea93b4e981d03c1995e0cc9e84be",
+          "provenance": "source:evt-sweep-b-0006:independent",
+          "target": "store"
+        }
+      ],
+      "expected_decision": "accept",
+      "expected_receipt": "history rows counted as purged; undeclared cell empty; gate passed",
+      "negative_assertions": [
+        "no_reconstructable_residue",
+        "no_undeclared_residue"
+      ],
+      "postcondition_readback": {
+        "confirmed": true,
+        "kind": "sweep",
+        "performed": true
+      },
+      "reason": "deletion dominates correction: superseded versions retained for reconstructability are purged with their source",
+      "residue_model": {
+        "expected_gate": true,
+        "expected_undeclared_total": 0,
+        "purged_classes": [
+          "history"
+        ]
+      },
+      "title": "Deletion dominates correction: superseded versions are removed with their source",
+      "trace_id": "residue-deletion-dominates-correction"
     }
   ]
 }

@@ -10893,11 +10893,21 @@ pub fn handle_bench(db: &Database, args: Value) -> Result<String, String> {
 pub struct PurgeArgs {
     #[serde(default)]
     pub dry_run: bool,
+    /// #990: run only the independent residue sweep (no deletion), reporting
+    /// undeclared residual state and the hard-gate status.
+    #[serde(default)]
+    pub sweep_only: bool,
 }
 
 pub fn handle_purge(db: &Database, args: Value) -> Result<String, String> {
     let a: PurgeArgs =
         serde_json::from_value(args).map_err(|e| format!("Invalid purge arguments: {}", e))?;
+    if a.sweep_only {
+        let sweep = db
+            .residue_sweep()
+            .map_err(|e| format!("Residue sweep failed: {}", e))?;
+        return serde_json::to_string(&sweep).map_err(|e| format!("Serialization failed: {}", e));
+    }
     let report = db
         .purge(a.dry_run)
         .map_err(|e| format!("Purge failed: {}", e))?;
@@ -11647,6 +11657,34 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn purge_sweep_only_reports_without_deleting() {
+        let (db, _path) = temp_db();
+        db.conn()
+            .unwrap()
+            .execute(
+                "INSERT INTO entities_embedding_snapshot (id, embedding, created_at_unix_ms)
+                 VALUES ('ghost-tool', X'00', 1)",
+                [],
+            )
+            .unwrap();
+        let out = handle_purge(&db, serde_json::json!({"sweep_only": true})).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["hard_gate_passed"], false);
+        assert_eq!(v["undeclared_total"], 1);
+        // Nothing was deleted.
+        let count: i64 = db
+            .conn()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM entities_embedding_snapshot WHERE id = 'ghost-tool'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
     }
 
     #[test]
