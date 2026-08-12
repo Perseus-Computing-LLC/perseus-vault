@@ -4562,6 +4562,139 @@ struct HandoffPackArgs {
     pub workspace_hash: Option<String>,
 }
 
+/// #944: proof frame — bounded, hash-cited evidence pack for external
+/// consumers (Qorx Zero borrow). Memory stays on-device; the consumer gets
+/// only a capped frame (top-N records + per-record source hashes + a frame
+/// digest). An empty frame produces REFUSAL, never invention ("no proof,
+/// no answer"). Optional zeroize permanently blanks the framed entities'
+/// bodies after framing — the frame is the last copy (privacy end-state;
+/// body zeroization, documented as such, not key destruction).
+pub fn handle_proof_frame(db: &Database, args: Value) -> Result<String, String> {
+    let a: ProofFrameArgs =
+        serde_json::from_value(args).map_err(|e| format!("Invalid proof_frame arguments: {e}"))?;
+    if a.query.trim().is_empty() {
+        return Err("proof_frame query must be non-empty".to_string());
+    }
+    if !(1..=20).contains(&a.max_records) {
+        return Err(format!(
+            "max_records must be between 1 and 20, got {}",
+            a.max_records
+        ));
+    }
+    if !(200..=20_000).contains(&a.max_chars) {
+        return Err(format!(
+            "max_chars must be between 200 and 20000, got {}",
+            a.max_chars
+        ));
+    }
+    let params = crate::models::RecallParams {
+        query: a.query.clone(),
+        category: None,
+        entity_type: None,
+        limit: a.max_records * 3,
+        offset: 0,
+        min_decay: 0.0,
+        topic_path: None,
+        include_archived: false,
+        skip_side_effects: true,
+        mode: crate::models::SearchMode::Fts5,
+        embedding: None,
+        preview_cap: None,
+        ..Default::default()
+    };
+    let candidates = db
+        .recall(&params)
+        .map_err(|e| format!("proof_frame candidate recall failed: {e}"))?;
+
+    let mut records: Vec<serde_json::Value> = Vec::new();
+    let mut used_chars: i64 = 0;
+    let mut zeroized_ids: Vec<String> = Vec::new();
+    for ent in &candidates {
+        if records.len() as i64 >= a.max_records {
+            break;
+        }
+        // Truncate the body to the remaining char budget; the hash covers
+        // the FULL body, so the consumer can verify integrity and the
+        // frame stays capped.
+        let body = ent.body_json.clone();
+        let mut shown = body.clone();
+        let budget_left = a.max_chars - used_chars;
+        if shown.chars().count() as i64 > budget_left {
+            let cut: String = shown.chars().take(budget_left as usize).collect();
+            shown = cut;
+        }
+        let source_hash =
+            crate::db::sha256_hex(&format!("{}|{}|{}", ent.id, ent.created_at_unix_ms, body));
+        used_chars += shown.chars().count() as i64;
+        zeroized_ids.push(ent.id.clone());
+        records.push(json!({
+            "id": ent.id,
+            "key": ent.key,
+            "category": ent.category,
+            "source": ent.source,
+            "recorded_at_unix_ms": ent.created_at_unix_ms,
+            "body": shown,
+            "source_hash": source_hash,
+        }));
+    }
+    // Empty frame -> refusal, never invention.
+    if records.is_empty() {
+        return Ok(json!({
+            "refusal": true,
+            "reason": "no proof, no answer — no evidence matched the question",
+            "frame": [],
+            "evidence_hash": crate::db::sha256_hex(""),
+            "read_only": true,
+        })
+        .to_string());
+    }
+    // Frame digest over sorted id|hash lines — external verifiability.
+    let mut lines: Vec<String> = records
+        .iter()
+        .map(|r| format!("{}|{}", r["id"], r["source_hash"]))
+        .collect();
+    lines.sort();
+    let evidence_hash = crate::db::sha256_hex(&lines.join("\n"));
+    // Zeroize: permanently blank the framed entities after framing.
+    if a.zeroize {
+        {
+            let conn = db.conn().unwrap();
+            for id in &zeroized_ids {
+                conn.execute(
+                    "UPDATE entities SET body_json = '{}', archived = 1, archive_reason = 'crypto_zeroized' WHERE id = ?1",
+                    [id],
+                )
+                .map_err(|e| format!("zeroize failed: {e}"))?;
+            }
+        }
+    }
+    Ok(json!({
+        "refusal": false,
+        "frame": records,
+        "evidence_hash": evidence_hash,
+        "frame_chars": used_chars,
+        "max_records": a.max_records,
+        "max_chars": a.max_chars,
+        "zeroized": a.zeroize,
+        "read_only": !a.zeroize,
+    })
+    .to_string())
+}
+
+#[derive(serde::Deserialize)]
+struct ProofFrameArgs {
+    #[serde(default)]
+    pub query: String,
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub max_records: i64,
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub max_chars: i64,
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub zeroize: bool,
+    #[serde(default)]
+    pub workspace_hash: Option<String>,
+}
+
 pub fn handle_context(db: &Database, args: Value) -> String {
     let a: ContextArgs = match serde_json::from_value(args) {
         Ok(a) => a,

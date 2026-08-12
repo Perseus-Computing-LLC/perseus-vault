@@ -1225,6 +1225,25 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Handoff Pack"
   },
   {
+    "name": "perseus_vault_proof_frame",
+    "description": "Proof frame: bounded, hash-cited evidence pack for external consumers (Qorx Zero borrow). Memory stays on-device; the consumer gets only a capped frame (top-N records + per-record source hashes + frame digest). Empty frame -> refusal, never invention. zeroize:true permanently blanks framed entities' bodies after framing (privacy end-state).",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "query": { "type": "string", "description": "Evidence question (required, non-empty)" },
+        "max_records": { "type": "integer", "description": "Max records in the frame, 1..20, default 5" },
+        "max_chars": { "type": "integer", "description": "Max frame chars, 200..20000, default 1600" },
+        "zeroize": { "type": "boolean", "description": "Blank framed entities' bodies after framing (default false)" },
+        "workspace_hash": { "type": "string", "description": "Workspace scope hash" }
+      },
+      "required": ["query"]
+    },
+    "annotations": {
+      "readOnlyHint": true
+    },
+    "title": "Proof Frame"
+  },
+  {
     "name": "perseus_vault_recall_batch",
     "description": "Recall entities across a batch of queries, fusing their results server-side using reciprocal rank fusion (RRF) to merge, deduplicate, and surface the most globally relevant memories first.",
     "inputSchema": {
@@ -6750,6 +6769,7 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
 
         "perseus_vault_recall" => tools::handle_recall(db, args).map_err(|e| e.to_string()),
         "perseus_vault_handoff_pack" => tools::handle_handoff_pack(db, args).map_err(|e| e.to_string()),
+        "perseus_vault_proof_frame" => tools::handle_proof_frame(db, args).map_err(|e| e.to_string()),
 
         "perseus_vault_recall_batch" => {
             tools::handle_recall_batch(db, args).map_err(|e| e.to_string())
@@ -7066,7 +7086,7 @@ mod tests {
         );
         assert_eq!(
             registry_names.len(),
-            132,
+            133,
             "update public metadata when adding a tool"
         );
 
