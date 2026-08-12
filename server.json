@@ -2,7 +2,11 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.Perseus-Computing-LLC/perseus-vault",
   "title": "Perseus Vault — persistent, encrypted memory for AI agents",
-  "description": "Persistent, encrypted, deterministic memory for AI agents. Local-first, 127 canonical tools.",
+<<<<<<< HEAD
+  "description": "Persistent, encrypted, deterministic memory for AI agents. Local-first, 130 canonical tools.",
+=======
+  "description": "Persistent, encrypted, deterministic memory for AI agents. Local-first, 129 canonical tools.",
+>>>>>>> 9cf565e (feat(#951): shadow-import workflow — stage, compare, promote, rollback)
   "version": "2.23.0",
   "packages": [
     {

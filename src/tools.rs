@@ -5070,6 +5070,11 @@ pub struct VaultExportArgs {
     pub vault_dir: String,
     #[serde(default)]
     pub workspace_hash: Option<String>,
+    /// #951: shadow import target — when set, `vault_import` forces every
+    /// imported entity into this workspace (frontmatter values ignored), so
+    /// the live bank is never touched. Omit for the legacy import path.
+    #[serde(default)]
+    pub shadow_workspace: Option<String>,
 }
 
 pub fn handle_vault_export(db: &Database, args: Value) -> String {
@@ -5356,7 +5361,13 @@ pub fn handle_vault_import(db: &Database, args: Value) -> String {
     // #871: durable op-state wrap — the import run stays observable even if
     // the process dies mid-write (recovered as `interrupted` on restart).
     run_tracked(db, "import", "", "internal", move |run_id| {
-        match db.vault_import(&dir) {
+        let result = match &a.shadow_workspace {
+            // #951: shadow import — every entity forced into the shadow
+            // workspace; the live bank is never written.
+            Some(ws) => db.vault_import_shadow(&dir, ws),
+            None => db.vault_import(&dir),
+        };
+        match result {
             Ok(report) => {
                 let receipt = format!(
                     "files_created={} files_updated={} errors={}",
@@ -5375,6 +5386,108 @@ pub fn handle_vault_import(db: &Database, args: Value) -> String {
             Err(e) => Err(format!("Vault import failed: {e}")),
         }
     })
+}
+
+/// #951: shadow-import comparison harness. Runs a fixed query set against
+/// the live workspace and a shadow workspace (Fts5 mode, side-effect-free)
+/// and reports per-query coverage + context-token estimates — machine
+/// readable, gating-able, read-only.
+#[derive(Debug, Deserialize)]
+pub struct ShadowCompareArgs {
+    pub queries: Vec<String>,
+    /// Live workspace to compare against; omit (or "") for the unscoped bank.
+    #[serde(default)]
+    pub live_workspace: Option<String>,
+    pub shadow_workspace: String,
+    #[serde(default = "default_limit", deserialize_with = "null_as_default_limit")]
+    pub limit: i64,
+}
+
+pub fn handle_shadow_compare(db: &Database, args: Value) -> Result<String, String> {
+    let a: ShadowCompareArgs = serde_json::from_value(args)
+        .map_err(|e| format!("Invalid shadow_compare arguments: {e}"))?;
+    if a.queries.is_empty() || a.queries.len() > 500 {
+        return Err("queries must contain 1..=500 entries".to_string());
+    }
+    if a.shadow_workspace.is_empty() {
+        return Err("shadow_workspace must not be empty".to_string());
+    }
+    let live_ws = a
+        .live_workspace
+        .as_deref()
+        .filter(|w| !w.is_empty());
+    let report = db
+        .shadow_compare(&a.queries, live_ws, &a.shadow_workspace, a.limit)
+        .map_err(|e| format!("shadow_compare failed: {e}"))?;
+    serde_json::to_string(&report).map_err(|e| format!("Serialization failed: {e}"))
+}
+
+/// #951: promote — move every non-archived entity from the shadow workspace
+/// into the target workspace in one atomic operation, journaling the moved
+/// ids so `shadow_rollback` can undo the cutover in one operation.
+#[derive(Debug, Deserialize)]
+pub struct ShadowPromoteArgs {
+    pub shadow_workspace: String,
+    /// Target workspace (default: "" — the unscoped live bank).
+    #[serde(default)]
+    pub target_workspace: Option<String>,
+    /// Preview the move (count only — nothing written, no journal).
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub dry_run: bool,
+}
+
+pub fn handle_shadow_promote(db: &Database, args: Value) -> Result<String, String> {
+    let a: ShadowPromoteArgs = serde_json::from_value(args)
+        .map_err(|e| format!("Invalid shadow_promote arguments: {e}"))?;
+    if a.shadow_workspace.is_empty() {
+        return Err("shadow_workspace must not be empty".to_string());
+    }
+    let target = a.target_workspace.unwrap_or_default();
+    if a.dry_run {
+        // Count-only preview: never writes, never journals.
+        let n = db
+            .count_entities(None, None, Some(&a.shadow_workspace))
+            .map_err(|e| format!("shadow_promote dry-run failed: {e}"))?;
+        return Ok(json!({
+            "dry_run": true,
+            "would_move": n,
+            "from_workspace": a.shadow_workspace,
+            "to_workspace": target,
+        })
+        .to_string());
+    }
+    let report = db
+        .shadow_promote(&a.shadow_workspace, &target)
+        .map_err(|e| format!("shadow_promote failed: {e}"))?;
+    serde_json::to_string(&report).map_err(|e| format!("Serialization failed: {e}"))
+}
+
+/// #951: rollback — one operation returns every promoted id to its
+/// pre-promote workspace (from the `shadow_promote_last` journal).
+#[derive(Debug, Deserialize)]
+pub struct ShadowRollbackArgs {
+    /// Preview the rollback (nothing written, journal kept).
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub dry_run: bool,
+}
+
+pub fn handle_shadow_rollback(db: &Database, args: Value) -> Result<String, String> {
+    let a: ShadowRollbackArgs = serde_json::from_value(args)
+        .map_err(|e| format!("Invalid shadow_rollback arguments: {e}"))?;
+    if a.dry_run {
+        let j = db
+            .shadow_promote_journal()
+            .map_err(|e| format!("shadow_rollback dry-run failed: {e}"))?;
+        return Ok(json!({
+            "dry_run": true,
+            "journal": j,
+        })
+        .to_string());
+    }
+    let report = db
+        .shadow_rollback()
+        .map_err(|e| format!("shadow_rollback failed: {e}"))?;
+    serde_json::to_string(&report).map_err(|e| format!("Serialization failed: {e}"))
 }
 
 #[derive(Debug, Deserialize)]
@@ -10098,6 +10211,95 @@ mod tests {
             "{raw}"
         );
         assert_eq!(db.count_entities(None, None, None).unwrap(), 1);
+    }
+
+    // ─── #951 shadow-import workflow ───────────────────────────────────────
+
+    /// Build a vault dir with two .md files whose frontmatter claims
+    /// `workspace_hash: live-ws` — a shadow import must override that.
+    fn shadow_vault_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "perseus-vault-shadow-{tag}-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("a.md"),
+            "---\nid: imp-a\ncategory: facts\nkey: imported-a\ntype: insight\nworkspace_hash: live-ws\n---\ndeployment pipeline shadow variant alpha\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("b.md"),
+            "---\nid: imp-b\ncategory: facts\nkey: imported-b\ntype: insight\nworkspace_hash: live-ws\n---\napi gateway timeout budget monitoring\n",
+        )
+        .unwrap();
+        dir
+    }
+
+    fn shadow_recall_keys(db: &crate::db::Database, query: &str, ws: &str) -> Vec<String> {
+        let raw = handle_recall(
+            db,
+            json!({"query": query, "mode": "fts5", "workspace_hash": ws, "limit": 10}),
+        )
+        .expect("recall");
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        v["items"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|r| r["key"].as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn shadow_import_isolates_live_workspace() {
+        let (db, path) = temp_db();
+        // Live bank: an entity with the SAME (category, key) as an imported
+        // file — identity is workspace-scoped, so the shadow import must
+        // create a separate entity and leave this one untouched.
+        let raw = handle_remember(
+            &db,
+            json!({"category": "facts", "key": "imported-a",
+                   "body_json": "{\"note\":\"deployment pipeline live version\"}",
+                   "workspace_hash": "live-ws"}),
+        )
+        .expect("live seed");
+        let live_id = serde_json::from_str::<Value>(&raw).unwrap()["id"].clone();
+
+        let dir = shadow_vault_dir("iso");
+        let before = shadow_recall_keys(&db, "deployment", "live-ws");
+
+        let import = handle_vault_import(
+            &db,
+            json!({"vault_dir": dir.to_str().unwrap(), "shadow_workspace": "shadow-ws"}),
+        );
+        let v: Value = serde_json::from_str(&import).unwrap();
+        assert_eq!(v["files_created"], json!(2), "{import}");
+
+        // Live recall byte-identical before/during/after; live entity intact.
+        let after = shadow_recall_keys(&db, "deployment", "live-ws");
+        assert_eq!(before, after, "live workspace must not change during shadow import");
+        let raw2 = handle_recall(
+            &db,
+            json!({"query": "deployment", "mode": "fts5", "workspace_hash": "live-ws", "limit": 10}),
+        )
+        .expect("live recall");
+        let v2: Value = serde_json::from_str(&raw2).unwrap();
+        assert_eq!(v2["items"][0]["id"], live_id, "live entity must still be the top hit");
+        assert_eq!(v2["items"][0]["key"], json!("imported-a"));
+
+        // Shadow workspace sees the imported entities (frontmatter ws ignored).
+        let shadow = shadow_recall_keys(&db, "deployment", "shadow-ws");
+        assert_eq!(shadow, vec!["imported-a".to_string()], "{shadow:?}");
+        let shadow_b = shadow_recall_keys(&db, "gateway", "shadow-ws");
+        assert_eq!(shadow_b, vec!["imported-b".to_string()]);
+
+        // Count: exactly 2 entities live (1) + shadow (2).
+        assert_eq!(db.count_entities(None, None, Some("live-ws")).unwrap(), 1);
+        assert_eq!(db.count_entities(None, None, Some("shadow-ws")).unwrap(), 2);
+
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_file(path);
     }
@@ -10132,6 +10334,7 @@ mod tests {
             cold_first: false,
             archive_sources: false,
             global: false,
+            force: false,
             requesting_agent_id: "test-agent".to_string(),
             quote_cap_chars: 6000,
             refine_existing: true,
@@ -10148,6 +10351,28 @@ mod tests {
             )
             .unwrap();
         assert_eq!(poisoned, 1, "only the original source row exists; no observation copied it");
+    }
+
+    fn shadow_import_rerun_creates_zero_new_identities() {
+        let (db, path) = temp_db();
+        let dir = shadow_vault_dir("rerun");
+        let mut created = Vec::new();
+        for _ in 0..2 {
+            let raw = handle_vault_import(
+                &db,
+                json!({"vault_dir": dir.to_str().unwrap(), "shadow_workspace": "shadow-ws"}),
+            );
+            let v: Value = serde_json::from_str(&raw).unwrap();
+            created.push(v["files_created"].as_u64().unwrap());
+        }
+        assert_eq!(created, vec![2, 0], "first run creates, second run is a no-op update");
+        assert_eq!(
+            db.count_entities(None, None, Some("shadow-ws")).unwrap(),
+            2,
+            "rerun must create zero new identities"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
         let _ = std::fs::remove_file(path);
     }
 
@@ -10160,6 +10385,124 @@ mod tests {
         )
         .expect_err("federate is fail-closed by design");
         assert!(err.contains("authenticated authoritative admission"), "{err}");
+    }
+
+    fn shadow_compare_reports_per_query_and_totals() {
+        let (db, path) = temp_db();
+        // Live has "deployment" content; shadow has both topics.
+        handle_remember(
+            &db,
+            json!({"category": "facts", "key": "live-deploy",
+                   "body_json": "{\"note\":\"deployment pipeline live\"}",
+                   "workspace_hash": "live-ws"}),
+        )
+        .expect("live");
+        let dir = shadow_vault_dir("cmp");
+        handle_vault_import(
+            &db,
+            json!({"vault_dir": dir.to_str().unwrap(), "shadow_workspace": "shadow-ws"}),
+        );
+
+        let raw = handle_shadow_compare(
+            &db,
+            json!({"queries": ["deployment", "gateway", "zzzzzz qqqqqq"], "shadow_workspace": "shadow-ws",
+                   "live_workspace": "live-ws", "limit": 5}),
+        )
+        .expect("compare");
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        let queries = v["queries"].as_array().unwrap();
+        assert_eq!(queries.len(), 3, "{raw}");
+        assert_eq!(queries[0]["live"]["hit"], json!(true), "{raw}");
+        assert_eq!(queries[0]["shadow"]["hit"], json!(true));
+        assert_eq!(queries[1]["live"]["hit"], json!(false), "{raw}");
+        assert_eq!(queries[1]["shadow"]["hit"], json!(true));
+        assert_eq!(queries[2]["live"]["hit"], json!(false));
+        assert_eq!(queries[2]["shadow"]["hit"], json!(false));
+        let totals = &v["totals"];
+        assert_eq!(totals["queries"], json!(3));
+        assert_eq!(totals["live_coverage"], json!(1.0 / 3.0));
+        assert_eq!(totals["shadow_coverage"], json!(2.0 / 3.0));
+        assert!(totals["shadow_context_tokens_est"].as_u64().unwrap() > 0, "{raw}");
+        // Read-only: entity counts unchanged.
+        assert_eq!(db.count_entities(None, None, Some("live-ws")).unwrap(), 1);
+        assert_eq!(db.count_entities(None, None, Some("shadow-ws")).unwrap(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn shadow_promote_and_rollback_are_single_ops_with_recall_equivalence() {
+        let (db, path) = temp_db();
+        let dir = shadow_vault_dir("promo");
+        handle_vault_import(
+            &db,
+            json!({"vault_dir": dir.to_str().unwrap(), "shadow_workspace": "shadow-ws"}),
+        );
+        let before_shadow = shadow_recall_keys(&db, "deployment", "shadow-ws");
+
+        // Promote: one call moves both entities into the live workspace.
+        let raw = handle_shadow_promote(
+            &db,
+            json!({"shadow_workspace": "shadow-ws", "target_workspace": "live-ws"}),
+        )
+        .expect("promote");
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["moved"], json!(2), "{raw}");
+        assert_eq!(v["journaled"], json!("shadow_promote_last"));
+        // Recall equivalence: the imported content is now live.
+        let live = shadow_recall_keys(&db, "deployment", "live-ws");
+        assert_eq!(live, vec!["imported-a".to_string()], "{live:?}");
+        // Shadow is now empty for that content.
+        assert!(shadow_recall_keys(&db, "deployment", "shadow-ws").is_empty());
+
+        // Rollback: one call restores everything.
+        let raw2 = handle_shadow_rollback(&db, json!({})).expect("rollback");
+        let v2: Value = serde_json::from_str(&raw2).unwrap();
+        assert_eq!(v2["rolled_back"], json!(2), "{raw2}");
+        assert!(shadow_recall_keys(&db, "deployment", "shadow-ws") == before_shadow);
+        assert!(shadow_recall_keys(&db, "deployment", "live-ws").is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn shadow_promote_dry_run_writes_nothing_and_rollback_without_journal_fails() {
+        let (db, path) = temp_db();
+        let dir = shadow_vault_dir("dry");
+        handle_vault_import(
+            &db,
+            json!({"vault_dir": dir.to_str().unwrap(), "shadow_workspace": "shadow-ws"}),
+        );
+
+        let raw = handle_shadow_promote(
+            &db,
+            json!({"shadow_workspace": "shadow-ws", "dry_run": true}),
+        )
+        .expect("dry run");
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["dry_run"], json!(true), "{raw}");
+        assert_eq!(v["would_move"], json!(2), "{raw}");
+        assert_eq!(db.count_entities(None, None, Some("shadow-ws")).unwrap(), 2);
+
+        let j = handle_shadow_rollback(&db, json!({"dry_run": true})).expect("dry rollback");
+        let vj: Value = serde_json::from_str(&j).unwrap();
+        assert!(vj["journal"].is_null(), "{j}");
+
+        let err = handle_shadow_rollback(&db, json!({})).expect_err("no journal");
+        assert!(err.contains("nothing to roll back"), "{err}");
+
+        // Validation: empty query set refused; empty shadow ws refused.
+        let err2 = handle_shadow_compare(
+            &db,
+            json!({"queries": [], "shadow_workspace": "shadow-ws"}),
+        )
+        .expect_err("empty queries");
+        assert!(err2.contains("1..=500"), "{err2}");
+        let err3 = handle_shadow_promote(&db, json!({"shadow_workspace": ""}))
+            .expect_err("empty shadow ws");
+        assert!(err3.contains("must not be empty"), "{err3}");
+        let _ = std::fs::remove_dir_all(&dir);
+
         let _ = std::fs::remove_file(path);
     }
 

@@ -5213,7 +5213,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
   },
   {
     "name": "perseus_vault_vault_import",
-    "description": "Import .md files from a vault directory into the database. Reads YAML frontmatter for metadata and markdown body for content. Idempotent — re-running on the same vault won't duplicate entities. Pair with perseus_vault_vault_export for transfer.",
+    "description": "Import .md files from a vault directory into the database. Reads YAML frontmatter for metadata and markdown body for content. Idempotent — re-running on the same vault won't duplicate entities. Pass shadow_workspace to run a shadow import: every entity is forced into that scratch workspace and the live bank is never touched, so you can compare recall before cutting over (see perseus_vault_shadow_compare / _promote / _rollback). Pair with perseus_vault_vault_export for transfer.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -5221,6 +5221,10 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
           "type": "string",
           "default": "~/.perseus-vault/vault",
           "description": "Directory path to read .md files from. Use ~ for home directory."
+        },
+        "shadow_workspace": {
+          "type": "string",
+          "description": "#951 shadow import: when set, every imported entity is forced into this workspace regardless of frontmatter. Zero writes to the live bank; rerunnable with zero new identities."
         }
       },
       "required": []
@@ -5257,6 +5261,85 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
       "destructiveHint": true
     },
     "title": "Import Vault from Files"
+  },
+  {
+    "name": "perseus_vault_shadow_compare",
+    "description": "#951: recall comparison between the live workspace and a shadow workspace over a fixed query set. Deterministic (Fts5 mode), side-effect-free, machine-readable — the gate for deciding whether a shadow import clears cutover.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "queries": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Fixed query set to run in both workspaces (1..=500)."
+        },
+        "live_workspace": {
+          "type": "string",
+          "description": "Live workspace to compare against; omit for the unscoped bank."
+        },
+        "shadow_workspace": {
+          "type": "string",
+          "description": "The scratch workspace holding the shadow import."
+        },
+        "limit": {
+          "type": "integer",
+          "default": 5,
+          "description": "Recall limit per query (1..=100)."
+        }
+      },
+      "required": ["queries", "shadow_workspace"]
+    },
+    "annotations": {
+      "readOnlyHint": true
+    },
+    "title": "Compare Live vs Shadow Recall"
+  },
+  {
+    "name": "perseus_vault_shadow_promote",
+    "description": "#951: promote — move every non-archived entity from the shadow workspace into the target workspace in ONE atomic operation, journaling the moved ids so perseus_vault_shadow_rollback can undo the cutover in one operation. dry_run previews the count without writing.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "shadow_workspace": {
+          "type": "string",
+          "description": "The scratch workspace to promote from."
+        },
+        "target_workspace": {
+          "type": "string",
+          "default": "",
+          "description": "Target workspace (default: the unscoped live bank)."
+        },
+        "dry_run": {
+          "type": "boolean",
+          "default": false,
+          "description": "Preview the move (count only — nothing written, no journal)."
+        }
+      },
+      "required": ["shadow_workspace"]
+    },
+    "annotations": {
+      "destructiveHint": true
+    },
+    "title": "Promote Shadow Import to Live"
+  },
+  {
+    "name": "perseus_vault_shadow_rollback",
+    "description": "#951: rollback — one operation returns every promoted id to its pre-promote workspace, using the shadow_promote_last journal. dry_run previews the journal without writing.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "dry_run": {
+          "type": "boolean",
+          "default": false,
+          "description": "Preview the journal (nothing written, journal kept)."
+        }
+      },
+      "required": []
+    },
+    "annotations": {
+      "destructiveHint": true
+    },
+    "title": "Roll Back Shadow Promote"
   },
   {
     "name": "perseus_vault_decay",
@@ -6827,6 +6910,15 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
         "perseus_vault_markdown_import" => tools::handle_markdown_import(db, args),
         "perseus_vault_structured_index_anchor" => tools::handle_structured_index_anchor(db, args),
         "perseus_vault_vault_import" => Ok(tools::handle_vault_import(db, args)),
+        "perseus_vault_shadow_compare" => {
+            tools::handle_shadow_compare(db, args).map_err(|e| e.to_string())
+        }
+        "perseus_vault_shadow_promote" => {
+            tools::handle_shadow_promote(db, args).map_err(|e| e.to_string())
+        }
+        "perseus_vault_shadow_rollback" => {
+            tools::handle_shadow_rollback(db, args).map_err(|e| e.to_string())
+        }
         "perseus_vault_decay" => Ok(tools::handle_decay(db, args)),
         "perseus_vault_reindex" => Ok(tools::handle_reindex(db, args)),
         "perseus_vault_share" => tools::handle_share(db, args).map_err(|e| e.to_string()),
@@ -6919,7 +7011,7 @@ mod tests {
         );
         assert_eq!(
             registry_names.len(),
-            127,
+            130,
             "update public metadata when adding a tool"
         );
 
