@@ -165,9 +165,13 @@ jobs:
         run: |
           cd "target/${{ matrix.target }}/release"
           asset="perseus-vault-${{ matrix.target }}.tar.gz"
+          base="perseus-vault-${{ matrix.target }}"
           tar -czf "$asset" perseus-vault
-          shasum -a 256 "$asset" > "$asset.sha256"
-          gh release upload "$GITHUB_REF_NAME" "$asset" "$asset.sha256" \
+          # #992: checksum must be named from the archive BASE (like the
+          # taiki leg does for Linux/Windows), not from the full asset name —
+          # '<base>.tar.gz.sha256' broke install.sh on Darwin (v2.21-v2.23).
+          shasum -a 256 "$asset" > "$base.sha256"
+          gh release upload "$GITHUB_REF_NAME" "$asset" "$base.sha256" \
             --repo "$GITHUB_REPOSITORY" --clobber
       - name: Upload full binary (Linux/Windows)
         if: runner.os != 'macOS'
