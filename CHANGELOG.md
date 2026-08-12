@@ -6,6 +6,14 @@ All notable changes to Perseus Vault are documented here. This project adheres t
 ## [Unreleased]
 
 ### Added
+- **Active-decision anchor query expansion (#1009).** Opt-in
+  `anchor_expansion` on recall: keystones (#683) + ACTIVE decision entities
+  (un-superseded via the #363/#472 chain — a structural fact, not an LLM
+  label) become extra lexical FTS5 queries after fusion; matching candidates
+  get a capped boost (1.15/match, 1.5 cumulative) and are recorded in
+  `FusedTrace.anchor_matched`. Workspace-scoped, read-only, default OFF
+  (#247 byte-identical default recalls). Spec:
+  `docs/specs/anchor-expansion.md`.
 - **Config self-report with requested-vs-resolved diff (#1010).** New
   `perseus_vault_config_report` MCP tool (registry 134→135): per-stage
   provider/config self-report — embedding_backend, model_backend,

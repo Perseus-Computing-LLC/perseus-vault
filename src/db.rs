@@ -7536,6 +7536,9 @@ impl Database {
                     } else {
                         fused
                     };
+                    // #1009: active-decision anchor expansion (opt-in,
+                    // capped, read-only — ranking only).
+                    let fused = self.apply_anchor_expansion(fused, params)?;
                     timer.stage("usefulness");
                     // #485: scope preference in the same first-phase expression —
                     // broader-scope (global) hits fused at `scope_weight`.
@@ -8168,6 +8171,10 @@ impl Database {
         } else {
             fused
         };
+        // #1009: active-decision anchor expansion (opt-in, capped,
+        // read-only); anchor-matched ids land in the fused trace.
+        let (fused, anchor_matched) = self.apply_anchor_expansion_traced(fused, params)?;
+        trace.anchor_matched = anchor_matched;
         let fused = Self::apply_scope_rank_weight(fused, params);
         let fused = Self::apply_supersede_recency(fused);
         let mut cand: Vec<Entity> = fused.into_iter().map(|(e, _)| e).collect();
@@ -8585,6 +8592,44 @@ impl Database {
             .filter(|q| *q > 0.0)
             .unwrap_or(0.0004);
         supersede_reorder(fused, quantum)
+    }
+
+    /// #1009: active-decision anchor expansion — load the workspace-scoped
+    /// anchor set (keystones + active decisions) and apply the capped
+    /// anchor-match boost. Read-only: ranking only, no access-state writes
+    /// (#247). Opt-in via `params.anchor_expansion`; off = no-op (byte-
+    /// identical default recalls).
+    fn apply_anchor_expansion(
+        &self,
+        fused: Vec<(Entity, f64)>,
+        params: &RecallParams,
+    ) -> Result<Vec<(Entity, f64)>, Box<dyn std::error::Error>> {
+        let (fused, _matched) = self.apply_anchor_expansion_traced(fused, params)?;
+        Ok(fused)
+    }
+
+    /// #1009: `apply_anchor_expansion` plus the matched-entity ids for the
+    /// fused trace (anchor matches are surfaced, never silent).
+    fn apply_anchor_expansion_traced(
+        &self,
+        mut fused: Vec<(Entity, f64)>,
+        params: &RecallParams,
+    ) -> Result<(Vec<(Entity, f64)>, Vec<String>), Box<dyn std::error::Error>> {
+        if !params.anchor_expansion {
+            return Ok((fused, Vec::new()));
+        }
+        let conn = self.conn()?;
+        let anchors = crate::anchor_expansion::load_anchors(
+            &conn,
+            params.workspace_hash.as_deref(),
+            crate::anchor_expansion::DEFAULT_ANCHOR_K,
+        )?;
+        if anchors.is_empty() {
+            return Ok((fused, Vec::new()));
+        }
+        let mut matched = Vec::new();
+        crate::anchor_expansion::boost_anchor_matches(&conn, &mut fused, &anchors, &mut matched)?;
+        Ok((fused, matched))
     }
 
     /// #487 + #681: multiply each fused score by the honest-usage weights —

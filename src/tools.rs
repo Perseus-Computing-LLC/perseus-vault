@@ -475,6 +475,10 @@ pub struct RecallArgs {
     /// never a silent fallback to fuzzy recall.
     #[serde(default)]
     pub declared_filters: Option<std::collections::HashMap<String, serde_json::Value>>,
+    /// #1009: active-decision anchor expansion (opt-in, capped boost,
+    /// workspace-scoped). Default false — a default recall is byte-identical.
+    #[serde(default)]
+    pub anchor_expansion: bool,
 }
 
 pub type BatchQuery = RecallArgs;
@@ -1859,6 +1863,7 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
         tier_order: a.tier_order,
         declared_category: a.declared_category.clone(),
         declared_filters: a.declared_filters.clone(),
+        anchor_expansion: a.anchor_expansion,
         reinforce: a.reinforce,
         strategies: a.strategies,
         max_tokens: a.max_tokens,
@@ -2347,6 +2352,7 @@ pub fn handle_recall_batch(db: &Database, args: Value) -> Result<String, String>
             tier_order: q.tier_order,
             declared_category: q.declared_category.clone(),
             declared_filters: q.declared_filters.clone(),
+            anchor_expansion: q.anchor_expansion,
         };
 
         let mut entities = db
