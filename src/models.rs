@@ -1105,6 +1105,11 @@ pub struct ContextOptions {
     /// #875: caller session id for preload usage telemetry. Empty when
     /// unknown — events then group into a pseudo-session per context hash.
     pub session_id: String,
+    /// #996: transport-stamped requester identity. When present (and
+    /// non-empty), entities the requester may not read (private/fleet
+    /// visibility) are dropped before rendering — context injection gets the
+    /// same visibility gate as recall.
+    pub requesting_agent_id: Option<String>,
 }
 
 /// A rendered context block plus injection metadata (#366).
