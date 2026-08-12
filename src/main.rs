@@ -2,6 +2,7 @@ mod beliefs;
 mod capture;
 mod claim_card;
 mod communities;
+mod config_report;
 mod connectors;
 mod court_audit;
 mod db;
@@ -4052,6 +4053,12 @@ fn run() {
                 false,
                 external_actions,
             );
+
+            // #1010: per-stage config self-report at startup — one line per
+            // stage, drift conditions printed loudly so a requested-vs-
+            // resolved mismatch is visible in the process log, not just
+            // queryable via perseus_vault_config_report.
+            crate::config_report::log_block(&database, database.deployment_context());
 
             // One Database (one connection pool) per process (#402): every
             // surface — web dashboard, MCP transport, stdio server — shares

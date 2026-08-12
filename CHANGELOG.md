@@ -6,6 +6,16 @@ All notable changes to Perseus Vault are documented here. This project adheres t
 ## [Unreleased]
 
 ### Added
+- **Config self-report with requested-vs-resolved diff (#1010).** New
+  `perseus_vault_config_report` MCP tool (registry 134→135): per-stage
+  provider/config self-report — embedding_backend, model_backend,
+  quantization, db_path, encryption, network — each with `requested` (the
+  operator knob as literally given, sanitized), `resolved` (runtime truth),
+  `drifted` (loud flag when they differ), and a remediation `note`.
+  Quantization reads the live store record (not the open cache), so a store
+  declared by a previous process drifts loudly against this process's
+  default. Startup prints one line per stage; drift lines are prefixed
+  `CONFIG DRIFT`. Docs: `docs/specs/config-self-report.md`.
 - **Scheduled recall evaluation with regression alerts (#930).** New
   `perseus-vault eval` CLI (record | history | alerts) and
   `perseus_vault_eval_history` MCP tool (registry 122→123): durable

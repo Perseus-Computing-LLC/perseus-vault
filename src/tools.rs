@@ -4340,6 +4340,20 @@ pub fn handle_deployment_profile(db: &Database, _args: Value) -> Result<String, 
     serde_json::to_string(&profile).map_err(|e| format!("Serialization failed: {e}"))
 }
 
+// ─── perseus_vault_config_report (#1010) ──────────────────────────────
+
+/// Per-stage provider/config self-report with the requested-vs-resolved
+/// diff. Extends #870's deployment profile (resolved posture only) with the
+/// REQUESTED half of the diff: each stage reports the operator-facing knob as
+/// literally given, the runtime's actual resolution, and a `drifted` flag
+/// with a remediation note when they differ. The Hy-Memory / MindCache
+/// lesson: a stage silently resolving away from what was requested must be a
+/// loud, queryable condition — never an ERROR-log-only silent skip.
+pub fn handle_config_report(db: &Database, _args: Value) -> Result<String, String> {
+    let report = crate::config_report::build(db, db.deployment_context());
+    serde_json::to_string(&report).map_err(|e| format!("Serialization failed: {e}"))
+}
+
 fn default_telemetry_category() -> String {
     "general".to_string()
 }
