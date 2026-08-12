@@ -36,7 +36,7 @@ jobs:
   verify-registry:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Verify MCP registry metadata
         run: cargo test --no-default-features 'mcp::tests::registry_and_advertised_manifest_are_unique_and_in_sync' -- --exact
       - name: Verify count-bearing public surfaces match the registry
@@ -50,7 +50,7 @@ jobs:
        startsWith(github.event.workflow_run.head_branch, 'v'))
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Sync server.json version from Cargo.toml
         run: |

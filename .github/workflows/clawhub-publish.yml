@@ -18,7 +18,7 @@ permissions:
 
 jobs:
   publish:
-    uses: openclaw/clawhub/.github/workflows/skill-publish.yml@main
+    uses: openclaw/clawhub/.github/workflows/skill-publish.yml@faab45bace675a046b9b628dbc4581008ebbef96 # main
     with:
       owner: tcconnally
       root: clawhub/skills
