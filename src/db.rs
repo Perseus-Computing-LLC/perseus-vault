@@ -35360,7 +35360,12 @@ mod tests {
         );
         assert_eq!(r.observations[0].proof_count, 2);
         assert_eq!(r.observations[0].quotes.len(), 2);
-        assert_eq!(r.observations[0].source_ids, vec!["p884-1", "p884-2"]);
+        // source_ids order is a HashMap-iteration artifact (per-process
+        // RandomState seed) — not part of the consolidate contract. Compare
+        // as a set; Windows CI hit the unlucky seed (2026-08-12).
+        let mut got_ids = r.observations[0].source_ids.clone();
+        got_ids.sort();
+        assert_eq!(got_ids, vec!["p884-1", "p884-2"]);
         let _ = fs::remove_file(&path);
     }
 
