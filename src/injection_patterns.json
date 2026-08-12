@@ -1,0 +1,14 @@
+{
+  "patterns": [
+    {"id": "ignore_previous", "severity": "hard", "needles": ["ignore all previous", "ignore any previous"]},
+    {"id": "disregard_instructions", "severity": "hard", "needles": ["disregard all previous", "disregard your instructions", "disregard your rules"]},
+    {"id": "must_now", "severity": "hard", "needles": ["you must now"]},
+    {"id": "tool_invocation", "severity": "hard", "needles": ["mcp__", "tool_call(", "function_call("]},
+    {"id": "system_tag", "severity": "hard", "needles": ["<system>", "</system>", "<instructions>", "</instructions>"]},
+    {"id": "fetch_imperative", "severity": "hard", "needles": ["fetch https://", "fetch http://", "curl https://", "curl http://", "wget https://", "wget http://"]},
+    {"id": "jailbreak_hint", "severity": "soft", "needles": ["jailbreak", "do anything now"]},
+    {"id": "hidden_directive", "severity": "soft", "needles": ["do not tell the user", "do not mention this", "do not reveal"]},
+    {"id": "role_override", "severity": "soft", "needles": ["you are now"]},
+    {"id": "system_prompt_mention", "severity": "soft", "needles": ["system prompt"]}
+  ]
+}

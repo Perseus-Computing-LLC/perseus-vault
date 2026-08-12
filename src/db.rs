@@ -16482,6 +16482,7 @@ impl Database {
         // #874: folds skipped because the merged body would heavily activate
         // an entity outside the fold's source set (interference discipline).
         let mut interference_skips: i64 = 0;
+        let mut lint_skips: i64 = 0;
         let now = now_ms();
 
         // #952: maintenance/serving isolation — mid-run SLO probe between
@@ -16760,6 +16761,46 @@ impl Database {
                     // would dilute the activation overlap.
                     let merged_body = crate::observations::observation_body(&meta);
                     let merged_text = crate::observations::body_text(&merged_body);
+                    // #957: admission lint on the merged body AND the quoted
+                    // source evidence — a poisoned source must never propagate
+                    // into an observation via consolidation (its quote text is
+                    // served with the observation). Fail closed: skip the fold
+                    // and journal.
+                    let lint_haystack = format!(
+                        "{}\n{}",
+                        merged_text,
+                        meta.quotes
+                            .iter()
+                            .map(|q| q.quote.as_str())
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    );
+                    if let Some(hit) = crate::injection_lint::first_hit(&lint_haystack) {
+                        lint_skips += 1;
+                        self.journal(&JournalEvent {
+                            id: format!("jrn-{}", uuid::Uuid::new_v4().simple()),
+                            event_type: "consolidate_lint_skip".to_string(),
+                            evaluated_json: serde_json::to_string(&serde_json::json!({
+                                "pattern_id": hit.pattern_id,
+                                "target_observation": target.entity.id,
+                                "category": params.category,
+                            }))?,
+                            acted_json: serde_json::to_string(&serde_json::json!({
+                                "folded": false,
+                                "reason": crate::injection_lint::reason_for(&hit),
+                            }))?,
+                            forward_json: "{\"note\":\"fold skipped; sources left untouched; \
+                                the merged body matched an injection pattern\"}"
+                                .to_string(),
+                            category: crate::observations::OBSERVATION_CATEGORY.to_string(),
+                            key: String::new(),
+                            entity_id: target.entity.id.clone(),
+                            agent_id: params.requesting_agent_id.clone(),
+                            workspace_hash: scope_ws.clone().unwrap_or_default(),
+                            created_at_unix_ms: now,
+                        })?;
+                        continue;
+                    }
                     // The fold's own slots are the ENTIRE evidence set —
                     // new sources AND the target observation's existing
                     // sources (refine() preserves them in meta.source_ids).
@@ -16895,6 +16936,43 @@ impl Database {
                     let obs_exclude: Vec<String> = meta.source_ids.clone();
                     let merged_body = crate::observations::observation_body(&meta);
                     let merged_text = crate::observations::body_text(&merged_body);
+                    // #957: admission lint on fresh observations — same
+                    // fail-closed guard as the refine path above (quotes
+                    // included in the haystack).
+                    let lint_haystack = format!(
+                        "{}\n{}",
+                        merged_text,
+                        meta.quotes
+                            .iter()
+                            .map(|q| q.quote.as_str())
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    );
+                    if let Some(hit) = crate::injection_lint::first_hit(&lint_haystack) {
+                        lint_skips += 1;
+                        self.journal(&JournalEvent {
+                            id: format!("jrn-{}", uuid::Uuid::new_v4().simple()),
+                            event_type: "consolidate_lint_skip".to_string(),
+                            evaluated_json: serde_json::to_string(&serde_json::json!({
+                                "pattern_id": hit.pattern_id,
+                                "category": params.category,
+                            }))?,
+                            acted_json: serde_json::to_string(&serde_json::json!({
+                                "folded": false,
+                                "reason": crate::injection_lint::reason_for(&hit),
+                            }))?,
+                            forward_json: "{\"note\":\"fresh observation skipped; sources left \
+                                untouched; the merged body matched an injection pattern\"}"
+                                .to_string(),
+                            category: crate::observations::OBSERVATION_CATEGORY.to_string(),
+                            key: String::new(),
+                            entity_id: entity_id.clone(),
+                            agent_id: params.requesting_agent_id.clone(),
+                            workspace_hash: scope_ws.clone().unwrap_or_default(),
+                            created_at_unix_ms: now,
+                        })?;
+                        continue;
+                    }
                     if let Some((top_id, score)) = self.consolidate_interference_hit(
                         &merged_text,
                         &obs_exclude,
@@ -17192,6 +17270,7 @@ impl Database {
             observations_stale,
             quotes_captured,
             interference_skips,
+            lint_skips,
             dry_run: params.dry_run,
             observations,
             workspace_hash: scope_ws,
@@ -19158,6 +19237,18 @@ last_accessed: {}
             let fm = fm_lines.join("\n");
             // Remaining lines are the body
             let body: String = lines.collect::<Vec<_>>().join("\n").trim().to_string();
+
+            // #957: admission lint — reject files whose body matches
+            // instruction-injection patterns (fail closed; stable reason).
+            // Identical table and semantics to remember: no bypass via import.
+            if let Some(hit) = crate::injection_lint::first_hit(&body) {
+                errors.push(format!(
+                    "{}: {}",
+                    path.display(),
+                    crate::injection_lint::reason_for(&hit)
+                ));
+                continue;
+            }
 
             // Extract fields from frontmatter
             let get_fm = |key: &str| -> String {
@@ -23172,7 +23263,7 @@ impl Drop for TestDatabase {
 pub(crate) static HINTS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::fs;
 
@@ -23231,7 +23322,7 @@ mod tests {
         );
     }
 
-    fn make_entity(id: &str, category: &str, key: &str, body: &str) -> Entity {
+    pub(crate) fn make_entity(id: &str, category: &str, key: &str, body: &str) -> Entity {
         Entity {
             id: id.to_string(),
             category: category.to_string(),

@@ -29,6 +29,7 @@ mod httplimit;
 mod inspect;
 mod instruction_extraction;
 mod interference;
+mod injection_lint;
 mod log_digest;
 mod mcp;
 mod maintenance;
