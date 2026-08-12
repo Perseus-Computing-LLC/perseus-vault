@@ -349,6 +349,7 @@ pub fn build_projection(db: &Database, req: &ProjectionRequest) -> Result<Projec
         category: req.category.clone(),
         entity_type: None,
         type_filter: None,
+        budget_profile: None,
         limit: pool_limit,
         offset: 0,
         min_decay: 0.0,

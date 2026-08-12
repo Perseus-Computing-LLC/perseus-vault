@@ -8330,11 +8330,36 @@ impl Database {
         }
 
         // ── caller limit, then token-budget truncation ──────────────────
-        ranked.truncate(limit);
+        // #1008: per-type shaping (floors + caps) replaces the plain
+        // limit-truncate when a budget_profile is requested; the token
+        // budget still applies afterwards (floor items front-load the
+        // order, so the budget drops tail items first).
+        let mut per_type: Option<serde_json::Value> = None;
+        let mut ordered: Vec<(Entity, f64)> = Vec::new();
+        if let Some(profile_name) = params.budget_profile.as_deref() {
+            let prof = crate::type_budgets::profile(profile_name).ok_or_else(|| {
+                format!(
+                    "fused recall budget_profile: unknown profile '{profile_name}' \
+                     (expected diverse | fact_lookup | broad)"
+                )
+            })?;
+            let (ents, report) = crate::type_budgets::apply(&ranked, &prof, limit);
+            per_type = serde_json::to_value(&report).ok();
+            ordered = ents
+                .into_iter()
+                .map(|e| {
+                    let s = ranked.iter().find(|(c, _)| c.id == e.id).map(|(_, s)| *s).unwrap_or(0.0);
+                    (e, s)
+                })
+                .collect();
+        } else {
+            ranked.truncate(limit);
+            ordered = ranked;
+        }
         let mut retained: Vec<Entity> = Vec::new();
         let mut tokens_used: i64 = 0;
         let mut dropped = 0usize;
-        for (e, _) in ranked {
+        for (e, _) in ordered {
             let est = (e.body_json.chars().count() / 4).max(1) as i64;
             if !retained.is_empty() && tokens_used + est > budget_tokens {
                 dropped += 1;
@@ -8348,6 +8373,7 @@ impl Database {
             estimated_tokens_used: tokens_used,
             retained: retained.len(),
             dropped,
+            per_type,
         };
 
         // ── trace: placement + consensus sources ────────────────────────

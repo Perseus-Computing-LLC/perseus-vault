@@ -26,6 +26,14 @@ All notable changes to Perseus Vault are documented here. This project adheres t
   `perseus_vault_operator_review`. #952-bounded (maintenance gate, scan +
   proposal budgets), dry_run performs identical work with zero writes.
   Spec: `docs/specs/sleep-consolidation.md`.
+- **Per-type retrieval context budgets (#1008).** Opt-in `budget_profile`
+  on recall (diverse | fact_lookup | broad): floors guarantee decision and
+  constraint classes a share of the fused result (pulled from below the
+  caller limit); caps stop any one typed class from crowding the rest out;
+  the #942 token budget still composes on top. Allocation is reported in
+  `fused_trace.truncation.per_type` (never silent); unknown profiles are a
+  hard error; default None keeps recalls byte-identical (#247). Spec:
+  `docs/specs/per-type-context-budgets.md`.
 - **Config self-report with requested-vs-resolved diff (#1010).** New
   `perseus_vault_config_report` MCP tool (registry 134→135): per-stage
   provider/config self-report — embedding_backend, model_backend,
@@ -36,7 +44,6 @@ All notable changes to Perseus Vault are documented here. This project adheres t
   declared by a previous process drifts loudly against this process's
   default. Startup prints one line per stage; drift lines are prefixed
   `CONFIG DRIFT`. Docs: `docs/specs/config-self-report.md`.
-=======
 - **Typed memory classes with per-type policies (#1000).** New
   `perseus_vault_type_policies` MCP tool (registry 135→136): 8 CogniCore-
   borrowed MemoryTypes (semantic, episodic, procedural, preference,
