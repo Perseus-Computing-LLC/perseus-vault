@@ -6609,6 +6609,16 @@ pub fn handle_consolidate(db: &Database, args: Value) -> String {
     if params.quote_cap_chars < 64 || params.quote_cap_chars > 4096 {
         return json!({"error": "Invalid consolidate arguments: quote_cap_chars must be in 64..=4096"}).to_string();
     }
+    // #952: maintenance/serving isolation — off-peak window + live-recall
+    // SLO start gate, serialized execution slot (fail-early on overlap).
+    if let Err(e) = crate::maintenance::check_start(db, params.force) {
+        return json!({"error": e}).to_string();
+    }
+    let _lock = match crate::maintenance::acquire_maintenance(db, "consolidate") {
+        Ok(l) => l,
+        Err(e) => return json!({"error": e}).to_string(),
+    };
+    let force = params.force;
     // #871: durable op-state wrap — terminal state + bounded progress are
     // observable via perseus_vault_op_run_* even when the call itself fails.
     let scope = params.workspace_hash.clone().unwrap_or_default();
@@ -6621,9 +6631,10 @@ pub fn handle_consolidate(db: &Database, args: Value) -> String {
             "entities_examined={} observations_created={} sources_archived={}",
             report.entities_examined, report.observations_created, report.sources_archived
         );
-        serde_json::to_value(&report)
-            .map(|v| (v, receipt))
-            .map_err(|e| format!("Serialization failed: {e}"))
+        let mut v = serde_json::to_value(&report)
+            .map_err(|e| format!("Serialization failed: {e}"))?;
+        v["maintenance_guard"] = crate::maintenance::guard_block(force);
+        Ok((v, receipt))
     })
 }
 
@@ -6642,11 +6653,20 @@ pub struct DreamArgs {
     /// different artifacts, so the substitution must be explicit.
     #[serde(default)]
     pub fallback_consolidate: bool,
+    /// #952: explicit operator trigger — bypasses the maintenance off-peak
+    /// window and the live-recall SLO start gate (mid-run pauses still apply).
+    #[serde(default)]
+    pub force: bool,
 }
 
 pub fn handle_dream(db: &Database, args: Value) -> Result<String, String> {
     let a: DreamArgs =
         serde_json::from_value(args).map_err(|e| format!("Invalid dream arguments: {}", e))?;
+
+    // #952: maintenance/serving isolation — off-peak window + live-recall
+    // SLO start gate, serialized execution slot.
+    crate::maintenance::check_start(db, a.force).map_err(|e| e.to_string())?;
+    let _lock = crate::maintenance::acquire_maintenance(db, "dream")?;
 
     if !db.llm_enabled() && a.fallback_consolidate {
         // Graceful no-LLM fallback: run the mechanical consolidation pass
@@ -6681,6 +6701,7 @@ pub fn handle_dream(db: &Database, args: Value) -> Result<String, String> {
                     requesting_agent_id: a.params.requesting_agent_id.clone(),
                     refine_existing: true,
                     quote_cap_chars: 512,
+                    force: false,
                 })
                 .map_err(|e| format!("Dream fallback (consolidate {}) failed: {}", cat, e))?;
             observations_created += report.observations_created;
@@ -6695,6 +6716,7 @@ pub fn handle_dream(db: &Database, args: Value) -> Result<String, String> {
             "observations_created": observations_created,
             "sources_archived": sources_archived,
             "dry_run": a.params.dry_run,
+            "maintenance_guard": crate::maintenance::guard_block(a.force),
         })
         .to_string());
     }
@@ -6702,7 +6724,9 @@ pub fn handle_dream(db: &Database, args: Value) -> Result<String, String> {
     let report = db
         .dream(&a.params)
         .map_err(|e| format!("Dream failed: {}", e))?;
-    serde_json::to_string(&report).map_err(|e| format!("Serialization failed: {}", e))
+    let mut v = serde_json::to_value(&report).map_err(|e| format!("Serialization failed: {}", e))?;
+    v["maintenance_guard"] = crate::maintenance::guard_block(a.force);
+    Ok(v.to_string())
 }
 
 pub fn handle_decay(db: &Database, _args: Value) -> String {
@@ -6727,6 +6751,12 @@ pub fn handle_reindex(db: &Database, _args: Value) -> String {
             .map_err(|e| format!("Reindex failed: {e}"))?;
         Ok((json!({"reindexed": n}), format!("reindexed={n}")))
     })
+}
+
+/// #952: read-only maintenance/serving isolation observability — window,
+/// SLO budget, execution-slot state, and counters.
+pub fn handle_maintenance_status(db: &Database, _args: Value) -> Result<String, String> {
+    Ok(crate::maintenance::status(db).to_string())
 }
 
 // ─── #871: durable operation states (perseus_vault_op_run_*) ─────────────
@@ -8454,6 +8484,10 @@ pub struct AutocohereArgs {
     /// global-mode authorization and consolidation author attribution.
     #[serde(default)]
     pub requesting_agent_id: String,
+    /// #952: explicit operator trigger — bypasses the maintenance off-peak
+    /// window and the live-recall SLO start gate (mid-run pauses still apply).
+    #[serde(default)]
+    pub force: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -8478,6 +8512,10 @@ pub struct CohereArgs {
     pub dry_run: bool,
     #[serde(default = "default_max_links_cohere")]
     pub max_links: usize,
+    /// #952: explicit operator trigger — bypasses the maintenance off-peak
+    /// window and the live-recall SLO start gate (mid-run pauses still apply).
+    #[serde(default)]
+    pub force: bool,
 }
 
 fn default_max_links_cohere() -> usize {
@@ -8511,6 +8549,11 @@ pub fn handle_recall_when(db: &Database, args: Value) -> Result<String, String> 
 pub fn handle_autocohere(db: &Database, args: Value) -> Result<String, String> {
     let a: AutocohereArgs =
         serde_json::from_value(args).map_err(|e| format!("Invalid autocohere arguments: {}", e))?;
+    // #952: maintenance/serving isolation — the composite is one maintenance
+    // run: gated + serialized like the individual tools.
+    crate::maintenance::check_start(db, a.force).map_err(|e| e.to_string())?;
+    let _lock = crate::maintenance::acquire_maintenance(db, "autocohere")?;
+    let force = a.force;
 
     let mut total_promoted = 0i64;
     let mut total_links = 0i64;
@@ -8616,6 +8659,7 @@ pub fn handle_autocohere(db: &Database, args: Value) -> Result<String, String> {
                 requesting_agent_id: a.requesting_agent_id.clone(),
                 refine_existing: true,
                 quote_cap_chars: 512,
+                force: false,
             })
             .map_err(|e| format!("Autocohere step (consolidate {}) failed: {}", cat, e))?;
         observations_created += report.observations_created;
@@ -8665,6 +8709,10 @@ pub fn handle_autocohere(db: &Database, args: Value) -> Result<String, String> {
 pub fn handle_cohere(db: &Database, args: Value) -> Result<String, String> {
     let a: CohereArgs =
         serde_json::from_value(args).map_err(|e| format!("Invalid cohere arguments: {}", e))?;
+    // #952: maintenance/serving isolation — off-peak window + live-recall
+    // SLO start gate, serialized execution slot.
+    crate::maintenance::check_start(db, a.force).map_err(|e| e.to_string())?;
+    let _lock = crate::maintenance::acquire_maintenance(db, "cohere")?;
     let params = crate::models::CohereParams {
         dry_run: a.dry_run,
         max_links: a.max_links,
@@ -8673,8 +8721,9 @@ pub fn handle_cohere(db: &Database, args: Value) -> Result<String, String> {
     let report = db
         .cohere(&params)
         .map_err(|e| format!("Cohere failed: {}", e))?;
-
-    serde_json::to_string(&report).map_err(|e| format!("Serialization failed: {}", e))
+    let mut v = serde_json::to_value(&report).map_err(|e| format!("Serialization failed: {}", e))?;
+    v["maintenance_guard"] = crate::maintenance::guard_block(a.force);
+    Ok(v.to_string())
 }
 
 // ─── perseus_vault_supersede handler ────────────────────────────────────
@@ -9271,6 +9320,11 @@ pub fn handle_maintenance(db: &Database, args: Value) -> Result<String, String> 
 /// `PERSEUS_VAULT_HISTORY_*` env knobs opt in; it runs inside the autocohere step,
 /// so it is deliberately NOT requested again from maintenance.
 pub fn run_maintenance_pass(db: &Database, dry_run: bool, vacuum: bool) -> Result<Value, String> {
+    // #952: maintenance/serving isolation — scheduled/composite runs are
+    // window-gated (an unattended caller cannot force; the CLI `maintain`
+    // verb is an operator trigger but still respects a configured window).
+    // The autocohere phase acquires the serialized execution slot itself.
+    crate::maintenance::check_start(db, false).map_err(|e| e.to_string())?;
     // #871: durable op-state wrap — a crash mid-pass is recovered as
     // `interrupted` on the next open; per-phase progress is observable.
     let run = db
@@ -9320,6 +9374,7 @@ pub fn run_maintenance_pass(db: &Database, dry_run: bool, vacuum: bool) -> Resul
         "maintenance": maintenance,
         "dry_run": dry_run,
         "vacuum_requested": vacuum,
+        "maintenance_guard": crate::maintenance::guard_block(false),
         "op_run_id": run.id,
         "op_run_state": "completed",
     }))
@@ -14786,6 +14841,104 @@ mod tests {
         let a: crate::models::ConsolidateParams = serde_json::from_value(v).unwrap();
         assert!(a.refine_existing);
         assert_eq!(a.quote_cap_chars, 512);
+        assert!(!a.force, "force defaults off");
+    }
+
+    // ─── #952: maintenance/serving isolation gates ────────────────────────
+
+    #[test]
+    fn maintenance_gate_refuses_without_force_and_force_runs() {
+        // Thread-local override: visible only to this test thread and its
+        // own handler calls — no process-global env, no cross-test races.
+        crate::maintenance::set_test_budget(Some(0));
+        let (db, path) = temp_tool_db();
+        // Refusal: a 0ms budget always trips the live-recall probe.
+        let out = handle_consolidate(
+            &db,
+            json!({"category": "facts", "workspace_hash": "ws-x", "force": false}),
+        );
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert!(
+            v["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("exceeds budget"),
+            "gate must refuse on an over-budget probe: {out}"
+        );
+        // Explicit trigger: force bypasses the start gate and the run
+        // completes with the guard block stamped.
+        let out = handle_consolidate(
+            &db,
+            json!({"category": "facts", "workspace_hash": "ws-x", "force": true}),
+        );
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert!(v.get("error").is_none(), "force must run: {out}");
+        assert_eq!(v["maintenance_guard"]["force"], json!(true));
+        assert!(v["maintenance_guard"]["slo"]["budget_ms"].is_number());
+        crate::maintenance::set_test_budget(None);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn maintenance_lock_serializes_handlers() {
+        let db = crate::db::TestDatabase::new("perseus_vault-test-db-lock");
+        let _lock = crate::maintenance::acquire_maintenance(&db, "test-hold").unwrap();
+        // A second maintenance handler must fail fast (bounded retry then
+        // error) instead of running concurrently on the same store.
+        let out = handle_consolidate(
+            &db,
+            json!({"category": "facts", "workspace_hash": "ws-x"}),
+        );
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert!(
+            v["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("another maintenance run is in progress"),
+            "handler must respect the execution slot: {out}"
+        );
+        drop(_lock);
+    }
+
+    #[test]
+    fn cohere_mid_run_pause_stamps_slo_paused() {
+        crate::maintenance::set_test_budget(Some(0));
+        let (db, path) = temp_tool_db();
+        handle_remember(
+            &db,
+            json!({"category": "facts", "key": "c1", "body_json": "{\"content\":\"alpha topic a\"}"}),
+        )
+        .unwrap();
+        handle_remember(
+            &db,
+            json!({"category": "facts", "key": "c2", "body_json": "{\"content\":\"beta topic b\"}"}),
+        )
+        .unwrap();
+        // force bypasses the START gate; the mid-run probe (0ms budget)
+        // pauses before the link window — the run still completes with a
+        // partial report and slo_paused stamped.
+        let out = handle_cohere(&db, json!({"force": true})).unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            v["maintenance_guard"]["slo_paused"],
+            json!(true),
+            "mid-run probe must pause the run: {out}"
+        );
+        assert_eq!(v["linked"], json!(0), "paused run must not link");
+        crate::maintenance::set_test_budget(None);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn maintenance_status_reports_config_and_slot() {
+        let (db, path) = temp_tool_db();
+        let out = handle_maintenance_status(&db, json!({})).unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert!(v["window"]["open"].is_boolean());
+        assert!(v["lock"]["held"].is_boolean());
+        assert_eq!(v["lock"]["held"], json!(false), "no run → slot free");
+        assert!(v["counters"]["runs_started"].is_u64());
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

@@ -31,6 +31,7 @@ mod instruction_extraction;
 mod interference;
 mod log_digest;
 mod mcp;
+mod maintenance;
 mod mental_model;
 mod models;
 mod multimodal;

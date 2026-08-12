@@ -1864,6 +1864,12 @@ pub struct ConsolidateParams {
     /// truncated at the cap with an ellipsis marker.
     #[serde(default = "default_quote_cap")]
     pub quote_cap_chars: i64,
+    /// #952: explicit operator trigger. Bypasses the off-peak window and the
+    /// live-recall SLO start gate (the run may still pause mid-run when a
+    /// probe trips the budget). Handler-level maintenance gate; ignored by
+    /// the database layer.
+    #[serde(default)]
+    pub force: bool,
 }
 
 fn default_refine_existing() -> bool {
