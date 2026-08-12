@@ -360,6 +360,7 @@ pub fn build_projection(db: &Database, req: &ProjectionRequest) -> Result<Projec
         always_on: None,
         content_weight: 0.0,
         trust_weight: 0.0,
+        max_prior_overturn: crate::models::default_max_prior_overturn(),
         diversity_halving: 1.0,
         diversity_per_query_share: 0.0,
         recency_half_life_secs: None,
