@@ -16501,6 +16501,7 @@ impl Database {
                 observations_refreshed: 0,
                 observations_stale: 0,
                 quotes_captured: 0,
+                lint_skips: 0,
                 dry_run: params.dry_run,
                 observations: Vec::new(),
                 workspace_hash: scope_ws,
@@ -19175,6 +19176,31 @@ last_accessed: {}
     /// Import .md files from a vault directory into the database.
     /// Reads YAML frontmatter + body, calls remember() for each.
     pub fn vault_import(&self, vault_dir: &str) -> Result<VaultReport, Box<dyn std::error::Error>> {
+        self.vault_import_inner(vault_dir, None)
+    }
+
+    /// #951: shadow import — same loader as `vault_import`, but every entity
+    /// is forced into `shadow_workspace` regardless of the frontmatter value.
+    /// The live bank is untouched: entity identity is workspace-scoped (see
+    /// the remember dedup key), so imported rows are only visible to recall
+    /// scoped to the shadow workspace. Rerunning is idempotent — the same
+    /// (category, key, workspace) identity resolves to "updated", never a new id.
+    pub fn vault_import_shadow(
+        &self,
+        vault_dir: &str,
+        shadow_workspace: &str,
+    ) -> Result<VaultReport, Box<dyn std::error::Error>> {
+        if shadow_workspace.is_empty() {
+            return Err("shadow_workspace must not be empty".into());
+        }
+        self.vault_import_inner(vault_dir, Some(shadow_workspace))
+    }
+
+    fn vault_import_inner(
+        &self,
+        vault_dir: &str,
+        workspace_override: Option<&str>,
+    ) -> Result<VaultReport, Box<dyn std::error::Error>> {
         use std::fs;
         use std::path::Path;
 
@@ -19332,7 +19358,9 @@ last_accessed: {}
                 source: "vault-import".to_string(),
                 always_on: false,
                 certainty: 0.5,
-                workspace_hash: workspace_hash_val,
+                workspace_hash: workspace_override
+                    .map(str::to_string)
+                    .unwrap_or(workspace_hash_val),
                 agent_id: agent_id_val,
                 visibility: "workspace".to_string(),
                 created_at_unix_ms: now_ms(),
@@ -19368,6 +19396,204 @@ last_accessed: {}
             vault_dir: vault_dir.to_string(),
             completed_at_unix_ms: now_ms(),
         })
+    }
+
+    /// #951: recall comparison between the live workspace and a shadow
+    /// workspace over a fixed query set. Deterministic (Fts5 mode — no dense
+    /// pool variance), read-only (`skip_side_effects` — comparison must not
+    /// perturb live recall state), machine-readable for gating.
+    pub fn shadow_compare(
+        &self,
+        queries: &[String],
+        live_workspace: Option<&str>,
+        shadow_workspace: &str,
+        limit: i64,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+        let limit = limit.clamp(1, 100);
+        let mut per_query = Vec::new();
+        let mut live_hits = 0usize;
+        let mut shadow_hits = 0usize;
+        let mut live_tokens_est = 0usize;
+        let mut shadow_tokens_est = 0usize;
+        for q in queries {
+            let live = self.recall(&crate::models::RecallParams {
+                query: q.clone(),
+                limit,
+                workspace_hash: live_workspace.map(str::to_string),
+                skip_side_effects: true,
+                ..crate::models::RecallParams::default()
+            })?;
+            let shadow = self.recall(&crate::models::RecallParams {
+                query: q.clone(),
+                limit,
+                workspace_hash: Some(shadow_workspace.to_string()),
+                skip_side_effects: true,
+                ..crate::models::RecallParams::default()
+            })?;
+            let live_hit = !live.is_empty();
+            let shadow_hit = !shadow.is_empty();
+            if live_hit {
+                live_hits += 1;
+            }
+            if shadow_hit {
+                shadow_hits += 1;
+            }
+            // Token estimate: 4 chars/token on the recalled bodies (documented
+            // as an estimate — the gating decision is coverage + relative
+            // magnitude, not exact token accounting).
+            live_tokens_est += live
+                .iter()
+                .map(|e| e.body_json.chars().count() / 4)
+                .sum::<usize>();
+            shadow_tokens_est += shadow
+                .iter()
+                .map(|e| e.body_json.chars().count() / 4)
+                .sum::<usize>();
+            per_query.push(serde_json::json!({
+                "query": q,
+                "live": {
+                    "hit": live_hit,
+                    "top_key": live.first().map(|e| e.key.clone()).unwrap_or_default(),
+                },
+                "shadow": {
+                    "hit": shadow_hit,
+                    "top_key": shadow.first().map(|e| e.key.clone()).unwrap_or_default(),
+                },
+            }));
+        }
+        let n = queries.len().max(1);
+        Ok(serde_json::json!({
+            "queries": per_query,
+            "totals": {
+                "queries": queries.len(),
+                "live_coverage": live_hits as f64 / n as f64,
+                "shadow_coverage": shadow_hits as f64 / n as f64,
+                "live_context_tokens_est": live_tokens_est,
+                "shadow_context_tokens_est": shadow_tokens_est,
+            },
+        }))
+    }
+
+    /// #951: promote — move every non-archived entity from the shadow
+    /// workspace into `target_workspace` in ONE statement, and journal the
+    /// moved ids in state (`shadow_promote_last`) so `shadow_rollback` can
+    /// undo the whole cutover in one operation. Workspace filtering is a
+    /// read-time predicate (the FTS index stores no workspace column), so
+    /// recall equivalence holds immediately after the move.
+    pub fn shadow_promote(
+        &self,
+        shadow_workspace: &str,
+        target_workspace: &str,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+        if shadow_workspace.is_empty() || shadow_workspace == target_workspace {
+            return Err(
+                "shadow_workspace must be non-empty and differ from target_workspace".into(),
+            );
+        }
+        let conn = self.conn().map_err(|e| e.to_string())?;
+        let ids: Vec<String> = {
+            let mut stmt =
+                conn.prepare("SELECT id FROM entities WHERE workspace_hash = ?1 AND archived = 0")?;
+            let rows = stmt.query_map([shadow_workspace], |r| r.get::<_, String>(0))?;
+            let mut v = Vec::new();
+            for row in rows {
+                v.push(row?);
+            }
+            v
+        };
+        let moved = ids.len();
+        if moved == 0 {
+            return Ok(serde_json::json!({
+                "moved": 0,
+                "from_workspace": shadow_workspace,
+                "to_workspace": target_workspace,
+            }));
+        }
+        let tx = conn.unchecked_transaction()?;
+        {
+            let mut stmt = tx.prepare("UPDATE entities SET workspace_hash = ?1 WHERE id = ?2")?;
+            for id in &ids {
+                stmt.execute(rusqlite::params![target_workspace, id])?;
+            }
+        }
+        tx.commit()?;
+        let state = crate::models::StateEntry {
+            key: "shadow_promote_last".to_string(),
+            value_json: serde_json::json!({
+                "ids": ids,
+                "from": shadow_workspace,
+                "to": target_workspace,
+            })
+            .to_string(),
+            expires_at_unix_ms: None,
+            created_at_unix_ms: now_ms(),
+        };
+        self.state_set(&state)?;
+        Ok(serde_json::json!({
+            "moved": moved,
+            "from_workspace": shadow_workspace,
+            "to_workspace": target_workspace,
+            "journaled": "shadow_promote_last",
+        }))
+    }
+
+    /// #951: read-only peek at the promote journal (for rollback dry-runs and
+    /// operator inspection). Returns `null` when no promote is journaled.
+    pub fn shadow_promote_journal(&self) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+        match self.state_get("shadow_promote_last")? {
+            Some(entry) => {
+                let mut v: serde_json::Value = serde_json::from_str(&entry.value_json)?;
+                if let Some(obj) = v.as_object_mut() {
+                    obj.insert(
+                        "created_at_unix_ms".to_string(),
+                        serde_json::json!(entry.created_at_unix_ms),
+                    );
+                }
+                Ok(v)
+            }
+            None => Ok(serde_json::Value::Null),
+        }
+    }
+
+    /// #951: rollback — one operation returns every promoted id to its
+    /// pre-promote workspace, using the `shadow_promote_last` journal. The
+    /// `AND workspace_hash = ?3` guard makes the rollback safe to re-run and
+    /// immune to double-application after manual edits.
+    pub fn shadow_rollback(&self) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+        let entry = self
+            .state_get("shadow_promote_last")?
+            .ok_or_else(|| -> Box<dyn std::error::Error> {
+                "no promote journal found — nothing to roll back".into()
+            })?;
+        let j: serde_json::Value = serde_json::from_str(&entry.value_json)?;
+        let ids: Vec<String> = j["ids"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let from = j["from"].as_str().unwrap_or("").to_string();
+        let to = j["to"].as_str().unwrap_or("").to_string();
+        let conn = self.conn().map_err(|e| e.to_string())?;
+        let mut rolled_back = 0usize;
+        let tx = conn.unchecked_transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "UPDATE entities SET workspace_hash = ?1 WHERE id = ?2 AND workspace_hash = ?3",
+            )?;
+            for id in &ids {
+                rolled_back += stmt.execute(rusqlite::params![from, id, to])? as usize;
+            }
+        }
+        tx.commit()?;
+        self.state_delete("shadow_promote_last")?;
+        Ok(serde_json::json!({
+            "rolled_back": rolled_back,
+            "from_workspace": to,
+            "to_workspace": from,
+        }))
     }
 
     /// Legacy `context` entry point — preserved signature for the gRPC
