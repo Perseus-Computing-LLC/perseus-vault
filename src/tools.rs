@@ -265,6 +265,10 @@ pub struct RecallArgs {
     #[serde(default, deserialize_with = "null_as_default")]
     pub offset: i64,
     #[serde(default, deserialize_with = "null_as_default")]
+    /// DEPRECATED (#953): decay scores saturate near 1.0, so this threshold
+    /// cannot separate evidence from noise. Kept API-compatible; the
+    /// retrieval layer never gates answers on scores — the model decides
+    /// abstention from the `outcome` block.
     pub min_decay: f64,
     #[serde(default)]
     pub topic_path: Option<String>,
@@ -285,6 +289,15 @@ pub struct RecallArgs {
         deserialize_with = "null_as_default_trust_weight"
     )]
     pub trust_weight: f64,
+    /// #956: max-overturn bound for ranking priors (default 2.0). A single
+    /// prior (recency/content/trust) can overturn at most this × a relevance
+    /// gap; exponents are derived, not tuned. ≤ 0 selects the legacy
+    /// additive/unbounded path. Spec: docs/specs/recall-serving-contract.md §3.
+    #[serde(
+        default = "crate::models::default_max_prior_overturn",
+        deserialize_with = "null_as_default_max_prior_overturn"
+    )]
+    pub max_prior_overturn: f64,
     #[serde(
         default = "default_halving",
         deserialize_with = "null_as_default_halving"
@@ -672,6 +685,19 @@ null_as_named_default!(
 );
 null_as_named_default!(null_as_default_halving, f64, default_halving);
 
+/// #956: explicit `null`/absent → the 2.0 default, NOT 0.0 — 0.0 selects
+/// legacy additive/unbounded mode and must only be reachable via an explicit
+/// numeric `0` (an LLM tool-call client emitting null must never silently
+/// flip ranking semantics).
+fn default_max_prior_overturn_wrapper() -> f64 {
+    crate::models::default_max_prior_overturn()
+}
+null_as_named_default!(
+    null_as_default_max_prior_overturn,
+    f64,
+    default_max_prior_overturn_wrapper
+);
+
 fn default_trust_weight_wrapper() -> f64 {
     crate::models::default_trust_weight()
 }
@@ -781,6 +807,10 @@ pub struct StateListArgs {
 #[derive(Debug, Deserialize)]
 pub struct CompactArgs {
     #[serde(default = "default_min_decay")]
+    /// DEPRECATED (#953): decay scores saturate near 1.0, so this threshold
+    /// cannot separate evidence from noise. Kept API-compatible; the
+    /// retrieval layer never gates answers on scores — the model decides
+    /// abstention from the `outcome` block.
     pub min_decay: f64,
     #[serde(default)]
     pub dry_run: bool,
@@ -1717,6 +1747,7 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
         always_on: a.always_on,
         content_weight: a.content_weight,
         trust_weight: a.trust_weight,
+        max_prior_overturn: a.max_prior_overturn,
         diversity_halving: a.diversity_halving,
         diversity_per_query_share: 0.0,
         recency_half_life_secs: a.recency_half_life_secs,
@@ -2134,6 +2165,7 @@ pub fn handle_recall_batch(db: &Database, args: Value) -> Result<String, String>
             always_on: q.always_on,
             content_weight: q.content_weight,
             trust_weight: q.trust_weight,
+            max_prior_overturn: q.max_prior_overturn,
             diversity_halving: q.diversity_halving,
             diversity_per_query_share: 0.0,
             recency_half_life_secs: q.recency_half_life_secs,
@@ -2182,13 +2214,18 @@ pub fn handle_recall_batch(db: &Database, args: Value) -> Result<String, String>
         }
 
         let scored: Vec<(Entity, f64)> = entities.into_iter().map(|e| (e, 1.0)).collect();
-        all_results.push((scored, q.recency_half_life_secs));
+        all_results.push((scored, q.recency_half_life_secs, q.max_prior_overturn));
     }
 
     // Fuse pairwise
-    let (mut fused, mut last_half_life) = all_results[0].clone();
-    for (next_res, next_half_life) in all_results.into_iter().skip(1) {
+    let (mut fused, mut last_half_life, mut last_overturn) = all_results[0].clone();
+    for (next_res, next_half_life, next_overturn) in all_results.into_iter().skip(1) {
         let half_life = next_half_life.or(last_half_life);
+        let overturn = if next_overturn > 0.0 {
+            next_overturn
+        } else {
+            last_overturn
+        };
         fused = crate::db::reciprocal_rank_fusion(
             &fused,
             &next_res,
@@ -2196,9 +2233,11 @@ pub fn handle_recall_batch(db: &Database, args: Value) -> Result<String, String>
             limit,
             1.0,
             half_life,
+            overturn,
             crate::db::now_ms(),
         );
         last_half_life = half_life;
+        last_overturn = overturn;
     }
 
     let mut items_expanded: Vec<serde_json::Value> = Vec::new();
@@ -2537,6 +2576,7 @@ fn handle_recall_with_expansion(db: &Database, a: &RecallArgs) -> Result<String,
             always_on: a.always_on,
             content_weight: a.content_weight,
             trust_weight: a.trust_weight,
+            max_prior_overturn: a.max_prior_overturn,
             diversity_halving: a.diversity_halving,
             diversity_per_query_share: 0.0,
             // Query expansion runs in Fts5 mode only, so recency (a hybrid-fusion
