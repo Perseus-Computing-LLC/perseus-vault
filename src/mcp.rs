@@ -1225,6 +1225,23 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Handoff Pack"
   },
   {
+    "name": "perseus_vault_intention",
+    "description": "Prospective memory: typed intention programs (Latch borrow) with immutable revisions, compound triggers/inhibitors, time windows, approval flags, atomic exactly-once claims (JSON1 compare-and-set), and purpose-based forgetting. Ops: create|update (new immutable revision), evaluate (waiting|ready|blocked|expired + reasons), claim (exactly-once), complete|fail (one-shot auto-forgets), list.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "op": { "type": "string", "enum": ["create", "update", "evaluate", "claim", "complete", "fail", "list"], "description": "Operation" },
+        "name": { "type": "string", "description": "Intention name (required for all ops except list)" },
+        "purpose": { "type": "string", "enum": ["one_shot", "recurring"], "description": "one_shot auto-forgets on completion (default one_shot)" },
+        "program": { "type": "object", "description": "Instruction: {when:{triggers:[{query}]}, unless:{inhibitors:[{query}]}, window:{after_unix_ms?,before_unix_ms?}, action:{kind,params}, approval:'required'|'auto'}" },
+        "claimed_by": { "type": "string", "description": "Claimer identity for the claim op" },
+        "note": { "type": "string", "description": "Outcome note for complete/fail" }
+      },
+      "required": ["op"]
+    },
+    "title": "Intention Program"
+  },
+  {
     "name": "perseus_vault_proof_frame",
     "description": "Proof frame: bounded, hash-cited evidence pack for external consumers (Qorx Zero borrow). Memory stays on-device; the consumer gets only a capped frame (top-N records + per-record source hashes + frame digest). Empty frame -> refusal, never invention. zeroize:true permanently blanks framed entities' bodies after framing (privacy end-state).",
     "inputSchema": {
@@ -6769,6 +6786,7 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
 
         "perseus_vault_recall" => tools::handle_recall(db, args).map_err(|e| e.to_string()),
         "perseus_vault_handoff_pack" => tools::handle_handoff_pack(db, args).map_err(|e| e.to_string()),
+        "perseus_vault_intention" => tools::handle_intention(db, args).map_err(|e| e.to_string()),
         "perseus_vault_proof_frame" => tools::handle_proof_frame(db, args).map_err(|e| e.to_string()),
 
         "perseus_vault_recall_batch" => {
@@ -7086,7 +7104,7 @@ mod tests {
         );
         assert_eq!(
             registry_names.len(),
-            133,
+            134,
             "update public metadata when adding a tool"
         );
 

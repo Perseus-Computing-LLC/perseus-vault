@@ -4695,6 +4695,385 @@ struct ProofFrameArgs {
     pub workspace_hash: Option<String>,
 }
 
+/// #943: prospective memory — typed intention programs with exactly-once
+/// execution (Latch borrow). Intentions live as entities in the
+/// "intention" category, keyed by name, with IMMUTABLE instruction
+/// revisions: every update writes a new revision entity that supersedes
+/// the previous one, so the instruction that authorized an action is
+/// always identifiable. Runtime state (claim/outcome) mutates only the
+/// latest revision's runtime fields, never the instruction. Exactly-once
+/// via an atomic compare-and-set claim (JSON1 json_extract in the WHERE
+/// clause). Purpose-based forgetting: a one-shot intention archives
+/// itself when its outcome completes. Deterministic, offline.
+pub fn handle_intention(db: &Database, args: Value) -> Result<String, String> {
+    let a: IntentionArgs =
+        serde_json::from_value(args).map_err(|e| format!("Invalid intention arguments: {e}"))?;
+    match a.op.as_str() {
+        "create" | "update" => intention_upsert(db, &a),
+        "evaluate" => intention_evaluate(db, &a),
+        "claim" => intention_claim(db, &a),
+        "complete" | "fail" => intention_outcome(db, &a),
+        "list" => intention_list(db, &a),
+        other => Err(format!(
+            "invalid intention op '{other}': expected create|update|evaluate|claim|complete|fail|list"
+        )),
+    }
+}
+
+fn intention_latest(db: &Database, name: &str) -> Result<Option<crate::models::Entity>, String> {
+    let conn = db.conn().map_err(|e| e.to_string())?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT * FROM entities WHERE category = 'intention' AND key = ?1 AND archived = 0 ORDER BY body_json DESC",
+        )
+        .map_err(|e| e.to_string())?;
+    // body_json DESC orders {"revision":9,...} before {"revision":8,...}
+    // lexicographically for single-digit revisions; scan all and pick the
+    // max revision to stay deterministic.
+    let rows = stmt
+        .query_map([name], |row| {
+            crate::db::entity_from_row(row, None)
+        })
+        .map_err(|e| e.to_string())?;
+    let mut best: Option<crate::models::Entity> = None;
+    for r in rows {
+        let ent = r.map_err(|e| e.to_string())?;
+        let rev = serde_json::from_str::<serde_json::Value>(&ent.body_json)
+            .ok()
+            .and_then(|v| v["revision"].as_i64())
+            .unwrap_or(0);
+        let best_rev = best
+            .as_ref()
+            .and_then(|b| serde_json::from_str::<serde_json::Value>(&b.body_json).ok())
+            .and_then(|v| v["revision"].as_i64())
+            .unwrap_or(0);
+        if rev >= best_rev {
+            best = Some(ent);
+        }
+    }
+    Ok(best)
+}
+
+fn intention_upsert(db: &Database, a: &IntentionArgs) -> Result<String, String> {
+    let name = a.name.as_deref().unwrap_or("").trim();
+    if name.is_empty() {
+        return Err("intention name is required".to_string());
+    }
+    let program = a
+        .program
+        .as_ref()
+        .ok_or_else(|| "intention program is required".to_string())?;
+    // Immutable instruction: the program body must not carry runtime
+    // fields; runtime state is attached by the claim/outcome ops.
+    let prev = intention_latest(db, name)?;
+    let revision = prev
+        .as_ref()
+        .and_then(|p| serde_json::from_str::<serde_json::Value>(&p.body_json).ok())
+        .and_then(|v| v["revision"].as_i64())
+        .unwrap_or(0)
+        + 1;
+    let now = crate::db::now_ms();
+    let body = json!({
+        "revision": revision,
+        "purpose": a.purpose.as_deref().unwrap_or("one_shot"),
+        "when": program.get("when").cloned().unwrap_or(json!({"triggers": [{"query": ""}]})),
+        "unless": program.get("unless").cloned().unwrap_or(json!({"inhibitors": []})),
+        "window": program.get("window").cloned().unwrap_or(json!({})),
+        "action": program.get("action").cloned().unwrap_or(json!({})),
+        "approval": program.get("approval").cloned().unwrap_or(json!("required")),
+        "captured_at_unix_ms": now,
+    });
+    let mut ent = crate::models::Entity {
+        id: format!("intention-{name}-{revision}"),
+        category: "intention".to_string(),
+        key: name.to_string(),
+        body_json: body.to_string(),
+        status: "active".to_string(),
+        entity_type: "intention_program".to_string(),
+        tags: vec![],
+        decay_score: 1.0,
+        retrieval_count: 0,
+        layer: "working".to_string(),
+        topic_path: String::new(),
+        archived: false,
+        archive_reason: String::new(),
+        links: vec![],
+        verified: false,
+        source: "intention".to_string(),
+        always_on: false,
+        certainty: 0.9,
+        workspace_hash: String::new(),
+        agent_id: String::new(),
+        visibility: "workspace".to_string(),
+        created_at_unix_ms: now,
+        last_accessed_unix_ms: now,
+        follow_count: 0,
+        miss_count: 0,
+        follow_rate: 0.0,
+        efficacy_status: "unverified".to_string(),
+        epistemic_state: crate::models::default_epistemic_state(),
+        hints: vec![],
+        embedding: None,
+        _parsed_body: None,
+    };
+    db.remember_with_options(&ent, true, None, None, false)
+        .map_err(|e| format!("intention write failed: {e}"))?;
+    if let Some(prev) = prev {
+        db.link("intention", name, &prev.id, "supersedes")
+            .map_err(|e| format!("revision link failed: {e}"))?;
+    }
+    Ok(json!({
+        "op": if revision == 1 { "create" } else { "update" },
+        "name": name,
+        "revision": revision,
+        "id": ent.id,
+        "immutable_history": true,
+        "read_only": false,
+    })
+    .to_string())
+}
+
+fn intention_evaluate(db: &Database, a: &IntentionArgs) -> Result<String, String> {
+    let name = a.name.as_deref().unwrap_or("").trim();
+    let ent = intention_latest(db, name)?
+        .ok_or_else(|| format!("intention '{name}' not found"))?;
+    let body: serde_json::Value =
+        serde_json::from_str(&ent.body_json).map_err(|e| format!("intention body: {e}"))?;
+    let now = crate::db::now_ms();
+    // Window: after/before bounds.
+    let window = &body["window"];
+    let after = window.get("after_unix_ms").and_then(|v| v.as_i64());
+    let before = window.get("before_unix_ms").and_then(|v| v.as_i64());
+    if let Some(b) = before {
+        if now > b {
+            return Ok(json!({"state": "expired", "reason": "window closed (before_unix_ms passed)", "read_only": true}).to_string());
+        }
+    }
+    if let Some(a2) = after {
+        if now < a2 {
+            return Ok(json!({"state": "waiting", "reason": "window not open (after_unix_ms in the future)", "read_only": true}).to_string());
+        }
+    }
+    // Inhibitors: any match blocks.
+    let mut inhibitors: Vec<String> = Vec::new();
+    if let Some(list) = body["unless"]["inhibitors"].as_array() {
+        for q in list {
+            if let Some(qs) = q.get("query").and_then(|v| v.as_str()) {
+                if !qs.is_empty() && recall_hits(db, qs)? {
+                    inhibitors.push(qs.to_string());
+                }
+            }
+        }
+    }
+    if !inhibitors.is_empty() {
+        return Ok(json!({
+            "state": "blocked",
+            "reason": "inhibitor matched",
+            "inhibitors": inhibitors,
+            "read_only": true,
+        })
+        .to_string());
+    }
+    // Triggers: any match fires (an empty trigger list waits forever).
+    let mut triggers: Vec<String> = Vec::new();
+    if let Some(list) = body["when"]["triggers"].as_array() {
+        for q in list {
+            if let Some(qs) = q.get("query").and_then(|v| v.as_str()) {
+                if !qs.is_empty() && recall_hits(db, qs)? {
+                    triggers.push(qs.to_string());
+                }
+            }
+        }
+    }
+    let state = if triggers.is_empty() { "waiting" } else { "ready" };
+    Ok(json!({
+        "state": state,
+        "reason": if state == "ready" { "trigger matched" } else { "no trigger matched yet" },
+        "triggers": triggers,
+        "approval": body["approval"],
+        "action": body["action"],
+        "read_only": true,
+    })
+    .to_string())
+}
+
+fn recall_hits(db: &Database, query: &str) -> Result<bool, String> {
+    let params = crate::models::RecallParams {
+        query: query.to_string(),
+        limit: 5,
+        skip_side_effects: true,
+        mode: crate::models::SearchMode::Fts5,
+        ..Default::default()
+    };
+    // An intention must never be evidence for its OWN triggers/inhibitors:
+    // its body contains the query strings verbatim.
+    Ok(db
+        .recall(&params)
+        .map_err(|e| e.to_string())?
+        .iter()
+        .any(|e| e.category != "intention"))
+}
+
+fn intention_claim(db: &Database, a: &IntentionArgs) -> Result<String, String> {
+    let name = a.name.as_deref().unwrap_or("").trim();
+    let ent = intention_latest(db, name)?
+        .ok_or_else(|| format!("intention '{name}' not found"))?;
+    let body: serde_json::Value =
+        serde_json::from_str(&ent.body_json).map_err(|e| format!("intention body: {e}"))?;
+    let state = intention_state_of(&body);
+    if state != "ready" {
+        return Ok(json!({
+            "claimed": false,
+            "reason": format!("intention is not ready (state: {state})"),
+            "read_only": true,
+        })
+        .to_string());
+    }
+    let now = crate::db::now_ms();
+    let claim_id = crate::db::sha256_hex(&format!("{}-{}", ent.id, now));
+    // Exactly-once: atomic compare-and-set — the claim lands only if no
+    // claim_id exists yet in the latest revision.
+    let conn = db.conn().map_err(|e| e.to_string())?;
+    let mut body2 = body.clone();
+    if let Some(obj) = body2.as_object_mut() {
+        obj.insert(
+            "claim".to_string(),
+            json!({"claim_id": claim_id, "claimed_at_unix_ms": now, "claimed_by": a.claimed_by}),
+        );
+    }
+    let n = conn
+        .execute(
+            "UPDATE entities SET body_json = ?1 WHERE id = ?2 AND json_extract(body_json, '$.claim.claim_id') IS NULL",
+            rusqlite::params![body2.to_string(), ent.id],
+        )
+        .map_err(|e| e.to_string())?;
+    if n == 0 {
+        return Ok(json!({
+            "claimed": false,
+            "reason": "duplicate claim refused — intention already claimed (exactly-once)",
+            "read_only": true,
+        })
+        .to_string());
+    }
+    Ok(json!({
+        "claimed": true,
+        "claim_id": claim_id,
+        "name": name,
+        "revision": body["revision"],
+        "read_only": false,
+    })
+    .to_string())
+}
+
+fn intention_outcome(db: &Database, a: &IntentionArgs) -> Result<String, String> {
+    let name = a.name.as_deref().unwrap_or("").trim();
+    let ent = intention_latest(db, name)?
+        .ok_or_else(|| format!("intention '{name}' not found"))?;
+    let body: serde_json::Value =
+        serde_json::from_str(&ent.body_json).map_err(|e| format!("intention body: {e}"))?;
+    if body.get("claim").and_then(|c| c.get("claim_id")).is_none() {
+        return Ok(json!({
+            "recorded": false,
+            "reason": "intention was never claimed — cannot complete or fail it",
+            "read_only": true,
+        })
+        .to_string());
+    }
+    let now = crate::db::now_ms();
+    let status = if a.op == "complete" { "completed" } else { "failed" };
+    let mut body2 = body.clone();
+    if let Some(obj) = body2.as_object_mut() {
+        obj.insert(
+            "outcome".to_string(),
+            json!({"status": status, "completed_at_unix_ms": now, "note": a.note}),
+        );
+    }
+    let conn = db.conn().map_err(|e| e.to_string())?;
+    conn.execute(
+        "UPDATE entities SET body_json = ?1 WHERE id = ?2",
+        rusqlite::params![body2.to_string(), ent.id],
+    )
+    .map_err(|e| e.to_string())?;
+    // Purpose-based forgetting: one-shot intentions archive themselves
+    // when the outcome completes (Latch borrow).
+    let mut forgotten = false;
+    if status == "completed" && body["purpose"].as_str() == Some("one_shot") {
+        conn.execute(
+            "UPDATE entities SET archived = 1, archive_reason = 'purpose_fulfilled' WHERE id = ?1",
+            rusqlite::params![ent.id],
+        )
+        .map_err(|e| e.to_string())?;
+        forgotten = true;
+    }
+    Ok(json!({
+        "recorded": true,
+        "status": status,
+        "purpose_forgotten": forgotten,
+        "read_only": false,
+    })
+    .to_string())
+}
+
+fn intention_state_of(body: &serde_json::Value) -> &'static str {
+    if body.get("outcome").and_then(|o| o.get("status")).is_some() {
+        return "finished";
+    }
+    if body.get("claim").and_then(|c| c.get("claim_id")).is_some() {
+        return "claimed";
+    }
+    "ready"
+}
+
+fn intention_list(db: &Database, _a: &IntentionArgs) -> Result<String, String> {
+    let conn = db.conn().map_err(|e| e.to_string())?;
+    let mut stmt = conn
+        .prepare("SELECT * FROM entities WHERE category = 'intention' AND archived = 0")
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], |row| crate::db::entity_from_row(row, None))
+        .map_err(|e| e.to_string())?;
+    let mut by_name: std::collections::BTreeMap<String, (i64, serde_json::Value)> =
+        std::collections::BTreeMap::new();
+    for r in rows {
+        let ent = r.map_err(|e| e.to_string())?;
+        let body: serde_json::Value =
+            serde_json::from_str(&ent.body_json).unwrap_or(json!({}));
+        let rev = body["revision"].as_i64().unwrap_or(0);
+        let entry = by_name.entry(ent.key.clone()).or_insert((0, json!({})));
+        if rev > entry.0 {
+            *entry = (rev, body);
+        }
+    }
+    let items: Vec<serde_json::Value> = by_name
+        .into_iter()
+        .map(|(name, (rev, body))| {
+            json!({
+                "name": name,
+                "revision": rev,
+                "state": intention_state_of(&body),
+                "purpose": body["purpose"],
+            })
+        })
+        .collect();
+    Ok(json!({"intentions": items, "read_only": true}).to_string())
+}
+
+#[derive(serde::Deserialize)]
+struct IntentionArgs {
+    #[serde(default)]
+    pub op: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub purpose: Option<String>,
+    #[serde(default)]
+    pub program: Option<serde_json::Value>,
+    #[serde(default)]
+    pub claimed_by: Option<String>,
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
 pub fn handle_context(db: &Database, args: Value) -> String {
     let a: ContextArgs = match serde_json::from_value(args) {
         Ok(a) => a,
