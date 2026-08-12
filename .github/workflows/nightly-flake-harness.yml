@@ -1,0 +1,137 @@
+name: Nightly Flake-Rate Harness
+
+# #955: measure the documented Windows spawn-teardown fault class (#873/#889)
+# instead of hoping a passing streak means it is gone. One run per push
+# samples a bursty fault too rarely to measure anything either way.
+#
+# Pattern borrowed from NexusMem (MIT, .github/workflows/nightly.yml), proven
+# in their repo: nightly + workflow_dispatch with a `runs` input (default 10),
+# suite repeated 10x per platform, fail-fast disabled, Linux as a CONTROL
+# column (the crash is Windows-specific — a failure on both platforms points
+# at a genuine regression, not the spawn fault), and each failed run's tail
+# printed so OS teardown (exit 3221225477 / NTSTATUS 0xC0000005) is
+# distinguishable from a real test failure.
+#
+# Verdict contract:
+#   - ubuntu-latest (control column): ANY failed run fails the job.
+#   - windows-latest: failures whose exit code is an NTSTATUS exception code
+#     (0xC0000000-0xC000FFFF, of which 0xC0000005/3221225477 is the documented
+#     spawn-teardown example) are the measured flake class -> job passes with
+#     the flake rate reported. ANY other failure code (including cargo's
+#     ordinary test-failure exit 101) fails the job.
+
+on:
+  schedule:
+    - cron: "23 3 * * *"
+  workflow_dispatch:
+    inputs:
+      runs:
+        description: "Suite repetitions per platform (default 10)"
+        required: false
+        default: 10
+        type: number
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly-flake-${{ github.event.inputs.runs || 'scheduled' }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  # build.rs copies the bundled embedding model from here instead of hitting
+  # HuggingFace, so the (cached) model is fetched at most once per runner.
+  PERSEUS_VAULT_BUNDLED_MODEL_DIR: ${{ github.workspace }}/.model-cache
+
+jobs:
+  flake-sweep:
+    name: Sweep ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+      - name: Cache embedding model
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: .model-cache
+          key: minilm-l6-v2-qint8-v1
+      - name: Fetch embedding model (if not cached)
+        shell: bash
+        run: |
+          mkdir -p .model-cache
+          base=https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main
+          [ -s .model-cache/model_qint8_avx512_vnni.onnx ] || curl -fL --retry 5 --retry-all-errors "$base/onnx/model_qint8_avx512_vnni.onnx" -o .model-cache/model_qint8_avx512_vnni.onnx
+          [ -s .model-cache/tokenizer.json ] || curl -fL --retry 5 --retry-all-errors "$base/tokenizer.json" -o .model-cache/tokenizer.json
+          # build.rs looks for these exact names:
+          cp .model-cache/model_qint8_avx512_vnni.onnx .model-cache/model_quantized.onnx
+      - name: Build once
+        run: cargo build --locked
+      - name: Sweep suite, classify failures
+        shell: bash
+        env:
+          RUNS: ${{ inputs.runs }}
+        run: |
+          runs="${RUNS:-10}"
+          fails=0
+          known=0
+          unknown_logs=""
+          for i in $(seq 1 "$runs"); do
+            echo "::group::run $i/$runs"
+            cargo test --locked > "run-$i.log" 2>&1
+            code=$?
+            if [ "$code" -eq 0 ]; then
+              echo "run $i: PASS"
+            else
+              fails=$((fails + 1))
+              echo "run $i: FAIL (exit $code)"
+              # Tail of the failed run distinguishes OS teardown from a real
+              # test failure (cargo exits 101 on the latter).
+              tail -40 "run-$i.log"
+              if [ "$code" -ge 3221225472 ] && [ "$code" -le 3221227519 ]; then
+                # NTSTATUS exception class 0xC0000000-0xC000FFFF; the documented
+                # spawn-teardown fault is 0xC0000005 = 3221225477 (#873/#889/#955).
+                known=$((known + 1))
+              else
+                unknown_logs="$unknown_logs run-$i"
+              fi
+            fi
+            echo "::endgroup::"
+          done
+          {
+            echo "## Flake sweep — ${{ matrix.os }}"
+            echo "runs=$runs  failures=$fails  known_ntstatus_class=$known"
+            if [ "$fails" -eq 0 ]; then
+              echo "**verdict: PASS** (all runs clean)"
+            elif [ "${{ matrix.os }}" = "ubuntu-latest" ]; then
+              echo "**verdict: FAIL** (control column — any Linux failure is a genuine regression)"
+            elif [ "$known" -eq "$fails" ]; then
+              echo "**verdict: PASS** with measured flake rate (all failures in the documented NTSTATUS class)"
+            else
+              echo "**verdict: FAIL** (unknown failure class:$unknown_logs)"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$fails" -eq 0 ]; then
+            exit 0
+          fi
+          if [ "${{ matrix.os }}" = "ubuntu-latest" ]; then
+            exit 1
+          fi
+          if [ "$known" -eq "$fails" ]; then
+            exit 0
+          fi
+          exit 1
+      - name: Upload failed-run logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: flake-logs-${{ matrix.os }}
+          path: run-*.log
+          if-no-files-found: ignore
