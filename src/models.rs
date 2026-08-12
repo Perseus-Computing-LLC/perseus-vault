@@ -2056,6 +2056,9 @@ pub struct ConsolidateReport {
     /// #874: folds skipped because the merged body would heavily activate an
     /// entity outside the fold's source set (interference discipline).
     pub interference_skips: i64,
+    /// #957: folds skipped because the merged body matched an
+    /// admission-lint injection pattern (fail closed).
+    pub lint_skips: i64,
     /// #884: observations whose stored stale flag was recomputed this run.
     pub observations_refreshed: i64,
     /// #884: observations stale after this run (newer unconsolidated facts
