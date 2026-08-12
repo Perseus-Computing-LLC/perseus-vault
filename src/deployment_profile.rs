@@ -37,7 +37,7 @@ fn is_loopback_host(host: &str) -> bool {
 
 /// Extract the host (no port) from an http(s) URL ("" on parse failure).
 /// Handles `host`, `host:port`, `[::1]:port`, and userinfo prefixes.
-fn host_of(url: &str) -> String {
+pub(crate) fn host_of(url: &str) -> String {
     let rest = url
         .strip_prefix("https://")
         .or_else(|| url.strip_prefix("http://"))
