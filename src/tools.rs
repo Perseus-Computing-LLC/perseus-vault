@@ -2403,6 +2403,10 @@ pub struct HygieneArgs {
     /// Max flagged rows to return, worst first (default 50, cap 1000).
     #[serde(default)]
     pub limit: Option<i64>,
+    /// #961: entrenchment index above which a never-verified fact is flagged
+    /// (default 0.2 — the healthy maximum).
+    #[serde(default)]
+    pub entrenchment_threshold: Option<f64>,
 }
 
 /// #675: read-only hygiene report — surface likely low-signal memories (vague,
@@ -2415,11 +2419,18 @@ pub fn handle_hygiene(db: &Database, args: Value) -> Result<String, String> {
     let a: HygieneArgs =
         serde_json::from_value(args).map_err(|e| format!("Invalid hygiene arguments: {}", e))?;
     let threshold = a.threshold.unwrap_or(0.35).clamp(0.0, 1.0);
+    let entrenchment_threshold = a
+        .entrenchment_threshold
+        .unwrap_or(crate::models::ENTRENCHMENT_HEALTHY_MAX)
+        .clamp(0.0, 1.0);
     let scan_cap = a.scan_limit.unwrap_or(1000).clamp(1, 10_000);
     let report_cap = a.limit.unwrap_or(50).clamp(1, 1000) as usize;
 
     let mut scanned = 0i64;
     let mut flagged: Vec<(f64, serde_json::Value)> = Vec::new();
+    // #961: entrenched = never-verified facts whose strength/age/retrieval
+    // amplification put them above the healthy maximum.
+    let mut entrenched: Vec<(f64, serde_json::Value)> = Vec::new();
     let mut cursor: Option<String> = None;
     const PAGE: i64 = 500;
     while scanned < scan_cap {
@@ -2463,6 +2474,23 @@ pub fn handle_hygiene(db: &Database, args: Value) -> Result<String, String> {
                     }),
                 ));
             }
+            // #961: entrenchment — the inverse of decay. Only unverified
+            // facts can be entrenched (verified ones have gap = 0).
+            let entrenchment = crate::models::entrenchment_index(e);
+            if entrenchment > entrenchment_threshold {
+                entrenched.push((
+                    entrenchment,
+                    json!({
+                        "id": e.id,
+                        "category": e.category,
+                        "key": e.key,
+                        "entrenchment_index": (entrenchment * 1000.0).round() / 1000.0,
+                        "encoding_strength": crate::models::encoding_strength_label(crate::models::encoding_strength(e)),
+                        "retrieval_count": e.retrieval_count,
+                        "reasons": ["entrenchment: never verified"],
+                    }),
+                ));
+            }
         }
         if !has_more {
             break;
@@ -2485,12 +2513,26 @@ pub fn handle_hygiene(db: &Database, args: Value) -> Result<String, String> {
         .take(report_cap)
         .map(|(_, v)| v)
         .collect();
+    // #961: worst entrenched first, capped like flagged.
+    entrenched.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    let entrenchment_count = entrenched.len();
+    let entrenched_items: Vec<serde_json::Value> = entrenched
+        .into_iter()
+        .take(report_cap)
+        .map(|(_, v)| v)
+        .collect();
     Ok(json!({
         "scanned": scanned,
         "flagged_count": flagged_count,
         "returned": items.len(),
         "threshold": threshold,
         "flagged": items,
+        // #961: entrenchment lane — never-verified facts above the healthy
+        // maximum (strength x age x verification-gap x amplification).
+        "entrenchment_count": entrenchment_count,
+        "entrenchment_threshold": entrenchment_threshold,
+        "entrenchment_healthy_max": crate::models::ENTRENCHMENT_HEALTHY_MAX,
+        "entrenchment": entrenched_items,
     })
     .to_string())
 }
@@ -4122,6 +4164,10 @@ pub fn handle_quality_telemetry(db: &Database, args: Value) -> Result<String, St
             .unwrap_or(0)
     });
     let mut deprecated = 0i64;
+    // #961: entrenchment telemetry — count of never-verified facts above the
+    // healthy maximum plus the worst index seen (deterministic, offline).
+    let mut entrenched_count = 0i64;
+    let mut entrenchment_max = 0.0f64;
     let mut cursor: Option<String> = None;
     loop {
         let rows = db
@@ -4131,11 +4177,16 @@ pub fn handle_quality_telemetry(db: &Database, args: Value) -> Result<String, St
             break;
         }
         let take = rows.len().min(500);
-        deprecated += rows
-            .iter()
-            .take(take)
-            .filter(|e| e.status == "deprecated")
-            .count() as i64;
+        for e in rows.iter().take(take) {
+            if e.status == "deprecated" {
+                deprecated += 1;
+            }
+            let idx = crate::models::entrenchment_index(e);
+            if idx > crate::models::ENTRENCHMENT_HEALTHY_MAX {
+                entrenched_count += 1;
+            }
+            entrenchment_max = entrenchment_max.max(idx);
+        }
         if rows.len() <= 500 {
             break;
         }
@@ -4146,6 +4197,10 @@ pub fn handle_quality_telemetry(db: &Database, args: Value) -> Result<String, St
         "contradiction_count": contradiction_count,
         "contradiction_rate": if stats.active_entities > 0 { contradiction_count as f64 / stats.active_entities as f64 } else { 0.0 },
         "supersession_lag_count": deprecated,
+        // #961: entrenchment lane telemetry with the healthy maximum.
+        "entrenchment_count": entrenched_count,
+        "entrenchment_max_index": (entrenchment_max * 1000.0).round() / 1000.0,
+        "entrenchment_healthy_max": crate::models::ENTRENCHMENT_HEALTHY_MAX,
         "class_distribution": stats.by_category_active,
         "layer_distribution": stats.by_layer_active,
         "promotion_flow": {"working": stats.by_layer_active["working"], "semantic": stats.by_layer_active["semantic"], "core": stats.by_layer_active["core"]},
@@ -6308,6 +6363,10 @@ pub fn handle_operator_review(db: &Database, args: Value) -> Result<String, Stri
     let mut out = json!({
         "reviewed_at_unix_ms": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as i64, "category":a.category,
         "contradictions":contradictions, "stale_candidates":stale["flagged"],
+        // #961: never-verified facts entrenched above the healthy maximum.
+        // Read-only lane; resolve by verifying or forgetting category/key.
+        "entrenchment": stale["entrenchment"],
+        "entrenchment_healthy_max": crate::models::ENTRENCHMENT_HEALTHY_MAX,
         "supersession_lag":supersession_lag,
         "keystone_suggestions": pending_suggestions,
         "keystone_suggestions_note": "pending directive candidates from correct captures; promote via keystone_suggestion_decide(approve)",
@@ -14413,6 +14472,65 @@ mod tests {
         let v2: Value = serde_json::from_str(&raw2).unwrap();
         assert!(v2.get("table").is_none(), "prose mode must not add a table");
         assert_eq!(v2["read_only"], json!(true));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn entrenchment_flags_unverified_strong_old_facts_only() {
+        let (db, path) = temp_db();
+        let old = crate::db::now_ms() - 200 * 86_400_000; // 200 days ago -> age_frac 1.0
+        // A: code-grounded (S5), admitted unverified (import-like path),
+        // aged -> index 1.0, above the 0.2 healthy maximum.
+        db.remember_with_options(
+            &crate::db::tests::make_entity(
+                "entrenched-a", "facts", "entrenched-a",
+                "{\"note\":\"rate limiter caps at 200 req per hour\",\"index_type\":\"ide_symbol\",\"index_uri\":\"src/rate.rs\"}",
+            ),
+            false, None, None, false,
+        )
+        .unwrap();
+        // B: same strength/shape but VERIFIED admission -> gap 0.
+        let mut b = crate::db::tests::make_entity(
+            "entrenched-b", "facts", "entrenched-b",
+            "{\"note\":\"prometheus scrapes the gateway every 15 seconds\",\"index_type\":\"ide_symbol\",\"index_uri\":\"src/rate.rs\"}",
+        );
+        b.verified = true;
+        db.remember_with_options(&b, false, None, None, false).unwrap();
+        // C: fresh unverified fact -> age_frac ~ 0.
+        db.remember_with_options(
+            &crate::db::tests::make_entity(
+                "entrenched-c", "facts", "entrenched-c",
+                "{\"note\":\"load balancer uses round robin\"}",
+            ),
+            false, None, None, false,
+        )
+        .unwrap();
+        {
+            let conn = db.conn().unwrap();
+            conn.execute("UPDATE entities SET created_at_unix_ms = ?1 WHERE key = 'entrenched-a'", [old]).unwrap();
+        }
+        // Hygiene lane: only A is entrenched; healthy max exposed.
+        let raw = handle_hygiene(&db, json!({"category": "facts", "scan_limit": 1000})).unwrap();
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["entrenchment_healthy_max"], json!(0.2), "{raw}");
+        assert_eq!(v["entrenchment_threshold"], json!(0.2));
+        let lane = v["entrenchment"].as_array().unwrap();
+        assert_eq!(lane.len(), 1, "only the unverified S5 fact entrenched: {raw}");
+        assert_eq!(lane[0]["key"], json!("entrenched-a"));
+        assert!(lane[0]["entrenchment_index"].as_f64().unwrap() > 0.2, "{lane:?}");
+        assert_eq!(lane[0]["reasons"][0], json!("entrenchment: never verified"));
+        // Operator review surfaces the same lane.
+        let raw2 = handle_operator_review(&db, json!({"category": "facts", "limit": 20})).unwrap();
+        let v2: Value = serde_json::from_str(&raw2).unwrap();
+        let o = v2["entrenchment"].as_array().unwrap();
+        assert_eq!(o.len(), 1, "operator review entrenchment lane: {raw2}");
+        assert_eq!(o[0]["key"], json!("entrenched-a"));
+        // Quality telemetry carries count + healthy max.
+        let raw3 = handle_quality_telemetry(&db, json!({"category": "facts"})).unwrap();
+        let v3: Value = serde_json::from_str(&raw3).unwrap();
+        assert!(v3["entrenchment_count"].as_i64().unwrap() >= 1, "{raw3}");
+        assert!(v3["entrenchment_max_index"].as_f64().unwrap() >= 0.9);
+        assert_eq!(v3["entrenchment_healthy_max"], json!(0.2));
         let _ = std::fs::remove_file(path);
     }
 
