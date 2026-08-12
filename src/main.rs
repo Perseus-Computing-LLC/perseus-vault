@@ -1,4 +1,5 @@
 mod beliefs;
+mod anchor_expansion;
 mod capture;
 mod claim_card;
 mod communities;

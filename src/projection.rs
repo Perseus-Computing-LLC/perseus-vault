@@ -384,6 +384,7 @@ pub fn build_projection(db: &Database, req: &ProjectionRequest) -> Result<Projec
         tier_order: false,
         declared_category: None,
         declared_filters: None,
+        anchor_expansion: false,
     };
     let (entities, _count, _trace) = db
         .fused_recall(&params)

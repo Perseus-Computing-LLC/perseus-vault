@@ -692,6 +692,12 @@ pub struct RecallParams {
     /// fused pool is identical and only the returned set narrows. Legacy
     /// rows ('') satisfy a `semantic` filter. Empty = no filtering.
     pub type_filter: Option<String>,
+    /// #1009: active-decision anchor expansion (MindCache borrow) — after
+    /// fusion, top-k active decisions + keystones become extra lexical
+    /// queries; candidates matching them get a CAPPED boost and are recorded
+    /// as anchor-matched in the fused trace. Opt-in, default OFF: a default
+    /// recall stays byte-identical (#247). Workspace-scoped.
+    pub anchor_expansion: bool,
 }
 
 /// Search mode for recall: FTS5 keyword, dense vector, hybrid fusion, or
@@ -888,6 +894,10 @@ pub struct FusedTrace {
     /// flagged context-invalid.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub validity: Option<ValidityTrace>,
+    /// #1009: entity ids boosted by active-decision anchor matches (empty
+    /// when anchor expansion is off or nothing matched).
+    #[serde(default)]
+    pub anchor_matched: Vec<String>,
 }
 
 /// #860: observable validity-profile trace attached to a fused recall.
@@ -1054,6 +1064,7 @@ impl Default for RecallParams {
             tier_order: false,
             declared_category: None,
             declared_filters: None,
+            anchor_expansion: false,
         }
     }
 }
