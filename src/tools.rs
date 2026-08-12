@@ -4395,7 +4395,6 @@ pub fn handle_type_policies(_db: &Database, _args: Value) -> Result<String, Stri
     }))
     .map_err(|e| format!("Serialization failed: {e}"))
 }
-}
 
 fn default_telemetry_category() -> String {
     "general".to_string()
