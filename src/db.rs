@@ -7156,6 +7156,7 @@ impl Database {
                             candidate_k,
                             sparse_weight,
                             params.recency_half_life_secs,
+                            params.max_prior_overturn,
                             now_ms(),
                         )
                     } else {
@@ -7172,6 +7173,7 @@ impl Database {
                             candidate_k,
                             sparse_weight,
                             params.recency_half_life_secs,
+                            params.max_prior_overturn,
                             now_ms(),
                         );
                         crate::db::reciprocal_rank_fusion(
@@ -7181,6 +7183,7 @@ impl Database {
                             candidate_k,
                             graph_weight,
                             params.recency_half_life_secs,
+                            params.max_prior_overturn,
                             now_ms(),
                         )
                     };
@@ -7240,6 +7243,7 @@ impl Database {
                                     candidate_k,
                                     crate::db::sparse_arm_weight(s.len()),
                                     params.recency_half_life_secs,
+                                    params.max_prior_overturn,
                                     now_ms(),
                                 );
                                 for (e, _) in &sub_fused {
@@ -8175,12 +8179,21 @@ impl Database {
         for params in queries {
             let entities = self.recall(params)?;
             let scored: Vec<(Entity, f64)> = entities.into_iter().map(|e| (e, 1.0)).collect();
-            all_results.push((scored, params.recency_half_life_secs));
+            all_results.push((
+                scored,
+                params.recency_half_life_secs,
+                params.max_prior_overturn,
+            ));
         }
 
-        let (mut fused, mut last_half_life) = all_results[0].clone();
-        for (next_res, next_half_life) in all_results.into_iter().skip(1) {
+        let (mut fused, mut last_half_life, mut last_overturn) = all_results[0].clone();
+        for (next_res, next_half_life, next_overturn) in all_results.into_iter().skip(1) {
             let half_life = next_half_life.or(last_half_life);
+            let overturn = if next_overturn > 0.0 {
+                next_overturn
+            } else {
+                last_overturn
+            };
             fused = crate::db::reciprocal_rank_fusion(
                 &fused,
                 &next_res,
@@ -8188,9 +8201,11 @@ impl Database {
                 limit,
                 1.0,
                 half_life,
+                overturn,
                 crate::db::now_ms(),
             );
             last_half_life = half_life;
+            last_overturn = overturn;
         }
 
         Ok(fused)
@@ -8764,8 +8779,17 @@ impl Database {
             items.push(entity);
         }
 
-        // #106: Content witness signal (additive boost, never penalizes)
+        // #106: Content witness signal (additive boost, never penalizes).
+        // #956: with max_prior_overturn > 0 the boost is a floored
+        // multiplicative factor raised to the derived exponent — a content
+        // match can lift a hit by at most `max_prior_overturn`× over an
+        // equally-relevant non-matching hit, and it can never swamp a
+        // stronger relevance gap (scores no longer saturate at 1.0). The
+        // legacy additive path is preserved for `max_prior_overturn <= 0`.
         if params.content_weight > 0.0 && !params.query.is_empty() {
+            // Values <= 1.0 are misuse; only > 1.0 engages the bounded path
+            // (prior_exponent's debug_assert requires max_overturn > 1.0).
+            let bounded = params.max_prior_overturn > 1.0;
             let query_lower = params.query.to_lowercase();
             let size_pivot: f64 = 5000.0;
             for entity in &mut items {
@@ -8773,9 +8797,20 @@ impl Database {
                 if body_lower.contains(&query_lower) {
                     let content_len = entity.body_json.len() as f64;
                     let damper = 1.0 / (1.0 + (1.0 + content_len / size_pivot.max(1.0)).log10());
-                    // Boost decay_score as a proxy for ranking (additive, never penalizes)
-                    entity.decay_score =
-                        (entity.decay_score + params.content_weight * damper).min(1.0);
+                    if bounded {
+                        let s = (params.content_weight * damper).clamp(0.0, 1.0);
+                        entity.decay_score = (entity.decay_score
+                            * bounded_prior_factor(
+                                CONTENT_PRIOR_FLOOR,
+                                params.max_prior_overturn,
+                                s,
+                            ))
+                        .min(1.0);
+                    } else {
+                        // Boost decay_score as a proxy for ranking (additive, never penalizes)
+                        entity.decay_score =
+                            (entity.decay_score + params.content_weight * damper).min(1.0);
+                    }
                 }
             }
             // Re-sort after content witness boost
@@ -8799,13 +8834,26 @@ impl Database {
         // entities and fail to reorder — exactly when trust must reorder. We
         // also avoid returning a >1.0 or inflated decay_score to the caller.
         if params.trust_weight > 0.0 {
-            let trust_score = |e: &Entity| -> f64 {
-                let trust = if e.verified {
+            // #956: bounded form — floored multiplicative factor raised to
+            // the derived exponent; verified evidence can lift a hit by at
+            // most `max_prior_overturn`× over an equally-relevant
+            // low-trust hit. Legacy additive form preserved for
+            // `max_prior_overturn <= 0`.
+            // Values <= 1.0 are misuse; only > 1.0 engages the bounded path.
+            let bounded = params.max_prior_overturn > 1.0;
+            let trust_score = |ent: &Entity| -> f64 {
+                let trust = if ent.verified {
                     1.0
                 } else {
-                    e.certainty.clamp(0.0, 1.0)
+                    ent.certainty.clamp(0.0, 1.0)
                 };
-                e.decay_score + params.trust_weight * trust
+                if bounded {
+                    let s = (params.trust_weight * trust).clamp(0.0, 1.0);
+                    ent.decay_score
+                        * bounded_prior_factor(TRUST_PRIOR_FLOOR, params.max_prior_overturn, s)
+                } else {
+                    ent.decay_score + params.trust_weight * trust
+                }
             };
             items.sort_by(|a, b| {
                 trust_score(b)
@@ -22126,6 +22174,42 @@ fn entity_event_days(e: &crate::models::Entity) -> Option<i64> {
     Some(days_from_civil(y, m, d))
 }
 
+/// #956: ranking-prior bounds. Each prior is floored into `[floor, 1]` and
+/// raised to a derived exponent so a single prior can overturn at most
+/// `MAX_PRIOR_OVERTURN_DEFAULT`× a relevance gap. Spec:
+/// docs/specs/recall-serving-contract.md §3.
+pub const MAX_PRIOR_OVERTURN_DEFAULT: f64 = 2.0;
+/// Recency (half-life decay) prior floor.
+pub const RECENCY_PRIOR_FLOOR: f64 = 0.3;
+/// Content-witness (substring match) prior floor.
+pub const CONTENT_PRIOR_FLOOR: f64 = 0.2;
+/// Provenance-trust prior floor.
+pub const TRUST_PRIOR_FLOOR: f64 = 0.2;
+
+/// #956: derive a prior's exponent from its floor and the max-overturn
+/// constant: `(1/floor)^e == max_overturn` → `e = ln(max_overturn) /
+/// ln(1/floor)`. Pure function; unit-tested to the span identity. A factor
+/// `p ∈ [floor, 1]` raised to `e` can then shrink relevance by at most
+/// `1/max_overturn` — never zero a strong match, never crown a weak one.
+pub fn prior_exponent(floor: f64, max_overturn: f64) -> f64 {
+    debug_assert!(floor > 0.0 && floor < 1.0);
+    debug_assert!(max_overturn > 1.0);
+    max_overturn.ln() / (1.0 / floor).ln()
+}
+
+/// #956: the floored multiplicative prior factor for a signal `s ∈ [0, 1]`
+/// under the derived-exponent scheme. Returns `(floor + (1-floor)*s)^e`
+/// where `e = prior_exponent(floor, max_overturn)`. Properties (unit-tested):
+/// monotonic increasing in `s`; `factor(_, _, 1.0) == 1.0` (no penalty for a
+/// full-strength prior); `factor(_, _, 0.0) == 1/max_overturn` (a no-signal
+/// prior can shrink relevance by at most `1/max_overturn` — never zero a
+/// strong match, never crown a weak one).
+pub fn bounded_prior_factor(floor: f64, max_overturn: f64, signal: f64) -> f64 {
+    let s = signal.clamp(0.0, 1.0);
+    let e = prior_exponent(floor, max_overturn);
+    (floor + (1.0 - floor) * s).powf(e)
+}
+
 pub fn reciprocal_rank_fusion(
     dense_results: &[(crate::models::Entity, f64)],
     sparse_results: &[(crate::models::Entity, f64)],
@@ -22133,6 +22217,7 @@ pub fn reciprocal_rank_fusion(
     limit: usize,
     sparse_weight: f64,
     recency_half_life_secs: Option<f64>,
+    max_prior_overturn: f64,
     now_ms: i64,
 ) -> Vec<(crate::models::Entity, f64)> {
     use std::collections::HashMap;
@@ -22162,13 +22247,22 @@ pub fn reciprocal_rank_fusion(
     // Optional recency re-weighting (#235): multiply each fused score by an
     // exponential decay on the entity's age. half_life seconds → factor 0.5.
     let recency = recency_half_life_secs.filter(|hl| *hl > 0.0);
+    // Values <= 1.0 select the legacy unbounded decay (no exponent).
+    let recency_e = (max_prior_overturn > 1.0)
+        .then(|| prior_exponent(RECENCY_PRIOR_FLOOR, max_prior_overturn));
 
     let mut fused: Vec<_> = scores
         .into_iter()
         .filter_map(|(id, score)| {
             entities.remove(&id).map(|entity| {
-                let score = match recency {
-                    Some(hl) if entity.created_at_unix_ms > 0 => {
+                let score = match (recency, recency_e) {
+                    (Some(hl), Some(e)) if entity.created_at_unix_ms > 0 => {
+                        let age_secs =
+                            ((now_ms - entity.created_at_unix_ms).max(0) as f64) / 1000.0;
+                        let factor = 0.5_f64.powf(age_secs / hl).max(RECENCY_PRIOR_FLOOR);
+                        score * factor.powf(e)
+                    }
+                    (Some(hl), None) if entity.created_at_unix_ms > 0 => {
                         let age_secs =
                             ((now_ms - entity.created_at_unix_ms).max(0) as f64) / 1000.0;
                         score * 0.5_f64.powf(age_secs / hl)
@@ -23405,6 +23499,56 @@ mod tests {
         assert!(outcome.abstained);
         assert_eq!(outcome.reason, "empty_store");
         assert!(outcome.backend_health.is_some());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn recall_outcome_populated_store_out_of_scope_query_abstains_no_match() {
+        // #953: an out-of-scope query over a NON-empty store is genuine
+        // no-evidence — empty + abstained with reason no_match, so the model
+        // layer abstains instead of inventing facts. (The empty-store half
+        // of the contract is covered above.)
+        let (db, path) = temp_db();
+        db.remember(&make_entity(
+            "known-1",
+            "facts",
+            "known-1",
+            r#"{"note":"quantum tunneling cross-section"}"#,
+        ))
+        .unwrap();
+        let hits = db
+            .recall(&crate::models::RecallParams {
+                query: "coffee consumption in 1987 in vienna".to_string(),
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(
+            hits.is_empty(),
+            "out-of-scope query must return no evidence"
+        );
+        let outcome = db.recall_outcome(&crate::models::SearchMode::Fts5, false, 0, None);
+        assert!(
+            outcome.abstained,
+            "no-evidence must abstain, never present itself as a fact"
+        );
+        // The descriptor is backend-state-dependent by design: the lean build
+        // has no embedding backend, so the store is fully searchable ->
+        // Empty/no_match; the default build just enqueued the entity's
+        // auto-embed job, so the index is behind -> Stale/index_behind. Both
+        // abstain; neither is a confident answer.
+        match outcome.status {
+            crate::models::RecallStatus::Empty => {
+                assert_eq!(outcome.reason, "no_match");
+            }
+            crate::models::RecallStatus::Stale => {
+                assert_eq!(outcome.reason, "index_behind");
+            }
+            other => panic!(
+                "no-evidence must be Empty or Stale, got {other:?} (abstained={})",
+                outcome.abstained
+            ),
+        }
         let _ = std::fs::remove_file(path);
     }
 
@@ -34248,6 +34392,7 @@ mod tests {
             10,
             1.0,
             None,
+            MAX_PRIOR_OVERTURN_DEFAULT,
             0,
         );
         let fused_ids: Vec<&str> = fused.iter().map(|(e, _)| e.id.as_str()).collect();
@@ -34285,7 +34430,8 @@ mod tests {
         let sparse: Vec<(Entity, f64)> = vec![];
 
         // Relevance-only (default): the older, more-relevant entity ranks first.
-        let baseline = crate::db::reciprocal_rank_fusion(&dense, &sparse, 60.0, 10, 1.0, None, now);
+        let baseline =
+            crate::db::reciprocal_rank_fusion(&dense, &sparse, 60.0, 10, 1.0, None, MAX_PRIOR_OVERTURN_DEFAULT, now);
         assert_eq!(
             baseline[0].0.id, "old",
             "without recency, the top-relevance entity must win"
@@ -34295,7 +34441,7 @@ mod tests {
         // brand-new entity overtakes it.
         let hl = day_ms as f64 / 1000.0;
         let boosted =
-            crate::db::reciprocal_rank_fusion(&dense, &sparse, 60.0, 10, 1.0, Some(hl), now);
+            crate::db::reciprocal_rank_fusion(&dense, &sparse, 60.0, 10, 1.0, Some(hl), MAX_PRIOR_OVERTURN_DEFAULT, now);
         assert_eq!(
             boosted[0].0.id, "fresh",
             "recency boost must promote the newer entity"
@@ -34303,7 +34449,7 @@ mod tests {
 
         // A non-positive half-life is treated as disabled (no-op) — same as None.
         let disabled =
-            crate::db::reciprocal_rank_fusion(&dense, &sparse, 60.0, 10, 1.0, Some(0.0), now);
+            crate::db::reciprocal_rank_fusion(&dense, &sparse, 60.0, 10, 1.0, Some(0.0), MAX_PRIOR_OVERTURN_DEFAULT, now);
         assert_eq!(
             disabled[0].0.id, "old",
             "hl <= 0 must disable recency weighting"
@@ -34321,12 +34467,163 @@ mod tests {
         let dense = vec![(unset, 0.5)];
         let sparse: Vec<(Entity, f64)> = vec![];
 
-        let out = crate::db::reciprocal_rank_fusion(&dense, &sparse, 60.0, 10, 1.0, Some(1.0), now);
+        let out = crate::db::reciprocal_rank_fusion(&dense, &sparse, 60.0, 10, 1.0, Some(1.0), MAX_PRIOR_OVERTURN_DEFAULT, now);
         let expected = 1.0 / (60.0 + 1.0); // rank-0 RRF, unscaled
         assert!(
             (out[0].1 - expected).abs() < 1e-12,
             "entity with unset created_at must not be recency-penalized"
         );
+    }
+
+    // ─── #956: derived max-overturn prior bounds ─────────────────────────
+
+    #[test]
+    fn prior_exponent_derivation_identity() {
+        // span^e must equal max_overturn for every floor/constant pair: a
+        // no-signal prior (factor = floor) shrinks relevance by at most
+        // 1/max_overturn.
+        for (floor, max_overturn) in [
+            (0.2, 2.0),
+            (0.3, 2.0),
+            (0.2, 4.0),
+            (0.3, 8.0),
+            (0.5, 2.0),
+            (0.1, 2.0),
+        ] {
+            let e = crate::db::prior_exponent(floor, max_overturn);
+            let span = 1.0 / floor;
+            let got = span.powf(e);
+            assert!(
+                (got - max_overturn).abs() < 1e-9,
+                "span^e must equal max_overturn: floor {floor} c {max_overturn} -> {got}"
+            );
+        }
+        // NexusMem reference values (their src/retrieval/rank.ts floors).
+        assert!((crate::db::prior_exponent(0.2, 2.0) - 0.4307).abs() < 1e-3);
+        assert!((crate::db::prior_exponent(0.3, 2.0) - 0.576).abs() < 1e-3);
+    }
+
+    #[test]
+    fn bounded_prior_factor_properties() {
+        // Monotonic increasing in signal: priors still order
+        // equally-relevant hits exactly as before.
+        let mut prev = -1.0_f64;
+        for s in [0.0, 0.1, 0.25, 0.5, 0.75, 0.9, 1.0] {
+            let f = crate::db::bounded_prior_factor(0.2, 2.0, s);
+            assert!(f >= prev, "factor must be monotonic in signal");
+            assert!(f <= 1.0 + 1e-12);
+            prev = f;
+        }
+        // Full-strength prior: no penalty at all.
+        assert_eq!(crate::db::bounded_prior_factor(0.2, 2.0, 1.0), 1.0);
+        // No-signal prior: exact 1/max_overturn penalty — the bound itself.
+        assert!((crate::db::bounded_prior_factor(0.2, 2.0, 0.0) - 0.5).abs() < 1e-12);
+        assert!((crate::db::bounded_prior_factor(0.3, 2.0, 0.0) - 0.5).abs() < 1e-12);
+        assert!((crate::db::bounded_prior_factor(0.2, 4.0, 0.0) - 0.25).abs() < 1e-12);
+        // Signal clamps into [0, 1] (out-of-range input cannot amplify).
+        assert_eq!(
+            crate::db::bounded_prior_factor(0.2, 2.0, 1.7),
+            crate::db::bounded_prior_factor(0.2, 2.0, 1.0)
+        );
+        assert_eq!(
+            crate::db::bounded_prior_factor(0.2, 2.0, -0.3),
+            crate::db::bounded_prior_factor(0.2, 2.0, 0.0)
+        );
+    }
+
+    #[test]
+    #[test]
+    fn rrf_recency_bound_does_not_overturn_gt2x_relevance_gap() {
+        // #956 e2e on the fusion path: with a recency half-life active, the
+        // recency prior is floored + exponentiated so it can overturn at most
+        // `max_prior_overturn`× a relevance gap. RRF relevance is rank-based,
+        // so the gap is expressed in ranks: rank 1 (1/61) vs rank 200
+        // (1/260) is a 4.26× relevance gap.
+        //
+        // NOTE: an equivalent >2× gap is NOT constructible on the FTS5 path
+        // — fresh entities saturate decay_score at 1.0 (#953), so score gaps
+        // there are ~0. The bound is unit-proven via bounded_prior_factor and
+        // demonstrated end-to-end here on the fusion path.
+        let now = 1_000_000_000_000_i64;
+        let day_ms = 24 * 60 * 60 * 1000;
+        let mut old = make_entity("old-r1", "insight", "old-r1", r#"{"n":"old"}"#);
+        old.created_at_unix_ms = now - 100 * day_ms; // 100 days old
+        let mut fresh = make_entity("fresh-r200", "insight", "fresh-r200", r#"{"n":"fresh"}"#);
+        fresh.created_at_unix_ms = now;
+        // old at rank 1 (max relevance), fresh at rank 200: a >2× gap.
+        let mut dense = vec![(old.clone(), 0.99)];
+        for i in 0..199 {
+            // Fillers are as old as `old` (same recency penalty): the ranking
+            // is relevance-only among the penalized set, so the gap between
+            // old-r1 and fresh-r200 is the only signal.
+            let mut f = make_entity(&format!("filler-{i}"), "insight", &format!("filler-{i}"), r#"{"n":"x"}"#);
+            f.created_at_unix_ms = now - 100 * day_ms;
+            dense.push((f, 0.5));
+        }
+        dense.push((fresh.clone(), 0.5));
+        let sparse: Vec<(Entity, f64)> = vec![];
+        let hl = day_ms as f64 / 1000.0;
+
+        // Default bound (2.0): the >2× relevance gap survives the max recency
+        // penalty (old keeps >= half its fused score).
+        let bounded = crate::db::reciprocal_rank_fusion(
+            &dense, &sparse, 60.0, 210, 1.0, Some(hl), MAX_PRIOR_OVERTURN_DEFAULT, now,
+        );
+        assert_eq!(
+            bounded[0].0.id, "old-r1",
+            "a >2x relevance gap must beat the recency prior at the default bound"
+        );
+
+        // Widened bound (64): the recency prior may now overturn the gap.
+        let wide = crate::db::reciprocal_rank_fusion(
+            &dense, &sparse, 60.0, 210, 1.0, Some(hl), 64.0, now,
+        );
+        assert_eq!(
+            wide[0].0.id, "fresh-r200",
+            "a 64x bound must let recency overturn the relevance gap"
+        );
+
+        // Legacy (<= 0): unbounded decay — old is crushed to ~0 regardless.
+        let legacy = crate::db::reciprocal_rank_fusion(
+            &dense, &sparse, 60.0, 210, 1.0, Some(hl), 0.0, now,
+        );
+        assert_eq!(
+            legacy[0].0.id, "fresh-r200",
+            "legacy unbounded recency must crush the 100-day-old hit"
+        );
+    }
+
+    #[test]
+    fn recall_legacy_prior_path_bit_identical_when_disabled() {
+        // #956: max_prior_overturn <= 0 (and the misuse range (0, 1]) must
+        // reproduce the legacy additive content boost exactly — bounded
+        // factors only engage above 1.0.
+        let (db, path) = temp_db();
+        for i in 0..3 {
+            db.remember_skip_dedup(&make_entity(
+                &format!("legacy-{i}"),
+                "facts",
+                &format!("legacy-{i}"),
+                &format!(r#"{{"note":"legacy bound check alpha {i} common"}}"#),
+            ))
+            .unwrap();
+        }
+        let mk = |overturn: f64| crate::models::RecallParams {
+            query: "legacy bound check alpha".to_string(),
+            limit: 10,
+            content_weight: 0.8,
+            max_prior_overturn: overturn,
+            ..Default::default()
+        };
+        let a = db.recall(&mk(0.0)).unwrap();
+        let b = db.recall(&mk(-1.0)).unwrap();
+        let c = db.recall(&mk(0.5)).unwrap(); // misuse range -> legacy
+        let ids = |v: &Vec<crate::models::Entity>| -> Vec<String> {
+            v.iter().map(|e| e.id.clone()).collect()
+        };
+        assert_eq!(ids(&a), ids(&b), "0 and negative must match");
+        assert_eq!(ids(&a), ids(&c), "misuse range must fall back to legacy");
+        let _ = std::fs::remove_file(path);
     }
 
     // ─── #247: relevance-aware, deterministic hybrid fusion ──────────────
@@ -34362,7 +34659,7 @@ mod tests {
         // Keyword arm ranks an irrelevant entity first.
         let sparse = vec![(noise, 5.0)];
 
-        let fused = crate::db::reciprocal_rank_fusion(&dense, &sparse, 60.0, 10, 0.0, None, 0);
+        let fused = crate::db::reciprocal_rank_fusion(&dense, &sparse, 60.0, 10, 0.0, None, MAX_PRIOR_OVERTURN_DEFAULT, 0);
         assert_eq!(
             fused[0].0.id, "dense-top",
             "a weight-0 keyword arm must not displace the dense rank-1 hit"
@@ -34374,7 +34671,7 @@ mod tests {
         let noise2 = make_entity("kw-noise", "insight", "k3", r#"{"n":"c"}"#);
         let dense2 = vec![(want2, 0.91)];
         let sparse2 = vec![(noise2, 5.0)];
-        let tied = crate::db::reciprocal_rank_fusion(&dense2, &sparse2, 60.0, 10, 1.0, None, 0);
+        let tied = crate::db::reciprocal_rank_fusion(&dense2, &sparse2, 60.0, 10, 1.0, None, MAX_PRIOR_OVERTURN_DEFAULT, 0);
         // Both rank-0 in their arm → equal fused score → id tie-break (asc).
         assert_eq!(tied[0].0.id, "dense-top");
         assert_eq!(tied[1].0.id, "kw-noise");
@@ -34397,7 +34694,7 @@ mod tests {
                 0.5, // identical scores → identical RRF ranks → all tied
             ));
         }
-        let first = crate::db::reciprocal_rank_fusion(&dense, &[], 60.0, 10, 0.0, None, 0);
+        let first = crate::db::reciprocal_rank_fusion(&dense, &[], 60.0, 10, 0.0, None, MAX_PRIOR_OVERTURN_DEFAULT, 0);
         let order: Vec<String> = first.iter().map(|(e, _)| e.id.clone()).collect();
         // All scores equal, so id order must be ascending and stable.
         let mut sorted = order.clone();
@@ -34407,7 +34704,7 @@ mod tests {
             "all-tied results must be ordered by id ascending"
         );
         for _ in 0..50 {
-            let again = crate::db::reciprocal_rank_fusion(&dense, &[], 60.0, 10, 0.0, None, 0);
+            let again = crate::db::reciprocal_rank_fusion(&dense, &[], 60.0, 10, 0.0, None, MAX_PRIOR_OVERTURN_DEFAULT, 0);
             let again_order: Vec<String> = again.iter().map(|(e, _)| e.id.clone()).collect();
             assert_eq!(again_order, order, "fused tie order must be deterministic");
         }
@@ -43169,6 +43466,52 @@ mod tests {
         params.depth_budget = Some("low".to_string());
         let (_e, _c, trace) = db.fused_recall(&params).unwrap();
         assert_eq!(trace.truncation.budget_tokens, 1024, "low -> 1024");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn fused_recall_budget_monotonic_superset() {
+        // #954: raising the token budget must never lose delivered hits — the
+        // delivered set is a monotonic superset of every smaller budget's set.
+        // (The Hindsight k-sweep's non-monotonicity is a *recall* curve
+        // artifact; the budget PACKING contract is monotonic by construction
+        // and this test pins it.)
+        let (db, path) = temp_db();
+        for i in 0..12 {
+            db.remember_skip_dedup(&make_entity(
+                &format!("mono-{i}"),
+                "insight",
+                &format!("mono-{i}"),
+                &format!(
+                    r#"{{"note":"monotonic budget topic delta {i} {}"}}"#,
+                    "q".repeat(200)
+                ),
+            ))
+            .unwrap();
+        }
+        let ids = |es: &[crate::models::Entity]| -> Vec<String> {
+            es.iter().map(|e| e.id.clone()).collect()
+        };
+        let mut prev: Vec<String> = Vec::new();
+        for budget in [256, 512, 1024, 4096, 100_000] {
+            let mut params = fused_params("monotonic budget topic");
+            params.strategies = vec!["fts5".into(), "graph".into()];
+            params.max_tokens = budget;
+            let (entities, _c, trace) = db.fused_recall(&params).unwrap();
+            let got = ids(&entities);
+            assert!(
+                trace.truncation.estimated_tokens_used <= budget.max(1) as i64,
+                "injection size must stay within budget (min-1 top entity)"
+            );
+            for id in &prev {
+                assert!(
+                    got.contains(id),
+                    "budget {budget} must keep everything budget {prev_budget} kept (lost {id})",
+                    prev_budget = budget
+                );
+            }
+            prev = got;
+        }
         let _ = std::fs::remove_file(path);
     }
 

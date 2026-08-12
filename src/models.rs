@@ -159,6 +159,12 @@ pub fn default_trust_weight() -> f64 {
     0.15
 }
 
+/// Default recall max-prior-overturn constant (#956). A single prior
+/// (recency/content/trust) can overturn at most this × a relevance gap.
+pub fn default_max_prior_overturn() -> f64 {
+    crate::db::MAX_PRIOR_OVERTURN_DEFAULT
+}
+
 fn default_visibility() -> String {
     "workspace".to_string()
 }
@@ -378,6 +384,13 @@ pub struct RecallParams {
     pub entity_type: Option<String>,
     pub limit: i64,
     pub offset: i64,
+    /// DEPRECATED (#953): decay scores saturate near 1.0 for fresh entities,
+    /// so this threshold cannot separate evidence from noise (a min-score
+    /// sweep 0.2→0.65 produces byte-identical results). Kept as an
+    /// API-compatible filter on `decay_score`; do not rely on it and do not
+    /// add new score gates — suppression is governed by visibility/erasure
+    /// state, never by score. The retrieval layer never gates answers on
+    /// scores; the model decides abstention from the `outcome` block.
     pub min_decay: f64,
     pub topic_path: Option<String>,
     pub include_archived: bool,
@@ -397,6 +410,14 @@ pub struct RecallParams {
     /// proportion to their certainty, so trusted sources outrank AI drafts on
     /// the same topic. Never penalizes.
     pub trust_weight: f64,
+    /// #956: max-overturn bound for ranking priors. Each prior (recency,
+    /// content witness, provenance trust) contributes a factor floored into
+    /// [floor, 1] raised to a DERIVED exponent `ln(max_prior_overturn) /
+    /// ln(1/floor)`, so a single prior can overturn at most `max_prior_overturn`×
+    /// a relevance gap (default 2.0). ≤ 0 selects the legacy additive
+    /// (content/trust) + unbounded recency path for exact backward
+    /// compatibility. Spec: docs/specs/recall-serving-contract.md §3.
+    pub max_prior_overturn: f64,
     /// Per-keyword halving quota for result diversity (1.0 = disabled).
     /// Each distinct matched keyword gets ceil(max_results × halving^n) slots.
     pub diversity_halving: f64,
@@ -856,6 +877,7 @@ impl Default for RecallParams {
             always_on: None,
             content_weight: 0.0,
             trust_weight: default_trust_weight(),
+            max_prior_overturn: default_max_prior_overturn(),
             diversity_halving: 1.0,
             diversity_per_query_share: 0.0,
             recency_half_life_secs: None,
