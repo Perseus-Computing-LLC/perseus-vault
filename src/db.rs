@@ -4556,7 +4556,11 @@ impl Database {
             return Ok(());
         }
         let conn = self.conn()?;
-        Self::apply_recall_side_effects_with_conn(&conn, ids)
+        Self::apply_recall_side_effects_with_conn(&conn, ids)?;
+        // #1001: usage accrued — deterministic promotion check over exactly
+        // the touched ids (never an unbounded sweep).
+        let _ = self.maybe_promote_entities(&conn, ids);
+        Ok(())
     }
 
     /// #397: `apply_recall_side_effects` on the CALLER's already-held
@@ -4575,6 +4579,7 @@ impl Database {
                 retrieval_count = retrieval_count + 1, \
                 last_accessed_unix_ms = ?, \
                 decay_score = MIN(1.0, decay_score + {boost}), \
+                utility_score = MIN({cap}, utility_score + {hitu}), \
                 layer = CASE \
                     WHEN retrieval_count + 1 >= {core} THEN 'core' \
                     WHEN retrieval_count + 1 >= {working} THEN 'working' \
@@ -4583,6 +4588,8 @@ impl Database {
             boost = Self::DECAY_BOOST,
             core = Self::CORE_THRESHOLD,
             working = Self::WORKING_THRESHOLD,
+            cap = crate::utility_promotion::UTILITY_CAP,
+            hitu = crate::utility_promotion::RETRIEVAL_HIT_DELTA,
         );
 
         let now = now_ms();
@@ -9249,6 +9256,8 @@ impl Database {
         if !params.skip_side_effects && !items.is_empty() {
             let ids: Vec<String> = items.iter().map(|e| e.id.clone()).collect();
             let _ = Self::apply_recall_side_effects_with_conn(&conn, &ids);
+            // #1001: deterministic promotion check over the touched ids.
+            let _ = self.maybe_promote_entities(&conn, &ids);
         }
         // #872: displacement telemetry — entities the diversity quota
         // removed, with the sole-evidence flag (its dominant keyword has
@@ -15822,24 +15831,52 @@ impl Database {
     ) -> Result<bool, Box<dyn std::error::Error>> {
         let conn = self.conn()?;
         let now = now_ms();
+        // Resolve the target id FIRST so the promotion check runs on the
+        // exact row (the subquery update can't report which row it hit).
+        let id: Option<String> = match workspace_hash {
+            Some(ws) => conn
+                .query_row(
+                    "SELECT id FROM entities WHERE category = ?1 AND key = ?2 \
+                     AND workspace_hash = ?3 AND archived = 0 ORDER BY id ASC LIMIT 1",
+                    params![category, key, ws],
+                    |r| r.get(0),
+                )
+                .ok(),
+            None => conn
+                .query_row(
+                    "SELECT id FROM entities WHERE category = ?1 AND key = ?2 \
+                     AND archived = 0 ORDER BY workspace_hash ASC, id ASC LIMIT 1",
+                    params![category, key],
+                    |r| r.get(0),
+                )
+                .ok(),
+        };
         let affected = match workspace_hash {
             Some(ws) => conn.execute(
                 "UPDATE entities SET usefulness_count = usefulness_count + 1, \
+                 utility_score = MIN(?3, utility_score + ?4), \
                  last_useful_unix_ms = ?1, last_accessed_unix_ms = ?1 \
                  WHERE id = (SELECT id FROM entities \
-                     WHERE category = ?2 AND key = ?3 AND workspace_hash = ?4 \
+                     WHERE category = ?2 AND key = ?5 AND workspace_hash = ?6 \
                      AND archived = 0 ORDER BY id ASC LIMIT 1)",
-                params![now, category, key, ws],
+                params![now, category, crate::utility_promotion::UTILITY_CAP, crate::utility_promotion::CITATION_DELTA, key, ws],
             )?,
             None => conn.execute(
                 "UPDATE entities SET usefulness_count = usefulness_count + 1, \
+                 utility_score = MIN(?3, utility_score + ?4), \
                  last_useful_unix_ms = ?1, last_accessed_unix_ms = ?1 \
                  WHERE id = (SELECT id FROM entities \
-                     WHERE category = ?2 AND key = ?3 AND archived = 0 \
+                     WHERE category = ?2 AND key = ?5 AND archived = 0 \
                      ORDER BY workspace_hash ASC, id ASC LIMIT 1)",
-                params![now, category, key],
+                params![now, category, crate::utility_promotion::UTILITY_CAP, crate::utility_promotion::CITATION_DELTA, key],
             )?,
         };
+        if affected > 0 {
+            if let Some(id) = id {
+                let ids = vec![id];
+                let _ = self.maybe_promote_entities(&conn, &ids);
+            }
+        }
         Ok(affected > 0)
     }
 
@@ -15852,11 +15889,98 @@ impl Database {
         let now = now_ms();
         let affected = conn.execute(
             "UPDATE entities SET usefulness_count = usefulness_count + 1, \
+             utility_score = MIN(?3, utility_score + ?4), \
              last_useful_unix_ms = ?1, last_accessed_unix_ms = ?1 \
              WHERE id = ?2 AND archived = 0",
-            params![now, id],
+            params![now, id, crate::utility_promotion::UTILITY_CAP, crate::utility_promotion::CITATION_DELTA],
         )?;
+        if affected > 0 {
+            let ids = vec![id.to_string()];
+            let _ = self.maybe_promote_entities(&conn, &ids);
+        }
         Ok(affected > 0)
+    }
+
+    /// #1001: deterministic promotion check over exactly the touched ids
+    /// (never an unbounded sweep — callers run it after their own
+    /// side-effect UPDATEs). Applies the pure transition function from
+    /// `utility_promotion`, CAS-guards the write against concurrent
+    /// epistemic changes, and journals every transition as 'auto_promotion'.
+    /// Failures are best-effort by contract: the side effect that accrued
+    /// the utility already committed.
+    fn maybe_promote_entities(
+        &self,
+        conn: &rusqlite::Connection,
+        ids: &[String],
+    ) -> Result<usize, Box<dyn std::error::Error>> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let placeholders = vec!["?"; ids.len()].join(",");
+        let sql = format!(
+            "SELECT id, epistemic_state, utility_score, usefulness_count, category, key, \
+                    agent_id, workspace_hash \
+             FROM entities WHERE id IN ({placeholders}) AND archived = 0"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(ids.iter()), |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<String>>(1)
+                    .unwrap_or(None)
+                    .unwrap_or_else(crate::models::default_epistemic_state),
+                r.get::<_, f64>(2).unwrap_or(0.0),
+                r.get::<_, Option<i64>>(3).unwrap_or(None).unwrap_or(0),
+                r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
+                r.get::<_, String>(6)?,
+                r.get::<_, String>(7)?,
+            ))
+        })?;
+        let mut candidates: Vec<(String, String, f64, i64, String, String, String, String)> =
+            Vec::new();
+        for row in rows {
+            candidates.push(row?);
+        }
+        drop(stmt);
+
+        let mut promoted = 0usize;
+        for (id, state, utility, outcomes, category, key, agent_id, workspace_hash) in candidates {
+            let Some(next) = crate::utility_promotion::next_epistemic_state(&state, utility, outcomes) else {
+                continue;
+            };
+            // CAS: only move if the state we evaluated is still the stored
+            // state (a concurrent explicit promotion wins; we don't fight it).
+            let updated = conn.execute(
+                "UPDATE entities SET epistemic_state = ?1 WHERE id = ?2 AND epistemic_state = ?3",
+                params![next, id, state],
+            )?;
+            if updated == 0 {
+                continue;
+            }
+            promoted += 1;
+            let event = crate::models::JournalEvent {
+                id: format!("jrn-{}", uuid::Uuid::new_v4().simple()),
+                event_type: "auto_promotion".to_string(),
+                evaluated_json: serde_json::to_string(&serde_json::json!({
+                    "from_state": state,
+                    "to_state": next,
+                    "utility_score": utility,
+                    "usefulness_count": outcomes,
+                    "rule": "#1001 utility-driven promotion (pure transition function)",
+                }))?,
+                acted_json: "{\"transitioned\":true}".to_string(),
+                forward_json: format!("{{\"entity_id\":\"{id}\"}}"),
+                category,
+                key,
+                entity_id: id,
+                agent_id,
+                workspace_hash,
+                created_at_unix_ms: now_ms(),
+            };
+            self.journal_with_conn(conn, &event)?;
+        }
+        Ok(promoted)
     }
 
     /// How many of the most-recently-accessed entities in a category a single
@@ -45462,7 +45586,7 @@ pub(crate) mod tests {
         // Report carries denominator + artifact hash (acceptance #5).
         assert!(rep["denominator"]["slots"].as_i64().unwrap() >= 3);
         assert!(rep["artifact"]["git_hash"].as_str().unwrap().len() >= 7);
-        assert_eq!(rep["artifact"]["schema_version"], 41);
+        assert_eq!(rep["artifact"]["schema_version"], 42);
         let _ = std::fs::remove_file(path);
     }
 

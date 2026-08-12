@@ -64,6 +64,7 @@ mod util;
 mod validity;
 mod vector_quant;
 mod verify;
+mod utility_promotion;
 mod web;
 mod web_gap_fill;
 mod write_gate;
