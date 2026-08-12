@@ -105,6 +105,15 @@ impl Entity {
                 }
             }
         }
+        // #960: source-grounded encoding strength, visible in recall items /
+        // structured content so consumers can see why one fact outranked
+        // another in conflict resolution.
+        if let Some(obj) = val.as_object_mut() {
+            obj.insert(
+                "encoding_strength".to_string(),
+                serde_json::json!(encoding_strength_label(encoding_strength(self))),
+            );
+        }
         val
     }
 }
@@ -151,6 +160,47 @@ pub const EPISTEMIC_STATES: [&str; 5] = [
     "rejected",
     "defensively_recalled",
 ];
+
+/// #960: source-grounded encoding-strength tier (S1 weakest .. S5 strongest).
+/// How a fact was learned determines the tier, and higher tiers dominate
+/// lower tiers in conflict resolution as a HARD rule (court_audit::recommend
+/// checks it before any other rung) — no consolidation flip, no LLM call.
+/// Derived additively from existing fields; deterministic and offline.
+///
+/// S5 code-grounded  — structured index anchor / code reference bodies
+/// S4 executable     — test/executable/bench/eval-sourced records
+/// S3 direct         — verified epistemic state (admission evidence)
+/// S2 corroborated   — corroborated epistemic state
+/// S1 single         — default candidate inference
+pub fn encoding_strength(e: &Entity) -> u8 {
+    let body: serde_json::Value =
+        serde_json::from_str(&e.body_json).unwrap_or(serde_json::Value::Null);
+    let code_grounded = body.get("index_type").is_some()
+        || body.get("mode").and_then(|v| v.as_str()) == Some("reference")
+        || matches!(e.source.as_str(), "code" | "ide" | "structured_index");
+    if code_grounded {
+        5
+    } else if matches!(e.source.as_str(), "test" | "executable" | "eval" | "bench") {
+        4
+    } else if e.epistemic_state == "verified" {
+        3
+    } else if e.epistemic_state == "corroborated" {
+        2
+    } else {
+        1
+    }
+}
+
+/// Human label for an encoding-strength tier (clamped to 1..=5).
+pub fn encoding_strength_label(strength: u8) -> &'static str {
+    match strength.clamp(1, 5) {
+        5 => "S5",
+        4 => "S4",
+        3 => "S3",
+        2 => "S2",
+        _ => "S1",
+    }
+}
 
 /// Default recall trust weight. Non-zero so verified sources are preferred
 /// over unverified AI drafts everywhere by default; kept low so it acts as a
