@@ -42,7 +42,7 @@ fn rejected_value_digest(value: &str) -> String {
 /// Hex sha256 of raw bytes (no normalization) — used for hash-only audit
 /// evidence of identifiers (contract §6.2/§6.4 in
 /// docs/specs/data-boundaries-retention-lifecycle.md).
-fn sha256_hex(value: &str) -> String {
+pub(crate) fn sha256_hex(value: &str) -> String {
     format!("{:x}", Sha256::digest(value.as_bytes()))
 }
 

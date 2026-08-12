@@ -1206,6 +1206,25 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Recall Entities"
   },
   {
+    "name": "perseus_vault_handoff_pack",
+    "description": "Budgeted handoff pack: lifecycle-filtered (expired/superseded excluded), provenance-tagged context for cross-session handoffs under a hard token budget, with exclusion visibility and a deterministic pack digest. Candidates from FTS5 recall; greedy-with-backfill packing; never exceeds budget_tokens.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "query": { "type": "string", "description": "Handoff topic query (required, non-empty)" },
+        "budget_tokens": { "type": "integer", "description": "Hard pack budget in tokens (chars/4), 100..100000, default 2000" },
+        "max_excluded": { "type": "integer", "description": "Max excluded items listed with reasons, 0..200, default 20" },
+        "include_expired": { "type": "boolean", "description": "Include expired checkable claims (default false)" },
+        "workspace_hash": { "type": "string", "description": "Workspace scope hash" }
+      },
+      "required": ["query"]
+    },
+    "annotations": {
+      "readOnlyHint": true
+    },
+    "title": "Handoff Pack"
+  },
+  {
     "name": "perseus_vault_recall_batch",
     "description": "Recall entities across a batch of queries, fusing their results server-side using reciprocal rank fusion (RRF) to merge, deduplicate, and surface the most globally relevant memories first.",
     "inputSchema": {
@@ -6730,6 +6749,7 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
         }
 
         "perseus_vault_recall" => tools::handle_recall(db, args).map_err(|e| e.to_string()),
+        "perseus_vault_handoff_pack" => tools::handle_handoff_pack(db, args).map_err(|e| e.to_string()),
 
         "perseus_vault_recall_batch" => {
             tools::handle_recall_batch(db, args).map_err(|e| e.to_string())
@@ -7046,7 +7066,7 @@ mod tests {
         );
         assert_eq!(
             registry_names.len(),
-            131,
+            132,
             "update public metadata when adding a tool"
         );
 

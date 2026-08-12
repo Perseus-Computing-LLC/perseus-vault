@@ -4387,6 +4387,181 @@ pub fn handle_migrate(db: &Database, args: Value) -> String {
     }
 }
 
+/// #942: budgeted handoff pack — lifecycle-filtered, provenance-tagged,
+/// hard-budget context for cross-session handoffs (RecallPack/Lamplight/
+/// engram borrow). Deterministic and offline: candidates come from a plain
+/// FTS5 recall; lifecycle filtering drops expired checkable claims and
+/// superseded entities; greedy-with-backfill packing honors a hard token
+/// budget; excluded items are listed with reasons (exclusion visibility);
+/// the pack digest is a sha256 over sorted id|key lines (bridge-style).
+pub fn handle_handoff_pack(db: &Database, args: Value) -> Result<String, String> {
+    let a: HandoffPackArgs =
+        serde_json::from_value(args).map_err(|e| format!("Invalid handoff_pack arguments: {e}"))?;
+    if a.query.trim().is_empty() {
+        return Err("handoff_pack query must be non-empty".to_string());
+    }
+    if !(100..=100_000).contains(&a.budget_tokens) {
+        return Err(format!(
+            "budget_tokens must be between 100 and 100000, got {}",
+            a.budget_tokens
+        ));
+    }
+    if !(0..=200).contains(&a.max_excluded) {
+        return Err(format!(
+            "max_excluded must be between 0 and 200, got {}",
+            a.max_excluded
+        ));
+    }
+    let params = crate::models::RecallParams {
+        query: a.query.clone(),
+        category: None,
+        entity_type: None,
+        limit: 250,
+        offset: 0,
+        min_decay: 0.0,
+        topic_path: None,
+        include_archived: false,
+        skip_side_effects: true,
+        mode: crate::models::SearchMode::Fts5,
+        embedding: None,
+        preview_cap: None,
+        ..Default::default()
+    };
+    let candidates = db
+        .recall(&params)
+        .map_err(|e| format!("handoff_pack candidate recall failed: {e}"))?;
+    let now = crate::db::now_ms();
+    let tokens_of = |body: &str| -> i64 { ((body.chars().count() as i64) + 3) / 4 };
+    // Supersession lives in the entity link graph: the SUPERSEDING entity
+    // carries a "supersedes" link whose target is the stale fact. A fact is
+    // superseded when any candidate links to it that way (the superseder
+    // shares the topic, so it is normally in the candidate set too).
+    let mut superseded_targets: std::collections::HashSet<&str> =
+        std::collections::HashSet::new();
+    for ent in &candidates {
+        for l in &ent.links {
+            if l.relationship == "supersedes" {
+                superseded_targets.insert(l.target_id.as_str());
+            }
+        }
+    }
+    let is_superseded = |ent: &crate::models::Entity| -> bool {
+        superseded_targets.contains(ent.id.as_str())
+    };
+
+    let mut pack: Vec<serde_json::Value> = Vec::new();
+    let mut excluded: Vec<serde_json::Value> = Vec::new();
+    let mut used: i64 = 0;
+    let mut lifecycle_filtered: i64 = 0;
+    // Greedy pass: best-ranked first (score blend: rank × decay ×
+    // criticality), skipping anything that no longer fits.
+    for (rank, ent) in candidates.iter().enumerate() {
+        let reason = if is_superseded(ent) {
+            Some("superseded")
+        } else if !a.include_expired
+            && crate::models::freshness_status(ent, now) == "expired"
+        {
+            Some("expired")
+        } else {
+            None
+        };
+        if let Some(r) = reason {
+            lifecycle_filtered += 1;
+            if (excluded.len() as i64) < a.max_excluded {
+                excluded.push(json!({
+                    "id": ent.id, "key": ent.key, "category": ent.category,
+                    "reason": r, "rank": rank,
+                }));
+            }
+            continue;
+        }
+        let item_tokens = tokens_of(&ent.body_json);
+        if used + item_tokens <= a.budget_tokens {
+            used += item_tokens;
+            pack.push(pack_item_json(ent, item_tokens));
+        } else if (excluded.len() as i64) < a.max_excluded {
+            excluded.push(json!({
+                "id": ent.id, "key": ent.key, "category": ent.category,
+                "reason": "budget", "rank": rank, "tokens": item_tokens,
+            }));
+        }
+    }
+    // Backfill (engram borrow): after the greedy pass, small items that
+    // fit the remainder are packed, smallest first, best rank wins ties.
+    let mut skipped: Vec<(&crate::models::Entity, usize)> = Vec::new();
+    for (rank, ent) in candidates.iter().enumerate() {
+        let already = pack.iter().any(|p| p["id"] == ent.id);
+        if already {
+            continue;
+        }
+        let expired = !a.include_expired
+            && crate::models::freshness_status(ent, now) == "expired";
+        if is_superseded(ent) || expired {
+            continue;
+        }
+        skipped.push((ent, rank));
+    }
+    skipped.sort_by_key(|(e, _)| tokens_of(&e.body_json));
+    for (ent, _rank) in skipped {
+        let item_tokens = tokens_of(&ent.body_json);
+        if used + item_tokens <= a.budget_tokens {
+            used += item_tokens;
+            pack.push(pack_item_json(ent, item_tokens));
+        }
+    }
+    // Deterministic digest: sha256 over sorted id|key lines, 16 hex chars.
+    let mut idkeys: Vec<String> = pack.iter().map(|p| format!("{}|{}", p["id"], p["key"])).collect();
+    idkeys.sort();
+    let digest = crate::db::sha256_hex(&idkeys.join("\n"))[..16].to_string();
+
+    Ok(json!({
+        "pack": pack,
+        "budget": {
+            "limit_tokens": a.budget_tokens,
+            "used_tokens": used,
+            "remaining_tokens": a.budget_tokens - used,
+            "item_count": pack.len(),
+        },
+        "excluded": excluded,
+        "lifecycle_filtered": lifecycle_filtered,
+        "pack_digest": digest,
+        "read_only": true,
+    })
+    .to_string())
+}
+
+fn pack_item_json(ent: &crate::models::Entity, tokens: i64) -> serde_json::Value {
+    let body: serde_json::Value = serde_json::from_str(&ent.body_json).unwrap_or(json!({}));
+    let derived_from = body.get("derived_from").cloned().unwrap_or(json!(null));
+    json!({
+        "id": ent.id,
+        "key": ent.key,
+        "category": ent.category,
+        "body": body,
+        "tokens": tokens,
+        "provenance": {
+            "source": ent.source,
+            "derived_from": derived_from,
+            "captured_at_unix_ms": ent.created_at_unix_ms,
+            "verified": ent.verified,
+        },
+    })
+}
+
+#[derive(serde::Deserialize)]
+struct HandoffPackArgs {
+    #[serde(default)]
+    pub query: String,
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub budget_tokens: i64,
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub max_excluded: i64,
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub include_expired: bool,
+    #[serde(default)]
+    pub workspace_hash: Option<String>,
+}
+
 pub fn handle_context(db: &Database, args: Value) -> String {
     let a: ContextArgs = match serde_json::from_value(args) {
         Ok(a) => a,
@@ -14923,6 +15098,120 @@ mod tests {
         let v2: Value = serde_json::from_str(&raw2).unwrap();
         assert_eq!(v2["decay_policies"]["facts"]["half_life_days"], json!(15), "{raw2}");
         assert_eq!(v2["decay_policies"]["facts"]["source"], json!("state"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn handoff_pack_respects_budget_and_lifecycle_filters() {
+        let (db, path) = temp_db();
+        let now = crate::db::now_ms();
+        // Three candidates in the same subject area (distinct bodies: the
+        // content-hash dedup is store-global).
+        db.remember_with_options(
+            &crate::db::tests::make_entity(
+                "hp-a", "facts", "hp-a",
+                "{\"note\":\"alpha deployment pipeline uses docker compose v2 with kubernetes orchestration for the public tier\",\"derived_from\":[\"session-x\"]}",
+            ),
+            false, None, None, false,
+        )
+        .unwrap();
+        db.remember_with_options(
+            &crate::db::tests::make_entity(
+                "hp-b", "facts", "hp-b",
+                "{\"note\":\"beta staging deployment environment runs podman with a traefik reverse proxy across three zones\"}",
+            ),
+            false, None, None, false,
+        )
+        .unwrap();
+        let hp_a_id: String = {
+            let conn = db.conn().unwrap();
+            conn.query_row("SELECT id FROM entities WHERE key = 'hp-a'", [], |r| r.get(0)).unwrap()
+        };
+        // Expired web claim: created 60 days ago (30d TTL).
+        db.remember_with_options(
+            &crate::db::tests::make_entity(
+                "hp-exp", "web", "hp-exp",
+                "{\"note\":\"gamma rollout completed at midnight on the third of august\",\"verification\":\"unverified_until_confirmed\"}",
+            ),
+            false, None, None, false,
+        )
+        .unwrap();
+        {
+            let conn = db.conn().unwrap();
+            conn.execute("UPDATE entities SET created_at_unix_ms = ?1 WHERE key = 'hp-exp'", [now - 60 * 86_400_000]).unwrap();
+        }
+        // Superseded via the link graph ONLY (no status flip): the stale
+        // fact stays a recall candidate, so the pack's lifecycle filter must
+        // catch it and surface it in the excluded list. (The real supersede
+        // tool also flips status to deprecated, which removes the fact from
+        // retrieval entirely.)
+        db.link("facts", "hp-b", &hp_a_id, "supersedes").unwrap();
+        // Tiny budget forces exclusion visibility: only small items fit.
+        let raw = handle_handoff_pack(&db, json!({"query": "deployment pipeline", "budget_tokens": 400, "max_excluded": 10})).unwrap();
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        let budget = &v["budget"];
+        let used = budget["used_tokens"].as_i64().unwrap();
+        assert!(used <= 400, "budget exceeded: {used} > 400");
+        assert_eq!(budget["limit_tokens"], json!(400));
+        // Lifecycle: the superseded claim never packs (it does not match
+        // this query, so the expired claim is not a candidate here).
+        let pack = v["pack"].as_array().unwrap();
+        assert!(pack.iter().all(|p| p["key"] != "hp-a"), "superseded claim packed: {pack:?}");
+        // Exclusion visibility: superseded listed with reason.
+        let excluded = v["excluded"].as_array().unwrap();
+        let sup = excluded.iter().find(|x| x["key"] == "hp-a").expect(&format!("superseded listed in {raw}"));
+        assert_eq!(sup["reason"], json!("superseded"));
+        // Provenance + digest present and deterministic.
+        let first = pack[0].clone();
+        assert!(first["provenance"].get("source").is_some());
+        let d1 = v["pack_digest"].as_str().unwrap().to_string();
+        let raw2 = handle_handoff_pack(&db, json!({"query": "deployment pipeline", "budget_tokens": 400, "max_excluded": 10})).unwrap();
+        let v2: Value = serde_json::from_str(&raw2).unwrap();
+        assert_eq!(v2["pack_digest"], json!(d1), "digest must be deterministic");
+        // Expired claim: excluded by default (reason expired) from its own
+        // topic query; admitted with include_expired: true.
+        let raw3 = handle_handoff_pack(&db, json!({"query": "gamma rollout", "budget_tokens": 2000, "max_excluded": 10})).unwrap();
+        let v3: Value = serde_json::from_str(&raw3).unwrap();
+        assert_eq!(v3["lifecycle_filtered"], json!(1), "{raw3}");
+        assert!(v3["pack"].as_array().unwrap().is_empty(), "{raw3}");
+        let exp = v3["excluded"].as_array().unwrap().iter().find(|x| x["key"] == "hp-exp").expect("expired listed");
+        assert_eq!(exp["reason"], json!("expired"));
+        let raw4 = handle_handoff_pack(&db, json!({"query": "gamma rollout", "budget_tokens": 2000, "max_excluded": 10, "include_expired": true})).unwrap();
+        let v4: Value = serde_json::from_str(&raw4).unwrap();
+        assert!(v4["pack"].as_array().unwrap().iter().any(|p| p["key"] == "hp-exp"), "{raw4}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn handoff_pack_property_never_exceeds_budget() {
+        let (db, path) = temp_db();
+        // 24 candidates with varied sizes (80..~1600 chars) across topics.
+        let topics = ["deployment", "rate limiter", "observability", "onboarding"];
+        for i in 0..24usize {
+            let topic = topics[i % topics.len()];
+            let fill = " x".repeat(20 * (i % 8)); // 0..140 filler chars
+            db.remember_with_options(
+                &crate::db::tests::make_entity(
+                    &format!("prop-{i}"), "facts", &format!("prop-{i}"),
+                    &format!("{{\"note\":\"{topic} fact number {i} with a distinctive body{fill}\"}}"),
+                ),
+                false, None, None, false,
+            )
+            .unwrap();
+        }
+        for budget in [100i64, 250, 500, 1000, 3000] {
+            let raw = handle_handoff_pack(&db, json!({"query": "deployment", "budget_tokens": budget, "max_excluded": 50})).unwrap();
+            let v: Value = serde_json::from_str(&raw).unwrap();
+            let used = v["budget"]["used_tokens"].as_i64().unwrap();
+            assert!(used <= budget, "budget {budget} exceeded: {used}");
+            // Every packed item is <= remaining space at pack time (implied
+            // by the invariant above) and each carries provenance.
+            let pack = v["pack"].as_array().unwrap();
+            for p in pack {
+                assert!(p["tokens"].as_i64().unwrap() > 0);
+                assert!(p["provenance"].get("source").is_some());
+            }
+        }
         let _ = std::fs::remove_file(path);
     }
 
