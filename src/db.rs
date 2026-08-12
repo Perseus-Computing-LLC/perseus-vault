@@ -39,6 +39,26 @@ fn rejected_value_digest(value: &str) -> String {
     format!("{:x}", Sha256::digest(normalized.as_bytes()))
 }
 
+/// #999: visibility lattice — private < fleet < workspace/tenant < public
+/// (most → least restrictive). Intersection of a set = its most restrictive
+/// member; mirrors `can_read`'s tier semantics so the lattice and the
+/// enforcement agree. Unknown values are treated as open (historical rows).
+fn more_restrictive_visibility(a: &str, b: &str) -> String {
+    fn rank(v: &str) -> u8 {
+        match v {
+            "private" => 0,
+            "fleet" => 1,
+            "workspace" | "tenant" => 2,
+            _ => 3,
+        }
+    }
+    if rank(a) <= rank(b) {
+        a.to_string()
+    } else {
+        b.to_string()
+    }
+}
+
 /// Hex sha256 of raw bytes (no normalization) — used for hash-only audit
 /// evidence of identifiers (contract §6.2/§6.4 in
 /// docs/specs/data-boundaries-retention-lifecycle.md).
@@ -6086,6 +6106,62 @@ impl Database {
         )
     }
 
+    /// #999: derived-visibility intersection (concept borrowed from
+    /// RunAlphaLoop/verity, M1: "derived-visibility intersection").
+    ///
+    /// A write that DECLARES lineage — at least one link with relationship
+    /// `derived_from` — may not be more open than its cited inputs: the
+    /// derived row's visibility becomes the most restrictive visibility among
+    /// (declared visibility, cited inputs), so a summary of a private source
+    /// can never surface as workspace-visible by forgetting its provenance.
+    ///
+    /// Unreadable inputs refuse the WHOLE write, fail-closed: an agent that
+    /// cannot read an input cannot derive from it, and a stale/missing target
+    /// id is a lineage error, not a silent no-op. Legacy writes without
+    /// `derived_from` links are unchanged.
+    fn apply_derived_visibility(
+        &self,
+        mut entity: Entity,
+    ) -> Result<Entity, Box<dyn std::error::Error>> {
+        let derived_targets: Vec<String> = entity
+            .links
+            .iter()
+            .filter(|l| l.relationship == "derived_from")
+            .map(|l| l.target_id.clone())
+            .collect();
+        if derived_targets.is_empty() {
+            return Ok(entity);
+        }
+        let writer = entity.agent_id.clone();
+        let mut restricted: Option<String> = None;
+        for id in derived_targets {
+            let target = self.get_entity_by_id_public(&id)?.ok_or_else(|| {
+                format!(
+                    "write rejected: derived_from target not found: {id} \
+                     (lineage must reference existing rows)"
+                )
+            })?;
+            if !self.can_read(&writer, &target.visibility, &target.agent_id) {
+                return Err(format!(
+                    "write rejected: derived_from input {id} ({}:{}) is not visible \
+                     to the writing agent ({writer}); agents may only derive from \
+                     inputs they can read",
+                    target.category, target.key
+                )
+                .into());
+            }
+            restricted = Some(match restricted {
+                None => target.visibility.clone(),
+                Some(cur) => more_restrictive_visibility(&cur, &target.visibility),
+            });
+        }
+        if let Some(most_restrictive) = restricted {
+            entity.visibility =
+                more_restrictive_visibility(&entity.visibility, &most_restrictive);
+        }
+        Ok(entity)
+    }
+
     fn remember_impl_with_admission(
         &self,
         entity: &Entity,
@@ -6097,6 +6173,12 @@ impl Database {
         gate_opts: &crate::interference::WriteGateOptions,
     ) -> Result<(String, String), Box<dyn std::error::Error>> {
         let enriched_entity = ensure_durable_write_provenance(entity, verified_admission);
+        // #999: derived-visibility intersection — a write that declares
+        // lineage (links with relationship "derived_from") may not be MORE
+        // open than its cited inputs, and unreadable inputs refuse the whole
+        // write. Runs before tombstone/insert logic so a rejected write never
+        // touches the store.
+        let enriched_entity = self.apply_derived_visibility(enriched_entity)?;
         let entity = &enriched_entity;
         // #849/#882: scoped rejected-value tombstones are enforced on every
         // remember-path write (agent remember, capture, ingest, connectors,

@@ -155,7 +155,7 @@ mod tests {
             "last_accessed_unix_ms": 0,
             "links": [{
                 "target_id": sentinel_a,
-                "relationship": "derived_from",
+                "relationship": "related_to",
                 "source": "graph-root-b"
             }]
         }))

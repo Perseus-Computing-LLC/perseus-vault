@@ -8,6 +8,8 @@ mod court_audit;
 mod db;
 mod declared;
 mod dedup;
+#[cfg(test)]
+mod derived_visibility;
 mod embedding;
 mod encryption;
 mod eval_regression;
