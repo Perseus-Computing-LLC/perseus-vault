@@ -145,6 +145,7 @@ mod tests {
             epistemic_state: crate::models::default_epistemic_state(),
             hints: vec![],
             embedding: None,
+            memory_type: String::new(),
             _parsed_body: None,
         };
         // remember() write-dedups near-duplicates (signature-based), so seed
