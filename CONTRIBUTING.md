@@ -10,11 +10,11 @@ ideas.
 git clone https://github.com/Perseus-Computing-LLC/perseus-vault.git
 cd perseus-vault
 
-# Build (requires Rust 1.70+)
-cargo build --release
+# Build (the pinned Rust 1.97.1 toolchain is selected automatically)
+cargo build --locked --release
 
 # Run tests
-cargo test
+cargo test --locked
 
 # Run with a test database
 cargo run -- --db /tmp/perseus-vault-test.db
