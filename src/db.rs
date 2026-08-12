@@ -12367,7 +12367,138 @@ impl Database {
             )
             .optional()?
         };
+        // #997: revocation subtraction — the ACTIVE manifest's grant sets are
+        // narrowed by the durable revocation ledger before anything consumes
+        // them. Deprovisioned principals (global revocations) drop
+        // unconditionally; workspace-scoped revocations drop for any
+        // credential minted before the revocation (credential-relative
+        // cutoff). A deprovisioned/recently-revoked AGENT loses its manifest
+        // entirely (fail-closed over-hide).
+        drop(conn);
+        let mut result = result;
+        if !include_revoked {
+            if let Some(mut m) = result.take() {
+                result = self.subtract_revoked_principals(m)?;
+            }
+        }
         Ok(result)
+    }
+
+    /// #997: apply the revocation ledger to one ACTIVE manifest. Returns None
+    /// when the manifest's own agent is deprovisioned (global revocation) or
+    /// was revoked at/after the manifest's mint time (the credential itself is
+    /// dead). Errors fail the whole read path — a revocation check that cannot
+    /// complete refuses to serve, it never serves optimistically.
+    fn subtract_revoked_principals(
+        &self,
+        mut m: AuthorityManifest,
+    ) -> Result<Option<AuthorityManifest>, Box<dyn std::error::Error>> {
+        let conn = self.conn()?;
+        let mut rows: Vec<(String, String, i64)> = Vec::new();
+        {
+            let mut stmt = conn.prepare(
+                "SELECT principal, workspace_hash, MIN(at_unix_ms) FROM revocations \
+                 WHERE reinstated_at_unix_ms IS NULL AND (workspace_hash = ?1 OR workspace_hash = '') \
+                 GROUP BY principal, workspace_hash",
+            )?;
+            let mapped = stmt.query_map(params![m.workspace_hash], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?;
+            for row in mapped {
+                rows.push(row?);
+            }
+        }
+        drop(conn);
+        let mut dropped_principals: Vec<String> = Vec::new();
+        for (principal, ws, at) in rows {
+            // Global (workspace '') = durable deprovisioned set: unconditional.
+            // Workspace-scoped = credential-relative: bites only credentials
+            // minted before (or at) the revocation.
+            if ws.is_empty() || at >= m.created_at_unix_ms {
+                dropped_principals.push(principal);
+            }
+        }
+        if dropped_principals
+            .iter()
+            .any(|p| *p == m.agent_id)
+        {
+            return Ok(None);
+        }
+        m.scope_anchors.retain(|p| !dropped_principals.contains(p));
+        m.approver_principals.retain(|p| !dropped_principals.contains(p));
+        m.allowed_inbound_principals
+            .retain(|p| !dropped_principals.contains(p));
+        Ok(Some(m))
+    }
+
+    /// #997: durable-before-ack revocation. Append-only; revoking an already-
+    /// revoked principal at the same instant is a no-op (INSERT OR IGNORE on
+    /// the (principal, workspace, at) identity). A reinstated principal can be
+    /// revoked again — the new revocation gets its own `at`.
+    pub fn record_revocation(
+        &self,
+        principal: &str,
+        workspace_hash: &str,
+        reason: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let now = now_ms();
+        let id = format!("rev-{}", uuid::Uuid::new_v4().simple());
+        let conn = self.conn()?;
+        conn.execute(
+            "INSERT OR IGNORE INTO revocations \
+             (id, principal, workspace_hash, at_unix_ms, reinstated_at_unix_ms, reason, recorded_at_unix_ms) \
+             VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6)",
+            params![id, principal, workspace_hash, now, reason, now],
+        )?;
+        drop(conn);
+        self.journal(&JournalEvent {
+            id: format!("jrn-{}", uuid::Uuid::new_v4().simple()),
+            event_type: "principal_revoked".to_string(),
+            evaluated_json: json!({"principal": principal, "workspace_hash": workspace_hash, "at_unix_ms": now}).to_string(),
+            acted_json: json!({"reason": reason, "stored": true}).to_string(),
+            forward_json: "{}".to_string(),
+            category: "authority".to_string(),
+            key: principal.to_string(),
+            entity_id: String::new(),
+            agent_id: "operator".to_string(),
+            workspace_hash: workspace_hash.to_string(),
+            created_at_unix_ms: now,
+        })?;
+        Ok(())
+    }
+
+    /// #997: explicit, durable reinstatement. Clears every active revocation
+    /// for the principal in the given scope ('' = the global deprovisioned
+    /// set). Idempotent — no live revocation rows is success.
+    pub fn reinstate_revocation(
+        &self,
+        principal: &str,
+        workspace_hash: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let now = now_ms();
+        let conn = self.conn()?;
+        let n = conn.execute(
+            "UPDATE revocations SET reinstated_at_unix_ms=?1 \
+             WHERE principal=?2 AND workspace_hash=?3 AND reinstated_at_unix_ms IS NULL",
+            params![now, principal, workspace_hash],
+        )?;
+        drop(conn);
+        if n > 0 {
+            self.journal(&JournalEvent {
+                id: format!("jrn-{}", uuid::Uuid::new_v4().simple()),
+                event_type: "principal_reinstated".to_string(),
+                evaluated_json: json!({"principal": principal, "workspace_hash": workspace_hash}).to_string(),
+                acted_json: json!({"reinstated_rows": n}).to_string(),
+                forward_json: "{}".to_string(),
+                category: "authority".to_string(),
+                key: principal.to_string(),
+                entity_id: String::new(),
+                agent_id: "operator".to_string(),
+                workspace_hash: workspace_hash.to_string(),
+                created_at_unix_ms: now,
+            })?;
+        }
+        Ok(())
     }
 
     pub fn authority_revoke(
@@ -44885,7 +45016,7 @@ pub(crate) mod tests {
         // Report carries denominator + artifact hash (acceptance #5).
         assert!(rep["denominator"]["slots"].as_i64().unwrap() >= 3);
         assert!(rep["artifact"]["git_hash"].as_str().unwrap().len() >= 7);
-        assert_eq!(rep["artifact"]["schema_version"], 39);
+        assert_eq!(rep["artifact"]["schema_version"], 40);
         let _ = std::fs::remove_file(path);
     }
 

@@ -41,6 +41,8 @@ mod op_runs;
 mod preload;
 mod projection;
 mod retrieval_telemetry;
+#[cfg(test)]
+mod revocation_cutoff;
 mod schema;
 mod signed_profile;
 pub(crate) mod stage_trace;

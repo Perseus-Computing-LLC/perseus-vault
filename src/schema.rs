@@ -293,6 +293,22 @@ CREATE TABLE IF NOT EXISTS authority_manifests (
 );
 CREATE INDEX IF NOT EXISTS idx_authority_active
  ON authority_manifests(agent_id, workspace_hash, revoked_at_unix_ms, version DESC);
+-- #997: durable principal-revocation ledger. A revocation row subtracts the
+-- principal from every ACTIVE manifest grant set (credential-relative cutoff:
+-- a revocation stamped at >= the manifest's mint time bites for the
+-- credential's full lifetime; reinstatement is an explicit, durable act).
+CREATE TABLE IF NOT EXISTS revocations (
+    id TEXT PRIMARY KEY,
+    principal TEXT NOT NULL,
+    workspace_hash TEXT NOT NULL DEFAULT '',
+    at_unix_ms INTEGER NOT NULL,
+    reinstated_at_unix_ms INTEGER,
+    reason TEXT NOT NULL DEFAULT '',
+    recorded_at_unix_ms INTEGER NOT NULL,
+    UNIQUE(principal, workspace_hash, at_unix_ms)
+);
+CREATE INDEX IF NOT EXISTS idx_revocations_active
+ ON revocations(workspace_hash, principal, reinstated_at_unix_ms);
 CREATE TABLE IF NOT EXISTS authorized_actions (
     id TEXT PRIMARY KEY,
     manifest_id TEXT NOT NULL REFERENCES authority_manifests(id),
@@ -624,7 +640,7 @@ CREATE INDEX IF NOT EXISTS idx_preload_proposals_state
 /// basis for tier-3 projections (embeddings first). New table, idempotent,
 /// no backfill (DDL_V0_2_0 is re-run at every open, so existing stores pick
 /// it up on next open).
-pub(crate) const SCHEMA_VERSION: i64 = 39;
+pub(crate) const SCHEMA_VERSION: i64 = 40;
 
 /// Initialize the v0.2.0 schema on a fresh database.
 pub fn initialize_schema(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
