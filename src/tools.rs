@@ -405,6 +405,18 @@ pub struct RecallArgs {
     /// responses stay byte-identical; set true to always include it.
     #[serde(default, deserialize_with = "null_as_default")]
     pub include_outcome: bool,
+    /// #938: opt-in freshness/trust-expiry on every returned item
+    /// (freshness + trust_expires_at_unix_ms per item, plus a
+    /// freshness_summary). Off by default — nominal recalls stay
+    /// byte-identical.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub freshness: bool,
+    /// #938: deterministic freshness gate for the AAR control-plane
+    /// approval path (#768): when any RETURNED item is past its trust TTL,
+    /// proceed=false (requires_verification) and the expired ids are
+    /// listed. Only meaningful with freshness: true.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub freshness_gate: bool,
     /// #883 (TEMPR-style fused recall, mode "fused"): the strategies to
     /// engage. Recognized: "fts5", "dense", "graph", "temporal" (2-4).
     /// Omit = all four.
@@ -2129,6 +2141,65 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
                 "fused_trace".to_string(),
                 serde_json::to_value(t).unwrap_or(serde_json::json!({})),
             );
+        }
+    }
+    // #938: opt-in freshness/trust-expiry pass — per-item freshness +
+    // expiry, summary counts, and the deterministic AAR freshness gate.
+    if a.freshness {
+        let now = crate::db::now_ms();
+        let mut fresh = 0i64;
+        let mut expired = 0i64;
+        let mut never_verified = 0i64;
+        let mut expired_ids: Vec<String> = Vec::new();
+        if let Some(items) = result.get_mut("items").and_then(|v| v.as_array_mut()) {
+            for item in items.iter_mut() {
+                let Some(id) = item
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned)
+                else {
+                    continue;
+                };
+                let Ok(Some(ent)) = db.get_entity_by_id_public(&id) else {
+                    continue;
+                };
+                let status = crate::models::freshness_status(&ent, now);
+                item["freshness"] = json!(status);
+                if let Some(expiry) = crate::models::trust_expiry_ms(&ent) {
+                    item["trust_expires_at_unix_ms"] = json!(expiry);
+                }
+                match status {
+                    "fresh" => fresh += 1,
+                    "expired" => {
+                        expired += 1;
+                        expired_ids.push(id.to_string());
+                    }
+                    _ => never_verified += 1,
+                }
+            }
+        }
+        if let Some(obj) = result.as_object_mut() {
+            obj.insert(
+                "freshness_summary".to_string(),
+                json!({"fresh": fresh, "expired": expired, "never_verified": never_verified}),
+            );
+            if a.freshness_gate {
+                let proceed = expired == 0;
+                obj.insert(
+                    "freshness_gate".to_string(),
+                    json!({
+                        "proceed": proceed,
+                        "verdict": if proceed { "proceed" } else { "requires_verification" },
+                        "reason": if proceed {
+                            "all returned items are within trust TTL or verified"
+                        } else {
+                            "expired checkable claims must be re-verified before consequential action (AAR #768)"
+                        },
+                        "expired_ids": expired_ids,
+                        "note": "re-verify via perseus_vault_web_gap_fill (web class) or re-read the source (code/config class); forget stale claims with perseus_vault_forget",
+                    }),
+                );
+            }
         }
     }
     Ok(result.to_string())
@@ -14594,6 +14665,90 @@ mod tests {
         assert!(v["reason"].as_str().unwrap().contains("importance_floor"));
         // Gate never mutates: only the one admitted entity exists.
         assert_eq!(db.count_entities(None, None, None).unwrap(), 1);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn recall_freshness_gate_blocks_expired_checkable_claims() {
+        let (db, path) = temp_db();
+        let now = crate::db::now_ms();
+        // Expired web claim: category web, created 60 days ago (30d TTL).
+        db.remember_with_options(
+            &crate::db::tests::make_entity(
+                "web-old", "web", "web-old",
+                "{\"note\":\"the api rate limiter caps at 200 requests per hour\",\"verification\":\"unverified_until_confirmed\"}",
+            ),
+            false, None, None, false,
+        )
+        .unwrap();
+        // Fresh web claim: created 5 days ago. DIFFERENT subject: the
+        // remember path near-duplicate-merges same-subject bodies.
+        db.remember_with_options(
+            &crate::db::tests::make_entity(
+                "web-new", "web", "web-new",
+                "{\"note\":\"the deployment pipeline uses compose files with a traefik proxy\",\"verification\":\"unverified_until_confirmed\"}",
+            ),
+            false, None, None, false,
+        )
+        .unwrap();
+        // Chat memory: never verified, no TTL. Different subject wording so
+        // the remember path does not near-duplicate-merge it into web-new.
+        db.remember_with_options(
+            &crate::db::tests::make_entity(
+                "chat-note", "facts", "chat-note",
+                "{\"note\":\"deployment pipeline overview lives in the ops handbook\"}",
+            ),
+            false, None, None, false,
+        )
+        .unwrap();
+        {
+            let conn = db.conn().unwrap();
+            conn.execute("UPDATE entities SET created_at_unix_ms = ?1 WHERE key = 'web-old'", [now - 60 * 86_400_000]).unwrap();
+            conn.execute("UPDATE entities SET created_at_unix_ms = ?1 WHERE key = 'web-new'", [now - 5 * 86_400_000]).unwrap();
+        }
+        // Baseline (no freshness args) stays byte-identical in shape: no
+        // freshness keys anywhere.
+        let base = handle_recall(&db, json!({"query": "rate limiter", "mode": "fts5", "limit": 10})).unwrap();
+        let bv: Value = serde_json::from_str(&base).unwrap();
+        assert!(bv.get("freshness_gate").is_none(), "{base}");
+        assert!(bv.get("freshness_summary").is_none());
+        assert!(bv["items"].as_array().unwrap().iter().all(|i| i.get("freshness").is_none()));
+        // Opt-in: per-item freshness + summary + deterministic gate.
+        let raw = handle_recall(
+            &db,
+            json!({"query": "rate limiter", "mode": "fts5", "limit": 10, "freshness": true, "freshness_gate": true}),
+        )
+        .unwrap();
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        let items = v["items"].as_array().unwrap();
+        let old = items.iter().find(|i| i["key"] == "web-old").expect("web-old returned");
+        assert_eq!(old["freshness"], json!("expired"), "{old}");
+        assert!(old["trust_expires_at_unix_ms"].as_i64().unwrap() > 0);
+        let summary = &v["freshness_summary"];
+        assert!(summary["expired"].as_i64().unwrap() >= 1, "{summary}");
+        let gate = &v["freshness_gate"];
+        assert_eq!(gate["proceed"], json!(false), "{gate}");
+        assert_eq!(gate["verdict"], json!("requires_verification"));
+        let ids = gate["expired_ids"].as_array().unwrap();
+        assert!(ids.iter().any(|i| i == &json!("web-old")), "{ids:?}");
+        // Gate passes when only fresh/unbounded items are returned; the
+        // fresh web claim is fresh and the chat memory never_verified (no
+        // TTL -> not a gate blocker).
+        let raw2 = handle_recall(
+            &db,
+            json!({"query": "deployment pipeline", "mode": "fts5", "limit": 10, "freshness": true, "freshness_gate": true}),
+        )
+        .unwrap();
+        let v2: Value = serde_json::from_str(&raw2).unwrap();
+        let items2 = v2["items"].as_array().unwrap();
+        let neww = items2.iter().find(|i| i["key"] == "web-new").expect("web-new returned");
+        assert_eq!(neww["freshness"], json!("fresh"), "{neww}");
+        let chat = items2.iter().find(|i| i["key"] == "chat-note").expect("chat-note returned");
+        assert_eq!(chat["freshness"], json!("never_verified"), "{chat}");
+        assert!(chat.get("trust_expires_at_unix_ms").is_none());
+        let gate2 = &v2["freshness_gate"];
+        assert_eq!(gate2["proceed"], json!(true), "{raw2}");
+        assert_eq!(gate2["verdict"], json!("proceed"));
         let _ = std::fs::remove_file(path);
     }
 

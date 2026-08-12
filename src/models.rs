@@ -229,6 +229,72 @@ pub fn entrenchment_index(e: &Entity) -> f64 {
 /// Healthy maximum for the entrenchment index (gitmem borrow).
 pub const ENTRENCHMENT_HEALTHY_MAX: f64 = 0.2;
 
+/// #938: per-class trust TTLs (ms) for CHECKABLE claims. Verified admission
+/// never expires (authoritative until revoked); web-derived claims re-verify
+/// within 30 days; config/code-grounded facts re-read within 90 days
+/// (config facts go stale in weeks — Palimpsest borrow). Chat/derived
+/// memories get no TTL and report `never_verified` instead.
+const WEB_TRUST_TTL_MS: i64 = 30 * 86_400_000;
+const CODE_TRUST_TTL_MS: i64 = 90 * 86_400_000;
+
+/// Trust expiry for an entity, if it belongs to a checkable class.
+/// None = no expiry (verified admission or uncheckable memory).
+pub fn trust_expiry_ms(e: &Entity) -> Option<i64> {
+    if e.verified {
+        return None;
+    }
+    if is_web_derived(e) {
+        Some(e.created_at_unix_ms.saturating_add(WEB_TRUST_TTL_MS))
+    } else if is_code_grounded(e) {
+        Some(e.created_at_unix_ms.saturating_add(CODE_TRUST_TTL_MS))
+    } else {
+        None
+    }
+}
+
+/// Freshness status at a given time: "fresh" (within TTL or verified),
+/// "expired" (past TTL — re-verify before acting on it), or
+/// "never_verified" (no TTL, unverified admission — treat with care).
+pub fn freshness_status(e: &Entity, now_ms: i64) -> &'static str {
+    if e.verified {
+        return "fresh";
+    }
+    match trust_expiry_ms(e) {
+        Some(expiry) if now_ms > expiry => "expired",
+        Some(_) => "fresh",
+        None => "never_verified",
+    }
+}
+
+/// Web-derived checkable class: unverified web gap-fill captures (body
+/// marker `verification: unverified_until_confirmed`), web sources, or the
+/// web category.
+pub fn is_web_derived(e: &Entity) -> bool {
+    if e.category == "web" || e.source.starts_with("web") {
+        return true;
+    }
+    serde_json::from_str::<serde_json::Value>(&e.body_json)
+        .ok()
+        .and_then(|v| {
+            v.get("verification")
+                .and_then(|x| x.as_str())
+                .map(str::to_string)
+        })
+        .map_or(false, |s| s == "unverified_until_confirmed")
+}
+
+/// Code/config-grounded checkable class: structured index anchors (body
+/// marker `index_type`) or code/config sources.
+pub fn is_code_grounded(e: &Entity) -> bool {
+    if matches!(e.source.as_str(), "code" | "config" | "ide") {
+        return true;
+    }
+    serde_json::from_str::<serde_json::Value>(&e.body_json)
+        .ok()
+        .and_then(|v| v.get("index_type").and_then(|x| x.as_str()).map(str::to_string))
+        .is_some()
+}
+
 /// Default recall trust weight. Non-zero so verified sources are preferred
 /// over unverified AI drafts everywhere by default; kept low so it acts as a
 /// tie-breaker rather than overriding relevance/recency.
