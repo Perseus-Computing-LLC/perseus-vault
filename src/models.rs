@@ -202,6 +202,33 @@ pub fn encoding_strength_label(strength: u8) -> &'static str {
     }
 }
 
+/// #961: entrenchment detection — the inverse of decay. A fact that was
+/// never verified but keeps accumulating strength (high encoding tier, age,
+/// retrieval amplification) gets an entrenchment index; above the healthy
+/// maximum (0.2, matching gitmem's healthy_max) it is flagged for operator
+/// review as "entrenchment: never verified". Deterministic, offline.
+///
+/// index = strength_frac × age_frac × verification_gap × amplification
+/// where strength_frac = encoding_strength/5, age_frac = min(days/90, 1),
+/// verification_gap = 1 when not verified/corroborated (0 otherwise),
+/// amplification = ln(1 + retrieval_count) clamped to [1, 3].
+pub fn entrenchment_index(e: &Entity) -> f64 {
+    let strength_frac = encoding_strength(e) as f64 / 5.0;
+    let age_days = (crate::db::now_ms().saturating_sub(e.created_at_unix_ms)) as f64 / 86_400_000.0;
+    let age_frac = (age_days / 90.0).clamp(0.0, 1.0);
+    let verification_gap =
+        if e.verified || e.epistemic_state == "verified" || e.epistemic_state == "corroborated" {
+            0.0
+        } else {
+            1.0
+        };
+    let amplification = (1.0 + (e.retrieval_count.max(0) as f64).ln_1p()).clamp(1.0, 3.0);
+    strength_frac * age_frac * verification_gap * amplification
+}
+
+/// Healthy maximum for the entrenchment index (gitmem borrow).
+pub const ENTRENCHMENT_HEALTHY_MAX: f64 = 0.2;
+
 /// Default recall trust weight. Non-zero so verified sources are preferred
 /// over unverified AI drafts everywhere by default; kept low so it acts as a
 /// tie-breaker rather than overriding relevance/recency.
