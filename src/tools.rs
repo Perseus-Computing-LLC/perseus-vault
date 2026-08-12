@@ -1500,6 +1500,61 @@ pub fn handle_remember(db: &Database, args: Value) -> Result<String, String> {
     Ok(result.to_string())
 }
 
+/// #939: zero-token write gate — deterministic keep/supersede/forget BEFORE
+/// LLM enrichment. Read-only precheck that decides
+/// store / duplicate / supersede / forget / adjudicate from content-hash +
+/// stored-signature near-duplicate scans and an importance floor, with ZERO
+/// LLM tokens. Only `adjudicate` (near-duplicate, possibly a contradiction)
+/// should escalate to the LLM or operator review. Call this before the
+/// enrichment pass to cut per-write Ollama load (Greg).
+#[derive(Debug, Deserialize)]
+pub struct WriteGateArgs {
+    pub category: String,
+    pub key: String,
+    pub body_json: String,
+    #[serde(default)]
+    pub workspace_hash: Option<String>,
+}
+
+pub fn handle_write_gate(db: &Database, args: Value) -> Result<String, String> {
+    let a: WriteGateArgs =
+        serde_json::from_value(args).map_err(|e| format!("Invalid write_gate arguments: {e}"))?;
+    let verdict = crate::write_gate::run_gate(
+        db,
+        &a.category,
+        &a.key,
+        &a.body_json,
+        a.workspace_hash.as_deref(),
+    )?;
+    let mut out = serde_json::json!({
+        "verdict": verdict.name(),
+        "needs_llm": verdict.needs_llm(),
+        "gate": "zero_token",
+        "read_only": true,
+    });
+    match &verdict {
+        crate::write_gate::GateVerdict::Store { note } => {
+            out["reason"] = json!(note);
+        }
+        crate::write_gate::GateVerdict::Duplicate { matched_id } => {
+            out["reason"] = json!("content already admitted");
+            out["matched_id"] = json!(matched_id);
+        }
+        crate::write_gate::GateVerdict::Forget { reason } => {
+            out["reason"] = json!(reason);
+        }
+        crate::write_gate::GateVerdict::Supersede { target_id } => {
+            out["reason"] = json!("same (category, key) exists; supersede deterministically");
+            out["matched_id"] = json!(target_id);
+        }
+        crate::write_gate::GateVerdict::Adjudicate { matched_id, reason } => {
+            out["reason"] = json!(reason);
+            out["matched_id"] = json!(matched_id);
+        }
+    }
+    Ok(out.to_string())
+}
+
 /// #677: when a recall comes back empty, build a self-describing diagnostic so
 /// the caller can tell a genuinely empty / no-match store apart from an
 /// unhealthy DB or a degraded (keyword-only / no-coverage) semantic backend —
@@ -14473,6 +14528,73 @@ mod tests {
         assert!(v2.get("table").is_none(), "prose mode must not add a table");
         assert_eq!(v2["read_only"], json!(true));
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn write_gate_decides_all_five_verdicts_deterministically() {
+        let (db, path) = temp_db();
+        // Store: fresh substantive body, zero LLM needed.
+        let raw = handle_write_gate(
+            &db,
+            json!({"category": "facts", "key": "g-new",
+                   "body_json": "{\"note\":\"the api rate limiter caps at 200 requests per hour for the public tier\"}"}),
+        )
+        .unwrap();
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["verdict"], json!("store"), "{raw}");
+        assert_eq!(v["needs_llm"], json!(false));
+        assert_eq!(v["gate"], json!("zero_token"));
+        assert_eq!(v["read_only"], json!(true));
+        // Admit the fact for real, then gate the same content under a new key.
+        handle_remember(
+            &db,
+            json!({"category": "facts", "key": "g-new",
+                   "body_json": "{\"note\":\"the api rate limiter caps at 200 requests per hour for the public tier\"}"}),
+        )
+        .unwrap();
+        let raw = handle_write_gate(
+            &db,
+            json!({"category": "facts", "key": "g-dup",
+                   "body_json": "{\"note\":\"the api rate limiter caps at 200 requests per hour for the public tier\"}"}),
+        )
+        .unwrap();
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["verdict"], json!("duplicate"), "{raw}");
+        assert!(v["matched_id"].as_str().is_some());
+        // Supersede: same (category, key) with new content.
+        let raw = handle_write_gate(
+            &db,
+            json!({"category": "facts", "key": "g-new",
+                   "body_json": "{\"note\":\"the api rate limiter now caps at 500 requests per hour\"}"}),
+        )
+        .unwrap();
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["verdict"], json!("supersede"), "{raw}");
+        assert!(v["matched_id"].as_str().is_some());
+        // Adjudicate: near-duplicate divergent content under a new key —
+        // the only verdict that may spend LLM tokens.
+        let raw = handle_write_gate(
+            &db,
+            json!({"category": "facts", "key": "g-conflict",
+                   "body_json": "{\"note\":\"the api rate limiter caps at 500 requests per hour for the public tier\"}"}),
+        )
+        .unwrap();
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["verdict"], json!("adjudicate"), "{raw}");
+        assert_eq!(v["needs_llm"], json!(true));
+        assert!(v["matched_id"].as_str().is_some());
+        // Forget: vague note below the importance floor.
+        let raw = handle_write_gate(
+            &db,
+            json!({"category": "facts", "key": "g-vague", "body_json": "ok"}),
+        )
+        .unwrap();
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["verdict"], json!("forget"), "{raw}");
+        assert!(v["reason"].as_str().unwrap().contains("importance_floor"));
+        // Gate never mutates: only the one admitted entity exists.
+        assert_eq!(db.count_entities(None, None, None).unwrap(), 1);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

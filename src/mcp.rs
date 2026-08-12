@@ -928,6 +928,36 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Remember Entity"
   },
   {
+    "name": "perseus_vault_write_gate",
+    "description": "#939 zero-token write gate: deterministic keep/supersede/forget BEFORE LLM enrichment. Read-only precheck over (category, key, body) that decides store / duplicate / supersede / forget / adjudicate from content-hash + stored-signature near-duplicate scans and an importance floor — ZERO LLM tokens. Only 'adjudicate' (a near-duplicate that may be a contradiction) should escalate to the LLM or operator review. Call this before the enrichment pass to cut per-write Ollama load.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "category": {
+          "type": "string",
+          "description": "Entity category of the candidate write."
+        },
+        "key": {
+          "type": "string",
+          "description": "Entity key of the candidate write."
+        },
+        "body_json": {
+          "type": "string",
+          "description": "Serialized body of the candidate write."
+        },
+        "workspace_hash": {
+          "type": "string",
+          "description": "Optional workspace scope for the scans."
+        }
+      },
+      "required": ["category", "key", "body_json"]
+    },
+    "annotations": {
+      "readOnlyHint": true
+    },
+    "title": "Write Gate"
+  },
+  {
     "name": "perseus_vault_recall",
     "description": "Search entities with FTS5 keyword search. Words are OR'd together. Returns entities sorted by relevance with expanded content/summary fields at top level. Use this to find previously stored facts, decisions, or architecture notes. When encryption is enabled, body_json is decrypted transparently.",
     "inputSchema": {
@@ -6690,6 +6720,11 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
     let handler_result: Result<String, String> = match name {
         "perseus_vault_remember" => tools::handle_remember(db, args).map_err(|e| e.to_string()),
 
+        "perseus_vault_write_gate" => {
+            tools::handle_write_gate(db, args).map_err(|e| e.to_string())
+        }
+
+
         "perseus_vault_reject_value" => {
             tools::handle_reject_value(db, args).map_err(|e| e.to_string())
         }
@@ -7011,7 +7046,7 @@ mod tests {
         );
         assert_eq!(
             registry_names.len(),
-            130,
+            131,
             "update public metadata when adding a tool"
         );
 

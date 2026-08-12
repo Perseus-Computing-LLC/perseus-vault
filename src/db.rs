@@ -4843,7 +4843,7 @@ impl Database {
     /// `find_near_duplicate_with_conn`: drawing a second pooled connection
     /// while one is held deadlock-collapses the pool at >= pool-size
     /// concurrency (#397).
-    fn find_near_duplicate(
+    pub(crate) fn find_near_duplicate(
         &self,
         category: &str,
         workspace_hash: &str,
