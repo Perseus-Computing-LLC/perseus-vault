@@ -701,6 +701,12 @@ pub struct RecallParams {
     /// #1008: per-type retrieval context budget at assembly. See the RecallArgs
     /// doc. None = unshaped (default recall stays byte-identical, #247).
     pub budget_profile: Option<String>,
+    /// #1003: multi-hop selection strategy (CogniCore MultiHopMemoryBackend
+    /// borrow): hop-expand from the top fused anchors via the entity link
+    /// graph, then select the final set by ENTITY COVERAGE (greedy set-cover
+    /// over the query's significant tokens) within the token budget. Opt-in,
+    /// default OFF — a default recall stays byte-identical (#247).
+    pub multihop: bool,
 }
 
 /// Search mode for recall: FTS5 keyword, dense vector, hybrid fusion, or
@@ -901,6 +907,10 @@ pub struct FusedTrace {
     /// when anchor expansion is off or nothing matched).
     #[serde(default)]
     pub anchor_matched: Vec<String>,
+    /// #1003: multi-hop selection trace (hop expansion + coverage order).
+    /// Present only when `multihop` was requested.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub multihop: Option<crate::multihop::MultiHopTrace>,
 }
 
 /// #860: observable validity-profile trace attached to a fused recall.
@@ -1038,6 +1048,7 @@ impl Default for RecallParams {
             entity_type: None,
             type_filter: None,
             budget_profile: None,
+            multihop: false,
             limit: 10,
             offset: 0,
             min_decay: 0.0,

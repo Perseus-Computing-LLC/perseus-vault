@@ -8331,11 +8331,44 @@ impl Database {
 
         // ── caller limit, then token-budget truncation ──────────────────
         // #1008: per-type shaping (floors + caps) replaces the plain
-        // limit-truncate when a budget_profile is requested; the token
-        // budget still applies afterwards (floor items front-load the
-        // order, so the budget drops tail items first).
+        // limit-truncate when a budget_profile is requested. #1003:
+        // multi-hop (opt-in) owns selection when requested: hop-expand from
+        // the top fused anchors via the entity link graph, then greedy
+        // entity-coverage selection. When BOTH are set the order is:
+        // expansion -> shaping -> coverage selection (floors may pull
+        // expanded neighbors; coverage never reorders them out of budget).
+        // Everything feeds the shared token loop below (idempotent — the
+        // selection stages already respected the same budget). Both off =
+        // the plain ranked walk (byte-identical, #247).
         let mut per_type: Option<serde_json::Value> = None;
         let mut ordered: Vec<(Entity, f64)> = Vec::new();
+        let mut hop_expanded = 0usize;
+        let mut expanded_ids: Vec<String> = Vec::new();
+        if params.multihop {
+            let anchors: Vec<Entity> = ranked
+                .iter()
+                .take(crate::multihop::DEFAULT_ANCHORS)
+                .map(|(e, _)| e.clone())
+                .collect();
+            let (neighbors, _stats) =
+                self.graph_expand(&anchors, crate::multihop::MAX_NEIGHBORS_PER_HOP)?;
+            let anchor_max_score = ranked
+                .iter()
+                .take(crate::multihop::DEFAULT_ANCHORS)
+                .map(|(_, s)| *s)
+                .fold(0.0_f64, f64::max);
+            for (n, _ns) in neighbors {
+                if ranked.iter().any(|(e, _)| e.id == n.id) {
+                    continue;
+                }
+                expanded_ids.push(n.id.clone());
+                ordered.push((n, anchor_max_score * crate::multihop::HOP_DISCOUNT));
+            }
+            hop_expanded = expanded_ids.len();
+            ordered.extend(ranked);
+        } else {
+            ordered = ranked;
+        }
         if let Some(profile_name) = params.budget_profile.as_deref() {
             let prof = crate::type_budgets::profile(profile_name).ok_or_else(|| {
                 format!(
@@ -8343,18 +8376,36 @@ impl Database {
                      (expected diverse | fact_lookup | broad)"
                 )
             })?;
-            let (ents, report) = crate::type_budgets::apply(&ranked, &prof, limit);
+            let (ents, report) = crate::type_budgets::apply(&ordered, &prof, limit);
             per_type = serde_json::to_value(&report).ok();
             ordered = ents
                 .into_iter()
                 .map(|e| {
-                    let s = ranked.iter().find(|(c, _)| c.id == e.id).map(|(_, s)| *s).unwrap_or(0.0);
+                    let s = ordered.iter().find(|(c, _)| c.id == e.id).map(|(_, s)| *s).unwrap_or(0.0);
                     (e, s)
                 })
                 .collect();
-        } else {
-            ranked.truncate(limit);
-            ordered = ranked;
+        }
+        if params.multihop {
+            let query_ents = crate::multihop::query_entities(&params.query);
+            let (ents, mut mh_trace) = crate::multihop::coverage_select(
+                &ordered,
+                &query_ents,
+                limit,
+                budget_tokens,
+            );
+            mh_trace.hop_expanded = hop_expanded;
+            mh_trace.expanded_ids = expanded_ids;
+            trace.multihop = Some(mh_trace);
+            ordered = ents
+                .into_iter()
+                .map(|e| {
+                    let s = ordered.iter().find(|(c, _)| c.id == e.id).map(|(_, s)| *s).unwrap_or(0.0);
+                    (e, s)
+                })
+                .collect();
+        } else if params.budget_profile.is_none() {
+            ordered.truncate(limit);
         }
         let mut retained: Vec<Entity> = Vec::new();
         let mut tokens_used: i64 = 0;
