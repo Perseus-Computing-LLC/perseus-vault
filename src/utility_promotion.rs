@@ -129,6 +129,7 @@ mod tests {
             epistemic_state: "candidate".to_string(),
             hints: vec![],
             embedding: None,
+            memory_type: String::new(),
             _parsed_body: None,
         };
         db.remember(&entity).unwrap();
@@ -187,6 +188,7 @@ mod tests {
             epistemic_state: "candidate".to_string(),
             hints: vec![],
             embedding: None,
+            memory_type: String::new(),
             _parsed_body: None,
         };
         entity = {
