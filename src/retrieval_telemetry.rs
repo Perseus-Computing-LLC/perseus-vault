@@ -1038,6 +1038,7 @@ mod tests {
             efficacy_status: "unverified".to_string(),
             epistemic_state: "candidate".to_string(),
             hints: vec![],
+            memory_type: String::new(),
             embedding: None,
             _parsed_body: None,
         }

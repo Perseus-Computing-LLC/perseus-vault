@@ -227,6 +227,7 @@ pub fn declared_schema_set(
         efficacy_status: "unverified".to_string(),
         epistemic_state: crate::models::default_epistemic_state(),
         hints: vec![],
+        memory_type: String::new(),
         embedding: None,
         _parsed_body: None,
     };
@@ -302,7 +303,7 @@ pub fn declared_candidates(
                         verified, source, created_at_unix_ms, last_accessed_unix_ms,
                         NULL as embedding, always_on, certainty, workspace_hash, agent_id,
                         visibility, follow_count, miss_count, follow_rate, efficacy_status,
-                        epistemic_state, hints
+                        epistemic_state, hints, memory_type
                  FROM entities WHERE category = ?1 AND archived = 0",
             )
             .map_err(|e| e.to_string())?;

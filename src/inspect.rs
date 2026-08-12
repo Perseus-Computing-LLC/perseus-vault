@@ -181,7 +181,7 @@ const ENTITY_COLUMNS: &str = "id, category, key, body_json, status, type, tags, 
      retrieval_count, layer, topic_path, archived, archive_reason, links, verified, source, \
      created_at_unix_ms, last_accessed_unix_ms, NULL as embedding, always_on, certainty, \
      workspace_hash, agent_id, visibility, follow_count, miss_count, follow_rate, \
-     efficacy_status, epistemic_state, hints";
+     efficacy_status, epistemic_state, hints, memory_type";
 
 impl Inspector {
     /// Open a vault database read-only. `key_file` overrides
@@ -689,6 +689,7 @@ mod tests {
             efficacy_status: "unverified".to_string(),
             epistemic_state: crate::models::default_epistemic_state(),
             hints: vec![],
+            memory_type: String::new(),
             embedding: None,
             _parsed_body: None,
         }
@@ -926,10 +927,10 @@ mod tests {
                  last_accessed_unix_ms, type, status, tags, layer, topic_path, links, \
                  source, always_on, certainty, workspace_hash, agent_id, visibility, \
                  decay_score, retrieval_count, archived, archive_reason, verified, \
-                 follow_count, miss_count, follow_rate, efficacy_status, epistemic_state, hints) \
+                 follow_count, miss_count, follow_rate, efficacy_status, epistemic_state, hints, memory_type) \
                  VALUES ('i-9', 'enc', 'k1', ?1, 1, 1, 'insight', 'active', '[]', \
                  'working', '', '[]', 'agent', 0, 0.5, '', '', 'workspace', 1.0, 0, 0, '', \
-                 0, 0, 0, 0.0, 'unverified', 'candidate', '[]')",
+                 0, 0, 0, 0.0, 'unverified', 'candidate', '[]', '')",
                 [&cipher],
             )
             .unwrap();

@@ -126,6 +126,12 @@ pub struct RememberArgs {
     pub visibility: String,
     #[serde(default)]
     pub layer: Option<String>,
+    /// #1000: typed memory class (CogniCore borrow) — one of semantic,
+    /// episodic, procedural, preference, constraint, failure, reflection,
+    /// knowledge. Omitted/empty = legacy (SEMANTIC policy). Unknown values
+    /// are a hard write error (fail-closed, never a silent fallback).
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub memory_type: String,
     /// Application-time period (#363, SQL:2011 APPLICATION_TIME): when the
     /// fact became true in the world. Defaults to transaction time. Set in
     /// the past for retroactive facts ("this was true last week").
@@ -1334,6 +1340,18 @@ pub fn handle_remember(db: &Database, args: Value) -> Result<String, String> {
         efficacy_status: "unverified".to_string(),
         epistemic_state: crate::models::default_epistemic_state(),
         hints,
+        memory_type: {
+            // #1000: fail-closed type validation — an unknown type is a hard
+            // write error, never a silent SEMANTIC fallback.
+            if a.memory_type.trim().is_empty() {
+                String::new()
+            } else {
+                crate::memory_types::MemoryType::parse(&a.memory_type)
+                    .map_err(|e| e.to_string())?
+                    .as_str()
+                    .to_string()
+            }
+        },
         embedding: None,
         _parsed_body: None,
     };
@@ -1804,6 +1822,7 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
         query: a.query,
         category: a.category,
         entity_type: a.entity_type,
+        type_filter: None,
         limit: effective_limit,
         offset: a.offset,
         min_decay: a.min_decay,
@@ -2288,6 +2307,7 @@ pub fn handle_recall_batch(db: &Database, args: Value) -> Result<String, String>
             query: q.query.clone(),
             category: q.category.clone(),
             entity_type: q.entity_type.clone(),
+            type_filter: None,
             limit: q.limit,
             offset: q.offset,
             min_decay: q.min_decay,
@@ -3467,6 +3487,7 @@ pub fn handle_promote(db: &Database, args: Value) -> Result<String, String> {
         efficacy_status: "unverified".to_string(),
         epistemic_state: crate::models::default_epistemic_state(),
         hints: vec![],
+        memory_type: String::new(),
         embedding: None,
         _parsed_body: None,
     };
@@ -3670,6 +3691,7 @@ pub fn handle_demote(db: &Database, args: Value) -> Result<String, String> {
         efficacy_status: "unverified".into(),
         epistemic_state: "candidate".into(),
         hints: vec![],
+        memory_type: String::new(),
         embedding: None,
         _parsed_body: None,
     };
@@ -4354,6 +4376,27 @@ pub fn handle_config_report(db: &Database, _args: Value) -> Result<String, Strin
     serde_json::to_string(&report).map_err(|e| format!("Serialization failed: {e}"))
 }
 
+// ─── perseus_vault_type_policies (#1000) ──────────────────────────────
+
+/// Read-only policy table for the typed memory classes (#1000, CogniCore
+/// borrow): the 8 MemoryTypes with per-type decay_multiplier (scales the
+/// #941 category half-life) and retrieval_weight (multiplies the final fused
+/// recall score). One machine-readable answer to "how is this class treated
+/// differently?" — the taxonomy the vault's governance regime cares most
+/// about (PROCEDURAL / CONSTRAINT / FAILURE / REFLECTION) is visible at a
+/// glance.
+pub fn handle_type_policies(_db: &Database, _args: Value) -> Result<String, String> {
+    let policies: Vec<crate::memory_types::TypePolicy> =
+        crate::memory_types::policies().to_vec();
+    serde_json::to_string(&json!({
+        "memory_types": policies,
+        "legacy_rows": "memory_type '' resolves to the SEMANTIC policy (byte-compatible baseline)",
+        "write_validation": "unknown memory_type on remember() is a hard error (fail-closed)",
+    }))
+    .map_err(|e| format!("Serialization failed: {e}"))
+}
+}
+
 fn default_telemetry_category() -> String {
     "general".to_string()
 }
@@ -4905,6 +4948,7 @@ fn intention_upsert(db: &Database, a: &IntentionArgs) -> Result<String, String> 
         efficacy_status: "unverified".to_string(),
         epistemic_state: crate::models::default_epistemic_state(),
         hints: vec![],
+        memory_type: String::new(),
         embedding: None,
         _parsed_body: None,
     };
@@ -5555,6 +5599,7 @@ pub fn handle_capture(db: &Database, args: Value) -> Result<String, String> {
             efficacy_status: "unverified".to_string(),
             epistemic_state: crate::models::default_epistemic_state(),
             hints: vec![],
+            memory_type: String::new(),
             embedding: None,
             _parsed_body: None,
         };
@@ -5628,6 +5673,7 @@ pub fn handle_capture(db: &Database, args: Value) -> Result<String, String> {
             efficacy_status: "unverified".to_string(),
             epistemic_state: crate::models::default_epistemic_state(),
             hints: vec![],
+            memory_type: String::new(),
             embedding: None,
             _parsed_body: None,
         };
@@ -8913,6 +8959,7 @@ pub fn handle_ingest_file(db: &Database, args: Value) -> Result<String, String> 
         efficacy_status: "unverified".to_string(),
         epistemic_state: crate::models::default_epistemic_state(),
         hints: vec![],
+        memory_type: String::new(),
         embedding: None,
         _parsed_body: None,
     };
@@ -11324,6 +11371,7 @@ fn memories_write(
                 efficacy_status: "unverified".to_string(),
                 epistemic_state: "candidate".to_string(),
                 hints: vec![],
+                memory_type: String::new(),
                 embedding: None,
                 _parsed_body: None,
             }
@@ -11914,6 +11962,7 @@ mod tests {
             efficacy_status: "unverified".to_string(),
             epistemic_state: "candidate".to_string(),
             hints: vec![],
+            memory_type: String::new(),
             embedding: None,
             _parsed_body: None,
         };
@@ -16870,6 +16919,7 @@ mod tests {
             efficacy_status: "unverified".to_string(),
             epistemic_state: "candidate".to_string(),
             hints: vec![],
+            memory_type: String::new(),
             embedding: None,
             _parsed_body: None,
         }

@@ -348,6 +348,7 @@ pub fn build_projection(db: &Database, req: &ProjectionRequest) -> Result<Projec
         query: req.query.clone(),
         category: req.category.clone(),
         entity_type: None,
+        type_filter: None,
         limit: pool_limit,
         offset: 0,
         min_decay: 0.0,
@@ -630,6 +631,7 @@ mod tests {
             efficacy_status: "unverified".to_string(),
             epistemic_state: "candidate".to_string(),
             hints: vec![],
+            memory_type: String::new(),
             embedding: None,
             _parsed_body: None,
         }

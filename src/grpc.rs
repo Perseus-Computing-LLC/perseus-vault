@@ -113,6 +113,7 @@ pub mod grpc {
                     efficacy_status: "unverified".to_string(),
                     epistemic_state: crate::models::default_epistemic_state(),
                     hints: vec![],
+                    memory_type: String::new(),
                     embedding: None,
                     _parsed_body: None,
                 };
@@ -630,6 +631,7 @@ pub mod grpc {
                 efficacy_status: "unverified".to_string(),
                 epistemic_state: crate::models::default_epistemic_state(),
                 hints: vec![],
+                memory_type: String::new(),
                 embedding: None,
                 _parsed_body: None,
             };

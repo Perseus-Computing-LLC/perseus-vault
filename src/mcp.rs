@@ -3262,6 +3262,29 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Config Self-Report"
   },
   {
+    "name": "perseus_vault_type_policies",
+    "description": "Typed memory-class policy table (#1000, CogniCore borrow): the 8 MemoryTypes (semantic, episodic, procedural, preference, constraint, failure, reflection, knowledge) with per-type decay_multiplier (scales the per-category half-life at decay tick) and retrieval_weight (multiplies the final fused recall score), plus each policy's rationale. Legacy rows (memory_type '') resolve to the SEMANTIC policy — the byte-compatible baseline. Unknown memory_type values on remember() are hard write errors (fail-closed, never a silent fallback). Read-only.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {}
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "memory_types": {
+          "type": "array",
+          "description": "One entry per MemoryType: memory_type/decay_multiplier/retrieval_weight/rationale"
+        },
+        "legacy_rows": { "type": "string", "description": "Legacy-row resolution semantics" },
+        "write_validation": { "type": "string", "description": "Write-time validation semantics" }
+      }
+    },
+    "annotations": {
+      "readOnlyHint": true
+    },
+    "title": "Typed Memory Policies"
+  },
+  {
     "name": "perseus_vault_handoff_restart",
     "description": "Live-update / reconnect for long-lived stdio sessions (#858). When the perseus-vault binary was rebuilt or replaced on disk mid-session, the running process image is stale: every other tool refuses loudly (isError) until the session is restarted — or this tool hot-swaps the process on the SAME stdio connection. States: binary unchanged -> no_handoff_needed (identity report); stale + dry_run -> dry_run (what would happen); stale without confirm -> confirm_required; stale + confirm:true -> the replacement binary is spawned on this session's stdio and the old process exits immediately after this response — the MCP session continues uninterrupted in the new process image. Do not pipeline requests during the handoff.",
     "inputSchema": {
@@ -6920,6 +6943,7 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
         "perseus_vault_health" => Ok(tools::handle_health(db)),
         "perseus_vault_deployment_profile" => tools::handle_deployment_profile(db, args),
         "perseus_vault_config_report" => tools::handle_config_report(db, args),
+        "perseus_vault_type_policies" => tools::handle_type_policies(db, args),
         "perseus_vault_handoff_restart" => crate::live_update::handle_handoff_restart(args),
         "perseus_vault_quality_telemetry" => tools::handle_quality_telemetry(db, args),
         "perseus_vault_retrieval_telemetry" => tools::handle_retrieval_telemetry(db, args),
@@ -7156,7 +7180,7 @@ mod tests {
         );
         assert_eq!(
             registry_names.len(),
-            135,
+            136,
             "update public metadata when adding a tool"
         );
 

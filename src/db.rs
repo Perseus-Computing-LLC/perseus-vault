@@ -2032,6 +2032,7 @@ impl Database {
                             efficacy_status: "unverified".to_string(),
                             epistemic_state: crate::models::default_epistemic_state(),
                             hints: vec![],
+                            memory_type: String::new(),
                             embedding: None,
                             _parsed_body: None,
                         };
@@ -4390,7 +4391,7 @@ impl Database {
                     created_at_unix_ms, last_accessed_unix_ms, NULL as embedding,
                     always_on, certainty, workspace_hash, agent_id, visibility,
                     follow_count, miss_count, follow_rate, efficacy_status,
-                    epistemic_state, hints
+                    epistemic_state, hints, memory_type
              FROM entities WHERE id IN ({})",
             placeholders
         );
@@ -4717,11 +4718,11 @@ impl Database {
         // Update decay_score for non-archived entities, optionally capped
         let sql = if let Some(max) = max_entities {
             format!(
-                "SELECT id, last_accessed_unix_ms, verified, efficacy_status, follow_rate, importance, decay_score, usefulness_count, category FROM entities WHERE archived = 0 LIMIT {}",
+                "SELECT id, last_accessed_unix_ms, verified, efficacy_status, follow_rate, importance, decay_score, usefulness_count, category, memory_type FROM entities WHERE archived = 0 LIMIT {}",
                 max
             )
         } else {
-            "SELECT id, last_accessed_unix_ms, verified, efficacy_status, follow_rate, importance, decay_score, usefulness_count, category FROM entities WHERE archived = 0".to_string()
+            "SELECT id, last_accessed_unix_ms, verified, efficacy_status, follow_rate, importance, decay_score, usefulness_count, category, memory_type FROM entities WHERE archived = 0".to_string()
         };
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map([], |r| {
@@ -4737,17 +4738,19 @@ impl Database {
                 r.get::<_, f64>(6).unwrap_or(0.0),
                 r.get::<_, Option<i64>>(7).unwrap_or(None).unwrap_or(0),
                 r.get::<_, Option<String>>(8).unwrap_or(None).unwrap_or_default(),
+                // #1000: typed memory class — tolerant read for pre-v41 rows.
+                r.get::<_, Option<String>>(9).unwrap_or(None).unwrap_or_default(),
             ))
         })?;
 
         let mut updated = 0i64;
         let mut auto_archived = 0i64;
-        let mut batch: Vec<(String, i64, bool, String, f64, f64, f64, i64, String)> =
+        let mut batch: Vec<(String, i64, bool, String, f64, f64, f64, i64, String, String)> =
             Vec::with_capacity(1000);
         let now_val = now;
 
         // Helper: flush the current batch in a transaction.
-        let flush_batch = |batch: &mut Vec<(String, i64, bool, String, f64, f64, f64, i64, String)>,
+        let flush_batch = |batch: &mut Vec<(String, i64, bool, String, f64, f64, f64, i64, String, String)>,
                            updated: &mut i64,
                            auto_archived: &mut i64|
          -> Result<(), Box<dyn std::error::Error>> {
@@ -4765,13 +4768,23 @@ impl Database {
                 stored_decay,
                 usefulness,
                 category,
+                memory_type,
             ) in batch.drain(..)
             {
-                let half_life = policies
-                    .get(&category)
-                    .copied()
-                    .unwrap_or(7)
-                    .saturating_mul(86_400_000);
+                // #1000: the typed-class multiplier scales the #941 category
+                // half-life IN DAYS (composes — never overrides). The "never"
+                // encoding (i64::MAX/86_400_000 days) passes through exactly:
+                // an f64 round-trip would destroy its precision, and a finite
+                // multiplier must not shorten "never". Floor: 1 day.
+                let type_multiplier = crate::memory_types::decay_multiplier(&memory_type);
+                let never_days = i64::MAX / 86_400_000;
+                let base_days = policies.get(&category).copied().unwrap_or(7);
+                let days = if base_days == never_days {
+                    never_days
+                } else {
+                    (((base_days as f64) * type_multiplier).max(1.0) as i64)
+                };
+                let half_life = days.saturating_mul(86_400_000);
                 let mut new_decay = Self::compute_decay_with_half_life(last_access, now_val, half_life);
                 // #298: verified/curated facts get a decay floor so the
                 // forgetting curve can never auto-archive them.
@@ -4864,6 +4877,7 @@ impl Database {
                 stored_decay,
                 usefulness,
                 category,
+                memory_type,
             ) = row?;
             batch.push((
                 id,
@@ -4875,6 +4889,7 @@ impl Database {
                 stored_decay,
                 usefulness,
                 category,
+                memory_type,
             ));
             if batch.len() >= 1000 {
                 flush_batch(&mut batch, &mut updated, &mut auto_archived)?;
@@ -6919,12 +6934,12 @@ impl Database {
                   always_on, certainty, created_at_unix_ms, last_accessed_unix_ms,
                   workspace_hash, agent_id, visibility, recorded_at_unix_ms,
                   valid_from_unix_ms, valid_to_unix_ms, epistemic_state,
-                  expires_at_unix_ms, hints)
+                  expires_at_unix_ms, hints, memory_type)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7,
                          ?8, ?9, ?10, ?11,
                          ?12, ?13, ?14, ?15, ?16,
                          ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27,
-                         ?28, ?29)",
+                         ?28, ?29, ?30)",
                 params![
                     id,
                     entity.category,
@@ -6967,6 +6982,8 @@ impl Database {
                     entity_expiry_ms(&entity.body_json),
                     // #919: advisory prospective query hints (JSON array).
                     hints_encrypted,
+                    // #1000: typed memory class (validated upstream; '' = legacy).
+                    entity.memory_type.clone(),
                 ],
             )?;
 
@@ -7129,7 +7146,19 @@ impl Database {
     }
 
     pub fn recall(&self, params: &RecallParams) -> Result<Vec<Entity>, Box<dyn std::error::Error>> {
+        // #1000: the typed-class filter applies to EVERY mode (FTS, Dense,
+        // Hybrid, Fused) — validated here (fail-closed), filtered after the
+        // mode-specific path. Fused also filters pre-truncation for limit
+        // quality; both filters are idempotent.
+        if let Some(tf) = params.type_filter.as_deref() {
+            if !tf.trim().is_empty() {
+                crate::memory_types::MemoryType::parse(tf)?;
+            }
+        }
         let (mut entities, _) = self.recall_with_completeness(params)?;
+        if let Some(tf) = params.type_filter.as_deref() {
+            entities.retain(|e| type_matches(e, tf));
+        }
         // #886: hierarchical tier ordering (mental models → observations →
         // raw facts) — opt-in, reorders the returned list only.
         if params.tier_order {
@@ -7498,6 +7527,15 @@ impl Database {
                     // truncate, so a cited/followed memory ranked just past `limit`
                     // can still make the cut over a never-reused near-tie.
                     let fused = self.apply_usefulness_rank_boost(fused)?;
+                    // #1000: post-fuse typed-class filter (validated in
+                    // fused_recall; '' = legacy = semantic).
+                    let fused = if let Some(tf) = params.type_filter.as_deref() {
+                        let mut f = fused;
+                        f.retain(|(e, _)| type_matches(e, tf));
+                        f
+                    } else {
+                        fused
+                    };
                     timer.stage("usefulness");
                     // #485: scope preference in the same first-phase expression —
                     // broader-scope (global) hits fused at `scope_weight`.
@@ -7725,6 +7763,14 @@ impl Database {
                 .cmp(&ALL.iter().position(|x| x == b).unwrap_or(99))
         });
         let wants = |s: &str| strategies.contains(&s);
+
+        // #1000: type_filter is fail-closed — an unknown class is a caller
+        // error, never a silent no-match.
+        if let Some(tf) = params.type_filter.as_deref() {
+            if !tf.trim().is_empty() {
+                crate::memory_types::MemoryType::parse(tf)?;
+            }
+        }
 
         // ── #923: declared arm validation (fail-closed) ─────────────────
         // The exact arm is opt-in and never silently degrades: filters
@@ -8113,6 +8159,15 @@ impl Database {
         // scope preference, supersede recency, then layer + metadata
         // filters, then the governance interceptor).
         let fused = self.apply_usefulness_rank_boost(fused)?;
+        // #1000: post-fuse typed-class filter (validated above; '' = legacy
+        // = semantic).
+        let fused = if let Some(tf) = params.type_filter.as_deref() {
+            let mut f = fused;
+            f.retain(|(e, _)| type_matches(e, tf));
+            f
+        } else {
+            fused
+        };
         let fused = Self::apply_scope_rank_weight(fused, params);
         let fused = Self::apply_supersede_recency(fused);
         let mut cand: Vec<Entity> = fused.into_iter().map(|(e, _)| e).collect();
@@ -8592,6 +8647,11 @@ impl Database {
                     *score *= efficacy_rank_weight(status, *rate);
                 }
             }
+            // #1000: per-type retrieval weight (CogniCore TypePolicy borrow).
+            // Multiplies the final fused score so a CONSTRAINT outranks pure
+            // similarity and an EPISODE is damped — legacy rows ('' =
+            // SEMANTIC) keep weight 1.0, byte-compatible with pre-#1000.
+            *score *= crate::memory_types::retrieval_weight(&entity.memory_type);
         }
         fused.sort_by(|a, b| {
             b.1.partial_cmp(&a.1)
@@ -8878,7 +8938,7 @@ impl Database {
                     created_at_unix_ms, last_accessed_unix_ms, NULL as embedding,
                     always_on, certainty, workspace_hash, agent_id, visibility,
                     follow_count, miss_count, follow_rate, efficacy_status,
-                    epistemic_state, hints
+                    epistemic_state, hints, memory_type
              FROM entities",
         );
 
@@ -9584,7 +9644,7 @@ impl Database {
                     created_at_unix_ms, last_accessed_unix_ms, NULL as embedding,
                     always_on, certainty, workspace_hash, agent_id, visibility,
                     follow_count, miss_count, follow_rate, efficacy_status,
-                    epistemic_state, hints
+                    epistemic_state, hints, memory_type
              FROM entities WHERE category = ?1 AND key = ?2
              ORDER BY workspace_hash ASC, id ASC LIMIT 1",
         )?;
@@ -10403,6 +10463,7 @@ impl Database {
             efficacy_status: "unverified".to_string(),
             epistemic_state: crate::models::default_epistemic_state(),
             hints: vec![],
+            memory_type: String::new(),
             embedding: None,
             _parsed_body: None,
         };
@@ -13351,7 +13412,7 @@ impl Database {
                             created_at_unix_ms, last_accessed_unix_ms, NULL as embedding,
                             always_on, certainty, workspace_hash, agent_id, visibility,
                             follow_count, miss_count, follow_rate, efficacy_status,
-                            epistemic_state, hints
+                            epistemic_state, hints, memory_type
                      FROM entities WHERE id = ?1",
                     params![link.target_id],
                     |row| entity_from_row(row, self.encryption.as_ref()),
@@ -14085,7 +14146,7 @@ impl Database {
                     created_at_unix_ms, last_accessed_unix_ms, NULL as embedding,
                     always_on, certainty, workspace_hash, agent_id, visibility,
                     follow_count, miss_count, follow_rate, efficacy_status,
-                    epistemic_state, hints
+                    epistemic_state, hints, memory_type
              FROM entities WHERE id = ?1",
         )?;
         let entity = {
@@ -15124,7 +15185,7 @@ impl Database {
                     created_at_unix_ms, last_accessed_unix_ms, NULL as embedding,
                     always_on, certainty, workspace_hash, agent_id, visibility,
                     follow_count, miss_count, follow_rate, efficacy_status,
-                    epistemic_state, hints
+                    epistemic_state, hints, memory_type
              FROM entities WHERE archived = 0",
         );
         let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
@@ -15195,7 +15256,7 @@ impl Database {
                     created_at_unix_ms, last_accessed_unix_ms, NULL as embedding,
                     always_on, certainty, workspace_hash, agent_id, visibility,
                     follow_count, miss_count, follow_rate, efficacy_status,
-                    epistemic_state, hints
+                    epistemic_state, hints, memory_type
              FROM entities WHERE archived = 0",
         );
         let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
@@ -15263,7 +15324,7 @@ impl Database {
                     created_at_unix_ms, last_accessed_unix_ms, NULL as embedding,
                     always_on, certainty, workspace_hash, agent_id, visibility,
                     follow_count, miss_count, follow_rate, efficacy_status,
-                    epistemic_state, hints
+                    epistemic_state, hints, memory_type
              FROM entities WHERE 1=1",
         );
         let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
@@ -16354,6 +16415,7 @@ impl Database {
             efficacy_status: "active".to_string(),
             epistemic_state: "verified".to_string(),
             hints: vec![],
+            memory_type: String::new(),
             embedding: None,
             _parsed_body: None,
         };
@@ -16955,6 +17017,7 @@ impl Database {
                                 efficacy_status: "unverified".to_string(),
                                 epistemic_state: crate::models::default_epistemic_state(),
                                 hints: vec![],
+                                memory_type: String::new(),
                                 embedding: None,
                                 _parsed_body: None,
                                 created_at_unix_ms: created_at,
@@ -17278,6 +17341,7 @@ impl Database {
                         efficacy_status: "unverified".to_string(),
                         epistemic_state: crate::models::default_epistemic_state(),
                         hints: vec![],
+                        memory_type: String::new(),
                         embedding: None,
                         _parsed_body: None,
                         created_at_unix_ms: now,
@@ -17997,6 +18061,7 @@ impl Database {
                             efficacy_status: "unverified".to_string(),
                             epistemic_state: crate::models::default_epistemic_state(),
                             hints: vec![],
+                            memory_type: String::new(),
                             embedding: None,
                             _parsed_body: None,
                             created_at_unix_ms: now,
@@ -19931,6 +19996,7 @@ last_accessed: {}
                 efficacy_status: "unverified".to_string(),
                 epistemic_state: crate::models::default_epistemic_state(),
                 hints: vec![],
+                memory_type: String::new(),
                 embedding: None,
                 _parsed_body: None,
             };
@@ -20643,7 +20709,7 @@ last_accessed: {}
                     created_at_unix_ms, last_accessed_unix_ms, NULL as embedding,
                     always_on, certainty, workspace_hash, agent_id, visibility,
                     follow_count, miss_count, follow_rate, efficacy_status,
-                    epistemic_state, hints
+                    epistemic_state, hints, memory_type
              FROM entities
              WHERE archived = 0
                AND (status IS NULL OR status = '' OR status NOT IN
@@ -21123,6 +21189,7 @@ last_accessed: {}
                 efficacy_status: "unverified".to_string(),
                 epistemic_state: crate::models::default_epistemic_state(),
                 hints: vec![],
+                memory_type: String::new(),
                 embedding: None,
                 _parsed_body: None,
                 created_at_unix_ms: now,
@@ -21482,6 +21549,7 @@ last_accessed: {}
             efficacy_status: "unverified".to_string(),
             epistemic_state: crate::models::default_epistemic_state(),
             hints: vec![],
+            memory_type: String::new(),
             embedding: None,
             _parsed_body: None,
             created_at_unix_ms: now,
@@ -21710,6 +21778,7 @@ If no clear lessons found, return: {{"lessons": []}}"#,
                 efficacy_status: "unverified".to_string(),
                 epistemic_state: "candidate".to_string(),
                 hints: vec![],
+                memory_type: String::new(),
                 embedding: None,
                 _parsed_body: None,
                 created_at_unix_ms: now,
@@ -21805,6 +21874,7 @@ If no clear lessons found, return: {{"lessons": []}}"#,
             efficacy_status: "unverified".to_string(),
             epistemic_state: "candidate".to_string(),
             hints: vec![],
+            memory_type: String::new(),
             embedding: None,
             _parsed_body: None,
             created_at_unix_ms: now,
@@ -22232,6 +22302,17 @@ fn cosine_with_query_norm(query: &[f32], q_norm: f64, b: &[f32]) -> f64 {
 /// boost so the two never drift. Log-damped (`ln(1+n)`) and capped so
 /// citation counts separate ties and near-ties but can never drown out
 /// relevance: 1 citation → ~1.07, 10 → ~1.24, cap 1.4 from ~55 citations.
+/// #1000: does a stored memory_type value satisfy a type_filter? Legacy
+/// rows ('') satisfy the `semantic` filter (their effective policy).
+pub(crate) fn type_matches(entity: &crate::models::Entity, filter: &str) -> bool {
+    let stored = entity.memory_type.trim();
+    let want = filter.trim().to_lowercase();
+    if stored.is_empty() {
+        return want == "semantic";
+    }
+    stored == want
+}
+
 pub(crate) fn usefulness_weight(usefulness_count: i64) -> f64 {
     1.0 + ((usefulness_count.max(0) as f64).ln_1p() * 0.1).min(0.4)
 }
@@ -23433,7 +23514,7 @@ impl Database {
                         created_at_unix_ms, last_accessed_unix_ms, NULL as embedding,
                         always_on, certainty, workspace_hash, agent_id, visibility,
                         follow_count, miss_count, follow_rate, efficacy_status,
-                    epistemic_state, hints
+                    epistemic_state, hints, memory_type
                  FROM entities WHERE archived = 0 AND id IN ({})",
                 placeholders
             );
@@ -23856,6 +23937,14 @@ pub(crate) fn entity_from_row(
                 _ => Vec::new(),
             }
         },
+        // #1000: typed memory class, read tolerantly like hints — SELECTs
+        // that do not include the column (history snapshots, pre-v41 rows)
+        // resolve to '' = legacy = SEMANTIC policy.
+        memory_type: row
+            .get::<_, Option<String>>(30)
+            .ok()
+            .flatten()
+            .unwrap_or_default(),
         embedding: None,
         _parsed_body: parsed_body,
     })
@@ -24152,6 +24241,7 @@ pub(crate) mod tests {
             efficacy_status: "unverified".to_string(),
             epistemic_state: crate::models::default_epistemic_state(),
             hints: vec![],
+            memory_type: String::new(),
             embedding: None,
             _parsed_body: None,
         }
@@ -25902,6 +25992,7 @@ pub(crate) mod tests {
                 efficacy_status: "unverified".to_string(),
                 epistemic_state: "candidate".to_string(),
                 hints: vec![],
+                memory_type: String::new(),
                 embedding: None,
                 _parsed_body: None,
             };
@@ -26118,6 +26209,7 @@ pub(crate) mod tests {
             efficacy_status: "unverified".to_string(),
             epistemic_state: "candidate".to_string(),
             hints: vec![],
+            memory_type: String::new(),
             embedding: None,
             _parsed_body: None,
         };
@@ -26332,6 +26424,7 @@ pub(crate) mod tests {
             efficacy_status: "unverified".to_string(),
             epistemic_state: "candidate".to_string(),
             hints: vec![],
+            memory_type: String::new(),
             embedding: None,
             _parsed_body: None,
         })
@@ -26418,6 +26511,7 @@ pub(crate) mod tests {
             efficacy_status: "unverified".to_string(),
             epistemic_state: "candidate".to_string(),
             hints: vec![],
+            memory_type: String::new(),
             embedding: None,
             _parsed_body: None,
         };
@@ -45111,7 +45205,7 @@ pub(crate) mod tests {
         // Report carries denominator + artifact hash (acceptance #5).
         assert!(rep["denominator"]["slots"].as_i64().unwrap() >= 3);
         assert!(rep["artifact"]["git_hash"].as_str().unwrap().len() >= 7);
-        assert_eq!(rep["artifact"]["schema_version"], 40);
+        assert_eq!(rep["artifact"]["schema_version"], 41);
         let _ = std::fs::remove_file(path);
     }
 
