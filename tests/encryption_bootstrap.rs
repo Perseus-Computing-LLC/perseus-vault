@@ -144,3 +144,339 @@ fn explicit_plaintext_optout_suppresses_default_key_creation() {
 
     let _ = std::fs::remove_dir_all(&home);
 }
+
+// #1018 companion guard: keygen/init previously truncated any key file at the
+// resolved path, which would destroy the key of an existing encrypted vault
+// (precedence resolution now finds legacy `~/.mimir/secret.key` files, making
+// the footgun reachable again). Keygen must fail closed on an existing key;
+// init must USE the existing key as-is ("generates a key, if none exists")
+// and leave its bytes untouched.
+#[test]
+fn keygen_refuses_and_init_reuses_an_existing_key_file() {
+    let home = sandbox("keyguard");
+    let key_path = home.join("secret.key");
+    let db_path = home.join("vault.db");
+
+    // Create a real key with keygen (fresh path).
+    let keygen = Command::new(BIN)
+        .env("HOME", &home)
+        .args(["keygen", "--key-file", key_path.to_str().unwrap()])
+        .output()
+        .expect("spawn perseus-vault keygen");
+    assert!(
+        keygen.status.success(),
+        "keygen on a fresh path must succeed: {}",
+        String::from_utf8_lossy(&keygen.stderr)
+    );
+    let key_before = std::fs::read_to_string(&key_path).unwrap();
+
+    // keygen again on the same path: refused, key untouched.
+    let keygen2 = Command::new(BIN)
+        .env("HOME", &home)
+        .args(["keygen", "--key-file", key_path.to_str().unwrap()])
+        .output()
+        .expect("spawn perseus-vault keygen");
+    assert!(
+        !keygen2.status.success(),
+        "keygen must refuse to overwrite an existing key file"
+    );
+    assert!(
+        String::from_utf8_lossy(&keygen2.stderr).contains("refusing to overwrite existing key file"),
+        "refusal must name the action: {}",
+        String::from_utf8_lossy(&keygen2.stderr)
+    );
+    assert_eq!(std::fs::read_to_string(&key_path).unwrap(), key_before);
+
+    // init on the same key: reuses it, succeeds, bytes untouched.
+    let init = Command::new(BIN)
+        .env("HOME", &home)
+        .args([
+            "init",
+            "--db",
+            db_path.to_str().unwrap(),
+            "--key-file",
+            key_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("spawn perseus-vault init");
+    assert!(
+        init.status.success(),
+        "init must reuse an existing key: {}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+    assert_eq!(std::fs::read_to_string(&key_path).unwrap(), key_before);
+    // The database was encrypted with that key (canary established).
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let canary: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM encryption_canary WHERE id = 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(canary, 1, "init must establish the canary with the existing key");
+    drop(conn);
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+// #1018: a v2.21-era encrypted vault (canary under the pre-rebrand
+// `mimir_internal` AAD, key at the legacy `~/.mimir/secret.key` path) must
+// open with the CURRENT binary using that same key — no key regeneration, no
+// manual DB repair — and recall must keep working through the MCP server.
+// The fixture is synthesized by re-encrypting the canary under the legacy AAD
+// with the same AES-256-GCM scheme the binary uses (aes-gcm is a direct
+// dependency, so the wire format matches by construction).
+#[test]
+fn legacy_mimir_vault_opens_and_recalls_with_current_binary() {
+    use aes_gcm::aead::{Aead, KeyInit, OsRng};
+    use aes_gcm::aead::rand_core::RngCore;
+    use aes_gcm::{Aes256Gcm, Key, Nonce};
+    use base64::Engine as _;
+    use std::io::{BufRead, BufReader, Write};
+    use std::process::Stdio;
+
+    let home = sandbox("legacy1018");
+    let db_path = home.join("mimir.db");
+    let key_path = home.join(".mimir").join("secret.key");
+    std::fs::create_dir_all(key_path.parent().unwrap()).unwrap();
+
+    // 1. v2.21-era key at the legacy path.
+    let keygen = Command::new(BIN)
+        .env("HOME", &home)
+        .args(["keygen", "--key-file", key_path.to_str().unwrap()])
+        .output()
+        .expect("spawn perseus-vault keygen");
+    assert!(
+        keygen.status.success(),
+        "keygen failed: {}",
+        String::from_utf8_lossy(&keygen.stderr)
+    );
+
+    // 2. Bootstrap the encrypted fixture with the current binary.
+    let write1 = Command::new(BIN)
+        .env("HOME", &home)
+        .args([
+            "write",
+            "--db",
+            db_path.to_str().unwrap(),
+            "--encryption-key",
+            key_path.to_str().unwrap(),
+            "--category",
+            "facts",
+            "--key",
+            "legacy-entity",
+            "--body-json",
+            r#"{"note":"pre-rebrand secret"}"#,
+        ])
+        .output()
+        .expect("spawn perseus-vault write");
+    assert!(
+        write1.status.success(),
+        "fixture write failed: {}",
+        String::from_utf8_lossy(&write1.stderr)
+    );
+
+    // 3. Downgrade the canary to the v2.21-era AAD (`mimir_internal`).
+    let key_b64 = std::fs::read_to_string(&key_path).unwrap();
+    let key_bytes = base64::engine::general_purpose::STANDARD
+        .decode(key_b64.trim())
+        .unwrap();
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key_bytes));
+    let current_aad = format!(
+        "{}:{}:{}",
+        "perseus_vault_internal".len(),
+        "perseus_vault_internal",
+        "encryption_canary"
+    );
+    let legacy_aad = format!(
+        "{}:{}:{}",
+        "mimir_internal".len(),
+        "mimir_internal",
+        "encryption_canary"
+    );
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let stored: String = conn
+        .query_row(
+            "SELECT ciphertext FROM encryption_canary WHERE id = 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let combined = base64::engine::general_purpose::STANDARD
+        .decode(&stored)
+        .unwrap();
+    let (nonce_bytes, ct_body) = combined.split_at(12);
+    let plain = cipher
+        .decrypt(
+            Nonce::from_slice(nonce_bytes),
+            aes_gcm::aead::Payload {
+                msg: ct_body,
+                aad: current_aad.as_bytes(),
+            },
+        )
+        .expect("fixture canary must decrypt under the current AAD");
+    let mut new_nonce = [0u8; 12];
+    OsRng.fill_bytes(&mut new_nonce);
+    let legacy_ct = cipher
+        .encrypt(
+            Nonce::from_slice(&new_nonce),
+            aes_gcm::aead::Payload {
+                msg: plain.as_slice(),
+                aad: legacy_aad.as_bytes(),
+            },
+        )
+        .expect("re-encrypt canary under the legacy AAD");
+    // App format is base64(nonce[12] || ciphertext) — prepend the nonce.
+    let mut combined = new_nonce.to_vec();
+    combined.extend_from_slice(&legacy_ct);
+    let legacy_ct_b64 = base64::engine::general_purpose::STANDARD.encode(combined);
+    conn.execute(
+        "UPDATE encryption_canary SET ciphertext = ?1 WHERE id = 1",
+        rusqlite::params![legacy_ct_b64],
+    )
+    .unwrap();
+    drop(conn);
+
+    // 4. The CURRENT binary must open the v2.21-era vault with its existing
+    //    key. Pre-fix this exits 1 with "failed to decrypt encryption canary".
+    let write2 = Command::new(BIN)
+        .env("HOME", &home)
+        .args([
+            "write",
+            "--db",
+            db_path.to_str().unwrap(),
+            "--encryption-key",
+            key_path.to_str().unwrap(),
+            "--category",
+            "facts",
+            "--key",
+            "legacy-entity-2",
+            "--body-json",
+            r#"{"note":"post-upgrade secret"}"#,
+        ])
+        .output()
+        .expect("spawn perseus-vault write");
+    let stderr2 = String::from_utf8_lossy(&write2.stderr);
+    assert!(
+        write2.status.success(),
+        "upgraded binary must open a v2.21-era encrypted vault with its existing key\nstderr: {stderr2}"
+    );
+    assert!(
+        !stderr2.contains("failed to decrypt encryption canary"),
+        "the canary regression error must not fire: {stderr2}"
+    );
+
+    // 5. Startup + recall through the real MCP stdio server, same key.
+    let mut child = Command::new(BIN)
+        .env("HOME", &home)
+        .args([
+            "serve",
+            "--db",
+            db_path.to_str().unwrap(),
+            "--encryption-key",
+            key_path.to_str().unwrap(),
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn perseus-vault serve");
+    let mut stdin = child.stdin.take().unwrap();
+    let stdout_handle = child.stdout.take().unwrap();
+
+    // Reader thread: the stdio server answers on stdout. A channel decouples
+    // reading from the bounded wait below, so a silent server can never hang
+    // the CI job forever (the pre-fix #1018 crash is one failure mode; a
+    // stuck server is the other).
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let reader = std::thread::spawn(move || {
+        let stdout = BufReader::new(stdout_handle);
+        for line in stdout.lines() {
+            match line {
+                Ok(l) => {
+                    if tx.send(l).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    // One JSON-RPC exchange: initialize, then recall. Fails fast if the
+    // server exits (the #1018 regression) or goes silent (hard 240s
+    // deadline per call, then the child is killed).
+    fn mcp_call(
+        stdin: &mut std::process::ChildStdin,
+        child: &mut std::process::Child,
+        rx: &std::sync::mpsc::Receiver<String>,
+        payload: &str,
+        target: u64,
+    ) -> String {
+        use std::time::{Duration, Instant};
+        writeln!(stdin, "{payload}").unwrap();
+        let deadline = Duration::from_secs(240);
+        let start = Instant::now();
+        loop {
+            match rx.recv_timeout(Duration::from_secs(5)) {
+                Ok(line) => {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
+                        if v.get("id").and_then(|i| i.as_u64()) == Some(target) {
+                            return line;
+                        }
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if let Ok(Some(status)) = child.try_wait() {
+                        panic!("serve exited ({status}) before answering id {target}");
+                    }
+                    if start.elapsed() >= deadline {
+                        let _ = child.kill();
+                        panic!(
+                            "serve did not answer id {target} within {deadline:?} — killed it"
+                        );
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    panic!("serve stdout closed before answering id {target}");
+                }
+            }
+        }
+    }
+
+    let init = mcp_call(
+        &mut stdin,
+        &mut child,
+        &rx,
+        r#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{}}"#,
+        0,
+    );
+    assert!(init.contains("\"result\""), "initialize failed: {init}");
+
+    // Initialized notification — no response expected.
+    stdin
+        .write_all(br#"{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}"#)
+        .unwrap();
+    stdin.write_all(b"\n").unwrap();
+
+    let recall = mcp_call(
+        &mut stdin,
+        &mut child,
+        &rx,
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"perseus_vault_recall","arguments":{"query":"pre-rebrand secret"}}}"#,
+        1,
+    );
+    assert!(recall.contains("\"result\""), "recall failed: {recall}");
+    assert!(
+        recall.contains("legacy-entity"),
+        "recall must return the pre-rebrand entity: {recall}"
+    );
+
+    // Shutdown: closing stdin makes the stdio server exit (EOF), which also
+    // ends the reader thread.
+    drop(stdin);
+    let _ = child.wait();
+    let _ = reader.join();
+    let _ = std::fs::remove_dir_all(&home);
+}

@@ -104,6 +104,22 @@ All notable changes to Perseus Vault are documented here. This project adheres t
   122→124. Docs: `docs/specs/court-of-record.md` (design),
   `docs/court-of-record.md` (ops).
 
+### Fixed
+- **Pre-rebrand encrypted vaults unlock after upgrade (#1018).** The rebrand
+  changed the encryption-canary AAD category (`mimir_internal` →
+  `perseus_vault_internal`) with no read fallback, so v2.23.0 rejected
+  v2.21-era encrypted vaults even with the correct key ("failed to decrypt
+  encryption canary"). `verify_or_init_canary` now falls back to the
+  pre-rebrand AAD (the same key opens; a wrong key still fails loudly), and
+  `rekey-aad` migrates the canary onto the current AAD as the deliberate,
+  recoverable upgrade step (new `canary_migrated` tuple field). Restored #427
+  key-path precedence: the default key resolves `~/.perseus-vault/secret.key`,
+  else a legacy `~/.mimir/secret.key`, so upgraded installs never lose their
+  key; `init` reuses an existing key instead of overwriting it, and `keygen`
+  refuses to overwrite. End-to-end upgrade regression test drives the real
+  binary: v2.21-era fixture (legacy canary AAD + legacy key path) →
+  serve startup and recall succeed.
+
 ## [2.23.0] - 2026-08-10
 
 ### Fixed

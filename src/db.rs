@@ -887,13 +887,18 @@ impl Database {
     /// the new scheme (or unencrypted/legacy-plaintext) are detected and left
     /// untouched. No-op if encryption is not enabled.
     ///
-    /// Returns `(migrated, already_current, failed)`. A row lands in `failed`
-    /// only if it authenticates under NEITHER scheme (wrong key, tampering,
-    /// or genuine corruption) -- it is left untouched rather than guessed at.
-    pub fn rekey_aad(&self) -> Result<(usize, usize, usize), Box<dyn std::error::Error>> {
+    /// Returns `(migrated, already_current, failed, canary_migrated)`. A row
+    /// lands in `failed` only if it authenticates under NEITHER scheme (wrong
+    /// key, tampering, or genuine corruption) -- it is left untouched rather
+    /// than guessed at. `canary_migrated` is 1 when the encryption canary
+    /// itself still authenticated only under the pre-rebrand AAD and was
+    /// rewritten onto the current AAD (#1018).
+    pub fn rekey_aad(
+        &self,
+    ) -> Result<(usize, usize, usize, usize), Box<dyn std::error::Error>> {
         let enc = match &self.encryption {
             Some(enc) => enc,
-            None => return Ok((0, 0, 0)),
+            None => return Ok((0, 0, 0, 0)),
         };
         let conn = self.conn()?;
         let rows: Vec<(i64, String, String, String)> = {
@@ -952,7 +957,61 @@ impl Database {
                 }
             }
         }
-        Ok((migrated, already_current, failed))
+
+        // #1018: bring the canary itself onto the current AAD when it still
+        // authenticates only under the pre-rebrand AAD.
+        let canary_migrated = Self::rekey_canary_aad(enc, &conn)?;
+        Ok((migrated, already_current, failed, canary_migrated))
+    }
+
+    /// #1018: migrate the encryption canary onto the current AAD if it still
+    /// authenticates only under the pre-rebrand (`mimir_internal`) AAD. This
+    /// is the deliberate, recoverable migration path for rebrand-era vaults:
+    /// the key is unchanged, and the rewrite lands only after the legacy AAD
+    /// authenticates. Idempotent; returns 1 when the canary was rewritten.
+    fn rekey_canary_aad(
+        enc: &EncryptionManager,
+        conn: &rusqlite::Connection,
+    ) -> Result<usize, Box<dyn std::error::Error>> {
+        let stored: Option<String> = conn
+            .query_row(
+                "SELECT ciphertext FROM encryption_canary WHERE id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(ct) = stored else {
+            return Ok(0);
+        };
+        match enc.decrypt_body(&ct, Self::canary_aad().as_bytes()) {
+            crate::encryption::BodyDecrypt::Plaintext(_) => Ok(0),
+            crate::encryption::BodyDecrypt::AuthFailed(_) => {
+                match enc.decrypt_body(&ct, Self::legacy_canary_aad().as_bytes()) {
+                    crate::encryption::BodyDecrypt::Plaintext(plain) => {
+                        let new_ct = enc.encrypt(&plain, Self::canary_aad().as_bytes())?;
+                        conn.execute(
+                            "UPDATE encryption_canary SET ciphertext = ?1, created_at_unix_ms = ?2 \
+                             WHERE id = 1 AND ciphertext = ?3",
+                            params![new_ct, now_ms(), ct],
+                        )?;
+                        eprintln!(
+                            "perseus-vault: rekey-aad migrated the encryption canary to the \
+                             current AAD"
+                        );
+                        Ok(1)
+                    }
+                    _ => {
+                        eprintln!(
+                            "perseus-vault: rekey-aad could not authenticate the encryption \
+                             canary under either AAD — left untouched"
+                        );
+                        Ok(0)
+                    }
+                }
+            }
+            // Not our ciphertext (e.g. a legacy plaintext row); leave it.
+            _ => Ok(0),
+        }
     }
 
     /// Encrypt existing plaintext body_json records in place. Operates on
@@ -1373,6 +1432,14 @@ impl Database {
         Self::build_aad("perseus_vault_internal", "encryption_canary")
     }
 
+    /// AAD the encryption canary was written under BEFORE the rebrand
+    /// (v2.21.0 and earlier used the `mimir_internal` category). Kept ONLY as
+    /// a read fallback so pre-rebrand encrypted vaults open with their
+    /// existing key (#1018); never used for new canaries.
+    fn legacy_canary_aad() -> String {
+        Self::build_aad("mimir_internal", "encryption_canary")
+    }
+
     /// Known plaintext stored (encrypted) in the canary row. Version-tagged so a
     /// future format change is distinguishable rather than ambiguous.
     const CANARY_MARKER: &'static str = "{\"canary\":\"perseus-vault\",\"v\":1}";
@@ -1403,6 +1470,30 @@ impl Database {
         if let Some(ct) = stored {
             return match enc.decrypt_body(&ct, aad.as_bytes()) {
                 crate::encryption::BodyDecrypt::Plaintext(_) => Ok(()),
+                crate::encryption::BodyDecrypt::AuthFailed(_) => {
+                    // #1018: the rebrand changed the canary's AAD category
+                    // (`mimir_internal` -> `perseus_vault_internal`) without a
+                    // read fallback, so v2.23.0 rejected pre-rebrand vaults
+                    // even with the correct key. The same key authenticates
+                    // the legacy canary: accept it and leave the row untouched
+                    // until `rekey-aad` migrates it. A wrong key fails under
+                    // BOTH AADs and still errors loudly.
+                    match enc.decrypt_body(&ct, Self::legacy_canary_aad().as_bytes()) {
+                        crate::encryption::BodyDecrypt::Plaintext(_) => {
+                            eprintln!(
+                                "perseus-vault: NOTE — encryption canary authenticated under \
+                                 the pre-rebrand (mimir) AAD; key accepted. Run \
+                                 `perseus-vault rekey-aad` to migrate the canary to the \
+                                 current AAD."
+                            );
+                            Ok(())
+                        }
+                        _ => Err("failed to decrypt encryption canary — the provided key \
+                                  is incorrect or the database is corrupt (also tried the \
+                                  pre-rebrand canary AAD)"
+                            .to_string()),
+                    }
+                }
                 // A canary we wrote is always ciphertext, so anything other than a
                 // clean decrypt means the key is wrong or the row is corrupt.
                 _ => Err("failed to decrypt encryption canary — the provided key \
@@ -31278,6 +31369,140 @@ pub(crate) mod tests {
         let _ = fs::remove_file(&path);
     }
 
+    // #1018: rebrand canary-AAD compatibility (mimir_internal -> perseus_vault_internal).
+    // A v2.21-era vault's canary was encrypted under `build_aad("mimir_internal",
+    // "encryption_canary")`; the rebrand changed the category to
+    // `perseus_vault_internal` WITHOUT a read fallback, so v2.23.0 rejected the
+    // same key as "incorrect or the database is corrupt".
+
+    /// Rewrite the canary row the way a v2.21-era vault has it on disk:
+    /// ciphertext under the PRE-rebrand AAD, same key, same marker plaintext.
+    fn rewrite_canary_to_legacy_rebrand_aad(db: &Database, key_path: &str) {
+        use crate::encryption::EncryptionManager;
+        let enc = EncryptionManager::from_key_file(key_path).unwrap();
+        let stored: String = db
+            .conn()
+            .unwrap()
+            .query_row(
+                "SELECT ciphertext FROM encryption_canary WHERE id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        // Must authenticate under the CURRENT canary AAD first (this build
+        // wrote it); re-encrypt under the pre-rebrand AAD.
+        let plain = match enc.decrypt_body(&stored, Database::canary_aad().as_bytes()) {
+            crate::encryption::BodyDecrypt::Plaintext(p) => p,
+            _ => panic!("fixture: canary did not decrypt under current AAD"),
+        };
+        let legacy_ct = enc
+            .encrypt(
+                &plain,
+                Database::build_aad("mimir_internal", "encryption_canary").as_bytes(),
+            )
+            .unwrap();
+        db.conn()
+            .unwrap()
+            .execute(
+                "UPDATE encryption_canary SET ciphertext = ?1 WHERE id = 1",
+                rusqlite::params![legacy_ct],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn legacy_rebrand_canary_opens_with_the_same_key() {
+        let (mut db, path) = temp_db();
+        let (key_path, _) = temp_key_file();
+        db.set_encryption(&key_path).unwrap();
+        db.remember(&make_entity("r-1", "note", "r-1", r#"{"vault":"pre-rebrand"}"#))
+            .unwrap();
+        rewrite_canary_to_legacy_rebrand_aad(&db, &key_path);
+        drop(db);
+
+        // Reopen with the SAME key: must succeed. Regression: v2.23.0 failed
+        // here with "failed to decrypt encryption canary — the provided key is
+        // incorrect or the database is corrupt".
+        let mut db2 = Database::open(&path).unwrap();
+        db2.set_encryption(&key_path)
+            .expect("the existing key must open a legacy-rebrand canary vault");
+        // And the stored data still reads back.
+        let ent = db2.get_entity("note", "r-1").unwrap().unwrap();
+        assert_eq!(ent.body_json, r#"{"vault":"pre-rebrand"}"#);
+        let _ = std::fs::remove_file(&key_path);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn wrong_key_still_rejected_on_legacy_rebrand_canary() {
+        let (mut db, path) = temp_db();
+        let (key_a, _) = temp_key_file();
+        db.set_encryption(&key_a).unwrap();
+        db.remember(&make_entity("r-2", "note", "r-2", r#"{"vault":"pre-rebrand"}"#))
+            .unwrap();
+        rewrite_canary_to_legacy_rebrand_aad(&db, &key_a);
+        drop(db);
+
+        // A genuinely wrong key must STILL fail loudly: the legacy fallback
+        // only accepts the key that authenticates the canary.
+        let (key_b, _) = temp_key_file();
+        let mut db2 = Database::open(&path).unwrap();
+        let err = db2.set_encryption(&key_b).unwrap_err();
+        assert!(
+            err.contains("canary"),
+            "wrong key must fail loudly on a legacy-rebrand canary, got: {err}"
+        );
+        let _ = std::fs::remove_file(&key_a);
+        let _ = std::fs::remove_file(&key_b);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn rekey_aad_migrates_legacy_rebrand_canary() {
+        let (mut db, path) = temp_db();
+        let (key_path, _) = temp_key_file();
+        db.set_encryption(&key_path).unwrap();
+        db.remember(&make_entity("r-3", "note", "r-3", r#"{"vault":"pre-rebrand"}"#))
+            .unwrap();
+        rewrite_canary_to_legacy_rebrand_aad(&db, &key_path);
+
+        // rekey-aad is the deliberate migration path: it must also bring the
+        // canary onto the current AAD.
+        let report = db.rekey_aad().unwrap();
+        assert_eq!(report.0, 0, "entity rows were already on the current AAD");
+        assert_eq!(report.1, 1, "the single entity row is already current");
+        assert_eq!(report.2, 0, "nothing may fail to authenticate");
+        assert_eq!(report.3, 1, "the legacy-rebrand canary must be migrated");
+
+        // The canary must now authenticate under the CURRENT AAD alone.
+        let enc = crate::encryption::EncryptionManager::from_key_file(&key_path).unwrap();
+        let stored: String = db
+            .conn()
+            .unwrap()
+            .query_row(
+                "SELECT ciphertext FROM encryption_canary WHERE id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            matches!(
+                enc.decrypt_body(&stored, Database::canary_aad().as_bytes()),
+                crate::encryption::BodyDecrypt::Plaintext(_)
+            ),
+            "migrated canary must authenticate under the current AAD"
+        );
+
+        // Idempotent: a second run must not re-migrate the canary.
+        let report2 = db.rekey_aad().unwrap();
+        assert_eq!(report2.0, 0);
+        assert_eq!(report2.1, 1);
+        assert_eq!(report2.2, 0);
+        assert_eq!(report2.3, 0, "re-running rekey-aad must not re-migrate the canary");
+        let _ = std::fs::remove_file(&key_path);
+        let _ = fs::remove_file(&path);
+    }
+
     // #849: scoped rejected-value tombstones — db-level contract tests.
     #[test]
     fn rejected_value_tombstone_blocks_same_value_under_any_key_in_scope() {
@@ -35709,13 +35934,14 @@ pub(crate) mod tests {
         let before = db.get_entity("insight", "old-note").unwrap().unwrap();
         assert_eq!(before.body_json, r#"{"content": "pre-migration secret"}"#);
 
-        let (migrated, already_current, failed) = db.rekey_aad().unwrap();
+        let (migrated, already_current, failed, canary_migrated) = db.rekey_aad().unwrap();
         assert_eq!(migrated, 1, "only the legacy row should need migrating");
         assert_eq!(
             already_current, 1,
             "the fresh row is already on the new scheme"
         );
         assert_eq!(failed, 0);
+        assert_eq!(canary_migrated, 0, "the canary is already on the current AAD");
 
         // Still reads correctly after migration, and the raw column is now
         // encrypted under the new scheme (decryptable via build_aad alone).
@@ -35741,10 +35967,11 @@ pub(crate) mod tests {
         );
 
         // Idempotent: running it again finds nothing left to migrate.
-        let (migrated2, already_current2, failed2) = db.rekey_aad().unwrap();
+        let (migrated2, already_current2, failed2, canary_migrated2) = db.rekey_aad().unwrap();
         assert_eq!(migrated2, 0, "re-running rekey_aad should be a no-op");
         assert_eq!(already_current2, 2);
         assert_eq!(failed2, 0);
+        assert_eq!(canary_migrated2, 0);
 
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(&key_path);
