@@ -383,39 +383,72 @@ fn legacy_mimir_vault_opens_and_recalls_with_current_binary() {
         .spawn()
         .expect("spawn perseus-vault serve");
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let stdout_handle = child.stdout.take().unwrap();
+
+    // Reader thread: the stdio server answers on stdout. A channel decouples
+    // reading from the bounded wait below, so a silent server can never hang
+    // the CI job forever (the pre-fix #1018 crash is one failure mode; a
+    // stuck server is the other).
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let reader = std::thread::spawn(move || {
+        let stdout = BufReader::new(stdout_handle);
+        for line in stdout.lines() {
+            match line {
+                Ok(l) => {
+                    if tx.send(l).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
 
     // One JSON-RPC exchange: initialize, then recall. Fails fast if the
-    // server exits (the #1018 regression) instead of answering.
+    // server exits (the #1018 regression) or goes silent (hard 240s
+    // deadline per call, then the child is killed).
     fn mcp_call(
         stdin: &mut std::process::ChildStdin,
         child: &mut std::process::Child,
-        stdout: &mut impl BufRead,
+        rx: &std::sync::mpsc::Receiver<String>,
         payload: &str,
         target: u64,
     ) -> String {
+        use std::time::{Duration, Instant};
         writeln!(stdin, "{payload}").unwrap();
-        let mut line = String::new();
-        for _ in 0..5000 {
-            if let Ok(Some(status)) = child.try_wait() {
-                panic!("serve exited ({status}) before answering id {target}");
-            }
-            line.clear();
-            let n = stdout.read_line(&mut line).expect("read serve stdout");
-            assert!(n > 0, "serve stdout closed before answering id {target}");
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
-                if v.get("id").and_then(|i| i.as_u64()) == Some(target) {
-                    return line;
+        let deadline = Duration::from_secs(240);
+        let start = Instant::now();
+        loop {
+            match rx.recv_timeout(Duration::from_secs(5)) {
+                Ok(line) => {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
+                        if v.get("id").and_then(|i| i.as_u64()) == Some(target) {
+                            return line;
+                        }
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if let Ok(Some(status)) = child.try_wait() {
+                        panic!("serve exited ({status}) before answering id {target}");
+                    }
+                    if start.elapsed() >= deadline {
+                        let _ = child.kill();
+                        panic!(
+                            "serve did not answer id {target} within {deadline:?} — killed it"
+                        );
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    panic!("serve stdout closed before answering id {target}");
                 }
             }
         }
-        panic!("serve did not answer id {target} within the line budget");
     }
 
     let init = mcp_call(
         &mut stdin,
         &mut child,
-        &mut stdout,
+        &rx,
         r#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{}}"#,
         0,
     );
@@ -430,7 +463,7 @@ fn legacy_mimir_vault_opens_and_recalls_with_current_binary() {
     let recall = mcp_call(
         &mut stdin,
         &mut child,
-        &mut stdout,
+        &rx,
         r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"perseus_vault_recall","arguments":{"query":"pre-rebrand secret"}}}"#,
         1,
     );
@@ -440,8 +473,10 @@ fn legacy_mimir_vault_opens_and_recalls_with_current_binary() {
         "recall must return the pre-rebrand entity: {recall}"
     );
 
-    // Shutdown: closing stdin makes the stdio server exit (EOF).
+    // Shutdown: closing stdin makes the stdio server exit (EOF), which also
+    // ends the reader thread.
     drop(stdin);
     let _ = child.wait();
+    let _ = reader.join();
     let _ = std::fs::remove_dir_all(&home);
 }
