@@ -486,6 +486,9 @@ pub struct RecallArgs {
     /// Unknown names are a hard error. Default None = unshaped (#247).
     #[serde(default)]
     pub budget_profile: Option<String>,
+    /// #1003: multi-hop selection strategy (opt-in). See the RecallParams doc.
+    #[serde(default)]
+    pub multihop: bool,
 }
 
 pub type BatchQuery = RecallArgs;
@@ -1835,6 +1838,7 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
         entity_type: a.entity_type,
         type_filter: None,
         budget_profile: a.budget_profile.clone(),
+        multihop: a.multihop,
         limit: effective_limit,
         offset: a.offset,
         min_decay: a.min_decay,
@@ -2322,6 +2326,7 @@ pub fn handle_recall_batch(db: &Database, args: Value) -> Result<String, String>
             entity_type: q.entity_type.clone(),
             type_filter: None,
             budget_profile: q.budget_profile.clone(),
+            multihop: q.multihop,
             limit: q.limit,
             offset: q.offset,
             min_decay: q.min_decay,

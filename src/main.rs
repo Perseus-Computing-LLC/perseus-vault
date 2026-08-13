@@ -40,6 +40,7 @@ mod log_digest;
 mod mcp;
 mod maintenance;
 mod memory_types;
+mod multihop;
 mod mental_model;
 mod models;
 mod multimodal;

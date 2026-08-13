@@ -350,6 +350,7 @@ pub fn build_projection(db: &Database, req: &ProjectionRequest) -> Result<Projec
         entity_type: None,
         type_filter: None,
         budget_profile: None,
+        multihop: false,
         limit: pool_limit,
         offset: 0,
         min_decay: 0.0,

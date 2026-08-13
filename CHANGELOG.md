@@ -34,6 +34,16 @@ All notable changes to Perseus Vault are documented here. This project adheres t
   `fused_trace.truncation.per_type` (never silent); unknown profiles are a
   hard error; default None keeps recalls byte-identical (#247). Spec:
   `docs/specs/per-type-context-budgets.md`.
+- **Multi-hop retrieval arm: graph traversal + entity coverage (#1003).**
+  Opt-in `multihop` on recall (default OFF, #247): hop-expands from the top
+  fused anchors via the entity link graph (existing `graph_expand`, #869
+  gates intact, 0.8^hop discount), then selects the final set by greedy
+  ENTITY COVERAGE — the stopword-filtered significant query tokens, set-cover
+  order within the caller limit + #942 token budget (CogniCore
+  MultiHopMemoryBackend borrow). Trace in `fused_trace.multihop`
+  (hop_expanded, expanded_ids, selection_order, covered/uncovered entities).
+  Deterministic and bounded (3 anchors, 1 hop, 20 neighbors, 12 entities).
+  Spec: `docs/specs/multihop-retrieval.md`. No registry change.
 - **Config self-report with requested-vs-resolved diff (#1010).** New
   `perseus_vault_config_report` MCP tool (registry 134→135): per-stage
   provider/config self-report — embedding_backend, model_backend,
