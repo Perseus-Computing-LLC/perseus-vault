@@ -7412,6 +7412,25 @@ pub fn handle_operator_review(db: &Database, args: Value) -> Result<String, Stri
     let mental_models = db.mental_model_review_list(limit, None).unwrap_or_default();
     let write_quarantine = db.write_quarantine_list(None, limit).unwrap_or_default();
     let eval_regressions = db.eval_run_alerts(24, 10).unwrap_or_default();
+    // #1002: pending sleep proposals (dedup + negation-shaped conflicts)
+    // surface as their own lane — decisions stay explicit.
+    let sleep_proposals = db
+        .state_list(crate::sleep::STATE_PREFIX)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|key| {
+            db.state_get(&key)
+                .ok()
+                .flatten()
+                .and_then(|e| serde_json::from_str::<serde_json::Value>(&e.value_json).ok())
+                .map(|mut v| {
+                    if let serde_json::Value::Object(obj) = &mut v {
+                        obj.insert("state_key".into(), serde_json::Value::String(key));
+                    }
+                    v
+                })
+        })
+        .collect::<Vec<_>>();
     let mut out = json!({
         "reviewed_at_unix_ms": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as i64, "category":a.category,
         "contradictions":contradictions, "stale_candidates":stale["flagged"],
@@ -7433,6 +7452,10 @@ pub fn handle_operator_review(db: &Database, args: Value) -> Result<String, Stri
         // evaluation) — the regression-alert lane. Read-only; full history
         // and trend via perseus_vault_eval_history.
         "eval_regressions": eval_regressions.clone(),
+        // #1002: sleep-cycle proposals (merge + negation-shaped conflicts),
+        // pending operator decision. Read-only; decide via merge/verify/
+        // forget or dismiss by deleting the named state_key.
+        "sleep_proposals": sleep_proposals.clone(),
         "read_only":true
     });
     if a.table {
@@ -7450,6 +7473,7 @@ pub fn handle_operator_review(db: &Database, args: Value) -> Result<String, Stri
             &json!(mental_models),
             &json!(write_quarantine),
             &json!(eval_regressions),
+            &json!(sleep_proposals),
         );
         let mut summary = serde_json::Map::new();
         for it in &items {
@@ -7488,6 +7512,7 @@ fn operator_review_table_items(
     mental_models: &Value,
     write_quarantine: &Value,
     eval_regressions: &Value,
+    sleep_proposals: &Value,
 ) -> Vec<Value> {
     fn cell(v: &Value) -> String {
         v.as_str().unwrap_or("n/a").to_string()
@@ -7604,6 +7629,22 @@ fn operator_review_table_items(
                 false,
                 "<24h".into(),
                 format!("eval_history id={id}"),
+            ));
+        }
+    }
+    if let Some(props) = sleep_proposals.as_array() {
+        for p in props {
+            let kind = cell(&p["kind"]);
+            let sk = cell(&p["state_key"]);
+            items.push(row(
+                "sleep",
+                format!("{}:{}", cell(&p["entity_a"]), cell(&p["entity_b"])),
+                cell(&p["category"]),
+                format!("{} proposal", kind),
+                cell(&p["reason"]),
+                kind == "conflict",
+                "n/a".into(),
+                format!("decide via merge/verify/forget; dismiss: state_delete key={sk}"),
             ));
         }
     }
@@ -8058,6 +8099,61 @@ pub fn handle_consolidate(db: &Database, args: Value) -> String {
         v["maintenance_guard"] = crate::maintenance::guard_block(force);
         Ok((v, receipt))
     })
+}
+
+// ─── perseus_vault_sleep handler (#1002) ────────────────────────────────
+
+/// Wire args for perseus_vault_sleep: SleepParams plus a flattened
+/// serde surface (defaults live in the handler, not in the model).
+#[derive(Debug, Deserialize)]
+pub struct SleepArgs {
+    #[serde(flatten)]
+    pub params: crate::models::SleepParams,
+}
+
+impl Default for SleepArgs {
+    fn default() -> Self {
+        Self {
+            params: crate::models::SleepParams {
+                category: String::new(),
+                similarity_threshold: 0.75,
+                max_entities: 200,
+                max_proposals: 50,
+                dry_run: false,
+                include_compression: false,
+                workspace_hash: None,
+                global: false,
+                requesting_agent_id: String::new(),
+                force: false,
+            },
+        }
+    }
+}
+
+pub fn handle_sleep(db: &Database, args: Value) -> String {
+    let params: crate::models::SleepParams = match serde_json::from_value(args) {
+        Ok(p) => p,
+        Err(e) => {
+            return json!({"error": format!("Invalid sleep arguments: {e}")}).to_string()
+        }
+    };
+    if params.category.is_empty() {
+        return json!({"error": "Invalid sleep arguments: category is required"}).to_string();
+    }
+    match db.run_sleep(&params) {
+        Ok(report) => {
+            let mut v = serde_json::to_value(&report)
+                .unwrap_or_else(|e| json!({"error": format!("Serialization failed: {e}")}));
+            if let serde_json::Value::Object(obj) = &mut v {
+                obj.insert(
+                    "maintenance_guard".into(),
+                    crate::maintenance::guard_block(params.force),
+                );
+            }
+            v.to_string()
+        }
+        Err(e) => json!({"error": format!("sleep failed: {e}")}).to_string(),
+    }
 }
 
 // ─── perseus_vault_dream handler ─────────────────────────────────────────

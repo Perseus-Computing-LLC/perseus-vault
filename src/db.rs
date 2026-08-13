@@ -17746,6 +17746,192 @@ impl Database {
         })
     }
 
+    /// #1002: bounded sleep-cycle pass (CogniCore SleepProcessor borrow).
+    /// Dedup + contradiction resolution WITHOUT the LLM: one bounded scan
+    /// (same #952 window discipline), pairwise trigram similarity, and the
+    /// cheap negation prefilter. Everything it finds is a PROPOSAL —
+    /// merge pairs and negation-shaped conflicts are persisted under
+    /// `sleep_proposal.<uuid>` state keys (skipped in dry-run) and surface
+    /// as the `sleep` lane of perseus_vault_operator_review; nothing is
+    /// auto-merged or auto-resolved. Compression, the only auto-committed
+    /// phase, delegates to the existing #952 `consolidate` (bounded,
+    /// verified/scored-exempt, evidence-linked) when requested.
+    pub fn run_sleep(
+        &self,
+        params: &crate::models::SleepParams,
+    ) -> Result<crate::sleep::SleepReport, Box<dyn std::error::Error>> {
+        // #886: curated mental models are off-limits to automatic passes.
+        if params.category == crate::mental_model::MENTAL_MODEL_CATEGORY {
+            return Err(format!(
+                "sleep refuses category '{}': mental models are curated, not \
+                 auto-generated",
+                crate::mental_model::MENTAL_MODEL_CATEGORY
+            )
+            .into());
+        }
+        let (scope_ws, global) =
+            Self::resolve_maintenance_scope(params.workspace_hash.as_deref(), params.global)?;
+        if global {
+            self.authorize_global_maintenance(&params.requesting_agent_id)?;
+        }
+        // #952: maintenance/serving isolation — off-peak window + live-recall
+        // SLO start gate, serialized execution slot (fail-early on overlap).
+        if let Err(e) = crate::maintenance::check_start(self, params.force) {
+            return Err(e.into());
+        }
+        let _lock = match crate::maintenance::acquire_maintenance(self, "sleep") {
+            Ok(l) => l,
+            Err(e) => return Err(e.into()),
+        };
+        let conn = self.conn()?;
+        let budget = params.max_entities.clamp(1, 2000);
+        let (sql, ws): (String, Option<&str>) = match &scope_ws {
+            Some(ws) => (
+                "SELECT id, key, body_json, certainty, workspace_hash \
+                 FROM entities WHERE category = ?1 AND archived = 0 \
+                 AND (workspace_hash = ?2 OR workspace_hash = '') \
+                 ORDER BY last_accessed_unix_ms DESC LIMIT ?3"
+                    .to_string(),
+                Some(ws.as_str()),
+            ),
+            None => (
+                "SELECT id, key, body_json, certainty, workspace_hash \
+                 FROM entities WHERE category = ?1 AND archived = 0 \
+                 ORDER BY last_accessed_unix_ms DESC LIMIT ?2"
+                    .to_string(),
+                None,
+            ),
+        };
+        let mut stmt = conn.prepare(&sql)?;
+        let map_row = |r: &rusqlite::Row| -> rusqlite::Result<(String, String, String, f64, String)> {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, f64>(3).unwrap_or(0.5),
+                r.get::<_, String>(4).unwrap_or_default(),
+            ))
+        };
+        let rows = match ws {
+            Some(ws) => stmt.query_map(
+                rusqlite::params_from_iter(vec![
+                    Box::new(params.category.as_str()) as Box<dyn rusqlite::types::ToSql>,
+                    Box::new(ws) as Box<dyn rusqlite::types::ToSql>,
+                    Box::new(budget) as Box<dyn rusqlite::types::ToSql>,
+                ]),
+                map_row,
+            )?,
+            None => stmt.query_map(
+                rusqlite::params_from_iter(vec![
+                    Box::new(params.category.as_str()) as Box<dyn rusqlite::types::ToSql>,
+                    Box::new(budget) as Box<dyn rusqlite::types::ToSql>,
+                ]),
+                map_row,
+            )?,
+        };
+        let entities: Vec<(String, String, String, f64, String)> =
+            rows.filter_map(|r| r.ok()).collect();
+        drop(stmt);
+
+        let mut proposals: Vec<crate::sleep::SleepProposal> = Vec::new();
+        let max_proposals = params.max_proposals.clamp(1, 200) as usize;
+        for i in 0..entities.len() {
+            for j in (i + 1)..entities.len() {
+                if proposals.len() >= max_proposals {
+                    break;
+                }
+                let (id1, _k1, body1, _c1, ws1) = &entities[i];
+                let (id2, _k2, body2, _c2, ws2) = &entities[j];
+                let sim = Self::trigram_similarity(body1, body2);
+                if crate::sleep::negation_prefilter(body1, body2) {
+                    // Negation-shaped pairs are contradictions FIRST — even a
+                    // high trigram similarity ("X works" vs "X does not work")
+                    // must never be proposed as a merge.
+                    proposals.push(crate::sleep::SleepProposal {
+                        kind: "conflict".into(),
+                        category: params.category.clone(),
+                        entity_a: id1.clone(),
+                        entity_b: id2.clone(),
+                        similarity: sim,
+                        reason: "negation-shaped pair (token overlap + negation word)".into(),
+                        workspace_hash: if ws1 == ws2 { ws1.clone() } else { String::new() },
+                        status: "pending".into(),
+                    });
+                } else if sim >= params.similarity_threshold {
+                    proposals.push(crate::sleep::SleepProposal {
+                        kind: "merge".into(),
+                        category: params.category.clone(),
+                        entity_a: id1.clone(),
+                        entity_b: id2.clone(),
+                        similarity: sim,
+                        reason: format!("trigram similarity {sim:.3} >= threshold"),
+                        workspace_hash: if ws1 == ws2 { ws1.clone() } else { String::new() },
+                        status: "pending".into(),
+                    });
+                }
+            }
+        }
+
+        // Persist proposals (state-table keys; no schema change). Dry-run is
+        // pure: identical work, zero writes.
+        if !params.dry_run {
+            for p in &proposals {
+                let key = format!("{}{}", crate::sleep::STATE_PREFIX, uuid::Uuid::new_v4().simple());
+                let value = serde_json::to_string(p)?;
+                self.state_set(&crate::models::StateEntry {
+                    key,
+                    value_json: value,
+                    expires_at_unix_ms: None,
+                    created_at_unix_ms: now_ms(),
+                })?;
+            }
+        }
+
+        // Release the maintenance slot BEFORE delegating compression —
+        // consolidate acquires its own slot and nested acquisition would
+        // fail-early.
+        drop(_lock);
+
+        // Compression phase: delegated to the existing bounded consolidate.
+        let compression = if params.include_compression {
+            let cparams = crate::models::ConsolidateParams {
+                category: params.category.clone(),
+                similarity_threshold: params.similarity_threshold,
+                limit: budget.min(100),
+                offset: 0,
+                dry_run: params.dry_run,
+                cold_first: true,
+                archive_sources: false,
+                workspace_hash: scope_ws.clone(),
+                global,
+                requesting_agent_id: params.requesting_agent_id.clone(),
+                refine_existing: false,
+                quote_cap_chars: 1500,
+                force: params.force,
+            };
+            match self.consolidate(&cparams) {
+                Ok(rep) => serde_json::to_value(&rep).unwrap_or_else(|e| {
+                    serde_json::json!({ "error": format!("serialize: {e}") })
+                }),
+                Err(e) => serde_json::json!({ "error": format!("{e}") }),
+            }
+        } else {
+            serde_json::Value::Null
+        };
+
+        let dedup_proposals = proposals.iter().filter(|p| p.kind == "merge").count();
+        let conflict_proposals = proposals.iter().filter(|p| p.kind == "conflict").count();
+        Ok(crate::sleep::SleepReport {
+            category: params.category.clone(),
+            dry_run: params.dry_run,
+            scanned: entities.len(),
+            dedup_proposals,
+            conflict_proposals,
+            compression,
+            proposals,
+        })
+    }
+
     /// Categories `dream` never scans: its own output ("insight" — no
     /// meta-insights / runaway recursion), consolidate's output
     /// ("observation"), synthesize's output ("synthesis"), and "memories"

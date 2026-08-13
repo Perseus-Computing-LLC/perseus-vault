@@ -5153,6 +5153,106 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Consolidate Overlapping Facts into Observations"
   },
   {
+    "name": "perseus_vault_sleep",
+    "description": "#1002: bounded sleep-cycle consolidation without an LLM (CogniCore SleepProcessor borrow). One bounded scan of a category (max_entities, #952 window discipline + maintenance gate) produces PROPOSALS, never silent changes: (1) dedup — pairs at/above similarity_threshold become merge proposals; (2) contradiction — pairs with token overlap PLUS a negation word ('X works' vs 'X does not work') become conflict proposals; (3) optional compression — delegates to perseus_vault_consolidate (cold_first) so fading memories are compressed into evidence-linked observations (the only auto-committed artifact; verified/scored sources exempt). Proposals persist under sleep_proposal.* state keys and surface as the 'sleep' lane of perseus_vault_operator_review for explicit operator decisions. dry_run=true performs the identical work with zero writes.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "category": {
+          "type": "string",
+          "description": "Category to scan. The curated mental_model category is refused (curated-only)."
+        },
+        "similarity_threshold": {
+          "type": "number",
+          "default": 0.75,
+          "description": "Trigram similarity at or above which two entities are dedup candidates (merge proposal)"
+        },
+        "max_entities": {
+          "type": "integer",
+          "default": 200,
+          "description": "Scan budget: most-recently-accessed entities examined (clamped 1..=2000)"
+        },
+        "max_proposals": {
+          "type": "integer",
+          "default": 50,
+          "description": "Proposal budget: cap on merge+conflict proposals per run (clamped 1..=200)"
+        },
+        "dry_run": {
+          "type": "boolean",
+          "default": false,
+          "description": "Preview: identical scan and report, zero persisted proposals, zero compression writes"
+        },
+        "include_compression": {
+          "type": "boolean",
+          "default": false,
+          "description": "Also run the delegated cold_first consolidate pass over the same category (its own maintenance slot; results reported under 'compression')"
+        },
+        "workspace_hash": {
+          "type": "string",
+          "description": "#854 workspace scope. Mutually exclusive with global=true. One of workspace_hash or global is required."
+        },
+        "global": {
+          "type": "boolean",
+          "default": false,
+          "description": "#854 deliberate whole-vault mode, capability-gated. Mutually exclusive with workspace_hash."
+        },
+        "requesting_agent_id": {
+          "type": "string",
+          "default": "",
+          "description": "Host identity stamped by the MCP transport; used for global-mode authorization."
+        },
+        "force": {
+          "type": "boolean",
+          "default": false,
+          "description": "#952: explicit operator trigger — bypasses the maintenance off-peak window and the live-recall SLO start gate (mid-run pauses still apply)."
+        }
+      },
+      "required": [
+        "category"
+      ]
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "category": {
+          "type": "string"
+        },
+        "dry_run": {
+          "type": "boolean"
+        },
+        "scanned": {
+          "type": "integer",
+          "description": "Entities examined in this run"
+        },
+        "dedup_proposals": {
+          "type": "integer",
+          "description": "Merge proposals found (kind=merge)"
+        },
+        "conflict_proposals": {
+          "type": "integer",
+          "description": "Negation-shaped conflict proposals found (kind=conflict)"
+        },
+        "compression": {
+          "description": "Delegated consolidate report, or null when include_compression is false"
+        },
+        "proposals": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "description": "SleepProposal: kind, category, entity_a, entity_b, similarity, reason, workspace_hash, status"
+          }
+        },
+        "maintenance_guard": {
+          "description": "#952 maintenance-window status for this run"
+        }
+      }
+    },
+    "annotations": {
+      "readOnlyHint": false
+    },
+    "title": "Sleep-Cycle Consolidation (Proposal-Only Pass)"
+  },
+  {
     "name": "perseus_vault_dream",
     "description": "Sleep-time LLM consolidation: batch clusters of related cold/episodic memories, reflect over each cluster via the configured LLM endpoint, and write back durable higher-order SEMANTIC insights (category='insight', semantic layer) — 'given these N memories, what stable pattern/preference/fact do they collectively imply?'. Each written insight carries evidence_for links to every source entity (full provenance), a certainty blended from LLM confidence and evidence coverage, and derivation='dream' so it is auditable and reversible. Idempotent: insights are keyed by an evidence-set hash, so re-dreaming an unchanged cluster never spawns duplicates. Contradictory sources surface as a flagged 'contradiction' insight, never a silent merge. Never fabricates: clusters that support no durable generalization are a no-op. Requires --llm-endpoint (fully local via Ollama); returns a clean error without it unless fallback_consolidate=true, which runs the non-LLM perseus_vault_consolidate pass instead. Bounded by max_entities/max_clusters budgets. Preview with dry_run=true.",
     "inputSchema": {
@@ -7070,6 +7170,7 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
         "perseus_vault_declared_query" => tools::handle_declared_query(db, args).map_err(|e| e.to_string()),
         "perseus_vault_conflicts" => Ok(tools::handle_conflicts(db, args)),
         "perseus_vault_consolidate" => Ok(tools::handle_consolidate(db, args)),
+        "perseus_vault_sleep" => Ok(tools::handle_sleep(db, args)),
         "perseus_vault_maintenance_status" => {
             tools::handle_maintenance_status(db, args).map_err(|e| e.to_string())
         }
@@ -7180,7 +7281,7 @@ mod tests {
         );
         assert_eq!(
             registry_names.len(),
-            136,
+            137,
             "update public metadata when adding a tool"
         );
 

@@ -52,6 +52,7 @@ mod retrieval_telemetry;
 mod revocation_cutoff;
 mod schema;
 mod signed_profile;
+mod sleep;
 pub(crate) mod stage_trace;
 mod tools;
 mod transport;

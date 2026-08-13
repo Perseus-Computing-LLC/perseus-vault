@@ -2035,6 +2035,22 @@ pub struct BenchResult {
     pub created_at_unix_ms: i64,
 }
 
+/// #1002: bounded sleep-cycle pass — dedup + negation-prefiltered
+/// contradiction proposals and optional delegated compression.
+#[derive(Debug, Deserialize)]
+pub struct SleepParams {
+    pub category: String,
+    pub similarity_threshold: f64,
+    pub max_entities: i64,
+    pub max_proposals: i64,
+    pub dry_run: bool,
+    pub include_compression: bool,
+    pub workspace_hash: Option<String>,
+    pub global: bool,
+    pub requesting_agent_id: String,
+    pub force: bool,
+}
+
 /// Parameters for the perseus_vault_consolidate tool (#steal-2, competitive research:
 /// Hindsight's Observation layer). Merges overlapping/duplicative facts within
 /// a category into a smaller number of durable, evidence-tracked observations.

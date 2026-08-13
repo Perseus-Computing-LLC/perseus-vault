@@ -14,6 +14,18 @@ All notable changes to Perseus Vault are documented here. This project adheres t
   `FusedTrace.anchor_matched`. Workspace-scoped, read-only, default OFF
   (#247 byte-identical default recalls). Spec:
   `docs/specs/anchor-expansion.md`.
+- **Sleep-cycle consolidation, proposal-only (#1002).** New
+  `perseus_vault_sleep` MCP tool (registry 136→137): a bounded, LLM-free
+  pass over a category that PROPOSES, never silently changes — merge
+  proposals (trigram similarity ≥ threshold), negation-shaped conflict
+  proposals (token overlap + negation word, classified BEFORE similarity so
+  "X works" vs "X does not work" is never a merge), and optional delegated
+  cold_first compression via consolidate (the only auto-committed phase;
+  verified/scored exempt). Proposals persist under `sleep_proposal.*` state
+  keys and surface as the new `sleep` lane of
+  `perseus_vault_operator_review`. #952-bounded (maintenance gate, scan +
+  proposal budgets), dry_run performs identical work with zero writes.
+  Spec: `docs/specs/sleep-consolidation.md`.
 - **Config self-report with requested-vs-resolved diff (#1010).** New
   `perseus_vault_config_report` MCP tool (registry 134→135): per-stage
   provider/config self-report — embedding_backend, model_backend,
