@@ -640,7 +640,7 @@ CREATE INDEX IF NOT EXISTS idx_preload_proposals_state
 /// basis for tier-3 projections (embeddings first). New table, idempotent,
 /// no backfill (DDL_V0_2_0 is re-run at every open, so existing stores pick
 /// it up on next open).
-pub(crate) const SCHEMA_VERSION: i64 = 41;
+pub(crate) const SCHEMA_VERSION: i64 = 42;
 
 /// Initialize the v0.2.0 schema on a fresh database.
 pub fn initialize_schema(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
@@ -770,6 +770,11 @@ fn apply_migrations(conn: &Connection) -> Result<(), Box<dyn std::error::Error>>
     // (SEMANTIC policy, byte-compatible with pre-#1000 behavior); validated
     // at write time against the MemoryType taxonomy. Additive.
     ensure_column(conn, "entities", "memory_type", "TEXT DEFAULT ''")?;
+
+    // #1001: utility-driven promotion — the accrued-usage signal that
+    //    feeds the pure candidate→verified transition. Saturating cap
+    //    enforced at every bump. Additive; existing rows start at 0.
+    ensure_column(conn, "entities", "utility_score", "REAL NOT NULL DEFAULT 0")?;
 
     // v29 (#876): governed-distillation lifecycle on artifact bindings.
     // A learned artifact (trained weights / distilled cartridge) is bound to

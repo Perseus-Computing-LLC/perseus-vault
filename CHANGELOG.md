@@ -65,6 +65,14 @@ All notable changes to Perseus Vault are documented here. This project adheres t
   (unknown = hard write error, never a silent fallback); recall gains
   `type_filter` (all modes, validated at the public entry). Spec:
   `docs/specs/typed-memory-classes.md`.
+- **Utility-driven lifecycle promotion (#1001).** Schema v42 adds
+  `entities.utility_score` (saturating cap 100): +1 per reinforced recall
+  hit, +5 per citation — default recalls stay pure reads (#247 preserved).
+  A pure transition function auto-promotes `candidate → verified` at
+  utility >= 10 with >= 1 citation, CAS-guarded against concurrent explicit
+  promotion, and journals every transition as `auto_promotion` (the
+  evidence surface — no silent mutation). Spec:
+  `docs/specs/utility-driven-promotion.md`.
 - **Scheduled recall evaluation with regression alerts (#930).** New
   `perseus-vault eval` CLI (record | history | alerts) and
   `perseus_vault_eval_history` MCP tool (registry 122→123): durable
