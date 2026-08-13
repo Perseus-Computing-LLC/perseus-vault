@@ -334,7 +334,9 @@ enum Commands {
 
     /// Generate a new AES-256-GCM encryption key and write it to a file
     Keygen {
-        /// Path to write the key file (default: ~/.perseus-vault/secret.key)
+        /// Path to write the key file (default: ~/.perseus-vault/secret.key,
+        /// or an existing ~/.mimir/secret.key from before the rename).
+        /// Refuses to overwrite an existing key file.
         #[arg(long, default_value_t = default_key_file())]
         key_file: String,
     },
@@ -365,7 +367,10 @@ enum Commands {
         /// SQLite database path
         #[arg(long, default_value_t = default_db_path())]
         db: String,
-        /// Path to write the AES-256-GCM key file (default: ~/.perseus-vault/secret.key)
+        /// Path to write the AES-256-GCM key file (default:
+        /// ~/.perseus-vault/secret.key, or an existing ~/.mimir/secret.key
+        /// from before the rename). An existing key file is used as-is,
+        /// never overwritten.
         #[arg(long, default_value_t = default_key_file())]
         key_file: String,
         /// Also encrypt existing plaintext body_json records in place
@@ -996,11 +1001,30 @@ fn warn_plaintext_writes_to_encrypted_db(database: &db::Database) {
     }
 }
 
+/// Resolve the standard key file for a home directory. #427 precedence-only:
+/// prefer whichever secret.key already exists — the new `.perseus-vault` path
+/// first, then the pre-rebrand `~/.mimir/secret.key` — so an existing
+/// encrypted install NEVER loses its key (a wrong default would silently make
+/// the vault undecryptable). Restored for #1018 after the rebrand purge
+/// dropped the legacy fallback. Fresh installs (neither exists) use the new
+/// path.
+fn resolve_default_key_file(home: &str) -> String {
+    let new_key = format!("{home}/.perseus-vault/secret.key");
+    let legacy_key = format!("{home}/.mimir/secret.key");
+    if std::path::Path::new(&new_key).exists() {
+        new_key
+    } else if std::path::Path::new(&legacy_key).exists() {
+        legacy_key
+    } else {
+        new_key
+    }
+}
+
 fn default_key_file() -> String {
     let home = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
         .unwrap_or_else(|_| "/root".to_string());
-    format!("{}/.perseus-vault/secret.key", home)
+    resolve_default_key_file(&home)
 }
 
 /// Resolve an explicitly supplied key, or use the standard key path when it
@@ -2763,6 +2787,20 @@ fn run() {
                 key_file.clone()
             };
 
+            // #1018: never overwrite an existing key file — truncating it
+            // would make every vault encrypted with it permanently
+            // undecryptable. Refuse and point at the safe alternatives.
+            if std::path::Path::new(&expanded).exists() {
+                eprintln!(
+                    "perseus-vault: refusing to overwrite existing key file {}. \
+                     This key may encrypt an existing vault, and a replacement \
+                     key would make it unrecoverable. Point --encryption-key at \
+                     this file to use it, or choose a new key path for a fresh key.",
+                    expanded
+                );
+                std::process::exit(1);
+            }
+
             // Create parent directory if needed
             if let Some(parent) = std::path::Path::new(&expanded).parent() {
                 if let Err(e) = std::fs::create_dir_all(parent) {
@@ -2847,7 +2885,12 @@ fn run() {
             key_file: ref key_path,
             rekey,
         }) => {
-            // 1. Write the key file (same logic as Keygen).
+            // 1. Resolve the key file. #1018: if a key ALREADY exists at the
+            // resolved path (including a pre-rebrand ~/.mimir/secret.key),
+            // USE it as-is — never overwrite it, or any vault encrypted with
+            // it becomes permanently undecryptable. A fresh key is generated
+            // only when none exists (matching the documented "Generates a key
+            // (if none exists)" contract).
             let expanded = if key_path.starts_with("~/") {
                 let home = std::env::var("HOME")
                     .or_else(|_| std::env::var("USERPROFILE"))
@@ -2856,64 +2899,71 @@ fn run() {
             } else {
                 key_path.clone()
             };
-            if let Some(parent) = std::path::Path::new(&expanded).parent() {
-                if let Err(e) = std::fs::create_dir_all(parent) {
-                    eprintln!(
-                        "perseus-vault: failed to create directory {}: {}",
-                        parent.display(),
-                        e
-                    );
-                    std::process::exit(1);
+            if !std::path::Path::new(&expanded).exists() {
+                if let Some(parent) = std::path::Path::new(&expanded).parent() {
+                    if let Err(e) = std::fs::create_dir_all(parent) {
+                        eprintln!(
+                            "perseus-vault: failed to create directory {}: {}",
+                            parent.display(),
+                            e
+                        );
+                        std::process::exit(1);
+                    }
                 }
-            }
-            let key = crate::encryption::EncryptionManager::generate_key();
-            let write_result: std::io::Result<()> = {
-                #[cfg(unix)]
-                {
-                    use std::io::Write;
-                    use std::os::unix::fs::OpenOptionsExt;
-                    std::fs::OpenOptions::new()
-                        .write(true)
-                        .create(true)
-                        .truncate(true)
-                        .mode(0o600)
-                        .open(&expanded)
-                        .and_then(|mut f| f.write_all(key.as_bytes()))
-                }
-                #[cfg(not(unix))]
-                {
-                    std::fs::write(&expanded, &key)
-                }
-            };
-            match write_result {
-                Ok(_) => {
+                let key = crate::encryption::EncryptionManager::generate_key();
+                let write_result: std::io::Result<()> = {
                     #[cfg(unix)]
                     {
-                        use std::os::unix::fs::PermissionsExt;
-                        let _ = std::fs::set_permissions(
-                            &expanded,
-                            std::fs::Permissions::from_mode(0o600),
-                        );
+                        use std::io::Write;
+                        use std::os::unix::fs::OpenOptionsExt;
+                        std::fs::OpenOptions::new()
+                            .write(true)
+                            .create(true)
+                            .truncate(true)
+                            .mode(0o600)
+                            .open(&expanded)
+                            .and_then(|mut f| f.write_all(key.as_bytes()))
                     }
-                    #[cfg(windows)]
+                    #[cfg(not(unix))]
                     {
-                        if !tighten_windows_key_acls(&expanded) {
-                            eprintln!(
-                                "perseus-vault: WARNING: could not restrict ACLs on key file {}. \
-                                 Other local users may be able to read your encryption key. \
-                                 Restrict it manually: icacls \"{}\" /inheritance:r /grant:r %USERNAME%:F",
-                                expanded, expanded
+                        std::fs::write(&expanded, &key)
+                    }
+                };
+                match write_result {
+                    Ok(_) => {
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::PermissionsExt;
+                            let _ = std::fs::set_permissions(
+                                &expanded,
+                                std::fs::Permissions::from_mode(0o600),
                             );
                         }
+                        #[cfg(windows)]
+                        {
+                            if !tighten_windows_key_acls(&expanded) {
+                                eprintln!(
+                                    "perseus-vault: WARNING: could not restrict ACLs on key file {}. \
+                                     Other local users may be able to read your encryption key. \
+                                     Restrict it manually: icacls \"{}\" /inheritance:r /grant:r %USERNAME%:F",
+                                    expanded, expanded
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "perseus-vault: failed to write key file {}: {}",
+                            expanded, e
+                        );
+                        std::process::exit(1);
                     }
                 }
-                Err(e) => {
-                    eprintln!(
-                        "perseus-vault: failed to write key file {}: {}",
-                        expanded, e
-                    );
-                    std::process::exit(1);
-                }
+            } else {
+                eprintln!(
+                    "perseus-vault: using existing encryption key at {} (not overwriting it)",
+                    expanded
+                );
             }
 
             // 2. Open/create the database and enable encryption.
@@ -2977,10 +3027,17 @@ fn run() {
                 std::process::exit(1);
             }
             match database.rekey_aad() {
-                Ok((migrated, already_current, failed)) => {
+                Ok((migrated, already_current, failed, canary_migrated)) => {
                     println!(
-                        "rekey-aad: {} migrated, {} already current, {} failed to authenticate (see stderr)",
-                        migrated, already_current, failed
+                        "rekey-aad: {} migrated, {} already current, {} failed to authenticate (see stderr); canary {}",
+                        migrated,
+                        already_current,
+                        failed,
+                        if canary_migrated == 1 {
+                            "migrated to the current AAD"
+                        } else {
+                            "already current"
+                        }
                     );
                     if failed > 0 {
                         std::process::exit(1);
@@ -4873,6 +4930,36 @@ mod tests {
             Some("/home/tester/.perseus-vault/secret.key".to_string())
         );
         assert_eq!(select_encryption_key(None, "/missing.key", false), None);
+    }
+
+    #[test]
+    fn default_key_file_prefers_existing_legacy_key_over_new_path() {
+        // #1018: the rebrand purge dropped the pre-rebrand `~/.mimir/secret.key`
+        // fallback, locking upgraded vaults out of their own key. Restored
+        // #427 precedence: whichever key file exists is the one resolved, so an
+        // existing encrypted install never loses its key.
+        let dir = std::env::temp_dir().join(format!(
+            "perseus-keypath-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(dir.join(".mimir")).unwrap();
+        std::fs::create_dir_all(dir.join(".perseus-vault")).unwrap();
+        let legacy = dir.join(".mimir").join("secret.key");
+        let newp = dir.join(".perseus-vault").join("secret.key");
+        let home = dir.to_str().unwrap();
+
+        // Neither exists → fresh installs use the new path.
+        assert_eq!(resolve_default_key_file(home), newp.to_str().unwrap());
+
+        // Only the legacy key exists → it is resolved (v2.21-era upgrade).
+        std::fs::write(&legacy, "k").unwrap();
+        assert_eq!(resolve_default_key_file(home), legacy.to_str().unwrap());
+
+        // Both exist → the new path wins.
+        std::fs::write(&newp, "k").unwrap();
+        assert_eq!(resolve_default_key_file(home), newp.to_str().unwrap());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
