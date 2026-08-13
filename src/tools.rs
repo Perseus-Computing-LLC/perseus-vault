@@ -479,6 +479,13 @@ pub struct RecallArgs {
     /// workspace-scoped). Default false — a default recall is byte-identical.
     #[serde(default)]
     pub anchor_expansion: bool,
+    /// #1008: per-type retrieval context budget at assembly: "diverse" |
+    /// "fact_lookup" | "broad". Floors guarantee standing decisions and
+    /// constraints a share of the result; caps stop one class from crowding
+    /// the rest out. Allocation reported in fused_trace.truncation.per_type.
+    /// Unknown names are a hard error. Default None = unshaped (#247).
+    #[serde(default)]
+    pub budget_profile: Option<String>,
 }
 
 pub type BatchQuery = RecallArgs;
@@ -1827,6 +1834,7 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
         category: a.category,
         entity_type: a.entity_type,
         type_filter: None,
+        budget_profile: a.budget_profile.clone(),
         limit: effective_limit,
         offset: a.offset,
         min_decay: a.min_decay,
@@ -2313,6 +2321,7 @@ pub fn handle_recall_batch(db: &Database, args: Value) -> Result<String, String>
             category: q.category.clone(),
             entity_type: q.entity_type.clone(),
             type_filter: None,
+            budget_profile: q.budget_profile.clone(),
             limit: q.limit,
             offset: q.offset,
             min_decay: q.min_decay,

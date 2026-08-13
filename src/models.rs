@@ -698,6 +698,9 @@ pub struct RecallParams {
     /// as anchor-matched in the fused trace. Opt-in, default OFF: a default
     /// recall stays byte-identical (#247). Workspace-scoped.
     pub anchor_expansion: bool,
+    /// #1008: per-type retrieval context budget at assembly. See the RecallArgs
+    /// doc. None = unshaped (default recall stays byte-identical, #247).
+    pub budget_profile: Option<String>,
 }
 
 /// Search mode for recall: FTS5 keyword, dense vector, hybrid fusion, or
@@ -974,6 +977,11 @@ pub struct FusedTruncationTrace {
     pub estimated_tokens_used: i64,
     pub retained: usize,
     pub dropped: usize,
+    /// #1008: per-type allocation when budget_profile was requested —
+    /// one entry per class with floor/cap/retained/floor_shortfall.
+    /// Present only for shaped runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub per_type: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -1029,6 +1037,7 @@ impl Default for RecallParams {
             category: None,
             entity_type: None,
             type_filter: None,
+            budget_profile: None,
             limit: 10,
             offset: 0,
             min_decay: 0.0,

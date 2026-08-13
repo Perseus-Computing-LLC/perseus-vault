@@ -56,6 +56,7 @@ mod sleep;
 pub(crate) mod stage_trace;
 mod tools;
 mod transport;
+mod type_budgets;
 #[cfg(feature = "tui")]
 mod tui;
 mod trust_admission;
