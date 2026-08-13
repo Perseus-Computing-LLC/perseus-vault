@@ -94,7 +94,12 @@ class _FakeVault(VaultClient):
             key = (arguments["category"], arguments["key"])
             existed = key in self.entities
             self.entities.pop(key, None)
-            return {"archived": 1 if existed else 0}
+            # Mirror the current server wire contract (#1024): {"found": bool, ...}
+            return {
+                "found": existed,
+                "category": arguments["category"],
+                "key": arguments["key"],
+            }
         if short == "context":
             return {"markdown": "## Perseus Vault Context\n\n- (test)\n"}
         raise AssertionError(f"unexpected tool {name}")
@@ -137,11 +142,20 @@ def test_recall_score_never_none():
     assert normalized[0]["metadata"] == {}
 
 
-def test_forget_true_only_when_archived():
+def test_forget_true_only_when_found():
     v = _FakeVault()
     v.remember("c", "k", {"content": "bye"})
     assert v.forget("c", "k") is True
     assert v.forget("c", "missing") is False
+
+
+def test_forget_legacy_archived_response_still_supported():
+    # Pre-2.x servers answered {"archived": N}; keep that contract working (#1024).
+    v = _FakeVault()
+    v.call_tool = lambda name, arguments: {"archived": 1}
+    assert v.forget("c", "k") is True
+    v.call_tool = lambda name, arguments: {"archived": 0}
+    assert v.forget("c", "k") is False
 
 
 def test_forget_non_dict_response_is_false():
@@ -322,3 +336,15 @@ def test_real_binary_store_recall(tmp_path):
         assert any("SQLite" in h["text"] for h in hits)
         vault.prune("architecture", purge_all=True)
         assert vault.recall("", category="architecture") == []
+
+
+@pytest.mark.skipif(not _REAL_BIN, reason="perseus-vault binary not available")
+def test_real_binary_forget_reports_found(tmp_path):
+    # #1024: forget() must report success against the real wire contract
+    # {"found": true|false} — not the legacy {"archived": N} shape.
+    db = str(tmp_path / "forget.db")
+    with VaultClient(binary=_REAL_BIN, db_path=db) as vault:
+        vault.remember("scratch", "bye", {"content": "temporary"})
+        assert vault.forget("scratch", "bye") is True
+        # Forgetting an already-archived entity reports found=false, not an error.
+        assert vault.forget("scratch", "bye") is False

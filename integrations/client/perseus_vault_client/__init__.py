@@ -409,12 +409,17 @@ class VaultClient:
         return ""
 
     def forget(self, category: str, key: str, *, reason: Optional[str] = None) -> bool:
-        """Soft-delete an entity. Returns True only if the vault archived it."""
+        """Soft-delete an entity. Returns True only if the vault found and archived it."""
         args: Dict[str, Any] = {"category": category, "key": key}
         if reason:
             args["reason"] = reason
         res = self.call_tool(self._tool("forget"), args)
-        return bool(isinstance(res, dict) and res.get("archived", 0))
+        if not isinstance(res, dict):
+            return False
+        # #1024: current servers answer {"found": true|false}; pre-2.x servers
+        # answered {"archived": N}. Accept either so the client stays compatible
+        # across server versions.
+        return bool(res.get("found") or res.get("archived", 0))
 
     def prune(self, category: str, *, purge_all: bool = False, **extra: Any) -> Dict[str, Any]:
         """Bulk-archive entities in a category. ``purge_all=True`` clears the

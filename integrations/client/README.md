@@ -56,7 +56,7 @@ with VaultClient(binary="perseus-vault", db_path="./vault.db") as vault:
     # pre-rendered markdown block for prompt injection
     block = vault.context(query="database choice")
 
-    # soft-delete; True only if the vault actually archived it
+    # soft-delete; True only if the vault found and archived it
     vault.forget("architecture", "use-sqlite")
 ```
 
@@ -78,7 +78,7 @@ vault.call_tool("perseus_vault_bitemporal", {"category": "decision", "as_of": 17
 | `semantic_search(query, *, category=None, limit=10)` | `*_semantic_search` | dense-only |
 | `scan(category, *, page_size=100, max_items=None)` | `*_recall` | paginated full-category enumeration |
 | `context(query=None, **extra)` | `*_context` | returns markdown string |
-| `forget(category, key, *, reason=None)` | `*_forget` | `True` only if archived |
+| `forget(category, key, *, reason=None)` | `*_forget` | `True` only if found+archived |
 | `prune(category, *, purge_all=False)` | `*_prune` | `purge_all` clears the category |
 | `get_entity(id)` / `stats()` / `health()` | `*_get_entity` / `*_stats` / `*_health` | |
 | `call_tool(name, arguments)` / `list_tools()` | any | escape hatch |
