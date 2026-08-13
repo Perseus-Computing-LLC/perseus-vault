@@ -4949,15 +4949,27 @@ mod tests {
         let home = dir.to_str().unwrap();
 
         // Neither exists → fresh installs use the new path.
-        assert_eq!(resolve_default_key_file(home), newp.to_str().unwrap());
+        assert_eq!(
+            std::path::PathBuf::from(resolve_default_key_file(home)),
+            newp,
+            "fresh installs use the new path"
+        );
 
         // Only the legacy key exists → it is resolved (v2.21-era upgrade).
         std::fs::write(&legacy, "k").unwrap();
-        assert_eq!(resolve_default_key_file(home), legacy.to_str().unwrap());
+        assert_eq!(
+            std::path::PathBuf::from(resolve_default_key_file(home)),
+            legacy,
+            "an existing legacy key must be resolved"
+        );
 
         // Both exist → the new path wins.
         std::fs::write(&newp, "k").unwrap();
-        assert_eq!(resolve_default_key_file(home), newp.to_str().unwrap());
+        assert_eq!(
+            std::path::PathBuf::from(resolve_default_key_file(home)),
+            newp,
+            "the new path wins when both exist"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
