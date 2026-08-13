@@ -24909,7 +24909,12 @@ pub(crate) mod tests {
     /// starvation probes, and #210/#382/#387 read+write concurrency
     /// contracts — with rollback journaling, concurrent readers hold SHARED
     /// locks that deadlock writer EXCLUSIVE upgrades into immediate
-    /// `database is locked`). The default fixture is DELETE-journaling
+    /// `database is locked`). #1020 follow-up: the #379 audited-writer
+    /// serialization test moved here after flaking on Windows main — its
+    /// remember re-assert thread is read-decide-write, NOT write-only, so
+    /// the old DELETE-journaling classification was wrong. A test that runs
+    /// remember() (dedup scan + precondition reads) concurrently with
+    /// audited writers needs WAL. The default fixture is DELETE-journaling
     /// (#950).
     pub(crate) fn temp_db_wal() -> (TestDatabase, String) {
         let db = TestDatabase::new_wal("perseus_vault-test-db-wal");
@@ -29133,7 +29138,21 @@ pub(crate) mod tests {
         use std::sync::Arc;
         use std::thread;
 
-        let (db, path) = temp_db();
+        // #1020 follow-up (Windows CI flake on main, 2026-08-13): this test
+        // was classified write-only and kept on DELETE journaling, but the
+        // remember re-assert thread is read-decide-write inside a transaction
+        // — on DELETE journaling a reader holding SHARED deadlocks a writer's
+        // EXCLUSIVE upgrade and SQLite returns SQLITE_BUSY IMMEDIATELY
+        // (busy_timeout cannot heal a detected lock cycle). Windows timing
+        // (slow FS + Defender) opens that window; Linux/macOS pass by luck.
+        // WAL readers never block the writer, so the audited-writer
+        // discipline serializes on the write lock instead. Auto-embed is
+        // disabled for the same reason as #891: the background embed worker
+        // is a fourth writer injecting nondeterministic traffic into a
+        // serialization test (the Windows lane runs the bundled default
+        // build where it is enabled by default).
+        let (mut db, path) = temp_db_wal();
+        db.embedding_config.enabled = false;
         let e = make_entity("e-379", "facts", "race-key", r#"{"note":"v0"}"#);
         db.remember(&e).unwrap();
         // Winner for the post-join #381 invalidation, created up front so the

@@ -2358,6 +2358,10 @@ mod tests {
 
         // Pre-upgrade fixture: legacy tables without the ALTER-added columns,
         // user_version=0 (same shape as migrates_pre_versioned_db_missing_a_column).
+        // #1020 follow-up (Windows CI flake on main, 2026-08-13): the fixture
+        // runs WAL like every production store — the DELETE-journaling default
+        // here tested a mode production never uses, and its reader/writer
+        // upgrade-deadlock class is irrelevant to the #353 contract.
         {
             let conn = Connection::open(&path_str).unwrap();
             conn.execute_batch(
@@ -2370,7 +2374,8 @@ mod tests {
                  CREATE TABLE journal (
                     id TEXT PRIMARY KEY, entity_id TEXT DEFAULT '',
                     created_at_unix_ms INTEGER NOT NULL
-                 );",
+                 );
+                 PRAGMA journal_mode=WAL;",
             )
             .unwrap();
         }
@@ -2382,9 +2387,15 @@ mod tests {
                 let barrier = barrier.clone();
                 std::thread::spawn(move || {
                     let conn = Connection::open(&path).map_err(|e| e.to_string())?;
-                    // Same busy_timeout Database::open applies: the loser must
-                    // WAIT on BEGIN IMMEDIATE, not fail fast with SQLITE_BUSY.
-                    conn.execute_batch("PRAGMA busy_timeout=5000;")
+                    // The loser must WAIT on BEGIN IMMEDIATE, not fail fast
+                    // with SQLITE_BUSY. 60s (not the pool's 5s default): on
+                    // the shared Windows runner a cold-FS/Defender stall can
+                    // push the winner's migration past 5s (#950 recorded a
+                    // 411ms stall on a single first write; full-suite runs
+                    // there take ~600s vs ~80s serial on Linux), and the
+                    // migration here is bounded work — expiry is not part of
+                    // the #353 contract.
+                    conn.execute_batch("PRAGMA busy_timeout=60000;")
                         .map_err(|e| e.to_string())?;
                     barrier.wait();
                     initialize_schema(&conn).map_err(|e| e.to_string())?;
