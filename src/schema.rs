@@ -640,7 +640,12 @@ CREATE INDEX IF NOT EXISTS idx_preload_proposals_state
 /// basis for tier-3 projections (embeddings first). New table, idempotent,
 /// no backfill (DDL_V0_2_0 is re-run at every open, so existing stores pick
 /// it up on next open).
-pub(crate) const SCHEMA_VERSION: i64 = 42;
+/// v43 (#1020 fingerprint tier): `entities.fingerprint` — deterministic
+/// subword-HDC sign-bit fingerprint of the plaintext body, written on
+/// content change only while the tier is enabled, NULL otherwise. Additive,
+/// no backfill (pre-enablement rows simply have no fingerprint and stay
+/// out of the zero-API fallback pool).
+pub(crate) const SCHEMA_VERSION: i64 = 43;
 
 /// Initialize the v0.2.0 schema on a fresh database.
 pub fn initialize_schema(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
@@ -775,6 +780,17 @@ fn apply_migrations(conn: &Connection) -> Result<(), Box<dyn std::error::Error>>
     //    feeds the pure candidate→verified transition. Saturating cap
     //    enforced at every bump. Additive; existing rows start at 0.
     ensure_column(conn, "entities", "utility_score", "REAL NOT NULL DEFAULT 0")?;
+
+    // #1020: deterministic subword-HDC fingerprint tier. Additive and
+    //    backfill-free: rows written before enablement simply have NULL
+    //    and stay out of the zero-API fallback pool; enablement covers
+    //    new and changed bodies from the next write onward.
+    //    DELIBERATELY absent from DDL_V0_2_0: ALTER appends at the end, and
+    //    the DDL must keep the exact physical column order migrated stores
+    //    get, because `entity_from_row` hydrates `SELECT *` projections
+    //    positionally (e.g. the intention readers in tools.rs). A column
+    //    placed mid-DDL would shift every later column on FRESH stores only.
+    ensure_column(conn, "entities", "fingerprint", "BLOB")?;
 
     // v29 (#876): governed-distillation lifecycle on artifact bindings.
     // A learned artifact (trained weights / distilled cartridge) is bound to
@@ -2101,6 +2117,46 @@ mod tests {
         let (conn, _path) = temp_db();
         initialize_schema(&conn).expect("init schema");
         assert!(is_v0_2_0(&conn).unwrap());
+    }
+
+    /// #1020 regression: fresh-store and migrated-store PHYSICAL column
+    /// order must be identical. `entity_from_row` hydrates `SELECT *`
+    /// projections positionally, so a column placed mid-DDL (instead of via
+    /// the append-only migration) shifts every later column on fresh stores
+    /// only and silently mis-hydrates rows there.
+    #[test]
+    fn fresh_and_migrated_stores_share_physical_column_order() {
+        // Fresh store: full initialize_schema from scratch.
+        let (conn, _path) = temp_db();
+        initialize_schema(&conn).expect("init schema");
+        let fresh: Vec<String> = {
+            let mut stmt = conn.prepare("PRAGMA table_info(entities)").unwrap();
+            let rows = stmt
+                .query_map([], |r| r.get::<_, String>(1))
+                .unwrap();
+            rows.map(|r| r.unwrap()).collect()
+        };
+        // Migrated store: legacy DDL only, stamped with an old version, then
+        // migrated — the upgrade path a real pre-#1020 store takes.
+        let (conn2, _path2) = temp_db();
+        conn2.execute_batch(DDL_V0_2_0).unwrap();
+        conn2.pragma_update(None, "user_version", 10).unwrap();
+        initialize_schema(&conn2).expect("migrate legacy store");
+        let migrated: Vec<String> = {
+            let mut stmt = conn2.prepare("PRAGMA table_info(entities)").unwrap();
+            let rows = stmt
+                .query_map([], |r| r.get::<_, String>(1))
+                .unwrap();
+            rows.map(|r| r.unwrap()).collect()
+        };
+        assert_eq!(
+            fresh, migrated,
+            "fresh and migrated stores must share physical column order"
+        );
+        assert!(
+            fresh.iter().any(|c| c == "fingerprint"),
+            "fingerprint column missing from {fresh:?}"
+        );
     }
 
     #[test]

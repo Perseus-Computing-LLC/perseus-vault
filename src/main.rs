@@ -15,6 +15,7 @@ mod embedding;
 mod encryption;
 mod eval_regression;
 mod extraction;
+mod fingerprint;
 mod live_update;
 // __isoc23_strto* link shims so the default (bundled-embeddings) build links
 // against the prebuilt ONNX Runtime on glibc < 2.38 hosts, e.g. Ubuntu 22.04
@@ -143,6 +144,15 @@ struct Cli {
     /// Environment equivalent: PERSEUS_VAULT_EMBEDDING_QUANT.
     #[arg(long, value_name = "none|int8|bit")]
     embedding_quant: Option<String>,
+
+    /// #1020: deterministic zero-API fallback — store a subword-HDC
+    /// fingerprint (10k sign bits, ~1.25KB) per entity on content change and
+    /// rank dense recall by Hamming over those fingerprints when the
+    /// embedding backend is unavailable. Off by default; never primary while
+    /// dense embeddings exist. Environment equivalent:
+    /// PERSEUS_VAULT_EMBEDDING_FINGERPRINT.
+    #[arg(long, value_name = "on|off")]
+    embedding_fingerprint: Option<String>,
 
     /// Ollama model name (default: llama3)
     #[arg(long, default_value_t = String::from("llama3"))]
@@ -4081,6 +4091,27 @@ fn run() {
                 eprintln!(
                     "perseus-vault: embedding storage format declared: {}",
                     q.as_str()
+                );
+            }
+
+            // #1020: deterministic fingerprint tier. Unlike quant there is no
+            // store record to reconcile — enablement covers writes from this
+            // process on, disablement stops storing new fingerprints.
+            if let Some(ref fp) = cli.embedding_fingerprint {
+                let on = match crate::db::Database::parse_fingerprint_flag(fp) {
+                    Ok(on) => on,
+                    Err(e) => {
+                        eprintln!(
+                            "perseus-vault: invalid --embedding-fingerprint: {e} \
+                             (also settable via PERSEUS_VAULT_EMBEDDING_FINGERPRINT)"
+                        );
+                        std::process::exit(1);
+                    }
+                };
+                database.set_embedding_fingerprint(on);
+                eprintln!(
+                    "perseus-vault: embedding fingerprint tier {}",
+                    if on { "enabled" } else { "disabled" }
                 );
             }
 

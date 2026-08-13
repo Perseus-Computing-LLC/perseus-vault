@@ -6,6 +6,19 @@ All notable changes to Perseus Vault are documented here. This project adheres t
 ## [Unreleased]
 
 ### Added
+- **Deterministic fingerprint tier — zero-API fallback semantic hashing
+  (#1020).** Opt-in `PERSEUS_VAULT_EMBEDDING_FINGERPRINT=on|off` /
+  `--embedding-fingerprint <on|off>` (default off): content-changing writes
+  store a deterministic subword-HDC fingerprint of the plaintext body
+  (Hillock-mirror: char 3–5-grams superposed into 10k bipolar sign bits,
+  FNV-1a-seeded splitmix64, 1,250 bytes/entity, schema v43) and dense/hybrid
+  recall falls back to popcount/Hamming ranking over those fingerprints when
+  the embedding backend is unavailable — never primary while dense
+  embeddings exist, and the #226 error contract is preserved while the tier
+  is off. The fallback keeps the dense arm's governance suppression,
+  bounded-scan ceiling, and completeness semantics, reports the arm as
+  `fingerprint` in recall arm audits, and gains a `fingerprint_tier` stage
+  in the config self-report. Spec: `docs/specs/fingerprint-tier.md`.
 - **Active-decision anchor query expansion (#1009).** Opt-in
   `anchor_expansion` on recall: keystones (#683) + ACTIVE decision entities
   (un-superseded via the #363/#472 chain — a structural fact, not an LLM

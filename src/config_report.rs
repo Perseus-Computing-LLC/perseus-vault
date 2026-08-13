@@ -170,6 +170,32 @@ pub fn build(db: &Database, ctx: &DeploymentContext) -> ConfigReport {
         });
     }
 
+    // ── fingerprint tier (#1020) ────────────────────────────────────────
+    {
+        let flag = std::env::var("PERSEUS_VAULT_EMBEDDING_FINGERPRINT").ok();
+        let enabled = db.fingerprint_enabled();
+        let requested = flag
+            .clone()
+            .unwrap_or_else(|| "(unset → off)".to_string());
+        let resolved = if enabled { "on".to_string() } else { "off".to_string() };
+        let drifted = flag.as_deref().is_some_and(|f| {
+            crate::db::Database::parse_fingerprint_flag(f).ok() != Some(enabled)
+        });
+        stages.push(StageReport {
+            stage: "fingerprint_tier".to_string(),
+            requested,
+            resolved,
+            drifted,
+            note: if enabled {
+                "dense recall falls back to deterministic fingerprint (Hamming) ranking when \
+                 the embedding backend is unavailable"
+                    .to_string()
+            } else {
+                String::new()
+            },
+        });
+    }
+
     // ── db path ──────────────────────────────────────────────────────────
     {
         let requested_env = std::env::var("PERSEUS_VAULT_DB_PATH").ok();
@@ -310,10 +336,13 @@ mod tests {
         let mut db = TestDatabase::new("cfg-report");
         db.set_deployment_context(false, false, "127.0.0.1", false, false);
         let r = build(&db, db.deployment_context());
-        assert_eq!(r.stages.len(), 6);
+        assert_eq!(r.stages.len(), 7);
         // Fresh store: quantization resolves to float32 (the store default).
         assert_eq!(stage(&r, "quantization").resolved, "float32");
         assert!(!stage(&r, "quantization").drifted);
+        // Fingerprint tier defaults off with no drift.
+        assert_eq!(stage(&r, "fingerprint_tier").resolved, "off");
+        assert!(!stage(&r, "fingerprint_tier").drifted);
         // The test harness opens stores WITHOUT encryption (plaintext), which
         // the report correctly flags as drift — loud by design. The other
         // stages must resolve cleanly.
@@ -379,6 +408,37 @@ mod tests {
         assert_eq!(q.resolved, "int8");
         assert!(q.drifted, "{q:?}");
         assert!(q.note.contains("reindex"));
+    }
+
+    // #1020: the fingerprint tier reports its resolved state (off by
+    // default, no drift, no note).
+    #[test]
+    fn fingerprint_tier_stage_reports_default_off_without_drift() {
+        let mut db = TestDatabase::new("cfg-report-fp");
+        db.set_deployment_context(false, false, "127.0.0.1", false, false);
+        let r = build(&db, db.deployment_context());
+        let f = stage(&r, "fingerprint_tier");
+        assert_eq!(f.resolved, "off");
+        assert!(!f.drifted, "{f:?}");
+        assert!(f.note.is_empty());
+    }
+
+    // #1020: a process-level flag that disagrees with the open-time
+    // resolution is a loud requested-vs-resolved diff.
+    #[test]
+    fn fingerprint_flag_mismatch_drifts() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let mut db = TestDatabase::new("cfg-report-fp-drift");
+        db.set_deployment_context(false, false, "127.0.0.1", false, false);
+        // The Database resolved OFF at open (flag unset); now request ON in
+        // this process — exactly the drift condition this stage reports.
+        std::env::set_var("PERSEUS_VAULT_EMBEDDING_FINGERPRINT", "on");
+        let r = build(&db, db.deployment_context());
+        std::env::remove_var("PERSEUS_VAULT_EMBEDDING_FINGERPRINT");
+        let f = stage(&r, "fingerprint_tier");
+        assert_eq!(f.requested, "on");
+        assert_eq!(f.resolved, "off");
+        assert!(f.drifted, "{f:?}");
     }
 
     #[test]

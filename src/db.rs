@@ -646,6 +646,14 @@ pub struct Database {
     /// Atomic so the reindex/restore tools can flip it through `&self` (the
     /// tool dispatcher only holds a shared reference).
     embedding_quant: std::sync::atomic::AtomicU8,
+    /// #1020: deterministic subword-HDC fingerprint tier. Enabled from
+    /// `PERSEUS_VAULT_EMBEDDING_FINGERPRINT` at open (or the CLI flag after
+    /// open). When on, content-changing writes store `entities.fingerprint`
+    /// and dense recall falls back to Hamming ranking over fingerprints
+    /// when the embedding backend is unavailable — never primary while
+    /// dense embeddings exist. Atomic for the same shared-reference reason
+    /// as `embedding_quant`.
+    fingerprint_enabled: std::sync::atomic::AtomicBool,
 }
 
 /// #619: bumped by every in-place emb_sig write; one of the sig cache's two
@@ -1195,6 +1203,10 @@ impl Database {
         // startup with the migration hint instead of serving mis-decoded
         // vectors.
         let embedding_quant = Self::resolve_embedding_quant(&setup_conn)?;
+        // #1020: deterministic fingerprint tier — pure function of config,
+        // no store record (unlike quant, nothing already stored can be
+        // mis-decoded; enablement covers writes from this process on).
+        let fingerprint_enabled = Self::fingerprint_enabled_from_env()?;
         drop(setup_conn);
 
         Ok(Database {
@@ -1212,6 +1224,7 @@ impl Database {
             governance_overlay: std::sync::Mutex::new(None),
             cached_suppression_active: std::sync::Mutex::new(None),
             embedding_quant: std::sync::atomic::AtomicU8::new(embedding_quant.to_byte()),
+            fingerprint_enabled: std::sync::atomic::AtomicBool::new(fingerprint_enabled),
         })
     }
 
@@ -1355,6 +1368,50 @@ impl Database {
         self.embedding_quant
             .store(quant.to_byte(), std::sync::atomic::Ordering::Relaxed);
         Ok(())
+    }
+
+    /// #1020: strict parse for the fingerprint tier flag (shared by the env
+    /// resolution, the CLI wiring, the config self-report, and tests). An
+    /// invalid non-empty value is an error (fail-closed), never a silent off.
+    pub(crate) fn parse_fingerprint_flag(s: &str) -> Result<bool, String> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "on" | "yes" => Ok(true),
+            "0" | "false" | "off" | "no" | "" => Ok(false),
+            other => Err(format!(
+                "invalid embedding-fingerprint value '{other}': expected on | off"
+            )),
+        }
+    }
+
+    /// #1020: fingerprint tier flag from the environment. Strict where the
+    /// quant flag is strict: an invalid non-empty value is an open-time
+    /// error (fail-closed) rather than a silent off.
+    fn fingerprint_enabled_from_env() -> Result<bool, Box<dyn std::error::Error>> {
+        match std::env::var("PERSEUS_VAULT_EMBEDDING_FINGERPRINT") {
+            Ok(v) => Ok(Self::parse_fingerprint_flag(&v).map_err(|e| {
+                format!("invalid PERSEUS_VAULT_EMBEDDING_FINGERPRINT '{v}': {e}")
+            })?),
+            Err(_) => Ok(false),
+        }
+    }
+
+    /// #1020: whether the deterministic fingerprint tier is active in this
+    /// process (writes store fingerprints; dense recall may fall back to
+    /// Hamming ranking over them when embeddings are unavailable).
+    pub fn fingerprint_enabled(&self) -> bool {
+        self.fingerprint_enabled
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// #1020: apply the `--embedding-fingerprint` CLI declaration AFTER open
+    /// (the open-time env resolution already ran). Unlike quant there is no
+    /// store record to reconcile — fingerprints are deterministic functions
+    /// of text and the fixed 10k-dim layout, so flipping the flag is safe
+    /// on any store: enablement covers writes from here on, disablement
+    /// simply stops storing new fingerprints.
+    pub fn set_embedding_fingerprint(&mut self, enabled: bool) {
+        self.fingerprint_enabled
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Check out a pooled connection. Each DB method binds one of these and uses
@@ -3822,6 +3879,101 @@ impl Database {
             };
             scored.push((entity, score));
         }
+        scored.sort_by(|left, right| {
+            right
+                .1
+                .partial_cmp(&left.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| left.0.id.cmp(&right.0.id))
+        });
+        scored.truncate(limit);
+        Ok(scored)
+    }
+
+    /// #1020: zero-API dense fallback — Hamming-rank the corpus over
+    /// deterministic subword-HDC fingerprints (`entities.fingerprint`).
+    /// Mirror of `dense_search_governed_scan`: bounded scan (same
+    /// `max_scan` dial), governance suppression respected (materialize
+    /// before the sidecar check — the Windows connection-ownership rule),
+    /// score desc + id asc tie-break, truncate to `limit`. Rows without a
+    /// fingerprint (written before enablement) simply are not in the pool.
+    /// Never primary: callers use this only when the embedding backend is
+    /// unavailable AND the fingerprint tier is enabled.
+    pub fn fingerprint_search_bounded(
+        &self,
+        query_text: &str,
+        limit: usize,
+        max_scan: usize,
+    ) -> Result<Vec<(Entity, f64)>, Box<dyn std::error::Error>> {
+        if limit == 0 || max_scan == 0 {
+            return Ok(Vec::new());
+        }
+        let query_fp = crate::fingerprint::fingerprint_bytes(query_text);
+        let conn = self.conn()?;
+        let sql = if max_scan == usize::MAX {
+            "SELECT id, category, key, body_json, status, type, tags,
+                    decay_score, retrieval_count, layer, topic_path,
+                    archived, archive_reason, links, verified, source,
+                    created_at_unix_ms, last_accessed_unix_ms, NULL as embedding,
+                    always_on, certainty, workspace_hash, agent_id, visibility,
+                    follow_count, miss_count, follow_rate, efficacy_status,
+                    epistemic_state, fingerprint
+             FROM entities
+             WHERE archived = 0 AND fingerprint IS NOT NULL
+               AND (status IS NULL OR status = '' OR status NOT IN
+                   ('deprecated','expired','quarantined','redacted'))"
+                .to_string()
+        } else {
+            format!(
+                "SELECT id, category, key, body_json, status, type, tags,
+                        decay_score, retrieval_count, layer, topic_path,
+                        archived, archive_reason, links, verified, source,
+                        created_at_unix_ms, last_accessed_unix_ms, NULL as embedding,
+                        always_on, certainty, workspace_hash, agent_id, visibility,
+                        follow_count, miss_count, follow_rate, efficacy_status,
+                        epistemic_state, fingerprint
+                 FROM entities
+                 WHERE archived = 0 AND fingerprint IS NOT NULL
+                   AND (status IS NULL OR status = '' OR status NOT IN
+                       ('deprecated','expired','quarantined','redacted'))
+                 LIMIT {}",
+                max_scan
+            )
+        };
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map([], |row| {
+            let entity = entity_from_row(row, self.encryption.as_ref())?;
+            // #1020: fail-closed on foreign lengths — a blob of any other
+            // size was not produced by this encoder and cannot score.
+            let fp: Vec<u8> = row.get(29)?;
+            Ok((entity, fp))
+        })?;
+        let mut candidates = Vec::new();
+        for row in rows {
+            let (entity, fp) = row?;
+            if fp.len() == crate::fingerprint::FINGERPRINT_BYTES {
+                candidates.push((entity, fp));
+            }
+        }
+        drop(stmt);
+        // Same ownership boundary as dense_search_governed_scan: release the
+        // pooled connection before the governance interceptor obtains its
+        // own (Windows can otherwise observe an empty governed set).
+        drop(conn);
+        let entities: Vec<Entity> = candidates
+            .iter()
+            .map(|(entity, _)| entity.clone())
+            .collect();
+        let visible = self.filter_suppressed(entities)?;
+        let visible_ids: std::collections::HashSet<String> =
+            visible.into_iter().map(|entity| entity.id).collect();
+        let mut scored: Vec<(Entity, f64)> = candidates
+            .into_iter()
+            .filter(|(entity, _)| visible_ids.contains(&entity.id))
+            .map(|(entity, fp)| {
+                (entity, crate::fingerprint::fingerprint_similarity(&query_fp, &fp))
+            })
+            .collect();
         scored.sort_by(|left, right| {
             right
                 .1
@@ -6857,11 +7009,21 @@ impl Database {
             // backend is enabled — a vector for a body the row no longer has is
             // wrong in any configuration.
             if content_changed {
+                // #1020: deterministic fingerprint tier — recomputed from the
+                // new plaintext when enabled, cleared when off (a fingerprint
+                // for a body the row no longer has is wrong in any
+                // configuration, same rule as the embedding clear).
+                let fp_val: Option<Vec<u8>> = if self.fingerprint_enabled() {
+                    Some(crate::fingerprint::fingerprint_bytes(&entity.body_json))
+                } else {
+                    None
+                };
                 tx.execute(
                     "UPDATE entities SET recorded_at_unix_ms = ?1, supersedes = ?2,
                         valid_from_unix_ms = ?4, valid_to_unix_ms = ?5,
-                        embedding = NULL, emb_sig = NULL, emb_sig4 = NULL WHERE id = ?3",
-                    params![now, history_id, id, valid_from.unwrap_or(now), valid_to],
+                        embedding = NULL, emb_sig = NULL, emb_sig4 = NULL,
+                        fingerprint = ?6 WHERE id = ?3",
+                    params![now, history_id, id, valid_from.unwrap_or(now), valid_to, fp_val],
                 )?;
                 SIG_WRITE_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             // #619
@@ -7021,6 +7183,15 @@ impl Database {
             // Insert new entity
             id = entity.id.clone();
 
+            // #1020: fingerprint tier — deterministic function of the
+            // PLAINTEXT body (the same text the embed worker will consume),
+            // computed inline: no backend, no queue, no I/O.
+            let fp_val: Option<Vec<u8>> = if self.fingerprint_enabled() {
+                Some(crate::fingerprint::fingerprint_bytes(&entity.body_json))
+            } else {
+                None
+            };
+
             // M-1: wrap entity row + FTS index write in a transaction
             // so a failure in one doesn't leave the other orphaned.
             let tx = conn.unchecked_transaction()?;
@@ -7032,12 +7203,12 @@ impl Database {
                   always_on, certainty, created_at_unix_ms, last_accessed_unix_ms,
                   workspace_hash, agent_id, visibility, recorded_at_unix_ms,
                   valid_from_unix_ms, valid_to_unix_ms, epistemic_state,
-                  expires_at_unix_ms, hints, memory_type)
+                  expires_at_unix_ms, hints, memory_type, fingerprint)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7,
                          ?8, ?9, ?10, ?11,
                          ?12, ?13, ?14, ?15, ?16,
                          ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27,
-                         ?28, ?29, ?30)",
+                         ?28, ?29, ?30, ?31)",
                 params![
                     id,
                     entity.category,
@@ -7082,6 +7253,8 @@ impl Database {
                     hints_encrypted,
                     // #1000: typed memory class (validated upstream; '' = legacy).
                     entity.memory_type.clone(),
+                    // #1020: fingerprint (Some = tier enabled, None = off).
+                    fp_val,
                 ],
             )?;
 
@@ -7294,17 +7467,40 @@ impl Database {
             // non-empty query with no embedding backend surfaces a clear error
             // rather than silently degrading to keyword search.
             let embedded;
+            // #1020: when the embedding backend is unavailable AND the
+            // deterministic fingerprint tier is enabled, dense/hybrid recall
+            // degrades to Hamming ranking over stored fingerprints instead of
+            // failing outright. Fingerprint mode never outranks a working
+            // backend — it is engaged only on the embed error path.
+            let mut fingerprint_fallback = false;
             let query_vec: Option<&[f32]> = match params.embedding {
                 Some(ref v) => Some(v.as_slice()),
                 None if !params.query.trim().is_empty() => {
-                    embedded = self.generate_embedding_with_fallback(&params.query)?;
-                    Some(embedded.as_slice())
+                    match self.generate_embedding_with_fallback(&params.query) {
+                        Ok(v) => {
+                            embedded = v;
+                            Some(embedded.as_slice())
+                        }
+                        Err(e) if self.fingerprint_enabled() => {
+                            rate_limited_log(
+                                "fingerprint-fallback",
+                                &format!(
+                                    "perseus-vault: embedding backend unavailable ({}); dense \
+                                     arm falling back to deterministic fingerprint ranking",
+                                    e
+                                ),
+                            );
+                            fingerprint_fallback = true;
+                            None
+                        }
+                        Err(e) => return Err(e),
+                    }
                 }
                 None => None,
             };
             timer.stage("embed");
 
-            if let Some(query_vec) = query_vec {
+            if query_vec.is_some() || fingerprint_fallback {
                 // Deterministic dense/hybrid recall: the background auto-embed
                 // worker can land derived embeddings between two identical
                 // calls and shift dense rankings, breaking replay determinism
@@ -7313,9 +7509,13 @@ impl Database {
                 // synchronous embed), then drain the auto-embed queue
                 // (bounded), so ranking is a deterministic function of the
                 // settled store; the RecallOutcome contract still reports
-                // Partial when jobs remain after the bounds.
-                let _ = self.settle_dense_candidates(128);
-                let _ = self.embed_queue_flush(std::time::Duration::from_millis(250));
+                // Partial when jobs remain after the bounds. Skipped in
+                // fingerprint-fallback mode: there is no backend to settle
+                // against, and the fingerprint pool is already deterministic.
+                if !fingerprint_fallback {
+                    let _ = self.settle_dense_candidates(128);
+                    let _ = self.embed_queue_flush(std::time::Duration::from_millis(250));
+                }
                 if params.mode == crate::models::SearchMode::Dense {
                     // Clamp negative limits to 0 before the usize cast (a negative
                     // i64 would wrap to a huge usize).
@@ -7332,7 +7532,16 @@ impl Database {
                     let mut dense_returned: usize = 0;
                     let mut attempts = 0;
                     loop {
-                        let dense_results = self.dense_search_governed(query_vec, pool)?;
+                        // #1020: fingerprint fallback replaces the dense scan
+                        // when no backend exists (query_vec is None there).
+                        let dense_results = match (query_vec, fingerprint_fallback) {
+                            (Some(qv), false) => self.dense_search_governed(qv, pool)?,
+                            _ => self.fingerprint_search_bounded(
+                                &params.query,
+                                pool,
+                                Self::dense_max_scan_from_env(),
+                            )?,
+                        };
                         let dense_results = self.filter_suppressed_scored(dense_results)?;
                         let dense_results = Self::apply_scope_rank_weight(dense_results, params);
                         dense_returned = dense_results.len();
@@ -7381,7 +7590,7 @@ impl Database {
                             let _ = crate::retrieval_telemetry::record_arm_audit(
                                 &*conn,
                                 "dense",
-                                "dense",
+                                if fingerprint_fallback { "fingerprint" } else { "dense" },
                                 dense_returned,
                                 0,
                                 out.len(),
@@ -7455,9 +7664,20 @@ impl Database {
                             (r, arm_ms(t0))
                         });
                         let t0 = arm_clock(timing_on);
-                        let dense_res = self
-                            .dense_search_governed(query_vec, candidate_k)
-                            .map_err(|e| e.to_string());
+                        // #1020: fingerprint fallback replaces the dense arm
+                        // (query_vec is None when the backend is gone).
+                        let dense_res = match (query_vec, fingerprint_fallback) {
+                            (Some(qv), false) => self
+                                .dense_search_governed(qv, candidate_k)
+                                .map_err(|e| e.to_string()),
+                            _ => self
+                                .fingerprint_search_bounded(
+                                    &params.query,
+                                    candidate_k,
+                                    Self::dense_max_scan_from_env(),
+                                )
+                                .map_err(|e| e.to_string()),
+                        };
                         let dense_ms = arm_ms(t0);
                         let (sparse_res, sparse_ms) = sparse_handle.join().unwrap_or_else(|_| {
                             (Err("hybrid sparse arm panicked".to_string()), 0.0)
@@ -7692,7 +7912,7 @@ impl Database {
                         let _ = crate::retrieval_telemetry::record_arm_audit(
                             &*conn,
                             "hybrid",
-                            "dense",
+                            if fingerprint_fallback { "fingerprint" } else { "dense" },
                             d,
                             0,
                             d,
@@ -27560,6 +27780,7 @@ pub(crate) mod tests {
             governance_overlay: std::sync::Mutex::new(None),
             cached_suppression_active: std::sync::Mutex::new(None),
             embedding_quant: std::sync::atomic::AtomicU8::new(EmbeddingQuant::F32.to_byte()),
+            fingerprint_enabled: std::sync::atomic::AtomicBool::new(false),
         };
 
         db.remember_skip_dedup(&make_entity(
@@ -35639,6 +35860,258 @@ pub(crate) mod tests {
         );
 
         let _ = fs::remove_file(&path);
+    }
+
+    // #1020: strict flag parse — documented spellings accepted, garbage
+    // rejected (fail-closed, never a silent off).
+    #[test]
+    fn parse_fingerprint_flag_accepts_documented_spellings_and_rejects_garbage() {
+        assert_eq!(Database::parse_fingerprint_flag("on"), Ok(true));
+        assert_eq!(Database::parse_fingerprint_flag(" ON "), Ok(true));
+        assert_eq!(Database::parse_fingerprint_flag("true"), Ok(true));
+        assert_eq!(Database::parse_fingerprint_flag("1"), Ok(true));
+        assert_eq!(Database::parse_fingerprint_flag("yes"), Ok(true));
+        assert_eq!(Database::parse_fingerprint_flag("off"), Ok(false));
+        assert_eq!(Database::parse_fingerprint_flag("false"), Ok(false));
+        assert_eq!(Database::parse_fingerprint_flag("0"), Ok(false));
+        assert_eq!(Database::parse_fingerprint_flag("no"), Ok(false));
+        assert_eq!(Database::parse_fingerprint_flag(""), Ok(false));
+        assert!(Database::parse_fingerprint_flag("maybe").is_err());
+        assert!(Database::parse_fingerprint_flag("2").is_err());
+    }
+
+    // #1020: write-path semantics — enabled writes store the fingerprint of
+    // the plaintext body, content changes recompute it, disabled writes
+    // store NULL (a fingerprint for a body the row no longer has is wrong
+    // in any configuration, the same rule as the embedding clear).
+    #[test]
+    fn fingerprint_write_path_stores_recomputes_and_clears() {
+        let (mut db, _path) = temp_db();
+        db.embedding_config.enabled = false; // the fingerprint tier needs no backend
+        db.set_embedding_fingerprint(true);
+
+        let body_a = "the rusty sprocket lives in the tool drawer";
+        db.remember_skip_dedup(&make_entity("fp-a", "insight", "fp-a", body_a))
+            .unwrap();
+        let fp_a = crate::fingerprint::fingerprint_bytes(body_a);
+        let stored: Option<Vec<u8>> = db
+            .conn()
+            .unwrap()
+            .query_row(
+                "SELECT fingerprint FROM entities WHERE id = 'fp-a'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored.as_deref(), Some(fp_a.as_slice()));
+
+        // Content change -> recomputed from the new body.
+        let body_b = "the rusty sprocket was moved to the garden shed";
+        db.remember_skip_dedup(&make_entity("fp-a", "insight", "fp-a", body_b))
+            .unwrap();
+        let fp_b = crate::fingerprint::fingerprint_bytes(body_b);
+        let stored: Option<Vec<u8>> = db
+            .conn()
+            .unwrap()
+            .query_row(
+                "SELECT fingerprint FROM entities WHERE id = 'fp-a'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored.as_deref(), Some(fp_b.as_slice()));
+        assert_ne!(fp_a, fp_b);
+
+        // Disabled process -> next content change CLEARS the fingerprint so
+        // a later re-enablement can never serve a stale one.
+        db.set_embedding_fingerprint(false);
+        db.remember_skip_dedup(&make_entity(
+            "fp-a",
+            "insight",
+            "fp-a",
+            "completely different body text now",
+        ))
+        .unwrap();
+        let stored: Option<Vec<u8>> = db
+            .conn()
+            .unwrap()
+            .query_row(
+                "SELECT fingerprint FROM entities WHERE id = 'fp-a'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            stored.is_none(),
+            "disabled writes must clear the fingerprint"
+        );
+
+        // Fresh create while disabled -> NULL.
+        db.remember_skip_dedup(&make_entity("fp-b", "insight", "fp-b", "another body"))
+            .unwrap();
+        let stored: Option<Vec<u8>> = db
+            .conn()
+            .unwrap()
+            .query_row(
+                "SELECT fingerprint FROM entities WHERE id = 'fp-b'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(stored.is_none());
+    }
+
+    // #1020: zero-API fallback — with the tier enabled, a dense recall whose
+    // embedding backend is unavailable degrades to deterministic Hamming
+    // ranking over fingerprints instead of the #226 error, and the near-miss
+    // (lexical-adjacent) candidate tops the ranking.
+    #[test]
+    fn fingerprint_fallback_ranks_without_embedding_backend() {
+        let (mut db, _path) = temp_db();
+        db.embedding_config.enabled = false; // no local backend
+        db.set_embedding_fingerprint(true);
+        db.remember_skip_dedup(&make_entity(
+            "f1",
+            "insight",
+            "turing",
+            "Alan Turing broke the Enigma cipher at Bletchley Park",
+        ))
+        .unwrap();
+        db.remember_skip_dedup(&make_entity(
+            "f2",
+            "insight",
+            "hopper",
+            "Grace Hopper wrote the first compiler",
+        ))
+        .unwrap();
+        db.remember_skip_dedup(&make_entity(
+            "f3",
+            "insight",
+            "tesla",
+            "Nikola Tesla pioneered alternating current",
+        ))
+        .unwrap();
+
+        // Near-miss query: separator/case variant of the stored body's key
+        // phrase — lexical-adjacent, exactly this tier's contract.
+        let res = db.recall(&RecallParams {
+            query: "alan turing enigma bletchley".to_string(),
+            mode: crate::models::SearchMode::Dense,
+            limit: 3,
+            skip_side_effects: true,
+            ..RecallParams::default()
+        });
+        let hits = res.expect("fingerprint fallback must rank, not error");
+        assert!(!hits.is_empty(), "fallback must return ranked candidates");
+        assert_eq!(
+            hits[0].id, "f1",
+            "near-miss candidate must top the fallback ranking"
+        );
+    }
+
+    // #1020: the tier is gated by the process flag, not by data presence —
+    // stored fingerprints must NOT change the #226 error contract while the
+    // tier is off in this process.
+    #[test]
+    fn fingerprint_tier_disabled_keeps_error_contract_despite_stored_fingerprints() {
+        let (mut db, _path) = temp_db();
+        db.embedding_config.enabled = false;
+        db.set_embedding_fingerprint(true);
+        db.remember_skip_dedup(&make_entity(
+            "f1",
+            "insight",
+            "k1",
+            "some body text about memory tooling",
+        ))
+        .unwrap();
+        db.set_embedding_fingerprint(false); // tier off for THIS process
+
+        let res = db.recall(&RecallParams {
+            query: "memory tooling".to_string(),
+            mode: crate::models::SearchMode::Dense,
+            limit: 3,
+            skip_side_effects: true,
+            ..RecallParams::default()
+        });
+        assert!(
+            res.is_err(),
+            "tier off must preserve the no-backend error contract even with fingerprints stored"
+        );
+    }
+
+    // #1020: rows written before enablement carry no fingerprint and stay
+    // out of the fallback pool.
+    #[test]
+    fn fingerprint_fallback_skips_rows_without_fingerprints() {
+        let (mut db, _path) = temp_db();
+        db.embedding_config.enabled = false;
+        // Written BEFORE enablement: no fingerprint.
+        db.remember_skip_dedup(&make_entity(
+            "f1",
+            "insight",
+            "legacy",
+            "Alan Turing at Bletchley Park",
+        ))
+        .unwrap();
+        db.set_embedding_fingerprint(true);
+        db.remember_skip_dedup(&make_entity(
+            "f2",
+            "insight",
+            "modern",
+            "Grace Hopper and the first compiler",
+        ))
+        .unwrap();
+
+        let res = db.recall(&RecallParams {
+            query: "grace hopper compiler".to_string(),
+            mode: crate::models::SearchMode::Dense,
+            limit: 5,
+            skip_side_effects: true,
+            ..RecallParams::default()
+        });
+        let hits = res.expect("fallback ranks the fingerprint pool");
+        assert_eq!(hits[0].id, "f2");
+        assert!(
+            hits.iter().all(|h| h.id != "f1"),
+            "unfingerprinted rows must stay out of the fallback pool"
+        );
+    }
+
+    // #1020: hybrid mode fuses the fingerprint dense arm with the FTS arm
+    // when the backend is gone.
+    #[test]
+    fn fingerprint_fallback_supports_hybrid_mode() {
+        let (mut db, _path) = temp_db();
+        db.embedding_config.enabled = false;
+        db.set_embedding_fingerprint(true);
+        db.remember_skip_dedup(&make_entity(
+            "h1",
+            "insight",
+            "spanner",
+            "the spanner wrenches bolts tight",
+        ))
+        .unwrap();
+        db.remember_skip_dedup(&make_entity(
+            "h2",
+            "insight",
+            "chisel",
+            "the chisel carves stone",
+        ))
+        .unwrap();
+
+        let res = db.recall(&RecallParams {
+            query: "spanner wrench bolts".to_string(),
+            mode: crate::models::SearchMode::Hybrid,
+            limit: 2,
+            skip_side_effects: true,
+            ..RecallParams::default()
+        });
+        let hits = res.expect("hybrid must fuse the fingerprint dense arm with FTS");
+        assert!(!hits.is_empty());
+        assert!(
+            hits.iter().any(|h| h.id == "h1"),
+            "hybrid fallback must surface the near-miss candidate"
+        );
     }
 
     // #210: a single Database (pooled internally) shared as Arc<Database> across
@@ -45864,7 +46337,10 @@ pub(crate) mod tests {
         // Report carries denominator + artifact hash (acceptance #5).
         assert!(rep["denominator"]["slots"].as_i64().unwrap() >= 3);
         assert!(rep["artifact"]["git_hash"].as_str().unwrap().len() >= 7);
-        assert_eq!(rep["artifact"]["schema_version"], 42);
+        assert_eq!(
+            rep["artifact"]["schema_version"],
+            crate::schema::SCHEMA_VERSION
+        );
         let _ = std::fs::remove_file(path);
     }
 

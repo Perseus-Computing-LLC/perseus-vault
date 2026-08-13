@@ -22,6 +22,7 @@ first time, the REQUESTED half of the diff:
 | embedding_backend | provider endpoint host / bundled / none | kind + available + degraded + semantic_recall | backend configured but unusable (never reclassified as empty success) |
 | model_backend     | endpoint host + model, or none       | kind + available                   | endpoint configured but unavailable |
 | quantization      | PERSEUS_VAULT_EMBEDDING_QUANT or unset→store record | live embedding_format record (point-in-time read, not the open cache) | flag unset but store record quantized (or vice versa) |
+| fingerprint_tier  | PERSEUS_VAULT_EMBEDDING_FINGERPRINT or unset→off    | on/off (open-time resolution)          | flag set but not the resolved state |
 | db_path           | PERSEUS_VAULT_DB_PATH or default     | actual opened path                 | env path set but not the one in use |
 | encryption        | plaintext-allowed or encrypted       | at_rest + storage_state            | plaintext or mixed-legacy store |
 | network           | effective flags snapshot             | listener list                     | never (effective snapshot) |
@@ -46,8 +47,9 @@ first time, the REQUESTED half of the diff:
 
 ## Tests
 
-`src/config_report.rs` (5): default config drift-free (test-harness plaintext
+`src/config_report.rs` (7): default config drift-free (test-harness plaintext
 stores are correctly reported as encryption drift — loud by design),
 degraded embedding backend drifts (provider configured while LLM integration
-is off), quantized store without flag drifts against the default, db-path
+is off), quantized store without flag drifts against the default, fingerprint
+tier default-off without drift, fingerprint flag mismatch drifts, db-path
 env mismatch drifts, machine-readable shape stability.
