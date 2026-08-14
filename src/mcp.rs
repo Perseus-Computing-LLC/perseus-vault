@@ -186,7 +186,7 @@ pub fn is_orphaned_by_ppid() -> bool {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct JsonRpcRequest {
     pub jsonrpc: String,
     #[serde(default)]
@@ -235,6 +235,34 @@ impl MCPState {
     }
 }
 
+/// #1045: apply a forwarded handoff state (see `live_update::HandoffState`)
+/// to a fresh process's session state. The client already initialized the
+/// pre-handoff image and never re-sends `initialize`, so the replacement
+/// process must consider itself initialized; the transport-captured agent
+/// identity (#684/#855) is restored so visibility-scoped tools keep working.
+fn apply_handoff_state(state: &MCPState, hs: crate::live_update::HandoffState) {
+    if hs.initialized {
+        state
+            .initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    if !hs.session_agent_id.is_empty() {
+        if let Ok(mut slot) = state.session_agent_id.write() {
+            *slot = hs.session_agent_id;
+        }
+    }
+}
+
+/// #1045: read + clear the forwarded handoff state from the environment and
+/// apply it. Bounds/sanitization are enforced by `HandoffState::from_env_json`
+/// (mirroring the initialize path), so an env-carried value cannot bypass
+/// them. A no-op for a normally-spawned server (no env var).
+fn restore_handoff_session(state: &MCPState) {
+    if let Some(hs) = crate::live_update::take_handoff_state() {
+        apply_handoff_state(state, hs);
+    }
+}
+
 /// Parse the `PERSEUS_VAULT_IDLE_TIMEOUT_SECS` env value into an idle-watchdog duration.
 ///
 /// - unset / "0" / unparseable  -> disabled (None). DEFAULT IS OFF since #748:
@@ -267,6 +295,45 @@ pub fn parse_idle_timeout(raw: Option<&str>) -> Option<std::time::Duration> {
     }
 }
 
+/// Parse one raw JSON-RPC line, dispatch it, and write the response (if any)
+/// to stdout. Shared by the read loop and the #1045 pending-request path so a
+/// forwarded in-flight request gets exactly the same treatment as a live one.
+fn process_request_line(
+    line: &str,
+    state: &MCPState,
+    db: &Database,
+    stdout: &mut std::io::Stdout,
+) {
+    let request: JsonRpcRequest = match serde_json::from_str(line) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("perseus-vault: JSON parse error: {} in line: {}", e, line);
+            let error_response = json!({
+                "jsonrpc": "2.0",
+                "id": Value::Null,
+                "error": {"code": -32700, "message": format!("Parse error: {}", e)}
+            });
+            let _ = writeln!(stdout, "{}", error_response);
+            let _ = stdout.flush();
+            return;
+        }
+    };
+
+    let response = handle_request(&request, state, db);
+    if let Some(resp) = response {
+        let resp_str = serde_json::to_string(&resp).unwrap_or_else(|_| {
+            json!({
+                "jsonrpc": "2.0",
+                "id": request.id,
+                "error": {"code": -32603, "message": "Internal error: serialization failed"}
+            })
+            .to_string()
+        });
+        let _ = writeln!(stdout, "{}", resp_str);
+        let _ = stdout.flush();
+    }
+}
+
 /// Run the MCP server loop: read JSON-RPC from stdin, write responses to stdout.
 ///
 /// Takes `Arc<Database>` (#402) so main.rs can hand the SAME pooled Database
@@ -281,6 +348,20 @@ pub fn run_server(db: std::sync::Arc<Database>) {
 
     let mut stdout = std::io::stdout();
     let state = MCPState::new();
+
+    // #1045: a handoff child resumes the forwarded session — the client
+    // already initialized the pre-handoff image and never re-sends
+    // `initialize`, and the transport-captured agent identity must survive.
+    restore_handoff_session(&state);
+
+    // #1045: the replacement image may carry a prepared response
+    // (PERSEUS_VAULT_HANDOFF_PENDING_RESPONSE) for the explicit handoff call
+    // — the client is blocked on exactly this report. Write it before
+    // entering the read loop.
+    if let Some(resp_str) = crate::live_update::take_handoff_pending_response() {
+        let _ = writeln!(stdout, "{}", resp_str);
+        let _ = stdout.flush();
+    }
 
     // Idle watchdog — OPT-IN since #748 (PERSEUS_VAULT_IDLE_TIMEOUT_SECS, default off).
     //
@@ -375,6 +456,13 @@ pub fn run_server(db: std::sync::Arc<Database>) {
         });
     }
 
+    // #1045: the replacement image may carry the auto-handoff's in-flight
+    // request (PERSEUS_VAULT_HANDOFF_PENDING_REQUEST) — the client is blocked
+    // on exactly this response. Process it before entering the read loop.
+    if let Some(pending_line) = crate::live_update::take_handoff_pending_request() {
+        process_request_line(&pending_line, &state, &db, &mut stdout);
+    }
+
     loop {
         let line = match idle_timeout {
             Some(timeout) => match rx.recv_timeout(timeout) {
@@ -417,47 +505,33 @@ pub fn run_server(db: std::sync::Arc<Database>) {
             break;
         }
 
-        let request: JsonRpcRequest = match serde_json::from_str(&line) {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("perseus-vault: JSON parse error: {} in line: {}", e, line);
-                let error_response = json!({
-                    "jsonrpc": "2.0",
-                    "id": Value::Null,
-                    "error": {"code": -32700, "message": format!("Parse error: {}", e)}
-                });
-                let _ = writeln!(stdout, "{}", error_response);
-                let _ = stdout.flush();
-                continue;
-            }
-        };
+        process_request_line(&line, &state, &db, &mut stdout);
 
-        let response = handle_request(&request, &state, &db);
-
-        if let Some(resp) = response {
-            let resp_str = serde_json::to_string(&resp).unwrap_or_else(|_| {
-                json!({
-                    "jsonrpc": "2.0",
-                    "id": request.id,
-                    "error": {"code": -32603, "message": "Internal error: serialization failed"}
-                })
-                .to_string()
-            });
-            let _ = writeln!(stdout, "{}", resp_str);
-            let _ = stdout.flush();
-
-            // #858: fd-preserving live-update handoff. The response above is
-            // flushed FIRST so the client receives the report before the
-            // process image switches; the child inherits the same stdin/stdout
-            // pipes, so the MCP session continues uninterrupted.
-            if crate::live_update::handoff_pending() {
-                if let Err(e) = crate::live_update::perform_handoff() {
-                    eprintln!("perseus-vault: handoff spawn failed: {e}");
+        // #858/#1045: live-update handoff — runs AFTER the response is
+        // flushed (explicit handoff tool) or INSTEAD of a response (an
+        // auto-handoff intercepted the in-flight call and suppressed it; the
+        // replacement image answers it). Hoisted out of the response write so
+        // a suppressed response still hands off.
+        if crate::live_update::handoff_pending() {
+            let initialized = state
+                .initialized
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let agent = state
+                .session_agent_id
+                .read()
+                .map(|s| s.clone())
+                .unwrap_or_default();
+            match crate::live_update::perform_handoff(initialized, &agent) {
+                // Windows spawn path: the replacement child owns the session.
+                Ok(()) => std::process::exit(0),
+                // Unix exec failure: keep serving — the fail-loud stale gate
+                // stays active and the client can retry or restart.
+                Err(e) => {
+                    eprintln!(
+                        "perseus-vault: handoff failed: {e} — continuing on the stale image (fail-loud gate active)"
+                    );
+                    crate::live_update::clear_handoff_pending();
                 }
-                // Exit regardless: on success the child owns the session; on
-                // failure the client sees EOF and can restart cleanly (the
-                // stale gate keeps serving loud errors until then).
-                std::process::exit(0);
             }
         }
     }
@@ -555,7 +629,73 @@ pub fn handle_request(
                 None => return Some(error_response(id, -32602, "Missing tool name")),
             };
 
+            // #1045: transparent auto-handoff — when the binary was replaced
+            // and PERSEUS_VAULT_AUTO_HANDOFF=1, hand the session to the new
+            // image WITH this request attached instead of refusing with the
+            // loud isError: the replacement process answers this very call,
+            // so the client sees one clean response and no error. The
+            // handoff tool and health stay exempt (stale_error_message is
+            // None for them); oversized requests fall through to the loud
+            // path.
+            if crate::live_update::auto_handoff_enabled()
+                && crate::live_update::stale_error_message(tool_name).is_some()
+            {
+                let pending = serde_json::to_string(req).ok();
+                if crate::live_update::schedule_auto_handoff(pending) {
+                    // No response here: the replacement image answers the
+                    // forwarded request on the same stdio connection.
+                    return None;
+                }
+            }
+
             let mut tool_args = params.get("arguments").cloned().unwrap_or(json!({}));
+
+            // #1045: window-free explicit handoff. With confirm:true on a
+            // stale image, the old process must NOT write the report itself
+            // — the replacement image writes it (forwarded via
+            // schedule_handoff_with_response). The pre-fix sequence (flush
+            // report, then exec) left a gap in which a client's next request
+            // could be consumed by the dying image's stdin BufReader and
+            // vanish, making the session look dead even though the swap
+            // succeeded.
+            if tool_name == "perseus_vault_handoff_restart" {
+                let confirm = tool_args.get("confirm").and_then(Value::as_bool).unwrap_or(false);
+                let dry_run = tool_args.get("dry_run").and_then(Value::as_bool).unwrap_or(false);
+                if confirm && !dry_run && crate::live_update::running_stale() {
+                    let report_text =
+                        match crate::live_update::handle_handoff_restart(tool_args.clone()) {
+                            Ok(t) => t,
+                            Err(e) => e,
+                        };
+                    let structured: Option<serde_json::Value> =
+                        serde_json::from_str(&report_text).ok();
+                    let mut result = json!({
+                        "content": [{ "type": "text", "text": report_text }]
+                    });
+                    if let Some(parsed) = structured {
+                        if let Some(ie) = parsed.get("isError") {
+                            result["isError"] = ie.clone();
+                        }
+                        result["structuredContent"] = parsed;
+                    }
+                    let resp = JsonRpcResponse {
+                        jsonrpc: "2.0".to_string(),
+                        id: id.clone(),
+                        result: Some(result),
+                        error: None,
+                    };
+                    if let Ok(resp_str) = serde_json::to_string(&resp) {
+                        if crate::live_update::schedule_handoff_with_response(resp_str) {
+                            // No response written here — the replacement
+                            // image writes the report after the swap.
+                            return None;
+                        }
+                    }
+                    // Oversized/unserializable: fall through to normal
+                    // dispatch (report written by the stale image; the
+                    // fail-loud gate stays up).
+                }
+            }
 
             // #684: stamp the captured session identity so tools that enforce
             // visibility (recall) know who is asking, without the caller having
@@ -8204,6 +8344,48 @@ mod tests {
         assert!(other.contains("Unknown tool: custom_bogus"), "got: {other}");
 
         let _ = fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn handoff_state_resumes_initialized_session_and_identity() {
+        // #1045: the replacement process must consider itself initialized
+        // (the client never re-sends `initialize`) and must carry the
+        // transport-captured agent identity so visibility-scoped tools keep
+        // working.
+        let state = MCPState::new();
+        assert!(!state.initialized.load(std::sync::atomic::Ordering::Relaxed));
+        assert_eq!(*state.session_agent_id.read().unwrap(), "");
+
+        apply_handoff_state(
+            &state,
+            crate::live_update::HandoffState {
+                initialized: true,
+                session_agent_id: "rovo-dev-agent".to_string(),
+            },
+        );
+        assert!(state.initialized.load(std::sync::atomic::Ordering::Relaxed));
+        assert_eq!(*state.session_agent_id.read().unwrap(), "rovo-dev-agent");
+        // tools/call must dispatch (not -32002) and stamp the identity.
+        assert!(
+            state.session_agent_id.read().unwrap().len() > 0,
+            "identity must be restored"
+        );
+    }
+
+    #[test]
+    fn handoff_state_without_init_flag_leaves_session_uninitialized() {
+        // A malformed/partial forwarded state must not silently authorize the
+        // session: initialized:false means the client must still initialize.
+        let state = MCPState::new();
+        apply_handoff_state(
+            &state,
+            crate::live_update::HandoffState {
+                initialized: false,
+                session_agent_id: String::new(),
+            },
+        );
+        assert!(!state.initialized.load(std::sync::atomic::Ordering::Relaxed));
+        assert_eq!(*state.session_agent_id.read().unwrap(), "");
     }
 
     #[test]
