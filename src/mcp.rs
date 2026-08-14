@@ -4740,6 +4740,103 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     }
   },
   {
+    "name": "perseus_vault_grounding_admit",
+    "description": "#1034: admit a deterministic grounding fingerprint for evidence grounded to a file/symbol. Captures a K=64 seeded-sha256 trigram MinHash + neighbor set at admission (zero LLM, reproducible). Fail-closed authoring rule: if trustworthy ground facts are unavailable, stop and report it — never invent node ids or fingerprints. The agent supplies the grounded content; the vault never fetches. Re-admission refreshes the baseline with an appended provenance trail (never silent last-write-wins).",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "workspace_hash": {"type": "string", "description": "Workspace the grounding belongs to"},
+        "entity_id": {"type": "string", "description": "Evidence entity the grounding anchors (must exist)"},
+        "target_ref": {"type": "string", "description": "File path or symbol reference the evidence is grounded to"},
+        "kind": {"type": "string", "enum": ["file", "symbol"], "description": "What target_ref names"},
+        "content": {"type": "string", "description": "The grounded source content at admission (agent-supplied; bounded)"}
+      },
+      "required": ["entity_id", "target_ref", "content"]
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "id": {"type": "string"},
+        "target_ref": {"type": "string"},
+        "fingerprint_hex": {"type": "string"},
+        "baseline_digest": {"type": "string"},
+        "status": {"type": "string"},
+        "captured_at_unix_ms": {"type": "integer"}
+      }
+    }
+  },
+  {
+    "name": "perseus_vault_grounding_reconcile",
+    "description": "#1034: reconcile admitted groundings against a current-content scan (agent-supplied target_ref/content pairs). Deterministic, zero LLM: identical digest → ok; exists-but-changed → GROUNDING_DRIFT; reconcile score (0.7×minhashJaccard + 0.3×neighborOverlap, HI 0.85 / LO 0.55) → MOVED (auto-rewrite anchor + migrate baseline with a provenance trail) / GONE (flag for review) / AMBIGUOUS (surface candidates for operator review).",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "workspace_hash": {"type": "string", "description": "Workspace to reconcile"},
+        "current": {"type": "array", "items": {"type": "object", "properties": {
+          "target_ref": {"type": "string"},
+          "content": {"type": "string"}
+        }}, "description": "Current content scan: target_ref + content pairs"}
+      }
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "checked": {"type": "integer"},
+        "ok": {"type": "integer"},
+        "drift": {"type": "integer"},
+        "moved": {"type": "integer"},
+        "gone": {"type": "integer"},
+        "ambiguous": {"type": "integer"},
+        "issues": {"type": "array", "items": {"type": "object"}},
+        "note": {"type": "string"}
+      }
+    }
+  },
+  {
+    "name": "perseus_vault_drift_check",
+    "description": "#1035: deterministic drift-check pre-pass over the store (zero LLM in detection): REFERENCE_INTEGRITY (dangling derived_from citations), GROUNDING_STATUS (drift/gone/ambiguous fingerprints), PATH_EXISTENCE (missing grounded files), CROSS_FILE_CONFLICT (two evidence entities asserting different values for the same keyed claim), STALE_ENTITY (stale vs last-access threshold). Health score = 100 − (10×error + 3×warning + 1×info). Repair scope = flagged items only (perseus_vault_drift_repair).",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "workspace_hash": {"type": "string", "description": "Optional workspace scope"},
+        "staleness_days": {"type": "integer", "minimum": 1, "maximum": 3650, "default": 90, "description": "Staleness threshold in days"}
+      }
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "health_score": {"type": "integer"},
+        "errors": {"type": "integer"},
+        "warnings": {"type": "integer"},
+        "infos": {"type": "integer"},
+        "checker_counts": {"type": "object"},
+        "issues": {"type": "array", "items": {"type": "object"}},
+        "note": {"type": "string"}
+      }
+    }
+  },
+  {
+    "name": "perseus_vault_drift_repair",
+    "description": "#1035: targeted repair + verify leg of the drift loop. Mechanical fixes only: unlink dangling derived_from references (journaled), acknowledge grounding findings. Contradictions, staleness, and missing files are never auto-resolved — they land in requires_review for the operator queue. Re-runs the check and reports the before/after health-score delta; a repair that regresses the score is refused fail-closed.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "workspace_hash": {"type": "string", "description": "Optional workspace scope"},
+        "staleness_days": {"type": "integer", "minimum": 1, "maximum": 3650, "default": 90, "description": "Staleness threshold in days"}
+      }
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "before_score": {"type": "integer"},
+        "after_score": {"type": "integer"},
+        "repaired": {"type": "array", "items": {"type": "string"}},
+        "requires_review": {"type": "array", "items": {"type": "string"}},
+        "note": {"type": "string"}
+      }
+    }
+  },
+  {
     "name": "perseus_vault_restore_forward",
     "description": "#1028: forward-only restoration — restore from a checkpoint directory as an audited VERSION ADVANCE of the current head, never as a rewrite. Each checkpoint entity advances its (category, key, workspace) identity: the pre-restore version moves to entity_history (the parent; a rollback is just another forward migration) and the checkpoint body becomes the new head. Protected authority paths always take CURRENT values — authority, policy, revocation, issuer, writer, epoch, dirSeq/lifecycle, createdFrom/provenance are excluded from the mask (M ∩ P = ∅; only `entities` is maskable in v1), so a restore can never revive a stale credential, resurrect a superseded authority, or undo a recorded external effect (authorized actions untouched). Workspace-scoped; an active writer directory (#1027) requires the current writer_epoch. Report: restored / superseded_current_heads / created / errors.",
     "inputSchema": {
@@ -7289,6 +7386,10 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
         "perseus_vault_writer_handoff" => tools::handle_writer_handoff(db, args),
         "perseus_vault_impact_report" => tools::handle_impact_report(db, args),
         "perseus_vault_finding_record" => tools::handle_finding_record(db, args),
+        "perseus_vault_grounding_admit" => tools::handle_grounding_admit(db, args),
+        "perseus_vault_grounding_reconcile" => tools::handle_grounding_reconcile(db, args),
+        "perseus_vault_drift_check" => tools::handle_drift_check(db, args),
+        "perseus_vault_drift_repair" => tools::handle_drift_repair(db, args),
         "perseus_vault_restore_forward" => tools::handle_restore_forward(db, args),
         "perseus_vault_op_run" => tools::handle_op_run(db, args).map_err(|e| e.to_string()),
         "perseus_vault_op_run_list" => {
@@ -7433,7 +7534,7 @@ mod tests {
         );
         assert_eq!(
             registry_names.len(),
-            142,
+            146,
             "update public metadata when adding a tool"
         );
 

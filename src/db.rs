@@ -15054,6 +15054,506 @@ impl Database {
         Ok(finding)
     }
 
+    /// #1034: admit a deterministic grounding fingerprint for evidence
+    /// grounded to a file/symbol. Fail-closed authoring rule adopted
+    /// verbatim from mex: "If trustworthy ground facts are unavailable,
+    /// stop and report it. Never invent node ids or fingerprints."
+    pub fn grounding_admit(
+        &self,
+        workspace_hash: &str,
+        entity_id: &str,
+        target_ref: &str,
+        kind: &str,
+        content: &str,
+    ) -> Result<crate::models::GroundingRow, Box<dyn std::error::Error>> {
+        if entity_id.trim().is_empty() || target_ref.trim().is_empty() {
+            return Err(
+                "grounding admission refused: entity_id and target_ref are required".into(),
+            );
+        }
+        if !matches!(kind, "file" | "symbol") {
+            return Err("grounding admission refused: kind must be 'file' or 'symbol'".into());
+        }
+        let exists: i64 = self
+            .conn()?
+            .query_row(
+                "SELECT COUNT(*) FROM entities WHERE id = ?1 AND archived = 0",
+                params![entity_id],
+                |r| r.get(0),
+            )?;
+        if exists == 0 {
+            return Err(
+                "grounding admission refused: entity not found — never invent node ids"
+                    .into(),
+            );
+        }
+        if content.trim().len() < crate::grounding::MIN_TOKENS {
+            return Err(
+                "grounding admission refused [insufficient_content]: trustworthy ground facts                  are unavailable — stop and report it; never invent fingerprints"
+                    .into(),
+            );
+        }
+        if content.len() > crate::grounding::MAX_BODY_LEN {
+            return Err(format!(
+                "grounding admission refused: content exceeds {} bytes",
+                crate::grounding::MAX_BODY_LEN
+            )
+            .into());
+        }
+        let fp = crate::grounding::fingerprint_hex(content, crate::grounding::SEED)
+            .ok_or("grounding admission refused [insufficient_content]: content is not fingerprintable")?;
+        let baseline_digest = crate::grounding::content_digest(content);
+        let neighbors: Vec<String> = {
+            let set = crate::grounding::neighbor_set(content);
+            let mut v: Vec<String> = set.into_iter().collect();
+            v.sort();
+            v.truncate(crate::grounding::MAX_STORED_NEIGHBORS);
+            v
+        };
+        let neighbor_count = neighbors.len();
+        let neighbors_json = serde_json::to_string(&neighbors)?;
+        let now = now_ms();
+        let conn = self.conn()?;
+        let existing: Option<String> = conn
+            .query_row(
+                "SELECT id FROM grounding_fingerprints WHERE workspace_hash = ?1 AND entity_id = ?2 AND target_ref = ?3",
+                params![workspace_hash, entity_id, target_ref],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let (id, provenance_json, captured_at, is_existing) = match existing {
+            Some(id) => {
+                // Re-admission: refresh fingerprint/baseline, keep the
+                // provenance trail (append, never silent overwrite).
+                let provenance: String = conn.query_row(
+                    "SELECT provenance_json FROM grounding_fingerprints WHERE id = ?1",
+                    params![id],
+                    |r| r.get(0),
+                )?;
+                let previous_digest: String = conn.query_row(
+                    "SELECT baseline_digest FROM grounding_fingerprints WHERE id = ?1",
+                    params![id],
+                    |r| r.get(0),
+                )?;
+                let mut prov: Vec<serde_json::Value> =
+                    serde_json::from_str(&provenance).unwrap_or_default();
+                prov.push(serde_json::json!({
+                    "event": "re_admitted",
+                    "at_unix_ms": now,
+                    "previous_digest": previous_digest,
+                }));
+                (id, serde_json::to_string(&prov)?, None, true)
+            }
+            None => (
+                format!("grn-{}", uuid::Uuid::new_v4().simple()),
+                "[]".to_string(),
+                Some(now),
+                false,
+            ),
+        };
+        if is_existing {
+            conn.execute(
+                "UPDATE grounding_fingerprints SET fingerprint_hex = ?1, neighbor_count = ?2,
+                 neighbors_json = ?3, baseline_digest = ?4, provenance_json = ?5,
+                 updated_at_unix_ms = ?6 WHERE id = ?7",
+                params![fp, neighbor_count as i64, neighbors_json, baseline_digest, provenance_json, now, id],
+            )?;
+        } else {
+            conn.execute(
+                "INSERT INTO grounding_fingerprints
+                 (id,workspace_hash,entity_id,target_ref,kind,fingerprint_hex,neighbor_count,
+                  neighbors_json,baseline_digest,status,candidates_json,provenance_json,
+                  captured_at_unix_ms,updated_at_unix_ms)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,'ok','[]',?10,?11,?12)",
+                params![
+                    id,
+                    workspace_hash,
+                    entity_id,
+                    target_ref,
+                    kind,
+                    fp,
+                    neighbor_count as i64,
+                    neighbors_json,
+                    baseline_digest,
+                    provenance_json,
+                    captured_at.unwrap_or(now),
+                    now,
+                ],
+            )?;
+        }
+        drop(conn);
+        self.journal(&JournalEvent {
+            id: format!("jrn-{}", uuid::Uuid::new_v4().simple()),
+            event_type: "grounding_admitted".to_string(),
+            evaluated_json: json!({
+                "target_ref": target_ref,
+                "kind": kind,
+                "baseline_digest": baseline_digest,
+            })
+            .to_string(),
+            acted_json: "{}".to_string(),
+            forward_json: "{}".to_string(),
+            category: "grounding".to_string(),
+            key: target_ref.to_string(),
+            entity_id: entity_id.to_string(),
+            agent_id: String::new(),
+            workspace_hash: workspace_hash.to_string(),
+            created_at_unix_ms: now,
+        })?;
+        self.grounding_get(workspace_hash, entity_id, target_ref)?
+            .ok_or_else(|| "grounding row not found after admit".into())
+    }
+
+    fn grounding_get(
+        &self,
+        workspace_hash: &str,
+        entity_id: &str,
+        target_ref: &str,
+    ) -> Result<Option<crate::models::GroundingRow>, Box<dyn std::error::Error>> {
+        let conn = self.conn()?;
+        let row = conn
+            .query_row(
+                "SELECT id, workspace_hash, entity_id, target_ref, kind, fingerprint_hex,
+                        neighbor_count, neighbors_json, baseline_digest, status,
+                        candidates_json, provenance_json, reviewed_at_unix_ms,
+                        captured_at_unix_ms, updated_at_unix_ms
+                 FROM grounding_fingerprints
+                 WHERE workspace_hash = ?1 AND entity_id = ?2 AND target_ref = ?3",
+                params![workspace_hash, entity_id, target_ref],
+                |r| {
+                    let neighbor_count: i64 = r.get(6)?;
+                    Ok(crate::models::GroundingRow {
+                        id: r.get(0)?,
+                        workspace_hash: r.get(1)?,
+                        entity_id: r.get(2)?,
+                        target_ref: r.get(3)?,
+                        kind: r.get(4)?,
+                        fingerprint_hex: r.get(5)?,
+                        neighbor_count: neighbor_count as usize,
+                        baseline_digest: r.get(8)?,
+                        status: r.get(9)?,
+                        candidates_json: r.get(10).unwrap_or_default(),
+                        provenance_json: r.get(11).unwrap_or_default(),
+                        reviewed_at_unix_ms: r.get(12).ok().flatten(),
+                        captured_at_unix_ms: r.get(13)?,
+                        updated_at_unix_ms: r.get(14)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// #1034: reconcile admitted groundings against a current-content scan.
+    /// `current` is the agent's re-scan: (target_ref, content) pairs.
+    /// Deterministic, zero LLM. MOVED auto-rewrites the anchor + migrates
+    /// the baseline with a supersede-style provenance trail; GONE and
+    /// AMBIGUOUS flag for operator review (never auto-delete).
+    pub fn grounding_reconcile(
+        &self,
+        workspace_hash: &str,
+        current: &[(String, String)],
+    ) -> Result<crate::models::GroundingReconcileReport, Box<dyn std::error::Error>> {
+        use crate::grounding as g;
+        let now = now_ms();
+        let conn = self.conn()?;
+        let mut rows: Vec<crate::models::GroundingRow> = Vec::new();
+        {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, workspace_hash, entity_id, target_ref, kind, fingerprint_hex,
+                            neighbor_count, neighbors_json, baseline_digest, status,
+                            candidates_json, provenance_json, reviewed_at_unix_ms,
+                            captured_at_unix_ms, updated_at_unix_ms
+                     FROM grounding_fingerprints WHERE workspace_hash = ?1",
+                )
+                .map_err(|e| format!("reconcile prepare failed: {e}"))?;
+            let mut q = stmt
+                .query(params![workspace_hash])
+                .map_err(|e| format!("reconcile query failed: {e}"))?;
+            while let Some(r) = q.next().map_err(|e| format!("reconcile row failed: {e}"))? {
+                let neighbor_count: i64 = r.get(6)?;
+                rows.push(crate::models::GroundingRow {
+                    id: r.get(0)?,
+                    workspace_hash: r.get(1)?,
+                    entity_id: r.get(2)?,
+                    target_ref: r.get(3)?,
+                    kind: r.get(4)?,
+                    fingerprint_hex: r.get(5)?,
+                    neighbor_count: neighbor_count as usize,
+                    baseline_digest: r.get(8)?,
+                    status: r.get(9)?,
+                    candidates_json: r.get(10).unwrap_or_default(),
+                    provenance_json: r.get(11).unwrap_or_default(),
+                    reviewed_at_unix_ms: r.get(12).ok().flatten(),
+                    captured_at_unix_ms: r.get(13)?,
+                    updated_at_unix_ms: r.get(14)?,
+                });
+            }
+        }
+        drop(conn);
+
+        let mut report = crate::models::GroundingReconcileReport {
+            checked: rows.len(),
+            ok: 0,
+            drift: 0,
+            moved: 0,
+            gone: 0,
+            ambiguous: 0,
+            issues: Vec::new(),
+            note: "deterministic fingerprint reconcile (zero LLM); MOVED auto-rewrites the anchor with a provenance trail; GONE/AMBIGUOUS flag for operator review".to_string(),
+        };
+        // Map: target_ref -> (content, digest, sig, neighbors)
+        let scan: std::collections::HashMap<
+            String,
+            (String, String, Vec<u64>, std::collections::HashSet<String>),
+        > = current
+            .iter()
+            .filter_map(|(t, c)| {
+                let sig = g::minhash(c, g::SEED)?;
+                Some((
+                    t.clone(),
+                    (
+                        c.clone(),
+                        g::content_digest(c),
+                        sig,
+                        g::neighbor_set(c),
+                    ),
+                ))
+            })
+            .collect();
+
+        for row in rows {
+            let baseline_sig = match g::parse_fingerprint(&row.fingerprint_hex) {
+                Some((seed, sig)) if seed == g::SEED => sig,
+                _ => {
+                    report.issues.push(crate::models::GroundingReconcileIssue {
+                        target_ref: row.target_ref.clone(),
+                        entity_id: row.entity_id.clone(),
+                        status: "unverifiable".to_string(),
+                        detail: "baseline fingerprint unparseable — flag for review, never guess".to_string(),
+                    });
+                    continue;
+                }
+            };
+            let baseline_neighbors: std::collections::HashSet<String> = {
+                let raw: Vec<String> = serde_json::from_str(
+                    &{
+                        let conn = self.conn()?;
+                        let v: String = conn
+                            .query_row(
+                                "SELECT neighbors_json FROM grounding_fingerprints WHERE id = ?1",
+                                params![row.id],
+                                |r| r.get(0),
+                            )
+                            .unwrap_or_else(|_| "[]".to_string());
+                        v
+                    },
+                )
+                .unwrap_or_default();
+                raw.into_iter().collect()
+            };
+
+            let current_entry = scan.get(&row.target_ref);
+            match current_entry {
+                Some((content, digest, _sig, _nb)) if *digest == row.baseline_digest => {
+                    report.ok += 1;
+                    if row.status != "ok" {
+                        // Content restored (e.g. move reverted): clear the flag.
+                        let conn = self.conn()?;
+                        conn.execute(
+                            "UPDATE grounding_fingerprints SET status = 'ok', candidates_json = '[]',
+                             reviewed_at_unix_ms = NULL, updated_at_unix_ms = ?1 WHERE id = ?2",
+                            params![now, row.id],
+                        )?;
+                        drop(conn);
+                    }
+                }
+                _ => {
+                    // Changed (in place or absent): find a moved candidate.
+                    let row_ref: &str = row.target_ref.as_str();
+                    let mut candidates: Vec<(String, f64)> = scan
+                        .iter()
+                        .filter(|(t, _)| *t != row_ref)
+                        .map(|(t, (_, _, sig, nb))| {
+                            let score = g::reconcile_score(
+                                &baseline_sig,
+                                sig,
+                                &baseline_neighbors,
+                                nb,
+                            );
+                            (t.clone(), score)
+                        })
+                        .filter(|(_, s)| *s >= g::LO)
+                        .collect();
+                    candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                    let in_band: Vec<(String, f64)> = candidates
+                        .iter()
+                        .filter(|(_, s)| *s < g::HI)
+                        .cloned()
+                        .collect();
+                    let hi_hits: Vec<(String, f64)> = candidates
+                        .iter()
+                        .filter(|(_, s)| *s >= g::HI)
+                        .cloned()
+                        .collect();
+
+                    if hi_hits.len() == 1 {
+                        // MOVED: auto-rewrite the anchor + migrate the
+                        // baseline with a provenance trail.
+                        let (to_target, score) = hi_hits.into_iter().next().unwrap();
+                        let (to_content, to_digest, to_sig, to_nb) = {
+                            let (c, d, s, n) = scan.get(&to_target).unwrap();
+                            (c.clone(), d.clone(), s.clone(), n.clone())
+                        };
+                        let new_fp = format!(
+                            "seed={:016x};k={};{}",
+                            g::SEED,
+                            g::K,
+                            to_sig
+                                .iter()
+                                .map(|h| format!("{h:016x}"))
+                                .collect::<Vec<_>>()
+                                .join(":")
+                        );
+                        let mut prov: Vec<serde_json::Value> =
+                            serde_json::from_str(&row.provenance_json).unwrap_or_default();
+                        prov.push(serde_json::json!({
+                            "event": "moved",
+                            "at_unix_ms": now,
+                            "from_target": row.target_ref,
+                            "to_target": to_target,
+                            "previous_digest": row.baseline_digest,
+                            "new_digest": to_digest,
+                            "score": score,
+                        }));
+                        let conn = self.conn()?;
+                        conn.execute(
+                            "UPDATE grounding_fingerprints SET target_ref = ?1,
+                             fingerprint_hex = ?2, baseline_digest = ?3, status = 'ok',
+                             candidates_json = '[]', provenance_json = ?4,
+                             reviewed_at_unix_ms = NULL, updated_at_unix_ms = ?5
+                             WHERE id = ?6",
+                            params![
+                                to_target,
+                                new_fp,
+                                to_digest,
+                                serde_json::to_string(&prov)?,
+                                now,
+                                row.id
+                            ],
+                        )?;
+                        drop(conn);
+                        self.journal(&JournalEvent {
+                            id: format!("jrn-{}", uuid::Uuid::new_v4().simple()),
+                            event_type: "grounding_moved".to_string(),
+                            evaluated_json: json!({
+                                "from_target": row.target_ref,
+                                "to_target": to_target,
+                                "score": score,
+                            })
+                            .to_string(),
+                            acted_json: serde_json::to_string(&prov)?,
+                            forward_json: "{}".to_string(),
+                            category: "grounding".to_string(),
+                            key: row.target_ref.clone(),
+                            entity_id: row.entity_id.clone(),
+                            agent_id: String::new(),
+                            workspace_hash: workspace_hash.to_string(),
+                            created_at_unix_ms: now,
+                        })?;
+                        report.moved += 1;
+                        report.issues.push(crate::models::GroundingReconcileIssue {
+                            target_ref: row.target_ref.clone(),
+                            entity_id: row.entity_id.clone(),
+                            status: "moved".to_string(),
+                            detail: format!(
+                                "anchor auto-migrated to {to_target} (score {score:.3}); provenance trail recorded"
+                            ),
+                        });
+                    } else if !in_band.is_empty() || hi_hits.len() > 1 {
+                        // AMBIGUOUS: surface candidates for operator review.
+                        let listed: Vec<serde_json::Value> = candidates
+                            .iter()
+                            .map(|(t, s)| serde_json::json!({"target_ref": t, "score": s}))
+                            .collect();
+                        let conn = self.conn()?;
+                        conn.execute(
+                            "UPDATE grounding_fingerprints SET status = 'ambiguous',
+                             candidates_json = ?1, reviewed_at_unix_ms = NULL,
+                             updated_at_unix_ms = ?2 WHERE id = ?3",
+                            params![
+                                serde_json::to_string(&listed)?,
+                                now,
+                                row.id
+                            ],
+                        )?;
+                        drop(conn);
+                        report.ambiguous += 1;
+                        report.issues.push(crate::models::GroundingReconcileIssue {
+                            target_ref: row.target_ref.clone(),
+                            entity_id: row.entity_id.clone(),
+                            status: "ambiguous".to_string(),
+                            detail: format!(
+                                "multiple/no single moved candidate; candidates: {listed:?}"
+                            ),
+                        });
+                    } else if current_entry.is_some() {
+                        // Exists but changed, no moved candidate: DRIFT.
+                        let conn = self.conn()?;
+                        conn.execute(
+                            "UPDATE grounding_fingerprints SET status = 'drift',
+                             candidates_json = '[]', reviewed_at_unix_ms = NULL,
+                             updated_at_unix_ms = ?1 WHERE id = ?2",
+                            params![now, row.id],
+                        )?;
+                        drop(conn);
+                        report.drift += 1;
+                        report.issues.push(crate::models::GroundingReconcileIssue {
+                            target_ref: row.target_ref.clone(),
+                            entity_id: row.entity_id.clone(),
+                            status: "drift".to_string(),
+                            detail: "content changed in place; no moved candidate — re-verify"
+                                .to_string(),
+                        });
+                    } else {
+                        // Gone and no plausible candidate: GONE.
+                        let conn = self.conn()?;
+                        conn.execute(
+                            "UPDATE grounding_fingerprints SET status = 'gone',
+                             candidates_json = '[]', reviewed_at_unix_ms = NULL,
+                             updated_at_unix_ms = ?1 WHERE id = ?2",
+                            params![now, row.id],
+                        )?;
+                        drop(conn);
+                        self.journal(&JournalEvent {
+                            id: format!("jrn-{}", uuid::Uuid::new_v4().simple()),
+                            event_type: "grounding_gone".to_string(),
+                            evaluated_json: json!({"target_ref": row.target_ref}).to_string(),
+                            acted_json: "{}".to_string(),
+                            forward_json: "{}".to_string(),
+                            category: "grounding".to_string(),
+                            key: row.target_ref.clone(),
+                            entity_id: row.entity_id.clone(),
+                            agent_id: String::new(),
+                            workspace_hash: workspace_hash.to_string(),
+                            created_at_unix_ms: now,
+                        })?;
+                        report.gone += 1;
+                        report.issues.push(crate::models::GroundingReconcileIssue {
+                            target_ref: row.target_ref.clone(),
+                            entity_id: row.entity_id.clone(),
+                            status: "gone".to_string(),
+                            detail: "target content absent and no plausible moved candidate — flag for review"
+                                .to_string(),
+                        });
+                    }
+                }
+            }
+        }
+        Ok(report)
+    }
+
     pub fn action_receipt_get(
         &self,
         action_id: &str,
@@ -28236,6 +28736,254 @@ pub(crate) mod tests {
         assert_eq!(ok.status, "intent");
         assert!(!ok.approval_required);
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ─── #1034: deterministic grounding verification ───
+
+    #[test]
+    fn grounding_admit_is_fail_closed_on_missing_entity_and_short_content() {
+        let (db, _path) = temp_db();
+        // Never invent node ids: anchoring a nonexistent entity is refused.
+        let err = db
+            .grounding_admit("ws-g1", "no-such-entity", "/src/a.rs", "file", &"x".repeat(200))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("never invent node ids"), "unexpected error: {err}");
+
+        db.remember(&make_entity("e-g1", "evidence", "g1", r#"{"v":1}"#))
+            .unwrap();
+        // Fail-closed authoring rule: trustworthy ground facts unavailable.
+        let err = db
+            .grounding_admit("ws-g1", "e-g1", "/src/a.rs", "file", "tiny content")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("insufficient_content"),
+            "unexpected error: {err}"
+        );
+
+        // Bad kind refused.
+        let err = db
+            .grounding_admit("ws-g1", "e-g1", "/src/a.rs", "url", &"x".repeat(200))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("kind must be"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn grounding_reconcile_detects_drift_moved_gone_ambiguous() {
+        let (db, _path) = temp_db();
+        db.remember(&make_entity("e-g2a", "evidence", "g2a", r#"{"v":1}"#))
+            .unwrap();
+        db.remember(&make_entity("e-g2b", "evidence", "g2b", r#"{"v":2}"#))
+            .unwrap();
+        db.remember(&make_entity("e-g2c", "evidence", "g2c", r#"{"v":3}"#))
+            .unwrap();
+        let content_x = "fn compute_total(items: &[u32]) -> u64 { items.iter().map(|i| *i as u64).sum() } // evidence body";
+        let content_y = "fn unrelated_impl() -> String { let parts = vec![\"a\",\"b\",\"c\",\"d\"]; parts.join(\"-\") } // other file body";
+
+        db.grounding_admit("ws-g2", "e-g2a", "/src/a.rs", "file", content_x)
+            .unwrap();
+        db.grounding_admit("ws-g2", "e-g2b", "/src/b.rs", "file", content_y)
+            .unwrap();
+
+        // All match -> ok.
+        let report = db
+            .grounding_reconcile(
+                "ws-g2",
+                &[
+                    ("/src/a.rs".to_string(), content_x.to_string()),
+                    ("/src/b.rs".to_string(), content_y.to_string()),
+                ],
+            )
+            .unwrap();
+        assert_eq!(report.checked, 2);
+        assert_eq!(report.ok, 2);
+
+        // In-place mutation -> drift.
+        let mutated_x = format!("{content_x} // edited tail");
+        let report = db
+            .grounding_reconcile(
+                "ws-g2",
+                &[
+                    ("/src/a.rs".to_string(), mutated_x.clone()),
+                    ("/src/b.rs".to_string(), content_y.to_string()),
+                ],
+            )
+            .unwrap();
+        assert_eq!(report.drift, 1, "in-place change is drift, not moved");
+
+        // Content moved from a.rs to b.rs: G1's baseline is found at b ->
+        // MOVED auto-rewrites the anchor; G2's baseline is gone from b but
+        // the target still exists with different content -> drift.
+        let report = db
+            .grounding_reconcile(
+                "ws-g2",
+                &[("/src/b.rs".to_string(), content_x.to_string())],
+            )
+            .unwrap();
+        assert_eq!(report.moved, 1, "move must auto-migrate the anchor");
+        assert_eq!(report.drift, 1, "other grounding sees changed content");
+        let migrated = db
+            .grounding_get("ws-g2", "e-g2a", "/src/b.rs")
+            .unwrap()
+            .expect("migrated grounding must live at the new target");
+        assert_eq!(migrated.status, "ok");
+        assert!(
+            migrated.provenance_json.contains("moved"),
+            "provenance trail must record the move: {}",
+            migrated.provenance_json
+        );
+
+        // Nothing present -> gone (no plausible candidate).
+        let report = db.grounding_reconcile("ws-g2", &[]).unwrap();
+        assert_eq!(report.gone, 2);
+
+        // Two equally strong candidates -> ambiguous (surface both).
+        db.grounding_admit("ws-g2", "e-g2c", "/src/c.rs", "file", content_x)
+            .unwrap();
+        let report = db
+            .grounding_reconcile(
+                "ws-g2",
+                &[
+                    ("/src/d.rs".to_string(), content_x.to_string()),
+                    ("/src/e.rs".to_string(), content_x.to_string()),
+                ],
+            )
+            .unwrap();
+        assert!(
+            report.ambiguous >= 1,
+            "two HI candidates must surface as ambiguous"
+        );
+        let conn = db.conn().unwrap();
+        let candidates: String = conn
+            .query_row(
+                "SELECT candidates_json FROM grounding_fingerprints WHERE target_ref = '/src/c.rs'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            candidates.contains("/src/d.rs") && candidates.contains("/src/e.rs"),
+            "candidates must list both: {candidates}"
+        );
+    }
+
+    // ─── #1035: deterministic drift-check → repair → verify loop ───
+
+    #[test]
+    fn drift_check_scores_and_repair_loop_verifies() {
+        let (db, _path) = temp_db();
+        // Conflicting evidence values for the same keyed claim.
+        db.remember(&make_entity("e-d1", "evidence", "d1", r#"{"version":"2.23.0"}"#))
+            .unwrap();
+        db.remember(&make_entity("e-d2", "evidence", "d2", r#"{"version":"2.22.1"}"#))
+            .unwrap();
+        // Dangling derived_from citation: link then archive the target.
+        db.remember(&make_entity("e-d3", "evidence", "d3", r#"{"x":1}"#))
+            .unwrap();
+        db.remember(&make_entity("e-d4", "evidence", "d4", r#"{"z":1}"#))
+            .unwrap();
+        db.link("evidence", "d3", "e-d4", "derived_from").unwrap();
+        db.forget("evidence", "d4", "test").unwrap();
+        // Grounding gone (reconcile with an empty scan) + missing path.
+        db.remember(&make_entity("e-d5", "evidence", "d5", r#"{"w":1}"#))
+            .unwrap();
+        let content = "fn grounded_fact() -> u64 { let v = vec![1,2,3,4,5,6]; v.iter().sum::<u64>() } // grounded";
+        db.grounding_admit(
+            "ws-drift",
+            "e-d5",
+            "/opt/data/nonexistent-grounding-file-xyz.rs",
+            "file",
+            content,
+        )
+        .unwrap();
+        db.grounding_reconcile("ws-drift", &[]).unwrap();
+        // A second, still-'ok' grounding whose path has since disappeared
+        // (never reconciled) → PATH_EXISTENCE error.
+        db.grounding_admit(
+            "ws-drift",
+            "e-d5",
+            "/opt/data/another-missing-grounding-file.rs",
+            "file",
+            content,
+        )
+        .unwrap();
+        // Stale entity (last accessed far in the past).
+        db.remember(&make_entity("e-d6", "evidence", "d6", r#"{"y":1}"#))
+            .unwrap();
+        db.conn()
+            .unwrap()
+            .execute(
+                "UPDATE entities SET last_accessed_unix_ms = 1 WHERE id = 'e-d6'",
+                [],
+            )
+            .unwrap();
+
+        let report = crate::drift_check::drift_check(&db, None, 90).unwrap();
+        let codes: Vec<&str> = report.issues.iter().map(|i| i.code.as_str()).collect();
+        assert!(
+            codes.contains(&"REFERENCE_INTEGRITY"),
+            "missing: {codes:?}"
+        );
+        assert!(
+            codes.contains(&"CROSS_FILE_CONFLICT"),
+            "missing: {codes:?}"
+        );
+        assert!(codes.contains(&"GROUNDING_STATUS"), "missing: {codes:?}");
+        assert!(codes.contains(&"PATH_EXISTENCE"), "missing: {codes:?}");
+        assert!(codes.contains(&"STALE_ENTITY"), "missing: {codes:?}");
+        // errors: ref(1) + conflict(1) + grounding-gone(1) + path(1); warnings: stale(1)
+        assert_eq!(report.errors, 4, "report: {report:?}");
+        assert_eq!(report.warnings, 1);
+        assert_eq!(report.health_score, 57, "score math: {report:?}");
+
+        // Targeted repair: unlink dangling ref + acknowledge grounding;
+        // conflicts/staleness/paths stay review-only.
+        let repair = crate::drift_check::drift_repair(&db, None, 90).unwrap();
+        assert_eq!(repair.before_score, 57);
+        assert_eq!(repair.after_score, 77, "repair: {repair:?}");
+        assert!(
+            repair
+                .repaired
+                .iter()
+                .any(|k| k.starts_with("REFERENCE_INTEGRITY:")),
+            "repaired: {:?}",
+            repair.repaired
+        );
+        assert!(
+            repair
+                .requires_review
+                .iter()
+                .any(|k| k.starts_with("CROSS_FILE_CONFLICT:")),
+            "conflicts must be review-only: {:?}",
+            repair.requires_review
+        );
+        assert!(
+            repair
+                .requires_review
+                .iter()
+                .any(|k| k.starts_with("STALE_ENTITY:")),
+            "staleness must be review-only: {:?}",
+            repair.requires_review
+        );
+
+        // Verify leg: the repaired store no longer reports the fixed issues.
+        let after = crate::drift_check::drift_check(&db, None, 90).unwrap();
+        assert!(
+            !after
+                .issues
+                .iter()
+                .any(|i| i.code == "REFERENCE_INTEGRITY"),
+            "dangling ref must be unlinked"
+        );
+        let links: String = db
+            .conn()
+            .unwrap()
+            .query_row("SELECT links FROM entities WHERE id = 'e-d3'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(links, "[]", "dangling citation removed: {links}");
+        assert_eq!(after.health_score, repair.after_score);
     }
 
     // ─── #1033: compensation admission (fail-closed, stable reason codes) ───

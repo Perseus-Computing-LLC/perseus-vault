@@ -8487,6 +8487,100 @@ pub fn handle_finding_record(db: &Database, args: Value) -> Result<String, Strin
     serde_json::to_string(&finding).map_err(|e| e.to_string())
 }
 
+/// #1034: admit a deterministic grounding fingerprint for evidence grounded
+/// to a file/symbol. Fail-closed authoring rule: if trustworthy ground facts
+/// are unavailable, stop and report it — never invent node ids or
+/// fingerprints.
+pub fn handle_grounding_admit(db: &Database, args: Value) -> Result<String, String> {
+    let workspace_hash = args
+        .get("workspace_hash")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let entity_id = args
+        .get("entity_id")
+        .and_then(|v| v.as_str())
+        .ok_or("grounding_admit requires an entity_id")?
+        .to_string();
+    let target_ref = args
+        .get("target_ref")
+        .and_then(|v| v.as_str())
+        .ok_or("grounding_admit requires a target_ref")?
+        .to_string();
+    let kind = args
+        .get("kind")
+        .and_then(|v| v.as_str())
+        .unwrap_or("file")
+        .to_string();
+    let content = args
+        .get("content")
+        .and_then(|v| v.as_str())
+        .ok_or("grounding_admit requires the grounded content (the vault never fetches; the agent reports)")?
+        .to_string();
+    let row = db
+        .grounding_admit(&workspace_hash, &entity_id, &target_ref, &kind, &content)
+        .map_err(|e| format!("grounding_admit failed: {e}"))?;
+    serde_json::to_string(&row).map_err(|e| e.to_string())
+}
+
+/// #1034: reconcile admitted groundings against a current-content scan.
+/// Deterministic, zero LLM: MOVED auto-rewrites the anchor with a provenance
+/// trail; GONE/AMBIGUOUS flag for operator review.
+pub fn handle_grounding_reconcile(db: &Database, args: Value) -> Result<String, String> {
+    let workspace_hash = args
+        .get("workspace_hash")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let current: Vec<(String, String)> = args
+        .get("current")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|e| {
+                    let t = e.get("target_ref")?.as_str()?;
+                    let c = e.get("content")?.as_str()?;
+                    Some((t.to_string(), c.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let report = db
+        .grounding_reconcile(&workspace_hash, &current)
+        .map_err(|e| format!("grounding_reconcile failed: {e}"))?;
+    serde_json::to_string(&report).map_err(|e| e.to_string())
+}
+
+/// #1035: deterministic drift-check pre-pass — broken references, grounding
+/// drift, missing paths, cross-file contradictions, staleness — with a
+/// health score (100 − 10×error − 3×warning − 1×info). Zero LLM in
+/// detection; repair scope = flagged items only.
+pub fn handle_drift_check(db: &Database, args: Value) -> Result<String, String> {
+    let workspace_hash = args.get("workspace_hash").and_then(|v| v.as_str());
+    let staleness_days = args
+        .get("staleness_days")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(90);
+    let report = crate::drift_check::drift_check(db, workspace_hash, staleness_days)
+        .map_err(|e| format!("drift_check failed: {e}"))?;
+    serde_json::to_string(&report).map_err(|e| e.to_string())
+}
+
+/// #1035: targeted repair + verify leg. Mechanical fixes only (unlink
+/// dangling references, acknowledge grounding findings); contradictions and
+/// staleness stay review-only. Re-runs the check and reports the score
+/// delta — repairs accepted only when the score improves or holds.
+pub fn handle_drift_repair(db: &Database, args: Value) -> Result<String, String> {
+    let workspace_hash = args.get("workspace_hash").and_then(|v| v.as_str());
+    let staleness_days = args
+        .get("staleness_days")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(90);
+    let report = crate::drift_check::drift_repair(db, workspace_hash, staleness_days)
+        .map_err(|e| format!("drift_repair failed: {e}"))?;
+    serde_json::to_string(&report).map_err(|e| e.to_string())
+}
+
 /// #1028: forward restoration — restore from a checkpoint as NEW successors
 /// of the current head, never as a rewrite. Protected authority paths
 /// (authority, policy, revocation, issuer, writer, epoch, dirSeq, lifecycle,
