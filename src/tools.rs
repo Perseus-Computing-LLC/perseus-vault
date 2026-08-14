@@ -17558,6 +17558,378 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    /// #1043: scoped enrichment isolation. A workspace-scoped pack with the
+    /// #1039 opt-ins must not surface the OTHER workspace's journal events,
+    /// forward plans, or recall_when triggers — even when those events would
+    /// pass the trail's candidate filter (category-anchored). The timeline
+    /// workspace clause is what keeps them out; a regression that drops it
+    /// would leak `jrn-iso-b` into the alpha-scoped trail.
+    #[test]
+    fn handoff_pack_enrichment_isolated_by_workspace_scope() {
+        let (db, path) = temp_db();
+        // Workspace alpha: a packed fact, an entity-anchored journal event
+        // with a forward plan, and a recall_when trigger entity.
+        let mut iso_a = crate::db::tests::make_entity(
+            "iso-a",
+            "facts",
+            "iso-a",
+            "{\"note\":\"deployment pipeline alpha release notes\"}",
+        );
+        iso_a.workspace_hash = "workspace-a".to_string();
+        db.remember_with_options(&iso_a, false, None, None, false).unwrap();
+        let iso_a_id: String = {
+            let conn = db.conn().unwrap();
+            conn.query_row("SELECT id FROM entities WHERE key = 'iso-a'", [], |r| {
+                r.get(0)
+            })
+            .unwrap()
+        };
+        db.journal(&crate::models::JournalEvent {
+            id: "jrn-iso-a".to_string(),
+            event_type: "action".to_string(),
+            evaluated_json: String::new(),
+            acted_json: "{\"done\":\"alpha rollout staged\"}".to_string(),
+            forward_json: "{\"next\":\"alpha canary run\"}".to_string(),
+            category: "facts".to_string(),
+            key: "iso-a".to_string(),
+            entity_id: iso_a_id,
+            agent_id: String::new(),
+            workspace_hash: "workspace-a".to_string(),
+            created_at_unix_ms: crate::db::now_ms(),
+        })
+        .unwrap();
+        let mut iso_a_trig = crate::db::tests::make_entity(
+            "iso-a-trig",
+            "facts",
+            "iso-a-trig",
+            "{\"note\":\"alpha recall checklist\",\"recall_when\":[\"deployment\"]}",
+        );
+        iso_a_trig.workspace_hash = "workspace-a".to_string();
+        db.remember_with_options(&iso_a_trig, false, None, None, false)
+            .unwrap();
+        // Workspace beta: same shape. The beta journal event is
+        // category-anchored (no entity_id), so it passes the trail's
+        // candidate filter whenever "facts" is a candidate category — only
+        // the timeline workspace clause keeps it out of the alpha trail.
+        let mut iso_b = crate::db::tests::make_entity(
+            "iso-b",
+            "facts",
+            "iso-b",
+            "{\"note\":\"deployment pipeline beta release notes\"}",
+        );
+        iso_b.workspace_hash = "workspace-b".to_string();
+        db.remember_with_options(&iso_b, false, None, None, false).unwrap();
+        db.journal(&crate::models::JournalEvent {
+            id: "jrn-iso-b".to_string(),
+            event_type: "action".to_string(),
+            evaluated_json: String::new(),
+            acted_json: "{\"done\":\"beta rollout staged\"}".to_string(),
+            forward_json: "{\"next\":\"beta canary run\"}".to_string(),
+            category: "facts".to_string(),
+            key: String::new(),
+            entity_id: String::new(),
+            agent_id: String::new(),
+            workspace_hash: "workspace-b".to_string(),
+            created_at_unix_ms: crate::db::now_ms(),
+        })
+        .unwrap();
+        let mut iso_b_trig = crate::db::tests::make_entity(
+            "iso-b-trig",
+            "facts",
+            "iso-b-trig",
+            "{\"note\":\"beta recall checklist\",\"recall_when\":[\"deployment\"]}",
+        );
+        iso_b_trig.workspace_hash = "workspace-b".to_string();
+        db.remember_with_options(&iso_b_trig, false, None, None, false)
+            .unwrap();
+
+        let raw = handle_handoff_pack(
+            &db,
+            json!({"query": "deployment pipeline", "budget_tokens": 4000,
+                   "max_excluded": 10, "workspace_hash": "workspace-a",
+                   "include_intent_trail": true, "include_next_work": true}),
+        )
+        .unwrap();
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        let trail = v["intent_trail"].as_array().expect("intent_trail present");
+        assert!(
+            trail.iter().any(|t| t["id"] == "jrn-iso-a"),
+            "own event missing from scoped trail: {raw}"
+        );
+        assert!(
+            trail.iter().all(|t| t["id"] != "jrn-iso-b"),
+            "cross-workspace event leaked into scoped trail: {raw}"
+        );
+        let fwd = v["next_work"]["forward_plans"].as_array().unwrap();
+        assert!(
+            fwd.iter().any(|f| f["id"] == "jrn-iso-a"),
+            "own forward plan missing: {raw}"
+        );
+        assert!(
+            fwd.iter().all(|f| f["id"] != "jrn-iso-b"),
+            "cross-workspace forward plan leaked: {raw}"
+        );
+        let ant = v["next_work"]["anticipation"].as_array().unwrap();
+        assert!(
+            ant.iter().any(|a| a["key"] == "iso-a-trig"),
+            "own trigger missing: {raw}"
+        );
+        assert!(
+            ant.iter().all(|a| a["key"] != "iso-b-trig"),
+            "cross-workspace trigger leaked: {raw}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// #1043: conflict pairs must stay within the scoped candidate set. The
+    /// detector's category scan is workspace-agnostic (it materializes the
+    /// cross-workspace pairs), so only the pack-scoped candidate filter can
+    /// keep them out of a scoped call's `conflicts`.
+    #[test]
+    fn handoff_pack_conflicts_are_scoped_to_the_candidate_set() {
+        let (db, path) = temp_db();
+        // Two contradictory facts per workspace. All four share the query
+        // vocabulary but their bodies diverge enough that the detector flags
+        // every pair, including the cross-workspace ones.
+        let mut a1 = crate::db::tests::make_entity(
+            "cf-a1",
+            "facts",
+            "cf-a1",
+            "{\"note\":\"deployment pipeline uses kubernetes for rollout orchestration\"}",
+        );
+        a1.workspace_hash = "workspace-a".to_string();
+        db.remember_with_options(&a1, false, None, None, false).unwrap();
+        let mut a2 = crate::db::tests::make_entity(
+            "cf-a2",
+            "facts",
+            "cf-a2",
+            "{\"note\":\"deployment pipeline rolls back automatically whenever a canary probe detects latency spikes beyond the alert threshold\"}",
+        );
+        a2.workspace_hash = "workspace-a".to_string();
+        db.remember_with_options(&a2, false, None, None, false).unwrap();
+        let mut b1 = crate::db::tests::make_entity(
+            "cf-b1",
+            "facts",
+            "cf-b1",
+            "{\"note\":\"deployment pipeline runs on jenkins workers with manual gates\"}",
+        );
+        b1.workspace_hash = "workspace-b".to_string();
+        db.remember_with_options(&b1, false, None, None, false).unwrap();
+        let mut b2 = crate::db::tests::make_entity(
+            "cf-b2",
+            "facts",
+            "cf-b2",
+            "{\"note\":\"deployment pipeline moved to github actions with matrix builds and artifact signing\"}",
+        );
+        b2.workspace_hash = "workspace-b".to_string();
+        db.remember_with_options(&b2, false, None, None, false).unwrap();
+        let b_ids: Vec<String> = {
+            let conn = db.conn().unwrap();
+            let mut stmt = conn
+                .prepare("SELECT id FROM entities WHERE key IN ('cf-b1', 'cf-b2') ORDER BY key")
+                .unwrap();
+            stmt.query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        let a_ids: Vec<String> = {
+            let conn = db.conn().unwrap();
+            let mut stmt = conn
+                .prepare("SELECT id FROM entities WHERE key IN ('cf-a1', 'cf-a2') ORDER BY key")
+                .unwrap();
+            stmt.query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+
+        let raw = handle_handoff_pack(
+            &db,
+            json!({"query": "deployment pipeline", "budget_tokens": 4000,
+                   "max_excluded": 10, "workspace_hash": "workspace-a",
+                   "include_conflicts": true}),
+        )
+        .unwrap();
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        let pack_ids: Vec<&str> = v["pack"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|p| p["id"].as_str())
+            .collect();
+        let conflicts = v["conflicts"].as_array().expect("conflicts present");
+        assert!(!conflicts.is_empty(), "no in-scope pair flagged: {raw}");
+        for pair in conflicts {
+            let a = pair["pair"]["entity_a"]["id"].as_str().unwrap_or("");
+            let b = pair["pair"]["entity_b"]["id"].as_str().unwrap_or("");
+            assert!(pack_ids.contains(&a), "out-of-scope member {a}: {raw}");
+            assert!(pack_ids.contains(&b), "out-of-scope member {b}: {raw}");
+            assert!(
+                !b_ids.contains(&a.to_string()) && !b_ids.contains(&b.to_string()),
+                "cross-workspace pair leaked into scoped conflicts: {raw}"
+            );
+        }
+        // Contrast: the unscoped pack surfaces the cross-workspace pairs,
+        // proving the fixture materializes them and the scoped filter works.
+        let raw_g = handle_handoff_pack(
+            &db,
+            json!({"query": "deployment pipeline", "budget_tokens": 4000,
+                   "max_excluded": 10, "include_conflicts": true}),
+        )
+        .unwrap();
+        let vg: Value = serde_json::from_str(&raw_g).unwrap();
+        let g_conflicts = vg["conflicts"].as_array().unwrap();
+        // A genuine cross-workspace pair has exactly one endpoint from each
+        // workspace; a within-B pair would not prove the fixture materializes
+        // cross pairs, so require the split explicitly.
+        let cross_pairs = g_conflicts.iter().filter(|pair| {
+            let a = pair["pair"]["entity_a"]["id"].as_str().unwrap_or("");
+            let b = pair["pair"]["entity_b"]["id"].as_str().unwrap_or("");
+            (a_ids.contains(&a.to_string()) && b_ids.contains(&b.to_string()))
+                || (a_ids.contains(&b.to_string()) && b_ids.contains(&a.to_string()))
+        });
+        assert!(
+            cross_pairs.count() > 0,
+            "unscoped pack missing cross-workspace pairs — fixture too weak: {raw_g}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// #1043: max_trail bounds and ordering. 0 clamps to 1, 25 clamps to 20;
+    /// the trail is newest-first with a deterministic id tie-break, and the
+    /// truncation boundary sits exactly at the bound.
+    #[test]
+    fn handoff_pack_intent_trail_max_trail_bounds_and_newest_first_order() {
+        let (db, path) = temp_db();
+        db.remember_with_options(
+            &crate::db::tests::make_entity(
+                "mt-e1",
+                "facts",
+                "mt-e1",
+                "{\"note\":\"deployment pipeline metrics collection\"}",
+            ),
+            false,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let mt_id: String = {
+            let conn = db.conn().unwrap();
+            conn.query_row("SELECT id FROM entities WHERE key = 'mt-e1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap()
+        };
+        // Anchored ahead of write-time: every remember_with_options journals
+        // an auto `interference_scored` event carrying the write timestamp,
+        // so the synthetic events must be strictly newer to dominate the
+        // trail deterministically.
+        let base = crate::db::now_ms() + 60_000;
+        // 19 strictly-increasing events, then a 4-event same-timestamp group
+        // (id tie-break), then 4 newer events — 27 total.
+        for i in 0i64..=18 {
+            db.journal(&crate::models::JournalEvent {
+                id: format!("tr-{i:02}"),
+                event_type: "action".to_string(),
+                evaluated_json: String::new(),
+                acted_json: format!("{{\"step\":{i}}}"),
+                forward_json: String::new(),
+                category: "facts".to_string(),
+                key: "mt-e1".to_string(),
+                entity_id: mt_id.clone(),
+                agent_id: String::new(),
+                workspace_hash: String::new(),
+                created_at_unix_ms: base + i * 10,
+            })
+            .unwrap();
+        }
+        for (k, id) in ["tr-t0", "tr-t1", "tr-t2", "tr-t3"].iter().enumerate() {
+            db.journal(&crate::models::JournalEvent {
+                id: id.to_string(),
+                event_type: "action".to_string(),
+                evaluated_json: String::new(),
+                acted_json: format!("{{\"tie\":{k}}}"),
+                forward_json: String::new(),
+                category: "facts".to_string(),
+                key: "mt-e1".to_string(),
+                entity_id: mt_id.clone(),
+                agent_id: String::new(),
+                workspace_hash: String::new(),
+                created_at_unix_ms: base + 190,
+            })
+            .unwrap();
+        }
+        for i in 0i64..4 {
+            db.journal(&crate::models::JournalEvent {
+                id: format!("tr-u{i}"),
+                event_type: "action".to_string(),
+                evaluated_json: String::new(),
+                acted_json: format!("{{\"top\":{i}}}"),
+                forward_json: String::new(),
+                category: "facts".to_string(),
+                key: "mt-e1".to_string(),
+                entity_id: mt_id.clone(),
+                agent_id: String::new(),
+                workspace_hash: String::new(),
+                created_at_unix_ms: base + 200 + i * 10,
+            })
+            .unwrap();
+        }
+
+        let call = |mt: i64| {
+            handle_handoff_pack(
+                &db,
+                json!({"query": "deployment pipeline", "budget_tokens": 4000,
+                       "max_excluded": 10, "include_intent_trail": true,
+                       "max_trail": mt}),
+            )
+            .unwrap()
+        };
+        // Lower bound: 0 clamps to 1 and yields the single newest event.
+        let raw0 = call(0);
+        let v0: Value = serde_json::from_str(&raw0).unwrap();
+        let trail0 = v0["intent_trail"].as_array().unwrap();
+        assert_eq!(trail0.len(), 1, "max_trail 0 must clamp to 1: {raw0}");
+        assert_eq!(trail0[0]["id"], json!("tr-u3"), "{raw0}");
+        // Upper bound: 25 clamps to 20.
+        let raw25 = call(25);
+        let v25: Value = serde_json::from_str(&raw25).unwrap();
+        let trail25 = v25["intent_trail"].as_array().unwrap();
+        assert_eq!(trail25.len(), 20, "max_trail 25 must clamp to 20: {raw25}");
+        let ids25: Vec<&str> = trail25.iter().filter_map(|t| t["id"].as_str()).collect();
+        assert_eq!(ids25[0], "tr-u3", "{raw25}");
+        // Newest-first: created_at is strictly non-increasing.
+        let ts_of = |id: &str| -> i64 {
+            trail25
+                .iter()
+                .find(|t| t["id"] == id)
+                .and_then(|t| t["created_at_unix_ms"].as_i64())
+                .unwrap()
+        };
+        for w in ids25.windows(2) {
+            assert!(ts_of(w[0]) >= ts_of(w[1]), "order violation {w:?}: {raw25}");
+        }
+        // The tie group shares one timestamp: the deterministic id tie-break
+        // is newest-first on id (descending), so t3 precedes t2, t1, t0.
+        let tie_pos: Vec<usize> = ["tr-t3", "tr-t2", "tr-t1", "tr-t0"]
+            .iter()
+            .map(|id| ids25.iter().position(|x| x == id).expect("tie member present"))
+            .collect();
+        assert!(
+            tie_pos.windows(2).all(|w| w[0] < w[1]),
+            "tie-break must order ids descending: {raw25}"
+        );
+        // Truncation boundary: exactly 20 kept — the 20th-newest (tr-07) is
+        // in, the 21st-newest (tr-06) is out.
+        assert!(ids25.contains(&"tr-07"), "{raw25}");
+        assert!(!ids25.contains(&"tr-06"), "truncation boundary: {raw25}");
+        // Determinism: identical store state -> identical trail.
+        assert_eq!(call(25), raw25);
+        let _ = std::fs::remove_file(path);
+    }
+
     #[test]
     fn delegation_brief_is_deterministic_and_self_contained() {
         let (db, path) = temp_db();
@@ -17624,10 +17996,62 @@ mod tests {
         let brief = v["brief"].as_str().unwrap();
         assert!(brief.contains("# Delegation Brief"), "{brief}");
         assert!(brief.contains("implement the promotion flow end to end"));
-        assert!(brief.contains("## Binding context"));
-        assert!(brief.contains("[decision] [db-d1]"), "{brief}");
-        assert!(brief.contains("## Rejected or superseded — do not resurrect"));
-        assert!(brief.contains("db-d2"), "superseded decision must be listed: {brief}");
+        // #1043: the superseded decision must appear ONLY in the
+        // do-not-resurrect section. A weak whole-brief `contains` passes
+        // both sections, so a section-scoped read is required to catch a
+        // regression that leaks it into binding context.
+        let bind_start = brief.find("## Binding context").expect("binding header");
+        let bind_end = brief
+            .find("## Rejected or superseded — do not resurrect")
+            .expect("resurrect header");
+        let binding = &brief[bind_start..bind_end];
+        assert!(binding.contains("[decision] [db-d1]"), "{brief}");
+        assert!(
+            !binding.contains("db-d2"),
+            "superseded decision leaked into binding context: {brief}"
+        );
+        let resurrect = &brief[bind_end..brief.find("## Intent trail (recent)").expect("trail header")];
+        assert!(
+            resurrect.contains("db-d2"),
+            "superseded decision missing from do-not-resurrect: {brief}"
+        );
+        // Response-level exclusion visibility: db-d2 excluded with reason.
+        let excluded = v["excluded"].as_array().expect("excluded present");
+        let sup = excluded
+            .iter()
+            .find(|x| x["key"] == "db-d2")
+            .unwrap_or_else(|| panic!("superseded decision missing from excluded: {raw}"));
+        assert_eq!(sup["reason"], json!("superseded"));
+        assert!(
+            excluded.iter().all(|x| x["key"] != "db-d1"),
+            "binding decision must not be excluded: {raw}"
+        );
+        // Same fixture through handoff_pack: the superseded key never packs.
+        let hp_raw = handle_handoff_pack(
+            &db,
+            json!({"query": "deployment promotion", "budget_tokens": 4000,
+                   "max_excluded": 10}),
+        )
+        .unwrap();
+        let hp_v: Value = serde_json::from_str(&hp_raw).unwrap();
+        // Positive control first: the current decision must actually pack,
+        // or the exclusion assertion below would be vacuously true.
+        let hp_pack = hp_v["pack"].as_array().unwrap();
+        assert!(
+            hp_pack.iter().any(|p| p["key"] == "db-d1"),
+            "current decision missing from pack: {hp_raw}"
+        );
+        assert!(
+            hp_pack.iter().all(|p| p["key"] != "db-d2"),
+            "superseded key packed: {hp_raw}"
+        );
+        let hp_sup = hp_v["excluded"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|x| x["key"] == "db-d2")
+            .unwrap_or_else(|| panic!("superseded key missing from excluded: {hp_raw}"));
+        assert_eq!(hp_sup["reason"], json!("superseded"));
         assert!(brief.contains("## Next work"));
         assert!(
             brief.contains("implement the promotion flow"),
