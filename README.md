@@ -408,6 +408,26 @@ Any MCP-compatible framework works with Perseus Vault directly. See
 > fallback), or set `PERSEUS_VAULT_TOOL_ALIASES=all` on the vault as a bridge
 > while older clients remain deployed.
 
+### Tool scopes (advertisement tiers, #1051)
+
+By default `tools/list` advertises every canonical tool. Set
+`PERSEUS_VAULT_TOOL_SCOPE` to narrow the advertised surface for token- and
+attention-constrained agent clients:
+
+| Setting | Advertised surface | Count |
+|---|---|---|
+| `full` (default) | everything | 147 |
+| `ops` | agent surface + operational grooming, maintenance, governance, export | 140 |
+| `agent` | everyday memory + coordination surface (recall / remember / context / handoffs / state, plus the agent-side AAR calls) | 48 |
+
+Scopes are **advertisement-only**: a hidden tool remains fully callable via
+`tools/call`, and authorization stays with workspace binding and authority
+manifests. The tier classification is a 1:1 side table (`TOOL_SCOPES` in
+`src/mcp.rs`), CI-enforced by `scripts/registry_metadata_check.py` — every
+new tool must be classified. `admin`-tier tools (`migrate`, `purge`,
+`erase`, `vault_import`, `authority_set` / `authority_revoke` /
+`authority_set_signed`) never appear in a scoped list.
+
 ### Entity CRUD
 | Tool | Description |
 |---|---|

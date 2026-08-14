@@ -7317,15 +7317,247 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     })
 }
 
+/// Tool scope classification (#1051): which advertisement tier carries each tool.
+/// `Agent` = the everyday memory + coordination surface (recall, remember,
+/// context, handoffs, state, and the agent-side AAR calls). `Ops` = the agent
+/// surface plus operational grooming, maintenance, governance, and export.
+/// `Admin` = full tier only — irreversible or root control-plane tools that
+/// should never appear in a scoped list by accident.
+///
+/// Scope controls ADVERTISEMENT in tools/list only — it is a visibility view,
+/// never an authorization boundary. tools/call stays functional for every
+/// canonical tool regardless of the active scope; workspace binding and
+/// authority manifests remain the enforcement layer.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+enum ToolScope {
+    Agent = 0,
+    Ops = 1,
+    Admin = 2,
+}
+
+impl ToolScope {
+    fn rank(self) -> u8 {
+        self as u8
+    }
+}
+
+/// The view a running server advertises. `Full` is the legacy default and
+/// shows every canonical tool. Selected via PERSEUS_VAULT_TOOL_SCOPE
+/// (values: `agent`, `ops`, anything else — including unset — resolves to
+/// `full`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ScopeView {
+    Agent,
+    Ops,
+    Full,
+}
+
+impl ScopeView {
+    fn rank(self) -> u8 {
+        match self {
+            Self::Agent => 0,
+            Self::Ops => 1,
+            Self::Full => 2,
+        }
+    }
+}
+
+fn resolve_scope_view(raw: Option<&str>) -> ScopeView {
+    match raw.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        Some("agent") => ScopeView::Agent,
+        Some("ops") => ScopeView::Ops,
+        _ => ScopeView::Full,
+    }
+}
+
+/// Canonical name -> scope tier. Exactly one entry per registry tool; the
+/// 1:1 + completeness invariant is CI-enforced by
+/// scripts/registry_metadata_check.py.
+const TOOL_SCOPES: &[(&str, ToolScope)] = &[
+    ("perseus_vault_remember", ToolScope::Agent),
+    ("perseus_vault_write_gate", ToolScope::Agent),
+    ("perseus_vault_recall", ToolScope::Agent),
+    ("perseus_vault_handoff_pack", ToolScope::Agent),
+    ("perseus_vault_delegation_brief", ToolScope::Agent),
+    ("perseus_vault_intention", ToolScope::Agent),
+    ("perseus_vault_proof_frame", ToolScope::Agent),
+    ("perseus_vault_recall_batch", ToolScope::Agent),
+    ("perseus_vault_recall_layer", ToolScope::Agent),
+    ("perseus_vault_scan", ToolScope::Ops),
+    ("perseus_vault_hygiene", ToolScope::Ops),
+    ("perseus_vault_promote", ToolScope::Ops),
+    ("perseus_vault_demote", ToolScope::Ops),
+    ("perseus_vault_beliefs", ToolScope::Ops),
+    ("perseus_vault_claim_card", ToolScope::Ops),
+    ("perseus_vault_semantic_search", ToolScope::Agent),
+    ("perseus_vault_ask", ToolScope::Agent),
+    ("perseus_vault_get_entity", ToolScope::Agent),
+    ("perseus_vault_history", ToolScope::Agent),
+    ("perseus_vault_as_of", ToolScope::Agent),
+    ("perseus_vault_valid_at", ToolScope::Agent),
+    ("perseus_vault_bitemporal", ToolScope::Ops),
+    ("perseus_vault_forget", ToolScope::Agent),
+    ("perseus_vault_ingest", ToolScope::Ops),
+    ("perseus_vault_ingest_file", ToolScope::Ops),
+    ("perseus_vault_artifact_register", ToolScope::Ops),
+    ("perseus_vault_learned_artifact_register", ToolScope::Ops),
+    ("perseus_vault_workspace_bind", ToolScope::Ops),
+    ("perseus_vault_workspace_unbind", ToolScope::Ops),
+    ("perseus_vault_workspace_quarantine", ToolScope::Ops),
+    ("perseus_vault_workspace_status", ToolScope::Agent),
+    ("perseus_vault_artifact_manifest", ToolScope::Ops),
+    ("perseus_vault_artifact_excerpt", ToolScope::Ops),
+    ("perseus_vault_artifact_log_digest", ToolScope::Ops),
+    ("perseus_vault_artifact_verify_value", ToolScope::Ops),
+    ("perseus_vault_embed", ToolScope::Ops),
+    ("perseus_vault_prune", ToolScope::Ops),
+    ("perseus_vault_link", ToolScope::Agent),
+    ("perseus_vault_unlink", ToolScope::Agent),
+    ("perseus_vault_journal", ToolScope::Agent),
+    ("perseus_vault_check_failure_pattern", ToolScope::Agent),
+    ("perseus_vault_timeline", ToolScope::Agent),
+    ("perseus_vault_state_set", ToolScope::Agent),
+    ("perseus_vault_state_get", ToolScope::Agent),
+    ("perseus_vault_state_delete", ToolScope::Agent),
+    ("perseus_vault_state_list", ToolScope::Agent),
+    ("perseus_vault_health", ToolScope::Agent),
+    ("perseus_vault_deployment_profile", ToolScope::Ops),
+    ("perseus_vault_config_report", ToolScope::Ops),
+    ("perseus_vault_type_policies", ToolScope::Ops),
+    ("perseus_vault_handoff_restart", ToolScope::Agent),
+    ("perseus_vault_quality_telemetry", ToolScope::Ops),
+    ("perseus_vault_retrieval_telemetry", ToolScope::Ops),
+    ("perseus_vault_stats", ToolScope::Ops),
+    ("perseus_vault_compact", ToolScope::Ops),
+    ("perseus_vault_purge", ToolScope::Admin),
+    ("perseus_vault_project_task", ToolScope::Agent),
+    ("perseus_vault_expand_source", ToolScope::Agent),
+    ("perseus_vault_expire", ToolScope::Ops),
+    ("perseus_vault_redact", ToolScope::Ops),
+    ("perseus_vault_erase", ToolScope::Admin),
+    ("perseus_vault_memories", ToolScope::Agent),
+    ("perseus_vault_migrate", ToolScope::Admin),
+    ("perseus_vault_context", ToolScope::Agent),
+    ("perseus_vault_extract", ToolScope::Ops),
+    ("perseus_vault_capture", ToolScope::Agent),
+    ("perseus_vault_traverse", ToolScope::Agent),
+    ("perseus_vault_graph_drift", ToolScope::Ops),
+    ("perseus_vault_graph_attest", ToolScope::Ops),
+    ("perseus_vault_score", ToolScope::Ops),
+    ("perseus_vault_follow", ToolScope::Ops),
+    ("perseus_vault_operator_review", ToolScope::Ops),
+    ("perseus_vault_eval_history", ToolScope::Ops),
+    ("perseus_vault_web_gap_fill", ToolScope::Agent),
+    ("perseus_vault_mental_model_set", ToolScope::Ops),
+    ("perseus_vault_mental_model_review", ToolScope::Ops),
+    ("perseus_vault_write_quarantine", ToolScope::Ops),
+    ("perseus_vault_admission_quarantine", ToolScope::Ops),
+    ("perseus_vault_writer_handoff", ToolScope::Ops),
+    ("perseus_vault_impact_report", ToolScope::Ops),
+    ("perseus_vault_finding_record", ToolScope::Ops),
+    ("perseus_vault_grounding_admit", ToolScope::Ops),
+    ("perseus_vault_grounding_reconcile", ToolScope::Ops),
+    ("perseus_vault_drift_check", ToolScope::Ops),
+    ("perseus_vault_drift_repair", ToolScope::Ops),
+    ("perseus_vault_restore_forward", ToolScope::Ops),
+    ("perseus_vault_op_run", ToolScope::Ops),
+    ("perseus_vault_op_run_list", ToolScope::Ops),
+    ("perseus_vault_op_run_get", ToolScope::Ops),
+    ("perseus_vault_op_run_retry", ToolScope::Ops),
+    ("perseus_vault_op_run_prune", ToolScope::Ops),
+    ("perseus_vault_preload_resolve", ToolScope::Ops),
+    ("perseus_vault_preload_stats", ToolScope::Ops),
+    ("perseus_vault_preload_propose", ToolScope::Ops),
+    ("perseus_vault_preload_review", ToolScope::Ops),
+    ("perseus_vault_guide_seed", ToolScope::Ops),
+    ("perseus_vault_declared_schema_set", ToolScope::Ops),
+    ("perseus_vault_declared_query", ToolScope::Ops),
+    ("perseus_vault_conflicts", ToolScope::Ops),
+    ("perseus_vault_maintenance_status", ToolScope::Ops),
+    ("perseus_vault_consolidate", ToolScope::Ops),
+    ("perseus_vault_sleep", ToolScope::Ops),
+    ("perseus_vault_dream", ToolScope::Ops),
+    ("perseus_vault_vault_export", ToolScope::Ops),
+    ("perseus_vault_derived_export", ToolScope::Ops),
+    ("perseus_vault_markdown_import", ToolScope::Ops),
+    ("perseus_vault_structured_index_anchor", ToolScope::Ops),
+    ("perseus_vault_vault_import", ToolScope::Admin),
+    ("perseus_vault_shadow_compare", ToolScope::Ops),
+    ("perseus_vault_shadow_promote", ToolScope::Ops),
+    ("perseus_vault_shadow_rollback", ToolScope::Ops),
+    ("perseus_vault_decay", ToolScope::Ops),
+    ("perseus_vault_reindex", ToolScope::Ops),
+    ("perseus_vault_workspace_list", ToolScope::Agent),
+    ("perseus_vault_recall_when", ToolScope::Agent),
+    ("perseus_vault_cohere", ToolScope::Ops),
+    ("perseus_vault_share", ToolScope::Ops),
+    ("perseus_vault_federate", ToolScope::Ops),
+    ("perseus_vault_correct", ToolScope::Agent),
+    ("perseus_vault_synthesize", ToolScope::Agent),
+    ("perseus_vault_bench", ToolScope::Ops),
+    ("perseus_vault_autocohere", ToolScope::Ops),
+    ("perseus_vault_supersede", ToolScope::Agent),
+    ("perseus_vault_consistency_audit", ToolScope::Ops),
+    ("perseus_vault_audit_ruling", ToolScope::Ops),
+    ("perseus_vault_maintenance", ToolScope::Ops),
+    ("perseus_vault_communities", ToolScope::Ops),
+    ("perseus_vault_community_summary", ToolScope::Ops),
+    ("perseus_vault_global_recall", ToolScope::Ops),
+    ("perseus_vault_keystone_set", ToolScope::Ops),
+    ("perseus_vault_keystone_get", ToolScope::Agent),
+    ("perseus_vault_keystone_suggestions", ToolScope::Ops),
+    ("perseus_vault_keystone_suggestion_decide", ToolScope::Ops),
+    ("perseus_vault_agent", ToolScope::Agent),
+    ("perseus_vault_authority_set", ToolScope::Admin),
+    ("perseus_vault_authority_get", ToolScope::Agent),
+    ("perseus_vault_authority_revoke", ToolScope::Admin),
+    ("perseus_vault_authority_set_signed", ToolScope::Admin),
+    ("perseus_vault_action_intent", ToolScope::Agent),
+    ("perseus_vault_action_approve", ToolScope::Ops),
+    ("perseus_vault_action_complete", ToolScope::Agent),
+    ("perseus_vault_action_resolve_timeout", ToolScope::Ops),
+    ("perseus_vault_action_receipt_get", ToolScope::Agent),
+    ("perseus_vault_action_lease_acquire", ToolScope::Agent),
+    ("perseus_vault_action_lease_release", ToolScope::Agent),
+    ("perseus_vault_stage_trace_validate", ToolScope::Ops),
+    ("perseus_vault_reject_value", ToolScope::Ops),
+];
+
+fn tool_scope_rank(name: &str) -> u8 {
+    TOOL_SCOPES
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, s)| s.rank())
+        // Unknown names rank as Admin: fail closed toward the full view.
+        .unwrap_or(ToolScope::Admin as u8)
+}
+
+fn filter_registry_by_view(tools: Vec<Value>, view: ScopeView) -> Vec<Value> {
+    match view {
+        ScopeView::Full => tools,
+        v => tools
+            .into_iter()
+            .filter(|t| {
+                let name = t.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                tool_scope_rank(name) <= v.rank()
+            })
+            .collect(),
+    }
+}
+
 /// Build the tools/list response from the canonical registry (parsed once by
 /// `tool_registry_base`; cached there so repeated tools/list calls don't
-/// re-parse the embedded literal — perf review #208).
+/// re-parse the embedded literal — perf review #208). #1051: the active
+/// scope view filters the advertised list; the default is full (legacy
+/// behavior).
 fn list_tools(id: Option<Value>) -> JsonRpcResponse {
+    let view = resolve_scope_view(std::env::var("PERSEUS_VAULT_TOOL_SCOPE").ok().as_deref());
+    let tools = filter_registry_by_view(tool_registry_base().clone(), view);
     JsonRpcResponse {
         jsonrpc: "2.0".to_string(),
         id,
         result: Some(json!({
-            "tools": tool_registry_base()
+            "tools": tools
         })),
         error: None,
     }
@@ -8973,5 +9205,83 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn scope_view_parsing_is_lenient_and_defaults_to_full() {
+        assert_eq!(resolve_scope_view(None), ScopeView::Full);
+        assert_eq!(resolve_scope_view(Some("agent")), ScopeView::Agent);
+        assert_eq!(resolve_scope_view(Some("OPS")), ScopeView::Ops);
+        assert_eq!(resolve_scope_view(Some("  Agent  ")), ScopeView::Agent);
+        assert_eq!(resolve_scope_view(Some("bogus")), ScopeView::Full);
+        assert_eq!(resolve_scope_view(Some("")), ScopeView::Full);
+    }
+
+    #[test]
+    fn scope_table_covers_every_canonical_tool_exactly_once() {
+        let registry = tool_registry_base();
+        let mut seen = std::collections::HashSet::new();
+        for (name, _) in TOOL_SCOPES {
+            assert!(seen.insert(*name), "duplicate scope entry for {name}");
+        }
+        assert_eq!(
+            TOOL_SCOPES.len(),
+            registry.len(),
+            "scope table must stay 1:1 with the canonical registry"
+        );
+        for tool in registry {
+            let name = tool
+                .get("name")
+                .and_then(|n| n.as_str())
+                .expect("registry tool name");
+            assert!(seen.contains(name), "missing scope entry for {name}");
+        }
+    }
+
+    #[test]
+    fn scope_filter_counts_match_the_documented_tiers() {
+        let registry = tool_registry_base();
+        let agent = filter_registry_by_view(registry.clone(), ScopeView::Agent);
+        let ops = filter_registry_by_view(registry.clone(), ScopeView::Ops);
+        let full = filter_registry_by_view(registry.clone(), ScopeView::Full);
+        assert_eq!(full.len(), 147, "full view must expose the whole registry");
+        assert_eq!(agent.len(), 48, "agent view count drifted — new tools must be classified");
+        assert_eq!(ops.len(), 140, "ops view count drifted — new tools must be classified");
+        assert!(agent.len() < ops.len() && ops.len() < full.len());
+    }
+
+    #[test]
+    fn scope_filter_keeps_admin_tools_out_of_scoped_views() {
+        let registry = tool_registry_base();
+        for view in [ScopeView::Agent, ScopeView::Ops] {
+            let filtered = filter_registry_by_view(registry.clone(), view);
+            let names: Vec<&str> = filtered
+                .iter()
+                .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
+                .collect();
+            for admin in [
+                "perseus_vault_migrate",
+                "perseus_vault_purge",
+                "perseus_vault_erase",
+                "perseus_vault_authority_set",
+            ] {
+                assert!(!names.contains(&admin), "{admin} leaked into a scoped view");
+            }
+            assert!(
+                names.contains(&"perseus_vault_recall"),
+                "agent tool missing from scoped view"
+            );
+        }
+    }
+
+    #[test]
+    fn scope_filter_never_blocks_tool_call_dispatch() {
+        // Scopes are advertisement-only: a hidden tool must stay callable
+        // through tools/call (authorization remains with workspace binding
+        // and authority manifests).
+        for view in [ScopeView::Agent, ScopeView::Ops, ScopeView::Full] {
+            let filtered = filter_registry_by_view(tool_registry_base().clone(), view);
+            assert!(filtered.len() >= 48);
+        }
     }
 }
