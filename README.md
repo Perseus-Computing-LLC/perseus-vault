@@ -563,6 +563,26 @@ perseus-vault keygen --key-file ~/.perseus-vault/secret.key
 perseus-vault inspect --db /data/perseus-vault.db --key-file ~/.perseus-vault/secret.key
 ```
 
+### Live updates without restarting the session
+
+`perseus-vault serve` detects when its own binary is replaced on disk
+mid-session (the normal `cargo build` / reinstall flow) and refuses to serve
+results from the stale process image — every tool answers a loud, explicit
+error instead of degrading into empty results (#858, #1045). Two recovery
+paths, both on the same stdio connection (no client restart):
+
+- **Explicit:** call `perseus_vault_handoff_restart {"confirm": true}` — the
+  process hot-swaps to the new binary and the session continues seamlessly,
+  with the MCP session state (initialization + agent identity) preserved.
+- **Automatic (opt-in):** launch the server with
+  `PERSEUS_VAULT_AUTO_HANDOFF=1` and the swap happens transparently on the
+  next tool call, which the new binary answers directly.
+
+On macOS/Linux the swap is a true `exec` (same PID, same pipes). Windows
+locks a running executable, so mid-session replacement is not possible there;
+update across a session boundary. Full contract and the local dev workflow:
+[`docs/specs/live-update-handoff.md`](docs/specs/live-update-handoff.md).
+
 > **Manual DB edits.** The maintenance verbs above and the normal MCP write path
 > keep the FTS5 index in sync automatically. Editing the `entities` table
 > **directly** with `sqlite3` (a manual `DELETE`/`UPDATE`) bypasses that sync and
