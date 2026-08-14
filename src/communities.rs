@@ -486,7 +486,31 @@ impl Database {
     /// Partition the (per-workspace) link graph into communities, generate
     /// extractive summaries, and persist the result — replacing any previous
     /// detection run for the workspace. Deterministic on a frozen DB.
+    ///
+    /// Detection replaces a derived, workspace-scoped projection atomically and
+    /// is idempotent for an unchanged graph. A concurrent writer can briefly
+    /// own SQLite's single write lock, so retry only `BUSY`/`LOCKED` errors with
+    /// bounded backoff while propagating all other failures immediately.
     pub fn detect_communities(
+        &self,
+        workspace_hash: &str,
+        algorithm: &str,
+        min_size: usize,
+    ) -> Result<CommunitiesReport, Box<dyn std::error::Error>> {
+        let mut attempt = 0;
+        loop {
+            match self.detect_communities_inner(workspace_hash, algorithm, min_size) {
+                Ok(report) => return Ok(report),
+                Err(e) if attempt < 3 && Self::err_is_busy(e.as_ref()) => {
+                    attempt += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(100 * attempt));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    fn detect_communities_inner(
         &self,
         workspace_hash: &str,
         algorithm: &str,
@@ -1630,6 +1654,52 @@ mod tests {
             })
             .is_err());
 
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn err_is_busy_classifies_transient_sqlite_locks() {
+        // Regression for the #1046 retry wrapper: only the transient
+        // BUSY/LOCKED class may be retried; anything else must propagate.
+        let busy = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            None,
+        );
+        assert!(Database::err_is_busy(&busy), "SQLITE_BUSY must be retried");
+        let locked = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_LOCKED),
+            None,
+        );
+        assert!(
+            Database::err_is_busy(&locked),
+            "SQLITE_LOCKED must be retried"
+        );
+        let constraint = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
+            None,
+        );
+        assert!(
+            !Database::err_is_busy(&constraint),
+            "SQLITE_CONSTRAINT is not transient lock contention"
+        );
+        let io = std::io::Error::new(std::io::ErrorKind::Other, "not sqlite");
+        assert!(
+            !Database::err_is_busy(&io),
+            "non-SQLite errors must propagate immediately"
+        );
+    }
+
+    #[test]
+    fn detect_propagates_non_busy_errors_without_retrying() {
+        let (db, path) = temp_db();
+        // Unknown algorithm is a hard validation error, not lock contention:
+        // the retry wrapper must return it on the first attempt instead of
+        // burning its bounded retries on a permanent failure.
+        let err = db
+            .detect_communities("", "not_an_algorithm", 2)
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Unknown algorithm"), "{msg}");
         let _ = std::fs::remove_file(&path);
     }
 }
