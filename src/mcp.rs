@@ -611,6 +611,8 @@ pub fn handle_request(
                     "perseus_vault_artifact_manifest",
                     "perseus_vault_artifact_excerpt",
                     "perseus_vault_artifact_verify_value",
+                    "perseus_vault_handoff_pack",
+                    "perseus_vault_delegation_brief",
                 ];
                 let profile = tool_args
                     .get("requesting_agent_id")
@@ -1207,7 +1209,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
   },
   {
     "name": "perseus_vault_handoff_pack",
-    "description": "Budgeted handoff pack: lifecycle-filtered (expired/superseded excluded), provenance-tagged context for cross-session handoffs under a hard token budget, with exclusion visibility and a deterministic pack digest. Candidates from FTS5 recall; greedy-with-backfill packing; never exceeds budget_tokens.",
+    "description": "Budgeted handoff pack: lifecycle-filtered (expired/superseded excluded), provenance-tagged context for cross-session handoffs under a hard token budget, with exclusion visibility and a deterministic pack digest. Candidates from FTS5 recall; greedy-with-backfill packing; never exceeds budget_tokens. Optional planning-boundary enrichment (#1039): include_intent_trail adds recent journal events tied to the pack, include_next_work adds journal forward plans plus recall_when anticipation matches, include_conflicts adds pack-scoped contradiction flags.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -1215,7 +1217,11 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
         "budget_tokens": { "type": "integer", "description": "Hard pack budget in tokens (chars/4), 100..100000, default 2000" },
         "max_excluded": { "type": "integer", "description": "Max excluded items listed with reasons, 0..200, default 20" },
         "include_expired": { "type": "boolean", "description": "Include expired checkable claims (default false)" },
-        "workspace_hash": { "type": "string", "description": "Workspace scope hash" }
+        "workspace_hash": { "type": "string", "description": "Workspace scope hash. When set, the pack and its enrichment are scoped to that workspace." },
+        "include_intent_trail": { "type": "boolean", "description": "Add intent_trail: recent journal events tied to the packed entities (default false)" },
+        "include_next_work": { "type": "boolean", "description": "Add next_work: journal forward plans + recall_when anticipation matches for the scope (default false)" },
+        "include_conflicts": { "type": "boolean", "description": "Add pack-scoped contradiction flags from the conflict detector (default false)" },
+        "max_trail": { "type": "integer", "description": "Max intent-trail events to return, 1..20, default 5" }
       },
       "required": ["query"]
     },
@@ -1223,6 +1229,26 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
       "readOnlyHint": true
     },
     "title": "Handoff Pack"
+  },
+  {
+    "name": "perseus_vault_delegation_brief",
+    "description": "Deterministic markdown delegation brief generated at the planning boundary (#1039): goal + scope + binding context (superseded items excluded and listed as do-not-resurrect) + intent trail + next work + output contract. Hand a subagent the brief instead of the parent chat session; the brief is self-contained for the delegated task.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "query": { "type": "string", "description": "Scope anchor query for the delegation (required, non-empty)" },
+        "goal": { "type": "string", "description": "One-sentence goal of the delegated task (required, non-empty)" },
+        "output_contract": { "type": "string", "description": "Exact output the delegate must produce (files, commands, report shape). Omitted = return a plan with explicit open questions." },
+        "budget_tokens": { "type": "integer", "description": "Hard brief budget in tokens (chars/4), 200..100000, default 4000" },
+        "include_expired": { "type": "boolean", "description": "Include expired checkable claims in binding context (default false)" },
+        "workspace_hash": { "type": "string", "description": "Workspace scope hash. When set, the brief is built only from that workspace." }
+      },
+      "required": ["query", "goal"]
+    },
+    "annotations": {
+      "readOnlyHint": true
+    },
+    "title": "Delegation Brief"
   },
   {
     "name": "perseus_vault_intention",
@@ -7197,6 +7223,9 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
         "perseus_vault_recall" => tools::handle_recall(db, args).map_err(|e| e.to_string()),
         "perseus_vault_handoff_pack" => {
             tools::handle_handoff_pack(db, args).map_err(|e| e.to_string())
+        }
+        "perseus_vault_delegation_brief" => {
+            tools::handle_delegation_brief(db, args).map_err(|e| e.to_string())
         }
         "perseus_vault_intention" => tools::handle_intention(db, args).map_err(|e| e.to_string()),
         "perseus_vault_proof_frame" => {

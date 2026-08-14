@@ -4640,9 +4640,307 @@ pub fn handle_migrate(db: &Database, args: Value) -> String {
 /// superseded entities; greedy-with-backfill packing honors a hard token
 /// budget; excluded items are listed with reasons (exclusion visibility);
 /// the pack digest is a sha256 over sorted id|key lines (bridge-style).
+/// #1039: shared candidate pipeline for the planning-pack surfaces.
+/// Lifecycle-filtered (superseded/expired excluded), provenance-tagged
+/// budget pack with exclusion visibility and a deterministic digest. The
+/// raw candidates are returned so callers can enrich with the intent-trail
+/// and next-work sections without re-running recall.
+struct PackOutcome {
+    pack: Vec<serde_json::Value>,
+    excluded: Vec<serde_json::Value>,
+    lifecycle_filtered: i64,
+    used: i64,
+    digest: String,
+    candidates: Vec<crate::models::Entity>,
+}
+
+fn pack_pipeline(
+    db: &Database,
+    query: &str,
+    budget_tokens: i64,
+    include_expired: bool,
+    max_excluded: i64,
+    workspace_hash: Option<&str>,
+) -> Result<PackOutcome, String> {
+    let params = crate::models::RecallParams {
+        query: query.to_string(),
+        category: None,
+        entity_type: None,
+        limit: 250,
+        offset: 0,
+        min_decay: 0.0,
+        topic_path: None,
+        include_archived: false,
+        skip_side_effects: true,
+        mode: crate::models::SearchMode::Fts5,
+        embedding: None,
+        preview_cap: None,
+        // #1039: the pack must be scoped to the caller's workspace — an
+        // unscoped pack could leak another workspace's decisions into the
+        // planning boundary. None keeps the legacy unscoped behavior for
+        // callers that do not pass a workspace.
+        workspace_hash: workspace_hash.map(|s| s.to_string()),
+        ..Default::default()
+    };
+    let candidates = db
+        .recall(&params)
+        .map_err(|e| format!("handoff_pack candidate recall failed: {e}"))?;
+    let now = crate::db::now_ms();
+    let tokens_of = |body: &str| -> i64 { ((body.chars().count() as i64) + 3) / 4 };
+    // Supersession lives in the entity link graph: the SUPERSEDING entity
+    // carries a "supersedes" link whose target is the stale fact. A fact is
+    // superseded when any candidate links to it that way (the superseder
+    // shares the topic, so it is normally in the candidate set too).
+    let mut superseded_targets: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for ent in &candidates {
+        for l in &ent.links {
+            if l.relationship == "supersedes" {
+                superseded_targets.insert(l.target_id.clone());
+            }
+        }
+    }
+    let is_superseded =
+        |ent: &crate::models::Entity| -> bool { superseded_targets.contains(&ent.id) };
+
+    let mut pack: Vec<serde_json::Value> = Vec::new();
+    let mut excluded: Vec<serde_json::Value> = Vec::new();
+    let mut used: i64 = 0;
+    let mut lifecycle_filtered: i64 = 0;
+    // Greedy pass: best-ranked first (score blend: rank × decay ×
+    // criticality), skipping anything that no longer fits.
+    for (rank, ent) in candidates.iter().enumerate() {
+        let reason = if is_superseded(ent) {
+            Some("superseded")
+        } else if !include_expired && crate::models::freshness_status(ent, now) == "expired" {
+            Some("expired")
+        } else {
+            None
+        };
+        if let Some(r) = reason {
+            lifecycle_filtered += 1;
+            if (excluded.len() as i64) < max_excluded {
+                excluded.push(json!({
+                    "id": ent.id, "key": ent.key, "category": ent.category,
+                    "reason": r, "rank": rank,
+                }));
+            }
+            continue;
+        }
+        let item_tokens = tokens_of(&ent.body_json);
+        if used + item_tokens <= budget_tokens {
+            used += item_tokens;
+            pack.push(pack_item_json(ent, item_tokens));
+        } else if (excluded.len() as i64) < max_excluded {
+            excluded.push(json!({
+                "id": ent.id, "key": ent.key, "category": ent.category,
+                "reason": "budget", "rank": rank, "tokens": item_tokens,
+            }));
+        }
+    }
+    // Backfill (engram borrow): after the greedy pass, small items that
+    // fit the remainder are packed, smallest first, best rank wins ties.
+    let mut skipped: Vec<(&crate::models::Entity, usize)> = Vec::new();
+    for (rank, ent) in candidates.iter().enumerate() {
+        let already = pack.iter().any(|p| p["id"] == ent.id);
+        if already {
+            continue;
+        }
+        let expired = !include_expired && crate::models::freshness_status(ent, now) == "expired";
+        if is_superseded(ent) || expired {
+            continue;
+        }
+        skipped.push((ent, rank));
+    }
+    skipped.sort_by_key(|(e, _)| tokens_of(&e.body_json));
+    for (ent, _rank) in skipped {
+        let item_tokens = tokens_of(&ent.body_json);
+        if used + item_tokens <= budget_tokens {
+            used += item_tokens;
+            pack.push(pack_item_json(ent, item_tokens));
+        }
+    }
+    // Deterministic digest: sha256 over sorted id|key lines, 16 hex chars.
+    let mut idkeys: Vec<String> = pack
+        .iter()
+        .map(|p| format!("{}|{}", p["id"], p["key"]))
+        .collect();
+    idkeys.sort();
+    let digest = crate::db::sha256_hex(&idkeys.join("\n"))[..16].to_string();
+
+    Ok(PackOutcome {
+        pack,
+        excluded,
+        lifecycle_filtered,
+        used,
+        digest,
+        candidates,
+    })
+}
+
+/// #1039: intent trail — recent journal events tied to the candidate set
+/// (same entity_id, or same category when the event is not entity-anchored).
+/// Newest first with a deterministic id tie-break, bounded by `max_trail`.
+/// This is the "last plan / result / checkpoint touching the anchor" slot:
+/// the vault's journal carries evaluated/acted/forward records that
+/// reconstruct the recent development narrative.
+fn intent_trail(
+    db: &Database,
+    candidates: &[crate::models::Entity],
+    workspace_hash: Option<&str>,
+    max_trail: i64,
+) -> Result<Vec<serde_json::Value>, String> {
+    let max_trail = max_trail.clamp(1, 20);
+    let ids: std::collections::HashSet<&str> =
+        candidates.iter().map(|e| e.id.as_str()).collect();
+    let cats: std::collections::HashSet<&str> =
+        candidates.iter().map(|e| e.category.as_str()).collect();
+    let params = crate::models::TimelineParams {
+        // Public readers must name an explicit scope; None is reserved for
+        // internal/admin callers. A caller without a workspace_hash (legacy
+        // unscoped mode) gets the explicit global partition — the timeline
+        // then covers the same partition an unscoped pack sees.
+        workspace_hash: Some(workspace_hash.unwrap_or("").to_string()),
+        from_ms: None,
+        to_ms: None,
+        event_type: None,
+        category: None,
+        entity_id: None,
+        limit: 500,
+        offset: 0,
+    };
+    let events = db
+        .timeline(&params)
+        .map_err(|e| format!("intent trail failed: {e}"))?;
+    let mut kept: Vec<crate::models::JournalEvent> = events
+        .into_iter()
+        .filter(|ev| {
+            (!ev.entity_id.is_empty() && ids.contains(ev.entity_id.as_str()))
+                || (ev.entity_id.is_empty()
+                    && !ev.category.is_empty()
+                    && cats.contains(ev.category.as_str()))
+        })
+        .collect();
+    kept.sort_by(|a, b| {
+        b.created_at_unix_ms
+            .cmp(&a.created_at_unix_ms)
+            .then_with(|| b.id.cmp(&a.id))
+    });
+    kept.truncate(max_trail as usize);
+    let clip = |s: &str, max: usize| -> String {
+        if s.chars().count() <= max {
+            s.to_string()
+        } else {
+            s.chars().take(max).collect::<String>() + "…"
+        }
+    };
+    Ok(kept
+        .into_iter()
+        .map(|ev| {
+            json!({
+                "id": ev.id,
+                "event_type": ev.event_type,
+                "category": ev.category,
+                "entity_id": ev.entity_id,
+                "created_at_unix_ms": ev.created_at_unix_ms,
+                "evaluated": clip(&ev.evaluated_json, 800),
+                "acted": clip(&ev.acted_json, 800),
+                "forward": clip(&ev.forward_json, 800),
+            })
+        })
+        .collect())
+}
+
+/// #1039: next-work sections — journal forward plans (non-empty forward)
+/// from the intent trail, plus recall_when anticipation matches for the
+/// query (entities that declared they should fire in this context = active
+/// work that depends on this decision area).
+fn next_work_sections(
+    db: &Database,
+    query: &str,
+    workspace_hash: Option<&str>,
+    trail: &[serde_json::Value],
+    args: &serde_json::Value,
+) -> serde_json::Value {
+    let forward: Vec<serde_json::Value> = trail
+        .iter()
+        .filter(|t| {
+            t.get("forward")
+                .and_then(|f| f.as_str())
+                .map(|f| !f.trim().is_empty())
+                .unwrap_or(false)
+        })
+        .take(5)
+        .cloned()
+        .collect();
+    let mut anticipation: Vec<serde_json::Value> = Vec::new();
+    if let Ok(mut ents) = db.recall_when_with_session(query, 5, workspace_hash, "") {
+        // #996: trigger reads inherit the recall visibility gate.
+        if let Some(req) = stamped_requester(args) {
+            ents.retain(|e| db.can_read(req, &e.visibility, &e.agent_id));
+        }
+        for ent in ents {
+            let triggers: serde_json::Value = serde_json::from_str(&ent.body_json)
+                .ok()
+                .and_then(|b: serde_json::Value| b.get("recall_when").cloned())
+                .unwrap_or(json!(null));
+            anticipation.push(json!({
+                "id": ent.id,
+                "key": ent.key,
+                "category": ent.category,
+                "recall_when": triggers,
+            }));
+        }
+    }
+    json!({ "forward_plans": forward, "anticipation": anticipation })
+}
+
+/// #1039: pack-scoped contradiction flags — runs the existing conflict
+/// detector per distinct pack category (bounded to 3) and keeps only pairs
+/// where BOTH members are inside the pack candidate set. Opt-in: the full
+/// pre-injection contradiction surface stays gated on #917 (MemConflict
+/// replication).
+fn pack_conflicts(
+    db: &Database,
+    candidates: &[crate::models::Entity],
+    pack: &[serde_json::Value],
+) -> Vec<serde_json::Value> {
+    let candidate_ids: std::collections::HashSet<&str> =
+        candidates.iter().map(|e| e.id.as_str()).collect();
+    let mut cats: Vec<&str> = pack
+        .iter()
+        .filter_map(|p| p.get("category").and_then(|c| c.as_str()))
+        .collect();
+    cats.sort_unstable();
+    cats.dedup();
+    cats.truncate(3);
+    let mut out = Vec::new();
+    for cat in cats {
+        if let Ok(report) = db.detect_conflicts(cat, 0.6, 20, 0) {
+            if let Some(pairs) = report.get("conflicts").and_then(|c| c.as_array()) {
+                for pair in pairs {
+                    let a = pair
+                        .get("entity_a")
+                        .and_then(|e| e.get("id"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let b = pair
+                        .get("entity_b")
+                        .and_then(|e| e.get("id"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    if candidate_ids.contains(a) && candidate_ids.contains(b) {
+                        out.push(json!({ "category": cat, "pair": pair }));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 pub fn handle_handoff_pack(db: &Database, args: Value) -> Result<String, String> {
-    let a: HandoffPackArgs =
-        serde_json::from_value(args).map_err(|e| format!("Invalid handoff_pack arguments: {e}"))?;
+    let a: HandoffPackArgs = serde_json::from_value(args.clone())
+        .map_err(|e| format!("Invalid handoff_pack arguments: {e}"))?;
     if a.query.trim().is_empty() {
         return Err("handoff_pack query must be non-empty".to_string());
     }
@@ -4658,120 +4956,250 @@ pub fn handle_handoff_pack(db: &Database, args: Value) -> Result<String, String>
             a.max_excluded
         ));
     }
-    let params = crate::models::RecallParams {
-        query: a.query.clone(),
-        category: None,
-        entity_type: None,
-        limit: 250,
-        offset: 0,
-        min_decay: 0.0,
-        topic_path: None,
-        include_archived: false,
-        skip_side_effects: true,
-        mode: crate::models::SearchMode::Fts5,
-        embedding: None,
-        preview_cap: None,
-        ..Default::default()
-    };
-    let candidates = db
-        .recall(&params)
-        .map_err(|e| format!("handoff_pack candidate recall failed: {e}"))?;
-    let now = crate::db::now_ms();
-    let tokens_of = |body: &str| -> i64 { ((body.chars().count() as i64) + 3) / 4 };
-    // Supersession lives in the entity link graph: the SUPERSEDING entity
-    // carries a "supersedes" link whose target is the stale fact. A fact is
-    // superseded when any candidate links to it that way (the superseder
-    // shares the topic, so it is normally in the candidate set too).
-    let mut superseded_targets: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    for ent in &candidates {
-        for l in &ent.links {
-            if l.relationship == "supersedes" {
-                superseded_targets.insert(l.target_id.as_str());
-            }
-        }
-    }
-    let is_superseded =
-        |ent: &crate::models::Entity| -> bool { superseded_targets.contains(ent.id.as_str()) };
-
-    let mut pack: Vec<serde_json::Value> = Vec::new();
-    let mut excluded: Vec<serde_json::Value> = Vec::new();
-    let mut used: i64 = 0;
-    let mut lifecycle_filtered: i64 = 0;
-    // Greedy pass: best-ranked first (score blend: rank × decay ×
-    // criticality), skipping anything that no longer fits.
-    for (rank, ent) in candidates.iter().enumerate() {
-        let reason = if is_superseded(ent) {
-            Some("superseded")
-        } else if !a.include_expired && crate::models::freshness_status(ent, now) == "expired" {
-            Some("expired")
-        } else {
-            None
-        };
-        if let Some(r) = reason {
-            lifecycle_filtered += 1;
-            if (excluded.len() as i64) < a.max_excluded {
-                excluded.push(json!({
-                    "id": ent.id, "key": ent.key, "category": ent.category,
-                    "reason": r, "rank": rank,
-                }));
-            }
-            continue;
-        }
-        let item_tokens = tokens_of(&ent.body_json);
-        if used + item_tokens <= a.budget_tokens {
-            used += item_tokens;
-            pack.push(pack_item_json(ent, item_tokens));
-        } else if (excluded.len() as i64) < a.max_excluded {
-            excluded.push(json!({
-                "id": ent.id, "key": ent.key, "category": ent.category,
-                "reason": "budget", "rank": rank, "tokens": item_tokens,
-            }));
-        }
-    }
-    // Backfill (engram borrow): after the greedy pass, small items that
-    // fit the remainder are packed, smallest first, best rank wins ties.
-    let mut skipped: Vec<(&crate::models::Entity, usize)> = Vec::new();
-    for (rank, ent) in candidates.iter().enumerate() {
-        let already = pack.iter().any(|p| p["id"] == ent.id);
-        if already {
-            continue;
-        }
-        let expired = !a.include_expired && crate::models::freshness_status(ent, now) == "expired";
-        if is_superseded(ent) || expired {
-            continue;
-        }
-        skipped.push((ent, rank));
-    }
-    skipped.sort_by_key(|(e, _)| tokens_of(&e.body_json));
-    for (ent, _rank) in skipped {
-        let item_tokens = tokens_of(&ent.body_json);
-        if used + item_tokens <= a.budget_tokens {
-            used += item_tokens;
-            pack.push(pack_item_json(ent, item_tokens));
-        }
-    }
-    // Deterministic digest: sha256 over sorted id|key lines, 16 hex chars.
-    let mut idkeys: Vec<String> = pack
-        .iter()
-        .map(|p| format!("{}|{}", p["id"], p["key"]))
-        .collect();
-    idkeys.sort();
-    let digest = crate::db::sha256_hex(&idkeys.join("\n"))[..16].to_string();
-
-    Ok(json!({
-        "pack": pack,
+    let outcome = pack_pipeline(
+        db,
+        &a.query,
+        a.budget_tokens,
+        a.include_expired,
+        a.max_excluded,
+        a.workspace_hash.as_deref(),
+    )?;
+    let mut result = json!({
+        "pack": outcome.pack,
         "budget": {
             "limit_tokens": a.budget_tokens,
-            "used_tokens": used,
-            "remaining_tokens": a.budget_tokens - used,
-            "item_count": pack.len(),
+            "used_tokens": outcome.used,
+            "remaining_tokens": a.budget_tokens - outcome.used,
+            "item_count": outcome.pack.len(),
         },
-        "excluded": excluded,
-        "lifecycle_filtered": lifecycle_filtered,
-        "pack_digest": digest,
+        "excluded": outcome.excluded,
+        "lifecycle_filtered": outcome.lifecycle_filtered,
+        "pack_digest": outcome.digest,
+        "read_only": true,
+    });
+    if a.include_intent_trail || a.include_next_work {
+        let trail =
+            intent_trail(db, &outcome.candidates, a.workspace_hash.as_deref(), a.max_trail)?;
+        result["intent_trail"] = json!(trail);
+        if a.include_next_work {
+            result["next_work"] = next_work_sections(
+                db,
+                &a.query,
+                a.workspace_hash.as_deref(),
+                &trail,
+                &args,
+            );
+        }
+    }
+    if a.include_conflicts {
+        result["conflicts"] = json!(pack_conflicts(db, &outcome.candidates, &outcome.pack));
+    }
+    Ok(result.to_string())
+}
+
+// ─── #1039: perseus_vault_delegation_brief ──────────────────────────────
+
+#[derive(serde::Deserialize)]
+struct DelegationBriefArgs {
+    #[serde(default)]
+    pub query: String,
+    #[serde(default)]
+    pub goal: String,
+    #[serde(default)]
+    pub output_contract: Option<String>,
+    #[serde(
+        default = "default_brief_budget",
+        deserialize_with = "null_as_default_brief_budget"
+    )]
+    pub budget_tokens: i64,
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub include_expired: bool,
+    #[serde(default)]
+    pub workspace_hash: Option<String>,
+}
+
+fn default_brief_budget() -> i64 {
+    4000
+}
+null_as_named_default!(null_as_default_brief_budget, i64, default_brief_budget);
+
+/// #1039: delegation brief — a deterministic markdown handoff packet
+/// generated from the same planning-pack machinery as handoff_pack:
+/// goal + scope + binding context (superseded items excluded and listed as
+/// "do not resurrect") + intent trail + next work + output contract.
+/// Sized for the planning boundary: a parent agent can hand the brief to a
+/// subagent without inheriting the chat session; the subagent reconstructs
+/// the task, its scope, and the binding decisions from the brief alone.
+pub fn handle_delegation_brief(db: &Database, args: Value) -> Result<String, String> {
+    let a: DelegationBriefArgs = serde_json::from_value(args.clone())
+        .map_err(|e| format!("Invalid delegation_brief arguments: {e}"))?;
+    if a.query.trim().is_empty() {
+        return Err("delegation_brief query must be non-empty".to_string());
+    }
+    if a.goal.trim().is_empty() {
+        return Err("delegation_brief goal must be non-empty".to_string());
+    }
+    if !(200..=100_000).contains(&a.budget_tokens) {
+        return Err(format!(
+            "budget_tokens must be between 200 and 100000, got {}",
+            a.budget_tokens
+        ));
+    }
+    let outcome = pack_pipeline(
+        db,
+        &a.query,
+        a.budget_tokens,
+        a.include_expired,
+        50,
+        a.workspace_hash.as_deref(),
+    )?;
+    let trail = intent_trail(db, &outcome.candidates, a.workspace_hash.as_deref(), 5)?;
+    let next = next_work_sections(
+        db,
+        &a.query,
+        a.workspace_hash.as_deref(),
+        &trail,
+        &args,
+    );
+    let brief = render_delegation_brief(&a, &outcome, &trail, &next);
+    Ok(json!({
+        "brief": brief,
+        "brief_digest": outcome.digest,
+        "budget": {
+            "limit_tokens": a.budget_tokens,
+            "used_tokens": outcome.used,
+            "item_count": outcome.pack.len(),
+        },
+        "excluded": outcome.excluded,
         "read_only": true,
     })
     .to_string())
+}
+
+fn render_delegation_brief(
+    a: &DelegationBriefArgs,
+    outcome: &PackOutcome,
+    trail: &[serde_json::Value],
+    next: &serde_json::Value,
+) -> String {
+    let one_line = |s: &str, max: usize| -> String {
+        let flat = s.replace('\n', " ").replace('\r', " ");
+        if flat.chars().count() <= max {
+            flat
+        } else {
+            flat.chars().take(max).collect::<String>() + "…"
+        }
+    };
+    let mut out = String::new();
+    out.push_str("# Delegation Brief\n\n");
+    out.push_str(&format!("goal: {}  \n", a.goal.trim()));
+    out.push_str(&format!("scope: `{}`  \n", a.query.trim()));
+    out.push_str(&format!(
+        "pack: {}/{} tokens, {} items · digest `{}` · deterministic\n\n",
+        outcome.used,
+        a.budget_tokens,
+        outcome.pack.len(),
+        outcome.digest
+    ));
+    out.push_str("## Binding context\n");
+    for item in &outcome.pack {
+        let key = item["key"].as_str().unwrap_or("");
+        let cat = item["category"].as_str().unwrap_or("");
+        let body = item["body"]
+            .as_object()
+            .and_then(|b| {
+                b.get("note")
+                    .or_else(|| b.get("content"))
+                    .or_else(|| b.get("decision"))
+            })
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let src = item["provenance"]["source"].as_str().unwrap_or("");
+        out.push_str(&format!(
+            "- [{}] [{}] {} (source: {})\n",
+            cat,
+            key,
+            one_line(body, 300),
+            src
+        ));
+    }
+    if outcome.pack.is_empty() {
+        out.push_str("- (no binding context matched the scope)\n");
+    }
+    out.push_str("\n## Rejected or superseded — do not resurrect\n");
+    let sup: Vec<&serde_json::Value> = outcome
+        .excluded
+        .iter()
+        .filter(|x| x["reason"] == "superseded")
+        .collect();
+    if sup.is_empty() {
+        out.push_str("- (none)\n");
+    } else {
+        for x in sup {
+            out.push_str(&format!(
+                "- [{}] {} ({})\n",
+                x["category"].as_str().unwrap_or(""),
+                x["key"].as_str().unwrap_or(""),
+                x["reason"].as_str().unwrap_or("")
+            ));
+        }
+    }
+    out.push_str("\n## Intent trail (recent)\n");
+    if trail.is_empty() {
+        out.push_str("- (none)\n");
+    } else {
+        for t in trail {
+            out.push_str(&format!(
+                "- {} {} [{}] {}\n",
+                t["created_at_unix_ms"].as_i64().unwrap_or(0),
+                t["event_type"].as_str().unwrap_or(""),
+                t["category"].as_str().unwrap_or(""),
+                one_line(t["acted"].as_str().unwrap_or(""), 240)
+            ));
+        }
+    }
+    out.push_str("\n## Next work\n");
+    let fwd = next
+        .get("forward_plans")
+        .and_then(|f| f.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if fwd.is_empty() {
+        out.push_str("- (no recorded forward plans)\n");
+    } else {
+        for f in &fwd {
+            out.push_str(&format!(
+                "- {} [{}]: {}\n",
+                f["created_at_unix_ms"].as_i64().unwrap_or(0),
+                f["category"].as_str().unwrap_or(""),
+                one_line(f["forward"].as_str().unwrap_or(""), 300)
+            ));
+        }
+    }
+    let ant = next
+        .get("anticipation")
+        .and_then(|f| f.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if !ant.is_empty() {
+        out.push_str("- recall_when (will fire for this scope):\n");
+        for x in &ant {
+            out.push_str(&format!(
+                "  - [{}] {}\n",
+                x["category"].as_str().unwrap_or(""),
+                x["key"].as_str().unwrap_or("")
+            ));
+        }
+    }
+    out.push_str("\n## Output contract\n");
+    match a.output_contract.as_deref().map(str::trim) {
+        Some(c) if !c.is_empty() => out.push_str(&format!("{}\n", c)),
+        _ => out.push_str("(none specified — return a plan with explicit open questions)\n"),
+    }
+    out.push_str("\n## Sources\n");
+    let ids: Vec<&str> = outcome.pack.iter().filter_map(|p| p["id"].as_str()).collect();
+    out.push_str(&format!("{}\n", ids.join(", ")));
+    out
 }
 
 fn pack_item_json(ent: &crate::models::Entity, tokens: i64) -> serde_json::Value {
@@ -4804,7 +5232,25 @@ struct HandoffPackArgs {
     pub include_expired: bool,
     #[serde(default)]
     pub workspace_hash: Option<String>,
+    // #1039 planning-boundary enrichment. All opt-in: the output is
+    // byte-identical to the pre-#1039 contract when all three are false.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub include_intent_trail: bool,
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub include_next_work: bool,
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub include_conflicts: bool,
+    #[serde(
+        default = "default_max_trail",
+        deserialize_with = "null_as_default_max_trail"
+    )]
+    pub max_trail: i64,
 }
+
+fn default_max_trail() -> i64 {
+    5
+}
+null_as_named_default!(null_as_default_max_trail, i64, default_max_trail);
 
 /// #944: proof frame — bounded, hash-cited evidence pack for external
 /// consumers (Qorx Zero borrow). Memory stays on-device; the consumer gets
@@ -16907,6 +17353,267 @@ mod tests {
                 .any(|p| p["key"] == "hp-exp"),
             "{raw4}"
         );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn handoff_pack_enrichment_sections_are_bounded_and_deterministic() {
+        let (db, path) = temp_db();
+        db.remember_with_options(
+            &crate::db::tests::make_entity(
+                "hp-e1",
+                "facts",
+                "hp-e1",
+                "{\"note\":\"the deployment pipeline uses kubernetes for the public tier\"}",
+            ),
+            false, None, None, false,
+        )
+        .unwrap();
+        db.remember_with_options(
+            &crate::db::tests::make_entity(
+                "hp-e2",
+                "decision",
+                "hp-e2",
+                "{\"note\":\"deployment promotion requires two-person review\"}",
+            ),
+            false, None, None, false,
+        )
+        .unwrap();
+        let hp_e1_id: String = {
+            let conn = db.conn().unwrap();
+            conn.query_row("SELECT id FROM entities WHERE key = 'hp-e1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap()
+        };
+        // Intent-trail event tied to a packed entity, with a forward plan.
+        db.journal(&crate::models::JournalEvent {
+            id: "jrn-e1".to_string(),
+            event_type: "action".to_string(),
+            evaluated_json: "{\"option\":\"canary\"}".to_string(),
+            acted_json: "{\"done\":\"wired the rollout gate\"}".to_string(),
+            forward_json: "{\"next\":\"run the rollout canary and record evidence\"}".to_string(),
+            category: "facts".to_string(),
+            key: "hp-e1".to_string(),
+            entity_id: hp_e1_id,
+            agent_id: String::new(),
+            workspace_hash: String::new(),
+            created_at_unix_ms: crate::db::now_ms(),
+        })
+        .unwrap();
+        // Unrelated event must NOT leak into the trail.
+        db.journal(&crate::models::JournalEvent {
+            id: "jrn-other".to_string(),
+            event_type: "decision".to_string(),
+            evaluated_json: String::new(),
+            acted_json: "{\"done\":\"unrelated topic\"}".to_string(),
+            forward_json: String::new(),
+            category: "other".to_string(),
+            key: String::new(),
+            entity_id: String::new(),
+            agent_id: String::new(),
+            workspace_hash: String::new(),
+            created_at_unix_ms: crate::db::now_ms() - 1000,
+        })
+        .unwrap();
+        // Anticipation: an entity declaring recall_when for this scope.
+        db.remember_with_options(
+            &crate::db::tests::make_entity(
+                "hp-ant",
+                "facts",
+                "hp-ant",
+                "{\"note\":\"rollout canary checklist\",\"recall_when\":[\"deployment\"]}",
+            ),
+            false, None, None, false,
+        )
+        .unwrap();
+
+        let args = json!({
+            "query": "deployment pipeline",
+            "budget_tokens": 4000,
+            "max_excluded": 10,
+            "include_intent_trail": true,
+            "include_next_work": true,
+        });
+        let raw = handle_handoff_pack(&db, args.clone()).unwrap();
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        let trail = v["intent_trail"].as_array().expect("intent_trail present");
+        assert!(
+            trail.iter().any(|t| t["id"] == "jrn-e1"),
+            "packed-entity event missing from trail: {raw}"
+        );
+        assert!(
+            trail.iter().all(|t| t["id"] != "jrn-other"),
+            "unrelated event leaked into trail: {raw}"
+        );
+        let fwd = v["next_work"]["forward_plans"].as_array().unwrap();
+        assert!(
+            fwd.iter().any(|f| f["id"] == "jrn-e1"),
+            "forward plan missing: {raw}"
+        );
+        let ant = v["next_work"]["anticipation"].as_array().unwrap();
+        assert!(
+            ant.iter().any(|a| a["key"] == "hp-ant"),
+            "anticipation match missing: {raw}"
+        );
+        // Backward compatibility: enrichment keys are absent unless asked.
+        let raw_plain = handle_handoff_pack(
+            &db,
+            json!({"query": "deployment pipeline", "budget_tokens": 4000, "max_excluded": 10}),
+        )
+        .unwrap();
+        let vp: Value = serde_json::from_str(&raw_plain).unwrap();
+        assert!(vp.get("intent_trail").is_none(), "unrequested trail: {raw_plain}");
+        assert!(vp.get("next_work").is_none(), "unrequested next_work: {raw_plain}");
+        // Determinism: identical store state -> identical enriched output.
+        let raw2 = handle_handoff_pack(&db, args).unwrap();
+        assert_eq!(raw2, raw, "enriched pack must be deterministic");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn handoff_pack_workspace_scope_isolates_the_pack() {
+        let (db, path) = temp_db();
+        let mut e_a = crate::db::tests::make_entity(
+            "ws-a",
+            "facts",
+            "ws-a",
+            "{\"note\":\"deployment pipeline runs kubernetes for workspace alpha\"}",
+        );
+        e_a.workspace_hash = "workspace-a".to_string();
+        db.remember_with_options(&e_a, false, None, None, false).unwrap();
+        let mut e_b = crate::db::tests::make_entity(
+            "ws-b",
+            "facts",
+            "ws-b",
+            "{\"note\":\"deployment pipeline runs kubernetes for workspace beta\"}",
+        );
+        e_b.workspace_hash = "workspace-b".to_string();
+        db.remember_with_options(&e_b, false, None, None, false).unwrap();
+
+        let raw = handle_handoff_pack(
+            &db,
+            json!({"query": "deployment pipeline", "budget_tokens": 4000,
+                   "max_excluded": 10, "workspace_hash": "workspace-a"}),
+        )
+        .unwrap();
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        let keys: Vec<&str> = v["pack"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|p| p["key"].as_str())
+            .collect();
+        assert!(keys.contains(&"ws-a"), "scoped pack missing own entity: {raw}");
+        assert!(!keys.contains(&"ws-b"), "cross-workspace leak: {raw}");
+        // Legacy: no workspace -> unscoped pack sees both.
+        let raw_g = handle_handoff_pack(
+            &db,
+            json!({"query": "deployment pipeline", "budget_tokens": 4000, "max_excluded": 10}),
+        )
+        .unwrap();
+        let vg: Value = serde_json::from_str(&raw_g).unwrap();
+        let gkeys: Vec<&str> = vg["pack"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|p| p["key"].as_str())
+            .collect();
+        assert!(
+            gkeys.contains(&"ws-a") && gkeys.contains(&"ws-b"),
+            "unscoped pack: {raw_g}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn delegation_brief_is_deterministic_and_self_contained() {
+        let (db, path) = temp_db();
+        db.remember_with_options(
+            &crate::db::tests::make_entity(
+                "db-d1",
+                "decision",
+                "db-d1",
+                "{\"note\":\"deployment promotion requires two-person review before production\"}",
+            ),
+            false, None, None, false,
+        )
+        .unwrap();
+        db.remember_with_options(
+            &crate::db::tests::make_entity(
+                "db-d2",
+                "decision",
+                "db-d2",
+                "{\"note\":\"deployment promotion approved by a single reviewer\"}",
+            ),
+            false, None, None, false,
+        )
+        .unwrap();
+        let db_d2_id: String = {
+            let conn = db.conn().unwrap();
+            conn.query_row("SELECT id FROM entities WHERE key = 'db-d2'", [], |r| {
+                r.get(0)
+            })
+            .unwrap()
+        };
+        // db-d1 supersedes db-d2: the old decision must be excluded and
+        // listed as do-not-resurrect, never binding context.
+        db.link("decision", "db-d1", &db_d2_id, "supersedes").unwrap();
+        let db_d1_id: String = {
+            let conn = db.conn().unwrap();
+            conn.query_row("SELECT id FROM entities WHERE key = 'db-d1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap()
+        };
+        db.journal(&crate::models::JournalEvent {
+            id: "jrn-db1".to_string(),
+            event_type: "action".to_string(),
+            evaluated_json: String::new(),
+            acted_json: "{\"done\":\"reviewed promotion gate\"}".to_string(),
+            forward_json: "{\"next\":\"implement the promotion flow\"}".to_string(),
+            category: "decision".to_string(),
+            key: "db-d1".to_string(),
+            entity_id: db_d1_id,
+            agent_id: String::new(),
+            workspace_hash: String::new(),
+            created_at_unix_ms: crate::db::now_ms(),
+        })
+        .unwrap();
+
+        let args = json!({
+            "query": "deployment promotion",
+            "goal": "implement the promotion flow end to end",
+            "output_contract": "files: src/promote.rs; verification: cargo test",
+            "budget_tokens": 4000,
+        });
+        let raw = handle_delegation_brief(&db, args.clone()).unwrap();
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        let brief = v["brief"].as_str().unwrap();
+        assert!(brief.contains("# Delegation Brief"), "{brief}");
+        assert!(brief.contains("implement the promotion flow end to end"));
+        assert!(brief.contains("## Binding context"));
+        assert!(brief.contains("[decision] [db-d1]"), "{brief}");
+        assert!(brief.contains("## Rejected or superseded — do not resurrect"));
+        assert!(brief.contains("db-d2"), "superseded decision must be listed: {brief}");
+        assert!(brief.contains("## Next work"));
+        assert!(
+            brief.contains("implement the promotion flow"),
+            "forward plan missing: {brief}"
+        );
+        assert!(brief.contains("## Output contract"));
+        assert!(brief.contains("src/promote.rs"));
+        // Determinism + digest stability.
+        let raw2 = handle_delegation_brief(&db, args).unwrap();
+        let v2: Value = serde_json::from_str(&raw2).unwrap();
+        assert_eq!(v2["brief"], v["brief"], "brief must be deterministic");
+        assert_eq!(v2["brief_digest"], v["brief_digest"]);
+        // Validation: goal and query are required.
+        assert!(
+            handle_delegation_brief(&db, json!({"query": "deployment promotion", "goal": "  "}))
+                .is_err()
+        );
+        assert!(handle_delegation_brief(&db, json!({"query": "", "goal": "x"})).is_err());
         let _ = std::fs::remove_file(path);
     }
 
