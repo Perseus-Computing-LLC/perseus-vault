@@ -486,7 +486,32 @@ impl Database {
     /// Partition the (per-workspace) link graph into communities, generate
     /// extractive summaries, and persist the result — replacing any previous
     /// detection run for the workspace. Deterministic on a frozen DB.
+    /// Detect and persist communities, retrying a transient SQLite writer race.
+    ///
+    /// Detection replaces a derived, workspace-scoped projection atomically and
+    /// is idempotent for an unchanged graph. A concurrent writer can briefly
+    /// own SQLite's single write lock, so retry only `BUSY`/`LOCKED` errors with
+    /// bounded backoff while propagating all other failures immediately.
     pub fn detect_communities(
+        &self,
+        workspace_hash: &str,
+        algorithm: &str,
+        min_size: usize,
+    ) -> Result<CommunitiesReport, Box<dyn std::error::Error>> {
+        let mut attempt = 0;
+        loop {
+            match self.detect_communities_inner(workspace_hash, algorithm, min_size) {
+                Ok(report) => return Ok(report),
+                Err(e) if attempt < 3 && Self::err_is_busy(e.as_ref()) => {
+                    attempt += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(100 * attempt));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    fn detect_communities_inner(
         &self,
         workspace_hash: &str,
         algorithm: &str,
