@@ -1275,7 +1275,21 @@ impl Database {
         let busy_timeout_ms: u64 = std::env::var("PERSEUS_VAULT_BUSY_TIMEOUT_MS")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(5000);
+            // #1031 follow-up (test-windows flake class): the 5s default is
+            // tuned for production lock queues. Test fixtures on Windows and
+            // macOS CI runners see far longer lock/stall latencies (2-vCPU
+            // runners, Defender-style file scanning on freshly created temp
+            // files, WAL snapshot races under parallel harness load), so
+            // fixtures default to 30s unless the env is set explicitly
+            // (tests that sweep PERSEUS_VAULT_BUSY_TIMEOUT_MS, e.g. the
+            // #223 pool load test, keep their explicit intent). Production
+            // builds are unaffected: test_mode is true only for TestDatabase
+            // fixtures under cfg(test).
+            .unwrap_or(if test_mode && cfg!(any(windows, target_os = "macos")) {
+                30_000
+            } else {
+                5000
+            });
         // #397: how long a request waits for a pooled connection before giving
         // up. r2d2's default is 30s, which under pool exhaustion turned into a
         // 30-second brownout per request; operators can now tune it (e.g. fail
@@ -32467,7 +32481,16 @@ pub(crate) mod tests {
     // set (which member is returned follows signature-index order since v17).
     #[test]
     fn find_near_duplicate_signature_path_matches_exhaustive_scan_property() {
-        let (db, path) = temp_db();
+        // WAL fixture (#1031 follow-up, same class as #379/#400/#971): this
+        // test runs remember_skip_dedup (read-decide-write) and raw-conn
+        // inserts/reads on the same file concurrently. Under the
+        // DELETE-journaling default a writer waiting for EXCLUSIVE starves
+        // past busy_timeout while fresh SHARED readers keep arriving — the
+        // documented "database is locked after busy_timeout" flake on
+        // Windows CI (observed 2026-08-14). WAL lets the readers and writer
+        // proceed concurrently; the test's dedup/property semantics are
+        // unchanged.
+        let (db, path) = temp_db_wal();
         let threshold = 0.7;
         let mut boundary_hits = 0usize;
 

@@ -5,6 +5,16 @@ All notable changes to Perseus Vault are documented here. This project adheres t
 
 ## [Unreleased]
 
+### Fixed
+- **Windows/macOS CI fixture flakes (SQLITE_BUSY "database is locked", #1031
+  follow-up).** Test fixtures now default to a 30s `busy_timeout` on
+  Windows/macOS (explicit `PERSEUS_VAULT_BUSY_TIMEOUT_MS` still wins;
+  production default unchanged at 5000ms), raw `schema` fixture connections
+  get the same headroom, and the dedup signature property test moved to the
+  WAL fixture — under DELETE journaling its concurrent raw-conn reads +
+  read-decide-write remembers starved the writer past busy_timeout (same
+  class as #379/#400/#971).
+
 ### Added
 - **Admission quarantine disposition (#1026).** A fourth terminal admission
   disposition: candidates disposed as `quarantined` by trust admission are
