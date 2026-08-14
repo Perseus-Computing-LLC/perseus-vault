@@ -24235,7 +24235,7 @@ last_accessed: {}
 
     /// True if a boxed error is a transient SQLite write-lock contention
     /// (DatabaseBusy / DatabaseLocked) — the class of failure cohere retries.
-    fn err_is_busy(e: &(dyn std::error::Error + 'static)) -> bool {
+    pub(crate) fn err_is_busy(e: &(dyn std::error::Error + 'static)) -> bool {
         if let Some(rusqlite::Error::SqliteFailure(err, _)) = e.downcast_ref::<rusqlite::Error>() {
             return err.code == rusqlite::ErrorCode::DatabaseBusy
                 || err.code == rusqlite::ErrorCode::DatabaseLocked;

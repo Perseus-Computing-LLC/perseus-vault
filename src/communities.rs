@@ -486,7 +486,6 @@ impl Database {
     /// Partition the (per-workspace) link graph into communities, generate
     /// extractive summaries, and persist the result — replacing any previous
     /// detection run for the workspace. Deterministic on a frozen DB.
-    /// Detect and persist communities, retrying a transient SQLite writer race.
     ///
     /// Detection replaces a derived, workspace-scoped projection atomically and
     /// is idempotent for an unchanged graph. A concurrent writer can briefly
@@ -1655,6 +1654,52 @@ mod tests {
             })
             .is_err());
 
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn err_is_busy_classifies_transient_sqlite_locks() {
+        // Regression for the #1046 retry wrapper: only the transient
+        // BUSY/LOCKED class may be retried; anything else must propagate.
+        let busy = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            None,
+        );
+        assert!(Database::err_is_busy(&busy), "SQLITE_BUSY must be retried");
+        let locked = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_LOCKED),
+            None,
+        );
+        assert!(
+            Database::err_is_busy(&locked),
+            "SQLITE_LOCKED must be retried"
+        );
+        let constraint = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
+            None,
+        );
+        assert!(
+            !Database::err_is_busy(&constraint),
+            "SQLITE_CONSTRAINT is not transient lock contention"
+        );
+        let io = std::io::Error::new(std::io::ErrorKind::Other, "not sqlite");
+        assert!(
+            !Database::err_is_busy(&io),
+            "non-SQLite errors must propagate immediately"
+        );
+    }
+
+    #[test]
+    fn detect_propagates_non_busy_errors_without_retrying() {
+        let (db, path) = temp_db();
+        // Unknown algorithm is a hard validation error, not lock contention:
+        // the retry wrapper must return it on the first attempt instead of
+        // burning its bounded retries on a permanent failure.
+        let err = db
+            .detect_communities("", "not_an_algorithm", 2)
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Unknown algorithm"), "{msg}");
         let _ = std::fs::remove_file(&path);
     }
 }
