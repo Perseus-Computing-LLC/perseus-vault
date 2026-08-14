@@ -38,6 +38,28 @@ if not all(name.startswith("perseus_vault_") for name in canonical):
 expected_count = len(canonical)
 expected_all_count = expected_count * 3
 
+# #1051 tool-scope classification: the TOOL_SCOPES side table in mcp.rs must
+# be 1:1 with the canonical registry and use only the three known tiers.
+scope_table = re.search(
+    r"const TOOL_SCOPES: &\[\(&str, ToolScope\)\] = &\[(.*?)\];",
+    source,
+    flags=re.DOTALL,
+)
+if not scope_table:
+    raise SystemExit("could not locate TOOL_SCOPES table in src/mcp.rs")
+scope_entries = re.findall(
+    r'"((?:perseus_vault_)[a-z0-9_]+)",\s*ToolScope::(Agent|Ops|Admin)',
+    scope_table.group(1),
+)
+scope_names = [n for n, _ in scope_entries]
+if len(set(scope_names)) != len(scope_names):
+    raise SystemExit("TOOL_SCOPES contains duplicate names")
+if sorted(scope_names) != sorted(canonical):
+    raise SystemExit("TOOL_SCOPES is not 1:1 with the canonical registry")
+scope_counts = {"agent": 0, "ops": 0, "admin": 0}
+for _, tier in scope_entries:
+    scope_counts[tier.lower()] += 1
+
 # Current-facing metadata must carry the source-derived count. Historical
 # evidence is intentionally excluded from this check.
 metadata = {
@@ -69,6 +91,7 @@ print(json.dumps({
     "registry_count": expected_count,
     "canonical_tools_list_count": expected_count,
     "compatibility_manifest_count": expected_all_count,
+    "scope_counts": scope_counts,
     "source": str(SOURCE.relative_to(ROOT)),
 }, sort_keys=True))
 
