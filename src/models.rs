@@ -500,6 +500,53 @@ pub struct ImpactFinding {
     pub created_at_unix_ms: i64,
 }
 
+/// #1034: a deterministic grounding fingerprint — evidence grounded to a
+/// file/symbol captures a content fingerprint (K=64 seeded-sha256 trigram
+/// MinHash + neighbor set) at admission. Maintenance passes reconcile the
+/// current content against this baseline: ok / drift / moved / gone /
+/// ambiguous. MOVED auto-rewrites the anchor with a provenance trail
+/// (never silent last-write-wins).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GroundingRow {
+    pub id: String,
+    pub workspace_hash: String,
+    pub entity_id: String,
+    pub target_ref: String,
+    pub kind: String,
+    pub fingerprint_hex: String,
+    pub neighbor_count: usize,
+    pub baseline_digest: String,
+    pub status: String,
+    #[serde(default)]
+    pub candidates_json: String,
+    #[serde(default)]
+    pub provenance_json: String,
+    pub reviewed_at_unix_ms: Option<i64>,
+    pub captured_at_unix_ms: i64,
+    pub updated_at_unix_ms: i64,
+}
+
+/// #1034: reconcile pass result over admitted groundings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GroundingReconcileReport {
+    pub checked: usize,
+    pub ok: usize,
+    pub drift: usize,
+    pub moved: usize,
+    pub gone: usize,
+    pub ambiguous: usize,
+    pub issues: Vec<GroundingReconcileIssue>,
+    pub note: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GroundingReconcileIssue {
+    pub target_ref: String,
+    pub entity_id: String,
+    pub status: String,
+    pub detail: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthorityManifest {
     pub id: String,

@@ -21,12 +21,14 @@ mod live_update;
 // against the prebuilt ONNX Runtime on glibc < 2.38 hosts, e.g. Ubuntu 22.04
 // — the dominant cloud/CI base image (#526).
 mod deployment_profile;
+mod drift_check;
 #[cfg(all(
     feature = "bundled-embeddings",
     target_os = "linux",
     target_env = "gnu"
 ))]
 mod glibc_compat;
+mod grounding;
 mod graph_route;
 mod grpc;
 mod guide;

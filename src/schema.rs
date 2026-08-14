@@ -718,10 +718,17 @@ CREATE INDEX IF NOT EXISTS idx_preload_proposals_state
 /// columns (`compensates_for`, `finding_ref`, `superseding_head`,
 /// `handoff_receipt_ref`) — compensation intents must cite an authenticated
 /// finding + superseding head; self-claimed undo is rejected fail-closed.
+///
+/// v48 (#1034 grounding verification): `grounding_fingerprints` table —
+/// deterministic content fingerprints (K=64 seeded-sha256 trigram MinHash +
+/// neighbor set) captured at admission for evidence grounded to
+/// files/symbols; maintenance passes reconcile current content vs the
+/// baseline (ok / drift / moved / gone / ambiguous) with auto-rewrite +
+/// provenance trail on MOVED.
 /// — the entity ids an action cited as grounding, so the reverse impact
 /// closure can flag PENDING actions whose justification changed. Additive
 /// column, no backfill (pre-existing actions cite nothing).
-pub(crate) const SCHEMA_VERSION: i64 = 47;
+pub(crate) const SCHEMA_VERSION: i64 = 48;
 
 /// Initialize the v0.2.0 schema on a fresh database.
 pub fn initialize_schema(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
@@ -976,6 +983,35 @@ fn apply_migrations(conn: &Connection) -> Result<(), Box<dyn std::error::Error>>
           ON impact_findings(workspace_hash, finding_ref);
          CREATE INDEX IF NOT EXISTS idx_impact_findings_ws
           ON impact_findings(workspace_hash, status, archived);",
+    )?;
+
+    // #1034: grounding verification — deterministic content fingerprints for
+    //    evidence grounded to files/symbols. New table only; nothing existed
+    //    before. `status` transitions ok -> drift/moved/gone/ambiguous on
+    //    reconcile passes; `provenance_json` is the append-only migration
+    //    trail (MOVED never silent last-write-wins).
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS grounding_fingerprints (
+            id TEXT PRIMARY KEY,
+            workspace_hash TEXT NOT NULL DEFAULT '',
+            entity_id TEXT NOT NULL,
+            target_ref TEXT NOT NULL,
+            kind TEXT NOT NULL DEFAULT 'file',
+            fingerprint_hex TEXT NOT NULL DEFAULT '',
+            neighbor_count INTEGER NOT NULL DEFAULT 0,
+            neighbors_json TEXT NOT NULL DEFAULT '[]',
+            baseline_digest TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'ok',
+            candidates_json TEXT NOT NULL DEFAULT '[]',
+            provenance_json TEXT NOT NULL DEFAULT '[]',
+            reviewed_at_unix_ms INTEGER,
+            captured_at_unix_ms INTEGER NOT NULL,
+            updated_at_unix_ms INTEGER NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS idx_grounding_fp_ws
+          ON grounding_fingerprints(workspace_hash, status);
+         CREATE INDEX IF NOT EXISTS idx_grounding_fp_entity
+          ON grounding_fingerprints(entity_id);",
     )?;
 
     // v29 (#876): governed-distillation lifecycle on artifact bindings.
