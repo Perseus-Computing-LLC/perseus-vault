@@ -4891,6 +4891,9 @@ fn next_work_sections(
             }));
         }
     }
+    // Total tie-break: the trigger matcher ranks by non-unique fields, so an
+    // explicit id sort keeps the enriched output deterministic.
+    anticipation.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
     json!({ "forward_plans": forward, "anticipation": anticipation })
 }
 
@@ -4935,6 +4938,20 @@ fn pack_conflicts(
             }
         }
     }
+    // Total tie-break on (category, entity_a id, entity_b id): the detector
+    // orders by last-accessed (non-unique), so an explicit sort keeps the
+    // enriched output deterministic.
+    out.sort_by(|x, y| {
+        let xc = x["category"].as_str().unwrap_or("");
+        let yc = y["category"].as_str().unwrap_or("");
+        let xa = x["pair"]["entity_a"]["id"].as_str().unwrap_or("");
+        let ya = y["pair"]["entity_a"]["id"].as_str().unwrap_or("");
+        let xb = x["pair"]["entity_b"]["id"].as_str().unwrap_or("");
+        let yb = y["pair"]["entity_b"]["id"].as_str().unwrap_or("");
+        xc.cmp(yc)
+            .then_with(|| xa.cmp(ya))
+            .then_with(|| xb.cmp(yb))
+    });
     out
 }
 
@@ -4978,9 +4995,14 @@ pub fn handle_handoff_pack(db: &Database, args: Value) -> Result<String, String>
         "read_only": true,
     });
     if a.include_intent_trail || a.include_next_work {
+        // The trail is computed whenever either section is requested (next_work
+        // derives its forward plans from it), but each OUTPUT key is emitted
+        // only when its own flag is set — the opt-in output contract.
         let trail =
             intent_trail(db, &outcome.candidates, a.workspace_hash.as_deref(), a.max_trail)?;
-        result["intent_trail"] = json!(trail);
+        if a.include_intent_trail {
+            result["intent_trail"] = json!(trail);
+        }
         if a.include_next_work {
             result["next_work"] = next_work_sections(
                 db,
@@ -17465,6 +17487,16 @@ mod tests {
         let vp: Value = serde_json::from_str(&raw_plain).unwrap();
         assert!(vp.get("intent_trail").is_none(), "unrequested trail: {raw_plain}");
         assert!(vp.get("next_work").is_none(), "unrequested next_work: {raw_plain}");
+        // Opt-in granularity: next_work alone must not emit intent_trail.
+        let raw_nw = handle_handoff_pack(
+            &db,
+            json!({"query": "deployment pipeline", "budget_tokens": 4000,
+                   "max_excluded": 10, "include_next_work": true}),
+        )
+        .unwrap();
+        let vn: Value = serde_json::from_str(&raw_nw).unwrap();
+        assert!(vn.get("next_work").is_some(), "next_work missing: {raw_nw}");
+        assert!(vn.get("intent_trail").is_none(), "trail emitted without flag: {raw_nw}");
         // Determinism: identical store state -> identical enriched output.
         let raw2 = handle_handoff_pack(&db, args).unwrap();
         assert_eq!(raw2, raw, "enriched pack must be deterministic");
