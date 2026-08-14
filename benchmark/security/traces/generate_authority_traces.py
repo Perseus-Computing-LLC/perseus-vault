@@ -574,17 +574,290 @@ TRACES = [
 ]
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Remediation/compensation trace family (#1032): "whose authority does the
+# compensation run under if the authority behind the original action has been
+# revoked?" — the r/AI_Agents continuity-thread third exchange (2026-08-13).
+# Answer encoded as runnable traces: authority is evaluated at COMPENSATION
+# time, never inherited; revocation without remediation handoff is fail-closed.
+# Events below are replayed by the Rust runner against the live AAR surfaces
+# (authority_set / action_intent / action_complete / authority_revoke /
+# finding_record); refs of the form "ref:<event_id>" resolve to the real
+# record ids created during replay. Deterministic payload digests throughout.
+REM_WS = "ws-trace-rem"
+REM_SCOPE = "trace-scope"
+REM_HEAD = "head-superseding-0001"
+
+
+def rem_grant(event_id, actor, caps, t, digest_tag="rem-grant-payload"):
+    return {
+        "event_id": event_id,
+        "observed_time_unix_ms": t,
+        "effective_time_unix_ms": t,
+        "actor_id": actor,
+        "operation": "grant",
+        "allowed_capabilities": caps,
+        "authority_scope": REM_SCOPE,
+        "payload_digest": digest(f"canary:{digest_tag}"),
+        "provenance": f"source:{event_id}:admission",
+    }
+
+
+def rem_effect(event_id, actor, key, t, digest_tag="rem-effect-payload"):
+    return {
+        "event_id": event_id,
+        "observed_time_unix_ms": t,
+        "effective_time_unix_ms": t,
+        "actor_id": actor,
+        "operation": "execute_action",
+        "capability": "execute_action",
+        "action_key": key,
+        "authority_scope": REM_SCOPE,
+        "payload_digest": digest(f"canary:{digest_tag}"),
+        "provenance": f"source:{event_id}:admission",
+    }
+
+
+def rem_finding(event_id, actor, finding_ref, covers, cited_head, t):
+    return {
+        "event_id": event_id,
+        "observed_time_unix_ms": t,
+        "effective_time_unix_ms": t,
+        "actor_id": actor,
+        "operation": "record_finding",
+        "finding_ref": finding_ref,
+        "covers": covers,
+        "cited_head": cited_head,
+        "basis": "supersession",
+        "payload_digest": digest(f"canary:{event_id}:finding"),
+        "provenance": f"source:{event_id}:detection",
+    }
+
+
+def rem_revoke(event_id, actor, grant_ref, t):
+    return {
+        "event_id": event_id,
+        "observed_time_unix_ms": t,
+        "effective_time_unix_ms": t,
+        "actor_id": actor,
+        "operation": "revoke",
+        "grant_ref": grant_ref,
+        "payload_digest": digest(f"canary:{event_id}:revoke"),
+        "provenance": f"source:{event_id}:authority",
+    }
+
+
+def rem_handoff(event_id, actor, beneficiary, original_effects, t):
+    return {
+        "event_id": event_id,
+        "observed_time_unix_ms": t,
+        "effective_time_unix_ms": t,
+        "actor_id": actor,
+        "operation": "handoff",
+        "capability": "remediation_handoff",
+        "beneficiary_agent_id": beneficiary,
+        "original_effects": original_effects,
+        "authority_scope": REM_SCOPE,
+        "payload_digest": digest(f"canary:{event_id}:handoff"),
+        "provenance": f"source:{event_id}:admission",
+    }
+
+
+def rem_compensate(event_id, actor, compensates_for, finding_ref, head,
+                   handoff_ref, t, expected_reason_code=None):
+    ev = {
+        "event_id": event_id,
+        "observed_time_unix_ms": t,
+        "effective_time_unix_ms": t,
+        "actor_id": actor,
+        "operation": "compensate",
+        "compensates_for": compensates_for,
+        "finding_ref": finding_ref,
+        "superseding_head": head,
+        "handoff_receipt_ref": handoff_ref,
+        "authority_scope": REM_SCOPE,
+        "payload_digest": digest(f"canary:{event_id}:compensation"),
+        "provenance": f"source:{event_id}:compensation",
+    }
+    if expected_reason_code is not None:
+        ev["expected_reason_code"] = expected_reason_code
+    return ev
+
+
+REMEDIATION_TRACES = [
+    {
+        "trace_id": "remediation-revocation-barrier",
+        "title": "Revocation barrier: a revoked principal cannot compensate its own past effect",
+        "description": (
+            "Grant G authorizes agent A; A executes effect E with a receipt. G is "
+            "revoked. A files a compensation intent citing E + a valid authenticated "
+            "finding + the superseding head. The intent must be rejected on CURRENT "
+            "action authority — compensation authority is never inherited from the "
+            "original action — while E's receipt still verifies historically."
+        ),
+        "events": [
+            rem_grant("evt-rem-grant-a", "agent-rem-a",
+                      ["execute_action", "finding.record"], T["grant"]),
+            rem_effect("evt-rem-effect-e", "agent-rem-a", "effect-E", T["grant_obs"]),
+            rem_finding("evt-rem-finding-a", "agent-rem-a", "fnd-rem-a",
+                        ["ref:evt-rem-effect-e"], REM_HEAD, T["revoke"]),
+            rem_revoke("evt-rem-revoke-a", "operator", "ref:evt-rem-grant-a", T["revoke"]),
+            rem_compensate(
+                "evt-rem-comp-a", "agent-rem-a", "ref:evt-rem-effect-e", "fnd-rem-a",
+                REM_HEAD, "", T["attempt"], expected_reason_code="no active authority manifest",
+            ),
+        ],
+        "expected_decision": "reject",
+        "reason": "authority is evaluated at compensation time, never inherited; the revoked principal holds no current action authority",
+        "expected_receipt": "no compensation effect created; original receipt still verifies historically",
+        "postcondition_readback": {"performed": False, "kind": "none"},
+        "negative_assertions": ["no_compensation_effect", "no_inherited_authority"],
+        "remediation_model": {
+            "trace_family": "remediation",
+            "finding_final_state": "open",
+            "historical_authenticity": {"retained": True, "current_authority": False},
+            "no_compensation_effect": True,
+        },
+    },
+    {
+        "trace_id": "remediation-handoff-transfer",
+        "title": "Remediation handoff: receipted 'revoke A, hand open cases to B' transfers remediation authority",
+        "description": (
+            "The revocation carries a remediation handoff as a SEPARATE authorized "
+            "action with its own receipt ('revoke A, hand open cases to B'), filed "
+            "under A's still-active authority. After revocation, B files compensation "
+            "citing E + the authenticated finding + the superseding head + the "
+            "handoff receipt. The compensation passes, and the handoff receipt is "
+            "part of B's evidence set."
+        ),
+        "events": [
+            rem_grant("evt-rem-grant-a", "agent-rem-a",
+                      ["execute_action", "remediation_handoff", "finding.record"],
+                      T["grant"]),
+            rem_effect("evt-rem-effect-e", "agent-rem-a", "effect-E", T["grant_obs"]),
+            rem_finding("evt-rem-finding-b", "agent-rem-a", "fnd-rem-b",
+                        ["ref:evt-rem-effect-e"], REM_HEAD, T["revoke"]),
+            rem_handoff("evt-rem-handoff", "agent-rem-a", "agent-rem-b",
+                        ["ref:evt-rem-effect-e"], T["revoke"]),
+            rem_revoke("evt-rem-revoke-a", "operator", "ref:evt-rem-grant-a",
+                       T["revoke"] + 100),
+            rem_grant("evt-rem-grant-b", "agent-rem-b", ["execute_action"],
+                      T["revoke"] + 200),
+            rem_compensate(
+                "evt-rem-comp-b", "agent-rem-b", "ref:evt-rem-effect-e", "fnd-rem-b",
+                REM_HEAD, "ref:evt-rem-handoff", T["attempt"],
+            ),
+        ],
+        "expected_decision": "accept",
+        "reason": "B holds current authority; the compensation cites an authenticated finding, the matching superseding head, and a receipted remediation handoff naming B as beneficiary",
+        "expected_receipt": "compensation accepted; handoff receipt recorded in B's evidence set",
+        "postcondition_readback": {"performed": True, "kind": "compensation", "confirmed": True},
+        "negative_assertions": ["no_inherited_authority"],
+        "remediation_model": {
+            "trace_family": "remediation",
+            "finding_final_state": "open",
+            "historical_authenticity": {"retained": True},
+            "handoff_in_evidence_set": True,
+            "no_compensation_effect": False,
+        },
+    },
+    {
+        "trace_id": "remediation-no-authority-fail-closed",
+        "title": "No valid authority: compensation is not executable and the finding waits",
+        "description": (
+            "Grant G revoked, no handoff, no successor grant. The revoked principal's "
+            "compensation is rejected (no current authority). A second principal with "
+            "unrelated current authority also fails: with the original authority "
+            "revoked and no receipted handoff, compensation is not executable — the "
+            "finding stays open in review and no effect record is created."
+        ),
+        "events": [
+            rem_grant("evt-rem-grant-a", "agent-rem-a",
+                      ["execute_action", "finding.record"], T["grant"]),
+            rem_effect("evt-rem-effect-e", "agent-rem-a", "effect-E", T["grant_obs"]),
+            rem_finding("evt-rem-finding-c", "agent-rem-a", "fnd-rem-c",
+                        ["ref:evt-rem-effect-e"], REM_HEAD, T["revoke"]),
+            rem_revoke("evt-rem-revoke-a", "operator", "ref:evt-rem-grant-a", T["revoke"]),
+            rem_compensate(
+                "evt-rem-comp-a", "agent-rem-a", "ref:evt-rem-effect-e", "fnd-rem-c",
+                REM_HEAD, "", T["attempt"], expected_reason_code="no active authority manifest",
+            ),
+            rem_grant("evt-rem-grant-b", "agent-rem-b", ["execute_action"],
+                      T["attempt"] + 100),
+            rem_compensate(
+                "evt-rem-comp-b", "agent-rem-b", "ref:evt-rem-effect-e", "fnd-rem-c",
+                REM_HEAD, "", T["attempt"] + 200,
+                expected_reason_code="requires_receipted_handoff",
+            ),
+        ],
+        "expected_decision": "reject",
+        "reason": "no valid authority exists for the effect: the revoked principal cannot act, and a third party without a receipted handoff cannot remediate — fail closed, the finding waits in review",
+        "expected_receipt": "no compensation effect created; finding remains open",
+        "postcondition_readback": {"performed": False, "kind": "none"},
+        "negative_assertions": ["no_compensation_effect", "no_inherited_authority", "no_third_party_compensation"],
+        "remediation_model": {
+            "trace_family": "remediation",
+            "finding_final_state": "open",
+            "no_compensation_effect": True,
+        },
+    },
+    {
+        "trace_id": "remediation-self-claimed-undo",
+        "title": "AAR linkage: a self-claimed undo with no finding linkage is rejected",
+        "description": (
+            "Compensation is the strongest authority-laundering vector: 'I'm just "
+            "undoing my earlier action' without evidence. The AAR admission rule "
+            "requires compensates_for + an authenticated finding_ref + the matching "
+            "superseding head. Three linkage negatives: missing linkage, forged "
+            "finding reference, and mismatched head — each rejected with a stable "
+            "reason code, even while the principal holds current authority."
+        ),
+        "events": [
+            rem_grant("evt-rem-grant-a", "agent-rem-a",
+                      ["execute_action", "finding.record"], T["grant"]),
+            rem_effect("evt-rem-effect-e", "agent-rem-a", "effect-E", T["grant_obs"]),
+            rem_compensate(
+                "evt-rem-comp-nolink", "agent-rem-a", "ref:evt-rem-effect-e", "", "",
+                "", T["attempt"], expected_reason_code="compensation_requires_finding_linkage",
+            ),
+            rem_compensate(
+                "evt-rem-comp-forged", "agent-rem-a", "ref:evt-rem-effect-e",
+                "fnd-forged", REM_HEAD, "", T["attempt"] + 100,
+                expected_reason_code="finding_unauthenticated",
+            ),
+            rem_finding("evt-rem-finding-d", "agent-rem-a", "fnd-rem-d",
+                        ["ref:evt-rem-effect-e"], REM_HEAD, T["attempt"] + 200),
+            rem_compensate(
+                "evt-rem-comp-wronghead", "agent-rem-a", "ref:evt-rem-effect-e",
+                "fnd-rem-d", "head-wrong", "", T["attempt"] + 300,
+                expected_reason_code="superseding_head_mismatch",
+            ),
+        ],
+        "expected_decision": "reject",
+        "reason": "detection produces a finding, never a decision; a compensation intent without a verified finding+head linkage is a laundering attempt and is rejected fail-closed",
+        "expected_receipt": "no compensation effect created; the authenticated finding remains open",
+        "postcondition_readback": {"performed": False, "kind": "none"},
+        "negative_assertions": ["no_compensation_effect", "no_self_claimed_undo"],
+        "remediation_model": {
+            "trace_family": "remediation",
+            "finding_final_state": "open",
+            "no_compensation_effect": True,
+        },
+    },
+]
+
+
 def main() -> None:
     out = {
         "suite": "perseus-vault-authority-traces-v1",
         "generator": "generate_authority_traces.py",
         "outcome_taxonomy": ["accept", "reject", "failed_to_confirm", "blocked"],
-        "trace_count": len(TRACES),
-        "traces": TRACES,
+        "trace_count": len(TRACES) + len(REMEDIATION_TRACES),
+        "traces": TRACES + REMEDIATION_TRACES,
     }
     path = Path(__file__).parent / "authority_traces.json"
     path.write_text(json.dumps(out, indent=2, sort_keys=True) + "\n")
-    print(f"wrote {path} ({len(TRACES)} traces)")
+    print(f"wrote {path} ({len(TRACES) + len(REMEDIATION_TRACES)} traces)")
 
 
 if __name__ == "__main__":

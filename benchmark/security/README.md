@@ -43,7 +43,15 @@ Negative assertions are first-class checks, not afterthoughts:
 - `no_accept_without_readback` — a success toast without authoritative
   postcondition readback is `failed_to_confirm`, not `accept`;
 - `no_post_rotation_authority` — a pre-rotation signature stays historically
-  authentic but never conveys post-rotation action authority.
+  authentic but never conveys post-rotation action authority;
+- `no_compensation_effect` — a rejected compensation attempt creates no
+  effect record;
+- `no_inherited_authority` — compensation authority is evaluated at
+  compensation time, never inherited from the original action;
+- `no_third_party_compensation` — without a receipted remediation handoff, an
+  unrelated current grant cannot remediate a revoked authority's effect;
+- `no_self_claimed_undo` — "I'm just undoing my earlier action" without a
+  verified finding+head linkage is rejected fail-closed.
 
 ## Corpus
 
@@ -82,11 +90,41 @@ Trace inventory:
    point → reject current, retain historical authenticity.
 10. `authority-identity-collision` — display-name collision → reject; no
     identity merge; fail closed under ambiguity.
+11. `residue-undeclared-snapshot-orphan` — an embedding snapshot row outliving
+    its source → the independent sweep observes it as undeclared residual and
+    any purge refuses to complete (hard gate).
+12. `residue-compliant-purge-partition` — a compliant purge removes projections
+    with their source (or declares them), keeps journal rows redacted as
+    declared residual, and the sweep observes zero undeclared residue.
+13. `residue-deletion-dominates-correction` — superseded versions retained for
+    reconstructability are purged with their source; deletion dominates
+    correction.
+14. `remediation-revocation-barrier` — a revoked principal attempts to
+    compensate its own past effect → reject on CURRENT action authority
+    (compensation authority is never inherited); the original receipt still
+    verifies historically.
+15. `remediation-handoff-transfer` — a receipted "revoke A, hand open cases to
+    B" remediation handoff transfers remediation authority; B's compensation
+    citing E + finding + head + the handoff receipt → accept, with the
+    handoff receipt recorded in B's evidence set.
+16. `remediation-no-authority-fail-closed` — no valid authority exists
+    (revoked principal + third party without a handoff) → compensation is not
+    executable, the finding waits in review, no effect record is created.
+17. `remediation-self-claimed-undo` — the AAR linkage negatives: missing
+    finding linkage, forged finding reference, and mismatched superseding
+    head are each rejected with a stable reason code (detection produces a
+    finding, never a decision).
 
 ## Execution note
 
-The corpus is the spec and the shared-publishable artifact. Runner wiring
-against the live binary (authority_set / action_lease / action_intent /
-receipts / recall surfaces) follows the `benchmark/package` adapter contract;
-until the runner exists, each trace's `expected_decision` is the documented
-contract, and the suite reports `not_measured` rather than a fabricated pass.
+The corpus is the spec and the shared-publishable artifact. The deletion-
+residue and remediation trace families are wired against the live binary in
+the Rust suite (`deletion_residue_trace_corpus_runner` and
+`remediation_trace_corpus_runner` in `src/db.rs`): each event replays through
+the public surfaces (remember / purge / authority_set / action_intent /
+action_complete / authority_revoke / finding_record) and the model outcome is
+asserted against the corpus contract. The remaining families (canonical
+revocation, split-brain, key rotation, identity collision) follow the
+`benchmark/package` adapter contract; until their runner exists, each trace's
+`expected_decision` is the documented contract and the suite reports
+`not_measured` rather than a fabricated pass.

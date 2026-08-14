@@ -4709,6 +4709,37 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     }
   },
   {
+    "name": "perseus_vault_finding_record",
+    "description": "#1033: record an authenticated impact finding — the durable, receipted admission record a detection pass produces about a superseded/retracted fact (the supersession impact index surface is the read side; this is the write side compensation intents cite). A finding is detection output, NEVER a decision: it cannot self-trigger execution; the disposition (accept-drift / revalidate-pending / open-compensation-case / escalate) is chosen by the authority plane. Compensation intents (action_intent with compensates_for) must cite a finding_ref whose covers list includes the compensated effect and whose cited_head matches the presented superseding_head — fail-closed, stable compensation_* reason codes. covered effects must reference existing action receipts; (category,key) or entity_id targets the changed fact.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "finding_ref": {"type": "string", "description": "Stable caller-facing reference, unique per workspace"},
+        "workspace_hash": {"type": "string", "description": "Workspace the finding belongs to"},
+        "agent_id": {"type": "string", "description": "Recording agent identity (stamped into the journal)"},
+        "category": {"type": "string", "description": "Changed fact's category (with key; alternative to entity_id)"},
+        "key": {"type": "string", "description": "Changed fact's key (with category; alternative to entity_id)"},
+        "entity_id": {"type": "string", "description": "Changed fact's entity id (alternative to category+key)"},
+        "cited_head": {"type": "string", "description": "Exact superseding head that invalidated the original justification (required)"},
+        "covers": {"type": "array", "items": {"type": "string"}, "description": "Original effect/action receipt ids this finding covers (each must exist)"},
+        "basis": {"type": "string", "description": "Why the finding exists (e.g. 'supersession', 'retraction')"}
+      },
+      "required": ["finding_ref", "cited_head"]
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "id": {"type": "string"},
+        "finding_ref": {"type": "string"},
+        "cited_head": {"type": "string"},
+        "covers": {"type": "array", "items": {"type": "string"}},
+        "status": {"type": "string"},
+        "archived": {"type": "boolean"},
+        "created_at_unix_ms": {"type": "integer"}
+      }
+    }
+  },
+  {
     "name": "perseus_vault_restore_forward",
     "description": "#1028: forward-only restoration — restore from a checkpoint directory as an audited VERSION ADVANCE of the current head, never as a rewrite. Each checkpoint entity advances its (category, key, workspace) identity: the pre-restore version moves to entity_history (the parent; a rollback is just another forward migration) and the checkpoint body becomes the new head. Protected authority paths always take CURRENT values — authority, policy, revocation, issuer, writer, epoch, dirSeq/lifecycle, createdFrom/provenance are excluded from the mask (M ∩ P = ∅; only `entities` is maskable in v1), so a restore can never revive a stale credential, resurrect a superseded authority, or undo a recorded external effect (authorized actions untouched). Workspace-scoped; an active writer directory (#1027) requires the current writer_epoch. Report: restored / superseded_current_heads / created / errors.",
     "inputSchema": {
@@ -7257,6 +7288,7 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
         "perseus_vault_admission_quarantine" => tools::handle_admission_quarantine(db, args),
         "perseus_vault_writer_handoff" => tools::handle_writer_handoff(db, args),
         "perseus_vault_impact_report" => tools::handle_impact_report(db, args),
+        "perseus_vault_finding_record" => tools::handle_finding_record(db, args),
         "perseus_vault_restore_forward" => tools::handle_restore_forward(db, args),
         "perseus_vault_op_run" => tools::handle_op_run(db, args).map_err(|e| e.to_string()),
         "perseus_vault_op_run_list" => {
@@ -7401,7 +7433,7 @@ mod tests {
         );
         assert_eq!(
             registry_names.len(),
-            141,
+            142,
             "update public metadata when adding a tool"
         );
 

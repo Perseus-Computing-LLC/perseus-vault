@@ -14219,11 +14219,15 @@ impl Database {
                 let raw: String = r.get(18).unwrap_or_else(|_| "[]".to_string());
                 serde_json::from_str(&raw).unwrap_or_default()
             },
+            compensates_for: r.get(19).unwrap_or_default(),
+            finding_ref: r.get(20).unwrap_or_default(),
+            superseding_head: r.get(21).unwrap_or_default(),
+            handoff_receipt_ref: r.get(22).unwrap_or_default(),
         })
     }
 
     fn action_select_sql() -> &'static str {
-        "SELECT id, manifest_id, manifest_version, agent_id, workspace_hash, scope_anchor, external_ref, capability, action_key, intent_hash, outcome_hash, status, approval_required, approval_ref, created_at_unix_ms, updated_at_unix_ms, resource_constraints_json, resource_constraints_hash, justification_json FROM authorized_actions"
+        "SELECT id, manifest_id, manifest_version, agent_id, workspace_hash, scope_anchor, external_ref, capability, action_key, intent_hash, outcome_hash, status, approval_required, approval_ref, created_at_unix_ms, updated_at_unix_ms, resource_constraints_json, resource_constraints_hash, justification_json, compensates_for, finding_ref, superseding_head, handoff_receipt_ref FROM authorized_actions"
     }
 
     fn active_authority(
@@ -14529,6 +14533,7 @@ impl Database {
         intent_hash: &str,
         resource_constraints_json: Option<&str>,
         justification_entity_ids: &[String],
+        compensation: Option<&crate::models::CompensationLinkage>,
     ) -> Result<AuthorizedAction, Box<dyn std::error::Error>> {
         let manifest = self.active_authority(agent_id, workspace_hash)?;
         if !manifest
@@ -14574,6 +14579,29 @@ impl Database {
             })?;
         }
         let justification_json = serde_json::to_string(justification_entity_ids)?;
+        // #1033: compensation admission — a compensation/undo intent must
+        // cite an authenticated impact finding + the superseding head, and
+        // (when the original authority was revoked) a receipted remediation
+        // handoff. Verified fail-closed BEFORE the policy/constraint stage
+        // so a self-claimed undo can never reach approval. The verified
+        // linkage is stored on the action row for audit.
+        let linkage = match compensation {
+            None => None,
+            Some(link) => {
+                self.validate_compensation_linkage(agent_id, workspace_hash, link)?;
+                Some(link.clone())
+            }
+        };
+        let (compensates_for, finding_ref, superseding_head, handoff_receipt_ref) =
+            match &linkage {
+                Some(l) => (
+                    l.compensates_for.clone(),
+                    l.finding_ref.clone(),
+                    l.superseding_head.clone(),
+                    l.handoff_receipt_ref.clone(),
+                ),
+                None => (String::new(), String::new(), String::new(), String::new()),
+            };
         let resource_constraints_json =
             canonical_constraint_json(resource_constraints_json.unwrap_or("{}"))?;
         if !resource_constraints_permit(
@@ -14608,6 +14636,10 @@ impl Database {
                 resource_constraints_json: resource_constraints_json.clone(),
                 resource_constraints_hash: constraint_hash(&resource_constraints_json),
                 justification_entity_ids: justification_entity_ids.to_vec(),
+                compensates_for: compensates_for.clone(),
+                finding_ref: finding_ref.clone(),
+                superseding_head: superseding_head.clone(),
+                handoff_receipt_ref: handoff_receipt_ref.clone(),
             };
             let conn = self.conn()?;
             conn.execute(
@@ -14615,8 +14647,9 @@ impl Database {
                  (id,manifest_id,manifest_version,agent_id,workspace_hash,scope_anchor,
                   external_ref,capability,action_key,intent_hash,outcome_hash,status,
                   approval_required,approval_ref,created_at_unix_ms,updated_at_unix_ms,
-                  resource_constraints_json,resource_constraints_hash,justification_json)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?15,?16,?17,?18)",
+                  resource_constraints_json,resource_constraints_hash,justification_json,
+                  compensates_for,finding_ref,superseding_head,handoff_receipt_ref)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?15,?16,?17,?18,?19,?20,?21,?22)",
                 params![
                     action.id,
                     action.manifest_id,
@@ -14636,6 +14669,10 @@ impl Database {
                     action.resource_constraints_json,
                     action.resource_constraints_hash,
                     justification_json,
+                    compensates_for,
+                    finding_ref,
+                    superseding_head,
+                    handoff_receipt_ref,
                 ],
             )?;
             drop(conn);
@@ -14686,6 +14723,10 @@ impl Database {
             resource_constraints_json,
             resource_constraints_hash,
             justification_entity_ids: justification_entity_ids.to_vec(),
+            compensates_for: compensates_for.clone(),
+            finding_ref: finding_ref.clone(),
+            superseding_head: superseding_head.clone(),
+            handoff_receipt_ref: handoff_receipt_ref.clone(),
         };
         let conn = self.conn()?;
         conn.execute(
@@ -14693,8 +14734,9 @@ impl Database {
              (id,manifest_id,manifest_version,agent_id,workspace_hash,scope_anchor,
               external_ref,capability,action_key,intent_hash,outcome_hash,status,
               approval_required,approval_ref,created_at_unix_ms,updated_at_unix_ms,
-              resource_constraints_json,resource_constraints_hash,justification_json)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?15,?16,?17,?18)",
+              resource_constraints_json,resource_constraints_hash,justification_json,
+              compensates_for,finding_ref,superseding_head,handoff_receipt_ref)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?15,?16,?17,?18,?19,?20,?21,?22)",
             params![
                 action.id,
                 action.manifest_id,
@@ -14714,6 +14756,10 @@ impl Database {
                 action.resource_constraints_json,
                 action.resource_constraints_hash,
                 justification_json,
+                compensates_for,
+                finding_ref,
+                superseding_head,
+                handoff_receipt_ref,
             ],
         )?;
         drop(conn);
@@ -14731,6 +14777,281 @@ impl Database {
             created_at_unix_ms: now,
         })?;
         Ok(action)
+    }
+
+    /// #1033: fail-closed compensation admission. A compensation/undo
+    /// intent must cite (1) the original effect receipt it compensates,
+    /// (2) an authenticated impact finding that covers that effect, and
+    /// (3) the exact superseding head the finding cites. When the original
+    /// effect's authority manifest was revoked, a receipted remediation
+    /// handoff naming the requesting principal as beneficiary is required
+    /// — authority is evaluated at compensation time, never inherited.
+    /// Every violation returns a stable `compensation_*` reason code.
+    fn validate_compensation_linkage(
+        &self,
+        agent_id: &str,
+        workspace_hash: &str,
+        link: &crate::models::CompensationLinkage,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if link.finding_ref.trim().is_empty() || link.superseding_head.trim().is_empty() {
+            return Err(
+                "compensation intent rejected [compensation_requires_finding_linkage]: \
+                 compensates_for requires an authenticated finding_ref and superseding_head \
+                 — a self-claimed undo is not admissible (detection produces a finding, \
+                 never a decision)"
+                    .into(),
+            );
+        }
+        let original = self.action_receipt_get(&link.compensates_for)?.ok_or_else(|| {
+            format!(
+                "compensation intent rejected [original_effect_not_found]: compensates_for \
+                 {effect:?} does not reference an existing effect receipt",
+                effect = link.compensates_for
+            )
+        })?;
+        let finding = self.finding_get(workspace_hash, &link.finding_ref)?;
+        let finding = finding.ok_or_else(|| {
+            format!(
+                "compensation intent rejected [finding_unauthenticated]: finding_ref \
+                 {finding_ref:?} does not reference an authenticated impact finding \
+                 (findings are recorded via perseus_vault_finding_record)",
+                finding_ref = link.finding_ref
+            )
+        })?;
+        if finding.archived {
+            return Err(format!(
+                "compensation intent rejected [finding_unauthenticated]: finding \
+                 {finding_ref:?} is archived",
+                finding_ref = link.finding_ref
+            )
+            .into());
+        }
+        if !finding.covers.iter().any(|c| c == &link.compensates_for) {
+            return Err(format!(
+                "compensation intent rejected [finding_does_not_cover_effect]: finding \
+                 {finding_ref:?} does not cover the cited original effect {effect:?}",
+                finding_ref = link.finding_ref,
+                effect = link.compensates_for
+            )
+            .into());
+        }
+        if link.superseding_head != finding.cited_head {
+            return Err(format!(
+                "compensation intent rejected [superseding_head_mismatch]: presented head \
+                 {presented:?} does not match the finding's cited head {cited:?}",
+                presented = link.superseding_head,
+                cited = finding.cited_head
+            )
+            .into());
+        }
+        // Authority is evaluated at compensation time, never inherited: if
+        // the manifest behind the original effect was revoked, remediation
+        // requires a receipted handoff (itself an authorized action filed
+        // under the revoker's still-active authority) naming the requesting
+        // principal as beneficiary and covering the compensated effect.
+        let conn = self.conn()?;
+        let original_manifest_revoked: bool = conn.query_row(
+            "SELECT revoked_at_unix_ms IS NOT NULL FROM authority_manifests WHERE id=?1",
+            params![original.manifest_id],
+            |r| r.get(0),
+        )?;
+        drop(conn);
+        if original_manifest_revoked {
+            if link.handoff_receipt_ref.trim().is_empty() {
+                return Err(
+                    "compensation intent rejected [requires_receipted_handoff]: the original \
+                     effect's authority was revoked — compensation requires a receipted \
+                     remediation handoff ('revoke A, hand open cases to B') naming this \
+                     principal as beneficiary"
+                        .into(),
+                );
+            }
+            let handoff = self
+                .action_receipt_get(&link.handoff_receipt_ref)?
+                .ok_or_else(|| {
+                    format!(
+                        "compensation intent rejected [handoff_not_receipted]: handoff \
+                         receipt {handoff:?} does not reference an existing action",
+                        handoff = link.handoff_receipt_ref
+                    )
+                })?;
+            if handoff.status != "action_executed" || handoff.capability != "remediation_handoff"
+            {
+                return Err(format!(
+                    "compensation intent rejected [handoff_not_receipted]: handoff receipt \
+                     {handoff:?} is not a receipted remediation handoff (status={status}, \
+                     capability={capability})",
+                    handoff = link.handoff_receipt_ref,
+                    status = handoff.status,
+                    capability = handoff.capability
+                )
+                .into());
+            }
+            let constraints: serde_json::Value =
+                serde_json::from_str(&handoff.resource_constraints_json).unwrap_or_default();
+            let beneficiary = constraints
+                .get("beneficiary_agent_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            if beneficiary != agent_id {
+                return Err(format!(
+                    "compensation intent rejected [handoff_beneficiary_mismatch]: handoff \
+                     {handoff:?} names beneficiary {beneficiary:?} but the intent is filed \
+                     by {agent_id:?}",
+                    handoff = link.handoff_receipt_ref
+                )
+                .into());
+            }
+            let covers_effect = constraints
+                .get("original_effects")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .any(|e| e.as_str() == Some(link.compensates_for.as_str()))
+                })
+                .unwrap_or(false);
+            if !covers_effect {
+                return Err(format!(
+                    "compensation intent rejected [handoff_does_not_cover_effect]: handoff \
+                     {handoff:?} does not cover the cited original effect {effect:?}",
+                    handoff = link.handoff_receipt_ref,
+                    effect = link.compensates_for
+                )
+                .into());
+            }
+        }
+        Ok(())
+    }
+
+    /// #1033: load an authenticated impact finding by (workspace, ref).
+    pub fn finding_get(
+        &self,
+        workspace_hash: &str,
+        finding_ref: &str,
+    ) -> Result<Option<crate::models::ImpactFinding>, Box<dyn std::error::Error>> {
+        let conn = self.conn()?;
+        let row = conn
+            .query_row(
+                "SELECT id, finding_ref, workspace_hash, agent_id, category, key, entity_id, \
+                 cited_head, covers_json, basis, status, archived, created_at_unix_ms \
+                 FROM impact_findings WHERE workspace_hash=?1 AND finding_ref=?2",
+                params![workspace_hash, finding_ref],
+                |r| {
+                    let covers_json: String = r.get(8).unwrap_or_else(|_| "[]".to_string());
+                    Ok(crate::models::ImpactFinding {
+                        id: r.get(0)?,
+                        finding_ref: r.get(1)?,
+                        workspace_hash: r.get(2)?,
+                        agent_id: r.get(3)?,
+                        category: r.get(4)?,
+                        key: r.get(5)?,
+                        entity_id: r.get(6)?,
+                        cited_head: r.get(7)?,
+                        covers: serde_json::from_str(&covers_json).unwrap_or_default(),
+                        basis: r.get(9)?,
+                        status: r.get(10)?,
+                        archived: r.get::<_, i64>(11)? != 0,
+                        created_at_unix_ms: r.get(12)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// #1033: record an authenticated impact finding. Findings are durable
+    /// admission records produced by the detection layer (impact report,
+    /// supersession review) — they are what compensation intents cite, and
+    /// they are NEVER self-triggering: a finding cannot execute anything.
+    pub fn finding_record(
+        &self,
+        workspace_hash: &str,
+        agent_id: &str,
+        finding_ref: &str,
+        category: &str,
+        key: &str,
+        entity_id: &str,
+        cited_head: &str,
+        covers: &[String],
+        basis: &str,
+    ) -> Result<crate::models::ImpactFinding, Box<dyn std::error::Error>> {
+        if finding_ref.trim().is_empty() {
+            return Err("finding_ref must be non-empty".into());
+        }
+        if cited_head.trim().is_empty() {
+            return Err("cited_head must be non-empty (the superseding head that invalidated the justification)".into());
+        }
+        if category.is_empty() && key.is_empty() && entity_id.is_empty() {
+            return Err("a finding must target a fact via (category, key) or entity_id".into());
+        }
+        if covers.len() > 64 {
+            return Err("covers must contain at most 64 entries".into());
+        }
+        // Fail-closed coverage validation: every covered effect must
+        // reference an existing action receipt, mirroring the
+        // justification-entity validation on action_intent.
+        for effect in covers {
+            self.action_receipt_get(effect)?.ok_or_else(|| {
+                format!("finding rejected: covered effect not found: {effect}")
+            })?;
+        }
+        let now = now_ms();
+        let finding = crate::models::ImpactFinding {
+            id: format!("fnd-{}", uuid::Uuid::new_v4().simple()),
+            finding_ref: finding_ref.to_string(),
+            workspace_hash: workspace_hash.to_string(),
+            agent_id: agent_id.to_string(),
+            category: category.to_string(),
+            key: key.to_string(),
+            entity_id: entity_id.to_string(),
+            cited_head: cited_head.to_string(),
+            covers: covers.to_vec(),
+            basis: basis.to_string(),
+            status: "open".to_string(),
+            archived: false,
+            created_at_unix_ms: now,
+        };
+        let conn = self.conn()?;
+        conn.execute(
+            "INSERT INTO impact_findings
+             (id,finding_ref,workspace_hash,agent_id,category,key,entity_id,cited_head,
+              covers_json,basis,status,archived,created_at_unix_ms)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+            params![
+                finding.id,
+                finding.finding_ref,
+                finding.workspace_hash,
+                finding.agent_id,
+                finding.category,
+                finding.key,
+                finding.entity_id,
+                finding.cited_head,
+                serde_json::to_string(&finding.covers)?,
+                finding.basis,
+                finding.status,
+                finding.archived as i64,
+                now,
+            ],
+        )?;
+        drop(conn);
+        self.journal(&JournalEvent {
+            id: format!("jrn-{}", uuid::Uuid::new_v4().simple()),
+            event_type: "finding_recorded".to_string(),
+            evaluated_json: json!({
+                "cited_head": finding.cited_head,
+                "basis": finding.basis,
+            })
+            .to_string(),
+            acted_json: serde_json::to_string(&finding)?,
+            forward_json: "{}".to_string(),
+            category: "impact_finding".to_string(),
+            key: finding.finding_ref.clone(),
+            entity_id: finding.entity_id.clone(),
+            agent_id: agent_id.to_string(),
+            workspace_hash: workspace_hash.to_string(),
+            created_at_unix_ms: now,
+        })?;
+        Ok(finding)
     }
 
     pub fn action_receipt_get(
@@ -27785,7 +28106,7 @@ pub(crate) mod tests {
                 "a".repeat(64).as_str(),
                 Some("{}"),
                 &[],
-            )
+            None)
             .unwrap();
         assert_eq!(intent.status, "approval_requested");
         assert!(intent.approval_required);
@@ -27832,7 +28153,7 @@ pub(crate) mod tests {
                 &"a".repeat(64),
                 Some("{}"),
                 &[],
-            )
+            None)
             .unwrap_err()
             .to_string();
         assert!(
@@ -27857,7 +28178,7 @@ pub(crate) mod tests {
                 &"a".repeat(64),
                 Some("{}"),
                 &[],
-            )
+            None)
             .unwrap_err()
             .to_string();
         assert!(
@@ -27885,7 +28206,7 @@ pub(crate) mod tests {
                 &"a".repeat(64),
                 Some("{}"),
                 &[],
-            )
+            None)
             .unwrap_err()
             .to_string();
         assert!(
@@ -27910,11 +28231,523 @@ pub(crate) mod tests {
                 &"a".repeat(64),
                 Some("{}"),
                 &[],
-            )
+            None)
             .unwrap();
         assert_eq!(ok.status, "intent");
         assert!(!ok.approval_required);
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ─── #1033: compensation admission (fail-closed, stable reason codes) ───
+
+    fn comp_manifest(agent: &str, ws: &str, caps: &[&str]) -> crate::models::AuthorityManifestInput {
+        crate::models::AuthorityManifestInput {
+            agent_id: agent.to_string(),
+            workspace_hash: ws.to_string(),
+            allowed_capabilities: caps.iter().map(|s| s.to_string()).collect(),
+            approval_required_capabilities: vec![],
+            scope_anchors: vec!["trace-scope".to_string()],
+            approver_principals: vec![],
+            allowed_inbound_principals: vec![],
+            permitted_external_ref_prefixes: vec!["trace-ref".to_string()],
+            max_parallel_actions: 4,
+            mode: "enforce".to_string(),
+            expires_at_unix_ms: None,
+            capability_constraints_json: "{}".to_string(),
+        }
+    }
+
+    fn comp_intent(
+        db: &Database,
+        agent: &str,
+        ws: &str,
+        capability: &str,
+        action_key: &str,
+        linkage: Option<crate::models::CompensationLinkage>,
+    ) -> Result<AuthorizedAction, Box<dyn std::error::Error>> {
+        db.action_intent(
+            agent,
+            ws,
+            "trace-scope",
+            "trace-ref",
+            capability,
+            action_key,
+            &"c".repeat(64),
+            Some("{}"),
+            &[],
+            linkage.as_ref(),
+        )
+    }
+
+    fn execute_effect(db: &Database, agent: &str, ws: &str, key: &str) -> AuthorizedAction {
+        let action = comp_intent(db, agent, ws, "execute_action", key, None).unwrap();
+        db.action_complete(&action.id, agent, "executed", &"d".repeat(64))
+            .unwrap()
+    }
+
+    #[test]
+    fn compensation_requires_authenticated_finding_linkage() {
+        let (db, _path) = temp_db();
+        db.agent_upsert("agent-comp-a", "Trace", 3, "trace").unwrap();
+        db.authority_set(&comp_manifest("agent-comp-a", "ws-comp", &["execute_action"]), "admin")
+            .unwrap();
+        let effect = execute_effect(&db, "agent-comp-a", "ws-comp", "effect-E");
+
+        // Self-claimed undo: compensates_for without finding linkage.
+        let err = comp_intent(
+            &db,
+            "agent-comp-a",
+            "ws-comp",
+            "execute_action",
+            "undo-1",
+            Some(crate::models::CompensationLinkage {
+                compensates_for: effect.id.clone(),
+                ..Default::default()
+            }),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("compensation_requires_finding_linkage"),
+            "unexpected error: {err}"
+        );
+
+        // Forged finding reference.
+        let err = comp_intent(
+            &db,
+            "agent-comp-a",
+            "ws-comp",
+            "execute_action",
+            "undo-2",
+            Some(crate::models::CompensationLinkage {
+                compensates_for: effect.id.clone(),
+                finding_ref: "fnd-forged".to_string(),
+                superseding_head: "head-0001".to_string(),
+                ..Default::default()
+            }),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("finding_unauthenticated"), "unexpected error: {err}");
+
+        // Original effect must exist.
+        let err = comp_intent(
+            &db,
+            "agent-comp-a",
+            "ws-comp",
+            "execute_action",
+            "undo-3",
+            Some(crate::models::CompensationLinkage {
+                compensates_for: "act-nonexistent".to_string(),
+                finding_ref: "fnd-any".to_string(),
+                superseding_head: "head-0001".to_string(),
+                ..Default::default()
+            }),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("original_effect_not_found"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn compensation_verifies_finding_coverage_and_head() {
+        let (db, _path) = temp_db();
+        db.agent_upsert("agent-comp-b", "Trace", 3, "trace").unwrap();
+        db.authority_set(&comp_manifest("agent-comp-b", "ws-comp", &["execute_action"]), "admin")
+            .unwrap();
+        let effect = execute_effect(&db, "agent-comp-b", "ws-comp", "effect-E");
+
+        // A finding that does NOT cover the effect.
+        db.finding_record(
+            "ws-comp",
+            "agent-comp-b",
+            "fnd-unrelated",
+            "insight",
+            "other",
+            "",
+            "head-0001",
+            &[],
+            "supersession",
+        )
+        .unwrap();
+        let err = comp_intent(
+            &db,
+            "agent-comp-b",
+            "ws-comp",
+            "execute_action",
+            "undo-4",
+            Some(crate::models::CompensationLinkage {
+                compensates_for: effect.id.clone(),
+                finding_ref: "fnd-unrelated".to_string(),
+                superseding_head: "head-0001".to_string(),
+                ..Default::default()
+            }),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("finding_does_not_cover_effect"),
+            "unexpected error: {err}"
+        );
+
+        // A valid finding with a mismatched presented head.
+        db.finding_record(
+            "ws-comp",
+            "agent-comp-b",
+            "fnd-covering",
+            "insight",
+            "fact",
+            "",
+            "head-superseding-0001",
+            &[effect.id.clone()],
+            "supersession",
+        )
+        .unwrap();
+        let err = comp_intent(
+            &db,
+            "agent-comp-b",
+            "ws-comp",
+            "execute_action",
+            "undo-5",
+            Some(crate::models::CompensationLinkage {
+                compensates_for: effect.id.clone(),
+                finding_ref: "fnd-covering".to_string(),
+                superseding_head: "head-wrong".to_string(),
+                ..Default::default()
+            }),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("superseding_head_mismatch"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn compensation_requires_receipted_handoff_when_original_revoked() {
+        let (db, _path) = temp_db();
+        db.agent_upsert("agent-comp-c", "Trace", 3, "trace").unwrap();
+        db.authority_set(
+            &comp_manifest(
+                "agent-comp-c",
+                "ws-comp",
+                &["execute_action", "remediation_handoff"],
+            ),
+            "admin",
+        )
+        .unwrap();
+        let manifest_a = db
+            .authority_get("agent-comp-c", "ws-comp", false)
+            .unwrap()
+            .unwrap();
+        let effect = execute_effect(&db, "agent-comp-c", "ws-comp", "effect-E");
+        db.finding_record(
+            "ws-comp",
+            "agent-comp-c",
+            "fnd-covering",
+            "insight",
+            "fact",
+            "",
+            "head-superseding-0001",
+            &[effect.id.clone()],
+            "supersession",
+        )
+        .unwrap();
+
+        // A valid handoff: receipted under the revoker's still-active
+        // authority, naming B as beneficiary and covering E.
+        let handoff = db
+            .action_intent(
+                "agent-comp-c",
+                "ws-comp",
+                "trace-scope",
+                "trace-ref",
+                "remediation_handoff",
+                "handoff-E",
+                &"e".repeat(64),
+                Some(&format!(
+                    r#"{{"beneficiary_agent_id":"agent-comp-d","original_effects":["{}"]}}"#,
+                    effect.id
+                )),
+                &[],
+                None,
+            )
+            .unwrap();
+        let handoff = db
+            .action_complete(&handoff.id, "agent-comp-c", "executed", &"f".repeat(64))
+            .unwrap();
+
+        // Revoke the original grant.
+        db.authority_revoke(&manifest_a.id, "operator", "trace revoke")
+            .unwrap();
+
+        // B holds current authority.
+        db.agent_upsert("agent-comp-d", "Trace", 3, "trace").unwrap();
+        db.authority_set(&comp_manifest("agent-comp-d", "ws-comp", &["execute_action"]), "admin")
+            .unwrap();
+
+        // B without a handoff -> rejected.
+        let err = comp_intent(
+            &db,
+            "agent-comp-d",
+            "ws-comp",
+            "execute_action",
+            "comp-1",
+            Some(crate::models::CompensationLinkage {
+                compensates_for: effect.id.clone(),
+                finding_ref: "fnd-covering".to_string(),
+                superseding_head: "head-superseding-0001".to_string(),
+                ..Default::default()
+            }),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("requires_receipted_handoff"),
+            "unexpected error: {err}"
+        );
+
+        // A nonexistent handoff receipt -> rejected.
+        let err = comp_intent(
+            &db,
+            "agent-comp-d",
+            "ws-comp",
+            "execute_action",
+            "comp-2",
+            Some(crate::models::CompensationLinkage {
+                compensates_for: effect.id.clone(),
+                finding_ref: "fnd-covering".to_string(),
+                superseding_head: "head-superseding-0001".to_string(),
+                handoff_receipt_ref: "act-nonexistent".to_string(),
+            }),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("handoff_not_receipted"),
+            "unexpected error: {err}"
+        );
+
+        // The revoked principal cannot compensate its own past effect:
+        // no current action authority (authority is never inherited).
+        let err = comp_intent(
+            &db,
+            "agent-comp-c",
+            "ws-comp",
+            "execute_action",
+            "comp-3",
+            Some(crate::models::CompensationLinkage {
+                compensates_for: effect.id.clone(),
+                finding_ref: "fnd-covering".to_string(),
+                superseding_head: "head-superseding-0001".to_string(),
+                handoff_receipt_ref: handoff.id.clone(),
+            }),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("no active authority manifest"),
+            "unexpected error: {err}"
+        );
+
+        // The legitimate path: B cites E + finding + head + the receipted
+        // handoff -> accepted, with the linkage stored on the row.
+        let compensation = comp_intent(
+            &db,
+            "agent-comp-d",
+            "ws-comp",
+            "execute_action",
+            "comp-4",
+            Some(crate::models::CompensationLinkage {
+                compensates_for: effect.id.clone(),
+                finding_ref: "fnd-covering".to_string(),
+                superseding_head: "head-superseding-0001".to_string(),
+                handoff_receipt_ref: handoff.id.clone(),
+            }),
+        )
+        .unwrap();
+        assert_eq!(compensation.status, "intent");
+        assert_eq!(compensation.compensates_for, effect.id);
+        assert_eq!(compensation.finding_ref, "fnd-covering");
+        assert_eq!(compensation.superseding_head, "head-superseding-0001");
+        assert_eq!(compensation.handoff_receipt_ref, handoff.id);
+
+        // The original effect receipt still verifies historically.
+        let original = db.action_receipt_get(&effect.id).unwrap().unwrap();
+        assert_eq!(original.status, "action_executed");
+    }
+
+    #[test]
+    fn compensation_handoff_must_name_beneficiary_and_cover_effect() {
+        let (db, _path) = temp_db();
+        db.agent_upsert("agent-comp-e", "Trace", 3, "trace").unwrap();
+        db.authority_set(
+            &comp_manifest(
+                "agent-comp-e",
+                "ws-comp",
+                &["execute_action", "remediation_handoff"],
+            ),
+            "admin",
+        )
+        .unwrap();
+        let manifest_a = db
+            .authority_get("agent-comp-e", "ws-comp", false)
+            .unwrap()
+            .unwrap();
+        let effect = execute_effect(&db, "agent-comp-e", "ws-comp", "effect-E");
+        db.finding_record(
+            "ws-comp",
+            "agent-comp-e",
+            "fnd-covering",
+            "insight",
+            "fact",
+            "",
+            "head-0001",
+            &[effect.id.clone()],
+            "supersession",
+        )
+        .unwrap();
+
+        // Handoff naming a different beneficiary.
+        let handoff_wrong_beneficiary = db
+            .action_intent(
+                "agent-comp-e",
+                "ws-comp",
+                "trace-scope",
+                "trace-ref",
+                "remediation_handoff",
+                "handoff-E",
+                &"e".repeat(64),
+                Some(&format!(
+                    r#"{{"beneficiary_agent_id":"agent-comp-other","original_effects":["{}"]}}"#,
+                    effect.id
+                )),
+                &[],
+                None,
+            )
+            .unwrap();
+        let handoff_wrong_beneficiary = db
+            .action_complete(
+                &handoff_wrong_beneficiary.id,
+                "agent-comp-e",
+                "executed",
+                &"f".repeat(64),
+            )
+            .unwrap();
+
+        // Handoff that does not cover the effect.
+        let handoff_wrong_cover = db
+            .action_intent(
+                "agent-comp-e",
+                "ws-comp",
+                "trace-scope",
+                "trace-ref",
+                "remediation_handoff",
+                "handoff-other",
+                &"e".repeat(64),
+                Some(r#"{"beneficiary_agent_id":"agent-comp-f","original_effects":["act-other"]}"#),
+                &[],
+                None,
+            )
+            .unwrap();
+        let handoff_wrong_cover = db
+            .action_complete(
+                &handoff_wrong_cover.id,
+                "agent-comp-e",
+                "executed",
+                &"f".repeat(64),
+            )
+            .unwrap();
+
+        // An intent-status (not executed) handoff.
+        let handoff_not_executed = db
+            .action_intent(
+                "agent-comp-e",
+                "ws-comp",
+                "trace-scope",
+                "trace-ref",
+                "remediation_handoff",
+                "handoff-pending",
+                &"e".repeat(64),
+                Some(&format!(
+                    r#"{{"beneficiary_agent_id":"agent-comp-f","original_effects":["{}"]}}"#,
+                    effect.id
+                )),
+                &[],
+                None,
+            )
+            .unwrap();
+
+        db.authority_revoke(&manifest_a.id, "operator", "trace revoke")
+            .unwrap();
+        db.agent_upsert("agent-comp-f", "Trace", 3, "trace").unwrap();
+        db.authority_set(&comp_manifest("agent-comp-f", "ws-comp", &["execute_action"]), "admin")
+            .unwrap();
+
+        let linkage_base = crate::models::CompensationLinkage {
+            compensates_for: effect.id.clone(),
+            finding_ref: "fnd-covering".to_string(),
+            superseding_head: "head-0001".to_string(),
+            handoff_receipt_ref: String::new(),
+        };
+
+        let err = comp_intent(
+            &db,
+            "agent-comp-f",
+            "ws-comp",
+            "execute_action",
+            "comp-1",
+            Some(crate::models::CompensationLinkage {
+                handoff_receipt_ref: handoff_wrong_beneficiary.id.clone(),
+                ..linkage_base.clone()
+            }),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("handoff_beneficiary_mismatch"),
+            "unexpected error: {err}"
+        );
+
+        let err = comp_intent(
+            &db,
+            "agent-comp-f",
+            "ws-comp",
+            "execute_action",
+            "comp-2",
+            Some(crate::models::CompensationLinkage {
+                handoff_receipt_ref: handoff_wrong_cover.id.clone(),
+                ..linkage_base.clone()
+            }),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("handoff_does_not_cover_effect"),
+            "unexpected error: {err}"
+        );
+
+        let err = comp_intent(
+            &db,
+            "agent-comp-f",
+            "ws-comp",
+            "execute_action",
+            "comp-3",
+            Some(crate::models::CompensationLinkage {
+                handoff_receipt_ref: handoff_not_executed.id.clone(),
+                ..linkage_base.clone()
+            }),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("handoff_not_receipted"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -27989,7 +28822,7 @@ pub(crate) mod tests {
                 &"a".repeat(64),
                 Some("{}"),
                 &[],
-            )
+            None)
             .unwrap();
         assert_eq!(action.manifest_version, stored.version);
         assert_eq!(action.status, "approval_requested");
@@ -28122,7 +28955,7 @@ pub(crate) mod tests {
         let benign = db.action_intent("agent-836", "ws-836", "github:Perseus-Computing-LLC/perseus-vault", "github:Perseus-Computing-LLC/ledger", "tool.run", "run-1", &"a".repeat(64),
             Some("{\"tool\":\"git\",\"argv_canonical\":{\"action\":\"push\",\"remote\":\"github.com/Perseus-Computing-LLC/ledger.git\"}}"),
                 &[],
-            ).unwrap();
+            None).unwrap();
         assert_eq!(benign.status, "intent");
 
         // Escalation argv (exfiltration remote): explicit denied receipt, no
@@ -28130,7 +28963,7 @@ pub(crate) mod tests {
         let escalation = db.action_intent("agent-836", "ws-836", "github:Perseus-Computing-LLC/perseus-vault", "github:Perseus-Computing-LLC/ledger", "tool.run", "run-2", &"b".repeat(64),
             Some("{\"tool\":\"git\",\"argv_canonical\":{\"action\":\"push\",\"remote\":\"evil.example.com/exfil.git\"}}"),
                 &[],
-            ).unwrap();
+            None).unwrap();
         assert_eq!(escalation.status, "denied");
         assert_eq!(
             escalation.outcome_hash.len(),
@@ -28193,7 +29026,7 @@ pub(crate) mod tests {
                 &"a".repeat(64),
                 Some("{}"),
                 &[],
-            )
+            None)
             .unwrap();
         assert_eq!(action.status, "approval_requested");
         let denied = db
@@ -28253,7 +29086,7 @@ pub(crate) mod tests {
                 &"a".repeat(64),
                 Some("{}"),
                 &[],
-            )
+            None)
             .unwrap();
         assert_eq!(action.status, "approval_requested");
         // Before the window elapses, timeout resolution refuses.
@@ -45153,6 +45986,296 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn remediation_trace_corpus_runner() {
+        // #1032: runner wiring for the remediation/compensation trace family —
+        // each event replays through the live AAR surfaces (authority_set /
+        // action_intent / action_complete / authority_revoke /
+        // finding_record) and the outcome + reason code are asserted against
+        // the corpus contract. Refs of the form "ref:<event_id>" resolve to
+        // the real record ids created during replay.
+        let corpus_path = format!(
+            "{}/benchmark/security/traces/authority_traces.json",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let corpus: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&corpus_path).expect("read authority_traces.json"),
+        )
+        .expect("parse authority_traces.json");
+        let traces: Vec<&serde_json::Value> = corpus["traces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|t| t["remediation_model"].is_object())
+            .collect();
+        assert!(
+            traces.len() >= 4,
+            "corpus must carry the remediation trace family"
+        );
+
+        let ws = "ws-trace-rem";
+
+        fn resolve(refs: &std::collections::HashMap<String, String>, r: &str) -> String {
+            match r.strip_prefix("ref:") {
+                Some(ev) => refs.get(ev).cloned().unwrap_or_else(|| {
+                    panic!("unresolved corpus ref {r}")
+                }),
+                None => r.to_string(),
+            }
+        }
+
+        for trace in traces {
+            let trace_id = trace["trace_id"].as_str().unwrap();
+            let (db, _path) = temp_db();
+            let mut refs: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+            for ev in trace["events"].as_array().unwrap() {
+                let op = ev["operation"].as_str().unwrap();
+                match op {
+                    "grant" => {
+                        let agent = ev["actor_id"].as_str().unwrap();
+                        db.agent_upsert(agent, "Trace", 3, "trace").unwrap();
+                        let caps: Vec<String> = ev["allowed_capabilities"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .map(|c| c.as_str().unwrap().to_string())
+                            .collect();
+                        let manifest = db
+                            .authority_set(
+                                &crate::models::AuthorityManifestInput {
+                                    agent_id: agent.to_string(),
+                                    workspace_hash: ws.to_string(),
+                                    allowed_capabilities: caps,
+                                    approval_required_capabilities: vec![],
+                                    scope_anchors: vec!["trace-scope".to_string()],
+                                    approver_principals: vec![],
+                                    allowed_inbound_principals: vec![],
+                                    permitted_external_ref_prefixes: vec!["trace-ref".to_string()],
+                                    max_parallel_actions: 8,
+                                    mode: "enforce".to_string(),
+                                    expires_at_unix_ms: None,
+                                    capability_constraints_json: "{}".to_string(),
+                                },
+                                "admin",
+                            )
+                            .unwrap();
+                        refs.insert(
+                            ev["event_id"].as_str().unwrap().to_string(),
+                            manifest.id.clone(),
+                        );
+                    }
+                    "execute_action" => {
+                        let agent = ev["actor_id"].as_str().unwrap();
+                        let action = db
+                            .action_intent(
+                                agent,
+                                ws,
+                                "trace-scope",
+                                "trace-ref",
+                                ev["capability"].as_str().unwrap(),
+                                ev["action_key"].as_str().unwrap(),
+                                &"c".repeat(64),
+                                Some("{}"),
+                                &[],
+                                None,
+                            )
+                            .unwrap();
+                        let action = db
+                            .action_complete(&action.id, agent, "executed", &"d".repeat(64))
+                            .unwrap();
+                        refs.insert(
+                            ev["event_id"].as_str().unwrap().to_string(),
+                            action.id.clone(),
+                        );
+                    }
+                    "record_finding" => {
+                        let covers: Vec<String> = ev["covers"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .map(|c| resolve(&refs, c.as_str().unwrap()))
+                            .collect();
+                        db.finding_record(
+                            ws,
+                            ev["actor_id"].as_str().unwrap(),
+                            ev["finding_ref"].as_str().unwrap(),
+                            "insight",
+                            "fact",
+                            "",
+                            ev["cited_head"].as_str().unwrap(),
+                            &covers,
+                            ev["basis"].as_str().unwrap(),
+                        )
+                        .unwrap();
+                    }
+                    "revoke" => {
+                        let manifest_id =
+                            resolve(&refs, ev["grant_ref"].as_str().unwrap());
+                        db.authority_revoke(&manifest_id, "operator", "trace revoke")
+                            .unwrap();
+                    }
+                    "handoff" => {
+                        let agent = ev["actor_id"].as_str().unwrap();
+                        let effects: Vec<String> = ev["original_effects"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .map(|e| resolve(&refs, e.as_str().unwrap()))
+                            .collect();
+                        let constraints = serde_json::json!({
+                            "beneficiary_agent_id": ev["beneficiary_agent_id"].as_str().unwrap(),
+                            "original_effects": effects,
+                        })
+                        .to_string();
+                        let action = db
+                            .action_intent(
+                                agent,
+                                ws,
+                                "trace-scope",
+                                "trace-ref",
+                                "remediation_handoff",
+                                "handoff",
+                                &"e".repeat(64),
+                                Some(&constraints),
+                                &[],
+                                None,
+                            )
+                            .unwrap();
+                        let action = db
+                            .action_complete(&action.id, agent, "executed", &"f".repeat(64))
+                            .unwrap();
+                        refs.insert(
+                            ev["event_id"].as_str().unwrap().to_string(),
+                            action.id.clone(),
+                        );
+                    }
+                    "compensate" => {
+                        let agent = ev["actor_id"].as_str().unwrap();
+                        let effect = resolve(&refs, ev["compensates_for"].as_str().unwrap());
+                        let handoff = if ev["handoff_receipt_ref"].as_str().unwrap_or("").is_empty()
+                        {
+                            String::new()
+                        } else {
+                            resolve(
+                                &refs,
+                                ev["handoff_receipt_ref"].as_str().unwrap(),
+                            )
+                        };
+                        let linkage = crate::models::CompensationLinkage {
+                            compensates_for: effect.clone(),
+                            finding_ref: ev["finding_ref"].as_str().unwrap_or("").to_string(),
+                            superseding_head: ev["superseding_head"]
+                                .as_str()
+                                .unwrap_or("")
+                                .to_string(),
+                            handoff_receipt_ref: handoff,
+                        };
+                        let result = db.action_intent(
+                            agent,
+                            ws,
+                            "trace-scope",
+                            "trace-ref",
+                            "execute_action",
+                            "compensation",
+                            &"c".repeat(64),
+                            Some("{}"),
+                            &[],
+                            Some(&linkage),
+                        );
+                        if trace["expected_decision"] == "reject"
+                            || ev["expected_reason_code"].is_string()
+                        {
+                            let err = result
+                                .expect_err(&format!("{trace_id}: compensation should fail"))
+                                .to_string();
+                            if let Some(code) = ev["expected_reason_code"].as_str() {
+                                assert!(
+                                    err.contains(code),
+                                    "{trace_id}: expected reason code {code:?} in: {err}"
+                                );
+                            }
+                        } else {
+                            let action = result
+                                .expect(&format!("{trace_id}: compensation should pass"));
+                            assert_eq!(action.compensates_for, effect);
+                            assert_eq!(
+                                action.finding_ref,
+                                ev["finding_ref"].as_str().unwrap()
+                            );
+                            assert_eq!(
+                                action.superseding_head,
+                                ev["superseding_head"].as_str().unwrap()
+                            );
+                            let handoff_ref =
+                                ev["handoff_receipt_ref"].as_str().unwrap();
+                            assert_eq!(
+                                action.handoff_receipt_ref,
+                                resolve(&refs, handoff_ref),
+                                "{trace_id}: handoff receipt must be part of the evidence set"
+                            );
+                        }
+                    }
+                    other => panic!("{trace_id}: unknown remediation operation {other}"),
+                }
+            }
+
+            // Corpus-contract assertions.
+            let model = &trace["remediation_model"];
+            if model["historical_authenticity"].is_object()
+                && model["historical_authenticity"]["retained"] == serde_json::Value::Bool(true)
+            {
+                let effect_event_id = trace["events"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|e| e["operation"] == "execute_action")
+                    .expect("remediation trace must contain an execute_action event")["event_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_string();
+                let effect = refs
+                    .get(&effect_event_id)
+                    .cloned()
+                    .unwrap_or_else(|| panic!("{trace_id}: effect id not mapped"));
+                let original = db
+                    .action_receipt_get(&effect)
+                    .unwrap()
+                    .expect("original effect receipt must still verify historically");
+                assert_eq!(original.status, "action_executed");
+            }
+            if model["no_compensation_effect"] == serde_json::Value::Bool(true) {
+                let count: i64 = db
+                    .conn()
+                    .unwrap()
+                    .query_row(
+                        "SELECT COUNT(*) FROM authorized_actions WHERE compensates_for != ''",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    count, 0,
+                    "{trace_id}: a compensation effect record was created"
+                );
+            }
+            if let Some(state) = model["finding_final_state"].as_str() {
+                let finding_ref = trace["events"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|e| e["operation"] == "record_finding")
+                    .expect("remediation trace must record a finding")["finding_ref"]
+                    .as_str()
+                    .unwrap();
+                let finding = db
+                    .finding_get(ws, finding_ref)
+                    .unwrap()
+                    .expect("finding must exist");
+                assert_eq!(finding.status, state, "{trace_id}: finding state mismatch");
+            }
+        }
+    }
+
+    #[test]
     fn purge_dry_run_dedupes_journal_rows_shared_across_workspaces() {
         let (db, path) = temp_db();
         let mut e1 = make_entity("e-ws-a", "facts", "shared", r#"{"n":"a"}"#);
@@ -46030,7 +47153,7 @@ pub(crate) mod tests {
                 &"a".repeat(64),
                 Some("{}"),
                 &[],
-            )
+            None)
             .unwrap();
         let err = db
             .action_complete(&action.id, "forged-actor", "executed", &"b".repeat(64))
@@ -46671,7 +47794,7 @@ pub(crate) mod tests {
                 &"a".repeat(64),
                 Some("{}"),
                 &[],
-            )
+            None)
             .unwrap();
         db.action_complete(&action.id, "agent-lm", "executed", &artifact_sha)
             .unwrap();
@@ -46707,7 +47830,7 @@ pub(crate) mod tests {
                 &"b".repeat(64),
                 Some("{}"),
                 &[],
-            )
+            None)
             .unwrap();
         db.action_complete(&action.id, "agent-lm", "executed", &"c".repeat(64))
             .unwrap();
@@ -46740,7 +47863,7 @@ pub(crate) mod tests {
                 &"d".repeat(64),
                 Some("{}"),
                 &[],
-            )
+            None)
             .unwrap();
         db.action_complete(&action.id, "agent-lm", "executed", &artifact_sha)
             .unwrap();
@@ -46776,7 +47899,7 @@ pub(crate) mod tests {
                 &"e".repeat(64),
                 Some("{}"),
                 &[],
-            )
+            None)
             .unwrap();
         db.action_complete(&action.id, "agent-lm", "executed", &artifact_sha)
             .unwrap();
@@ -46828,7 +47951,7 @@ pub(crate) mod tests {
                 &"f".repeat(64),
                 Some("{}"),
                 &[],
-            )
+            None)
             .unwrap();
         db.action_complete(&action.id, "agent-lm", "executed", &artifact_sha)
             .unwrap();
@@ -46913,7 +48036,7 @@ pub(crate) mod tests {
                 &"c".repeat(64),
                 Some("{}"),
                 &[],
-            )
+            None)
             .unwrap();
         db.action_complete(&action.id, "agent-lm", "executed", &artifact_sha)
             .unwrap();
@@ -47006,7 +48129,7 @@ pub(crate) mod tests {
                 &"d".repeat(64),
                 Some("{}"),
                 &[],
-            )
+            None)
             .unwrap();
         db.action_complete(&action.id, "agent-lm", "executed", &artifact_sha)
             .unwrap();

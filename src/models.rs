@@ -453,6 +453,53 @@ pub struct AuthorityManifestInput {
     pub capability_constraints_json: String,
 }
 
+/// #1033: compensation linkage on an action intent — a compensation/undo
+/// action cites the original effect receipt it compensates plus an
+/// authenticated impact finding and the superseding head that invalidated
+/// the original justification. The admission gate verifies the linkage
+/// fail-closed: self-claimed undo (no finding), forged findings, and
+/// mismatched heads are rejected with stable reason codes.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CompensationLinkage {
+    /// Receipt id of the original effect/action being compensated.
+    pub compensates_for: String,
+    /// Authenticated impact-finding reference (impact_findings.finding_ref).
+    pub finding_ref: String,
+    /// Exact superseding head that invalidated the original justification.
+    pub superseding_head: String,
+    /// Optional receipted remediation handoff (authorized action id) that
+    /// transferred remediation authority after the original grant's
+    /// revocation — required when the original effect's manifest is revoked.
+    #[serde(default)]
+    pub handoff_receipt_ref: String,
+}
+
+/// #1033: an authenticated impact finding — the durable, receipted record
+/// that a detection pass produced about a superseded/retracted fact.
+/// Compensation intents must cite one of these (plus the matching
+/// superseding head) to prove they compensate a real, detected impact
+/// rather than laundering a fresh action through "undo" framing. A finding
+/// is detection output, never a decision: it cannot self-trigger execution.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImpactFinding {
+    pub id: String,
+    pub finding_ref: String,
+    pub workspace_hash: String,
+    pub agent_id: String,
+    pub category: String,
+    pub key: String,
+    pub entity_id: String,
+    /// Exact head the finding cites as the supersession point.
+    pub cited_head: String,
+    /// Original effect/action receipt ids the finding covers.
+    #[serde(default)]
+    pub covers: Vec<String>,
+    pub basis: String,
+    pub status: String,
+    pub archived: bool,
+    pub created_at_unix_ms: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthorityManifest {
     pub id: String,
@@ -502,6 +549,17 @@ pub struct AuthorizedAction {
     /// pre-execution authority check can re-validate freshness.
     #[serde(default)]
     pub justification_entity_ids: Vec<String>,
+    /// #1033: compensation linkage (empty = not a compensation intent).
+    /// Stored on the action row for audit; verified fail-closed at
+    /// admission.
+    #[serde(default)]
+    pub compensates_for: String,
+    #[serde(default)]
+    pub finding_ref: String,
+    #[serde(default)]
+    pub superseding_head: String,
+    #[serde(default)]
+    pub handoff_receipt_ref: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
