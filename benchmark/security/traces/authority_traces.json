@@ -7,7 +7,7 @@
     "blocked"
   ],
   "suite": "perseus-vault-authority-traces-v1",
-  "trace_count": 13,
+  "trace_count": 17,
   "traces": [
     {
       "description": "A user grants permission for action X, later revokes it, and a new agent session retrieves the stale grant and attempts X.",
@@ -826,6 +826,447 @@
       },
       "title": "Deletion dominates correction: superseded versions are removed with their source",
       "trace_id": "residue-deletion-dominates-correction"
+    },
+    {
+      "description": "Grant G authorizes agent A; A executes effect E with a receipt. G is revoked. A files a compensation intent citing E + a valid authenticated finding + the superseding head. The intent must be rejected on CURRENT action authority \u2014 compensation authority is never inherited from the original action \u2014 while E's receipt still verifies historically.",
+      "events": [
+        {
+          "actor_id": "agent-rem-a",
+          "allowed_capabilities": [
+            "execute_action",
+            "finding.record"
+          ],
+          "authority_scope": "trace-scope",
+          "effective_time_unix_ms": 1000000,
+          "event_id": "evt-rem-grant-a",
+          "observed_time_unix_ms": 1000000,
+          "operation": "grant",
+          "payload_digest": "sha256:59a0e2227d02f00fff325bd1a6b2d1979158374b8220de3635aab5563a1fd0b9",
+          "provenance": "source:evt-rem-grant-a:admission"
+        },
+        {
+          "action_key": "effect-E",
+          "actor_id": "agent-rem-a",
+          "authority_scope": "trace-scope",
+          "capability": "execute_action",
+          "effective_time_unix_ms": 1000050,
+          "event_id": "evt-rem-effect-e",
+          "observed_time_unix_ms": 1000050,
+          "operation": "execute_action",
+          "payload_digest": "sha256:a6b96c98a8de22d413addca4801c05a54d4d6914df7a62c7d61d634fed46b581",
+          "provenance": "source:evt-rem-effect-e:admission"
+        },
+        {
+          "actor_id": "agent-rem-a",
+          "basis": "supersession",
+          "cited_head": "head-superseding-0001",
+          "covers": [
+            "ref:evt-rem-effect-e"
+          ],
+          "effective_time_unix_ms": 2000000,
+          "event_id": "evt-rem-finding-a",
+          "finding_ref": "fnd-rem-a",
+          "observed_time_unix_ms": 2000000,
+          "operation": "record_finding",
+          "payload_digest": "sha256:e014c25e750d1bf76fc48d54d0ac7550ca9b72c0aacaeb5f2073aefe33f254e1",
+          "provenance": "source:evt-rem-finding-a:detection"
+        },
+        {
+          "actor_id": "operator",
+          "effective_time_unix_ms": 2000000,
+          "event_id": "evt-rem-revoke-a",
+          "grant_ref": "ref:evt-rem-grant-a",
+          "observed_time_unix_ms": 2000000,
+          "operation": "revoke",
+          "payload_digest": "sha256:7224cfce4b9318e80aeb76d4aa97ad14aaa96697e227d8f8f0a502e789fb2f9d",
+          "provenance": "source:evt-rem-revoke-a:authority"
+        },
+        {
+          "actor_id": "agent-rem-a",
+          "authority_scope": "trace-scope",
+          "compensates_for": "ref:evt-rem-effect-e",
+          "effective_time_unix_ms": 3000000,
+          "event_id": "evt-rem-comp-a",
+          "expected_reason_code": "no active authority manifest",
+          "finding_ref": "fnd-rem-a",
+          "handoff_receipt_ref": "",
+          "observed_time_unix_ms": 3000000,
+          "operation": "compensate",
+          "payload_digest": "sha256:85a726aa373ffa5f669ac380b0dd8b82dbe43a9528436b1d35c0841c57b7cf10",
+          "provenance": "source:evt-rem-comp-a:compensation",
+          "superseding_head": "head-superseding-0001"
+        }
+      ],
+      "expected_decision": "reject",
+      "expected_receipt": "no compensation effect created; original receipt still verifies historically",
+      "negative_assertions": [
+        "no_compensation_effect",
+        "no_inherited_authority"
+      ],
+      "postcondition_readback": {
+        "kind": "none",
+        "performed": false
+      },
+      "reason": "authority is evaluated at compensation time, never inherited; the revoked principal holds no current action authority",
+      "remediation_model": {
+        "finding_final_state": "open",
+        "historical_authenticity": {
+          "current_authority": false,
+          "retained": true
+        },
+        "no_compensation_effect": true,
+        "trace_family": "remediation"
+      },
+      "title": "Revocation barrier: a revoked principal cannot compensate its own past effect",
+      "trace_id": "remediation-revocation-barrier"
+    },
+    {
+      "description": "The revocation carries a remediation handoff as a SEPARATE authorized action with its own receipt ('revoke A, hand open cases to B'), filed under A's still-active authority. After revocation, B files compensation citing E + the authenticated finding + the superseding head + the handoff receipt. The compensation passes, and the handoff receipt is part of B's evidence set.",
+      "events": [
+        {
+          "actor_id": "agent-rem-a",
+          "allowed_capabilities": [
+            "execute_action",
+            "remediation_handoff",
+            "finding.record"
+          ],
+          "authority_scope": "trace-scope",
+          "effective_time_unix_ms": 1000000,
+          "event_id": "evt-rem-grant-a",
+          "observed_time_unix_ms": 1000000,
+          "operation": "grant",
+          "payload_digest": "sha256:59a0e2227d02f00fff325bd1a6b2d1979158374b8220de3635aab5563a1fd0b9",
+          "provenance": "source:evt-rem-grant-a:admission"
+        },
+        {
+          "action_key": "effect-E",
+          "actor_id": "agent-rem-a",
+          "authority_scope": "trace-scope",
+          "capability": "execute_action",
+          "effective_time_unix_ms": 1000050,
+          "event_id": "evt-rem-effect-e",
+          "observed_time_unix_ms": 1000050,
+          "operation": "execute_action",
+          "payload_digest": "sha256:a6b96c98a8de22d413addca4801c05a54d4d6914df7a62c7d61d634fed46b581",
+          "provenance": "source:evt-rem-effect-e:admission"
+        },
+        {
+          "actor_id": "agent-rem-a",
+          "basis": "supersession",
+          "cited_head": "head-superseding-0001",
+          "covers": [
+            "ref:evt-rem-effect-e"
+          ],
+          "effective_time_unix_ms": 2000000,
+          "event_id": "evt-rem-finding-b",
+          "finding_ref": "fnd-rem-b",
+          "observed_time_unix_ms": 2000000,
+          "operation": "record_finding",
+          "payload_digest": "sha256:a663badcdad530132eaa60b4f236e74755a7ff73eb5d29df471fdf9b319bfda2",
+          "provenance": "source:evt-rem-finding-b:detection"
+        },
+        {
+          "actor_id": "agent-rem-a",
+          "authority_scope": "trace-scope",
+          "beneficiary_agent_id": "agent-rem-b",
+          "capability": "remediation_handoff",
+          "effective_time_unix_ms": 2000000,
+          "event_id": "evt-rem-handoff",
+          "observed_time_unix_ms": 2000000,
+          "operation": "handoff",
+          "original_effects": [
+            "ref:evt-rem-effect-e"
+          ],
+          "payload_digest": "sha256:67448ce38de4fce546496af7a61a2ccfc5d51dadd8ff7575d5b1fe97d0fb349f",
+          "provenance": "source:evt-rem-handoff:admission"
+        },
+        {
+          "actor_id": "operator",
+          "effective_time_unix_ms": 2000100,
+          "event_id": "evt-rem-revoke-a",
+          "grant_ref": "ref:evt-rem-grant-a",
+          "observed_time_unix_ms": 2000100,
+          "operation": "revoke",
+          "payload_digest": "sha256:7224cfce4b9318e80aeb76d4aa97ad14aaa96697e227d8f8f0a502e789fb2f9d",
+          "provenance": "source:evt-rem-revoke-a:authority"
+        },
+        {
+          "actor_id": "agent-rem-b",
+          "allowed_capabilities": [
+            "execute_action"
+          ],
+          "authority_scope": "trace-scope",
+          "effective_time_unix_ms": 2000200,
+          "event_id": "evt-rem-grant-b",
+          "observed_time_unix_ms": 2000200,
+          "operation": "grant",
+          "payload_digest": "sha256:59a0e2227d02f00fff325bd1a6b2d1979158374b8220de3635aab5563a1fd0b9",
+          "provenance": "source:evt-rem-grant-b:admission"
+        },
+        {
+          "actor_id": "agent-rem-b",
+          "authority_scope": "trace-scope",
+          "compensates_for": "ref:evt-rem-effect-e",
+          "effective_time_unix_ms": 3000000,
+          "event_id": "evt-rem-comp-b",
+          "finding_ref": "fnd-rem-b",
+          "handoff_receipt_ref": "ref:evt-rem-handoff",
+          "observed_time_unix_ms": 3000000,
+          "operation": "compensate",
+          "payload_digest": "sha256:31a660b24f0c39819e4c03f5f9ef9bbf0b73e11d276677cc5c8fb1a6cd111ca5",
+          "provenance": "source:evt-rem-comp-b:compensation",
+          "superseding_head": "head-superseding-0001"
+        }
+      ],
+      "expected_decision": "accept",
+      "expected_receipt": "compensation accepted; handoff receipt recorded in B's evidence set",
+      "negative_assertions": [
+        "no_inherited_authority"
+      ],
+      "postcondition_readback": {
+        "confirmed": true,
+        "kind": "compensation",
+        "performed": true
+      },
+      "reason": "B holds current authority; the compensation cites an authenticated finding, the matching superseding head, and a receipted remediation handoff naming B as beneficiary",
+      "remediation_model": {
+        "finding_final_state": "open",
+        "handoff_in_evidence_set": true,
+        "historical_authenticity": {
+          "retained": true
+        },
+        "no_compensation_effect": false,
+        "trace_family": "remediation"
+      },
+      "title": "Remediation handoff: receipted 'revoke A, hand open cases to B' transfers remediation authority",
+      "trace_id": "remediation-handoff-transfer"
+    },
+    {
+      "description": "Grant G revoked, no handoff, no successor grant. The revoked principal's compensation is rejected (no current authority). A second principal with unrelated current authority also fails: with the original authority revoked and no receipted handoff, compensation is not executable \u2014 the finding stays open in review and no effect record is created.",
+      "events": [
+        {
+          "actor_id": "agent-rem-a",
+          "allowed_capabilities": [
+            "execute_action",
+            "finding.record"
+          ],
+          "authority_scope": "trace-scope",
+          "effective_time_unix_ms": 1000000,
+          "event_id": "evt-rem-grant-a",
+          "observed_time_unix_ms": 1000000,
+          "operation": "grant",
+          "payload_digest": "sha256:59a0e2227d02f00fff325bd1a6b2d1979158374b8220de3635aab5563a1fd0b9",
+          "provenance": "source:evt-rem-grant-a:admission"
+        },
+        {
+          "action_key": "effect-E",
+          "actor_id": "agent-rem-a",
+          "authority_scope": "trace-scope",
+          "capability": "execute_action",
+          "effective_time_unix_ms": 1000050,
+          "event_id": "evt-rem-effect-e",
+          "observed_time_unix_ms": 1000050,
+          "operation": "execute_action",
+          "payload_digest": "sha256:a6b96c98a8de22d413addca4801c05a54d4d6914df7a62c7d61d634fed46b581",
+          "provenance": "source:evt-rem-effect-e:admission"
+        },
+        {
+          "actor_id": "agent-rem-a",
+          "basis": "supersession",
+          "cited_head": "head-superseding-0001",
+          "covers": [
+            "ref:evt-rem-effect-e"
+          ],
+          "effective_time_unix_ms": 2000000,
+          "event_id": "evt-rem-finding-c",
+          "finding_ref": "fnd-rem-c",
+          "observed_time_unix_ms": 2000000,
+          "operation": "record_finding",
+          "payload_digest": "sha256:6e7645565bca25c08a772e16bb54915e467c3f73fb1ff226828c681b14019b15",
+          "provenance": "source:evt-rem-finding-c:detection"
+        },
+        {
+          "actor_id": "operator",
+          "effective_time_unix_ms": 2000000,
+          "event_id": "evt-rem-revoke-a",
+          "grant_ref": "ref:evt-rem-grant-a",
+          "observed_time_unix_ms": 2000000,
+          "operation": "revoke",
+          "payload_digest": "sha256:7224cfce4b9318e80aeb76d4aa97ad14aaa96697e227d8f8f0a502e789fb2f9d",
+          "provenance": "source:evt-rem-revoke-a:authority"
+        },
+        {
+          "actor_id": "agent-rem-a",
+          "authority_scope": "trace-scope",
+          "compensates_for": "ref:evt-rem-effect-e",
+          "effective_time_unix_ms": 3000000,
+          "event_id": "evt-rem-comp-a",
+          "expected_reason_code": "no active authority manifest",
+          "finding_ref": "fnd-rem-c",
+          "handoff_receipt_ref": "",
+          "observed_time_unix_ms": 3000000,
+          "operation": "compensate",
+          "payload_digest": "sha256:85a726aa373ffa5f669ac380b0dd8b82dbe43a9528436b1d35c0841c57b7cf10",
+          "provenance": "source:evt-rem-comp-a:compensation",
+          "superseding_head": "head-superseding-0001"
+        },
+        {
+          "actor_id": "agent-rem-b",
+          "allowed_capabilities": [
+            "execute_action"
+          ],
+          "authority_scope": "trace-scope",
+          "effective_time_unix_ms": 3000100,
+          "event_id": "evt-rem-grant-b",
+          "observed_time_unix_ms": 3000100,
+          "operation": "grant",
+          "payload_digest": "sha256:59a0e2227d02f00fff325bd1a6b2d1979158374b8220de3635aab5563a1fd0b9",
+          "provenance": "source:evt-rem-grant-b:admission"
+        },
+        {
+          "actor_id": "agent-rem-b",
+          "authority_scope": "trace-scope",
+          "compensates_for": "ref:evt-rem-effect-e",
+          "effective_time_unix_ms": 3000200,
+          "event_id": "evt-rem-comp-b",
+          "expected_reason_code": "requires_receipted_handoff",
+          "finding_ref": "fnd-rem-c",
+          "handoff_receipt_ref": "",
+          "observed_time_unix_ms": 3000200,
+          "operation": "compensate",
+          "payload_digest": "sha256:31a660b24f0c39819e4c03f5f9ef9bbf0b73e11d276677cc5c8fb1a6cd111ca5",
+          "provenance": "source:evt-rem-comp-b:compensation",
+          "superseding_head": "head-superseding-0001"
+        }
+      ],
+      "expected_decision": "reject",
+      "expected_receipt": "no compensation effect created; finding remains open",
+      "negative_assertions": [
+        "no_compensation_effect",
+        "no_inherited_authority",
+        "no_third_party_compensation"
+      ],
+      "postcondition_readback": {
+        "kind": "none",
+        "performed": false
+      },
+      "reason": "no valid authority exists for the effect: the revoked principal cannot act, and a third party without a receipted handoff cannot remediate \u2014 fail closed, the finding waits in review",
+      "remediation_model": {
+        "finding_final_state": "open",
+        "no_compensation_effect": true,
+        "trace_family": "remediation"
+      },
+      "title": "No valid authority: compensation is not executable and the finding waits",
+      "trace_id": "remediation-no-authority-fail-closed"
+    },
+    {
+      "description": "Compensation is the strongest authority-laundering vector: 'I'm just undoing my earlier action' without evidence. The AAR admission rule requires compensates_for + an authenticated finding_ref + the matching superseding head. Three linkage negatives: missing linkage, forged finding reference, and mismatched head \u2014 each rejected with a stable reason code, even while the principal holds current authority.",
+      "events": [
+        {
+          "actor_id": "agent-rem-a",
+          "allowed_capabilities": [
+            "execute_action",
+            "finding.record"
+          ],
+          "authority_scope": "trace-scope",
+          "effective_time_unix_ms": 1000000,
+          "event_id": "evt-rem-grant-a",
+          "observed_time_unix_ms": 1000000,
+          "operation": "grant",
+          "payload_digest": "sha256:59a0e2227d02f00fff325bd1a6b2d1979158374b8220de3635aab5563a1fd0b9",
+          "provenance": "source:evt-rem-grant-a:admission"
+        },
+        {
+          "action_key": "effect-E",
+          "actor_id": "agent-rem-a",
+          "authority_scope": "trace-scope",
+          "capability": "execute_action",
+          "effective_time_unix_ms": 1000050,
+          "event_id": "evt-rem-effect-e",
+          "observed_time_unix_ms": 1000050,
+          "operation": "execute_action",
+          "payload_digest": "sha256:a6b96c98a8de22d413addca4801c05a54d4d6914df7a62c7d61d634fed46b581",
+          "provenance": "source:evt-rem-effect-e:admission"
+        },
+        {
+          "actor_id": "agent-rem-a",
+          "authority_scope": "trace-scope",
+          "compensates_for": "ref:evt-rem-effect-e",
+          "effective_time_unix_ms": 3000000,
+          "event_id": "evt-rem-comp-nolink",
+          "expected_reason_code": "compensation_requires_finding_linkage",
+          "finding_ref": "",
+          "handoff_receipt_ref": "",
+          "observed_time_unix_ms": 3000000,
+          "operation": "compensate",
+          "payload_digest": "sha256:f1797074717e60d6b1ab204aee32b2cfbdf463c06b748c9951647904d5638a76",
+          "provenance": "source:evt-rem-comp-nolink:compensation",
+          "superseding_head": ""
+        },
+        {
+          "actor_id": "agent-rem-a",
+          "authority_scope": "trace-scope",
+          "compensates_for": "ref:evt-rem-effect-e",
+          "effective_time_unix_ms": 3000100,
+          "event_id": "evt-rem-comp-forged",
+          "expected_reason_code": "finding_unauthenticated",
+          "finding_ref": "fnd-forged",
+          "handoff_receipt_ref": "",
+          "observed_time_unix_ms": 3000100,
+          "operation": "compensate",
+          "payload_digest": "sha256:9de65d7f4a4ac8cc69fa8be00e97c5c1aa69d95d1ebfdad934c57247aed8b9a5",
+          "provenance": "source:evt-rem-comp-forged:compensation",
+          "superseding_head": "head-superseding-0001"
+        },
+        {
+          "actor_id": "agent-rem-a",
+          "basis": "supersession",
+          "cited_head": "head-superseding-0001",
+          "covers": [
+            "ref:evt-rem-effect-e"
+          ],
+          "effective_time_unix_ms": 3000200,
+          "event_id": "evt-rem-finding-d",
+          "finding_ref": "fnd-rem-d",
+          "observed_time_unix_ms": 3000200,
+          "operation": "record_finding",
+          "payload_digest": "sha256:0d9bb9cb204a17cb00219c32e11ed0fa7a91420f4c5b9c5c87bd9d0ed3a55b0a",
+          "provenance": "source:evt-rem-finding-d:detection"
+        },
+        {
+          "actor_id": "agent-rem-a",
+          "authority_scope": "trace-scope",
+          "compensates_for": "ref:evt-rem-effect-e",
+          "effective_time_unix_ms": 3000300,
+          "event_id": "evt-rem-comp-wronghead",
+          "expected_reason_code": "superseding_head_mismatch",
+          "finding_ref": "fnd-rem-d",
+          "handoff_receipt_ref": "",
+          "observed_time_unix_ms": 3000300,
+          "operation": "compensate",
+          "payload_digest": "sha256:a48373a79ac43910d3843986562171a0b34ea0077fa5d023f4e012bf9561f4e2",
+          "provenance": "source:evt-rem-comp-wronghead:compensation",
+          "superseding_head": "head-wrong"
+        }
+      ],
+      "expected_decision": "reject",
+      "expected_receipt": "no compensation effect created; the authenticated finding remains open",
+      "negative_assertions": [
+        "no_compensation_effect",
+        "no_self_claimed_undo"
+      ],
+      "postcondition_readback": {
+        "kind": "none",
+        "performed": false
+      },
+      "reason": "detection produces a finding, never a decision; a compensation intent without a verified finding+head linkage is a laundering attempt and is rejected fail-closed",
+      "remediation_model": {
+        "finding_final_state": "open",
+        "no_compensation_effect": true,
+        "trace_family": "remediation"
+      },
+      "title": "AAR linkage: a self-claimed undo with no finding linkage is rejected",
+      "trace_id": "remediation-self-claimed-undo"
     }
   ]
 }

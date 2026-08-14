@@ -7314,10 +7314,34 @@ pub struct ActionIntentArgs {
     /// index re-validates PENDING actions whose cited facts later changed.
     #[serde(default)]
     pub justification_entity_ids: Vec<String>,
+    /// #1033: compensation linkage — set `compensates_for` to file a
+    /// compensation/undo intent. The gate then requires an authenticated
+    /// `finding_ref` + the exact `superseding_head` it cites (and, when the
+    /// original authority was revoked, a receipted `handoff_receipt_ref`
+    /// naming this agent as beneficiary). Self-claimed undo is rejected
+    /// fail-closed.
+    #[serde(default)]
+    pub compensates_for: String,
+    #[serde(default)]
+    pub finding_ref: String,
+    #[serde(default)]
+    pub superseding_head: String,
+    #[serde(default)]
+    pub handoff_receipt_ref: String,
 }
 pub fn handle_action_intent(db: &Database, args: Value) -> Result<String, String> {
     let a: ActionIntentArgs = serde_json::from_value(args)
         .map_err(|e| format!("Invalid action_intent arguments: {e}"))?;
+    let compensation = if a.compensates_for.trim().is_empty() {
+        None
+    } else {
+        Some(crate::models::CompensationLinkage {
+            compensates_for: a.compensates_for.clone(),
+            finding_ref: a.finding_ref.clone(),
+            superseding_head: a.superseding_head.clone(),
+            handoff_receipt_ref: a.handoff_receipt_ref.clone(),
+        })
+    };
     serde_json::to_string(
         &db.action_intent(
             &a.agent_id,
@@ -7329,6 +7353,7 @@ pub fn handle_action_intent(db: &Database, args: Value) -> Result<String, String
             &a.intent_hash,
             Some(&a.resource_constraints_json),
             &a.justification_entity_ids,
+            compensation.as_ref(),
         )
         .map_err(|e| format!("action_intent failed: {e}"))?,
     )
@@ -8388,6 +8413,78 @@ pub fn handle_impact_report(db: &Database, args: Value) -> Result<String, String
         )
         .map_err(|e| format!("impact report failed: {e}"))?;
     serde_json::to_string(&report).map_err(|e| format!("Serialization failed: {e}"))
+}
+
+/// #1033: record an authenticated impact finding — the durable admission
+/// record a detection pass produces about a superseded/retracted fact.
+/// Compensation intents cite findings (+ the matching superseding head) to
+/// prove they compensate a real, detected impact; a finding itself can
+/// never self-trigger execution (detection produces a finding, never a
+/// decision).
+pub fn handle_finding_record(db: &Database, args: Value) -> Result<String, String> {
+    let finding_ref = args
+        .get("finding_ref")
+        .and_then(|v| v.as_str())
+        .ok_or("finding_record requires a finding_ref")?
+        .to_string();
+    let workspace_hash = args
+        .get("workspace_hash")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let agent_id = args
+        .get("agent_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let category = args
+        .get("category")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let key = args
+        .get("key")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let entity_id = args
+        .get("entity_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let cited_head = args
+        .get("cited_head")
+        .and_then(|v| v.as_str())
+        .ok_or("finding_record requires a cited_head (the superseding head that invalidated the justification)")?
+        .to_string();
+    let covers: Vec<String> = args
+        .get("covers")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|e| e.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let basis = args
+        .get("basis")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let finding = db
+        .finding_record(
+            &workspace_hash,
+            &agent_id,
+            &finding_ref,
+            &category,
+            &key,
+            &entity_id,
+            &cited_head,
+            &covers,
+            &basis,
+        )
+        .map_err(|e| format!("finding_record failed: {e}"))?;
+    serde_json::to_string(&finding).map_err(|e| e.to_string())
 }
 
 /// #1028: forward restoration — restore from a checkpoint as NEW successors

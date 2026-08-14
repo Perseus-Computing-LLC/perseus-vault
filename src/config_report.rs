@@ -414,6 +414,10 @@ mod tests {
     // default, no drift, no note).
     #[test]
     fn fingerprint_tier_stage_reports_default_off_without_drift() {
+        // The sibling fingerprint tests mutate PERSEUS_VAULT_EMBEDDING_FINGERPRINT
+        // under ENV_LOCK; take it here too so a concurrent set_var can't make
+        // the default-off resolution look drifted (macOS scheduler race).
+        let _guard = ENV_LOCK.lock().unwrap();
         let mut db = TestDatabase::new("cfg-report-fp");
         db.set_deployment_context(false, false, "127.0.0.1", false, false);
         let r = build(&db, db.deployment_context());

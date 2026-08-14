@@ -712,10 +712,16 @@ CREATE INDEX IF NOT EXISTS idx_preload_proposals_state
 /// active directory must carry a matching `writer_epoch`. New table,
 /// idempotent, no backfill.
 /// v46 (#1029 supersession impact index): `authorized_actions.justification_json`
+///
+/// v47 (#1033 compensation admission): `impact_findings` table (durable
+/// detection records) + four `authorized_actions` compensation-linkage
+/// columns (`compensates_for`, `finding_ref`, `superseding_head`,
+/// `handoff_receipt_ref`) — compensation intents must cite an authenticated
+/// finding + superseding head; self-claimed undo is rejected fail-closed.
 /// — the entity ids an action cited as grounding, so the reverse impact
 /// closure can flag PENDING actions whose justification changed. Additive
 /// column, no backfill (pre-existing actions cite nothing).
-pub(crate) const SCHEMA_VERSION: i64 = 46;
+pub(crate) const SCHEMA_VERSION: i64 = 47;
 
 /// Initialize the v0.2.0 schema on a fresh database.
 pub fn initialize_schema(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
@@ -918,6 +924,58 @@ fn apply_migrations(conn: &Connection) -> Result<(), Box<dyn std::error::Error>>
         "authorized_actions",
         "justification_json",
         "TEXT NOT NULL DEFAULT '[]'",
+    )?;
+
+    // #1033: compensation admission — compensation/undo intents must cite an
+    //    authenticated impact finding + the superseding head that invalidated
+    //    the original justification. Additive columns, ALTER-appended at the
+    //    physical end of the row (index-based hydration only), so fresh-DDL
+    //    column order stays identical to migrated stores. `impact_findings`
+    //    is a new table (durable detection records); nothing existed before.
+    ensure_column(
+        conn,
+        "authorized_actions",
+        "compensates_for",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    ensure_column(
+        conn,
+        "authorized_actions",
+        "finding_ref",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    ensure_column(
+        conn,
+        "authorized_actions",
+        "superseding_head",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    ensure_column(
+        conn,
+        "authorized_actions",
+        "handoff_receipt_ref",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS impact_findings (
+            id TEXT PRIMARY KEY,
+            finding_ref TEXT NOT NULL,
+            workspace_hash TEXT NOT NULL DEFAULT '',
+            agent_id TEXT NOT NULL DEFAULT '',
+            category TEXT NOT NULL DEFAULT '',
+            key TEXT NOT NULL DEFAULT '',
+            entity_id TEXT NOT NULL DEFAULT '',
+            cited_head TEXT NOT NULL,
+            covers_json TEXT NOT NULL DEFAULT '[]',
+            basis TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'open',
+            archived INTEGER NOT NULL DEFAULT 0,
+            created_at_unix_ms INTEGER NOT NULL
+         );
+         CREATE UNIQUE INDEX IF NOT EXISTS idx_impact_findings_ref
+          ON impact_findings(workspace_hash, finding_ref);
+         CREATE INDEX IF NOT EXISTS idx_impact_findings_ws
+          ON impact_findings(workspace_hash, status, archived);",
     )?;
 
     // v29 (#876): governed-distillation lifecycle on artifact bindings.
