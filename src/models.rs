@@ -296,7 +296,11 @@ pub fn is_code_grounded(e: &Entity) -> bool {
     }
     serde_json::from_str::<serde_json::Value>(&e.body_json)
         .ok()
-        .and_then(|v| v.get("index_type").and_then(|x| x.as_str()).map(str::to_string))
+        .and_then(|v| {
+            v.get("index_type")
+                .and_then(|x| x.as_str())
+                .map(str::to_string)
+        })
         .is_some()
 }
 
@@ -492,6 +496,12 @@ pub struct AuthorizedAction {
     pub resource_constraints_json: String,
     #[serde(default)]
     pub resource_constraints_hash: String,
+    /// #1029: entity ids this action cited as grounding (the action's
+    /// `derived_from` closure). The supersession impact index flags PENDING
+    /// actions whose cited justification has since changed, so the
+    /// pre-execution authority check can re-validate freshness.
+    #[serde(default)]
+    pub justification_entity_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -862,6 +872,13 @@ pub struct RecallCompleteness {
     pub completeness: Completeness,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<CandidateScope>,
+    /// #1030: when set, the recall served a DEGRADED arm — e.g. a hybrid
+    /// query whose dense leg was unavailable (embedding tier off / no
+    /// backend) fell back to the sparse arm only. The reason string names
+    /// the missing leg. Callers must not treat these results as a complete
+    /// consensus: the MCP handler maps this to `status: partial`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub degraded: Option<String>,
 }
 
 /// #883/#867: fused multi-strategy recall trace. Every fused recall reports

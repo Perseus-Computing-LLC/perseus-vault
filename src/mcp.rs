@@ -4622,6 +4622,117 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     }
   },
   {
+    "name": "perseus_vault_admission_quarantine",
+    "description": "#1026: review the admission-quarantine hold — candidates disposed as `quarantined` by trust admission are sealed OUTSIDE the authoritative head (never served by any read surface; storage presence confers no authority). list (default): active candidates with attempt metadata (no bodies); show: full sealed record incl. decrypted body + admission attempt linkage + hash-only receipt; retire: record the review decision (the row is retained so its proposal identifier stays retired); purge: reclaim retired rows and/or active rows past the age watermark (purged proposal identifiers become reusable). Every decision is journaled (admission_quarantined / admission_quarantine_retired / admission_quarantine_purged). Pending items also surface in perseus_vault_operator_review.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "action": {
+          "type": "string",
+          "enum": ["list", "show", "retire", "purge"],
+          "default": "list",
+          "description": "list (default) | show | retire | purge"
+        },
+        "id": {"type": "string", "description": "Quarantine id (required for show/retire)"},
+        "workspace_hash": {"type": "string", "description": "Workspace scope for list (default all)"},
+        "include_retired": {"type": "boolean", "default": false, "description": "list: include retired rows (default active only)"},
+        "limit": {"type": "integer", "default": 50, "maximum": 10000},
+        "purge_retired": {"type": "boolean", "default": true, "description": "purge: reclaim retired rows (default true)"},
+        "max_age_days": {"type": "integer", "minimum": 1, "maximum": 3650, "description": "purge: reclaim active rows older than this many days (default 30)"},
+        "requesting_agent_id": {"type": "string", "description": "Reviewer identity stamped into the journal (default empty)"}
+      }
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "count": {"type": "integer"},
+        "items": {"type": "array", "items": {"type": "object"}},
+        "retired": {"type": "boolean"},
+        "purged": {"type": "integer"}
+      }
+    }
+  },
+  {
+    "name": "perseus_vault_writer_handoff",
+    "description": "#1027: epoch-fenced writer handoff — prevent split-brain on concurrent multi-agent writes. Directory-serialized lifecycle actions, each appending a signed lifecycle result (receipt digest): prepare (open the handoff pointer; the source may still advance), abort (clear the pointer; source stays active), fence (clear the writer + advance the epoch — after this NO writer is authorized; a crash in the Fence→Activate gap leaves zero writers, fail-closed), retarget (advance target + epoch; the abandoned target can no longer activate), activate (admission against the exact fenced revision; the current target becomes the active writer, epoch advances again). status: read the directory. Every write (remember) against an active directory must present the current writer_epoch — stale writes fail with a stable StaleRevision / WriterEpoch reason. Workspace-scoped; absent directory = unfenced legacy posture.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "action": {
+          "type": "string",
+          "enum": ["prepare", "abort", "fence", "retarget", "activate", "status"],
+          "default": "status",
+          "description": "status (default) | prepare | abort | fence | retarget | activate"
+        },
+        "workspace_hash": {"type": "string", "description": "Workspace whose writer directory is managed (required except status; must be non-empty)"},
+        "target_agent_id": {"type": "string", "description": "Handoff target agent (required for prepare/retarget)"},
+        "presented_epoch": {"type": "integer", "description": "activate: the fenced epoch the activating agent must present (exact match required)"},
+        "requesting_agent_id": {"type": "string", "description": "Acting identity — activate requires it to equal target_agent_id; stamped into lifecycle receipts"}
+      }
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "epoch": {"type": "integer"},
+        "pointer_state": {"type": "string"},
+        "writer_agent_id": {"type": "string"},
+        "target_agent_id": {"type": "string"},
+        "receipt_digest": {"type": "string"},
+        "lifecycle_len": {"type": "integer"},
+        "directory": {"type": "object"}
+      }
+    }
+  },
+  {
+    "name": "perseus_vault_impact_report",
+    "description": "#1029: supersession impact index — when a fact is superseded or retracted, enumerate the downstream decisions and actions that derived from it (reverse closure over derived_from citations + action justifications). Lists dependent entities ordered by authority (importance) + recency, flags PENDING actions whose cited justification changed (AAR review flag — re-validate freshness before execution), and lists COMPLETED actions for review (external effects are irreversible — flag only, never automatic reversal). Bounded closure: depth_cap (1..16, default 3), age_cap_days (default 365); as_of_unix_ms computes the report at a past transaction instant (v1 filters by dependent creation time; full bi-temporal closure via entity_history is a documented follow-on). Computed lazily at read time.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "entity_id": {"type": "string", "description": "The changed fact's id (alternative to category+key)"},
+        "category": {"type": "string", "description": "The changed fact's category (with key; alternative to entity_id)"},
+        "key": {"type": "string", "description": "The changed fact's key (with category; alternative to entity_id)"},
+        "depth_cap": {"type": "integer", "minimum": 1, "maximum": 16, "default": 3, "description": "Max closure depth (transitive derived_from hops)"},
+        "age_cap_days": {"type": "integer", "minimum": 1, "maximum": 36500, "default": 365, "description": "Ignore dependents older than this many days"},
+        "as_of_unix_ms": {"type": "integer", "description": "Compute the report as of this transaction instant (default: now)"}
+      }
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "target": {"type": "object"},
+        "dependents": {"type": "array", "items": {"type": "object"}},
+        "pending_actions": {"type": "array", "items": {"type": "object"}},
+        "completed_actions": {"type": "array", "items": {"type": "object"}},
+        "bounded_closure": {"type": "object"}
+      }
+    }
+  },
+  {
+    "name": "perseus_vault_restore_forward",
+    "description": "#1028: forward-only restoration — restore from a checkpoint directory as an audited VERSION ADVANCE of the current head, never as a rewrite. Each checkpoint entity advances its (category, key, workspace) identity: the pre-restore version moves to entity_history (the parent; a rollback is just another forward migration) and the checkpoint body becomes the new head. Protected authority paths always take CURRENT values — authority, policy, revocation, issuer, writer, epoch, dirSeq/lifecycle, createdFrom/provenance are excluded from the mask (M ∩ P = ∅; only `entities` is maskable in v1), so a restore can never revive a stale credential, resurrect a superseded authority, or undo a recorded external effect (authorized actions untouched). Workspace-scoped; an active writer directory (#1027) requires the current writer_epoch. Report: restored / superseded_current_heads / created / errors.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "checkpoint_dir": {"type": "string", "description": "Directory of vault-format .md files (the vault_export wire shape)"},
+        "workspace_hash": {"type": "string", "description": "Workspace to restore into (required)"},
+        "path_mask": {"type": "array", "items": {"type": "string"}, "default": ["entities"], "description": "State paths to restore (only `entities` in v1; protected paths are refused fail-closed)"},
+        "writer_epoch": {"type": "integer", "description": "Required when the workspace has an active writer directory (#1027)"},
+        "requesting_agent_id": {"type": "string", "description": "Acting identity stamped into the journal"}
+      }
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "restored": {"type": "integer"},
+        "superseded_current_heads": {"type": "integer"},
+        "created": {"type": "integer"},
+        "errors": {"type": "array", "items": {"type": "string"}},
+        "protected_paths": {"type": "array", "items": {"type": "string"}}
+      }
+    }
+  },
+  {
     "name": "perseus_vault_op_run",
     "description": "#871: durable long-running operation states. Lifecycle tool for the shared run/run-item contract (maintenance, embed, consolidation, export/import, reindex). Actions: begin (queued; requires op_type, optional scope/input_digest/max_retries 0..10/created_by), start (queued->running), progress (done/failed/total counters; partial derived), complete (running->completed with receipt linkage), fail (running->failed; error_detail is sanitized at rest — secrets masked, length capped), failed_to_start (queued->failed_to_start), cancel (queued|running->cancelled), timeout (running->failed with timeout flag), item_add/item_start/item_complete/item_fail/item_cancel (per-item receipts; UNIQUE(run_id, item_ref)). Terminal states accept no further transitions. Restart recovery marks in-flight runs interrupted (mark-only); resume only via perseus_vault_op_run_retry.",
     "inputSchema": {
@@ -6893,7 +7004,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
   {"name":"perseus_vault_authority_get", "description":"Get the active authority manifest for an agent and workspace.", "inputSchema":{"type":"object","properties":{"agent_id":{"type":"string"},"workspace_hash":{"type":"string"},"include_revoked":{"type":"boolean","default":false}},"required":["agent_id","workspace_hash"]}, "title":"Get Action Authority"},
   {"name":"perseus_vault_authority_revoke", "description":"Revoke an authority manifest.", "inputSchema":{"type":"object","properties":{"manifest_id":{"type":"string"},"actor_agent_id":{"type":"string"},"reason":{"type":"string"}},"required":["manifest_id"]}, "title":"Revoke Action Authority"},
   {"name":"perseus_vault_authority_set_signed", "description":"Load a signed, distributable policy/authority profile (Ed25519 sigstore-style attestation); verification failure grants no authority (fail closed) and the verification result lands in the ledger journal.", "inputSchema":{"type":"object","properties":{"profile_json":{"type":"string"},"trusted_public_key_b64":{"type":"string"},"author_agent_id":{"type":"string"}},"required":["profile_json","trusted_public_key_b64","author_agent_id"]}, "title":"Load Signed Authority Profile"},
-  {"name":"perseus_vault_action_intent", "description":"Record a fail-closed authorized action intent.", "inputSchema":{"type":"object","properties":{"agent_id":{"type":"string"},"workspace_hash":{"type":"string"},"scope_anchor":{"type":"string"},"external_ref":{"type":"string"},"capability":{"type":"string"},"action_key":{"type":"string"},"intent_hash":{"type":"string"},"resource_constraints_json":{"type":"string","default":"{}"}},"required":["agent_id","workspace_hash","scope_anchor","external_ref","capability","action_key","intent_hash"]}, "title":"Record Action Intent"},
+  {"name":"perseus_vault_action_intent", "description":"Record a fail-closed authorized action intent.", "inputSchema":{"type":"object","properties":{"agent_id":{"type":"string"},"workspace_hash":{"type":"string"},"scope_anchor":{"type":"string"},"external_ref":{"type":"string"},"capability":{"type":"string"},"action_key":{"type":"string"},"intent_hash":{"type":"string"},"resource_constraints_json":{"type":"string","default":"{}"},"justification_entity_ids":{"type":"array","items":{"type":"string"},"description":"#1029: entity ids this action cites as grounding (must reference existing rows; the supersession impact index flags PENDING actions whose cited facts later changed)"}},"required":["agent_id","workspace_hash","scope_anchor","external_ref","capability","action_key","intent_hash"]}, "title":"Record Action Intent"},
   {"name":"perseus_vault_action_approve", "description":"Grant or deny an approval-requested action.", "inputSchema":{"type":"object","properties":{"action_id":{"type":"string"},"approver_principal":{"type":"string"},"decision":{"type":"string","enum":["granted","denied"]}},"required":["action_id","approver_principal","decision"]}, "title":"Decide Action Approval"},
   {"name":"perseus_vault_action_complete", "description":"Record an executed, failed, cancelled, or denied action outcome by hash.", "inputSchema":{"type":"object","properties":{"action_id":{"type":"string"},"actor_agent_id":{"type":"string"},"outcome":{"type":"string","enum":["executed","failed","cancelled","denied"]},"outcome_hash":{"type":"string"}},"required":["action_id","actor_agent_id","outcome","outcome_hash"]}, "title":"Complete Authorized Action"},
   {"name":"perseus_vault_action_resolve_timeout", "description":"Resolve a pending approval to deny once its window has expired (timeout defaults to deny).", "inputSchema":{"type":"object","properties":{"action_id":{"type":"string"},"approval_timeout_ms":{"type":"integer"}},"required":["action_id","approval_timeout_ms"]}, "title":"Resolve Approval Timeout"},
@@ -6949,19 +7060,20 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
     let handler_result: Result<String, String> = match name {
         "perseus_vault_remember" => tools::handle_remember(db, args).map_err(|e| e.to_string()),
 
-        "perseus_vault_write_gate" => {
-            tools::handle_write_gate(db, args).map_err(|e| e.to_string())
-        }
-
+        "perseus_vault_write_gate" => tools::handle_write_gate(db, args).map_err(|e| e.to_string()),
 
         "perseus_vault_reject_value" => {
             tools::handle_reject_value(db, args).map_err(|e| e.to_string())
         }
 
         "perseus_vault_recall" => tools::handle_recall(db, args).map_err(|e| e.to_string()),
-        "perseus_vault_handoff_pack" => tools::handle_handoff_pack(db, args).map_err(|e| e.to_string()),
+        "perseus_vault_handoff_pack" => {
+            tools::handle_handoff_pack(db, args).map_err(|e| e.to_string())
+        }
         "perseus_vault_intention" => tools::handle_intention(db, args).map_err(|e| e.to_string()),
-        "perseus_vault_proof_frame" => tools::handle_proof_frame(db, args).map_err(|e| e.to_string()),
+        "perseus_vault_proof_frame" => {
+            tools::handle_proof_frame(db, args).map_err(|e| e.to_string())
+        }
 
         "perseus_vault_recall_batch" => {
             tools::handle_recall_batch(db, args).map_err(|e| e.to_string())
@@ -7142,6 +7254,10 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
         "perseus_vault_mental_model_set" => tools::handle_mental_model_set(db, args),
         "perseus_vault_mental_model_review" => tools::handle_mental_model_review(db, args),
         "perseus_vault_write_quarantine" => tools::handle_write_quarantine(db, args),
+        "perseus_vault_admission_quarantine" => tools::handle_admission_quarantine(db, args),
+        "perseus_vault_writer_handoff" => tools::handle_writer_handoff(db, args),
+        "perseus_vault_impact_report" => tools::handle_impact_report(db, args),
+        "perseus_vault_restore_forward" => tools::handle_restore_forward(db, args),
         "perseus_vault_op_run" => tools::handle_op_run(db, args).map_err(|e| e.to_string()),
         "perseus_vault_op_run_list" => {
             tools::handle_op_run_list(db, args).map_err(|e| e.to_string())
@@ -7166,8 +7282,12 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
             tools::handle_preload_review(db, args).map_err(|e| e.to_string())
         }
         "perseus_vault_guide_seed" => tools::handle_guide_seed(db, args).map_err(|e| e.to_string()),
-        "perseus_vault_declared_schema_set" => tools::handle_declared_schema_set(db, args).map_err(|e| e.to_string()),
-        "perseus_vault_declared_query" => tools::handle_declared_query(db, args).map_err(|e| e.to_string()),
+        "perseus_vault_declared_schema_set" => {
+            tools::handle_declared_schema_set(db, args).map_err(|e| e.to_string())
+        }
+        "perseus_vault_declared_query" => {
+            tools::handle_declared_query(db, args).map_err(|e| e.to_string())
+        }
         "perseus_vault_conflicts" => Ok(tools::handle_conflicts(db, args)),
         "perseus_vault_consolidate" => Ok(tools::handle_consolidate(db, args)),
         "perseus_vault_sleep" => Ok(tools::handle_sleep(db, args)),
@@ -7281,7 +7401,7 @@ mod tests {
         );
         assert_eq!(
             registry_names.len(),
-            137,
+            141,
             "update public metadata when adding a tool"
         );
 

@@ -6,6 +6,53 @@ All notable changes to Perseus Vault are documented here. This project adheres t
 ## [Unreleased]
 
 ### Added
+- **Admission quarantine disposition (#1026).** A fourth terminal admission
+  disposition: candidates disposed as `quarantined` by trust admission are
+  sealed OUTSIDE the authoritative head in a new `admission_quarantine`
+  table (schema v44; body encrypted like entities, hash-only receipt, linked
+  to the admission decision digest) — storage presence confers no authority,
+  no read surface serves them, and only `perseus_vault_admission_quarantine`
+  (list/show/retire/purge; the `admission_quarantine` lane of
+  `perseus_vault_operator_review`) reaches them. Optional `proposal_id` on
+  remember: a proposal disposed as quarantined stays RETIRED until purged —
+  reuse is refused with a stable `RetiredIdentifier` error. Journaled
+  admission_quarantined / admission_quarantine_retired /
+  admission_quarantine_purged. Tests cover all four terminal dispositions
+  (Commit / Reject / Quarantine / Defer) plus the retire→purge lifecycle.
+- **Epoch-fenced writer handoff (#1027).** Per-workspace `writer_directory`
+  (schema v45) with the Prepare → Fence → Retarget → Activate lifecycle,
+  monotonically advanced epochs, and signed lifecycle receipts
+  (`perseus_vault_writer_handoff`). Fence CLEARS the writer: the
+  Fence→Activate gap leaves ZERO writers (fail-closed, never two), and a
+  stale writer's in-flight write fails with a stable StaleRevision /
+  WriterEpoch reason. Writes (`remember`) against an active directory must
+  present the current `writer_epoch`; absent directory = unfenced legacy
+  posture. Restore (#1028) honors the same fence.
+- **Forward restoration (#1028).** `perseus_vault_restore_forward`: a
+  checkpoint restore is a typed, forward-only transition — each candidate is
+  applied as an audited VERSION ADVANCE of the current head (the
+  pre-restore version moves to `entity_history` — the parent; a rollback is
+  just another forward migration), never a rewrite or truncation. Protected
+  authority paths P = {authority, policy, revocation, issuer, writer, epoch,
+  dirSeq, lifecycle, createdFrom, provenance} always take CURRENT values
+  (mask ∩ P = ∅ enforced fail-closed: `RestoreMaskProtected`), so a restore
+  can never revive a stale credential, resurrect a superseded authority, or
+  undo a recorded external effect (authorized actions untouched).
+- **Supersession impact index (#1029).** Reverse `derived_from` closure +
+  action justifications: `perseus_vault_impact_report` enumerates the
+  decisions/actions that cited a changed fact, flags PENDING actions
+  (`intent`/`approval_requested`) for AAR justification re-validation, and
+  lists COMPLETED actions for review (never auto-reversed). Bounded by
+  depth/age caps; `as_of_unix_ms` computes the report at a past transaction
+  instant. `action_intent` gained `justification_entity_ids` (schema v46,
+  fail-closed on unknown ids). Design:
+  `docs/specs/supersession-impact-index.md`.
+- **Hybrid recall graceful degradation (#1030).** A hybrid recall whose
+  dense leg is unavailable (embedding tier off, no backend, no fingerprint
+  tier) now DEGRADES to the sparse arm with an explicit marker
+  (`RecallCompleteness.degraded`, outcome `status: partial` /
+  `partial_arms`) instead of failing the whole recall — integrations on lean
+  binaries get keyword hits. Dense mode keeps its hard error (#226).
 - **Deterministic fingerprint tier — zero-API fallback semantic hashing
   (#1020).** Opt-in `PERSEUS_VAULT_EMBEDDING_FINGERPRINT=on|off` /
   `--embedding-fingerprint <on|off>` (default off): content-changing writes

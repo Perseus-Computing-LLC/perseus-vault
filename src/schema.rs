@@ -449,6 +449,61 @@ CREATE TABLE IF NOT EXISTS write_quarantine (
 CREATE INDEX IF NOT EXISTS idx_write_quarantine_ws
  ON write_quarantine(workspace_hash, created_at_unix_ms);
 
+-- #1026 admission quarantine disposition: sealed REJECTED candidates.
+-- When trust admission disposes a candidate as `quarantined`, the sealed
+-- payload + attempt metadata land HERE, OUTSIDE the authoritative head —
+-- storage presence confers no authority, and no read surface serves it.
+-- Reachable only through `perseus_vault_admission_quarantine` (operator
+-- review). `proposal_id` is a caller-supplied attempt identifier: once a
+-- workspace disposes a proposal_id as quarantined, reusing it is refused
+-- with a stable RetiredIdentifier-equivalent error (row retained until
+-- purged). `admission_decision_digest` links the attempt outcome; the
+-- `receipt_digest` is the canonical hash-only receipt of the sealed
+-- record. Body is encrypted like entities when encryption is on.
+CREATE TABLE IF NOT EXISTS admission_quarantine (
+    id TEXT PRIMARY KEY,
+    proposal_id TEXT NOT NULL DEFAULT '',
+    category TEXT NOT NULL,
+    key TEXT NOT NULL,
+    body_json TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
+    workspace_hash TEXT NOT NULL DEFAULT '',
+    agent_id TEXT NOT NULL DEFAULT '',
+    actor_kind TEXT NOT NULL DEFAULT '',
+    outcome TEXT NOT NULL DEFAULT 'quarantined',
+    reason_codes TEXT NOT NULL DEFAULT '[]',
+    record_digest TEXT NOT NULL DEFAULT '',
+    admission_decision_digest TEXT NOT NULL DEFAULT '',
+    receipt_digest TEXT NOT NULL DEFAULT '',
+    decay_score REAL NOT NULL DEFAULT 0.5,
+    created_at_unix_ms INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_admission_quarantine_ws
+ ON admission_quarantine(workspace_hash, created_at_unix_ms);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_admission_quarantine_proposal
+ ON admission_quarantine(workspace_hash, proposal_id)
+ WHERE proposal_id != '';
+
+-- #1027 epoch-fenced writer handoff: the per-workspace writer directory.
+-- pointer_state machine: '' (unfenced) -> prepared -> fenced -> active.
+-- Fence CLEARS the writer and advances the epoch: after a fence NO writer
+-- is authorized (a crash in the Fence->Activate gap leaves zero writers,
+-- fail-closed, never two). Activate runs admission against the exact fenced
+-- revision: the activating agent must equal the current target AND present
+-- the current epoch. Every write against a directory row must carry a
+-- matching writer_epoch; stale epochs fail with a stable StaleRevision /
+-- WriterEpoch reason. lifecycle_json is the append-only signed receipt log
+-- (canonical digests per lifecycle result).
+CREATE TABLE IF NOT EXISTS writer_directory (
+    workspace_hash TEXT PRIMARY KEY,
+    epoch INTEGER NOT NULL DEFAULT 0,
+    pointer_state TEXT NOT NULL DEFAULT '',
+    writer_agent_id TEXT NOT NULL DEFAULT '',
+    target_agent_id TEXT NOT NULL DEFAULT '',
+    lifecycle_json TEXT NOT NULL DEFAULT '[]',
+    updated_at_unix_ms INTEGER NOT NULL
+);
+
 -- #871: durable long-running operation states — shared run/run-item contract
 -- for maintenance, embed, consolidation, export/import, and reindex
 -- operations. Terminal states: completed | failed | cancelled | interrupted |
@@ -645,7 +700,22 @@ CREATE INDEX IF NOT EXISTS idx_preload_proposals_state
 /// content change only while the tier is enabled, NULL otherwise. Additive,
 /// no backfill (pre-enablement rows simply have no fingerprint and stay
 /// out of the zero-API fallback pool).
-pub(crate) const SCHEMA_VERSION: i64 = 43;
+/// v44 (#1026 admission quarantine disposition): `admission_quarantine` —
+/// sealed rejected candidates retained outside the authoritative head,
+/// linked to their attempt outcome (admission decision digest) and hash-only
+/// receipt, reachable only through explicit review tooling. New table,
+/// idempotent, no backfill.
+/// v45 (#1027 epoch-fenced writer handoff): `writer_directory` — per-workspace
+/// epoch-fenced single-writer handoff (Prepare/Fence/Retarget/Activate with
+/// monotonically advanced epochs; Fence clears the writer so a crash in the
+/// Fence→Activate gap leaves zero writers, fail-closed). Writes against an
+/// active directory must carry a matching `writer_epoch`. New table,
+/// idempotent, no backfill.
+/// v46 (#1029 supersession impact index): `authorized_actions.justification_json`
+/// — the entity ids an action cited as grounding, so the reverse impact
+/// closure can flag PENDING actions whose justification changed. Additive
+/// column, no backfill (pre-existing actions cite nothing).
+pub(crate) const SCHEMA_VERSION: i64 = 46;
 
 /// Initialize the v0.2.0 schema on a fresh database.
 pub fn initialize_schema(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
@@ -791,6 +861,64 @@ fn apply_migrations(conn: &Connection) -> Result<(), Box<dyn std::error::Error>>
     //    positionally (e.g. the intention readers in tools.rs). A column
     //    placed mid-DDL would shift every later column on FRESH stores only.
     ensure_column(conn, "entities", "fingerprint", "BLOB")?;
+
+    // #1026: admission quarantine disposition — sealed rejected candidates
+    //    live OUTSIDE the authoritative head. New table only; nothing
+    //    existed before to migrate (previous quarantined writes landed in
+    //    `entities` and stay there as historical non-authoritative rows).
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS admission_quarantine (
+            id TEXT PRIMARY KEY,
+            proposal_id TEXT NOT NULL DEFAULT '',
+            category TEXT NOT NULL,
+            key TEXT NOT NULL,
+            body_json TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'active',
+            workspace_hash TEXT NOT NULL DEFAULT '',
+            agent_id TEXT NOT NULL DEFAULT '',
+            actor_kind TEXT NOT NULL DEFAULT '',
+            outcome TEXT NOT NULL DEFAULT 'quarantined',
+            reason_codes TEXT NOT NULL DEFAULT '[]',
+            record_digest TEXT NOT NULL DEFAULT '',
+            admission_decision_digest TEXT NOT NULL DEFAULT '',
+            receipt_digest TEXT NOT NULL DEFAULT '',
+            decay_score REAL NOT NULL DEFAULT 0.5,
+            created_at_unix_ms INTEGER NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS idx_admission_quarantine_ws
+          ON admission_quarantine(workspace_hash, created_at_unix_ms);
+         CREATE UNIQUE INDEX IF NOT EXISTS idx_admission_quarantine_proposal
+          ON admission_quarantine(workspace_hash, proposal_id)
+          WHERE proposal_id != '';",
+    )?;
+
+    // #1027: epoch-fenced writer handoff — the per-workspace writer
+    //    directory. New table only; no backfill (no handoff state existed
+    //    before; an absent row means unfenced, which is the legacy posture).
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS writer_directory (
+            workspace_hash TEXT PRIMARY KEY,
+            epoch INTEGER NOT NULL DEFAULT 0,
+            pointer_state TEXT NOT NULL DEFAULT '',
+            writer_agent_id TEXT NOT NULL DEFAULT '',
+            target_agent_id TEXT NOT NULL DEFAULT '',
+            lifecycle_json TEXT NOT NULL DEFAULT '[]',
+            updated_at_unix_ms INTEGER NOT NULL
+         );",
+    )?;
+
+    // #1029: supersession impact index — actions record the entities they
+    //    cited as grounding, so a later supersede/retract can enumerate
+    //    which pending actions must re-validate their justification.
+    //    Additive column; index-based hydration only (no SELECT *), and
+    //    ALTER appends at the end of the physical row, so the fresh-DDL
+    //    column order stays identical to migrated stores.
+    ensure_column(
+        conn,
+        "authorized_actions",
+        "justification_json",
+        "TEXT NOT NULL DEFAULT '[]'",
+    )?;
 
     // v29 (#876): governed-distillation lifecycle on artifact bindings.
     // A learned artifact (trained weights / distilled cartridge) is bound to
@@ -2131,9 +2259,7 @@ mod tests {
         initialize_schema(&conn).expect("init schema");
         let fresh: Vec<String> = {
             let mut stmt = conn.prepare("PRAGMA table_info(entities)").unwrap();
-            let rows = stmt
-                .query_map([], |r| r.get::<_, String>(1))
-                .unwrap();
+            let rows = stmt.query_map([], |r| r.get::<_, String>(1)).unwrap();
             rows.map(|r| r.unwrap()).collect()
         };
         // Migrated store: legacy DDL only, stamped with an old version, then
@@ -2144,9 +2270,7 @@ mod tests {
         initialize_schema(&conn2).expect("migrate legacy store");
         let migrated: Vec<String> = {
             let mut stmt = conn2.prepare("PRAGMA table_info(entities)").unwrap();
-            let rows = stmt
-                .query_map([], |r| r.get::<_, String>(1))
-                .unwrap();
+            let rows = stmt.query_map([], |r| r.get::<_, String>(1)).unwrap();
             rows.map(|r| r.unwrap()).collect()
         };
         assert_eq!(
