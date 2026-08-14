@@ -2237,6 +2237,12 @@ mod tests {
         ));
         let path_str = path.to_str().unwrap().to_string();
         let conn = Connection::open(&path_str).expect("open test db");
+        // #1031 follow-up (test-windows flake): raw fixture connections skip
+        // the pool's PRAGMA init, so give them the same stall headroom the
+        // pool fixtures get on Windows/macOS CI runners.
+        #[cfg(any(windows, target_os = "macos"))]
+        conn.execute_batch("PRAGMA busy_timeout=30000;")
+            .expect("set fixture busy timeout");
         (conn, path_str)
     }
 
