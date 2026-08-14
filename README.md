@@ -91,6 +91,31 @@ Or connect any MCP host by hand (Claude Desktop, Cursor, Hermes Agent, Perseus, 
 }
 ```
 
+## For Agents: Connect Over MCP
+
+When the primary consumer is an agent, the interface is **MCP** — the agent
+adopts the Vault through its MCP client, and no per-machine CLI install is
+needed beyond running the server itself:
+
+```bash
+# 1. Run the server (one line)
+perseus-vault serve --db ~/.perseus-vault/data/perseus-vault.db &
+
+# 2. Register it in the agent's MCP client config
+#    { "mcpServers": { "perseus-vault": {
+#        "command": "perseus-vault",
+#        "args": ["serve", "--db", "~/.perseus-vault/data/perseus-vault.db"] } } }
+
+# 3. Verify the agent-facing surface
+perseus-vault doctor
+```
+
+`perseus-vault install-client --hooks --rules` wires the whole
+recall/capture loop for Claude Code / Codex / Cursor / Hermes in one command.
+For the agent-facing capability map — which tool does which job, and the
+planning-boundary pattern — see
+[docs/integration/agent-adoption.md](docs/integration/agent-adoption.md).
+
 ## 30-Second Quickstart
 
 ```bash
@@ -362,7 +387,7 @@ Each adapter:
 Any MCP-compatible framework works with Perseus Vault directly. See
 [MCP client and framework integrations](docs/clients/README.md) for the full list.
 
-## 65 Canonical MCP Tools
+## 147 Canonical MCP Tools
 
 > **Canonical product and tool names.** Perseus Vault is the product name, and integrations use the canonical `perseus_vault_*` tools (for example, `perseus_vault_remember`). The legacy `mimir_*` / `mneme_*` / `plutus_*` names were removed in the 2026-27 major release — the canonical names are the only interface.
 > The count is the number of unique canonical tools in the source registry. Compatibility aliases are callable but are not counted separately.
@@ -491,6 +516,22 @@ Any MCP-compatible framework works with Perseus Vault directly. See
 | `perseus_vault_maintenance` | DB maintenance: dedup, orphan detection, VACUUM, FTS5 reindex (supports dry-run). |
 | `perseus_vault_synthesize` | LLM session synthesis — extract lessons from transcripts. |
 | `perseus_vault_migrate` | Migrate v0.1.x DB to current schema. |
+
+### Tools by job (agent cheat sheet)
+
+Not a category listing — a job listing. Pick the row for what the agent is
+trying to do:
+
+| Job | Tools |
+|---|---|
+| Remember a durable fact / decision / correction | `remember`, `capture`, `journal`, `correct` |
+| Recall before planning | `recall`, `recall_batch`, `recall_when`, `context`, `ask` |
+| Reconstruct the development narrative (intent trail, next work) | `handoff_pack` (with `include_intent_trail` / `include_next_work`), `delegation_brief`, `timeline`, `traverse` |
+| Decisions: supersession and authority | `supersede`, `history`, `authority_get`, `action_receipt_get`, `keystone_get` |
+| Ask "what did we believe then?" | `as_of`, `valid_at`, `bitemporal`, `history` |
+| Correct the record / surface contradictions | `correct`, `supersede`, `conflicts`, `reject_value` |
+| Policy that survives compaction | `keystone_get`, `keystone_set` |
+| Ops, trust, and scope | `health`, `stats`, `agent`, `workspace_status`, `doctor` (CLI) |
 
 ## CLI
 
