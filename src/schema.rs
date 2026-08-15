@@ -728,7 +728,7 @@ CREATE INDEX IF NOT EXISTS idx_preload_proposals_state
 /// — the entity ids an action cited as grounding, so the reverse impact
 /// closure can flag PENDING actions whose justification changed. Additive
 /// column, no backfill (pre-existing actions cite nothing).
-pub(crate) const SCHEMA_VERSION: i64 = 48;
+pub(crate) const SCHEMA_VERSION: i64 = 49;
 
 /// Initialize the v0.2.0 schema on a fresh database.
 pub fn initialize_schema(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
@@ -1974,7 +1974,31 @@ fn apply_migrations(conn: &Connection) -> Result<(), Box<dyn std::error::Error>>
         CREATE INDEX IF NOT EXISTS idx_court_rulings_status
             ON court_rulings(status, created_at_unix_ms);",
     )?;
-    // ── end v38 ────────────────────────────────────────────────────────
+    // ── v39 (#1050): provenance-admission containment replay ─────────────
+    // Exact-content admission ledger for connector re-ingest. A row records
+    // that a canonical (category, key, body) was already admitted into a live
+    // entity, so re-ingesting an unchanged feed becomes zero-work
+    // revalidation instead of extraction/admission churn. The gate is a
+    // containment shortcut only — admitted documents still flow through the
+    // normal remember/admission path, and the row is refreshed only on a
+    // successful admission.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS admission_replay (
+            fingerprint TEXT NOT NULL,
+            source TEXT NOT NULL,
+            first_seen_ms INTEGER NOT NULL,
+            last_seen_ms INTEGER NOT NULL,
+            covered_entity_id TEXT NOT NULL,
+            admitted INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (fingerprint, source)
+         );
+         CREATE INDEX IF NOT EXISTS idx_admission_replay_source
+            ON admission_replay(source, last_seen_ms);
+         CREATE INDEX IF NOT EXISTS idx_admission_replay_entity
+            ON admission_replay(covered_entity_id);",
+    )?;
+    // ── end v39 ────────────────────────────────────────────────────────
+
 
     // Stamp the migration level so subsequent opens skip the probe block above.
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;

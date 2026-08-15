@@ -451,7 +451,7 @@ new tool must be classified. `admin`-tier tools (`migrate`, `purge`,
 | `perseus_vault_embed` | Generate dense vectors via the bundled model, Ollama, or OpenAI-compatible endpoint. |
 | `perseus_vault_semantic_search` | Dense-only semantic search shortcut — find entities by meaning, ranked purely by embedding similarity (no keyword fallback). |
 | `perseus_vault_context` | Pre-formatted markdown block for session injection. Recall-first by default: pass `query` (the current task/message) and only topically relevant entities are injected, clamped to a per-model budget; the legacy unconditional dump requires `mode: "always_inject"`. |
-| `perseus_vault_ingest` | Trigger connector syncs (GitHub, file watcher). |
+| `perseus_vault_ingest` | Trigger connector syncs (GitHub, file watcher); unchanged content is skipped via containment replay (#1050). |
 | `perseus_vault_ingest_file` | Locally extract a document's text (plaintext/markdown always; DOCX/PDF with the `multimodal` feature) and store it as a recallable entity. |
 | `perseus_vault_extract` | Local, deterministic, rule-based knowledge extraction (facts / preferences / temporal events / episodes) from text or a stored entity. Read-only. |
 | `perseus_vault_capture` | Opt-in in-session capture (#520): distill a transcript/insight payload (text, markdown, or JSONL) into durable entities (root-cause / pitfall / decision / pattern / takeaway) the moment a problem is solved. Local rule-based distiller by default, optional `llm: true` with graceful fallback; near-dup merging stays ON plus a per-invocation cap (anti-flood). Also a CLI verb: `perseus-vault capture`. |
