@@ -16946,8 +16946,8 @@ impl Database {
         Ok(active - fts)
     }
 
-    /// Get a single entity by ID (internal helper).
-    fn get_entity_by_id(&self, id: &str) -> Result<Option<Entity>, Box<dyn std::error::Error>> {
+    /// Get a single entity by ID without governance filtering (internal helper).
+    fn get_entity_by_id_raw(&self, id: &str) -> Result<Option<Entity>, Box<dyn std::error::Error>> {
         let conn = self.conn()?;
         let mut stmt = conn.prepare(
             "SELECT id, category, key, body_json, status, type, tags,
@@ -16970,12 +16970,29 @@ impl Database {
         };
         drop(stmt);
         drop(conn);
-        if let Some(entity) = entity {
-            let mut kept = self.filter_suppressed(vec![entity])?;
-            Ok(kept.pop())
-        } else {
-            Ok(None)
-        }
+        Ok(entity)
+    }
+
+    /// Internal identity-only access for deterministic conflict-card assembly.
+    /// Callers must never serialize the returned body; the public getter below
+    /// remains suppression-enforced.
+    pub(crate) fn get_entity_by_id_unfiltered(
+        &self,
+        id: &str,
+    ) -> Result<Option<Entity>, Box<dyn std::error::Error>> {
+        self.get_entity_by_id_raw(id)
+    }
+
+    /// Get a single entity by ID through the governed public read path.
+    fn get_entity_by_id(
+        &self,
+        id: &str,
+    ) -> Result<Option<Entity>, Box<dyn std::error::Error>> {
+        let Some(entity) = self.get_entity_by_id_raw(id)? else {
+            return Ok(None);
+        };
+        let mut kept = self.filter_suppressed(vec![entity])?;
+        Ok(kept.pop())
     }
 
     /// Public alias for get_entity_by_id used by the web API.
@@ -19051,7 +19068,26 @@ impl Database {
             ))
         })?;
 
-        let entities: Vec<(String, String, String, f64)> = rows.filter_map(|r| r.ok()).collect();
+        let entities: Vec<(String, String, String, f64)> = rows
+            .filter_map(|r| r.ok())
+            .map(|(id, key, body, cert)| {
+                // #917: compare DECRYPTED bodies. Raw-ciphertext comparison made
+                // every pair ~0-similar on encrypted deployments, flagging all
+                // pairs as conflicts. Auth-failed rows compare as empty (they are
+                // unreadable by definition); plaintext rows pass through.
+                let body = match self.encryption.as_ref() {
+                    Some(enc) => {
+                        match Self::decrypt_body_with_aad_fallback(enc, &body, &id, &key) {
+                            crate::encryption::BodyDecrypt::Plaintext(s)
+                            | crate::encryption::BodyDecrypt::LegacyPlaintext(s) => s,
+                            _ => String::new(),
+                        }
+                    }
+                    None => body,
+                };
+                (id, key, body, cert)
+            })
+            .collect();
         let mut conflicts = Vec::new();
 
         for i in 0..entities.len() {

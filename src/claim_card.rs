@@ -320,10 +320,60 @@ pub fn build_claim_card(
     include_agent_projection: bool,
     now: i64,
 ) -> Result<ClaimCard, String> {
-    let entity = db
-        .get_entity_by_id_public(entity_id)
-        .map_err(|e| format!("claim card: entity lookup failed: {e}"))?
-        .ok_or_else(|| format!("claim card: no entity with id '{entity_id}'"))?;
+    build_claim_card_inner(
+        db,
+        entity_id,
+        workspace_hash,
+        agent_id,
+        include_evidence,
+        include_agent_projection,
+        false,
+        now,
+    )
+}
+
+/// Build a card for the internal contradiction surface. This deliberately
+/// permits a governance-suppressed row so its existence, validity range, and
+/// card digest can be linked without ever serializing its claim/body. The
+/// public `build_claim_card` handler remains suppression-enforced.
+pub(crate) fn build_claim_card_for_conflict(
+    db: &Database,
+    entity_id: &str,
+    workspace_hash: Option<&str>,
+    agent_id: Option<&str>,
+    include_evidence: bool,
+    include_agent_projection: bool,
+    now: i64,
+) -> Result<ClaimCard, String> {
+    build_claim_card_inner(
+        db,
+        entity_id,
+        workspace_hash,
+        agent_id,
+        include_evidence,
+        include_agent_projection,
+        true,
+        now,
+    )
+}
+
+fn build_claim_card_inner(
+    db: &Database,
+    entity_id: &str,
+    workspace_hash: Option<&str>,
+    agent_id: Option<&str>,
+    include_evidence: bool,
+    include_agent_projection: bool,
+    allow_suppressed: bool,
+    now: i64,
+) -> Result<ClaimCard, String> {
+    let entity = if allow_suppressed {
+        db.get_entity_by_id_unfiltered(entity_id)
+    } else {
+        db.get_entity_by_id_public(entity_id)
+    }
+    .map_err(|e| format!("claim card: entity lookup failed: {e}"))?
+    .ok_or_else(|| format!("claim card: no entity with id '{entity_id}'"))?;
 
     let rows = scan_live_rows(db)?;
 
