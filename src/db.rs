@@ -9019,14 +9019,18 @@ impl Database {
         // dense rank-1 was demoted ~25 positions when fts5+temporal+graph
         // arms agreed on distractor sessions (gpt4_f2262a51,
         // gpt4_1e4a8aec).
-        let arm_top_ids: std::collections::HashSet<String> = arms
+        // Deterministic: arm order [fts5, dense, graph, temporal] — never
+        // iterate the HashSet (randomized order flaked the regression test).
+        let arm_top_order: Vec<String> = arms
             .iter()
             .filter(|(_, w)| *w > 0.0)
             .filter_map(|(ids, _)| ids.first().cloned())
             .collect();
+        let arm_top_ids: std::collections::HashSet<String> =
+            arm_top_order.iter().cloned().collect();
         if !arm_top_ids.is_empty() {
             let mut top_pinned: Vec<(Entity, f64)> = Vec::new();
-            for id in arm_top_ids.iter() {
+            for id in arm_top_order.iter() {
                 if let Some(e) = by_id.get(id) {
                     if !declared_ids_for_sources.iter().any(|d| d == id) {
                         top_pinned.push((e.clone(), 0.0));
