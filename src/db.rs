@@ -9029,22 +9029,54 @@ impl Database {
         let arm_top_ids: std::collections::HashSet<String> =
             arm_top_order.iter().cloned().collect();
         if !arm_top_ids.is_empty() {
-            let mut top_pinned: Vec<(Entity, f64)> = Vec::new();
-            for id in arm_top_order.iter() {
-                if let Some(e) = by_id.get(id) {
-                    if !declared_ids_for_sources.iter().any(|d| d == id) {
-                        top_pinned.push((e.clone(), 0.0));
-                    }
-                }
-            }
+            let declared_set: std::collections::HashSet<&str> =
+                declared_ids_for_sources.iter().map(|s| s.as_str()).collect();
             let top_set: std::collections::HashSet<&str> =
                 arm_top_ids.iter().map(|s| s.as_str()).collect();
-            top_pinned.extend(
-                ranked
-                    .into_iter()
-                    .filter(|(e, _)| !top_set.contains(e.id.as_str())),
+            // Head-preserving (#1059): the declared prefix AND the first
+            // non-declared consensus head keep their positions; arm rank-0
+            // evidence pins directly behind the head. Prevents the pin from
+            // displacing declared exact matches (#923 contract) or the
+            // validity-reordered head (#1048 contract).
+            let declared_len = ranked
+                .iter()
+                .take_while(|(e, _)| declared_set.contains(e.id.as_str()))
+                .count();
+            let head_id: Option<String> =
+                ranked.get(declared_len).map(|(e, _)| e.id.clone());
+            let mut top_pinned: Vec<(Entity, f64)> = Vec::new();
+            for id in arm_top_order.iter() {
+                if declared_set.contains(id.as_str())
+                    || head_id.as_deref() == Some(id.as_str())
+                {
+                    continue;
+                }
+                if let Some(e) = by_id.get(id) {
+                    top_pinned.push((e.clone(), 0.0));
+                }
+            }
+            let mut rest = ranked.into_iter();
+            let mut combined: Vec<(Entity, f64)> = Vec::with_capacity(
+                declared_len + top_pinned.len() + 1,
             );
-            ranked = top_pinned;
+            combined.extend(rest.by_ref().take(declared_len)); // declared prefix
+            if let Some(head) = rest.next() {
+                combined.push(head); // consensus head keeps the pole
+            }
+            combined.append(&mut top_pinned); // arm pins behind the head
+            combined.extend(rest); // remaining pool
+            // Dedup: an arm top may also appear later in the pool.
+            let mut seen: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            let mut deduped: Vec<(Entity, f64)> =
+                Vec::with_capacity(combined.len());
+            for (e, s) in combined {
+                if seen.insert(e.id.clone()) {
+                    deduped.push((e, s));
+                }
+            }
+            ranked = deduped;
+            let _ = top_set;
         }
 
         // ── caller limit, then token-budget truncation ──────────────────
@@ -49347,11 +49379,14 @@ pub(crate) mod tests {
 
     #[test]
     fn fused_recall_arm_rank0_pins_ahead_of_multiarm_consensus() {
-        // #1059: an arm's rank-0 hit is decisive evidence — it must precede
-        // the RRF pool even when many distractors win multi-arm consensus
-        // (LongMemEval regression: dense #1 was demoted ~25 slots by
-        // fts5+temporal agreement and dropped from hybrid top-k entirely;
-        // fixtures gpt4_f2262a51 / gpt4_1e4a8aec).
+        // #1059 head-preserving contract: the RRF consensus head keeps the
+        // pole; an arm's rank-0 hit pins directly behind it. Without the
+        // pin, multi-arm consensus buries a decisive arm #1 (LongMemEval
+        // regression: dense #1 demoted ~25 slots by fts5+temporal
+        // agreement, dropped from hybrid top-k; fixtures gpt4_f2262a51 /
+        // gpt4_1e4a8aec). Front-pinning was measured WORSE on the full
+        // benchmark (displaced a correct consensus #1 in 49/500) — keep
+        // the head.
         let (db, path) = temp_db();
         let now = crate::db::now_ms();
         // Gold: strongest fts5 (bm25) match, but temporally far — without
@@ -49376,9 +49411,10 @@ pub(crate) mod tests {
         let (entities, _completeness, _trace) = db.fused_recall(&params).unwrap();
 
         assert!(!entities.is_empty(), "fixture must return results");
-        assert_eq!(
-            entities[0].id, "pin-gold",
-            "arm rank-0 hit must be pinned ahead of multi-arm consensus"
+        assert!(
+            entities.iter().take(2).any(|e| e.id == "pin-gold"),
+            "arm rank-0 hit must sit within the consensus head + pin slot, got: {:?}",
+            entities.iter().take(4).map(|e| e.id.clone()).collect::<Vec<_>>()
         );
         let _ = std::fs::remove_file(path);
     }
