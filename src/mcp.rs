@@ -7315,7 +7315,80 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
   {"name":"perseus_vault_action_lease_acquire", "description":"Acquire the single active lease for an action key.", "inputSchema":{"type":"object","properties":{"action_id":{"type":"string"},"holder_id":{"type":"string"},"ttl_seconds":{"type":"integer","default":1}},"required":["action_id","holder_id"]}, "title":"Acquire Action Lease"},
   {"name":"perseus_vault_action_lease_release", "description":"Release an action lease held by its owner.", "inputSchema":{"type":"object","properties":{"lease_id":{"type":"string"},"holder_id":{"type":"string"}},"required":["lease_id","holder_id"]}, "title":"Release Action Lease"},
   {"name":"perseus_vault_stage_trace_validate", "description":"Validate a versioned hash-only runtime stage trace and optionally compare replay semantics. Raw prompts, memory bodies, credentials, and tool payloads are not accepted.", "inputSchema":{"type":"object","properties":{"trace":{"type":"object","description":"perseus-vault-stage-trace/v1 structured trace"},"replay_of":{"type":"object","description":"Optional second trace to compare by replay fingerprint"}},"required":["trace"]}, "title":"Validate Runtime Stage Trace"},
-  {"name":"perseus_vault_reject_value", "description":"Record a scoped digest-only rejected-value tombstone. Equivalent values remain rejected across new entity keys and writer paths until the tombstone expires or is explicitly superseded.", "inputSchema":{"type":"object","properties":{"workspace_hash":{"type":"string","description":"Workspace scope; empty means global."},"subject":{"type":"string"},"predicate":{"type":"string"},"value":{"type":"string","description":"Normalized only for matching; the value is not stored."},"reason":{"type":"string"},"evidence_ref":{"type":"string"},"author_agent_id":{"type":"string"},"expires_at_unix_ms":{"type":"integer"}},"required":["workspace_hash","subject","predicate","value"]}, "title":"Reject Value"}
+  {"name":"perseus_vault_reject_value", "description":"Record a scoped digest-only rejected-value tombstone. Equivalent values remain rejected across new entity keys and writer paths until the tombstone expires or is explicitly superseded.", "inputSchema":{"type":"object","properties":{"workspace_hash":{"type":"string","description":"Workspace scope; empty means global."},"subject":{"type":"string"},"predicate":{"type":"string"},"value":{"type":"string","description":"Normalized only for matching; the value is not stored."},"reason":{"type":"string"},"evidence_ref":{"type":"string"},"author_agent_id":{"type":"string"},"expires_at_unix_ms":{"type":"integer"}},"required":["workspace_hash","subject","predicate","value"]}, "title":"Reject Value"},
+  {
+    "name": "perseus_vault_span_audit",
+    "description": "Extraction-loss net (#1048): audit an entity for fact-bearing sentences its extracted claims missed, retaining them verbatim as residual spans with provenance (embedding-first similarity, token fallback — no extra LLM call). Append-only; re-audits never duplicate. Spans are regular, decay/hygiene-subject memory state — never auto-served into recall.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "entity_id": { "type": "string", "description": "Entity id to audit" },
+        "min_chars": { "type": "integer", "default": 12, "description": "Minimum sentence length in chars to consider" },
+        "coverage_threshold": { "type": "number", "default": 0.55, "description": "Max claim-similarity below which a sentence is residual" },
+        "mode": { "type": "string", "default": "auto", "description": "Similarity backend: auto | embedding | token" }
+      },
+      "required": ["entity_id"]
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "entity_id": { "type": "string" },
+        "claims": { "type": "integer" },
+        "spans_n": { "type": "integer" },
+        "spans": { "type": "array", "items": { "type": "object" } },
+        "mode_used": { "type": "string" }
+      }
+    },
+    "annotations": { "readOnlyHint": false },
+    "title": "Audit Extraction Loss (Residual Spans)"
+  },
+  {
+    "name": "perseus_vault_report_refusal",
+    "description": "Extraction-loss net (#1048): an answerer's refusal over a served payload is evidence. Re-scores the served entities' residual spans against the original query and returns a retry payload (spans whose query-similarity beats the entity's own by a margin — the anomaly rule). Units with no retry material accumulate lossy marks; at the threshold they are flagged for repair-on-touch.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "query": { "type": "string", "description": "The query the answerer could not answer" },
+        "served_ids": { "type": "array", "items": { "type": "string" }, "description": "Entity ids that were in the served payload" },
+        "reason": { "type": "string", "description": "Optional refusal reason (kept for the journal)" }
+      },
+      "required": ["query", "served_ids"]
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "retry": { "type": "array", "items": { "type": "object" } },
+        "retry_n": { "type": "integer" },
+        "lossy_flagged": { "type": "array", "items": { "type": "object" } },
+        "margin": { "type": "number" }
+      }
+    },
+    "annotations": { "readOnlyHint": false },
+    "title": "Report Refusal (Retry Payload)"
+  },
+  {
+    "name": "perseus_vault_report_success",
+    "description": "Extraction-loss net (#1048): confirm a retry payload answered the query. Attaches a provisional query key (query fingerprint to entity ids) so an identical repeat query serves first-pass; served spans become confirmed; lossy units are cleared to repaired. The binding is durable until superseded by another report_success for the same query.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "query": { "type": "string", "description": "The query that was answered" },
+        "entity_ids": { "type": "array", "items": { "type": "string" }, "description": "Entity ids that carried the answer" }
+      },
+      "required": ["query", "entity_ids"]
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "confirmed": { "type": "boolean" },
+        "entity_ids": { "type": "array", "items": { "type": "string" } },
+        "spans_confirmed": { "type": "integer" },
+        "query_fingerprint": { "type": "string" }
+      }
+    },
+    "annotations": { "readOnlyHint": false },
+    "title": "Report Success (Confirm Query Key)"
+  }
 ]"###,
         )
         .expect("tools JSON must be valid");
@@ -7530,6 +7603,9 @@ const TOOL_SCOPES: &[(&str, ToolScope)] = &[
     ("perseus_vault_action_lease_release", ToolScope::Agent),
     ("perseus_vault_stage_trace_validate", ToolScope::Ops),
     ("perseus_vault_reject_value", ToolScope::Ops),
+    ("perseus_vault_span_audit", ToolScope::Agent),
+    ("perseus_vault_report_refusal", ToolScope::Agent),
+    ("perseus_vault_report_success", ToolScope::Agent),
 ];
 
 fn tool_scope_rank(name: &str) -> u8 {
@@ -7599,6 +7675,13 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
 
         "perseus_vault_reject_value" => {
             tools::handle_reject_value(db, args).map_err(|e| e.to_string())
+        }
+        "perseus_vault_span_audit" => tools::handle_span_audit(db, args).map_err(|e| e.to_string()),
+        "perseus_vault_report_refusal" => {
+            tools::handle_report_refusal(db, args).map_err(|e| e.to_string())
+        }
+        "perseus_vault_report_success" => {
+            tools::handle_report_success(db, args).map_err(|e| e.to_string())
         }
 
         "perseus_vault_recall" => tools::handle_recall(db, args).map_err(|e| e.to_string()),
@@ -7944,7 +8027,7 @@ mod tests {
         );
         assert_eq!(
             registry_names.len(),
-            147,
+            150,
             "update public metadata when adding a tool"
         );
 
@@ -9253,9 +9336,9 @@ mod tests {
         let agent = filter_registry_by_view(registry.clone(), ScopeView::Agent);
         let ops = filter_registry_by_view(registry.clone(), ScopeView::Ops);
         let full = filter_registry_by_view(registry.clone(), ScopeView::Full);
-        assert_eq!(full.len(), 147, "full view must expose the whole registry");
-        assert_eq!(agent.len(), 48, "agent view count drifted — new tools must be classified");
-        assert_eq!(ops.len(), 140, "ops view count drifted — new tools must be classified");
+        assert_eq!(full.len(), 150, "full view must expose the whole registry");
+        assert_eq!(agent.len(), 51, "agent view count drifted — new tools must be classified");
+        assert_eq!(ops.len(), 143, "ops view count drifted — new tools must be classified");
         assert!(agent.len() < ops.len() && ops.len() < full.len());
     }
 

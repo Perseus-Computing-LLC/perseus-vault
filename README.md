@@ -21,7 +21,7 @@
 
 Give your agents memory that survives the session, so they stop re-deriving what they
 already learned and stop repeating past mistakes. Hybrid recall (BM25 + dense + RRF),
-bi-temporal history, and **AES-256-GCM** at rest, exposed as **147 canonical MCP tools**
+bi-temporal history, and **AES-256-GCM** at rest, exposed as **150 canonical MCP tools**
 that work with any host. Legacy `mimir_*`/`mneme_*` aliases were removed in the 2026-27
 major release and are
 not counted separately. **73.8% on LongMemEval's official harness** (vs Zep 63.8%, Mem0
@@ -387,7 +387,7 @@ Each adapter:
 Any MCP-compatible framework works with Perseus Vault directly. See
 [MCP client and framework integrations](docs/clients/README.md) for the full list.
 
-## 147 Canonical MCP Tools
+## 150 Canonical MCP Tools
 
 > **Canonical product and tool names.** Perseus Vault is the product name, and integrations use the canonical `perseus_vault_*` tools (for example, `perseus_vault_remember`). The legacy `mimir_*` / `mneme_*` / `plutus_*` names were removed in the 2026-27 major release — the canonical names are the only interface.
 > The count is the number of unique canonical tools in the source registry. Compatibility aliases are callable but are not counted separately.
@@ -416,7 +416,7 @@ attention-constrained agent clients:
 
 | Setting | Advertised surface | Count |
 |---|---|---|
-| `full` (default) | everything | 147 |
+| `full` (default) | everything | 150 |
 | `ops` | agent surface + operational grooming, maintenance, governance, export | 140 |
 | `agent` | everyday memory + coordination surface (recall / remember / context / handoffs / state, plus the agent-side AAR calls) | 48 |
 
@@ -452,6 +452,9 @@ new tool must be classified. `admin`-tier tools (`migrate`, `purge`,
 | `perseus_vault_semantic_search` | Dense-only semantic search shortcut — find entities by meaning, ranked purely by embedding similarity (no keyword fallback). |
 | `perseus_vault_context` | Pre-formatted markdown block for session injection. Recall-first by default: pass `query` (the current task/message) and only topically relevant entities are injected, clamped to a per-model budget; the legacy unconditional dump requires `mode: "always_inject"`. |
 | `perseus_vault_ingest` | Trigger connector syncs (GitHub, file watcher); unchanged content is skipped via containment replay (#1050). |
+| `perseus_vault_span_audit` | Extraction-loss net (#1048): retain sentences the extractor missed as residual spans, verbatim with provenance. |
+| `perseus_vault_report_refusal` | Extraction-loss net (#1048): refusal-as-signal — re-score spans vs the query, return a retry payload, flag lossy units. |
+| `perseus_vault_report_success` | Extraction-loss net (#1048): confirm a retry — attach a provisional query key so the identical repeat query serves first-pass. |
 | `perseus_vault_ingest_file` | Locally extract a document's text (plaintext/markdown always; DOCX/PDF with the `multimodal` feature) and store it as a recallable entity. |
 | `perseus_vault_extract` | Local, deterministic, rule-based knowledge extraction (facts / preferences / temporal events / episodes) from text or a stored entity. Read-only. |
 | `perseus_vault_capture` | Opt-in in-session capture (#520): distill a transcript/insight payload (text, markdown, or JSONL) into durable entities (root-cause / pitfall / decision / pattern / takeaway) the moment a problem is solved. Local rule-based distiller by default, optional `llm: true` with graceful fallback; near-dup merging stays ON plus a per-invocation cap (anti-flood). Also a CLI verb: `perseus-vault capture`. |

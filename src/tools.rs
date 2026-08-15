@@ -1794,6 +1794,8 @@ fn apply_promotion_explanations(items: &mut [Value]) {
 pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
     let a: RecallArgs =
         serde_json::from_value(args).map_err(|e| format!("Invalid recall arguments: {}", e))?;
+    // #1048: captured before `a.query` is moved into the recall params below.
+    let confirmed_query = a.query.clone();
 
     // #865: granular authority — a manifest's presence requires memory.read
     // for retrieval. Fail-open when no manifest exists (legacy vault).
@@ -2154,6 +2156,29 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
     let mut items_expanded: Vec<serde_json::Value> =
         entities.iter().map(|e| e.to_json_expanded()).collect();
     apply_promotion_explanations(&mut items_expanded);
+
+    // #1048: confirmed query key — an identical repeat of a query that was
+    // successfully repaired (report_success) serves its confirmed entities
+    // first-pass, marked so the caller can see the provenance of the hit.
+    if !confirmed_query.is_empty() {
+        if let Ok(Some(confirmed)) = db.serve_confirmed_query_key(&confirmed_query) {
+            let existing_ids: std::collections::HashSet<String> =
+                items_expanded.iter().filter_map(|v| v.get("id").and_then(|x| x.as_str()).map(String::from)).collect();
+            let mut prepend: Vec<serde_json::Value> = Vec::new();
+            for e in confirmed {
+                if existing_ids.contains(&e.id) {
+                    continue;
+                }
+                let mut item = e.to_json_expanded();
+                if let Some(obj) = item.as_object_mut() {
+                    obj.insert("confirmed_query_key".to_string(), serde_json::json!(true));
+                }
+                prepend.push(item);
+            }
+            prepend.extend(items_expanded);
+            items_expanded = prepend;
+        }
+    }
 
     // #865: retrieved memory is UNTRUSTED DATA. Every hit whose epistemic
     // trust axis is not established fact (candidate/rejected/
@@ -9903,6 +9928,82 @@ pub fn handle_ingest(db: &Database, args: Value) -> Result<String, String> {
     match db.ingest(&params) {
         Ok(result) => Ok(reviewable_write_result(result, "connector_ingest").to_string()),
         Err(e) => Err(format!("Ingest failed: {}", e)),
+    }
+}
+
+
+#[derive(Debug, Deserialize)]
+pub struct SpanAuditArgs {
+    pub entity_id: String,
+    #[serde(default = "default_span_min_chars")]
+    pub min_chars: usize,
+    #[serde(default = "default_coverage_threshold")]
+    pub coverage_threshold: f64,
+    /// Similarity backend: "auto" (embedding when available) | "embedding" | "token".
+    #[serde(default = "default_span_mode")]
+    pub mode: String,
+}
+
+fn default_span_min_chars() -> usize {
+    12
+}
+fn default_coverage_threshold() -> f64 {
+    crate::extraction_loss::DEFAULT_COVERAGE_THRESHOLD
+}
+fn default_span_mode() -> String {
+    "auto".to_string()
+}
+
+pub fn handle_span_audit(db: &Database, args: Value) -> Result<String, String> {
+    let a: SpanAuditArgs =
+        serde_json::from_value(args).map_err(|e| format!("Invalid span_audit arguments: {e}"))?;
+    match db.span_audit(&a.entity_id, a.min_chars, a.coverage_threshold, &a.mode) {
+        Ok(v) => Ok(v.to_string()),
+        Err(e) => Err(format!("span_audit failed: {e}")),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ReportRefusalArgs {
+    pub query: String,
+    pub served_ids: Vec<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+pub fn handle_report_refusal(db: &Database, args: Value) -> Result<String, String> {
+    let a: ReportRefusalArgs =
+        serde_json::from_value(args).map_err(|e| format!("Invalid report_refusal arguments: {e}"))?;
+    if a.query.trim().is_empty() {
+        return Err("report_refusal: query must be non-empty".to_string());
+    }
+    if a.served_ids.is_empty() {
+        return Err("report_refusal: served_ids must be non-empty".to_string());
+    }
+    match db.report_refusal(&a.query, &a.served_ids, a.reason.as_deref()) {
+        Ok(v) => Ok(v.to_string()),
+        Err(e) => Err(format!("report_refusal failed: {e}")),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ReportSuccessArgs {
+    pub query: String,
+    pub entity_ids: Vec<String>,
+}
+
+pub fn handle_report_success(db: &Database, args: Value) -> Result<String, String> {
+    let a: ReportSuccessArgs =
+        serde_json::from_value(args).map_err(|e| format!("Invalid report_success arguments: {e}"))?;
+    if a.query.trim().is_empty() {
+        return Err("report_success: query must be non-empty".to_string());
+    }
+    if a.entity_ids.is_empty() {
+        return Err("report_success: entity_ids must be non-empty".to_string());
+    }
+    match db.report_success(&a.query, &a.entity_ids) {
+        Ok(v) => Ok(v.to_string()),
+        Err(e) => Err(format!("report_success failed: {e}")),
     }
 }
 
