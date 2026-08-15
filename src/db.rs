@@ -8197,11 +8197,31 @@ impl Database {
                             }
                         }
                         if !pinned.is_empty() {
+                            // Keep the RRF consensus head at the pole; arm rank-0
+                            // evidence is pinned right behind it. Front-pinning
+                            // displaced a correct consensus #1 in 49/500 questions
+                            // (R@1 0.828 -> 0.758); head-preserving pinning keeps
+                            // those and still recovers the buried arm tops.
                             let pinned_ids: std::collections::HashSet<String> =
                                 pinned.iter().map(|e| e.id.clone()).collect();
-                            cand.retain(|e| !pinned_ids.contains(&e.id));
-                            let mut combined = pinned;
-                            combined.extend(cand);
+                            let head: Option<Entity> = cand.first().cloned();
+                            if let Some(h) = &head {
+                                pinned.retain(|p| p.id != h.id);
+                            }
+                            cand.retain(|e| {
+                                !pinned_ids.contains(&e.id)
+                                    && head.as_ref().map(|h| h.id != e.id).unwrap_or(true)
+                            });
+                            let mut combined: Vec<Entity> =
+                                Vec::with_capacity(cand.len() + pinned.len() + 1);
+                            if let Some(h) = head {
+                                combined.push(h);
+                                combined.extend(pinned);
+                                combined.extend(cand);
+                            } else {
+                                combined.extend(pinned);
+                                combined.extend(cand);
+                            }
                             cand = combined;
                         }
                     }
