@@ -2248,6 +2248,7 @@ impl Database {
         }
 
         let mut ingested = 0u64;
+        let mut contained = 0u64;
         let mut errors = Vec::new();
         let now = crate::db::now_ms();
 
@@ -2268,6 +2269,20 @@ impl Database {
                         continue;
                     }
                     for doc in docs {
+                        // #1050: provenance-admission containment replay. If this
+                        // exact content was already admitted and its covering
+                        // entity is still live, the re-ingest is zero-work
+                        // revalidation — skip extraction/admission churn. The
+                        // gate is a shortcut: `force_reingest` bypasses it, and
+                        // admitted documents still flow through `remember`'s
+                        // normal authority/admission path.
+                        let fingerprint = Self::doc_fingerprint(&doc);
+                        if !params.force_reingest
+                            && self.contained_replay(&fingerprint, &name, now)?
+                        {
+                            contained += 1;
+                            continue;
+                        }
                         let entity = Entity {
                             id: {
                                 let raw = uuid::Uuid::new_v4().to_string().replace('-', "");
@@ -2310,7 +2325,17 @@ impl Database {
                             _parsed_body: None,
                         };
                         match self.remember(&entity) {
-                            Ok(_) => ingested += 1,
+                            Ok((row_id, _)) => {
+                                ingested += 1;
+                                if let Err(e) = self
+                                    .record_admission(&fingerprint, &name, &row_id, now)
+                                {
+                                    errors.push(format!(
+                                        "{}/{}: admitted but replay record failed: {}",
+                                        name, entity.key, e
+                                    ));
+                                }
+                            }
                             Err(e) => errors.push(format!("{}/{}: {}", name, entity.key, e)),
                         }
                     }
@@ -2324,10 +2349,94 @@ impl Database {
 
         let result = serde_json::json!({
             "ingested": ingested,
+            "contained": contained,
             "dry_run": params.dry_run,
             "errors": errors,
         });
         Ok(result)
+    }
+
+    /// #1050: canonical content fingerprint of a connector document. The body
+    /// JSON is parsed and re-serialized with sorted keys so byte-identical
+    /// content with different formatting maps to the same fingerprint.
+    fn doc_fingerprint(doc: &crate::models::RawDocument) -> String {
+        let body: serde_json::Value =
+            serde_json::from_str(&doc.body_json).unwrap_or_else(|_| {
+                serde_json::Value::String(doc.body_json.clone())
+            });
+        let canonical = serde_json::to_string(&serde_json::json!({
+            "category": doc.category,
+            "key": doc.key,
+            "body": body,
+        }))
+        .unwrap_or_default();
+        let mut hasher = Sha256::new();
+        hasher.update(canonical.as_bytes());
+        format!("{:x}", hasher.finalize())
+    }
+
+    /// #1050: is this exact content already admitted into a live entity?
+    /// True only when a replay row exists AND its covering entity is still
+    /// active (not archived) — archived coverage means the content is no
+    /// longer served, so it must be re-admitted. Refreshes last_seen on a
+    /// contained hit (zero-work revalidation is still a touch).
+    fn contained_replay(
+        &self,
+        fingerprint: &str,
+        source: &str,
+        now: i64,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        let conn = self.conn()?;
+        let covered: Option<String> = conn
+            .query_row(
+                "SELECT covered_entity_id FROM admission_replay
+                 WHERE fingerprint = ?1 AND source = ?2",
+                params![fingerprint, source],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(entity_id) = covered else {
+            return Ok(false);
+        };
+        let live: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM entities WHERE id = ?1 AND archived = 0",
+            params![entity_id],
+            |r| r.get(0),
+        )?;
+        if live > 0 {
+            conn.execute(
+                "UPDATE admission_replay SET last_seen_ms = ?1
+                 WHERE fingerprint = ?2 AND source = ?3",
+                params![now, fingerprint, source],
+            )?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// #1050: record (or refresh) that this exact content was admitted as the
+    /// given entity. Called only after a successful `remember` — containment
+    /// is tied to actual admission, never to a failed/quarantined write.
+    fn record_admission(
+        &self,
+        fingerprint: &str,
+        source: &str,
+        entity_id: &str,
+        now: i64,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let conn = self.conn()?;
+        conn.execute(
+            "INSERT INTO admission_replay
+                (fingerprint, source, first_seen_ms, last_seen_ms, covered_entity_id, admitted)
+             VALUES (?1, ?2, ?3, ?3, ?4, 1)
+             ON CONFLICT(fingerprint, source) DO UPDATE SET
+                last_seen_ms = excluded.last_seen_ms,
+                covered_entity_id = excluded.covered_entity_id,
+                admitted = 1",
+            params![fingerprint, source, now, entity_id],
+        )?;
+        Ok(())
     }
 
     /// Store a dense vector embedding for an entity (and its sign-bit
@@ -53261,4 +53370,220 @@ pub(crate) mod tests {
         );
         let _ = std::fs::remove_file(path);
     }
+    // ── #1050: provenance-admission containment replay ────────────────────
+    fn replay_docs() -> Vec<crate::models::RawDocument> {
+        vec![
+            crate::models::RawDocument {
+                key: "k1".to_string(),
+                category: "insight".to_string(),
+                // Bodies are deliberately non-near-duplicate: connector docs
+                // share the evidence wrapper, so identical-shaped short texts
+                // would be deduped by remember() (#392) instead of stored.
+                body_json: "{\"text\": \"alpha flux capacitor resonance tuning manual\"}"
+                    .to_string(),
+                tags: vec![],
+            },
+            crate::models::RawDocument {
+                key: "k2".to_string(),
+                category: "reference".to_string(),
+                body_json: "{\"text\": \"beta coastal garden watering schedule for tuesday\"}"
+                    .to_string(),
+                tags: vec![],
+            },
+        ]
+    }
+
+    fn replay_params() -> IngestParams {
+        IngestParams {
+            connector: None,
+            dry_run: false,
+            force_reingest: false,
+        }
+    }
+
+    fn replay_entity_count(db: &Database) -> i64 {
+        let conn = db.conn().unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM entities WHERE category IN ('insight', 'reference')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn ingest_containment_replay_skips_unchanged_docs() {
+        let (mut db, path) = temp_db();
+        db.set_connectors(vec![Box::new(crate::connectors::StaticConnector::new(
+            "src",
+            replay_docs(),
+        ))]);
+        let params = replay_params();
+
+        let first = db.ingest(&params).unwrap();
+        assert_eq!(first["ingested"], 2, "first pass admits both");
+        assert_eq!(first["contained"], 0);
+        assert_eq!(replay_entity_count(&db), 2);
+
+        let second = db.ingest(&params).unwrap();
+        assert_eq!(second["ingested"], 0, "unchanged feed is zero-work");
+        assert_eq!(second["contained"], 2);
+        assert_eq!(replay_entity_count(&db), 2, "no duplicate entities");
+
+        let conn = db.conn().unwrap();
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM admission_replay", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 2, "one replay row per admitted doc");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn ingest_containment_replay_readmits_changed_doc() {
+        let (mut db, path) = temp_db();
+        db.set_connectors(vec![Box::new(crate::connectors::StaticConnector::new(
+            "src",
+            replay_docs(),
+        ))]);
+        let params = replay_params();
+        let _ = db.ingest(&params).unwrap();
+
+        let mut changed = replay_docs();
+        changed[0].body_json =
+            "{\"text\": \"alpha interplanetary shipping routes through the belt\"}".to_string();
+        db.set_connectors(vec![Box::new(crate::connectors::StaticConnector::new(
+            "src",
+            changed,
+        ))]);
+        let third = db.ingest(&params).unwrap();
+        assert_eq!(third["ingested"], 1, "changed doc re-admitted");
+        assert_eq!(third["contained"], 1, "unchanged doc stayed contained");
+        assert_eq!(replay_entity_count(&db), 2, "upsert updates the existing row");
+        // The covering row now carries the new content.
+        let conn = db.conn().unwrap();
+        let body: String = conn
+            .query_row(
+                "SELECT body_json FROM entities WHERE category = 'insight' AND key = 'k1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            body.contains("shipping routes"),
+            "changed content must reach the store: {body}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn ingest_containment_replay_force_reingest_bypasses() {
+        let (mut db, path) = temp_db();
+        db.set_connectors(vec![Box::new(crate::connectors::StaticConnector::new(
+            "src",
+            replay_docs(),
+        ))]);
+        let params = replay_params();
+        let _ = db.ingest(&params).unwrap();
+
+        let forced = IngestParams {
+            connector: None,
+            dry_run: false,
+            force_reingest: true,
+        };
+        let forced_run = db.ingest(&forced).unwrap();
+        assert_eq!(forced_run["ingested"], 2, "force bypasses the gate");
+        assert_eq!(forced_run["contained"], 0);
+        assert_eq!(replay_entity_count(&db), 2, "upsert keeps entity count stable");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn ingest_containment_replay_readmits_archived_coverage() {
+        let (mut db, path) = temp_db();
+        db.set_connectors(vec![Box::new(crate::connectors::StaticConnector::new(
+            "src",
+            replay_docs(),
+        ))]);
+        let params = replay_params();
+        let _ = db.ingest(&params).unwrap();
+
+        // Archive the covering entity: its content is no longer served, so
+        // containment must NOT hold and the doc is re-admitted.
+        let conn = db.conn().unwrap();
+        let id: String = conn
+            .query_row(
+                "SELECT id FROM entities WHERE category = 'insight' AND key = 'k1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "UPDATE entities SET archived = 1, status = 'archived' WHERE id = ?1",
+            params![id],
+        )
+        .unwrap();
+
+        let third = db.ingest(&params).unwrap();
+        assert_eq!(third["ingested"], 1, "archived coverage re-admits");
+        assert_eq!(third["contained"], 1, "live k2 stays contained");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn ingest_containment_replay_dry_run_writes_nothing() {
+        let (mut db, path) = temp_db();
+        db.set_connectors(vec![Box::new(crate::connectors::StaticConnector::new(
+            "src",
+            replay_docs(),
+        ))]);
+        let params = IngestParams {
+            connector: None,
+            dry_run: true,
+            force_reingest: false,
+        };
+        let dry = db.ingest(&params).unwrap();
+        assert_eq!(dry["ingested"], 2, "dry run previews the would-be set");
+        assert_eq!(dry["contained"], 0, "gate never writes in dry run");
+        assert_eq!(replay_entity_count(&db), 0, "dry run stores nothing");
+        let conn = db.conn().unwrap();
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM admission_replay", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 0, "dry run records no replay rows");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn ingest_containment_replay_fingerprint_canonicalizes() {
+        let a = crate::models::RawDocument {
+            key: "k".to_string(),
+            category: "c".to_string(),
+            body_json: "{\"text\":\"same\",\"n\":1}".to_string(),
+            tags: vec![],
+        };
+        let b = crate::models::RawDocument {
+            key: "k".to_string(),
+            category: "c".to_string(),
+            body_json: "{\n  \"n\": 1,\n  \"text\": \"same\"\n}".to_string(),
+            tags: vec![],
+        };
+        assert_eq!(
+            Database::doc_fingerprint(&a),
+            Database::doc_fingerprint(&b),
+            "formatting differences must not change the fingerprint"
+        );
+        let c = crate::models::RawDocument {
+            key: "k2".to_string(),
+            category: "c".to_string(),
+            body_json: "{\"text\":\"same\",\"n\":1}".to_string(),
+            tags: vec![],
+        };
+        assert_ne!(
+            Database::doc_fingerprint(&a),
+            Database::doc_fingerprint(&c),
+            "key changes must change the fingerprint"
+        );
+    }
+
+
 }

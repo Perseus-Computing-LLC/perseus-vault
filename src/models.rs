@@ -1931,6 +1931,10 @@ pub struct IngestParams {
     pub connector: Option<String>,
     #[serde(default)]
     pub dry_run: bool,
+    /// #1050: bypass the provenance-admission containment replay gate and
+    /// re-admit every fetched document (default false).
+    #[serde(default)]
+    pub force_reingest: bool,
 }
 
 /// A raw document from an external connector before it becomes an entity.

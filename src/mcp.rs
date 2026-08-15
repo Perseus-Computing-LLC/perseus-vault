@@ -2366,7 +2366,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
   },
   {
     "name": "perseus_vault_ingest",
-    "description": "Sync external data connectors (GitHub issues, file watcher) into Perseus Vault. Call with no arguments to run all enabled connectors, or specify a connector name to run only that one. Use dry_run=true to preview without storing.",
+    "description": "Sync external data connectors (GitHub issues, file watcher) into Perseus Vault. Call with no arguments to run all enabled connectors, or specify a connector name to run only that one. Use dry_run=true to preview without storing. Unchanged content from a previous successful ingest is skipped as zero-work revalidation (provenance-admission containment replay, #1050); use force_reingest=true to bypass.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -2378,6 +2378,11 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
           "type": "boolean",
           "default": false,
           "description": "Preview documents without storing them"
+        },
+        "force_reingest": {
+          "type": "boolean",
+          "default": false,
+          "description": "Bypass the containment replay gate and re-admit every fetched document (#1050)"
         }
       }
     },
@@ -2387,6 +2392,10 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
         "ingested": {
           "type": "integer",
           "description": "Number of documents ingested (or would be ingested in dry run)"
+        },
+        "contained": {
+          "type": "integer",
+          "description": "Documents skipped as already-covered by a live entity (zero-work revalidation, #1050)"
         },
         "dry_run": {
           "type": "boolean",
