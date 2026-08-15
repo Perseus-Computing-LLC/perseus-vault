@@ -6796,13 +6796,27 @@ impl Database {
         let archived_int = if entity.archived { 1 } else { 0 };
         let verified_int = if entity.verified { 1 } else { 0 };
 
+        // #1048: lossy repair on touch — a remembered unit with un-repaired
+        // loss marks folds its confirmed/active residual spans into the body
+        // (append-only) and clears the mark. Runs before encryption so the
+        // merged plaintext is what gets stored and indexed.
+        let mut effective_body = entity.body_json.clone();
+        // The repair is a write-side fold; a true return means spans were
+        // appended (and the lossy mark cleared); a false return is a no-op.
+        let _ = self.repair_lossy_body(
+            &conn,
+            &entity.category,
+            &entity.key,
+            &mut effective_body,
+        )?;
+
         // Encrypt body_json with category+key as AAD to bind ciphertext to entity identity
         let body_encrypted = if let Some(ref enc) = self.encryption {
             let aad = Self::build_aad(&entity.category, &entity.key);
-            enc.encrypt(&entity.body_json, aad.as_bytes())
+            enc.encrypt(&effective_body, aad.as_bytes())
                 .map_err(|e| format!("Encryption error in remember: {}", e))?
         } else {
-            entity.body_json.clone()
+            effective_body.clone()
         };
 
         // #919: prospective query hints — advisory retrieval metadata stored
@@ -7326,7 +7340,7 @@ impl Database {
             // that case.
             let fts_rows = tx.execute(
                 "UPDATE entities_fts SET body_json = ?1 WHERE rowid = (SELECT rowid FROM entities WHERE id = ?2)",
-                params![Self::fts_indexed_text(&entity.body_json, &entity.hints), id],
+                params![Self::fts_indexed_text(&effective_body, &entity.hints), id],
             )?;
             if fts_rows == 0 {
                 // OR REPLACE (#517): same self-heal as the insert path — the
@@ -7335,7 +7349,7 @@ impl Database {
                 tx.execute(
                     "INSERT OR REPLACE INTO entities_fts (rowid, body_json)
                      VALUES ((SELECT rowid FROM entities WHERE id = ?2), ?1)",
-                    params![Self::fts_indexed_text(&entity.body_json, &entity.hints), id],
+                    params![Self::fts_indexed_text(&effective_body, &entity.hints), id],
                 )?;
             }
             // #392: keep the stored dedup signature in step with the stored
@@ -7538,7 +7552,7 @@ impl Database {
             // and self-heals that drift per-write.
             tx.execute(
                 "INSERT OR REPLACE INTO entities_fts (rowid, body_json) VALUES (last_insert_rowid(), ?1)",
-                params![Self::fts_indexed_text(&entity.body_json, &entity.hints)],
+                params![Self::fts_indexed_text(&effective_body, &entity.hints)],
             )?;
             // #392: store the row's dedup signature (derived from the STORED
             // body value — ciphertext when encryption is on) in the same
@@ -16970,6 +16984,20 @@ impl Database {
         id: &str,
     ) -> Result<Option<Entity>, Box<dyn std::error::Error>> {
         self.get_entity_by_id(id)
+    }
+
+    /// #1048: crate-internal alias for get_entity_by_id (extraction-loss net).
+    pub(crate) fn get_entity_by_id_pub(
+        &self,
+        id: &str,
+    ) -> Result<Option<Entity>, Box<dyn std::error::Error>> {
+        self.get_entity_by_id(id)
+    }
+
+    /// #1048: read access to the embedding configuration (extraction-loss net
+    /// similarity scoring).
+    pub(crate) fn embedding_config(&self) -> &crate::embedding::EmbeddingConfig {
+        &self.embedding_config
     }
 
     fn artifact_store_aad(sha256: &str) -> Vec<u8> {

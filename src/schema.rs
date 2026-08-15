@@ -728,7 +728,7 @@ CREATE INDEX IF NOT EXISTS idx_preload_proposals_state
 /// — the entity ids an action cited as grounding, so the reverse impact
 /// closure can flag PENDING actions whose justification changed. Additive
 /// column, no backfill (pre-existing actions cite nothing).
-pub(crate) const SCHEMA_VERSION: i64 = 49;
+pub(crate) const SCHEMA_VERSION: i64 = 50;
 
 /// Initialize the v0.2.0 schema on a fresh database.
 pub fn initialize_schema(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
@@ -1998,6 +1998,43 @@ fn apply_migrations(conn: &Connection) -> Result<(), Box<dyn std::error::Error>>
             ON admission_replay(covered_entity_id);",
     )?;
     // ── end v39 ────────────────────────────────────────────────────────
+
+    // ── v40 (#1048): extraction-loss net ─────────────────────────────────
+    // Residual spans (sentences an extractor missed, retained verbatim with
+    // provenance), provisional query keys (confirmed retries serve
+    // first-pass), and lossy-unit marks (repeated under-coverage, repaired
+    // append-only on touch).
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS residual_spans (
+            id TEXT PRIMARY KEY,
+            entity_id TEXT NOT NULL,
+            span_text TEXT NOT NULL,
+            source TEXT NOT NULL DEFAULT '',
+            max_coverage REAL NOT NULL DEFAULT 0,
+            coverage_mode TEXT NOT NULL DEFAULT 'token',
+            status TEXT NOT NULL DEFAULT 'active',
+            lossy_count INTEGER NOT NULL DEFAULT 0,
+            created_ms INTEGER NOT NULL,
+            last_served_ms INTEGER
+         );
+         CREATE INDEX IF NOT EXISTS idx_residual_spans_entity
+            ON residual_spans(entity_id, status);
+         CREATE TABLE IF NOT EXISTS query_keys (
+            fingerprint TEXT PRIMARY KEY,
+            query TEXT NOT NULL,
+            entity_ids TEXT NOT NULL,
+            confirmed_ms INTEGER NOT NULL,
+            hit_count INTEGER NOT NULL DEFAULT 0
+         );
+         CREATE TABLE IF NOT EXISTS lossy_units (
+            entity_id TEXT PRIMARY KEY,
+            lossy_count INTEGER NOT NULL DEFAULT 0,
+            marked_at_ms INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'lossy'
+         );",
+    )?;
+    // ── end v40 ────────────────────────────────────────────────────────
+
 
 
     // Stamp the migration level so subsequent opens skip the probe block above.
