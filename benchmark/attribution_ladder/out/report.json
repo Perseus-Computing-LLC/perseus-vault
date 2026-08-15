@@ -1,0 +1,67 @@
+{
+  "inputs": {
+    "binary": "/opt/data/perseus-vault-105x/target/debug/perseus-vault",
+    "dataset_digest": "b96cffb4b0351cea3598a716f2cb3d26dadada782980433bdc65787e879bf0db",
+    "judge": "deterministic",
+    "n_queries": 22,
+    "schema": "perseus-vault-attribution-ladder/v1",
+    "shapes": [
+      "bare",
+      "key_only",
+      "key_source",
+      "key_source_time"
+    ]
+  },
+  "retrieval_ok_rate": 1.0,
+  "schema": "perseus-vault-attribution-ladder/v1",
+  "shapes": {
+    "bare": {
+      "accuracy": 0.2727,
+      "correct": 6,
+      "n": 22,
+      "partial": 0,
+      "refusal": 16,
+      "refusal_rate": 0.7273
+    },
+    "key_only": {
+      "accuracy": 0.2727,
+      "correct": 6,
+      "n": 22,
+      "partial": 0,
+      "refusal": 16,
+      "refusal_rate": 0.7273
+    },
+    "key_source": {
+      "accuracy": 0.6364,
+      "correct": 14,
+      "n": 22,
+      "partial": 0,
+      "refusal": 8,
+      "refusal_rate": 0.3636
+    },
+    "key_source_time": {
+      "accuracy": 0.8182,
+      "correct": 18,
+      "n": 22,
+      "partial": 0,
+      "refusal": 4,
+      "refusal_rate": 0.1818
+    }
+  },
+  "signature": {
+    "inputs": {
+      "binary": "/opt/data/perseus-vault-105x/target/debug/perseus-vault",
+      "dataset_digest": "b96cffb4b0351cea3598a716f2cb3d26dadada782980433bdc65787e879bf0db",
+      "judge": "deterministic",
+      "n_queries": 22,
+      "schema": "perseus-vault-attribution-ladder/v1",
+      "shapes": [
+        "bare",
+        "key_only",
+        "key_source",
+        "key_source_time"
+      ]
+    },
+    "value": "51d87ab680c4113b53cbec3ed4a138ddc774bfe474c2bd631447793e688eea02"
+  }
+}

@@ -1,0 +1,288 @@
+{
+  "schema": "perseus-vault-attribution-ladder/v1",
+  "note": "Fixed store + fixed queries + fixed grader for the attribution-header ladder (#1049). Per-outlet and per-outlet-as-of questions are ONLY resolvable when the rendered payload carries source (and date) attribution — reproducing the Coalent gap mechanism offline. Text/source/valid_from live in the body so recall's top-level expansion exposes them to the renderer.",
+  "store": [
+    {
+      "key": "orion-ship-acme",
+      "category": "insight",
+      "text": "Orion v2.0 ships in June 2026.",
+      "source": "Acme Blog",
+      "valid_from": "2026-04-01"
+    },
+    {
+      "key": "orion-ship-nimbus",
+      "category": "insight",
+      "text": "Orion v2.0 ships in October 2026.",
+      "source": "Nimbus Docs",
+      "valid_from": "2026-05-10"
+    },
+    {
+      "key": "orion-budget-acme",
+      "category": "insight",
+      "text": "The Orion stack budget is 40k.",
+      "source": "Acme Blog",
+      "valid_from": "2026-03-15"
+    },
+    {
+      "key": "orion-budget-vertex",
+      "category": "insight",
+      "text": "The Orion stack budget is 55k.",
+      "source": "Vertex Forge",
+      "valid_from": "2026-04-20"
+    },
+    {
+      "key": "orion-owner-nimbus",
+      "category": "insight",
+      "text": "Orion is owned by the platform team.",
+      "source": "Nimbus Docs",
+      "valid_from": "2026-02-01"
+    },
+    {
+      "key": "orion-owner-retro",
+      "category": "insight",
+      "text": "Orion is owned by the data team.",
+      "source": "team retro",
+      "valid_from": "2026-06-30"
+    },
+    {
+      "key": "orion-pg14-nimbus",
+      "category": "insight",
+      "text": "Orion v1.9 runs postgres 14.",
+      "source": "Nimbus Docs",
+      "valid_from": "2026-01-15"
+    },
+    {
+      "key": "orion-pg15-nimbus",
+      "category": "insight",
+      "text": "Orion v1.9 moved to postgres 15 in the spring release.",
+      "source": "Nimbus Docs",
+      "valid_from": "2026-03-01"
+    },
+    {
+      "key": "orion-deploy-nimbus",
+      "category": "insight",
+      "text": "The Orion stack deploys to us-east-1.",
+      "source": "Nimbus Docs",
+      "valid_from": "2026-01-20"
+    },
+    {
+      "key": "orion-ci-retro",
+      "category": "insight",
+      "text": "The Orion CI pipeline runs nightly at 02:00 UTC.",
+      "source": "team retro",
+      "valid_from": "2026-02-10"
+    },
+    {
+      "key": "orion-queue-vertex",
+      "category": "insight",
+      "text": "Orion uses the internal queue service.",
+      "source": "Vertex Forge",
+      "valid_from": "2026-03-05"
+    },
+    {
+      "key": "orion-rollback-acme",
+      "category": "insight",
+      "text": "Orion rollbacks take 15 minutes.",
+      "source": "Acme Blog",
+      "valid_from": "2026-04-25"
+    }
+  ],
+  "queries": [
+    {
+      "q": "According to Acme Blog, when does Orion v2.0 ship?",
+      "kind": "outlet",
+      "resolve": {
+        "source": "Acme Blog"
+      },
+      "facts": [
+        "June 2026"
+      ]
+    },
+    {
+      "q": "According to Nimbus Docs, when does Orion v2.0 ship?",
+      "kind": "outlet",
+      "resolve": {
+        "source": "Nimbus Docs"
+      },
+      "facts": [
+        "October 2026"
+      ]
+    },
+    {
+      "q": "According to Vertex Forge, what is the Orion stack budget?",
+      "kind": "outlet",
+      "resolve": {
+        "source": "Vertex Forge"
+      },
+      "facts": [
+        "55k"
+      ]
+    },
+    {
+      "q": "According to Acme Blog, what is the Orion stack budget?",
+      "kind": "outlet",
+      "resolve": {
+        "source": "Acme Blog"
+      },
+      "facts": [
+        "40k"
+      ]
+    },
+    {
+      "q": "According to Nimbus Docs, who owns the Orion stack?",
+      "kind": "outlet",
+      "resolve": {
+        "source": "Nimbus Docs"
+      },
+      "facts": [
+        "platform team"
+      ]
+    },
+    {
+      "q": "According to team retro, who owns the Orion stack?",
+      "kind": "outlet",
+      "resolve": {
+        "source": "team retro"
+      },
+      "facts": [
+        "data team"
+      ]
+    },
+    {
+      "q": "According to Acme Blog, how long do Orion rollbacks take?",
+      "kind": "outlet",
+      "resolve": {
+        "source": "Acme Blog"
+      },
+      "facts": [
+        "15 minutes"
+      ]
+    },
+    {
+      "q": "According to Nimbus Docs, where does the Orion stack deploy?",
+      "kind": "outlet",
+      "resolve": {
+        "source": "Nimbus Docs"
+      },
+      "facts": [
+        "us-east-1"
+      ]
+    },
+    {
+      "q": "According to Nimbus Docs as of 2026-02-01, which postgres does Orion v1.9 run?",
+      "kind": "outlet_asof",
+      "resolve": {
+        "source": "Nimbus Docs",
+        "as_of": "2026-02-01"
+      },
+      "facts": [
+        "postgres 14"
+      ]
+    },
+    {
+      "q": "According to Nimbus Docs as of 2026-04-01, which postgres does Orion v1.9 run?",
+      "kind": "outlet_asof",
+      "resolve": {
+        "source": "Nimbus Docs",
+        "as_of": "2026-04-01"
+      },
+      "facts": [
+        "postgres 15"
+      ]
+    },
+    {
+      "q": "As of 2026-06-01, when does Orion v2.0 ship according to Nimbus Docs?",
+      "kind": "outlet_asof",
+      "resolve": {
+        "source": "Nimbus Docs",
+        "as_of": "2026-06-01"
+      },
+      "facts": [
+        "October 2026"
+      ]
+    },
+    {
+      "q": "As of 2026-05-01, what is the Orion stack budget according to Vertex Forge?",
+      "kind": "outlet_asof",
+      "resolve": {
+        "source": "Vertex Forge",
+        "as_of": "2026-05-01"
+      },
+      "facts": [
+        "55k"
+      ]
+    },
+    {
+      "q": "When does the Orion CI pipeline run?",
+      "kind": "plain",
+      "resolve": {},
+      "facts": [
+        "02:00"
+      ]
+    },
+    {
+      "q": "Which queue service does the Orion stack use?",
+      "kind": "plain",
+      "resolve": {},
+      "facts": [
+        "queue service"
+      ]
+    },
+    {
+      "q": "Where does the Orion stack deploy?",
+      "kind": "plain",
+      "resolve": {},
+      "facts": [
+        "us-east-1"
+      ]
+    },
+    {
+      "q": "How long do Orion rollbacks take?",
+      "kind": "plain",
+      "resolve": {},
+      "facts": [
+        "15 minutes"
+      ]
+    },
+    {
+      "q": "Does Orion v1.9 run postgres?",
+      "kind": "plain",
+      "resolve": {},
+      "facts": [
+        "postgres"
+      ]
+    },
+    {
+      "q": "Does the Orion CI pipeline run at night?",
+      "kind": "plain",
+      "resolve": {},
+      "facts": [
+        "nightly"
+      ]
+    },
+    {
+      "q": "What is the Orion stack's disaster recovery RTO?",
+      "kind": "absent",
+      "resolve": {},
+      "facts": []
+    },
+    {
+      "q": "Which database does the marketing site use?",
+      "kind": "absent",
+      "resolve": {},
+      "facts": []
+    },
+    {
+      "q": "What is the Orion team's on-call rotation?",
+      "kind": "absent",
+      "resolve": {},
+      "facts": []
+    },
+    {
+      "q": "What is the company's headcount target?",
+      "kind": "absent",
+      "resolve": {},
+      "facts": []
+    }
+  ]
+}
