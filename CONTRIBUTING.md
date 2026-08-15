@@ -40,6 +40,14 @@ src/
 
 Keep PRs focused — one concern per PR. If you're fixing a bug, add a test.
 
+**Tool registry changes** (new tools, renames, deletions): every canonical tool
+is a public contract. Adding a tool requires a registry entry in `src/mcp.rs`,
+a `TOOL_SCOPES` classification, the README tool-family section, and the
+metadata count surfaces (README / CLAIMS-AUDIT / manifest / server / glama) —
+`scripts/registry_metadata_check.py` enforces the lockstep. Deleting or
+merging tools follows the [tool lifecycle policy](docs/specs/tool-lifecycle-policy.md)
+and [consolidation & deprecation-alias design](docs/specs/tool-consolidation-deprecation.md).
+
 ## Code Style
 
 - `cargo fmt` (standard Rust formatting)
