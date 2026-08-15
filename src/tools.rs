@@ -364,6 +364,14 @@ pub struct RecallArgs {
     /// existing callers and snapshot tests are unaffected; ranking is unchanged.
     #[serde(default, deserialize_with = "null_as_default")]
     pub include_confidence: bool,
+    /// #917: emit deterministic contradiction/supersession/staleness flags
+    /// alongside recall. Off by default so nominal recall stays compatible.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub include_conflict_flags: bool,
+    /// #917: render the same ID/hash/validity-only flags as a markdown block.
+    /// Independent from structured JSON and off by default.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub include_conflict_flags_markdown: bool,
     /// Opt-in reinforcement for dense/hybrid recall: bump retrieval stats on
     /// the returned hits so semantically-used memories resist decay. Default
     /// false — the semantic paths stay byte-deterministic (#247).
@@ -2285,6 +2293,34 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
             "retrieval_profile": profile_name,
         })
     };
+    // #917: the conflict surface is assembled only after ordinary recall has
+    // selected/governed the delivered candidates. It adds no side-effects to
+    // the pre-existing recall contract; the detector, suppression interceptor,
+    // and claim cards are all read-only projections.
+    if a.include_conflict_flags || a.include_conflict_flags_markdown {
+        let conflict_report = crate::conflict_flags::assemble(
+            db,
+            &entities,
+            a.workspace_hash.as_deref(),
+            a.scope_weight,
+            a.requesting_agent_id.as_deref(),
+        )?;
+        if let Some(obj) = result.as_object_mut() {
+            if a.include_conflict_flags {
+                obj.insert("conflict_flags".to_string(), json!(conflict_report.flags));
+                obj.insert(
+                    "abstain_hint".to_string(),
+                    json!(conflict_report.abstain_hint),
+                );
+            }
+            if a.include_conflict_flags_markdown {
+                obj.insert(
+                    "conflict_flags_markdown".to_string(),
+                    json!(conflict_report.markdown),
+                );
+            }
+        }
+    }
     if include_outcome {
         if let Some(obj) = result.as_object_mut() {
             obj.insert("outcome".to_string(), outcome_value);

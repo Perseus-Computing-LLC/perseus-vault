@@ -2,6 +2,7 @@ mod beliefs;
 mod anchor_expansion;
 mod capture;
 mod claim_card;
+mod conflict_flags;
 mod communities;
 mod config_report;
 mod connectors;

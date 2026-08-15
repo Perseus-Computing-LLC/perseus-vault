@@ -1199,6 +1199,16 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
           "default": false,
           "description": "Add a normalized confidence score (0.0-1.0) to each result, rolled up from rank, trust (verified/certainty), and decay. Presentation-only; does not change ranking."
         },
+        "include_conflict_flags": {
+          "type": "boolean",
+          "default": false,
+          "description": "#917: add deterministic contradiction/superseded/stale flags containing only entity IDs, validity ranges, and hash-linked claim-card evidence refs. Suppressed values disclose existence only; no body value is rendered."
+        },
+        "include_conflict_flags_markdown": {
+          "type": "boolean",
+          "default": false,
+          "description": "#917: independently add an ID/hash/validity-only markdown conflict block. Does not implicitly enable structured conflict_flags."
+        },
         "reinforce": {
           "type": "boolean",
           "default": false,
@@ -1339,6 +1349,19 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
         "variants": {
           "type": "integer",
           "description": "Number of query variants used when expansion is enabled"
+        },
+        "conflict_flags": {
+          "type": "array",
+          "items": { "type": "object" },
+          "description": "#917: optional deterministic contradiction/supersession/staleness flags; IDs, validity ranges, and hash-linked evidence refs only"
+        },
+        "abstain_hint": {
+          "type": "boolean",
+          "description": "#917: true only when a high-confidence direct contradiction is present in the delivered set"
+        },
+        "conflict_flags_markdown": {
+          "type": "string",
+          "description": "#917: optional ID/hash/validity-only markdown rendering of conflict flags"
         }
       }
     },
