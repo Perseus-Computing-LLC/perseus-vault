@@ -25489,6 +25489,20 @@ pub fn verify_audit_chain(db: &Database) -> Result<i64, String> {
     // audit key (HMAC) when encryption is enabled. Verifying a keyed chain
     // requires the key — fail CLOSED (never a false pass) if it is absent.
     let audit_key = db.audit_key();
+    // RFC §3.5: if the chain is recorded as keyed but no key is loaded, fail
+    // closed with an explicit error instead of falling through to an unkeyed
+    // MAC comparison (which would also fail, but ambiguously).
+    let scheme: Option<String> = conn
+        .query_row(
+            "SELECT scheme FROM audit_chain_state WHERE id = 1",
+            [],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| format!("audit-chain scheme read: {}", e))?;
+    if scheme.as_deref() == Some("hmac-sha256-v1") && audit_key.is_none() {
+        return Err("audit chain is keyed; provide --encryption-key to verify".to_string());
+    }
     let mut stmt = conn
         .prepare(
             "SELECT id, audit_hash, created_at_unix_ms, COALESCE(workspace_hash, ''), \
@@ -47966,6 +47980,238 @@ pub(crate) mod tests {
         assert_eq!(
             verify_audit_chain(&db).expect("chain must verify after v11->v12 migration"),
             3
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ─── #1067: keyed-MAC audit chain (docs/audit-chain-keyed-mac-design.md) ───
+
+    /// Seed three journal rows through the production writer.
+    fn seed_chain_rows(db: &TestDatabase) {
+        let base = now_ms();
+        for (i, (id, ws)) in [("k1", "wsA"), ("k2", "wsB"), ("k3", "wsA")]
+            .iter()
+            .enumerate()
+        {
+            db.journal(&crate::models::JournalEvent {
+                id: id.to_string(),
+                event_type: "decision".to_string(),
+                evaluated_json: format!("{{\"payload\":{i}}}"),
+                acted_json: "{}".to_string(),
+                forward_json: "{}".to_string(),
+                category: "facts".to_string(),
+                key: "k".to_string(),
+                entity_id: String::new(),
+                agent_id: "test".to_string(),
+                workspace_hash: ws.to_string(),
+                created_at_unix_ms: base + i as i64,
+            })
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn keyed_audit_chain_verifies_and_rekey_is_canary_gated() {
+        let (mut db, path) = temp_db();
+        let (key_path, _key) = temp_key_file();
+        seed_chain_rows(&db);
+        // Unkeyed (no encryption): the plain SHA-256 chain verifies.
+        assert_eq!(verify_audit_chain(&db).unwrap(), 3);
+
+        // set_encryption rekeys the chain to HMAC — with the key loaded it
+        // verifies and the scheme marker records keyed mode.
+        db.set_encryption(&key_path).unwrap();
+        assert_eq!(verify_audit_chain(&db).unwrap(), 3);
+        let conn = db.conn().unwrap();
+        let scheme: String = conn
+            .query_row(
+                "SELECT scheme FROM audit_chain_state WHERE id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(scheme, "hmac-sha256-v1");
+        let before: String = conn
+            .query_row("SELECT audit_hash FROM journal WHERE id = 'k3'", [], |r| r.get(0))
+            .unwrap();
+        drop(conn);
+
+        // Second set_encryption: the audit-key canary matches → the O(journal)
+        // rekey is skipped and the chain is byte-identical (idempotent).
+        db.set_encryption(&key_path).unwrap();
+        let conn = db.conn().unwrap();
+        let after: String = conn
+            .query_row("SELECT audit_hash FROM journal WHERE id = 'k3'", [], |r| r.get(0))
+            .unwrap();
+        drop(conn);
+        assert_eq!(before, after, "rekey must be canary-gated and idempotent");
+        assert_eq!(verify_audit_chain(&db).unwrap(), 3);
+
+        let _ = std::fs::remove_file(&key_path);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn keyed_chain_fails_closed_without_key_and_rejects_wrong_key() {
+        let (mut db, path) = temp_db();
+        let (key_path, _key) = temp_key_file();
+        seed_chain_rows(&db);
+        db.set_encryption(&key_path).unwrap();
+
+        // Reopen WITHOUT encryption: verify must fail closed with the explicit
+        // RFC §3.5 error, not fall through to an ambiguous MAC mismatch.
+        let db2 = Database::open(&path).unwrap();
+        let err = verify_audit_chain(&db2).unwrap_err();
+        assert!(
+            err.contains("keyed") && err.contains("--encryption-key"),
+            "expected the explicit fail-closed error, got: {err}"
+        );
+
+        // Wrong key: rejected at set_encryption by the encryption canary
+        // (fail-fast), and the chain remains unverifiable without the key.
+        let (wrong_path, _wrong) = temp_key_file();
+        let mut db3 = Database::open(&path).unwrap();
+        assert!(
+            db3.set_encryption(&wrong_path).is_err(),
+            "a wrong key must be rejected before any verify"
+        );
+        assert!(verify_audit_chain(&db3).is_err());
+
+        // Right key: verifies.
+        let mut db4 = Database::open(&path).unwrap();
+        db4.set_encryption(&key_path).unwrap();
+        assert_eq!(verify_audit_chain(&db4).unwrap(), 3);
+
+        let _ = std::fs::remove_file(&wrong_path);
+        let _ = std::fs::remove_file(&key_path);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn keyed_chain_detects_content_tamper_and_recompute_attacker() {
+        let (mut db, path) = temp_db();
+        let (key_path, _key) = temp_key_file();
+        seed_chain_rows(&db);
+        db.set_encryption(&key_path).unwrap();
+
+        // Content tamper: altering a payload breaks the commitment.
+        {
+            let conn = db.conn().unwrap();
+            conn.execute(
+                "UPDATE journal SET evaluated_json = '{\"evil\":true}' WHERE id = 'k2'",
+                [],
+            )
+            .unwrap();
+        }
+        assert!(
+            verify_audit_chain(&db).is_err(),
+            "content tampering must break keyed-chain verification"
+        );
+
+        // Recompute attacker (the RFC's motivating case): an attacker who can
+        // write the DB but does NOT hold the key recomputes a fully-valid
+        // UNKEYED chain over the doctored rows. The keyed chain must still
+        // reject it — the HMAC links cannot be reproduced without the key.
+        {
+            let conn = db.conn().unwrap();
+            crate::db::rehash_audit_chain_keyed(&conn, None).unwrap();
+        }
+        assert!(
+            verify_audit_chain(&db).is_err(),
+            "an unkeyed recompute over doctored rows must not satisfy a keyed chain"
+        );
+
+        let _ = std::fs::remove_file(&key_path);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn keyed_chain_survives_redaction() {
+        let (mut db, path) = temp_db();
+        let (key_path, _key) = temp_key_file();
+        seed_chain_rows(&db);
+        db.set_encryption(&key_path).unwrap();
+
+        // Purge-style redaction: scrub the payload of one entry, keep its
+        // commitment. The chain must still verify (erasure preserved)…
+        {
+            let conn = db.conn().unwrap();
+            conn.execute(
+                "UPDATE journal SET event_type = 'redacted', evaluated_json = '', \
+                 acted_json = '', forward_json = '', category = '', key = '', \
+                 entity_id = '', agent_id = '' WHERE id = 'k2'",
+                [],
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            verify_audit_chain(&db).expect("redacted entry must still verify in keyed mode"),
+            3
+        );
+
+        // …but content tamper of a NON-redacted entry still breaks it.
+        {
+            let conn = db.conn().unwrap();
+            conn.execute(
+                "UPDATE journal SET evaluated_json = '{\"evil\":true}' WHERE id = 'k1'",
+                [],
+            )
+            .unwrap();
+        }
+        assert!(
+            verify_audit_chain(&db).is_err(),
+            "tampering a non-redacted entry must still break verification"
+        );
+
+        let _ = std::fs::remove_file(&key_path);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn v14_audit_chain_verifies_after_migration_to_v15() {
+        // Forge a v14-era journal: pre-v15 chain hashes (unverifiable under the
+        // current formula) and EMPTY payload commitments (the column did not
+        // exist pre-v15). The v15 migration must backfill commitments from the
+        // payload and rehash the chain (unkeyed at migration time — no key is
+        // available at open), after which the chain verifies.
+        let (db, path) = temp_db();
+        let base = now_ms();
+        let rows = [("jv-1", "wsA"), ("jv-2", "wsB"), ("jv-3", "wsA")];
+        {
+            let conn = db.conn().unwrap();
+            for (i, (id, ws)) in rows.iter().enumerate() {
+                conn.execute(
+                    "INSERT INTO journal (id, event_type, evaluated_json, acted_json, \
+                     forward_json, category, key, entity_id, agent_id, audit_hash, \
+                     payload_commitment, workspace_hash, created_at_unix_ms) \
+                     VALUES (?1, 'decision', ?2, '{}', '{}', 'facts', 'k', '', 'test', \
+                     'pre-v15-garbage', '', ?3, ?4)",
+                    params![id, format!("{{\"n\":{i}}}"), ws, base + i as i64],
+                )
+                .unwrap();
+            }
+        }
+        {
+            let conn = db.conn().unwrap();
+            conn.pragma_update(None, "user_version", 14i64).unwrap();
+            crate::schema::initialize_schema(&conn).expect("v14->v15 migration must succeed");
+        }
+        assert_eq!(
+            verify_audit_chain(&db).expect("chain must verify after v14->v15 migration"),
+            3
+        );
+        let conn = db.conn().unwrap();
+        let uncommitted: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM journal WHERE event_type != 'redacted' \
+                 AND payload_commitment = ''",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            uncommitted, 0,
+            "v15 migration must backfill every payload commitment"
         );
         let _ = std::fs::remove_file(&path);
     }

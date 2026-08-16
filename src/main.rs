@@ -411,6 +411,12 @@ enum Commands {
         /// SQLite database path
         #[arg(long, default_value_t = default_db_path())]
         db: String,
+        /// Optional AES-256-GCM key file. Required to verify a keyed
+        /// (HMAC-SHA256) audit chain — without it, verification of a keyed
+        /// chain fails closed, never a false pass
+        /// (docs/audit-chain-keyed-mac-design.md §3.5).
+        #[arg(long)]
+        encryption_key: Option<String>,
     },
 
     /// #958: runtime self-audit — re-assert the Vault's invariants on the
@@ -3063,8 +3069,18 @@ fn run() {
                 }
             }
         }
-        Some(Commands::VerifyAuditChain { db: ref db_path }) => {
-            let database = open_db_or_exit(db_path);
+        Some(Commands::VerifyAuditChain { db: ref db_path, encryption_key }) => {
+            let mut database = open_db_or_exit(db_path);
+            // A keyed (HMAC-SHA256) chain can only be verified with the key
+            // loaded (docs/audit-chain-keyed-mac-design.md §3.5). Load it via
+            // the same fail-fast canary path as `serve` — a wrong key is
+            // rejected here, before any verify attempt.
+            if let Some(key_file) = encryption_key {
+                if let Err(e) = database.set_encryption(&key_file) {
+                    eprintln!("perseus-vault: failed to load encryption key: {}", e);
+                    std::process::exit(1);
+                }
+            }
             match crate::db::verify_audit_chain(&database) {
                 Ok(n) => println!("audit chain OK: {} entries verified", n),
                 Err(e) => {
