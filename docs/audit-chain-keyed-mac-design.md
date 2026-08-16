@@ -1,9 +1,15 @@
 # Design / RFC: Keyed-MAC audit chain + redaction-safe payload commitment
 
-Status: **Draft for review** (2026-07-05 security review, follow-up to the v14
-SHA-256 chain). This document is the artifact for external review *before* the
-implementation is merged. A first-pass implementation accompanies it (opened, not
-merged) so reviewers have running code + spec.
+Status: **Implemented** (2026-08-16). First pass merged in #463/#464; hardened
+by #1067 — `verify-audit-chain` gained `--encryption-key`, verification fails
+closed with an explicit error on a keyed chain without the key (RFC §3.5), and
+the keyed-mode regression suite (RFC 4231 vectors, content tamper,
+recompute-attacker, wrong-key fail-fast, redaction, unkeyed→keyed transition,
+v14→v15 backfill) is in the test suite. Compliance matrix rows 3.3.1 / 3.3.8 /
+SC-3.13.10 are SERVED (gap G1 closed). Reviewer question 1 is resolved by the
+implementation: the audit key derives from the encryption key (zero-config); a
+separate `--audit-key` remains an open option for separation-of-duties
+deployments.
 
 ## 1. Why
 

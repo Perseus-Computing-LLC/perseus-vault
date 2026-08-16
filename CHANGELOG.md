@@ -16,6 +16,15 @@ All notable changes to Perseus Vault are documented here. This project adheres t
   class as #379/#400/#971).
 
 ### Added
+- **Keyed-MAC audit-chain verification hardening (#1067).** `verify-audit-chain`
+  now accepts `--encryption-key` so operators can verify a keyed (HMAC-SHA256)
+  chain, and verification fails closed with an explicit "chain is keyed" error
+  when the key is absent (RFC §3.5 of `docs/audit-chain-keyed-mac-design.md`).
+  New keyed-mode regression suite: unkeyed→keyed transition + canary-gated
+  idempotent rekey, content-tamper and recompute-attacker detection, wrong-key
+  fail-fast, keyed redaction, and v14→v15 payload-commitment backfill. The
+  CMMC/NIST matrix rows 3.3.1 / 3.3.8 / 3.13.10 move PARTIAL → SERVED (gap G1
+  closed).
 - **Admission quarantine disposition (#1026).** A fourth terminal admission
   disposition: candidates disposed as `quarantined` by trust admission are
   sealed OUTSIDE the authoritative head in a new `admission_quarantine`

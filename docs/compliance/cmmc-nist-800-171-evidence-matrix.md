@@ -21,7 +21,7 @@
 
 | # | Artifact | Surface | What it proves | Replay |
 |---|---|---|---|---|
-| E1 | Journal audit chain (v14) | journal / timeline tools | append-only order, id, time, workspace continuity (`prev_hash` chained over `id, created_at_unix_ms, workspace_hash`) | RB §2 |
+| E1 | Journal audit chain (v15: keyed MAC + payload commitment) | journal / timeline tools | append-only order, id, time, workspace continuity plus a per-entry payload commitment covered by an HMAC-SHA256 link MAC when encryption is enabled (keyed mode) | RB §2 |
 | E2 | Authority manifests | `authority_get` / `authority_set` | per-workspace, agent-bound grant of named capabilities; revocation | RB §3 |
 | E3 | AAR receipts | `action_intent` → `action_lease_acquire` → `action_complete` → `action_receipt_get` | intent, lease holder, completion, outcome + durable hashes; fail-closed denial recorded | RB §3 |
 | E4 | Ledger receipts (v1.2.3+) | `ledger_record`, receipt verification block | HMAC-SHA256 signature, evidence levels (structural/attested/replay/inclusion), trusted-key attestation, inclusion anchors | RB §4 |
@@ -58,14 +58,14 @@
 
 | Req | Artifact | Non-repudiation argument | Status |
 |---|---|---|---|
-| 3.3.1 create + retain audit logs | E1 journal chain + E4 ledger events + E7 artifact manifests | every mutation journaled; chain links records; retention documented | **PARTIAL** (chain unkeyed → G1) |
+| 3.3.1 create + retain audit logs | E1 journal chain + E4 ledger events + E7 artifact manifests | every mutation journaled; keyed-MAC chain links records (HMAC-SHA256 when encrypted) + per-entry payload commitments; retention documented | **SERVED** |
 | 3.3.2 uniquely trace actions to users | journal `agent_id`/actor per event; E3 receipts bind agent+workspace | per-actor attribution via registered identity + receipt | **SERVED** |
 | 3.3.3 review/update logged events | operator-review queue; `consistency_audit`; timeline/journal reads | review loop with deterministic recommendations | **SERVED** |
 | 3.3.4 alert on audit logging failure | fail-closed AAR errors; ledger prebind failures surfaced | logging failure = operation failure (no silent pass) | **PARTIAL** (alerting channel = deployment) |
 | 3.3.5 correlate reviews for investigation | E11 bridge; bi-temporal `as_of`/`valid_at`; graph `traverse` | hash-only bindings join served-memory evidence to ledger events | **SERVED** |
 | 3.3.6 reduction + report generation | E8 log digests; E6 claim cards; hygiene reports | deterministic summaries w/ verbatim-preserved risk lines | **SERVED** |
 | 3.3.7 time sync w/ authoritative source | `created_at_unix_ms` in chain | authoritative clock = enclave NTP (documented in runbook) | **PARTIAL**/DEPLOY |
-| 3.3.8 protect audit info from access/modification/deletion | append-only journal + chain continuity + governed purge w/ history | modification breaks chain; deletion = governed, tombstoned, chain-visible | **PARTIAL** (unkeyed chain forgeable by motivated attacker → G1) |
+| 3.3.8 protect audit info from access/modification/deletion | append-only journal + keyed chain continuity + governed purge w/ history | payload tampering breaks the per-entry commitment; reorder/forge breaks the keyed MAC (an attacker without the key cannot recompute); deletion = governed, tombstoned, chain-visible | **SERVED** |
 | 3.3.9 limit audit-logging management to privileged subset | E2 gated destructive ops; operator-only purge | privileged management requires manifest capability | **SERVED** |
 
 ## 6. Matrix — 3.13 System & Communications Protection (SC, 16 requirements)
@@ -79,7 +79,7 @@
 | 3.13.5 subnetworks | enclave | enclave | **DEPLOY** |
 | 3.13.6 deny by default | fail-closed AAR; retrieval abstention (#953); deny-by-default tool policy | default action without grant = deny + record | **SERVED** |
 | 3.13.7–3.13.9 remote sessions, transmission crypto, session termination | TLS transport | enclave/transport | **DEPLOY** |
-| 3.13.10 key establishment & management | DB encryption key path; ledger trusted-key registry (`key_registry`, `sign_key_id`) | key lifecycle visible in receipts | **PARTIAL** (vault chain keying = G1) |
+| 3.13.10 key establishment & management | DB encryption key path (audit MAC subkey domain-separated via SHA-256); ledger trusted-key registry (`key_registry`, `sign_key_id`) | audit chain rekeyed on `set_encryption`, canary-gated and idempotent; key lifecycle visible in receipts | **SERVED** |
 | 3.13.11 FIPS-validated cryptography for CUI | — | no FIPS-validated module today (AES-256-GCM + HMAC-SHA256 implementations not certified) | **GAP** (G2) |
 | 3.13.12–3.13.14 collaborative devices, mobile code, VoIP | n/a for this product surface | n/a | **DEPLOY/N/A** |
 | 3.13.15 authenticity of comms sessions | TLS + gRPC authn + MAC'd ledger receipts | session + artifact authenticity | **PARTIAL** |
@@ -192,7 +192,7 @@
 
 | # | Controls | Gap | Action |
 |---|---|---|---|
-| G1 | AU-3.3.8, SC-3.13.10 | v14 journal chain is **unkeyed** — a motivated attacker who can write the DB can recompute a valid chain; payload excluded (redaction-safe) so chain attests existence/order/time, not content | implement keyed-MAC audit chain per `docs/audit-chain-keyed-mac-design.md` (RFC drafted; no surviving first-pass branch — fresh implementation; staged in #1067) |
+| G1 | AU-3.3.8, SC-3.13.10 | **CLOSED (#1067).** v15 keyed-MAC chain: HMAC-SHA256 links + per-entry payload commitments. Content tamper, reorder, and unkeyed recompute all break verification; redaction preserved; unencrypted deployments fall back to the unkeyed SHA-256 chain (documented limit) | merged #463/#464 + #1067 (`verify-audit-chain --encryption-key`, fail-closed scheme check, keyed regression suite); matrix rows SERVED |
 | G2 | SC-3.13.11 | no FIPS-validated crypto module | guidance + decision delivered: `docs/compliance/fips-validated-crypto-path.md` (Paths A/B deploy-now, Path C roadmap) — row now PARTIAL w/ dated plan; #1068 |
 | G3 | all families | Rev 2→Rev 3 crosswalk + CMMC ODP alignment | delivered: `docs/compliance/nist-800-171-rev2-rev3-crosswalk.md`; #1069 |
 | G4 | AU-3.3.7 | authoritative time = operator NTP | runbook step (no code change) |
