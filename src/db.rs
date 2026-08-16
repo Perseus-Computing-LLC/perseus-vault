@@ -10678,19 +10678,100 @@ impl Database {
         to_id: &str,
         relationship: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        self.link_inner(from_category, from_key, to_id, relationship, None)
+    }
+
+    /// #1064: typed link write path — the same audited edge write as
+    /// [`link`], with a declared [`crate::models::RelationKind`]. Per-kind
+    /// semantics are enforced HERE, deterministically, at the write
+    /// boundary:
+    /// - `authorized_by`: the target must be an authority manifest or an
+    ///   authorized-action receipt (provenance != authorization).
+    /// - `invalidates`: the target must be a live entity.
+    /// - `supports`/`contradicts`: refuse without the evidence anchor (the
+    ///   linking entity always anchors, so these kinds always carry it —
+    ///   enforced for symmetry with the graph serve-time gate).
+    pub fn link_typed(
+        &self,
+        from_category: &str,
+        from_key: &str,
+        to_id: &str,
+        relationship: &str,
+        kind: crate::models::RelationKind,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let conn = self.conn()?;
+        match kind {
+            crate::models::RelationKind::AuthorizedBy => {
+                let manifest_hit: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM authority_manifests WHERE id = ?1",
+                    params![to_id],
+                    |r| r.get(0),
+                )?;
+                let action_hit: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM authorized_actions WHERE id = ?1",
+                    params![to_id],
+                    |r| r.get(0),
+                )?;
+                if manifest_hit == 0 && action_hit == 0 {
+                    return Err(format!(
+                        "authorized_by target '{}' is not an authority manifest or action receipt",
+                        to_id
+                    )
+                    .into());
+                }
+            }
+            crate::models::RelationKind::Invalidates => {
+                let live: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM entities WHERE id = ?1 AND archived = 0",
+                    params![to_id],
+                    |r| r.get(0),
+                )?;
+                if live == 0 {
+                    return Err(format!(
+                        "invalidates target '{}' is not a live entity",
+                        to_id
+                    )
+                    .into());
+                }
+            }
+            crate::models::RelationKind::Supports
+            | crate::models::RelationKind::Contradicts => {
+                // The linking entity is always the evidence anchor; nothing
+                // further to check beyond target existence (below).
+            }
+            _ => {}
+        }
+        drop(conn);
+        self.link_inner(from_category, from_key, to_id, relationship, Some(kind))
+    }
+
+    fn link_inner(
+        &self,
+        from_category: &str,
+        from_key: &str,
+        to_id: &str,
+        relationship: &str,
+        kind: Option<crate::models::RelationKind>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let conn = self.conn()?;
         // Verify both entities exist (id resolution only — ids are immutable,
         // so these reads don't need the writer lock; and they run on THIS
         // connection, see resolve_entity_id / #387).
         let from_id = Self::resolve_entity_id(&conn, from_category, from_key)?
             .ok_or("Source entity not found")?;
-        let _to: String = conn
-            .query_row(
-                "SELECT id FROM entities WHERE id = ?1",
-                params![to_id],
-                |r| r.get(0),
-            )
-            .map_err(|_| "Target entity not found")?;
+        // #1064: authorized_by targets are authority manifests / action
+        // receipts, not entities — existence was validated by link_typed,
+        // so the entity check is skipped for that kind only.
+        let _to: String = match kind {
+            Some(crate::models::RelationKind::AuthorizedBy) => String::new(),
+            _ => conn
+                .query_row(
+                    "SELECT id FROM entities WHERE id = ?1",
+                    params![to_id],
+                    |r| r.get(0),
+                )
+                .map_err(|_| "Target entity not found")?,
+        };
 
         // #382: the links read-modify-write must hold the writer lock — two
         // concurrent link() calls reading the same base array on the bare
@@ -10707,8 +10788,13 @@ impl Database {
             .unwrap_or_else(|_| "[]".to_string());
 
         let mut links: Vec<MemoryLink> = serde_json::from_str(&links_str).unwrap_or_default();
-        // Avoid duplicates
-        if !links.iter().any(|l| l.target_id == to_id) {
+        // Avoid duplicates — keyed on (target, relationship): the typed-edge
+        // model lets one record assert multiple distinct relations toward the
+        // same target (e.g. invalidates + supports in different contexts).
+        if !links
+            .iter()
+            .any(|l| l.target_id == to_id && l.relationship == relationship)
+        {
             links.push(MemoryLink {
                 target_id: to_id.to_string(),
                 relationship: relationship.to_string(),
@@ -10717,6 +10803,10 @@ impl Database {
                 // exists because this record asserts it. Attested edges are
                 // serveable by the graph arms; unattested ones are not.
                 source: Some(from_id.clone()),
+                // #1064: typed kind (None for legacy link() calls) + write
+                // time assertion stamp.
+                kind,
+                asserted_at_unix_ms: Some(now_ms()),
             });
         }
         let new_links = serde_json::to_string(&links)?;
@@ -20449,7 +20539,9 @@ impl Database {
                                 // #869: the consolidated observation asserts the
                                 // evidence_for edges to its sources.
                                 source: Some(entity_id.clone()),
-                            })
+                                                            kind: None,
+                                asserted_at_unix_ms: Some(now_ms()),
+})
                             .collect(),
                         verified: false,
                         source: "perseus_vault_consolidate".to_string(),
@@ -21367,7 +21459,9 @@ impl Database {
                                     // #869: the dreamed insight asserts the
                                     // evidence_for edges to its sources.
                                     source: Some(entity_id.clone()),
-                                })
+                                                                    kind: None,
+                                    asserted_at_unix_ms: Some(now_ms()),
+})
                                 .collect(),
                             verified: false,
                             source: "perseus_vault_dream".to_string(),
@@ -23556,6 +23650,239 @@ last_accessed: {}
         })
     }
 
+    pub fn provenance_projection(
+        &self,
+        seed_id: &str,
+        mode: &str,
+        depth: usize,
+    ) -> Result<crate::models::ProvenanceProjection, Box<dyn std::error::Error>> {
+        let conn = self.conn()?;
+        let mut proj = crate::models::ProvenanceProjection {
+            seed_id: seed_id.to_string(),
+            mode: mode.to_string(),
+            depth,
+            nodes: Vec::new(),
+            edges: Vec::new(),
+            blocked_actions: Vec::new(),
+        };
+        match mode {
+            "evidence" => {
+                let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+                let mut frontier: Vec<String> = vec![seed_id.to_string()];
+                seen.insert(seed_id.to_string());
+                for _level in 0..depth.max(1) {
+                    let mut next: Vec<String> = Vec::new();
+                    for from_id in &frontier {
+                        let (cat, key): (String, String) = conn
+                            .query_row(
+                                "SELECT category, key FROM entities WHERE id = ?1",
+                                params![from_id],
+                                |r| Ok((r.get(0)?, r.get(1)?)),
+                            )
+                            .optional()?
+                            .unwrap_or_default();
+                        if cat.is_empty() && frontier.len() > 1 {
+                            continue;
+                        }
+                        if !proj.nodes.iter().any(|n| n.id == *from_id) {
+                            proj.nodes.push(crate::models::ProvenanceNode {
+                                id: from_id.clone(),
+                                category: cat,
+                                key,
+                            });
+                        }
+                        let links_json: String = conn
+                            .query_row(
+                                "SELECT links FROM entities WHERE id = ?1",
+                                params![from_id],
+                                |r| r.get(0),
+                            )
+                            .unwrap_or_else(|_| "[]".to_string());
+                        let links: Vec<crate::models::MemoryLink> =
+                            serde_json::from_str(&links_json).unwrap_or_default();
+                        for l in links {
+                            let kind_str = match l.kind {
+                                Some(k) => format!("{:?}", k).to_lowercase(),
+                                None => format!(
+                                    "{:?}",
+                                    crate::models::classify_relation(&l.relationship)
+                                )
+                                .to_lowercase(),
+                            };
+                            proj.edges.push(crate::models::ProvenanceEdge {
+                                from: from_id.clone(),
+                                to: l.target_id.clone(),
+                                relationship: l.relationship.clone(),
+                                kind: kind_str,
+                                source: l.source.clone(),
+                            });
+                            if seen.insert(l.target_id.clone()) {
+                                next.push(l.target_id);
+                            }
+                        }
+                    }
+                    frontier = next;
+                    if frontier.is_empty() {
+                        break;
+                    }
+                }
+            }
+            "execution" => {
+                // Journal events referencing the entity (what was done with
+                // it), newest first, bounded.
+                let mut stmt = conn.prepare(
+                    "SELECT id, event_type, COALESCE(agent_id,''), created_at_unix_ms \
+                     FROM journal WHERE entity_id = ?1 \
+                     ORDER BY created_at_unix_ms DESC LIMIT 200",
+                )?;
+                let events = stmt
+                    .query_map(params![seed_id], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, i64>(3)?,
+                        ))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                for (id, etype, agent, ts) in events {
+                    if !proj.nodes.iter().any(|n| n.id == id) {
+                        proj.nodes.push(crate::models::ProvenanceNode {
+                            id,
+                            category: format!("journal/{}", etype),
+                            key: agent,
+                        });
+                    }
+                }
+                // Blocked actions: intent + failure receipt from the AAR
+                // table, extended into the graph projection. Bounded.
+                let mut stmt = conn.prepare(
+                    "SELECT id, capability, action_key, status, intent_hash, \
+                            created_at_unix_ms \
+                     FROM authorized_actions \
+                     WHERE status IN ('denied','revoked','failed','expired') \
+                     ORDER BY created_at_unix_ms DESC LIMIT 50",
+                )?;
+                let blocked = stmt
+                    .query_map([], |r| {
+                        Ok(crate::models::BlockedActionReceipt {
+                            id: r.get(0)?,
+                            capability: r.get(1)?,
+                            action_key: r.get(2)?,
+                            status: r.get(3)?,
+                            intent_hash: r.get(4)?,
+                            created_at_unix_ms: r.get(5)?,
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                proj.blocked_actions = blocked;
+            }
+            other => return Err(format!("unknown projection mode '{}'", other).into()),
+        }
+        Ok(proj)
+    }
+
+    /// #1064: record parameter-level lineage for a sensitive tool argument.
+    /// `source_ref` may cite the producing entity id — a forged/dangling
+    /// source is detectable at query time (resolved=false), never trusted.
+    pub fn param_lineage_set(
+        &self,
+        entity_id: &str,
+        param_path: &str,
+        source_kind: &str,
+        source_ref: &str,
+        workspace_hash: &str,
+        agent_id: &str,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let conn = self.conn()?;
+        // The entity must exist — lineage over a ghost entity is a tamper
+        // signal, not a record.
+        let live: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM entities WHERE id = ?1",
+            params![entity_id],
+            |r| r.get(0),
+        )?;
+        if live == 0 {
+            return Err(format!("no live entity with id '{}'", entity_id).into());
+        }
+        let lineage_id = format!("pl-{}", uuid::Uuid::new_v4().simple());
+        conn.execute(
+            "INSERT INTO param_lineage (lineage_id, entity_id, param_path, \
+             source_kind, source_ref, workspace_hash, agent_id, asserted_at_unix_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                lineage_id,
+                entity_id,
+                param_path,
+                source_kind,
+                source_ref,
+                workspace_hash,
+                agent_id,
+                now_ms()
+            ],
+        )?;
+        Ok(lineage_id)
+    }
+
+    /// #1064: query parameter-level lineage rows for an entity. Every row is
+    /// validated: a non-empty `source_ref` must resolve to a live entity,
+    /// otherwise the row is returned with `resolved: false` (dangling source
+    /// = tamper/forge signal, surfaced rather than trusted).
+    pub fn param_lineage_query(
+        &self,
+        entity_id: &str,
+    ) -> Result<Vec<crate::models::ParamLineage>, Box<dyn std::error::Error>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT lineage_id, entity_id, param_path, source_kind, source_ref, \
+                    COALESCE(workspace_hash, ''), COALESCE(agent_id, ''), \
+                    asserted_at_unix_ms \
+             FROM param_lineage WHERE entity_id = ?1 ORDER BY asserted_at_unix_ms DESC",
+        )?;
+        let rows = stmt
+            .query_map(params![entity_id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, String>(5)?,
+                    r.get::<_, String>(6)?,
+                    r.get::<_, i64>(7)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut out = Vec::with_capacity(rows.len());
+        for (id, eid, path, kind, sref, ws, agent, ts) in rows {
+            let resolved = if sref.is_empty() {
+                true // manual assertion — nothing to resolve
+            } else {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM entities WHERE id = ?1",
+                    params![sref],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap_or(0)
+                    > 0
+            };
+            out.push(crate::models::ParamLineage {
+                lineage_id: id,
+                entity_id: eid,
+                param_path: path,
+                source_kind: kind,
+                source_ref: sref,
+                resolved,
+                workspace_hash: ws,
+                agent_id: agent,
+                asserted_at_unix_ms: ts,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Import .md files from a vault directory into the database.
+    /// Reads YAML frontmatter + body, calls remember() for each.
     /// Import .md files from a vault directory into the database.
     /// Reads YAML frontmatter + body, calls remember() for each.
     pub fn vault_import(&self, vault_dir: &str) -> Result<VaultReport, Box<dyn std::error::Error>> {
@@ -24915,7 +25242,9 @@ last_accessed: {}
                     weight: 1.0,
                     // #869: the promoted entity asserts the edge.
                     source: Some(promoted_id.clone()),
-                })
+                                    kind: None,
+                    asserted_at_unix_ms: Some(now_ms()),
+})
                 .collect();
             let entity = crate::models::Entity {
                 id: promoted_id,
@@ -25155,7 +25484,9 @@ last_accessed: {}
                         // #869: the source entity is the evidence anchor for
                         // the derived edge.
                         source: Some(e1_id.clone()),
-                    });
+                                            kind: None,
+                        asserted_at_unix_ms: Some(now_ms()),
+});
                     candidate_links += 1;
                     if candidate_links >= max_links {
                         break 'link;
@@ -29177,7 +29508,9 @@ pub(crate) mod tests {
             weight: 0.5,
             // #869: attested edge (the root asserts it).
             source: Some("g-root".to_string()),
-        }];
+                    kind: None,
+            asserted_at_unix_ms: Some(now_ms()),
+}];
         db.remember_skip_dedup(&root).unwrap();
         // Target entity — will be suppressed.
         db.remember_skip_dedup(&make_entity(
@@ -33312,7 +33645,9 @@ pub(crate) mod tests {
             relationship: "caused-by".to_string(),
             weight: 0.9,
             source: None,
-        });
+                    kind: None,
+            asserted_at_unix_ms: Some(now_ms()),
+});
         db.remember(&e).unwrap();
 
         let live = db.get_entity("facts", "src382b").unwrap().unwrap();
@@ -43353,7 +43688,9 @@ pub(crate) mod tests {
                 relationship: "related".to_string(),
                 weight: 0.5,
                 source: None,
-            }])
+                            kind: None,
+                asserted_at_unix_ms: Some(now_ms()),
+}])
             .unwrap()],
         )
         .unwrap();
@@ -43469,7 +43806,9 @@ pub(crate) mod tests {
             relationship: "related".to_string(),
             weight: 0.5,
             source: Some("d-root".to_string()),
-        }];
+                    kind: None,
+            asserted_at_unix_ms: Some(now_ms()),
+}];
         db.remember(&e).unwrap();
         let seed = db.get_entity("facts", "d-root").unwrap().unwrap();
         let (expanded, stats) = db.graph_expand(&[seed], 10).unwrap();
@@ -43585,7 +43924,9 @@ pub(crate) mod tests {
                 relationship: "related".to_string(),
                 weight: 0.5,
                 source: None,
-            }])
+                            kind: None,
+                asserted_at_unix_ms: Some(now_ms()),
+}])
             .unwrap()],
         )
         .unwrap();
@@ -43643,13 +43984,17 @@ pub(crate) mod tests {
                 relationship: "related".to_string(),
                 weight: 0.5,
                 source: None,
-            },
+                            kind: None,
+                asserted_at_unix_ms: Some(now_ms()),
+},
             crate::models::MemoryLink {
                 target_id: "w-ghost".to_string(),
                 relationship: "references".to_string(),
                 weight: 0.5,
                 source: Some("external-ref-42".to_string()),
-            },
+                            kind: None,
+                asserted_at_unix_ms: Some(now_ms()),
+},
         ];
         db.remember(&e).unwrap();
         let stored = db.get_entity("facts", "w-src").unwrap().unwrap();
@@ -46813,7 +47158,9 @@ pub(crate) mod tests {
             relationship: "caused-by".to_string(),
             weight: 0.99,
             source: None,
-        });
+                    kind: None,
+            asserted_at_unix_ms: Some(now_ms()),
+});
         db.remember(&e).unwrap();
 
         let live = db.get_entity("facts", "swin-src").unwrap().unwrap();
@@ -48901,6 +49248,249 @@ pub(crate) mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    // ─── #1064: typed provenance edges + evidence/execution split ─────────
+
+    /// Insert a minimal authority manifest row (FK target for receipts).
+    fn manifest_fixture(conn: &rusqlite::Connection, id: &str) {
+        conn.execute(
+            "INSERT OR REPLACE INTO authority_manifests (id, agent_id, workspace_hash, \
+             version, allowed_capabilities, approval_required_capabilities, \
+             scope_anchors, approver_principals, allowed_inbound_principals, \
+             permitted_external_ref_prefixes, max_parallel_actions, mode, \
+             created_at_unix_ms) \
+             VALUES (?1, 'agent-test', '', 1, '[]', '[]', '[]', '[]', '[]', '[]', 1, \
+             'shadow', ?2)",
+            params![id, now_ms()],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn legacy_relation_classification_is_deterministic() {
+        use crate::models::{classify_relation, RelationKind};
+        assert_eq!(classify_relation("derived_from"), RelationKind::Supports);
+        assert_eq!(classify_relation("evidence_for"), RelationKind::Supports);
+        assert_eq!(classify_relation("supports"), RelationKind::Supports);
+        assert_eq!(classify_relation("contradicts"), RelationKind::Contradicts);
+        assert_eq!(classify_relation("supersedes"), RelationKind::Invalidates);
+        assert_eq!(classify_relation("invalidates"), RelationKind::Invalidates);
+        assert_eq!(classify_relation("promoted_to"), RelationKind::Updates);
+        assert_eq!(classify_relation("authorized_by"), RelationKind::AuthorizedBy);
+        assert_eq!(classify_relation("depends_on"), RelationKind::Related);
+        assert_eq!(classify_relation(""), RelationKind::Related);
+    }
+
+    #[test]
+    fn typed_edges_enforce_per_kind_semantics() {
+        let (db, path) = temp_db();
+        db.remember(&make_entity("tp-src", "facts", "tp-src", r#"{"c":"a"}"#))
+            .unwrap();
+        db.remember(&make_entity("tp-tgt", "facts", "tp-tgt", r#"{"c":"b"}"#))
+            .unwrap();
+
+        // authorized_by: ordinary content target is REFUSED.
+        assert!(db
+            .link_typed(
+                "facts",
+                "tp-src",
+                "tp-tgt",
+                "authorized_by",
+                crate::models::RelationKind::AuthorizedBy,
+            )
+            .is_err());
+        // …but a real authority manifest is accepted.
+        manifest_fixture(&db.conn().unwrap(), "manif-tp-1");
+        db.link_typed(
+            "facts",
+            "tp-src",
+            "manif-tp-1",
+            "authorized_by",
+            crate::models::RelationKind::AuthorizedBy,
+        )
+        .unwrap();
+
+        // invalidates: a missing target is REFUSED; a live one is accepted.
+        assert!(db
+            .link_typed(
+                "facts",
+                "tp-src",
+                "tp-ghost",
+                "invalidates",
+                crate::models::RelationKind::Invalidates,
+            )
+            .is_err());
+        db.link_typed(
+            "facts",
+            "tp-src",
+            "tp-tgt",
+            "invalidates",
+            crate::models::RelationKind::Invalidates,
+        )
+        .unwrap();
+
+        // supports: records with the typed kind stamped on the edge.
+        db.link_typed(
+            "facts",
+            "tp-src",
+            "tp-tgt",
+            "supports",
+            crate::models::RelationKind::Supports,
+        )
+        .unwrap();
+        let conn = db.conn().unwrap();
+        let links_json: String = conn
+            .query_row(
+                "SELECT links FROM entities WHERE id = 'tp-src'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        drop(conn);
+        let links: Vec<crate::models::MemoryLink> = serde_json::from_str(&links_json).unwrap();
+        assert!(links.iter().any(|l| {
+            l.target_id == "tp-tgt"
+                && l.kind == Some(crate::models::RelationKind::Supports)
+                && l.asserted_at_unix_ms.is_some()
+        }));
+        // The legacy link() path still records kind=None edges.
+        db.link("facts", "tp-src", "tp-tgt", "related").unwrap();
+        let conn = db.conn().unwrap();
+        let links_json: String = conn
+            .query_row(
+                "SELECT links FROM entities WHERE id = 'tp-src'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        drop(conn);
+        let links: Vec<crate::models::MemoryLink> = serde_json::from_str(&links_json).unwrap();
+        assert!(links
+            .iter()
+            .any(|l| l.target_id == "tp-tgt" && l.kind.is_none()));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn provenance_projection_separates_evidence_from_execution() {
+        let (db, path) = temp_db();
+        db.remember(&make_entity("pp-src", "facts", "pp-src", r#"{"c":"alpha"}"#))
+            .unwrap();
+        db.remember(&make_entity("pp-tgt", "facts", "pp-tgt", r#"{"c":"beta"}"#))
+            .unwrap();
+        db.link_typed(
+            "facts",
+            "pp-src",
+            "pp-tgt",
+            "supports",
+            crate::models::RelationKind::Supports,
+        )
+        .unwrap();
+
+        // Evidence mode: the typed edge graph.
+        let ev = db.provenance_projection("pp-src", "evidence", 3).unwrap();
+        assert_eq!(ev.mode, "evidence");
+        assert!(
+            ev.edges
+                .iter()
+                .any(|e| e.to == "pp-tgt" && e.kind == "supports"),
+            "edges: {:?}",
+            ev.edges
+        );
+        assert!(ev.nodes.iter().any(|n| n.id == "pp-tgt"));
+
+        // Execution mode: journal events referencing the seed (what was done
+        // with it) — NOT the support edge.
+        let ex = db.provenance_projection("pp-src", "execution", 3).unwrap();
+        assert_eq!(ex.mode, "execution");
+        assert!(
+            ex.nodes.iter().any(|n| n.id.contains("jrn-")),
+            "execution projection must surface journal events: {:?}",
+            ex.nodes
+        );
+        assert!(ex.edges.is_empty(), "execution is not the evidence graph");
+
+        // Blocked actions: intent + failure receipt extended into the graph.
+        {
+            let conn = db.conn().unwrap();
+            manifest_fixture(&conn, "manif-pp-1");
+            conn.execute(
+                "INSERT INTO authorized_actions (id, manifest_id, manifest_version, \
+                 agent_id, workspace_hash, scope_anchor, external_ref, capability, \
+                 action_key, intent_hash, outcome_hash, status, approval_required, \
+                 approval_ref, created_at_unix_ms, updated_at_unix_ms) \
+                 VALUES ('act-denied-1', 'manif-pp-1', 1, 'agent-test', '', \
+                 'github:org/repo', 'refs/heads/x', 'git push', 'k1', 'intent-hash', \
+                 '', 'denied', 0, '', ?1, ?1)",
+                params![now_ms()],
+            )
+            .unwrap();
+        }
+        let ex2 = db.provenance_projection("pp-src", "execution", 3).unwrap();
+        assert!(
+            ex2.blocked_actions.iter().any(|b| b.id == "act-denied-1"),
+            "denied action receipts must surface in the execution projection: {:?}",
+            ex2.blocked_actions
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn param_lineage_records_and_detects_dangling_sources() {
+        let (db, path) = temp_db();
+        db.remember(&make_entity(
+            "pl-dec",
+            "decision",
+            "pl-dec",
+            r#"{"authorization":{"key_ref":"kms/alpha"}}"#,
+        ))
+        .unwrap();
+        db.remember(&make_entity("pl-prod", "facts", "pl-prod", r#"{"c":"producer"}"#))
+            .unwrap();
+
+        // Sensitive-argument lineage: the value came from the producing entity.
+        let id = db
+            .param_lineage_set(
+                "pl-dec",
+                "authorization.key_ref",
+                "derived",
+                "pl-prod",
+                "",
+                "test",
+            )
+            .unwrap();
+        assert!(id.starts_with("pl-"));
+
+        let rows = db.param_lineage_query("pl-dec").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].resolved, "live source must resolve");
+        assert_eq!(rows[0].param_path, "authorization.key_ref");
+
+        // A forged/dangling source_ref is surfaced, not trusted.
+        db.param_lineage_set(
+            "pl-dec",
+            "authorization.key_ref",
+            "derived",
+            "pl-ghost",
+            "",
+            "test",
+        )
+        .unwrap();
+        let rows = db.param_lineage_query("pl-dec").unwrap();
+        assert!(
+            rows.iter().any(|r| !r.resolved && r.source_ref == "pl-ghost"),
+            "dangling source must be flagged: {:?}",
+            rows
+        );
+
+        // Lineage over a missing entity is refused outright.
+        assert!(db
+            .param_lineage_set("pl-ghost", "x", "manual", "", "", "test")
+            .is_err());
+        let _ = std::fs::remove_file(&path);
+    }
+
+
+
 #[test]
     fn v16_migration_delivers_usefulness_columns_to_v15_stores() {
         let (db, path) = temp_db();
@@ -49560,7 +50150,9 @@ pub(crate) mod tests {
             relationship: "derived_from".to_string(),
             weight: 1.0,
             source: None,
-        }];
+                    kind: None,
+            asserted_at_unix_ms: Some(now_ms()),
+}];
         db.remember(&belief).unwrap();
         let mut plain = make_entity(
             "plain-1",
@@ -51714,13 +52306,17 @@ pub(crate) mod tests {
                 relationship: "related_to".to_string(),
                 weight: 0.5,
                 source: None,
-            },
+                            kind: None,
+                asserted_at_unix_ms: Some(now_ms()),
+},
             crate::models::MemoryLink {
                 target_id: "unrelated".to_string(),
                 relationship: "related_to".to_string(),
                 weight: 0.5,
                 source: None,
-            },
+                            kind: None,
+                asserted_at_unix_ms: Some(now_ms()),
+},
         ];
         db.remember_with_write_options(
             &e,
@@ -51765,7 +52361,9 @@ pub(crate) mod tests {
             relationship: "related_to".to_string(),
             weight: 0.5,
             source: None,
-        }];
+                    kind: None,
+            asserted_at_unix_ms: Some(now_ms()),
+}];
         db.remember_with_write_options(
             &e2,
             false,
@@ -51997,7 +52595,9 @@ pub(crate) mod tests {
             relationship: "related_to".to_string(),
             weight: 0.5,
             source: None,
-        }];
+                    kind: None,
+            asserted_at_unix_ms: Some(now_ms()),
+}];
         db.remember_with_write_options(
             &e,
             false,

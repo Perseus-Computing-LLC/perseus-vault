@@ -322,6 +322,104 @@ fn default_visibility() -> String {
 }
 
 /// A link between two entities. Stored as JSON array in entities.links.
+/// #1064: typed provenance relation (arXiv:2606.04990 vocabulary). Distinct
+/// edge classes with deterministic per-type semantics — a cited item is not
+/// necessarily supporting evidence, and a recorded action is not thereby
+/// permitted (provenance != authorization != truth).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RelationKind {
+    /// Evidential support (also the classification for legacy
+    /// `derived_from` / `evidence_for` relations).
+    Supports,
+    /// Explicit conflict with the target's content.
+    Contradicts,
+    /// Supersession of the target's truth-value (legacy `supersedes`).
+    Invalidates,
+    /// Newer revision of the target (legacy `promoted_to` / revision edges).
+    Updates,
+    /// Permission provenance: the target is an authority manifest or an
+    /// authorized-action receipt, never ordinary content.
+    AuthorizedBy,
+    /// Generic relatedness (the fallback classification).
+    Related,
+}
+
+/// Classify a legacy free-form relationship string into its typed kind.
+/// The mapping is deterministic and idempotent; unknown strings classify as
+/// `related` rather than silently upgrading to a stronger kind.
+pub fn classify_relation(relationship: &str) -> RelationKind {
+    match relationship {
+        "supports" | "derived_from" | "evidence_for" => RelationKind::Supports,
+        "contradicts" => RelationKind::Contradicts,
+        "invalidates" | "supersedes" => RelationKind::Invalidates,
+        "updates" | "promoted_to" => RelationKind::Updates,
+        "authorized_by" => RelationKind::AuthorizedBy,
+        _ => RelationKind::Related,
+    }
+}
+
+/// #1064: one node/edge cell of a provenance projection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProvenanceNode {
+    pub id: String,
+    pub category: String,
+    pub key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProvenanceEdge {
+    pub from: String,
+    pub to: String,
+    pub relationship: String,
+    /// Classified kind (typed or legacy-mapped).
+    pub kind: String,
+    /// Evidence anchor (the asserting record), when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+}
+
+/// #1064: blocked action retains intent + failure receipt — the AAR shape
+/// (intent_hash + status) surfaced inside the execution projection so a
+/// denied/blocked action is part of the graph, not only the journal.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlockedActionReceipt {
+    pub id: String,
+    pub capability: String,
+    pub action_key: String,
+    pub status: String,
+    pub intent_hash: String,
+    pub created_at_unix_ms: i64,
+}
+
+/// #1064: evidence-vs-execution projection over the typed graph.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProvenanceProjection {
+    pub seed_id: String,
+    pub mode: String,
+    pub depth: usize,
+    pub nodes: Vec<ProvenanceNode>,
+    pub edges: Vec<ProvenanceEdge>,
+    #[serde(default)]
+    pub blocked_actions: Vec<BlockedActionReceipt>,
+}
+
+/// #1064: one parameter-level lineage row (Agent-Sentry pattern).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ParamLineage {
+    pub lineage_id: String,
+    pub entity_id: String,
+    pub param_path: String,
+    pub source_kind: String,
+    pub source_ref: String,
+    /// true when source_ref is empty (manual assertion) or resolves to a
+    /// live entity; false = forged/dangling source (tamper signal).
+    pub resolved: bool,
+    pub workspace_hash: String,
+    pub agent_id: String,
+    pub asserted_at_unix_ms: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryLink {
     pub target_id: String,
@@ -337,6 +435,13 @@ pub struct MemoryLink {
     /// `graph_drift` report and `graph_attest` migration tool.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+    /// #1064: typed relation kind. `None` on legacy edges — classified at
+    /// read time via [`classify_relation`] over the free-form relationship.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<RelationKind>,
+    /// #1064: assertion timestamp for the edge (write time).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asserted_at_unix_ms: Option<i64>,
 }
 
 fn default_weight() -> f64 {

@@ -878,6 +878,8 @@ impl Database {
                 weight: 0.5,
                 // #869: the community summary asserts its member edges.
                 source: Some(summary_id.clone()),
+                kind: None,
+                asserted_at_unix_ms: Some(now_ms()),
             })
             .collect();
         if let Some(old_summary_id) = prior_summary_id {
@@ -886,6 +888,8 @@ impl Database {
                 relationship: "rehydrates".to_string(),
                 weight: 1.0,
                 source: Some(summary_id.clone()),
+                kind: None,
+                asserted_at_unix_ms: Some(now_ms()),
             });
         }
         let entity = Entity {
@@ -1237,7 +1241,9 @@ mod tests {
                     relationship: "related".to_string(),
                     weight: 0.5,
                     source: None,
-                })
+                                    kind: None,
+                    asserted_at_unix_ms: None,
+})
                 .collect()
         };
         build_graph(&[

@@ -728,7 +728,7 @@ CREATE INDEX IF NOT EXISTS idx_preload_proposals_state
 /// — the entity ids an action cited as grounding, so the reverse impact
 /// closure can flag PENDING actions whose justification changed. Additive
 /// column, no backfill (pre-existing actions cite nothing).
-pub(crate) const SCHEMA_VERSION: i64 = 51;
+pub(crate) const SCHEMA_VERSION: i64 = 52;
 
 /// Initialize the v0.2.0 schema on a fresh database.
 pub fn initialize_schema(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
@@ -2056,6 +2056,27 @@ fn apply_migrations(conn: &Connection) -> Result<(), Box<dyn std::error::Error>>
             ON memory_seals(target_id, workspace_hash, created_at_unix_ms);",
     )?;
     // ── end v51 ──────────────────────────────────────────────────────────
+
+    // ── v52 (#1064 typed provenance edges) ───────────────────────────────
+    // Parameter-level lineage for high-risk tool arguments: where did this
+    // value come from (Agent-Sentry pattern, arXiv:2603.22868). One row per
+    // (entity, parameter path) assertion; source_ref may cite the producing
+    // entity so forged lineage is detectable at query time.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS param_lineage (
+            lineage_id TEXT PRIMARY KEY,
+            entity_id TEXT NOT NULL,
+            param_path TEXT NOT NULL,
+            source_kind TEXT NOT NULL DEFAULT 'manual',
+            source_ref TEXT NOT NULL DEFAULT '',
+            workspace_hash TEXT NOT NULL DEFAULT '',
+            agent_id TEXT NOT NULL DEFAULT '',
+            asserted_at_unix_ms INTEGER NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS idx_param_lineage_entity
+            ON param_lineage(entity_id, param_path);",
+    )?;
+    // ── end v52 ──────────────────────────────────────────────────────────
 
 
 

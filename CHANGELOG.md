@@ -26,6 +26,17 @@ All notable changes to Perseus Vault are documented here. This project adheres t
   CMMC/NIST matrix rows 3.3.1 / 3.3.8 / 3.13.10 move PARTIAL → SERVED (gap G1
   closed).
 - **Seal-style tamper evidence for persisted state and exports (#1060).**
+- **Typed provenance edges + evidence/execution split (#1064).** The
+  2606.04990 relation vocabulary lands on the link graph: `supports` /
+  `contradicts` / `invalidates` / `updates` / `authorized_by` kinds with
+  per-kind write-boundary validation (authorized_by targets must be
+  authority manifests or action receipts; invalidates requires a live
+  target), legacy relations classify deterministically at read time, and
+  `perseus_vault_provenance_projection` separates the evidence graph from
+  the execution trace (journal events + blocked-action receipts — intent +
+  failure receipt extended into the graph). `perseus_vault_param_lineage`
+  (registry 152→154) adds parameter-level lineage for high-risk tool
+  arguments with dangling-source detection. Schema v52.
   New `memory_seals` table (schema v51) records SHA-256 commitments at
   seal/export time — hash + label only, never content. Compare-on-recall
   journals a `tamper_evidence` event naming any entity whose served bytes no
