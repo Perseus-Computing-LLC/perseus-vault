@@ -14,6 +14,7 @@ Ready-to-use adapters that connect Perseus Vault to popular AI agent frameworks.
 | **FastMCP EventStore** (MCP SDK) | `EventStore` implementation | [`perseus-vault-persist/`](perseus-vault-persist/) |
 | **Claude Code** (Anthropic) | MCP server config | [`../docs/integration/claude-code.md`](../docs/integration/claude-code.md) |
 | **Cursor** | MCP server config | [`../docs/integration/cursor.md`](../docs/integration/cursor.md) |
+| **DeepSeek Harness** (`dsh`) | MCP config + native memory-injection plugin | [`../docs/integration/deepseek-harness.md`](../docs/integration/deepseek-harness.md) |
 
 ## Adding a New Integration
 
