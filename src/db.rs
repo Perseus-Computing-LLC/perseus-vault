@@ -4906,6 +4906,337 @@ impl Database {
         Ok(visible)
     }
 
+    // ─── Signed Transitions (#1080 MutMem) ───────────────────────────────
+
+    /// Register (or replace) the Ed25519 signing key for an epoch. The vault
+    /// stores the raw seed (base64) to sign transitions in-process; at-rest
+    /// posture matches the AES key file — the DB and its signing seed live in
+    /// the same operator trust domain. Returns the public-key fingerprint.
+    pub fn register_signer_epoch(&self, epoch: u64, seed_b64: &str) -> Result<String, String> {
+        let seed = crate::signed_transition::decode_seed(seed_b64)?;
+        let signing = ed25519_dalek::SigningKey::from_bytes(&seed);
+        let verifying = signing.verifying_key();
+        let pub_b64 = crate::signed_transition::encode_public_key(&verifying);
+        let fingerprint = crate::signed_transition::sha256_hex(&verifying.to_bytes());
+        let conn = self.conn().map_err(|e| format!("connection failed: {e}"))?;
+        conn.execute(
+            "INSERT INTO signer_epochs (epoch, public_key_b64, fingerprint, seed_b64, created_at_unix_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(epoch) DO UPDATE SET
+                public_key_b64 = excluded.public_key_b64,
+                fingerprint = excluded.fingerprint,
+                seed_b64 = excluded.seed_b64",
+            params![epoch as i64, pub_b64, fingerprint, seed_b64, now_ms()],
+        )
+        .map_err(|e| format!("signer epoch registration failed: {e}"))?;
+        Ok(fingerprint)
+    }
+
+    /// Highest registered signer epoch and its signing key, if any.
+    pub(crate) fn latest_signer_key(
+        &self,
+    ) -> Result<Option<(u64, ed25519_dalek::SigningKey)>, String> {
+        let conn = self.conn().map_err(|e| format!("connection failed: {e}"))?;
+        let row = conn
+            .query_row(
+                "SELECT epoch, seed_b64 FROM signer_epochs ORDER BY epoch DESC LIMIT 1",
+                [],
+                |r| {
+                    let epoch: i64 = r.get(0)?;
+                    let seed: String = r.get(1)?;
+                    Ok((epoch, seed))
+                },
+            )
+            .optional()
+            .map_err(|e| format!("signer epoch query failed: {e}"))?;
+        match row {
+            Some((epoch, seed)) => {
+                let seed = crate::signed_transition::decode_seed(&seed)?;
+                Ok(Some((epoch as u64, ed25519_dalek::SigningKey::from_bytes(&seed))))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Chain hash of the most recent signed transition ('' = genesis).
+    pub(crate) fn last_transition_chain_hash(&self) -> Result<String, String> {
+        let conn = self.conn().map_err(|e| format!("connection failed: {e}"))?;
+        let hash: Option<String> = conn
+            .query_row(
+                "SELECT chain_hash FROM signed_transitions
+                 ORDER BY created_at_unix_ms DESC, rowid DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| format!("chain-hash query failed: {e}"))?;
+        Ok(hash.unwrap_or_default())
+    }
+
+    /// Commit a signed transition binding `terminal_node`'s old→new state.
+    /// Returns `Ok(None)` when no signer epoch is registered (the unsigned
+    /// regime — backward-compatible; callers journal it) and the signed
+    /// record on success. Fails closed when an epoch exists but signing or
+    /// storage fails.
+    pub fn record_signed_transition(
+        &self,
+        terminal_node: &str,
+        old_value: &serde_json::Value,
+        new_value: &serde_json::Value,
+    ) -> Result<Option<crate::signed_transition::SignedTransition>, String> {
+        let Some((epoch, signing)) = self.latest_signer_key()? else {
+            return Ok(None);
+        };
+        let predecessor = self.last_transition_chain_hash()?;
+        let t = crate::signed_transition::sign_transition(
+            &signing,
+            epoch,
+            terminal_node,
+            old_value,
+            new_value,
+            &predecessor,
+        )?;
+        let raw_id = uuid::Uuid::new_v4().to_string().replace('-', "");
+        let id = format!("stn-{}", &raw_id[..12.min(raw_id.len())]);
+        let conn = self.conn().map_err(|e| format!("connection failed: {e}"))?;
+        conn.execute(
+            "INSERT INTO signed_transitions (id, terminal_node, signer_epoch, signer_fingerprint,
+                 old_value_json, new_value_json, commitment_old, commitment_new,
+                 predecessor_hash, signature_b64, chain_hash, created_at_unix_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                id,
+                t.payload.terminal_node,
+                t.payload.signer_epoch as i64,
+                t.payload.signer_fingerprint,
+                t.payload.old_value.to_string(),
+                t.payload.new_value.to_string(),
+                t.commitment_old,
+                t.commitment_new,
+                t.payload.predecessor_hash,
+                t.signature_b64,
+                t.chain_hash,
+                now_ms(),
+            ],
+        )
+        .map_err(|e| format!("signed transition storage failed: {e}"))?;
+        Ok(Some(t))
+    }
+
+    /// Replay the signed-transition chain end to end: every record must
+    /// verify against its epoch key, link to the previous chain hash (no
+    /// forks), and reproduce its own chain hash. Returns a full report; the
+    /// first divergence is named with its reason.
+    pub fn verify_transition_chain(&self) -> Result<serde_json::Value, String> {
+        let conn = self.conn().map_err(|e| format!("connection failed: {e}"))?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, terminal_node, signer_epoch, signer_fingerprint, old_value_json,
+                        new_value_json, commitment_old, commitment_new, predecessor_hash,
+                        signature_b64, chain_hash, created_at_unix_ms
+                 FROM signed_transitions ORDER BY created_at_unix_ms, rowid",
+            )
+            .map_err(|e| format!("transition query prepare failed: {e}"))?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, String>(5)?,
+                    r.get::<_, String>(6)?,
+                    r.get::<_, String>(7)?,
+                    r.get::<_, String>(8)?,
+                    r.get::<_, String>(9)?,
+                    r.get::<_, String>(10)?,
+                    r.get::<_, i64>(11)?,
+                ))
+            })
+            .map_err(|e| format!("transition query failed: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("transition row decode failed: {e}"))?;
+        drop(stmt);
+        let mut records = 0usize;
+        let mut verified = 0usize;
+        let mut divergence: Option<serde_json::Value> = None;
+        let mut running: String = String::new();
+        for (id, terminal, epoch, fingerprint, old_j, new_j, c_old, c_new, pred, sig, chain, _created) in rows {
+            records += 1;
+            if divergence.is_some() {
+                continue;
+            }
+            let key_row: Option<String> = conn
+                .query_row(
+                    "SELECT public_key_b64 FROM signer_epochs WHERE epoch = ?1",
+                    [epoch],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(|e| format!("epoch key lookup failed: {e}"))?;
+            let Some(pub_b64) = key_row else {
+                divergence = Some(serde_json::json!({
+                    "id": id, "reason": format!("no signer epoch {epoch} registered")
+                }));
+                continue;
+            };
+            let old_v: serde_json::Value = serde_json::from_str(&old_j)
+                .map_err(|e| format!("record {id}: old value is not JSON: {e}"))?;
+            let new_v: serde_json::Value = serde_json::from_str(&new_j)
+                .map_err(|e| format!("record {id}: new value is not JSON: {e}"))?;
+            let t = crate::signed_transition::SignedTransition {
+                payload: crate::signed_transition::TransitionPayload {
+                    schema: crate::signed_transition::TRANSITION_SCHEMA.into(),
+                    terminal_node: terminal,
+                    signer_epoch: epoch as u64,
+                    signer_fingerprint: fingerprint,
+                    old_value: old_v,
+                    new_value: new_v,
+                    predecessor_hash: pred,
+                },
+                commitment_old: c_old,
+                commitment_new: c_new,
+                signature_b64: sig,
+                chain_hash: chain,
+            };
+            match crate::signed_transition::verify_transition(&t, &pub_b64) {
+                Ok(v) => {
+                    if t.payload.predecessor_hash != running {
+                        divergence = Some(serde_json::json!({
+                            "id": id,
+                            "reason": format!(
+                                "fork or reorder: predecessor {} != running chain hash {}",
+                                t.payload.predecessor_hash, running
+                            ),
+                        }));
+                        continue;
+                    }
+                    running = v.chain_hash;
+                    verified += 1;
+                }
+                Err(e) => {
+                    divergence = Some(serde_json::json!({"id": id, "reason": e}));
+                    continue;
+                }
+            }
+        }
+        let report = serde_json::json!({
+            "records": records,
+            "verified": verified,
+            "divergence": divergence,
+            "chain_head": if verified > 0 && divergence.is_none() {
+                running
+            } else {
+                String::new()
+            },
+            "note": format!(
+                "chain replay over {records} records (created_at asc); a divergence names the first failing record"
+            ),
+        });
+        Ok(report)
+    }
+
+    /// Set or revise a signed poison label on an entity (MutMem: poison-likely
+    /// content is retained, not deleted; recall consumes the label as trust
+    /// evidence). Fails closed when no signer epoch is registered — labels
+    /// are authorized mutations.
+    pub fn set_poison_label(
+        &self,
+        entity_id: &str,
+        level: &str,
+        reason: &str,
+    ) -> Result<serde_json::Value, String> {
+        if !crate::signed_transition::POISON_LEVELS.contains(&level) {
+            return Err(format!(
+                "unknown poison level {:?}; expected one of {:?}",
+                level,
+                crate::signed_transition::POISON_LEVELS
+            ));
+        }
+        {
+            let conn = self.conn().map_err(|e| format!("connection failed: {e}"))?;
+            let exists: Option<String> = conn
+                .query_row(
+                    "SELECT id FROM entities WHERE id = ?1",
+                    [entity_id],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(|e| format!("entity lookup failed: {e}"))?;
+            if exists.is_none() {
+                return Err(format!("entity {entity_id} not found"));
+            }
+            let prev: Option<String> = conn
+                .query_row(
+                    "SELECT level FROM poison_labels WHERE entity_id = ?1",
+                    [entity_id],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(|e| format!("label lookup failed: {e}"))?;
+            let old_value = match prev {
+                Some(prev_level) => serde_json::json!({"level": prev_level}),
+                None => serde_json::json!({"level": "none"}),
+            };
+            let new_value = serde_json::json!({"level": level, "reason": reason});
+            let t = self
+                .record_signed_transition(entity_id, &old_value, &new_value)?
+                .ok_or_else(|| {
+                    "no signer epoch registered: poison labels are authorized mutations — \
+                     register one via perseus_vault_signer_epoch_set"
+                        .to_string()
+                })?;
+            conn.execute(
+                "INSERT INTO poison_labels (entity_id, level, reason, transition_id, updated_at_unix_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(entity_id) DO UPDATE SET level = excluded.level,
+                    reason = excluded.reason, transition_id = excluded.transition_id,
+                    updated_at_unix_ms = excluded.updated_at_unix_ms",
+                params![entity_id, level, reason, t.chain_hash, now_ms()],
+            )
+            .map_err(|e| format!("poison label write failed: {e}"))?;
+            Ok(serde_json::json!({
+                "entity_id": entity_id,
+                "level": level,
+                "reason": reason,
+                "transition": {
+                    "chain_hash": t.chain_hash,
+                    "signer_epoch": t.payload.signer_epoch,
+                    "predecessor_hash": t.payload.predecessor_hash,
+                },
+            }))
+        }
+    }
+
+    /// Effective trust penalties for a bounded id set (missing ids map to 0).
+    pub(crate) fn poison_penalties(
+        &self,
+        ids: &[String],
+    ) -> Result<std::collections::HashMap<String, f64>, Box<dyn std::error::Error>> {
+        if ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let conn = self.conn()?;
+        let placeholders = vec!["?"; ids.len()].join(",");
+        let sql = format!(
+            "SELECT entity_id, level FROM poison_labels WHERE entity_id IN ({placeholders})"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(ids.iter()), |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        let mut out = std::collections::HashMap::new();
+        for row in rows {
+            let (id, level) = row?;
+            let penalty = crate::signed_transition::poison_penalty(&level);
+            if penalty > 0.0 {
+                out.insert(id, penalty);
+            }
+        }
+        Ok(out)
+    }
+
     // ─── Decay & Layer Progression ──────────────────────────────────
 
     /// Ebbinghaus decay half-life in milliseconds (default: 7 days).
@@ -9953,6 +10284,17 @@ impl Database {
             items.push(entity);
         }
 
+        // #1080: signed poison-likely labels are consumed as trust evidence
+        // at ranking time — a labeled entity's effective score is multiplied
+        // by (1 − penalty) in both the content-witness re-sort and the
+        // provenance-trust sort below.
+        let poison = match self
+            .poison_penalties(&items.iter().map(|e| e.id.clone()).collect::<Vec<_>>())
+        {
+            Ok(p) => p,
+            Err(_) => std::collections::HashMap::new(),
+        };
+
         // #106: Content witness signal (additive boost, never penalizes).
         // #956: with max_prior_overturn > 0 the boost is a floored
         // multiplicative factor raised to the derived exponent — a content
@@ -9987,11 +10329,13 @@ impl Database {
                     }
                 }
             }
-            // Re-sort after content witness boost
+            // Re-sort after content witness boost — poison-penalized so a
+            // labeled entity ranks below clean matches of equal relevance.
+            let eff = |e: &crate::models::Entity| {
+                e.decay_score * (1.0 - poison.get(&e.id).copied().unwrap_or(0.0))
+            };
             items.sort_by(|a, b| {
-                b.decay_score
-                    .partial_cmp(&a.decay_score)
-                    .unwrap_or(std::cmp::Ordering::Equal)
+                eff(b).partial_cmp(&eff(a)).unwrap_or(std::cmp::Ordering::Equal)
             });
         }
 
@@ -10021,13 +10365,16 @@ impl Database {
                 } else {
                     ent.certainty.clamp(0.0, 1.0)
                 };
-                if bounded {
+                // #1080: poison-likely labels damp the trust-weighted score.
+                let p = poison.get(&ent.id).copied().unwrap_or(0.0);
+                let base = if bounded {
                     let s = (params.trust_weight * trust).clamp(0.0, 1.0);
                     ent.decay_score
                         * bounded_prior_factor(TRUST_PRIOR_FLOOR, params.max_prior_overturn, s)
                 } else {
                     ent.decay_score + params.trust_weight * trust
-                }
+                };
+                base * (1.0 - p)
             };
             items.sort_by(|a, b| {
                 trust_score(b)

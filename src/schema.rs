@@ -728,7 +728,7 @@ CREATE INDEX IF NOT EXISTS idx_preload_proposals_state
 /// — the entity ids an action cited as grounding, so the reverse impact
 /// closure can flag PENDING actions whose justification changed. Additive
 /// column, no backfill (pre-existing actions cite nothing).
-pub(crate) const SCHEMA_VERSION: i64 = 54;
+pub(crate) const SCHEMA_VERSION: i64 = 55;
 
 /// Initialize the v0.2.0 schema on a fresh database.
 pub fn initialize_schema(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
@@ -2128,6 +2128,52 @@ fn apply_migrations(conn: &Connection) -> Result<(), Box<dyn std::error::Error>>
             ON model_incarnations(subject_id, started_at_unix_ms);",
     )?;
     // ── end v54 ──────────────────────────────────────────────────────────
+
+    // ── v55 (#1080 signed transitions + poison labels) ─────────────────
+    // MutMem (arXiv:2608.02843): retrieval-relevant mutations commit as
+    // Ed25519-signed transitions in a no-fork chain; poison-likely content is
+    // retained with signed, revisable labels consumed by recall as trust
+    // evidence. `seed_b64` holds the epoch's Ed25519 seed so the writer can
+    // sign in-process; at-rest posture matches the AES key file (same
+    // operator trust domain, documented in docs/specs/signed-transitions.md).
+    // The UNIQUE predecessor index makes forks unrepresentable at the storage
+    // level: at most one successor may claim any predecessor, and at most one
+    // record may be the genesis (empty predecessor).
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS signer_epochs (
+            epoch INTEGER PRIMARY KEY,
+            public_key_b64 TEXT NOT NULL,
+            fingerprint TEXT NOT NULL,
+            seed_b64 TEXT NOT NULL,
+            created_at_unix_ms INTEGER NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS signed_transitions (
+            id TEXT PRIMARY KEY,
+            terminal_node TEXT NOT NULL,
+            signer_epoch INTEGER NOT NULL,
+            signer_fingerprint TEXT NOT NULL,
+            old_value_json TEXT NOT NULL,
+            new_value_json TEXT NOT NULL,
+            commitment_old TEXT NOT NULL,
+            commitment_new TEXT NOT NULL,
+            predecessor_hash TEXT NOT NULL DEFAULT '',
+            signature_b64 TEXT NOT NULL,
+            chain_hash TEXT NOT NULL,
+            created_at_unix_ms INTEGER NOT NULL
+         );
+         CREATE UNIQUE INDEX IF NOT EXISTS idx_signed_transitions_predecessor
+            ON signed_transitions(predecessor_hash);
+         CREATE INDEX IF NOT EXISTS idx_signed_transitions_epoch
+            ON signed_transitions(signer_epoch, created_at_unix_ms);
+         CREATE TABLE IF NOT EXISTS poison_labels (
+            entity_id TEXT PRIMARY KEY,
+            level TEXT NOT NULL,
+            reason TEXT NOT NULL DEFAULT '',
+            transition_id TEXT NOT NULL DEFAULT '',
+            updated_at_unix_ms INTEGER NOT NULL
+         );",
+    )?;
+    // ── end v55 ──────────────────────────────────────────────────────────
 
     // Stamp the migration level so subsequent opens skip the probe block above.
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;

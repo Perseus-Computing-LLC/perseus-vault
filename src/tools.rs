@@ -3735,7 +3735,15 @@ pub fn handle_promote(db: &Database, args: Value) -> Result<String, String> {
         });
     }
 
-    let result = json!({
+    // #1080: the ladder transition commits as a signed transition (old layer
+    // identity → new identity superseding the source).
+    let transition = mutation_transition(
+        db,
+        &new_id,
+        json!({"layer": src.layer, "category": src.category, "key": src.key, "status": src.status}),
+        json!({"category": to_category, "key": to_key, "status": src.status, "supersedes": src.id}),
+    );
+    let mut result = json!({
         "promoted": true,
         "action": action,
         "from": format!("{}/{}", a.from_category, a.from_key),
@@ -3745,6 +3753,9 @@ pub fn handle_promote(db: &Database, args: Value) -> Result<String, String> {
         "to_workspace_hash": to_scope,
         "reason": a.reason,
     });
+    if let Some(t) = transition {
+        result["transition"] = t;
+    }
     Ok(result.to_string())
 }
 
@@ -3923,10 +3934,18 @@ pub fn handle_demote(db: &Database, args: Value) -> Result<String, String> {
             (unlink_result, cleanup_result) => format!("Demotion audit journal failed and rollback was incomplete: {error}; unlink={unlink_result:?}; cleanup={cleanup_result:?}"),
         });
     }
-    Ok(reviewable_write_result(
-        json!({"demoted":true,"action":action,"from":format!("{}/{}",a.from_category,a.from_key),"to":format!("{}/{}",a.to_category,to_key),"to_id":new_id,"reason":a.reason}),
-        "demotion",
-    ).to_string())
+    // #1080: the demotion commits as a signed transition (reverse ladder
+    // identity change superseding the source).
+    let mut demoted = json!({"demoted":true,"action":action,"from":format!("{}/{}",a.from_category,a.from_key),"to":format!("{}/{}",a.to_category,to_key),"to_id":new_id,"reason":a.reason});
+    if let Some(t) = mutation_transition(
+        db,
+        &new_id,
+        json!({"layer": src.layer, "category": src.category, "key": src.key, "status": src.status}),
+        json!({"category": a.to_category, "key": to_key, "status": src.status, "supersedes": src.id}),
+    ) {
+        demoted["transition"] = t;
+    }
+    Ok(reviewable_write_result(demoted, "demotion").to_string())
 }
 
 fn hash_only_public_journal_payload(value: &Value) -> String {
@@ -7643,10 +7662,27 @@ pub fn handle_score(db: &Database, args: Value) -> String {
         Ok(a) => a,
         Err(e) => return json!({"error": format!("Invalid score arguments: {}", e)}).to_string(),
     };
+    let prior = db.get_entity(&a.category, &a.key).ok().flatten();
     match db.score_entity(&a.category, &a.key, a.score) {
         Ok(found) => {
-            json!({"found": found, "category": a.category, "key": a.key, "score": a.score})
-                .to_string()
+            let mut out = json!({"found": found, "category": a.category, "key": a.key, "score": a.score});
+            if found {
+                // #1080: an explicit score mutation commits as a signed
+                // transition (old decay → new decay/importance).
+                let terminal = prior
+                    .as_ref()
+                    .map(|e| e.id.clone())
+                    .unwrap_or_else(|| format!("{}/{}", a.category, a.key));
+                let old_value = prior
+                    .as_ref()
+                    .map(|e| json!({"decay_score": e.decay_score}))
+                    .unwrap_or(json!({"decay_score": null}));
+                let new_value = json!({"decay_score": a.score, "importance": a.score});
+                if let Some(t) = mutation_transition(db, &terminal, old_value, new_value) {
+                    out["transition"] = t;
+                }
+            }
+            out.to_string()
         }
         Err(e) => json!({"error": format!("Score failed: {}", e)}).to_string(),
     }
@@ -7680,6 +7716,70 @@ pub fn handle_follow(db: &Database, args: Value) -> Result<String, String> {
         .map_err(|e| format!("Follow failed: {}", e))?;
 
     serde_json::to_string(&report).map_err(|e| format!("Serialization failed: {}", e))
+}
+
+// ── #1080 signed transitions + poison labels (MutMem) ─────────────────
+
+/// #1080: attach a signed transition to a mutation response when a signer
+/// epoch is registered. `None` = unsigned regime (no epoch key registered;
+/// the mutation is journaled by its own handler and remains backward
+/// compatible). An `Err` becomes a loud `signed:false` warning — never a
+/// silent mutation.
+fn mutation_transition(
+    db: &Database,
+    terminal: &str,
+    old_value: Value,
+    new_value: Value,
+) -> Option<Value> {
+    match db.record_signed_transition(terminal, &old_value, &new_value) {
+        Ok(Some(t)) => Some(json!({
+            "signed": true,
+            "chain_hash": t.chain_hash,
+            "signer_epoch": t.payload.signer_epoch,
+            "predecessor_hash": t.payload.predecessor_hash,
+        })),
+        Ok(None) => None,
+        Err(e) => Some(json!({
+            "signed": false,
+            "warning": format!("transition recording failed: {e}"),
+        })),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SignerEpochSetArgs {
+    pub epoch: u64,
+    /// Raw 32-byte Ed25519 seed, base64-encoded. Stored at rest alongside the
+    /// database (same trust domain as the AES key file); never echoed back.
+    pub seed_b64: String,
+}
+
+pub fn handle_signer_epoch_set(db: &Database, args: Value) -> Result<String, String> {
+    let a: SignerEpochSetArgs = serde_json::from_value(args)
+        .map_err(|e| format!("Invalid signer_epoch_set arguments: {e}"))?;
+    let fingerprint = db.register_signer_epoch(a.epoch, &a.seed_b64)?;
+    Ok(json!({"registered_epoch": a.epoch, "signer_fingerprint": fingerprint}).to_string())
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PoisonLabelArgs {
+    pub entity_id: String,
+    pub level: String,
+    #[serde(default)]
+    pub reason: String,
+}
+
+pub fn handle_poison_label(db: &Database, args: Value) -> Result<String, String> {
+    let a: PoisonLabelArgs = serde_json::from_value(args)
+        .map_err(|e| format!("Invalid poison_label arguments: {e}"))?;
+    let report = db.set_poison_label(&a.entity_id, &a.level, &a.reason)?;
+    serde_json::to_string(&report).map_err(|e| format!("Serialization failed: {e}"))
+}
+
+pub fn handle_transition_audit(db: &Database, args: Value) -> Result<String, String> {
+    let _ = args;
+    let report = db.verify_transition_chain()?;
+    serde_json::to_string(&report).map_err(|e| format!("Serialization failed: {e}"))
 }
 
 // ── #683 Keystones: mandatory policy rules ───────────────────────────────
