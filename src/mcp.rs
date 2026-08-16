@@ -5968,6 +5968,57 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Parameter-Level Lineage for High-Risk Arguments"
   },
   {
+    "name": "perseus_vault_typed_traversal",
+    "description": "Intent-aware typed-relational traversal (#1065, MAGMA pattern): routes the query to one relation view (temporal / causal / entity / semantic) via a deterministic classifier, runs that view's traversal policy, and returns the explainable selected path (steps carry the relation they were taken over) plus rejected distractors with reasons — with token accounting for the context-budget discipline. LLM-free and reproducible: identical query → identical route.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "query": {"type": "string"},
+        "limit": {
+          "type": "integer",
+          "description": "Selected-path size bound (1-50, default 10)."
+        }
+      },
+      "required": ["query"]
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "query": {"type": "string"},
+        "intent": {"type": "string"},
+        "view": {"type": "string"},
+        "path": {"type": "array"},
+        "rejected": {"type": "array"},
+        "tokens_selected": {"type": "integer"},
+        "tokens_rejected": {"type": "integer"},
+        "run_id": {"type": "string"}
+      }
+    },
+    "annotations": {
+      "readOnlyHint": false
+    },
+    "title": "Intent-Aware Typed-Relational Traversal"
+  },
+  {
+    "name": "perseus_vault_traversal_ablation",
+    "description": "Per-relation-view ablation report over recorded typed traversals (#1065): mean selected/rejected tokens and distractor ratio per view — auditable evidence for whether each relation view earns its token cost.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "required": []
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "views": {"type": "array"}
+      }
+    },
+    "annotations": {
+      "readOnlyHint": true
+    },
+    "title": "Typed-Traversal Ablation Report"
+  },
+  {
     "name": "perseus_vault_vault_export",
     "description": "Export all non-archived entities to .md files with YAML frontmatter in a vault directory. Files are human-readable, git-trackable, and Obsidian-compatible. Use this for backup, transfer between workspaces, or offline review.",
     "inputSchema": {
@@ -7737,6 +7788,8 @@ const TOOL_SCOPES: &[(&str, ToolScope)] = &[
     ("perseus_vault_tamper_scan", ToolScope::Ops),
     ("perseus_vault_provenance_projection", ToolScope::Ops),
     ("perseus_vault_param_lineage", ToolScope::Ops),
+    ("perseus_vault_typed_traversal", ToolScope::Ops),
+    ("perseus_vault_traversal_ablation", ToolScope::Ops),
     ("perseus_vault_vault_export", ToolScope::Ops),
     ("perseus_vault_derived_export", ToolScope::Ops),
     ("perseus_vault_markdown_import", ToolScope::Ops),
@@ -8103,6 +8156,8 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
         "perseus_vault_tamper_scan" => tools::handle_tamper_scan(db, args),
         "perseus_vault_provenance_projection" => tools::handle_provenance_projection(db, args),
         "perseus_vault_param_lineage" => tools::handle_param_lineage(db, args),
+        "perseus_vault_typed_traversal" => tools::handle_typed_traversal(db, args),
+        "perseus_vault_traversal_ablation" => tools::handle_traversal_ablation(db, args),
         "perseus_vault_vault_export" => Ok(tools::handle_vault_export(db, args)),
         "perseus_vault_derived_export" => tools::handle_derived_export(db, args),
         "perseus_vault_markdown_import" => tools::handle_markdown_import(db, args),
@@ -8209,7 +8264,7 @@ mod tests {
         );
         assert_eq!(
             registry_names.len(),
-            154,
+            156,
             "update public metadata when adding a tool"
         );
 
@@ -9518,9 +9573,9 @@ mod tests {
         let agent = filter_registry_by_view(registry.clone(), ScopeView::Agent);
         let ops = filter_registry_by_view(registry.clone(), ScopeView::Ops);
         let full = filter_registry_by_view(registry.clone(), ScopeView::Full);
-        assert_eq!(full.len(), 154, "full view must expose the whole registry");
+        assert_eq!(full.len(), 156, "full view must expose the whole registry");
         assert_eq!(agent.len(), 51, "agent view count drifted — new tools must be classified");
-        assert_eq!(ops.len(), 147, "ops view count drifted — new tools must be classified");
+        assert_eq!(ops.len(), 149, "ops view count drifted — new tools must be classified");
         assert!(agent.len() < ops.len() && ops.len() < full.len());
     }
 

@@ -404,6 +404,52 @@ pub struct ProvenanceProjection {
     pub blocked_actions: Vec<BlockedActionReceipt>,
 }
 
+/// #1065: one step of an explainable typed-traversal path.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TraversalStep {
+    pub entity_id: String,
+    /// Relation the step was taken over (typed kind, valid-time relation,
+    /// or link relationship).
+    pub relation: String,
+    /// The entity the step was reached from (empty for root hits).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub via: String,
+}
+
+/// #1065: a candidate that the intent policy REJECTED, with the reason —
+/// the "rejected distractors" half of the explainable path.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RejectedDistractor {
+    pub entity_id: String,
+    pub reason: String,
+}
+
+/// #1065: intent-aware typed-relational traversal result. The selected path
+/// is explainable (steps carry the relation they were taken over); rejected
+/// distractors name what the policy dropped and why; token fields feed the
+/// token-budget discipline and the ablation report.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TypedTraversal {
+    pub query: String,
+    pub intent: String,
+    pub view: String,
+    pub path: Vec<TraversalStep>,
+    pub rejected: Vec<RejectedDistractor>,
+    pub tokens_selected: usize,
+    pub tokens_rejected: usize,
+    pub run_id: String,
+}
+
+/// #1065: one ablation cell — per-view cost/benefit over recorded runs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TraversalAblationRow {
+    pub view: String,
+    pub runs: i64,
+    pub avg_selected_tokens: f64,
+    pub avg_rejected_tokens: f64,
+    pub avg_distractor_ratio: f64,
+}
+
 /// #1064: one parameter-level lineage row (Agent-Sentry pattern).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ParamLineage {

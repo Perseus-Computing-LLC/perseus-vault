@@ -728,7 +728,7 @@ CREATE INDEX IF NOT EXISTS idx_preload_proposals_state
 /// — the entity ids an action cited as grounding, so the reverse impact
 /// closure can flag PENDING actions whose justification changed. Additive
 /// column, no backfill (pre-existing actions cite nothing).
-pub(crate) const SCHEMA_VERSION: i64 = 52;
+pub(crate) const SCHEMA_VERSION: i64 = 53;
 
 /// Initialize the v0.2.0 schema on a fresh database.
 pub fn initialize_schema(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
@@ -2077,6 +2077,28 @@ fn apply_migrations(conn: &Connection) -> Result<(), Box<dyn std::error::Error>>
             ON param_lineage(entity_id, param_path);",
     )?;
     // ── end v52 ──────────────────────────────────────────────────────────
+
+    // ── v53 (#1065 intent-aware typed-relational traversal) ──────────────
+    // Ablation substrate: one row per typed-traversal run so each relation
+    // view (temporal/causal/entity/semantic) can report whether it earns its
+    // token cost. Hash-only query identity; bounded by retention pruning.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS traversal_runs (
+            run_id TEXT PRIMARY KEY,
+            query_hash TEXT NOT NULL,
+            intent TEXT NOT NULL DEFAULT '',
+            view TEXT NOT NULL DEFAULT '',
+            selected_count INTEGER NOT NULL DEFAULT 0,
+            rejected_count INTEGER NOT NULL DEFAULT 0,
+            tokens_selected INTEGER NOT NULL DEFAULT 0,
+            tokens_rejected INTEGER NOT NULL DEFAULT 0,
+            created_at_unix_ms INTEGER NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS idx_traversal_runs_view
+            ON traversal_runs(view, created_at_unix_ms);",
+    )?;
+    // ── end v53 ──────────────────────────────────────────────────────────
+
 
 
 

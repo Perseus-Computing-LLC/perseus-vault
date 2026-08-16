@@ -26,7 +26,16 @@ All notable changes to Perseus Vault are documented here. This project adheres t
   CMMC/NIST matrix rows 3.3.1 / 3.3.8 / 3.13.10 move PARTIAL → SERVED (gap G1
   closed).
 - **Seal-style tamper evidence for persisted state and exports (#1060).**
-- **Typed provenance edges + evidence/execution split (#1064).** The
+- **Typed provenance edges + evidence/execution split (#1064).**
+- **Intent-aware typed-relational traversal (#1065).** MAGMA-pattern
+  relation views over the existing graph: `temporal` (valid-time ordering),
+  `causal` (depends_on/causes/updates/invalidates edges), `entity`
+  (mention/identity neighborhood), `semantic` (ranked similarity) — routed
+  by the deterministic query-shape classifier (identical query → identical
+  route, no LLM). `perseus_vault_typed_traversal` returns the explainable
+  selected path plus rejected distractors with reasons, with per-run token
+  accounting; `perseus_vault_traversal_ablation` (registry 154→156) reports
+  per-view cost/benefit so each view's token cost is auditable. Schema v53. The
   2606.04990 relation vocabulary lands on the link graph: `supports` /
   `contradicts` / `invalidates` / `updates` / `authorized_by` kinds with
   per-kind write-boundary validation (authorized_by targets must be

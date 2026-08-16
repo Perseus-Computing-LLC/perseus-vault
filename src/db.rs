@@ -23883,8 +23883,272 @@ last_accessed: {}
 
     /// Import .md files from a vault directory into the database.
     /// Reads YAML frontmatter + body, calls remember() for each.
-    /// Import .md files from a vault directory into the database.
-    /// Reads YAML frontmatter + body, calls remember() for each.
+
+    // ─── #1065: intent-aware typed-relational traversal (MAGMA pattern) ───
+
+    /// Route a query to one relation view from its intent. The
+    /// classification reuses the deterministic graph-utility signal
+    /// (`crate::graph_route::classify_graph_utility`), mapping its reason
+    /// codes onto the typed views — no LLM, identical query → identical
+    /// route:
+    /// - `temporal` → the temporal view (valid-time relations)
+    /// - `causal` → multi-hop/relational intent (causes/depends_on/updates/
+    ///   invalidates edges)
+    /// - `entity` → entity-centric intent (mentions/identifies neighborhood)
+    /// - `semantic` → everything else (semantic-similarity neighborhood)
+    pub(crate) fn route_intent_to_view(query: &str) -> (&'static str, &'static str) {
+        let route = crate::graph_route::classify_graph_utility(query);
+        match route.reason {
+            crate::graph_route::GraphRouteReason::Temporal => ("temporal", "temporal"),
+            crate::graph_route::GraphRouteReason::MultiHop
+            | crate::graph_route::GraphRouteReason::Relational => ("causal", "causal"),
+            crate::graph_route::GraphRouteReason::EntityCentric => ("entity", "entity"),
+            _ => ("semantic", "semantic"),
+        }
+    }
+
+    /// Intent-aware typed-relational traversal: classify the query, run the
+    /// view's traversal policy, and return the explainable selected path
+    /// plus the rejected distractors with reasons. Each run is recorded for
+    /// the ablation report (does each view earn its token cost?).
+    pub fn typed_traversal(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<crate::models::TypedTraversal, Box<dyn std::error::Error>> {
+        let (intent, view) = Self::route_intent_to_view(query);
+        let limit = limit.clamp(1, 50);
+        // Base recall: twice the limit so the policy has a tail to reject.
+        let params = RecallParams {
+            query: query.to_string(),
+            limit: (limit as i64) * 2,
+            skip_side_effects: true,
+            ..RecallParams::default()
+        };
+        let base = self.recall(&params)?;
+        let mut path = Vec::new();
+        let mut rejected = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        let select = |path: &mut Vec<crate::models::TraversalStep>,
+                      seen: &mut std::collections::HashSet<String>,
+                      id: &str,
+                      relation: &str,
+                      via: &str| {
+            if seen.insert(id.to_string()) {
+                path.push(crate::models::TraversalStep {
+                    entity_id: id.to_string(),
+                    relation: relation.to_string(),
+                    via: via.to_string(),
+                });
+            }
+        };
+
+        match view {
+            "causal" => {
+                // Traverse causal edges (depends_on / causes / updates /
+                // invalidates / derived_from) from the top hit, one hop.
+                for (i, hit) in base.iter().enumerate() {
+                    select(&mut path, &mut seen, &hit.id, "root_hit", "");
+                    if i > 0 {
+                        continue; // causal policy: expand only the top hit
+                    }
+                    let conn = self.conn()?;
+                    let links_json: String = conn
+                        .query_row(
+                            "SELECT links FROM entities WHERE id = ?1",
+                            params![hit.id],
+                            |r| r.get(0),
+                        )
+                        .unwrap_or_else(|_| "[]".to_string());
+                    drop(conn);
+                    let links: Vec<crate::models::MemoryLink> =
+                        serde_json::from_str(&links_json).unwrap_or_default();
+                    for l in links {
+                        let kind = crate::models::classify_relation(&l.relationship);
+                        if matches!(
+                            kind,
+                            crate::models::RelationKind::Invalidates
+                                | crate::models::RelationKind::Updates
+                        ) || l.relationship == "depends_on"
+                            || l.relationship == "causes"
+                            || l.relationship == "derived_from"
+                        {
+                            select(
+                                &mut path,
+                                &mut seen,
+                                &l.target_id,
+                                &l.relationship,
+                                &hit.id,
+                            );
+                        } else {
+                            rejected.push(crate::models::RejectedDistractor {
+                                entity_id: l.target_id.clone(),
+                                reason: format!("wrong edge kind for causal view: {}", l.relationship),
+                            });
+                        }
+                    }
+                }
+                // Tail of the base ranking = distractors the policy dropped.
+                for hit in base.iter().skip(1) {
+                    if !seen.contains(&hit.id) {
+                        rejected.push(crate::models::RejectedDistractor {
+                            entity_id: hit.id.clone(),
+                            reason: "rank_below_policy_selection".to_string(),
+                        });
+                    }
+                }
+            }
+            "entity" => {
+                // Entity view: the hit's mention/identity neighborhood — all
+                // outbound links plus inbound references.
+                for hit in base.iter() {
+                    select(&mut path, &mut seen, &hit.id, "root_hit", "");
+                }
+                let anchors: Vec<String> = base.iter().take(3).map(|h| h.id.clone()).collect();
+                let conn = self.conn()?;
+                for anchor in &anchors {
+                    let links_json: String = conn
+                        .query_row(
+                            "SELECT links FROM entities WHERE id = ?1",
+                            params![anchor],
+                            |r| r.get(0),
+                        )
+                        .unwrap_or_else(|_| "[]".to_string());
+                    let links: Vec<crate::models::MemoryLink> =
+                        serde_json::from_str(&links_json).unwrap_or_default();
+                    for l in links {
+                        select(&mut path, &mut seen, &l.target_id, &l.relationship, anchor);
+                    }
+                }
+                drop(conn);
+                for hit in base.iter().skip(3) {
+                    rejected.push(crate::models::RejectedDistractor {
+                        entity_id: hit.id.clone(),
+                        reason: "entity view anchors only the top 3 hits".to_string(),
+                    });
+                }
+            }
+            "temporal" => {
+                // Temporal view: serve hits in valid-time order, not rank
+                // order, and reject candidates outside the anchor window.
+                let mut ordered = base;
+                ordered.sort_by_key(|e| std::cmp::Reverse(e.last_accessed_unix_ms));
+                let cutoff = if ordered.is_empty() {
+                    i64::MIN
+                } else {
+                    ordered[0].last_accessed_unix_ms
+                };
+                for hit in ordered.iter() {
+                    if seen.len() < limit {
+                        select(
+                            &mut path,
+                            &mut seen,
+                            &hit.id,
+                            "valid_time_order",
+                            "",
+                        );
+                    }
+                }
+                // Window policy: anything older than a year behind the anchor
+                // is a rejected distractor (deterministic, unit-testable).
+                const YEAR_MS: i64 = 365 * 86_400_000;
+                for hit in ordered.iter().skip(limit) {
+                    rejected.push(crate::models::RejectedDistractor {
+                        entity_id: hit.id.clone(),
+                        reason: if cutoff - hit.last_accessed_unix_ms > YEAR_MS {
+                            "outside_valid_time_window".to_string()
+                        } else {
+                            "rank_below_policy_selection".to_string()
+                        },
+                    });
+                }
+            }
+            _ => {
+                // Semantic view: the ranked base list IS the policy; the
+                // tail beyond `limit` are the rejected distractors.
+                for hit in base.iter().take(limit) {
+                    select(&mut path, &mut seen, &hit.id, "semantic_similar", "");
+                }
+                for hit in base.iter().skip(limit) {
+                    rejected.push(crate::models::RejectedDistractor {
+                        entity_id: hit.id.clone(),
+                        reason: "rank_below_policy_selection".to_string(),
+                    });
+                }
+            }
+        }
+
+        let pt = path_text(&path);
+        let rt = rejected_text(&rejected);
+        // Named-entity count with a word-count floor: relation/step text can
+        // be id-heavy (no capitalized named entities), and the budget
+        // discipline must never under-count served tokens.
+        let tokens_selected = crate::graph_route::count_entity_tokens(&pt)
+            .max(pt.split_whitespace().count());
+        let tokens_rejected = crate::graph_route::count_entity_tokens(&rt)
+            .max(rt.split_whitespace().count());
+        let run_id = format!("tr-{}", uuid::Uuid::new_v4().simple());
+        {
+            let conn = self.conn()?;
+            let _ = conn.execute(
+                "INSERT INTO traversal_runs (run_id, query_hash, intent, view, \
+                 selected_count, rejected_count, tokens_selected, tokens_rejected, \
+                 created_at_unix_ms) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    run_id,
+                    sha256_hex(query),
+                    intent,
+                    view,
+                    path.len() as i64,
+                    rejected.len() as i64,
+                    tokens_selected as i64,
+                    tokens_rejected as i64,
+                    now_ms()
+                ],
+            );
+        }
+        Ok(crate::models::TypedTraversal {
+            query: query.to_string(),
+            intent: intent.to_string(),
+            view: view.to_string(),
+            path,
+            rejected,
+            tokens_selected,
+            tokens_rejected,
+            run_id,
+        })
+    }
+
+    /// #1065: per-view ablation report — mean selected/rejected tokens and
+    /// distractor ratio over recorded runs, so each relation view's cost is
+    /// auditable (is the view earning its cost?).
+    pub fn typed_traversal_ablation(
+        &self,
+    ) -> Result<Vec<crate::models::TraversalAblationRow>, Box<dyn std::error::Error>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT view, COUNT(*), COALESCE(AVG(tokens_selected), 0), \
+                    COALESCE(AVG(tokens_rejected), 0), \
+                    COALESCE(AVG(CAST(rejected_count AS REAL) / \
+                        MAX(selected_count + rejected_count, 1)), 0) \
+             FROM traversal_runs GROUP BY view ORDER BY view",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(crate::models::TraversalAblationRow {
+                    view: r.get(0)?,
+                    runs: r.get(1)?,
+                    avg_selected_tokens: r.get(2)?,
+                    avg_rejected_tokens: r.get(3)?,
+                    avg_distractor_ratio: r.get(4)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     pub fn vault_import(&self, vault_dir: &str) -> Result<VaultReport, Box<dyn std::error::Error>> {
         self.vault_import_inner(vault_dir, None)
     }
@@ -28253,6 +28517,24 @@ impl Drop for TestDatabase {
 // every hints test so parallel runs cannot race the env var.
 #[cfg(test)]
 pub(crate) static HINTS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+
+/// #1065: path text for token estimation (ids + relations only — hash-free).
+fn path_text(path: &[crate::models::TraversalStep]) -> String {
+    path.iter()
+        .map(|s| format!("{} via {}", s.entity_id, s.relation))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// #1065: rejected-distractor text for token estimation.
+fn rejected_text(rejected: &[crate::models::RejectedDistractor]) -> String {
+    rejected
+        .iter()
+        .map(|d| format!("{} ({})", d.entity_id, d.reason))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
 
 #[cfg(test)]
 pub(crate) mod tests {
@@ -48776,6 +49058,94 @@ pub(crate) mod tests {
             verify_audit_chain(&db).expect("chain must verify after v11->v12 migration"),
             3
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ─── #1065: intent-aware typed-relational traversal ─────────────────
+
+    #[test]
+    fn intent_routing_maps_reasons_to_views() {
+        assert_eq!(crate::db::Database::route_intent_to_view("what depends on the gateway service"), ("causal", "causal"));
+        assert_eq!(crate::db::Database::route_intent_to_view("what happened before the june launch"), ("temporal", "temporal"));
+        assert_eq!(crate::db::Database::route_intent_to_view("what shipped on 2026-06-20"), ("temporal", "temporal"));
+        assert_eq!(
+            crate::db::Database::route_intent_to_view("tell me about the Aurora program"),
+            ("entity", "entity")
+        );
+        assert_eq!(crate::db::Database::route_intent_to_view("database choice"), ("semantic", "semantic"));
+    }
+
+    #[test]
+    fn typed_traversal_causal_view_explains_path_and_rejects_wrong_edges() {
+        let (db, path) = temp_db();
+        db.remember(&make_entity("tr-a", "facts", "tr-a", r#"{"c":"gateway service alpha"}"#))
+            .unwrap();
+        db.remember(&make_entity("tr-b", "facts", "tr-b", r#"{"c":"auth module beta"}"#))
+            .unwrap();
+        db.remember(&make_entity("tr-c", "facts", "tr-c", r#"{"c":"rate limiter gamma"}"#))
+            .unwrap();
+        db.link("facts", "tr-a", "tr-b", "depends_on").unwrap();
+        db.link("facts", "tr-a", "tr-c", "related").unwrap();
+
+        let t = db
+            .typed_traversal("what depends on the gateway service", 10)
+            .unwrap();
+        assert_eq!(t.intent, "causal");
+        assert_eq!(t.view, "causal");
+        assert!(
+            t.path.iter().any(|s| s.entity_id == "tr-b" && s.relation == "depends_on"),
+            "causal traversal must follow depends_on with an explainable step: {:?}",
+            t.path
+        );
+        assert!(
+            t.rejected.iter().any(|d| d.entity_id == "tr-c"),
+            "wrong-edge targets must be rejected distractors with a reason: {:?}",
+            t.rejected
+        );
+        assert!(t.tokens_selected > 0);
+        assert!(!t.run_id.is_empty());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn typed_traversal_entity_view_walks_neighborhood() {
+        let (db, path) = temp_db();
+        db.remember(&make_entity("te-1", "facts", "te-1", r#"{"c":"aurora program"}"#))
+            .unwrap();
+        db.remember(&make_entity("te-2", "facts", "te-2", r#"{"c":"aurora launch plan"}"#))
+            .unwrap();
+        db.link("facts", "te-1", "te-2", "mentions").unwrap();
+
+        let t = db
+            .typed_traversal("tell me about the Aurora program", 10)
+            .unwrap();
+        assert_eq!(t.view, "entity");
+        assert!(
+            t.path.iter().any(|s| s.entity_id == "te-2"),
+            "entity view must include linked neighbors: {:?}",
+            t.path
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn typed_traversal_ablation_accumulates_per_view() {
+        let (db, path) = temp_db();
+        db.remember(&make_entity("ab-1", "facts", "ab-1", r#"{"c":"gateway service"}"#))
+            .unwrap();
+        db.remember(&make_entity("ab-2", "facts", "ab-2", r#"{"c":"gateway auth"}"#))
+            .unwrap();
+        db.link("facts", "ab-1", "ab-2", "depends_on").unwrap();
+
+        db.typed_traversal("what depends on the gateway service", 10).unwrap();
+        db.typed_traversal("what depends on the gateway service", 10).unwrap();
+        db.typed_traversal("gateway service", 10).unwrap();
+
+        let rows = db.typed_traversal_ablation().unwrap();
+        let causal = rows.iter().find(|r| r.view == "causal").expect("causal runs recorded");
+        assert_eq!(causal.runs, 2);
+        assert!(causal.avg_selected_tokens > 0.0);
+        assert!(rows.iter().any(|r| r.view == "semantic" && r.runs == 1));
         let _ = std::fs::remove_file(&path);
     }
 

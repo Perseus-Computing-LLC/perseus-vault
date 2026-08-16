@@ -185,7 +185,7 @@ pub fn classify_graph_utility(query: &str) -> GraphRoute {
 
 /// Count named-entity references: capitalized tokens not at sentence start,
 /// ALL-CAPS acronyms, quoted/backticked spans, and `#refs`.
-fn count_entity_tokens(query: &str) -> usize {
+pub(crate) fn count_entity_tokens(query: &str) -> usize {
     let mut count = 0usize;
     // Quoted or backticked spans count as one entity reference each.
     for quote in ['"', '\'', '`'] {
