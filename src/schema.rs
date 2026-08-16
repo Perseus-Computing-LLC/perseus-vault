@@ -728,7 +728,7 @@ CREATE INDEX IF NOT EXISTS idx_preload_proposals_state
 /// — the entity ids an action cited as grounding, so the reverse impact
 /// closure can flag PENDING actions whose justification changed. Additive
 /// column, no backfill (pre-existing actions cite nothing).
-pub(crate) const SCHEMA_VERSION: i64 = 50;
+pub(crate) const SCHEMA_VERSION: i64 = 51;
 
 /// Initialize the v0.2.0 schema on a fresh database.
 pub fn initialize_schema(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
@@ -2033,7 +2033,30 @@ fn apply_migrations(conn: &Connection) -> Result<(), Box<dyn std::error::Error>>
             status TEXT NOT NULL DEFAULT 'lossy'
          );",
     )?;
-    // ── end v40 ────────────────────────────────────────────────────────
+    // ── end v38 ────────────────────────────────────────────────────────
+
+    // ── v51 (#1060 seal-style tamper evidence) ───────────────────────────
+    // Seals: SHA-256 commitments over content recorded at write/export time,
+    // stored OUTSIDE the sealed content itself (hash + label only — no content
+    // leak). Compare-on-recall/reload surfaces any mismatch as a tamper event.
+    // Integrity ≠ truth by design: a seal proves unchanged-since-sealed, never
+    // true-when-written. See docs/seals-tamper-evidence.md.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS memory_seals (
+            seal_id TEXT PRIMARY KEY,
+            target_id TEXT NOT NULL,
+            label TEXT NOT NULL DEFAULT '',
+            scope TEXT NOT NULL DEFAULT 'entity',
+            sha256 TEXT NOT NULL,
+            workspace_hash TEXT NOT NULL DEFAULT '',
+            agent_id TEXT NOT NULL DEFAULT '',
+            created_at_unix_ms INTEGER NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS idx_memory_seals_target
+            ON memory_seals(target_id, workspace_hash, created_at_unix_ms);",
+    )?;
+    // ── end v51 ──────────────────────────────────────────────────────────
+
 
 
 

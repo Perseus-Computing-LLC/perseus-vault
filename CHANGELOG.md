@@ -25,8 +25,17 @@ All notable changes to Perseus Vault are documented here. This project adheres t
   fail-fast, keyed redaction, and v14→v15 payload-commitment backfill. The
   CMMC/NIST matrix rows 3.3.1 / 3.3.8 / 3.13.10 move PARTIAL → SERVED (gap G1
   closed).
-- **Admission quarantine disposition (#1026).** A fourth terminal admission
-  disposition: candidates disposed as `quarantined` by trust admission are
+- **Seal-style tamper evidence for persisted state and exports (#1060).**
+  New `memory_seals` table (schema v51) records SHA-256 commitments at
+  seal/export time — hash + label only, never content. Compare-on-recall
+  journals a `tamper_evidence` event naming any entity whose served bytes no
+  longer match its seal (never served silently); `perseus_vault_seal` seals a
+  live entity, `perseus_vault_tamper_scan` verifies every entity + export seal
+  (registry 150→152). `perseus_vault_vault_export` now writes a `.seals.json`
+  manifest (per-file hashes) sealed into the chain. Integrity ≠ truth by
+  design: a seal proves unchanged-since-sealed, never true-when-written.
+  Docs: `docs/seals-tamper-evidence.md`.
+- **Admission quarantine disposition (#1026).**  disposition: candidates disposed as `quarantined` by trust admission are
   sealed OUTSIDE the authoritative head in a new `admission_quarantine`
   table (schema v44; body encrypted like entities, hash-only receipt, linked
   to the admission decision digest) — storage presence confers no authority,

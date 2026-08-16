@@ -5817,6 +5817,84 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Dream: LLM Consolidation of Episodic Memory into Semantic Insights"
   },
   {
+    "name": "perseus_vault_seal",
+    "description": "Record a seal (SHA-256 commitment) over a live entity's stored content — hash + label only, never the content itself. Compare-on-recall and perseus_vault_tamper_scan surface any later mismatch as a tamper event naming the entity, so a tampered store is never served silently. Integrity != truth: a seal proves unchanged-since-sealed, never true-when-written.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "target_id": {
+          "type": "string",
+          "description": "Entity id to seal."
+        },
+        "workspace_hash": {
+          "type": "string",
+          "description": "Workspace of the entity (optional; empty = global)."
+        },
+        "agent_id": {
+          "type": "string",
+          "description": "Sealing agent identity for the audit trail."
+        },
+        "label": {
+          "type": "string",
+          "description": "Human-readable label recorded with the seal."
+        }
+      },
+      "required": ["target_id"]
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "seal_id": {"type": "string"},
+        "target_id": {"type": "string"},
+        "label": {"type": "string"},
+        "scope": {"type": "string"},
+        "sha256": {"type": "string", "description": "SHA-256 over the sealed content (hash only — no content leak)."},
+        "workspace_hash": {"type": "string"},
+        "agent_id": {"type": "string"},
+        "created_at_unix_ms": {"type": "integer"}
+      }
+    },
+    "annotations": {
+      "readOnlyHint": false
+    },
+    "title": "Seal: Tamper Evidence for Persisted Memory"
+  },
+  {
+    "name": "perseus_vault_tamper_scan",
+    "description": "Verify every seal (entity + export) against the live content. Returns mismatches and journals each as a tamper event naming the target. Integrity != truth: seals detect unchanged-since-sealed violations, not truth at write time.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "required": []
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "seals_checked": {"type": "integer"},
+        "ok": {"type": "boolean"},
+        "tampered": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "seal_id": {"type": "string"},
+              "target_id": {"type": "string"},
+              "label": {"type": "string"},
+              "scope": {"type": "string"},
+              "expected_sha256": {"type": "string"},
+              "actual_sha256": {"type": "string"},
+              "detected_at_unix_ms": {"type": "integer"}
+            }
+          }
+        }
+      }
+    },
+    "annotations": {
+      "readOnlyHint": true
+    },
+    "title": "Seal Verification: Tamper Evidence Scan"
+  },
+  {
     "name": "perseus_vault_vault_export",
     "description": "Export all non-archived entities to .md files with YAML frontmatter in a vault directory. Files are human-readable, git-trackable, and Obsidian-compatible. Use this for backup, transfer between workspaces, or offline review.",
     "inputSchema": {
@@ -7582,6 +7660,8 @@ const TOOL_SCOPES: &[(&str, ToolScope)] = &[
     ("perseus_vault_consolidate", ToolScope::Ops),
     ("perseus_vault_sleep", ToolScope::Ops),
     ("perseus_vault_dream", ToolScope::Ops),
+    ("perseus_vault_seal", ToolScope::Ops),
+    ("perseus_vault_tamper_scan", ToolScope::Ops),
     ("perseus_vault_vault_export", ToolScope::Ops),
     ("perseus_vault_derived_export", ToolScope::Ops),
     ("perseus_vault_markdown_import", ToolScope::Ops),
@@ -7944,6 +8024,8 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
             tools::handle_maintenance_status(db, args).map_err(|e| e.to_string())
         }
         "perseus_vault_dream" => tools::handle_dream(db, args),
+        "perseus_vault_seal" => tools::handle_seal(db, args),
+        "perseus_vault_tamper_scan" => tools::handle_tamper_scan(db, args),
         "perseus_vault_vault_export" => Ok(tools::handle_vault_export(db, args)),
         "perseus_vault_derived_export" => tools::handle_derived_export(db, args),
         "perseus_vault_markdown_import" => tools::handle_markdown_import(db, args),
@@ -8050,7 +8132,7 @@ mod tests {
         );
         assert_eq!(
             registry_names.len(),
-            150,
+            152,
             "update public metadata when adding a tool"
         );
 
@@ -9359,9 +9441,9 @@ mod tests {
         let agent = filter_registry_by_view(registry.clone(), ScopeView::Agent);
         let ops = filter_registry_by_view(registry.clone(), ScopeView::Ops);
         let full = filter_registry_by_view(registry.clone(), ScopeView::Full);
-        assert_eq!(full.len(), 150, "full view must expose the whole registry");
+        assert_eq!(full.len(), 152, "full view must expose the whole registry");
         assert_eq!(agent.len(), 51, "agent view count drifted — new tools must be classified");
-        assert_eq!(ops.len(), 143, "ops view count drifted — new tools must be classified");
+        assert_eq!(ops.len(), 145, "ops view count drifted — new tools must be classified");
         assert!(agent.len() < ops.len() && ops.len() < full.len());
     }
 
