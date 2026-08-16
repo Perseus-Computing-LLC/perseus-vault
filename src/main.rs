@@ -58,6 +58,7 @@ mod retrieval_telemetry;
 mod revocation_cutoff;
 mod schema;
 mod signed_profile;
+mod signed_transition;
 mod sleep;
 pub(crate) mod stage_trace;
 mod tools;
@@ -242,6 +243,18 @@ enum Commands {
         /// key path when one exists.
         #[arg(long)]
         encryption_key: Option<String>,
+    },
+
+    /// #1080: portable verifier for a signed transition — verify an Ed25519
+    /// signed-transition JSON record against an epoch public key with no
+    /// database access (the same pure function the writer uses).
+    VerifyTransition {
+        /// Signed transition record as JSON
+        #[arg(long)]
+        json: String,
+        /// Epoch public key (base64, raw 32-byte Ed25519 key)
+        #[arg(long)]
+        epoch_key_b64: String,
     },
 
     /// Start the MCP JSON-RPC stdio server
@@ -946,7 +959,10 @@ impl Commands {
             | Commands::Capture { db, .. }
             | Commands::Inspect { db, .. }
             | Commands::Eval { db, .. } => Some(db),
-            Commands::ObsidianSync { .. } | Commands::Migrate { .. } | Commands::Keygen { .. } => {
+            Commands::ObsidianSync { .. }
+            | Commands::Migrate { .. }
+            | Commands::Keygen { .. }
+            | Commands::VerifyTransition { .. } => {
                 None
             }
         }
@@ -2797,6 +2813,36 @@ fn run() {
     let mut cli = Cli::parse();
     apply_top_level_db(&mut cli); // #313: `perseus-vault --db PATH serve` must honor --db
     match cli.command {
+        Some(Commands::VerifyTransition { json, epoch_key_b64 }) => {
+            // #1080: portable verifier — no database access. Verification
+            // failure exits non-zero and names the failing check.
+            let record: crate::signed_transition::SignedTransition =
+                match serde_json::from_str(&json) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        eprintln!("perseus-vault: transition record is not valid JSON: {e}");
+                        std::process::exit(1);
+                    }
+                };
+            match crate::signed_transition::verify_transition(&record, &epoch_key_b64) {
+                Ok(v) => {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "verified": true,
+                            "signer_fingerprint": v.signer_fingerprint,
+                            "old_digest": v.old_digest,
+                            "new_digest": v.new_digest,
+                            "chain_hash": v.chain_hash,
+                        })
+                    );
+                }
+                Err(e) => {
+                    eprintln!("perseus-vault: transition verification FAILED: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
         Some(Commands::Keygen { key_file }) => {
             let expanded = if key_file.starts_with("~/") {
                 let home = std::env::var("HOME")

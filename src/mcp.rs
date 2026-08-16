@@ -7645,6 +7645,68 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     },
     "annotations": { "readOnlyHint": false },
     "title": "Report Success (Confirm Query Key)"
+  },
+  {
+    "name": "perseus_vault_signer_epoch_set",
+    "description": "#1080 (MutMem): register or replace the Ed25519 signing key for a signer epoch — the authorization root for signed transitions. The seed (32 raw bytes, base64) is stored at rest alongside the database (same trust domain as the AES key file) and never echoed back. Ops scope.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "epoch": {"type": "integer", "minimum": 1, "description": "Signer epoch number (key generation era)"},
+        "seed_b64": {"type": "string", "description": "Raw 32-byte Ed25519 seed, base64-encoded"}
+      },
+      "required": ["epoch", "seed_b64"]
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "registered_epoch": {"type": "integer"},
+        "signer_fingerprint": {"type": "string"}
+      }
+    },
+    "annotations": { "readOnlyHint": false },
+    "title": "Set Signer Epoch Key"
+  },
+  {
+    "name": "perseus_vault_poison_label",
+    "description": "#1080 (MutMem): set or revise a SIGNED poison label on a stored entity. Poison-likely content is retained (never silently deleted); recall consumes the label as trust evidence (poison_likely −90% effective score, suspect −50%, clean = restored). Every label write commits as a signed transition — fails closed when no signer epoch is registered.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "entity_id": {"type": "string", "description": "Entity to label"},
+        "level": {"type": "string", "enum": ["poison_likely", "suspect", "clean"]},
+        "reason": {"type": "string", "description": "Attribution for the label (recorded in the signed transition)"}
+      },
+      "required": ["entity_id", "level"]
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "entity_id": {"type": "string"},
+        "level": {"type": "string"},
+        "reason": {"type": "string"},
+        "transition": {"type": "object"}
+      }
+    },
+    "annotations": { "readOnlyHint": false },
+    "title": "Set Poison Label"
+  },
+  {
+    "name": "perseus_vault_transition_audit",
+    "description": "#1080 (MutMem): replay the signed-transition chain end to end — every record must verify against its epoch key, link to the previous chain hash (no forks), and reproduce its own chain hash. Reports record count, verified count, chain head, and the first divergence (if any).",
+    "inputSchema": {"type": "object", "properties": {}},
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "records": {"type": "integer"},
+        "verified": {"type": "integer"},
+        "divergence": {"type": "object"},
+        "chain_head": {"type": "string"},
+        "note": {"type": "string"}
+      }
+    },
+    "annotations": { "readOnlyHint": true },
+    "title": "Audit Signed Transition Chain"
   }
 ]"###,
         )
@@ -7799,6 +7861,9 @@ const TOOL_SCOPES: &[(&str, ToolScope)] = &[
     ("perseus_vault_drift_check", ToolScope::Ops),
     ("perseus_vault_drift_repair", ToolScope::Ops),
     ("perseus_vault_restore_forward", ToolScope::Ops),
+    ("perseus_vault_signer_epoch_set", ToolScope::Ops),
+    ("perseus_vault_poison_label", ToolScope::Ops),
+    ("perseus_vault_transition_audit", ToolScope::Ops),
     ("perseus_vault_op_run", ToolScope::Ops),
     ("perseus_vault_op_run_list", ToolScope::Ops),
     ("perseus_vault_op_run_get", ToolScope::Ops),
@@ -8148,6 +8213,9 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
         "perseus_vault_drift_check" => tools::handle_drift_check(db, args),
         "perseus_vault_drift_repair" => tools::handle_drift_repair(db, args),
         "perseus_vault_restore_forward" => tools::handle_restore_forward(db, args),
+        "perseus_vault_signer_epoch_set" => tools::handle_signer_epoch_set(db, args),
+        "perseus_vault_poison_label" => tools::handle_poison_label(db, args),
+        "perseus_vault_transition_audit" => tools::handle_transition_audit(db, args),
         "perseus_vault_op_run" => tools::handle_op_run(db, args).map_err(|e| e.to_string()),
         "perseus_vault_op_run_list" => {
             tools::handle_op_run_list(db, args).map_err(|e| e.to_string())
@@ -8298,7 +8366,7 @@ mod tests {
         );
         assert_eq!(
             registry_names.len(),
-            157,
+            160,
             "update public metadata when adding a tool"
         );
 
@@ -9607,9 +9675,9 @@ mod tests {
         let agent = filter_registry_by_view(registry.clone(), ScopeView::Agent);
         let ops = filter_registry_by_view(registry.clone(), ScopeView::Ops);
         let full = filter_registry_by_view(registry.clone(), ScopeView::Full);
-        assert_eq!(full.len(), 157, "full view must expose the whole registry");
+        assert_eq!(full.len(), 160, "full view must expose the whole registry");
         assert_eq!(agent.len(), 51, "agent view count drifted — new tools must be classified");
-        assert_eq!(ops.len(), 150, "ops view count drifted — new tools must be classified");
+        assert_eq!(ops.len(), 153, "ops view count drifted — new tools must be classified");
         assert!(agent.len() < ops.len() && ops.len() < full.len());
     }
 
