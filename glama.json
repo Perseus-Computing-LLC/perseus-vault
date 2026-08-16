@@ -3,7 +3,7 @@
   "maintainers": [
     "tcconnally"
   ],
-  "tools": 156,
+  "tools": 157,
   "transport": {
     "stdio": true,
     "sse": true,

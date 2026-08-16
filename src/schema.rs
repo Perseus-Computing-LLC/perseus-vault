@@ -728,7 +728,7 @@ CREATE INDEX IF NOT EXISTS idx_preload_proposals_state
 /// — the entity ids an action cited as grounding, so the reverse impact
 /// closure can flag PENDING actions whose justification changed. Additive
 /// column, no backfill (pre-existing actions cite nothing).
-pub(crate) const SCHEMA_VERSION: i64 = 53;
+pub(crate) const SCHEMA_VERSION: i64 = 54;
 
 /// Initialize the v0.2.0 schema on a fresh database.
 pub fn initialize_schema(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
@@ -2102,6 +2102,32 @@ fn apply_migrations(conn: &Connection) -> Result<(), Box<dyn std::error::Error>>
 
 
 
+
+    // ── v54 (#1066 model-upgrade inheritance receipts) ──────────────────
+    // Identity/vessel split (arXiv:2603.04740): a subject identity survives
+    // model changes; incarnations record which model instance served it and
+    // when. Inheritance receipts make the boundary between incarnations an
+    // explicit, governed, auditable transition.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS subject_identities (
+            subject_id TEXT PRIMARY KEY,
+            label TEXT NOT NULL DEFAULT '',
+            created_at_unix_ms INTEGER NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS model_incarnations (
+            incarnation_id TEXT PRIMARY KEY,
+            subject_id TEXT NOT NULL,
+            model_id TEXT NOT NULL,
+            provider TEXT NOT NULL DEFAULT '',
+            started_at_unix_ms INTEGER NOT NULL,
+            ended_at_unix_ms INTEGER,
+            departure_reason TEXT NOT NULL DEFAULT '',
+            UNIQUE(subject_id, model_id, started_at_unix_ms)
+         );
+         CREATE INDEX IF NOT EXISTS idx_incarnations_subject
+            ON model_incarnations(subject_id, started_at_unix_ms);",
+    )?;
+    // ── end v54 ──────────────────────────────────────────────────────────
 
     // Stamp the migration level so subsequent opens skip the probe block above.
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;

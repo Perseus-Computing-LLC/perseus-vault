@@ -6899,6 +6899,99 @@ pub fn handle_param_lineage(db: &Database, args: Value) -> Result<String, String
         Ok(json!({"views": rows}).to_string())
     }
 
+    // ─── #1066 model-upgrade inheritance handler ───────────────────────────
+
+    #[derive(Debug, Deserialize)]
+    pub struct ModelInheritanceArgs {
+        /// record | approve | query | depart | replay
+        pub action: String,
+        #[serde(default)]
+        pub subject_id: Option<String>,
+        #[serde(default)]
+        pub from_model: Option<String>,
+        #[serde(default)]
+        pub to_model: Option<String>,
+        #[serde(default)]
+        pub provider: Option<String>,
+        #[serde(default)]
+        pub source_state_hash: Option<String>,
+        #[serde(default)]
+        pub compatibility_report: Option<String>,
+        #[serde(default)]
+        pub receipt_id: Option<String>,
+        #[serde(default)]
+        pub approver: Option<String>,
+        #[serde(default)]
+        pub incarnation_id: Option<String>,
+        #[serde(default)]
+        pub reason: Option<String>,
+        #[serde(default = "default_replay_limit")]
+        pub sample_limit: usize,
+        #[serde(default)]
+        pub requesting_agent_id: Option<String>,
+    }
+
+    fn default_replay_limit() -> usize {
+        10
+    }
+
+    /// Model-upgrade inheritance receipts (#1066): a stable subject identity
+    /// distinct from any model/provider/session id, per-incarnation records, and
+    /// explicit governed transitions (record / approve / query / depart / replay)
+    /// so identity continuity across model upgrades is auditable, never
+    /// implicit. Departure preserves tombstones — no silent destruction.
+    pub fn handle_model_inheritance(db: &Database, args: Value) -> Result<String, String> {
+        let a: ModelInheritanceArgs = serde_json::from_value(args)
+            .map_err(|e| format!("Invalid model_inheritance arguments: {}", e))?;
+        let subject = a.subject_id.as_deref().unwrap_or("default-subject");
+        match a.action.as_str() {
+            "record" => {
+                let from_model = a.from_model.as_deref().ok_or("from_model is required")?;
+                let to_model = a.to_model.as_deref().ok_or("to_model is required")?;
+                let receipt = db
+                    .inheritance_receipt_record(
+                        subject,
+                        from_model,
+                        to_model,
+                        a.provider.as_deref().unwrap_or(""),
+                        a.source_state_hash.as_deref().unwrap_or(""),
+                        a.compatibility_report.as_deref().unwrap_or(""),
+                        a.requesting_agent_id.as_deref().unwrap_or(""),
+                    )
+                    .map_err(|e| e.to_string())?;
+                Ok(json!(receipt).to_string())
+            }
+            "approve" => {
+                let receipt_id = a.receipt_id.as_deref().ok_or("receipt_id is required")?;
+                let approver = a.approver.as_deref().ok_or("approver is required")?;
+                let receipt = db
+                    .inheritance_receipt_approve(receipt_id, approver)
+                    .map_err(|e| e.to_string())?;
+                Ok(json!(receipt).to_string())
+            }
+            "query" => {
+                let rows = db
+                    .inheritance_receipt_query(subject)
+                    .map_err(|e| e.to_string())?;
+                Ok(json!({"subject_id": subject, "receipts": rows}).to_string())
+            }
+            "depart" => {
+                let inc = a.incarnation_id.as_deref().ok_or("incarnation_id is required")?;
+                db.incarnation_depart(inc, a.reason.as_deref().unwrap_or(""))
+                    .map_err(|e| e.to_string())?;
+                Ok(json!({"ok": true, "incarnation_id": inc}).to_string())
+            }
+            "replay" => {
+                let receipt_id = a.receipt_id.as_deref().ok_or("receipt_id is required")?;
+                let replay = db
+                    .inheritance_replay(receipt_id, a.sample_limit)
+                    .map_err(|e| e.to_string())?;
+                Ok(json!(replay).to_string())
+            }
+            other => Err(format!("unknown action '{}' (record|approve|query|depart|replay)", other)),
+        }
+    }
+
     pub fn handle_vault_export(db: &Database, args: Value) -> String {
     let a: VaultExportArgs = match serde_json::from_value(args) {
         Ok(a) => a,
