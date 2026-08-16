@@ -60,6 +60,7 @@ mod retrieval_telemetry;
 #[cfg(test)]
 mod revocation_cutoff;
 mod schema;
+mod segments;
 mod signed_profile;
 mod signed_transition;
 mod sleep;
