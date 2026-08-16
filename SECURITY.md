@@ -136,6 +136,26 @@ on-disk state.
 - We monitor [RustSec Advisory Database](https://rustsec.org) for crate CVEs
 - `cargo audit` run in CI on every push
 
+### RustSec triage
+
+`cargo audit --deny warnings` runs on every push, every PR, and weekly against
+the live advisory database (`.github/workflows/audit.yml`). As of 2026-08-16 the
+scan reports **0 vulnerabilities** across 438 locked dependencies. Two
+*unmaintained* advisories (informational severity — not exploitable
+vulnerabilities) are explicitly accepted, with justification, in that workflow:
+
+| Advisory | Crate | Why it is accepted |
+|---|---|---|
+| RUSTSEC-2024-0436 | `paste` 1.0.15 | Unmaintained, but a proc-macro: it executes only at compile time and adds no runtime attack surface. Reachable only through `tokenizers`, whose newest release still pins it — no patched version exists. |
+| RUSTSEC-2026-0192 | `ttf-parser` 0.25.1 | Unmaintained. Compiled only in the opt-in `multimodal` build (local PDF text extraction via `pdf-extract`/`lopdf`); the default binary does not contain it. The newest `lopdf` release still pins it — no patched version exists. |
+
+Both chains were re-verified against crates.io on 2026-08-16: every crate in
+each chain is at its newest release and the newest releases still carry these
+crates, so there is currently no upgrade path that removes them. Any *new*
+advisory fails the CI gate immediately; if an upstream chain ever drops one of
+these crates, the corresponding ignore in `.github/workflows/audit.yml` is
+removed.
+
 ---
 
 ## Verifying releases
