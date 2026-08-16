@@ -26,6 +26,16 @@ All notable changes to Perseus Vault are documented here. This project adheres t
   CMMC/NIST matrix rows 3.3.1 / 3.3.8 / 3.13.10 move PARTIAL → SERVED (gap G1
   closed).
 - **Seal-style tamper evidence for persisted state and exports (#1060).**
+- **Model-upgrade inheritance receipts (#1066).** Identity/vessel split
+  (arXiv:2603.04740): `subject_identities` + `model_incarnations` tables
+  (schema bump) keep a stable subject id separate from any
+  model/provider/session id. `perseus_vault_model_inheritance`
+  (registry +1) records policy-gated inheritance receipts (source-state
+  hash, old/new model identities, compatibility report, approver-stamped
+  approval), queryable in the provenance graph; `depart` is a governed
+  transition preserving tombstones; `replay` samples representative
+  memories as hash-only digests. Memory survives the model — and now the
+  handoff is auditable. Docs: `docs/model-upgrade-inheritance.md`.
 - **Typed provenance edges + evidence/execution split (#1064).**
 - **Intent-aware typed-relational traversal (#1065).** MAGMA-pattern
   relation views over the existing graph: `temporal` (valid-time ordering),

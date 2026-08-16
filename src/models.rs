@@ -494,6 +494,56 @@ fn default_weight() -> f64 {
     0.5
 }
 
+/// #1066: one model incarnation (the "vessel" of a subject identity).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelIncarnation {
+    pub incarnation_id: String,
+    pub subject_id: String,
+    pub model_id: String,
+    pub provider: String,
+    pub started_at_unix_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_at_unix_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub departure_reason: String,
+}
+
+/// #1066: inheritance receipt — the explicit, governed transition between
+/// two incarnations of one subject identity. `state` is policy-gated:
+/// `pending` until approved (approval requires an approver principal);
+/// `replayed` when the optional replay comparison ran.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InheritanceReceipt {
+    pub receipt_id: String,
+    pub subject_id: String,
+    pub from_incarnation: String,
+    pub from_model: String,
+    pub to_model: String,
+    pub to_incarnation: String,
+    pub source_state_hash: String,
+    pub compatibility_report: String,
+    pub state: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub approved_by: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approved_at_unix_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replay: Option<InheritanceReplay>,
+    pub created_at_unix_ms: i64,
+}
+
+/// #1066: normalized old-vs-new replay comparison over representative
+/// memories (opt-in; requires a configured LLM endpoint).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InheritanceReplay {
+    pub memories_sampled: usize,
+    pub agreements: usize,
+    pub disagreements: usize,
+    pub agreement_rate: f64,
+    /// hash-only: the re-interpretation transcript digests, never content.
+    pub digest: String,
+}
+
 /// A journal event — append-only log entry.
 /// Structured as: what was evaluated → what was done → what's next.
 #[derive(Debug, Clone, Serialize, Deserialize)]

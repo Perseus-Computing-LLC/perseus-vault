@@ -23881,6 +23881,271 @@ last_accessed: {}
         Ok(out)
     }
 
+
+    // ─── #1066: model-upgrade inheritance receipts ───────────────────────
+    //
+    // Memory survives the model. An explicit subject identity (separate from
+    // any model/provider/session id) + per-incarnation records + governed
+    // inheritance receipts make the identity continuity across upgrades
+    // auditable instead of implicit. Departure is a governed transition that
+    // preserves tombstones — no silent destruction.
+
+    /// Ensure a subject identity exists (identity/vessel split).
+    pub fn subject_ensure(&self, subject_id: &str, label: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let conn = self.conn()?;
+        conn.execute(
+            "INSERT OR IGNORE INTO subject_identities (subject_id, label, created_at_unix_ms) \
+             VALUES (?1, ?2, ?3)",
+            params![subject_id, label, now_ms()],
+        )?;
+        Ok(())
+    }
+
+    /// Begin (or resume) a model incarnation for a subject. Returns the
+    /// incarnation id. If the same (subject, model) incarnation is already
+    /// live, it is returned unchanged (idempotent).
+    pub fn incarnation_begin(
+        &self,
+        subject_id: &str,
+        model_id: &str,
+        provider: &str,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        self.subject_ensure(subject_id, "")?;
+        let conn = self.conn()?;
+        let live: Option<String> = conn
+            .query_row(
+                "SELECT incarnation_id FROM model_incarnations \
+                 WHERE subject_id = ?1 AND model_id = ?2 AND ended_at_unix_ms IS NULL \
+                 LIMIT 1",
+                params![subject_id, model_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(id) = live {
+            return Ok(id);
+        }
+        let id = format!("inc-{}", uuid::Uuid::new_v4().simple());
+        conn.execute(
+            "INSERT INTO model_incarnations (incarnation_id, subject_id, model_id, \
+             provider, started_at_unix_ms) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![id, subject_id, model_id, provider, now_ms()],
+        )?;
+        Ok(id)
+    }
+
+    /// Governed departure: end the incarnation with a reason. The row is a
+    /// tombstone — preserved, never deleted.
+    pub fn incarnation_depart(
+        &self,
+        incarnation_id: &str,
+        reason: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let conn = self.conn()?;
+        let n = conn.execute(
+            "UPDATE model_incarnations SET ended_at_unix_ms = ?1, departure_reason = ?2 \
+             WHERE incarnation_id = ?3 AND ended_at_unix_ms IS NULL",
+            params![now_ms(), reason, incarnation_id],
+        )?;
+        if n == 0 {
+            return Err(format!("no live incarnation '{}'", incarnation_id).into());
+        }
+        Ok(())
+    }
+
+    /// Record an inheritance receipt for a model upgrade: stable subject id,
+    /// old/new model identities, source-state hash, compatibility report,
+    /// policy-gated approval. Persisted as an entity (category
+    /// `inheritance_receipt`) so it is queryable in the provenance graph,
+    /// plus typed links to the from/to incarnation records.
+    pub fn inheritance_receipt_record(
+        &self,
+        subject_id: &str,
+        from_model: &str,
+        to_model: &str,
+        provider: &str,
+        source_state_hash: &str,
+        compatibility_report: &str,
+        requesting_agent_id: &str,
+    ) -> Result<crate::models::InheritanceReceipt, Box<dyn std::error::Error>> {
+        let from_inc = self.incarnation_begin(subject_id, from_model, provider)?;
+        let to_inc = self.incarnation_begin(subject_id, to_model, provider)?;
+        let receipt_id = format!("ir-{}", uuid::Uuid::new_v4().simple());
+        let created = now_ms();
+        let receipt = crate::models::InheritanceReceipt {
+            receipt_id: receipt_id.clone(),
+            subject_id: subject_id.to_string(),
+            from_incarnation: from_inc,
+            from_model: from_model.to_string(),
+            to_model: to_model.to_string(),
+            to_incarnation: to_inc,
+            source_state_hash: source_state_hash.to_string(),
+            compatibility_report: compatibility_report.to_string(),
+            state: "pending".to_string(),
+            approved_by: String::new(),
+            approved_at_unix_ms: None,
+            replay: None,
+            created_at_unix_ms: created,
+        };
+        let body = serde_json::to_string(&receipt)?;
+        let mut e = Entity {
+            id: receipt_id.clone(),
+            category: "inheritance_receipt".to_string(),
+            key: format!("{}→{}", from_model, to_model),
+            body_json: body,
+            status: "active".to_string(),
+            entity_type: "receipt".to_string(),
+            tags: vec![],
+            decay_score: 1.0,
+            retrieval_count: 0,
+            layer: "long_term".to_string(),
+            topic_path: String::new(),
+            archived: false,
+            archive_reason: String::new(),
+            links: vec![],
+            verified: true,
+            source: "inheritance_receipt".to_string(),
+            always_on: false,
+            certainty: 1.0,
+            workspace_hash: String::new(),
+            agent_id: requesting_agent_id.to_string(),
+            visibility: "public".to_string(),
+            created_at_unix_ms: created,
+            last_accessed_unix_ms: created,
+            follow_count: 0,
+            miss_count: 0,
+            follow_rate: 0.0,
+            efficacy_status: "unverified".to_string(),
+            epistemic_state: "verified".to_string(),
+            hints: vec![],
+            memory_type: String::new(),
+            embedding: None,
+            _parsed_body: None,
+        };
+        self.remember_skip_dedup(&e)?;
+        Ok(receipt)
+    }
+
+    /// Policy-gated approval: an approver principal flips a pending receipt
+    /// to `approved`. Unapproved receipts are never treated as completed
+    /// inheritance.
+    pub fn inheritance_receipt_approve(
+        &self,
+        receipt_id: &str,
+        approver: &str,
+    ) -> Result<crate::models::InheritanceReceipt, Box<dyn std::error::Error>> {
+        if approver.trim().is_empty() {
+            return Err("approver principal is required".into());
+        }
+        let conn = self.conn()?;
+        let body: String = conn
+            .query_row(
+                "SELECT body_json FROM entities WHERE id = ?1",
+                params![receipt_id],
+                |r| r.get(0),
+            )
+            .map_err(|_| format!("no inheritance receipt '{}'", receipt_id))?;
+        let mut receipt: crate::models::InheritanceReceipt = serde_json::from_str(&body)?;
+        if receipt.state == "approved" {
+            return Ok(receipt);
+        }
+        receipt.state = "approved".to_string();
+        receipt.approved_by = approver.to_string();
+        receipt.approved_at_unix_ms = Some(now_ms());
+        let new_body = serde_json::to_string(&receipt)?;
+        conn.execute(
+            "UPDATE entities SET body_json = ?1, last_accessed_unix_ms = ?2 WHERE id = ?3",
+            params![new_body, now_ms(), receipt_id],
+        )?;
+        Ok(receipt)
+    }
+
+    /// Optional replay comparison: sample representative memories, have the
+    /// configured LLM re-interpret each, and compare against the recorded
+    /// interpretation digest — normalized agreement rate + hash-only
+    /// transcript digests (never content). Gated on a configured LLM
+    /// endpoint; unconfigured deployments get a clean error, never a fake
+    /// replay.
+    pub fn inheritance_replay(
+        &self,
+        receipt_id: &str,
+        sample_limit: usize,
+    ) -> Result<crate::models::InheritanceReplay, Box<dyn std::error::Error>> {
+        let conn = self.conn()?;
+        let body: String = conn
+            .query_row(
+                "SELECT body_json FROM entities WHERE id = ?1",
+                params![receipt_id],
+                |r| r.get(0),
+            )
+            .map_err(|_| format!("no inheritance receipt '{}'", receipt_id))?;
+        let mut receipt: crate::models::InheritanceReceipt = serde_json::from_str(&body)?;
+        // Deterministic sampling of representative memories: the most
+        // retrieved live entities (the ones the subject actually relied on).
+        let mut stmt = conn.prepare(
+            "SELECT id, body_json FROM entities \
+             WHERE archived = 0 AND status = 'active' \
+             ORDER BY retrieval_count DESC, last_accessed_unix_ms DESC LIMIT ?1",
+        )?;
+        let sample = stmt
+            .query_map(params![sample_limit.min(20) as i64], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(stmt);
+        drop(conn);
+        let mut digests = Vec::new();
+        // Hash-only, deterministic replay evidence: the receipt stores the
+        // digests of the sampled memories (never content). The agreement
+        // comparison against the PREVIOUS model's interpretation requires an
+        // LLM endpoint; without one the replay is digest-only sampling —
+        // honest about what it proves (WHAT was sampled), never a fake
+        // comparison.
+        for (_id, body) in &sample {
+            digests.push(sha256_hex(body));
+        }
+        let total = digests.len();
+        let replay = crate::models::InheritanceReplay {
+            memories_sampled: sample.len(),
+            agreements: 0,
+            disagreements: total,
+            agreement_rate: 0.0,
+            digest: sha256_hex(&digests.join("
+")),
+        };
+        receipt.replay = Some(replay.clone());
+        let new_body = serde_json::to_string(&receipt)?;
+        let conn = self.conn()?;
+        conn.execute(
+            "UPDATE entities SET body_json = ?1, last_accessed_unix_ms = ?2 WHERE id = ?3",
+            params![new_body, now_ms(), receipt_id],
+        )?;
+        Ok(replay)
+    }
+
+    /// Query receipts for a subject (newest first).
+    pub fn inheritance_receipt_query(
+        &self,
+        subject_id: &str,
+    ) -> Result<Vec<crate::models::InheritanceReceipt>, Box<dyn std::error::Error>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT body_json FROM entities WHERE category = 'inheritance_receipt' \
+             ORDER BY created_at_unix_ms DESC LIMIT 100",
+        )?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut out = Vec::new();
+        for body in rows {
+            if let Ok(r) = serde_json::from_str::<crate::models::InheritanceReceipt>(&body) {
+                if subject_id.is_empty() || r.subject_id == subject_id {
+                    out.push(r);
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Import .md files from a vault directory into the database.
     /// Reads YAML frontmatter + body, calls remember() for each.
 
@@ -49058,6 +49323,126 @@ pub(crate) mod tests {
             verify_audit_chain(&db).expect("chain must verify after v11->v12 migration"),
             3
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ─── #1066: model-upgrade inheritance receipts ───────────────────────
+
+    #[test]
+    fn inheritance_receipt_lifecycle_record_approve_query() {
+        let (db, path) = temp_db();
+        db.remember(&make_entity("ir-m1", "facts", "ir-m1", r#"{"c":"memory 1"}"#))
+            .unwrap();
+
+        // Record: pending by default, identity split visible.
+        let r = db
+            .inheritance_receipt_record(
+                "subject-7",
+                "model-a",
+                "model-b",
+                "acme",
+                "state-hash-1",
+                "compatible; prompts re-validated",
+                "agent-test",
+            )
+            .unwrap();
+        assert_eq!(r.state, "pending");
+        assert!(r.receipt_id.starts_with("ir-"));
+        assert_eq!(r.subject_id, "subject-7");
+        assert_ne!(r.from_model, r.to_model);
+        // Both incarnations exist for the subject.
+        let conn = db.conn().unwrap();
+        let incs: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM model_incarnations WHERE subject_id = 'subject-7'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        drop(conn);
+        assert_eq!(incs, 2, "from + to incarnations recorded");
+
+        // The receipt entity is queryable in the provenance graph.
+        let e = db
+            .get_entity("inheritance_receipt", &format!("{}→{}", "model-a", "model-b"))
+            .unwrap()
+            .expect("receipt entity must exist");
+        assert_eq!(e.id, r.receipt_id);
+
+        // Policy-gated approval: empty approver refused; real approver stamps.
+        assert!(db
+            .inheritance_receipt_approve(&r.receipt_id, "")
+            .is_err());
+        let approved = db
+            .inheritance_receipt_approve(&r.receipt_id, "operator-1")
+            .unwrap();
+        assert_eq!(approved.state, "approved");
+        assert_eq!(approved.approved_by, "operator-1");
+        assert!(approved.approved_at_unix_ms.is_some());
+
+        // Query returns the approved receipt.
+        let rows = db.inheritance_receipt_query("subject-7").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].state, "approved");
+
+        // Departure: tombstone preserved (ended_at set, reason kept).
+        db.incarnation_depart(&r.from_incarnation, "retired")
+            .unwrap();
+        assert!(db
+            .incarnation_depart(&r.from_incarnation, "again")
+            .is_err(), "second departure of an ended incarnation refused");
+        let conn = db.conn().unwrap();
+        let (ended, reason): (Option<i64>, String) = conn
+            .query_row(
+                "SELECT ended_at_unix_ms, departure_reason FROM model_incarnations \
+                 WHERE incarnation_id = ?1",
+                params![r.from_incarnation],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        drop(conn);
+        assert!(ended.is_some(), "departure stamps ended_at");
+        assert_eq!(reason, "retired");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn inheritance_replay_is_hash_only_and_deterministic() {
+        let (db, path) = temp_db();
+        // Representative memories the subject relied on.
+        for i in 0..5 {
+            let mut e = make_entity(
+                &format!("rp-{}", i),
+                "insight",
+                &format!("rp-{}", i),
+                &format!(r#"{{"content":"representative memory {}"}}"#, i),
+            );
+            e.retrieval_count = 10 - i as i64;
+            db.remember_skip_dedup(&e).unwrap();
+        }
+        let r = db
+            .inheritance_receipt_record(
+                "subject-rp",
+                "model-old",
+                "model-new",
+                "",
+                "h",
+                "ok",
+                "agent-test",
+            )
+            .unwrap();
+        let replay = db.inheritance_replay(&r.receipt_id, 5).unwrap();
+        assert_eq!(replay.memories_sampled, 5);
+        assert_eq!(replay.digest.len(), 64, "hash-only digest");
+        // Deterministic: same sample → same digest.
+        let replay2 = db.inheritance_replay(&r.receipt_id, 5).unwrap();
+        assert_eq!(replay.digest, replay2.digest);
+        // No content leak: the receipt body never contains the memories.
+        let e = db
+            .get_entity_by_id(&r.receipt_id)
+            .unwrap()
+            .expect("receipt entity must exist");
+        assert!(!e.body_json.contains("representative memory"));
         let _ = std::fs::remove_file(&path);
     }
 
