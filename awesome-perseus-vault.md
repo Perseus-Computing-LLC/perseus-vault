@@ -45,6 +45,7 @@ Perseus Vault is MCP-native — any framework with MCP support can use Perseus V
 - [Google ADK](https://github.com/google/adk-python) — via MCP stdio
 - [Agno](https://github.com/agno-agi/agno) — via MCP stdio
 - [Magentic-One](https://github.com/anthropics/anthropic-quickstarts) — via MCP stdio
+- [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) — MCP config + native memory-injection plugin ([perseus-vault-dsh](https://github.com/Perseus-Computing-LLC/perseus-vault-dsh))
 
 ## MCP Hosts
 
@@ -90,6 +91,7 @@ Tested and confirmed working with:
 
 - [hermes-perseus-vault-plugin](https://github.com/Perseus-Computing-LLC/hermes-perseus-vault-plugin) — Native Perseus Vault integration for Hermes Agent
 - [Perseus Perseus Vault Connector](https://github.com/Perseus-Computing-LLC/perseus) — Perseus live context injection from Perseus Vault
+- [perseus-vault-dsh](https://github.com/Perseus-Computing-LLC/perseus-vault-dsh) — DeepSeek Harness plugin: pre-step memory injection + MCP config example
 
 ## Community Projects
 
