@@ -325,6 +325,10 @@ pub struct RecallArgs {
     /// Omit (default) for relevance-only ranking; set to bias toward recent memories.
     #[serde(default)]
     pub recency_half_life_secs: Option<f64>,
+    /// #1091 (ScrubJay): when true (default), recall excludes entities past
+    /// their memory type's utility horizon regardless of residual decay.
+    #[serde(default = "crate::models::default_true")]
+    pub enforce_utility_horizon: bool,
     #[serde(default)]
     pub workspace_hash: Option<String>,
     /// #485: scope as a ranking multiplier. 0.0–1.0; requires workspace_hash.
@@ -1967,6 +1971,7 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
         diversity_halving: a.diversity_halving,
         diversity_per_query_share: 0.0,
         recency_half_life_secs: a.recency_half_life_secs,
+        enforce_utility_horizon: a.enforce_utility_horizon,
         workspace_hash: profile_workspace.clone(),
         scope_weight: a.scope_weight,
         agent_id: a.agent_id.clone(),
@@ -2503,6 +2508,7 @@ pub fn handle_recall_batch(db: &Database, args: Value) -> Result<String, String>
             diversity_halving: q.diversity_halving,
             diversity_per_query_share: 0.0,
             recency_half_life_secs: q.recency_half_life_secs,
+            enforce_utility_horizon: q.enforce_utility_horizon,
             workspace_hash: q.workspace_hash.clone(),
             scope_weight: q.scope_weight,
             agent_id: q.agent_id.clone(),
@@ -7873,6 +7879,14 @@ pub fn handle_skill_audit(db: &Database, args: Value) -> Result<String, String> 
     serde_json::to_string(&report).map_err(|e| format!("Serialization failed: {e}"))
 }
 
+
+// ── #1091 type-conditioned temporal decay (ScrubJay) ──────────────────────
+
+pub fn handle_decay_audit(db: &Database, args: Value) -> Result<String, String> {
+    let _ = args;
+    let report = db.decay_audit()?;
+    serde_json::to_string(&report).map_err(|e| format!("Serialization failed: {e}"))
+}
 
 // ── #683 Keystones: mandatory policy rules ───────────────────────────────
 

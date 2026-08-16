@@ -6012,6 +6012,79 @@ impl Database {
         }))
     }
 
+    // ─── Type-Conditioned Temporal Decay (#1091 ScrubJay) ──────────────
+
+    /// Audit the type-conditioned decay state: the deterministic profile
+    /// table plus per-type population aggregates (count, mean decay score,
+    /// mean age, past-horizon rows). Past-horizon rows are exactly the
+    /// entities the recall horizon gate excludes by default.
+    pub fn decay_audit(&self) -> Result<serde_json::Value, String> {
+        use crate::memory_types::MemoryType;
+        let conn = self.conn().map_err(|e| format!("connection failed: {e}"))?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT memory_type, decay_score, created_at_unix_ms \
+                 FROM entities WHERE archived = 0",
+            )
+            .map_err(|e| format!("decay audit prepare failed: {e}"))?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, f64>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            })
+            .map_err(|e| format!("decay audit scan failed: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("decay audit row decode failed: {e}"))?;
+        drop(stmt);
+        let now = crate::db::now_ms();
+        let mut by_type: std::collections::BTreeMap<String, (i64, f64, i64, i64)> =
+            std::collections::BTreeMap::new();
+        for (memory_type, decay, created) in rows {
+            let past =
+                crate::temporal_decay::past_utility_horizon(created, &memory_type, now);
+            let entry = by_type.entry(memory_type).or_insert((0, 0.0, 0, 0));
+            entry.0 += 1;
+            entry.1 += decay;
+            entry.2 += (now.saturating_sub(created) / 86_400_000).max(0);
+            entry.3 += i64::from(past);
+        }
+        drop(conn);
+        let profiles: Vec<serde_json::Value> = std::iter::once(String::new())
+            .chain(MemoryType::ALL.iter().map(|t| t.as_str().to_string()))
+            .map(|t| {
+                let p = crate::temporal_decay::profile_for(&t);
+                serde_json::json!({
+                    "memory_type": if t.is_empty() { "legacy" } else { &t },
+                    "perishability_days": p.perishability_days,
+                    "utility_horizon_days": if p.utility_horizon_days >= crate::temporal_decay::HORIZON_NEVER_DAYS
+                        { serde_json::Value::String("never".into()) } else { serde_json::Value::from(p.utility_horizon_days) },
+                })
+            })
+            .collect();
+        let population: Vec<serde_json::Value> = by_type
+            .into_iter()
+            .map(|(memory_type, (count, decay_sum, age_sum, past))| {
+                let label = if memory_type.is_empty() { "legacy".to_string() } else { memory_type };
+                serde_json::json!({
+                    "memory_type": label,
+                    "count": count,
+                    "mean_decay_score": if count > 0 { (decay_sum / count as f64 * 1000.0).round() / 1000.0 } else { 0.0 },
+                    "mean_age_days": if count > 0 { age_sum / count } else { 0 },
+                    "past_horizon_count": past,
+                })
+            })
+            .collect();
+        Ok(serde_json::json!({
+            "generated_at_unix_ms": now,
+            "profiles": profiles,
+            "population": population,
+            "note": "past_horizon_count rows are excluded from default recall while enforce_utility_horizon is on; reachable via explicit as-of/history surfaces",
+        }))
+    }
+
     // ─── Decay & Layer Progression ──────────────────────────────────
 
     /// Ebbinghaus decay half-life in milliseconds (default: 7 days).
@@ -8827,6 +8900,19 @@ impl Database {
         let (mut entities, _) = self.recall_with_completeness(params)?;
         if let Some(tf) = params.type_filter.as_deref() {
             entities.retain(|e| type_matches(e, tf));
+        }
+        // #1091 (ScrubJay): utility-horizon gate — perishable types stop
+        // surfacing past their horizon regardless of residual decay score.
+        // Query-adaptive via params.enforce_utility_horizon (default ON).
+        if params.enforce_utility_horizon {
+            let now = crate::db::now_ms();
+            entities.retain(|e| {
+                !crate::temporal_decay::past_utility_horizon(
+                    e.created_at_unix_ms,
+                    &e.memory_type,
+                    now,
+                )
+            });
         }
         // #886: hierarchical tier ordering (mental models → observations →
         // raw facts) — opt-in, reorders the returned list only.
@@ -30849,6 +30935,8 @@ pub(crate) mod tests {
                 diversity_halving: 0.0,
                 diversity_per_query_share: 0.0,
                 recency_half_life_secs: None,
+
+                enforce_utility_horizon: true,
                 workspace_hash: None,
                 scope_weight: None,
                 agent_id: None,
@@ -30893,6 +30981,8 @@ pub(crate) mod tests {
                 diversity_halving: 0.0,
                 diversity_per_query_share: 0.0,
                 recency_half_life_secs: None,
+
+                enforce_utility_horizon: true,
                 workspace_hash: None,
                 scope_weight: None,
                 agent_id: None,
@@ -30975,6 +31065,8 @@ pub(crate) mod tests {
                 diversity_halving: 0.0,
                 diversity_per_query_share: 0.0,
                 recency_half_life_secs: None,
+
+                enforce_utility_horizon: true,
                 workspace_hash: None,
                 scope_weight: None,
                 agent_id: None,
@@ -46688,6 +46780,8 @@ pub(crate) mod tests {
                 diversity_halving: 1.0,
                 diversity_per_query_share: 0.0,
                 recency_half_life_secs: None,
+
+                enforce_utility_horizon: true,
                 workspace_hash: None,
                 scope_weight: None,
                 agent_id: None,
@@ -47219,6 +47313,8 @@ pub(crate) mod tests {
                     diversity_halving: 1.0f64,
                     diversity_per_query_share: 0.0f64,
                     recency_half_life_secs: None,
+
+                    enforce_utility_horizon: true,
                     workspace_hash: None,
                     scope_weight: None,
                     agent_id: None,
@@ -47309,6 +47405,8 @@ pub(crate) mod tests {
             diversity_halving: 1.0,
             diversity_per_query_share: 0.0,
             recency_half_life_secs: None,
+
+            enforce_utility_horizon: true,
             workspace_hash: ws,
             scope_weight: None,
             agent_id: None,
@@ -47392,6 +47490,8 @@ pub(crate) mod tests {
             diversity_halving: 1.0,
             diversity_per_query_share: 0.0,
             recency_half_life_secs: None,
+
+            enforce_utility_horizon: true,
             workspace_hash: None,
             scope_weight: None,
             agent_id: None,

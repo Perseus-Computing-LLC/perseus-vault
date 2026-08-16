@@ -311,6 +311,11 @@ pub fn default_trust_weight() -> f64 {
     0.15
 }
 
+/// serde default for boolean-flag args that default ON.
+pub fn default_true() -> bool {
+    true
+}
+
 /// Default recall max-prior-overturn constant (#956). A single prior
 /// (recency/content/trust) can overturn at most this × a relevance gap.
 pub fn default_max_prior_overturn() -> f64 {
@@ -897,6 +902,9 @@ pub struct RecallParams {
     /// Only applies to `SearchMode::Hybrid`; entities with an unset (<= 0)
     /// `created_at_unix_ms` are never penalized.
     pub recency_half_life_secs: Option<f64>,
+    /// #1091 (ScrubJay): when true (default), recall excludes entities past
+    /// their type's utility horizon regardless of residual decay score.
+    pub enforce_utility_horizon: bool,
     /// Workspace scope filter (v1.2.0). When Some, only entities with a
     /// matching workspace_hash are returned. None = no workspace filtering.
     pub workspace_hash: Option<String>,
@@ -1388,6 +1396,7 @@ impl Default for RecallParams {
             diversity_halving: 1.0,
             diversity_per_query_share: 0.0,
             recency_half_life_secs: None,
+            enforce_utility_horizon: true,
             workspace_hash: None,
             scope_weight: None,
             agent_id: None,

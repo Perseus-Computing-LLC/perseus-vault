@@ -367,6 +367,7 @@ pub fn build_projection(db: &Database, req: &ProjectionRequest) -> Result<Projec
         diversity_halving: 1.0,
         diversity_per_query_share: 0.0,
         recency_half_life_secs: None,
+        enforce_utility_horizon: true,
         workspace_hash: req.workspace_hash.clone(),
         scope_weight: None,
         agent_id: None,
