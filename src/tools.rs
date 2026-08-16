@@ -7929,6 +7929,21 @@ pub fn handle_segment_consolidate(db: &Database, args: Value) -> Result<String, 
     serde_json::to_string(&report).map_err(|e| format!("Serialization failed: {e}"))
 }
 
+// ── #1093 state-to-draft audit (STALE/StateAuditor) ───────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct StateAuditArgs {
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+pub fn handle_state_audit(db: &Database, args: Value) -> Result<String, String> {
+    let a: StateAuditArgs = serde_json::from_value(args)
+        .map_err(|e| format!("Invalid state_audit arguments: {e}"))?;
+    let report = db.state_audit(a.dry_run)?;
+    serde_json::to_string(&report).map_err(|e| format!("Serialization failed: {e}"))
+}
+
 // ── #683 Keystones: mandatory policy rules ───────────────────────────────
 
 #[derive(Debug, Deserialize)]
