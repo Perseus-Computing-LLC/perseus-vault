@@ -7793,6 +7793,14 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "outputSchema": {"type": "object", "properties": {"skills": {"type": "array", "items": {"type": "object"}}, "serving_version": {"type": "object"}, "experience_stats": {"type": "object"}, "receipts": {"type": "array", "items": {"type": "object"}}}},
     "annotations": { "readOnlyHint": true },
     "title": "Audit Retrieval Skills"
+  },
+{
+    "name": "perseus_vault_decay_audit",
+    "description": "#1091 (ScrubJay-MEM, arXiv:2608.04746): audit type-conditioned temporal decay — the deterministic perishability/utility-horizon profile table per memory type plus population aggregates (count, mean decay, mean age, past-horizon rows excluded from default recall).",
+    "inputSchema": {"type": "object", "properties": {}},
+    "outputSchema": {"type": "object", "properties": {"generated_at_unix_ms": {"type": "integer"}, "profiles": {"type": "array", "items": {"type": "object"}}, "population": {"type": "array", "items": {"type": "object"}}, "note": {"type": "string"}}},
+    "annotations": { "readOnlyHint": true },
+    "title": "Audit Temporal Decay"
   }
 
 ]"###,
@@ -7955,6 +7963,7 @@ const TOOL_SCOPES: &[(&str, ToolScope)] = &[
         ("perseus_vault_skill_route", ToolScope::Ops),
         ("perseus_vault_skill_advance", ToolScope::Ops),
         ("perseus_vault_skill_audit", ToolScope::Ops),
+        ("perseus_vault_decay_audit", ToolScope::Ops),
     ("perseus_vault_rollback_repair", ToolScope::Ops),    ("perseus_vault_op_run", ToolScope::Ops),
     ("perseus_vault_op_run_list", ToolScope::Ops),
     ("perseus_vault_op_run_get", ToolScope::Ops),
@@ -8312,6 +8321,8 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
         "perseus_vault_skill_route" => tools::handle_skill_route(db, args),
         "perseus_vault_skill_advance" => tools::handle_skill_advance(db, args),
         "perseus_vault_skill_audit" => tools::handle_skill_audit(db, args),
+
+        "perseus_vault_decay_audit" => tools::handle_decay_audit(db, args),
 "perseus_vault_rollback_repair" => tools::handle_rollback_repair(db, args),        "perseus_vault_op_run" => tools::handle_op_run(db, args).map_err(|e| e.to_string()),
         "perseus_vault_op_run_list" => {
             tools::handle_op_run_list(db, args).map_err(|e| e.to_string())
@@ -8462,7 +8473,7 @@ mod tests {
         );
         assert_eq!(
             registry_names.len(),
-            165,            "update public metadata when adding a tool"
+            166,            "update public metadata when adding a tool"
         );
 
         let canonical = advertised_names();
@@ -9771,8 +9782,8 @@ mod tests {
         let ops = filter_registry_by_view(registry.clone(), ScopeView::Ops);
         let full = filter_registry_by_view(registry.clone(), ScopeView::Full);
         assert_eq!(agent.len(), 51, "agent view count drifted — new tools must be classified");
-        assert_eq!(ops.len(), 158, "ops view count drifted — new tools must be classified");
-        assert_eq!(full.len(), 165, "full view must expose the whole registry");
+        assert_eq!(ops.len(), 159, "ops view count drifted — new tools must be classified");
+        assert_eq!(full.len(), 166, "full view must expose the whole registry");
         assert!(agent.len() < ops.len() && ops.len() < full.len());
     }
 
