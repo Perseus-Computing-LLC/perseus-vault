@@ -5645,6 +5645,373 @@ impl Database {
         Ok(out)
     }
 
+    // ─── Retrieval-Skill Routing (#1090 ERSkill) ────────────────────────
+
+    /// Journal a skill-governance receipt and return its id.
+    fn skill_journal_receipt(
+        &self,
+        event_type: &str,
+        detail: serde_json::Value,
+    ) -> Result<String, String> {
+        let raw = uuid::Uuid::new_v4().to_string().replace('-', "");
+        let id = format!("jrn-{}", &raw[..12.min(raw.len())]);
+        self.journal(&crate::models::JournalEvent {
+            id: id.clone(),
+            event_type: event_type.to_string(),
+            evaluated_json: "{}".to_string(),
+            acted_json: detail.to_string(),
+            forward_json: "{}".to_string(),
+            category: String::new(),
+            key: String::new(),
+            entity_id: String::new(),
+            agent_id: "retrieval_skills".to_string(),
+            workspace_hash: String::new(),
+            created_at_unix_ms: now_ms(),
+        })
+        .map_err(|e| format!("receipt journal failed: {e}"))?;
+        Ok(id)
+    }
+
+    /// Load every registered skill definition (both frontiers).
+    pub(crate) fn skill_load_all(
+        &self,
+    ) -> Result<Vec<crate::retrieval_skills::SkillDef>, String> {
+        let conn = self.conn().map_err(|e| format!("connection failed: {e}"))?;
+        let mut stmt = conn
+            .prepare("SELECT value_json FROM state WHERE key LIKE 'skill.def.%'")
+            .map_err(|e| format!("skill scan prepare failed: {e}"))?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(|e| format!("skill scan failed: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("skill row decode failed: {e}"))?;
+        drop(stmt);
+        let mut out = Vec::new();
+        for row in rows {
+            let def: crate::retrieval_skills::SkillDef = serde_json::from_str(&row)
+                .map_err(|e| format!("stored skill definition is not valid JSON: {e}"))?;
+            out.push(def);
+        }
+        out.sort_by(|a, b| a.skill_id.cmp(&b.skill_id));
+        Ok(out)
+    }
+
+    /// Define or version a retrieval skill. New versions always land in the
+    /// `expansion` frontier (double-frontier deployment): they never affect
+    /// routing until a governed advancement promotes them. Versions are
+    /// monotonic per skill id.
+    pub fn skill_set(
+        &self,
+        def: &crate::retrieval_skills::SkillDef,
+    ) -> Result<serde_json::Value, String> {
+        if def.skill_id.trim().is_empty() || def.skill_id.len() > 64 {
+            return Err("skill_id must be 1..=64 chars".into());
+        }
+        def.template.validate()?;
+        if def.version == 0 {
+            return Err("skill version must be >= 1".into());
+        }
+        let skills = self.skill_load_all()?;
+        if skills.len() >= crate::retrieval_skills::SKILL_MAX_DEFS
+            && !skills.iter().any(|s| s.skill_id == def.skill_id)
+        {
+            return Err(format!(
+                "skill registry at capacity ({})",
+                crate::retrieval_skills::SKILL_MAX_DEFS
+            ));
+        }
+        if let Some(existing) = skills.iter().find(|s| s.skill_id == def.skill_id) {
+            if def.version <= existing.version {
+                return Err(format!(
+                    "skill {} version {} is not newer than stored version {}",
+                    def.skill_id, def.version, existing.version
+                ));
+            }
+        }
+        // Double-frontier: a defined/updated skill is never router-facing
+        // until governed advancement.
+        let mut stored = def.clone();
+        stored.frontier = crate::retrieval_skills::FRONTIER_EXPANSION.to_string();
+        self.state_set(&crate::models::StateEntry {
+            key: format!(
+                "{}{}",
+                crate::retrieval_skills::SKILL_DEF_PREFIX,
+                def.skill_id
+            ),
+            value_json: serde_json::to_string(&stored).map_err(|e| format!("serialize failed: {e}"))?,
+            expires_at_unix_ms: None,
+            created_at_unix_ms: now_ms(),
+        })
+        .map_err(|e| format!("skill definition write failed: {e}"))?;
+        let receipt = self.skill_journal_receipt(
+            "skill_defined",
+            serde_json::json!({
+                "skill_id": stored.skill_id,
+                "name": stored.name,
+                "version": stored.version,
+                "frontier": stored.frontier,
+                "mode": stored.template.mode,
+            }),
+        )?;
+        Ok(serde_json::json!({
+            "defined": true,
+            "skill_id": stored.skill_id,
+            "version": stored.version,
+            "frontier": stored.frontier,
+            "receipt": receipt,
+            "note": "new versions enter the expansion frontier; advance them with governed non-regression evidence to serve",
+        }))
+    }
+
+    /// Route a query through the serving frontier and (optionally) execute
+    /// the chosen skill. Serving logs the explored path into the experience
+    /// trie (skill id × query fingerprint × outcome).
+    pub fn skill_route(&self, query: &str, serve: bool) -> Result<serde_json::Value, String> {
+        if query.trim().is_empty() {
+            return Err("skill_route requires a query".into());
+        }
+        let skills = self.skill_load_all()?;
+        let Some((chosen, score, ranking)) =
+            crate::retrieval_skills::route_serving(query, &skills)
+        else {
+            return Err(
+                "no serving-frontier retrieval skills — define one via perseus_vault_skill_set and advance it with non-regression evidence"
+                    .into(),
+            );
+        };
+        let mut out = serde_json::json!({
+            "skill_id": chosen.skill_id,
+            "skill_version": chosen.version,
+            "score": score,
+            "ranking": ranking.iter().map(|(id, s)| serde_json::json!({"skill_id": id, "score": s})).collect::<Vec<_>>(),
+            "served": false,
+        });
+        if serve {
+            let params = chosen.template.to_recall_params(query);
+            let entities = self
+                .recall(&params)
+                .map_err(|e| format!("skill recall failed: {e}"))?;
+            let fp = crate::retrieval_skills::query_fingerprint(query);
+            let served = entities.len() as i64;
+            // Experience trie: explored path (skill, fingerprint, outcome).
+            self.state_set(&crate::models::StateEntry {
+                key: format!(
+                    "{}{}.{}",
+                    crate::retrieval_skills::SKILL_EXP_PREFIX,
+                    chosen.skill_id,
+                    fp
+                ),
+                value_json: serde_json::json!({"served": served, "at_unix_ms": now_ms()}).to_string(),
+                expires_at_unix_ms: None,
+                created_at_unix_ms: now_ms(),
+            })
+            .map_err(|e| format!("experience path write failed: {e}"))?;
+            // Trie stats: reuse rather than re-explore.
+            let stats_key = format!(
+                "{}{}",
+                crate::retrieval_skills::SKILL_EXP_STATS_PREFIX,
+                chosen.skill_id
+            );
+            let conn = self.conn().map_err(|e| format!("connection failed: {e}"))?;
+            let prev: Option<String> = conn
+                .query_row(
+                    "SELECT value_json FROM state WHERE key = ?1",
+                    [&stats_key],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(|e| format!("stats lookup failed: {e}"))?;
+            drop(conn);
+            let prev_v: serde_json::Value = serde_json::from_str(&prev.unwrap_or_else(|| "{}".into())).unwrap_or(serde_json::json!({}));
+            let n = prev_v["n"].as_i64().unwrap_or(0) + 1;
+            let ok = prev_v["ok"].as_i64().unwrap_or(0) + if served > 0 { 1 } else { 0 };
+            self.state_set(&crate::models::StateEntry {
+                key: stats_key,
+                value_json: serde_json::json!({"n": n, "ok": ok, "last_served_at_unix_ms": now_ms()}).to_string(),
+                expires_at_unix_ms: None,
+                created_at_unix_ms: now_ms(),
+            })
+            .map_err(|e| format!("stats write failed: {e}"))?;
+            out["served"] = serde_json::Value::from(served);
+            out["entities"] = serde_json::to_value(&entities)
+                .map_err(|e| format!("serialize failed: {e}"))?;
+            out["query_fingerprint"] = serde_json::Value::from(fp);
+        }
+        Ok(out)
+    }
+
+    /// Governed frontier transition (double-frontier gate). `advance` moves
+    /// expansion → serving and REQUIRES non-regression evidence (fail
+    /// closed); `demote` moves serving → expansion (the governed rollback,
+    /// evidence optional). Every transition is receipt-anchored.
+    pub fn skill_advance(
+        &self,
+        skill_id: &str,
+        evidence: Option<&crate::retrieval_skills::AdvanceEvidence>,
+        direction: &str,
+    ) -> Result<serde_json::Value, String> {
+        let mut skills = self.skill_load_all()?;
+        let Some(idx) = skills.iter().position(|s| s.skill_id == skill_id) else {
+            return Err(format!("unknown skill {skill_id}"));
+        };
+        let (from, to) = match direction {
+            "advance" => (
+                crate::retrieval_skills::FRONTIER_EXPANSION,
+                crate::retrieval_skills::FRONTIER_SERVING,
+            ),
+            "demote" => (
+                crate::retrieval_skills::FRONTIER_SERVING,
+                crate::retrieval_skills::FRONTIER_EXPANSION,
+            ),
+            other => return Err(format!("unknown direction {other:?}; expected advance | demote")),
+        };
+        if skills[idx].frontier != from {
+            return Err(format!(
+                "skill {skill_id} is in frontier {:?}; {direction} requires {:?}",
+                skills[idx].frontier, from
+            ));
+        }
+        if direction == "advance" {
+            let Some(ev) = evidence else {
+                let receipt = self.skill_journal_receipt(
+                    "skill_advance_refused",
+                    serde_json::json!({"skill_id": skill_id, "reason": "no evidence"}),
+                )?;
+                return Ok(serde_json::json!({
+                    "accepted": false,
+                    "skill_id": skill_id,
+                    "reason": "advancement requires non-regression evidence (eval_ref, wins/losses/ties, recall_delta)",
+                    "receipt": receipt,
+                }));
+            };
+            if !ev.passes() {
+                let receipt = self.skill_journal_receipt(
+                    "skill_advance_refused",
+                    serde_json::json!({"skill_id": skill_id, "evidence": ev, "reason": "regression"}),
+                )?;
+                return Ok(serde_json::json!({
+                    "accepted": false,
+                    "skill_id": skill_id,
+                    "reason": "refused: evidence shows regression (losses > wins or negative recall delta)",
+                    "evidence": ev,
+                    "receipt": receipt,
+                }));
+            }
+        }
+        skills[idx].frontier = to.to_string();
+        self.state_set(&crate::models::StateEntry {
+            key: format!("{}{}", crate::retrieval_skills::SKILL_DEF_PREFIX, skill_id),
+            value_json: serde_json::to_string(&skills[idx]).map_err(|e| format!("serialize failed: {e}"))?,
+            expires_at_unix_ms: None,
+            created_at_unix_ms: now_ms(),
+        })
+        .map_err(|e| format!("skill frontier write failed: {e}"))?;
+        // Serving-version counter (receipt-anchored rollback point).
+        let conn = self.conn().map_err(|e| format!("connection failed: {e}"))?;
+        let prev_version: Option<String> = conn
+            .query_row(
+                "SELECT value_json FROM state WHERE key = ?1",
+                [crate::retrieval_skills::SKILL_SERVING_VERSION_KEY],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| format!("version lookup failed: {e}"))?;
+        drop(conn);
+        let prev: serde_json::Value =
+            serde_json::from_str(&prev_version.unwrap_or_else(|| "{\"version\":0}".into()))
+                .unwrap_or(serde_json::json!({"version": 0}));
+        let next = prev["version"].as_i64().unwrap_or(0) + 1;
+        let receipt = self.skill_journal_receipt(
+            "skill_advancement",
+            serde_json::json!({
+                "skill_id": skill_id,
+                "version": skills[idx].version,
+                "direction": direction,
+                "evidence": evidence,
+                "serving_version": next,
+            }),
+        )?;
+        self.state_set(&crate::models::StateEntry {
+            key: crate::retrieval_skills::SKILL_SERVING_VERSION_KEY.to_string(),
+            value_json: serde_json::json!({"version": next, "last_receipt": receipt}).to_string(),
+            expires_at_unix_ms: None,
+            created_at_unix_ms: now_ms(),
+        })
+        .map_err(|e| format!("serving version write failed: {e}"))?;
+        Ok(serde_json::json!({
+            "accepted": true,
+            "skill_id": skill_id,
+            "frontier": to,
+            "serving_version": next,
+            "receipt": receipt,
+        }))
+    }
+
+    /// Read-only audit: definitions by frontier, serving version, experience
+    /// trie stats, and the advancement receipt trail.
+    pub fn skill_audit(&self) -> Result<serde_json::Value, String> {
+        let skills = self.skill_load_all()?;
+        let conn = self.conn().map_err(|e| format!("connection failed: {e}"))?;
+        let serving_version: Option<String> = conn
+            .query_row(
+                "SELECT value_json FROM state WHERE key = ?1",
+                [crate::retrieval_skills::SKILL_SERVING_VERSION_KEY],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| format!("version lookup failed: {e}"))?;
+        let mut stats: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
+        let mut stmt = conn
+            .prepare("SELECT key, value_json FROM state WHERE key LIKE 'skill.exp.stats.%'")
+            .map_err(|e| format!("stats scan prepare failed: {e}"))?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .map_err(|e| format!("stats scan failed: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("stats row decode failed: {e}"))?;
+        drop(stmt);
+        for (key, value) in rows {
+            let skill_id = key
+                .trim_start_matches(crate::retrieval_skills::SKILL_EXP_STATS_PREFIX)
+                .to_string();
+            stats.insert(skill_id, serde_json::from_str(&value).unwrap_or(serde_json::Value::Null));
+        }
+        let mut receipts: Vec<serde_json::Value> = Vec::new();
+        let mut stmt2 = conn
+            .prepare("SELECT acted_json, created_at_unix_ms FROM journal WHERE event_type IN ('skill_defined','skill_advancement','skill_advance_refused') ORDER BY created_at_unix_ms DESC LIMIT 50")
+            .map_err(|e| format!("receipt scan prepare failed: {e}"))?;
+        let rows2 = stmt2
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+            .map_err(|e| format!("receipt scan failed: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("receipt row decode failed: {e}"))?;
+        drop(stmt2);
+        for (acted, at) in rows2 {
+            let mut v: serde_json::Value = serde_json::from_str(&acted).unwrap_or(serde_json::Value::Null);
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("at_unix_ms".into(), serde_json::Value::from(at));
+            }
+            receipts.push(v);
+        }
+        let mut defs: Vec<serde_json::Value> = skills
+            .iter()
+            .map(|s| serde_json::json!({
+                "skill_id": s.skill_id,
+                "name": s.name,
+                "version": s.version,
+                "frontier": s.frontier,
+                "mode": s.template.mode,
+            }))
+            .collect();
+        defs.sort_by(|a, b| a["skill_id"].as_str().cmp(&b["skill_id"].as_str()));
+        Ok(serde_json::json!({
+            "skills": defs,
+            "serving_version": serde_json::from_str::<serde_json::Value>(&serving_version.unwrap_or_else(|| "{\"version\":0}".into())).unwrap_or(serde_json::json!({"version": 0})),
+            "experience_stats": stats,
+            "receipts": receipts,
+        }))
+    }
+
     // ─── Decay & Layer Progression ──────────────────────────────────
 
     /// Ebbinghaus decay half-life in milliseconds (default: 7 days).
