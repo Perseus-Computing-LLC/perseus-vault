@@ -760,6 +760,8 @@ mod tests {
             target_id: target.to_string(),
             weight: 0.5,
             source: None,
+            kind: None,
+            asserted_at_unix_ms: None,
         }
     }
 

@@ -5895,6 +5895,79 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Seal Verification: Tamper Evidence Scan"
   },
   {
+    "name": "perseus_vault_provenance_projection",
+    "description": "Evidence-vs-execution provenance projection over the typed link graph (#1064). mode=evidence walks supports/contradicts/invalidates/updates/authorized_by edges with classified kinds; mode=execution lists journal events referencing the entity plus blocked/denied authorized-action receipts (intent + failure receipt extended into the graph). Provenance != authorization != truth.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "seed_id": {
+          "type": "string",
+          "description": "Entity id to project from."
+        },
+        "mode": {
+          "type": "string",
+          "description": "evidence (typed edge graph) or execution (journal events + blocked action receipts). Default: evidence."
+        },
+        "depth": {
+          "type": "integer",
+          "description": "BFS depth bound for evidence mode (1-10, default 3)."
+        }
+      },
+      "required": ["seed_id"]
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "seed_id": {"type": "string"},
+        "mode": {"type": "string"},
+        "depth": {"type": "integer"},
+        "nodes": {"type": "array"},
+        "edges": {"type": "array"},
+        "blocked_actions": {"type": "array"}
+      }
+    },
+    "annotations": {
+      "readOnlyHint": true
+    },
+    "title": "Typed Provenance Projection: Evidence vs Execution"
+  },
+  {
+    "name": "perseus_vault_param_lineage",
+    "description": "Parameter-level lineage for high-risk tool arguments (Agent-Sentry pattern, #1064): record or query where a specific parameter value came from. Query validates every source — a dangling source_ref is returned with resolved=false, surfaced rather than trusted.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "action": {
+          "type": "string",
+          "description": "set (record a lineage row) or query (list rows)."
+        },
+        "entity_id": {"type": "string"},
+        "param_path": {"type": "string"},
+        "source_kind": {"type": "string"},
+        "source_ref": {
+          "type": "string",
+          "description": "Optional producing entity id; validated at query time."
+        },
+        "workspace_hash": {"type": "string"},
+        "agent_id": {"type": "string"}
+      },
+      "required": ["action", "entity_id"]
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "ok": {"type": "boolean"},
+        "lineage_id": {"type": "string"},
+        "entity_id": {"type": "string"},
+        "lineage": {"type": "array"}
+      }
+    },
+    "annotations": {
+      "readOnlyHint": false
+    },
+    "title": "Parameter-Level Lineage for High-Risk Arguments"
+  },
+  {
     "name": "perseus_vault_vault_export",
     "description": "Export all non-archived entities to .md files with YAML frontmatter in a vault directory. Files are human-readable, git-trackable, and Obsidian-compatible. Use this for backup, transfer between workspaces, or offline review.",
     "inputSchema": {
@@ -7662,6 +7735,8 @@ const TOOL_SCOPES: &[(&str, ToolScope)] = &[
     ("perseus_vault_dream", ToolScope::Ops),
     ("perseus_vault_seal", ToolScope::Ops),
     ("perseus_vault_tamper_scan", ToolScope::Ops),
+    ("perseus_vault_provenance_projection", ToolScope::Ops),
+    ("perseus_vault_param_lineage", ToolScope::Ops),
     ("perseus_vault_vault_export", ToolScope::Ops),
     ("perseus_vault_derived_export", ToolScope::Ops),
     ("perseus_vault_markdown_import", ToolScope::Ops),
@@ -8026,6 +8101,8 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
         "perseus_vault_dream" => tools::handle_dream(db, args),
         "perseus_vault_seal" => tools::handle_seal(db, args),
         "perseus_vault_tamper_scan" => tools::handle_tamper_scan(db, args),
+        "perseus_vault_provenance_projection" => tools::handle_provenance_projection(db, args),
+        "perseus_vault_param_lineage" => tools::handle_param_lineage(db, args),
         "perseus_vault_vault_export" => Ok(tools::handle_vault_export(db, args)),
         "perseus_vault_derived_export" => tools::handle_derived_export(db, args),
         "perseus_vault_markdown_import" => tools::handle_markdown_import(db, args),
@@ -8132,7 +8209,7 @@ mod tests {
         );
         assert_eq!(
             registry_names.len(),
-            152,
+            154,
             "update public metadata when adding a tool"
         );
 
@@ -9441,9 +9518,9 @@ mod tests {
         let agent = filter_registry_by_view(registry.clone(), ScopeView::Agent);
         let ops = filter_registry_by_view(registry.clone(), ScopeView::Ops);
         let full = filter_registry_by_view(registry.clone(), ScopeView::Full);
-        assert_eq!(full.len(), 152, "full view must expose the whole registry");
+        assert_eq!(full.len(), 154, "full view must expose the whole registry");
         assert_eq!(agent.len(), 51, "agent view count drifted — new tools must be classified");
-        assert_eq!(ops.len(), 145, "ops view count drifted — new tools must be classified");
+        assert_eq!(ops.len(), 147, "ops view count drifted — new tools must be classified");
         assert!(agent.len() < ops.len() && ops.len() < full.len());
     }
 

@@ -769,6 +769,12 @@ pub struct LinkArgs {
     pub to_id: String,
     #[serde(default)]
     pub relationship: String,
+    /// #1064: optional typed relation kind (supports | contradicts |
+    /// invalidates | updates | authorized_by | related). When absent the
+    /// edge is recorded legacy-style and classified at read time from
+    /// `relationship`.
+    #[serde(default)]
+    pub kind: Option<crate::models::RelationKind>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3409,8 +3415,15 @@ pub fn handle_link(db: &Database, args: Value) -> Result<String, String> {
         a.relationship
     };
 
-    db.link(&a.from_category, &a.from_key, &a.to_id, &rel)
-        .map_err(|e| format!("Link failed: {}", e))?;
+    // #1064: typed write path when a kind is declared; legacy path otherwise.
+    match a.kind {
+        Some(kind) => db
+            .link_typed(&a.from_category, &a.from_key, &a.to_id, &rel, kind)
+            .map_err(|e| format!("Link failed: {}", e))?,
+        None => db
+            .link(&a.from_category, &a.from_key, &a.to_id, &rel)
+            .map_err(|e| format!("Link failed: {}", e))?,
+    }
 
     let result = json!({
         "success": true,
@@ -6763,6 +6776,92 @@ pub fn handle_seal(db: &Database, args: Value) -> Result<String, String> {
 pub fn handle_tamper_scan(db: &Database, _args: Value) -> Result<String, String> {
     let report = db.scan_seals().map_err(|e| e.to_string())?;
     Ok(json!(report).to_string())
+}
+
+// ─── #1064 typed provenance handlers ───────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct ProvenanceProjectionArgs {
+    pub seed_id: String,
+    #[serde(default = "default_projection_mode")]
+    pub mode: String,
+    #[serde(default = "default_projection_depth")]
+    pub depth: usize,
+}
+
+fn default_projection_mode() -> String {
+    "evidence".to_string()
+}
+
+fn default_projection_depth() -> usize {
+    3
+}
+
+/// Evidence-vs-execution provenance projection over the typed link graph.
+/// `evidence` walks supports/contradicts/invalidates/updates/authorized_by
+/// edges; `execution` lists journal events referencing the entity plus
+/// blocked/denied authorized-action receipts (the AAR shape extended into
+/// the graph). Provenance != authorization != truth.
+pub fn handle_provenance_projection(db: &Database, args: Value) -> Result<String, String> {
+    let a: ProvenanceProjectionArgs = serde_json::from_value(args)
+        .map_err(|e| format!("Invalid provenance_projection arguments: {}", e))?;
+    let depth = a.depth.min(10).max(1);
+    let proj = db
+        .provenance_projection(&a.seed_id, &a.mode, depth)
+        .map_err(|e| e.to_string())?;
+    Ok(json!(proj).to_string())
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ParamLineageArgs {
+    /// "set" records a lineage row; "query" lists them.
+    pub action: String,
+    pub entity_id: String,
+    #[serde(default)]
+    pub param_path: Option<String>,
+    #[serde(default)]
+    pub source_kind: Option<String>,
+    #[serde(default)]
+    pub source_ref: Option<String>,
+    #[serde(default)]
+    pub workspace_hash: Option<String>,
+    #[serde(default)]
+    pub agent_id: Option<String>,
+}
+
+/// Parameter-level lineage for high-risk tool arguments (Agent-Sentry
+/// pattern): where did this value come from. Query validates every source —
+/// a dangling source_ref is returned with resolved=false, surfaced rather
+/// than trusted.
+pub fn handle_param_lineage(db: &Database, args: Value) -> Result<String, String> {
+    let a: ParamLineageArgs = serde_json::from_value(args)
+        .map_err(|e| format!("Invalid param_lineage arguments: {}", e))?;
+    match a.action.as_str() {
+        "set" => {
+            let path = a
+                .param_path
+                .as_deref()
+                .ok_or("param_path is required for action=set")?;
+            let id = db
+                .param_lineage_set(
+                    &a.entity_id,
+                    path,
+                    a.source_kind.as_deref().unwrap_or("manual"),
+                    a.source_ref.as_deref().unwrap_or(""),
+                    a.workspace_hash.as_deref().unwrap_or(""),
+                    a.agent_id.as_deref().unwrap_or(""),
+                )
+                .map_err(|e| e.to_string())?;
+            Ok(json!({"lineage_id": id, "ok": true}).to_string())
+        }
+        "query" => {
+            let rows = db
+                .param_lineage_query(&a.entity_id)
+                .map_err(|e| e.to_string())?;
+            Ok(json!({"entity_id": a.entity_id, "lineage": rows}).to_string())
+        }
+        other => Err(format!("unknown action '{}' (set|query)", other)),
+    }
 }
 
 pub fn handle_vault_export(db: &Database, args: Value) -> String {

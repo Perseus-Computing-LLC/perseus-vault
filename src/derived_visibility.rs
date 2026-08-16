@@ -50,6 +50,8 @@ mod tests {
                 relationship: "derived_from".to_string(),
                 weight: 0.5,
                 source: Some("test".to_string()),
+                kind: None,
+                asserted_at_unix_ms: None,
             })
             .collect();
         e
@@ -231,6 +233,8 @@ mod tests {
             relationship: "related".to_string(),
             weight: 0.5,
             source: Some("test".to_string()),
+            kind: None,
+            asserted_at_unix_ms: None,
         }];
         let (id, _) = db.remember(&e).unwrap();
         let stored = db.get_entity_by_id_public(&id).unwrap().unwrap();
