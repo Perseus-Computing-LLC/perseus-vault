@@ -1,0 +1,78 @@
+general:
+  project_path: ./
+  log_level: INFO
+  data_path: ${general.project_path}/data
+  output_path: ${general.project_path}/outputs/memora_s_v2
+  results_path: ${general.project_path}/results/memora_s_v2
+  memory_store_path: ${general.project_path}/memory_store
+  logs_path: ${general.output_path}/logs
+  cache_path: ${general.output_path}/cache
+  debug: false
+llm:
+  model: gpt-4.1-mini
+  answer_model: gpt-4.1-mini
+  seed: 42
+  temperature: 0.0
+  max_tokens: 1024
+  answer_max_tokens: 256
+openai:
+  api_type: openai
+  managed_identity: ${oc.env:AZURE_MANAGED_IDENTITY_CLIENT_ID,''}
+  api_key: ${oc.env:OPENAI_API_KEY,''}
+  llm_api_base: ''
+  llm_api_version: 2024-12-01-preview
+  embedding_api_base: ''
+  embedding_api_version: 2024-12-01-preview
+  embedding_deployment_name: text-embedding-3-small
+  embedding_model: text-embedding-3-small
+memory:
+  type: memora
+  memory_store: memora_s_v2
+  persist_path: ${general.memory_store_path}/${memory.memory_store}
+  collection_name: agent_memory
+  distance: cosine
+  query_score_threshold: 0.4
+  update_score_threshold: 0.8
+  top_k: 30
+  force_rebuild: true
+  return_history: true
+  enhance_query: false
+  multimodal_support: false
+  enable_cue_index: true
+  cue_top_k: 20
+  chunk_size: 1000
+  num_chunks: 1
+  enable_hybrid_search: true
+  hybrid_search_method: bm25
+  hybrid_top_k: 10
+  bm25_score_threshold: 0.4
+  enable_segmentation: true
+  enable_episodic_memory: true
+  use_segments_as_episodic: true
+  use_segments_as_episodic_include_factual: true
+retrieval:
+  strategy: semantic
+  prompted_policy:
+    max_steps: 4
+    temperature: 0.0
+    max_tokens: 256
+  enable_llm_filter: false
+  enable_relaxed_frontier: false
+eval:
+  max_workers: 3
+  use_combined_user: true
+  prompt_template: mem0
+  model: gpt-4.1-mini
+  temperature: 0.0
+  judge_max_tokens: 64
+  subset_idx: -1
+PROMPT_VERSION: v2
+extraction:
+  enabled: true
+  mode: native_memora_chat_memory_builder
+  prompt_symbol: src/memora/builder/memory_builder.py:PROMPT_BUILD_MEMORY
+  prompt_version_runtime: false
+isolation:
+  enabled: true
+  mode: unique_memory_store_and_results_path_per_run
+  run_id: memora_s_v2
