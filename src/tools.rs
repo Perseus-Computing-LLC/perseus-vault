@@ -6864,7 +6864,42 @@ pub fn handle_param_lineage(db: &Database, args: Value) -> Result<String, String
     }
 }
 
-pub fn handle_vault_export(db: &Database, args: Value) -> String {
+// ─── #1065 intent-aware typed-relational traversal handlers ─────────────
+
+    #[derive(Debug, Deserialize)]
+    pub struct TypedTraversalArgs {
+        pub query: String,
+        #[serde(default = "default_traversal_limit")]
+        pub limit: usize,
+    }
+
+    fn default_traversal_limit() -> usize {
+        10
+    }
+
+    /// Intent-aware typed-relational traversal (MAGMA pattern): the query is
+    /// routed to one relation view (temporal / causal / entity / semantic) by a
+    /// deterministic classifier, the view's traversal policy runs, and the
+    /// explainable path + rejected distractors come back with token accounting
+    /// for the budget discipline. Each run is recorded for the ablation report.
+    pub fn handle_typed_traversal(db: &Database, args: Value) -> Result<String, String> {
+        let a: TypedTraversalArgs = serde_json::from_value(args)
+            .map_err(|e| format!("Invalid typed_traversal arguments: {}", e))?;
+        let t = db
+            .typed_traversal(&a.query, a.limit)
+            .map_err(|e| e.to_string())?;
+        Ok(json!(t).to_string())
+    }
+
+    /// Per-view ablation report over recorded traversals: mean selected/rejected
+    /// tokens and distractor ratio per relation view — is each view earning its
+    /// token cost?
+    pub fn handle_traversal_ablation(db: &Database, _args: Value) -> Result<String, String> {
+        let rows = db.typed_traversal_ablation().map_err(|e| e.to_string())?;
+        Ok(json!({"views": rows}).to_string())
+    }
+
+    pub fn handle_vault_export(db: &Database, args: Value) -> String {
     let a: VaultExportArgs = match serde_json::from_value(args) {
         Ok(a) => a,
         Err(e) => {
