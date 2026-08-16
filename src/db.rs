@@ -6234,6 +6234,123 @@ impl Database {
         }))
     }
 
+    // ─── State-to-Draft Audit (#1093 STALE/StateAuditor) ────────────────
+
+    /// Audit the state table for implicit stale-dependency drift and
+    /// (when not dry-run) demote stale entries to draft: the original value
+    /// is preserved verbatim under `state_draft.<receipt>`, the live key is
+    /// rewritten shape-compatibly with `status: "stale"`, and a journal
+    /// receipt anchors every repair.
+    pub fn state_audit(&self, dry_run: bool) -> Result<serde_json::Value, String> {
+        let keys = self.state_list("").map_err(|e| format!("state scan failed: {e}"))?;
+        let scanned = keys.len();
+        let mut found: Vec<serde_json::Value> = Vec::new();
+        let mut repaired: Vec<serde_json::Value> = Vec::new();
+        for key in keys {
+            // Never audit the draft staging area itself (it holds the
+            // already-preserved originals).
+            if key.starts_with(crate::state_auditor::STATE_DRAFT_PREFIX) {
+                continue;
+            }
+            let Some(entry) = self.state_get(&key).map_err(|e| format!("state get failed: {e}"))? else {
+                continue;
+            };
+            let Some(finding) = crate::state_auditor::evaluate(self, &key, &entry.value_json)
+            else {
+                continue;
+            };
+            let found_v = serde_json::json!({
+                "key": finding.key,
+                "reason": finding.reason,
+            });
+            found.push(found_v.clone());
+            if dry_run {
+                continue;
+            }
+            let raw = uuid::Uuid::new_v4().to_string().replace('-', "");
+            let receipt = format!("jrn-{}", &raw[..12.min(raw.len())]);
+            let draft_key = format!("{}{}", crate::state_auditor::STATE_DRAFT_PREFIX, receipt);
+            // Draft-copy: the stale value is preserved verbatim, wrapped
+            // with its provenance.
+            let draft = serde_json::json!({
+                "source_key": finding.key,
+                "demoted_at_unix_ms": crate::db::now_ms(),
+                "reason": finding.reason,
+                "original": serde_json::from_str::<serde_json::Value>(&entry.value_json)
+                    .unwrap_or(serde_json::Value::Null),
+            });
+            self.state_set(&crate::models::StateEntry {
+                key: draft_key.clone(),
+                value_json: draft.to_string(),
+                expires_at_unix_ms: None,
+                created_at_unix_ms: crate::db::now_ms(),
+            })
+            .map_err(|e| format!("draft write failed: {e}"))?;
+            // Demote the live key, shape-compatibly: sleep proposals keep
+            // their SleepProposal shape with status flipped to "stale";
+            // everything else gets a stale marker object.
+            let demoted = match serde_json::from_str::<serde_json::Value>(&entry.value_json) {
+                Ok(mut v) if v.is_object() && v.get("entity_a").is_some() => {
+                    let obj = v.as_object_mut().expect("checked object");
+                    obj.insert("status".into(), serde_json::json!("stale"));
+                    obj.insert("stale_reason".into(), serde_json::json!(finding.reason));
+                    obj.insert("demoted_to_draft".into(), serde_json::json!(draft_key));
+                    v
+                }
+                _ => serde_json::json!({
+                    "stale": true,
+                    "reason": finding.reason,
+                    "demoted_to_draft": draft_key,
+                    "demoted_at_unix_ms": crate::db::now_ms(),
+                }),
+            };
+            self.state_set(&crate::models::StateEntry {
+                key: finding.key.clone(),
+                value_json: demoted.to_string(),
+                expires_at_unix_ms: None,
+                created_at_unix_ms: crate::db::now_ms(),
+            })
+            .map_err(|e| format!("demotion write failed: {e}"))?;
+            let journal_id = {
+                let raw2 = uuid::Uuid::new_v4().to_string().replace('-', "");
+                let id = format!("jrn-{}", &raw2[..12.min(raw2.len())]);
+                self.journal(&crate::models::JournalEvent {
+                    id: id.clone(),
+                    event_type: "state_stale_repaired".to_string(),
+                    evaluated_json: "{}".to_string(),
+                    acted_json: serde_json::json!({
+                        "key": finding.key,
+                        "reason": finding.reason,
+                        "draft_key": draft_key,
+                    })
+                    .to_string(),
+                    forward_json: "{}".to_string(),
+                    category: String::new(),
+                    key: finding.key.clone(),
+                    entity_id: String::new(),
+                    agent_id: "state_auditor".to_string(),
+                    workspace_hash: String::new(),
+                    created_at_unix_ms: crate::db::now_ms(),
+                })
+                .map_err(|e| format!("repair receipt failed: {e}"))?;
+                id
+            };
+            repaired.push(serde_json::json!({
+                "key": finding.key,
+                "reason": finding.reason,
+                "receipt": journal_id,
+            }));
+        }
+        Ok(serde_json::json!({
+            "dry_run": dry_run,
+            "scanned": scanned,
+            "stale_count": found.len(),
+            "found_stale": found,
+            "repaired": repaired,
+            "note": "state-to-draft demotion: originals preserved under state_draft.*, live keys marked stale",
+        }))
+    }
+
     // ─── Decay & Layer Progression ──────────────────────────────────
 
     /// Ebbinghaus decay half-life in milliseconds (default: 7 days).

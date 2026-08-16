@@ -7833,6 +7833,19 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     },
     "annotations": { "readOnlyHint": false },
     "title": "Segment-Level Consolidation"
+  },
+{
+    "name": "perseus_vault_state_audit",
+    "description": "#1093 (STALE/StateAuditor, arXiv:2608.01619): audit state-table entries for implicit stale-dependency drift (sleep proposals whose entities vanished, experience-stats drift, cached entity-count drift, shadow-promote records) and repair by state-to-draft demotion — originals preserved verbatim under state_draft.*, live keys marked stale, journal receipts anchored. dry_run=true only reports.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "dry_run": {"type": "boolean", "default": false, "description": "Report only; make no writes"}
+      }
+    },
+    "outputSchema": {"type": "object", "properties": {"dry_run": {"type": "boolean"}, "scanned": {"type": "integer"}, "stale_count": {"type": "integer"}, "found_stale": {"type": "array", "items": {"type": "object"}}, "repaired": {"type": "array", "items": {"type": "object"}}}},
+    "annotations": { "readOnlyHint": false },
+    "title": "Audit State Staleness"
   }
 
 ]"###,
@@ -7997,6 +8010,7 @@ const TOOL_SCOPES: &[(&str, ToolScope)] = &[
         ("perseus_vault_skill_audit", ToolScope::Ops),
         ("perseus_vault_decay_audit", ToolScope::Ops),
         ("perseus_vault_segment_consolidate", ToolScope::Ops),
+        ("perseus_vault_state_audit", ToolScope::Ops),
     ("perseus_vault_rollback_repair", ToolScope::Ops),    ("perseus_vault_op_run", ToolScope::Ops),
     ("perseus_vault_op_run_list", ToolScope::Ops),
     ("perseus_vault_op_run_get", ToolScope::Ops),
@@ -8358,6 +8372,8 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
         "perseus_vault_decay_audit" => tools::handle_decay_audit(db, args),
 
         "perseus_vault_segment_consolidate" => tools::handle_segment_consolidate(db, args),
+
+        "perseus_vault_state_audit" => tools::handle_state_audit(db, args),
 "perseus_vault_rollback_repair" => tools::handle_rollback_repair(db, args),        "perseus_vault_op_run" => tools::handle_op_run(db, args).map_err(|e| e.to_string()),
         "perseus_vault_op_run_list" => {
             tools::handle_op_run_list(db, args).map_err(|e| e.to_string())
@@ -8508,7 +8524,7 @@ mod tests {
         );
         assert_eq!(
             registry_names.len(),
-            167,            "update public metadata when adding a tool"
+            168,            "update public metadata when adding a tool"
         );
 
         let canonical = advertised_names();
@@ -9817,8 +9833,8 @@ mod tests {
         let ops = filter_registry_by_view(registry.clone(), ScopeView::Ops);
         let full = filter_registry_by_view(registry.clone(), ScopeView::Full);
         assert_eq!(agent.len(), 51, "agent view count drifted — new tools must be classified");
-        assert_eq!(ops.len(), 160, "ops view count drifted — new tools must be classified");
-        assert_eq!(full.len(), 167, "full view must expose the whole registry");
+        assert_eq!(ops.len(), 161, "ops view count drifted — new tools must be classified");
+        assert_eq!(full.len(), 168, "full view must expose the whole registry");
         assert!(agent.len() < ops.len() && ops.len() < full.len());
     }
 
