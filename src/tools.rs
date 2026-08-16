@@ -7888,6 +7888,62 @@ pub fn handle_decay_audit(db: &Database, args: Value) -> Result<String, String> 
     serde_json::to_string(&report).map_err(|e| format!("Serialization failed: {e}"))
 }
 
+// ── #1088 semantic segment-level consolidation (LycheeMemory V2) ───────────
+
+#[derive(Debug, Deserialize)]
+pub struct SegmentConsolidateArgs {
+    pub category: String,
+    #[serde(default)]
+    pub workspace_hash: String,
+    #[serde(default = "default_segment_gap_ms")]
+    pub gap_ms: i64,
+    #[serde(default = "default_segment_sim_floor")]
+    pub sim_floor: f64,
+    #[serde(default = "default_segment_max_entities")]
+    pub max_entities: i64,
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+fn default_segment_gap_ms() -> i64 {
+    3_600_000
+}
+fn default_segment_sim_floor() -> f64 {
+    0.3
+}
+fn default_segment_max_entities() -> i64 {
+    500
+}
+
+pub fn handle_segment_consolidate(db: &Database, args: Value) -> Result<String, String> {
+    let a: SegmentConsolidateArgs = serde_json::from_value(args)
+        .map_err(|e| format!("Invalid segment_consolidate arguments: {e}"))?;
+    let report = db.segment_consolidate(
+        &a.category,
+        &a.workspace_hash,
+        a.gap_ms,
+        a.sim_floor,
+        a.max_entities,
+        a.dry_run,
+    )?;
+    serde_json::to_string(&report).map_err(|e| format!("Serialization failed: {e}"))
+}
+
+// ── #1093 state-to-draft audit (STALE/StateAuditor) ───────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct StateAuditArgs {
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+pub fn handle_state_audit(db: &Database, args: Value) -> Result<String, String> {
+    let a: StateAuditArgs = serde_json::from_value(args)
+        .map_err(|e| format!("Invalid state_audit arguments: {e}"))?;
+    let report = db.state_audit(a.dry_run)?;
+    serde_json::to_string(&report).map_err(|e| format!("Serialization failed: {e}"))
+}
+
 // ── #683 Keystones: mandatory policy rules ───────────────────────────────
 
 #[derive(Debug, Deserialize)]

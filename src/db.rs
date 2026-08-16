@@ -4906,6 +4906,155 @@ impl Database {
         Ok(visible)
     }
 
+    // ─── Segment-Level Consolidation (#1088, arXiv:2608.12990) ─────────
+
+    /// Segment-level consolidation (LycheeMemory V2): batch the category's
+    /// entities into semantic segments via deterministic boundary detection
+    /// (inter-arrival gap + adjacent trigram discontinuity), then run ONE
+    /// bounded consolidate pass per finalized segment (≥2 members) scoped to
+    /// that segment's candidate ids. Construction frequency is
+    /// segment-count-bound, not write-count-bound. Segment plans are indexed
+    /// under `segment_plan.<id>` state keys.
+    pub fn segment_consolidate(
+        &self,
+        category: &str,
+        workspace_hash: &str,
+        gap_ms: i64,
+        sim_floor: f64,
+        max_entities: i64,
+        dry_run: bool,
+    ) -> Result<serde_json::Value, String> {
+        if category.trim().is_empty() {
+            return Err("segment_consolidate requires a category".into());
+        }
+        if workspace_hash.trim().is_empty() {
+            return Err(
+                "segment_consolidate requires an explicit workspace (ordinary runs are workspace-scoped)"
+                    .into(),
+            );
+        }
+        let gap_ms = gap_ms.clamp(0, 31_536_000_000);
+        let sim_floor = sim_floor.clamp(0.0, 1.0);
+        let max_entities = max_entities.clamp(1, 5000);
+        let conn = self.conn().map_err(|e| format!("connection failed: {e}"))?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, key, body_json, created_at_unix_ms FROM entities
+                 WHERE category = ?1 AND workspace_hash = ?2 AND archived = 0
+                 ORDER BY created_at_unix_ms ASC, id ASC LIMIT ?3",
+            )
+            .map_err(|e| format!("segment scan prepare failed: {e}"))?;
+        let rows = stmt
+            .query_map(params![category, workspace_hash, max_entities], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)?,
+                ))
+            })
+            .map_err(|e| format!("segment scan failed: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("segment row decode failed: {e}"))?;
+        drop(stmt);
+        let mut inputs: Vec<crate::segments::SegmentInput> = Vec::new();
+        for (id, key, raw_body, created) in rows {
+            let body = match self.encryption.as_ref() {
+                Some(enc) => {
+                    match Self::decrypt_body_with_aad_fallback(enc, &raw_body, category, &key) {
+                        crate::encryption::BodyDecrypt::Plaintext(p)
+                        | crate::encryption::BodyDecrypt::LegacyPlaintext(p) => p,
+                        crate::encryption::BodyDecrypt::AuthFailed(_) => continue,
+                    }
+                }
+                None => raw_body,
+            };
+            inputs.push(crate::segments::SegmentInput {
+                entity_id: id,
+                created_at_unix_ms: created,
+                body_text: crate::observations::body_text(&body),
+            });
+        }
+        let groups = crate::segments::detect_segments(&inputs, gap_ms, sim_floor);
+        let mut consolidations: Vec<serde_json::Value> = Vec::new();
+        let mut plans: Vec<serde_json::Value> = Vec::new();
+        let mut skipped_singletons = 0usize;
+        for group in &groups {
+            if group.members.len() < 2 {
+                skipped_singletons += 1;
+                continue;
+            }
+            let seg_id = {
+                let raw = uuid::Uuid::new_v4().to_string().replace('-', "");
+                format!("seg-{}", &raw[..12.min(raw.len())])
+            };
+            let params: crate::models::ConsolidateParams = serde_json::from_value(
+                serde_json::json!({
+                    "category": category,
+                    "workspace_hash": workspace_hash,
+                    "dry_run": dry_run,
+                }),
+            )
+            .map_err(|e| format!("segment consolidate params failed: {e}"))?;
+            match self.consolidate_with_candidates(&params, Some(group.members.as_slice())) {
+                Ok(report) => {
+                    consolidations.push(serde_json::json!({
+                        "segment_id": seg_id,
+                        "members": group.members,
+                        "span_ms": [group.start_ms, group.end_ms],
+                        "boundary_reason": group.next_boundary_reason,
+                        "report": serde_json::to_value(&report)
+                            .unwrap_or(serde_json::json!({})),
+                    }));
+                    if !dry_run {
+                        self.state_set(&crate::models::StateEntry {
+                            key: format!("segment_plan.{seg_id}"),
+                            value_json: serde_json::json!({
+                                "segment_id": seg_id,
+                                "category": category,
+                                "workspace_hash": workspace_hash,
+                                "members": group.members,
+                                "start_ms": group.start_ms,
+                                "end_ms": group.end_ms,
+                                "boundary_reason": group.next_boundary_reason,
+                            })
+                            .to_string(),
+                            expires_at_unix_ms: None,
+                            created_at_unix_ms: now_ms(),
+                        })
+                        .map_err(|e| format!("segment plan record failed: {e}"))?;
+                        plans.push(serde_json::json!({
+                            "segment_id": seg_id,
+                            "member_count": group.members.len(),
+                        }));
+                    }
+                }
+                Err(e) => {
+                    consolidations.push(serde_json::json!({
+                        "segment_id": seg_id,
+                        "members": group.members,
+                        "error": e.to_string(),
+                    }));
+                }
+            }
+        }
+        Ok(serde_json::json!({
+            "category": category,
+            "workspace_hash": workspace_hash,
+            "dry_run": dry_run,
+            "scanned": inputs.len(),
+            "segments": groups.len(),
+            "consolidated": consolidations.len(),
+            "skipped_singletons": skipped_singletons,
+            "gap_ms": gap_ms,
+            "sim_floor": sim_floor,
+            "consolidations": consolidations,
+            "plans": plans,
+            "note": "one bounded consolidate pass per finalized segment (>=2 members); segment plans indexed under state keys segment_plan.<id>",
+        }))
+    }
+
+
     // ─── Rollback Repair (#1084, arXiv:2608.10502) ─────────────────────
 
     /// Journal a rollback-repair receipt and return its id.
@@ -6082,6 +6231,123 @@ impl Database {
             "profiles": profiles,
             "population": population,
             "note": "past_horizon_count rows are excluded from default recall while enforce_utility_horizon is on; reachable via explicit as-of/history surfaces",
+        }))
+    }
+
+    // ─── State-to-Draft Audit (#1093 STALE/StateAuditor) ────────────────
+
+    /// Audit the state table for implicit stale-dependency drift and
+    /// (when not dry-run) demote stale entries to draft: the original value
+    /// is preserved verbatim under `state_draft.<receipt>`, the live key is
+    /// rewritten shape-compatibly with `status: "stale"`, and a journal
+    /// receipt anchors every repair.
+    pub fn state_audit(&self, dry_run: bool) -> Result<serde_json::Value, String> {
+        let keys = self.state_list("").map_err(|e| format!("state scan failed: {e}"))?;
+        let scanned = keys.len();
+        let mut found: Vec<serde_json::Value> = Vec::new();
+        let mut repaired: Vec<serde_json::Value> = Vec::new();
+        for key in keys {
+            // Never audit the draft staging area itself (it holds the
+            // already-preserved originals).
+            if key.starts_with(crate::state_auditor::STATE_DRAFT_PREFIX) {
+                continue;
+            }
+            let Some(entry) = self.state_get(&key).map_err(|e| format!("state get failed: {e}"))? else {
+                continue;
+            };
+            let Some(finding) = crate::state_auditor::evaluate(self, &key, &entry.value_json)
+            else {
+                continue;
+            };
+            let found_v = serde_json::json!({
+                "key": finding.key,
+                "reason": finding.reason,
+            });
+            found.push(found_v.clone());
+            if dry_run {
+                continue;
+            }
+            let raw = uuid::Uuid::new_v4().to_string().replace('-', "");
+            let receipt = format!("jrn-{}", &raw[..12.min(raw.len())]);
+            let draft_key = format!("{}{}", crate::state_auditor::STATE_DRAFT_PREFIX, receipt);
+            // Draft-copy: the stale value is preserved verbatim, wrapped
+            // with its provenance.
+            let draft = serde_json::json!({
+                "source_key": finding.key,
+                "demoted_at_unix_ms": crate::db::now_ms(),
+                "reason": finding.reason,
+                "original": serde_json::from_str::<serde_json::Value>(&entry.value_json)
+                    .unwrap_or(serde_json::Value::Null),
+            });
+            self.state_set(&crate::models::StateEntry {
+                key: draft_key.clone(),
+                value_json: draft.to_string(),
+                expires_at_unix_ms: None,
+                created_at_unix_ms: crate::db::now_ms(),
+            })
+            .map_err(|e| format!("draft write failed: {e}"))?;
+            // Demote the live key, shape-compatibly: sleep proposals keep
+            // their SleepProposal shape with status flipped to "stale";
+            // everything else gets a stale marker object.
+            let demoted = match serde_json::from_str::<serde_json::Value>(&entry.value_json) {
+                Ok(mut v) if v.is_object() && v.get("entity_a").is_some() => {
+                    let obj = v.as_object_mut().expect("checked object");
+                    obj.insert("status".into(), serde_json::json!("stale"));
+                    obj.insert("stale_reason".into(), serde_json::json!(finding.reason));
+                    obj.insert("demoted_to_draft".into(), serde_json::json!(draft_key));
+                    v
+                }
+                _ => serde_json::json!({
+                    "stale": true,
+                    "reason": finding.reason,
+                    "demoted_to_draft": draft_key,
+                    "demoted_at_unix_ms": crate::db::now_ms(),
+                }),
+            };
+            self.state_set(&crate::models::StateEntry {
+                key: finding.key.clone(),
+                value_json: demoted.to_string(),
+                expires_at_unix_ms: None,
+                created_at_unix_ms: crate::db::now_ms(),
+            })
+            .map_err(|e| format!("demotion write failed: {e}"))?;
+            let journal_id = {
+                let raw2 = uuid::Uuid::new_v4().to_string().replace('-', "");
+                let id = format!("jrn-{}", &raw2[..12.min(raw2.len())]);
+                self.journal(&crate::models::JournalEvent {
+                    id: id.clone(),
+                    event_type: "state_stale_repaired".to_string(),
+                    evaluated_json: "{}".to_string(),
+                    acted_json: serde_json::json!({
+                        "key": finding.key,
+                        "reason": finding.reason,
+                        "draft_key": draft_key,
+                    })
+                    .to_string(),
+                    forward_json: "{}".to_string(),
+                    category: String::new(),
+                    key: finding.key.clone(),
+                    entity_id: String::new(),
+                    agent_id: "state_auditor".to_string(),
+                    workspace_hash: String::new(),
+                    created_at_unix_ms: crate::db::now_ms(),
+                })
+                .map_err(|e| format!("repair receipt failed: {e}"))?;
+                id
+            };
+            repaired.push(serde_json::json!({
+                "key": finding.key,
+                "reason": finding.reason,
+                "receipt": journal_id,
+            }));
+        }
+        Ok(serde_json::json!({
+            "dry_run": dry_run,
+            "scanned": scanned,
+            "stale_count": found.len(),
+            "found_stale": found,
+            "repaired": repaired,
+            "note": "state-to-draft demotion: originals preserved under state_draft.*, live keys marked stale",
         }))
     }
 
@@ -21162,6 +21428,19 @@ impl Database {
         &self,
         params: &crate::models::ConsolidateParams,
     ) -> Result<crate::models::ConsolidateReport, Box<dyn std::error::Error>> {
+        self.consolidate_with_candidates(params, None)
+    }
+
+    /// #1088: candidate-scoped consolidation (segment replay). When
+    /// `candidate_ids` is `Some`, the scan operates over exactly those entity
+    /// ids (still filtered by category/workspace/archive state and bounded by
+    /// the list length) instead of the recency window. Identical to
+    /// `consolidate` otherwise.
+    pub fn consolidate_with_candidates(
+        &self,
+        params: &crate::models::ConsolidateParams,
+        candidate_ids: Option<&[String]>,
+    ) -> Result<crate::models::ConsolidateReport, Box<dyn std::error::Error>> {
         // #886: the curated mental_model category is OFF-LIMITS to
         // auto-generated consolidation — mental models are only ever
         // created/refreshed by explicit curation
@@ -21188,25 +21467,48 @@ impl Database {
         // observations instead of losing them one by one. Default (DESC)
         // preserves the original recent-window behavior.
         let order = if params.cold_first { "ASC" } else { "DESC" };
+        // #1088: candidate-scoped consolidation (segment replay) — the scan
+        // is restricted to exactly these ids, bounded by the list length.
+        let candidate_ids: Vec<&str> = candidate_ids
+            .map(|ids| {
+                ids.iter()
+                    .map(String::as_str)
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let candidate_clause = if candidate_ids.is_empty() {
+            String::new()
+        } else {
+            let placeholders = vec!["?"; candidate_ids.len()].join(",");
+            format!(" AND id IN ({placeholders})")
+        };
+        let scan_limit = if candidate_ids.is_empty() {
+            Self::CONFLICT_SCAN_WINDOW
+        } else {
+            candidate_ids.len() as i64
+        };
         let (sql, scan_ws): (String, Option<&str>) = match &scope_ws {
             Some(ws) => (
                 format!(
                     "SELECT id, key, body_json, certainty, verified, importance
                      FROM entities WHERE category = ?1 AND archived = 0
-                     AND workspace_hash = ?2
-                     ORDER BY last_accessed_unix_ms {}, id ASC LIMIT {} OFFSET ?3",
+                     AND workspace_hash = ?2{candidate_clause}
+                     ORDER BY last_accessed_unix_ms {}, id ASC LIMIT {} OFFSET ?{}",
                     order,
-                    Self::CONFLICT_SCAN_WINDOW
+                    scan_limit,
+                    3 + candidate_ids.len(),
                 ),
                 Some(ws),
             ),
             None => (
                 format!(
                     "SELECT id, key, body_json, certainty, verified, importance
-                     FROM entities WHERE category = ?1 AND archived = 0
-                     ORDER BY last_accessed_unix_ms {}, id ASC LIMIT {} OFFSET ?2",
+                     FROM entities WHERE category = ?1 AND archived = 0{candidate_clause}
+                     ORDER BY last_accessed_unix_ms {}, id ASC LIMIT {} OFFSET ?{}",
                     order,
-                    Self::CONFLICT_SCAN_WINDOW
+                    scan_limit,
+                    2 + candidate_ids.len(),
                 ),
                 None,
             ),
@@ -21224,8 +21526,24 @@ impl Database {
                 ))
             };
         let rows = match scan_ws {
-            Some(ws) => stmt.query_map(params![params.category, ws, params.offset], map_row)?,
-            None => stmt.query_map(params![params.category, params.offset], map_row)?,
+            Some(ws) => {
+                let mut bind: Vec<&dyn rusqlite::ToSql> =
+                    vec![&params.category as &dyn rusqlite::ToSql, &ws as &dyn rusqlite::ToSql];
+                for id in &candidate_ids {
+                    bind.push(id);
+                }
+                bind.push(&params.offset);
+                stmt.query_map(rusqlite::params_from_iter(bind), map_row)?
+            }
+            None => {
+                let mut bind: Vec<&dyn rusqlite::ToSql> =
+                    vec![&params.category as &dyn rusqlite::ToSql];
+                for id in &candidate_ids {
+                    bind.push(id);
+                }
+                bind.push(&params.offset);
+                stmt.query_map(rusqlite::params_from_iter(bind), map_row)?
+            }
         };
         // #884: at-rest encryption — the scan reads body_json via raw SQL,
         // so decrypt each row before any clustering. AuthFailed rows are

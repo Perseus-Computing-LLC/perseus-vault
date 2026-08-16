@@ -55,11 +55,13 @@ mod preload;
 mod projection;
 mod rollback_repair;
 mod retrieval_skills;
+mod state_auditor;
 mod temporal_decay;
 mod retrieval_telemetry;
 #[cfg(test)]
 mod revocation_cutoff;
 mod schema;
+mod segments;
 mod signed_profile;
 mod signed_transition;
 mod sleep;

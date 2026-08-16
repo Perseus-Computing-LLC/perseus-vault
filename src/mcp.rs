@@ -7801,6 +7801,51 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "outputSchema": {"type": "object", "properties": {"generated_at_unix_ms": {"type": "integer"}, "profiles": {"type": "array", "items": {"type": "object"}}, "population": {"type": "array", "items": {"type": "object"}}, "note": {"type": "string"}}},
     "annotations": { "readOnlyHint": true },
     "title": "Audit Temporal Decay"
+  },
+{
+    "name": "perseus_vault_segment_consolidate",
+    "description": "#1088 (LycheeMemory V2, arXiv:2608.12990): semantic segment-level consolidation — batch entities into semantic segments via deterministic boundary detection (inter-arrival gap + adjacent trigram discontinuity, never fixed windows), then run ONE bounded consolidate pass per finalized segment (>=2 members). Construction frequency is segment-count-bound, not write-count-bound. Segment plans are indexed under state keys segment_plan.<id>.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "category": {"type": "string", "description": "Category to consolidate"},
+        "workspace_hash": {"type": "string", "description": "Workspace scope (required — ordinary runs are workspace-scoped)"},
+        "gap_ms": {"type": "integer", "minimum": 0, "default": 21600000, "description": "Inter-arrival gap in ms that starts a new segment"},
+        "sim_floor": {"type": "number", "minimum": 0, "maximum": 1, "default": 0.25, "description": "Adjacent trigram similarity below which a new segment starts"},
+        "max_entities": {"type": "integer", "minimum": 1, "maximum": 5000, "default": 1000, "description": "Scan cap"},
+        "dry_run": {"type": "boolean", "default": false, "description": "Report plans without writing"}
+      },
+      "required": ["category", "workspace_hash"]
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "category": {"type": "string"},
+        "workspace_hash": {"type": "string"},
+        "dry_run": {"type": "boolean"},
+        "scanned": {"type": "integer"},
+        "segments": {"type": "integer"},
+        "consolidated": {"type": "integer"},
+        "skipped_singletons": {"type": "integer"},
+        "consolidations": {"type": "array", "items": {"type": "object"}},
+        "plans": {"type": "array", "items": {"type": "object"}}
+      }
+    },
+    "annotations": { "readOnlyHint": false },
+    "title": "Segment-Level Consolidation"
+  },
+{
+    "name": "perseus_vault_state_audit",
+    "description": "#1093 (STALE/StateAuditor, arXiv:2608.01619): audit state-table entries for implicit stale-dependency drift (sleep proposals whose entities vanished, experience-stats drift, cached entity-count drift, shadow-promote records) and repair by state-to-draft demotion — originals preserved verbatim under state_draft.*, live keys marked stale, journal receipts anchored. dry_run=true only reports.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "dry_run": {"type": "boolean", "default": false, "description": "Report only; make no writes"}
+      }
+    },
+    "outputSchema": {"type": "object", "properties": {"dry_run": {"type": "boolean"}, "scanned": {"type": "integer"}, "stale_count": {"type": "integer"}, "found_stale": {"type": "array", "items": {"type": "object"}}, "repaired": {"type": "array", "items": {"type": "object"}}}},
+    "annotations": { "readOnlyHint": false },
+    "title": "Audit State Staleness"
   }
 
 ]"###,
@@ -7964,6 +8009,8 @@ const TOOL_SCOPES: &[(&str, ToolScope)] = &[
         ("perseus_vault_skill_advance", ToolScope::Ops),
         ("perseus_vault_skill_audit", ToolScope::Ops),
         ("perseus_vault_decay_audit", ToolScope::Ops),
+        ("perseus_vault_segment_consolidate", ToolScope::Ops),
+        ("perseus_vault_state_audit", ToolScope::Ops),
     ("perseus_vault_rollback_repair", ToolScope::Ops),    ("perseus_vault_op_run", ToolScope::Ops),
     ("perseus_vault_op_run_list", ToolScope::Ops),
     ("perseus_vault_op_run_get", ToolScope::Ops),
@@ -8323,6 +8370,10 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
         "perseus_vault_skill_audit" => tools::handle_skill_audit(db, args),
 
         "perseus_vault_decay_audit" => tools::handle_decay_audit(db, args),
+
+        "perseus_vault_segment_consolidate" => tools::handle_segment_consolidate(db, args),
+
+        "perseus_vault_state_audit" => tools::handle_state_audit(db, args),
 "perseus_vault_rollback_repair" => tools::handle_rollback_repair(db, args),        "perseus_vault_op_run" => tools::handle_op_run(db, args).map_err(|e| e.to_string()),
         "perseus_vault_op_run_list" => {
             tools::handle_op_run_list(db, args).map_err(|e| e.to_string())
@@ -8473,7 +8524,7 @@ mod tests {
         );
         assert_eq!(
             registry_names.len(),
-            166,            "update public metadata when adding a tool"
+            168,            "update public metadata when adding a tool"
         );
 
         let canonical = advertised_names();
@@ -9782,8 +9833,8 @@ mod tests {
         let ops = filter_registry_by_view(registry.clone(), ScopeView::Ops);
         let full = filter_registry_by_view(registry.clone(), ScopeView::Full);
         assert_eq!(agent.len(), 51, "agent view count drifted — new tools must be classified");
-        assert_eq!(ops.len(), 159, "ops view count drifted — new tools must be classified");
-        assert_eq!(full.len(), 166, "full view must expose the whole registry");
+        assert_eq!(ops.len(), 161, "ops view count drifted — new tools must be classified");
+        assert_eq!(full.len(), 168, "full view must expose the whole registry");
         assert!(agent.len() < ops.len() && ops.len() < full.len());
     }
 
