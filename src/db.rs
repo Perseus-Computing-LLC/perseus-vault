@@ -4906,6 +4906,414 @@ impl Database {
         Ok(visible)
     }
 
+    // ─── Rollback Repair (#1084, arXiv:2608.10502) ─────────────────────
+
+    /// Journal a rollback-repair receipt and return its id.
+    fn repair_journal_receipt(
+        &self,
+        event_type: &str,
+        entity_id: &str,
+        detail: serde_json::Value,
+    ) -> Result<String, String> {
+        let raw = uuid::Uuid::new_v4().to_string().replace('-', "");
+        let id = format!("jrn-{}", &raw[..12.min(raw.len())]);
+        self.journal(&crate::models::JournalEvent {
+            id: id.clone(),
+            event_type: event_type.to_string(),
+            evaluated_json: "{}".to_string(),
+            acted_json: detail.to_string(),
+            forward_json: "{}".to_string(),
+            category: String::new(),
+            key: String::new(),
+            entity_id: entity_id.to_string(),
+            agent_id: "rollback_repair".to_string(),
+            workspace_hash: String::new(),
+            created_at_unix_ms: now_ms(),
+        })
+        .map_err(|e| format!("receipt journal failed: {e}"))?;
+        Ok(id)
+    }
+
+    /// Dependency-guided rollback repair: for a diagnosed set of faulty
+    /// memories, build the memory→action dependency graph from runtime
+    /// provenance, preserve dependents with independent trusted support,
+    /// tombstone (quarantine — never delete) unsupported state, and report a
+    /// scoped selective-replay proposal. Every step is receipt-anchored and
+    /// the whole repair is reversible via the stored plan.
+    pub fn rollback_repair(
+        &self,
+        faulty_ids: &[String],
+        dry_run: bool,
+        replay: bool,
+        workspace_filter: Option<&str>,
+    ) -> Result<serde_json::Value, String> {
+        let faulty: std::collections::HashSet<String> = faulty_ids.iter().cloned().collect();
+        if faulty.is_empty() {
+            return Err("rollback_repair requires at least one faulty entity id".into());
+        }
+        let conn = self.conn().map_err(|e| format!("connection failed: {e}"))?;
+        for id in &faulty {
+            let exists: Option<String> = conn
+                .query_row("SELECT id FROM entities WHERE id = ?1", [id], |r| r.get(0))
+                .optional()
+                .map_err(|e| format!("faulty lookup failed: {e}"))?;
+            if exists.is_none() {
+                return Err(format!("faulty entity {id} not found"));
+            }
+        }
+        // ── graph build ──
+        // Dependents: entities whose links cite a faulty id (LIKE prefilter,
+        // exact parse after), plus supersession edges touching a faulty id.
+        let mut dependents: Vec<(String, Vec<String>)> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for fid in &faulty {
+            let mut stmt = conn
+                .prepare("SELECT id, links FROM entities WHERE archived = 0 AND links LIKE ?1")
+                .map_err(|e| format!("dependent scan prepare failed: {e}"))?;
+            let pattern = format!("%{fid}%");
+            let rows = stmt
+                .query_map([&pattern], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                })
+                .map_err(|e| format!("dependent scan failed: {e}"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("dependent row decode failed: {e}"))?;
+            drop(stmt);
+            for (eid, links_json) in rows {
+                if faulty.contains(&eid) || !seen.insert(eid.clone()) {
+                    continue;
+                }
+                let links: Vec<crate::models::MemoryLink> =
+                    serde_json::from_str(&links_json).unwrap_or_default();
+                let sources: Vec<String> = links.iter().map(|l| l.target_id.clone()).collect();
+                if sources.iter().any(|t| faulty.contains(t)) {
+                    dependents.push((eid, sources));
+                }
+            }
+            // Supersession edges: the entity a faulty one REPLACED carries the
+            // pre-fault state — its own value is independent evidence.
+            let mut s2 = conn
+                .prepare(
+                    "SELECT id FROM entities WHERE archived = 0 AND superseded_by = ?1",
+                )
+                .map_err(|e| format!("supersession scan prepare failed: {e}"))?;
+            let rows2 = s2
+                .query_map([fid], |r| r.get::<_, String>(0))
+                .map_err(|e| format!("supersession scan failed: {e}"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("supersession row decode failed: {e}"))?;
+            drop(s2);
+            for eid in rows2 {
+                if !faulty.contains(&eid) && seen.insert(eid.clone()) {
+                    dependents.push((eid.clone(), vec![eid]));
+                }
+            }
+        }
+        // Journal tool-call references (action evidence): how often each
+        // faulty memory was consumed by recorded tool calls.
+        let mut journal_refs: serde_json::Map<String, serde_json::Value> =
+            serde_json::Map::new();
+        for fid in &faulty {
+            let n: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM journal WHERE entity_id = ?1",
+                    [fid],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            journal_refs.insert(fid.clone(), serde_json::Value::from(n));
+        }
+        // ── classify ──
+        let mut preserved: Vec<crate::rollback_repair::DependentEvidence> = Vec::new();
+        let mut tombstoned: Vec<String> = faulty.iter().cloned().collect();
+        for (eid, sources) in &dependents {
+            let ev = crate::rollback_repair::classify(eid, sources, &faulty);
+            if ev.preserved {
+                preserved.push(ev);
+            } else {
+                tombstoned.push(eid.clone());
+            }
+        }
+        tombstoned.sort();
+        tombstoned.dedup();
+        let repair_id = {
+            let raw = uuid::Uuid::new_v4().to_string().replace('-', "");
+            format!("rpr-{}", &raw[..12.min(raw.len())])
+        };
+        let plan_shape = |dry: bool| {
+            serde_json::json!({
+                "repair_id": repair_id,
+                "dry_run": dry,
+                "faulty": faulty.iter().collect::<Vec<_>>(),
+                "journal_references": journal_refs,
+                "preserved": preserved.iter().map(|e| serde_json::json!({
+                    "entity_id": e.entity_id,
+                    "independent_support": e.independent_support,
+                    "faulty_support": e.faulty_support,
+                })).collect::<Vec<_>>(),
+                "tombstoned": tombstoned,
+            })
+        };
+        if dry_run {
+            let mut report = plan_shape(true);
+            report["note"] = serde_json::Value::String(
+                "dry run: nothing written; re-run with dry_run=false to execute".into(),
+            );
+            return Ok(report);
+        }
+        // ── execute ──
+        let mut tombstone_records: serde_json::Map<String, serde_json::Value> =
+            serde_json::Map::new();
+        for id in &tombstoned {
+            let prior: Option<String> = conn
+                .query_row(
+                    "SELECT status FROM entities WHERE id = ?1",
+                    [id],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(|e| format!("prior-status lookup failed for {id}: {e}"))?;
+            let prior_status = prior.unwrap_or_else(|| "active".to_string());
+            conn.execute(
+                "UPDATE entities SET status = ?1, archive_reason = ?2 WHERE id = ?3",
+                params![
+                    crate::rollback_repair::TOMBSTONE_STATUS,
+                    crate::rollback_repair::tombstone_reason(&repair_id),
+                    id
+                ],
+            )
+            .map_err(|e| format!("tombstone write failed for {id}: {e}"))?;
+            let receipt = self.repair_journal_receipt(
+                "rollback_repair_tombstone",
+                id,
+                serde_json::json!({"repair_id": repair_id, "prior_status": prior_status, "faulty": faulty.iter().collect::<Vec<_>>()}),
+            )?;
+            tombstone_records.insert(
+                id.clone(),
+                serde_json::json!({"prior_status": prior_status, "receipt": receipt}),
+            );
+        }
+        let mut preserved_records: Vec<serde_json::Value> = Vec::new();
+        for ev in &preserved {
+            let eid = &ev.entity_id;
+            let links_json: Option<String> = conn
+                .query_row(
+                    "SELECT links FROM entities WHERE id = ?1",
+                    [eid],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(|e| format!("links lookup failed for {eid}: {e}"))?;
+            let links: Vec<crate::models::MemoryLink> =
+                serde_json::from_str(&links_json.unwrap_or_default()).unwrap_or_default();
+            let (kept, removed) = crate::rollback_repair::sever_faulty_edges(&links, &faulty);
+            if removed.is_empty() {
+                // E.g. the supersession self-support case: nothing to sever.
+                preserved_records.push(serde_json::json!({
+                    "entity_id": eid,
+                    "removed_edges": [],
+                    "retained_support": ev.independent_support,
+                    "receipt": null,
+                }));
+                continue;
+            }
+            conn.execute(
+                "UPDATE entities SET links = ?1 WHERE id = ?2",
+                params![
+                    serde_json::to_string(&kept).map_err(|e| format!("serialize failed: {e}"))?,
+                    eid
+                ],
+            )
+            .map_err(|e| format!("edge sever write failed for {eid}: {e}"))?;
+            let receipt = self.repair_journal_receipt(
+                "rollback_repair_preserved",
+                eid,
+                serde_json::json!({"repair_id": repair_id, "removed_edges": removed, "retained_support": ev.independent_support}),
+            )?;
+            preserved_records.push(serde_json::json!({
+                "entity_id": eid,
+                "removed_edges": removed,
+                "retained_support": ev.independent_support,
+                "receipt": receipt,
+            }));
+        }
+        // ── durable, reversible plan ──
+        let plan = serde_json::json!({
+            "repair_id": repair_id,
+            "faulty": faulty.iter().collect::<Vec<_>>(),
+            "tombstoned": tombstone_records,
+            "preserved": preserved_records,
+            "created_at_unix_ms": now_ms(),
+        });
+        self.state_set(&crate::models::StateEntry {
+            key: format!("{}{repair_id}", crate::rollback_repair::REPAIR_STATE_PREFIX),
+            value_json: plan.to_string(),
+            expires_at_unix_ms: None,
+            created_at_unix_ms: now_ms(),
+        })
+        .map_err(|e| format!("repair state record failed: {e}"))?;
+        // ── selective replay (bounded, proposal-only) ──
+        let mut replay_out: Option<serde_json::Value> = None;
+        if replay {
+            let affected_ids: Vec<&String> = tombstoned
+                .iter()
+                .chain(preserved.iter().map(|e| &e.entity_id))
+                .collect();
+            let mut scopes: Vec<(String, String)> = Vec::new();
+            if !affected_ids.is_empty() {
+                let placeholders = vec!["?"; affected_ids.len()].join(",");
+                let sql = format!(
+                    "SELECT DISTINCT category, workspace_hash FROM entities WHERE id IN ({placeholders})"
+                );
+                let mut stmt = conn
+                    .prepare(&sql)
+                    .map_err(|e| format!("scope scan prepare failed: {e}"))?;
+                let rows = stmt
+                    .query_map(rusqlite::params_from_iter(affected_ids.iter()), |r| {
+                        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                    })
+                    .map_err(|e| format!("scope scan failed: {e}"))?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| format!("scope row decode failed: {e}"))?;
+                drop(stmt);
+                scopes = rows;
+            }
+            let mut proposals: Vec<serde_json::Value> = Vec::new();
+            for (category, ws) in &scopes {
+                if category.is_empty() {
+                    continue;
+                }
+                if ws.is_empty() {
+                    proposals.push(serde_json::json!({
+                        "category": category,
+                        "workspace_hash": ws,
+                        "note": "global-scope replay deferred (consolidate requires an explicit workspace for ordinary runs)",
+                    }));
+                    continue;
+                }
+                let params: crate::models::ConsolidateParams = serde_json::from_value(
+                    serde_json::json!({"category": category, "workspace_hash": ws, "dry_run": true}),
+                )
+                .map_err(|e| format!("replay params failed: {e}"))?;
+                match self.consolidate(&params) {
+                    Ok(report) => proposals.push(
+                        serde_json::to_value(&report)
+                            .unwrap_or(serde_json::json!({"error": "report serialization failed"})),
+                    ),
+                    Err(e) => proposals.push(serde_json::json!({
+                        "category": category, "workspace_hash": ws, "error": e.to_string(),
+                    })),
+                }
+            }
+            replay_out = Some(serde_json::json!({
+                "affected_scopes": scopes,
+                "proposals": proposals,
+                "committed": false,
+                "note": "selective replay is proposal-only here: scoped dry-run consolidation over the affected category/workspace; commit via perseus_vault_consolidate after review",
+            }));
+        }
+        let mut report = plan_shape(false);
+        report["tombstone_receipts"] = serde_json::Value::Object(tombstone_records);
+        report["preserved_records"] = serde_json::Value::Array(preserved_records);
+        if let Some(r) = replay_out {
+            report["replay"] = r;
+        }
+        report["rollback"] = serde_json::json!({
+            "state_key": format!("{}{repair_id}", crate::rollback_repair::REPAIR_STATE_PREFIX),
+            "reverse_via": "perseus_vault_rollback_repair {reverse_repair_id}",
+        });
+        Ok(report)
+    }
+
+    /// Reverse a recorded rollback repair: restore tombstoned statuses,
+    /// re-link severed edges, and journal the reversal. Fails closed on an
+    /// unknown repair id.
+    pub fn reverse_rollback_repair(&self, repair_id: &str) -> Result<serde_json::Value, String> {
+        let conn = self.conn().map_err(|e| format!("connection failed: {e}"))?;
+        let key = format!(
+            "{}{}",
+            crate::rollback_repair::REPAIR_STATE_PREFIX,
+            repair_id
+        );
+        let stored: Option<String> = conn
+            .query_row(
+                "SELECT value_json FROM state WHERE key = ?1",
+                [&key],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| format!("repair state lookup failed: {e}"))?;
+        let Some(plan_json) = stored else {
+            return Err(format!("unknown repair id {repair_id}"));
+        };
+        let plan: serde_json::Value = serde_json::from_str(&plan_json)
+            .map_err(|e| format!("repair state is not valid JSON: {e}"))?;
+        let mut restored: Vec<String> = Vec::new();
+        if let Some(tombs) = plan["tombstoned"].as_object() {
+            for (id, rec) in tombs {
+                let prior = rec["prior_status"].as_str().unwrap_or("active");
+                conn.execute(
+                    "UPDATE entities SET status = ?1, archive_reason = '' WHERE id = ?2",
+                    params![prior, id],
+                )
+                .map_err(|e| format!("tombstone restore failed for {id}: {e}"))?;
+                restored.push(id.clone());
+            }
+        }
+        let mut relinked: Vec<String> = Vec::new();
+        if let Some(pres) = plan["preserved"].as_array() {
+            for rec in pres {
+                let Some(eid) = rec["entity_id"].as_str() else {
+                    continue;
+                };
+                let links_json: Option<String> = conn
+                    .query_row(
+                        "SELECT links FROM entities WHERE id = ?1",
+                        [eid],
+                        |r| r.get(0),
+                    )
+                    .optional()
+                    .map_err(|e| format!("links lookup failed: {e}"))?;
+                let mut links: Vec<crate::models::MemoryLink> =
+                    serde_json::from_str(&links_json.unwrap_or_default()).unwrap_or_default();
+                if let Some(removed) = rec["removed_edges"].as_array() {
+                    for edge in removed {
+                        if let Ok(l) = serde_json::from_value::<crate::models::MemoryLink>(
+                            edge.clone(),
+                        ) {
+                            links.push(l);
+                        }
+                    }
+                }
+                conn.execute(
+                    "UPDATE entities SET links = ?1 WHERE id = ?2",
+                    params![
+                        serde_json::to_string(&links)
+                            .map_err(|e| format!("serialize failed: {e}"))?,
+                        eid
+                    ],
+                )
+                .map_err(|e| format!("relink failed for {eid}: {e}"))?;
+                relinked.push(eid.to_string());
+            }
+        }
+        conn.execute("DELETE FROM state WHERE key = ?1", [&key])
+            .map_err(|e| format!("state cleanup failed: {e}"))?;
+        drop(conn);
+        let receipt = self.repair_journal_receipt(
+            "rollback_repair_reversed",
+            "",
+            serde_json::json!({"repair_id": repair_id, "restored": restored, "relinked": relinked}),
+        )?;
+        Ok(serde_json::json!({
+            "reversed": true,
+            "repair_id": repair_id,
+            "restored": restored,
+            "relinked": relinked,
+            "receipt": receipt,
+        }))
+    }
+
     // ─── Signed Transitions (#1080 MutMem) ───────────────────────────────
 
     /// Register (or replace) the Ed25519 signing key for an epoch. The vault

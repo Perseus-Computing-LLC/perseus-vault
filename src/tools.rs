@@ -7718,7 +7718,6 @@ pub fn handle_follow(db: &Database, args: Value) -> Result<String, String> {
     serde_json::to_string(&report).map_err(|e| format!("Serialization failed: {}", e))
 }
 
-// ── #1080 signed transitions + poison labels (MutMem) ─────────────────
 
 /// #1080: attach a signed transition to a mutation response when a signer
 /// epoch is registered. `None` = unsigned regime (no epoch key registered;
@@ -7780,6 +7779,34 @@ pub fn handle_transition_audit(db: &Database, args: Value) -> Result<String, Str
     let _ = args;
     let report = db.verify_transition_chain()?;
     serde_json::to_string(&report).map_err(|e| format!("Serialization failed: {e}"))
+}
+
+// ── #1084 dependency-guided rollback repair (arXiv:2608.10502) ────────────
+
+#[derive(Debug, Deserialize)]
+pub struct RollbackRepairArgs {
+    #[serde(default)]
+    pub faulty_ids: Vec<String>,
+    #[serde(default)]
+    pub dry_run: bool,
+    #[serde(default)]
+    pub replay: bool,
+    #[serde(default)]
+    pub workspace_hash: Option<String>,
+    /// When set, reverse a previously recorded repair (restore tombstoned
+    /// statuses + severed edges) instead of running a new one.
+    #[serde(default)]
+    pub reverse_repair_id: Option<String>,
+}
+
+pub fn handle_rollback_repair(db: &Database, args: Value) -> Result<String, String> {
+    let a: RollbackRepairArgs = serde_json::from_value(args)
+        .map_err(|e| format!("Invalid rollback_repair arguments: {e}"))?;
+    let report = if let Some(repair_id) = &a.reverse_repair_id {
+        db.reverse_rollback_repair(repair_id)?
+    } else {
+        db.rollback_repair(&a.faulty_ids, a.dry_run, a.replay, a.workspace_hash.as_deref())?
+    };    serde_json::to_string(&report).map_err(|e| format!("Serialization failed: {e}"))
 }
 
 // ── #683 Keystones: mandatory policy rules ───────────────────────────────
