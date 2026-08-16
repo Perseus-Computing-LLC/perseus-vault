@@ -1342,6 +1342,45 @@ pub struct VaultReport {
     pub errors: Vec<String>,
     pub vault_dir: String,
     pub completed_at_unix_ms: i64,
+    /// #1060: seal receipt for the export (scope='export', target = the
+    /// `.seals.json` manifest written next to the notes). Present whenever
+    /// the export wrote a manifest; `None` on legacy paths that could not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seal: Option<SealReceipt>,
+}
+
+/// #1060: seal receipt — hash + label only, never the sealed content.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SealReceipt {
+    pub seal_id: String,
+    pub target_id: String,
+    pub label: String,
+    pub scope: String,
+    pub sha256: String,
+    pub workspace_hash: String,
+    pub agent_id: String,
+    pub created_at_unix_ms: i64,
+}
+
+/// #1060: one tamper finding — a seal whose stored hash no longer matches the
+/// live content it protects.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TamperFinding {
+    pub seal_id: String,
+    pub target_id: String,
+    pub label: String,
+    pub scope: String,
+    pub expected_sha256: String,
+    pub actual_sha256: String,
+    pub detected_at_unix_ms: i64,
+}
+
+/// #1060: tamper-scan report.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SealScanReport {
+    pub seals_checked: i64,
+    pub tampered: Vec<TamperFinding>,
+    pub ok: bool,
 }
 
 /// Decay tick report.

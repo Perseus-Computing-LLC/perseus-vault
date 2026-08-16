@@ -62,6 +62,13 @@ fn more_restrictive_visibility(a: &str, b: &str) -> String {
 /// Hex sha256 of raw bytes (no normalization) — used for hash-only audit
 /// evidence of identifiers (contract §6.2/§6.4 in
 /// docs/specs/data-boundaries-retention-lifecycle.md).
+/// #1060: raw-bytes SHA-256 hex (seal helper; entity bodies hash as UTF-8 via
+/// `sha256_hex` so the sealed bytes are exactly the stored string).
+pub(crate) fn seal_sha256_bytes(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    digest_to_hex(&Sha256::digest(bytes))
+}
+
 pub(crate) fn sha256_hex(value: &str) -> String {
     format!("{:x}", Sha256::digest(value.as_bytes()))
 }
@@ -7720,6 +7727,9 @@ impl Database {
         if params.tier_order {
             crate::mental_model::apply_tier_order(&mut entities);
         }
+        // #1060: compare-on-recall seal check — a mismatch journals a
+        // `tamper_evidence` event naming the entity (never served silently).
+        let _ = self.recall_seal_compare(&entities);
         Ok(entities)
     }
 
@@ -22986,6 +22996,8 @@ Return a JSON object with an "insights" array. Each insight has:
         let mut files_created = 0i64;
         let mut files_updated = 0i64;
         let mut errors = Vec::new();
+        // #1060: (filename, rendered bytes) for the seal manifest.
+        let mut sealed_files: Vec<(String, String)> = Vec::new();
 
         // Second pass: render each note, appending a `## Links` backlink section.
         for row in &collected {
@@ -23086,7 +23098,10 @@ last_accessed: {}
                 // links included, is a no-op).
                 let existing = fs::read_to_string(&filepath).unwrap_or_default();
                 if existing == md_content {
-                    continue; // unchanged
+                    // #1060: unchanged notes stay covered by the seal manifest
+                    // with the bytes already on disk.
+                    sealed_files.push((filename.clone(), md_content.clone()));
+                    continue;
                 }
                 files_updated += 1;
                 "updated"
@@ -23097,8 +23112,61 @@ last_accessed: {}
 
             if let Err(e) = fs::write(&filepath, &md_content) {
                 errors.push(format!("{}: {}", filename, e));
+            } else {
+                // #1060: remember the rendered bytes for the seal manifest.
+                sealed_files.push((filename.clone(), md_content.clone()));
             }
         }
+
+        // #1060: write a seal manifest next to the notes and record a seal
+        // over the manifest itself. The manifest is the tamper-evidence
+        // anchor for the export: per-file hashes let an operator detect any
+        // post-export edit; the seal row (hash only, never content) lets the
+        // Vault detect tampering of the manifest on the next scan. The
+        // manifest is not counted in files_created/files_updated.
+        let seal_receipt = {
+            let manifest = serde_json::json!({
+                "schema": 1,
+                "kind": "perseus-vault-seal-manifest",
+                "exported_at_unix_ms": now_ms(),
+                "workspace_hash": workspace_hash.unwrap_or(""),
+                "files": sealed_files
+                    .iter()
+                    .map(|(name, content)| serde_json::json!({
+                        "path": name,
+                        "sha256": seal_sha256_bytes(content.as_bytes()),
+                        "bytes": content.len(),
+                    }))
+                    .collect::<Vec<_>>(),
+            });
+            let manifest_json = serde_json::to_string_pretty(&manifest)
+                .unwrap_or_else(|_| "{}".to_string());
+            let manifest_path = vault.join(".seals.json");
+            match fs::write(&manifest_path, &manifest_json) {
+                Ok(_) => {
+                    let manifest_digest = seal_sha256_bytes(manifest_json.as_bytes());
+                    match self.seal_record_with_conn(
+                        &conn,
+                        &manifest_path.to_string_lossy(),
+                        "export",
+                        "vault_export",
+                        &manifest_digest,
+                        workspace_hash.unwrap_or(""),
+                        "",
+                    ) {
+                        Ok(r) => Some(r),
+                        Err(e) => {
+                            errors.push(format!(".seals.json seal: {}", e));
+                            None
+                        }
+                    }
+                }
+                Err(e) => {
+                    errors.push(format!(".seals.json: {}", e));
+                    None
+                }
+            }
+        };
 
         Ok(VaultReport {
             files_created,
@@ -23106,6 +23174,385 @@ last_accessed: {}
             errors,
             vault_dir: vault_dir.to_string(),
             completed_at_unix_ms: now_ms(),
+            seal: seal_receipt,
+        })
+    }
+
+
+    // ─── #1060: seal-style tamper evidence ──────────────────────────────
+    //
+    // A seal is a SHA-256 commitment over content (entity body_json, or the
+    // bytes of an exported file manifest) recorded at write/export time and
+    // stored OUTSIDE the sealed content itself — the seal row carries the
+    // hash + label only, never content. Compare-on-recall/reload surfaces a
+    // mismatch as a journaled `tamper_evidence` event naming the target, and
+    // `scan_seals` reports every mismatch. Integrity ≠ truth by design: a
+    // seal proves unchanged-since-sealed, never true-when-written
+    // (docs/seals-tamper-evidence.md; 1F916 borrow).
+
+    /// Insert a seal row + journal a `seal_created` event (hash + label only —
+    /// the content itself never enters the seal row or the event).
+    #[allow(clippy::too_many_arguments)]
+    fn seal_record_with_conn(
+        &self,
+        conn: &rusqlite::Connection,
+        target_id: &str,
+        scope: &str,
+        label: &str,
+        sha256: &str,
+        workspace_hash: &str,
+        agent_id: &str,
+    ) -> Result<crate::models::SealReceipt, Box<dyn std::error::Error>> {
+        let seal_id = format!("seal-{}", uuid::Uuid::new_v4().simple());
+        let created_at = now_ms();
+        conn.execute(
+            "INSERT INTO memory_seals (seal_id, target_id, label, scope, sha256, \
+             workspace_hash, agent_id, created_at_unix_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![seal_id, target_id, label, scope, sha256, workspace_hash, agent_id, created_at],
+        )?;
+        let event_id = format!("jrn-{}", uuid::Uuid::new_v4().simple());
+        self.journal_with_conn(
+            conn,
+            &crate::models::JournalEvent {
+                id: event_id,
+                event_type: "seal_created".to_string(),
+                evaluated_json: json!({
+                    "seal_id": seal_id,
+                    "target_id": target_id,
+                    "label": label,
+                    "scope": scope,
+                    "sha256": sha256,
+                })
+                .to_string(),
+                acted_json: "{}".to_string(),
+                forward_json: "{}".to_string(),
+                category: String::new(),
+                key: String::new(),
+                entity_id: String::new(),
+                agent_id: agent_id.to_string(),
+                workspace_hash: workspace_hash.to_string(),
+                created_at_unix_ms: created_at,
+            },
+        )?;
+        Ok(crate::models::SealReceipt {
+            seal_id,
+            target_id: target_id.to_string(),
+            label: label.to_string(),
+            scope: scope.to_string(),
+            sha256: sha256.to_string(),
+            workspace_hash: workspace_hash.to_string(),
+            agent_id: agent_id.to_string(),
+            created_at_unix_ms: created_at,
+        })
+    }
+
+    /// Record a seal over a live entity's canonical bytes (its stored
+    /// `body_json`). Returns the receipt; the seal row stores the hash only.
+    pub fn seal_entity(
+        &self,
+        entity_id: &str,
+        workspace_hash: &str,
+        agent_id: &str,
+        label: &str,
+    ) -> Result<crate::models::SealReceipt, Box<dyn std::error::Error>> {
+        let conn = self.conn()?;
+        let body: Option<String> = conn
+            .query_row(
+                "SELECT body_json FROM entities WHERE id = ?1",
+                params![entity_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let body = body.ok_or_else(|| format!("no live entity with id '{entity_id}'"))?;
+        let digest = sha256_hex(&body);
+        let label = if label.is_empty() { "entity" } else { label };
+        self.seal_record_with_conn(&conn, entity_id, "entity", label, &digest, workspace_hash, agent_id)
+    }
+
+    /// Journal a `tamper_evidence` event for a seal mismatch, deduped: if the
+    /// newest tamper event for the same target already carries the same
+    /// expected/actual pair, nothing is written (recall can run hot without
+    /// flooding the journal; the mismatch is still never silent — the first
+    /// occurrence is journaled and every scan reports it).
+    fn journal_tamper_evidence(
+        &self,
+        conn: &rusqlite::Connection,
+        seal: &str,
+        target_id: &str,
+        label: &str,
+        scope: &str,
+        expected: &str,
+        actual: &str,
+        surface: &str,
+        workspace_hash: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let last: Option<String> = conn
+            .query_row(
+                "SELECT evaluated_json FROM journal \
+                 WHERE entity_id = ?1 AND event_type = 'tamper_evidence' \
+                 ORDER BY created_at_unix_ms DESC LIMIT 1",
+                params![target_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(prev) = last {
+            if prev.contains(expected) && prev.contains(actual) {
+                return Ok(());
+            }
+        }
+        let event_id = format!("jrn-{}", uuid::Uuid::new_v4().simple());
+        let now = now_ms();
+        self.journal_with_conn(
+            conn,
+            &crate::models::JournalEvent {
+                id: event_id,
+                event_type: "tamper_evidence".to_string(),
+                evaluated_json: json!({
+                    "seal_id": seal,
+                    "target_id": target_id,
+                    "label": label,
+                    "scope": scope,
+                    "expected_sha256": expected,
+                    "actual_sha256": actual,
+                    "surface": surface,
+                })
+                .to_string(),
+                acted_json: "{}".to_string(),
+                forward_json: "{}".to_string(),
+                category: String::new(),
+                key: String::new(),
+                entity_id: target_id.to_string(),
+                agent_id: String::new(),
+                workspace_hash: workspace_hash.to_string(),
+                created_at_unix_ms: now,
+            },
+        )?;
+        Ok(())
+    }
+
+    /// Recall-time seal compare: for every delivered entity that has a seal,
+    /// recompute the hash over the served bytes. A mismatch is surfaced as a
+    /// journaled `tamper_evidence` event naming the entity — never served
+    /// silently. Returns the tampered entity ids. Best-effort: a seal-table
+    /// read failure never fails the recall itself.
+    pub(crate) fn recall_seal_compare(&self, entities: &[Entity]) -> Vec<String> {
+        if entities.is_empty() {
+            return vec![];
+        }
+        let conn = match self.conn() {
+            Ok(c) => c,
+            Err(_) => return vec![],
+        };
+        let any: i64 = match conn
+            .query_row("SELECT COUNT(*) FROM memory_seals LIMIT 1", [], |r| r.get(0))
+            .optional()
+        {
+            Ok(Some(n)) => n,
+            _ => return vec![],
+        };
+        if any == 0 {
+            return vec![];
+        }
+        let placeholders = vec!["?"; entities.len()].join(",");
+        let sql = format!(
+            "SELECT target_id, sha256 FROM memory_seals \
+             WHERE scope = 'entity' AND target_id IN ({placeholders}) \
+             ORDER BY created_at_unix_ms DESC"
+        );
+        let ids: Vec<&str> = entities.iter().map(|e| e.id.as_str()).collect();
+        let params: Vec<&dyn rusqlite::ToSql> = ids.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+        let mut latest: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        if let Ok(mut stmt) = conn.prepare(&sql) {
+            if let Ok(rows) = stmt.query_map(params.as_slice(), |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            }) {
+                for row in rows.flatten() {
+                    latest.entry(row.0).or_insert(row.1); // DESC order → first is newest
+                }
+            }
+        }
+        if latest.is_empty() {
+            return vec![];
+        }
+        let mut tampered = Vec::new();
+        for e in entities {
+            if let Some(expected) = latest.get(&e.id) {
+                let actual = sha256_hex(&e.body_json);
+                if &actual != expected {
+                    // Fetch label + seal id for the event.
+                    let (seal_id, label, ws): (String, String, String) = conn
+                        .query_row(
+                            "SELECT seal_id, label, COALESCE(workspace_hash, '') \
+                             FROM memory_seals WHERE target_id = ?1 AND sha256 = ?2 \
+                             ORDER BY created_at_unix_ms DESC LIMIT 1",
+                            params![e.id, expected],
+                            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                        )
+                        .unwrap_or_default();
+                    let ws = if ws.is_empty() { e.workspace_hash.clone() } else { ws };
+                    let _ = self.journal_tamper_evidence(
+                        &conn, &seal_id, &e.id, &label, "entity", expected, &actual, "recall", &ws,
+                    );
+                    tampered.push(e.id.clone());
+                }
+            }
+        }
+        tampered
+    }
+
+    /// Scan every seal and report mismatches (each mismatch also journaled via
+    /// `journal_tamper_evidence`, deduped). Entity seals are compared against
+    /// the live `body_json`; export seals against the on-disk manifest bytes
+    /// (a deleted manifest is a tamper finding).
+    pub fn scan_seals(&self) -> Result<crate::models::SealScanReport, Box<dyn std::error::Error>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT seal_id, target_id, label, scope, sha256, \
+                    COALESCE(workspace_hash, '') \
+             FROM memory_seals ORDER BY scope, target_id, created_at_unix_ms DESC",
+        )?;
+        let rows: Vec<(String, String, String, String, String, String)> = stmt
+            .query_map([], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
+            })?
+            .collect::<Result<_, _>>()?;
+        let mut latest: std::collections::HashMap<(String, String), (String, String, String, String)> =
+            std::collections::HashMap::new(); // (scope, target) -> (seal, label, sha, ws)
+        for (seal, target, label, scope, sha, ws) in rows {
+            latest.entry((scope, target)).or_insert((seal, label, sha, ws));
+        }
+        let now = now_ms();
+        let mut tampered = Vec::new();
+        let mut checked = 0i64;
+        for ((scope, target), (seal, label, expected, ws)) in latest {
+            checked += 1;
+            if scope == "export" {
+                // Export seals cover the `.seals.json` manifest. Verifying one
+                // means: (1) the manifest bytes must match the seal, and (2)
+                // every file listed IN the manifest must match its recorded
+                // per-file hash — so a tampered note is detected even when the
+                // manifest itself is intact.
+                match std::fs::read(&target) {
+                    Ok(bytes) => {
+                        let manifest_digest = seal_sha256_bytes(&bytes);
+                        if manifest_digest != expected {
+                            let _ = self.journal_tamper_evidence(
+                                &conn, &seal, &target, &label, &scope, &expected, &manifest_digest,
+                                "scan", &ws,
+                            );
+                            tampered.push(crate::models::TamperFinding {
+                                seal_id: seal,
+                                target_id: target,
+                                label,
+                                scope,
+                                expected_sha256: expected,
+                                actual_sha256: manifest_digest,
+                                detected_at_unix_ms: now,
+                            });
+                            continue;
+                        }
+                        if let Ok(manifest) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                            let dir = std::path::Path::new(&target)
+                                .parent()
+                                .map(|d| d.to_path_buf())
+                                .unwrap_or_default();
+                            for f in manifest["files"].as_array().cloned().unwrap_or_default() {
+                                let fpath = f["path"].as_str().unwrap_or("").to_string();
+                                let fexp = f["sha256"].as_str().unwrap_or("").to_string();
+                                let full = dir.join(&fpath);
+                                let full_s = full.to_string_lossy().to_string();
+                                match std::fs::read(&full) {
+                                    Ok(b) => {
+                                        let a = seal_sha256_bytes(&b);
+                                        if a != fexp {
+                                            let _ = self.journal_tamper_evidence(
+                                                &conn, &seal, &full_s, &label, "export", &fexp, &a,
+                                                "scan", &ws,
+                                            );
+                                            tampered.push(crate::models::TamperFinding {
+                                                seal_id: seal.clone(),
+                                                target_id: full_s,
+                                                label: label.clone(),
+                                                scope: "export".to_string(),
+                                                expected_sha256: fexp,
+                                                actual_sha256: a,
+                                                detected_at_unix_ms: now,
+                                            });
+                                        }
+                                    }
+                                    Err(_) => {
+                                        let missing = format!("{} (file missing)", full_s);
+                                        let _ = self.journal_tamper_evidence(
+                                            &conn, &seal, &full_s, &label, "export", &fexp,
+                                            &missing, "scan", &ws,
+                                        );
+                                        tampered.push(crate::models::TamperFinding {
+                                            seal_id: seal.clone(),
+                                            target_id: full_s,
+                                            label: label.clone(),
+                                            scope: "export".to_string(),
+                                            expected_sha256: fexp,
+                                            actual_sha256: missing,
+                                            detected_at_unix_ms: now,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        let missing = format!("{} (file missing)", target);
+                        let _ = self.journal_tamper_evidence(
+                            &conn, &seal, &target, &label, &scope, &expected, &missing, "scan", &ws,
+                        );
+                        tampered.push(crate::models::TamperFinding {
+                            seal_id: seal,
+                            target_id: target,
+                            label,
+                            scope,
+                            expected_sha256: expected,
+                            actual_sha256: missing,
+                            detected_at_unix_ms: now,
+                        });
+                    }
+                }
+                continue;
+            }
+            // Entity seals: compare against the live body_json.
+            let actual: Option<String> = conn
+                .query_row(
+                    "SELECT body_json FROM entities WHERE id = ?1",
+                    params![target],
+                    |r| r.get::<_, Option<String>>(0),
+                )
+                .optional()?
+                .flatten()
+                .map(|b| sha256_hex(&b));
+            match actual {
+                Some(a) if a == expected => {}
+                Some(a) => {
+                    let _ = self.journal_tamper_evidence(
+                        &conn, &seal, &target, &label, &scope, &expected, &a, "scan", &ws,
+                    );
+                    tampered.push(crate::models::TamperFinding {
+                        seal_id: seal,
+                        target_id: target,
+                        label,
+                        scope,
+                        expected_sha256: expected,
+                        actual_sha256: a,
+                        detected_at_unix_ms: now,
+                    });
+                }
+                None => {} // entity gone (forgotten/erased): nothing left to compare
+            }
+        }
+        Ok(crate::models::SealScanReport {
+            seals_checked: checked,
+            ok: tampered.is_empty(),
+            tampered,
         })
     }
 
@@ -23332,6 +23779,7 @@ last_accessed: {}
             errors,
             vault_dir: vault_dir.to_string(),
             completed_at_unix_ms: now_ms(),
+            seal: None,
         })
     }
 
@@ -48223,7 +48671,237 @@ pub(crate) mod tests {
     /// usefulness_count" on the first v2.19.0 production deploy. Simulate that
     /// exact store shape: drop the columns, stamp the pre-bump version, and
     /// assert the real migration path (initialize_schema) delivers them.
+        // ─── #1060: seal-style tamper evidence ──────────────────────────────
+
+    /// Remember one entity and seal it through the production surface.
+    fn seal_fixture(db: &TestDatabase) -> (String, String) {
+        // (entity id, seal sha256)
+        db.remember(&make_entity(
+            "seal-e1",
+            "facts",
+            "seal-k1",
+            r#"{"content":"sealed payload alpha"}"#,
+        ))
+        .unwrap();
+        let receipt = db.seal_entity("seal-e1", "", "test", "test-seal").unwrap();
+        assert_eq!(receipt.target_id, "seal-e1");
+        assert_eq!(receipt.sha256.len(), 64, "sha256 hex length");
+        assert!(receipt.sha256.chars().all(|c| c.is_ascii_hexdigit()));
+        (receipt.seal_id.clone(), receipt.sha256.clone())
+    }
+
     #[test]
+    fn seal_entity_stores_hash_only_and_journals_event() {
+        let (db, path) = temp_db();
+        let (seal_id, sha) = seal_fixture(&db);
+
+        // The seal row stores the hash + metadata only — never content.
+        let conn = db.conn().unwrap();
+        let (target, scope, stored_sha, label): (String, String, String, String) = conn
+            .query_row(
+                "SELECT target_id, scope, sha256, label FROM memory_seals WHERE seal_id = ?1",
+                params![seal_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(target, "seal-e1");
+        assert_eq!(scope, "entity");
+        assert_eq!(stored_sha, sha);
+        assert_eq!(label, "test-seal");
+        let seal_ev: String = conn
+            .query_row(
+                "SELECT evaluated_json FROM journal WHERE event_type='seal_created' ORDER BY created_at_unix_ms DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        drop(conn);
+        assert!(
+            seal_ev.contains(&sha) && !seal_ev.contains("sealed payload"),
+            "seal event carries the hash, never the content: {seal_ev}"
+        );
+        // The audit chain still verifies after the seal journal event.
+        assert!(verify_audit_chain(&db).is_ok());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn recall_surfaces_tamper_after_persisted_bit_flip() {
+        let (db, path) = temp_db();
+        let (_seal_id, sha) = seal_fixture(&db);
+
+        // Out-of-band editor flips the persisted row (simulated by direct
+        // SQL — same bytes a tampered store would serve).
+        {
+            let conn = db.conn().unwrap();
+            conn.execute(
+                "UPDATE entities SET body_json = '{\"evil\":true}' WHERE id = 'seal-e1'",
+                [],
+            )
+            .unwrap();
+        }
+
+        let hits = db
+            .recall(&RecallParams {
+                query: "sealed payload".to_string(),
+                limit: 10,
+                skip_side_effects: true,
+                ..RecallParams::default()
+            })
+            .unwrap();
+        assert!(hits.iter().any(|e| e.id == "seal-e1"), "row still hydrates");
+
+        // The mismatch must be surfaced: a tamper_evidence event naming the
+        // entity, with expected (seal) and actual hashes.
+        let conn = db.conn().unwrap();
+        let ev: String = conn
+            .query_row(
+                "SELECT evaluated_json FROM journal WHERE event_type='tamper_evidence' AND entity_id='seal-e1' ORDER BY created_at_unix_ms DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&ev).unwrap();
+        assert_eq!(v["target_id"], "seal-e1");
+        assert_eq!(v["expected_sha256"], sha.as_str());
+        assert_eq!(v["surface"], "recall");
+        assert_ne!(v["actual_sha256"], sha.as_str());
+        drop(conn);
+
+        // The tamper scan reports the same finding.
+        let report = db.scan_seals().unwrap();
+        assert!(!report.ok);
+        assert_eq!(report.tampered.len(), 1);
+        assert_eq!(report.tampered[0].target_id, "seal-e1");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn recall_is_silent_when_sealed_row_is_unchanged() {
+        let (db, path) = temp_db();
+        let (_seal_id, _sha) = seal_fixture(&db);
+
+        db.recall(&RecallParams {
+            query: "sealed payload".to_string(),
+            limit: 10,
+            skip_side_effects: true,
+            ..RecallParams::default()
+        })
+        .unwrap();
+
+        let conn = db.conn().unwrap();
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM journal WHERE event_type='tamper_evidence'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        drop(conn);
+        assert_eq!(n, 0, "an unmodified sealed row must not surface tamper events");
+
+        let report = db.scan_seals().unwrap();
+        assert!(report.ok);
+        assert!(report.tampered.is_empty());
+        assert_eq!(report.seals_checked, 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn scan_seals_dedupes_repeat_findings_in_journal() {
+        let (db, path) = temp_db();
+        let (_seal_id, _sha) = seal_fixture(&db);
+        {
+            let conn = db.conn().unwrap();
+            conn.execute(
+                "UPDATE entities SET body_json = '{\"evil\":true}' WHERE id = 'seal-e1'",
+                [],
+            )
+            .unwrap();
+        }
+        // Two scans over the same tampered row: the finding is reported
+        // twice, but the journal gains only ONE tamper_evidence event for the
+        // same (expected, actual) pair — no journal flood on hot scans.
+        let r1 = db.scan_seals().unwrap();
+        let r2 = db.scan_seals().unwrap();
+        assert!(!r1.ok && !r2.ok);
+        assert_eq!(r1.tampered.len(), 1);
+        assert_eq!(r2.tampered.len(), 1);
+        let conn = db.conn().unwrap();
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM journal WHERE event_type='tamper_evidence' AND entity_id='seal-e1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        drop(conn);
+        assert_eq!(n, 1, "duplicate findings must not flood the journal");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn export_seals_manifest_and_scan_detects_file_tamper() {
+        let (db, path) = temp_db();
+        db.remember(&make_entity(
+            "seal-x1",
+            "facts",
+            "seal-xk",
+            r#"{"content":"exported note"}"#,
+        ))
+        .unwrap();
+        let vault = std::env::temp_dir().join(format!("perseus_vault-seal-{}", uuid::Uuid::new_v4()));
+        let vault_str = vault.to_str().unwrap().to_string();
+
+        let report = db.vault_export(&vault_str, None).unwrap();
+        assert!(report.errors.is_empty(), "export errors: {:?}", report.errors);
+        let seal = report.seal.expect("export must produce a seal receipt");
+        assert_eq!(seal.scope, "export");
+        assert!(seal.target_id.ends_with(".seals.json"));
+
+        // Manifest: per-file hashes matching the on-disk bytes.
+        let manifest_path = vault.join(".seals.json");
+        let manifest_json = std::fs::read_to_string(&manifest_path).unwrap();
+        let manifest: serde_json::Value = serde_json::from_str(&manifest_json).unwrap();
+        assert_eq!(manifest["kind"], "perseus-vault-seal-manifest");
+        let files = manifest["files"].as_array().unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0]["path"], "seal-x1.md");
+        let note_bytes = std::fs::read(&vault.join("seal-x1.md")).unwrap();
+        assert_eq!(files[0]["sha256"], seal_sha256_bytes(&note_bytes).as_str());
+
+        // Untampered export scans clean…
+        let r1 = db.scan_seals().unwrap();
+        assert!(r1.ok, "tampered={:?}", r1.tampered);
+
+        // …a bit-flipped export file is detected and named.
+        std::fs::write(&vault.join("seal-x1.md"), "tampered export bytes").unwrap();
+        let r2 = db.scan_seals().unwrap();
+        assert!(!r2.ok);
+        assert!(
+            r2.tampered.iter().any(|t| t.target_id.ends_with("seal-x1.md")),
+            "tampered export file must be named by the scan: {:?}",
+            r2.tampered
+        );
+        // The scan also journals the finding.
+        let conn = db.conn().unwrap();
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM journal WHERE event_type='tamper_evidence' AND entity_id LIKE '%seal-x1.md'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        drop(conn);
+        assert_eq!(n, 1, "export tamper must be journaled");
+        // Audit chain still verifies after all seal/tamper events.
+        assert!(verify_audit_chain(&db).is_ok());
+
+        let _ = std::fs::remove_dir_all(&vault);
+        let _ = std::fs::remove_file(&path);
+    }
+
+#[test]
     fn v16_migration_delivers_usefulness_columns_to_v15_stores() {
         let (db, path) = temp_db();
         db.remember(&make_entity(

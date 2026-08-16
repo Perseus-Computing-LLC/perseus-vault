@@ -6725,6 +6725,46 @@ pub struct VaultExportArgs {
     pub shadow_workspace: Option<String>,
 }
 
+// ─── #1060 seal-style tamper evidence handlers ─────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct SealArgs {
+    pub target_id: String,
+    #[serde(default)]
+    pub workspace_hash: Option<String>,
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    #[serde(default)]
+    pub label: Option<String>,
+}
+
+/// Record a seal over a live entity's stored content (SHA-256 commitment,
+/// hash + label only — never the content itself). Compare-on-recall surfaces
+/// any later mismatch as a tamper event; `perseus_vault_tamper_scan` reports
+/// it. Integrity ≠ truth: a seal proves unchanged-since-sealed, never
+/// true-when-written.
+pub fn handle_seal(db: &Database, args: Value) -> Result<String, String> {
+    let a: SealArgs = serde_json::from_value(args)
+        .map_err(|e| format!("Invalid seal arguments: {e}"))?;
+    let receipt = db
+        .seal_entity(
+            &a.target_id,
+            a.workspace_hash.as_deref().unwrap_or(""),
+            a.agent_id.as_deref().unwrap_or(""),
+            a.label.as_deref().unwrap_or(""),
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(json!(receipt).to_string())
+}
+
+/// Verify every seal (entity + export) against the live content. Mismatches
+/// are journaled as tamper events and returned here — a tampered store or
+/// export is never served silently.
+pub fn handle_tamper_scan(db: &Database, _args: Value) -> Result<String, String> {
+    let report = db.scan_seals().map_err(|e| e.to_string())?;
+    Ok(json!(report).to_string())
+}
+
 pub fn handle_vault_export(db: &Database, args: Value) -> String {
     let a: VaultExportArgs = match serde_json::from_value(args) {
         Ok(a) => a,
