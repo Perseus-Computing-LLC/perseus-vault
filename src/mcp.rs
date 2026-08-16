@@ -7736,7 +7736,65 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     },
     "annotations": { "readOnlyHint": true },
     "title": "Audit Signed Transition Chain"
+  },
+{
+    "name": "perseus_vault_skill_set",
+    "description": "#1090 (ERSkill, arXiv:2608.12720): define or version a retrieval skill — a validated parameterization of recall primitives (mode, typed filters, trust/content weights, recency). New versions always enter the expansion frontier (double-frontier deployment): they never affect routing until a governed advancement.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "skill_id": {"type": "string"},
+        "name": {"type": "string"},
+        "version": {"type": "integer", "minimum": 1},
+        "profile": {"type": "object", "description": "Router affinity weights: base/recent/negation/question/type_hint/long_query"},
+        "template": {"type": "object", "description": "Skill template: mode (fts5|dense|hybrid|fused), limit 1..50, optional category/type_filter/layer/epistemic_state/weights"}
+      },
+      "required": ["skill_id", "version", "template"]
+    },
+    "outputSchema": {"type": "object", "properties": {"defined": {"type": "boolean"}, "skill_id": {"type": "string"}, "version": {"type": "integer"}, "frontier": {"type": "string"}, "receipt": {"type": "string"}}},
+    "annotations": { "readOnlyHint": false },
+    "title": "Define Retrieval Skill"
+  },
+  {
+    "name": "perseus_vault_skill_route",
+    "description": "#1090 (ERSkill): deterministic per-query routing over the SERVING frontier only — feature-based scoring, ties break by skill id. With serve=true the chosen skill executes (recall with its template) and the explored path is logged into the experience trie (skill id × query fingerprint × outcome).",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "query": {"type": "string"},
+        "serve": {"type": "boolean", "default": false}
+      },
+      "required": ["query"]
+    },
+    "outputSchema": {"type": "object", "properties": {"skill_id": {"type": "string"}, "skill_version": {"type": "integer"}, "score": {"type": "number"}, "served": {"type": "boolean"}, "entities": {"type": "array", "items": {"type": "object"}}}},
+    "annotations": { "readOnlyHint": false },
+    "title": "Route Retrieval Query"
+  },
+  {
+    "name": "perseus_vault_skill_advance",
+    "description": "#1090 (ERSkill): governed double-frontier transition. advance (expansion→serving) REQUIRES non-regression evidence (wins/losses/ties + recall_delta) and is refused fail-closed on regression; demote (serving→expansion) is the governed rollback. Every transition is receipt-anchored and bumps the serving version.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "skill_id": {"type": "string"},
+        "direction": {"type": "string", "enum": ["advance", "demote"]},
+        "evidence": {"type": "object", "description": "eval_ref, wins, losses, ties, recall_delta"}
+      },
+      "required": ["skill_id", "direction"]
+    },
+    "outputSchema": {"type": "object", "properties": {"accepted": {"type": "boolean"}, "skill_id": {"type": "string"}, "frontier": {"type": "string"}, "serving_version": {"type": "integer"}, "receipt": {"type": "string"}, "reason": {"type": "string"}}},
+    "annotations": { "readOnlyHint": false },
+    "title": "Advance Retrieval Skill Frontier"
+  },
+  {
+    "name": "perseus_vault_skill_audit",
+    "description": "#1090 (ERSkill): read-only audit of the skill registry — definitions by frontier, serving version, experience-trie stats per skill, and the receipt trail (definitions, advancements, refusals).",
+    "inputSchema": {"type": "object", "properties": {}},
+    "outputSchema": {"type": "object", "properties": {"skills": {"type": "array", "items": {"type": "object"}}, "serving_version": {"type": "object"}, "experience_stats": {"type": "object"}, "receipts": {"type": "array", "items": {"type": "object"}}}},
+    "annotations": { "readOnlyHint": true },
+    "title": "Audit Retrieval Skills"
   }
+
 ]"###,
         )
         .expect("tools JSON must be valid");
@@ -7893,6 +7951,10 @@ const TOOL_SCOPES: &[(&str, ToolScope)] = &[
     ("perseus_vault_signer_epoch_set", ToolScope::Ops),
     ("perseus_vault_poison_label", ToolScope::Ops),
     ("perseus_vault_transition_audit", ToolScope::Ops),
+        ("perseus_vault_skill_set", ToolScope::Ops),
+        ("perseus_vault_skill_route", ToolScope::Ops),
+        ("perseus_vault_skill_advance", ToolScope::Ops),
+        ("perseus_vault_skill_audit", ToolScope::Ops),
     ("perseus_vault_rollback_repair", ToolScope::Ops),    ("perseus_vault_op_run", ToolScope::Ops),
     ("perseus_vault_op_run_list", ToolScope::Ops),
     ("perseus_vault_op_run_get", ToolScope::Ops),
@@ -8245,7 +8307,12 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
         "perseus_vault_signer_epoch_set" => tools::handle_signer_epoch_set(db, args),
         "perseus_vault_poison_label" => tools::handle_poison_label(db, args),
         "perseus_vault_transition_audit" => tools::handle_transition_audit(db, args),
-        "perseus_vault_rollback_repair" => tools::handle_rollback_repair(db, args),        "perseus_vault_op_run" => tools::handle_op_run(db, args).map_err(|e| e.to_string()),
+        
+        "perseus_vault_skill_set" => tools::handle_skill_set(db, args),
+        "perseus_vault_skill_route" => tools::handle_skill_route(db, args),
+        "perseus_vault_skill_advance" => tools::handle_skill_advance(db, args),
+        "perseus_vault_skill_audit" => tools::handle_skill_audit(db, args),
+"perseus_vault_rollback_repair" => tools::handle_rollback_repair(db, args),        "perseus_vault_op_run" => tools::handle_op_run(db, args).map_err(|e| e.to_string()),
         "perseus_vault_op_run_list" => {
             tools::handle_op_run_list(db, args).map_err(|e| e.to_string())
         }
@@ -8395,7 +8462,7 @@ mod tests {
         );
         assert_eq!(
             registry_names.len(),
-            161,            "update public metadata when adding a tool"
+            165,            "update public metadata when adding a tool"
         );
 
         let canonical = advertised_names();
@@ -9704,8 +9771,8 @@ mod tests {
         let ops = filter_registry_by_view(registry.clone(), ScopeView::Ops);
         let full = filter_registry_by_view(registry.clone(), ScopeView::Full);
         assert_eq!(agent.len(), 51, "agent view count drifted — new tools must be classified");
-        assert_eq!(ops.len(), 154, "ops view count drifted — new tools must be classified");
-        assert_eq!(full.len(), 161, "full view must expose the whole registry");
+        assert_eq!(ops.len(), 158, "ops view count drifted — new tools must be classified");
+        assert_eq!(full.len(), 165, "full view must expose the whole registry");
         assert!(agent.len() < ops.len() && ops.len() < full.len());
     }
 
