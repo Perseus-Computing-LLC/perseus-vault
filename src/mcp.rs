@@ -7647,6 +7647,35 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "title": "Report Success (Confirm Query Key)"
   },
   {
+    "name": "perseus_vault_rollback_repair",
+    "description": "#1084 (arXiv:2608.10502): dependency-guided rollback repair for poisoned/stale memories. Builds a typed memory→action dependency graph from runtime provenance, preserves dependents with independent trusted support, tombstones unsupported state (quarantine — never deletes), and reports a scoped selective-replay proposal. Every step is journal-receipted and the repair is reversible (reverse_repair_id).",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "faulty_ids": {"type": "array", "items": {"type": "string"}, "description": "Diagnosed faulty entity ids"},
+        "dry_run": {"type": "boolean", "default": false, "description": "Report the plan without writing"},
+        "replay": {"type": "boolean", "default": false, "description": "Include a scoped selective-replay proposal (dry-run consolidation over the affected category/workspace)"},
+        "workspace_hash": {"type": "string", "description": "Optional workspace scope hint"},
+        "reverse_repair_id": {"type": "string", "description": "When set, reverse this previously recorded repair instead of running a new one"}
+      },
+      "required": ["faulty_ids"]
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "repair_id": {"type": "string"},
+        "dry_run": {"type": "boolean"},
+        "faulty": {"type": "array", "items": {"type": "string"}},
+        "preserved": {"type": "array", "items": {"type": "object"}},
+        "tombstoned": {"type": "array", "items": {"type": "string"}},
+        "replay": {"type": "object"},
+        "rollback": {"type": "object"}
+      }
+    },
+    "annotations": { "readOnlyHint": false },
+    "title": "Dependency-Guided Rollback Repair"
+  },
+  {
     "name": "perseus_vault_signer_epoch_set",
     "description": "#1080 (MutMem): register or replace the Ed25519 signing key for a signer epoch — the authorization root for signed transitions. The seed (32 raw bytes, base64) is stored at rest alongside the database (same trust domain as the AES key file) and never echoed back. Ops scope.",
     "inputSchema": {
@@ -7864,7 +7893,7 @@ const TOOL_SCOPES: &[(&str, ToolScope)] = &[
     ("perseus_vault_signer_epoch_set", ToolScope::Ops),
     ("perseus_vault_poison_label", ToolScope::Ops),
     ("perseus_vault_transition_audit", ToolScope::Ops),
-    ("perseus_vault_op_run", ToolScope::Ops),
+    ("perseus_vault_rollback_repair", ToolScope::Ops),    ("perseus_vault_op_run", ToolScope::Ops),
     ("perseus_vault_op_run_list", ToolScope::Ops),
     ("perseus_vault_op_run_get", ToolScope::Ops),
     ("perseus_vault_op_run_retry", ToolScope::Ops),
@@ -8216,7 +8245,7 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
         "perseus_vault_signer_epoch_set" => tools::handle_signer_epoch_set(db, args),
         "perseus_vault_poison_label" => tools::handle_poison_label(db, args),
         "perseus_vault_transition_audit" => tools::handle_transition_audit(db, args),
-        "perseus_vault_op_run" => tools::handle_op_run(db, args).map_err(|e| e.to_string()),
+        "perseus_vault_rollback_repair" => tools::handle_rollback_repair(db, args),        "perseus_vault_op_run" => tools::handle_op_run(db, args).map_err(|e| e.to_string()),
         "perseus_vault_op_run_list" => {
             tools::handle_op_run_list(db, args).map_err(|e| e.to_string())
         }
@@ -8366,8 +8395,7 @@ mod tests {
         );
         assert_eq!(
             registry_names.len(),
-            160,
-            "update public metadata when adding a tool"
+            161,            "update public metadata when adding a tool"
         );
 
         let canonical = advertised_names();
@@ -9675,9 +9703,9 @@ mod tests {
         let agent = filter_registry_by_view(registry.clone(), ScopeView::Agent);
         let ops = filter_registry_by_view(registry.clone(), ScopeView::Ops);
         let full = filter_registry_by_view(registry.clone(), ScopeView::Full);
-        assert_eq!(full.len(), 160, "full view must expose the whole registry");
         assert_eq!(agent.len(), 51, "agent view count drifted — new tools must be classified");
-        assert_eq!(ops.len(), 153, "ops view count drifted — new tools must be classified");
+        assert_eq!(ops.len(), 154, "ops view count drifted — new tools must be classified");
+        assert_eq!(full.len(), 161, "full view must expose the whole registry");
         assert!(agent.len() < ops.len() && ops.len() < full.len());
     }
 
