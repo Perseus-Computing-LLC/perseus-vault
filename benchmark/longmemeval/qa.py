@@ -114,41 +114,52 @@ ANSWER_PROMPT = (
     "Answer:"
 )
 
-# #579: LongMemEval's OFFICIAL chain-of-thought answer prompt variant. The
-# benchmark ships BOTH prompts (run_generation.py cot=true); this is still 100%
-# official methodology — it is not a homegrown prompt. It asks the model to
-# reason step-by-step before answering, which the retrieval diagnostic (#580)
-# showed recovers the large "evidence-was-retrieved-but-reasoning-failed" class
-# (89 of 129 consistent failures). Reports/journals MUST record which prompt was
-# used (answer_prompt: plain | official-cot) so a CoT number is never silently
-# blended with a plain-prompt one.
+# LongMemEval's official chain-of-thought answer prompt, copied from
+# xiaowu0162/LongMemEval/src/generation/run_generation.py. The complete model
+# response is retained for the official per-type judge and hypotheses artifact.
 ANSWER_PROMPT_COT = (
     "I will give you several history chats between you and a user. Please answer "
-    "the question based on the relevant chat history.\n\n\n"
+    "the question based on the relevant chat history. Answer the question step by step: "
+    "first extract all the relevant information, and then reason over the information to "
+    "get the answer.\n\n\n"
     "History Chats:\n\n{context}\n\n"
     "Current Date: {question_date}\n"
-    "Question: {question}\n\n"
-    "Let's think step by step, then give the final answer. "
-    "Reason briefly over the relevant chat history, then end with a line that "
-    "starts with 'Answer:' followed by the final answer.\n"
+    "Question: {question}\n"
+    "Answer (step by step):"
 )
 
 
+def hypothesis_for_judge(text, cot=False):
+    """Return the complete response expected by LongMemEval's official judge.
+
+    CoT responses must not be reduced to the tail after ``Answer:``: the
+    official evaluator grades the complete ``hypothesis`` string. The ``cot``
+    argument is retained as an explicit call-site contract and for future
+    protocol assertions.
+    """
+    del cot
+    return text.strip() if text else text
+
+
 def extract_cot_answer(text):
-    """Pull the final answer out of a CoT response. The prompt asks the model to
-    end with a line 'Answer: <final>'; return the text after the LAST such
-    marker (case-insensitive). Falls back to the full response when no marker is
-    present, so the judge still sees the reasoning-embedded answer rather than
-    an empty string."""
+    """Extract a final-answer tail for optional diagnostics only.
+
+    This helper is deliberately not used for official judging or hypothesis
+    artifacts, because LongMemEval's evaluator receives the full response.
+    """
     if not text:
         return text
-    marker = None
     lower = text.lower()
     idx = lower.rfind("answer:")
-    if idx != -1:
-        marker = text[idx + len("answer:"):].strip()
+    marker = text[idx + len("answer:"):].strip() if idx != -1 else ""
     return marker if marker else text.strip()
 
+
+def write_checkpoint(journal, record):
+    """Append one JSONL checkpoint and force it to durable storage."""
+    journal.write(json.dumps(record) + "\n")
+    journal.flush()
+    os.fsync(journal.fileno())
 
 def get_anscheck_prompt(task, question, answer, response, abstention=False):
     """Judge prompt, ported VERBATIM from LongMemEval's official metric
@@ -626,8 +637,7 @@ def main():
                   f"{journal_path.name}; errored/unfinished questions will run.")
         journal = open(journal_path, "a" if resume_ok else "w", encoding="utf-8")
         if not resume_ok:
-            journal.write(json.dumps({"_config": run_config}) + "\n")
-            journal.flush()
+            write_checkpoint(journal, {"_config": run_config})
         # Seed the accumulators from the reloaded verdicts so the final report
         # covers the WHOLE run, not just this process's share.
         for rec in done.values():
@@ -644,10 +654,9 @@ def main():
         """Append a verdict to memory AND the crash-safe journal."""
         verdicts.append(rec)
         if journal:
-            journal.write(json.dumps({**rec, "hypothesis": hypothesis,
-                                      "tokens_est": tokens_est,
-                                      "sessions": sessions}) + "\n")
-            journal.flush()
+            write_checkpoint(journal, {**rec, "hypothesis": hypothesis,
+                                       "tokens_est": tokens_est,
+                                       "sessions": sessions})
 
     for idx, inst in enumerate(data):
         qid = inst["question_id"]
@@ -678,13 +687,13 @@ def main():
                 q_tokens = est_tokens(prompt)
                 a_usage = {}
                 if args.mock_llm:
-                    ans = mock_answer(inst, idx)
+                    raw_ans = mock_answer(inst, idx)
                 else:
                     try:
                         # #579: CoT needs completion room to reason (1200 tok);
                         # the plain prompt keeps the provider default.
-                        ans, a_usage = call_llm(base_url, api_key, args.model, prompt, budget,
-                                                max_tokens=1200 if args.cot else None)
+                        raw_ans, a_usage = call_llm(base_url, api_key, args.model, prompt, budget,
+                                                   max_tokens=1200 if args.cot else None)
                     except Exception as e:
                         # A rate-limited/failed question must NEVER deflate accuracy:
                         # record it as answer_error and exclude it from the denominator.
@@ -698,12 +707,11 @@ def main():
                                 "judge_raw": None, "ans_usage": None,
                                 "judge_usage": None}, "", q_tokens, len(chosen))
                         continue
-                # #579: under CoT the model reasons then emits 'Answer: <final>';
-                # judge the final answer, not the whole reasoning trace.
-                if args.cot:
-                    ans = extract_cot_answer(ans)
+                # Official LongMemEval judging receives the complete response.
+                # Do not replace it with extract_cot_answer(raw_ans); that tail-only
+                # behavior caused the invalid 74.3% refresh.
+                ans = hypothesis_for_judge(raw_ans, cot=args.cot)
                 hyps[system].append({"question_id": qid, "hypothesis": ans})
-
                 jp = get_anscheck_prompt(qtype, inst["question"], inst["answer"],
                                          ans or "(no answer)", abstention=is_abs)
                 j_usage = {}
