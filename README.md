@@ -21,7 +21,7 @@
 
 Give your agents memory that survives the session, so they stop re-deriving what they
 already learned and stop repeating past mistakes. Hybrid recall (BM25 + dense + RRF),
-bi-temporal history, and **AES-256-GCM** at rest, exposed as **168 canonical MCP tools**that work with any host. Legacy `mimir_*`/`mneme_*` aliases were removed in the 2026-27
+bi-temporal history, and **AES-256-GCM** at rest, exposed as **169 canonical MCP tools**that work with any host. Legacy `mimir_*`/`mneme_*` aliases were removed in the 2026-27
 major release and are
 not counted separately. **73.8% on LongMemEval's official harness** (vs Zep 63.8%, Mem0
 49.0%).
@@ -386,7 +386,7 @@ Each adapter:
 Any MCP-compatible framework works with Perseus Vault directly. See
 [MCP client and framework integrations](docs/clients/README.md) for the full list.
 
-## 150 Canonical MCP Tools
+## 169 Canonical MCP Tools
 
 > **Canonical product and tool names.** Perseus Vault is the product name, and integrations use the canonical `perseus_vault_*` tools (for example, `perseus_vault_remember`). The legacy `mimir_*` / `mneme_*` / `plutus_*` names were removed in the 2026-27 major release — the canonical names are the only interface.
 > The count is the number of unique canonical tools in the source registry. Compatibility aliases are callable but are not counted separately.
@@ -415,7 +415,7 @@ attention-constrained agent clients:
 
 | Setting | Advertised surface | Count |
 |---|---|---|
-| `full` (default) | everything | 150 |
+| `full` (default) | everything | 169 |
 | `ops` | agent surface + operational grooming, maintenance, governance, export | 140 |
 | `agent` | everyday memory + coordination surface (recall / remember / context / handoffs / state, plus the agent-side AAR calls) | 48 |
 

@@ -138,6 +138,43 @@ almost every time. (Token counts use tiktoken when present, else a ~4-chars/toke
 estimate; the *ratio* is tokenizer-independent. This is the honest, reproducible version
 of the deprecated doc's "82x fewer tokens" claim.)
 
+**Opt-in compact evidence ledger (#1108).** `--context-assembly evidence-ledger`
+replaces the ranked session text with a deterministic, extractive ledger. It keeps
+dated source rows, turn/session provenance, user-stated evidence, and explicitly
+labeled assistant context; repeated normalized statements share provenance while
+numeric/date versions remain distinct. The default is a 12,000 estimated-token
+budget and the implementation rejects budgets above the 16,000-token hard cap.
+The default `full` path, `none`/`preference` guidance, and the existing ranked
+snippet arm are unchanged. The ledger performs no provider, judge, embedding, or
+summarizer call:
+
+```bash
+python benchmark/longmemeval/qa.py --data longmemeval_s_cleaned.json \
+    --mock-llm --cot --context-assembly evidence-ledger --ledger-budget 12000 \
+    --limit 5 --bin /path/to/perseus-vault --out ledger-smoke.json
+```
+
+**Preregistered free gate (#1109).** Before any paid counterfactual, run the
+provider-free paired gate over the frozen 63-case fixture. A pinned retrieval
+replay is preferred; without `--retrieval-replay`, pass `--bin` to reproduce
+retrieval locally. The report includes per-case dated evidence blocks, session
+inclusion, deterministic/budget/source-token checks, answer-token proxies, and
+causal-stratum regressions:
+
+```bash
+python benchmark/longmemeval/evidence_ledger_gate.py \
+    --data /path/longmemeval_focus_canary_63.json \
+    --causal-ledger /path/causal_decomposition.json \
+    --focus-audit /path/focus_failure_audit.json \
+    --retrieval-replay /path/focus_failure_audit.json \
+    --out evidence-ledger-free-gate.json
+```
+
+The gate is offline by construction, requires the preregistered 18/15/6/24
+strata, requires the candidate not to lose the ranked arm's gold-session
+inclusion, and never authorizes paid spend itself. A paid run remains a separate
+operator decision and must use the paired protocol from issue #1109.
+
 **Accuracy (needs a named LLM + judge; opt-in, NOT in any CI gate).** To produce it:
 
 ```bash

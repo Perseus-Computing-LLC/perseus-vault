@@ -78,6 +78,10 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent.parent
 sys.path.insert(0, str(HERE))
+from context_assembly import (  # noqa: E402
+    assemble_evidence_ledger,
+    assemble_ranked_snippets,
+)
 from run import PerseusVaultServer, session_text, find_binary  # noqa: E402
 
 # Pinned defaults. Zep's published LongMemEval number is quoted as "GPT-4o";
@@ -114,41 +118,52 @@ ANSWER_PROMPT = (
     "Answer:"
 )
 
-# #579: LongMemEval's OFFICIAL chain-of-thought answer prompt variant. The
-# benchmark ships BOTH prompts (run_generation.py cot=true); this is still 100%
-# official methodology — it is not a homegrown prompt. It asks the model to
-# reason step-by-step before answering, which the retrieval diagnostic (#580)
-# showed recovers the large "evidence-was-retrieved-but-reasoning-failed" class
-# (89 of 129 consistent failures). Reports/journals MUST record which prompt was
-# used (answer_prompt: plain | official-cot) so a CoT number is never silently
-# blended with a plain-prompt one.
+# LongMemEval's official chain-of-thought answer prompt, copied from
+# xiaowu0162/LongMemEval/src/generation/run_generation.py. The complete model
+# response is retained for the official per-type judge and hypotheses artifact.
 ANSWER_PROMPT_COT = (
     "I will give you several history chats between you and a user. Please answer "
-    "the question based on the relevant chat history.\n\n\n"
+    "the question based on the relevant chat history. Answer the question step by step: "
+    "first extract all the relevant information, and then reason over the information to "
+    "get the answer.\n\n\n"
     "History Chats:\n\n{context}\n\n"
     "Current Date: {question_date}\n"
-    "Question: {question}\n\n"
-    "Let's think step by step, then give the final answer. "
-    "Reason briefly over the relevant chat history, then end with a line that "
-    "starts with 'Answer:' followed by the final answer.\n"
+    "Question: {question}\n"
+    "Answer (step by step):"
 )
 
 
+def hypothesis_for_judge(text, cot=False):
+    """Return the complete response expected by LongMemEval's official judge.
+
+    CoT responses must not be reduced to the tail after ``Answer:``: the
+    official evaluator grades the complete ``hypothesis`` string. The ``cot``
+    argument is retained as an explicit call-site contract and for future
+    protocol assertions.
+    """
+    del cot
+    return text.strip() if text else text
+
+
 def extract_cot_answer(text):
-    """Pull the final answer out of a CoT response. The prompt asks the model to
-    end with a line 'Answer: <final>'; return the text after the LAST such
-    marker (case-insensitive). Falls back to the full response when no marker is
-    present, so the judge still sees the reasoning-embedded answer rather than
-    an empty string."""
+    """Extract a final-answer tail for optional diagnostics only.
+
+    This helper is deliberately not used for official judging or hypothesis
+    artifacts, because LongMemEval's evaluator receives the full response.
+    """
     if not text:
         return text
-    marker = None
     lower = text.lower()
     idx = lower.rfind("answer:")
-    if idx != -1:
-        marker = text[idx + len("answer:"):].strip()
+    marker = text[idx + len("answer:"):].strip() if idx != -1 else ""
     return marker if marker else text.strip()
 
+
+def write_checkpoint(journal, record):
+    """Append one JSONL checkpoint and force it to durable storage."""
+    journal.write(json.dumps(record) + "\n")
+    journal.flush()
+    os.fsync(journal.fileno())
 
 def get_anscheck_prompt(task, question, answer, response, abstention=False):
     """Judge prompt, ported VERBATIM from LongMemEval's official metric
@@ -358,7 +373,11 @@ def _date_ms(datestr):
     return int(d.timestamp() * 1000)
 
 
-def build_context(system, inst, srv, qid, k, ku_shared=False):
+def build_context(
+    system, inst, srv, qid, k, ku_shared=False, context_assembly="full",
+    assembly_k=20, context_budget=32768, assembly_windows=2,
+    context_guidance="none", ledger_budget=12000
+):
     """Return (context_text, [chosen_session_ids]) for the given system.
 
     With ku_shared, the perseus_vault arm ingests the gold (fact-version) sessions
@@ -367,6 +386,16 @@ def build_context(system, inst, srv, qid, k, ku_shared=False):
     latest-wins row and stale versions go to `entity_history`. Grouping uses
     the dataset's evidence labels — authoring-time knowledge, exactly what a
     real caller has when it re-remembers a fact under its key."""
+    if context_assembly not in {"full", "ranked-snippets", "evidence-ledger"}:
+        raise ValueError(f"unknown context assembly: {context_assembly}")
+    if context_guidance not in {"none", "preference", "preference-structured", "evidence-structured"}:
+        raise ValueError(f"unknown context guidance: {context_guidance}")
+    if context_guidance != "none" and context_assembly != "ranked-snippets":
+        raise ValueError("context guidance requires ranked-snippets assembly")
+    if assembly_k <= 0 or context_budget <= 0 or assembly_windows <= 0:
+        raise ValueError("assembly_k, context_budget, and assembly_windows must be positive")
+    if ledger_budget <= 0 or ledger_budget > 16000:
+        raise ValueError("ledger_budget must be between 1 and 16000 tokens")
     sessions = inst["haystack_sessions"]
     sids = inst["haystack_session_ids"]
     dates = inst.get("haystack_dates") or [None] * len(sids)
@@ -382,7 +411,9 @@ def build_context(system, inst, srv, qid, k, ku_shared=False):
         chosen = inst.get("answer_session_ids", [])
     elif system == "perseus-vault":
         # Ingest this instance's haystack, embed, hybrid-retrieve top-k sessions.
-        gold = inst.get("answer_session_ids", []) or []
+        # Gold labels are needed only for the explicit shared-key product arm;
+        # ordinary retrieval and every answer-facing projection stay gold-blind.
+        gold = (inst.get("answer_session_ids", []) or []) if ku_shared else []
         dated_gold = sorted([g for g in gold if by_id.get(g, (None, None))[1]],
                             key=lambda g: _date_ms(by_id[g][1]))
         shared = set(dated_gold) if (ku_shared and len(dated_gold) >= 2) else set()
@@ -399,15 +430,28 @@ def build_context(system, inst, srv, qid, k, ku_shared=False):
                                         "body_json": json.dumps({"note": session_note(d, turns)}),
                                         "type": "fact", "valid_from_unix_ms": _date_ms(d)})
         srv.call("perseus_vault_embed", {"batch_category": qid, "batch_limit": 1000})
+        retrieval_k = assembly_k if context_assembly in {"ranked-snippets", "evidence-ledger"} else k
         r = srv.call("perseus_vault_recall", {"query": inst["question"], "mode": "hybrid",
-                                      "category": qid, "limit": k, "trust_weight": 0,
+                                      "category": qid, "limit": retrieval_k, "trust_weight": 0,
                                       "min_decay": 0})
         items = r.get("items", []) if isinstance(r, dict) else []
-        chosen = [it.get("key") for it in items][:k]
+        chosen = [it.get("key") for it in items][:retrieval_k]
         if shared:
             # The live shared-key row IS the latest gold session; surface it in
             # the context under that session's real id/date.
             chosen = [dated_gold[-1] if key == SHARED_FACT_KEY else key for key in chosen]
+        if context_assembly == "ranked-snippets":
+            return assemble_ranked_snippets(
+                inst, chosen, budget_tokens=context_budget,
+                max_windows_per_session=assembly_windows,
+                guidance=context_guidance
+            )[:2]
+        if context_assembly == "evidence-ledger":
+            return assemble_evidence_ledger(
+                inst["question"], inst["haystack_session_ids"],
+                inst["haystack_sessions"], inst.get("haystack_dates") or [],
+                chosen, budget_tokens=ledger_budget
+            )[:2]
     else:
         raise ValueError(system)
 
@@ -425,8 +469,15 @@ def price_for(model):
     return PRICING.get(model, FALLBACK_PRICE)
 
 
-def estimate_cost(data, systems, k, model, judge):
-    """Rough upfront USD estimate from dataset shape (4-chars/token heuristic)."""
+def estimate_cost(data, systems, k, model, judge, context_assembly="full",
+                  assembly_k=20, context_budget=32768, ledger_budget=12000):
+    """Rough upfront USD estimate from dataset shape (4-chars/token heuristic).
+
+    Ranked-snippet estimates use the configured candidate depth capped by the
+    answer-facing context budget, rather than silently pricing the old top-k
+    baseline. The estimate remains a bound/heuristic; provider usage is the
+    only quotable cost evidence.
+    """
     sample = data[:min(len(data), 20)]
     sess_toks, sess_counts = [], []
     for inst in sample:
@@ -436,7 +487,15 @@ def estimate_cost(data, systems, k, model, judge):
     avg_sess = sum(sess_toks) / max(1, len(sess_toks))
     avg_n = sum(sess_counts) / max(1, len(sess_counts))
 
-    ctx_per_system = {"perseus-vault": k * avg_sess, "fullcontext": avg_n * avg_sess,
+    ranked_ctx = min(context_budget, assembly_k * avg_sess)
+    ledger_ctx = min(ledger_budget, 16000)
+    if context_assembly == "ranked-snippets":
+        vault_ctx = ranked_ctx
+    elif context_assembly == "evidence-ledger":
+        vault_ctx = ledger_ctx
+    else:
+        vault_ctx = k * avg_sess
+    ctx_per_system = {"perseus-vault": vault_ctx, "fullcontext": avg_n * avg_sess,
                       "oracle": 2 * avg_sess, "stateless": 12}
     n = len(data)
     answer_out, judge_in_fixed, judge_out = 150, 250, 5
@@ -488,6 +547,22 @@ def main():
     ap.add_argument("--model", default=DEFAULT_ANSWERER, help=f"Answerer model id (default {DEFAULT_ANSWERER})")
     ap.add_argument("--judge", default=DEFAULT_JUDGE, help=f"Judge model id (default {DEFAULT_JUDGE})")
     ap.add_argument("--k", type=int, default=10, help="Sessions retrieved for the perseus_vault system (default 10)")
+    ap.add_argument("--context-assembly", choices=["full", "ranked-snippets", "evidence-ledger"], default="full",
+                    help="Answer-facing context projection; default full preserves the baseline, "
+                         "ranked-snippets retrieves a deeper pool and packs conversational pairs")
+    ap.add_argument("--assembly-k", type=int, default=20,
+                    help="Candidate retrieval depth for ranked-snippets (default 20)")
+    ap.add_argument("--context-budget", type=int, default=32768,
+                    help="chars/4 context budget for ranked-snippets (default 32768)")
+    ap.add_argument("--ledger-budget", type=int, default=12000,
+                    help="chars/4 budget for evidence-ledger (default 12000; hard max 16000)")
+    ap.add_argument("--assembly-windows", type=int, default=2,
+                    help="Maximum non-overlapping turn pairs per session (default 2)")
+    ap.add_argument("--context-guidance", choices=["none", "preference", "preference-structured", "evidence-structured"], default="none",
+                    help="Explicit answer-facing guide for ranked-snippets; preference "
+                         "privileges direct user statements over assistant suggestions; "
+                         "preference-structured labels provenance; evidence-structured adds "
+                         "dated fact/event evidence for cross-session and temporal questions")
     ap.add_argument("--limit", type=int, default=0, help="Only run the first N instances (0 = all; smoke tests)")
     ap.add_argument("--cot", action="store_true",
                     help="#579: use LongMemEval's OFFICIAL chain-of-thought answer prompt (still "
@@ -515,6 +590,9 @@ def main():
                     help="Token-per-minute budget for API pacing (default 25000, safely under "
                          "OpenAI Tier-1 gpt-4o's 30k TPM; 0 disables pacing). Answerer and "
                          "judge calls share the budget.")
+    ap.add_argument("--max-retries", type=int, default=12,
+                    help="Maximum provider attempts per answer/judge call (default 12; "
+                         "use 1 for a no-retry canary).")
     ap.add_argument("--resume", action="store_true",
                     help="#518: resume from the progress journal — already-judged questions are "
                          "skipped (their verdicts reload from disk); errored questions are "
@@ -551,7 +629,12 @@ def main():
     api_key = get_api_key() if live else ""
 
     if not args.dry_run:
-        cost, toks, detail = estimate_cost(data, args.systems, args.k, args.model, args.judge)
+        cost, toks, detail = estimate_cost(
+            data, args.systems, args.k, args.model, args.judge,
+            context_assembly=args.context_assembly,
+            assembly_k=args.assembly_k, context_budget=args.context_budget,
+            ledger_budget=args.ledger_budget
+        )
         print(f"Estimated cost for {len(data)} instances x {len(args.systems)} system(s) "
               f"(answerer={args.model}, judge={args.judge}):\n{detail}\n"
               f"  total     est ${cost:,.2f}"
@@ -602,7 +685,14 @@ def main():
                   "k": args.k,
                   "answer_prompt": "official-cot" if args.cot else "plain",
                   "only_types": sorted(args.only_types) if args.only_types else None,
-                  "ku_shared_key": args.ku_shared_key}
+                  "ku_shared_key": args.ku_shared_key,
+                  "context_assembly": args.context_assembly,
+                  "assembly_k": args.assembly_k,
+                  "context_budget": args.context_budget,
+                  "ledger_budget": args.ledger_budget,
+                  "assembly_windows": args.assembly_windows,
+                  "context_guidance": args.context_guidance,
+                  "max_retries": args.max_retries}
     done = {}
     journal = None
     if not args.dry_run:
@@ -626,8 +716,7 @@ def main():
                   f"{journal_path.name}; errored/unfinished questions will run.")
         journal = open(journal_path, "a" if resume_ok else "w", encoding="utf-8")
         if not resume_ok:
-            journal.write(json.dumps({"_config": run_config}) + "\n")
-            journal.flush()
+            write_checkpoint(journal, {"_config": run_config})
         # Seed the accumulators from the reloaded verdicts so the final report
         # covers the WHOLE run, not just this process's share.
         for rec in done.values():
@@ -644,10 +733,9 @@ def main():
         """Append a verdict to memory AND the crash-safe journal."""
         verdicts.append(rec)
         if journal:
-            journal.write(json.dumps({**rec, "hypothesis": hypothesis,
-                                      "tokens_est": tokens_est,
-                                      "sessions": sessions}) + "\n")
-            journal.flush()
+            write_checkpoint(journal, {**rec, "hypothesis": hypothesis,
+                                       "tokens_est": tokens_est,
+                                       "sessions": sessions})
 
     for idx, inst in enumerate(data):
         qid = inst["question_id"]
@@ -664,8 +752,16 @@ def main():
             for system in args.systems:
                 if (qid, system) in done:
                     continue
-                ctx, chosen = build_context(system, inst, srv, qid, args.k,
-                                            ku_shared=args.ku_shared_key)
+                ctx, chosen = build_context(
+                    system, inst, srv, qid, args.k,
+                    ku_shared=args.ku_shared_key,
+                    context_assembly=args.context_assembly,
+                    assembly_k=args.assembly_k,
+                    context_budget=args.context_budget,
+                    assembly_windows=args.assembly_windows,
+                    context_guidance=args.context_guidance,
+                    ledger_budget=args.ledger_budget,
+                )
                 answer_tmpl = ANSWER_PROMPT_COT if args.cot else ANSWER_PROMPT
                 prompt = answer_tmpl.format(context=ctx, question=inst["question"],
                                               question_date=inst.get("question_date", "unknown"))
@@ -678,13 +774,16 @@ def main():
                 q_tokens = est_tokens(prompt)
                 a_usage = {}
                 if args.mock_llm:
-                    ans = mock_answer(inst, idx)
+                    raw_ans = mock_answer(inst, idx)
                 else:
                     try:
                         # #579: CoT needs completion room to reason (1200 tok);
                         # the plain prompt keeps the provider default.
-                        ans, a_usage = call_llm(base_url, api_key, args.model, prompt, budget,
-                                                max_tokens=1200 if args.cot else None)
+                        raw_ans, a_usage = call_llm(
+                            base_url, api_key, args.model, prompt, budget,
+                            max_retries=args.max_retries,
+                            max_tokens=1200 if args.cot else None
+                        )
                     except Exception as e:
                         # A rate-limited/failed question must NEVER deflate accuracy:
                         # record it as answer_error and exclude it from the denominator.
@@ -698,12 +797,11 @@ def main():
                                 "judge_raw": None, "ans_usage": None,
                                 "judge_usage": None}, "", q_tokens, len(chosen))
                         continue
-                # #579: under CoT the model reasons then emits 'Answer: <final>';
-                # judge the final answer, not the whole reasoning trace.
-                if args.cot:
-                    ans = extract_cot_answer(ans)
+                # Official LongMemEval judging receives the complete response.
+                # Do not replace it with extract_cot_answer(raw_ans); that tail-only
+                # behavior caused the invalid 74.3% refresh.
+                ans = hypothesis_for_judge(raw_ans, cot=args.cot)
                 hyps[system].append({"question_id": qid, "hypothesis": ans})
-
                 jp = get_anscheck_prompt(qtype, inst["question"], inst["answer"],
                                          ans or "(no answer)", abstention=is_abs)
                 j_usage = {}
@@ -711,7 +809,10 @@ def main():
                     jraw = mock_judge(inst, ans)
                 else:
                     try:
-                        jraw, j_usage = call_llm(base_url, api_key, args.judge, jp, budget)
+                        jraw, j_usage = call_llm(
+                            base_url, api_key, args.judge, jp, budget,
+                            max_retries=args.max_retries
+                        )
                     except Exception as e:
                         print(f"  !! JUDGE_ERROR on {qid}/{system} (excluded from accuracy): {e}",
                               file=sys.stderr)
@@ -819,6 +920,13 @@ def main():
         "answer_prompt": "official-cot" if args.cot else "plain",
         "only_types": sorted(args.only_types) if args.only_types else None,
         "ku_shared_key": args.ku_shared_key,
+        "context_assembly": args.context_assembly,
+        "assembly_k": args.assembly_k,
+        "context_budget": args.context_budget,
+        "ledger_budget": args.ledger_budget,
+        "assembly_windows": args.assembly_windows,
+        "context_guidance": args.context_guidance,
+        "max_retries": args.max_retries,
         "verdicts": sorted([v["question_id"], v["system"], v["correct"]] for v in verdicts),
     }, sort_keys=True)
     signature = hashlib.sha256(sig_payload.encode("utf-8")).hexdigest()
@@ -842,7 +950,16 @@ def main():
         "answerer_model": "mock" if args.mock_llm else args.model,
         "judge_model": "mock" if args.mock_llm else args.judge,
         "temperature": 0,
+        "max_retries": args.max_retries,
         "retrieval": {"mode": "hybrid", "k": args.k, "embedding": "bundled-onnx"},
+        "context_assembly": {"mode": args.context_assembly, "assembly_k": args.assembly_k,
+                             "budget_tokens": (args.ledger_budget
+                                               if args.context_assembly == "evidence-ledger"
+                                               else args.context_budget),
+                             "context_budget": args.context_budget,
+                             "ledger_budget": args.ledger_budget,
+                             "windows_per_session": args.assembly_windows,
+                             "guidance": args.context_guidance},
         "systems": systems_report,
         "commit": git_commit(),
         "binary": Path(binary).name if binary else None,
