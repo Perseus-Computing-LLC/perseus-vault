@@ -10,6 +10,7 @@ are deliberately not retained.
 
 import argparse
 import hashlib
+import hmac
 import json
 import math
 import os
@@ -491,7 +492,12 @@ def build_metric_rates(cases, metrics):
         "compaction_projection_rate": from_metric("compaction_projection"),
         "action_grounding_rate": from_metric("action_grounding"),
         "recall_outcome_rate": from_case_category("recall_outcome"),
+        "admission": from_metric("admission"),
         "admission_rate": from_case_category("admission"),
+        "admission.save": from_metric("admission.save"),
+        "admission.drop": from_metric("admission.drop"),
+        "admission.block": from_metric("admission.block"),
+        "admission.pending_approval": from_metric("admission.pending_approval"),
         "prompt_safety_rate": from_case_category("prompt_safety"),
         "identity_ambiguity_rate": from_case_category("identity_ambiguity"),
     }
@@ -742,6 +748,71 @@ class VaultClient:
 QUALITY_HARNESS_WORKSPACE = "quality-harness-global-workspace"
 QUALITY_HARNESS_AGENT = "quality-harness"
 QUALITY_HARNESS_ACTOR_KIND = "assistant"
+QUALITY_ADMISSION_CAPABILITIES = [
+    "memory.admission.source",
+    "memory.commit",
+    "memory.propose",
+    "memory.read",
+]
+QUALITY_SOURCE_ATTESTATION_ENV = "PERSEUS_VAULT_ADMISSION_SOURCE_HMAC_KEY"
+QUALITY_SOURCE_ATTESTATION_KEY = "quality-harness-source-key-v1"
+
+
+def admission_source_attestation(evaluated, requesting_agent_id):
+    key = os.environ.get(QUALITY_SOURCE_ATTESTATION_ENV) or QUALITY_SOURCE_ATTESTATION_KEY
+    payload = stable_json({
+        "record_digest": evaluated["record_digest"],
+        "source_identity": evaluated["source_identity"],
+        "workspace_hash": evaluated["workspace_hash"],
+        "actor_kind": evaluated["actor_kind"],
+        "actor_identity": evaluated["actor_identity"],
+        "requesting_agent_id": requesting_agent_id,
+    })
+    return hmac.new(key.strip().encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def ensure_admission_authority(client, workspace):
+    os.environ.setdefault(QUALITY_SOURCE_ATTESTATION_ENV, QUALITY_SOURCE_ATTESTATION_KEY)
+    """Provision the explicit enforce policy required by public admission writes."""
+    workspace = str(workspace)
+    cache = getattr(client, "_admission_authority_workspaces", None)
+    if cache is None:
+        cache = set()
+        setattr(client, "_admission_authority_workspaces", cache)
+    if workspace in cache:
+        return
+    if not cache:
+        registered = client.call(
+            "perseus_vault_agent",
+            {
+                "agent_id": client.client_name,
+                "name": "Quality benchmark harness",
+                "trust_tier": 2,
+                "fleet_id": "quality",
+            },
+        )
+        if isinstance(registered, dict) and registered.get("isError"):
+            raise RuntimeError(f"quality harness agent registration failed: {registered}")
+    manifest = client.call(
+        "perseus_vault_authority_set",
+        {
+            "agent_id": client.client_name,
+            "workspace_hash": workspace,
+            "allowed_capabilities": list(QUALITY_ADMISSION_CAPABILITIES),
+            "scope_anchors": [f"quality:{workspace}"],
+            "approval_required_capabilities": [],
+            "approver_principals": [],
+            "allowed_inbound_principals": [],
+            "permitted_external_ref_prefixes": [],
+            "max_parallel_actions": 1,
+            "mode": "enforce",
+            "author_agent_id": client.client_name,
+            "capability_constraints_json": "{}",
+        },
+    )
+    if isinstance(manifest, dict) and manifest.get("isError"):
+        raise RuntimeError(f"quality harness authority setup failed for {workspace}: {manifest}")
+    cache.add(workspace)
 
 
 def remember_json(client, category, key, body_json, **kwargs):
@@ -757,19 +828,22 @@ def remember_json(client, category, key, body_json, **kwargs):
     agent = args.get("agent_id") or QUALITY_HARNESS_AGENT
     actor_kind = args.get("actor_kind") or QUALITY_HARNESS_ACTOR_KIND
     args.update({"workspace_hash": workspace, "agent_id": agent, "actor_kind": actor_kind})
+    ensure_admission_authority(client, workspace)
 
     record_digest = sha256_text(body_json)
+    evaluated = {
+        "record_digest": record_digest,
+        "source_identity": "quality-harness-source",
+        "workspace_hash": workspace,
+        "actor_kind": actor_kind,
+        "actor_identity": agent,
+    }
     source = client.call(
         "perseus_vault_journal",
         {
             "event_type": "admission_source",
-            "evaluated": {
-                "record_digest": record_digest,
-                "source_identity": "quality-harness-source",
-                "workspace_hash": workspace,
-                "actor_kind": actor_kind,
-                "actor_identity": agent,
-            },
+            "evaluated": evaluated,
+            "source_attestation": admission_source_attestation(evaluated, client.client_name),
             "acted": {"category": category, "key": key},
             "forward": {"workspace_hash": workspace},
             "category": category,
@@ -2157,22 +2231,25 @@ def run_evidence_observations(client, **_):
 def run_admission(client, **_):
     workspace = "quality-admission-workspace"
     agent = "quality-admission-agent"
+    ensure_admission_authority(client, workspace)
 
     # Positive control first: an authoritative, journal-bound admission must
     # commit and be recallable before any negative outcome is evaluated.
     save_body = stable_json({"note": "quality-fixture-admission-save-positive"})
     save_digest = sha256_text(save_body)
+    source_evaluated = {
+        "record_digest": save_digest,
+        "source_identity": "quality-source-authoritative",
+        "workspace_hash": workspace,
+        "actor_kind": "connector",
+        "actor_identity": agent,
+    }
     source = client.call(
         "perseus_vault_journal",
         {
             "event_type": "admission_source",
-            "evaluated": {
-                "record_digest": save_digest,
-                "source_identity": "quality-source-authoritative",
-                "workspace_hash": workspace,
-                "actor_kind": "connector",
-                "actor_identity": agent,
-            },
+            "evaluated": source_evaluated,
+            "source_attestation": admission_source_attestation(source_evaluated, client.client_name),
             "acted": {"kind": "quality_source"},
             "forward": {"kind": "quality_source"},
             "category": "quality_admission_source",
@@ -2498,23 +2575,26 @@ def run_interference_gate(client, **_):
     #    nothing is staged.
     refused_body = stable_json({"note": note})
     refused_digest = sha256_text(refused_body)
+    refused_evaluated = {
+        "record_digest": refused_digest,
+        "source_identity": "quality-harness-source",
+        "workspace_hash": ws,
+        "actor_kind": QUALITY_HARNESS_ACTOR_KIND,
+        "actor_identity": QUALITY_HARNESS_AGENT,
+    }
     refused_source = client.call(
         "perseus_vault_journal",
         {
             "event_type": "admission_source",
-            "evaluated": {
-                "record_digest": refused_digest,
-                "source_identity": "quality-harness-source",
-                "workspace_hash": ws,
-                "actor_kind": QUALITY_HARNESS_ACTOR_KIND,
-                "actor_identity": QUALITY_HARNESS_AGENT,
-            },
+            "evaluated": refused_evaluated,
+            "source_attestation": admission_source_attestation(refused_evaluated, client.client_name),
             "acted": {"category": cat, "key": "refused-1"},
             "forward": {"workspace_hash": ws},
             "category": cat,
             "key": "refused-1",
             "agent_id": QUALITY_HARNESS_AGENT,
             "workspace_hash": ws,
+            "requesting_agent_id": client.client_name,
         },
     )
     refused = client.call_allow_error(
@@ -3309,6 +3389,9 @@ def run_benchmark(manifest_path, binary=None, out=None):
     # interference_gate scenario opts in per-write (mode=quarantine/refuse)
     # to exercise the full MCP surface deterministically.
     os.environ.setdefault("PERSEUS_VAULT_INTERFERENCE_MODE", "off")
+    # The MCP child inherits its environment at spawn time; install the
+    # harness-only source signer before constructing VaultClient.
+    os.environ.setdefault(QUALITY_SOURCE_ATTESTATION_ENV, QUALITY_SOURCE_ATTESTATION_KEY)
     manifest = load_manifest(manifest_path)
     binary = find_binary(binary)
     tmpdir = Path(tempfile.mkdtemp(prefix="perseus-vault-quality-v0-"))

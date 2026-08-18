@@ -59,8 +59,26 @@ admission must reference a journal row whose event type is exactly
 transport stamps `requesting_agent_id` onto the source row rather than trusting
 the caller's `agent_id` field as the event producer.
 
+Public source-event creation is not a self-attestation path. The MCP caller
+must complete `initialize` with a non-empty `clientInfo.name`, and the captured
+transport identity must have an active `enforce`-mode authority manifest for the
+exact workspace with `memory.admission.source`. The caller must also supply a
+hex HMAC-SHA256 `source_attestation` over the canonical source fields, keyed by
+the deployment-only `PERSEUS_VAULT_ADMISSION_SOURCE_HMAC_KEY`; the attestation
+is verified in constant time and is never persisted. Missing, invalid,
+shadow-mode, expired, or capability-mismatched credentials are rejected; the
+legacy memory-write fail-open behavior does not apply to admission evidence.
+Review transitions similarly require `memory.admission.review`. An approval
+creates its own trusted, hash-only `admission_source` receipt bound to the
+reviewer and post-review body digest before activation. Internal connector code
+may append a source event through its trusted database integration, but the
+public generic journal surface cannot mint authoritative evidence without this
+policy.
+
 The source row's `evaluated` object must contain the hash-bound admission
-context needed by the writer:
+context needed by the writer. `origin`, `external_refs`, and `evidence` supplied
+as write metadata are merged into the candidate body before this digest is
+computed; they are not post-digest annotations:
 
 - `record_digest`: the SHA-256 digest of the canonical candidate body;
 - `source_identity`: the upstream source identity in the admission envelope;
@@ -77,9 +95,17 @@ The candidate body is canonical JSON before its `admission` and `provenance`
 envelopes are appended. The resulting SHA-256 is the `record_digest`. When a
 pending candidate is approved or rejected, the transition removes those two
 envelopes in memory, recomputes the canonical digest, and refuses the
-transition if it differs from the stored evidence. The review receipt is
-journaled before the verified entity transition; if the receipt cannot be
+transition if it differs from the stored evidence. An authenticated source
+receipt (approval only) and an `admission_review_started` intent with
+`stored=false` are journaled before the verified entity transition. The final
+`admission_approved` or `admission_rejected` receipt with `stored=true` is
+journaled only after the durable transition succeeds; if the intent cannot be
 written, the candidate remains proposed and is never activated.
+
+Promotion and sharing revalidate the stored source-event binding and canonical
+body digest. A promotion that adds `promoted_from` or transition metadata to an
+authoritative body is refused unless the resulting body has matching new
+admission evidence; it cannot copy stale evidence into an active row.
 
 This is not a universal security guarantee. It is a bounded admission and
 measurement contract; deployments still need authenticated source identity,

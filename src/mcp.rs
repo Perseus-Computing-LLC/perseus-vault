@@ -554,6 +554,16 @@ pub fn handle_request(
 
     match req.method.as_str() {
         "initialize" => {
+            if state
+                .initialized
+                .swap(true, std::sync::atomic::Ordering::AcqRel)
+            {
+                return Some(error_response(
+                    id,
+                    -32002,
+                    "Already initialized; session identity cannot be replaced",
+                ));
+            }
             let response = JsonRpcResponse {
                 jsonrpc: "2.0".to_string(),
                 id,
@@ -596,9 +606,6 @@ pub fn handle_request(
                     *slot = sanitized;
                 }
             }
-            state
-                .initialized
-                .store(true, std::sync::atomic::Ordering::Relaxed);
             Some(response)
         }
 
@@ -708,6 +715,40 @@ pub fn handle_request(
                     if let Some(obj) = tool_args.as_object_mut() {
                         obj.insert("requesting_agent_id".to_string(), json!(*sid));
                     }
+                }
+            }
+
+            // Admission provenance and review decisions cannot fall back to a
+            // caller-supplied requesting_agent_id. These operations require the
+            // identity captured from MCP initialize.clientInfo.name; otherwise
+            // an uninitialized caller could choose the reviewer/source agent.
+            let admission_source_call = tool_name == "perseus_vault_journal"
+                && tool_args
+                    .get("event_type")
+                    .and_then(Value::as_str)
+                    == Some("admission_source");
+            let admission_review_call = tool_name == "perseus_vault_admission_decide";
+            let admission_write_call = tool_name == "perseus_vault_remember"
+                && tool_args.get("admission").is_some();
+            if admission_source_call || admission_review_call || admission_write_call {
+                let captured_session = state
+                    .session_agent_id
+                    .read()
+                    .map(|sid| !sid.trim().is_empty())
+                    .unwrap_or(false);
+                if !captured_session {
+                    return Some(JsonRpcResponse {
+                        jsonrpc: "2.0".to_string(),
+                        id,
+                        result: Some(json!({
+                            "content": [{
+                                "type": "text",
+                                "text": "admission tools require an initialized MCP session with clientInfo.name"
+                            }],
+                            "isError": true
+                        })),
+                        error: None,
+                    });
                 }
             }
 
@@ -2986,7 +3027,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
   },
   {
     "name": "perseus_vault_journal",
-    "description": "Append a structured decision/observation log entry. Uses evaluated/acted/forward pattern: what was considered, what was done, and what happens next. Essential for audit trails and timeline reconstruction.",
+    "description": "Append a structured decision/observation log entry. Uses evaluated/acted/forward pattern: what was considered, what was done, and what happens next. Essential for audit trails and timeline reconstruction. Public admission_source events additionally require an initialized clientInfo.name and an enforce-mode memory.admission.source authority for the exact workspace; caller-supplied identities are never authoritative.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -3032,6 +3073,11 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
         "requesting_agent_id": {
           "type": "string",
           "description": "Transport-stamped caller identity; required for admission_source events."
+        },
+        "source_attestation": {
+          "type": "string",
+          "minLength": 64,
+          "description": "HMAC-SHA256 attestation over the canonical admission-source fields; required for public admission_source events and never stored."
         }
       },
       "required": []
@@ -4840,19 +4886,25 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
   },
   {
     "name": "perseus_vault_admission_decide",
-    "description": "#1107: resolve a proposed trust-admission candidate through an explicit operator decision. approve re-signs the pending evidence as SAVE and activates the existing row through the verified writer; reject requires rejection_class=drop or block, re-signs the evidence as that terminal class, archives the row, and never serves it. Both transitions are hash-only in the response and append distinct admission_approved/admission_rejected journal events.",
+    "description": "#1107: resolve a proposed trust-admission candidate through an explicit operator decision. approve re-signs the pending evidence as SAVE and activates the existing row through the verified writer; reject requires rejection_class=drop or block, re-signs the evidence as that terminal class, archives the row, and never serves it. Both transitions are hash-only in the response, record an admission_review_started intent before mutation, and append a completed admission_approved/admission_rejected receipt only after durable transition. Public calls require an initialized clientInfo.name and an enforce-mode memory.admission.review authority for the exact workspace.",
     "inputSchema": {
       "type": "object",
       "properties": {
-        "category": {"type": "string", "description": "Candidate entity category"},
-        "key": {"type": "string", "description": "Candidate entity key"},
-        "workspace_hash": {"type": "string", "description": "Exact non-empty workspace scope of the candidate"},
-        "requesting_agent_id": {"type": "string", "description": "Operator/reviewer identity stamped into the audit event"},
+        "category": {"type": "string", "minLength": 1, "description": "Candidate entity category"},
+        "key": {"type": "string", "minLength": 1, "description": "Candidate entity key"},
+        "workspace_hash": {"type": "string", "minLength": 1, "description": "Exact non-empty workspace scope of the candidate"},
+        "requesting_agent_id": {"type": "string", "minLength": 1, "description": "Operator/reviewer identity stamped into the audit event"},
         "decision": {"type": "string", "enum": ["approve", "reject"]},
         "rejection_class": {"type": "string", "enum": ["drop", "block"], "description": "Required when decision=reject"},
-        "reason": {"type": "string", "description": "Bounded non-empty review reason; the response stores only its SHA-256"}
+        "reason": {"type": "string", "minLength": 1, "description": "Bounded non-empty review reason; the response stores only its SHA-256"}
       },
-      "required": ["category", "key", "workspace_hash", "requesting_agent_id", "decision", "reason"]
+      "required": ["category", "key", "workspace_hash", "requesting_agent_id", "decision", "reason"],
+      "allOf": [
+        {
+          "if": {"properties": {"decision": {"const": "reject"}}},
+          "then": {"required": ["rejection_class"]}
+        }
+      ]
     },
     "outputSchema": {
       "type": "object",
@@ -9850,6 +9902,111 @@ mod tests {
             !super::is_orphaned_by_ppid(),
             "after recording baseline, a process with a live parent is not orphaned"
         );
+    }
+
+    #[test]
+    fn admission_decide_requires_captured_client_identity() {
+        let db_path = std::env::temp_dir().join(format!(
+            "perseus-vault-admission-identity-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let db = Database::open(db_path.to_str().expect("temp db path")).expect("open temp db");
+        let state = MCPState::new();
+        let init = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(0)),
+            method: "initialize".to_string(),
+            params: Some(json!({})),
+        };
+        handle_request(&init, &state, &db).expect("initialize without client identity");
+        let call = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(1)),
+            method: "tools/call".to_string(),
+            params: Some(json!({
+                "name": "perseus_vault_admission_decide",
+                "arguments": {
+                    "category": "decision",
+                    "key": "candidate",
+                    "workspace_hash": "review-ws",
+                    "requesting_agent_id": "forged-reviewer",
+                    "decision": "approve",
+                    "reason": "human approved"
+                }
+            })),
+        };
+        let resp = handle_request(&call, &state, &db).expect("tool response");
+        let result = resp.result.expect("tool result");
+        assert_eq!(result["isError"], json!(true), "{result}");
+        assert!(
+            result["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("clientInfo.name"),
+            "{result}"
+        );
+        let remember = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(2)),
+            method: "tools/call".to_string(),
+            params: Some(json!({
+                "name": "perseus_vault_remember",
+                "arguments": {
+                    "category": "decision",
+                    "key": "candidate",
+                    "workspace_hash": "review-ws",
+                    "requesting_agent_id": "forged-reviewer",
+                    "body_json": "{\"content\":\"candidate\"}",
+                    "admission": {"record_digest": "00"}
+                }
+            })),
+        };
+        let remember_resp = handle_request(&remember, &state, &db).expect("remember response");
+        let remember_result = remember_resp.result.expect("remember tool result");
+        assert_eq!(remember_result["isError"], json!(true), "{remember_result}");
+        assert!(
+            remember_result["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("clientInfo.name"),
+            "{remember_result}"
+        );
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn initialize_cannot_replace_captured_session_identity() {
+        let db_path = std::env::temp_dir().join(format!(
+            "perseus-vault-initialize-replay-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let db = Database::open(db_path.to_str().expect("temp db path")).expect("open temp db");
+        let state = MCPState::new();
+        let first = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(1)),
+            method: "initialize".to_string(),
+            params: Some(json!({"clientInfo": {"name": "first-client"}})),
+        };
+        let first_response = handle_request(&first, &state, &db).expect("first initialize response");
+        assert!(first_response.error.is_none());
+        let second = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(2)),
+            method: "initialize".to_string(),
+            params: Some(json!({"clientInfo": {"name": "forged-replacement"}})),
+        };
+        let second_response = handle_request(&second, &state, &db).expect("replay initialize response");
+        assert!(second_response.result.is_none());
+        assert_eq!(
+            second_response.error.as_ref().map(|error| error.message.as_str()),
+            Some("Already initialized; session identity cannot be replaced")
+        );
+        assert_eq!(
+            state.session_agent_id.read().unwrap().as_str(),
+            "first-client"
+        );
+        let _ = fs::remove_file(db_path);
     }
 
     #[test]

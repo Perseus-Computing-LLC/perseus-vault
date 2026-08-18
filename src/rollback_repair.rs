@@ -191,7 +191,7 @@ mod tests {
         assert_eq!(n_state, 0);
 
         // Execute.
-        let get = |id: &str| db.get_entity_by_id_pub(id).unwrap().unwrap();
+        let get = |id: &str| db.get_entity_by_id_unfiltered(id).unwrap().unwrap();
         let prior_a_status = get(a).status.clone();
         let prior_y_status = get("mem-claim-y").status.clone();
         let report = db
@@ -292,9 +292,9 @@ mod tests {
             .map(|v| v["entity_id"].as_str().unwrap())
             .collect();
         assert_eq!(preserved_ids, vec![good]);
-        let prior_good = db.get_entity_by_id_pub(good).unwrap().unwrap().status.clone();
+        let prior_good = db.get_entity_by_id_unfiltered(good).unwrap().unwrap().status.clone();
         assert_eq!(
-            db.get_entity_by_id_pub(good).unwrap().unwrap().status,
+            db.get_entity_by_id_unfiltered(good).unwrap().unwrap().status,
             prior_good
         );
         let rid = report["repair_id"].as_str().unwrap().to_string();

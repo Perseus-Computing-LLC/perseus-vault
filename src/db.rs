@@ -7916,6 +7916,95 @@ impl Database {
         self.is_value_erased_with_conn(&conn, workspace_hash, predicate, value)
     }
 
+    /// Lifecycle truth control shared by every public read surface. Recall SQL
+    /// applies the equivalent predicate before ranking, but direct/keyed,
+    /// historical, temporal, graph, and scan readers must apply it too: a
+    /// pending/proposed or quarantined body is never serveable merely because
+    /// the caller knows its id or category/key.
+    fn entity_lifecycle_serveable(entity: &Entity) -> bool {
+        !entity.archived
+            && !crate::retrieval_telemetry::NON_SERVEABLE_STATUSES
+                .contains(&entity.status.as_str())
+    }
+
+    fn filter_serveable_with_conn(
+        &self,
+        conn: &rusqlite::Connection,
+        entities: Vec<Entity>,
+    ) -> Result<Vec<Entity>, Box<dyn std::error::Error>> {
+        let lifecycle: Vec<Entity> = entities
+            .into_iter()
+            .filter(Self::entity_lifecycle_serveable)
+            .collect();
+        self.filter_suppressed_with_conn(conn, lifecycle)
+    }
+
+    fn entity_pending_hidden(entity: &Entity) -> bool {
+        matches!(entity.status.as_str(), "proposed" | "quarantined")
+    }
+
+    fn filter_direct_readable(
+        &self,
+        entities: Vec<Entity>,
+    ) -> Result<Vec<Entity>, Box<dyn std::error::Error>> {
+        let readable: Vec<Entity> = entities
+            .into_iter()
+            .filter(|entity| !Self::entity_pending_hidden(entity))
+            .collect();
+        if readable.is_empty() {
+            return Ok(readable);
+        }
+        let conn = self.conn()?;
+        let kept = self.filter_suppressed_with_conn(&conn, readable)?;
+        drop(conn);
+        Ok(kept)
+    }
+
+    fn filter_scan_entities(
+        &self,
+        entities: Vec<Entity>,
+        include_archived: bool,
+    ) -> Result<Vec<Entity>, Box<dyn std::error::Error>> {
+        let lifecycle: Vec<Entity> = entities
+            .into_iter()
+            .filter(|entity| {
+                (include_archived || !entity.archived)
+                    && !Self::entity_pending_hidden(entity)
+            })
+            .collect();
+        if lifecycle.is_empty() {
+            return Ok(lifecycle);
+        }
+        let conn = self.conn()?;
+        let kept = self.filter_suppressed_with_conn(&conn, lifecycle)?;
+        drop(conn);
+        Ok(kept)
+    }
+
+    pub(crate) fn filter_serveable(
+        &self,
+        entities: Vec<Entity>,
+    ) -> Result<Vec<Entity>, Box<dyn std::error::Error>> {
+        if entities.is_empty() {
+            return Ok(entities);
+        }
+        let conn = self.conn()?;
+        let kept = self.filter_serveable_with_conn(&conn, entities)?;
+        drop(conn);
+        Ok(kept)
+    }
+
+    pub(crate) fn filter_serveable_scored(
+        &self,
+        scored: Vec<(Entity, f64)>,
+    ) -> Result<Vec<(Entity, f64)>, Box<dyn std::error::Error>> {
+        let lifecycle: Vec<(Entity, f64)> = scored
+            .into_iter()
+            .filter(|(entity, _)| Self::entity_lifecycle_serveable(entity))
+            .collect();
+        self.filter_suppressed_scored(lifecycle)
+    }
+
     /// #882: full suppression check — decoupled overlay OR in-DB tombstone.
     /// Used by the write gate (continuous assertion) and by the read
     /// interceptor's single-value path.
@@ -12017,6 +12106,49 @@ impl Database {
     }
 
     /// Get a single entity by category and key.
+    pub(crate) fn get_entity_by_category_key_for_mutation(
+        &self,
+        category: &str,
+        key: &str,
+    ) -> Result<Option<Entity>, Box<dyn std::error::Error>> {
+        let conn = self.conn()?;
+        // Find the entity by category + key
+        let mut stmt = conn.prepare(
+            "SELECT id, category, key, body_json, status, type, tags,
+                    decay_score, retrieval_count, layer, topic_path,
+                    archived, archive_reason, links, verified, source,
+                    created_at_unix_ms, last_accessed_unix_ms, NULL as embedding,
+                    always_on, certainty, workspace_hash, agent_id, visibility,
+                    follow_count, miss_count, follow_rate, efficacy_status,
+                    epistemic_state, hints, memory_type
+             FROM entities WHERE category = ?1 AND key = ?2
+             ORDER BY workspace_hash ASC, id ASC LIMIT 1",
+        )?;
+        // With workspace-scoped identity (#339) the same (category, key) can
+        // legitimately exist in several workspaces. Callers without a
+        // workspace in hand get a DETERMINISTIC pick: the global ('') row
+        // first, then the lexicographically-first workspace — not whichever
+        // row SQLite happened to visit.
+
+        let entity = {
+            let mut rows = stmt.query_map(params![category, key], |row| {
+                entity_from_row(row, self.encryption.as_ref())
+            })?;
+            match rows.next() {
+                Some(row) => Some(row?),
+                None => None,
+            }
+        };
+        drop(stmt);
+        drop(conn);
+
+        // Mutation preflights may inspect a pending row in order to reject it
+        // for the correct authority reason; this helper is crate-private and
+        // never serves the body to a caller. Public readers use `get_entity`
+        // and apply the pending/quarantine gate.
+        Ok(entity)
+    }
+
     pub fn get_entity(
         &self,
         category: &str,
@@ -12058,7 +12190,7 @@ impl Database {
             // unreachable even by direct key lookup. The primary statement
             // and pooled connection are released before the sidecar/legacy
             // tombstone checks to avoid nested pool draws and SQLite locks.
-            let mut kept = self.filter_suppressed(vec![entity])?;
+            let mut kept = self.filter_direct_readable(vec![entity])?;
             Ok(kept.pop())
         } else {
             Ok(None)
@@ -15222,7 +15354,9 @@ impl Database {
         let now = now_ms();
         let mut visible = Vec::with_capacity(all.len());
         for entity in all {
-            if !self.entity_suppressed_with_conn(&conn, &entity, now)? {
+            if !Self::entity_pending_hidden(&entity)
+                && !self.entity_suppressed_with_conn(&conn, &entity, now)?
+            {
                 visible.push(entity);
             }
         }
@@ -15291,7 +15425,7 @@ impl Database {
         };
         if let Some(entity) = historical {
             drop(conn);
-            return Ok(self.filter_suppressed(vec![entity])?.into_iter().next());
+            return Ok(self.filter_direct_readable(vec![entity])?.into_iter().next());
         }
 
         // Otherwise the current live row answers iff it had been recorded by T.
@@ -15313,7 +15447,7 @@ impl Database {
         };
         drop(conn);
         let visible = match live {
-            Some(entity) => self.filter_suppressed(vec![entity])?,
+            Some(entity) => self.filter_direct_readable(vec![entity])?,
             None => Vec::new(),
         };
         Ok(visible.into_iter().next())
@@ -15375,7 +15509,7 @@ impl Database {
         let mut kept = Vec::with_capacity(out.len());
         for version in out {
             if self
-                .filter_suppressed(vec![version.entity.clone()])?
+                .filter_direct_readable(vec![version.entity.clone()])?
                 .is_empty()
             {
                 continue;
@@ -15561,7 +15695,7 @@ impl Database {
             let mut has_visible = false;
             for version in &versions {
                 if !self
-                    .filter_suppressed(vec![version.entity.clone()])?
+                    .filter_direct_readable(vec![version.entity.clone()])?
                     .is_empty()
                 {
                     has_visible = true;
@@ -17941,7 +18075,9 @@ impl Database {
                 )
                 .optional()?;
             let child = match child {
-                Some(entity) if !self.entity_suppressed_with_conn(conn, &entity, now_ms())? => {
+                Some(entity)
+                    if Self::entity_lifecycle_serveable(&entity)
+                        && !self.entity_suppressed_with_conn(conn, &entity, now_ms())? => {
                     entity
                 }
                 _ => continue,
@@ -18695,6 +18831,17 @@ impl Database {
         self.get_entity_by_id_raw(id)
     }
 
+    /// Internal admission-review lookup. This is deliberately crate-private:
+    /// the review handler must inspect a pending body to verify its canonical
+    /// digest, while public readers must never retrieve proposed/quarantined
+    /// bodies. The handler does not return the body to the caller.
+    pub(crate) fn get_entity_by_id_for_admission_review(
+        &self,
+        id: &str,
+    ) -> Result<Option<Entity>, Box<dyn std::error::Error>> {
+        self.get_entity_by_id_raw(id)
+    }
+
     /// Get a single entity by ID through the governed public read path.
     fn get_entity_by_id(
         &self,
@@ -18703,7 +18850,7 @@ impl Database {
         let Some(entity) = self.get_entity_by_id_raw(id)? else {
             return Ok(None);
         };
-        let mut kept = self.filter_suppressed(vec![entity])?;
+        let mut kept = self.filter_direct_readable(vec![entity])?;
         Ok(kept.pop())
     }
 
@@ -19921,7 +20068,7 @@ impl Database {
             items
         };
         drop(conn);
-        let mut visible = self.filter_suppressed(items)?;
+        let mut visible = self.filter_scan_entities(items, include_archived)?;
         visible.truncate(requested_limit as usize);
         Ok(visible)
     }
@@ -29666,7 +29813,7 @@ impl Database {
         // #869: targets that were not hydrateable at all (missing entirely
         // or archived) are drift, reported alongside the other gates.
         stats.dangling_targets = ordered_ids.len().saturating_sub(found_total);
-        let mut visible = self.filter_suppressed_scored(out)?;
+        let mut visible = self.filter_serveable_scored(out)?;
         visible.truncate(max_neighbors);
         Ok((visible, stats))
     }
@@ -29725,7 +29872,7 @@ impl Database {
             }
         }
         drop(conn);
-        self.filter_suppressed(out)
+        self.filter_serveable(out)
     }
 
     /// Minimal completion call against the configured LLM endpoint (Ollama
@@ -30381,6 +30528,69 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn non_serveable_entities_are_hidden_from_all_public_read_surfaces() {
+        let (db, path) = temp_db();
+        let mut pending = make_entity(
+            "pending-read-hidden",
+            "admission",
+            "pending-read-hidden",
+            r#"{"content":"pending body must never be served"}"#,
+        );
+        pending.status = "proposed".to_string();
+        let recorded_before = pending.created_at_unix_ms;
+        db.remember_skip_dedup(&pending).expect("seed proposed entity");
+
+        assert!(db
+            .get_entity("admission", "pending-read-hidden")
+            .unwrap()
+            .is_none());
+        assert!(db
+            .get_entity_by_id_public("pending-read-hidden")
+            .unwrap()
+            .is_none());
+        assert!(db
+            .scan_entities(Some("admission"), None, false, None, 100)
+            .unwrap()
+            .is_empty());
+        assert!(db
+            .as_of("admission", "pending-read-hidden", recorded_before + 1)
+            .unwrap()
+            .is_none());
+        assert!(db
+            .valid_at("admission", "pending-read-hidden", recorded_before + 1)
+            .unwrap()
+            .is_none());
+        let (nodes, edges, total) = db.get_entity_graph(None, -1, 0).unwrap();
+        assert!(nodes.iter().all(|node| node.id != "pending-read-hidden"));
+        assert!(edges
+            .iter()
+            .all(|edge| edge.from != "pending-read-hidden" && edge.to != "pending-read-hidden"));
+        assert_eq!(total, 0);
+        assert!(db
+            .traverse_chain("admission", "pending-read-hidden", 2, 10)
+            .is_err());
+
+        let mut active = pending.clone();
+        active.body_json = r#"{"content":"active replacement is serveable"}"#.to_string();
+        active.status = "active".to_string();
+        active.created_at_unix_ms = now_ms();
+        active.last_accessed_unix_ms = active.created_at_unix_ms;
+        db.remember_skip_dedup(&active)
+            .expect("supersede proposed entity");
+        let (history, visible_total) = db
+            .history_versions_page("admission", "pending-read-hidden", 100, 0)
+            .unwrap();
+        assert!(history.is_empty(), "pending history leaked: {history:?}");
+        assert_eq!(visible_total, 0);
+        assert!(db
+            .as_of("admission", "pending-read-hidden", recorded_before + 1)
+            .unwrap()
+            .is_none());
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
     fn test_database_fixture_removes_sqlite_sidecars_on_drop() {
         let path = {
             // WAL-mode fixture: the default TestDatabase uses DELETE
@@ -30465,7 +30675,7 @@ pub(crate) mod tests {
         entity.source = "cli-write".to_string();
         db.remember(&entity).expect("direct writer should persist");
         let stored = db
-            .get_entity("decision", "direct-provenance")
+            .get_entity_by_id_unfiltered("direct-provenance")
             .unwrap()
             .expect("stored entity");
         assert_eq!(stored.status, "proposed");
@@ -30496,7 +30706,7 @@ pub(crate) mod tests {
         entity.epistemic_state = "verified".to_string();
         db.remember(&entity).expect("write persists");
         let stored = db
-            .get_entity("decision", "forged-trust")
+            .get_entity_by_id_unfiltered("forged-trust")
             .unwrap()
             .expect("stored entity");
         assert_eq!(stored.epistemic_state, "candidate");
@@ -52491,7 +52701,10 @@ pub(crate) mod tests {
             "evidence-citing belief quarantined"
         );
 
-        let b = db.get_entity("beliefs", "belief-1").unwrap().unwrap();
+        let b = db
+            .get_entity_by_id_unfiltered("belief-1")
+            .unwrap()
+            .unwrap();
         assert_eq!(b.status, "quarantined");
         assert!(
             b.archive_reason.starts_with("source_erased:"),
