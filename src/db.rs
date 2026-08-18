@@ -9423,14 +9423,20 @@ impl Database {
             // near-duplicate merge above — e.g. skip_dedup writes, or
             // sub-threshold-but-high-activation overlaps) is held
             // (quarantine) / refused before any mutation.
-            let gate_verdict = self.run_interference_gate(
-                &conn,
-                entity,
-                &gate_opts.exclude_ids,
-                valid_from,
-                valid_to,
-                gate_opts,
-            )?;
+            let gate_verdict = if entity.status == "proposed" {
+                // Pending candidates are retained for human review and cannot
+                // activate or interfere with the serveable corpus yet.
+                GateVerdict::Proceed(None)
+            } else {
+                self.run_interference_gate(
+                    &conn,
+                    entity,
+                    &gate_opts.exclude_ids,
+                    valid_from,
+                    valid_to,
+                    gate_opts,
+                )?
+            };
             match gate_verdict {
                 GateVerdict::Proceed(_) => {}
                 GateVerdict::Quarantined(qid, action) => return Ok((qid, action)),
