@@ -78,6 +78,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent.parent
 sys.path.insert(0, str(HERE))
+from context_assembly import assemble_ranked_snippets  # noqa: E402
 from run import PerseusVaultServer, session_text, find_binary  # noqa: E402
 
 # Pinned defaults. Zep's published LongMemEval number is quoted as "GPT-4o";
@@ -369,7 +370,10 @@ def _date_ms(datestr):
     return int(d.timestamp() * 1000)
 
 
-def build_context(system, inst, srv, qid, k, ku_shared=False):
+def build_context(
+    system, inst, srv, qid, k, ku_shared=False, context_assembly="full",
+    assembly_k=20, context_budget=32768, assembly_windows=2
+):
     """Return (context_text, [chosen_session_ids]) for the given system.
 
     With ku_shared, the perseus_vault arm ingests the gold (fact-version) sessions
@@ -378,6 +382,10 @@ def build_context(system, inst, srv, qid, k, ku_shared=False):
     latest-wins row and stale versions go to `entity_history`. Grouping uses
     the dataset's evidence labels — authoring-time knowledge, exactly what a
     real caller has when it re-remembers a fact under its key."""
+    if context_assembly not in {"full", "ranked-snippets"}:
+        raise ValueError(f"unknown context assembly: {context_assembly}")
+    if assembly_k <= 0 or context_budget <= 0 or assembly_windows <= 0:
+        raise ValueError("assembly_k, context_budget, and assembly_windows must be positive")
     sessions = inst["haystack_sessions"]
     sids = inst["haystack_session_ids"]
     dates = inst.get("haystack_dates") or [None] * len(sids)
@@ -410,15 +418,21 @@ def build_context(system, inst, srv, qid, k, ku_shared=False):
                                         "body_json": json.dumps({"note": session_note(d, turns)}),
                                         "type": "fact", "valid_from_unix_ms": _date_ms(d)})
         srv.call("perseus_vault_embed", {"batch_category": qid, "batch_limit": 1000})
+        retrieval_k = assembly_k if context_assembly == "ranked-snippets" else k
         r = srv.call("perseus_vault_recall", {"query": inst["question"], "mode": "hybrid",
-                                      "category": qid, "limit": k, "trust_weight": 0,
+                                      "category": qid, "limit": retrieval_k, "trust_weight": 0,
                                       "min_decay": 0})
         items = r.get("items", []) if isinstance(r, dict) else []
-        chosen = [it.get("key") for it in items][:k]
+        chosen = [it.get("key") for it in items][:retrieval_k]
         if shared:
             # The live shared-key row IS the latest gold session; surface it in
             # the context under that session's real id/date.
             chosen = [dated_gold[-1] if key == SHARED_FACT_KEY else key for key in chosen]
+        if context_assembly == "ranked-snippets":
+            return assemble_ranked_snippets(
+                inst, chosen, budget_tokens=context_budget,
+                max_windows_per_session=assembly_windows
+            )[:2]
     else:
         raise ValueError(system)
 
@@ -499,6 +513,15 @@ def main():
     ap.add_argument("--model", default=DEFAULT_ANSWERER, help=f"Answerer model id (default {DEFAULT_ANSWERER})")
     ap.add_argument("--judge", default=DEFAULT_JUDGE, help=f"Judge model id (default {DEFAULT_JUDGE})")
     ap.add_argument("--k", type=int, default=10, help="Sessions retrieved for the perseus_vault system (default 10)")
+    ap.add_argument("--context-assembly", choices=["full", "ranked-snippets"], default="full",
+                    help="Answer-facing context projection; default full preserves the baseline, "
+                         "ranked-snippets retrieves a deeper pool and packs conversational pairs")
+    ap.add_argument("--assembly-k", type=int, default=20,
+                    help="Candidate retrieval depth for ranked-snippets (default 20)")
+    ap.add_argument("--context-budget", type=int, default=32768,
+                    help="chars/4 context budget for ranked-snippets (default 32768)")
+    ap.add_argument("--assembly-windows", type=int, default=2,
+                    help="Maximum non-overlapping turn pairs per session (default 2)")
     ap.add_argument("--limit", type=int, default=0, help="Only run the first N instances (0 = all; smoke tests)")
     ap.add_argument("--cot", action="store_true",
                     help="#579: use LongMemEval's OFFICIAL chain-of-thought answer prompt (still "
@@ -613,7 +636,11 @@ def main():
                   "k": args.k,
                   "answer_prompt": "official-cot" if args.cot else "plain",
                   "only_types": sorted(args.only_types) if args.only_types else None,
-                  "ku_shared_key": args.ku_shared_key}
+                  "ku_shared_key": args.ku_shared_key,
+                  "context_assembly": args.context_assembly,
+                  "assembly_k": args.assembly_k,
+                  "context_budget": args.context_budget,
+                  "assembly_windows": args.assembly_windows}
     done = {}
     journal = None
     if not args.dry_run:
@@ -673,8 +700,14 @@ def main():
             for system in args.systems:
                 if (qid, system) in done:
                     continue
-                ctx, chosen = build_context(system, inst, srv, qid, args.k,
-                                            ku_shared=args.ku_shared_key)
+                ctx, chosen = build_context(
+                    system, inst, srv, qid, args.k,
+                    ku_shared=args.ku_shared_key,
+                    context_assembly=args.context_assembly,
+                    assembly_k=args.assembly_k,
+                    context_budget=args.context_budget,
+                    assembly_windows=args.assembly_windows,
+                )
                 answer_tmpl = ANSWER_PROMPT_COT if args.cot else ANSWER_PROMPT
                 prompt = answer_tmpl.format(context=ctx, question=inst["question"],
                                               question_date=inst.get("question_date", "unknown"))
@@ -827,6 +860,10 @@ def main():
         "answer_prompt": "official-cot" if args.cot else "plain",
         "only_types": sorted(args.only_types) if args.only_types else None,
         "ku_shared_key": args.ku_shared_key,
+        "context_assembly": args.context_assembly,
+        "assembly_k": args.assembly_k,
+        "context_budget": args.context_budget,
+        "assembly_windows": args.assembly_windows,
         "verdicts": sorted([v["question_id"], v["system"], v["correct"]] for v in verdicts),
     }, sort_keys=True)
     signature = hashlib.sha256(sig_payload.encode("utf-8")).hexdigest()
@@ -851,6 +888,9 @@ def main():
         "judge_model": "mock" if args.mock_llm else args.judge,
         "temperature": 0,
         "retrieval": {"mode": "hybrid", "k": args.k, "embedding": "bundled-onnx"},
+        "context_assembly": {"mode": args.context_assembly, "assembly_k": args.assembly_k,
+                             "budget_tokens": args.context_budget,
+                             "windows_per_session": args.assembly_windows},
         "systems": systems_report,
         "commit": git_commit(),
         "binary": Path(binary).name if binary else None,
