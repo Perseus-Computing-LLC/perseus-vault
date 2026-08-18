@@ -90,11 +90,11 @@ pub fn derive_beliefs(db: &Database, category: Option<&str>) -> Result<Vec<Belie
     let sql = match category {
         Some(_) => "SELECT id, category, key, body_json, certainty, verified, status, \
                     workspace_hash, last_accessed_unix_ms, links \
-             FROM entities WHERE archived = 0 AND category = ?1"
+             FROM entities WHERE archived = 0 AND status IN ('active','draft') AND category = ?1"
             .to_string(),
         None => "SELECT id, category, key, body_json, certainty, verified, status, \
                     workspace_hash, last_accessed_unix_ms, links \
-             FROM entities WHERE archived = 0"
+             FROM entities WHERE archived = 0 AND status IN ('active','draft')"
             .to_string(),
     };
     let mut stmt = conn
@@ -271,7 +271,8 @@ mod tests {
     use super::*;
 
     fn temp_db() -> Database {
-        let path = std::env::temp_dir().join(format!("perseus_vault-beliefs-{}.db", uuid::Uuid::new_v4()));
+        let path =
+            std::env::temp_dir().join(format!("perseus_vault-beliefs-{}.db", uuid::Uuid::new_v4()));
         Database::open(path.to_str().expect("temp db path")).expect("open temp db")
     }
 
@@ -311,7 +312,7 @@ mod tests {
     }
 
     #[test]
-    fn superseded_excluded_by_default() {
+    fn superseded_excluded_from_public_reader_even_when_opted_in() {
         let db = temp_db();
         let a = remember(&db, "fact", "old-claim", "stale claim");
         let _b = remember(&db, "fact", "new-claim", "fresh claim");
@@ -332,13 +333,11 @@ mod tests {
 
         let out = handle_beliefs(&db, json!({"include_superseded": true})).expect("beliefs");
         let v: Value = serde_json::from_str(&out).unwrap();
-        let old = v["beliefs"]
+        assert!(!v["beliefs"]
             .as_array()
             .unwrap()
             .iter()
-            .find(|b| b["entity_id"] == a)
-            .expect("superseded belief visible when opted in");
-        assert_eq!(old["superseded"], true);
+            .any(|b| b["entity_id"] == a));
     }
 
     #[test]
@@ -391,5 +390,26 @@ mod tests {
         let v: Value = serde_json::from_str(&out).unwrap();
         // default certainty 0.5 × unverified 0.8 = 0.4 < 0.9
         assert_eq!(v["beliefs"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn deprecated_bodies_are_excluded_from_public_beliefs() {
+        let db = temp_db();
+        let id = remember(
+            &db,
+            "fact",
+            "deprecated-public-claim",
+            "deprecated body must not be projected",
+        );
+        db.update_entity_status(&id, "deprecated", "retired")
+            .expect("deprecate test entity");
+
+        let out = handle_beliefs(&db, json!({"include_superseded": true})).expect("beliefs");
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert!(!v["beliefs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|belief| belief["key"] == "deprecated-public-claim"));
     }
 }

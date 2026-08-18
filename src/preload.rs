@@ -871,7 +871,7 @@ pub fn review_approve(
         .map_err(|e| format!("preload review journal: {e}"))?;
 
     let _ = db
-        .remember(&entity)
+        .remember_internal_trusted_with_options(&entity, true, None, None, false, "preload_review")
         .map_err(|e| format!("preload review remember: {e}"))?;
 
     let conn = db.conn().map_err(|e| e.to_string())?;

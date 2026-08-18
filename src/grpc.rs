@@ -28,6 +28,18 @@ pub mod grpc {
         }
     }
 
+    /// Transport-bound requester identity. The metadata is populated by the
+    /// authenticated gRPC edge/interceptor; absent or blank metadata is
+    /// intentionally anonymous and therefore cannot read private/fleet rows.
+    fn requesting_agent_id<T>(req: &Request<T>) -> Option<String> {
+        req.metadata()
+            .get("x-requesting-agent-id")
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(str::to_owned)
+    }
+
     // Helper to run DB operations on the blocking thread pool.
     //
     // #402: DB work is synchronous rusqlite, so it must not run inline in an
@@ -75,7 +87,10 @@ pub mod grpc {
     #[tonic::async_trait]
     impl perseus_vault_server::PerseusVault for PerseusVaultGrpcServer {
         // ── CRUD ──
-        async fn remember(&self, req: Request<RememberRequest>) -> Result<Response<RememberResponse>, Status> {
+        async fn remember(
+            &self,
+            req: Request<RememberRequest>,
+        ) -> Result<Response<RememberResponse>, Status> {
             let r = req.into_inner();
             with_db(self, move |db| {
                 // Same id convention as the MCP surface (handle_remember):
@@ -118,12 +133,21 @@ pub mod grpc {
                     _parsed_body: None,
                 };
                 let (id, action) = db.remember(&entity)?;
-                Ok(Response::new(RememberResponse { id, action, category: entity.category, key: entity.key }))
+                Ok(Response::new(RememberResponse {
+                    id,
+                    action,
+                    category: entity.category,
+                    key: entity.key,
+                }))
             })
             .await
         }
 
-        async fn recall(&self, req: Request<RecallRequest>) -> Result<Response<RecallResponse>, Status> {
+        async fn recall(
+            &self,
+            req: Request<RecallRequest>,
+        ) -> Result<Response<RecallResponse>, Status> {
+            let requesting_agent_id = requesting_agent_id(&req);
             let r = req.into_inner();
             with_db(self, move |db| {
                 let params = models::RecallParams {
@@ -154,19 +178,23 @@ pub mod grpc {
                     reinforce: false,
                     ..Default::default() // #883 fused-mode params default here
                 };
-                let entities = db.recall(&params)?;
-                let items: Vec<EntityMessage> =
-                    entities.iter().map(entity_to_proto).collect();
+                let entities = db.recall_for_requester(&params, requesting_agent_id.as_deref())?;
+                let items: Vec<EntityMessage> = entities.iter().map(entity_to_proto).collect();
                 let total = items.len() as i64;
                 Ok(Response::new(RecallResponse { items, total }))
             })
             .await
         }
 
-        async fn get_entity(&self, req: Request<GetEntityRequest>) -> Result<Response<EntityMessage>, Status> {
+        async fn get_entity(
+            &self,
+            req: Request<GetEntityRequest>,
+        ) -> Result<Response<EntityMessage>, Status> {
+            let requesting_agent_id = requesting_agent_id(&req);
             let r = req.into_inner();
             with_db(self, move |db| {
-                let entity = db.get_entity_by_id_public(&r.id)
+                let entity = db
+                    .get_entity_by_id_for_requester(&r.id, requesting_agent_id.as_deref())
                     .map_err(|_| Status::not_found("entity not found"))?
                     .ok_or_else(|| Status::not_found("entity not found"))?;
                 Ok(Response::new(entity_to_proto(&entity)))
@@ -174,7 +202,10 @@ pub mod grpc {
             .await
         }
 
-        async fn forget(&self, req: Request<ForgetRequest>) -> Result<Response<ForgetResponse>, Status> {
+        async fn forget(
+            &self,
+            req: Request<ForgetRequest>,
+        ) -> Result<Response<ForgetResponse>, Status> {
             let r = req.into_inner();
             with_db(self, move |db| {
                 db.forget(&r.category, &r.key, &r.reason)?;
@@ -187,19 +218,36 @@ pub mod grpc {
         async fn link(&self, _req: Request<LinkRequest>) -> Result<Response<LinkResponse>, Status> {
             Err(Status::unimplemented("link"))
         }
-        async fn unlink(&self, _req: Request<UnlinkRequest>) -> Result<Response<UnlinkResponse>, Status> {
+        async fn unlink(
+            &self,
+            _req: Request<UnlinkRequest>,
+        ) -> Result<Response<UnlinkResponse>, Status> {
             Err(Status::unimplemented("unlink"))
         }
-        async fn traverse(&self, _req: Request<TraverseRequest>) -> Result<Response<TraverseResponse>, Status> {
+        async fn traverse(
+            &self,
+            _req: Request<TraverseRequest>,
+        ) -> Result<Response<TraverseResponse>, Status> {
             Err(Status::unimplemented("traverse"))
         }
 
         // ── Journal ──
-        async fn journal(&self, req: Request<JournalRequest>) -> Result<Response<JournalEvent>, Status> {
+        async fn journal(
+            &self,
+            req: Request<JournalRequest>,
+        ) -> Result<Response<JournalEvent>, Status> {
             let r = req.into_inner();
             with_db(self, move |db| {
                 let event = models::JournalEvent {
-                    id: format!("jrn-{}", uuid::Uuid::new_v4().to_string().replace('-', "").chars().take(12).collect::<String>()),
+                    id: format!(
+                        "jrn-{}",
+                        uuid::Uuid::new_v4()
+                            .to_string()
+                            .replace('-', "")
+                            .chars()
+                            .take(12)
+                            .collect::<String>()
+                    ),
                     event_type: r.event_type,
                     evaluated_json: r.evaluated_json,
                     acted_json: r.acted_json,
@@ -219,12 +267,18 @@ pub mod grpc {
             .await
         }
 
-        async fn timeline(&self, _req: Request<TimelineRequest>) -> Result<Response<TimelineResponse>, Status> {
+        async fn timeline(
+            &self,
+            _req: Request<TimelineRequest>,
+        ) -> Result<Response<TimelineResponse>, Status> {
             Err(Status::unimplemented("timeline"))
         }
 
         // ── State ──
-        async fn state_set(&self, req: Request<StateSetRequest>) -> Result<Response<StateSetResponse>, Status> {
+        async fn state_set(
+            &self,
+            req: Request<StateSetRequest>,
+        ) -> Result<Response<StateSetResponse>, Status> {
             let r = req.into_inner();
             with_db(self, move |db| {
                 let now = crate::db::now_ms();
@@ -240,24 +294,41 @@ pub mod grpc {
             })
             .await
         }
-        async fn state_get(&self, _req: Request<StateGetRequest>) -> Result<Response<StateEntry>, Status> {
+        async fn state_get(
+            &self,
+            _req: Request<StateGetRequest>,
+        ) -> Result<Response<StateEntry>, Status> {
             Err(Status::unimplemented("state_get"))
         }
-        async fn state_delete(&self, _req: Request<StateDeleteRequest>) -> Result<Response<StateDeleteResponse>, Status> {
+        async fn state_delete(
+            &self,
+            _req: Request<StateDeleteRequest>,
+        ) -> Result<Response<StateDeleteResponse>, Status> {
             Err(Status::unimplemented("state_delete"))
         }
-        async fn state_list(&self, _req: Request<StateListRequest>) -> Result<Response<StateListResponse>, Status> {
+        async fn state_list(
+            &self,
+            _req: Request<StateListRequest>,
+        ) -> Result<Response<StateListResponse>, Status> {
             Err(Status::unimplemented("state_list"))
         }
 
         // ── Ops ──
-        async fn health(&self, _req: Request<HealthRequest>) -> Result<Response<HealthResponse>, Status> {
+        async fn health(
+            &self,
+            _req: Request<HealthRequest>,
+        ) -> Result<Response<HealthResponse>, Status> {
             with_db(self, move |db| {
-                Ok(Response::new(HealthResponse { healthy: db.health_check() }))
+                Ok(Response::new(HealthResponse {
+                    healthy: db.health_check(),
+                }))
             })
             .await
         }
-        async fn stats(&self, _req: Request<StatsRequest>) -> Result<Response<StatsResponse>, Status> {
+        async fn stats(
+            &self,
+            _req: Request<StatsRequest>,
+        ) -> Result<Response<StatsResponse>, Status> {
             with_db(self, move |db| {
                 let s = db.stats()?;
                 Ok(Response::new(StatsResponse {
@@ -269,15 +340,30 @@ pub mod grpc {
             })
             .await
         }
-        async fn context(&self, req: Request<ContextRequest>) -> Result<Response<ContextResponse>, Status> {
+        async fn context(
+            &self,
+            req: Request<ContextRequest>,
+        ) -> Result<Response<ContextResponse>, Status> {
+            let requesting_agent_id = requesting_agent_id(&req);
             let r = req.into_inner();
             with_db(self, move |db| {
-                let ctx = db.context(&r.categories, r.limit, r.workspace_hash.as_deref())?;
+                let opts = models::ContextOptions {
+                    categories: r.categories,
+                    limit: r.limit,
+                    workspace_hash: r.workspace_hash,
+                    mode: models::ContextMode::AlwaysInject,
+                    requesting_agent_id,
+                    ..Default::default()
+                };
+                let ctx = db.context_block(&opts)?.markdown;
                 Ok(Response::new(ContextResponse { context: ctx }))
             })
             .await
         }
-        async fn workspace_list(&self, _req: Request<WorkspaceListRequest>) -> Result<Response<WorkspaceListResponse>, Status> {
+        async fn workspace_list(
+            &self,
+            _req: Request<WorkspaceListRequest>,
+        ) -> Result<Response<WorkspaceListResponse>, Status> {
             with_db(self, move |db| {
                 let cats = db.workspace_list_categories()?;
                 Ok(Response::new(WorkspaceListResponse { categories: cats }))
@@ -286,34 +372,99 @@ pub mod grpc {
         }
 
         // ── AI ──
-        async fn ask(&self, _req: Request<AskRequest>) -> Result<Response<AskResponse>, Status> { Err(Status::unimplemented("ask")) }
-        async fn embed(&self, _req: Request<EmbedRequest>) -> Result<Response<EmbedResponse>, Status> { Err(Status::unimplemented("embed")) }
-        async fn cohere(&self, _req: Request<CohereRequest>) -> Result<Response<CohereResponse>, Status> { Err(Status::unimplemented("cohere")) }
+        async fn ask(&self, _req: Request<AskRequest>) -> Result<Response<AskResponse>, Status> {
+            Err(Status::unimplemented("ask"))
+        }
+        async fn embed(
+            &self,
+            _req: Request<EmbedRequest>,
+        ) -> Result<Response<EmbedResponse>, Status> {
+            Err(Status::unimplemented("embed"))
+        }
+        async fn cohere(
+            &self,
+            _req: Request<CohereRequest>,
+        ) -> Result<Response<CohereResponse>, Status> {
+            Err(Status::unimplemented("cohere"))
+        }
 
         // ── Lifecycle ──
-        async fn decay(&self, _req: Request<DecayRequest>) -> Result<Response<DecayResponse>, Status> { Err(Status::unimplemented("decay")) }
-        async fn prune(&self, _req: Request<PruneRequest>) -> Result<Response<PruneResponse>, Status> { Err(Status::unimplemented("prune")) }
-        async fn compact(&self, _req: Request<CompactRequest>) -> Result<Response<CompactResponse>, Status> { Err(Status::unimplemented("compact")) }
-        async fn score(&self, _req: Request<ScoreRequest>) -> Result<Response<ScoreResponse>, Status> { Err(Status::unimplemented("score")) }
+        async fn decay(
+            &self,
+            _req: Request<DecayRequest>,
+        ) -> Result<Response<DecayResponse>, Status> {
+            Err(Status::unimplemented("decay"))
+        }
+        async fn prune(
+            &self,
+            _req: Request<PruneRequest>,
+        ) -> Result<Response<PruneResponse>, Status> {
+            Err(Status::unimplemented("prune"))
+        }
+        async fn compact(
+            &self,
+            _req: Request<CompactRequest>,
+        ) -> Result<Response<CompactResponse>, Status> {
+            Err(Status::unimplemented("compact"))
+        }
+        async fn score(
+            &self,
+            _req: Request<ScoreRequest>,
+        ) -> Result<Response<ScoreResponse>, Status> {
+            Err(Status::unimplemented("score"))
+        }
 
         // ── Quality ──
-        async fn conflicts(&self, _req: Request<ConflictsRequest>) -> Result<Response<ConflictsResponse>, Status> { Err(Status::unimplemented("conflicts")) }
+        async fn conflicts(
+            &self,
+            _req: Request<ConflictsRequest>,
+        ) -> Result<Response<ConflictsResponse>, Status> {
+            Err(Status::unimplemented("conflicts"))
+        }
 
         // ── Vault ──
-        async fn vault_export(&self, _req: Request<VaultExportRequest>) -> Result<Response<VaultExportResponse>, Status> { Err(Status::unimplemented("vault_export")) }
-        async fn vault_import(&self, _req: Request<VaultImportRequest>) -> Result<Response<VaultImportResponse>, Status> { Err(Status::unimplemented("vault_import")) }
+        async fn vault_export(
+            &self,
+            _req: Request<VaultExportRequest>,
+        ) -> Result<Response<VaultExportResponse>, Status> {
+            Err(Status::unimplemented("vault_export"))
+        }
+        async fn vault_import(
+            &self,
+            _req: Request<VaultImportRequest>,
+        ) -> Result<Response<VaultImportResponse>, Status> {
+            Err(Status::unimplemented("vault_import"))
+        }
 
         // ── Federation ──
-        async fn federate(&self, _req: Request<FederateRequest>) -> Result<Response<FederateResponse>, Status> { Err(Status::unimplemented("federate")) }
-        async fn share(&self, _req: Request<ShareRequest>) -> Result<Response<ShareResponse>, Status> { Err(Status::unimplemented("share")) }
+        async fn federate(
+            &self,
+            _req: Request<FederateRequest>,
+        ) -> Result<Response<FederateResponse>, Status> {
+            Err(Status::unimplemented("federate"))
+        }
+        async fn share(
+            &self,
+            _req: Request<ShareRequest>,
+        ) -> Result<Response<ShareResponse>, Status> {
+            Err(Status::unimplemented("share"))
+        }
 
         // ── Streaming ──
-        type WatchJournalStream = tokio_stream::wrappers::ReceiverStream<Result<JournalEvent, Status>>;
-        async fn watch_journal(&self, _req: Request<WatchJournalRequest>) -> Result<Response<Self::WatchJournalStream>, Status> {
+        type WatchJournalStream =
+            tokio_stream::wrappers::ReceiverStream<Result<JournalEvent, Status>>;
+        async fn watch_journal(
+            &self,
+            _req: Request<WatchJournalRequest>,
+        ) -> Result<Response<Self::WatchJournalStream>, Status> {
             Err(Status::unimplemented("watch_journal"))
         }
-        type StreamContextStream = tokio_stream::wrappers::ReceiverStream<Result<ContextChunk, Status>>;
-        async fn stream_context(&self, _req: Request<StreamContextRequest>) -> Result<Response<Self::StreamContextStream>, Status> {
+        type StreamContextStream =
+            tokio_stream::wrappers::ReceiverStream<Result<ContextChunk, Status>>;
+        async fn stream_context(
+            &self,
+            _req: Request<StreamContextRequest>,
+        ) -> Result<Response<Self::StreamContextStream>, Status> {
             Err(Status::unimplemented("stream_context"))
         }
     }
@@ -321,25 +472,43 @@ pub mod grpc {
     // ── Helpers ──
     fn entity_to_proto(e: &models::Entity) -> EntityMessage {
         EntityMessage {
-            id: e.id.clone(), category: e.category.clone(), key: e.key.clone(),
-            body_json: e.body_json.clone(), status: e.status.clone(), r#type: e.entity_type.clone(),
-            tags: e.tags.clone(), decay_score: e.decay_score, retrieval_count: e.retrieval_count,
-            layer: e.layer.clone(), topic_path: e.topic_path.clone(),
-            archived: e.archived, archive_reason: e.archive_reason.clone(),
-            verified: e.verified, source: e.source.clone(), always_on: e.always_on,
-            certainty: e.certainty, workspace_hash: e.workspace_hash.clone(),
-            agent_id: e.agent_id.clone(), visibility: e.visibility.clone(),
-            created_at_unix_ms: e.created_at_unix_ms, last_accessed_unix_ms: e.last_accessed_unix_ms,
+            id: e.id.clone(),
+            category: e.category.clone(),
+            key: e.key.clone(),
+            body_json: e.body_json.clone(),
+            status: e.status.clone(),
+            r#type: e.entity_type.clone(),
+            tags: e.tags.clone(),
+            decay_score: e.decay_score,
+            retrieval_count: e.retrieval_count,
+            layer: e.layer.clone(),
+            topic_path: e.topic_path.clone(),
+            archived: e.archived,
+            archive_reason: e.archive_reason.clone(),
+            verified: e.verified,
+            source: e.source.clone(),
+            always_on: e.always_on,
+            certainty: e.certainty,
+            workspace_hash: e.workspace_hash.clone(),
+            agent_id: e.agent_id.clone(),
+            visibility: e.visibility.clone(),
+            created_at_unix_ms: e.created_at_unix_ms,
+            last_accessed_unix_ms: e.last_accessed_unix_ms,
         }
     }
 
     fn journal_event_to_proto(e: &models::JournalEvent) -> JournalEvent {
         JournalEvent {
-            id: e.id.clone(), event_type: e.event_type.clone(),
-            evaluated_json: e.evaluated_json.clone(), acted_json: e.acted_json.clone(),
-            forward_json: e.forward_json.clone(), category: e.category.clone(),
-            key: e.key.clone(), entity_id: e.entity_id.clone(),
-            agent_id: e.agent_id.clone(), created_at_unix_ms: e.created_at_unix_ms,
+            id: e.id.clone(),
+            event_type: e.event_type.clone(),
+            evaluated_json: e.evaluated_json.clone(),
+            acted_json: e.acted_json.clone(),
+            forward_json: e.forward_json.clone(),
+            category: e.category.clone(),
+            key: e.key.clone(),
+            entity_id: e.entity_id.clone(),
+            agent_id: e.agent_id.clone(),
+            created_at_unix_ms: e.created_at_unix_ms,
         }
     }
 
@@ -386,8 +555,7 @@ pub mod grpc {
                 (Some(cert), Some(key)) => Some(GrpcTls {
                     cert_pem: std::fs::read(&cert)
                         .map_err(|e| format!("gRPC TLS cert {cert}: {e}"))?,
-                    key_pem: std::fs::read(&key)
-                        .map_err(|e| format!("gRPC TLS key {key}: {e}"))?,
+                    key_pem: std::fs::read(&key).map_err(|e| format!("gRPC TLS key {key}: {e}"))?,
                     client_ca_pem: match std::env::var("PERSEUS_VAULT_GRPC_TLS_CLIENT_CA").ok() {
                         Some(ca) => Some(
                             std::fs::read(&ca)
@@ -459,10 +627,17 @@ pub mod grpc {
         // unauthenticated, plaintext gRPC endpoint is a footgun. TLS with a
         // client CA (mTLS) also counts as authenticated.
         let authenticated = cfg.auth_token.is_some()
-            || cfg.tls.as_ref().map(|t| t.client_ca_pem.is_some()).unwrap_or(false);
+            || cfg
+                .tls
+                .as_ref()
+                .map(|t| t.client_ca_pem.is_some())
+                .unwrap_or(false);
         if !addr.ip().is_loopback()
             && !authenticated
-            && std::env::var("PERSEUS_VAULT_ALLOW_INSECURE_BIND").ok().as_deref() != Some("1")
+            && std::env::var("PERSEUS_VAULT_ALLOW_INSECURE_BIND")
+                .ok()
+                .as_deref()
+                != Some("1")
         {
             return Err(format!(
                 "refusing to expose gRPC on non-loopback {addr} without auth or mTLS. Set \
@@ -554,8 +729,10 @@ pub mod grpc {
         }
 
         fn test_server() -> (PerseusVaultGrpcServer, String) {
-            let path = std::env::temp_dir()
-                .join(format!("perseus_vault-test-grpc-{}.db", uuid::Uuid::new_v4()));
+            let path = std::env::temp_dir().join(format!(
+                "perseus_vault-test-grpc-{}.db",
+                uuid::Uuid::new_v4()
+            ));
             let path_str = path.to_str().unwrap().to_string();
             let db = Database::open(&path_str).expect("open test db");
             (PerseusVaultGrpcServer::new(Arc::new(db)), path_str)
@@ -679,7 +856,9 @@ pub mod grpc {
             // survive sanitize_error instead of being flattened to INTERNAL.
             let (server, path) = test_server();
             let err = server
-                .get_entity(Request::new(GetEntityRequest { id: "does-not-exist".to_string() }))
+                .get_entity(Request::new(GetEntityRequest {
+                    id: "does-not-exist".to_string(),
+                }))
                 .await
                 .expect_err("missing entity should error");
             assert_eq!(err.code(), tonic::Code::NotFound);
@@ -741,8 +920,8 @@ pub mod grpc {
 // Non-grpc fallback
 #[cfg(not(feature = "grpc"))]
 pub mod grpc {
-    use std::sync::Arc;
     use crate::db::Database;
+    use std::sync::Arc;
 
     /// Stub module — gRPC is compiled out.
     // No in-crate caller in the default (non-grpc) build; kept so callers behind
@@ -762,16 +941,15 @@ pub mod grpc {
 
         #[tokio::test]
         async fn stub_serve_returns_actionable_error() {
-            let path = std::env::temp_dir()
-                .join(format!("perseus_vault-test-grpc-stub-{}.db", uuid::Uuid::new_v4()));
+            let path = std::env::temp_dir().join(format!(
+                "perseus_vault-test-grpc-stub-{}.db",
+                uuid::Uuid::new_v4()
+            ));
             let path_str = path.to_str().unwrap().to_string();
             let db = Database::open(&path_str).expect("open test db");
-            let err = serve(
-                Arc::new(db),
-                "127.0.0.1:0".parse().unwrap(),
-            )
-            .await
-            .expect_err("stub must refuse to serve");
+            let err = serve(Arc::new(db), "127.0.0.1:0".parse().unwrap())
+                .await
+                .expect_err("stub must refuse to serve");
             assert!(err.to_string().contains("--features grpc"));
             let _ = std::fs::remove_file(&path_str);
         }

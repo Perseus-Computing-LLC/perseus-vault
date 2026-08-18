@@ -216,7 +216,17 @@
         "pending_status": {"$ref": "#/$defs/publicIdentifier"},
         "proposed_outcome": {"$ref": "#/$defs/publicIdentifier"},
         "untrusted_outcome": {"$ref": "#/$defs/publicIdentifier"},
-        "evidence_mode": {"$ref": "#/$defs/publicIdentifier"}
+        "evidence_mode": {"$ref": "#/$defs/publicIdentifier"},
+        "save_outcome_class": {"enum": ["save", "drop", "block", "pending_approval"]},
+        "drop_outcome_class": {"enum": ["save", "drop", "block", "pending_approval"]},
+        "block_outcome_class": {"enum": ["save", "drop", "block", "pending_approval"]},
+        "pending_outcome_class": {"enum": ["save", "drop", "block", "pending_approval"]},
+        "proposed_outcome_class": {"enum": ["save", "drop", "block", "pending_approval"]},
+        "save_serveable": {"type": "boolean"},
+        "drop_no_raw_content": {"type": "boolean"},
+        "block_no_raw_content": {"type": "boolean"},
+        "pending_not_serveable": {"type": "boolean"},
+        "proposed_not_serveable": {"type": "boolean"}
       }
     },
     "identifier": {

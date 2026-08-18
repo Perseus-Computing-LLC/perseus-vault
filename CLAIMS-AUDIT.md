@@ -25,7 +25,7 @@
 
 Claims verified against `src/`:
 
-- **169 canonical MCP tools**: ✓ The current registry contains 169 distinct  tool names in `src/mcp.rs`, each exposed under the canonical
+- **170 canonical MCP tools**: ✓ The current registry contains 170 distinct tool names in `src/mcp.rs`, each exposed under the canonical
   `perseus_vault_*` prefix. The legacy `perseus_vault_*` and `perseus_vault_*` aliases remain
   callable but are not counted separately.
 
@@ -60,6 +60,6 @@ Claims verified against `src/`:
   perseus_vault_follow, #345 perseus_vault_memories). Post-v2.13.0: 53 (#365
   perseus_vault_communities, perseus_vault_community_summary, perseus_vault_global_recall; #364
   perseus_vault_dream). 55 (#363 perseus_vault_valid_at, perseus_vault_bitemporal). 56 (#521
-  perseus_vault_check_failure_pattern). Now **95 canonical MCP tools** (registry-derived; #520 perseus_vault_capture and subsequent tools).
+  perseus_vault_check_failure_pattern). Now **170 canonical MCP tools** (registry-derived; #520 perseus_vault_capture and subsequent tools).
 
   Earlier figures kept as historical record only.

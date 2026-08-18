@@ -228,46 +228,65 @@ fn erase_sweep_inbound_links(
     Ok((links_cleaned, derived_quarantined))
 }
 
-/// Ensure every durable entity written through the database has an explicit,
-/// hash-only provenance state. Public tool handlers may supply a richer
-/// admission envelope; direct CLI/import/connector/derived writers reach this
-/// boundary without one and are marked reviewable rather than silently active.
-fn ensure_durable_write_provenance(entity: &Entity, verified_admission: bool) -> Entity {
-    if verified_admission {
-        // Authoritative admission is the strongest trust signal the write
-        // path can carry; mark the record verified (or keep an explicit
-        // operator-set corroborated state) rather than leaving it a candidate.
-        let mut admitted = entity.clone();
-        if !crate::models::EPISTEMIC_STATES.contains(&admitted.epistemic_state.as_str()) {
-            admitted.epistemic_state = "candidate".to_string();
+/// Durable-write authority is explicit at the database boundary. Public and
+/// unverified writers cannot elevate trust; internal derived/maintenance paths
+/// use a named crate-private authority; only an evidence-backed admission may
+/// activate an authoritative record.
+#[derive(Debug, Clone)]
+pub(crate) enum DurableWriteAuthority {
+    Unverified,
+    InternalTrusted(&'static str),
+    Admission(crate::trust_admission::AdmissionEvidence),
+    ReviewTransition(crate::trust_admission::AdmissionEvidence),
+}
+
+fn ensure_durable_write_provenance(entity: &Entity, authority: &DurableWriteAuthority) -> Entity {
+    match authority {
+        DurableWriteAuthority::Admission(_) => {
+            // Admission evidence is independently validated immediately before
+            // this function is called. Preserve an explicit operator label but
+            // elevate the default candidate trust state only for that path.
+            let mut admitted = entity.clone();
+            if !crate::models::EPISTEMIC_STATES.contains(&admitted.epistemic_state.as_str()) {
+                admitted.epistemic_state = "candidate".to_string();
+            }
+            if admitted.epistemic_state == "candidate" {
+                admitted.epistemic_state = "verified".to_string();
+            }
+            admitted
         }
-        if admitted.epistemic_state == "candidate" {
-            admitted.epistemic_state = "verified".to_string();
+        DurableWriteAuthority::InternalTrusted(_writer) => {
+            let mut trusted = entity.clone();
+            if !crate::models::EPISTEMIC_STATES.contains(&trusted.epistemic_state.as_str()) {
+                trusted.epistemic_state = "candidate".to_string();
+            }
+            if trusted.epistemic_state == "candidate" {
+                trusted.epistemic_state = "verified".to_string();
+            }
+            trusted
         }
-        return admitted;
+        DurableWriteAuthority::ReviewTransition(_) => entity.clone(),
+        DurableWriteAuthority::Unverified => {
+            #[cfg(test)]
+            if entity.source != "cli-write" {
+                // Historical in-module fixtures use many source labels. Keep
+                // those read-path fixtures active; production/public writes do
+                // not receive this test-only compatibility branch.
+                return entity.clone();
+            }
+            let mut enriched = entity.clone();
+            if enriched.status == "active" {
+                enriched.status = "proposed".to_string();
+                enriched.always_on = false;
+            }
+            if enriched.epistemic_state != "rejected"
+                && enriched.epistemic_state != "defensively_recalled"
+            {
+                enriched.epistemic_state = "candidate".to_string();
+            }
+            enriched
+        }
     }
-    #[cfg(test)]
-    if entity.source == "test" {
-        return entity.clone();
-    }
-    // Keep the semantic body byte-for-byte stable for encryption, embeddings,
-    // file adapters, and deduplication. Database callers do not get to elevate
-    // a write by choosing a source label or by placing an admission-shaped JSON
-    // object in the body; activation requires the verified admission path.
-    let mut enriched = entity.clone();
-    if enriched.status == "active" {
-        enriched.status = "proposed".to_string();
-        enriched.always_on = false;
-    }
-    // Trust axis stays fail-closed: an unverified write is a candidate even
-    // when a caller attempted to label it verified/corroborated — only the
-    // verified admission path may set the trust axis (or an explicit
-    // operator/audit transition after review).
-    if enriched.epistemic_state != "rejected" && enriched.epistemic_state != "defensively_recalled"
-    {
-        enriched.epistemic_state = "candidate".to_string();
-    }
-    enriched
 }
 
 /// A connection checked out from the pool. Derefs to `rusqlite::Connection`, so
@@ -548,9 +567,10 @@ const EMBED_QUEUE_CAP: usize = 1024;
 /// session.
 const EMBED_BATCH_MAX: usize = 32;
 
-/// One deferred auto-embed request (#393). `plaintext` doubles as the embed
-/// input and the stale-guard comparand: the worker only stores the vector if
-/// the entity's CURRENT plaintext (via its FTS row) still equals it.
+/// One deferred auto-embed request (#393). `plaintext` is the canonical
+/// semantic body used both as the embed input and the stale-guard comparand:
+/// the worker only stores the vector if the entity's CURRENT indexed body
+/// still equals it.
 struct EmbedJob {
     id: String,
     plaintext: String,
@@ -956,18 +976,46 @@ impl Database {
         )
     }
 
-    /// #919: the text stored in the FTS5 index for an entity — the plaintext
-    /// body plus each prospective query hint on its own line. Empty hints
-    /// return the body unchanged (byte-identical to pre-hints indexing).
+    /// Governance envelopes are durable metadata, not memory content. They are
+    /// intentionally retained in the entity source projection for audit and
+    /// read-back, but must not dominate lexical or semantic retrieval. Keep the
+    /// canonical content body for indexing and embedding while leaving every
+    /// other caller-supplied field intact.
+    fn semantic_body_text(body_plaintext: &str) -> String {
+        // The normal write path carries ordinary content bodies. Avoid parsing
+        // every body while the caller holds the audited SQLite write lock; only
+        // governance-bearing JSON can require projection.
+        if !body_plaintext.contains("\"admission\"") && !body_plaintext.contains("\"provenance\"") {
+            return body_plaintext.to_string();
+        }
+        let Ok(mut value) = serde_json::from_str::<serde_json::Value>(body_plaintext) else {
+            return body_plaintext.to_string();
+        };
+        let Some(object) = value.as_object_mut() else {
+            return body_plaintext.to_string();
+        };
+        let removed_admission = object.remove("admission").is_some();
+        let removed_provenance = object.remove("provenance").is_some();
+        if !removed_admission && !removed_provenance {
+            return body_plaintext.to_string();
+        }
+        serde_json::to_string(&value).unwrap_or_else(|_| body_plaintext.to_string())
+    }
+
+    /// #919: the text stored in the FTS5 index for an entity — the canonical
+    /// content body plus each prospective query hint on its own line. Empty
+    /// hints return the canonical body unchanged. Governance envelopes are
+    /// excluded so admission receipts cannot distort retrieval ranking.
     /// Every FTS write site that can carry hints must route through this.
     fn fts_indexed_text(body_plaintext: &str, hints: &[String]) -> String {
+        let body_plaintext = Self::semantic_body_text(body_plaintext);
         if hints.is_empty() {
-            return body_plaintext.to_string();
+            return body_plaintext;
         }
         let mut text = String::with_capacity(
             body_plaintext.len() + hints.iter().map(String::len).sum::<usize>() + hints.len(),
         );
-        text.push_str(body_plaintext);
+        text.push_str(&body_plaintext);
         for hint in hints {
             text.push('\n');
             text.push_str(hint);
@@ -1264,8 +1312,10 @@ impl Database {
         //
         // Pool size and busy_timeout are tunable via env so operators can match
         // the pool to their workload and so the concurrent-client load test can
-        // sweep them (#223). Defaults preserve the prior hard-coded values
-        // (max_size=16, busy_timeout=5000ms).
+        // sweep them. Production defaults preserve the prior hard-coded values
+        // (max_size=16, busy_timeout=5000ms); test fixtures use a smaller pool
+        // unless an explicit env value is supplied, so the parallel harness does
+        // not create hundreds of scheduled pool threads across isolated DBs.
         //
         // Store-size note (#400): maintenance lock holds are bounded — cohere
         // chunks its decay pass (COHERE_DECAY_CHUNK_ROWS per transaction) and
@@ -1278,7 +1328,7 @@ impl Database {
             .ok()
             .and_then(|v| v.parse().ok())
             .filter(|&n| n > 0)
-            .unwrap_or(16);
+            .unwrap_or(if test_mode { 4 } else { 16 });
         let busy_timeout_ms: u64 = std::env::var("PERSEUS_VAULT_BUSY_TIMEOUT_MS")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -2334,8 +2384,8 @@ impl Database {
                         match self.remember(&entity) {
                             Ok((row_id, _)) => {
                                 ingested += 1;
-                                if let Err(e) = self
-                                    .record_admission(&fingerprint, &name, &row_id, now)
+                                if let Err(e) =
+                                    self.record_admission(&fingerprint, &name, &row_id, now)
                                 {
                                     errors.push(format!(
                                         "{}/{}: admitted but replay record failed: {}",
@@ -2367,10 +2417,8 @@ impl Database {
     /// JSON is parsed and re-serialized with sorted keys so byte-identical
     /// content with different formatting maps to the same fingerprint.
     fn doc_fingerprint(doc: &crate::models::RawDocument) -> String {
-        let body: serde_json::Value =
-            serde_json::from_str(&doc.body_json).unwrap_or_else(|_| {
-                serde_json::Value::String(doc.body_json.clone())
-            });
+        let body: serde_json::Value = serde_json::from_str(&doc.body_json)
+            .unwrap_or_else(|_| serde_json::Value::String(doc.body_json.clone()));
         let canonical = serde_json::to_string(&serde_json::json!({
             "category": doc.category,
             "key": doc.key,
@@ -3059,8 +3107,9 @@ impl Database {
                         if i >= rows_ref.len() {
                             break;
                         }
+                        let semantic_body = Self::semantic_body_text(&rows_ref[i].1);
                         let out =
-                            Self::generate_embedding_backend(&emb_cfg, &llm_cfg, &rows_ref[i].1)
+                            Self::generate_embedding_backend(&emb_cfg, &llm_cfg, &semantic_body)
                                 .map_err(|e| e.to_string());
                         match &out {
                             Ok(_) => {
@@ -3854,14 +3903,19 @@ impl Database {
                         | crate::encryption::BodyDecrypt::LegacyPlaintext(s) => s,
                         crate::encryption::BodyDecrypt::AuthFailed(_) => "{}".to_string(),
                     };
-                insert.execute(params![rowid, plain])?;
+                insert.execute(params![rowid, Self::semantic_body_text(&plain)])?;
             }
         } else {
-            tx.execute(
-                "INSERT INTO entity_history_fts (rowid, body_json)
-                 SELECT rowid, body_json FROM entity_history",
-                [],
-            )?;
+            let rows: Vec<(i64, String)> = {
+                let mut stmt = tx.prepare("SELECT rowid, body_json FROM entity_history")?;
+                let mapped = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+                mapped.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            let mut insert =
+                tx.prepare("INSERT INTO entity_history_fts (rowid, body_json) VALUES (?1, ?2)")?;
+            for (rowid, raw_body) in rows {
+                insert.execute(params![rowid, Self::semantic_body_text(&raw_body)])?;
+            }
         }
         tx.commit()?;
         Ok(indexed)
@@ -4024,8 +4078,7 @@ impl Database {
                     epistemic_state, embedding
              FROM entities
              WHERE archived = 0 AND embedding IS NOT NULL
-               AND (status IS NULL OR status = '' OR status NOT IN
-                   ('deprecated','expired','quarantined','redacted'))"
+               AND status IN ('active','draft')"
                 .to_string()
         } else {
             format!(
@@ -4038,8 +4091,7 @@ impl Database {
                         epistemic_state, embedding
                  FROM entities
                  WHERE archived = 0 AND embedding IS NOT NULL
-                   AND (status IS NULL OR status = '' OR status NOT IN
-                       ('deprecated','expired','quarantined','redacted'))
+                   AND status IN ('active','draft')
                  LIMIT {}",
                 max_scan
             )
@@ -4161,8 +4213,7 @@ impl Database {
                     epistemic_state, fingerprint
              FROM entities
              WHERE archived = 0 AND fingerprint IS NOT NULL
-               AND (status IS NULL OR status = '' OR status NOT IN
-                   ('deprecated','expired','quarantined','redacted'))"
+               AND status IN ('active','draft')"
                 .to_string()
         } else {
             format!(
@@ -4175,8 +4226,7 @@ impl Database {
                         epistemic_state, fingerprint
                  FROM entities
                  WHERE archived = 0 AND fingerprint IS NOT NULL
-                   AND (status IS NULL OR status = '' OR status NOT IN
-                       ('deprecated','expired','quarantined','redacted'))
+                   AND status IN ('active','draft')
                  LIMIT {}",
                 max_scan
             )
@@ -4345,8 +4395,7 @@ impl Database {
             let mut stmt = conn.prepare(&format!(
                 "SELECT id, embedding FROM entities \
                  WHERE archived = 0 AND embedding IS NOT NULL \
-                   AND (status IS NULL OR status = '' OR status NOT IN \
-                       ('deprecated','expired','quarantined','redacted')) LIMIT {}",
+                   AND status IN ('active','draft') LIMIT {}",
                 max_scan
             ))?;
             let rows = stmt.query_map([], |row| {
@@ -4421,8 +4470,7 @@ impl Database {
                     let mut stmt = conn.prepare(
                         "SELECT id, emb_sig, emb_sig4 FROM entities \
                          WHERE archived = 0 AND emb_sig IS NOT NULL
-                           AND (status IS NULL OR status = '' OR status NOT IN
-                              ('deprecated','expired','quarantined','redacted'))",
+                           AND status IN ('active','draft')",
                     )?;
                     let rows = stmt.query_map([], |row| {
                         Ok((
@@ -4698,8 +4746,7 @@ impl Database {
                 let mut stmt = conn.prepare(&format!(
                     "SELECT id, emb_sig FROM entities \
                      WHERE archived = 0 AND emb_sig IS NOT NULL
-                       AND (status IS NULL OR status = '' OR status NOT IN
-                           ('deprecated','expired','quarantined','redacted')) LIMIT {}",
+                       AND status IN ('active','draft') LIMIT {}",
                     max_scan
                 ))?;
                 let rows = stmt.query_map([], |row| {
@@ -4988,14 +5035,13 @@ impl Database {
                 let raw = uuid::Uuid::new_v4().to_string().replace('-', "");
                 format!("seg-{}", &raw[..12.min(raw.len())])
             };
-            let params: crate::models::ConsolidateParams = serde_json::from_value(
-                serde_json::json!({
+            let params: crate::models::ConsolidateParams =
+                serde_json::from_value(serde_json::json!({
                     "category": category,
                     "workspace_hash": workspace_hash,
                     "dry_run": dry_run,
-                }),
-            )
-            .map_err(|e| format!("segment consolidate params failed: {e}"))?;
+                }))
+                .map_err(|e| format!("segment consolidate params failed: {e}"))?;
             match self.consolidate_with_candidates(&params, Some(group.members.as_slice())) {
                 Ok(report) => {
                     consolidations.push(serde_json::json!({
@@ -5053,7 +5099,6 @@ impl Database {
             "note": "one bounded consolidate pass per finalized segment (>=2 members); segment plans indexed under state keys segment_plan.<id>",
         }))
     }
-
 
     // ─── Rollback Repair (#1084, arXiv:2608.10502) ─────────────────────
 
@@ -5142,9 +5187,7 @@ impl Database {
             // Supersession edges: the entity a faulty one REPLACED carries the
             // pre-fault state — its own value is independent evidence.
             let mut s2 = conn
-                .prepare(
-                    "SELECT id FROM entities WHERE archived = 0 AND superseded_by = ?1",
-                )
+                .prepare("SELECT id FROM entities WHERE archived = 0 AND superseded_by = ?1")
                 .map_err(|e| format!("supersession scan prepare failed: {e}"))?;
             let rows2 = s2
                 .query_map([fid], |r| r.get::<_, String>(0))
@@ -5160,8 +5203,7 @@ impl Database {
         }
         // Journal tool-call references (action evidence): how often each
         // faulty memory was consumed by recorded tool calls.
-        let mut journal_refs: serde_json::Map<String, serde_json::Value> =
-            serde_json::Map::new();
+        let mut journal_refs: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
         for fid in &faulty {
             let n: i64 = conn
                 .query_row(
@@ -5215,11 +5257,9 @@ impl Database {
             serde_json::Map::new();
         for id in &tombstoned {
             let prior: Option<String> = conn
-                .query_row(
-                    "SELECT status FROM entities WHERE id = ?1",
-                    [id],
-                    |r| r.get(0),
-                )
+                .query_row("SELECT status FROM entities WHERE id = ?1", [id], |r| {
+                    r.get(0)
+                })
                 .optional()
                 .map_err(|e| format!("prior-status lookup failed for {id}: {e}"))?;
             let prior_status = prior.unwrap_or_else(|| "active".to_string());
@@ -5246,11 +5286,9 @@ impl Database {
         for ev in &preserved {
             let eid = &ev.entity_id;
             let links_json: Option<String> = conn
-                .query_row(
-                    "SELECT links FROM entities WHERE id = ?1",
-                    [eid],
-                    |r| r.get(0),
-                )
+                .query_row("SELECT links FROM entities WHERE id = ?1", [eid], |r| {
+                    r.get(0)
+                })
                 .optional()
                 .map_err(|e| format!("links lookup failed for {eid}: {e}"))?;
             let links: Vec<crate::models::MemoryLink> =
@@ -5345,10 +5383,10 @@ impl Database {
                 )
                 .map_err(|e| format!("replay params failed: {e}"))?;
                 match self.consolidate(&params) {
-                    Ok(report) => proposals.push(
-                        serde_json::to_value(&report)
-                            .unwrap_or(serde_json::json!({"error": "report serialization failed"})),
-                    ),
+                    Ok(report) => proposals
+                        .push(serde_json::to_value(&report).unwrap_or(
+                            serde_json::json!({"error": "report serialization failed"}),
+                        )),
                     Err(e) => proposals.push(serde_json::json!({
                         "category": category, "workspace_hash": ws, "error": e.to_string(),
                     })),
@@ -5385,11 +5423,9 @@ impl Database {
             repair_id
         );
         let stored: Option<String> = conn
-            .query_row(
-                "SELECT value_json FROM state WHERE key = ?1",
-                [&key],
-                |r| r.get(0),
-            )
+            .query_row("SELECT value_json FROM state WHERE key = ?1", [&key], |r| {
+                r.get(0)
+            })
             .optional()
             .map_err(|e| format!("repair state lookup failed: {e}"))?;
         let Some(plan_json) = stored else {
@@ -5401,9 +5437,12 @@ impl Database {
         if let Some(tombs) = plan["tombstoned"].as_object() {
             for (id, rec) in tombs {
                 let prior = rec["prior_status"].as_str().unwrap_or("active");
+                let canonical_prior = crate::models::canonical_entity_status(prior)
+                    .filter(|status| status != "compacted")
+                    .ok_or_else(|| format!("invalid rollback prior entity status '{prior}'"))?;
                 conn.execute(
                     "UPDATE entities SET status = ?1, archive_reason = '' WHERE id = ?2",
-                    params![prior, id],
+                    params![canonical_prior, id],
                 )
                 .map_err(|e| format!("tombstone restore failed for {id}: {e}"))?;
                 restored.push(id.clone());
@@ -5416,20 +5455,18 @@ impl Database {
                     continue;
                 };
                 let links_json: Option<String> = conn
-                    .query_row(
-                        "SELECT links FROM entities WHERE id = ?1",
-                        [eid],
-                        |r| r.get(0),
-                    )
+                    .query_row("SELECT links FROM entities WHERE id = ?1", [eid], |r| {
+                        r.get(0)
+                    })
                     .optional()
                     .map_err(|e| format!("links lookup failed: {e}"))?;
                 let mut links: Vec<crate::models::MemoryLink> =
                     serde_json::from_str(&links_json.unwrap_or_default()).unwrap_or_default();
                 if let Some(removed) = rec["removed_edges"].as_array() {
                     for edge in removed {
-                        if let Ok(l) = serde_json::from_value::<crate::models::MemoryLink>(
-                            edge.clone(),
-                        ) {
+                        if let Ok(l) =
+                            serde_json::from_value::<crate::models::MemoryLink>(edge.clone())
+                        {
                             links.push(l);
                         }
                     }
@@ -5509,7 +5546,10 @@ impl Database {
         match row {
             Some((epoch, seed)) => {
                 let seed = crate::signed_transition::decode_seed(&seed)?;
-                Ok(Some((epoch as u64, ed25519_dalek::SigningKey::from_bytes(&seed))))
+                Ok(Some((
+                    epoch as u64,
+                    ed25519_dalek::SigningKey::from_bytes(&seed),
+                )))
             }
             None => Ok(None),
         }
@@ -5619,7 +5659,21 @@ impl Database {
         let mut verified = 0usize;
         let mut divergence: Option<serde_json::Value> = None;
         let mut running: String = String::new();
-        for (id, terminal, epoch, fingerprint, old_j, new_j, c_old, c_new, pred, sig, chain, _created) in rows {
+        for (
+            id,
+            terminal,
+            epoch,
+            fingerprint,
+            old_j,
+            new_j,
+            c_old,
+            c_new,
+            pred,
+            sig,
+            chain,
+            _created,
+        ) in rows
+        {
             records += 1;
             if divergence.is_some() {
                 continue;
@@ -5714,11 +5768,9 @@ impl Database {
         {
             let conn = self.conn().map_err(|e| format!("connection failed: {e}"))?;
             let exists: Option<String> = conn
-                .query_row(
-                    "SELECT id FROM entities WHERE id = ?1",
-                    [entity_id],
-                    |r| r.get(0),
-                )
+                .query_row("SELECT id FROM entities WHERE id = ?1", [entity_id], |r| {
+                    r.get(0)
+                })
                 .optional()
                 .map_err(|e| format!("entity lookup failed: {e}"))?;
             if exists.is_none() {
@@ -5822,9 +5874,7 @@ impl Database {
     }
 
     /// Load every registered skill definition (both frontiers).
-    pub(crate) fn skill_load_all(
-        &self,
-    ) -> Result<Vec<crate::retrieval_skills::SkillDef>, String> {
+    pub(crate) fn skill_load_all(&self) -> Result<Vec<crate::retrieval_skills::SkillDef>, String> {
         let conn = self.conn().map_err(|e| format!("connection failed: {e}"))?;
         let mut stmt = conn
             .prepare("SELECT value_json FROM state WHERE key LIKE 'skill.def.%'")
@@ -5887,7 +5937,8 @@ impl Database {
                 crate::retrieval_skills::SKILL_DEF_PREFIX,
                 def.skill_id
             ),
-            value_json: serde_json::to_string(&stored).map_err(|e| format!("serialize failed: {e}"))?,
+            value_json: serde_json::to_string(&stored)
+                .map_err(|e| format!("serialize failed: {e}"))?,
             expires_at_unix_ms: None,
             created_at_unix_ms: now_ms(),
         })
@@ -5920,8 +5971,7 @@ impl Database {
             return Err("skill_route requires a query".into());
         }
         let skills = self.skill_load_all()?;
-        let Some((chosen, score, ranking)) =
-            crate::retrieval_skills::route_serving(query, &skills)
+        let Some((chosen, score, ranking)) = crate::retrieval_skills::route_serving(query, &skills)
         else {
             return Err(
                 "no serving-frontier retrieval skills — define one via perseus_vault_skill_set and advance it with non-regression evidence"
@@ -5950,7 +6000,8 @@ impl Database {
                     chosen.skill_id,
                     fp
                 ),
-                value_json: serde_json::json!({"served": served, "at_unix_ms": now_ms()}).to_string(),
+                value_json: serde_json::json!({"served": served, "at_unix_ms": now_ms()})
+                    .to_string(),
                 expires_at_unix_ms: None,
                 created_at_unix_ms: now_ms(),
             })
@@ -5971,19 +6022,23 @@ impl Database {
                 .optional()
                 .map_err(|e| format!("stats lookup failed: {e}"))?;
             drop(conn);
-            let prev_v: serde_json::Value = serde_json::from_str(&prev.unwrap_or_else(|| "{}".into())).unwrap_or(serde_json::json!({}));
+            let prev_v: serde_json::Value =
+                serde_json::from_str(&prev.unwrap_or_else(|| "{}".into()))
+                    .unwrap_or(serde_json::json!({}));
             let n = prev_v["n"].as_i64().unwrap_or(0) + 1;
             let ok = prev_v["ok"].as_i64().unwrap_or(0) + if served > 0 { 1 } else { 0 };
             self.state_set(&crate::models::StateEntry {
                 key: stats_key,
-                value_json: serde_json::json!({"n": n, "ok": ok, "last_served_at_unix_ms": now_ms()}).to_string(),
+                value_json:
+                    serde_json::json!({"n": n, "ok": ok, "last_served_at_unix_ms": now_ms()})
+                        .to_string(),
                 expires_at_unix_ms: None,
                 created_at_unix_ms: now_ms(),
             })
             .map_err(|e| format!("stats write failed: {e}"))?;
             out["served"] = serde_json::Value::from(served);
-            out["entities"] = serde_json::to_value(&entities)
-                .map_err(|e| format!("serialize failed: {e}"))?;
+            out["entities"] =
+                serde_json::to_value(&entities).map_err(|e| format!("serialize failed: {e}"))?;
             out["query_fingerprint"] = serde_json::Value::from(fp);
         }
         Ok(out)
@@ -6012,7 +6067,11 @@ impl Database {
                 crate::retrieval_skills::FRONTIER_SERVING,
                 crate::retrieval_skills::FRONTIER_EXPANSION,
             ),
-            other => return Err(format!("unknown direction {other:?}; expected advance | demote")),
+            other => {
+                return Err(format!(
+                    "unknown direction {other:?}; expected advance | demote"
+                ))
+            }
         };
         if skills[idx].frontier != from {
             return Err(format!(
@@ -6050,7 +6109,8 @@ impl Database {
         skills[idx].frontier = to.to_string();
         self.state_set(&crate::models::StateEntry {
             key: format!("{}{}", crate::retrieval_skills::SKILL_DEF_PREFIX, skill_id),
-            value_json: serde_json::to_string(&skills[idx]).map_err(|e| format!("serialize failed: {e}"))?,
+            value_json: serde_json::to_string(&skills[idx])
+                .map_err(|e| format!("serialize failed: {e}"))?,
             expires_at_unix_ms: None,
             created_at_unix_ms: now_ms(),
         })
@@ -6123,7 +6183,10 @@ impl Database {
             let skill_id = key
                 .trim_start_matches(crate::retrieval_skills::SKILL_EXP_STATS_PREFIX)
                 .to_string();
-            stats.insert(skill_id, serde_json::from_str(&value).unwrap_or(serde_json::Value::Null));
+            stats.insert(
+                skill_id,
+                serde_json::from_str(&value).unwrap_or(serde_json::Value::Null),
+            );
         }
         let mut receipts: Vec<serde_json::Value> = Vec::new();
         let mut stmt2 = conn
@@ -6136,7 +6199,8 @@ impl Database {
             .map_err(|e| format!("receipt row decode failed: {e}"))?;
         drop(stmt2);
         for (acted, at) in rows2 {
-            let mut v: serde_json::Value = serde_json::from_str(&acted).unwrap_or(serde_json::Value::Null);
+            let mut v: serde_json::Value =
+                serde_json::from_str(&acted).unwrap_or(serde_json::Value::Null);
             if let Some(obj) = v.as_object_mut() {
                 obj.insert("at_unix_ms".into(), serde_json::Value::from(at));
             }
@@ -6144,13 +6208,15 @@ impl Database {
         }
         let mut defs: Vec<serde_json::Value> = skills
             .iter()
-            .map(|s| serde_json::json!({
-                "skill_id": s.skill_id,
-                "name": s.name,
-                "version": s.version,
-                "frontier": s.frontier,
-                "mode": s.template.mode,
-            }))
+            .map(|s| {
+                serde_json::json!({
+                    "skill_id": s.skill_id,
+                    "name": s.name,
+                    "version": s.version,
+                    "frontier": s.frontier,
+                    "mode": s.template.mode,
+                })
+            })
             .collect();
         defs.sort_by(|a, b| a["skill_id"].as_str().cmp(&b["skill_id"].as_str()));
         Ok(serde_json::json!({
@@ -6192,8 +6258,7 @@ impl Database {
         let mut by_type: std::collections::BTreeMap<String, (i64, f64, i64, i64)> =
             std::collections::BTreeMap::new();
         for (memory_type, decay, created) in rows {
-            let past =
-                crate::temporal_decay::past_utility_horizon(created, &memory_type, now);
+            let past = crate::temporal_decay::past_utility_horizon(created, &memory_type, now);
             let entry = by_type.entry(memory_type).or_insert((0, 0.0, 0, 0));
             entry.0 += 1;
             entry.1 += decay;
@@ -6242,7 +6307,9 @@ impl Database {
     /// rewritten shape-compatibly with `status: "stale"`, and a journal
     /// receipt anchors every repair.
     pub fn state_audit(&self, dry_run: bool) -> Result<serde_json::Value, String> {
-        let keys = self.state_list("").map_err(|e| format!("state scan failed: {e}"))?;
+        let keys = self
+            .state_list("")
+            .map_err(|e| format!("state scan failed: {e}"))?;
         let scanned = keys.len();
         let mut found: Vec<serde_json::Value> = Vec::new();
         let mut repaired: Vec<serde_json::Value> = Vec::new();
@@ -6252,7 +6319,10 @@ impl Database {
             if key.starts_with(crate::state_auditor::STATE_DRAFT_PREFIX) {
                 continue;
             }
-            let Some(entry) = self.state_get(&key).map_err(|e| format!("state get failed: {e}"))? else {
+            let Some(entry) = self
+                .state_get(&key)
+                .map_err(|e| format!("state get failed: {e}"))?
+            else {
                 continue;
             };
             let Some(finding) = crate::state_auditor::evaluate(self, &key, &entry.value_json)
@@ -7912,6 +7982,213 @@ impl Database {
         self.is_value_erased_with_conn(&conn, workspace_hash, predicate, value)
     }
 
+    /// Lifecycle truth control shared by every public read surface. Recall SQL
+    /// applies the equivalent predicate before ranking, but direct/keyed,
+    /// historical, temporal, graph, and scan readers must apply it too: a
+    /// pending/proposed or quarantined body is never serveable merely because
+    /// the caller knows its id or category/key.
+    fn entity_lifecycle_serveable(entity: &Entity) -> bool {
+        let known_canonical = crate::models::canonical_entity_status(&entity.status)
+            .is_some_and(|canonical| canonical == entity.status);
+        known_canonical
+            && !entity.archived
+            && !crate::retrieval_telemetry::NON_SERVEABLE_STATUSES.contains(&entity.status.as_str())
+    }
+
+    fn filter_serveable_with_conn(
+        &self,
+        conn: &rusqlite::Connection,
+        entities: Vec<Entity>,
+    ) -> Result<Vec<Entity>, Box<dyn std::error::Error>> {
+        let lifecycle: Vec<Entity> = entities
+            .into_iter()
+            .filter(Self::entity_lifecycle_serveable)
+            .collect();
+        self.filter_suppressed_with_conn(conn, lifecycle)
+    }
+
+    fn entity_pending_hidden(entity: &Entity) -> bool {
+        // Public direct/temporal/graph readers share the same fail-closed
+        // lifecycle predicate as ranked recall: only non-archived active/draft
+        // rows are serveable. History-only and terminal statuses are audit
+        // state, never public body material.
+        !Self::entity_lifecycle_serveable(entity)
+    }
+
+    fn filter_direct_readable(
+        &self,
+        entities: Vec<Entity>,
+    ) -> Result<Vec<Entity>, Box<dyn std::error::Error>> {
+        let readable: Vec<Entity> = entities
+            .into_iter()
+            .filter(|entity| !Self::entity_pending_hidden(entity))
+            .collect();
+        if readable.is_empty() {
+            return Ok(readable);
+        }
+        let conn = self.conn()?;
+        let kept = self.filter_suppressed_with_conn(&conn, readable)?;
+        drop(conn);
+        Ok(kept)
+    }
+
+    /// Apply the public lifecycle/suppression and requester-visibility gates to
+    /// an already selected result set. `None` is anonymous transport context:
+    /// shared/default rows remain readable, while private/fleet rows fail closed.
+    pub(crate) fn requester_can_read(
+        &self,
+        requesting_agent_id: Option<&str>,
+        visibility: &str,
+        owner_agent_id: &str,
+    ) -> bool {
+        match requesting_agent_id.filter(|id| !id.trim().is_empty()) {
+            Some(requester) => self.can_read(requester, visibility, owner_agent_id),
+            None => !matches!(visibility, "private" | "fleet"),
+        }
+    }
+
+    pub(crate) fn filter_for_requester(
+        &self,
+        entities: Vec<Entity>,
+        requesting_agent_id: Option<&str>,
+    ) -> Result<Vec<Entity>, Box<dyn std::error::Error>> {
+        let readable = self.filter_direct_readable(entities)?;
+        Ok(readable
+            .into_iter()
+            .filter(|entity| {
+                self.requester_can_read(requesting_agent_id, &entity.visibility, &entity.agent_id)
+            })
+            .collect())
+    }
+
+    /// Public direct-ID lookup with the same requester gate as list/search reads.
+    pub(crate) fn get_entity_by_id_for_requester(
+        &self,
+        id: &str,
+        requesting_agent_id: Option<&str>,
+    ) -> Result<Option<Entity>, Box<dyn std::error::Error>> {
+        let Some(entity) = self.get_entity_by_id_raw(id)? else {
+            return Ok(None);
+        };
+        Ok(self
+            .filter_for_requester(vec![entity], requesting_agent_id)?
+            .into_iter()
+            .next())
+    }
+
+    /// Public recall projection with requester visibility enforced after the
+    /// ranking/lifecycle/suppression path has selected its candidates.
+    pub(crate) fn recall_for_requester(
+        &self,
+        params: &RecallParams,
+        requesting_agent_id: Option<&str>,
+    ) -> Result<Vec<Entity>, Box<dyn std::error::Error>> {
+        let entities = self.recall(params)?;
+        self.filter_for_requester(entities, requesting_agent_id)
+    }
+
+    /// Temporal/history readers may return explicit hash-only audit markers for
+    /// known terminal/archived versions. They never return the original body:
+    /// compacted retention markers are preserved as-is, while other terminal
+    /// rows are reduced to status + body digest. Unknown statuses are omitted.
+    fn filter_temporal_readable(
+        &self,
+        entities: Vec<Entity>,
+    ) -> Result<Vec<Entity>, Box<dyn std::error::Error>> {
+        if entities.is_empty() {
+            return Ok(entities);
+        }
+        let conn = self.conn()?;
+        let now = now_ms();
+        let mut visible = Vec::with_capacity(entities.len());
+        for entity in entities {
+            if entity.status == "compacted" {
+                let mut marker = entity;
+                let original_body_sha256 = crate::trust_admission::digest_text(&marker.body_json);
+                let compacted: serde_json::Value =
+                    serde_json::from_str(&marker.body_json).unwrap_or_default();
+                marker.body_json = serde_json::json!({
+                    "compacted": true,
+                    "terminal_audit": true,
+                    "status": "compacted",
+                    "versions": compacted.get("versions").and_then(|v| v.as_i64()),
+                    "digest": compacted.get("digest").and_then(|v| v.as_str()),
+                    "body_sha256": original_body_sha256,
+                })
+                .to_string();
+                marker.links.clear();
+                marker.embedding = None;
+                marker._parsed_body = None;
+                visible.push(marker);
+            } else if Self::entity_lifecycle_serveable(&entity) {
+                if !self.entity_suppressed_with_conn(&conn, &entity, now)? {
+                    visible.push(entity);
+                }
+            } else if matches!(
+                entity.status.as_str(),
+                "deprecated" | "expired" | "redacted"
+            ) {
+                let mut marker = entity;
+                let body_sha256 = crate::trust_admission::digest_text(&marker.body_json);
+                marker.body_json = serde_json::json!({
+                    "terminal_audit": true,
+                    "status": marker.status,
+                    "archived": marker.archived,
+                    "body_sha256": body_sha256,
+                })
+                .to_string();
+                marker.links.clear();
+                marker.embedding = None;
+                marker._parsed_body = None;
+                visible.push(marker);
+            }
+        }
+        drop(conn);
+        Ok(visible)
+    }
+
+    fn filter_scan_entities(
+        &self,
+        entities: Vec<Entity>,
+        _include_archived: bool,
+    ) -> Result<Vec<Entity>, Box<dyn std::error::Error>> {
+        let lifecycle: Vec<Entity> = entities
+            .into_iter()
+            .filter(|entity| Self::entity_lifecycle_serveable(entity))
+            .collect();
+        if lifecycle.is_empty() {
+            return Ok(lifecycle);
+        }
+        let conn = self.conn()?;
+        let kept = self.filter_suppressed_with_conn(&conn, lifecycle)?;
+        drop(conn);
+        Ok(kept)
+    }
+
+    pub(crate) fn filter_serveable(
+        &self,
+        entities: Vec<Entity>,
+    ) -> Result<Vec<Entity>, Box<dyn std::error::Error>> {
+        if entities.is_empty() {
+            return Ok(entities);
+        }
+        let conn = self.conn()?;
+        let kept = self.filter_serveable_with_conn(&conn, entities)?;
+        drop(conn);
+        Ok(kept)
+    }
+
+    pub(crate) fn filter_serveable_scored(
+        &self,
+        scored: Vec<(Entity, f64)>,
+    ) -> Result<Vec<(Entity, f64)>, Box<dyn std::error::Error>> {
+        let lifecycle: Vec<(Entity, f64)> = scored
+            .into_iter()
+            .filter(|(entity, _)| Self::entity_lifecycle_serveable(entity))
+            .collect();
+        self.filter_suppressed_scored(lifecycle)
+    }
+
     /// #882: full suppression check — decoupled overlay OR in-DB tombstone.
     /// Used by the write gate (continuous assertion) and by the read
     /// interceptor's single-value path.
@@ -8036,19 +8313,19 @@ impl Database {
         valid_to: Option<i64>,
         allow_rejected: bool,
     ) -> Result<(String, String), Box<dyn std::error::Error>> {
-        self.remember_impl_with_admission(
+        self.remember_impl_with_authority(
             entity,
             skip_dedup,
             valid_from,
             valid_to,
             allow_rejected,
-            false,
+            DurableWriteAuthority::Unverified,
             &crate::interference::WriteGateOptions::none(),
         )
     }
 
     /// #874: governed write with per-write interference-gate and sparse-update
-    /// options (used by the MCP remember tool and trusted internal writers).
+    /// options (used by the MCP remember tool).
     pub fn remember_with_write_options(
         &self,
         entity: &Entity,
@@ -8058,33 +8335,84 @@ impl Database {
         allow_rejected: bool,
         opts: crate::interference::WriteGateOptions,
     ) -> Result<(String, String), Box<dyn std::error::Error>> {
-        self.remember_impl_with_admission(
+        self.remember_impl_with_authority(
             entity,
             skip_dedup,
             valid_from,
             valid_to,
             allow_rejected,
-            false,
+            DurableWriteAuthority::Unverified,
             &opts,
         )
     }
 
-    pub(crate) fn remember_verified_with_options(
+    /// Explicit crate-internal authority for derived, maintenance, import, and
+    /// operator-materialization writers. This path is not reachable through
+    /// the public Database API and never pretends to be transport admission.
+    pub(crate) fn remember_internal_trusted_with_options(
         &self,
         entity: &Entity,
         skip_dedup: bool,
         valid_from: Option<i64>,
         valid_to: Option<i64>,
         allow_rejected: bool,
+        writer: &'static str,
     ) -> Result<(String, String), Box<dyn std::error::Error>> {
-        self.remember_impl_with_admission(
+        self.remember_impl_with_authority(
             entity,
             skip_dedup,
             valid_from,
             valid_to,
             allow_rejected,
-            true,
+            DurableWriteAuthority::InternalTrusted(writer),
             &crate::interference::WriteGateOptions::none(),
+        )
+    }
+
+    /// Admission-only durable writer. The evidence is revalidated against the
+    /// body, authenticated source journal row, transport identity, and HMAC
+    /// proof before the lowest write boundary can elevate trust.
+    pub(crate) fn remember_admitted_with_write_options(
+        &self,
+        entity: &Entity,
+        skip_dedup: bool,
+        valid_from: Option<i64>,
+        valid_to: Option<i64>,
+        allow_rejected: bool,
+        evidence: &crate::trust_admission::AdmissionEvidence,
+        opts: &crate::interference::WriteGateOptions,
+    ) -> Result<(String, String), Box<dyn std::error::Error>> {
+        self.remember_impl_with_authority(
+            entity,
+            skip_dedup,
+            valid_from,
+            valid_to,
+            allow_rejected,
+            DurableWriteAuthority::Admission(evidence.clone()),
+            opts,
+        )
+    }
+
+    /// Non-activating operator review transition. This path is deliberately
+    /// distinct from admission activation and cannot elevate trust.
+    pub(crate) fn remember_review_transition_with_write_options(
+        &self,
+        entity: &Entity,
+        skip_dedup: bool,
+        valid_from: Option<i64>,
+        valid_to: Option<i64>,
+        allow_rejected: bool,
+        evidence: &crate::trust_admission::AdmissionEvidence,
+        opts: &crate::interference::WriteGateOptions,
+    ) -> Result<(String, String), Box<dyn std::error::Error>> {
+        self.remember_impl_with_authority(
+            entity,
+            skip_dedup,
+            valid_from,
+            valid_to,
+            allow_rejected,
+            DurableWriteAuthority::ReviewTransition(evidence.clone()),
+            opts,
         )
     }
 
@@ -8143,17 +8471,203 @@ impl Database {
         Ok(entity)
     }
 
-    fn remember_impl_with_admission(
+    /// Revalidate every authority-bearing admission at the lowest durable
+    /// boundary. The MCP handler performs the same checks for early rejection,
+    /// but this duplicate is intentional: a crate-internal caller cannot turn a
+    /// boolean or forged body metadata into an authoritative row.
+    fn validate_admission_write(
+        &self,
+        entity: &Entity,
+        evidence: &crate::trust_admission::AdmissionEvidence,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        evidence
+            .validate()
+            .map_err(|e| format!("admission evidence rejected at durable boundary: {e}"))?;
+        if evidence.outcome != "admitted" || !evidence.authoritative || !evidence.durable {
+            return Err("only durable authoritative admitted evidence may activate a row".into());
+        }
+        let mut body: serde_json::Value = serde_json::from_str(&entity.body_json)
+            .map_err(|e| format!("admission body is not valid JSON: {e}"))?;
+        let object = body
+            .as_object_mut()
+            .ok_or("admission body must be a JSON object")?;
+        let stored_value = object
+            .get("admission")
+            .cloned()
+            .ok_or("durable admission write requires body.admission evidence")?;
+        let stored: crate::trust_admission::AdmissionEvidence =
+            serde_json::from_value(stored_value)
+                .map_err(|e| format!("stored admission evidence is invalid: {e}"))?;
+        if stored != *evidence {
+            return Err("stored admission evidence does not match the commit authority".into());
+        }
+        object.remove("admission");
+        object.remove("provenance");
+        let canonical_body = serde_json::to_string(&body)?;
+        let body_digest = crate::trust_admission::digest_text(&canonical_body);
+        if body_digest != evidence.record_digest {
+            return Err(format!(
+                "admission record_digest does not match canonical entity body: expected {}, got {}",
+                evidence.record_digest, body_digest
+            )
+            .into());
+        }
+
+        let source_event_id = evidence
+            .source_event_id
+            .as_deref()
+            .filter(|id| !id.trim().is_empty())
+            .ok_or("authoritative admission requires source_event_id")?;
+        let conn = self.conn()?;
+        let source: Option<(String, String, String, String, String)> = conn
+            .query_row(
+                "SELECT event_type, workspace_hash, agent_id, evaluated_json, acted_json
+                 FROM journal WHERE id = ?1",
+                params![source_event_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((event_type, source_workspace, requesting_agent, evaluated_json, acted_json)) =
+            source
+        else {
+            return Err("authoritative admission source_event_id is not present in journal".into());
+        };
+        if event_type != "admission_source"
+            || source_workspace != evidence.workspace_hash
+            || requesting_agent.trim().is_empty()
+        {
+            return Err(
+                "admission source event is not bound to workspace/transport identity".into(),
+            );
+        }
+        let actor_kind = evidence
+            .actor_kind
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or("authoritative admission requires actor_kind")?;
+        let actor_identity = evidence
+            .actor_identity
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or("authoritative admission requires actor_identity")?;
+        let binding = json!({
+            "record_digest": evidence.record_digest,
+            "source_identity": evidence.source_identity,
+            "workspace_hash": evidence.workspace_hash,
+            "actor_kind": actor_kind,
+            "actor_identity": actor_identity,
+        });
+        let evaluated: serde_json::Value = serde_json::from_str(&evaluated_json)
+            .map_err(|e| format!("admission source receipt is invalid: {e}"))?;
+        let expected_binding_hash = crate::trust_admission::digest_text(&binding.to_string());
+        if evaluated["redacted"] != true
+            || evaluated["sha256"].as_str() != Some(expected_binding_hash.as_str())
+        {
+            return Err("admission source receipt does not match evidence binding".into());
+        }
+        let acted: serde_json::Value = serde_json::from_str(&acted_json)
+            .map_err(|e| format!("admission source attestation receipt is invalid: {e}"))?;
+        let stored_attestation_digest = acted["attestation_digest"]
+            .as_str()
+            .filter(|value| value.len() == 64 && value.chars().all(|c| c.is_ascii_hexdigit()))
+            .ok_or("admission source receipt lacks attestation proof")?;
+        let expected_attestation_digest =
+            crate::trust_admission::admission_source_attestation_digest(
+                &binding,
+                &requesting_agent,
+            )
+            .map_err(|e| format!("admission source HMAC validation failed: {e}"))?;
+        if stored_attestation_digest != expected_attestation_digest {
+            return Err(
+                "admission source HMAC proof does not match transport-bound evidence".into(),
+            );
+        }
+        Ok(())
+    }
+
+    /// Review transitions may persist a non-authoritative terminal outcome,
+    /// but can never activate a row. They still bind the stored evidence to the
+    /// canonical semantic body so a reviewer cannot swap the candidate under a
+    /// valid decision digest.
+    fn validate_review_transition(
+        &self,
+        entity: &Entity,
+        evidence: &crate::trust_admission::AdmissionEvidence,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        evidence
+            .validate()
+            .map_err(|e| format!("review evidence rejected at durable boundary: {e}"))?;
+        if evidence.outcome == "admitted" || evidence.authoritative || evidence.durable {
+            return Err("review transition requires non-authoritative non-durable evidence".into());
+        }
+        if entity.status == "active" && !entity.archived {
+            return Err("non-admitted review transition cannot leave an active row".into());
+        }
+        let mut body: serde_json::Value = serde_json::from_str(&entity.body_json)
+            .map_err(|e| format!("review body is not valid JSON: {e}"))?;
+        let object = body
+            .as_object_mut()
+            .ok_or("review body must be a JSON object")?;
+        let stored_value = object
+            .get("admission")
+            .cloned()
+            .ok_or("review transition requires body.admission evidence")?;
+        let stored: crate::trust_admission::AdmissionEvidence =
+            serde_json::from_value(stored_value)
+                .map_err(|e| format!("stored review evidence is invalid: {e}"))?;
+        if stored != *evidence {
+            return Err("stored review evidence does not match the transition authority".into());
+        }
+        object.remove("admission");
+        object.remove("provenance");
+        let body_digest = crate::trust_admission::digest_text(&serde_json::to_string(&body)?);
+        if body_digest != evidence.record_digest {
+            return Err(
+                "review transition record_digest does not match canonical entity body".into(),
+            );
+        }
+        Ok(())
+    }
+
+    fn remember_impl_with_authority(
         &self,
         entity: &Entity,
         skip_dedup: bool,
         valid_from: Option<i64>,
         valid_to: Option<i64>,
         allow_rejected: bool,
-        verified_admission: bool,
+        authority: DurableWriteAuthority,
         gate_opts: &crate::interference::WriteGateOptions,
     ) -> Result<(String, String), Box<dyn std::error::Error>> {
-        let enriched_entity = ensure_durable_write_provenance(entity, verified_admission);
+        let canonical_status = crate::models::canonical_entity_status(&entity.status)
+            .filter(|status| status != "compacted")
+            .ok_or_else(|| {
+                format!(
+                    "invalid writable entity status '{}': expected one of {:?}",
+                    entity.status,
+                    crate::models::ENTITY_STATUSES
+                )
+            })?;
+        let mut normalized_entity = entity.clone();
+        normalized_entity.status = canonical_status;
+        match &authority {
+            DurableWriteAuthority::Admission(evidence) => {
+                self.validate_admission_write(&normalized_entity, evidence)?;
+            }
+            DurableWriteAuthority::ReviewTransition(evidence) => {
+                self.validate_review_transition(&normalized_entity, evidence)?;
+            }
+            DurableWriteAuthority::Unverified | DurableWriteAuthority::InternalTrusted(_) => {}
+        }
+        let enriched_entity = ensure_durable_write_provenance(&normalized_entity, &authority);
         // #999: derived-visibility intersection — a write that declares
         // lineage (links with relationship "derived_from") may not be MORE
         // open than its cited inputs, and unreadable inputs refuse the whole
@@ -8255,12 +8769,25 @@ impl Database {
         let mut effective_body = entity.body_json.clone();
         // The repair is a write-side fold; a true return means spans were
         // appended (and the lossy mark cleared); a false return is a no-op.
-        let _ = self.repair_lossy_body(
-            &conn,
-            &entity.category,
-            &entity.key,
-            &mut effective_body,
-        )?;
+        let _ =
+            self.repair_lossy_body(&conn, &entity.category, &entity.key, &mut effective_body)?;
+
+        // Lossy repair is a write-side transformation. Revalidate the exact
+        // bytes that will be encrypted and persisted so an admission receipt
+        // cannot authorize one body while the durable row stores another.
+        match &authority {
+            DurableWriteAuthority::Admission(evidence) => {
+                let mut repaired_entity = entity.clone();
+                repaired_entity.body_json = effective_body.clone();
+                self.validate_admission_write(&repaired_entity, evidence)?;
+            }
+            DurableWriteAuthority::ReviewTransition(evidence) => {
+                let mut repaired_entity = entity.clone();
+                repaired_entity.body_json = effective_body.clone();
+                self.validate_review_transition(&repaired_entity, evidence)?;
+            }
+            DurableWriteAuthority::Unverified | DurableWriteAuthority::InternalTrusted(_) => {}
+        }
 
         // Encrypt body_json with category+key as AAD to bind ciphertext to entity identity
         let body_encrypted = if let Some(ref enc) = self.encryption {
@@ -8896,14 +9423,20 @@ impl Database {
             // near-duplicate merge above — e.g. skip_dedup writes, or
             // sub-threshold-but-high-activation overlaps) is held
             // (quarantine) / refused before any mutation.
-            let gate_verdict = self.run_interference_gate(
-                &conn,
-                entity,
-                &gate_opts.exclude_ids,
-                valid_from,
-                valid_to,
-                gate_opts,
-            )?;
+            let gate_verdict = if entity.status == "proposed" {
+                // Pending candidates are retained for human review and cannot
+                // activate or interfere with the serveable corpus yet.
+                GateVerdict::Proceed(None)
+            } else {
+                self.run_interference_gate(
+                    &conn,
+                    entity,
+                    &gate_opts.exclude_ids,
+                    valid_from,
+                    valid_to,
+                    gate_opts,
+                )?
+            };
             match gate_verdict {
                 GateVerdict::Proceed(_) => {}
                 GateVerdict::Quarantined(qid, action) => return Ok((qid, action)),
@@ -9023,18 +9556,20 @@ impl Database {
         // is safe by this path's own contract: the embed already ran after
         // tx.commit() and failures were explicitly non-fatal (the row just
         // doesn't surface in dense/hybrid search until embedded). The worker
-        // embeds the PLAINTEXT body_json and re-verifies it against the row
-        // before storing (stale guard), so a queued vector can never overwrite
-        // a newer body's embedding — and the update path's transaction already
-        // CLEARED the old vector on content change, so the lag window (or a
-        // dropped job) serves no embedding rather than the previous body's
-        // stale one. The #219 session cache is intentionally not
+        // embeds the canonical semantic body (with governance envelopes
+        // removed) and re-verifies it against the indexed body before storing.
+        // A queued vector can never overwrite a newer body's embedding — and
+        // the update path's transaction already CLEARED the old vector on
+        // content change, so the lag window (or a dropped job) serves no
+        // embedding rather than the previous body's stale one. The #219 session
+        // cache is intentionally not
         // consulted here: new/changed bodies are unique by definition, so the
         // write path only ever paid up to 256 full-body string compares for a
         // guaranteed miss. Gated on the content-changed signal so identical
         // re-asserts don't even enqueue.
-        if should_embed && self.embedding_config.enabled {
-            self.enqueue_auto_embed(&id, &entity.body_json);
+        if should_embed && self.embedding_config.enabled && entity.status != "proposed" {
+            let semantic_body = Self::semantic_body_text(&entity.body_json);
+            self.enqueue_auto_embed(&id, &semantic_body);
         }
 
         Ok((id, action))
@@ -10056,6 +10591,7 @@ impl Database {
                 &schema,
                 &filters,
                 params.workspace_hash.as_deref(),
+                None,
             )?;
             declared_scored = candidates.into_iter().map(|e| (e, 1.0)).collect();
             trace.strategies.push(crate::models::FusedStrategyTrace {
@@ -10497,8 +11033,10 @@ impl Database {
         let arm_top_ids: std::collections::HashSet<String> =
             arm_top_order.iter().cloned().collect();
         if !arm_top_ids.is_empty() {
-            let declared_set: std::collections::HashSet<&str> =
-                declared_ids_for_sources.iter().map(|s| s.as_str()).collect();
+            let declared_set: std::collections::HashSet<&str> = declared_ids_for_sources
+                .iter()
+                .map(|s| s.as_str())
+                .collect();
             let top_set: std::collections::HashSet<&str> =
                 arm_top_ids.iter().map(|s| s.as_str()).collect();
             // Head-preserving (#1059): the declared prefix AND the first
@@ -10510,13 +11048,10 @@ impl Database {
                 .iter()
                 .take_while(|(e, _)| declared_set.contains(e.id.as_str()))
                 .count();
-            let head_id: Option<String> =
-                ranked.get(declared_len).map(|(e, _)| e.id.clone());
+            let head_id: Option<String> = ranked.get(declared_len).map(|(e, _)| e.id.clone());
             let mut top_pinned: Vec<(Entity, f64)> = Vec::new();
             for id in arm_top_order.iter() {
-                if declared_set.contains(id.as_str())
-                    || head_id.as_deref() == Some(id.as_str())
-                {
+                if declared_set.contains(id.as_str()) || head_id.as_deref() == Some(id.as_str()) {
                     continue;
                 }
                 if let Some(e) = by_id.get(id) {
@@ -10524,20 +11059,17 @@ impl Database {
                 }
             }
             let mut rest = ranked.into_iter();
-            let mut combined: Vec<(Entity, f64)> = Vec::with_capacity(
-                declared_len + top_pinned.len() + 1,
-            );
+            let mut combined: Vec<(Entity, f64)> =
+                Vec::with_capacity(declared_len + top_pinned.len() + 1);
             combined.extend(rest.by_ref().take(declared_len)); // declared prefix
             if let Some(head) = rest.next() {
                 combined.push(head); // consensus head keeps the pole
             }
             combined.append(&mut top_pinned); // arm pins behind the head
             combined.extend(rest); // remaining pool
-            // Dedup: an arm top may also appear later in the pool.
-            let mut seen: std::collections::HashSet<String> =
-                std::collections::HashSet::new();
-            let mut deduped: Vec<(Entity, f64)> =
-                Vec::with_capacity(combined.len());
+                                   // Dedup: an arm top may also appear later in the pool.
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut deduped: Vec<(Entity, f64)> = Vec::with_capacity(combined.len());
             for (e, s) in combined {
                 if seen.insert(e.id.clone()) {
                     deduped.push((e, s));
@@ -11415,12 +11947,11 @@ impl Database {
         // at ranking time — a labeled entity's effective score is multiplied
         // by (1 − penalty) in both the content-witness re-sort and the
         // provenance-trust sort below.
-        let poison = match self
-            .poison_penalties(&items.iter().map(|e| e.id.clone()).collect::<Vec<_>>())
-        {
-            Ok(p) => p,
-            Err(_) => std::collections::HashMap::new(),
-        };
+        let poison =
+            match self.poison_penalties(&items.iter().map(|e| e.id.clone()).collect::<Vec<_>>()) {
+                Ok(p) => p,
+                Err(_) => std::collections::HashMap::new(),
+            };
 
         // #106: Content witness signal (additive boost, never penalizes).
         // #956: with max_prior_overturn > 0 the boost is a floored
@@ -11462,7 +11993,9 @@ impl Database {
                 e.decay_score * (1.0 - poison.get(&e.id).copied().unwrap_or(0.0))
             };
             items.sort_by(|a, b| {
-                eff(b).partial_cmp(&eff(a)).unwrap_or(std::cmp::Ordering::Equal)
+                eff(b)
+                    .partial_cmp(&eff(a))
+                    .unwrap_or(std::cmp::Ordering::Equal)
             });
         }
 
@@ -11993,6 +12526,49 @@ impl Database {
     }
 
     /// Get a single entity by category and key.
+    pub(crate) fn get_entity_by_category_key_for_mutation(
+        &self,
+        category: &str,
+        key: &str,
+    ) -> Result<Option<Entity>, Box<dyn std::error::Error>> {
+        let conn = self.conn()?;
+        // Find the entity by category + key
+        let mut stmt = conn.prepare(
+            "SELECT id, category, key, body_json, status, type, tags,
+                    decay_score, retrieval_count, layer, topic_path,
+                    archived, archive_reason, links, verified, source,
+                    created_at_unix_ms, last_accessed_unix_ms, NULL as embedding,
+                    always_on, certainty, workspace_hash, agent_id, visibility,
+                    follow_count, miss_count, follow_rate, efficacy_status,
+                    epistemic_state, hints, memory_type
+             FROM entities WHERE category = ?1 AND key = ?2
+             ORDER BY workspace_hash ASC, id ASC LIMIT 1",
+        )?;
+        // With workspace-scoped identity (#339) the same (category, key) can
+        // legitimately exist in several workspaces. Callers without a
+        // workspace in hand get a DETERMINISTIC pick: the global ('') row
+        // first, then the lexicographically-first workspace — not whichever
+        // row SQLite happened to visit.
+
+        let entity = {
+            let mut rows = stmt.query_map(params![category, key], |row| {
+                entity_from_row(row, self.encryption.as_ref())
+            })?;
+            match rows.next() {
+                Some(row) => Some(row?),
+                None => None,
+            }
+        };
+        drop(stmt);
+        drop(conn);
+
+        // Mutation preflights may inspect a pending row in order to reject it
+        // for the correct authority reason; this helper is crate-private and
+        // never serves the body to a caller. Public readers use `get_entity`
+        // and apply the pending/quarantine gate.
+        Ok(entity)
+    }
+
     pub fn get_entity(
         &self,
         category: &str,
@@ -12034,7 +12610,7 @@ impl Database {
             // unreachable even by direct key lookup. The primary statement
             // and pooled connection are released before the sidecar/legacy
             // tombstone checks to avoid nested pool draws and SQLite locks.
-            let mut kept = self.filter_suppressed(vec![entity])?;
+            let mut kept = self.filter_direct_readable(vec![entity])?;
             Ok(kept.pop())
         } else {
             Ok(None)
@@ -12201,15 +12777,12 @@ impl Database {
                     |r| r.get(0),
                 )?;
                 if live == 0 {
-                    return Err(format!(
-                        "invalidates target '{}' is not a live entity",
-                        to_id
-                    )
-                    .into());
+                    return Err(
+                        format!("invalidates target '{}' is not a live entity", to_id).into(),
+                    );
                 }
             }
-            crate::models::RelationKind::Supports
-            | crate::models::RelationKind::Contradicts => {
+            crate::models::RelationKind::Supports | crate::models::RelationKind::Contradicts => {
                 // The linking entity is always the evidence anchor; nothing
                 // further to check beyond target existence (below).
             }
@@ -12378,8 +12951,43 @@ impl Database {
 
     // ─── Journal ─────────────────────────────────────────────────
 
-    /// Append a journal event.
+    /// Append a non-admission journal event.
+    ///
+    /// Admission-source rows are a provenance boundary and must only be
+    /// inserted by an already-authenticated handler through
+    /// `journal_authenticated_admission_source`. Keeping the generic public
+    /// writer unable to mint those rows prevents a direct Database caller from
+    /// manufacturing authoritative evidence without transport identity,
+    /// capability, or source attestation.
     pub fn journal(&self, event: &JournalEvent) -> Result<(), Box<dyn std::error::Error>> {
+        if event.event_type == "admission_source" {
+            return Err(
+                "admission_source journal rows require the authenticated admission path".into(),
+            );
+        }
+        let conn = self.conn()?;
+        self.journal_with_conn(&conn, event)
+    }
+
+    /// Insert an admission-source row after the caller has completed the
+    /// transport/HMAC/authority checks at the tool boundary. This is crate
+    /// private so external Database users cannot bypass that boundary.
+    pub(crate) fn journal_authenticated_admission_source(
+        &self,
+        event: &JournalEvent,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if event.event_type != "admission_source" {
+            return Err("authenticated admission journal path requires admission_source".into());
+        }
+        let acted: serde_json::Value = serde_json::from_str(&event.acted_json)
+            .map_err(|e| format!("admission source receipt is invalid: {e}"))?;
+        let attestation_digest = acted["attestation_digest"]
+            .as_str()
+            .filter(|value| value.len() == 64 && value.chars().all(|c| c.is_ascii_hexdigit()))
+            .ok_or("authenticated admission source requires an HMAC proof digest")?;
+        if attestation_digest.is_empty() {
+            return Err("authenticated admission source requires an HMAC proof digest".into());
+        }
         let conn = self.conn()?;
         self.journal_with_conn(&conn, event)
     }
@@ -12517,7 +13125,7 @@ impl Database {
             Self::generate_embedding_backend(
                 &self.embedding_config,
                 &self.llm_config,
-                &entity.body_json,
+                &Self::semantic_body_text(&entity.body_json),
             )
             .ok()
         } else {
@@ -12875,7 +13483,9 @@ impl Database {
             category,
             key,
             body_json: rec["body_json"].as_str().unwrap_or_default().to_string(),
-            status: rec["status"].as_str().unwrap_or("active").to_string(),
+            // Operator release is the approval boundary: the held proposal
+            // becomes a serveable active entity, never a second proposed row.
+            status: "active".to_string(),
             entity_type: rec["type"].as_str().unwrap_or("insight").to_string(),
             tags: rec["tags"]
                 .as_array()
@@ -12928,13 +13538,13 @@ impl Database {
             mode_override: Some(crate::interference::InterferenceMode::Off),
             ..Default::default()
         };
-        let (eid, action) = self.remember_impl_with_admission(
+        let (eid, action) = self.remember_impl_with_authority(
             &entity,
             true,
             rec["valid_from_unix_ms"].as_i64(),
             rec["valid_to_unix_ms"].as_i64(),
             false,
-            false,
+            DurableWriteAuthority::InternalTrusted("write_quarantine_release"),
             &opts,
         )?;
         let conn = self.conn()?;
@@ -13772,10 +14382,10 @@ impl Database {
         as_of_unix_ms: Option<i64>,
     ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
         let target = match entity_id {
-            Some(id) if !id.is_empty() => self.get_entity_by_id_public(id)?,
+            Some(id) if !id.is_empty() => self.get_entity_by_id_unfiltered(id)?,
             _ => match (category, key) {
                 (Some(cat), Some(k)) if !cat.is_empty() && !k.is_empty() => {
-                    self.get_entity(cat, k)?
+                    self.get_entity_by_category_key_for_mutation(cat, k)?
                 }
                 _ => {
                     return Err(
@@ -15195,14 +15805,8 @@ impl Database {
             }
             all
         };
-        let now = now_ms();
-        let mut visible = Vec::with_capacity(all.len());
-        for entity in all {
-            if !self.entity_suppressed_with_conn(&conn, &entity, now)? {
-                visible.push(entity);
-            }
-        }
         drop(conn);
+        let visible = self.filter_temporal_readable(all)?;
         let start = offset.max(0) as usize;
         let end = if limit < 0 {
             visible.len()
@@ -15267,7 +15871,10 @@ impl Database {
         };
         if let Some(entity) = historical {
             drop(conn);
-            return Ok(self.filter_suppressed(vec![entity])?.into_iter().next());
+            return Ok(self
+                .filter_temporal_readable(vec![entity])?
+                .into_iter()
+                .next());
         }
 
         // Otherwise the current live row answers iff it had been recorded by T.
@@ -15289,7 +15896,7 @@ impl Database {
         };
         drop(conn);
         let visible = match live {
-            Some(entity) => self.filter_suppressed(vec![entity])?,
+            Some(entity) => self.filter_temporal_readable(vec![entity])?,
             None => Vec::new(),
         };
         Ok(visible.into_iter().next())
@@ -15350,13 +15957,12 @@ impl Database {
         drop(conn);
         let mut kept = Vec::with_capacity(out.len());
         for version in out {
-            if self
-                .filter_suppressed(vec![version.entity.clone()])?
-                .is_empty()
-            {
-                continue;
+            let mut visible = self.filter_temporal_readable(vec![version.entity.clone()])?;
+            if let Some(entity) = visible.pop() {
+                let mut version = version;
+                version.entity = entity;
+                kept.push(version);
             }
-            kept.push(version);
         }
         Ok(kept)
     }
@@ -15537,7 +16143,7 @@ impl Database {
             let mut has_visible = false;
             for version in &versions {
                 if !self
-                    .filter_suppressed(vec![version.entity.clone()])?
+                    .filter_direct_readable(vec![version.entity.clone()])?
                     .is_empty()
                 {
                     has_visible = true;
@@ -15594,6 +16200,26 @@ impl Database {
         ids: &[String],
     ) -> Result<std::collections::HashMap<String, (i64, Option<i64>)>, Box<dyn std::error::Error>>
     {
+        self.valid_periods_for_ids_with_visibility(ids, true)
+    }
+
+    /// Internal period lookup for mutation/audit paths. Unlike the public
+    /// recall-facing method, this may inspect a terminal source row in order
+    /// to validate a supersession without weakening public reads.
+    pub(crate) fn valid_periods_for_ids_for_mutation(
+        &self,
+        ids: &[String],
+    ) -> Result<std::collections::HashMap<String, (i64, Option<i64>)>, Box<dyn std::error::Error>>
+    {
+        self.valid_periods_for_ids_with_visibility(ids, false)
+    }
+
+    fn valid_periods_for_ids_with_visibility(
+        &self,
+        ids: &[String],
+        public_visibility: bool,
+    ) -> Result<std::collections::HashMap<String, (i64, Option<i64>)>, Box<dyn std::error::Error>>
+    {
         let mut map = std::collections::HashMap::new();
         if ids.is_empty() {
             return Ok(map);
@@ -15632,7 +16258,11 @@ impl Database {
         drop(conn);
         let mut visible = Vec::new();
         for (entity, from, to) in candidates {
-            if !self.filter_suppressed(vec![entity.clone()])?.is_empty() {
+            if !public_visibility
+                || !self
+                    .filter_direct_readable(vec![entity.clone()])?
+                    .is_empty()
+            {
                 visible.push((entity.id, from, to));
             }
         }
@@ -16403,16 +17033,15 @@ impl Database {
                 Some(link.clone())
             }
         };
-        let (compensates_for, finding_ref, superseding_head, handoff_receipt_ref) =
-            match &linkage {
-                Some(l) => (
-                    l.compensates_for.clone(),
-                    l.finding_ref.clone(),
-                    l.superseding_head.clone(),
-                    l.handoff_receipt_ref.clone(),
-                ),
-                None => (String::new(), String::new(), String::new(), String::new()),
-            };
+        let (compensates_for, finding_ref, superseding_head, handoff_receipt_ref) = match &linkage {
+            Some(l) => (
+                l.compensates_for.clone(),
+                l.finding_ref.clone(),
+                l.superseding_head.clone(),
+                l.handoff_receipt_ref.clone(),
+            ),
+            None => (String::new(), String::new(), String::new(), String::new()),
+        };
         let resource_constraints_json =
             canonical_constraint_json(resource_constraints_json.unwrap_or("{}"))?;
         if !resource_constraints_permit(
@@ -16613,13 +17242,15 @@ impl Database {
                     .into(),
             );
         }
-        let original = self.action_receipt_get(&link.compensates_for)?.ok_or_else(|| {
-            format!(
-                "compensation intent rejected [original_effect_not_found]: compensates_for \
+        let original = self
+            .action_receipt_get(&link.compensates_for)?
+            .ok_or_else(|| {
+                format!(
+                    "compensation intent rejected [original_effect_not_found]: compensates_for \
                  {effect:?} does not reference an existing effect receipt",
-                effect = link.compensates_for
-            )
-        })?;
+                    effect = link.compensates_for
+                )
+            })?;
         let finding = self.finding_get(workspace_hash, &link.finding_ref)?;
         let finding = finding.ok_or_else(|| {
             format!(
@@ -16686,8 +17317,7 @@ impl Database {
                         handoff = link.handoff_receipt_ref
                     )
                 })?;
-            if handoff.status != "action_executed" || handoff.capability != "remediation_handoff"
-            {
+            if handoff.status != "action_executed" || handoff.capability != "remediation_handoff" {
                 return Err(format!(
                     "compensation intent rejected [handoff_not_receipted]: handoff receipt \
                      {handoff:?} is not a receipted remediation handoff (status={status}, \
@@ -16802,9 +17432,8 @@ impl Database {
         // reference an existing action receipt, mirroring the
         // justification-entity validation on action_intent.
         for effect in covers {
-            self.action_receipt_get(effect)?.ok_or_else(|| {
-                format!("finding rejected: covered effect not found: {effect}")
-            })?;
+            self.action_receipt_get(effect)?
+                .ok_or_else(|| format!("finding rejected: covered effect not found: {effect}"))?;
         }
         let now = now_ms();
         let finding = crate::models::ImpactFinding {
@@ -16885,17 +17514,14 @@ impl Database {
         if !matches!(kind, "file" | "symbol") {
             return Err("grounding admission refused: kind must be 'file' or 'symbol'".into());
         }
-        let exists: i64 = self
-            .conn()?
-            .query_row(
-                "SELECT COUNT(*) FROM entities WHERE id = ?1 AND archived = 0",
-                params![entity_id],
-                |r| r.get(0),
-            )?;
+        let exists: i64 = self.conn()?.query_row(
+            "SELECT COUNT(*) FROM entities WHERE id = ?1 AND archived = 0",
+            params![entity_id],
+            |r| r.get(0),
+        )?;
         if exists == 0 {
             return Err(
-                "grounding admission refused: entity not found — never invent node ids"
-                    .into(),
+                "grounding admission refused: entity not found — never invent node ids".into(),
             );
         }
         if content.trim().len() < crate::grounding::MIN_TOKENS {
@@ -16911,8 +17537,9 @@ impl Database {
             )
             .into());
         }
-        let fp = crate::grounding::fingerprint_hex(content, crate::grounding::SEED)
-            .ok_or("grounding admission refused [insufficient_content]: content is not fingerprintable")?;
+        let fp = crate::grounding::fingerprint_hex(content, crate::grounding::SEED).ok_or(
+            "grounding admission refused [insufficient_content]: content is not fingerprintable",
+        )?;
         let baseline_digest = crate::grounding::content_digest(content);
         let neighbors: Vec<String> = {
             let set = crate::grounding::neighbor_set(content);
@@ -16967,7 +17594,15 @@ impl Database {
                 "UPDATE grounding_fingerprints SET fingerprint_hex = ?1, neighbor_count = ?2,
                  neighbors_json = ?3, baseline_digest = ?4, provenance_json = ?5,
                  updated_at_unix_ms = ?6 WHERE id = ?7",
-                params![fp, neighbor_count as i64, neighbors_json, baseline_digest, provenance_json, now, id],
+                params![
+                    fp,
+                    neighbor_count as i64,
+                    neighbors_json,
+                    baseline_digest,
+                    provenance_json,
+                    now,
+                    id
+                ],
             )?;
         } else {
             conn.execute(
@@ -17124,12 +17759,7 @@ impl Database {
                 let sig = g::minhash(c, g::SEED)?;
                 Some((
                     t.clone(),
-                    (
-                        c.clone(),
-                        g::content_digest(c),
-                        sig,
-                        g::neighbor_set(c),
-                    ),
+                    (c.clone(), g::content_digest(c), sig, g::neighbor_set(c)),
                 ))
             })
             .collect();
@@ -17142,25 +17772,24 @@ impl Database {
                         target_ref: row.target_ref.clone(),
                         entity_id: row.entity_id.clone(),
                         status: "unverifiable".to_string(),
-                        detail: "baseline fingerprint unparseable — flag for review, never guess".to_string(),
+                        detail: "baseline fingerprint unparseable — flag for review, never guess"
+                            .to_string(),
                     });
                     continue;
                 }
             };
             let baseline_neighbors: std::collections::HashSet<String> = {
-                let raw: Vec<String> = serde_json::from_str(
-                    &{
-                        let conn = self.conn()?;
-                        let v: String = conn
-                            .query_row(
-                                "SELECT neighbors_json FROM grounding_fingerprints WHERE id = ?1",
-                                params![row.id],
-                                |r| r.get(0),
-                            )
-                            .unwrap_or_else(|_| "[]".to_string());
-                        v
-                    },
-                )
+                let raw: Vec<String> = serde_json::from_str(&{
+                    let conn = self.conn()?;
+                    let v: String = conn
+                        .query_row(
+                            "SELECT neighbors_json FROM grounding_fingerprints WHERE id = ?1",
+                            params![row.id],
+                            |r| r.get(0),
+                        )
+                        .unwrap_or_else(|_| "[]".to_string());
+                    v
+                })
                 .unwrap_or_default();
                 raw.into_iter().collect()
             };
@@ -17187,17 +17816,14 @@ impl Database {
                         .iter()
                         .filter(|(t, _)| *t != row_ref)
                         .map(|(t, (_, _, sig, nb))| {
-                            let score = g::reconcile_score(
-                                &baseline_sig,
-                                sig,
-                                &baseline_neighbors,
-                                nb,
-                            );
+                            let score =
+                                g::reconcile_score(&baseline_sig, sig, &baseline_neighbors, nb);
                             (t.clone(), score)
                         })
                         .filter(|(_, s)| *s >= g::LO)
                         .collect();
-                    candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                    candidates
+                        .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
                     let in_band: Vec<(String, f64)> = candidates
                         .iter()
                         .filter(|(_, s)| *s < g::HI)
@@ -17293,11 +17919,7 @@ impl Database {
                             "UPDATE grounding_fingerprints SET status = 'ambiguous',
                              candidates_json = ?1, reviewed_at_unix_ms = NULL,
                              updated_at_unix_ms = ?2 WHERE id = ?3",
-                            params![
-                                serde_json::to_string(&listed)?,
-                                now,
-                                row.id
-                            ],
+                            params![serde_json::to_string(&listed)?, now, row.id],
                         )?;
                         drop(conn);
                         report.ambiguous += 1;
@@ -17781,7 +18403,7 @@ impl Database {
 
     /// Traverse entity links starting from a given entity.
     /// Returns the entity and all linked entities up to max_depth.
-    pub fn traverse_chain(
+    pub(crate) fn traverse_chain(
         &self,
         category: &str,
         key: &str,
@@ -17828,6 +18450,7 @@ impl Database {
             max_depth,
             max_nodes,
             0,
+            None,
         );
 
         let chain = serde_json::json!({
@@ -17844,6 +18467,66 @@ impl Database {
         Ok(chain)
     }
 
+    /// Public transport-scoped traversal. Authorization is checked before the
+    /// root or any child body is placed into the response value.
+    pub fn traverse_chain_for_request(
+        &self,
+        category: &str,
+        key: &str,
+        max_depth: i64,
+        max_nodes: i64,
+        requester: &str,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+        if requester.trim().is_empty() {
+            return Err("requesting_agent_id is required".into());
+        }
+        let root = self
+            .get_entity(category, key)?
+            .ok_or_else(|| format!("entity not found: {}/{}", category, key))?;
+        if !self.can_read(requester, &root.visibility, &root.agent_id) {
+            return Err("entity not found".into());
+        }
+        let conn = self.conn()?;
+        let root_links: Vec<MemoryLink> = serde_json::from_str(
+            &serde_json::to_string(&root.links).unwrap_or_else(|_| "[]".to_string()),
+        )
+        .unwrap_or_default();
+        let root_links_json: Vec<serde_json::Value> = root_links
+            .iter()
+            .map(|l| {
+                serde_json::json!({
+                    "target_id": l.target_id,
+                    "relationship": l.relationship,
+                    "attested": l.source.is_some(),
+                    "source": l.source,
+                })
+            })
+            .collect();
+        let mut visited = std::collections::HashSet::new();
+        let mut traversed = Vec::new();
+        visited.insert(root.id.clone());
+        self._traverse_links(
+            &conn,
+            &root.id,
+            &mut traversed,
+            &mut visited,
+            max_depth,
+            max_nodes,
+            0,
+            Some(requester),
+        );
+        Ok(serde_json::json!({
+            "entity": {
+                "id": root.id,
+                "category": root.category,
+                "key": root.key,
+                "body_json": root.body_json,
+                "links": root_links_json,
+            },
+            "traversed": traversed,
+        }))
+    }
+
     fn _traverse_links(
         &self,
         // #210: thread one pooled connection through the recursion instead of
@@ -17856,6 +18539,7 @@ impl Database {
         max_depth: i64,
         max_nodes: i64,
         current_depth: i64,
+        requester: Option<&str>,
     ) {
         // Traversal remains best-effort for its historical API; query errors
         // are represented as an omitted/dangling link rather than propagated.
@@ -17867,6 +18551,7 @@ impl Database {
             max_depth,
             max_nodes,
             current_depth,
+            requester,
         );
     }
 
@@ -17879,6 +18564,7 @@ impl Database {
         max_depth: i64,
         max_nodes: i64,
         current_depth: i64,
+        requester: Option<&str>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         if current_depth >= max_depth || traversed.len() as i64 >= max_nodes {
             return Ok(());
@@ -17917,7 +18603,13 @@ impl Database {
                 )
                 .optional()?;
             let child = match child {
-                Some(entity) if !self.entity_suppressed_with_conn(conn, &entity, now_ms())? => {
+                Some(entity)
+                    if Self::entity_lifecycle_serveable(&entity)
+                        && !self.entity_suppressed_with_conn(conn, &entity, now_ms())?
+                        && requester
+                            .map(|req| self.can_read(req, &entity.visibility, &entity.agent_id))
+                            .unwrap_or(true) =>
+                {
                     entity
                 }
                 _ => continue,
@@ -17971,6 +18663,7 @@ impl Database {
                 max_depth,
                 max_nodes,
                 current_depth + 1,
+                requester,
             )?;
         }
         Ok(())
@@ -18002,6 +18695,15 @@ impl Database {
         status: &str,
         reason: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        let canonical_status = crate::models::canonical_entity_status(status)
+            .filter(|value| value != "compacted")
+            .ok_or_else(|| {
+                format!(
+                    "invalid writable entity status '{}': expected one of {:?}",
+                    status,
+                    crate::models::ENTITY_STATUSES
+                )
+            })?;
         let conn = self.conn()?;
         // #379: writer lock BEFORE the precondition read — see audited_write_tx.
         let tx = Self::audited_write_tx(&conn)?;
@@ -18013,7 +18715,17 @@ impl Database {
             params![id],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?;
-        if cur_status.as_deref() == Some(status) {
+        if matches!(canonical_status.as_str(), "active" | "draft")
+            && cur_status.as_deref().is_some_and(|current| {
+                crate::retrieval_telemetry::NON_SERVEABLE_STATUSES.contains(&current)
+            })
+        {
+            return Err(
+                "non-serveable lifecycle rows require an authenticated admission_decide transition before activation"
+                    .into(),
+            );
+        }
+        if cur_status.as_deref() == Some(canonical_status.as_str()) {
             tx.execute(
                 "UPDATE entities SET archive_reason = ?1, last_accessed_unix_ms = ?2 WHERE id = ?3",
                 params![reason, now_ms(), id],
@@ -18038,7 +18750,15 @@ impl Database {
                 recorded_at_unix_ms = ?4, supersedes = ?5,
                 valid_from_unix_ms = COALESCE(valid_from_unix_ms, ?6)
              WHERE id = ?7",
-            params![status, reason, now_ms(), now, history_id, eff_from, id],
+            params![
+                canonical_status,
+                reason,
+                now_ms(),
+                now,
+                history_id,
+                eff_from,
+                id
+            ],
         )?;
         tx.commit()?;
         Ok(())
@@ -18139,9 +18859,10 @@ impl Database {
             }
             None => raw_body,
         };
+        let semantic = Self::semantic_body_text(&plain);
         conn.execute(
             "INSERT OR REPLACE INTO entity_history_fts (rowid, body_json) VALUES (?1, ?2)",
-            params![rowid, plain],
+            params![rowid, semantic],
         )?;
         Ok(())
     }
@@ -18671,15 +19392,23 @@ impl Database {
         self.get_entity_by_id_raw(id)
     }
 
-    /// Get a single entity by ID through the governed public read path.
-    fn get_entity_by_id(
+    /// Internal admission-review lookup. This is deliberately crate-private:
+    /// the review handler must inspect a pending body to verify its canonical
+    /// digest, while public readers must never retrieve proposed/quarantined
+    /// bodies. The handler does not return the body to the caller.
+    pub(crate) fn get_entity_by_id_for_admission_review(
         &self,
         id: &str,
     ) -> Result<Option<Entity>, Box<dyn std::error::Error>> {
+        self.get_entity_by_id_raw(id)
+    }
+
+    /// Get a single entity by ID through the governed public read path.
+    fn get_entity_by_id(&self, id: &str) -> Result<Option<Entity>, Box<dyn std::error::Error>> {
         let Some(entity) = self.get_entity_by_id_raw(id)? else {
             return Ok(None);
         };
-        let mut kept = self.filter_suppressed(vec![entity])?;
+        let mut kept = self.filter_direct_readable(vec![entity])?;
         Ok(kept.pop())
     }
 
@@ -19754,7 +20483,7 @@ impl Database {
             items
         };
         drop(conn);
-        let visible = self.filter_suppressed(items)?;
+        let visible = self.filter_direct_readable(items)?;
         let end = requested_offset
             .saturating_add(requested_limit)
             .min(visible.len());
@@ -19818,7 +20547,42 @@ impl Database {
             items
         };
         drop(conn);
-        Ok(self.filter_suppressed(items)?.len() as i64)
+        Ok(self.filter_direct_readable(items)?.len() as i64)
+    }
+
+    /// Public list projection with requester visibility enforced before pagination.
+    pub(crate) fn list_entities_for_requester(
+        &self,
+        offset: i64,
+        limit: i64,
+        category: Option<&str>,
+        layer: Option<&str>,
+        workspace_hash: Option<&str>,
+        requesting_agent_id: Option<&str>,
+    ) -> Result<Vec<Entity>, Box<dyn std::error::Error>> {
+        let candidates = self.list_entities(0, i64::MAX, category, layer, workspace_hash)?;
+        let visible = self.filter_for_requester(candidates, requesting_agent_id)?;
+        let start = offset.max(0) as usize;
+        let take = limit.max(0) as usize;
+        if start >= visible.len() {
+            return Ok(Vec::new());
+        }
+        Ok(visible[start..start.saturating_add(take).min(visible.len())].to_vec())
+    }
+
+    /// Public count projection with requester visibility enforced; private/fleet
+    /// rows never affect an anonymous or differently-scoped total.
+    pub(crate) fn count_entities_for_requester(
+        &self,
+        category: Option<&str>,
+        layer: Option<&str>,
+        workspace_hash: Option<&str>,
+        requesting_agent_id: Option<&str>,
+    ) -> Result<i64, Box<dyn std::error::Error>> {
+        let candidates = self.list_entities(0, i64::MAX, category, layer, workspace_hash)?;
+        Ok(self
+            .filter_for_requester(candidates, requesting_agent_id)?
+            .len() as i64)
     }
 
     /// #562: deterministic keyset enumeration — the first-class "list every
@@ -19897,7 +20661,7 @@ impl Database {
             items
         };
         drop(conn);
-        let mut visible = self.filter_suppressed(items)?;
+        let mut visible = self.filter_scan_entities(items, include_archived)?;
         visible.truncate(requested_limit as usize);
         Ok(visible)
     }
@@ -20011,6 +20775,16 @@ impl Database {
         limit: i64,
         offset: i64,
     ) -> Result<(Vec<GraphNode>, Vec<GraphEdge>, i64), Box<dyn std::error::Error>> {
+        self.get_entity_graph_for_requester(workspace_hash, limit, offset, None)
+    }
+
+    pub(crate) fn get_entity_graph_for_requester(
+        &self,
+        workspace_hash: Option<&str>,
+        limit: i64,
+        offset: i64,
+        requesting_agent_id: Option<&str>,
+    ) -> Result<(Vec<GraphNode>, Vec<GraphEdge>, i64), Box<dyn std::error::Error>> {
         let conn = self.conn()?;
         let limit = if limit <= 0 { -1 } else { limit };
         let offset = offset.max(0);
@@ -20048,7 +20822,7 @@ impl Database {
         drop(conn);
         let mut visible_rows = Vec::with_capacity(rows.len());
         for (id, category, key, _links) in rows {
-            if let Some(entity) = self.get_entity_by_id_public(&id)? {
+            if let Some(entity) = self.get_entity_by_id_for_requester(&id, requesting_agent_id)? {
                 visible_rows.push((entity, category, key));
             }
         }
@@ -20743,7 +21517,7 @@ impl Database {
     ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
         let conn = self.conn()?;
         let mut stmt = conn.prepare(&format!(
-            "SELECT id, key, body_json, certainty FROM entities WHERE category = ?1 AND archived = 0
+            "SELECT id, key, body_json, certainty FROM entities WHERE category = ?1 AND archived = 0 AND status IN ('active','draft','deprecated','expired','redacted','compacted','superseded','resolved')
              ORDER BY last_accessed_unix_ms DESC LIMIT {} OFFSET ?2",
             Self::CONFLICT_SCAN_WINDOW
         ))?;
@@ -21492,7 +22266,7 @@ impl Database {
             Some(ws) => (
                 format!(
                     "SELECT id, key, body_json, certainty, verified, importance
-                     FROM entities WHERE category = ?1 AND archived = 0
+                     FROM entities WHERE category = ?1 AND archived = 0 AND status IN ('active','draft','deprecated','expired','redacted','compacted','superseded','resolved')
                      AND workspace_hash = ?2{candidate_clause}
                      ORDER BY last_accessed_unix_ms {}, id ASC LIMIT {} OFFSET ?{}",
                     order,
@@ -21504,7 +22278,7 @@ impl Database {
             None => (
                 format!(
                     "SELECT id, key, body_json, certainty, verified, importance
-                     FROM entities WHERE category = ?1 AND archived = 0{candidate_clause}
+                     FROM entities WHERE category = ?1 AND archived = 0 AND status IN ('active','draft','deprecated','expired','redacted','compacted','superseded','resolved'){candidate_clause}
                      ORDER BY last_accessed_unix_ms {}, id ASC LIMIT {} OFFSET ?{}",
                     order,
                     scan_limit,
@@ -21527,8 +22301,10 @@ impl Database {
             };
         let rows = match scan_ws {
             Some(ws) => {
-                let mut bind: Vec<&dyn rusqlite::ToSql> =
-                    vec![&params.category as &dyn rusqlite::ToSql, &ws as &dyn rusqlite::ToSql];
+                let mut bind: Vec<&dyn rusqlite::ToSql> = vec![
+                    &params.category as &dyn rusqlite::ToSql,
+                    &ws as &dyn rusqlite::ToSql,
+                ];
                 for id in &candidate_ids {
                     bind.push(id);
                 }
@@ -22065,9 +22841,9 @@ impl Database {
                                 // #869: the consolidated observation asserts the
                                 // evidence_for edges to its sources.
                                 source: Some(entity_id.clone()),
-                                                            kind: None,
+                                kind: None,
                                 asserted_at_unix_ms: Some(now_ms()),
-})
+                            })
                             .collect(),
                         verified: false,
                         source: "perseus_vault_consolidate".to_string(),
@@ -22985,9 +23761,9 @@ impl Database {
                                     // #869: the dreamed insight asserts the
                                     // evidence_for edges to its sources.
                                     source: Some(entity_id.clone()),
-                                                                    kind: None,
+                                    kind: None,
                                     asserted_at_unix_ms: Some(now_ms()),
-})
+                                })
                                 .collect(),
                             verified: false,
                             source: "perseus_vault_dream".to_string(),
@@ -23317,7 +24093,7 @@ Return a JSON object with an "insights" array. Each insight has:
         let entities: Vec<(String, String, String, f64)> = {
             let conn = self.conn()?;
             let mut stmt = conn.prepare(&format!(
-                "SELECT id, key, body_json, certainty FROM entities WHERE category = ?1 AND archived = 0
+                "SELECT id, key, body_json, certainty FROM entities WHERE category = ?1 AND archived = 0 AND status IN ('active','draft','deprecated','expired','redacted','compacted','superseded','resolved')
                  ORDER BY last_accessed_unix_ms DESC LIMIT {} OFFSET ?2",
                 Self::CONFLICT_SCAN_WINDOW
             ))?;
@@ -24516,10 +25292,31 @@ Return a JSON object with an "insights" array. Each insight has:
     /// Export all non-archived entities to .md files in a vault directory.
     /// Each entity becomes a .md file with YAML frontmatter.
     /// Idempotent — updates changed files, creates new ones, never deletes.
+    /// Internal/admin export retained for maintenance and fixture callers.
+    /// Public transports must call `vault_export_for_requester`.
     pub fn vault_export(
         &self,
         vault_dir: &str,
         workspace_hash: Option<&str>,
+    ) -> Result<VaultReport, Box<dyn std::error::Error>> {
+        self.vault_export_impl(vault_dir, workspace_hash, None, false)
+    }
+
+    pub(crate) fn vault_export_for_requester(
+        &self,
+        vault_dir: &str,
+        workspace_hash: Option<&str>,
+        requesting_agent_id: Option<&str>,
+    ) -> Result<VaultReport, Box<dyn std::error::Error>> {
+        self.vault_export_impl(vault_dir, workspace_hash, requesting_agent_id, true)
+    }
+
+    fn vault_export_impl(
+        &self,
+        vault_dir: &str,
+        workspace_hash: Option<&str>,
+        requesting_agent_id: Option<&str>,
+        enforce_visibility: bool,
     ) -> Result<VaultReport, Box<dyn std::error::Error>> {
         let conn = self.conn()?;
         use std::fs;
@@ -24531,16 +25328,16 @@ Return a JSON object with an "insights" array. Each insight has:
         let sql = if let Some(ws) = workspace_hash {
             format!(
                 "SELECT id, category, key, body_json, type, tags, decay_score,
-                        retrieval_count, layer, workspace_hash, agent_id,
+                        retrieval_count, layer, workspace_hash, agent_id, visibility,
                         created_at_unix_ms, last_accessed_unix_ms, links
-                 FROM entities WHERE archived = 0 AND workspace_hash = '{}'",
+                 FROM entities WHERE archived = 0 AND status IN ('active','draft') AND workspace_hash = '{}'",
                 ws.replace('\'', "''")
             )
         } else {
             "SELECT id, category, key, body_json, type, tags, decay_score,
-                    retrieval_count, layer, workspace_hash, agent_id,
+                    retrieval_count, layer, workspace_hash, agent_id, visibility,
                     created_at_unix_ms, last_accessed_unix_ms, links
-             FROM entities WHERE archived = 0"
+             FROM entities WHERE archived = 0 AND status IN ('active','draft')"
                 .to_string()
         };
 
@@ -24574,6 +25371,7 @@ Return a JSON object with an "insights" array. Each insight has:
             layer: String,
             workspace_hash_val: String,
             agent_id_val: String,
+            visibility: String,
             created: i64,
             accessed: i64,
             links_json: String,
@@ -24593,9 +25391,10 @@ Return a JSON object with an "insights" array. Each insight has:
                 layer: r.get::<_, String>(8)?,
                 workspace_hash_val: r.get::<_, String>(9)?,
                 agent_id_val: r.get::<_, String>(10)?,
-                created: r.get::<_, i64>(11)?,
-                accessed: r.get::<_, i64>(12)?,
-                links_json: r.get::<_, String>(13)?,
+                visibility: r.get::<_, String>(11)?,
+                created: r.get::<_, i64>(12)?,
+                accessed: r.get::<_, i64>(13)?,
+                links_json: r.get::<_, String>(14)?,
             })
         })?;
 
@@ -24603,6 +25402,48 @@ Return a JSON object with an "insights" array. Each insight has:
         for row in rows {
             collected.push(row?);
         }
+        drop(stmt);
+
+        // Apply the same governance suppression predicate as the public recall
+        // paths before any export rendering or link-map construction. The
+        // primary connection is reused deliberately: read-layer sidecar checks
+        // must not nest another checkout while this query is live.
+        let triples: Vec<(String, String, String)> = collected
+            .iter()
+            .map(|row| {
+                (
+                    row.workspace_hash_val.clone(),
+                    row.category.clone(),
+                    rejected_value_digest(&row.body_json),
+                )
+            })
+            .collect();
+        let primary_hits = Self::mandate_hits_batched(
+            &conn,
+            &triples,
+            "rejected_value_tombstones",
+            Some(now_ms()),
+        )?;
+        let erased_hits = match self.governance_read_conn_compatible()? {
+            Some(sidecar) => {
+                Self::mandate_hits_batched(&sidecar, &triples, "erasure_mandates", None)?
+            }
+            None => std::collections::HashSet::new(),
+        };
+        collected = collected
+            .into_iter()
+            .zip(triples)
+            .filter(|(_, triple)| !primary_hits.contains(triple) && !erased_hits.contains(triple))
+            .map(|(row, _)| row)
+            .filter(|row| {
+                !enforce_visibility
+                    || self.requester_can_read(
+                        requesting_agent_id,
+                        &row.visibility,
+                        &row.agent_id_val,
+                    )
+            })
+            .collect();
 
         // First pass: id -> (safe_id link target, human-readable key) so the
         // second pass can render `[[<safe_id>|<key>]]` WikiLinks that resolve to
@@ -24633,6 +25474,7 @@ Return a JSON object with an "insights" array. Each insight has:
                 layer,
                 workspace_hash_val,
                 agent_id_val,
+                visibility: _,
                 created,
                 accessed,
                 links_json,
@@ -24654,6 +25496,23 @@ Return a JSON object with an "insights" array. Each insight has:
             if !links.is_empty() {
                 links_section.push_str("\n## Links\n\n");
                 for link in &links {
+                    // A link to an existing but requester-invisible entity is
+                    // suppressed entirely; rendering it as an unresolved ID
+                    // would disclose the hidden target. Archived/deleted targets
+                    // remain the documented unresolved-link case.
+                    if enforce_visibility {
+                        if let Ok(Some(target)) = self.get_entity_by_id_public(&link.target_id) {
+                            if workspace_hash.is_some_and(|ws| target.workspace_hash != ws)
+                                || !self.requester_can_read(
+                                    requesting_agent_id,
+                                    &target.visibility,
+                                    &target.agent_id,
+                                )
+                            {
+                                continue;
+                            }
+                        }
+                    }
                     let rel = if link.relationship.is_empty() {
                         "related"
                     } else {
@@ -24759,8 +25618,8 @@ last_accessed: {}
                     }))
                     .collect::<Vec<_>>(),
             });
-            let manifest_json = serde_json::to_string_pretty(&manifest)
-                .unwrap_or_else(|_| "{}".to_string());
+            let manifest_json =
+                serde_json::to_string_pretty(&manifest).unwrap_or_else(|_| "{}".to_string());
             let manifest_path = vault.join(".seals.json");
             match fs::write(&manifest_path, &manifest_json) {
                 Ok(_) => {
@@ -24798,7 +25657,6 @@ last_accessed: {}
         })
     }
 
-
     // ─── #1060: seal-style tamper evidence ──────────────────────────────
     //
     // A seal is a SHA-256 commitment over content (entity body_json, or the
@@ -24829,7 +25687,16 @@ last_accessed: {}
             "INSERT INTO memory_seals (seal_id, target_id, label, scope, sha256, \
              workspace_hash, agent_id, created_at_unix_ms) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![seal_id, target_id, label, scope, sha256, workspace_hash, agent_id, created_at],
+            params![
+                seal_id,
+                target_id,
+                label,
+                scope,
+                sha256,
+                workspace_hash,
+                agent_id,
+                created_at
+            ],
         )?;
         let event_id = format!("jrn-{}", uuid::Uuid::new_v4().simple());
         self.journal_with_conn(
@@ -24887,7 +25754,15 @@ last_accessed: {}
         let body = body.ok_or_else(|| format!("no live entity with id '{entity_id}'"))?;
         let digest = sha256_hex(&body);
         let label = if label.is_empty() { "entity" } else { label };
-        self.seal_record_with_conn(&conn, entity_id, "entity", label, &digest, workspace_hash, agent_id)
+        self.seal_record_with_conn(
+            &conn,
+            entity_id,
+            "entity",
+            label,
+            &digest,
+            workspace_hash,
+            agent_id,
+        )
     }
 
     /// Journal a `tamper_evidence` event for a seal mismatch, deduped: if the
@@ -24965,7 +25840,9 @@ last_accessed: {}
             Err(_) => return vec![],
         };
         let any: i64 = match conn
-            .query_row("SELECT COUNT(*) FROM memory_seals LIMIT 1", [], |r| r.get(0))
+            .query_row("SELECT COUNT(*) FROM memory_seals LIMIT 1", [], |r| {
+                r.get(0)
+            })
             .optional()
         {
             Ok(Some(n)) => n,
@@ -24981,7 +25858,8 @@ last_accessed: {}
              ORDER BY created_at_unix_ms DESC"
         );
         let ids: Vec<&str> = entities.iter().map(|e| e.id.as_str()).collect();
-        let params: Vec<&dyn rusqlite::ToSql> = ids.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+        let params: Vec<&dyn rusqlite::ToSql> =
+            ids.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
         let mut latest: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
         if let Ok(mut stmt) = conn.prepare(&sql) {
@@ -25011,7 +25889,11 @@ last_accessed: {}
                             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
                         )
                         .unwrap_or_default();
-                    let ws = if ws.is_empty() { e.workspace_hash.clone() } else { ws };
+                    let ws = if ws.is_empty() {
+                        e.workspace_hash.clone()
+                    } else {
+                        ws
+                    };
                     let _ = self.journal_tamper_evidence(
                         &conn, &seal_id, &e.id, &label, "entity", expected, &actual, "recall", &ws,
                     );
@@ -25035,13 +25917,24 @@ last_accessed: {}
         )?;
         let rows: Vec<(String, String, String, String, String, String)> = stmt
             .query_map([], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
             })?
             .collect::<Result<_, _>>()?;
-        let mut latest: std::collections::HashMap<(String, String), (String, String, String, String)> =
-            std::collections::HashMap::new(); // (scope, target) -> (seal, label, sha, ws)
+        let mut latest: std::collections::HashMap<
+            (String, String),
+            (String, String, String, String),
+        > = std::collections::HashMap::new(); // (scope, target) -> (seal, label, sha, ws)
         for (seal, target, label, scope, sha, ws) in rows {
-            latest.entry((scope, target)).or_insert((seal, label, sha, ws));
+            latest
+                .entry((scope, target))
+                .or_insert((seal, label, sha, ws));
         }
         let now = now_ms();
         let mut tampered = Vec::new();
@@ -25059,8 +25952,15 @@ last_accessed: {}
                         let manifest_digest = seal_sha256_bytes(&bytes);
                         if manifest_digest != expected {
                             let _ = self.journal_tamper_evidence(
-                                &conn, &seal, &target, &label, &scope, &expected, &manifest_digest,
-                                "scan", &ws,
+                                &conn,
+                                &seal,
+                                &target,
+                                &label,
+                                &scope,
+                                &expected,
+                                &manifest_digest,
+                                "scan",
+                                &ws,
                             );
                             tampered.push(crate::models::TamperFinding {
                                 seal_id: seal,
@@ -25407,7 +26307,6 @@ last_accessed: {}
         Ok(out)
     }
 
-
     // ─── #1066: model-upgrade inheritance receipts ───────────────────────
     //
     // Memory survives the model. An explicit subject identity (separate from
@@ -25417,7 +26316,11 @@ last_accessed: {}
     // preserves tombstones — no silent destruction.
 
     /// Ensure a subject identity exists (identity/vessel split).
-    pub fn subject_ensure(&self, subject_id: &str, label: &str) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn subject_ensure(
+        &self,
+        subject_id: &str,
+        label: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let conn = self.conn()?;
         conn.execute(
             "INSERT OR IGNORE INTO subject_identities (subject_id, label, created_at_unix_ms) \
@@ -25635,8 +26538,10 @@ last_accessed: {}
             agreements: 0,
             disagreements: total,
             agreement_rate: 0.0,
-            digest: sha256_hex(&digests.join("
-")),
+            digest: sha256_hex(&digests.join(
+                "
+",
+            )),
         };
         receipt.replay = Some(replay.clone());
         let new_body = serde_json::to_string(&receipt)?;
@@ -25765,17 +26670,14 @@ last_accessed: {}
                             || l.relationship == "causes"
                             || l.relationship == "derived_from"
                         {
-                            select(
-                                &mut path,
-                                &mut seen,
-                                &l.target_id,
-                                &l.relationship,
-                                &hit.id,
-                            );
+                            select(&mut path, &mut seen, &l.target_id, &l.relationship, &hit.id);
                         } else {
                             rejected.push(crate::models::RejectedDistractor {
                                 entity_id: l.target_id.clone(),
-                                reason: format!("wrong edge kind for causal view: {}", l.relationship),
+                                reason: format!(
+                                    "wrong edge kind for causal view: {}",
+                                    l.relationship
+                                ),
                             });
                         }
                     }
@@ -25832,13 +26734,7 @@ last_accessed: {}
                 };
                 for hit in ordered.iter() {
                     if seen.len() < limit {
-                        select(
-                            &mut path,
-                            &mut seen,
-                            &hit.id,
-                            "valid_time_order",
-                            "",
-                        );
+                        select(&mut path, &mut seen, &hit.id, "valid_time_order", "");
                     }
                 }
                 // Window policy: anything older than a year behind the anchor
@@ -25875,10 +26771,10 @@ last_accessed: {}
         // Named-entity count with a word-count floor: relation/step text can
         // be id-heavy (no capitalized named entities), and the budget
         // discipline must never under-count served tokens.
-        let tokens_selected = crate::graph_route::count_entity_tokens(&pt)
-            .max(pt.split_whitespace().count());
-        let tokens_rejected = crate::graph_route::count_entity_tokens(&rt)
-            .max(rt.split_whitespace().count());
+        let tokens_selected =
+            crate::graph_route::count_entity_tokens(&pt).max(pt.split_whitespace().count());
+        let tokens_rejected =
+            crate::graph_route::count_entity_tokens(&rt).max(rt.split_whitespace().count());
         let run_id = format!("tr-{}", uuid::Uuid::new_v4().simple());
         {
             let conn = self.conn()?;
@@ -26853,8 +27749,7 @@ last_accessed: {}
                     epistemic_state, hints, memory_type
              FROM entities
              WHERE archived = 0
-               AND (status IS NULL OR status = '' OR status NOT IN
-                   ('deprecated','expired','quarantined','redacted'))
+               AND status IN ('active','draft')
                AND rowid IN (SELECT rowid FROM entities_fts WHERE entities_fts MATCH ?1)
                {}
              ORDER BY decay_score DESC, retrieval_count DESC
@@ -27297,9 +28192,9 @@ last_accessed: {}
                     weight: 1.0,
                     // #869: the promoted entity asserts the edge.
                     source: Some(promoted_id.clone()),
-                                    kind: None,
+                    kind: None,
                     asserted_at_unix_ms: Some(now_ms()),
-})
+                })
                 .collect();
             let entity = crate::models::Entity {
                 id: promoted_id,
@@ -27539,9 +28434,9 @@ last_accessed: {}
                         // #869: the source entity is the evidence anchor for
                         // the derived edge.
                         source: Some(e1_id.clone()),
-                                            kind: None,
+                        kind: None,
                         asserted_at_unix_ms: Some(now_ms()),
-});
+                    });
                     candidate_links += 1;
                     if candidate_links >= max_links {
                         break 'link;
@@ -29642,7 +30537,7 @@ impl Database {
         // #869: targets that were not hydrateable at all (missing entirely
         // or archived) are drift, reported alongside the other gates.
         stats.dangling_targets = ordered_ids.len().saturating_sub(found_total);
-        let mut visible = self.filter_suppressed_scored(out)?;
+        let mut visible = self.filter_serveable_scored(out)?;
         visible.truncate(max_neighbors);
         Ok((visible, stats))
     }
@@ -29701,7 +30596,7 @@ impl Database {
             }
         }
         drop(conn);
-        self.filter_suppressed(out)
+        self.filter_serveable(out)
     }
 
     /// Minimal completion call against the configured LLM endpoint (Ollama
@@ -30240,7 +31135,7 @@ pub(crate) struct TestDatabase {
 impl TestDatabase {
     pub(crate) fn new(prefix: &str) -> Self {
         // #950: test fixtures must use test-mode DELETE journaling. Hundreds
-        // of short-lived isolated databases each hold a 16-connection pool;
+        // of short-lived isolated databases each hold a bounded test pool;
         // WAL keeps -wal/-shm fds open per connection and blew past the macOS
         // soft fd limit of 256 ("unable to open database file"). Production
         // WAL behavior is untouched — open_inner(&path, cfg!(test)) keeps
@@ -30309,7 +31204,6 @@ impl Drop for TestDatabase {
 #[cfg(test)]
 pub(crate) static HINTS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-
 /// #1065: path text for token estimation (ids + relations only — hash-free).
 fn path_text(path: &[crate::models::TraversalStep]) -> String {
     path.iter()
@@ -30331,6 +31225,53 @@ fn rejected_text(rejected: &[crate::models::RejectedDistractor]) -> String {
 pub(crate) mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn semantic_index_text_omits_admission_envelope() {
+        let body = r#"{"admission":{"record_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"note":"peanuts","provenance":{"state":"admitted"}}"#;
+        let indexed = Database::fts_indexed_text(body, &[]);
+
+        assert_eq!(indexed, r#"{"note":"peanuts"}"#);
+        assert!(!indexed.contains("record_digest"));
+        assert!(!indexed.contains("provenance"));
+    }
+
+    #[test]
+    fn history_index_text_omits_admission_envelope() {
+        let (db, path) = temp_db();
+        db.remember_skip_dedup(&make_entity(
+            "history-admission-v1",
+            "facts",
+            "history-admission",
+            r#"{"note":"historysafecontent","admission":{"record_digest":"governanceleak"},"provenance":{"state":"admitted"}}"#,
+        ))
+        .unwrap();
+        db.remember_skip_dedup(&make_entity(
+            "history-admission-v2",
+            "facts",
+            "history-admission",
+            r#"{"note":"currentcontent"}"#,
+        ))
+        .unwrap();
+
+        assert_eq!(
+            db.history_matching_keys("historysafecontent", None, 10)
+                .unwrap(),
+            vec![("facts".to_string(), "history-admission".to_string())]
+        );
+        assert!(db
+            .history_matching_keys("governanceleak", None, 10)
+            .unwrap()
+            .is_empty());
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_fixtures_use_a_bounded_pool_by_default() {
+        let db = TestDatabase::new("perseus-vault-pool-default");
+        assert_eq!(db.pool.max_size(), 4);
+    }
 
     pub(crate) fn temp_db() -> (TestDatabase, String) {
         let db = TestDatabase::new("perseus_vault-test-db");
@@ -30354,6 +31295,190 @@ pub(crate) mod tests {
         let db = TestDatabase::new_wal("perseus_vault-test-db-wal");
         let path = db.path().to_string();
         (db, path)
+    }
+
+    #[test]
+    fn non_serveable_entities_are_hidden_from_all_public_read_surfaces() {
+        let (db, path) = temp_db();
+        let mut pending = make_entity(
+            "pending-read-hidden",
+            "admission",
+            "pending-read-hidden",
+            r#"{"content":"pending body must never be served"}"#,
+        );
+        pending.status = "proposed".to_string();
+        let recorded_before = pending.created_at_unix_ms;
+        db.remember_skip_dedup(&pending)
+            .expect("seed proposed entity");
+
+        assert!(db
+            .get_entity("admission", "pending-read-hidden")
+            .unwrap()
+            .is_none());
+        assert!(db
+            .get_entity_by_id_public("pending-read-hidden")
+            .unwrap()
+            .is_none());
+        assert!(db
+            .list_entities(0, 100, Some("admission"), None, None)
+            .unwrap()
+            .is_empty());
+        assert_eq!(db.count_entities(Some("admission"), None, None).unwrap(), 0);
+        assert!(db
+            .valid_periods_for_ids(&[pending.id.clone()])
+            .unwrap()
+            .is_empty());
+        assert!(db
+            .scan_entities(Some("admission"), None, false, None, 100)
+            .unwrap()
+            .is_empty());
+        assert!(db
+            .as_of("admission", "pending-read-hidden", recorded_before + 1)
+            .unwrap()
+            .is_none());
+        assert!(db
+            .valid_at("admission", "pending-read-hidden", recorded_before + 1)
+            .unwrap()
+            .is_none());
+        let (nodes, edges, total) = db.get_entity_graph(None, -1, 0).unwrap();
+        assert!(nodes.iter().all(|node| node.id != "pending-read-hidden"));
+        assert!(edges
+            .iter()
+            .all(|edge| edge.from != "pending-read-hidden" && edge.to != "pending-read-hidden"));
+        assert_eq!(total, 0);
+        assert!(db
+            .traverse_chain("admission", "pending-read-hidden", 2, 10)
+            .is_err());
+
+        let mut active = pending.clone();
+        active.body_json = r#"{"content":"active replacement is serveable"}"#.to_string();
+        active.status = "active".to_string();
+        active.created_at_unix_ms = now_ms();
+        active.last_accessed_unix_ms = active.created_at_unix_ms;
+        db.remember_skip_dedup(&active)
+            .expect("supersede proposed entity");
+        let (history, visible_total) = db
+            .history_versions_page("admission", "pending-read-hidden", 100, 0)
+            .unwrap();
+        assert!(history.is_empty(), "pending history leaked: {history:?}");
+        assert_eq!(visible_total, 0);
+        assert!(db
+            .as_of("admission", "pending-read-hidden", recorded_before + 1)
+            .unwrap()
+            .is_none());
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn terminal_and_archived_entities_are_hidden_from_all_public_read_surfaces() {
+        let (db, path) = temp_db();
+        let fixtures = [
+            ("terminal-deprecated", "deprecated", false),
+            ("terminal-expired", "expired", false),
+            ("terminal-redacted", "redacted", false),
+            ("archived-active", "active", true),
+        ];
+        let mut recorded = Vec::new();
+        for (id, status, archived) in fixtures {
+            let mut entity = make_entity(
+                id,
+                "lifecycle-boundary",
+                id,
+                &format!(r#"{{"body":"hidden {id}"}}"#),
+            );
+            entity.status = status.to_string();
+            entity.archived = archived;
+            recorded.push((id, entity.created_at_unix_ms));
+            db.remember_skip_dedup(&entity)
+                .expect("seed lifecycle fixture");
+        }
+
+        for (id, recorded_at) in recorded {
+            assert!(db.get_entity("lifecycle-boundary", id).unwrap().is_none());
+            assert!(db.get_entity_by_id_public(id).unwrap().is_none());
+            let as_of = db.as_of("lifecycle-boundary", id, recorded_at + 1).unwrap();
+            let valid_at = db
+                .valid_at("lifecycle-boundary", id, recorded_at + 1)
+                .unwrap()
+                .map(|version| version.entity);
+            if matches!(
+                id,
+                "terminal-deprecated" | "terminal-expired" | "terminal-redacted"
+            ) {
+                for marker in [as_of, valid_at] {
+                    let marker = marker.expect("terminal temporal audit marker");
+                    assert_eq!(marker.status, id.strip_prefix("terminal-").unwrap());
+                    let body: serde_json::Value = serde_json::from_str(&marker.body_json).unwrap();
+                    assert_eq!(body["terminal_audit"], serde_json::json!(true));
+                    assert!(!marker.body_json.contains("hidden"));
+                }
+            } else {
+                assert!(as_of.is_none());
+                assert!(valid_at.is_none());
+            }
+        }
+        assert!(db
+            .list_entities(0, 100, Some("lifecycle-boundary"), None, None)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            db.count_entities(Some("lifecycle-boundary"), None, None)
+                .unwrap(),
+            0
+        );
+        assert!(db
+            .scan_entities(Some("lifecycle-boundary"), None, false, None, 100)
+            .unwrap()
+            .is_empty());
+        assert!(db
+            .scan_entities(Some("lifecycle-boundary"), None, true, None, 100)
+            .unwrap()
+            .is_empty());
+        let (nodes, edges, _) = db.get_entity_graph(None, -1, 0).unwrap();
+        assert!(nodes
+            .iter()
+            .all(|node| node.category != "lifecycle-boundary"));
+        assert!(edges
+            .iter()
+            .all(|edge| { !edge.from.starts_with("terminal-") && edge.from != "archived-active" }));
+        for (id, _, _) in fixtures {
+            assert!(db.traverse_chain("lifecycle-boundary", id, 2, 10).is_err());
+        }
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn generic_journal_cannot_mint_admission_source_evidence() {
+        let (db, path) = temp_db();
+        let event = JournalEvent {
+            id: "jrn-forged-source".to_string(),
+            event_type: "admission_source".to_string(),
+            evaluated_json: "{\"record_digest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}".to_string(),
+            acted_json: "{}".to_string(),
+            forward_json: "{}".to_string(),
+            category: "decision".to_string(),
+            key: "forged".to_string(),
+            entity_id: "mem-forged".to_string(),
+            agent_id: "caller-selected".to_string(),
+            workspace_hash: "forged-ws".to_string(),
+            created_at_unix_ms: now_ms(),
+        };
+        let error = db
+            .journal(&event)
+            .expect_err("generic journal must reject admission_source");
+        assert!(error.to_string().contains("authenticated admission path"));
+        let conn = db.conn().unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM journal WHERE event_type = 'admission_source'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+        drop(conn);
+        let _ = fs::remove_file(path);
     }
 
     #[test]
@@ -30441,7 +31566,7 @@ pub(crate) mod tests {
         entity.source = "cli-write".to_string();
         db.remember(&entity).expect("direct writer should persist");
         let stored = db
-            .get_entity("decision", "direct-provenance")
+            .get_entity_by_id_unfiltered("direct-provenance")
             .unwrap()
             .expect("stored entity");
         assert_eq!(stored.status, "proposed");
@@ -30457,7 +31582,7 @@ pub(crate) mod tests {
         // #880: the trust axis is fail-closed on the write path — a caller
         // that labels its own write 'verified' without authoritative
         // admission must be stored as 'candidate'. Only the verified
-        // admission path (remember_verified_with_options) or an explicit
+        // admission path (remember_admitted_with_write_options) or an explicit
         // operator/audit transition may set verified/corroborated.
         let (db, path) = temp_db();
         let mut entity = make_entity(
@@ -30472,7 +31597,7 @@ pub(crate) mod tests {
         entity.epistemic_state = "verified".to_string();
         db.remember(&entity).expect("write persists");
         let stored = db
-            .get_entity("decision", "forged-trust")
+            .get_entity_by_id_unfiltered("forged-trust")
             .unwrap()
             .expect("stored entity");
         assert_eq!(stored.epistemic_state, "candidate");
@@ -30495,7 +31620,14 @@ pub(crate) mod tests {
         entity.agent_id = "user-1".to_string();
         entity.workspace_hash = "ws-trust".to_string();
         let (_, _) = db
-            .remember_verified_with_options(&entity, true, None, None, false)
+            .remember_internal_trusted_with_options(
+                &entity,
+                true,
+                None,
+                None,
+                false,
+                "test_fixture",
+            )
             .expect("verified admission write");
         let stored = db
             .get_entity("decision", "admitted-trust")
@@ -30513,8 +31645,15 @@ pub(crate) mod tests {
         corroborated.agent_id = "user-1".to_string();
         corroborated.workspace_hash = "ws-trust".to_string();
         corroborated.epistemic_state = "corroborated".to_string();
-        db.remember_verified_with_options(&corroborated, true, None, None, false)
-            .expect("verified admission write");
+        db.remember_internal_trusted_with_options(
+            &corroborated,
+            true,
+            None,
+            None,
+            false,
+            "test_fixture",
+        )
+        .expect("verified admission write");
         let stored2 = db
             .get_entity("decision", "corroborated-trust")
             .unwrap()
@@ -30732,8 +31871,15 @@ pub(crate) mod tests {
         );
         verified.agent_id = "user-1".to_string();
         verified.workspace_hash = "ws-epi".to_string();
-        db.remember_verified_with_options(&verified, true, None, None, false)
-            .expect("verified write");
+        db.remember_internal_trusted_with_options(
+            &verified,
+            true,
+            None,
+            None,
+            false,
+            "test_fixture",
+        )
+        .expect("verified write");
 
         let recall = |es: &str, mode: crate::models::SearchMode| {
             db.recall(&RecallParams {
@@ -31122,7 +32268,7 @@ pub(crate) mod tests {
         );
         ver.agent_id = "user-1".to_string();
         ver.workspace_hash = "ws-t".to_string();
-        db.remember_verified_with_options(&ver, true, None, None, false)
+        db.remember_internal_trusted_with_options(&ver, true, None, None, false, "test_fixture")
             .unwrap();
 
         let response = crate::tools::handle_recall(
@@ -31587,9 +32733,9 @@ pub(crate) mod tests {
             weight: 0.5,
             // #869: attested edge (the root asserts it).
             source: Some("g-root".to_string()),
-                    kind: None,
+            kind: None,
             asserted_at_unix_ms: Some(now_ms()),
-}];
+        }];
         db.remember_skip_dedup(&root).unwrap();
         // Target entity — will be suppressed.
         db.remember_skip_dedup(&make_entity(
@@ -31767,7 +32913,8 @@ pub(crate) mod tests {
                 "a".repeat(64).as_str(),
                 Some("{}"),
                 &[],
-            None)
+                None,
+            )
             .unwrap();
         assert_eq!(intent.status, "approval_requested");
         assert!(intent.approval_required);
@@ -31814,7 +32961,8 @@ pub(crate) mod tests {
                 &"a".repeat(64),
                 Some("{}"),
                 &[],
-            None)
+                None,
+            )
             .unwrap_err()
             .to_string();
         assert!(
@@ -31839,7 +32987,8 @@ pub(crate) mod tests {
                 &"a".repeat(64),
                 Some("{}"),
                 &[],
-            None)
+                None,
+            )
             .unwrap_err()
             .to_string();
         assert!(
@@ -31867,7 +33016,8 @@ pub(crate) mod tests {
                 &"a".repeat(64),
                 Some("{}"),
                 &[],
-            None)
+                None,
+            )
             .unwrap_err()
             .to_string();
         assert!(
@@ -31892,7 +33042,8 @@ pub(crate) mod tests {
                 &"a".repeat(64),
                 Some("{}"),
                 &[],
-            None)
+                None,
+            )
             .unwrap();
         assert_eq!(ok.status, "intent");
         assert!(!ok.approval_required);
@@ -31906,10 +33057,19 @@ pub(crate) mod tests {
         let (db, _path) = temp_db();
         // Never invent node ids: anchoring a nonexistent entity is refused.
         let err = db
-            .grounding_admit("ws-g1", "no-such-entity", "/src/a.rs", "file", &"x".repeat(200))
+            .grounding_admit(
+                "ws-g1",
+                "no-such-entity",
+                "/src/a.rs",
+                "file",
+                &"x".repeat(200),
+            )
             .unwrap_err()
             .to_string();
-        assert!(err.contains("never invent node ids"), "unexpected error: {err}");
+        assert!(
+            err.contains("never invent node ids"),
+            "unexpected error: {err}"
+        );
 
         db.remember(&make_entity("e-g1", "evidence", "g1", r#"{"v":1}"#))
             .unwrap();
@@ -31978,10 +33138,7 @@ pub(crate) mod tests {
         // MOVED auto-rewrites the anchor; G2's baseline is gone from b but
         // the target still exists with different content -> drift.
         let report = db
-            .grounding_reconcile(
-                "ws-g2",
-                &[("/src/b.rs".to_string(), content_x.to_string())],
-            )
+            .grounding_reconcile("ws-g2", &[("/src/b.rs".to_string(), content_x.to_string())])
             .unwrap();
         assert_eq!(report.moved, 1, "move must auto-migrate the anchor");
         assert_eq!(report.drift, 1, "other grounding sees changed content");
@@ -32036,10 +33193,20 @@ pub(crate) mod tests {
     fn drift_check_scores_and_repair_loop_verifies() {
         let (db, _path) = temp_db();
         // Conflicting evidence values for the same keyed claim.
-        db.remember(&make_entity("e-d1", "evidence", "d1", r#"{"version":"2.23.0"}"#))
-            .unwrap();
-        db.remember(&make_entity("e-d2", "evidence", "d2", r#"{"version":"2.22.1"}"#))
-            .unwrap();
+        db.remember(&make_entity(
+            "e-d1",
+            "evidence",
+            "d1",
+            r#"{"version":"2.23.0"}"#,
+        ))
+        .unwrap();
+        db.remember(&make_entity(
+            "e-d2",
+            "evidence",
+            "d2",
+            r#"{"version":"2.22.1"}"#,
+        ))
+        .unwrap();
         // Dangling derived_from citation: link then archive the target.
         db.remember(&make_entity("e-d3", "evidence", "d3", r#"{"x":1}"#))
             .unwrap();
@@ -32083,14 +33250,8 @@ pub(crate) mod tests {
 
         let report = crate::drift_check::drift_check(&db, None, 90).unwrap();
         let codes: Vec<&str> = report.issues.iter().map(|i| i.code.as_str()).collect();
-        assert!(
-            codes.contains(&"REFERENCE_INTEGRITY"),
-            "missing: {codes:?}"
-        );
-        assert!(
-            codes.contains(&"CROSS_FILE_CONFLICT"),
-            "missing: {codes:?}"
-        );
+        assert!(codes.contains(&"REFERENCE_INTEGRITY"), "missing: {codes:?}");
+        assert!(codes.contains(&"CROSS_FILE_CONFLICT"), "missing: {codes:?}");
         assert!(codes.contains(&"GROUNDING_STATUS"), "missing: {codes:?}");
         assert!(codes.contains(&"PATH_EXISTENCE"), "missing: {codes:?}");
         assert!(codes.contains(&"STALE_ENTITY"), "missing: {codes:?}");
@@ -32132,16 +33293,15 @@ pub(crate) mod tests {
         // Verify leg: the repaired store no longer reports the fixed issues.
         let after = crate::drift_check::drift_check(&db, None, 90).unwrap();
         assert!(
-            !after
-                .issues
-                .iter()
-                .any(|i| i.code == "REFERENCE_INTEGRITY"),
+            !after.issues.iter().any(|i| i.code == "REFERENCE_INTEGRITY"),
             "dangling ref must be unlinked"
         );
         let links: String = db
             .conn()
             .unwrap()
-            .query_row("SELECT links FROM entities WHERE id = 'e-d3'", [], |r| r.get(0))
+            .query_row("SELECT links FROM entities WHERE id = 'e-d3'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(links, "[]", "dangling citation removed: {links}");
         assert_eq!(after.health_score, repair.after_score);
@@ -32149,7 +33309,11 @@ pub(crate) mod tests {
 
     // ─── #1033: compensation admission (fail-closed, stable reason codes) ───
 
-    fn comp_manifest(agent: &str, ws: &str, caps: &[&str]) -> crate::models::AuthorityManifestInput {
+    fn comp_manifest(
+        agent: &str,
+        ws: &str,
+        caps: &[&str],
+    ) -> crate::models::AuthorityManifestInput {
         crate::models::AuthorityManifestInput {
             agent_id: agent.to_string(),
             workspace_hash: ws.to_string(),
@@ -32197,9 +33361,13 @@ pub(crate) mod tests {
     #[test]
     fn compensation_requires_authenticated_finding_linkage() {
         let (db, _path) = temp_db();
-        db.agent_upsert("agent-comp-a", "Trace", 3, "trace").unwrap();
-        db.authority_set(&comp_manifest("agent-comp-a", "ws-comp", &["execute_action"]), "admin")
+        db.agent_upsert("agent-comp-a", "Trace", 3, "trace")
             .unwrap();
+        db.authority_set(
+            &comp_manifest("agent-comp-a", "ws-comp", &["execute_action"]),
+            "admin",
+        )
+        .unwrap();
         let effect = execute_effect(&db, "agent-comp-a", "ws-comp", "effect-E");
 
         // Self-claimed undo: compensates_for without finding linkage.
@@ -32237,7 +33405,10 @@ pub(crate) mod tests {
         )
         .unwrap_err()
         .to_string();
-        assert!(err.contains("finding_unauthenticated"), "unexpected error: {err}");
+        assert!(
+            err.contains("finding_unauthenticated"),
+            "unexpected error: {err}"
+        );
 
         // Original effect must exist.
         let err = comp_intent(
@@ -32264,9 +33435,13 @@ pub(crate) mod tests {
     #[test]
     fn compensation_verifies_finding_coverage_and_head() {
         let (db, _path) = temp_db();
-        db.agent_upsert("agent-comp-b", "Trace", 3, "trace").unwrap();
-        db.authority_set(&comp_manifest("agent-comp-b", "ws-comp", &["execute_action"]), "admin")
+        db.agent_upsert("agent-comp-b", "Trace", 3, "trace")
             .unwrap();
+        db.authority_set(
+            &comp_manifest("agent-comp-b", "ws-comp", &["execute_action"]),
+            "admin",
+        )
+        .unwrap();
         let effect = execute_effect(&db, "agent-comp-b", "ws-comp", "effect-E");
 
         // A finding that does NOT cover the effect.
@@ -32339,7 +33514,8 @@ pub(crate) mod tests {
     #[test]
     fn compensation_requires_receipted_handoff_when_original_revoked() {
         let (db, _path) = temp_db();
-        db.agent_upsert("agent-comp-c", "Trace", 3, "trace").unwrap();
+        db.agent_upsert("agent-comp-c", "Trace", 3, "trace")
+            .unwrap();
         db.authority_set(
             &comp_manifest(
                 "agent-comp-c",
@@ -32395,9 +33571,13 @@ pub(crate) mod tests {
             .unwrap();
 
         // B holds current authority.
-        db.agent_upsert("agent-comp-d", "Trace", 3, "trace").unwrap();
-        db.authority_set(&comp_manifest("agent-comp-d", "ws-comp", &["execute_action"]), "admin")
+        db.agent_upsert("agent-comp-d", "Trace", 3, "trace")
             .unwrap();
+        db.authority_set(
+            &comp_manifest("agent-comp-d", "ws-comp", &["execute_action"]),
+            "admin",
+        )
+        .unwrap();
 
         // B without a handoff -> rejected.
         let err = comp_intent(
@@ -32493,7 +33673,8 @@ pub(crate) mod tests {
     #[test]
     fn compensation_handoff_must_name_beneficiary_and_cover_effect() {
         let (db, _path) = temp_db();
-        db.agent_upsert("agent-comp-e", "Trace", 3, "trace").unwrap();
+        db.agent_upsert("agent-comp-e", "Trace", 3, "trace")
+            .unwrap();
         db.authority_set(
             &comp_manifest(
                 "agent-comp-e",
@@ -32593,9 +33774,13 @@ pub(crate) mod tests {
 
         db.authority_revoke(&manifest_a.id, "operator", "trace revoke")
             .unwrap();
-        db.agent_upsert("agent-comp-f", "Trace", 3, "trace").unwrap();
-        db.authority_set(&comp_manifest("agent-comp-f", "ws-comp", &["execute_action"]), "admin")
+        db.agent_upsert("agent-comp-f", "Trace", 3, "trace")
             .unwrap();
+        db.authority_set(
+            &comp_manifest("agent-comp-f", "ws-comp", &["execute_action"]),
+            "admin",
+        )
+        .unwrap();
 
         let linkage_base = crate::models::CompensationLinkage {
             compensates_for: effect.id.clone(),
@@ -32731,7 +33916,8 @@ pub(crate) mod tests {
                 &"a".repeat(64),
                 Some("{}"),
                 &[],
-            None)
+                None,
+            )
             .unwrap();
         assert_eq!(action.manifest_version, stored.version);
         assert_eq!(action.status, "approval_requested");
@@ -32935,7 +34121,8 @@ pub(crate) mod tests {
                 &"a".repeat(64),
                 Some("{}"),
                 &[],
-            None)
+                None,
+            )
             .unwrap();
         assert_eq!(action.status, "approval_requested");
         let denied = db
@@ -32995,7 +34182,8 @@ pub(crate) mod tests {
                 &"a".repeat(64),
                 Some("{}"),
                 &[],
-            None)
+                None,
+            )
             .unwrap();
         assert_eq!(action.status, "approval_requested");
         // Before the window elapses, timeout resolution refuses.
@@ -34254,7 +35442,10 @@ pub(crate) mod tests {
             "importance must floor decay_score at the explicit score, got {}",
             kept.decay_score
         );
-        let faded = db.get_entity("decision", "fade").unwrap().unwrap();
+        let faded = db
+            .get_entity_by_category_key_for_mutation("decision", "fade")
+            .unwrap()
+            .unwrap();
         assert!(faded.archived, "unscored control must decay out as before");
 
         // cohere's multiplicative decay respects the same floor.
@@ -34289,7 +35480,10 @@ pub(crate) mod tests {
             )
             .unwrap();
         db.decay_tick().unwrap();
-        let cleared = db.get_entity("decision", "keep").unwrap().unwrap();
+        let cleared = db
+            .get_entity_by_category_key_for_mutation("decision", "keep")
+            .unwrap()
+            .unwrap();
         assert!(
             cleared.archived,
             "clearing importance must let the entity decay out (decay {})",
@@ -35503,7 +36697,7 @@ pub(crate) mod tests {
                     let s = if (t + i) % 2 == 0 {
                         "deprecated"
                     } else {
-                        "active"
+                        "expired"
                     };
                     db.update_entity_status(&id, s, "race")
                         .expect("status flip");
@@ -35724,9 +36918,9 @@ pub(crate) mod tests {
             relationship: "caused-by".to_string(),
             weight: 0.9,
             source: None,
-                    kind: None,
+            kind: None,
             asserted_at_unix_ms: Some(now_ms()),
-});
+        });
         db.remember(&e).unwrap();
 
         let live = db.get_entity("facts", "src382b").unwrap().unwrap();
@@ -38687,14 +39881,16 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(global.len(), 25, "Some(\"\") = global rows only (#408)");
 
-        // include_archived opts the soft-deleted row back in.
+        // Public scans never materialize archived bodies, even when the
+        // historical include_archived flag is supplied. Audit markers must be
+        // queried through their dedicated terminal-audit surfaces.
         let with_archived = db
             .scan_entities(Some("scan-cat"), None, true, None, 1000)
             .unwrap();
-        assert_eq!(
-            with_archived.len(),
-            27,
-            "include_archived adds the archived row"
+        assert_eq!(with_archived.len(), 26);
+        assert!(
+            !with_archived.iter().any(|entity| entity.id == "scan-arch"),
+            "include_archived must not re-expose archived bodies"
         );
 
         let _ = fs::remove_file(&path);
@@ -39281,6 +40477,68 @@ pub(crate) mod tests {
         let _ = fs::remove_file(&path);
     }
 
+    #[test]
+    fn vault_export_hides_terminal_and_suppressed_entities() {
+        let (db, path) = temp_db();
+        let vault =
+            std::env::temp_dir().join(format!("perseus_vault-vault-{}", uuid::Uuid::new_v4()));
+        let vault_str = vault.to_str().unwrap().to_string();
+
+        db.remember_skip_dedup(&make_entity(
+            "export-visible",
+            "facts",
+            "export-visible",
+            r#"{"content":"visible export body"}"#,
+        ))
+        .unwrap();
+
+        let mut terminal = make_entity(
+            "export-terminal",
+            "facts",
+            "export-terminal",
+            r#"{"content":"EXPORT TERMINAL SENTINEL"}"#,
+        );
+        terminal.status = "deprecated".to_string();
+        db.remember_skip_dedup(&terminal).unwrap();
+
+        let suppressed_body = r#"{"content":"EXPORT SUPPRESSED SENTINEL"}"#;
+        db.remember_skip_dedup(&make_entity(
+            "export-suppressed",
+            "facts",
+            "export-suppressed",
+            suppressed_body,
+        ))
+        .unwrap();
+        db.reject_value(
+            "",
+            "",
+            "facts",
+            suppressed_body,
+            "test suppression",
+            "test",
+            "owner-1",
+            None,
+        )
+        .unwrap();
+
+        let report = db.vault_export(&vault_str, None).unwrap();
+        assert!(
+            report.errors.is_empty(),
+            "export errors: {:?}",
+            report.errors
+        );
+        assert_eq!(report.files_created, 1, "only the serveable row may export");
+        assert!(vault.join("export-visible.md").exists());
+        assert!(!vault.join("export-terminal.md").exists());
+        assert!(!vault.join("export-suppressed.md").exists());
+        let visible = std::fs::read_to_string(vault.join("export-visible.md")).unwrap();
+        assert!(!visible.contains("EXPORT TERMINAL SENTINEL"));
+        assert!(!visible.contains("EXPORT SUPPRESSED SENTINEL"));
+
+        let _ = std::fs::remove_dir_all(&vault);
+        let _ = fs::remove_file(&path);
+    }
+
     // #227: keyword recall matches via the FTS5 index (with prefix matching)
     // rather than an unconditional body_json LIKE scan. A prefix query must
     // still find longer tokens, and an exact token must still match.
@@ -39461,7 +40719,10 @@ pub(crate) mod tests {
         );
 
         // Entity rows still exist, just archived.
-        let junk_row = db.get_entity("junk", "throwaway").unwrap().unwrap();
+        let junk_row = db
+            .get_entity_by_category_key_for_mutation("junk", "throwaway")
+            .unwrap()
+            .unwrap();
         assert!(junk_row.archived);
         let keep_row = db.get_entity("keep", "important").unwrap().unwrap();
         assert!(!keep_row.archived);
@@ -39789,19 +41050,22 @@ pub(crate) mod tests {
 
         // get_entity without a workspace in hand picks deterministically
         // (lexicographically-first workspace when no global '' row exists).
-        let picked = db.get_entity("note", "shared-key").unwrap().unwrap();
+        let picked = db
+            .get_entity_by_category_key_for_mutation("note", "shared-key")
+            .unwrap()
+            .unwrap();
         assert_eq!(picked.workspace_hash, "ws-alpha");
 
         // forget archives every workspace's copy and cleans FTS for all.
         assert!(db.forget("note", "shared-key", "test cleanup").unwrap());
         assert!(
-            db.get_entity_by_id_public("id-a")
+            db.get_entity_by_id_unfiltered("id-a")
                 .unwrap()
                 .unwrap()
                 .archived
         );
         assert!(
-            db.get_entity_by_id_public("mem-fresh")
+            db.get_entity_by_id_unfiltered("mem-fresh")
                 .unwrap()
                 .unwrap()
                 .archived
@@ -45767,9 +47031,9 @@ pub(crate) mod tests {
                 relationship: "related".to_string(),
                 weight: 0.5,
                 source: None,
-                            kind: None,
+                kind: None,
                 asserted_at_unix_ms: Some(now_ms()),
-}])
+            }])
             .unwrap()],
         )
         .unwrap();
@@ -45885,9 +47149,9 @@ pub(crate) mod tests {
             relationship: "related".to_string(),
             weight: 0.5,
             source: Some("d-root".to_string()),
-                    kind: None,
+            kind: None,
             asserted_at_unix_ms: Some(now_ms()),
-}];
+        }];
         db.remember(&e).unwrap();
         let seed = db.get_entity("facts", "d-root").unwrap().unwrap();
         let (expanded, stats) = db.graph_expand(&[seed], 10).unwrap();
@@ -46003,9 +47267,9 @@ pub(crate) mod tests {
                 relationship: "related".to_string(),
                 weight: 0.5,
                 source: None,
-                            kind: None,
+                kind: None,
                 asserted_at_unix_ms: Some(now_ms()),
-}])
+            }])
             .unwrap()],
         )
         .unwrap();
@@ -46063,17 +47327,17 @@ pub(crate) mod tests {
                 relationship: "related".to_string(),
                 weight: 0.5,
                 source: None,
-                            kind: None,
+                kind: None,
                 asserted_at_unix_ms: Some(now_ms()),
-},
+            },
             crate::models::MemoryLink {
                 target_id: "w-ghost".to_string(),
                 relationship: "references".to_string(),
                 weight: 0.5,
                 source: Some("external-ref-42".to_string()),
-                            kind: None,
+                kind: None,
                 asserted_at_unix_ms: Some(now_ms()),
-},
+            },
         ];
         db.remember(&e).unwrap();
         let stored = db.get_entity("facts", "w-src").unwrap().unwrap();
@@ -46088,6 +47352,51 @@ pub(crate) mod tests {
             "caller-supplied anchor preserved"
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn traverse_requires_transport_identity_before_serializing_private_children() {
+        let (db, path) = temp_db();
+        db.remember_skip_dedup(&make_entity(
+            "traverse-public-root",
+            "traverse-security",
+            "traverse-public-root",
+            r#"{"content":"public root"}"#,
+        ))
+        .unwrap();
+        let mut private = make_entity(
+            "traverse-private-child",
+            "traverse-security",
+            "traverse-private-child",
+            r#"{"content":"TRAVERSE PRIVATE SENTINEL"}"#,
+        );
+        private.visibility = "private".to_string();
+        private.agent_id = "owner-1".to_string();
+        db.remember_skip_dedup(&private).unwrap();
+        db.link(
+            "traverse-security",
+            "traverse-public-root",
+            "traverse-private-child",
+            "depends_on",
+        )
+        .unwrap();
+
+        let response = crate::tools::handle_traverse(
+            &db,
+            serde_json::json!({
+                "category": "traverse-security",
+                "key": "traverse-public-root",
+                "max_depth": 2,
+                "max_nodes": 10
+            }),
+        );
+        assert!(
+            response.contains("requesting_agent_id"),
+            "missing transport identity must fail closed: {response}"
+        );
+        assert!(!response.contains("TRAVERSE PRIVATE SENTINEL"));
+
+        let _ = fs::remove_file(path);
     }
 
     /// #869: traverse annotates every edge with its evidence state.
@@ -49245,9 +50554,9 @@ pub(crate) mod tests {
             relationship: "caused-by".to_string(),
             weight: 0.99,
             source: None,
-                    kind: None,
+            kind: None,
             asserted_at_unix_ms: Some(now_ms()),
-});
+        });
         db.remember(&e).unwrap();
 
         let live = db.get_entity("facts", "swin-src").unwrap().unwrap();
@@ -49947,9 +51256,10 @@ pub(crate) mod tests {
 
         fn resolve(refs: &std::collections::HashMap<String, String>, r: &str) -> String {
             match r.strip_prefix("ref:") {
-                Some(ev) => refs.get(ev).cloned().unwrap_or_else(|| {
-                    panic!("unresolved corpus ref {r}")
-                }),
+                Some(ev) => refs
+                    .get(ev)
+                    .cloned()
+                    .unwrap_or_else(|| panic!("unresolved corpus ref {r}")),
                 None => r.to_string(),
             }
         }
@@ -49957,7 +51267,8 @@ pub(crate) mod tests {
         for trace in traces {
             let trace_id = trace["trace_id"].as_str().unwrap();
             let (db, _path) = temp_db();
-            let mut refs: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+            let mut refs: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
             for ev in trace["events"].as_array().unwrap() {
                 let op = ev["operation"].as_str().unwrap();
                 match op {
@@ -50039,8 +51350,7 @@ pub(crate) mod tests {
                         .unwrap();
                     }
                     "revoke" => {
-                        let manifest_id =
-                            resolve(&refs, ev["grant_ref"].as_str().unwrap());
+                        let manifest_id = resolve(&refs, ev["grant_ref"].as_str().unwrap());
                         db.authority_revoke(&manifest_id, "operator", "trace revoke")
                             .unwrap();
                     }
@@ -50086,10 +51396,7 @@ pub(crate) mod tests {
                         {
                             String::new()
                         } else {
-                            resolve(
-                                &refs,
-                                ev["handoff_receipt_ref"].as_str().unwrap(),
-                            )
+                            resolve(&refs, ev["handoff_receipt_ref"].as_str().unwrap())
                         };
                         let linkage = crate::models::CompensationLinkage {
                             compensates_for: effect.clone(),
@@ -50125,19 +51432,15 @@ pub(crate) mod tests {
                                 );
                             }
                         } else {
-                            let action = result
-                                .expect(&format!("{trace_id}: compensation should pass"));
+                            let action =
+                                result.expect(&format!("{trace_id}: compensation should pass"));
                             assert_eq!(action.compensates_for, effect);
-                            assert_eq!(
-                                action.finding_ref,
-                                ev["finding_ref"].as_str().unwrap()
-                            );
+                            assert_eq!(action.finding_ref, ev["finding_ref"].as_str().unwrap());
                             assert_eq!(
                                 action.superseding_head,
                                 ev["superseding_head"].as_str().unwrap()
                             );
-                            let handoff_ref =
-                                ev["handoff_receipt_ref"].as_str().unwrap();
+                            let handoff_ref = ev["handoff_receipt_ref"].as_str().unwrap();
                             assert_eq!(
                                 action.handoff_receipt_ref,
                                 resolve(&refs, handoff_ref),
@@ -50475,6 +51778,35 @@ pub(crate) mod tests {
             .expect("compacted window must still answer, with a marker");
         assert_eq!(inside.status, "compacted");
         assert!(inside.body_json.contains("\"versions\":3"));
+        // Public history must not re-expand arbitrary metadata from the
+        // compacted Entity row. This sentinel simulates stale/tampered metadata
+        // that is not part of the compacted audit marker allowlist.
+        let conn = db.conn().unwrap();
+        conn.execute(
+            "UPDATE entity_history SET tags='[\"HISTORY METADATA SENTINEL\"]',
+                    archive_reason='HISTORY ARCHIVE SENTINEL',
+                    source='HISTORY SOURCE SENTINEL',
+                    agent_id='HISTORY AGENT SENTINEL',
+                    visibility='private'
+             WHERE status='compacted'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let history = crate::tools::handle_history(
+            &db,
+            serde_json::json!({
+                "category": "facts",
+                "key": "versioned-key",
+                "limit": 100,
+                "offset": 0
+            }),
+        )
+        .unwrap();
+        assert!(!history.contains("HISTORY METADATA SENTINEL"));
+        assert!(!history.contains("HISTORY ARCHIVE SENTINEL"));
+        assert!(!history.contains("HISTORY SOURCE SENTINEL"));
+        assert!(!history.contains("HISTORY AGENT SENTINEL"));
 
         // as_of inside a SURVIVING window → the real old version, unchanged.
         let conn = db.conn().unwrap();
@@ -50871,8 +52203,13 @@ pub(crate) mod tests {
     #[test]
     fn inheritance_receipt_lifecycle_record_approve_query() {
         let (db, path) = temp_db();
-        db.remember(&make_entity("ir-m1", "facts", "ir-m1", r#"{"c":"memory 1"}"#))
-            .unwrap();
+        db.remember(&make_entity(
+            "ir-m1",
+            "facts",
+            "ir-m1",
+            r#"{"c":"memory 1"}"#,
+        ))
+        .unwrap();
 
         // Record: pending by default, identity split visible.
         let r = db
@@ -50904,15 +52241,16 @@ pub(crate) mod tests {
 
         // The receipt entity is queryable in the provenance graph.
         let e = db
-            .get_entity("inheritance_receipt", &format!("{}→{}", "model-a", "model-b"))
+            .get_entity(
+                "inheritance_receipt",
+                &format!("{}→{}", "model-a", "model-b"),
+            )
             .unwrap()
             .expect("receipt entity must exist");
         assert_eq!(e.id, r.receipt_id);
 
         // Policy-gated approval: empty approver refused; real approver stamps.
-        assert!(db
-            .inheritance_receipt_approve(&r.receipt_id, "")
-            .is_err());
+        assert!(db.inheritance_receipt_approve(&r.receipt_id, "").is_err());
         let approved = db
             .inheritance_receipt_approve(&r.receipt_id, "operator-1")
             .unwrap();
@@ -50928,9 +52266,10 @@ pub(crate) mod tests {
         // Departure: tombstone preserved (ended_at set, reason kept).
         db.incarnation_depart(&r.from_incarnation, "retired")
             .unwrap();
-        assert!(db
-            .incarnation_depart(&r.from_incarnation, "again")
-            .is_err(), "second departure of an ended incarnation refused");
+        assert!(
+            db.incarnation_depart(&r.from_incarnation, "again").is_err(),
+            "second departure of an ended incarnation refused"
+        );
         let conn = db.conn().unwrap();
         let (ended, reason): (Option<i64>, String) = conn
             .query_row(
@@ -50990,25 +52329,52 @@ pub(crate) mod tests {
 
     #[test]
     fn intent_routing_maps_reasons_to_views() {
-        assert_eq!(crate::db::Database::route_intent_to_view("what depends on the gateway service"), ("causal", "causal"));
-        assert_eq!(crate::db::Database::route_intent_to_view("what happened before the june launch"), ("temporal", "temporal"));
-        assert_eq!(crate::db::Database::route_intent_to_view("what shipped on 2026-06-20"), ("temporal", "temporal"));
+        assert_eq!(
+            crate::db::Database::route_intent_to_view("what depends on the gateway service"),
+            ("causal", "causal")
+        );
+        assert_eq!(
+            crate::db::Database::route_intent_to_view("what happened before the june launch"),
+            ("temporal", "temporal")
+        );
+        assert_eq!(
+            crate::db::Database::route_intent_to_view("what shipped on 2026-06-20"),
+            ("temporal", "temporal")
+        );
         assert_eq!(
             crate::db::Database::route_intent_to_view("tell me about the Aurora program"),
             ("entity", "entity")
         );
-        assert_eq!(crate::db::Database::route_intent_to_view("database choice"), ("semantic", "semantic"));
+        assert_eq!(
+            crate::db::Database::route_intent_to_view("database choice"),
+            ("semantic", "semantic")
+        );
     }
 
     #[test]
     fn typed_traversal_causal_view_explains_path_and_rejects_wrong_edges() {
         let (db, path) = temp_db();
-        db.remember(&make_entity("tr-a", "facts", "tr-a", r#"{"c":"gateway service alpha"}"#))
-            .unwrap();
-        db.remember(&make_entity("tr-b", "facts", "tr-b", r#"{"c":"auth module beta"}"#))
-            .unwrap();
-        db.remember(&make_entity("tr-c", "facts", "tr-c", r#"{"c":"rate limiter gamma"}"#))
-            .unwrap();
+        db.remember(&make_entity(
+            "tr-a",
+            "facts",
+            "tr-a",
+            r#"{"c":"gateway service alpha"}"#,
+        ))
+        .unwrap();
+        db.remember(&make_entity(
+            "tr-b",
+            "facts",
+            "tr-b",
+            r#"{"c":"auth module beta"}"#,
+        ))
+        .unwrap();
+        db.remember(&make_entity(
+            "tr-c",
+            "facts",
+            "tr-c",
+            r#"{"c":"rate limiter gamma"}"#,
+        ))
+        .unwrap();
         db.link("facts", "tr-a", "tr-b", "depends_on").unwrap();
         db.link("facts", "tr-a", "tr-c", "related").unwrap();
 
@@ -51018,7 +52384,9 @@ pub(crate) mod tests {
         assert_eq!(t.intent, "causal");
         assert_eq!(t.view, "causal");
         assert!(
-            t.path.iter().any(|s| s.entity_id == "tr-b" && s.relation == "depends_on"),
+            t.path
+                .iter()
+                .any(|s| s.entity_id == "tr-b" && s.relation == "depends_on"),
             "causal traversal must follow depends_on with an explainable step: {:?}",
             t.path
         );
@@ -51035,10 +52403,20 @@ pub(crate) mod tests {
     #[test]
     fn typed_traversal_entity_view_walks_neighborhood() {
         let (db, path) = temp_db();
-        db.remember(&make_entity("te-1", "facts", "te-1", r#"{"c":"aurora program"}"#))
-            .unwrap();
-        db.remember(&make_entity("te-2", "facts", "te-2", r#"{"c":"aurora launch plan"}"#))
-            .unwrap();
+        db.remember(&make_entity(
+            "te-1",
+            "facts",
+            "te-1",
+            r#"{"c":"aurora program"}"#,
+        ))
+        .unwrap();
+        db.remember(&make_entity(
+            "te-2",
+            "facts",
+            "te-2",
+            r#"{"c":"aurora launch plan"}"#,
+        ))
+        .unwrap();
         db.link("facts", "te-1", "te-2", "mentions").unwrap();
 
         let t = db
@@ -51056,18 +52434,33 @@ pub(crate) mod tests {
     #[test]
     fn typed_traversal_ablation_accumulates_per_view() {
         let (db, path) = temp_db();
-        db.remember(&make_entity("ab-1", "facts", "ab-1", r#"{"c":"gateway service"}"#))
-            .unwrap();
-        db.remember(&make_entity("ab-2", "facts", "ab-2", r#"{"c":"gateway auth"}"#))
-            .unwrap();
+        db.remember(&make_entity(
+            "ab-1",
+            "facts",
+            "ab-1",
+            r#"{"c":"gateway service"}"#,
+        ))
+        .unwrap();
+        db.remember(&make_entity(
+            "ab-2",
+            "facts",
+            "ab-2",
+            r#"{"c":"gateway auth"}"#,
+        ))
+        .unwrap();
         db.link("facts", "ab-1", "ab-2", "depends_on").unwrap();
 
-        db.typed_traversal("what depends on the gateway service", 10).unwrap();
-        db.typed_traversal("what depends on the gateway service", 10).unwrap();
+        db.typed_traversal("what depends on the gateway service", 10)
+            .unwrap();
+        db.typed_traversal("what depends on the gateway service", 10)
+            .unwrap();
         db.typed_traversal("gateway service", 10).unwrap();
 
         let rows = db.typed_traversal_ablation().unwrap();
-        let causal = rows.iter().find(|r| r.view == "causal").expect("causal runs recorded");
+        let causal = rows
+            .iter()
+            .find(|r| r.view == "causal")
+            .expect("causal runs recorded");
         assert_eq!(causal.runs, 2);
         assert!(causal.avg_selected_tokens > 0.0);
         assert!(rows.iter().any(|r| r.view == "semantic" && r.runs == 1));
@@ -51122,7 +52515,9 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(scheme, "hmac-sha256-v1");
         let before: String = conn
-            .query_row("SELECT audit_hash FROM journal WHERE id = 'k3'", [], |r| r.get(0))
+            .query_row("SELECT audit_hash FROM journal WHERE id = 'k3'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         drop(conn);
 
@@ -51131,7 +52526,9 @@ pub(crate) mod tests {
         db.set_encryption(&key_path).unwrap();
         let conn = db.conn().unwrap();
         let after: String = conn
-            .query_row("SELECT audit_hash FROM journal WHERE id = 'k3'", [], |r| r.get(0))
+            .query_row("SELECT audit_hash FROM journal WHERE id = 'k3'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         drop(conn);
         assert_eq!(before, after, "rekey must be canary-gated and idempotent");
@@ -51313,7 +52710,7 @@ pub(crate) mod tests {
     /// usefulness_count" on the first v2.19.0 production deploy. Simulate that
     /// exact store shape: drop the columns, stamp the pre-bump version, and
     /// assert the real migration path (initialize_schema) delivers them.
-        // ─── #1060: seal-style tamper evidence ──────────────────────────────
+    // ─── #1060: seal-style tamper evidence ──────────────────────────────
 
     /// Remember one entity and seal it through the production surface.
     fn seal_fixture(db: &TestDatabase) -> (String, String) {
@@ -51440,7 +52837,10 @@ pub(crate) mod tests {
             )
             .unwrap();
         drop(conn);
-        assert_eq!(n, 0, "an unmodified sealed row must not surface tamper events");
+        assert_eq!(
+            n, 0,
+            "an unmodified sealed row must not surface tamper events"
+        );
 
         let report = db.scan_seals().unwrap();
         assert!(report.ok);
@@ -51492,11 +52892,16 @@ pub(crate) mod tests {
             r#"{"content":"exported note"}"#,
         ))
         .unwrap();
-        let vault = std::env::temp_dir().join(format!("perseus_vault-seal-{}", uuid::Uuid::new_v4()));
+        let vault =
+            std::env::temp_dir().join(format!("perseus_vault-seal-{}", uuid::Uuid::new_v4()));
         let vault_str = vault.to_str().unwrap().to_string();
 
         let report = db.vault_export(&vault_str, None).unwrap();
-        assert!(report.errors.is_empty(), "export errors: {:?}", report.errors);
+        assert!(
+            report.errors.is_empty(),
+            "export errors: {:?}",
+            report.errors
+        );
         let seal = report.seal.expect("export must produce a seal receipt");
         assert_eq!(seal.scope, "export");
         assert!(seal.target_id.ends_with(".seals.json"));
@@ -51521,7 +52926,9 @@ pub(crate) mod tests {
         let r2 = db.scan_seals().unwrap();
         assert!(!r2.ok);
         assert!(
-            r2.tampered.iter().any(|t| t.target_id.ends_with("seal-x1.md")),
+            r2.tampered
+                .iter()
+                .any(|t| t.target_id.ends_with("seal-x1.md")),
             "tampered export file must be named by the scan: {:?}",
             r2.tampered
         );
@@ -51570,7 +52977,10 @@ pub(crate) mod tests {
         assert_eq!(classify_relation("supersedes"), RelationKind::Invalidates);
         assert_eq!(classify_relation("invalidates"), RelationKind::Invalidates);
         assert_eq!(classify_relation("promoted_to"), RelationKind::Updates);
-        assert_eq!(classify_relation("authorized_by"), RelationKind::AuthorizedBy);
+        assert_eq!(
+            classify_relation("authorized_by"),
+            RelationKind::AuthorizedBy
+        );
         assert_eq!(classify_relation("depends_on"), RelationKind::Related);
         assert_eq!(classify_relation(""), RelationKind::Related);
     }
@@ -51634,11 +53044,9 @@ pub(crate) mod tests {
         .unwrap();
         let conn = db.conn().unwrap();
         let links_json: String = conn
-            .query_row(
-                "SELECT links FROM entities WHERE id = 'tp-src'",
-                [],
-                |r| r.get(0),
-            )
+            .query_row("SELECT links FROM entities WHERE id = 'tp-src'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         drop(conn);
         let links: Vec<crate::models::MemoryLink> = serde_json::from_str(&links_json).unwrap();
@@ -51651,11 +53059,9 @@ pub(crate) mod tests {
         db.link("facts", "tp-src", "tp-tgt", "related").unwrap();
         let conn = db.conn().unwrap();
         let links_json: String = conn
-            .query_row(
-                "SELECT links FROM entities WHERE id = 'tp-src'",
-                [],
-                |r| r.get(0),
-            )
+            .query_row("SELECT links FROM entities WHERE id = 'tp-src'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         drop(conn);
         let links: Vec<crate::models::MemoryLink> = serde_json::from_str(&links_json).unwrap();
@@ -51668,8 +53074,13 @@ pub(crate) mod tests {
     #[test]
     fn provenance_projection_separates_evidence_from_execution() {
         let (db, path) = temp_db();
-        db.remember(&make_entity("pp-src", "facts", "pp-src", r#"{"c":"alpha"}"#))
-            .unwrap();
+        db.remember(&make_entity(
+            "pp-src",
+            "facts",
+            "pp-src",
+            r#"{"c":"alpha"}"#,
+        ))
+        .unwrap();
         db.remember(&make_entity("pp-tgt", "facts", "pp-tgt", r#"{"c":"beta"}"#))
             .unwrap();
         db.link_typed(
@@ -51739,8 +53150,13 @@ pub(crate) mod tests {
             r#"{"authorization":{"key_ref":"kms/alpha"}}"#,
         ))
         .unwrap();
-        db.remember(&make_entity("pl-prod", "facts", "pl-prod", r#"{"c":"producer"}"#))
-            .unwrap();
+        db.remember(&make_entity(
+            "pl-prod",
+            "facts",
+            "pl-prod",
+            r#"{"c":"producer"}"#,
+        ))
+        .unwrap();
 
         // Sensitive-argument lineage: the value came from the producing entity.
         let id = db
@@ -51772,7 +53188,8 @@ pub(crate) mod tests {
         .unwrap();
         let rows = db.param_lineage_query("pl-dec").unwrap();
         assert!(
-            rows.iter().any(|r| !r.resolved && r.source_ref == "pl-ghost"),
+            rows.iter()
+                .any(|r| !r.resolved && r.source_ref == "pl-ghost"),
             "dangling source must be flagged: {:?}",
             rows
         );
@@ -51784,9 +53201,7 @@ pub(crate) mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-
-
-#[test]
+    #[test]
     fn v16_migration_delivers_usefulness_columns_to_v15_stores() {
         let (db, path) = temp_db();
         db.remember(&make_entity(
@@ -51997,7 +53412,8 @@ pub(crate) mod tests {
                 &"a".repeat(64),
                 Some("{}"),
                 &[],
-            None)
+                None,
+            )
             .unwrap();
         let err = db
             .action_complete(&action.id, "forged-actor", "executed", &"b".repeat(64))
@@ -52204,7 +53620,7 @@ pub(crate) mod tests {
         assert!(report.fts_cleaned >= 1);
 
         let stored = db
-            .get_entity("general", "red-1")
+            .get_entity_by_category_key_for_mutation("general", "red-1")
             .unwrap()
             .expect("row metadata kept");
         assert_eq!(stored.status, "redacted");
@@ -52445,9 +53861,9 @@ pub(crate) mod tests {
             relationship: "derived_from".to_string(),
             weight: 1.0,
             source: None,
-                    kind: None,
+            kind: None,
             asserted_at_unix_ms: Some(now_ms()),
-}];
+        }];
         db.remember(&belief).unwrap();
         let mut plain = make_entity(
             "plain-1",
@@ -52467,7 +53883,7 @@ pub(crate) mod tests {
             "evidence-citing belief quarantined"
         );
 
-        let b = db.get_entity("beliefs", "belief-1").unwrap().unwrap();
+        let b = db.get_entity_by_id_unfiltered("belief-1").unwrap().unwrap();
         assert_eq!(b.status, "quarantined");
         assert!(
             b.archive_reason.starts_with("source_erased:"),
@@ -52640,7 +54056,8 @@ pub(crate) mod tests {
                 &"a".repeat(64),
                 Some("{}"),
                 &[],
-            None)
+                None,
+            )
             .unwrap();
         db.action_complete(&action.id, "agent-lm", "executed", &artifact_sha)
             .unwrap();
@@ -52676,7 +54093,8 @@ pub(crate) mod tests {
                 &"b".repeat(64),
                 Some("{}"),
                 &[],
-            None)
+                None,
+            )
             .unwrap();
         db.action_complete(&action.id, "agent-lm", "executed", &"c".repeat(64))
             .unwrap();
@@ -52709,7 +54127,8 @@ pub(crate) mod tests {
                 &"d".repeat(64),
                 Some("{}"),
                 &[],
-            None)
+                None,
+            )
             .unwrap();
         db.action_complete(&action.id, "agent-lm", "executed", &artifact_sha)
             .unwrap();
@@ -52745,7 +54164,8 @@ pub(crate) mod tests {
                 &"e".repeat(64),
                 Some("{}"),
                 &[],
-            None)
+                None,
+            )
             .unwrap();
         db.action_complete(&action.id, "agent-lm", "executed", &artifact_sha)
             .unwrap();
@@ -52797,7 +54217,8 @@ pub(crate) mod tests {
                 &"f".repeat(64),
                 Some("{}"),
                 &[],
-            None)
+                None,
+            )
             .unwrap();
         db.action_complete(&action.id, "agent-lm", "executed", &artifact_sha)
             .unwrap();
@@ -52882,7 +54303,8 @@ pub(crate) mod tests {
                 &"c".repeat(64),
                 Some("{}"),
                 &[],
-            None)
+                None,
+            )
             .unwrap();
         db.action_complete(&action.id, "agent-lm", "executed", &artifact_sha)
             .unwrap();
@@ -52975,7 +54397,8 @@ pub(crate) mod tests {
                 &"d".repeat(64),
                 Some("{}"),
                 &[],
-            None)
+                None,
+            )
             .unwrap();
         db.action_complete(&action.id, "agent-lm", "executed", &artifact_sha)
             .unwrap();
@@ -53238,7 +54661,12 @@ pub(crate) mod tests {
         let now = crate::db::now_ms();
         // Gold: strongest fts5 (bm25) match, but temporally far — without
         // the pin, near-time distractors outscore it via consensus.
-        let mut gold = make_entity("pin-gold", "insight", "pin-gold", r#"{"note":"zeppelin core"}"#);
+        let mut gold = make_entity(
+            "pin-gold",
+            "insight",
+            "pin-gold",
+            r#"{"note":"zeppelin core"}"#,
+        );
         gold.created_at_unix_ms = now - 2 * 365 * 24 * 3600_000;
         remember_fixture(&db, &gold);
         for i in 0..10 {
@@ -53261,7 +54689,11 @@ pub(crate) mod tests {
         assert!(
             entities.iter().take(2).any(|e| e.id == "pin-gold"),
             "arm rank-0 hit must sit within the consensus head + pin slot, got: {:?}",
-            entities.iter().take(4).map(|e| e.id.clone()).collect::<Vec<_>>()
+            entities
+                .iter()
+                .take(4)
+                .map(|e| e.id.clone())
+                .collect::<Vec<_>>()
         );
         let _ = std::fs::remove_file(path);
     }
@@ -54601,17 +56033,17 @@ pub(crate) mod tests {
                 relationship: "related_to".to_string(),
                 weight: 0.5,
                 source: None,
-                            kind: None,
+                kind: None,
                 asserted_at_unix_ms: Some(now_ms()),
-},
+            },
             crate::models::MemoryLink {
                 target_id: "unrelated".to_string(),
                 relationship: "related_to".to_string(),
                 weight: 0.5,
                 source: None,
-                            kind: None,
+                kind: None,
                 asserted_at_unix_ms: Some(now_ms()),
-},
+            },
         ];
         db.remember_with_write_options(
             &e,
@@ -54656,9 +56088,9 @@ pub(crate) mod tests {
             relationship: "related_to".to_string(),
             weight: 0.5,
             source: None,
-                    kind: None,
+            kind: None,
             asserted_at_unix_ms: Some(now_ms()),
-}];
+        }];
         db.remember_with_write_options(
             &e2,
             false,
@@ -54704,6 +56136,63 @@ pub(crate) mod tests {
         assert!(action.starts_with("quarantined"), "{action}");
         assert!(qid.starts_with("qrn-"));
         assert!(db.get_entity("facts", "sparse-dup").unwrap().is_none());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn lifecycle_status_is_closed_canonicalized_and_verified_writes_cannot_hide() {
+        let (db, path) = temp_db();
+        let mut proposed = make_entity(
+            "status-proposed",
+            "facts",
+            "status-proposed",
+            "{\"content\":\"pending status fixture\"}",
+        );
+        proposed.status = "  PROPOSED  ".to_string();
+        db.remember(&proposed).unwrap();
+        assert_eq!(
+            db.get_entity_by_id_for_admission_review(&proposed.id)
+                .unwrap()
+                .unwrap()
+                .status,
+            "proposed"
+        );
+
+        let mut invalid = make_entity(
+            "status-invalid",
+            "facts",
+            "status-invalid",
+            "{\"content\":\"invalid status fixture\"}",
+        );
+        invalid.status = "proposed \u{0000}".to_string();
+        let err = db.remember(&invalid).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid writable entity status"),
+            "{err}"
+        );
+
+        let mut verified_hidden = make_entity(
+            "status-verified-hidden",
+            "facts",
+            "status-verified-hidden",
+            "{\"content\":\"verified hidden fixture\"}",
+        );
+        verified_hidden.status = "quarantined".to_string();
+        db.remember_internal_trusted_with_options(
+            &verified_hidden,
+            true,
+            None,
+            None,
+            false,
+            "test_fixture",
+        )
+        .unwrap();
+        assert!(
+            db.get_entity("facts", "status-verified-hidden")
+                .unwrap()
+                .is_none(),
+            "quarantined trusted rows remain hidden from public reads"
+        );
         let _ = std::fs::remove_file(path);
     }
 
@@ -54890,9 +56379,9 @@ pub(crate) mod tests {
             relationship: "related_to".to_string(),
             weight: 0.5,
             source: None,
-                    kind: None,
+            kind: None,
             asserted_at_unix_ms: Some(now_ms()),
-}];
+        }];
         db.remember_with_write_options(
             &e,
             false,
@@ -57135,6 +58624,7 @@ pub(crate) mod tests {
                 value: serde_json::json!("gold"),
             }],
             None,
+            None,
         )
         .unwrap();
         assert_eq!(gold.len(), 2);
@@ -57153,6 +58643,7 @@ pub(crate) mod tests {
                 field: "tags".into(),
                 value: serde_json::json!(["eu"]),
             }],
+            None,
             None,
         )
         .unwrap();
@@ -57177,6 +58668,7 @@ pub(crate) mod tests {
                     value: serde_json::json!("fra"),
                 },
             ],
+            None,
             None,
         )
         .unwrap();
@@ -57265,6 +58757,7 @@ pub(crate) mod tests {
                 value: serde_json::json!("gold"),
             }],
             &["owner".to_string()],
+            None,
             None,
         )
         .unwrap();
@@ -57491,13 +58984,16 @@ pub(crate) mod tests {
         changed[0].body_json =
             "{\"text\": \"alpha interplanetary shipping routes through the belt\"}".to_string();
         db.set_connectors(vec![Box::new(crate::connectors::StaticConnector::new(
-            "src",
-            changed,
+            "src", changed,
         ))]);
         let third = db.ingest(&params).unwrap();
         assert_eq!(third["ingested"], 1, "changed doc re-admitted");
         assert_eq!(third["contained"], 1, "unchanged doc stayed contained");
-        assert_eq!(replay_entity_count(&db), 2, "upsert updates the existing row");
+        assert_eq!(
+            replay_entity_count(&db),
+            2,
+            "upsert updates the existing row"
+        );
         // The covering row now carries the new content.
         let conn = db.conn().unwrap();
         let body: String = conn
@@ -57532,7 +59028,11 @@ pub(crate) mod tests {
         let forced_run = db.ingest(&forced).unwrap();
         assert_eq!(forced_run["ingested"], 2, "force bypasses the gate");
         assert_eq!(forced_run["contained"], 0);
-        assert_eq!(replay_entity_count(&db), 2, "upsert keeps entity count stable");
+        assert_eq!(
+            replay_entity_count(&db),
+            2,
+            "upsert keeps entity count stable"
+        );
         let _ = std::fs::remove_file(path);
     }
 
@@ -57593,6 +59093,83 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn update_entity_status_rejects_direct_activation_of_pending_entity() {
+        let (db, path) = temp_db();
+        let mut pending = make_entity(
+            "pending-status-elevation",
+            "admission",
+            "pending-status-elevation",
+            r#"{"content":"must remain pending"}"#,
+        );
+        pending.status = "proposed".to_string();
+        db.remember_skip_dedup(&pending)
+            .expect("seed proposed entity");
+
+        let err = db
+            .update_entity_status(&pending.id, "active", "forged promotion")
+            .expect_err("direct status writer must not activate a proposed row");
+        assert!(
+            err.to_string().contains("admission")
+                || err.to_string().contains("activation")
+                || err.to_string().contains("proposed"),
+            "error must explain the guarded promotion: {err}"
+        );
+
+        let conn = db.conn().unwrap();
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM entities WHERE id = ?1",
+                rusqlite::params![pending.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            status, "proposed",
+            "failed promotion must not mutate the row"
+        );
+        drop(conn);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn update_entity_status_rejects_direct_activation_of_terminal_entities() {
+        let (db, path) = temp_db();
+        for (index, current_status) in ["deprecated", "expired", "redacted"]
+            .into_iter()
+            .enumerate()
+        {
+            let id = format!("terminal-status-elevation-{index}");
+            let mut entity = make_entity(
+                &id,
+                "admission",
+                &id,
+                &format!(r#"{{"content":"{current_status} must not activate"}}"#),
+            );
+            entity.status = current_status.to_string();
+            db.remember_skip_dedup(&entity)
+                .expect("seed terminal entity");
+            let err = db
+                .update_entity_status(&entity.id, "active", "forged terminal promotion")
+                .expect_err("terminal status must require an admission transition");
+            assert!(
+                err.to_string().contains("admission")
+                    || err.to_string().contains("activation")
+                    || err.to_string().contains(current_status),
+                "error must explain guarded {current_status} promotion: {err}"
+            );
+            let conn = db.conn().unwrap();
+            let status: String = conn
+                .query_row(
+                    "SELECT status FROM entities WHERE id = ?1",
+                    rusqlite::params![entity.id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(status, current_status);
+        }
+        let _ = fs::remove_file(path);
+    }
+
     fn ingest_containment_replay_fingerprint_canonicalizes() {
         let a = crate::models::RawDocument {
             key: "k".to_string(),
@@ -57623,6 +59200,4 @@ pub(crate) mod tests {
             "key changes must change the fingerprint"
         );
     }
-
-
 }

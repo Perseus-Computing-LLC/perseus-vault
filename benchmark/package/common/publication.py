@@ -113,6 +113,10 @@ def _safe_evidence(raw: Any) -> dict[str, Any]:
         "frozen_digest", "intent_hash", "outcome_hash", "temporal_digest",
         "empty_status", "pending_status", "proposed_outcome", "untrusted_outcome",
         "evidence_mode", "digest", "evidence_hash",
+        "save_outcome_class", "drop_outcome_class", "block_outcome_class",
+        "pending_outcome_class", "proposed_outcome_class",
+        "save_serveable", "drop_no_raw_content", "block_no_raw_content",
+        "pending_not_serveable", "proposed_not_serveable",
     }
     result: dict[str, Any] = {}
     forbidden = ("private", "query", "token", "credential", "password", "secret", "prompt", "body")
@@ -137,6 +141,10 @@ def _safe_evidence(raw: Any) -> dict[str, Any]:
         elif isinstance(value, str) and lowered in {"digest", "evidence_hash", "frozen_digest", "intent_hash", "outcome_hash", "temporal_digest"}:
             if not re.fullmatch(r"[0-9a-f]{64}", value):
                 raise ValueError(f"evidence field {key} must be a lowercase SHA-256 digest")
+            result[str(key)] = value
+        elif isinstance(value, str) and lowered.endswith("_outcome_class"):
+            if value not in {"save", "drop", "block", "pending_approval"}:
+                raise ValueError(f"evidence field {key} has an invalid admission outcome class")
             result[str(key)] = value
         elif isinstance(value, str) and lowered in {"status", "reason", "category", "capability", "mode", "scope", "failure_class", "empty_status", "pending_status", "proposed_outcome", "untrusted_outcome", "evidence_mode"}:
             label = public_label(value, "redacted_label", field=lowered if lowered in {"status", "mode"} else "reason")

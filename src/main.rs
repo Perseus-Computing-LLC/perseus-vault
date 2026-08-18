@@ -1,12 +1,12 @@
-mod beliefs;
 mod anchor_expansion;
+mod beliefs;
 mod capture;
 mod claim_card;
-mod context_transform;
-mod conflict_flags;
 mod communities;
 mod config_report;
+mod conflict_flags;
 mod connectors;
+mod context_transform;
 mod court_audit;
 mod db;
 mod declared;
@@ -31,53 +31,53 @@ mod drift_check;
     target_env = "gnu"
 ))]
 mod glibc_compat;
-mod grounding;
 mod graph_route;
+mod grounding;
 mod grpc;
 mod guide;
 mod httplimit;
+mod injection_lint;
 mod inspect;
 mod instruction_extraction;
 mod interference;
 #[cfg(test)]
 mod leak_harness;
-mod injection_lint;
 mod log_digest;
-mod mcp;
 mod maintenance;
+mod mcp;
 mod memory_types;
-mod multihop;
 mod mental_model;
 mod models;
+mod multihop;
 mod multimodal;
 mod observations;
 mod op_runs;
 mod preload;
 mod projection;
-mod rollback_repair;
 mod retrieval_skills;
-mod state_auditor;
-mod temporal_decay;
 mod retrieval_telemetry;
 #[cfg(test)]
 mod revocation_cutoff;
+mod rollback_repair;
 mod schema;
 mod segments;
 mod signed_profile;
 mod signed_transition;
 mod sleep;
 pub(crate) mod stage_trace;
+mod state_auditor;
+mod temporal_decay;
 mod tools;
 mod transport;
-mod type_budgets;
+mod trust_admission;
 #[cfg(feature = "tui")]
 mod tui;
-mod trust_admission;
+mod type_budgets;
 mod util;
+mod utility_promotion;
 mod validity;
 mod vector_quant;
 mod verify;
-mod utility_promotion;
 mod web;
 mod web_gap_fill;
 mod write_gate;
@@ -968,9 +968,7 @@ impl Commands {
             Commands::ObsidianSync { .. }
             | Commands::Migrate { .. }
             | Commands::Keygen { .. }
-            | Commands::VerifyTransition { .. } => {
-                None
-            }
+            | Commands::VerifyTransition { .. } => None,
         }
     }
 }
@@ -1361,9 +1359,18 @@ fn eval_record_command(
             }
         }
     }
-    let checks_total = report.get("checks_total").and_then(|v| v.as_i64()).unwrap_or(0);
-    let checks_passed = report.get("checks_passed").and_then(|v| v.as_i64()).unwrap_or(0);
-    let accuracy = report.get("accuracy").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let checks_total = report
+        .get("checks_total")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let checks_passed = report
+        .get("checks_passed")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let accuracy = report
+        .get("accuracy")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
     let manifest_digest = report
         .get("control_profile_sha256")
         .and_then(|v| v.as_str())
@@ -2819,7 +2826,10 @@ fn run() {
     let mut cli = Cli::parse();
     apply_top_level_db(&mut cli); // #313: `perseus-vault --db PATH serve` must honor --db
     match cli.command {
-        Some(Commands::VerifyTransition { json, epoch_key_b64 }) => {
+        Some(Commands::VerifyTransition {
+            json,
+            epoch_key_b64,
+        }) => {
             // #1080: portable verifier — no database access. Verification
             // failure exits non-zero and names the failing check.
             let record: crate::signed_transition::SignedTransition =
@@ -3121,7 +3131,10 @@ fn run() {
                 }
             }
         }
-        Some(Commands::VerifyAuditChain { db: ref db_path, encryption_key }) => {
+        Some(Commands::VerifyAuditChain {
+            db: ref db_path,
+            encryption_key,
+        }) => {
             let mut database = open_db_or_exit(db_path);
             // A keyed (HMAC-SHA256) chain can only be verified with the key
             // loaded (docs/audit-chain-keyed-mac-design.md §3.5). Load it via
@@ -3155,7 +3168,10 @@ fn run() {
             ) {
                 Ok(c) => c,
                 Err(e) => {
-                    eprintln!("perseus-vault: failed to open database read-only at {}: {}", db_path, e);
+                    eprintln!(
+                        "perseus-vault: failed to open database read-only at {}: {}",
+                        db_path, e
+                    );
                     std::process::exit(1);
                 }
             };
@@ -3486,18 +3502,19 @@ fn run() {
                         }
                     }
                 }
-                "history" | _ => match database.eval_run_history(kind.as_deref(), limit, regressed_only)
-                {
-                    Ok(runs) => {
-                        // Trend over the returned runs (bounded by `limit`).
-                        let trend = crate::db::eval_trend(&runs);
-                        serde_json::json!({"count": runs.len(), "runs": runs, "trend": trend})
+                "history" | _ => {
+                    match database.eval_run_history(kind.as_deref(), limit, regressed_only) {
+                        Ok(runs) => {
+                            // Trend over the returned runs (bounded by `limit`).
+                            let trend = crate::db::eval_trend(&runs);
+                            serde_json::json!({"count": runs.len(), "runs": runs, "trend": trend})
+                        }
+                        Err(e) => {
+                            eprintln!("perseus-vault: eval history failed: {e}");
+                            std::process::exit(1);
+                        }
                     }
-                    Err(e) => {
-                        eprintln!("perseus-vault: eval history failed: {e}");
-                        std::process::exit(1);
-                    }
-                },
+                }
             };
             print_json(&out);
         }
@@ -3737,7 +3754,9 @@ fn run() {
             // must carry an admission envelope to activate. This is what
             // keeps operator seeding/scripting workflows (and the Noisegate
             // golden fixture) producing active memory.
-            match database.remember_verified_with_options(&entity, false, None, None, false) {
+            match database.remember_internal_trusted_with_options(
+                &entity, false, None, None, false, "cli_seed",
+            ) {
                 Ok((id, action)) => {
                     print_json(&serde_json::json!({ "ok": true, "id": id, "action": action }));
                 }
@@ -4991,7 +5010,11 @@ mod tests {
             "48",
         ]);
         match cli.command {
-            Some(Commands::Eval { action, since_hours, .. }) => {
+            Some(Commands::Eval {
+                action,
+                since_hours,
+                ..
+            }) => {
                 assert_eq!(action, "alerts");
                 assert_eq!(since_hours, Some(48));
             }
@@ -5041,10 +5064,7 @@ mod tests {
         // fallback, locking upgraded vaults out of their own key. Restored
         // #427 precedence: whichever key file exists is the one resolved, so an
         // existing encrypted install never loses its key.
-        let dir = std::env::temp_dir().join(format!(
-            "perseus-keypath-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let dir = std::env::temp_dir().join(format!("perseus-keypath-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(dir.join(".mimir")).unwrap();
         std::fs::create_dir_all(dir.join(".perseus-vault")).unwrap();
         let legacy = dir.join(".mimir").join("secret.key");

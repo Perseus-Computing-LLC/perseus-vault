@@ -33,8 +33,9 @@ const CALL_DEADLINE: Duration = Duration::from_secs(240);
 
 fn tmp_dir(tag: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!(
-        "vault-live-update-{tag}-{}",
-        std::process::id()
+        "vault-live-update-{tag}-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
     ));
     std::fs::create_dir_all(&dir).unwrap();
     dir

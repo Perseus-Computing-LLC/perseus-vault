@@ -56,6 +56,21 @@ class QualityHarnessTests(unittest.TestCase):
             len(manifest["cases"]),
         )
 
+    def test_manifest_has_one_metric_for_each_admission_outcome_class(self):
+        manifest = load_manifest(Path(__file__).with_name("manifest.json"))
+        admission = [case for case in manifest["cases"] if case["category"] == "admission"]
+        self.assertTrue({
+            "admission.save",
+            "admission.drop",
+            "admission.block",
+            "admission.pending_approval",
+        }.issubset({case["metric"] for case in admission}))
+        self.assertTrue({
+            "admission-save-positive-control",
+            "admission-drop-no-raw-content",
+            "admission-block-no-raw-content",
+        }.issubset({case["id"] for case in admission}))
+
     def test_load_manifest_normalizes_legacy_v1_four_case_shape(self):
         legacy = {
             "name": "perseus-vault-memory-quality-v1",
@@ -177,6 +192,32 @@ class QualityHarnessTests(unittest.TestCase):
         ]
         rates = build_metric_rates(cases, {})
         self.assertEqual(rates["stale_recall_rate"], {"rate": 0.0, "status": "available"})
+
+    def test_metric_rates_expose_admission_outcome_classes(self):
+        cases = [
+            {
+                "category": "admission",
+                "metric": {"name": name, "numerator": 1, "denominator": 1},
+                "status": "passed",
+            }
+            for name in (
+                "admission.save",
+                "admission.drop",
+                "admission.block",
+                "admission.pending_approval",
+            )
+        ]
+        metrics = compute_metrics(cases)
+        metrics["admission"] = {"status": "available", "numerator": 4, "denominator": 4, "rate": 1.0}
+        rates = build_metric_rates(cases, metrics)
+        self.assertEqual(rates["admission"], {"rate": 1.0, "status": "available"})
+        for name in (
+            "admission.save",
+            "admission.drop",
+            "admission.block",
+            "admission.pending_approval",
+        ):
+            self.assertEqual(rates[name], {"rate": 1.0, "status": "available"})
 
     def test_mcp_read_has_a_wall_clock_timeout(self):
         client = object.__new__(VaultClient)

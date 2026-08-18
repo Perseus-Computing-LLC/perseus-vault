@@ -298,12 +298,7 @@ pub fn parse_idle_timeout(raw: Option<&str>) -> Option<std::time::Duration> {
 /// Parse one raw JSON-RPC line, dispatch it, and write the response (if any)
 /// to stdout. Shared by the read loop and the #1045 pending-request path so a
 /// forwarded in-flight request gets exactly the same treatment as a live one.
-fn process_request_line(
-    line: &str,
-    state: &MCPState,
-    db: &Database,
-    stdout: &mut std::io::Stdout,
-) {
+fn process_request_line(line: &str, state: &MCPState, db: &Database, stdout: &mut std::io::Stdout) {
     let request: JsonRpcRequest = match serde_json::from_str(line) {
         Ok(r) => r,
         Err(e) => {
@@ -513,9 +508,7 @@ pub fn run_server(db: std::sync::Arc<Database>) {
         // replacement image answers it). Hoisted out of the response write so
         // a suppressed response still hands off.
         if crate::live_update::handoff_pending() {
-            let initialized = state
-                .initialized
-                .load(std::sync::atomic::Ordering::Relaxed);
+            let initialized = state.initialized.load(std::sync::atomic::Ordering::Relaxed);
             let agent = state
                 .session_agent_id
                 .read()
@@ -554,6 +547,16 @@ pub fn handle_request(
 
     match req.method.as_str() {
         "initialize" => {
+            if state
+                .initialized
+                .swap(true, std::sync::atomic::Ordering::AcqRel)
+            {
+                return Some(error_response(
+                    id,
+                    -32002,
+                    "Already initialized; session identity cannot be replaced",
+                ));
+            }
             let response = JsonRpcResponse {
                 jsonrpc: "2.0".to_string(),
                 id,
@@ -596,9 +599,6 @@ pub fn handle_request(
                     *slot = sanitized;
                 }
             }
-            state
-                .initialized
-                .store(true, std::sync::atomic::Ordering::Relaxed);
             Some(response)
         }
 
@@ -659,8 +659,14 @@ pub fn handle_request(
             // vanish, making the session look dead even though the swap
             // succeeded.
             if tool_name == "perseus_vault_handoff_restart" {
-                let confirm = tool_args.get("confirm").and_then(Value::as_bool).unwrap_or(false);
-                let dry_run = tool_args.get("dry_run").and_then(Value::as_bool).unwrap_or(false);
+                let confirm = tool_args
+                    .get("confirm")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let dry_run = tool_args
+                    .get("dry_run")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
                 if confirm && !dry_run && crate::live_update::running_stale() {
                     let report_text =
                         match crate::live_update::handle_handoff_restart(tool_args.clone()) {
@@ -704,10 +710,45 @@ pub fn handle_request(
             // (model-forged or empty) is overwritten, never trusted, so no
             // model can claim another agent's identity.
             if let Ok(sid) = state.session_agent_id.read() {
-                if !sid.is_empty() {
-                    if let Some(obj) = tool_args.as_object_mut() {
+                if let Some(obj) = tool_args.as_object_mut() {
+                    if sid.trim().is_empty() {
+                        // No transport identity: caller-supplied requester fields
+                        // are untrusted and must not survive into a public read.
+                        obj.remove("requesting_agent_id");
+                    } else {
                         obj.insert("requesting_agent_id".to_string(), json!(*sid));
                     }
+                }
+            }
+
+            // Admission provenance and review decisions cannot fall back to a
+            // caller-supplied requesting_agent_id. These operations require the
+            // identity captured from MCP initialize.clientInfo.name; otherwise
+            // an uninitialized caller could choose the reviewer/source agent.
+            let admission_source_call = tool_name == "perseus_vault_journal"
+                && tool_args.get("event_type").and_then(Value::as_str) == Some("admission_source");
+            let admission_review_call = tool_name == "perseus_vault_admission_decide";
+            let admission_write_call =
+                tool_name == "perseus_vault_remember" && tool_args.get("admission").is_some();
+            if admission_source_call || admission_review_call || admission_write_call {
+                let captured_session = state
+                    .session_agent_id
+                    .read()
+                    .map(|sid| !sid.trim().is_empty())
+                    .unwrap_or(false);
+                if !captured_session {
+                    return Some(JsonRpcResponse {
+                        jsonrpc: "2.0".to_string(),
+                        id,
+                        result: Some(json!({
+                            "content": [{
+                                "type": "text",
+                                "text": "admission tools require an initialized MCP session with clientInfo.name"
+                            }],
+                            "isError": true
+                        })),
+                        error: None,
+                    });
                 }
             }
 
@@ -722,6 +763,7 @@ pub fn handle_request(
             {
                 const SCOPE_MUTATION_TOOLS: &[&str] = &[
                     "perseus_vault_remember",
+                    "perseus_vault_journal",
                     "perseus_vault_reject_value",
                     "perseus_vault_forget",
                     "perseus_vault_link",
@@ -737,6 +779,7 @@ pub fn handle_request(
                     "perseus_vault_correct",
                     "perseus_vault_follow",
                     "perseus_vault_write_quarantine",
+                    "perseus_vault_admission_decide",
                     "perseus_vault_web_gap_fill",
                 ];
                 const SCOPE_READ_TOOLS: &[&str] = &[
@@ -857,8 +900,9 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
         },
         "status": {
           "type": "string",
+          "enum": ["active", "draft", "deprecated", "expired", "proposed", "quarantined", "redacted"],
           "default": "active",
-          "description": "Entity status: 'active', 'draft', 'deprecated'"
+          "description": "Closed lifecycle status vocabulary; proposed/quarantined are never publicly serveable"
         },
         "type": {
           "type": "string",
@@ -899,7 +943,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
         },
         "admission": {
           "type": "object",
-          "description": "Hash-only admission envelope. Authoritative admission requires a validated source_event_id and matching workspace; missing or unverified evidence is stored as proposed/requires_review.",
+          "description": "Hash-only admission envelope. The server emits one stable outcome_class: save, drop, block, or pending_approval. Authoritative admission requires a validated source_event_id and matching workspace; missing or unverified evidence is retained as proposed/requires_review and is not serveable. DROP/BLOCK decisions return hash-only evidence without persisting the candidate.",
           "properties": {
             "record_digest": {"type": "string"},
             "source_identity": {"type": "string"},
@@ -1061,6 +1105,19 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
         "provenance": {
           "type": "object",
           "description": "Hash-only admission/provenance state; raw prompts, bodies, credentials, and tool arguments are excluded."
+        },
+        "outcome_class": {
+          "type": "string",
+          "enum": ["save", "drop", "block", "pending_approval"],
+          "description": "Stable four-way admission result. SAVE is durably active; DROP and BLOCK are non-persisting terminal decisions; PENDING_APPROVAL is retained but non-serveable until review."
+        },
+        "disposition": {
+          "type": "string",
+          "description": "Existing detailed disposition, such as quarantined; use outcome_class for stable aggregation."
+        },
+        "admission": {
+          "type": "object",
+          "description": "Hash-covered, content-minimized admission evidence."
         }
       }
     },
@@ -1263,6 +1320,10 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
         "workspace_hash": {
           "type": "string",
           "description": "Workspace scope filter (v1.2.0). When set, only entities with a matching workspace_hash are returned. Omit for no workspace filtering."
+        },
+        "requesting_agent_id": {
+          "type": "string",
+          "description": "Transport-stamped requester identity used for private/fleet visibility enforcement."
         },
         "scope_weight": {
           "type": "number",
@@ -1591,6 +1652,10 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
               "query"
             ]
           }
+        },
+        "requesting_agent_id": {
+          "type": "string",
+          "description": "Transport-stamped requester identity applied to every nested query and fused result."
         }
       },
       "required": [
@@ -1633,6 +1698,10 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
           "type": "integer",
           "default": 10,
           "description": "Maximum number of results to return (max 1000)."
+        },
+        "requesting_agent_id": {
+          "type": "string",
+          "description": "Transport-stamped requester identity used for visibility enforcement."
         }
       },
       "required": ["layer"]
@@ -1672,7 +1741,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
         "include_archived": {
           "type": "boolean",
           "default": false,
-          "description": "Include archived (soft-deleted) entities in the scan."
+          "description": "Compatibility flag retained for callers that request historical rows; public scans never return archived or terminal bodies. Use dedicated terminal-audit surfaces for hash-only audit markers."
         },
         "cursor": {
           "type": "string",
@@ -1873,7 +1942,11 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
         },
         "agent_id": {
           "type": "string",
-          "description": "Caller identity for visibility enforcement (private/fleet entities require the author's agent_id → else revoked_access)"
+          "description": "Legacy caller field; public authorization uses the transport-stamped requesting_agent_id."
+        },
+        "requesting_agent_id": {
+          "type": "string",
+          "description": "Transport-stamped requester identity; required at runtime and never trusted from model input."
         },
         "include_evidence": {
           "type": "boolean",
@@ -1919,6 +1992,10 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
         "agent_id": {
           "type": "string",
           "description": "Agent identity filter. When set, only entities with a matching agent_id are returned."
+        },
+        "requesting_agent_id": {
+          "type": "string",
+          "description": "Transport-stamped requester identity used for private/fleet visibility enforcement."
         }
       },
       "required": [
@@ -2971,7 +3048,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
   },
   {
     "name": "perseus_vault_journal",
-    "description": "Append a structured decision/observation log entry. Uses evaluated/acted/forward pattern: what was considered, what was done, and what happens next. Essential for audit trails and timeline reconstruction.",
+    "description": "Append a structured decision/observation log entry. Uses evaluated/acted/forward pattern: what was considered, what was done, and what happens next. Essential for audit trails and timeline reconstruction. Public admission_source events additionally require an initialized clientInfo.name and an enforce-mode memory.admission.source authority for the exact workspace; caller-supplied identities are never authoritative.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -3013,9 +3090,86 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
           "type": "string",
           "default": "",
           "description": "Explicit workspace attribution for the journal event; empty string denotes the global partition."
+        },
+        "requesting_agent_id": {
+          "type": "string",
+          "description": "Transport-stamped caller identity; required for admission_source events."
+        },
+        "source_attestation": {
+          "type": "string",
+          "minLength": 64,
+          "maxLength": 64,
+          "pattern": "^[0-9a-fA-F]{64}$",
+          "description": "HMAC-SHA256 attestation over the canonical admission-source fields; required for public admission_source events and never stored."
         }
       },
-      "required": []
+      "required": [],
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "event_type": {
+                "const": "admission_source"
+              }
+            },
+            "required": ["event_type"]
+          },
+          "then": {
+            "required": [
+              "evaluated",
+              "workspace_hash",
+              "requesting_agent_id",
+              "source_attestation"
+            ],
+            "properties": {
+              "evaluated": {
+                "type": "object",
+                "required": [
+                  "record_digest",
+                  "source_identity",
+                  "workspace_hash",
+                  "actor_kind",
+                  "actor_identity"
+                ],
+                "properties": {
+                  "record_digest": {
+                    "type": "string",
+                    "pattern": "^[0-9a-fA-F]{64}$"
+                  },
+                  "source_identity": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "workspace_hash": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "actor_kind": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "actor_identity": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                }
+              },
+              "workspace_hash": {
+                "minLength": 1
+              },
+              "requesting_agent_id": {
+                "minLength": 1
+              },
+              "source_attestation": {
+                "type": "string",
+                "minLength": 64,
+                "maxLength": 64,
+                "pattern": "^[0-9a-fA-F]{64}$"
+              }
+            }
+          }
+        }
+      ]
     },
     "outputSchema": {
       "type": "object",
@@ -4439,6 +4593,10 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
           "type": "integer",
           "default": 100,
           "description": "Maximum total nodes to traverse before stopping"
+        },
+        "requesting_agent_id": {
+          "type": "string",
+          "description": "Transport-stamped requester identity; required at runtime for body-safe traversal."
         }
       },
       "required": [
@@ -4816,6 +4974,44 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
         "items": {"type": "array", "items": {"type": "object"}},
         "released": {"type": "boolean"},
         "deleted": {"type": "boolean"}
+      }
+    }
+  },
+  {
+    "name": "perseus_vault_admission_decide",
+    "description": "#1107: resolve a proposed trust-admission candidate through an explicit operator decision. approve re-signs the pending evidence as SAVE and activates the existing row through the verified writer; reject requires rejection_class=drop or block, re-signs the evidence as that terminal class, archives the row, and never serves it. Both transitions are hash-only in the response, record an admission_review_started intent before mutation, and append a completed admission_approved/admission_rejected receipt only after durable transition. Public calls require an initialized clientInfo.name and an enforce-mode memory.admission.review authority for the exact workspace.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "category": {"type": "string", "minLength": 1, "description": "Candidate entity category"},
+        "key": {"type": "string", "minLength": 1, "description": "Candidate entity key"},
+        "workspace_hash": {"type": "string", "minLength": 1, "description": "Exact non-empty workspace scope of the candidate"},
+        "requesting_agent_id": {"type": "string", "minLength": 1, "description": "Operator/reviewer identity stamped into the audit event"},
+        "decision": {"type": "string", "enum": ["approve", "reject"]},
+        "rejection_class": {"type": "string", "enum": ["drop", "block"], "description": "Required when decision=reject"},
+        "reason": {"type": "string", "minLength": 1, "description": "Bounded non-empty review reason; the response stores only its SHA-256"}
+      },
+      "required": ["category", "key", "workspace_hash", "requesting_agent_id", "decision", "reason"],
+      "allOf": [
+        {
+          "if": {"properties": {"decision": {"const": "reject"}}},
+          "then": {"required": ["rejection_class"]}
+        }
+      ]
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "ok": {"type": "boolean"},
+        "id": {"type": "string"},
+        "category": {"type": "string"},
+        "key": {"type": "string"},
+        "decision": {"type": "string", "enum": ["approve", "reject"]},
+        "outcome_class": {"type": "string", "enum": ["save", "drop", "block"]},
+        "status": {"type": "string"},
+        "serveable": {"type": "boolean"},
+        "audit_event_id": {"type": "string"},
+        "reason_sha256": {"type": "string"}
       }
     }
   },
@@ -5353,7 +5549,11 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
         },
         "limit": {"type": "integer", "default": 10},
         "offset": {"type": "integer", "default": 0},
-        "workspace_hash": {"type": "string", "default": ""}
+        "workspace_hash": {"type": "string", "default": ""},
+        "requesting_agent_id": {
+          "type": "string",
+          "description": "Transport-stamped requester identity used for item and facet visibility enforcement."
+        }
       },
       "required": ["category"]
     },
@@ -6060,6 +6260,10 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
           "type": "string",
           "default": "~/.perseus-vault/vault",
           "description": "Directory path to write .md files. Created if it doesn't exist. Use ~ for home directory."
+        },
+        "requesting_agent_id": {
+          "type": "string",
+          "description": "Transport-stamped requester identity used for visibility enforcement."
         }
       },
       "required": []
@@ -6103,10 +6307,22 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "inputSchema": {
       "type": "object",
       "properties": {
-        "output_path": {"type": "string", "description": "Markdown file path to write."},
-        "workspace_hash": {"type": "string", "description": "Optional exact workspace scope."}
+        "output_path": {
+          "type": "string",
+          "description": "Markdown file path to write."
+        },
+        "workspace_hash": {
+          "type": "string",
+          "description": "Optional exact workspace scope."
+        },
+        "requesting_agent_id": {
+          "type": "string",
+          "description": "Transport-stamped requester identity used for visibility enforcement."
+        }
       },
-      "required": ["output_path"]
+      "required": [
+        "output_path"
+      ]
     }
   },
   {
@@ -7994,6 +8210,7 @@ const TOOL_SCOPES: &[(&str, ToolScope)] = &[
     ("perseus_vault_mental_model_review", ToolScope::Ops),
     ("perseus_vault_write_quarantine", ToolScope::Ops),
     ("perseus_vault_admission_quarantine", ToolScope::Ops),
+    ("perseus_vault_admission_decide", ToolScope::Ops),
     ("perseus_vault_writer_handoff", ToolScope::Ops),
     ("perseus_vault_impact_report", ToolScope::Ops),
     ("perseus_vault_finding_record", ToolScope::Ops),
@@ -8005,14 +8222,15 @@ const TOOL_SCOPES: &[(&str, ToolScope)] = &[
     ("perseus_vault_signer_epoch_set", ToolScope::Ops),
     ("perseus_vault_poison_label", ToolScope::Ops),
     ("perseus_vault_transition_audit", ToolScope::Ops),
-        ("perseus_vault_skill_set", ToolScope::Ops),
-        ("perseus_vault_skill_route", ToolScope::Ops),
-        ("perseus_vault_skill_advance", ToolScope::Ops),
-        ("perseus_vault_skill_audit", ToolScope::Ops),
-        ("perseus_vault_decay_audit", ToolScope::Ops),
-        ("perseus_vault_segment_consolidate", ToolScope::Ops),
-        ("perseus_vault_state_audit", ToolScope::Ops),
-    ("perseus_vault_rollback_repair", ToolScope::Ops),    ("perseus_vault_op_run", ToolScope::Ops),
+    ("perseus_vault_skill_set", ToolScope::Ops),
+    ("perseus_vault_skill_route", ToolScope::Ops),
+    ("perseus_vault_skill_advance", ToolScope::Ops),
+    ("perseus_vault_skill_audit", ToolScope::Ops),
+    ("perseus_vault_decay_audit", ToolScope::Ops),
+    ("perseus_vault_segment_consolidate", ToolScope::Ops),
+    ("perseus_vault_state_audit", ToolScope::Ops),
+    ("perseus_vault_rollback_repair", ToolScope::Ops),
+    ("perseus_vault_op_run", ToolScope::Ops),
     ("perseus_vault_op_run_list", ToolScope::Ops),
     ("perseus_vault_op_run_get", ToolScope::Ops),
     ("perseus_vault_op_run_retry", ToolScope::Ops),
@@ -8389,6 +8607,7 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
         "perseus_vault_mental_model_review" => tools::handle_mental_model_review(db, args),
         "perseus_vault_write_quarantine" => tools::handle_write_quarantine(db, args),
         "perseus_vault_admission_quarantine" => tools::handle_admission_quarantine(db, args),
+        "perseus_vault_admission_decide" => tools::handle_admission_decide(db, args),
         "perseus_vault_writer_handoff" => tools::handle_writer_handoff(db, args),
         "perseus_vault_impact_report" => tools::handle_impact_report(db, args),
         "perseus_vault_finding_record" => tools::handle_finding_record(db, args),
@@ -8400,7 +8619,7 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
         "perseus_vault_signer_epoch_set" => tools::handle_signer_epoch_set(db, args),
         "perseus_vault_poison_label" => tools::handle_poison_label(db, args),
         "perseus_vault_transition_audit" => tools::handle_transition_audit(db, args),
-        
+
         "perseus_vault_skill_set" => tools::handle_skill_set(db, args),
         "perseus_vault_skill_route" => tools::handle_skill_route(db, args),
         "perseus_vault_skill_advance" => tools::handle_skill_advance(db, args),
@@ -8411,7 +8630,8 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
         "perseus_vault_segment_consolidate" => tools::handle_segment_consolidate(db, args),
 
         "perseus_vault_state_audit" => tools::handle_state_audit(db, args),
-"perseus_vault_rollback_repair" => tools::handle_rollback_repair(db, args),        "perseus_vault_op_run" => tools::handle_op_run(db, args).map_err(|e| e.to_string()),
+        "perseus_vault_rollback_repair" => tools::handle_rollback_repair(db, args),
+        "perseus_vault_op_run" => tools::handle_op_run(db, args).map_err(|e| e.to_string()),
         "perseus_vault_op_run_list" => {
             tools::handle_op_run_list(db, args).map_err(|e| e.to_string())
         }
@@ -8561,7 +8781,8 @@ mod tests {
         );
         assert_eq!(
             registry_names.len(),
-            169,            "update public metadata when adding a tool"
+            170,
+            "update public metadata when adding a tool"
         );
 
         let canonical = advertised_names();
@@ -9023,11 +9244,7 @@ mod tests {
             crate::context_transform::SUPPORTED_OPENAI_REQUEST_FORMAT,
             crate::context_transform::TransformerDescriptor::new("fixture", "1"),
             vec![crate::context_transform::TransformStage::new(
-                "distill",
-                "1",
-                true,
-                "trusted",
-                None,
+                "distill", "1", true, "trusted", None,
             )],
             "lossy_opt_in",
             input.clone(),
@@ -9050,11 +9267,17 @@ mod tests {
         assert_eq!(value["outcome"], "degraded", "{response}");
         assert_eq!(value["receipt"]["actual_lossiness"], "lossy", "{response}");
         assert_eq!(value["receipt"]["input_digest"].as_str().unwrap().len(), 64);
-        assert!(!response.contains("MCP_RAW_SENTINEL"), "raw transient body leaked: {response}");
-        assert!(!response.contains("\"message\""), "raw provider message leaked: {response}");
-        assert!(advertised_names().contains(
-            &"perseus_vault_context_transform_validate".to_string()
-        ));
+        assert!(
+            !response.contains("MCP_RAW_SENTINEL"),
+            "raw transient body leaked: {response}"
+        );
+        assert!(
+            !response.contains("\"message\""),
+            "raw provider message leaked: {response}"
+        );
+        assert!(
+            advertised_names().contains(&"perseus_vault_context_transform_validate".to_string())
+        );
         let _ = fs::remove_file(db_path);
     }
 
@@ -9800,6 +10023,116 @@ mod tests {
     }
 
     #[test]
+    fn admission_decide_requires_captured_client_identity() {
+        let db_path = std::env::temp_dir().join(format!(
+            "perseus-vault-admission-identity-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let db = Database::open(db_path.to_str().expect("temp db path")).expect("open temp db");
+        let state = MCPState::new();
+        let init = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(0)),
+            method: "initialize".to_string(),
+            params: Some(json!({})),
+        };
+        handle_request(&init, &state, &db).expect("initialize without client identity");
+        let call = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(1)),
+            method: "tools/call".to_string(),
+            params: Some(json!({
+                "name": "perseus_vault_admission_decide",
+                "arguments": {
+                    "category": "decision",
+                    "key": "candidate",
+                    "workspace_hash": "review-ws",
+                    "requesting_agent_id": "forged-reviewer",
+                    "decision": "approve",
+                    "reason": "human approved"
+                }
+            })),
+        };
+        let resp = handle_request(&call, &state, &db).expect("tool response");
+        let result = resp.result.expect("tool result");
+        assert_eq!(result["isError"], json!(true), "{result}");
+        assert!(
+            result["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("clientInfo.name"),
+            "{result}"
+        );
+        let remember = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(2)),
+            method: "tools/call".to_string(),
+            params: Some(json!({
+                "name": "perseus_vault_remember",
+                "arguments": {
+                    "category": "decision",
+                    "key": "candidate",
+                    "workspace_hash": "review-ws",
+                    "requesting_agent_id": "forged-reviewer",
+                    "body_json": "{\"content\":\"candidate\"}",
+                    "admission": {"record_digest": "00"}
+                }
+            })),
+        };
+        let remember_resp = handle_request(&remember, &state, &db).expect("remember response");
+        let remember_result = remember_resp.result.expect("remember tool result");
+        assert_eq!(remember_result["isError"], json!(true), "{remember_result}");
+        assert!(
+            remember_result["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("clientInfo.name"),
+            "{remember_result}"
+        );
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn initialize_cannot_replace_captured_session_identity() {
+        let db_path = std::env::temp_dir().join(format!(
+            "perseus-vault-initialize-replay-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let db = Database::open(db_path.to_str().expect("temp db path")).expect("open temp db");
+        let state = MCPState::new();
+        let first = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(1)),
+            method: "initialize".to_string(),
+            params: Some(json!({"clientInfo": {"name": "first-client"}})),
+        };
+        let first_response =
+            handle_request(&first, &state, &db).expect("first initialize response");
+        assert!(first_response.error.is_none());
+        let second = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(2)),
+            method: "initialize".to_string(),
+            params: Some(json!({"clientInfo": {"name": "forged-replacement"}})),
+        };
+        let second_response =
+            handle_request(&second, &state, &db).expect("replay initialize response");
+        assert!(second_response.result.is_none());
+        assert_eq!(
+            second_response
+                .error
+                .as_ref()
+                .map(|error| error.message.as_str()),
+            Some("Already initialized; session identity cannot be replaced")
+        );
+        assert_eq!(
+            state.session_agent_id.read().unwrap().as_str(),
+            "first-client"
+        );
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
     fn call_boundary_enforces_profile_workspace_bindings() {
         // #879 end-to-end: the transport-captured clientInfo.name is the
         // profile identity; a read_only binding denies mutations and a bound
@@ -9922,9 +10255,17 @@ mod tests {
         let agent = filter_registry_by_view(registry.clone(), ScopeView::Agent);
         let ops = filter_registry_by_view(registry.clone(), ScopeView::Ops);
         let full = filter_registry_by_view(registry.clone(), ScopeView::Full);
-        assert_eq!(agent.len(), 51, "agent view count drifted — new tools must be classified");
-        assert_eq!(ops.len(), 162, "ops view count drifted — new tools must be classified");
-        assert_eq!(full.len(), 169, "full view must expose the whole registry");
+        assert_eq!(
+            agent.len(),
+            51,
+            "agent view count drifted — new tools must be classified"
+        );
+        assert_eq!(
+            ops.len(),
+            163,
+            "ops view count drifted — new tools must be classified"
+        );
+        assert_eq!(full.len(), 170, "full view must expose the whole registry");
         assert!(agent.len() < ops.len() && ops.len() < full.len());
     }
 
@@ -9961,5 +10302,20 @@ mod tests {
             let filtered = filter_registry_by_view(tool_registry_base().clone(), view);
             assert!(filtered.len() >= 48);
         }
+    }
+
+    #[test]
+    fn remember_schema_excludes_history_only_compacted_status() {
+        let remember = tool_registry_base()
+            .iter()
+            .find(|tool| tool["name"] == "perseus_vault_remember")
+            .expect("remember tool must be registered");
+        let statuses = remember["inputSchema"]["properties"]["status"]["enum"]
+            .as_array()
+            .expect("remember status enum");
+        assert!(
+            statuses.iter().all(|status| status != "compacted"),
+            "history-only compacted status must not be advertised as writable"
+        );
     }
 }

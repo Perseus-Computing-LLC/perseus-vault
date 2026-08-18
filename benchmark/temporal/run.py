@@ -35,6 +35,9 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent.parent
+if str(REPO) not in sys.path:
+    sys.path.insert(0, str(REPO))
+from benchmark.admission_fixture import AGENT, WORKSPACE, admitted_remember, configure, child_env
 
 
 def find_binary(explicit):
@@ -64,11 +67,12 @@ class PerseusVault:
 
     def call(self, name, args):
         p = subprocess.Popen([self.binary, "--db", self.db], stdin=subprocess.PIPE,
-                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+                             env=child_env(os.environ))
         w = p.stdin.write
         w(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize",
                       "params": {"protocolVersion": "2025-06-18", "capabilities": {},
-                                 "clientInfo": {"name": "temporal-bench", "version": "1"}}}) + "\n")
+                                 "clientInfo": {"name": AGENT, "version": "1"}}}) + "\n")
         p.stdin.flush()
         p.stdout.readline()
         w(json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n")
@@ -114,6 +118,7 @@ def main():
         except OSError:
             pass
     m = PerseusVault(binary, db)
+    configure(m)
 
     checks = []
 
@@ -125,13 +130,15 @@ def main():
         cat, key = u["category"], u["key"]
         t_before = now_ms() - 60_000  # comfortably before the fact existed
 
-        m.call("perseus_vault_remember", {"category": cat, "key": key,
-                                  "body_json": json.dumps({"note": u["v1"]}), "type": "fact"})
+        admitted_remember(
+            m, cat, key, json.dumps({"note": u["v1"]})
+        )
         time.sleep(gap)
         t_mid = now_ms()             # an instant strictly between the two writes
         time.sleep(gap)
-        m.call("perseus_vault_remember", {"category": cat, "key": key,
-                                  "body_json": json.dumps({"note": u["v2"]}), "type": "fact"})
+        admitted_remember(
+            m, cat, key, json.dumps({"note": u["v2"]})
+        )
         t_now = now_ms() + 60_000    # comfortably after
 
         a_mid = m.call("perseus_vault_as_of", {"category": cat, "key": key, "as_of_unix_ms": t_mid})

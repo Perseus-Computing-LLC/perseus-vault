@@ -1,6 +1,8 @@
 use rusqlite::OptionalExtension;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
 use crate::db::{now_ms, Database};
@@ -811,6 +813,14 @@ pub struct JournalArgs {
     /// may set it (e.g. federated writes) to scope purge redaction precisely.
     #[serde(default)]
     pub workspace_hash: String,
+    /// Transport-stamped caller identity. Required for admission source
+    /// events; ordinary legacy journal entries may omit it.
+    #[serde(default)]
+    pub requesting_agent_id: String,
+    /// Server-keyed attestation over the hash-bound source context. Required
+    /// for public admission source events; never persisted in the journal.
+    #[serde(default)]
+    pub source_attestation: String,
 }
 
 fn default_event_type() -> String {
@@ -940,6 +950,47 @@ fn default_extract_strategy() -> String {
 
 // ─── Tool handlers ──────────────────────────────────────────────
 
+fn canonical_admission_body_digest(body: &str) -> Result<String, String> {
+    let value: Value = serde_json::from_str(body)
+        .map_err(|e| format!("admission body canonicalization failed: {e}"))?;
+    let canonical = serde_json::to_string(&value)
+        .map_err(|e| format!("admission body canonicalization failed: {e}"))?;
+    Ok(crate::trust_admission::digest_text(&canonical))
+}
+
+fn admission_source_binding_hash(
+    record_digest: &str,
+    source_identity: &str,
+    workspace_hash: &str,
+    actor_kind: &str,
+    actor_identity: &str,
+) -> String {
+    hash_only_public_journal_payload(&json!({
+        "record_digest": record_digest,
+        "source_identity": source_identity,
+        "workspace_hash": workspace_hash,
+        "actor_kind": actor_kind,
+        "actor_identity": actor_identity,
+    }))
+}
+
+fn canonical_admission_entity_body(body: &Value) -> Result<String, String> {
+    let mut candidate = body.clone();
+    let map = candidate
+        .as_object_mut()
+        .ok_or("admission entity body must be a JSON object")?;
+    map.remove("admission");
+    map.remove("provenance");
+    serde_json::to_string(&candidate)
+        .map_err(|e| format!("admission entity body canonicalization failed: {e}"))
+}
+
+fn canonical_admission_entity_body_digest(body: &Value) -> Result<String, String> {
+    Ok(crate::trust_admission::digest_text(
+        &canonical_admission_entity_body(body)?,
+    ))
+}
+
 fn authoritative_source_is_bound(
     db: &Database,
     request: &crate::trust_admission::AdmissionRequest,
@@ -947,11 +998,13 @@ fn authoritative_source_is_bound(
     requested_workspace: &str,
     agent_id: &str,
     actor_kind: &str,
+    requesting_agent_id: &str,
 ) -> Result<bool, String> {
-    if crate::trust_admission::digest_text(body) != request.record_digest
+    if canonical_admission_body_digest(body)? != request.record_digest
         || request.workspace_hash != requested_workspace
         || request.actor_identity.as_deref() != Some(agent_id)
         || request.actor_kind.as_deref() != Some(actor_kind)
+        || requesting_agent_id.trim().is_empty()
     {
         return Ok(false);
     }
@@ -961,16 +1014,28 @@ fn authoritative_source_is_bound(
     let conn = db
         .conn()
         .map_err(|e| format!("admission source lookup failed: {e}"))?;
-    let source: Option<(String, String)> = conn
+    let source: Option<(String, String, String, String)> = conn
         .query_row(
-            "SELECT workspace_hash, agent_id FROM journal WHERE id=?1",
+            "SELECT event_type, workspace_hash, agent_id, evaluated_json FROM journal WHERE id=?1",
             rusqlite::params![source_event_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .optional()
         .map_err(|e| format!("admission source lookup failed: {e}"))?;
-    Ok(source
-        .is_some_and(|(workspace, actor)| workspace == request.workspace_hash && actor == agent_id))
+    let Some((event_type, workspace, source_agent, evaluated_json)) = source else {
+        return Ok(false);
+    };
+    Ok(event_type == "admission_source"
+        && workspace == request.workspace_hash
+        && source_agent == requesting_agent_id
+        && evaluated_json
+            == admission_source_binding_hash(
+                &request.record_digest,
+                &request.source_identity,
+                &request.workspace_hash,
+                actor_kind,
+                agent_id,
+            ))
 }
 
 pub fn handle_remember(db: &Database, args: Value) -> Result<String, String> {
@@ -995,6 +1060,16 @@ pub fn handle_remember(db: &Database, args: Value) -> Result<String, String> {
     ) {
         return Err(format!("write denied: {e}"));
     }
+
+    let requested_status = crate::models::canonical_entity_status(&a.status)
+        .filter(|status| status != "compacted")
+        .ok_or_else(|| {
+            format!(
+                "invalid writable status '{}': expected one of {:?}",
+                a.status,
+                crate::models::ENTITY_STATUSES
+            )
+        })?;
 
     // Validate body_json is valid JSON
     if let Err(e) = serde_json::from_str::<serde_json::Value>(&a.body_json) {
@@ -1167,6 +1242,41 @@ pub fn handle_remember(db: &Database, args: Value) -> Result<String, String> {
             }
         }
     }
+    // Canonicalize all caller-supplied content metadata before authoritative
+    // source binding. These fields become part of the activated body and must
+    // therefore be covered by admission.record_digest.
+    let body = if a.origin.is_none() && a.external_refs.is_empty() && a.evidence.is_none() {
+        body
+    } else {
+        let mut obj: Value = serde_json::from_str(&body)
+            .map_err(|e| format!("body metadata canonicalization failed: {e}"))?;
+        let map = obj
+            .as_object_mut()
+            .ok_or("origin, external_refs, and evidence require an object body_json")?;
+        if let Some(ref origin) = a.origin {
+            map.insert(
+                "origin".to_string(),
+                serde_json::to_value(origin)
+                    .map_err(|e| format!("origin serialization failed: {e}"))?,
+            );
+        }
+        if !a.external_refs.is_empty() {
+            map.insert(
+                "external_refs".to_string(),
+                serde_json::to_value(&a.external_refs)
+                    .map_err(|e| format!("external_refs serialization failed: {e}"))?,
+            );
+        }
+        if let Some(ref evidence) = a.evidence {
+            map.insert(
+                "evidence".to_string(),
+                serde_json::to_value(evidence)
+                    .map_err(|e| format!("evidence serialization failed: {e}"))?,
+            );
+        }
+        serde_json::to_string(&obj)
+            .map_err(|e| format!("body metadata canonicalization failed: {e}"))?
+    };
     let is_imported_provenance = serde_json::from_str::<Value>(&body)
         .ok()
         .and_then(|value| {
@@ -1201,6 +1311,7 @@ pub fn handle_remember(db: &Database, args: Value) -> Result<String, String> {
                 &a.workspace_hash,
                 &a.agent_id,
                 &a.actor_kind,
+                &a.requesting_agent_id,
             )? {
                 verified_admission = true;
             } else {
@@ -1210,24 +1321,52 @@ pub fn handle_remember(db: &Database, args: Value) -> Result<String, String> {
             }
         }
         if !a.workspace_hash.is_empty() && request.workspace_hash != a.workspace_hash {
-            return Err(
-                "admission workspace scope does not match the requested workspace".to_string(),
-            );
+            return Ok(json!({
+                "ok": false,
+                "remembered": false,
+                "serveable": false,
+                "disposition": "block",
+                "outcome_class": "block",
+                "admission": decision,
+                "reason": "workspace_scope_mismatch",
+                "note": "workspace scope mismatch blocked persistence; only hash-only admission evidence remains",
+            })
+            .to_string());
         }
+        let outcome_class = decision
+            .outcome_class()
+            .map_err(|e| format!("admission outcome classification failed: {e}"))?;
         if decision
             .reason_codes
             .iter()
             .any(|reason| reason == "workspace_scope_mismatch")
         {
-            return Err(
-                "admission authorization scope does not match the admission workspace".to_string(),
-            );
-        }
-        if matches!(decision.outcome.as_str(), "suppressed" | "abstained") {
             return Ok(json!({
                 "ok": false,
                 "remembered": false,
+                "disposition": outcome_class.to_string(),
+                "outcome_class": outcome_class,
                 "admission": decision,
+                "note": "policy-blocked candidate was not stored; only hash-only admission evidence remains",
+            })
+            .to_string());
+        }
+        if matches!(
+            outcome_class,
+            crate::trust_admission::AdmissionOutcomeClass::Drop
+                | crate::trust_admission::AdmissionOutcomeClass::Block
+        ) {
+            return Ok(json!({
+                "ok": false,
+                "remembered": false,
+                "disposition": outcome_class.to_string(),
+                "outcome_class": outcome_class,
+                "admission": decision,
+                "note": if matches!(outcome_class, crate::trust_admission::AdmissionOutcomeClass::Drop) {
+                    "candidate dropped before persistence; only hash-only admission evidence remains"
+                } else {
+                    "candidate blocked by policy before persistence; only hash-only admission evidence remains"
+                },
             })
             .to_string());
         }
@@ -1248,11 +1387,7 @@ pub fn handle_remember(db: &Database, args: Value) -> Result<String, String> {
             "source_event_id": decision.source_event_id,
         });
         (Some(decision), Some(provenance))
-    } else if !is_imported_provenance
-        && (!a.agent_id.trim().is_empty()
-            || !a.workspace_hash.trim().is_empty()
-            || !a.actor_kind.trim().is_empty())
-    {
+    } else if !is_imported_provenance && !a.requesting_agent_id.trim().is_empty() {
         let actor_kind = if a.actor_kind.trim().is_empty() {
             "assistant"
         } else {
@@ -1268,52 +1403,32 @@ pub fn handle_remember(db: &Database, args: Value) -> Result<String, String> {
         });
         (None, Some(provenance))
     } else {
-        // Legacy/unscoped MCP writes retain their byte-compatible body and
-        // status; the result still explicitly requires review, while direct
-        // non-MCP writers are gated by Database::remember_impl.
+        // Direct/internal writers without a transport-stamped requester retain
+        // their legacy byte-compatible body and status. Public MCP callers are
+        // handled by the authenticated branch above.
         let _ = is_imported_provenance;
         (None, None)
     };
-    let body = if a.origin.is_none()
-        && a.external_refs.is_empty()
-        && a.evidence.is_none()
-        && admission_evidence.is_none()
-        && provenance.is_none()
-    {
+    let body = if admission_evidence.is_none() && provenance.is_none() {
         body
     } else {
-        let mut obj: serde_json::Value =
-            serde_json::from_str(&body).unwrap_or(serde_json::json!({}));
-        if let Some(map) = obj.as_object_mut() {
-            if let Some(ref origin) = a.origin {
-                map.insert(
-                    "origin".to_string(),
-                    serde_json::to_value(origin).unwrap_or(serde_json::json!({})),
-                );
-            }
-            if !a.external_refs.is_empty() {
-                map.insert(
-                    "external_refs".to_string(),
-                    serde_json::to_value(&a.external_refs).unwrap_or(serde_json::json!([])),
-                );
-            }
-            if let Some(ref evidence) = a.evidence {
-                map.insert(
-                    "evidence".to_string(),
-                    serde_json::to_value(evidence).unwrap_or(serde_json::json!({})),
-                );
-            }
-            if let Some(ref admission) = admission_evidence {
-                map.insert(
-                    "admission".to_string(),
-                    serde_json::to_value(admission).unwrap_or(serde_json::json!({})),
-                );
-            }
-            if let Some(ref provenance) = provenance {
-                map.insert("provenance".to_string(), provenance.clone());
-            }
+        let mut obj: Value = serde_json::from_str(&body)
+            .map_err(|e| format!("admission envelope canonicalization failed: {e}"))?;
+        let map = obj
+            .as_object_mut()
+            .ok_or("admission evidence requires an object body_json")?;
+        if let Some(ref admission) = admission_evidence {
+            map.insert(
+                "admission".to_string(),
+                serde_json::to_value(admission)
+                    .map_err(|e| format!("admission evidence serialization failed: {e}"))?,
+            );
         }
-        serde_json::to_string(&obj).unwrap_or(body)
+        if let Some(ref provenance) = provenance {
+            map.insert("provenance".to_string(), provenance.clone());
+        }
+        serde_json::to_string(&obj)
+            .map_err(|e| format!("admission envelope canonicalization failed: {e}"))?
     };
 
     let raw_id = Uuid::new_v4().to_string().replace('-', "");
@@ -1388,8 +1503,12 @@ pub fn handle_remember(db: &Database, args: Value) -> Result<String, String> {
             "proposed".to_string()
         } else if quarantined {
             "quarantined".to_string()
+        } else if verified_admission {
+            // An admitted SAVE owns lifecycle activation; caller-selected
+            // proposed/quarantined states cannot contradict the decision.
+            "active".to_string()
         } else {
-            a.status
+            requested_status
         },
         entity_type: a.entity_type,
         tags: a.tags,
@@ -1470,6 +1589,7 @@ pub fn handle_remember(db: &Database, args: Value) -> Result<String, String> {
             "quarantine_id": sealed["id"],
             "receipt_digest": sealed["receipt_digest"],
             "requires_review": true,
+            "outcome_class": "pending_approval",
             "note": "sealed candidate retained outside the authoritative head; \
                      review via perseus_vault_admission_quarantine",
             "admission": admission,
@@ -1519,13 +1639,30 @@ pub fn handle_remember(db: &Database, args: Value) -> Result<String, String> {
         exclude_ids: Vec::new(),
     };
 
-    let (eid, action) = if verified_admission {
-        db.remember_verified_with_options(
+    let (eid, action) = if verified_admission && admission_evidence.is_some() {
+        let evidence = admission_evidence
+            .as_ref()
+            .expect("verified admission requires evidence");
+        db.remember_admitted_with_write_options(
             &entity,
             a.skip_dedup,
             a.valid_from_unix_ms,
             a.valid_to_unix_ms,
             a.allow_rejected,
+            evidence,
+            &gate_opts,
+        )
+    } else if verified_admission {
+        // Test-only fixtures historically used the verified writer without a
+        // transport envelope. Keep that path explicitly internal and named;
+        // production cannot set verified_admission without evidence.
+        db.remember_internal_trusted_with_options(
+            &entity,
+            a.skip_dedup,
+            a.valid_from_unix_ms,
+            a.valid_to_unix_ms,
+            a.allow_rejected,
+            "mcp_test_fixture",
         )
     } else if gate_opts.sparse_update || mode_override.is_some() || a.interference_bound.is_some() {
         db.remember_with_write_options(
@@ -1638,17 +1775,444 @@ pub fn handle_remember(db: &Database, args: Value) -> Result<String, String> {
         result["derived_from"] = dr;
     }
     if let Some(admission) = admission_evidence {
+        let outcome_class = admission
+            .outcome_class()
+            .map_err(|e| format!("admission outcome classification failed: {e}"))?;
+        result["outcome_class"] = json!(outcome_class.to_string());
+        result["disposition"] = json!(outcome_class.to_string());
+        result["serveable"] = json!(matches!(
+            outcome_class,
+            crate::trust_admission::AdmissionOutcomeClass::Save
+        ));
         result["admission"] = serde_json::to_value(admission).unwrap_or(serde_json::json!({}));
     }
     if let Some(provenance) = provenance {
         result["proposed"] = json!(provenance["state"] == "proposed");
         result["requires_review"] = json!(provenance["requires_review"] == true);
+        if a.admission.is_none() {
+            result["outcome_class"] = json!("pending_approval");
+            result["disposition"] = json!("pending_approval");
+        }
+        if provenance["state"] != "admitted" {
+            result["pending_approval"] = json!(true);
+            result["serveable"] = json!(false);
+        }
         result["provenance"] = provenance;
     } else if a.admission.is_none() {
         result["proposed"] = json!(true);
         result["requires_review"] = json!(true);
+        result["pending_approval"] = json!(true);
+        result["serveable"] = json!(false);
+        result["outcome_class"] = json!("pending_approval");
+        result["disposition"] = json!("pending_approval");
+    }
+    // A write-gate quarantine is a held candidate even when its upstream
+    // admission evidence was otherwise authoritative. Never let the evidence
+    // envelope's SAVE class mask the durable write disposition.
+    if action.starts_with("quarantined") {
+        result["proposed"] = json!(true);
+        result["requires_review"] = json!(true);
+        result["serveable"] = json!(false);
+        result["outcome_class"] = json!("pending_approval");
+        result["disposition"] = json!("pending_approval");
     }
     Ok(result.to_string())
+}
+
+/// #1107: resolve a hash-only pending admission candidate through an explicit
+/// operator review. Approval activates the existing proposed row through the
+/// verified writer; rejection archives it as a terminal DROP or BLOCK. The
+/// original body is never returned by this operation, and the review decision
+/// is separately recorded in the append-only journal.
+pub fn handle_admission_decide(db: &Database, args: Value) -> Result<String, String> {
+    let category = args
+        .get("category")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or("admission_decide requires category")?;
+    let key = args
+        .get("key")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or("admission_decide requires key")?;
+    let workspace_hash = args
+        .get("workspace_hash")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or("admission_decide requires workspace_hash")?;
+    let reviewer = args
+        .get("requesting_agent_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or("admission_decide requires requesting_agent_id")?;
+    let decision = args
+        .get("decision")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    if !["approve", "reject"].contains(&decision.as_str()) {
+        return Err("admission_decide decision must be approve or reject".to_string());
+    }
+    let reason = args
+        .get("reason")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or("admission_decide requires a bounded non-empty reason")?;
+    if reason.len() > 256 || reason.chars().any(|c| c.is_control()) {
+        return Err(
+            "admission_decide reason must be at most 256 non-control characters".to_string(),
+        );
+    }
+    for (label, value) in [("category", category), ("key", key), ("reviewer", reviewer)] {
+        if value.len() > 256 || value.chars().any(|c| c.is_control() || c.is_whitespace()) {
+            return Err(format!(
+                "{label} must be a bounded non-whitespace identifier"
+            ));
+        }
+    }
+    if workspace_hash.len() > 256
+        || workspace_hash
+            .chars()
+            .any(|c| c.is_control() || c.is_whitespace())
+    {
+        return Err("workspace_hash must be a bounded non-whitespace identifier".to_string());
+    }
+    require_strict_memory_capability(db, reviewer, workspace_hash, "memory.admission.review")?;
+
+    let entity_id = {
+        let conn = db
+            .conn()
+            .map_err(|e| format!("admission_decide lookup failed: {e}"))?;
+        conn.query_row(
+            "SELECT id FROM entities WHERE category = ?1 AND key = ?2 AND workspace_hash = ?3 LIMIT 1",
+            rusqlite::params![category, key, workspace_hash],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|e| format!("admission_decide lookup failed: {e}"))?
+    }
+    .ok_or_else(|| {
+        format!(
+            "admission_decide candidate not found in workspace: {category}/{key}"
+        )
+    })?;
+    let source = db
+        .get_entity_by_id_for_admission_review(&entity_id)
+        .map_err(|e| format!("admission_decide entity read failed: {e}"))?
+        .ok_or_else(|| "admission_decide candidate is unavailable".to_string())?;
+    if source.status != "proposed" || source.archived {
+        return Err("admission_decide requires an active proposed candidate".to_string());
+    }
+
+    let mut body: Value = serde_json::from_str(&source.body_json)
+        .map_err(|e| format!("admission_decide candidate body is invalid JSON: {e}"))?;
+    let admission_value = body
+        .get("admission")
+        .cloned()
+        .ok_or("admission_decide candidate has no admission evidence")?;
+    let mut admission: crate::trust_admission::AdmissionEvidence =
+        serde_json::from_value(admission_value)
+            .map_err(|e| format!("admission_decide admission evidence is invalid: {e}"))?;
+    admission
+        .validate()
+        .map_err(|e| format!("admission_decide admission evidence failed validation: {e}"))?;
+    if admission.workspace_hash != source.workspace_hash {
+        return Err(
+            "admission_decide admission workspace does not match entity workspace".to_string(),
+        );
+    }
+    if admission.outcome_class().map_err(|e| e.to_string())?
+        != crate::trust_admission::AdmissionOutcomeClass::PendingApproval
+    {
+        return Err("admission_decide requires pending_approval evidence".to_string());
+    }
+    let mut candidate_body = body.clone();
+    let canonical_candidate = canonical_admission_entity_body(&candidate_body)?;
+    if crate::trust_admission::digest_text(&canonical_candidate) != admission.record_digest {
+        return Err(
+            "admission_decide candidate body digest does not match admission evidence".to_string(),
+        );
+    }
+    // The transition below must never retain the old proposed provenance or
+    // admission envelope. They are replaced by the newly signed evidence.
+    candidate_body
+        .as_object_mut()
+        .ok_or("admission_decide candidate body must be a JSON object")?
+        .remove("admission");
+    candidate_body
+        .as_object_mut()
+        .ok_or("admission_decide candidate body must be a JSON object")?
+        .remove("provenance");
+    body = candidate_body;
+
+    let rejection_class = if decision == "reject" {
+        let value = args
+            .get("rejection_class")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        match value.as_str() {
+            "drop" => crate::trust_admission::AdmissionOutcomeClass::Drop,
+            "block" => crate::trust_admission::AdmissionOutcomeClass::Block,
+            _ => return Err("reject requires rejection_class=drop or block".to_string()),
+        }
+    } else {
+        crate::trust_admission::AdmissionOutcomeClass::Save
+    };
+
+    let audit_event_id = format!("jrn-{}", Uuid::new_v4().simple());
+    let review_source_event_id = format!("jrn-{}", Uuid::new_v4().simple());
+    // The reviewer becomes the authenticated source for an approval. This
+    // receipt is written through the trusted database path below, never through
+    // the public generic journal surface, and is bound to the post-review body
+    // digest and reviewer identity.
+    admission.actor_kind = Some("operator".to_string());
+    admission.actor_identity = Some(reviewer.to_string());
+    let outcome_class = if decision == "approve" {
+        admission.source_identity = "operator_review".to_string();
+        admission.source_event_id = Some(review_source_event_id.clone());
+        admission
+            .approve(reason)
+            .map_err(|e| format!("admission approval failed: {e}"))?;
+        "save".to_string()
+    } else {
+        admission
+            .reject(rejection_class, reason)
+            .map_err(|e| format!("admission rejection failed: {e}"))?;
+        rejection_class.to_string()
+    };
+    body["admission"] = serde_json::to_value(&admission)
+        .map_err(|e| format!("admission evidence serialization failed: {e}"))?;
+
+    let mut updated = source.clone();
+    updated.body_json = serde_json::to_string(&body)
+        .map_err(|e| format!("admission_decide body serialization failed: {e}"))?;
+    updated.status = if decision == "approve" {
+        "active".to_string()
+    } else {
+        "deprecated".to_string()
+    };
+    updated.archived = decision == "reject";
+    updated.archive_reason = if decision == "reject" {
+        format!("admission_rejected_by_{reviewer}")
+    } else {
+        String::new()
+    };
+    updated.verified = decision == "approve";
+    updated.epistemic_state = if decision == "approve" {
+        "verified".to_string()
+    } else {
+        "rejected".to_string()
+    };
+
+    let event_type = if decision == "approve" {
+        "admission_approved"
+    } else {
+        "admission_rejected"
+    };
+    let event = JournalEvent {
+        id: audit_event_id.clone(),
+        event_type: event_type.to_string(),
+        evaluated_json: json!({
+            "entity_id": source.id,
+            "category": category,
+            "key": key,
+            "workspace_hash": workspace_hash,
+            "record_digest": admission.record_digest,
+            "from_outcome_class": "pending_approval",
+        })
+        .to_string(),
+        acted_json: json!({
+            "decision": decision,
+            "outcome_class": outcome_class,
+            "reviewer": reviewer,
+            "reason_sha256": crate::trust_admission::digest_text(reason),
+            "stored": true,
+        })
+        .to_string(),
+        forward_json: json!({
+            "next": if decision == "approve" {
+                "serve active evidence subject to workspace/relevance checks"
+            } else {
+                "do not serve; retain audit row until lifecycle cleanup"
+            }
+        })
+        .to_string(),
+        category: category.to_string(),
+        key: key.to_string(),
+        entity_id: source.id.clone(),
+        agent_id: reviewer.to_string(),
+        workspace_hash: workspace_hash.to_string(),
+        created_at_unix_ms: now_ms(),
+    };
+    // Append the authenticated approval source and a review-intent receipt
+    // before activating the row. The intent is explicitly stored=false: a
+    // failed transition can never leave a durable completed approval/rejection
+    // claim. The completed receipt is appended only after the writer succeeds.
+    if decision == "approve" {
+        let source_evaluated = json!({
+            "record_digest": admission.record_digest.clone(),
+            "source_identity": admission.source_identity.clone(),
+            "workspace_hash": workspace_hash,
+            "actor_kind": "operator",
+            "actor_identity": reviewer,
+        });
+        let attestation_digest = crate::trust_admission::admission_source_attestation_digest(
+            &source_evaluated,
+            reviewer,
+        )
+        .map_err(|e| format!("admission_decide source attestation failed: {e}"))?;
+        let mut source_acted: Value = serde_json::from_str(&hash_only_public_journal_payload(
+            &json!({"kind": "operator_review"}),
+        ))
+        .map_err(|e| format!("admission_decide source receipt serialization failed: {e}"))?;
+        source_acted["attestation_digest"] = json!(attestation_digest);
+        let source_event = JournalEvent {
+            id: review_source_event_id,
+            event_type: "admission_source".to_string(),
+            evaluated_json: hash_only_public_journal_payload(&source_evaluated),
+            acted_json: source_acted.to_string(),
+            forward_json: hash_only_public_journal_payload(
+                &json!({"next": "serve after approval"}),
+            ),
+            category: category.to_string(),
+            key: key.to_string(),
+            entity_id: source.id.clone(),
+            agent_id: reviewer.to_string(),
+            workspace_hash: workspace_hash.to_string(),
+            created_at_unix_ms: now_ms(),
+        };
+        db.journal_authenticated_admission_source(&source_event)
+            .map_err(|e| {
+                format!("admission_decide source receipt failed before transition: {e}")
+            })?;
+    }
+    let review_intent = JournalEvent {
+        id: format!("jrn-{}", Uuid::new_v4().simple()),
+        event_type: "admission_review_started".to_string(),
+        evaluated_json: event.evaluated_json.clone(),
+        acted_json: json!({
+            "decision": decision,
+            "outcome_class": outcome_class,
+            "reviewer": reviewer,
+            "reason_sha256": crate::trust_admission::digest_text(reason),
+            "stored": false,
+            "transition": "pending",
+        })
+        .to_string(),
+        forward_json: json!({"next": "complete after durable transition"}).to_string(),
+        category: category.to_string(),
+        key: key.to_string(),
+        entity_id: source.id.clone(),
+        agent_id: reviewer.to_string(),
+        workspace_hash: workspace_hash.to_string(),
+        created_at_unix_ms: now_ms(),
+    };
+    db.journal(&review_intent)
+        .map_err(|e| format!("admission_decide audit intent failed before transition: {e}"))?;
+    // This is an evidence/status transition, not an unreviewed semantic-body
+    // write. The reviewer capability and canonical admission checks above are
+    // the authorization boundary; do not let the default content-interference
+    // quarantine leave the candidate proposed after we have recorded an intent.
+    let review_write_options = crate::interference::WriteGateOptions {
+        mode_override: Some(crate::interference::InterferenceMode::Off),
+        ..Default::default()
+    };
+    let transition_result = if decision == "approve" {
+        db.remember_admitted_with_write_options(
+            &updated,
+            true,
+            None,
+            None,
+            false,
+            &admission,
+            &review_write_options,
+        )
+    } else {
+        db.remember_review_transition_with_write_options(
+            &updated,
+            true,
+            None,
+            None,
+            false,
+            &admission,
+            &review_write_options,
+        )
+    };
+    let (transition_id, transition_action) = transition_result.map_err(|e| {
+        format!("admission_decide durable transition failed after audit intent: {e}")
+    })?;
+    if transition_id != entity_id
+        || transition_action.starts_with("quarantined")
+        || transition_action.starts_with("deduped")
+    {
+        return Err(format!(
+            "admission_decide transition did not materialize the reviewed entity: id={transition_id}, action={transition_action}"
+        ));
+    }
+    if let Err(completion_error) = db.journal(&event) {
+        let completion_error_text = completion_error.to_string();
+        let failure_event = JournalEvent {
+            id: format!("jrn-{}", Uuid::new_v4().simple()),
+            event_type: "admission_review_failed".to_string(),
+            evaluated_json: json!({
+                "completion_event_type": event.event_type,
+                "entity_id": source.id,
+                "category": category,
+                "key": key,
+                "workspace_hash": workspace_hash,
+                "record_digest": admission.record_digest,
+            })
+            .to_string(),
+            acted_json: json!({
+                "decision": decision,
+                "outcome_class": outcome_class,
+                "reviewer": reviewer,
+                "stored": false,
+                "transition_applied": true,
+                "completion_recorded": false,
+                "completion_error_sha256": crate::trust_admission::digest_text(&completion_error_text),
+            })
+            .to_string(),
+            forward_json: json!({
+                "next": "operator reconciliation required; do not repeat review blindly"
+            })
+            .to_string(),
+            category: category.to_string(),
+            key: key.to_string(),
+            entity_id: source.id.clone(),
+            agent_id: reviewer.to_string(),
+            workspace_hash: workspace_hash.to_string(),
+            created_at_unix_ms: now_ms(),
+        };
+        let marker_result = db.journal(&failure_event);
+        let marker_note = match marker_result {
+            Ok(()) => "failed-completion marker recorded".to_string(),
+            Err(marker_error) => format!(
+                "failed-completion marker could not be recorded: {}",
+                marker_error
+            ),
+        };
+        return Err(format!(
+            "admission_decide completion receipt failed after durable transition: {completion_error}; {marker_note}"
+        ));
+    }
+
+    Ok(json!({
+        "ok": true,
+        "id": entity_id,
+        "category": category,
+        "key": key,
+        "decision": decision,
+        "outcome_class": outcome_class,
+        "status": updated.status,
+        "serveable": decision == "approve",
+        "audit_event_id": audit_event_id,
+        "reason_sha256": crate::trust_admission::digest_text(reason),
+    })
+    .to_string())
 }
 
 /// #939: zero-token write gate — deterministic keep/supersede/forget BEFORE
@@ -2086,9 +2650,7 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
     // with the surviving set. A no-op for unscoped requesters (empty id → tier
     // 3) and for the default `workspace`/`tenant`/'' visibility — so existing
     // single-agent callers and data are unaffected.
-    if let Some(req) = a.requesting_agent_id.as_deref().filter(|s| !s.is_empty()) {
-        entities.retain(|e| db.can_read(req, &e.visibility, &e.agent_id));
-    }
+    entities.retain(|e| requester_can_read(db, a.requesting_agent_id.as_deref(), e));
 
     // #784: profile-specific serving filter. This is additive to visibility:
     // profile choice can only narrow results and never exposes another scope.
@@ -2181,8 +2743,10 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
     // first-pass, marked so the caller can see the provenance of the hit.
     if !confirmed_query.is_empty() {
         if let Ok(Some(confirmed)) = db.serve_confirmed_query_key(&confirmed_query) {
-            let existing_ids: std::collections::HashSet<String> =
-                items_expanded.iter().filter_map(|v| v.get("id").and_then(|x| x.as_str()).map(String::from)).collect();
+            let existing_ids: std::collections::HashSet<String> = items_expanded
+                .iter()
+                .filter_map(|v| v.get("id").and_then(|x| x.as_str()).map(String::from))
+                .collect();
             let mut prepend: Vec<serde_json::Value> = Vec::new();
             for e in confirmed {
                 if existing_ids.contains(&e.id) {
@@ -2407,6 +2971,11 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
 }
 
 pub fn handle_recall_batch(db: &Database, args: Value) -> Result<String, String> {
+    let requester = args
+        .get("requesting_agent_id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned);
     let a: RecallBatchArgs = serde_json::from_value(args)
         .map_err(|e| format!("Invalid recall batch arguments: {}", e))?;
 
@@ -2581,6 +3150,7 @@ pub fn handle_recall_batch(db: &Database, args: Value) -> Result<String, String>
         last_overturn = overturn;
     }
 
+    fused.retain(|(entity, _)| requester_can_read(db, requester.as_deref(), entity));
     let mut items_expanded: Vec<serde_json::Value> = Vec::new();
     let entities_only: Vec<Entity> = fused.iter().map(|(e, _)| e.clone()).collect();
     for (entity, _score) in &fused {
@@ -2646,6 +3216,8 @@ pub struct SemanticSearchArgs {
     pub workspace_hash: Option<String>,
     #[serde(default)]
     pub agent_id: Option<String>,
+    #[serde(default)]
+    pub requesting_agent_id: Option<String>,
 }
 
 /// #271: `perseus_vault_semantic_search` — dense-only semantic search shortcut. Unlike
@@ -2669,9 +3241,12 @@ pub fn handle_semantic_search(db: &Database, args: Value) -> Result<String, Stri
         ..RecallParams::default()
     };
 
-    let entities = db
+    let mut entities = db
         .recall(&params)
         .map_err(|e| format!("Semantic search failed: {}", e))?;
+    entities = db
+        .filter_for_requester(entities, a.requesting_agent_id.as_deref())
+        .map_err(|e| format!("Semantic visibility filtering failed: {e}"))?;
 
     let items_expanded: Vec<serde_json::Value> =
         entities.iter().map(|e| e.to_json_expanded()).collect();
@@ -2880,6 +3455,12 @@ fn stamped_requester(args: &serde_json::Value) -> Option<&str> {
         .filter(|s| !s.is_empty())
 }
 
+fn stamped_requester_from_recall_args(args: &RecallArgs) -> Option<&str> {
+    args.requesting_agent_id
+        .as_deref()
+        .filter(|id| !id.is_empty())
+}
+
 /// #996: fail-closed visibility gate for single-entity direct reads. Returns
 /// true when the requester may read the row, or when no identity is stamped
 /// (legacy unscoped path). Handlers over-hide on false — a hidden row is
@@ -2890,9 +3471,11 @@ fn requester_can_read(
     requester: Option<&str>,
     entity: &crate::models::Entity,
 ) -> bool {
-    match requester {
+    match requester.filter(|req| !req.trim().is_empty()) {
         Some(req) => db.can_read(req, &entity.visibility, &entity.agent_id),
-        None => true,
+        // Anonymous public transports may serve shared/default rows, but must
+        // never become an implicit admin for requester-scoped visibility.
+        None => !matches!(entity.visibility.as_str(), "private" | "fleet"),
     }
 }
 
@@ -2918,9 +3501,7 @@ pub fn handle_scan(db: &Database, args: Value) -> Result<String, String> {
     // or fleet row never surfaces to a caller that may not read it. Applied
     // BEFORE the page/sentinel split so pagination stays exact over the
     // visible set (mirrors the recall retain in this file).
-    if let Some(req) = stamped_requester(&args) {
-        entities.retain(|e| db.can_read(req, &e.visibility, &e.agent_id));
-    }
+    entities.retain(|e| requester_can_read(db, stamped_requester(&args), e));
 
     let has_more = entities.len() as i64 > limit;
     if has_more {
@@ -3036,6 +3617,9 @@ fn handle_recall_with_expansion(db: &Database, a: &RecallArgs) -> Result<String,
     let mut merged: Vec<_> = best.into_values().collect();
     merged.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     merged.truncate(a.limit as usize);
+    merged.retain(|(entity, _)| {
+        requester_can_read(db, stamped_requester_from_recall_args(a), entity)
+    });
 
     // #363: valid-time filters, before side-effects so filtered-out entities
     // are not reinforced. No-op unless a filter was requested.
@@ -3088,6 +3672,8 @@ pub struct RecallLayerArgs {
     pub layer: String,
     #[serde(default = "default_limit")]
     pub limit: i64,
+    #[serde(default)]
+    pub requesting_agent_id: Option<String>,
 }
 
 pub fn handle_recall_layer(db: &Database, args: Value) -> Result<String, String> {
@@ -3105,6 +3691,7 @@ pub fn handle_recall_layer(db: &Database, args: Value) -> Result<String, String>
         "query": "",
         "limit": a.limit,
         "layer": layer,
+        "requesting_agent_id": a.requesting_agent_id,
     });
 
     handle_recall(db, recall_args)
@@ -3118,18 +3705,9 @@ pub fn handle_get_entity(db: &Database, args: Value) -> Result<String, String> {
         .ok_or_else(|| "Missing 'id' parameter".to_string())?;
 
     let entity = db
-        .get_entity_by_id_public(id)
+        .get_entity_by_id_for_requester(id, stamped_requester(&args))
         .map_err(|e| format!("Get entity failed: {e}"))?
         .ok_or_else(|| format!("Entity not found: {id}"))?;
-
-    // #996 leak-harness finding: get-by-id was identity-blind — any caller who
-    // knew an id read the full body with zero enforcement (the classic
-    // unguarded get-by-id leak class the SRB harness exists to catch). Gate on
-    // the transport-stamped identity like recall; over-hide as not-found so
-    // probing cannot confirm a hidden row's existence.
-    if !requester_can_read(db, stamped_requester(&args), &entity) {
-        return Err(format!("Entity not found: {id}"));
-    }
 
     let result = json!({
         "id": entity.id,
@@ -3182,7 +3760,7 @@ pub fn handle_as_of(db: &Database, args: Value) -> Result<String, String> {
                 "id": e.id,
                 "category": e.category,
                 "key": e.key,
-                "body_json": e.body_json,
+                "body_json": public_temporal_body_json(&e.status, &e.body_json),
                 "status": e.status,
                 "entity_type": e.entity_type,
                 "as_of_unix_ms": as_of,
@@ -3219,6 +3797,39 @@ fn decorate_compacted_marker(r: &mut serde_json::Value, status: &str, body_json:
     );
 }
 
+/// Closed body projection for every public temporal serializer. Database-level
+/// filters are still required, but this boundary must remain safe if a future
+/// caller constructs a TemporalVersion without passing through them.
+fn public_temporal_body_json(status: &str, body_json: &str) -> String {
+    if matches!(status, "active" | "draft") {
+        return body_json.to_string();
+    }
+    let body: serde_json::Value = serde_json::from_str(body_json).unwrap_or_default();
+    let body_sha256 = body
+        .get("body_sha256")
+        .and_then(|value| value.as_str())
+        .map(str::to_owned)
+        .unwrap_or_else(|| crate::trust_admission::digest_text(body_json));
+    if status == "compacted" {
+        return json!({
+            "compacted": true,
+            "terminal_audit": true,
+            "status": "compacted",
+            "versions": body.get("versions").and_then(|value| value.as_i64()),
+            "digest": body.get("digest").and_then(|value| value.as_str()),
+            "body_sha256": body_sha256,
+        })
+        .to_string();
+    }
+    json!({
+        "terminal_audit": true,
+        "status": status,
+        "archived": body.get("archived").and_then(|value| value.as_bool()),
+        "body_sha256": body_sha256,
+    })
+    .to_string()
+}
+
 /// Serialize a TemporalVersion into the shared found=true response shape used
 /// by perseus_vault_valid_at and perseus_vault_bitemporal (#363). Tombstone versions carry
 /// the #398 compacted-marker decoration.
@@ -3228,7 +3839,7 @@ fn temporal_version_json(v: &crate::db::TemporalVersion) -> serde_json::Value {
         "id": v.entity.id,
         "category": v.entity.category,
         "key": v.entity.key,
-        "body_json": v.entity.body_json,
+        "body_json": public_temporal_body_json(&v.entity.status, &v.entity.body_json),
         "status": v.entity.status,
         "entity_type": v.entity.entity_type,
         "valid_from_unix_ms": v.valid_from_unix_ms,
@@ -3375,7 +3986,7 @@ pub fn handle_history(db: &Database, args: Value) -> Result<String, String> {
         total
     };
 
-    let items: Vec<serde_json::Value> = versions.iter().map(|e| e.to_json_expanded()).collect();
+    let items: Vec<serde_json::Value> = versions.iter().map(|e| e.to_history_json()).collect();
     let result = json!({
         "category": category,
         "key": key,
@@ -3509,17 +4120,74 @@ fn valid_promotion_transition(from: &str, to: &str) -> bool {
     )
 }
 
-fn entity_has_authoritative_admission(entity: &Entity) -> bool {
-    let body: Value = match serde_json::from_str(&entity.body_json) {
-        Ok(value) => value,
-        Err(_) => return false,
-    };
+fn entity_has_authoritative_admission(db: &Database, entity: &Entity) -> Result<bool, String> {
+    let body: Value = serde_json::from_str(&entity.body_json)
+        .map_err(|_| "authoritative admission body is not valid JSON".to_string())?;
     let admission: crate::trust_admission::AdmissionEvidence =
         match serde_json::from_value(body.get("admission").cloned().unwrap_or(Value::Null)) {
             Ok(value) => value,
-            Err(_) => return false,
+            Err(_) => return Ok(false),
         };
-    admission.validate().is_ok() && admission.authoritative && admission.outcome == "admitted"
+    if admission.validate().is_err() || !admission.authoritative || admission.outcome != "admitted"
+    {
+        return Ok(false);
+    }
+    if canonical_admission_entity_body_digest(&body)? != admission.record_digest {
+        return Ok(false);
+    }
+    let actor_kind = admission
+        .actor_kind
+        .clone()
+        .ok_or_else(|| "authoritative admission is missing actor_kind binding".to_string())?;
+    let actor_identity = admission
+        .actor_identity
+        .clone()
+        .ok_or_else(|| "authoritative admission is missing actor_identity binding".to_string())?;
+    let source_event_id = admission
+        .source_event_id
+        .clone()
+        .ok_or_else(|| "authoritative admission is missing source_event_id binding".to_string())?;
+    let requester = {
+        let conn = db
+            .conn()
+            .map_err(|e| format!("promotion source lookup failed: {e}"))?;
+        conn.query_row(
+            "SELECT agent_id FROM journal WHERE id=?1 AND event_type='admission_source'",
+            rusqlite::params![source_event_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|e| format!("promotion source lookup failed: {e}"))?
+    };
+    let Some(requester) = requester.filter(|value| !value.trim().is_empty()) else {
+        return Ok(false);
+    };
+    let request = crate::trust_admission::AdmissionRequest {
+        record_digest: admission.record_digest.clone(),
+        source_identity: admission.source_identity.clone(),
+        source_event_id: Some(source_event_id),
+        authorization_scope: admission.authorization_scope.clone(),
+        ingestion_channel: admission.ingestion_channel.clone(),
+        workspace_hash: admission.workspace_hash.clone(),
+        source_trust: "authoritative".to_string(),
+        actor_kind: Some(actor_kind.clone()),
+        actor_identity: Some(actor_identity.clone()),
+        validated: true,
+        valid_from_unix_ms: 0,
+        recorded_at_unix_ms: 0,
+        task_relevance_bps: 0,
+        instruction_bearing: false,
+        contradicts_authoritative: false,
+    };
+    authoritative_source_is_bound(
+        db,
+        &request,
+        &canonical_admission_entity_body(&body)?,
+        &entity.workspace_hash,
+        &actor_identity,
+        &actor_kind,
+        &requester,
+    )
 }
 
 pub fn handle_promote(db: &Database, args: Value) -> Result<String, String> {
@@ -3533,7 +4201,7 @@ pub fn handle_promote(db: &Database, args: Value) -> Result<String, String> {
     }
 
     let src = db
-        .get_entity(&a.from_category, &a.from_key)
+        .get_entity_by_category_key_for_mutation(&a.from_category, &a.from_key)
         .map_err(|e| format!("Source entity lookup failed: {}", e))?
         .ok_or_else(|| {
             format!(
@@ -3570,7 +4238,7 @@ pub fn handle_promote(db: &Database, args: Value) -> Result<String, String> {
             return Err("agent_id does not match the selected source entity owner".to_string());
         }
     }
-    let mut source_authorized = entity_has_authoritative_admission(&src);
+    let mut source_authorized = entity_has_authoritative_admission(db, &src)?;
     #[cfg(test)]
     if src.source == "agent" && src.status == "active" && source_body.get("admission").is_none() {
         source_authorized = true;
@@ -3647,7 +4315,20 @@ pub fn handle_promote(db: &Database, args: Value) -> Result<String, String> {
             }),
         );
     }
-    let body_str = serde_json::to_string(&body).unwrap_or_else(|_| src.body_json.clone());
+    let body_str = serde_json::to_string(&body)
+        .map_err(|e| format!("promotion body serialization failed: {e}"))?;
+    if source_authorized && source_body.get("admission").is_some() {
+        let promoted_digest = canonical_admission_body_digest(&body_str)?;
+        let source_digest = source_body["admission"]["record_digest"]
+            .as_str()
+            .ok_or("authoritative promotion evidence is missing record_digest")?;
+        if promoted_digest != source_digest {
+            return Err(
+                "promotion would change an authoritative body; explicit re-admission of the promoted content is required"
+                    .to_string(),
+            );
+        }
+    }
 
     let raw_id = Uuid::new_v4().to_string().replace('-', "");
     let new_entity = Entity {
@@ -3691,7 +4372,7 @@ pub fn handle_promote(db: &Database, args: Value) -> Result<String, String> {
     // the promoted record lands VERIFIED on the trust axis (#880) — never
     // downgraded to a reviewable candidate by the write boundary.
     let (new_id, action) = if source_authorized {
-        db.remember_verified_with_options(&new_entity, true, None, None, false)
+        db.remember_internal_trusted_with_options(&new_entity, true, None, None, false, "promotion")
     } else {
         db.remember_skip_dedup(&new_entity)
     }
@@ -3786,7 +4467,7 @@ pub fn handle_demote(db: &Database, args: Value) -> Result<String, String> {
     let a: DemoteArgs =
         serde_json::from_value(args).map_err(|e| format!("Invalid demote arguments: {}", e))?;
     let src = db
-        .get_entity(&a.from_category, &a.from_key)
+        .get_entity_by_category_key_for_mutation(&a.from_category, &a.from_key)
         .map_err(|e| format!("Source entity lookup failed: {}", e))?
         .ok_or_else(|| {
             format!(
@@ -3818,9 +4499,15 @@ pub fn handle_demote(db: &Database, args: Value) -> Result<String, String> {
     if !src.agent_id.is_empty() && a.agent_id.is_none() {
         return Err("agent_id assertion is required for owned source demotion".to_string());
     }
-    let mut source_authorized = entity_has_authoritative_admission(&src);
+    let mut source_authorized = entity_has_authoritative_admission(db, &src)?;
     #[cfg(test)]
-    if src.source == "agent" && src.status == "active" {
+    if src.source == "agent"
+        && src.status == "active"
+        && src.workspace_hash.is_empty()
+        && src.agent_id.is_empty()
+    {
+        // Preserve the legacy unscoped fixture contract; scoped sources still
+        // require an authoritative admission even in tests.
         source_authorized = true;
     }
     if !source_authorized {
@@ -3962,6 +4649,129 @@ fn hash_only_public_journal_payload(value: &Value) -> String {
     .to_string()
 }
 
+/// Admission provenance is stricter than the legacy memory capability regime:
+/// a public source or review transition must have an explicit, enforce-mode
+/// authority manifest. A missing manifest is not the legacy fail-open case here;
+/// without one, a caller could mint the evidence that later makes its write
+/// authoritative.
+const ADMISSION_SOURCE_HMAC_KEY_ENV: &str = "PERSEUS_VAULT_ADMISSION_SOURCE_HMAC_KEY";
+
+fn admission_source_attestation_payload(
+    evaluated: &Value,
+    requesting_agent_id: &str,
+) -> Result<String, String> {
+    let object = evaluated
+        .as_object()
+        .ok_or("admission_source evaluated must be an object")?;
+    let field = |name: &str| {
+        object
+            .get(name)
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| format!("admission_source attestation requires evaluated.{name}"))
+    };
+    Ok(json!({
+        "record_digest": field("record_digest")?,
+        "source_identity": field("source_identity")?,
+        "workspace_hash": field("workspace_hash")?,
+        "actor_kind": field("actor_kind")?,
+        "actor_identity": field("actor_identity")?,
+        "requesting_agent_id": requesting_agent_id,
+    })
+    .to_string())
+}
+
+fn admission_source_hmac_hex(key: &str, payload: &str) -> String {
+    const BLOCK_SIZE: usize = 64;
+    let mut key_block = [0u8; BLOCK_SIZE];
+    if key.as_bytes().len() > BLOCK_SIZE {
+        let digest = Sha256::digest(key.as_bytes());
+        key_block[..digest.len()].copy_from_slice(&digest);
+    } else {
+        key_block[..key.len()].copy_from_slice(key.as_bytes());
+    }
+    let mut inner_pad = [0x36u8; BLOCK_SIZE];
+    let mut outer_pad = [0x5cu8; BLOCK_SIZE];
+    for index in 0..BLOCK_SIZE {
+        inner_pad[index] ^= key_block[index];
+        outer_pad[index] ^= key_block[index];
+    }
+    let mut inner = Sha256::new();
+    inner.update(inner_pad);
+    inner.update(payload.as_bytes());
+    let inner_digest = inner.finalize();
+    let mut outer = Sha256::new();
+    outer.update(outer_pad);
+    outer.update(inner_digest);
+    let digest = outer.finalize();
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn verify_admission_source_attestation(
+    evaluated: &Value,
+    requesting_agent_id: &str,
+    provided: &str,
+) -> Result<(), String> {
+    let key = std::env::var(ADMISSION_SOURCE_HMAC_KEY_ENV)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            format!(
+                "admission_source server attestation key is not configured ({ADMISSION_SOURCE_HMAC_KEY_ENV})"
+            )
+        })?;
+    let payload = admission_source_attestation_payload(evaluated, requesting_agent_id)?;
+    let expected = admission_source_hmac_hex(&key, &payload);
+    let supplied = provided.trim().to_ascii_lowercase();
+    if supplied.is_empty() {
+        return Err("admission_source requires source_attestation".into());
+    }
+    if expected.as_bytes().ct_eq(supplied.as_bytes()).unwrap_u8() != 1 {
+        return Err("admission_source source_attestation is invalid".into());
+    }
+    Ok(())
+}
+
+fn require_strict_memory_capability(
+    db: &Database,
+    requesting_agent_id: &str,
+    workspace_hash: &str,
+    capability: &str,
+) -> Result<(), String> {
+    if requesting_agent_id.trim().is_empty() {
+        return Err(format!(
+            "{capability} requires a transport-authenticated requesting_agent_id"
+        ));
+    }
+    if workspace_hash.trim().is_empty() {
+        return Err(format!("{capability} requires a non-empty workspace_hash"));
+    }
+    let permitted = db
+        .require_memory_capability(requesting_agent_id, workspace_hash, capability)
+        .map_err(|e| format!("{capability} authority lookup failed: {e}"))?;
+    if !permitted {
+        return Err(format!(
+            "{capability} requires an active enforce authority manifest for agent/workspace"
+        ));
+    }
+    let manifest = db
+        .authority_get(requesting_agent_id, workspace_hash, false)
+        .map_err(|e| format!("{capability} authority lookup failed: {e}"))?
+        .ok_or_else(|| {
+            format!(
+                "{capability} requires an active enforce authority manifest for agent/workspace"
+            )
+        })?;
+    if manifest.mode != "enforce" {
+        return Err(format!(
+            "{capability} requires an enforce authority manifest (mode is {})",
+            manifest.mode
+        ));
+    }
+    Ok(())
+}
+
 pub fn handle_journal(db: &Database, args: Value) -> Result<String, String> {
     let a: JournalArgs =
         serde_json::from_value(args).map_err(|e| format!("Invalid journal arguments: {}", e))?;
@@ -3978,25 +4788,106 @@ pub fn handle_journal(db: &Database, args: Value) -> Result<String, String> {
         ));
     }
 
+    let source_event = a.event_type == "admission_source";
+    if source_event {
+        let evaluated = a
+            .evaluated
+            .as_object()
+            .ok_or("admission_source evaluated must be an object")?;
+        let record_digest = evaluated
+            .get("record_digest")
+            .and_then(Value::as_str)
+            .ok_or("admission_source requires evaluated.record_digest")?;
+        let source_identity = evaluated
+            .get("source_identity")
+            .and_then(Value::as_str)
+            .ok_or("admission_source requires evaluated.source_identity")?;
+        let workspace = evaluated
+            .get("workspace_hash")
+            .and_then(Value::as_str)
+            .ok_or("admission_source requires evaluated.workspace_hash")?;
+        let actor_kind = evaluated
+            .get("actor_kind")
+            .and_then(Value::as_str)
+            .ok_or("admission_source requires evaluated.actor_kind")?;
+        let actor_identity = evaluated
+            .get("actor_identity")
+            .and_then(Value::as_str)
+            .ok_or("admission_source requires evaluated.actor_identity")?;
+        if record_digest.len() != 64 || !record_digest.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err("admission_source record_digest must be a 64-hex SHA-256 digest".into());
+        }
+        for (label, value) in [
+            ("source_identity", source_identity),
+            ("workspace_hash", workspace),
+            ("actor_kind", actor_kind),
+            ("actor_identity", actor_identity),
+        ] {
+            if value.is_empty() || value.len() > 256 || value.chars().any(|c| c.is_control()) {
+                return Err(format!("admission_source {label} is invalid"));
+            }
+        }
+        if workspace != a.workspace_hash {
+            return Err(
+                "admission_source workspace_hash must match evaluated.workspace_hash".into(),
+            );
+        }
+        if a.requesting_agent_id.trim().is_empty() {
+            return Err("admission_source requires transport-stamped requesting_agent_id".into());
+        }
+        verify_admission_source_attestation(
+            &a.evaluated,
+            &a.requesting_agent_id,
+            &a.source_attestation,
+        )?;
+        require_strict_memory_capability(
+            db,
+            &a.requesting_agent_id,
+            &a.workspace_hash,
+            "memory.admission.source",
+        )?;
+    }
     let raw_id = Uuid::new_v4().to_string().replace('-', "");
     let id = format!("jrn-{}", &raw_id[..12.min(raw_id.len())]);
+    let event_agent_id = if source_event {
+        a.requesting_agent_id.clone()
+    } else {
+        a.agent_id
+    };
 
+    let acted_json = if source_event {
+        let mut receipt: Value = serde_json::from_str(&hash_only_public_journal_payload(&a.acted))
+            .map_err(|e| format!("admission source receipt serialization failed: {e}"))?;
+        // The schema intentionally accepts either hex case. Persist the
+        // attestation digest over the canonical lowercase representation so
+        // verification and durable storage bind the same bytes.
+        receipt["attestation_digest"] = json!(crate::trust_admission::digest_text(
+            &a.source_attestation.trim().to_ascii_lowercase()
+        ));
+        receipt.to_string()
+    } else {
+        hash_only_public_journal_payload(&a.acted)
+    };
     let event = JournalEvent {
         id,
         event_type: a.event_type,
         evaluated_json: hash_only_public_journal_payload(&a.evaluated),
-        acted_json: hash_only_public_journal_payload(&a.acted),
+        acted_json,
         forward_json: hash_only_public_journal_payload(&a.forward),
         category: a.category,
         key: a.key,
         entity_id: a.entity_id,
-        agent_id: a.agent_id,
+        agent_id: event_agent_id,
         workspace_hash: a.workspace_hash,
         created_at_unix_ms: now_ms(),
     };
 
-    db.journal(&event)
-        .map_err(|e| format!("Journal failed: {}", e))?;
+    let journal_result = if source_event {
+        db.journal_authenticated_admission_source(&event)
+    } else {
+        db.journal(&event)
+    };
+    journal_result.map_err(|e| format!("Journal failed: {}", e))?;
 
     let result = json!({
         "id": event.id,
@@ -4790,7 +5681,8 @@ fn pack_pipeline(
     // carries a "supersedes" link whose target is the stale fact. A fact is
     // superseded when any candidate links to it that way (the superseder
     // shares the topic, so it is normally in the candidate set too).
-    let mut superseded_targets: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut superseded_targets: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
     for ent in &candidates {
         for l in &ent.links {
             if l.relationship == "supersedes" {
@@ -4889,8 +5781,7 @@ fn intent_trail(
     max_trail: i64,
 ) -> Result<Vec<serde_json::Value>, String> {
     let max_trail = max_trail.clamp(1, 20);
-    let ids: std::collections::HashSet<&str> =
-        candidates.iter().map(|e| e.id.as_str()).collect();
+    let ids: std::collections::HashSet<&str> = candidates.iter().map(|e| e.id.as_str()).collect();
     let cats: std::collections::HashSet<&str> =
         candidates.iter().map(|e| e.category.as_str()).collect();
     let params = crate::models::TimelineParams {
@@ -5047,9 +5938,7 @@ fn pack_conflicts(
         let ya = y["pair"]["entity_a"]["id"].as_str().unwrap_or("");
         let xb = x["pair"]["entity_b"]["id"].as_str().unwrap_or("");
         let yb = y["pair"]["entity_b"]["id"].as_str().unwrap_or("");
-        xc.cmp(yc)
-            .then_with(|| xa.cmp(ya))
-            .then_with(|| xb.cmp(yb))
+        xc.cmp(yc).then_with(|| xa.cmp(ya)).then_with(|| xb.cmp(yb))
     });
     out
 }
@@ -5097,19 +5986,18 @@ pub fn handle_handoff_pack(db: &Database, args: Value) -> Result<String, String>
         // The trail is computed whenever either section is requested (next_work
         // derives its forward plans from it), but each OUTPUT key is emitted
         // only when its own flag is set — the opt-in output contract.
-        let trail =
-            intent_trail(db, &outcome.candidates, a.workspace_hash.as_deref(), a.max_trail)?;
+        let trail = intent_trail(
+            db,
+            &outcome.candidates,
+            a.workspace_hash.as_deref(),
+            a.max_trail,
+        )?;
         if a.include_intent_trail {
             result["intent_trail"] = json!(trail);
         }
         if a.include_next_work {
-            result["next_work"] = next_work_sections(
-                db,
-                &a.query,
-                a.workspace_hash.as_deref(),
-                &trail,
-                &args,
-            );
+            result["next_work"] =
+                next_work_sections(db, &a.query, a.workspace_hash.as_deref(), &trail, &args);
         }
     }
     if a.include_conflicts {
@@ -5175,13 +6063,7 @@ pub fn handle_delegation_brief(db: &Database, args: Value) -> Result<String, Str
         a.workspace_hash.as_deref(),
     )?;
     let trail = intent_trail(db, &outcome.candidates, a.workspace_hash.as_deref(), 5)?;
-    let next = next_work_sections(
-        db,
-        &a.query,
-        a.workspace_hash.as_deref(),
-        &trail,
-        &args,
-    );
+    let next = next_work_sections(db, &a.query, a.workspace_hash.as_deref(), &trail, &args);
     let brief = render_delegation_brief(&a, &outcome, &trail, &next);
     Ok(json!({
         "brief": brief,
@@ -5318,7 +6200,11 @@ fn render_delegation_brief(
         _ => out.push_str("(none specified — return a plan with explicit open questions)\n"),
     }
     out.push_str("\n## Sources\n");
-    let ids: Vec<&str> = outcome.pack.iter().filter_map(|p| p["id"].as_str()).collect();
+    let ids: Vec<&str> = outcome
+        .pack
+        .iter()
+        .filter_map(|p| p["id"].as_str())
+        .collect();
     out.push_str(&format!("{}\n", ids.join(", ")));
     out
 }
@@ -6761,6 +7647,9 @@ pub struct VaultExportArgs {
     /// the live bank is never touched. Omit for the legacy import path.
     #[serde(default)]
     pub shadow_workspace: Option<String>,
+    /// Transport-stamped requester identity; absent means anonymous export.
+    #[serde(default)]
+    pub requesting_agent_id: Option<String>,
 }
 
 // ─── #1060 seal-style tamper evidence handlers ─────────────────────────
@@ -6782,8 +7671,8 @@ pub struct SealArgs {
 /// it. Integrity ≠ truth: a seal proves unchanged-since-sealed, never
 /// true-when-written.
 pub fn handle_seal(db: &Database, args: Value) -> Result<String, String> {
-    let a: SealArgs = serde_json::from_value(args)
-        .map_err(|e| format!("Invalid seal arguments: {e}"))?;
+    let a: SealArgs =
+        serde_json::from_value(args).map_err(|e| format!("Invalid seal arguments: {e}"))?;
     let receipt = db
         .seal_entity(
             &a.target_id,
@@ -6891,133 +7780,140 @@ pub fn handle_param_lineage(db: &Database, args: Value) -> Result<String, String
 
 // ─── #1065 intent-aware typed-relational traversal handlers ─────────────
 
-    #[derive(Debug, Deserialize)]
-    pub struct TypedTraversalArgs {
-        pub query: String,
-        #[serde(default = "default_traversal_limit")]
-        pub limit: usize,
-    }
+#[derive(Debug, Deserialize)]
+pub struct TypedTraversalArgs {
+    pub query: String,
+    #[serde(default = "default_traversal_limit")]
+    pub limit: usize,
+}
 
-    fn default_traversal_limit() -> usize {
-        10
-    }
+fn default_traversal_limit() -> usize {
+    10
+}
 
-    /// Intent-aware typed-relational traversal (MAGMA pattern): the query is
-    /// routed to one relation view (temporal / causal / entity / semantic) by a
-    /// deterministic classifier, the view's traversal policy runs, and the
-    /// explainable path + rejected distractors come back with token accounting
-    /// for the budget discipline. Each run is recorded for the ablation report.
-    pub fn handle_typed_traversal(db: &Database, args: Value) -> Result<String, String> {
-        let a: TypedTraversalArgs = serde_json::from_value(args)
-            .map_err(|e| format!("Invalid typed_traversal arguments: {}", e))?;
-        let t = db
-            .typed_traversal(&a.query, a.limit)
-            .map_err(|e| e.to_string())?;
-        Ok(json!(t).to_string())
-    }
+/// Intent-aware typed-relational traversal (MAGMA pattern): the query is
+/// routed to one relation view (temporal / causal / entity / semantic) by a
+/// deterministic classifier, the view's traversal policy runs, and the
+/// explainable path + rejected distractors come back with token accounting
+/// for the budget discipline. Each run is recorded for the ablation report.
+pub fn handle_typed_traversal(db: &Database, args: Value) -> Result<String, String> {
+    let a: TypedTraversalArgs = serde_json::from_value(args)
+        .map_err(|e| format!("Invalid typed_traversal arguments: {}", e))?;
+    let t = db
+        .typed_traversal(&a.query, a.limit)
+        .map_err(|e| e.to_string())?;
+    Ok(json!(t).to_string())
+}
 
-    /// Per-view ablation report over recorded traversals: mean selected/rejected
-    /// tokens and distractor ratio per relation view — is each view earning its
-    /// token cost?
-    pub fn handle_traversal_ablation(db: &Database, _args: Value) -> Result<String, String> {
-        let rows = db.typed_traversal_ablation().map_err(|e| e.to_string())?;
-        Ok(json!({"views": rows}).to_string())
-    }
+/// Per-view ablation report over recorded traversals: mean selected/rejected
+/// tokens and distractor ratio per relation view — is each view earning its
+/// token cost?
+pub fn handle_traversal_ablation(db: &Database, _args: Value) -> Result<String, String> {
+    let rows = db.typed_traversal_ablation().map_err(|e| e.to_string())?;
+    Ok(json!({"views": rows}).to_string())
+}
 
-    // ─── #1066 model-upgrade inheritance handler ───────────────────────────
+// ─── #1066 model-upgrade inheritance handler ───────────────────────────
 
-    #[derive(Debug, Deserialize)]
-    pub struct ModelInheritanceArgs {
-        /// record | approve | query | depart | replay
-        pub action: String,
-        #[serde(default)]
-        pub subject_id: Option<String>,
-        #[serde(default)]
-        pub from_model: Option<String>,
-        #[serde(default)]
-        pub to_model: Option<String>,
-        #[serde(default)]
-        pub provider: Option<String>,
-        #[serde(default)]
-        pub source_state_hash: Option<String>,
-        #[serde(default)]
-        pub compatibility_report: Option<String>,
-        #[serde(default)]
-        pub receipt_id: Option<String>,
-        #[serde(default)]
-        pub approver: Option<String>,
-        #[serde(default)]
-        pub incarnation_id: Option<String>,
-        #[serde(default)]
-        pub reason: Option<String>,
-        #[serde(default = "default_replay_limit")]
-        pub sample_limit: usize,
-        #[serde(default)]
-        pub requesting_agent_id: Option<String>,
-    }
+#[derive(Debug, Deserialize)]
+pub struct ModelInheritanceArgs {
+    /// record | approve | query | depart | replay
+    pub action: String,
+    #[serde(default)]
+    pub subject_id: Option<String>,
+    #[serde(default)]
+    pub from_model: Option<String>,
+    #[serde(default)]
+    pub to_model: Option<String>,
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub source_state_hash: Option<String>,
+    #[serde(default)]
+    pub compatibility_report: Option<String>,
+    #[serde(default)]
+    pub receipt_id: Option<String>,
+    #[serde(default)]
+    pub approver: Option<String>,
+    #[serde(default)]
+    pub incarnation_id: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default = "default_replay_limit")]
+    pub sample_limit: usize,
+    #[serde(default)]
+    pub requesting_agent_id: Option<String>,
+}
 
-    fn default_replay_limit() -> usize {
-        10
-    }
+fn default_replay_limit() -> usize {
+    10
+}
 
-    /// Model-upgrade inheritance receipts (#1066): a stable subject identity
-    /// distinct from any model/provider/session id, per-incarnation records, and
-    /// explicit governed transitions (record / approve / query / depart / replay)
-    /// so identity continuity across model upgrades is auditable, never
-    /// implicit. Departure preserves tombstones — no silent destruction.
-    pub fn handle_model_inheritance(db: &Database, args: Value) -> Result<String, String> {
-        let a: ModelInheritanceArgs = serde_json::from_value(args)
-            .map_err(|e| format!("Invalid model_inheritance arguments: {}", e))?;
-        let subject = a.subject_id.as_deref().unwrap_or("default-subject");
-        match a.action.as_str() {
-            "record" => {
-                let from_model = a.from_model.as_deref().ok_or("from_model is required")?;
-                let to_model = a.to_model.as_deref().ok_or("to_model is required")?;
-                let receipt = db
-                    .inheritance_receipt_record(
-                        subject,
-                        from_model,
-                        to_model,
-                        a.provider.as_deref().unwrap_or(""),
-                        a.source_state_hash.as_deref().unwrap_or(""),
-                        a.compatibility_report.as_deref().unwrap_or(""),
-                        a.requesting_agent_id.as_deref().unwrap_or(""),
-                    )
-                    .map_err(|e| e.to_string())?;
-                Ok(json!(receipt).to_string())
-            }
-            "approve" => {
-                let receipt_id = a.receipt_id.as_deref().ok_or("receipt_id is required")?;
-                let approver = a.approver.as_deref().ok_or("approver is required")?;
-                let receipt = db
-                    .inheritance_receipt_approve(receipt_id, approver)
-                    .map_err(|e| e.to_string())?;
-                Ok(json!(receipt).to_string())
-            }
-            "query" => {
-                let rows = db
-                    .inheritance_receipt_query(subject)
-                    .map_err(|e| e.to_string())?;
-                Ok(json!({"subject_id": subject, "receipts": rows}).to_string())
-            }
-            "depart" => {
-                let inc = a.incarnation_id.as_deref().ok_or("incarnation_id is required")?;
-                db.incarnation_depart(inc, a.reason.as_deref().unwrap_or(""))
-                    .map_err(|e| e.to_string())?;
-                Ok(json!({"ok": true, "incarnation_id": inc}).to_string())
-            }
-            "replay" => {
-                let receipt_id = a.receipt_id.as_deref().ok_or("receipt_id is required")?;
-                let replay = db
-                    .inheritance_replay(receipt_id, a.sample_limit)
-                    .map_err(|e| e.to_string())?;
-                Ok(json!(replay).to_string())
-            }
-            other => Err(format!("unknown action '{}' (record|approve|query|depart|replay)", other)),
+/// Model-upgrade inheritance receipts (#1066): a stable subject identity
+/// distinct from any model/provider/session id, per-incarnation records, and
+/// explicit governed transitions (record / approve / query / depart / replay)
+/// so identity continuity across model upgrades is auditable, never
+/// implicit. Departure preserves tombstones — no silent destruction.
+pub fn handle_model_inheritance(db: &Database, args: Value) -> Result<String, String> {
+    let a: ModelInheritanceArgs = serde_json::from_value(args)
+        .map_err(|e| format!("Invalid model_inheritance arguments: {}", e))?;
+    let subject = a.subject_id.as_deref().unwrap_or("default-subject");
+    match a.action.as_str() {
+        "record" => {
+            let from_model = a.from_model.as_deref().ok_or("from_model is required")?;
+            let to_model = a.to_model.as_deref().ok_or("to_model is required")?;
+            let receipt = db
+                .inheritance_receipt_record(
+                    subject,
+                    from_model,
+                    to_model,
+                    a.provider.as_deref().unwrap_or(""),
+                    a.source_state_hash.as_deref().unwrap_or(""),
+                    a.compatibility_report.as_deref().unwrap_or(""),
+                    a.requesting_agent_id.as_deref().unwrap_or(""),
+                )
+                .map_err(|e| e.to_string())?;
+            Ok(json!(receipt).to_string())
         }
+        "approve" => {
+            let receipt_id = a.receipt_id.as_deref().ok_or("receipt_id is required")?;
+            let approver = a.approver.as_deref().ok_or("approver is required")?;
+            let receipt = db
+                .inheritance_receipt_approve(receipt_id, approver)
+                .map_err(|e| e.to_string())?;
+            Ok(json!(receipt).to_string())
+        }
+        "query" => {
+            let rows = db
+                .inheritance_receipt_query(subject)
+                .map_err(|e| e.to_string())?;
+            Ok(json!({"subject_id": subject, "receipts": rows}).to_string())
+        }
+        "depart" => {
+            let inc = a
+                .incarnation_id
+                .as_deref()
+                .ok_or("incarnation_id is required")?;
+            db.incarnation_depart(inc, a.reason.as_deref().unwrap_or(""))
+                .map_err(|e| e.to_string())?;
+            Ok(json!({"ok": true, "incarnation_id": inc}).to_string())
+        }
+        "replay" => {
+            let receipt_id = a.receipt_id.as_deref().ok_or("receipt_id is required")?;
+            let replay = db
+                .inheritance_replay(receipt_id, a.sample_limit)
+                .map_err(|e| e.to_string())?;
+            Ok(json!(replay).to_string())
+        }
+        other => Err(format!(
+            "unknown action '{}' (record|approve|query|depart|replay)",
+            other
+        )),
     }
+}
 
-    pub fn handle_vault_export(db: &Database, args: Value) -> String {
+pub fn handle_vault_export(db: &Database, args: Value) -> String {
+    let stamped_requester = stamped_requester(&args).map(str::to_owned);
     let a: VaultExportArgs = match serde_json::from_value(args) {
         Ok(a) => a,
         Err(e) => {
@@ -7036,7 +7932,11 @@ pub fn handle_param_lineage(db: &Database, args: Value) -> Result<String, String
     // #871: durable op-state wrap — the export run stays observable even if
     // the process dies mid-write (recovered as `interrupted` on restart).
     run_tracked(db, "export", &scope, "internal", move |run_id| {
-        match db.vault_export(&dir, a.workspace_hash.as_deref()) {
+        match db.vault_export_for_requester(
+            &dir,
+            a.workspace_hash.as_deref(),
+            stamped_requester.as_deref(),
+        ) {
             Ok(report) => {
                 let receipt = format!(
                     "files_created={} files_updated={} errors={}",
@@ -7063,20 +7963,27 @@ pub struct DerivedExportArgs {
     pub output_path: String,
     #[serde(default)]
     pub workspace_hash: Option<String>,
+    #[serde(default)]
+    pub requesting_agent_id: Option<String>,
 }
 
 pub fn handle_derived_export(db: &Database, args: Value) -> Result<String, String> {
+    let stamped_requester = stamped_requester(&args).map(str::to_owned);
     let a: DerivedExportArgs = serde_json::from_value(args)
         .map_err(|e| format!("Invalid derived_export arguments: {e}"))?;
+    let _ = a.requesting_agent_id.as_deref();
     let entities = db
-        .recall(&crate::models::RecallParams {
-            query: String::new(),
-            limit: 1000,
-            include_archived: false,
-            workspace_hash: a.workspace_hash.clone(),
-            skip_side_effects: true,
-            ..crate::models::RecallParams::default()
-        })
+        .recall_for_requester(
+            &crate::models::RecallParams {
+                query: String::new(),
+                limit: 1000,
+                include_archived: false,
+                workspace_hash: a.workspace_hash.clone(),
+                skip_side_effects: true,
+                ..crate::models::RecallParams::default()
+            },
+            stamped_requester.as_deref(),
+        )
         .map_err(|e| format!("Derived export recall failed: {e}"))?;
     let mut selected: Vec<_> = entities
         .into_iter()
@@ -7541,13 +8448,13 @@ pub fn handle_traverse(db: &Database, args: Value) -> String {
     // request can't be asked to walk an unbounded depth/breadth of the link graph.
     let max_depth = a.max_depth.clamp(0, 64);
     let max_nodes = a.max_nodes.clamp(0, 100_000);
-    let requester = a.requesting_agent_id.as_deref().filter(|s| !s.is_empty());
-    match db.traverse_chain(&a.category, &a.key, max_depth, max_nodes) {
+    let requester = match a.requesting_agent_id.as_deref().filter(|s| !s.is_empty()) {
+        Some(requester) => requester,
+        None => return json!({"error": "requesting_agent_id is required"}).to_string(),
+    };
+    match db.traverse_chain_for_request(&a.category, &a.key, max_depth, max_nodes, requester) {
         Ok(chain) => {
-            let chain = match requester {
-                Some(req) => filter_chain_visibility(db, req, chain),
-                None => chain,
-            };
+            let chain = filter_chain_visibility(db, requester, chain);
             serde_json::to_string(&chain)
                 .unwrap_or_else(|e| json!({"error": format!("{e}")}).to_string())
         }
@@ -7671,7 +8578,8 @@ pub fn handle_score(db: &Database, args: Value) -> String {
     let prior = db.get_entity(&a.category, &a.key).ok().flatten();
     match db.score_entity(&a.category, &a.key, a.score) {
         Ok(found) => {
-            let mut out = json!({"found": found, "category": a.category, "key": a.key, "score": a.score});
+            let mut out =
+                json!({"found": found, "category": a.category, "key": a.key, "score": a.score});
             if found {
                 // #1080: an explicit score mutation commits as a signed
                 // transition (old decay → new decay/importance).
@@ -7724,7 +8632,6 @@ pub fn handle_follow(db: &Database, args: Value) -> Result<String, String> {
     serde_json::to_string(&report).map_err(|e| format!("Serialization failed: {}", e))
 }
 
-
 /// #1080: attach a signed transition to a mutation response when a signer
 /// epoch is registered. `None` = unsigned regime (no epoch key registered;
 /// the mutation is journaled by its own handler and remains backward
@@ -7775,8 +8682,8 @@ pub struct PoisonLabelArgs {
 }
 
 pub fn handle_poison_label(db: &Database, args: Value) -> Result<String, String> {
-    let a: PoisonLabelArgs = serde_json::from_value(args)
-        .map_err(|e| format!("Invalid poison_label arguments: {e}"))?;
+    let a: PoisonLabelArgs =
+        serde_json::from_value(args).map_err(|e| format!("Invalid poison_label arguments: {e}"))?;
     let report = db.set_poison_label(&a.entity_id, &a.level, &a.reason)?;
     serde_json::to_string(&report).map_err(|e| format!("Serialization failed: {e}"))
 }
@@ -7811,8 +8718,14 @@ pub fn handle_rollback_repair(db: &Database, args: Value) -> Result<String, Stri
     let report = if let Some(repair_id) = &a.reverse_repair_id {
         db.reverse_rollback_repair(repair_id)?
     } else {
-        db.rollback_repair(&a.faulty_ids, a.dry_run, a.replay, a.workspace_hash.as_deref())?
-    };    serde_json::to_string(&report).map_err(|e| format!("Serialization failed: {e}"))
+        db.rollback_repair(
+            &a.faulty_ids,
+            a.dry_run,
+            a.replay,
+            a.workspace_hash.as_deref(),
+        )?
+    };
+    serde_json::to_string(&report).map_err(|e| format!("Serialization failed: {e}"))
 }
 
 // ── #1090 evolvable retrieval-skill routing (ERSkill) ────────────────────
@@ -7829,11 +8742,15 @@ pub struct SkillSetArgs {
 }
 
 pub fn handle_skill_set(db: &Database, args: Value) -> Result<String, String> {
-    let a: SkillSetArgs = serde_json::from_value(args)
-        .map_err(|e| format!("Invalid skill_set arguments: {e}"))?;
+    let a: SkillSetArgs =
+        serde_json::from_value(args).map_err(|e| format!("Invalid skill_set arguments: {e}"))?;
     let def = crate::retrieval_skills::SkillDef {
         skill_id: a.skill_id,
-        name: if a.name.is_empty() { "skill".to_string() } else { a.name },
+        name: if a.name.is_empty() {
+            "skill".to_string()
+        } else {
+            a.name
+        },
         version: a.version,
         frontier: crate::retrieval_skills::FRONTIER_EXPANSION.to_string(),
         profile: a.profile,
@@ -7851,8 +8768,8 @@ pub struct SkillRouteArgs {
 }
 
 pub fn handle_skill_route(db: &Database, args: Value) -> Result<String, String> {
-    let a: SkillRouteArgs = serde_json::from_value(args)
-        .map_err(|e| format!("Invalid skill_route arguments: {e}"))?;
+    let a: SkillRouteArgs =
+        serde_json::from_value(args).map_err(|e| format!("Invalid skill_route arguments: {e}"))?;
     let report = db.skill_route(&a.query, a.serve)?;
     serde_json::to_string(&report).map_err(|e| format!("Serialization failed: {e}"))
 }
@@ -7878,7 +8795,6 @@ pub fn handle_skill_audit(db: &Database, args: Value) -> Result<String, String> 
     let report = db.skill_audit()?;
     serde_json::to_string(&report).map_err(|e| format!("Serialization failed: {e}"))
 }
-
 
 // ── #1091 type-conditioned temporal decay (ScrubJay) ──────────────────────
 
@@ -7938,8 +8854,8 @@ pub struct StateAuditArgs {
 }
 
 pub fn handle_state_audit(db: &Database, args: Value) -> Result<String, String> {
-    let a: StateAuditArgs = serde_json::from_value(args)
-        .map_err(|e| format!("Invalid state_audit arguments: {e}"))?;
+    let a: StateAuditArgs =
+        serde_json::from_value(args).map_err(|e| format!("Invalid state_audit arguments: {e}"))?;
     let report = db.state_audit(a.dry_run)?;
     serde_json::to_string(&report).map_err(|e| format!("Serialization failed: {e}"))
 }
@@ -10283,9 +11199,9 @@ pub fn handle_declared_schema_set(db: &Database, args: Value) -> Result<String, 
     let a: DeclaredSchemaSetArgs = serde_json::from_value(args)
         .map_err(|e| format!("Invalid declared_schema_set arguments: {e}"))?;
 
-    // Governed like any write: without a validated admission envelope the
-    // caller holds the propose capability only (reviewable candidate).
-    db.require_memory_capability(&a.requesting_agent_id, &a.workspace_hash, "memory.propose")
+    // A declared schema is an executable retrieval contract, so activation
+    // requires commit authority rather than the propose-only capability.
+    db.require_memory_capability(&a.requesting_agent_id, &a.workspace_hash, "memory.commit")
         .map_err(|e| format!("write denied: {e}"))?;
 
     let mut fields = Vec::with_capacity(a.fields.len());
@@ -10337,6 +11253,8 @@ pub fn handle_declared_query(db: &Database, args: Value) -> Result<String, Strin
         offset: i64,
         #[serde(default)]
         workspace_hash: Option<String>,
+        #[serde(default)]
+        requesting_agent_id: Option<String>,
     }
     let a: DeclaredQueryArgs = serde_json::from_value(args)
         .map_err(|e| format!("Invalid declared_query arguments: {e}"))?;
@@ -10356,8 +11274,13 @@ pub fn handle_declared_query(db: &Database, args: Value) -> Result<String, Strin
             value: v.clone(),
         })
         .collect();
-    let mut entities =
-        crate::declared::declared_candidates(db, &schema, &filters, a.workspace_hash.as_deref())?;
+    let mut entities = crate::declared::declared_candidates(
+        db,
+        &schema,
+        &filters,
+        a.workspace_hash.as_deref(),
+        a.requesting_agent_id.as_deref(),
+    )?;
     let total = entities.len();
     let offset = a.offset.max(0) as usize;
     let limit = if a.limit < 0 {
@@ -10377,6 +11300,7 @@ pub fn handle_declared_query(db: &Database, args: Value) -> Result<String, Strin
         &filters,
         &a.facets,
         a.workspace_hash.as_deref(),
+        a.requesting_agent_id.as_deref(),
     )?;
     Ok(json!({
         "ok": true,
@@ -10496,7 +11420,6 @@ pub fn handle_ingest(db: &Database, args: Value) -> Result<String, String> {
     }
 }
 
-
 #[derive(Debug, Deserialize)]
 pub struct SpanAuditArgs {
     pub entity_id: String,
@@ -10537,8 +11460,8 @@ pub struct ReportRefusalArgs {
 }
 
 pub fn handle_report_refusal(db: &Database, args: Value) -> Result<String, String> {
-    let a: ReportRefusalArgs =
-        serde_json::from_value(args).map_err(|e| format!("Invalid report_refusal arguments: {e}"))?;
+    let a: ReportRefusalArgs = serde_json::from_value(args)
+        .map_err(|e| format!("Invalid report_refusal arguments: {e}"))?;
     if a.query.trim().is_empty() {
         return Err("report_refusal: query must be non-empty".to_string());
     }
@@ -10558,8 +11481,8 @@ pub struct ReportSuccessArgs {
 }
 
 pub fn handle_report_success(db: &Database, args: Value) -> Result<String, String> {
-    let a: ReportSuccessArgs =
-        serde_json::from_value(args).map_err(|e| format!("Invalid report_success arguments: {e}"))?;
+    let a: ReportSuccessArgs = serde_json::from_value(args)
+        .map_err(|e| format!("Invalid report_success arguments: {e}"))?;
     if a.query.trim().is_empty() {
         return Err("report_success: query must be non-empty".to_string());
     }
@@ -11738,7 +12661,7 @@ pub fn handle_share(db: &Database, args: Value) -> Result<String, String> {
         .find(|e| e.key == a.key)
         .ok_or_else(|| format!("Entity not found: {}/{}", a.category, a.key))?;
 
-    if !entity_has_authoritative_admission(src) {
+    if !entity_has_authoritative_admission(db, src)? {
         return Err(
             "source requires_review: share requires durable authoritative admission".to_string(),
         );
@@ -12139,9 +13062,9 @@ pub fn handle_consistency_audit(db: &Database, args: Value) -> Result<String, St
             continue;
         }
         let (Some(a_ent), Some(b_ent)) = (
-            db.get_entity_by_id_public(id_a)
+            db.get_entity_by_id_unfiltered(id_a)
                 .map_err(|e| format!("Entity lookup failed: {e}"))?,
-            db.get_entity_by_id_public(id_b)
+            db.get_entity_by_id_unfiltered(id_b)
                 .map_err(|e| format!("Entity lookup failed: {e}"))?,
         ) else {
             continue;
@@ -12257,11 +13180,11 @@ pub fn handle_audit_ruling(db: &Database, args: Value) -> Result<String, String>
                 return Err("audit_ruling requires entity_a_key and entity_b_key".to_string());
             }
             let ent_a = db
-                .get_entity(&a.category, &a.entity_a_key)
+                .get_entity_by_category_key_for_mutation(&a.category, &a.entity_a_key)
                 .map_err(|e| format!("Entity A lookup failed: {e}"))?
                 .ok_or_else(|| format!("Entity A not found: {}/{}", a.category, a.entity_a_key))?;
             let ent_b = db
-                .get_entity(&a.category, &a.entity_b_key)
+                .get_entity_by_category_key_for_mutation(&a.category, &a.entity_b_key)
                 .map_err(|e| format!("Entity B lookup failed: {e}"))?
                 .ok_or_else(|| format!("Entity B not found: {}/{}", a.category, a.entity_b_key))?;
             if ent_a.id == ent_b.id {
@@ -12300,7 +13223,7 @@ pub fn handle_audit_ruling(db: &Database, args: Value) -> Result<String, String>
                     return Err("override requires winner_category and winner_key".to_string());
                 }
                 let winner_ent = db
-                    .get_entity(&a.winner_category, &a.winner_key)
+                    .get_entity_by_category_key_for_mutation(&a.winner_category, &a.winner_key)
                     .map_err(|e| format!("Winner lookup failed: {e}"))?
                     .ok_or_else(|| {
                         format!("Winner not found: {}/{}", a.winner_category, a.winner_key)
@@ -12382,7 +13305,7 @@ pub fn handle_supersede(db: &Database, args: Value) -> Result<String, String> {
 
     // Find the 'from' entity
     let from_entity = db
-        .get_entity(&a.from_category, &a.from_key)
+        .get_entity_by_category_key_for_mutation(&a.from_category, &a.from_key)
         .map_err(|e| format!("'From' entity lookup failed: {}", e))?
         .ok_or_else(|| {
             format!(
@@ -12393,7 +13316,7 @@ pub fn handle_supersede(db: &Database, args: Value) -> Result<String, String> {
 
     // Find the 'to' entity
     let to_entity = db
-        .get_entity(&a.to_category, &a.to_key)
+        .get_entity_by_category_key_for_mutation(&a.to_category, &a.to_key)
         .map_err(|e| format!("'To' entity lookup failed: {}", e))?
         .ok_or_else(|| format!("'To' entity not found: {}/{}", a.to_category, a.to_key))?;
 
@@ -12404,7 +13327,7 @@ pub fn handle_supersede(db: &Database, args: Value) -> Result<String, String> {
     //   * it must not EXTEND an already-closed period — a fact that ended
     //     stays ended; superseding may only tighten.
     let periods = db
-        .valid_periods_for_ids(&[from_entity.id.clone()])
+        .valid_periods_for_ids_for_mutation(&[from_entity.id.clone()])
         .map_err(|e| format!("'From' entity valid-period lookup failed: {}", e))?;
     let (eff_from, cur_to) = periods
         .get(&from_entity.id)
@@ -13395,6 +14318,36 @@ mod tests {
         let db = crate::db::TestDatabase::new("perseus_vault-test-tools");
         let path = db.path().to_string();
         (db, path)
+    }
+
+    static ADMISSION_ENV_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
+        std::sync::OnceLock::new();
+
+    struct AdmissionEnvGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        previous: Option<String>,
+    }
+
+    impl Drop for AdmissionEnvGuard {
+        fn drop(&mut self) {
+            match self.previous.as_deref() {
+                Some(value) => std::env::set_var(ADMISSION_SOURCE_HMAC_KEY_ENV, value),
+                None => std::env::remove_var(ADMISSION_SOURCE_HMAC_KEY_ENV),
+            }
+        }
+    }
+
+    fn admission_env_guard() -> AdmissionEnvGuard {
+        let lock = ADMISSION_ENV_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .expect("admission test environment lock");
+        let previous = std::env::var(ADMISSION_SOURCE_HMAC_KEY_ENV).ok();
+        std::env::remove_var(ADMISSION_SOURCE_HMAC_KEY_ENV);
+        AdmissionEnvGuard {
+            _lock: lock,
+            previous,
+        }
     }
 
     fn remember_rejects_injection_bodies_fail_closed() {
@@ -16325,7 +17278,11 @@ mod tests {
         .expect("first supersede");
         let snapshots = db.history_versions("facts", "rs-old").unwrap().len();
 
-        let old_id = db.get_entity("facts", "rs-old").unwrap().unwrap().id;
+        let old_id = db
+            .get_entity_by_category_key_for_mutation("facts", "rs-old")
+            .unwrap()
+            .unwrap()
+            .id;
         db.update_entity_status(&old_id, "deprecated", "second reason")
             .expect("same-status reason overwrite");
 
@@ -16334,7 +17291,10 @@ mod tests {
             snapshots,
             "a same-status reason overwrite must not write a snapshot"
         );
-        let e = db.get_entity("facts", "rs-old").unwrap().unwrap();
+        let e = db
+            .get_entity_by_category_key_for_mutation("facts", "rs-old")
+            .unwrap()
+            .unwrap();
         assert_eq!(e.status, "deprecated");
         assert_eq!(e.archive_reason, "second reason");
 
@@ -16636,6 +17596,27 @@ mod tests {
     }
 
     #[test]
+    fn direct_read_without_requester_hides_private_rows() {
+        let db = Database::open(":memory:").unwrap();
+        let entity: crate::models::Entity = serde_json::from_value(json!({
+            "id": "private-no-requester",
+            "category": "notes",
+            "key": "private-no-requester",
+            "body_json": "{\"secret\":\"NO_REQUESTER_SENTINEL\"}",
+            "status": "active",
+            "agent_id": "alice",
+            "visibility": "private",
+            "created_at_unix_ms": 1,
+            "last_accessed_unix_ms": 1
+        }))
+        .unwrap();
+        assert!(
+            !requester_can_read(&db, None, &entity),
+            "private rows must fail closed without a transport requester"
+        );
+    }
+
+    #[test]
     fn recall_enforces_visibility_by_requesting_agent() {
         // #684: a private entity is hidden from other agents but visible to its
         // author and to an unscoped requester; default-visibility entities are
@@ -16648,7 +17629,7 @@ mod tests {
             &db,
             json!({"category": "notes", "key": "secret",
                    "body_json": "{\"note\":\"quantum widget blueprint\"}",
-                   "visibility": "private", "agent_id": "alice"}),
+                   "visibility": "private", "agent_id": "alice", "layer": "buffer"}),
         )
         .expect("private");
         handle_remember(
@@ -16678,12 +17659,51 @@ mod tests {
             2,
             "alice sees her own private note"
         );
-        // No requester identity → unscoped → sees both (existing behavior).
+        // No requester identity → shared rows only; private/fleet rows fail closed.
         assert_eq!(
             count(json!({"query": "quantum", "mode": "fts5"})),
-            2,
-            "unscoped recall is unchanged"
+            1,
+            "unscoped recall must not expose private rows"
         );
+
+        let expanded = handle_recall(
+            &db,
+            json!({
+                "query": "quantum",
+                "mode": "fts5",
+                "expansion": {"enabled": true, "n_variants": 1},
+                "requesting_agent_id": "bob"
+            }),
+        )
+        .unwrap();
+        assert!(
+            !expanded.contains("quantum widget blueprint"),
+            "expanded recall leaked a private body: {expanded}"
+        );
+
+        let batch = handle_recall_batch(
+            &db,
+            json!({
+                "requesting_agent_id": "bob",
+                "queries": [{"query": "quantum", "mode": "fts5", "limit": 10}]
+            }),
+        )
+        .unwrap();
+        assert!(
+            !batch.contains("quantum widget blueprint"),
+            "recall_batch leaked a private body: {batch}"
+        );
+
+        let layer = handle_recall_layer(
+            &db,
+            json!({"layer": "episodic", "limit": 10, "requesting_agent_id": "bob"}),
+        )
+        .unwrap();
+        assert!(
+            !layer.contains("quantum widget blueprint"),
+            "recall_layer leaked a private body: {layer}"
+        );
+
         let _ = std::fs::remove_file(&path);
     }
 
@@ -17207,9 +18227,14 @@ mod tests {
         assert!(!v["supersede_receipt"].as_str().unwrap().is_empty());
         assert_eq!(v["compiled_guard"]["relationship"], "supersedes");
         // guard compiled: loser is deprecated with a CLOSED valid period
-        let loser = db.get_entity("facts", "audit-b").unwrap().unwrap();
+        let loser = db
+            .get_entity_by_category_key_for_mutation("facts", "audit-b")
+            .unwrap()
+            .unwrap();
         assert_eq!(loser.status, "deprecated");
-        let periods = db.valid_periods_for_ids(&[id_b.clone()]).unwrap();
+        let periods = db
+            .valid_periods_for_ids_for_mutation(&[id_b.clone()])
+            .unwrap();
         let (_, cur_to) = periods.get(&id_b).copied().unwrap_or((0, None));
         assert!(cur_to.is_some(), "loser valid period must be closed");
         // idempotent re-ruling: same ruling, no new row
@@ -17817,10 +18842,8 @@ mod tests {
                 "evt-fact" => "event",
                 _ => "general",
             };
-            db.scan_entities(Some(category), None, true, None, 50)
+            db.get_entity_by_category_key_for_mutation(category, key)
                 .unwrap()
-                .into_iter()
-                .find(|e| e.key == key)
                 .unwrap()
                 .decay_score
         };
@@ -18054,7 +19077,10 @@ mod tests {
                 "hp-e1",
                 "{\"note\":\"the deployment pipeline uses kubernetes for the public tier\"}",
             ),
-            false, None, None, false,
+            false,
+            None,
+            None,
+            false,
         )
         .unwrap();
         db.remember_with_options(
@@ -18064,7 +19090,10 @@ mod tests {
                 "hp-e2",
                 "{\"note\":\"deployment promotion requires two-person review\"}",
             ),
-            false, None, None, false,
+            false,
+            None,
+            None,
+            false,
         )
         .unwrap();
         let hp_e1_id: String = {
@@ -18112,7 +19141,10 @@ mod tests {
                 "hp-ant",
                 "{\"note\":\"rollout canary checklist\",\"recall_when\":[\"deployment\"]}",
             ),
-            false, None, None, false,
+            false,
+            None,
+            None,
+            false,
         )
         .unwrap();
 
@@ -18151,8 +19183,14 @@ mod tests {
         )
         .unwrap();
         let vp: Value = serde_json::from_str(&raw_plain).unwrap();
-        assert!(vp.get("intent_trail").is_none(), "unrequested trail: {raw_plain}");
-        assert!(vp.get("next_work").is_none(), "unrequested next_work: {raw_plain}");
+        assert!(
+            vp.get("intent_trail").is_none(),
+            "unrequested trail: {raw_plain}"
+        );
+        assert!(
+            vp.get("next_work").is_none(),
+            "unrequested next_work: {raw_plain}"
+        );
         // Opt-in granularity: next_work alone must not emit intent_trail.
         let raw_nw = handle_handoff_pack(
             &db,
@@ -18162,7 +19200,10 @@ mod tests {
         .unwrap();
         let vn: Value = serde_json::from_str(&raw_nw).unwrap();
         assert!(vn.get("next_work").is_some(), "next_work missing: {raw_nw}");
-        assert!(vn.get("intent_trail").is_none(), "trail emitted without flag: {raw_nw}");
+        assert!(
+            vn.get("intent_trail").is_none(),
+            "trail emitted without flag: {raw_nw}"
+        );
         // Determinism: identical store state -> identical enriched output.
         let raw2 = handle_handoff_pack(&db, args).unwrap();
         assert_eq!(raw2, raw, "enriched pack must be deterministic");
@@ -18179,7 +19220,8 @@ mod tests {
             "{\"note\":\"deployment pipeline runs kubernetes for workspace alpha\"}",
         );
         e_a.workspace_hash = "workspace-a".to_string();
-        db.remember_with_options(&e_a, false, None, None, false).unwrap();
+        db.remember_with_options(&e_a, false, None, None, false)
+            .unwrap();
         let mut e_b = crate::db::tests::make_entity(
             "ws-b",
             "facts",
@@ -18187,7 +19229,8 @@ mod tests {
             "{\"note\":\"deployment pipeline runs kubernetes for workspace beta\"}",
         );
         e_b.workspace_hash = "workspace-b".to_string();
-        db.remember_with_options(&e_b, false, None, None, false).unwrap();
+        db.remember_with_options(&e_b, false, None, None, false)
+            .unwrap();
 
         let raw = handle_handoff_pack(
             &db,
@@ -18202,7 +19245,10 @@ mod tests {
             .iter()
             .filter_map(|p| p["key"].as_str())
             .collect();
-        assert!(keys.contains(&"ws-a"), "scoped pack missing own entity: {raw}");
+        assert!(
+            keys.contains(&"ws-a"),
+            "scoped pack missing own entity: {raw}"
+        );
         assert!(!keys.contains(&"ws-b"), "cross-workspace leak: {raw}");
         // Legacy: no workspace -> unscoped pack sees both.
         let raw_g = handle_handoff_pack(
@@ -18242,7 +19288,8 @@ mod tests {
             "{\"note\":\"deployment pipeline alpha release notes\"}",
         );
         iso_a.workspace_hash = "workspace-a".to_string();
-        db.remember_with_options(&iso_a, false, None, None, false).unwrap();
+        db.remember_with_options(&iso_a, false, None, None, false)
+            .unwrap();
         let iso_a_id: String = {
             let conn = db.conn().unwrap();
             conn.query_row("SELECT id FROM entities WHERE key = 'iso-a'", [], |r| {
@@ -18284,7 +19331,8 @@ mod tests {
             "{\"note\":\"deployment pipeline beta release notes\"}",
         );
         iso_b.workspace_hash = "workspace-b".to_string();
-        db.remember_with_options(&iso_b, false, None, None, false).unwrap();
+        db.remember_with_options(&iso_b, false, None, None, false)
+            .unwrap();
         db.journal(&crate::models::JournalEvent {
             id: "jrn-iso-b".to_string(),
             event_type: "action".to_string(),
@@ -18364,7 +19412,8 @@ mod tests {
             "{\"note\":\"deployment pipeline uses kubernetes for rollout orchestration\"}",
         );
         a1.workspace_hash = "workspace-a".to_string();
-        db.remember_with_options(&a1, false, None, None, false).unwrap();
+        db.remember_with_options(&a1, false, None, None, false)
+            .unwrap();
         let mut a2 = crate::db::tests::make_entity(
             "cf-a2",
             "facts",
@@ -18372,7 +19421,8 @@ mod tests {
             "{\"note\":\"deployment pipeline rolls back automatically whenever a canary probe detects latency spikes beyond the alert threshold\"}",
         );
         a2.workspace_hash = "workspace-a".to_string();
-        db.remember_with_options(&a2, false, None, None, false).unwrap();
+        db.remember_with_options(&a2, false, None, None, false)
+            .unwrap();
         let mut b1 = crate::db::tests::make_entity(
             "cf-b1",
             "facts",
@@ -18380,7 +19430,8 @@ mod tests {
             "{\"note\":\"deployment pipeline runs on jenkins workers with manual gates\"}",
         );
         b1.workspace_hash = "workspace-b".to_string();
-        db.remember_with_options(&b1, false, None, None, false).unwrap();
+        db.remember_with_options(&b1, false, None, None, false)
+            .unwrap();
         let mut b2 = crate::db::tests::make_entity(
             "cf-b2",
             "facts",
@@ -18388,7 +19439,8 @@ mod tests {
             "{\"note\":\"deployment pipeline moved to github actions with matrix builds and artifact signing\"}",
         );
         b2.workspace_hash = "workspace-b".to_string();
-        db.remember_with_options(&b2, false, None, None, false).unwrap();
+        db.remember_with_options(&b2, false, None, None, false)
+            .unwrap();
         let b_ids: Vec<String> = {
             let conn = db.conn().unwrap();
             let mut stmt = conn
@@ -18581,7 +19633,12 @@ mod tests {
         // is newest-first on id (descending), so t3 precedes t2, t1, t0.
         let tie_pos: Vec<usize> = ["tr-t3", "tr-t2", "tr-t1", "tr-t0"]
             .iter()
-            .map(|id| ids25.iter().position(|x| x == id).expect("tie member present"))
+            .map(|id| {
+                ids25
+                    .iter()
+                    .position(|x| x == id)
+                    .expect("tie member present")
+            })
             .collect();
         assert!(
             tie_pos.windows(2).all(|w| w[0] < w[1]),
@@ -18606,7 +19663,10 @@ mod tests {
                 "db-d1",
                 "{\"note\":\"deployment promotion requires two-person review before production\"}",
             ),
-            false, None, None, false,
+            false,
+            None,
+            None,
+            false,
         )
         .unwrap();
         db.remember_with_options(
@@ -18616,7 +19676,10 @@ mod tests {
                 "db-d2",
                 "{\"note\":\"deployment promotion approved by a single reviewer\"}",
             ),
-            false, None, None, false,
+            false,
+            None,
+            None,
+            false,
         )
         .unwrap();
         let db_d2_id: String = {
@@ -18628,7 +19691,8 @@ mod tests {
         };
         // db-d1 supersedes db-d2: the old decision must be excluded and
         // listed as do-not-resurrect, never binding context.
-        db.link("decision", "db-d1", &db_d2_id, "supersedes").unwrap();
+        db.link("decision", "db-d1", &db_d2_id, "supersedes")
+            .unwrap();
         let db_d1_id: String = {
             let conn = db.conn().unwrap();
             conn.query_row("SELECT id FROM entities WHERE key = 'db-d1'", [], |r| {
@@ -18676,7 +19740,10 @@ mod tests {
             !binding.contains("db-d2"),
             "superseded decision leaked into binding context: {brief}"
         );
-        let resurrect = &brief[bind_end..brief.find("## Intent trail (recent)").expect("trail header")];
+        let resurrect = &brief[bind_end
+            ..brief
+                .find("## Intent trail (recent)")
+                .expect("trail header")];
         assert!(
             resurrect.contains("db-d2"),
             "superseded decision missing from do-not-resurrect: {brief}"
@@ -18731,10 +19798,11 @@ mod tests {
         assert_eq!(v2["brief"], v["brief"], "brief must be deterministic");
         assert_eq!(v2["brief_digest"], v["brief_digest"]);
         // Validation: goal and query are required.
-        assert!(
-            handle_delegation_brief(&db, json!({"query": "deployment promotion", "goal": "  "}))
-                .is_err()
-        );
+        assert!(handle_delegation_brief(
+            &db,
+            json!({"query": "deployment promotion", "goal": "  "})
+        )
+        .is_err());
         assert!(handle_delegation_brief(&db, json!({"query": "", "goal": "x"})).is_err());
         let _ = std::fs::remove_file(path);
     }
@@ -20218,6 +21286,35 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// Public temporal serializers must reduce compacted bodies to the marker
+    /// allowlist even when an upstream database filter is bypassed.
+    #[test]
+    fn temporal_version_serializer_closes_compacted_body_projection() {
+        let mut entity: crate::models::Entity = serde_json::from_value(json!({
+            "id": "temporal-serializer-compacted",
+            "category": "facts",
+            "key": "temporal-serializer-compacted",
+            "body_json": r#"{\"content\":\"TEMPORAL SERIALIZER SENTINEL\"}"#,
+            "created_at_unix_ms": 0,
+            "last_accessed_unix_ms": 0
+        }))
+        .unwrap();
+        entity.status = "compacted".to_string();
+        let version = crate::db::TemporalVersion {
+            entity,
+            valid_from_unix_ms: None,
+            valid_to_unix_ms: None,
+            recorded_at_unix_ms: 1,
+            invalidated_at_unix_ms: None,
+        };
+        let response = temporal_version_json(&version);
+        let body = response["body_json"].as_str().unwrap_or("");
+        assert!(!body.contains("TEMPORAL SERIALIZER SENTINEL"));
+        let body_value: Value = serde_json::from_str(body).unwrap();
+        assert_eq!(body_value["compacted"], json!(true));
+        assert_eq!(response["status"], json!("compacted"));
+    }
+
     /// #398: the as_of MCP tool surfaces the tombstone as an explicit
     /// compacted marker (flag + version count + digest), not a fake version.
     #[test]
@@ -20243,6 +21340,31 @@ mod tests {
             .unwrap()
         };
         handle_prune(&db, json!({"scope": "history", "max_versions_per_key": 1})).expect("evict");
+        {
+            let conn = db.conn().unwrap();
+            let compacted_rows: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM entity_history WHERE key = ?1 AND status = 'compacted'",
+                    ["hot398b"],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(compacted_rows, 1, "expected one compacted history row");
+            let original: String = conn
+                .query_row(
+                    "SELECT body_json FROM entity_history WHERE key = ?1 AND status = 'compacted'",
+                    ["hot398b"],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let mut tampered: Value = serde_json::from_str(&original).unwrap();
+            tampered["content"] = json!("COMPACTED_SENTINEL");
+            conn.execute(
+                "UPDATE entity_history SET body_json = ?1 WHERE key = ?2 AND status = 'compacted'",
+                rusqlite::params![tampered.to_string(), "hot398b"],
+            )
+            .unwrap();
+        }
 
         let resp = handle_as_of(
             &db,
@@ -20257,9 +21379,169 @@ mod tests {
             "marker must be explicit: {resp}"
         );
         assert_eq!(v["status"], json!("compacted"));
+        assert!(
+            !resp.contains("COMPACTED_SENTINEL"),
+            "compacted temporal response leaked the stored body: {resp}"
+        );
         assert_eq!(v["versions_compacted"].as_i64().unwrap(), 2);
         assert_eq!(v["digest"].as_str().unwrap().len(), 16);
         assert!(v["note"].as_str().unwrap().contains("not recoverable"));
+
+        let valid_resp = handle_valid_at(
+            &db,
+            json!({"category": "facts", "key": "hot398b", "valid_at_unix_ms": t_first}),
+        )
+        .expect("valid_at compacted probe");
+        let valid_value: Value = serde_json::from_str(&valid_resp).unwrap();
+        assert_eq!(
+            valid_value["found"],
+            json!(true),
+            "valid_at must find marker: {valid_resp}"
+        );
+        assert_eq!(valid_value["compacted"], json!(true));
+        assert!(
+            !valid_resp.contains("COMPACTED_SENTINEL"),
+            "valid_at leaked compacted body: {valid_resp}"
+        );
+
+        let bitemporal_resp = handle_bitemporal(
+            &db,
+            json!({"category": "facts", "key": "hot398b",
+                   "tx_at_unix_ms": t_first, "valid_at_unix_ms": t_first}),
+        )
+        .expect("bitemporal compacted probe");
+        let bitemporal_value: Value = serde_json::from_str(&bitemporal_resp).unwrap();
+        assert_eq!(
+            bitemporal_value["found"],
+            json!(true),
+            "bitemporal must find marker: {bitemporal_resp}"
+        );
+        assert_eq!(bitemporal_value["compacted"], json!(true));
+        assert!(
+            !bitemporal_resp.contains("COMPACTED_SENTINEL"),
+            "bitemporal leaked compacted body: {bitemporal_resp}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[cfg(feature = "bundled-embeddings")]
+    #[test]
+    fn semantic_search_enforces_requester_visibility() {
+        let (db, path) = temp_db();
+        handle_remember(
+            &db,
+            json!({
+                "category": "notes",
+                "key": "semantic-public",
+                "body_json": "{\"note\":\"quantum public reference\"}",
+                "visibility": "public",
+                "agent_id": "alice"
+            }),
+        )
+        .expect("public semantic fixture");
+        handle_remember(
+            &db,
+            json!({
+                "category": "notes",
+                "key": "semantic-private",
+                "body_json": "{\"note\":\"quantum private blueprint\"}",
+                "visibility": "private",
+                "agent_id": "alice"
+            }),
+        )
+        .expect("private semantic fixture");
+
+        let response = handle_semantic_search(
+            &db,
+            json!({
+                "query": "quantum",
+                "limit": 10,
+                "requesting_agent_id": "bob"
+            }),
+        )
+        .expect("semantic search");
+        assert!(
+            !response.contains("quantum private blueprint"),
+            "semantic search leaked a private body: {response}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn declared_query_excludes_terminal_rows_from_items_and_facets() {
+        let (db, path) = temp_db();
+        crate::declared::declared_schema_set(
+            &db,
+            "declared_lifecycle",
+            &[crate::declared::DeclaredField {
+                name: "kind".to_string(),
+                field_type: crate::declared::DeclaredFieldType::Scalar,
+                facet: true,
+            }],
+            "",
+        )
+        .expect("declare schema");
+        handle_remember(
+            &db,
+            json!({
+                "category": "declared_lifecycle",
+                "key": "public",
+                "body_json": "{\"kind\":\"public\"}"
+            }),
+        )
+        .expect("remember public row");
+        handle_remember(
+            &db,
+            json!({
+                "category": "declared_lifecycle",
+                "key": "terminal",
+                "body_json": "{\"kind\":\"secret\"}"
+            }),
+        )
+        .expect("remember terminal row");
+        handle_remember(
+            &db,
+            json!({
+                "category": "declared_lifecycle",
+                "key": "private",
+                "body_json": "{\"kind\":\"PRIVATE DECLARED SENTINEL\"}",
+                "visibility": "private",
+                "agent_id": "alice"
+            }),
+        )
+        .expect("remember private row");
+        {
+            let conn = db.conn().unwrap();
+            conn.execute(
+                "UPDATE entities SET status = 'deprecated', archived = 0 WHERE category = ?1 AND key = ?2",
+                ["declared_lifecycle", "terminal"],
+            )
+            .unwrap();
+        }
+
+        let response = handle_declared_query(
+            &db,
+            json!({
+                "category": "declared_lifecycle",
+                "facets": ["kind"],
+                "limit": 50,
+                "requesting_agent_id": "bob"
+            }),
+        )
+        .expect("declared query");
+        let value: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(value["total_matches"], json!(1));
+        assert_eq!(value["items"].as_array().unwrap().len(), 1);
+        assert_eq!(value["items"][0]["key"], json!("public"));
+        assert_eq!(
+            value["facet_counts"]["kind"],
+            json!([{"value":"public","count":1}])
+        );
+        assert!(
+            !response.contains("secret"),
+            "terminal row leaked: {response}"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -21356,6 +22638,144 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    #[test]
+    fn public_admission_source_requires_strict_source_authority() {
+        let _admission_env = admission_env_guard();
+        let (db, path) = temp_db();
+        let record_digest = crate::trust_admission::digest_text("{\"note\":\"source\"}");
+        std::env::set_var(ADMISSION_SOURCE_HMAC_KEY_ENV, "test-admission-source-key");
+        let evaluated = json!({
+            "record_digest": record_digest,
+            "source_identity": "connector-event",
+            "workspace_hash": "source-ws",
+            "actor_kind": "connector",
+            "actor_identity": "source-agent"
+        });
+        let source_attestation = admission_source_hmac_hex(
+            "test-admission-source-key",
+            &admission_source_attestation_payload(&evaluated, "requester").unwrap(),
+        );
+        let result = handle_journal(
+            &db,
+            json!({
+                "event_type": "admission_source",
+                "evaluated": evaluated,
+                "source_attestation": source_attestation,
+                "workspace_hash": "source-ws",
+                "requesting_agent_id": "requester"
+            }),
+        )
+        .expect_err("unprivileged public callers must not mint authoritative source events");
+        assert!(result.contains("memory.admission.source"), "{result}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn admission_source_requires_server_attestation_even_with_authority() {
+        let _admission_env = admission_env_guard();
+        let (db, path) = temp_db();
+        db.agent_upsert("source-requester", "Source requester", 2, "test")
+            .unwrap();
+        db.authority_set(
+            &crate::models::AuthorityManifestInput {
+                agent_id: "source-requester".to_string(),
+                workspace_hash: "source-ws".to_string(),
+                allowed_capabilities: vec!["memory.admission.source".to_string()],
+                approval_required_capabilities: Vec::new(),
+                scope_anchors: vec!["source-ws".to_string()],
+                approver_principals: Vec::new(),
+                allowed_inbound_principals: Vec::new(),
+                permitted_external_ref_prefixes: Vec::new(),
+                max_parallel_actions: 1,
+                mode: "enforce".to_string(),
+                expires_at_unix_ms: None,
+                capability_constraints_json: "{}".to_string(),
+            },
+            "operator",
+        )
+        .unwrap();
+        let err = handle_journal(
+            &db,
+            json!({
+                "event_type": "admission_source",
+                "evaluated": {
+                    "record_digest": crate::trust_admission::digest_text("{\"note\":\"source\"}"),
+                    "source_identity": "connector-event",
+                    "workspace_hash": "source-ws",
+                    "actor_kind": "connector",
+                    "actor_identity": "source-agent"
+                },
+                "workspace_hash": "source-ws",
+                "requesting_agent_id": "source-requester"
+            }),
+        )
+        .expect_err("a capability alone must not mint an admission source event");
+        assert!(err.contains("attestation"), "{err}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn admission_decide_requires_workspace_and_strict_review_authority() {
+        let (db, path) = temp_db();
+        let body = "{\"content\":\"candidate\"}";
+        handle_remember(
+            &db,
+            json!({
+                "category": "decision",
+                "key": "review-authority",
+                "workspace_hash": "review-ws",
+                "agent_id": "writer",
+                "actor_kind": "assistant",
+                "body_json": body,
+                "admission": {
+                    "record_digest": crate::trust_admission::digest_text(body),
+                    "source_identity": "review-source",
+                    "authorization_scope": "review-ws",
+                    "ingestion_channel": "review-fixture",
+                    "workspace_hash": "review-ws",
+                    "source_trust": "trusted",
+                    "valid_from_unix_ms": 100,
+                    "recorded_at_unix_ms": 110,
+                    "task_relevance_bps": 9000
+                },
+                "skip_dedup": true
+            }),
+        )
+        .expect("test candidate");
+        let missing_workspace = handle_admission_decide(
+            &db,
+            json!({
+                "category": "decision",
+                "key": "review-authority",
+                "requesting_agent_id": "reviewer",
+                "decision": "approve",
+                "reason": "human approved"
+            }),
+        )
+        .expect_err("empty workspace must be rejected before candidate lookup");
+        assert!(
+            missing_workspace.contains("workspace_hash"),
+            "{missing_workspace}"
+        );
+        let missing_authority = handle_admission_decide(
+            &db,
+            json!({
+                "category": "decision",
+                "key": "review-authority",
+                "workspace_hash": "review-ws",
+                "requesting_agent_id": "reviewer",
+                "decision": "approve",
+                "reason": "human approved"
+            }),
+        )
+        .expect_err("review transitions require explicit review authority");
+        assert!(
+            missing_authority.contains("memory.admission.review"),
+            "{missing_authority}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
     // #1026: the four terminal admission dispositions — Commit (admitted),
     // Reject (suppressed, dropped), Quarantine (sealed outside the head),
     // Defer (proposed, awaits review).
@@ -21363,22 +22783,39 @@ mod tests {
     fn remember_admission_terminal_dispositions_commit_reject_quarantine_defer() {
         let (db, path) = temp_db();
         // Source event binding so an authoritative admission can Commit.
-        db.journal(&crate::models::JournalEvent {
+        let commit_body = "{\"note\":\"authoritative fact\"}";
+        let commit_digest = crate::trust_admission::digest_text(commit_body);
+        std::env::set_var(ADMISSION_SOURCE_HMAC_KEY_ENV, "test-admission-source-key");
+        let source_evaluated = json!({
+            "record_digest": commit_digest,
+            "source_identity": "email-42",
+            "workspace_hash": "workspace-a",
+            "actor_kind": "connector",
+            "actor_identity": "agent-a"
+        });
+        let source_attestation_digest =
+            crate::trust_admission::admission_source_attestation_digest(
+                &source_evaluated,
+                "requester-a",
+            )
+            .unwrap();
+        let mut source_acted: Value =
+            serde_json::from_str(&hash_only_public_journal_payload(&json!({}))).unwrap();
+        source_acted["attestation_digest"] = json!(source_attestation_digest);
+        db.journal_authenticated_admission_source(&crate::models::JournalEvent {
             id: "src-event-1".to_string(),
-            event_type: "source_event".to_string(),
-            evaluated_json: "{}".to_string(),
-            acted_json: "{}".to_string(),
-            forward_json: "{}".to_string(),
+            event_type: "admission_source".to_string(),
+            evaluated_json: hash_only_public_journal_payload(&source_evaluated),
+            acted_json: source_acted.to_string(),
+            forward_json: hash_only_public_journal_payload(&json!({})),
             category: "source".to_string(),
             key: "src-1".to_string(),
             entity_id: String::new(),
-            agent_id: "agent-a".to_string(),
+            agent_id: "requester-a".to_string(),
             workspace_hash: "workspace-a".to_string(),
             created_at_unix_ms: 100,
         })
         .unwrap();
-        let commit_body = "{\"note\":\"authoritative fact\"}";
-        let commit_digest = crate::trust_admission::digest_text(commit_body);
 
         // ── Commit: authoritative, validated, bound source ──────────────────
         let response = handle_remember(
@@ -21389,6 +22826,7 @@ mod tests {
                 "body_json": commit_body,
                 "agent_id": "agent-a",
                 "actor_kind": "connector",
+                "requesting_agent_id": "requester-a",
                 "workspace_hash": "workspace-a",
                 "admission": {
                     "record_digest": commit_digest,
@@ -21503,7 +22941,7 @@ mod tests {
         let value: Value = serde_json::from_str(&response).unwrap();
         assert_eq!(value["admission"]["outcome"], "proposed");
         let deferred = db
-            .get_entity("fact", "deferred")
+            .get_entity_by_id_for_admission_review(value["id"].as_str().unwrap())
             .unwrap()
             .expect("deferred candidate should be retained as a reviewable proposal");
         assert_eq!(deferred.status, "proposed");
@@ -22196,6 +23634,9 @@ mod tests {
         let value: Value = serde_json::from_str(&response).unwrap();
         assert_eq!(value["ok"], false);
         assert_eq!(value["remembered"], false);
+        assert_eq!(value["disposition"], "drop");
+        assert_eq!(value["admission"]["outcome_class"], "drop");
+        assert!(!response.contains("not relevant"));
         assert!(db
             .get_entity("security", "irrelevant-record")
             .unwrap()
@@ -22214,6 +23655,7 @@ mod tests {
                 "key": "proposal-without-admission",
                 "workspace_hash": "ws-proposal",
                 "agent_id": "assistant-1",
+                "requesting_agent_id": "assistant-1",
                 "actor_kind": "assistant",
                 "body_json": format!("{{\"content\":\"{secret}\"}}"),
                 "skip_dedup": true
@@ -22221,6 +23663,7 @@ mod tests {
         )
         .expect("missing admission should return a structured proposal");
         let value: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(value["disposition"], "pending_approval", "{response}");
         assert_eq!(value["proposed"], json!(true), "{response}");
         assert_eq!(value["requires_review"], json!(true), "{response}");
         assert_eq!(
@@ -22246,7 +23689,7 @@ mod tests {
         );
 
         let entity = db
-            .get_entity("decision", "proposal-without-admission")
+            .get_entity_by_id_for_admission_review(value["id"].as_str().unwrap())
             .unwrap()
             .expect("proposal remains durable for review");
         assert_eq!(entity.status, "proposed");
@@ -22283,6 +23726,7 @@ mod tests {
         )
         .expect("unverified admission should be retained for review");
         let value: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(value["disposition"], "pending_approval", "{response}");
         assert_eq!(value["proposed"], json!(true), "{response}");
         assert_eq!(value["requires_review"], json!(true), "{response}");
         assert_eq!(
@@ -22296,12 +23740,226 @@ mod tests {
             "{response}"
         );
         assert_eq!(
-            db.get_entity("decision", "missing-source-validation")
+            db.get_entity_by_id_for_admission_review(value["id"].as_str().unwrap())
                 .unwrap()
                 .unwrap()
                 .status,
             "proposed"
         );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn admission_source_event_is_transport_stamped_and_digest_bound() {
+        let _admission_env = admission_env_guard();
+        let (db, path) = temp_db();
+        let workspace = "ws-source-bound";
+        let body = "{\"content\":\"bound candidate\"}";
+        db.agent_upsert("transport-requester", "Transport requester", 2, "test")
+            .unwrap();
+        db.authority_set(
+            &crate::models::AuthorityManifestInput {
+                agent_id: "transport-requester".to_string(),
+                workspace_hash: workspace.to_string(),
+                allowed_capabilities: vec![
+                    "memory.admission.source".to_string(),
+                    "memory.commit".to_string(),
+                ],
+                approval_required_capabilities: Vec::new(),
+                scope_anchors: vec![workspace.to_string()],
+                approver_principals: Vec::new(),
+                allowed_inbound_principals: Vec::new(),
+                permitted_external_ref_prefixes: Vec::new(),
+                max_parallel_actions: 1,
+                mode: "enforce".to_string(),
+                expires_at_unix_ms: None,
+                capability_constraints_json: "{}".to_string(),
+            },
+            "operator",
+        )
+        .unwrap();
+        std::env::set_var(ADMISSION_SOURCE_HMAC_KEY_ENV, "test-admission-source-key");
+        let evaluated = json!({
+            "record_digest": crate::trust_admission::digest_text(body),
+            "source_identity": "source-identity",
+            "workspace_hash": workspace,
+            "actor_kind": "connector",
+            "actor_identity": "claimed-agent"
+        });
+        let source_attestation = admission_source_hmac_hex(
+            "test-admission-source-key",
+            &admission_source_attestation_payload(&evaluated, "transport-requester").unwrap(),
+        )
+        .to_ascii_uppercase();
+        let source = handle_journal(
+            &db,
+            json!({
+                "event_type": "admission_source",
+                "evaluated": evaluated,
+                "source_attestation": source_attestation,
+                "acted": {},
+                "forward": {},
+                "agent_id": "caller-forged-agent",
+                "workspace_hash": workspace,
+                "requesting_agent_id": "transport-requester"
+            }),
+        )
+        .expect("bound source event");
+        let source: Value = serde_json::from_str(&source).unwrap();
+        let source_id = source["id"].as_str().unwrap();
+        let conn = db.conn().unwrap();
+        let stored_agent: String = conn
+            .query_row(
+                "SELECT agent_id FROM journal WHERE id=?1",
+                rusqlite::params![source_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_agent, "transport-requester");
+        drop(conn);
+        let admitted = handle_remember(
+            &db,
+            json!({
+                "category": "decision",
+                "key": "bound-source",
+                "body_json": body,
+                "status": "proposed",
+                "workspace_hash": workspace,
+                "agent_id": "claimed-agent",
+                "actor_kind": "connector",
+                "requesting_agent_id": "transport-requester",
+                "admission": {
+                    "record_digest": crate::trust_admission::digest_text(body),
+                    "source_identity": "source-identity",
+                    "source_event_id": source_id,
+                    "authorization_scope": workspace,
+                    "ingestion_channel": "connector",
+                    "workspace_hash": workspace,
+                    "source_trust": "authoritative",
+                    "actor_kind": "connector",
+                    "actor_identity": "claimed-agent",
+                    "validated": true,
+                    "valid_from_unix_ms": 1,
+                    "recorded_at_unix_ms": 2,
+                    "task_relevance_bps": 9000
+                }
+            }),
+        )
+        .unwrap();
+        let admitted: Value = serde_json::from_str(&admitted).unwrap();
+        assert_eq!(admitted["proposed"], false, "{admitted}");
+        assert_eq!(admitted["serveable"], true, "{admitted}");
+        assert_eq!(admitted["provenance"]["state"], "admitted");
+        assert_eq!(
+            db.get_entity("decision", "bound-source")
+                .unwrap()
+                .unwrap()
+                .status,
+            "active"
+        );
+
+        let metadata_mismatch = handle_remember(
+            &db,
+            json!({
+                "category": "decision",
+                "key": "bound-source-with-extra-metadata",
+                "body_json": "{\"content\":\"metadata candidate\"}",
+                "workspace_hash": workspace,
+                "agent_id": "claimed-agent",
+                "actor_kind": "connector",
+                "requesting_agent_id": "transport-requester",
+                "external_refs": [{
+                    "ref_type": "url",
+                    "ref_value": "https://example.invalid/source"
+                }],
+                "admission": {
+                    "record_digest": crate::trust_admission::digest_text(body),
+                    "source_identity": "source-identity",
+                    "source_event_id": source_id,
+                    "authorization_scope": workspace,
+                    "ingestion_channel": "connector",
+                    "workspace_hash": workspace,
+                    "source_trust": "authoritative",
+                    "actor_kind": "connector",
+                    "actor_identity": "claimed-agent",
+                    "validated": true,
+                    "valid_from_unix_ms": 1,
+                    "recorded_at_unix_ms": 2,
+                    "task_relevance_bps": 9000
+                }
+            }),
+        )
+        .expect("metadata mismatch should remain a reviewable proposal");
+        let metadata_mismatch: Value = serde_json::from_str(&metadata_mismatch).unwrap();
+        assert_eq!(metadata_mismatch["proposed"], true, "{metadata_mismatch}");
+        assert_eq!(
+            metadata_mismatch["admission"]["authoritative"], false,
+            "{metadata_mismatch}"
+        );
+
+        let wrong_body = "{\"content\":\"different candidate\"}";
+        let bad_evaluated = json!({
+            "record_digest": crate::trust_admission::digest_text(wrong_body),
+            "source_identity": "source-identity",
+            "workspace_hash": workspace,
+            "actor_kind": "connector",
+            "actor_identity": "claimed-agent"
+        });
+        let bad_attestation = admission_source_hmac_hex(
+            "test-admission-source-key",
+            &admission_source_attestation_payload(&bad_evaluated, "transport-requester").unwrap(),
+        );
+        let bad_source = handle_journal(
+            &db,
+            json!({
+                "event_type": "admission_source",
+                "evaluated": bad_evaluated,
+                "source_attestation": bad_attestation,
+                "acted": {},
+                "forward": {},
+                "agent_id": "caller-forged-agent",
+                "workspace_hash": workspace,
+                "requesting_agent_id": "transport-requester"
+            }),
+        )
+        .unwrap();
+        let bad_source: Value = serde_json::from_str(&bad_source).unwrap();
+        let pending = handle_remember(
+            &db,
+            json!({
+                "category": "decision",
+                "key": "bad-source-digest",
+                "body_json": "{\"content\":\"unbound candidate\"}",
+                "workspace_hash": workspace,
+                "agent_id": "claimed-agent",
+                "actor_kind": "connector",
+                "requesting_agent_id": "transport-requester",
+                "admission": {
+                    "record_digest": crate::trust_admission::digest_text(body),
+                    "source_identity": "source-identity",
+                    "source_event_id": bad_source["id"],
+                    "authorization_scope": workspace,
+                    "ingestion_channel": "connector",
+                    "workspace_hash": workspace,
+                    "source_trust": "authoritative",
+                    "actor_kind": "connector",
+                    "actor_identity": "claimed-agent",
+                    "validated": true,
+                    "valid_from_unix_ms": 1,
+                    "recorded_at_unix_ms": 2,
+                    "task_relevance_bps": 9000
+                }
+            }),
+        )
+        .unwrap();
+        let pending: Value = serde_json::from_str(&pending).unwrap();
+        assert_eq!(pending["proposed"], true, "{pending}");
+        assert_eq!(pending["outcome_class"], "pending_approval");
+        let entity = db
+            .get_entity_by_id_for_admission_review(pending["id"].as_str().unwrap())
+            .unwrap()
+            .unwrap_or_else(|| panic!("pending response but no entity: {pending}"));
+        assert_eq!(entity.status, "proposed");
         let _ = std::fs::remove_file(path);
     }
 
@@ -22344,7 +24002,7 @@ mod tests {
         );
         assert_eq!(value["proposed"], json!(true), "{response}");
         assert_eq!(
-            db.get_entity("decision", "forged-authority")
+            db.get_entity_by_id_for_admission_review(value["id"].as_str().unwrap())
                 .unwrap()
                 .unwrap()
                 .status,
@@ -22356,17 +24014,17 @@ mod tests {
     #[test]
     fn admission_workspace_mismatch_is_rejected_before_any_mutation() {
         let (db, path) = temp_db();
-        let err = handle_remember(
+        let response = handle_remember(
             &db,
             json!({
                 "category": "decision",
                 "key": "wrong-scope",
-                "workspace_hash": "ws-requested",
+                "workspace_hash": "",
                 "body_json": "{\"content\":\"must not write\"}",
                 "admission": {
                     "record_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
                     "source_identity": "event-1",
-                    "authorization_scope": "ws-admission",
+                    "authorization_scope": "ws-other",
                     "ingestion_channel": "connector",
                     "workspace_hash": "ws-admission",
                     "source_trust": "trusted",
@@ -22376,9 +24034,200 @@ mod tests {
                 }
             }),
         )
-        .expect_err("scope mismatch must fail before the durable write");
-        assert!(err.contains("workspace"), "{err}");
+        .expect("scope mismatch must return a structured block before the durable write");
+        let value: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(value["ok"], false, "{response}");
+        assert_eq!(value["remembered"], false, "{response}");
+        assert_eq!(value["disposition"], "block", "{response}");
+        assert_eq!(value["admission"]["outcome_class"], "block", "{response}");
+        assert!(!response.contains("must not write"), "{response}");
         assert!(db.get_entity("decision", "wrong-scope").unwrap().is_none());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn pending_admission_review_has_distinct_approval_and_rejection_audit_outcomes() {
+        let (db, path) = temp_db();
+        db.agent_upsert("reviewer", "Reviewer", 2, "test").unwrap();
+        db.authority_set(
+            &crate::models::AuthorityManifestInput {
+                agent_id: "reviewer".to_string(),
+                workspace_hash: "review-ws".to_string(),
+                allowed_capabilities: vec!["memory.admission.review".to_string()],
+                approval_required_capabilities: Vec::new(),
+                scope_anchors: vec!["review-ws".to_string()],
+                approver_principals: Vec::new(),
+                allowed_inbound_principals: Vec::new(),
+                permitted_external_ref_prefixes: Vec::new(),
+                max_parallel_actions: 1,
+                mode: "enforce".to_string(),
+                expires_at_unix_ms: None,
+                capability_constraints_json: "{}".to_string(),
+            },
+            "operator",
+        )
+        .unwrap();
+        let approve_body = "{\"content\":\"candidate to approve\"}";
+        let reject_body = "{\"content\":\"candidate to reject\"}";
+        let pending_admission = json!({
+            "record_digest": crate::trust_admission::digest_text(approve_body),
+            "source_identity": "review-source",
+            "authorization_scope": "review-ws",
+            "ingestion_channel": "review-fixture",
+            "workspace_hash": "review-ws",
+            "source_trust": "trusted",
+            "valid_from_unix_ms": 100,
+            "recorded_at_unix_ms": 110,
+            "task_relevance_bps": 9000
+        });
+        handle_remember(
+            &db,
+            json!({
+                "category": "decision",
+                "key": "review-approve",
+                "workspace_hash": "review-ws",
+                "agent_id": "writer",
+                "actor_kind": "assistant",
+                "body_json": approve_body,
+                "admission": pending_admission,
+                "skip_dedup": true
+            }),
+        )
+        .expect("pending approval candidate");
+        handle_remember(
+            &db,
+            json!({
+                "category": "decision",
+                "key": "review-reject",
+                "workspace_hash": "review-ws",
+                "agent_id": "writer",
+                "actor_kind": "assistant",
+                "body_json": reject_body,
+                "admission": {
+                    "record_digest": crate::trust_admission::digest_text(reject_body),
+                    "source_identity": "review-source",
+                    "authorization_scope": "review-ws",
+                    "ingestion_channel": "review-fixture",
+                    "workspace_hash": "review-ws",
+                    "source_trust": "trusted",
+                    "valid_from_unix_ms": 100,
+                    "recorded_at_unix_ms": 110,
+                    "task_relevance_bps": 9000
+                },
+                "skip_dedup": true
+            }),
+        )
+        .expect("pending rejection candidate");
+
+        let approved = handle_admission_decide(
+            &db,
+            json!({
+                "category": "decision",
+                "key": "review-approve",
+                "workspace_hash": "review-ws",
+                "requesting_agent_id": "reviewer",
+                "decision": "approve",
+                "reason": "human approved"
+            }),
+        )
+        .expect("approval transition");
+        let approved: Value = serde_json::from_str(&approved).unwrap();
+        assert_eq!(approved["outcome_class"], "save");
+        assert_eq!(approved["status"], "active");
+        assert!(approved["audit_event_id"]
+            .as_str()
+            .unwrap()
+            .starts_with("jrn-"));
+        let approved_entity = db
+            .get_entity("decision", "review-approve")
+            .unwrap()
+            .expect("approved entity remains readable");
+        assert_eq!(approved_entity.status, "active");
+        let approved_body: Value = serde_json::from_str(&approved_entity.body_json).unwrap();
+        let approved_evidence: crate::trust_admission::AdmissionEvidence =
+            serde_json::from_value(approved_body["admission"].clone()).unwrap();
+        assert_eq!(
+            approved_evidence.outcome_class().unwrap(),
+            crate::trust_admission::AdmissionOutcomeClass::Save
+        );
+        assert!(approved_evidence.authoritative);
+        assert!(
+            approved_evidence.source_event_id.as_deref().is_some_and(
+                |id| id.starts_with("jrn-") && Some(id) != approved["audit_event_id"].as_str()
+            ),
+            "approval must bind a distinct internal source receipt: {approved_evidence:?}"
+        );
+        assert_eq!(
+            approved_evidence.actor_identity.as_deref(),
+            Some("reviewer")
+        );
+        assert!(approved_evidence.validate().is_ok());
+
+        let rejected = handle_admission_decide(
+            &db,
+            json!({
+                "category": "decision",
+                "key": "review-reject",
+                "workspace_hash": "review-ws",
+                "requesting_agent_id": "reviewer",
+                "decision": "reject",
+                "rejection_class": "block",
+                "reason": "human rejected"
+            }),
+        )
+        .expect("rejection transition");
+        let rejected: Value = serde_json::from_str(&rejected).unwrap();
+        assert_eq!(rejected["outcome_class"], "block");
+        assert_eq!(rejected["status"], "deprecated");
+        assert_eq!(rejected["serveable"], false);
+        let rejected_entity = db
+            .get_entity_by_category_key_for_mutation("decision", "review-reject")
+            .unwrap()
+            .expect("rejected entity remains auditable");
+        assert_eq!(rejected_entity.status, "deprecated");
+        assert!(rejected_entity.archived);
+        let rejected_body: Value = serde_json::from_str(&rejected_entity.body_json).unwrap();
+        let rejected_evidence: crate::trust_admission::AdmissionEvidence =
+            serde_json::from_value(rejected_body["admission"].clone()).unwrap();
+        assert_eq!(
+            rejected_evidence.outcome_class().unwrap(),
+            crate::trust_admission::AdmissionOutcomeClass::Block
+        );
+        assert!(!rejected_evidence.authoritative);
+        assert!(rejected_evidence.validate().is_ok());
+
+        let conn = db.conn().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT event_type, acted_json FROM journal WHERE workspace_hash = ?1 AND event_type IN ('admission_review_started', 'admission_approved', 'admission_rejected') ORDER BY created_at_unix_ms ASC, id ASC")
+            .unwrap();
+        let events: Vec<(String, String)> = stmt
+            .query_map(rusqlite::params!["review-ws"], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        let mut kinds: Vec<&str> = events.iter().map(|(kind, _)| kind.as_str()).collect();
+        kinds.sort_unstable();
+        assert_eq!(
+            kinds,
+            vec![
+                "admission_approved",
+                "admission_rejected",
+                "admission_review_started",
+                "admission_review_started"
+            ]
+        );
+        for (kind, acted_json) in &events {
+            let acted: Value = serde_json::from_str(acted_json).unwrap();
+            if kind == "admission_review_started" {
+                assert_eq!(acted["stored"], false, "intent must not claim a commit");
+            } else {
+                assert_eq!(acted["stored"], true, "completion must follow the commit");
+            }
+        }
+        drop(stmt);
+        drop(conn);
         let _ = std::fs::remove_file(path);
     }
 
@@ -22433,7 +24282,7 @@ mod tests {
             .unwrap()
             .is_none());
         let source = db
-            .get_entity("episodes", "verified-source")
+            .get_entity_by_category_key_for_mutation("episodes", "verified-source")
             .unwrap()
             .unwrap();
         assert!(
@@ -22982,5 +24831,269 @@ mod tests {
 
         std::env::remove_var("PERSEUS_VAULT_HINTS_ENABLED");
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn admission_source_attestation_accepts_uppercase_hex_encoding() {
+        let _admission_env = admission_env_guard();
+        std::env::set_var(ADMISSION_SOURCE_HMAC_KEY_ENV, "test-admission-source-key");
+        let evaluated = json!({
+            "record_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "source_identity": "source-1",
+            "workspace_hash": "workspace-1",
+            "actor_kind": "connector",
+            "actor_identity": "agent-1"
+        });
+        let lower = admission_source_hmac_hex(
+            "test-admission-source-key",
+            &admission_source_attestation_payload(&evaluated, "requester-1").unwrap(),
+        );
+        verify_admission_source_attestation(&evaluated, "requester-1", &lower)
+            .expect("lowercase proof must verify");
+        verify_admission_source_attestation(&evaluated, "requester-1", &lower.to_ascii_uppercase())
+            .expect("uppercase hex proof accepted by the advertised schema must verify");
+    }
+
+    #[test]
+    fn admitted_write_rejects_post_validation_lossy_body_mutation() {
+        let _admission_env = admission_env_guard();
+        let (db, _path) = temp_db();
+        let workspace = "ws-lossy-admission";
+        let body = r#"{"text":"authorized body"}"#;
+        let mut pending = crate::db::tests::make_entity(
+            "pending-lossy-admission",
+            "decision",
+            "lossy-admission",
+            body,
+        );
+        pending.status = "proposed".to_string();
+        pending.workspace_hash = workspace.to_string();
+        pending.agent_id = "claimed-agent".to_string();
+        db.remember_skip_dedup(&pending).expect("seed pending row");
+        {
+            let conn = db.conn().unwrap();
+            conn.execute(
+                "INSERT INTO lossy_units (entity_id, lossy_count, marked_at_ms, status)
+                 VALUES (?1, 1, ?2, 'lossy')",
+                rusqlite::params![pending.id, crate::db::now_ms()],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO residual_spans
+                 (id, entity_id, span_text, source, max_coverage, coverage_mode, status,
+                  lossy_count, created_ms)
+                 VALUES (?1, ?2, ?3, 'test', 0.0, 'token', 'confirmed', 1, ?4)",
+                rusqlite::params![
+                    "span-lossy-admission",
+                    pending.id,
+                    "unauthorized residual",
+                    crate::db::now_ms()
+                ],
+            )
+            .unwrap();
+        }
+
+        db.agent_upsert("transport-requester", "Transport requester", 2, "test")
+            .unwrap();
+        db.authority_set(
+            &crate::models::AuthorityManifestInput {
+                agent_id: "transport-requester".to_string(),
+                workspace_hash: workspace.to_string(),
+                allowed_capabilities: vec![
+                    "memory.admission.source".to_string(),
+                    "memory.commit".to_string(),
+                ],
+                approval_required_capabilities: Vec::new(),
+                scope_anchors: vec![workspace.to_string()],
+                approver_principals: Vec::new(),
+                allowed_inbound_principals: Vec::new(),
+                permitted_external_ref_prefixes: Vec::new(),
+                max_parallel_actions: 1,
+                mode: "enforce".to_string(),
+                expires_at_unix_ms: None,
+                capability_constraints_json: "{}".to_string(),
+            },
+            "operator",
+        )
+        .unwrap();
+        std::env::set_var(ADMISSION_SOURCE_HMAC_KEY_ENV, "test-admission-source-key");
+        let evaluated = json!({
+            "record_digest": crate::trust_admission::digest_text(body),
+            "source_identity": "source-identity",
+            "workspace_hash": workspace,
+            "actor_kind": "connector",
+            "actor_identity": "claimed-agent"
+        });
+        let source_attestation = admission_source_hmac_hex(
+            "test-admission-source-key",
+            &admission_source_attestation_payload(&evaluated, "transport-requester").unwrap(),
+        );
+        let source: Value = serde_json::from_str(
+            &handle_journal(
+                &db,
+                json!({
+                    "event_type": "admission_source",
+                    "evaluated": evaluated,
+                    "source_attestation": source_attestation,
+                    "acted": {},
+                    "forward": {},
+                    "agent_id": "caller-forged-agent",
+                    "workspace_hash": workspace,
+                    "requesting_agent_id": "transport-requester"
+                }),
+            )
+            .expect("source receipt"),
+        )
+        .unwrap();
+        let source_id = source["id"].as_str().unwrap();
+
+        let result = handle_remember(
+            &db,
+            json!({
+                "category": "decision",
+                "key": "lossy-admission",
+                "body_json": body,
+                "status": "proposed",
+                "workspace_hash": workspace,
+                "agent_id": "claimed-agent",
+                "actor_kind": "connector",
+                "requesting_agent_id": "transport-requester",
+                "admission": {
+                    "record_digest": crate::trust_admission::digest_text(body),
+                    "source_identity": "source-identity",
+                    "source_event_id": source_id,
+                    "authorization_scope": workspace,
+                    "ingestion_channel": "connector",
+                    "workspace_hash": workspace,
+                    "source_trust": "authoritative",
+                    "actor_kind": "connector",
+                    "actor_identity": "claimed-agent",
+                    "validated": true,
+                    "valid_from_unix_ms": 1,
+                    "recorded_at_unix_ms": 2,
+                    "task_relevance_bps": 9000
+                }
+            }),
+        );
+        let error =
+            result.expect_err("admission must fail closed when repair changes its bound body");
+        assert!(
+            error.contains("canonical entity body") || error.contains("record_digest"),
+            "unexpected repair/digest error: {error}"
+        );
+        let conn = db.conn().unwrap();
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM entities WHERE category='decision' AND key='lossy-admission'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            status, "proposed",
+            "failed admitted write must not activate row"
+        );
+    }
+
+    #[test]
+    fn admission_decide_records_failed_completion_after_completion_write_error() {
+        let (db, _path) = temp_db();
+        let workspace = "review-failure-ws";
+        db.agent_upsert("reviewer-failure", "Failure reviewer", 2, "test")
+            .unwrap();
+        db.authority_set(
+            &crate::models::AuthorityManifestInput {
+                agent_id: "reviewer-failure".to_string(),
+                workspace_hash: workspace.to_string(),
+                allowed_capabilities: vec!["memory.admission.review".to_string()],
+                approval_required_capabilities: Vec::new(),
+                scope_anchors: vec![workspace.to_string()],
+                approver_principals: Vec::new(),
+                allowed_inbound_principals: Vec::new(),
+                permitted_external_ref_prefixes: Vec::new(),
+                max_parallel_actions: 1,
+                mode: "enforce".to_string(),
+                expires_at_unix_ms: None,
+                capability_constraints_json: "{}".to_string(),
+            },
+            "operator",
+        )
+        .unwrap();
+        let body = r#"{"content":"completion failure candidate"}"#;
+        handle_remember(
+            &db,
+            json!({
+                "category": "decision",
+                "key": "completion-failure",
+                "workspace_hash": workspace,
+                "agent_id": "writer",
+                "actor_kind": "assistant",
+                "body_json": body,
+                "admission": {
+                    "record_digest": crate::trust_admission::digest_text(body),
+                    "source_identity": "review-source",
+                    "authorization_scope": workspace,
+                    "ingestion_channel": "review-fixture",
+                    "workspace_hash": workspace,
+                    "source_trust": "trusted",
+                    "valid_from_unix_ms": 100,
+                    "recorded_at_unix_ms": 110,
+                    "task_relevance_bps": 9000
+                },
+                "skip_dedup": true
+            }),
+        )
+        .expect("pending approval candidate");
+        {
+            let conn = db.conn().unwrap();
+            conn.execute_batch(
+                "CREATE TRIGGER fail_admission_completion
+                 BEFORE INSERT ON journal
+                 WHEN NEW.event_type = 'admission_approved'
+                 BEGIN SELECT RAISE(ABORT, 'injected completion failure'); END;",
+            )
+            .unwrap();
+        }
+
+        let error = handle_admission_decide(
+            &db,
+            json!({
+                "category": "decision",
+                "key": "completion-failure",
+                "workspace_hash": workspace,
+                "requesting_agent_id": "reviewer-failure",
+                "decision": "approve",
+                "reason": "exercise completion failure"
+            }),
+        )
+        .expect_err("injected completion write must surface an error");
+        assert!(
+            error.contains("completion receipt"),
+            "unexpected error: {error}"
+        );
+
+        let conn = db.conn().unwrap();
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM entities WHERE category='decision' AND key='completion-failure'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            status, "active",
+            "transition happened before injected completion failure"
+        );
+        let failed_markers: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM journal WHERE event_type='admission_review_failed'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            failed_markers, 1,
+            "completion failure must have a durable marker"
+        );
     }
 }
