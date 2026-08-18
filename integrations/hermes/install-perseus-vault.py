@@ -308,7 +308,7 @@ SCHEMAS = json.loads(r"""[
     "status": {
      "default": "active",
      "description": "Closed lifecycle status vocabulary; proposed/quarantined/unknown statuses are never publicly serveable",
-     "enum": ["active", "draft", "deprecated", "expired", "proposed", "quarantined", "redacted", "compacted"],
+     "enum": ["active", "draft", "deprecated", "expired", "proposed", "quarantined", "redacted"],
      "type": "string"
     },
     "tags": {

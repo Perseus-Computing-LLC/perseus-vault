@@ -1062,7 +1062,8 @@ pub fn handle_remember(db: &Database, args: Value) -> Result<String, String> {
     }
 
     let requested_status = crate::models::canonical_entity_status(&a.status)
-        .ok_or_else(|| format!("invalid status '{}': expected one of {:?}", a.status, crate::models::ENTITY_STATUSES))?;
+        .filter(|status| status != "compacted")
+        .ok_or_else(|| format!("invalid writable status '{}': expected one of {:?}", a.status, crate::models::ENTITY_STATUSES))?;
 
     // Validate body_json is valid JSON
     if let Err(e) = serde_json::from_str::<serde_json::Value>(&a.body_json) {
@@ -2135,8 +2136,53 @@ pub fn handle_admission_decide(db: &Database, args: Value) -> Result<String, Str
             "admission_decide transition did not materialize the reviewed entity: id={transition_id}, action={transition_action}"
         ));
     }
-    db.journal(&event)
-        .map_err(|e| format!("admission_decide completion receipt failed after durable transition: {e}"))?;
+    if let Err(completion_error) = db.journal(&event) {
+        let completion_error_text = completion_error.to_string();
+        let failure_event = JournalEvent {
+            id: format!("jrn-{}", Uuid::new_v4().simple()),
+            event_type: "admission_review_failed".to_string(),
+            evaluated_json: json!({
+                "completion_event_type": event.event_type,
+                "entity_id": source.id,
+                "category": category,
+                "key": key,
+                "workspace_hash": workspace_hash,
+                "record_digest": admission.record_digest,
+            })
+            .to_string(),
+            acted_json: json!({
+                "decision": decision,
+                "outcome_class": outcome_class,
+                "reviewer": reviewer,
+                "stored": false,
+                "transition_applied": true,
+                "completion_recorded": false,
+                "completion_error_sha256": crate::trust_admission::digest_text(&completion_error_text),
+            })
+            .to_string(),
+            forward_json: json!({
+                "next": "operator reconciliation required; do not repeat review blindly"
+            })
+            .to_string(),
+            category: category.to_string(),
+            key: key.to_string(),
+            entity_id: source.id.clone(),
+            agent_id: reviewer.to_string(),
+            workspace_hash: workspace_hash.to_string(),
+            created_at_unix_ms: now_ms(),
+        };
+        let marker_result = db.journal(&failure_event);
+        let marker_note = match marker_result {
+            Ok(()) => "failed-completion marker recorded".to_string(),
+            Err(marker_error) => format!(
+                "failed-completion marker could not be recorded: {}",
+                marker_error
+            ),
+        };
+        return Err(format!(
+            "admission_decide completion receipt failed after durable transition: {completion_error}; {marker_note}"
+        ));
+    }
 
     Ok(json!({
         "ok": true,
@@ -4613,7 +4659,7 @@ fn verify_admission_source_attestation(
         })?;
     let payload = admission_source_attestation_payload(evaluated, requesting_agent_id)?;
     let expected = admission_source_hmac_hex(&key, &payload);
-    let supplied = provided.trim();
+    let supplied = provided.trim().to_ascii_lowercase();
     if supplied.is_empty() {
         return Err("admission_source requires source_attestation".into());
     }
@@ -24335,4 +24381,258 @@ mod tests {
         std::env::remove_var("PERSEUS_VAULT_HINTS_ENABLED");
         let _ = std::fs::remove_file(path);
     }
+
+    #[test]
+    fn admission_source_attestation_accepts_uppercase_hex_encoding() {
+        let _admission_env = admission_env_guard();
+        std::env::set_var(ADMISSION_SOURCE_HMAC_KEY_ENV, "test-admission-source-key");
+        let evaluated = json!({
+            "record_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "source_identity": "source-1",
+            "workspace_hash": "workspace-1",
+            "actor_kind": "connector",
+            "actor_identity": "agent-1"
+        });
+        let lower = admission_source_hmac_hex(
+            "test-admission-source-key",
+            &admission_source_attestation_payload(&evaluated, "requester-1").unwrap(),
+        );
+        verify_admission_source_attestation(&evaluated, "requester-1", &lower)
+            .expect("lowercase proof must verify");
+        verify_admission_source_attestation(&evaluated, "requester-1", &lower.to_ascii_uppercase())
+            .expect("uppercase hex proof accepted by the advertised schema must verify");
+    }
+
+
+    #[test]
+    fn admitted_write_rejects_post_validation_lossy_body_mutation() {
+        let _admission_env = admission_env_guard();
+        let (db, _path) = temp_db();
+        let workspace = "ws-lossy-admission";
+        let body = r#"{"text":"authorized body"}"#;
+        let mut pending = crate::db::tests::make_entity(
+            "pending-lossy-admission",
+            "decision",
+            "lossy-admission",
+            body,
+        );
+        pending.status = "proposed".to_string();
+        pending.workspace_hash = workspace.to_string();
+        pending.agent_id = "claimed-agent".to_string();
+        db.remember_skip_dedup(&pending).expect("seed pending row");
+        {
+            let conn = db.conn().unwrap();
+            conn.execute(
+                "INSERT INTO lossy_units (entity_id, lossy_count, marked_at_ms, status)
+                 VALUES (?1, 1, ?2, 'lossy')",
+                rusqlite::params![pending.id, crate::db::now_ms()],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO residual_spans
+                 (id, entity_id, span_text, source, max_coverage, coverage_mode, status,
+                  lossy_count, created_ms)
+                 VALUES (?1, ?2, ?3, 'test', 0.0, 'token', 'confirmed', 1, ?4)",
+                rusqlite::params![
+                    "span-lossy-admission",
+                    pending.id,
+                    "unauthorized residual",
+                    crate::db::now_ms()
+                ],
+            )
+            .unwrap();
+        }
+
+        db.agent_upsert("transport-requester", "Transport requester", 2, "test")
+            .unwrap();
+        db.authority_set(
+            &crate::models::AuthorityManifestInput {
+                agent_id: "transport-requester".to_string(),
+                workspace_hash: workspace.to_string(),
+                allowed_capabilities: vec![
+                    "memory.admission.source".to_string(),
+                    "memory.commit".to_string(),
+                ],
+                approval_required_capabilities: Vec::new(),
+                scope_anchors: vec![workspace.to_string()],
+                approver_principals: Vec::new(),
+                allowed_inbound_principals: Vec::new(),
+                permitted_external_ref_prefixes: Vec::new(),
+                max_parallel_actions: 1,
+                mode: "enforce".to_string(),
+                expires_at_unix_ms: None,
+                capability_constraints_json: "{}".to_string(),
+            },
+            "operator",
+        )
+        .unwrap();
+        std::env::set_var(ADMISSION_SOURCE_HMAC_KEY_ENV, "test-admission-source-key");
+        let evaluated = json!({
+            "record_digest": crate::trust_admission::digest_text(body),
+            "source_identity": "source-identity",
+            "workspace_hash": workspace,
+            "actor_kind": "connector",
+            "actor_identity": "claimed-agent"
+        });
+        let source_attestation = admission_source_hmac_hex(
+            "test-admission-source-key",
+            &admission_source_attestation_payload(&evaluated, "transport-requester").unwrap(),
+        );
+        let source: Value = serde_json::from_str(
+            &handle_journal(
+                &db,
+                json!({
+                    "event_type": "admission_source",
+                    "evaluated": evaluated,
+                    "source_attestation": source_attestation,
+                    "acted": {},
+                    "forward": {},
+                    "agent_id": "caller-forged-agent",
+                    "workspace_hash": workspace,
+                    "requesting_agent_id": "transport-requester"
+                }),
+            )
+            .expect("source receipt"),
+        )
+        .unwrap();
+        let source_id = source["id"].as_str().unwrap();
+
+        let result = handle_remember(
+            &db,
+            json!({
+                "category": "decision",
+                "key": "lossy-admission",
+                "body_json": body,
+                "status": "proposed",
+                "workspace_hash": workspace,
+                "agent_id": "claimed-agent",
+                "actor_kind": "connector",
+                "requesting_agent_id": "transport-requester",
+                "admission": {
+                    "record_digest": crate::trust_admission::digest_text(body),
+                    "source_identity": "source-identity",
+                    "source_event_id": source_id,
+                    "authorization_scope": workspace,
+                    "ingestion_channel": "connector",
+                    "workspace_hash": workspace,
+                    "source_trust": "authoritative",
+                    "actor_kind": "connector",
+                    "actor_identity": "claimed-agent",
+                    "validated": true,
+                    "valid_from_unix_ms": 1,
+                    "recorded_at_unix_ms": 2,
+                    "task_relevance_bps": 9000
+                }
+            }),
+        );
+        let error = result.expect_err("admission must fail closed when repair changes its bound body");
+        assert!(
+            error.contains("canonical entity body") || error.contains("record_digest"),
+            "unexpected repair/digest error: {error}"
+        );
+        let conn = db.conn().unwrap();
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM entities WHERE category='decision' AND key='lossy-admission'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "proposed", "failed admitted write must not activate row");
+    }
+
+
+    #[test]
+    fn admission_decide_records_failed_completion_after_completion_write_error() {
+        let (db, _path) = temp_db();
+        let workspace = "review-failure-ws";
+        db.agent_upsert("reviewer-failure", "Failure reviewer", 2, "test")
+            .unwrap();
+        db.authority_set(
+            &crate::models::AuthorityManifestInput {
+                agent_id: "reviewer-failure".to_string(),
+                workspace_hash: workspace.to_string(),
+                allowed_capabilities: vec!["memory.admission.review".to_string()],
+                approval_required_capabilities: Vec::new(),
+                scope_anchors: vec![workspace.to_string()],
+                approver_principals: Vec::new(),
+                allowed_inbound_principals: Vec::new(),
+                permitted_external_ref_prefixes: Vec::new(),
+                max_parallel_actions: 1,
+                mode: "enforce".to_string(),
+                expires_at_unix_ms: None,
+                capability_constraints_json: "{}".to_string(),
+            },
+            "operator",
+        )
+        .unwrap();
+        let body = r#"{"content":"completion failure candidate"}"#;
+        handle_remember(
+            &db,
+            json!({
+                "category": "decision",
+                "key": "completion-failure",
+                "workspace_hash": workspace,
+                "agent_id": "writer",
+                "actor_kind": "assistant",
+                "body_json": body,
+                "admission": {
+                    "record_digest": crate::trust_admission::digest_text(body),
+                    "source_identity": "review-source",
+                    "authorization_scope": workspace,
+                    "ingestion_channel": "review-fixture",
+                    "workspace_hash": workspace,
+                    "source_trust": "trusted",
+                    "valid_from_unix_ms": 100,
+                    "recorded_at_unix_ms": 110,
+                    "task_relevance_bps": 9000
+                },
+                "skip_dedup": true
+            }),
+        )
+        .expect("pending approval candidate");
+        {
+            let conn = db.conn().unwrap();
+            conn.execute_batch(
+                "CREATE TRIGGER fail_admission_completion
+                 BEFORE INSERT ON journal
+                 WHEN NEW.event_type = 'admission_approved'
+                 BEGIN SELECT RAISE(ABORT, 'injected completion failure'); END;",
+            )
+            .unwrap();
+        }
+
+        let error = handle_admission_decide(
+            &db,
+            json!({
+                "category": "decision",
+                "key": "completion-failure",
+                "workspace_hash": workspace,
+                "requesting_agent_id": "reviewer-failure",
+                "decision": "approve",
+                "reason": "exercise completion failure"
+            }),
+        )
+        .expect_err("injected completion write must surface an error");
+        assert!(error.contains("completion receipt"), "unexpected error: {error}");
+
+        let conn = db.conn().unwrap();
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM entities WHERE category='decision' AND key='completion-failure'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "active", "transition happened before injected completion failure");
+        let failed_markers: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM journal WHERE event_type='admission_review_failed'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(failed_markers, 1, "completion failure must have a durable marker");
+    }
+
 }

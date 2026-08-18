@@ -900,7 +900,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
         },
         "status": {
           "type": "string",
-          "enum": ["active", "draft", "deprecated", "expired", "proposed", "quarantined", "redacted", "compacted"],
+          "enum": ["active", "draft", "deprecated", "expired", "proposed", "quarantined", "redacted"],
           "default": "active",
           "description": "Closed lifecycle status vocabulary; proposed/quarantined are never publicly serveable"
         },
@@ -10241,4 +10241,20 @@ mod tests {
             assert!(filtered.len() >= 48);
         }
     }
+
+    #[test]
+    fn remember_schema_excludes_history_only_compacted_status() {
+        let remember = tool_registry_base()
+            .iter()
+            .find(|tool| tool["name"] == "perseus_vault_remember")
+            .expect("remember tool must be registered");
+        let statuses = remember["inputSchema"]["properties"]["status"]["enum"]
+            .as_array()
+            .expect("remember status enum");
+        assert!(
+            statuses.iter().all(|status| status != "compacted"),
+            "history-only compacted status must not be advertised as writable"
+        );
+    }
+
 }

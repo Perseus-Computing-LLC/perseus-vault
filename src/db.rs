@@ -8584,6 +8584,23 @@ impl Database {
             &mut effective_body,
         )?;
 
+        // Lossy repair is a write-side transformation. Revalidate the exact
+        // bytes that will be encrypted and persisted so an admission receipt
+        // cannot authorize one body while the durable row stores another.
+        match &authority {
+            DurableWriteAuthority::Admission(evidence) => {
+                let mut repaired_entity = entity.clone();
+                repaired_entity.body_json = effective_body.clone();
+                self.validate_admission_write(&repaired_entity, evidence)?;
+            }
+            DurableWriteAuthority::ReviewTransition(evidence) => {
+                let mut repaired_entity = entity.clone();
+                repaired_entity.body_json = effective_body.clone();
+                self.validate_review_transition(&repaired_entity, evidence)?;
+            }
+            DurableWriteAuthority::Unverified | DurableWriteAuthority::InternalTrusted(_) => {}
+        }
+
         // Encrypt body_json with category+key as AAD to bind ciphertext to entity identity
         let body_encrypted = if let Some(ref enc) = self.encryption {
             let aad = Self::build_aad(&entity.category, &entity.key);
@@ -18422,6 +18439,14 @@ impl Database {
             params![id],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?;
+        if canonical_status == "active"
+            && matches!(cur_status.as_deref(), Some("proposed") | Some("quarantined"))
+        {
+            return Err(
+                "pending admission rows require an authenticated admission_decide transition before activation"
+                    .into(),
+            );
+        }
         if cur_status.as_deref() == Some(canonical_status.as_str()) {
             tx.execute(
                 "UPDATE entities SET archive_reason = ?1, last_accessed_unix_ms = ?2 WHERE id = ?3",
@@ -58165,6 +58190,41 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn update_entity_status_rejects_direct_activation_of_pending_entity() {
+        let (db, path) = temp_db();
+        let mut pending = make_entity(
+            "pending-status-elevation",
+            "admission",
+            "pending-status-elevation",
+            r#"{"content":"must remain pending"}"#,
+        );
+        pending.status = "proposed".to_string();
+        db.remember_skip_dedup(&pending)
+            .expect("seed proposed entity");
+
+        let err = db
+            .update_entity_status(&pending.id, "active", "forged promotion")
+            .expect_err("direct status writer must not activate a proposed row");
+        assert!(
+            err.to_string().contains("admission")
+                || err.to_string().contains("activation")
+                || err.to_string().contains("proposed"),
+            "error must explain the guarded promotion: {err}"
+        );
+
+        let conn = db.conn().unwrap();
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM entities WHERE id = ?1",
+                rusqlite::params![pending.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "proposed", "failed promotion must not mutate the row");
+        drop(conn);
+        let _ = fs::remove_file(path);
+    }
+
     fn ingest_containment_replay_fingerprint_canonicalizes() {
         let a = crate::models::RawDocument {
             key: "k".to_string(),
