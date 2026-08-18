@@ -85,6 +85,7 @@ def admitted_remember(client: Any, category: str, key: str, body_json: str) -> d
             "category": category,
             "key": key,
             "body_json": body,
+            "type": "fact",
             "workspace_hash": WORKSPACE,
             "agent_id": AGENT,
             "actor_kind": "connector",
