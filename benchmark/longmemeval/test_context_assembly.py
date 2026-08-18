@@ -107,6 +107,40 @@ class RankedSnippetAssemblyTests(unittest.TestCase):
         self.assertIn("unrelated travel plans", context)
         self.assertIn("blue bicycle decision is recorded", context)
 
+    def test_qa_wires_preference_guidance_as_a_separate_arm(self):
+        qa = load_qa()
+        self.inst["question_type"] = "single-session-preference"
+        context, chosen = qa.build_context(
+            "perseus-vault",
+            self.inst,
+            _FakeServer(["s1", "s2", "s3"]),
+            "q",
+            10,
+            context_assembly="ranked-snippets",
+            context_guidance="preference",
+            assembly_k=20,
+            context_budget=1000,
+            assembly_windows=1,
+        )
+        self.assertEqual(chosen, ["s1", "s2", "s3"])
+        self.assertIn("Preference evidence guide", context)
+
+    def test_preference_guidance_is_explicitly_opt_in(self):
+        self.inst["question_type"] = "single-session-preference"
+        plain, plain_selected, plain_telemetry = assemble_ranked_snippets(
+            self.inst, ["s1", "s2", "s3"], guidance="none"
+        )
+        guided, guided_selected, guided_telemetry = assemble_ranked_snippets(
+            self.inst, ["s1", "s2", "s3"], guidance="preference"
+        )
+        self.assertNotIn("Preference evidence guide", plain)
+        self.assertIn("Preference evidence guide", guided)
+        self.assertIn("direct user statements", guided)
+        self.assertEqual(plain_selected, guided_selected)
+        self.assertLessEqual(guided_telemetry["estimated_tokens"], 1000)
+        self.assertEqual(plain_telemetry["guidance_applied"], "none")
+        self.assertEqual(guided_telemetry["guidance_applied"], "preference")
+
 
 if __name__ == "__main__":
     unittest.main()

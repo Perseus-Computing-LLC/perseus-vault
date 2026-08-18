@@ -372,7 +372,8 @@ def _date_ms(datestr):
 
 def build_context(
     system, inst, srv, qid, k, ku_shared=False, context_assembly="full",
-    assembly_k=20, context_budget=32768, assembly_windows=2
+    assembly_k=20, context_budget=32768, assembly_windows=2,
+    context_guidance="none"
 ):
     """Return (context_text, [chosen_session_ids]) for the given system.
 
@@ -384,6 +385,10 @@ def build_context(
     real caller has when it re-remembers a fact under its key."""
     if context_assembly not in {"full", "ranked-snippets"}:
         raise ValueError(f"unknown context assembly: {context_assembly}")
+    if context_guidance not in {"none", "preference"}:
+        raise ValueError(f"unknown context guidance: {context_guidance}")
+    if context_guidance != "none" and context_assembly != "ranked-snippets":
+        raise ValueError("context guidance requires ranked-snippets assembly")
     if assembly_k <= 0 or context_budget <= 0 or assembly_windows <= 0:
         raise ValueError("assembly_k, context_budget, and assembly_windows must be positive")
     sessions = inst["haystack_sessions"]
@@ -431,7 +436,8 @@ def build_context(
         if context_assembly == "ranked-snippets":
             return assemble_ranked_snippets(
                 inst, chosen, budget_tokens=context_budget,
-                max_windows_per_session=assembly_windows
+                max_windows_per_session=assembly_windows,
+                guidance=context_guidance
             )[:2]
     else:
         raise ValueError(system)
@@ -450,8 +456,15 @@ def price_for(model):
     return PRICING.get(model, FALLBACK_PRICE)
 
 
-def estimate_cost(data, systems, k, model, judge):
-    """Rough upfront USD estimate from dataset shape (4-chars/token heuristic)."""
+def estimate_cost(data, systems, k, model, judge, context_assembly="full",
+                  assembly_k=20, context_budget=32768):
+    """Rough upfront USD estimate from dataset shape (4-chars/token heuristic).
+
+    Ranked-snippet estimates use the configured candidate depth capped by the
+    answer-facing context budget, rather than silently pricing the old top-k
+    baseline. The estimate remains a bound/heuristic; provider usage is the
+    only quotable cost evidence.
+    """
     sample = data[:min(len(data), 20)]
     sess_toks, sess_counts = [], []
     for inst in sample:
@@ -461,7 +474,9 @@ def estimate_cost(data, systems, k, model, judge):
     avg_sess = sum(sess_toks) / max(1, len(sess_toks))
     avg_n = sum(sess_counts) / max(1, len(sess_counts))
 
-    ctx_per_system = {"perseus-vault": k * avg_sess, "fullcontext": avg_n * avg_sess,
+    ranked_ctx = min(context_budget, assembly_k * avg_sess)
+    vault_ctx = ranked_ctx if context_assembly == "ranked-snippets" else k * avg_sess
+    ctx_per_system = {"perseus-vault": vault_ctx, "fullcontext": avg_n * avg_sess,
                       "oracle": 2 * avg_sess, "stateless": 12}
     n = len(data)
     answer_out, judge_in_fixed, judge_out = 150, 250, 5
@@ -522,6 +537,9 @@ def main():
                     help="chars/4 context budget for ranked-snippets (default 32768)")
     ap.add_argument("--assembly-windows", type=int, default=2,
                     help="Maximum non-overlapping turn pairs per session (default 2)")
+    ap.add_argument("--context-guidance", choices=["none", "preference"], default="none",
+                    help="Explicit answer-facing guide for ranked-snippets; preference "
+                         "privileges direct user statements over assistant suggestions")
     ap.add_argument("--limit", type=int, default=0, help="Only run the first N instances (0 = all; smoke tests)")
     ap.add_argument("--cot", action="store_true",
                     help="#579: use LongMemEval's OFFICIAL chain-of-thought answer prompt (still "
@@ -585,7 +603,11 @@ def main():
     api_key = get_api_key() if live else ""
 
     if not args.dry_run:
-        cost, toks, detail = estimate_cost(data, args.systems, args.k, args.model, args.judge)
+        cost, toks, detail = estimate_cost(
+            data, args.systems, args.k, args.model, args.judge,
+            context_assembly=args.context_assembly,
+            assembly_k=args.assembly_k, context_budget=args.context_budget
+        )
         print(f"Estimated cost for {len(data)} instances x {len(args.systems)} system(s) "
               f"(answerer={args.model}, judge={args.judge}):\n{detail}\n"
               f"  total     est ${cost:,.2f}"
@@ -640,7 +662,8 @@ def main():
                   "context_assembly": args.context_assembly,
                   "assembly_k": args.assembly_k,
                   "context_budget": args.context_budget,
-                  "assembly_windows": args.assembly_windows}
+                  "assembly_windows": args.assembly_windows,
+                  "context_guidance": args.context_guidance}
     done = {}
     journal = None
     if not args.dry_run:
@@ -707,6 +730,7 @@ def main():
                     assembly_k=args.assembly_k,
                     context_budget=args.context_budget,
                     assembly_windows=args.assembly_windows,
+                    context_guidance=args.context_guidance,
                 )
                 answer_tmpl = ANSWER_PROMPT_COT if args.cot else ANSWER_PROMPT
                 prompt = answer_tmpl.format(context=ctx, question=inst["question"],
@@ -864,6 +888,7 @@ def main():
         "assembly_k": args.assembly_k,
         "context_budget": args.context_budget,
         "assembly_windows": args.assembly_windows,
+        "context_guidance": args.context_guidance,
         "verdicts": sorted([v["question_id"], v["system"], v["correct"]] for v in verdicts),
     }, sort_keys=True)
     signature = hashlib.sha256(sig_payload.encode("utf-8")).hexdigest()
@@ -890,7 +915,8 @@ def main():
         "retrieval": {"mode": "hybrid", "k": args.k, "embedding": "bundled-onnx"},
         "context_assembly": {"mode": args.context_assembly, "assembly_k": args.assembly_k,
                              "budget_tokens": args.context_budget,
-                             "windows_per_session": args.assembly_windows},
+                             "windows_per_session": args.assembly_windows,
+                             "guidance": args.context_guidance},
         "systems": systems_report,
         "commit": git_commit(),
         "binary": Path(binary).name if binary else None,
