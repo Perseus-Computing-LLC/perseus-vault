@@ -50,6 +50,19 @@
       "scope": "helpers are not yet integrated into canonical scale/BEAM reports"
     },
     {
+      "id": "beam-task-end-to-end-qa",
+      "suite": "beam_task",
+      "status": "not_measured",
+      "negative_claim": "No answerer/judge accuracy, rubric score, or cross-system leaderboard claim is made; the current lane is retrieval-only until separately authorized model/provider runs are pinned."
+    },
+    {
+      "id": "beam-task-protocol-v1",
+      "suite": "beam_task",
+      "status": "review",
+      "evidence": "fixture_contract_plus_vault_100k_retrieval_only",
+      "scope": "official BEAM 10-ability task ingestion, ranked hash-only retrieval artifacts, budget and model/prompt identity envelope, and custody digest"
+    },
+    {
       "id": "provider-failure-stress",
       "suite": "freshness",
       "status": "not_measured",

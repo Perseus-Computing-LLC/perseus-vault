@@ -1,0 +1,33 @@
+[
+  {
+    "batch_number": 1,
+    "turns": [
+      [
+        {
+          "role": "user",
+          "id": 0,
+          "time_anchor": "2026-01-03",
+          "question_type": "main_question",
+          "content": "The service codename is Atlas and the first release is planned for January 20, 2026."
+        },
+        {
+          "role": "assistant",
+          "id": 1,
+          "content": "Understood. I will use Atlas as the service codename and January 20, 2026 as the first-release target."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "id": 2,
+          "content": "Please remember that the release target moved to January 27, 2026 after the security review."
+        },
+        {
+          "role": "assistant",
+          "id": 3,
+          "content": "The updated release target is January 27, 2026 after the security review."
+        }
+      ]
+    ]
+  }
+]
