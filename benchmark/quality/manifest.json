@@ -1,7 +1,7 @@
 {
   "case_count": {
     "min": 20,
-    "max": 52
+    "max": 55
   },
   "cases": [
     {
@@ -263,22 +263,59 @@
       "category": "admission",
       "checks": [
         "quarantined",
-        "not_authoritative"
+        "not_authoritative",
+        "pending_outcome_class",
+        "pending_not_serveable"
       ],
-      "description": "An untrusted instruction-bearing memory is quarantined and cannot be authoritative.",
+      "description": "An untrusted instruction-bearing memory is held for pending approval, remains non-authoritative, and is not serveable.",
       "id": "admission-untrusted-instruction",
-      "metric": "admission",
+      "metric": "admission.pending_approval",
       "scenario": "admission"
     },
     {
       "category": "admission",
       "checks": [
         "proposed",
-        "requires_review"
+        "requires_review",
+        "proposed_outcome_class",
+        "proposed_not_serveable"
       ],
-      "description": "An authoritative claim without a bound source event remains proposed/reviewable.",
+      "description": "An authoritative claim without a bound source event remains pending approval, reviewable, and non-serveable.",
       "id": "admission-authoritative-needs-source",
-      "metric": "admission",
+      "metric": "admission.pending_approval",
+      "scenario": "admission"
+    },
+    {
+      "category": "admission",
+      "checks": [
+        "save",
+        "save_serveable"
+      ],
+      "description": "A journal-bound authoritative admission is a positive SAVE control and is recallable before negative outcomes are evaluated.",
+      "id": "admission-save-positive-control",
+      "metric": "admission.save",
+      "scenario": "admission"
+    },
+    {
+      "category": "admission",
+      "checks": [
+        "drop",
+        "drop_no_raw_content"
+      ],
+      "description": "A task-irrelevant candidate is DROP: it is not persisted and its response contains no raw candidate content.",
+      "id": "admission-drop-no-raw-content",
+      "metric": "admission.drop",
+      "scenario": "admission"
+    },
+    {
+      "category": "admission",
+      "checks": [
+        "block",
+        "block_no_raw_content"
+      ],
+      "description": "A workspace-policy mismatch is BLOCK: it is not persisted and its response contains only hash-only admission evidence.",
+      "id": "admission-block-no-raw-content",
+      "metric": "admission.block",
       "scenario": "admission"
     },
     {
@@ -580,6 +617,10 @@
   "metrics": [
     "action_grounding",
     "admission",
+    "admission.block",
+    "admission.drop",
+    "admission.pending_approval",
+    "admission.save",
     "compaction_projection",
     "declared",
     "evidence_observations",

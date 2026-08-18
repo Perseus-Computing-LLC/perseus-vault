@@ -61,6 +61,9 @@ V1_REQUIRED_CATEGORIES = V0_REQUIRED_CATEGORIES + (
     "interference_gate",
 )
 
+ADMISSION_OUTCOME_CLASSES = ("save", "drop", "block", "pending_approval")
+DERIVED_METRICS = {"admission"}
+
 CAPABILITY_TOOLS = {
     "compact": ("perseus_vault_compact",),
     "context": ("perseus_vault_context",),
@@ -211,6 +214,16 @@ SAFE_EVIDENCE_KEYS = {
     "anchor_reference_present",
     "lease_released",
     "failure_class",
+    "save_outcome_class",
+    "drop_outcome_class",
+    "block_outcome_class",
+    "pending_outcome_class",
+    "save_serveable",
+    "drop_no_raw_content",
+    "block_no_raw_content",
+    "pending_not_serveable",
+    "proposed_outcome_class",
+    "proposed_not_serveable",
 }
 
 
@@ -316,6 +329,8 @@ def sanitize_evidence(value, *, _key=None, strict=False):
         return value if _key in SAFE_EVIDENCE_KEYS else _DROP
     if isinstance(value, str):
         if _key in {"digest", "evidence_hash", "frozen_digest", "intent_hash", "outcome_hash", "temporal_digest"} and re.fullmatch(r"[0-9a-f]{64}", value):
+            return value
+        if _key.endswith("_outcome_class") and value in ADMISSION_OUTCOME_CLASSES:
             return value
         if _key == "status" and value in {"available", "partial", "unavailable", "not_measured", "failed", "passed", "blocked"}:
             return value
@@ -724,15 +739,68 @@ class VaultClient:
             raise RuntimeError("MCP client cleanup failed") from cleanup_error
 
 
-def remember(client, category, key, note, **kwargs):
+QUALITY_HARNESS_WORKSPACE = "quality-harness-global-workspace"
+QUALITY_HARNESS_AGENT = "quality-harness"
+QUALITY_HARNESS_ACTOR_KIND = "assistant"
+
+
+def remember_json(client, category, key, body_json, **kwargs):
+    """Write a serveable quality fixture through the real admission contract."""
     args = {
         "category": category,
         "key": key,
-        "body_json": stable_json({"note": note}),
+        "body_json": body_json,
         "skip_dedup": True,
     }
     args.update(kwargs)
+    workspace = args.get("workspace_hash") or QUALITY_HARNESS_WORKSPACE
+    agent = args.get("agent_id") or QUALITY_HARNESS_AGENT
+    actor_kind = args.get("actor_kind") or QUALITY_HARNESS_ACTOR_KIND
+    args.update({"workspace_hash": workspace, "agent_id": agent, "actor_kind": actor_kind})
+
+    record_digest = sha256_text(body_json)
+    source = client.call(
+        "perseus_vault_journal",
+        {
+            "event_type": "admission_source",
+            "evaluated": {
+                "record_digest": record_digest,
+                "source_identity": "quality-harness-source",
+                "workspace_hash": workspace,
+                "actor_kind": actor_kind,
+                "actor_identity": agent,
+            },
+            "acted": {"category": category, "key": key},
+            "forward": {"workspace_hash": workspace},
+            "category": category,
+            "key": key,
+            "agent_id": agent,
+            "workspace_hash": workspace,
+        },
+    )
+    source_event_id = source.get("id") if isinstance(source, dict) else None
+    if not source_event_id:
+        raise RuntimeError(f"quality fixture source event missing for {category}/{key}")
+    args["admission"] = {
+        "record_digest": record_digest,
+        "source_identity": "quality-harness-source",
+        "source_event_id": source_event_id,
+        "authorization_scope": workspace,
+        "ingestion_channel": "quality-harness",
+        "workspace_hash": workspace,
+        "source_trust": "authoritative",
+        "valid_from_unix_ms": 1,
+        "recorded_at_unix_ms": 1,
+        "task_relevance_bps": 9000,
+        "actor_kind": actor_kind,
+        "actor_identity": agent,
+        "validated": True,
+    }
     return client.call("perseus_vault_remember", args)
+
+
+def remember(client, category, key, note, **kwargs):
+    return remember_json(client, category, key, stable_json({"note": note}), **kwargs)
 
 
 def hit_items(client, query, **kwargs):
@@ -1705,35 +1773,29 @@ def run_validity_recall(client, **_):
     )
     # Expiring/expired fixtures carry `expires_at` inside body_json (the
     # read-time expiry contract reads it from the body).
-    client.call(
-        "perseus_vault_remember",
-        {
-            "category": "quality_validity",
-            "key": "validity-expiring",
-            "body_json": stable_json(
-                {
-                    "note": "quality-fixture-delta-protocol-expiring-note",
-                    "expires_at": now_ms + 120_000,
-                }
-            ),
-            "workspace_hash": ws,
-            "skip_dedup": True,
-        },
+    remember_json(
+        client,
+        "quality_validity",
+        "validity-expiring",
+        stable_json(
+            {
+                "note": "quality-fixture-delta-protocol-expiring-note",
+                "expires_at": now_ms + 120_000,
+            }
+        ),
+        workspace_hash=ws,
     )
-    client.call(
-        "perseus_vault_remember",
-        {
-            "category": "quality_validity",
-            "key": "validity-expired",
-            "body_json": stable_json(
-                {
-                    "note": "quality-fixture-delta-protocol-expired-note",
-                    "expires_at": now_ms - 1_000,
-                }
-            ),
-            "workspace_hash": ws,
-            "skip_dedup": True,
-        },
+    remember_json(
+        client,
+        "quality_validity",
+        "validity-expired",
+        stable_json(
+            {
+                "note": "quality-fixture-delta-protocol-expired-note",
+                "expires_at": now_ms - 1_000,
+            }
+        ),
+        workspace_hash=ws,
     )
 
     # Supersede v1 -> current: flips v1's status to deprecated (#684), so the
@@ -2093,6 +2155,128 @@ def run_evidence_observations(client, **_):
 
 
 def run_admission(client, **_):
+    workspace = "quality-admission-workspace"
+    agent = "quality-admission-agent"
+
+    # Positive control first: an authoritative, journal-bound admission must
+    # commit and be recallable before any negative outcome is evaluated.
+    save_body = stable_json({"note": "quality-fixture-admission-save-positive"})
+    save_digest = sha256_text(save_body)
+    source = client.call(
+        "perseus_vault_journal",
+        {
+            "event_type": "admission_source",
+            "evaluated": {
+                "record_digest": save_digest,
+                "source_identity": "quality-source-authoritative",
+                "workspace_hash": workspace,
+                "actor_kind": "connector",
+                "actor_identity": agent,
+            },
+            "acted": {"kind": "quality_source"},
+            "forward": {"kind": "quality_source"},
+            "category": "quality_admission_source",
+            "key": "save-source",
+            "entity_id": "",
+            "agent_id": agent,
+            "workspace_hash": workspace,
+        },
+    )
+    source_event_id = source.get("id") if isinstance(source, dict) else None
+    if not source_event_id:
+        raise RuntimeError("admission SAVE positive control could not create a source event")
+    save = client.call(
+        "perseus_vault_remember",
+        {
+            "category": "quality_admission",
+            "key": "saved",
+            "body_json": save_body,
+            "workspace_hash": workspace,
+            "agent_id": agent,
+            "actor_kind": "connector",
+            "admission": {
+                "record_digest": save_digest,
+                "source_identity": "quality-source-authoritative",
+                "source_event_id": source_event_id,
+                "authorization_scope": workspace,
+                "ingestion_channel": "quality-fixture",
+                "workspace_hash": workspace,
+                "source_trust": "authoritative",
+                "valid_from_unix_ms": 100,
+                "recorded_at_unix_ms": 100,
+                "task_relevance_bps": 9000,
+                "actor_kind": "connector",
+                "actor_identity": agent,
+                "validated": True,
+            },
+            "skip_dedup": True,
+        },
+    )
+    save_admission = save.get("admission", {}) if isinstance(save, dict) else {}
+    save_class = save_admission.get("outcome_class", "missing")
+    save_serveable = (
+        save.get("ok") is True
+        and save.get("id")
+        and save_class == "save"
+        and "saved" in recall_keys(client, "quality-fixture-admission-save-positive", workspace_hash=workspace)
+    )
+    if not save_serveable:
+        raise RuntimeError("admission SAVE positive control failed before negative outcomes")
+
+    drop_body = stable_json({"note": "quality-fixture-admission-drop-raw-marker"})
+    drop = client.call(
+        "perseus_vault_remember",
+        {
+            "category": "quality_admission",
+            "key": "dropped",
+            "body_json": drop_body,
+            "workspace_hash": workspace,
+            "agent_id": agent,
+            "actor_kind": "assistant",
+            "admission": {
+                "record_digest": sha256_text(drop_body),
+                "source_identity": "quality-source-trusted",
+                "authorization_scope": workspace,
+                "ingestion_channel": "quality-fixture",
+                "workspace_hash": workspace,
+                "source_trust": "trusted",
+                "valid_from_unix_ms": 100,
+                "recorded_at_unix_ms": 100,
+                "task_relevance_bps": 100,
+            },
+            "skip_dedup": True,
+        },
+    )
+    drop_admission = drop.get("admission", {}) if isinstance(drop, dict) else {}
+    drop_class = drop_admission.get("outcome_class", "missing")
+
+    block_body = stable_json({"note": "quality-fixture-admission-block-raw-marker"})
+    block = client.call(
+        "perseus_vault_remember",
+        {
+            "category": "quality_admission",
+            "key": "blocked",
+            "body_json": block_body,
+            "workspace_hash": workspace,
+            "agent_id": agent,
+            "actor_kind": "assistant",
+            "admission": {
+                "record_digest": sha256_text(block_body),
+                "source_identity": "quality-source-cross-workspace",
+                "authorization_scope": "quality-other-workspace",
+                "ingestion_channel": "quality-fixture",
+                "workspace_hash": workspace,
+                "source_trust": "trusted",
+                "valid_from_unix_ms": 100,
+                "recorded_at_unix_ms": 100,
+                "task_relevance_bps": 9000,
+            },
+            "skip_dedup": True,
+        },
+    )
+    block_admission = block.get("admission", {}) if isinstance(block, dict) else {}
+    block_class = block_admission.get("outcome_class", "missing")
+
     untrusted_body = stable_json({"note": "quality-fixture-admission-hostile-marker"})
     untrusted = client.call(
         "perseus_vault_remember",
@@ -2100,22 +2284,22 @@ def run_admission(client, **_):
             "category": "quality_admission",
             "key": "untrusted-instruction",
             "body_json": untrusted_body,
-            "workspace_hash": "quality-admission-workspace",
-            "agent_id": "quality-admission-agent",
+            "workspace_hash": workspace,
+            "agent_id": agent,
             "actor_kind": "assistant",
             "admission": {
                 "record_digest": sha256_text(untrusted_body),
                 "source_identity": "quality-source-untrusted",
-                "authorization_scope": "quality-admission-workspace",
+                "authorization_scope": workspace,
                 "ingestion_channel": "quality-fixture",
-                "workspace_hash": "quality-admission-workspace",
+                "workspace_hash": workspace,
                 "source_trust": "untrusted",
                 "valid_from_unix_ms": 100,
                 "recorded_at_unix_ms": 100,
                 "task_relevance_bps": 9000,
                 "instruction_bearing": True,
                 "actor_kind": "assistant",
-                "actor_identity": "quality-admission-agent",
+                "actor_identity": agent,
             },
             "skip_dedup": True,
         },
@@ -2127,48 +2311,70 @@ def run_admission(client, **_):
             "category": "quality_admission",
             "key": "missing-source",
             "body_json": proposed_body,
-            "workspace_hash": "quality-admission-workspace",
-            "agent_id": "quality-admission-agent",
+            "workspace_hash": workspace,
+            "agent_id": agent,
             "actor_kind": "assistant",
             "admission": {
                 "record_digest": sha256_text(proposed_body),
                 "source_identity": "quality-source-authoritative",
-                "authorization_scope": "quality-admission-workspace",
+                "authorization_scope": workspace,
                 "ingestion_channel": "quality-fixture",
-                "workspace_hash": "quality-admission-workspace",
+                "workspace_hash": workspace,
                 "source_trust": "authoritative",
                 "valid_from_unix_ms": 100,
                 "recorded_at_unix_ms": 100,
                 "task_relevance_bps": 9000,
                 "validated": False,
                 "actor_kind": "assistant",
-                "actor_identity": "quality-admission-agent",
+                "actor_identity": agent,
             },
             "skip_dedup": True,
         },
     )
     untrusted_admission = untrusted.get("admission", {}) if isinstance(untrusted, dict) else {}
     proposed_admission = proposed.get("admission", {}) if isinstance(proposed, dict) else {}
+    untrusted_class = untrusted_admission.get("outcome_class", "missing")
+    proposed_class = proposed_admission.get("outcome_class", "missing")
+    scanned = scan_items(client, "quality_admission", workspace_hash=workspace)
+    scanned_keys = {item.get("key") for item in scanned}
     checks = {
+        "save": save_class == "save",
+        "save_serveable": bool(save_serveable),
+        "drop": drop_class == "drop",
+        "drop_no_raw_content": drop_class == "drop" and "dropped" not in scanned_keys and "drop-raw-marker" not in stable_json(drop),
+        "block": block_class == "block",
+        "block_no_raw_content": block_class == "block" and "blocked" not in scanned_keys and "block-raw-marker" not in stable_json(block),
         "quarantined": untrusted_admission.get("outcome") == "quarantined",
         "not_authoritative": untrusted_admission.get("authoritative") is False,
+        "pending_outcome_class": untrusted_class == "pending_approval",
+        "pending_not_serveable": "untrusted-instruction" not in recall_keys(client, "quality-fixture-admission-hostile-marker", workspace_hash=workspace),
         "proposed": proposed_admission.get("outcome") == "proposed",
         "requires_review": proposed.get("requires_review") is True,
+        "proposed_outcome_class": proposed_class == "pending_approval",
+        "proposed_not_serveable": "missing-source" not in recall_keys(client, "quality-fixture-admission-proposed-marker", workspace_hash=workspace),
     }
     return output(
         checks,
         {
-            "untrusted_outcome": untrusted_admission.get("outcome", "missing"),
-            "untrusted_authoritative": bool(untrusted_admission.get("authoritative")),
-            "proposed_outcome": proposed_admission.get("outcome", "missing"),
-            "proposed_requires_review": proposed.get("requires_review") is True,
+            "save_outcome_class": save_class,
+            "save_serveable": bool(save_serveable),
+            "drop_outcome_class": drop_class,
+            "drop_no_raw_content": checks["drop_no_raw_content"],
+            "block_outcome_class": block_class,
+            "block_no_raw_content": checks["block_no_raw_content"],
+            "pending_outcome_class": untrusted_class,
+            "pending_not_serveable": checks["pending_not_serveable"],
+            "proposed_outcome_class": proposed_class,
+            "proposed_not_serveable": checks["proposed_not_serveable"],
         },
         {
-            "admission-untrusted-instruction": {"numerator": int(checks["quarantined"] and checks["not_authoritative"]), "denominator": 1},
-            "admission-authoritative-needs-source": {"numerator": int(checks["proposed"] and checks["requires_review"]), "denominator": 1},
+            "admission-save-positive-control": {"name": "admission.save", "numerator": int(checks["save"] and checks["save_serveable"]), "denominator": 1},
+            "admission-drop-no-raw-content": {"name": "admission.drop", "numerator": int(checks["drop"] and checks["drop_no_raw_content"]), "denominator": 1},
+            "admission-block-no-raw-content": {"name": "admission.block", "numerator": int(checks["block"] and checks["block_no_raw_content"]), "denominator": 1},
+            "admission-untrusted-instruction": {"name": "admission.pending_approval", "numerator": int(checks["pending_outcome_class"] and checks["pending_not_serveable"] and checks["quarantined"]), "denominator": 1},
+            "admission-authoritative-needs-source": {"name": "admission.pending_approval", "numerator": int(checks["proposed_outcome_class"] and checks["proposed_not_serveable"] and checks["proposed"] and checks["requires_review"]), "denominator": 1},
         },
     )
-
 
 def run_prompt_safety(client, **_):
     client.require_tool("perseus_vault_context", "context")
@@ -2258,24 +2464,27 @@ def run_interference_gate(client, **_):
     # materializes the held write.
     ws = "quality-interference-gate-workspace"
     cat = "quality_interference_gate"
-    note = "quality-fixture-interference-voyager-probe-trajectory"
+    note = ("quality-fixture-interference-voyager-probe-trajectory " * 32).strip()
     remember(client, cat, "seed-1", note, workspace_hash=ws)
 
     # 1. Default fail-closed quarantine (per-write explicit): near-verbatim
     #    skip_dedup write returns quarantined:true, is NOT served, and is
     #    listed in the write_quarantine review surface.
-    held = client.call(
-        "perseus_vault_remember",
-        {
-            "category": cat,
-            "key": "held-1",
-            "body_json": stable_json({"note": note}),
-            "skip_dedup": True,
-            "workspace_hash": ws,
-            "interference_mode": "quarantine",
-        },
+    held = remember_json(
+        client,
+        cat,
+        "held-1",
+        stable_json({"note": note}),
+        workspace_hash=ws,
+        interference_mode="quarantine",
     )
     quarantined_flag = isinstance(held, dict) and held.get("quarantined") is True
+    quarantined_pending = (
+        isinstance(held, dict)
+        and held.get("outcome_class") == "pending_approval"
+        and held.get("disposition") == "pending_approval"
+        and held.get("requires_review") is True
+    )
     held_id = held.get("id") if isinstance(held, dict) else None
     held_not_served = "held-1" not in recall_keys(
         client, "voyager probe trajectory", workspace_hash=ws
@@ -2287,15 +2496,53 @@ def run_interference_gate(client, **_):
 
     # 2. Per-write refuse override: the same duplicate errors out and
     #    nothing is staged.
+    refused_body = stable_json({"note": note})
+    refused_digest = sha256_text(refused_body)
+    refused_source = client.call(
+        "perseus_vault_journal",
+        {
+            "event_type": "admission_source",
+            "evaluated": {
+                "record_digest": refused_digest,
+                "source_identity": "quality-harness-source",
+                "workspace_hash": ws,
+                "actor_kind": QUALITY_HARNESS_ACTOR_KIND,
+                "actor_identity": QUALITY_HARNESS_AGENT,
+            },
+            "acted": {"category": cat, "key": "refused-1"},
+            "forward": {"workspace_hash": ws},
+            "category": cat,
+            "key": "refused-1",
+            "agent_id": QUALITY_HARNESS_AGENT,
+            "workspace_hash": ws,
+        },
+    )
     refused = client.call_allow_error(
         "perseus_vault_remember",
         {
             "category": cat,
             "key": "refused-1",
-            "body_json": stable_json({"note": note}),
+            "body_json": refused_body,
             "skip_dedup": True,
             "workspace_hash": ws,
+            "agent_id": QUALITY_HARNESS_AGENT,
+            "actor_kind": QUALITY_HARNESS_ACTOR_KIND,
             "interference_mode": "refuse",
+            "admission": {
+                "record_digest": refused_digest,
+                "source_identity": "quality-harness-source",
+                "source_event_id": refused_source.get("id"),
+                "authorization_scope": ws,
+                "ingestion_channel": "quality-harness",
+                "workspace_hash": ws,
+                "source_trust": "authoritative",
+                "valid_from_unix_ms": 1,
+                "recorded_at_unix_ms": 1,
+                "task_relevance_bps": 9000,
+                "actor_kind": QUALITY_HARNESS_ACTOR_KIND,
+                "actor_identity": QUALITY_HARNESS_AGENT,
+                "validated": True,
+            },
         },
     )
     refused_is_error = isinstance(refused, dict) and refused.get("isError") is True
@@ -2334,14 +2581,14 @@ def run_interference_gate(client, **_):
         )
 
     checks = {
-        "default_quarantines": quarantined_flag and qlist_has_held,
+        "default_quarantines": quarantined_flag and quarantined_pending and qlist_has_held,
         "quarantined_never_served": held_not_served,
         "refuse_override_errors": refused_is_error,
         "sparse_preserves_unrelated_recall": seed_still_recalled,
         "release_materializes": released and released_served,
     }
     evidence = {
-        "found": quarantined_flag,
+        "found": quarantined_flag and quarantined_pending,
         "count": int(qlist_has_held),
         "total": 1,
         "rate": 0.0 if held_not_served else 1.0,
@@ -2351,7 +2598,7 @@ def run_interference_gate(client, **_):
     }
     metric_events = {
         "interference-gate-default-quarantine": {
-            "numerator": int(quarantined_flag and held_not_served and qlist_has_held),
+            "numerator": int(quarantined_flag and quarantined_pending and held_not_served and qlist_has_held),
             "denominator": 1,
         },
         "interference-gate-refuse-override": {
@@ -2403,15 +2650,12 @@ def run_learned_anticipation(client, **_):
         return stable_json(body)
 
     def remember_body(key, note, triggers=None):
-        return client.call(
-            "perseus_vault_remember",
-            {
-                "category": cat,
-                "key": key,
-                "body_json": body_with(note, triggers),
-                "skip_dedup": True,
-                "workspace_hash": ws,
-            },
+        return remember_json(
+            client,
+            cat,
+            key,
+            body_with(note, triggers),
+            workspace_hash=ws,
         )
 
     noisy = remember_body("noisy", noisy_note, ["antineutrino"])
@@ -3030,7 +3274,9 @@ def load_manifest(path):
     if missing:
         raise ValueError(f"manifest missing required categories: {', '.join(missing)}")
     metric_names = {case.get("metric") for case in cases}
-    missing_metrics = sorted(set(manifest.get("metrics", [])) - metric_names)
+    # The aggregate admission metric is computed from the class cases below;
+    # class metrics themselves must still be manifest-backed cases.
+    missing_metrics = sorted(set(manifest.get("metrics", [])) - metric_names - DERIVED_METRICS)
     if missing_metrics:
         raise ValueError(f"manifest missing required metrics: {', '.join(missing_metrics)}")
     for case in cases:
@@ -3152,6 +3398,15 @@ def run_benchmark(manifest_path, binary=None, out=None):
                 )
             )
         metrics = compute_metrics(cases)
+        admission_cases = [case for case in cases if case.get("category") == "admission"]
+        if admission_cases:
+            admission_passed = sum(1 for case in admission_cases if case.get("status") == "passed")
+            metrics["admission"] = {
+                "status": "available" if admission_passed == len(admission_cases) else "failed",
+                "numerator": admission_passed,
+                "denominator": len(admission_cases),
+                "rate": admission_passed / len(admission_cases),
+            }
         metric_rates = build_metric_rates(cases, metrics)
         payload = {
             "benchmark": "perseus-vault-memory-quality",

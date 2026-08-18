@@ -99,6 +99,16 @@ _SAFE_EVIDENCE_KEYS = {
     "proposed_outcome",
     "untrusted_outcome",
     "evidence_mode",
+    "save_outcome_class",
+    "drop_outcome_class",
+    "block_outcome_class",
+    "pending_outcome_class",
+    "proposed_outcome_class",
+    "save_serveable",
+    "drop_no_raw_content",
+    "block_no_raw_content",
+    "pending_not_serveable",
+    "proposed_not_serveable",
 
     "available",
     "complete",
@@ -124,7 +134,8 @@ _SAFE_BOOLEAN_EVIDENCE_KEYS = {
     "personal_profile_key_present", "live_key_present", "prior_version_content_present",
     "other_workspace_visible", "origin_present", "empty_abstained", "pending_health_present",
     "proposed_requires_review", "untrusted_authoritative", "hostile_marker_visible",
-    "selected_a", "selected_b",
+    "selected_a", "selected_b", "save_serveable", "drop_no_raw_content",
+    "block_no_raw_content", "pending_not_serveable", "proposed_not_serveable",
 }
 _SAFE_INTEGER_EVIDENCE_KEYS = {
     "count",
@@ -294,6 +305,9 @@ def _validate_safe_evidence(evidence: Any, path: str = "evidence") -> None:
         elif key == "profiles_compared":
             if not isinstance(value, list) or not value or any(not _is_public_identifier(item) for item in value):
                 raise ValueError(f"{field_path} must contain bounded identifiers")
+        elif key in {"save_outcome_class", "drop_outcome_class", "block_outcome_class", "pending_outcome_class", "proposed_outcome_class"}:
+            if value not in {"save", "drop", "block", "pending_approval"}:
+                raise ValueError(f"{field_path} must be a valid admission outcome class")
         elif key in _SAFE_IDENTIFIER_EVIDENCE_KEYS:
             if not _is_public_identifier(value):
                 raise ValueError(f"{field_path} must be a bounded identifier")

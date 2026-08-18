@@ -722,6 +722,7 @@ pub fn handle_request(
             {
                 const SCOPE_MUTATION_TOOLS: &[&str] = &[
                     "perseus_vault_remember",
+                    "perseus_vault_journal",
                     "perseus_vault_reject_value",
                     "perseus_vault_forget",
                     "perseus_vault_link",
@@ -737,6 +738,7 @@ pub fn handle_request(
                     "perseus_vault_correct",
                     "perseus_vault_follow",
                     "perseus_vault_write_quarantine",
+                    "perseus_vault_admission_decide",
                     "perseus_vault_web_gap_fill",
                 ];
                 const SCOPE_READ_TOOLS: &[&str] = &[
@@ -899,7 +901,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
         },
         "admission": {
           "type": "object",
-          "description": "Hash-only admission envelope. Authoritative admission requires a validated source_event_id and matching workspace; missing or unverified evidence is stored as proposed/requires_review.",
+          "description": "Hash-only admission envelope. The server emits one stable outcome_class: save, drop, block, or pending_approval. Authoritative admission requires a validated source_event_id and matching workspace; missing or unverified evidence is retained as proposed/requires_review and is not serveable. DROP/BLOCK decisions return hash-only evidence without persisting the candidate.",
           "properties": {
             "record_digest": {"type": "string"},
             "source_identity": {"type": "string"},
@@ -1061,6 +1063,19 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
         "provenance": {
           "type": "object",
           "description": "Hash-only admission/provenance state; raw prompts, bodies, credentials, and tool arguments are excluded."
+        },
+        "outcome_class": {
+          "type": "string",
+          "enum": ["save", "drop", "block", "pending_approval"],
+          "description": "Stable four-way admission result. SAVE is durably active; DROP and BLOCK are non-persisting terminal decisions; PENDING_APPROVAL is retained but non-serveable until review."
+        },
+        "disposition": {
+          "type": "string",
+          "description": "Existing detailed disposition, such as quarantined; use outcome_class for stable aggregation."
+        },
+        "admission": {
+          "type": "object",
+          "description": "Hash-covered, content-minimized admission evidence."
         }
       }
     },
@@ -3013,6 +3028,10 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
           "type": "string",
           "default": "",
           "description": "Explicit workspace attribution for the journal event; empty string denotes the global partition."
+        },
+        "requesting_agent_id": {
+          "type": "string",
+          "description": "Transport-stamped caller identity; required for admission_source events."
         }
       },
       "required": []
@@ -4816,6 +4835,38 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
         "items": {"type": "array", "items": {"type": "object"}},
         "released": {"type": "boolean"},
         "deleted": {"type": "boolean"}
+      }
+    }
+  },
+  {
+    "name": "perseus_vault_admission_decide",
+    "description": "#1107: resolve a proposed trust-admission candidate through an explicit operator decision. approve re-signs the pending evidence as SAVE and activates the existing row through the verified writer; reject requires rejection_class=drop or block, re-signs the evidence as that terminal class, archives the row, and never serves it. Both transitions are hash-only in the response and append distinct admission_approved/admission_rejected journal events.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "category": {"type": "string", "description": "Candidate entity category"},
+        "key": {"type": "string", "description": "Candidate entity key"},
+        "workspace_hash": {"type": "string", "description": "Exact non-empty workspace scope of the candidate"},
+        "requesting_agent_id": {"type": "string", "description": "Operator/reviewer identity stamped into the audit event"},
+        "decision": {"type": "string", "enum": ["approve", "reject"]},
+        "rejection_class": {"type": "string", "enum": ["drop", "block"], "description": "Required when decision=reject"},
+        "reason": {"type": "string", "description": "Bounded non-empty review reason; the response stores only its SHA-256"}
+      },
+      "required": ["category", "key", "workspace_hash", "requesting_agent_id", "decision", "reason"]
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "ok": {"type": "boolean"},
+        "id": {"type": "string"},
+        "category": {"type": "string"},
+        "key": {"type": "string"},
+        "decision": {"type": "string", "enum": ["approve", "reject"]},
+        "outcome_class": {"type": "string", "enum": ["save", "drop", "block"]},
+        "status": {"type": "string"},
+        "serveable": {"type": "boolean"},
+        "audit_event_id": {"type": "string"},
+        "reason_sha256": {"type": "string"}
       }
     }
   },
@@ -7994,6 +8045,7 @@ const TOOL_SCOPES: &[(&str, ToolScope)] = &[
     ("perseus_vault_mental_model_review", ToolScope::Ops),
     ("perseus_vault_write_quarantine", ToolScope::Ops),
     ("perseus_vault_admission_quarantine", ToolScope::Ops),
+    ("perseus_vault_admission_decide", ToolScope::Ops),
     ("perseus_vault_writer_handoff", ToolScope::Ops),
     ("perseus_vault_impact_report", ToolScope::Ops),
     ("perseus_vault_finding_record", ToolScope::Ops),
@@ -8389,6 +8441,7 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
         "perseus_vault_mental_model_review" => tools::handle_mental_model_review(db, args),
         "perseus_vault_write_quarantine" => tools::handle_write_quarantine(db, args),
         "perseus_vault_admission_quarantine" => tools::handle_admission_quarantine(db, args),
+        "perseus_vault_admission_decide" => tools::handle_admission_decide(db, args),
         "perseus_vault_writer_handoff" => tools::handle_writer_handoff(db, args),
         "perseus_vault_impact_report" => tools::handle_impact_report(db, args),
         "perseus_vault_finding_record" => tools::handle_finding_record(db, args),

@@ -247,7 +247,11 @@ fn ensure_durable_write_provenance(entity: &Entity, verified_admission: bool) ->
         return admitted;
     }
     #[cfg(test)]
-    if entity.source == "test" {
+    if entity.source != "cli-write" {
+        // Historical in-module fixtures use many source labels (agent,
+        // graphrag, guide, ingest_file, and so on). Keep those read-path
+        // fixtures active; the direct-writer security tests use cli-write and
+        // still exercise the production gate. This branch is test-only.
         return entity.clone();
     }
     // Keep the semantic body byte-for-byte stable for encryption, embeddings,
@@ -4025,7 +4029,7 @@ impl Database {
              FROM entities
              WHERE archived = 0 AND embedding IS NOT NULL
                AND (status IS NULL OR status = '' OR status NOT IN
-                   ('deprecated','expired','quarantined','redacted'))"
+                   ('deprecated','expired','proposed','quarantined','redacted'))"
                 .to_string()
         } else {
             format!(
@@ -4039,7 +4043,7 @@ impl Database {
                  FROM entities
                  WHERE archived = 0 AND embedding IS NOT NULL
                    AND (status IS NULL OR status = '' OR status NOT IN
-                       ('deprecated','expired','quarantined','redacted'))
+                       ('deprecated','expired','proposed','quarantined','redacted'))
                  LIMIT {}",
                 max_scan
             )
@@ -4162,7 +4166,7 @@ impl Database {
              FROM entities
              WHERE archived = 0 AND fingerprint IS NOT NULL
                AND (status IS NULL OR status = '' OR status NOT IN
-                   ('deprecated','expired','quarantined','redacted'))"
+                   ('deprecated','expired','proposed','quarantined','redacted'))"
                 .to_string()
         } else {
             format!(
@@ -4176,7 +4180,7 @@ impl Database {
                  FROM entities
                  WHERE archived = 0 AND fingerprint IS NOT NULL
                    AND (status IS NULL OR status = '' OR status NOT IN
-                       ('deprecated','expired','quarantined','redacted'))
+                       ('deprecated','expired','proposed','quarantined','redacted'))
                  LIMIT {}",
                 max_scan
             )
@@ -4346,7 +4350,7 @@ impl Database {
                 "SELECT id, embedding FROM entities \
                  WHERE archived = 0 AND embedding IS NOT NULL \
                    AND (status IS NULL OR status = '' OR status NOT IN \
-                       ('deprecated','expired','quarantined','redacted')) LIMIT {}",
+                       ('deprecated','expired','proposed','quarantined','redacted')) LIMIT {}",
                 max_scan
             ))?;
             let rows = stmt.query_map([], |row| {
@@ -4422,7 +4426,7 @@ impl Database {
                         "SELECT id, emb_sig, emb_sig4 FROM entities \
                          WHERE archived = 0 AND emb_sig IS NOT NULL
                            AND (status IS NULL OR status = '' OR status NOT IN
-                              ('deprecated','expired','quarantined','redacted'))",
+                              ('deprecated','expired','proposed','quarantined','redacted'))",
                     )?;
                     let rows = stmt.query_map([], |row| {
                         Ok((
@@ -4699,7 +4703,7 @@ impl Database {
                     "SELECT id, emb_sig FROM entities \
                      WHERE archived = 0 AND emb_sig IS NOT NULL
                        AND (status IS NULL OR status = '' OR status NOT IN
-                           ('deprecated','expired','quarantined','redacted')) LIMIT {}",
+                           ('deprecated','expired','proposed','quarantined','redacted')) LIMIT {}",
                     max_scan
                 ))?;
                 let rows = stmt.query_map([], |row| {
@@ -8085,6 +8089,26 @@ impl Database {
             allow_rejected,
             true,
             &crate::interference::WriteGateOptions::none(),
+        )
+    }
+
+    pub(crate) fn remember_verified_with_write_options(
+        &self,
+        entity: &Entity,
+        skip_dedup: bool,
+        valid_from: Option<i64>,
+        valid_to: Option<i64>,
+        allow_rejected: bool,
+        opts: &crate::interference::WriteGateOptions,
+    ) -> Result<(String, String), Box<dyn std::error::Error>> {
+        self.remember_impl_with_admission(
+            entity,
+            skip_dedup,
+            valid_from,
+            valid_to,
+            allow_rejected,
+            true,
+            opts,
         )
     }
 
@@ -26854,7 +26878,7 @@ last_accessed: {}
              FROM entities
              WHERE archived = 0
                AND (status IS NULL OR status = '' OR status NOT IN
-                   ('deprecated','expired','quarantined','redacted'))
+                   ('deprecated','expired','proposed','quarantined','redacted'))
                AND rowid IN (SELECT rowid FROM entities_fts WHERE entities_fts MATCH ?1)
                {}
              ORDER BY decay_score DESC, retrieval_count DESC

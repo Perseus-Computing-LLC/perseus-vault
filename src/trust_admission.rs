@@ -19,6 +19,41 @@ const OUTCOMES: [&str; 7] = [
     "revoked",
 ];
 
+/// Stable public admission classes composed over the existing trust-admission
+/// outcomes. These are a reporting/evidence taxonomy, not a second lifecycle.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AdmissionOutcomeClass {
+    Save,
+    Drop,
+    Block,
+    PendingApproval,
+}
+
+impl AdmissionOutcomeClass {
+    pub fn from_outcome(outcome: &str) -> Result<Self, String> {
+        match outcome {
+            "admitted" => Ok(Self::Save),
+            "suppressed" => Ok(Self::Drop),
+            "abstained" | "revoked" => Ok(Self::Block),
+            "proposed" | "quarantined" | "escalated" => Ok(Self::PendingApproval),
+            other => Err(format!("unsupported admission outcome: {other}")),
+        }
+    }
+}
+
+impl std::fmt::Display for AdmissionOutcomeClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let value = match self {
+            Self::Save => "save",
+            Self::Drop => "drop",
+            Self::Block => "block",
+            Self::PendingApproval => "pending_approval",
+        };
+        f.write_str(value)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AdmissionRequest {
     pub record_digest: String,
@@ -51,6 +86,10 @@ pub struct AdmissionRequest {
 pub struct AdmissionEvidence {
     pub schema_version: String,
     pub outcome: String,
+    /// Hash-covered stable reporting class. `None` is accepted only for
+    /// pre-classification evidence; readers derive it from `outcome`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome_class: Option<AdmissionOutcomeClass>,
     pub reason_codes: Vec<String>,
     pub record_digest: String,
     pub source_identity: String,
@@ -78,6 +117,7 @@ impl AdmissionEvidence {
         if !OUTCOMES.contains(&self.outcome.as_str()) {
             return Err(format!("unsupported outcome: {}", self.outcome));
         }
+        self.outcome_class()?;
         for (label, value) in [
             ("record_digest", self.record_digest.as_str()),
             ("decision_digest", self.decision_digest.as_str()),
@@ -121,9 +161,79 @@ impl AdmissionEvidence {
         Ok(())
     }
 
+    /// Return the stable class, validating an explicitly stored class against
+    /// the canonical mapping. Legacy evidence without the field is readable.
+    pub fn outcome_class(&self) -> Result<AdmissionOutcomeClass, String> {
+        let expected = AdmissionOutcomeClass::from_outcome(&self.outcome)?;
+        if let Some(actual) = self.outcome_class {
+            if actual != expected {
+                return Err(format!(
+                    "outcome_class {} does not match outcome {}",
+                    actual, self.outcome
+                ));
+            }
+            Ok(actual)
+        } else {
+            Ok(expected)
+        }
+    }
+
+    /// Resolve a pending candidate through an explicit human approval. The
+    /// transition is hash-covered by the new decision digest; the reviewer's
+    /// audit identity is recorded by the caller's journal event rather than
+    /// copied into candidate content.
+    pub fn approve(&mut self, reason: &str) -> Result<(), String> {
+        validate_review_reason("approval_reason", reason)?;
+        if self.outcome_class()? != AdmissionOutcomeClass::PendingApproval {
+            return Err("only pending_approval evidence may be approved".to_string());
+        }
+        self.outcome = "admitted".to_string();
+        self.outcome_class = Some(AdmissionOutcomeClass::Save);
+        self.authoritative = true;
+        self.durable = true;
+        self.reason_codes.push("human_approved".to_string());
+        self.reason_codes
+            .push(format!("review_reason_{}", digest_text(reason)));
+        self.reason_codes.sort();
+        self.reason_codes.dedup();
+        self.decision_digest.clear();
+        self.decision_digest = canonical_digest(self)?;
+        self.validate()
+    }
+
+    /// Resolve a pending candidate through an explicit human rejection. DROP
+    /// maps to the existing relevance-suppression outcome; BLOCK maps to the
+    /// existing fail-closed scope/policy outcome. Neither can become active.
+    pub fn reject(&mut self, class: AdmissionOutcomeClass, reason: &str) -> Result<(), String> {
+        validate_review_reason("rejection_reason", reason)?;
+        if self.outcome_class()? != AdmissionOutcomeClass::PendingApproval {
+            return Err("only pending_approval evidence may be rejected".to_string());
+        }
+        let (outcome, marker) = match class {
+            AdmissionOutcomeClass::Drop => ("suppressed", "human_rejected_drop"),
+            AdmissionOutcomeClass::Block => ("abstained", "human_rejected_block"),
+            AdmissionOutcomeClass::Save | AdmissionOutcomeClass::PendingApproval => {
+                return Err("rejection class must be drop or block".to_string())
+            }
+        };
+        self.outcome = outcome.to_string();
+        self.outcome_class = Some(class);
+        self.authoritative = false;
+        self.durable = false;
+        self.reason_codes.push(marker.to_string());
+        self.reason_codes
+            .push(format!("review_reason_{}", digest_text(reason)));
+        self.reason_codes.sort();
+        self.reason_codes.dedup();
+        self.decision_digest.clear();
+        self.decision_digest = canonical_digest(self)?;
+        self.validate()
+    }
+
     pub fn downgrade_to_proposed(&mut self, reason: &str) -> Result<(), String> {
         validate_identifier("downgrade_reason", reason)?;
         self.outcome = "proposed".to_string();
+        self.outcome_class = Some(AdmissionOutcomeClass::PendingApproval);
         self.authoritative = false;
         self.durable = true;
         self.reason_codes.push(reason.to_string());
@@ -154,6 +264,7 @@ impl AdmissionEvidence {
         );
         self.revocation_digest = Some(canonical_digest(&material)?);
         self.outcome = "revoked".to_string();
+        self.outcome_class = Some(AdmissionOutcomeClass::Block);
         self.authoritative = false;
         self.durable = true;
         self.reason_codes.push("operator_revoked".to_string());
@@ -187,6 +298,7 @@ pub fn evaluate(request: &AdmissionRequest) -> Result<AdmissionEvidence, String>
     let mut evidence = AdmissionEvidence {
         schema_version: ADMISSION_SCHEMA_VERSION.to_string(),
         outcome: outcome.to_string(),
+        outcome_class: Some(AdmissionOutcomeClass::from_outcome(outcome)?),
         reason_codes: reasons.into_iter().map(str::to_string).collect(),
         record_digest: request.record_digest.clone(),
         source_identity: request.source_identity.clone(),
@@ -256,6 +368,13 @@ fn validate_sha256(label: &str, value: &str) -> Result<(), String> {
         || !value.bytes().all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
     {
         return Err(format!("{label} must be a lowercase SHA-256 value"));
+    }
+    Ok(())
+}
+
+fn validate_review_reason(label: &str, value: &str) -> Result<(), String> {
+    if value.trim().is_empty() || value.len() > 256 || value.chars().any(|c| c.is_control()) {
+        return Err(format!("{label} must be non-empty, bounded, and free of control characters"));
     }
     Ok(())
 }
@@ -354,6 +473,34 @@ mod tests {
         let mut evidence = evaluate(&request("trusted")).unwrap();
         evidence.reason_codes.push("forged_reason".to_string());
         assert!(evidence.validate().is_err());
+    }
+
+    #[test]
+    fn four_outcome_classes_are_stable_and_hash_covered() {
+        let mut drop_request = request("trusted");
+        drop_request.task_relevance_bps = 100;
+        let mut block_request = request("trusted");
+        block_request.authorization_scope = "workspace-b".to_string();
+        let cases = [
+            (evaluate(&request("authoritative")).unwrap(), AdmissionOutcomeClass::Save),
+            (evaluate(&drop_request).unwrap(), AdmissionOutcomeClass::Drop),
+            (evaluate(&block_request).unwrap(), AdmissionOutcomeClass::Block),
+            (evaluate(&request("trusted")).unwrap(), AdmissionOutcomeClass::PendingApproval),
+        ];
+
+        for (evidence, expected) in cases {
+            assert_eq!(evidence.outcome_class().unwrap(), expected);
+            let encoded = serde_json::to_string(&evidence).unwrap();
+            assert!(encoded.contains(&format!("\"outcome_class\":\"{expected}\"")));
+
+            let mut forged = evidence;
+            forged.outcome_class = Some(if expected == AdmissionOutcomeClass::Save {
+                AdmissionOutcomeClass::Drop
+            } else {
+                AdmissionOutcomeClass::Save
+            });
+            assert!(forged.validate().is_err());
+        }
     }
 
     #[test]

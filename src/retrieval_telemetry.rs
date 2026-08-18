@@ -25,7 +25,7 @@ use rusqlite::{params, Connection};
 /// Non-serveable lifecycle statuses — the truth controls (supersession,
 /// quarantine, expiry, redaction). Serving arms exclude these at the SQL
 /// boundary; telemetry verifies they never re-enter through another arm.
-pub const NON_SERVEABLE_STATUSES: &[&str] = &["deprecated", "expired", "quarantined", "redacted"];
+pub const NON_SERVEABLE_STATUSES: &[&str] = &["deprecated", "expired", "proposed", "quarantined", "redacted"];
 
 const SERVED_RETENTION_MS: i64 = 7 * 24 * 3600 * 1000;
 const SERVED_CAP_ROWS: i64 = 100_000;
@@ -45,9 +45,9 @@ pub fn serveable_status_clause(alias: &str) -> String {
 }
 
 /// Bare-column variant for splicing into existing SQL (no alias).
-pub const SERVEABLE_STATUS_SQL: &str = "(status IS NULL OR status = '' OR status NOT IN ('deprecated','expired','quarantined','redacted'))";
+pub const SERVEABLE_STATUS_SQL: &str = "(status IS NULL OR status = '' OR status NOT IN ('deprecated','expired','proposed','quarantined','redacted'))";
 
-const STATUS_LIST: &str = "'deprecated','expired','quarantined','redacted'";
+const STATUS_LIST: &str = "'deprecated','expired','proposed','quarantined','redacted'";
 
 /// Coarse query class: up to two content-bearing tokens, lowercased.
 /// Used for fan-out measurement (how many query classes a low-trust
@@ -480,7 +480,7 @@ pub fn retrieval_telemetry_report(
             let sql = format!(
                 "SELECT COUNT(*) FROM entities WHERE id IN ({placeholders}) \
                  AND archived = 0 AND (status IS NULL OR status = '' OR status NOT IN \
-                 ('deprecated','expired','quarantined','redacted'))"
+                 ('deprecated','expired','proposed','quarantined','redacted'))"
             );
             let refs: Vec<&dyn rusqlite::types::ToSql> =
                 chunk.iter().map(|s| s as &dyn rusqlite::types::ToSql).collect();
@@ -902,7 +902,7 @@ fn graph_probe(
             .prepare(
                 "SELECT e.id FROM entities_fts f JOIN entities e ON e.rowid = f.rowid \
                  WHERE entities_fts MATCH ?1 AND e.archived = 0 AND e.status NOT IN \
-                 ('deprecated','expired','quarantined','redacted') \
+                 ('deprecated','expired','proposed','quarantined','redacted') \
                  ORDER BY bm25(entities_fts) LIMIT 3",
             )?
             .query_map(params![fts_query], |r| r.get::<_, String>(0))?

@@ -5,7 +5,7 @@ for [issue #862](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/8
 It remains the same manifest-driven MCP stdio harness; there is no parallel
 benchmark runner.
 
-The current v1 manifest contains **30 deterministic cases and 41 checks**. The
+The current v1 manifest contains **55 deterministic cases and 102 checks**. The
 manifest identity is `perseus-vault-memory-quality-v1`; generated reports bind
 the manifest digest, binary digest, control profile, and harness commit. Synthetic fixtures use stable category/key/token commitments, while the report
 retains only booleans, counters, scope/key labels, and SHA-256 digests. Prompts,
@@ -29,7 +29,7 @@ store. It makes no network calls and does not use an LLM or embedding provider.
 The live-binary test is explicitly skipped when no binary is available; the
 CLI reports a blocked `binary_unavailable` result instead of fabricating a
 pass. The loader also accepts the prior v1 four-case manifest, normalizing its
-legacy category-shaped scenarios without weakening the v2 20–30-case checks.
+legacy category-shaped scenarios without weakening the current 55-case checks.
 
 ## Coverage
 
@@ -43,6 +43,7 @@ legacy category-shaped scenarios without weakening the v2 20–30-case checks.
 | Mutation, live-only recall, retained history | 3 | `stale_recall_rate`, `mutation_supersession_rate` |
 | Compaction and bounded context projections | 3 | `compaction_projection_rate` |
 | Authority, action receipt, grounding, lease lifecycle | 4 | `action_grounding_rate` |
+| Admission outcomes: SAVE, DROP, BLOCK, and PENDING_APPROVAL | 5 | `admission.save`, `admission.drop`, `admission.block`, `admission.pending_approval` |
 
 The report contains both a grouped `metrics` object and a flat
 `metric_rates` object with these stable names:
@@ -55,6 +56,8 @@ The report contains both a grouped `metrics` object and a flat
 - `mutation_supersession_rate`
 - `compaction_projection_rate`
 - `action_grounding_rate`
+- `admission` (aggregate case rate)
+- `admission.save`, `admission.drop`, `admission.block`, and `admission.pending_approval` (class counts/rates)
 
 A stale/scope-invalid rate counts the undesirable event, so zero is the good
 value. `stale_recall_rate` is computed from the live-recall assertion rather
@@ -85,7 +88,7 @@ The report includes:
 
 - `benchmark`, `dataset`, `harness_version`, and `required_categories`
 - v1 additions: recall outcome, admission, prompt safety, and identity ambiguity cases; v1 metric rates are required by the scorecard
-- exactly 30 manifest-driven `cases[]` in v1, each with `id`, `category`, `metric`,
+- exactly 55 manifest-driven `cases[]` in v1, each with `id`, `category`, `metric`,
   `status`, `checks`, sanitized `assertions`, and sanitized `evidence`
 - grouped `metrics` and flat `metric_rates`
 - `capabilities`, `offline: true`, `network_calls: 0`,
