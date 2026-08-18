@@ -1,0 +1,20 @@
+{
+  "abstention": [
+    {
+      "question": "What is the database vendor for the service?",
+      "ideal_response": "The database vendor is not specified in the conversation.",
+      "difficulty": "easy",
+      "source_chat_ids": [],
+      "rubric": ["The response must say that the database vendor is not specified."]
+    }
+  ],
+  "information_extraction": [
+    {
+      "question": "What is the service codename?",
+      "answer": "The service codename is Atlas.",
+      "difficulty": "easy",
+      "source_chat_ids": [0],
+      "rubric": ["The response must identify Atlas as the service codename."]
+    }
+  ]
+}

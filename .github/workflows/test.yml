@@ -177,6 +177,19 @@ jobs:
       - name: Test (no default features)
         run: cargo test --locked --no-default-features --verbose
 
+
+  # The public BEAM task lane is provider-free in CI: it validates the official
+  # file layout, rubric-only abilities, split-leakage checks, hash-only replay
+  # artifacts, retry telemetry, and deterministic custody projection. A real
+  # 100K Vault run is documented separately and is never launched by CI.
+  beam-task-contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Run provider-free BEAM task contract tests
+        run: python3 -m unittest benchmark.beam_task.test_protocol -v
+
   # Guard the optional gRPC transport (#354): src/grpc.rs is entirely
   # feature-gated and was previously absent from every CI lane, so the whole
   # external wire surface shipped unverified. tonic-build invokes protoc at
