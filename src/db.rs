@@ -567,9 +567,10 @@ const EMBED_QUEUE_CAP: usize = 1024;
 /// session.
 const EMBED_BATCH_MAX: usize = 32;
 
-/// One deferred auto-embed request (#393). `plaintext` doubles as the embed
-/// input and the stale-guard comparand: the worker only stores the vector if
-/// the entity's CURRENT plaintext (via its FTS row) still equals it.
+/// One deferred auto-embed request (#393). `plaintext` is the canonical
+/// semantic body used both as the embed input and the stale-guard comparand:
+/// the worker only stores the vector if the entity's CURRENT indexed body
+/// still equals it.
 struct EmbedJob {
     id: String,
     plaintext: String,
@@ -981,6 +982,12 @@ impl Database {
     /// canonical content body for indexing and embedding while leaving every
     /// other caller-supplied field intact.
     fn semantic_body_text(body_plaintext: &str) -> String {
+        // The normal write path carries ordinary content bodies. Avoid parsing
+        // every body while the caller holds the audited SQLite write lock; only
+        // governance-bearing JSON can require projection.
+        if !body_plaintext.contains("\"admission\"") && !body_plaintext.contains("\"provenance\"") {
+            return body_plaintext.to_string();
+        }
         let Ok(mut value) = serde_json::from_str::<serde_json::Value>(body_plaintext) else {
             return body_plaintext.to_string();
         };
@@ -1305,8 +1312,10 @@ impl Database {
         //
         // Pool size and busy_timeout are tunable via env so operators can match
         // the pool to their workload and so the concurrent-client load test can
-        // sweep them (#223). Test fixtures default to a bounded max_size=4 to
-        // avoid exhausting macOS/Windows CI resources; production retains 16.
+        // sweep them. Production defaults preserve the prior hard-coded values
+        // (max_size=16, busy_timeout=5000ms); test fixtures use a smaller pool
+        // unless an explicit env value is supplied, so the parallel harness does
+        // not create hundreds of scheduled pool threads across isolated DBs.
         //
         // Store-size note (#400): maintenance lock holds are bounded — cohere
         // chunks its decay pass (COHERE_DECAY_CHUNK_ROWS per transaction) and
@@ -3894,14 +3903,19 @@ impl Database {
                         | crate::encryption::BodyDecrypt::LegacyPlaintext(s) => s,
                         crate::encryption::BodyDecrypt::AuthFailed(_) => "{}".to_string(),
                     };
-                insert.execute(params![rowid, plain])?;
+                insert.execute(params![rowid, Self::semantic_body_text(&plain)])?;
             }
         } else {
-            tx.execute(
-                "INSERT INTO entity_history_fts (rowid, body_json)
-                 SELECT rowid, body_json FROM entity_history",
-                [],
-            )?;
+            let rows: Vec<(i64, String)> = {
+                let mut stmt = tx.prepare("SELECT rowid, body_json FROM entity_history")?;
+                let mapped = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+                mapped.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            let mut insert =
+                tx.prepare("INSERT INTO entity_history_fts (rowid, body_json) VALUES (?1, ?2)")?;
+            for (rowid, raw_body) in rows {
+                insert.execute(params![rowid, Self::semantic_body_text(&raw_body)])?;
+            }
         }
         tx.commit()?;
         Ok(indexed)
@@ -18839,9 +18853,10 @@ impl Database {
             }
             None => raw_body,
         };
+        let semantic = Self::semantic_body_text(&plain);
         conn.execute(
             "INSERT OR REPLACE INTO entity_history_fts (rowid, body_json) VALUES (?1, ?2)",
-            params![rowid, plain],
+            params![rowid, semantic],
         )?;
         Ok(())
     }
@@ -31114,7 +31129,7 @@ pub(crate) struct TestDatabase {
 impl TestDatabase {
     pub(crate) fn new(prefix: &str) -> Self {
         // #950: test fixtures must use test-mode DELETE journaling. Hundreds
-        // of short-lived isolated databases each hold a 16-connection pool;
+        // of short-lived isolated databases each hold a bounded test pool;
         // WAL keeps -wal/-shm fds open per connection and blew past the macOS
         // soft fd limit of 256 ("unable to open database file"). Production
         // WAL behavior is untouched — open_inner(&path, cfg!(test)) keeps
@@ -31213,6 +31228,43 @@ pub(crate) mod tests {
         assert_eq!(indexed, r#"{"note":"peanuts"}"#);
         assert!(!indexed.contains("record_digest"));
         assert!(!indexed.contains("provenance"));
+    }
+
+    #[test]
+    fn history_index_text_omits_admission_envelope() {
+        let (db, path) = temp_db();
+        db.remember_skip_dedup(&make_entity(
+            "history-admission-v1",
+            "facts",
+            "history-admission",
+            r#"{"note":"historysafecontent","admission":{"record_digest":"governanceleak"},"provenance":{"state":"admitted"}}"#,
+        ))
+        .unwrap();
+        db.remember_skip_dedup(&make_entity(
+            "history-admission-v2",
+            "facts",
+            "history-admission",
+            r#"{"note":"currentcontent"}"#,
+        ))
+        .unwrap();
+
+        assert_eq!(
+            db.history_matching_keys("historysafecontent", None, 10)
+                .unwrap(),
+            vec![("facts".to_string(), "history-admission".to_string())]
+        );
+        assert!(db
+            .history_matching_keys("governanceleak", None, 10)
+            .unwrap()
+            .is_empty());
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_fixtures_use_a_bounded_pool_by_default() {
+        let db = TestDatabase::new("perseus-vault-pool-default");
+        assert_eq!(db.pool.max_size(), 4);
     }
 
     pub(crate) fn temp_db() -> (TestDatabase, String) {
