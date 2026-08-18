@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import hmac
 import json
 import os
 import subprocess
@@ -18,6 +19,9 @@ from typing import Any
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent.parent
+WORKSPACE = "deletion-benchmark"
+AGENT = "deletion-benchmark"
+BENCHMARK_HMAC_KEY = "deletion-benchmark-fixture-key"
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 from benchmark.package.common.publication import build_common_report
@@ -44,7 +48,15 @@ def find_binary(explicit: str | None) -> str:
 
 class Client:
     def __init__(self, binary: str, db: Path):
-        self.p = subprocess.Popen([binary, "--db", str(db)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, start_new_session=(os.name != "nt"))
+        self.p = subprocess.Popen(
+            [binary, "--db", str(db)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            env={**os.environ, "PERSEUS_VAULT_ADMISSION_SOURCE_HMAC_KEY": BENCHMARK_HMAC_KEY},
+            start_new_session=(os.name != "nt"),
+        )
         try:
             self.responses: queue.Queue[object] = queue.Queue()
             self._reader = threading.Thread(target=self._reader_loop, daemon=True)
@@ -53,6 +65,30 @@ class Client:
             self.send({"jsonrpc": "2.0", "id": self.next_id(), "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "deletion-benchmark", "version": "1"}}})
             self.read()
             self.send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+            self.call(
+                "perseus_vault_agent",
+                {"agent_id": AGENT, "name": AGENT, "trust_tier": 2, "fleet_id": "benchmark"},
+            )
+            self.call(
+                "perseus_vault_authority_set",
+                {
+                    "agent_id": AGENT,
+                    "workspace_hash": WORKSPACE,
+                    "allowed_capabilities": [
+                        "memory.admission.source",
+                        "memory.commit",
+                        "memory.read",
+                        "memory.write",
+                        "memory.maintenance",
+                        "memory.delete",
+                        "memory.export",
+                    ],
+                    "scope_anchors": [WORKSPACE],
+                    "mode": "enforce",
+                    "author_agent_id": "operator",
+                    "capability_constraints_json": "{}",
+                },
+            )
         except BaseException:
             try:
                 self.close()
@@ -135,18 +171,70 @@ class Client:
 
 
 def remember(c: Client, category: str, key: str, marker: str) -> None:
-    c.call("perseus_vault_remember", {"category": category, "key": key, "body_json": stable_json({"marker": marker}), "skip_dedup": True})
+    body = stable_json({"marker": marker})
+    record_digest = digest(body)
+    evaluated = {
+        "record_digest": record_digest,
+        "source_identity": f"{category}:{key}",
+        "workspace_hash": WORKSPACE,
+        "actor_kind": "connector",
+        "actor_identity": AGENT,
+    }
+    # Match the Rust admission-source payload's canonical sorted JSON encoding.
+    attestation_payload = stable_json({**evaluated, "requesting_agent_id": AGENT})
+    source_attestation = hmac.new(
+        BENCHMARK_HMAC_KEY.encode(), attestation_payload.encode(), hashlib.sha256
+    ).hexdigest()
+    source = c.call(
+        "perseus_vault_journal",
+        {
+            "event_type": "admission_source",
+            "evaluated": evaluated,
+            "source_attestation": source_attestation,
+            "acted": {},
+            "forward": {},
+            "workspace_hash": WORKSPACE,
+        },
+    )
+    c.call(
+        "perseus_vault_remember",
+        {
+            "category": category,
+            "key": key,
+            "body_json": body,
+            "workspace_hash": WORKSPACE,
+            "agent_id": AGENT,
+            "actor_kind": "connector",
+            "requesting_agent_id": AGENT,
+            "skip_dedup": True,
+            "admission": {
+                "record_digest": record_digest,
+                "source_identity": evaluated["source_identity"],
+                "source_event_id": source["id"],
+                "authorization_scope": WORKSPACE,
+                "ingestion_channel": "deletion-benchmark",
+                "workspace_hash": WORKSPACE,
+                "source_trust": "authoritative",
+                "actor_kind": "connector",
+                "actor_identity": AGENT,
+                "validated": True,
+                "valid_from_unix_ms": 1,
+                "recorded_at_unix_ms": 2,
+                "task_relevance_bps": 9000,
+            },
+        },
+    )
 
 
 def recall(c: Client, category: str, query: str, include_archived: bool = False) -> dict[str, Any]:
     # FTS5 tokenizes markers; use a distinctive two-token query rather than a
     # full hyphenated marker, which can otherwise become a no-match probe.
     probe = query.replace("-", " ")
-    return c.call("perseus_vault_recall", {"query": probe, "category": category, "mode": "fts5", "limit": 100, "min_decay": 0, "trust_weight": 0, "include_archived": include_archived, "include_outcome": True})
+    return c.call("perseus_vault_recall", {"query": probe, "category": category, "mode": "fts5", "limit": 100, "min_decay": 0, "trust_weight": 0, "include_archived": include_archived, "include_outcome": True, "workspace_hash": WORKSPACE})
 
 
 def direct_items(c: Client, category: str, include_archived: bool = False) -> list[dict[str, Any]]:
-    result = c.call("perseus_vault_recall", {"query": "", "category": category, "mode": "fts5", "limit": 100, "min_decay": 0, "trust_weight": 0, "include_archived": include_archived, "include_outcome": True})
+    result = c.call("perseus_vault_recall", {"query": "", "category": category, "mode": "fts5", "limit": 100, "min_decay": 0, "trust_weight": 0, "include_archived": include_archived, "include_outcome": True, "workspace_hash": WORKSPACE})
     return result.get("items", []) if isinstance(result, dict) else []
 
 
@@ -177,7 +265,7 @@ def run_case(c: Client, case: dict[str, Any], db: Path, rows: list[dict[str, Any
     rows.append({"case": case["id"], "axis": "after_background_twin_survives", "ok": contains_marker(c, category, twin)})
     source = db.parent / f"{case['id']}.md"
     source.write_text(f"---\ncategory: {category}\nkey: {key}-reentry\n---\n\n{canary}\n")
-    c.call("perseus_vault_markdown_import", {"path": str(source), "source_system": "deletion-benchmark"})
+    c.call("perseus_vault_markdown_import", {"path": str(source), "workspace_hash": WORKSPACE, "source_system": "deletion-benchmark"})
     c.call("perseus_vault_reindex", {})
     rows.append({"case": case["id"], "axis": "after_reingest_stays_hidden", "ok": not contains_marker(c, category, canary)})
     exported = db.parent / f"{case['id']}-derived.md"
