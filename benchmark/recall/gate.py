@@ -25,6 +25,9 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent.parent
+if str(REPO) not in sys.path:
+    sys.path.insert(0, str(REPO))
+from benchmark.admission_fixture import AGENT, HMAC_KEY, WORKSPACE, admitted_remember, configure, child_env
 
 # Conservative invariants. The default (auto) path must clearly beat keyword-only.
 MIN_AUTO_RECALL_AT_5 = 0.80      # default path must find the answer in top 5 most of the time
@@ -62,11 +65,12 @@ class PerseusVault:
         self._stderr = open(self.stderr_path, "w", encoding="utf-8")
         self.p = subprocess.Popen([binary, "--db", db], stdin=subprocess.PIPE,
                                   stdout=subprocess.PIPE, stderr=self._stderr,
-                                  text=True, encoding="utf-8", errors="replace")
+                                  text=True, encoding="utf-8", errors="replace",
+                                  env=child_env(os.environ))
         self._id = 0
         self._send({"jsonrpc": "2.0", "id": self._n(), "method": "initialize",
                     "params": {"protocolVersion": "2025-06-18", "capabilities": {},
-                               "clientInfo": {"name": "recall-gate", "version": "1"}}})
+                               "clientInfo": {"name": AGENT, "version": "1"}}})
         self._read()
         self._send({"jsonrpc": "2.0", "method": "notifications/initialized"})
 
@@ -181,11 +185,18 @@ def main():
             pass
 
     m = PerseusVault(binary, db)
+    configure(m)
     try:
-        # Bare ingest. NO perseus_vault_embed call: auto-embed-on-write (#271) must populate vectors.
+        # Admitted fixture ingest; production MCP writes without this envelope
+        # are intentionally pending approval and non-serveable.
+        # No manual perseus_vault_embed call: auto-embed-on-write (#271) must populate vectors.
         for mem in memories:
-            m.call("perseus_vault_remember", {"category": mem["category"], "key": mem["key"],
-                                      "body_json": json.dumps({"note": mem["note"]}), "type": "fact"})
+            admitted_remember(
+                m,
+                mem["category"],
+                mem["key"],
+                json.dumps({"note": mem["note"]}),
+            )
         # #632: settle the ASYNC embed worker before measuring (see wait_for_autoembed).
         embedded = wait_for_autoembed(db, len(memories))
         if embedded < len(memories):
@@ -198,11 +209,11 @@ def main():
         auto_mrr = dense_mrr = 0.0
         for q in queries:
             # default path: no mode -> server auto-selects (#271)
-            ra = m.call("perseus_vault_recall", {"query": q["q"], "limit": 5, "trust_weight": 0, "min_decay": 0})
+            ra = m.call("perseus_vault_recall", {"query": q["q"], "limit": 5, "trust_weight": 0, "min_decay": 0, "workspace_hash": WORKSPACE})
             rf = m.call("perseus_vault_recall", {"query": q["q"], "mode": "fts5", "limit": 5,
-                                         "trust_weight": 0, "min_decay": 0})
+                                         "trust_weight": 0, "min_decay": 0, "workspace_hash": WORKSPACE})
             rd = m.call("perseus_vault_recall", {"query": q["q"], "mode": "dense", "limit": 5,
-                                         "trust_weight": 0, "min_decay": 0})
+                                         "trust_weight": 0, "min_decay": 0, "workspace_hash": WORKSPACE})
             auto = [it.get("key") for it in (ra.get("items", []) if isinstance(ra, dict) else [])]
             keyw = [it.get("key") for it in (rf.get("items", []) if isinstance(rf, dict) else [])]
             dens = [it.get("key") for it in (rd.get("items", []) if isinstance(rd, dict) else [])]
