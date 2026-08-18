@@ -2036,7 +2036,7 @@ pub fn handle_admission_decide(db: &Database, args: Value) -> Result<String, Str
             workspace_hash: workspace_hash.to_string(),
             created_at_unix_ms: now_ms(),
         };
-        db.journal(&source_event)
+        db.journal_authenticated_admission_source(&source_event)
             .map_err(|e| format!("admission_decide source receipt failed before transition: {e}"))?;
     }
     let review_intent = JournalEvent {
@@ -2062,8 +2062,32 @@ pub fn handle_admission_decide(db: &Database, args: Value) -> Result<String, Str
     };
     db.journal(&review_intent)
         .map_err(|e| format!("admission_decide audit intent failed before transition: {e}"))?;
-    db.remember_verified_with_options(&updated, true, None, None, false)
+    // This is an evidence/status transition, not an unreviewed semantic-body
+    // write. The reviewer capability and canonical admission checks above are
+    // the authorization boundary; do not let the default content-interference
+    // quarantine leave the candidate proposed after we have recorded an intent.
+    let review_write_options = crate::interference::WriteGateOptions {
+        mode_override: Some(crate::interference::InterferenceMode::Off),
+        ..Default::default()
+    };
+    let (transition_id, transition_action) = db
+        .remember_verified_with_write_options(
+            &updated,
+            true,
+            None,
+            None,
+            false,
+            &review_write_options,
+        )
         .map_err(|e| format!("admission_decide durable transition failed after audit intent: {e}"))?;
+    if transition_id != entity_id
+        || transition_action.starts_with("quarantined")
+        || transition_action.starts_with("deduped")
+    {
+        return Err(format!(
+            "admission_decide transition did not materialize the reviewed entity: id={transition_id}, action={transition_action}"
+        ));
+    }
     db.journal(&event)
         .map_err(|e| format!("admission_decide completion receipt failed after durable transition: {e}"))?;
 
@@ -4686,7 +4710,12 @@ pub fn handle_journal(db: &Database, args: Value) -> Result<String, String> {
         created_at_unix_ms: now_ms(),
     };
 
-    db.journal(&event)
+    let journal_result = if source_event {
+        db.journal_authenticated_admission_source(&event)
+    } else {
+        db.journal(&event)
+    };
+    journal_result
         .map_err(|e| format!("Journal failed: {}", e))?;
 
     let result = json!({
@@ -22215,7 +22244,7 @@ mod tests {
         // Source event binding so an authoritative admission can Commit.
         let commit_body = "{\"note\":\"authoritative fact\"}";
         let commit_digest = crate::trust_admission::digest_text(commit_body);
-        db.journal(&crate::models::JournalEvent {
+        db.journal_authenticated_admission_source(&crate::models::JournalEvent {
             id: "src-event-1".to_string(),
             event_type: "admission_source".to_string(),
             evaluated_json: hash_only_public_journal_payload(&json!({

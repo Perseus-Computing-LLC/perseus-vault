@@ -12534,8 +12534,34 @@ impl Database {
 
     // ─── Journal ─────────────────────────────────────────────────
 
-    /// Append a journal event.
+    /// Append a non-admission journal event.
+    ///
+    /// Admission-source rows are a provenance boundary and must only be
+    /// inserted by an already-authenticated handler through
+    /// `journal_authenticated_admission_source`. Keeping the generic public
+    /// writer unable to mint those rows prevents a direct Database caller from
+    /// manufacturing authoritative evidence without transport identity,
+    /// capability, or source attestation.
     pub fn journal(&self, event: &JournalEvent) -> Result<(), Box<dyn std::error::Error>> {
+        if event.event_type == "admission_source" {
+            return Err(
+                "admission_source journal rows require the authenticated admission path".into(),
+            );
+        }
+        let conn = self.conn()?;
+        self.journal_with_conn(&conn, event)
+    }
+
+    /// Insert an admission-source row after the caller has completed the
+    /// transport/HMAC/authority checks at the tool boundary. This is crate
+    /// private so external Database users cannot bypass that boundary.
+    pub(crate) fn journal_authenticated_admission_source(
+        &self,
+        event: &JournalEvent,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if event.event_type != "admission_source" {
+            return Err("authenticated admission journal path requires admission_source".into());
+        }
         let conn = self.conn()?;
         self.journal_with_conn(&conn, event)
     }
@@ -15790,7 +15816,7 @@ impl Database {
         drop(conn);
         let mut visible = Vec::new();
         for (entity, from, to) in candidates {
-            if !self.filter_suppressed(vec![entity.clone()])?.is_empty() {
+            if !self.filter_direct_readable(vec![entity.clone()])?.is_empty() {
                 visible.push((entity.id, from, to));
             }
         }
@@ -19925,7 +19951,7 @@ impl Database {
             items
         };
         drop(conn);
-        let visible = self.filter_suppressed(items)?;
+        let visible = self.filter_direct_readable(items)?;
         let end = requested_offset
             .saturating_add(requested_limit)
             .min(visible.len());
@@ -19989,7 +20015,7 @@ impl Database {
             items
         };
         drop(conn);
-        Ok(self.filter_suppressed(items)?.len() as i64)
+        Ok(self.filter_direct_readable(items)?.len() as i64)
     }
 
     /// #562: deterministic keyset enumeration — the first-class "list every
@@ -30549,6 +30575,15 @@ pub(crate) mod tests {
             .unwrap()
             .is_none());
         assert!(db
+            .list_entities(0, 100, Some("admission"), None, None)
+            .unwrap()
+            .is_empty());
+        assert_eq!(db.count_entities(Some("admission"), None, None).unwrap(), 0);
+        assert!(db
+            .valid_periods_for_ids(&[pending.id.clone()])
+            .unwrap()
+            .is_empty());
+        assert!(db
             .scan_entities(Some("admission"), None, false, None, 100)
             .unwrap()
             .is_empty());
@@ -30588,6 +30623,37 @@ pub(crate) mod tests {
             .is_none());
 
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn generic_journal_cannot_mint_admission_source_evidence() {
+        let (db, path) = temp_db();
+        let event = JournalEvent {
+            id: "jrn-forged-source".to_string(),
+            event_type: "admission_source".to_string(),
+            evaluated_json: "{\"record_digest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}".to_string(),
+            acted_json: "{}".to_string(),
+            forward_json: "{}".to_string(),
+            category: "decision".to_string(),
+            key: "forged".to_string(),
+            entity_id: "mem-forged".to_string(),
+            agent_id: "caller-selected".to_string(),
+            workspace_hash: "forged-ws".to_string(),
+            created_at_unix_ms: now_ms(),
+        };
+        let error = db.journal(&event).expect_err("generic journal must reject admission_source");
+        assert!(error.to_string().contains("authenticated admission path"));
+        let conn = db.conn().unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM journal WHERE event_type = 'admission_source'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+        drop(conn);
+        let _ = fs::remove_file(path);
     }
 
     #[test]

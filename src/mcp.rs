@@ -3080,7 +3080,41 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
           "description": "HMAC-SHA256 attestation over the canonical admission-source fields; required for public admission_source events and never stored."
         }
       },
-      "required": []
+      "required": [],
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "event_type": {
+                "const": "admission_source"
+              }
+            },
+            "required": ["event_type"]
+          },
+          "then": {
+            "required": [
+              "evaluated",
+              "workspace_hash",
+              "requesting_agent_id",
+              "source_attestation"
+            ],
+            "properties": {
+              "evaluated": {
+                "type": "object"
+              },
+              "workspace_hash": {
+                "minLength": 1
+              },
+              "requesting_agent_id": {
+                "minLength": 1
+              },
+              "source_attestation": {
+                "minLength": 64
+              }
+            }
+          }
+        }
+      ]
     },
     "outputSchema": {
       "type": "object",
