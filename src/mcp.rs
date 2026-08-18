@@ -900,8 +900,9 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
         },
         "status": {
           "type": "string",
+          "enum": ["active", "draft", "deprecated", "expired", "proposed", "quarantined", "redacted"],
           "default": "active",
-          "description": "Entity status: 'active', 'draft', 'deprecated'"
+          "description": "Closed lifecycle status vocabulary; proposed/quarantined are never publicly serveable"
         },
         "type": {
           "type": "string",
@@ -3077,6 +3078,8 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
         "source_attestation": {
           "type": "string",
           "minLength": 64,
+          "maxLength": 64,
+          "pattern": "^[0-9a-fA-F]{64}$",
           "description": "HMAC-SHA256 attestation over the canonical admission-source fields; required for public admission_source events and never stored."
         }
       },
@@ -3100,7 +3103,36 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
             ],
             "properties": {
               "evaluated": {
-                "type": "object"
+                "type": "object",
+                "required": [
+                  "record_digest",
+                  "source_identity",
+                  "workspace_hash",
+                  "actor_kind",
+                  "actor_identity"
+                ],
+                "properties": {
+                  "record_digest": {
+                    "type": "string",
+                    "pattern": "^[0-9a-fA-F]{64}$"
+                  },
+                  "source_identity": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "workspace_hash": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "actor_kind": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "actor_identity": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                }
               },
               "workspace_hash": {
                 "minLength": 1
@@ -3109,7 +3141,10 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
                 "minLength": 1
               },
               "source_attestation": {
-                "minLength": 64
+                "type": "string",
+                "minLength": 64,
+                "maxLength": 64,
+                "pattern": "^[0-9a-fA-F]{64}$"
               }
             }
           }

@@ -1061,6 +1061,9 @@ pub fn handle_remember(db: &Database, args: Value) -> Result<String, String> {
         return Err(format!("write denied: {e}"));
     }
 
+    let requested_status = crate::models::canonical_entity_status(&a.status)
+        .ok_or_else(|| format!("invalid status '{}': expected one of {:?}", a.status, crate::models::ENTITY_STATUSES))?;
+
     // Validate body_json is valid JSON
     if let Err(e) = serde_json::from_str::<serde_json::Value>(&a.body_json) {
         return Err(format!("body_json is not valid JSON: {}", e));
@@ -1493,8 +1496,12 @@ pub fn handle_remember(db: &Database, args: Value) -> Result<String, String> {
             "proposed".to_string()
         } else if quarantined {
             "quarantined".to_string()
+        } else if verified_admission {
+            // An admitted SAVE owns lifecycle activation; caller-selected
+            // proposed/quarantined states cannot contradict the decision.
+            "active".to_string()
         } else {
-            a.status
+            requested_status
         },
         entity_type: a.entity_type,
         tags: a.tags,
@@ -11003,9 +11010,9 @@ pub fn handle_declared_schema_set(db: &Database, args: Value) -> Result<String, 
     let a: DeclaredSchemaSetArgs = serde_json::from_value(args)
         .map_err(|e| format!("Invalid declared_schema_set arguments: {e}"))?;
 
-    // Governed like any write: without a validated admission envelope the
-    // caller holds the propose capability only (reviewable candidate).
-    db.require_memory_capability(&a.requesting_agent_id, &a.workspace_hash, "memory.propose")
+    // A declared schema is an executable retrieval contract, so activation
+    // requires commit authority rather than the propose-only capability.
+    db.require_memory_capability(&a.requesting_agent_id, &a.workspace_hash, "memory.commit")
         .map_err(|e| format!("write denied: {e}"))?;
 
     let mut fields = Vec::with_capacity(a.fields.len());
@@ -23270,6 +23277,7 @@ mod tests {
                 "category": "decision",
                 "key": "bound-source",
                 "body_json": body,
+                "status": "proposed",
                 "workspace_hash": workspace,
                 "agent_id": "claimed-agent",
                 "actor_kind": "connector",
@@ -23294,7 +23302,15 @@ mod tests {
         .unwrap();
         let admitted: Value = serde_json::from_str(&admitted).unwrap();
         assert_eq!(admitted["proposed"], false, "{admitted}");
+        assert_eq!(admitted["serveable"], true, "{admitted}");
         assert_eq!(admitted["provenance"]["state"], "admitted");
+        assert_eq!(
+            db.get_entity("decision", "bound-source")
+                .unwrap()
+                .unwrap()
+                .status,
+            "active"
+        );
 
         let metadata_mismatch = handle_remember(
             &db,

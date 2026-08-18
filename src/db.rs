@@ -4028,8 +4028,7 @@ impl Database {
                     epistemic_state, embedding
              FROM entities
              WHERE archived = 0 AND embedding IS NOT NULL
-               AND (status IS NULL OR status = '' OR status NOT IN
-                   ('deprecated','expired','proposed','quarantined','redacted'))"
+               AND status IN ('active','draft')"
                 .to_string()
         } else {
             format!(
@@ -4042,8 +4041,7 @@ impl Database {
                         epistemic_state, embedding
                  FROM entities
                  WHERE archived = 0 AND embedding IS NOT NULL
-                   AND (status IS NULL OR status = '' OR status NOT IN
-                       ('deprecated','expired','proposed','quarantined','redacted'))
+                   AND status IN ('active','draft')
                  LIMIT {}",
                 max_scan
             )
@@ -4165,8 +4163,7 @@ impl Database {
                     epistemic_state, fingerprint
              FROM entities
              WHERE archived = 0 AND fingerprint IS NOT NULL
-               AND (status IS NULL OR status = '' OR status NOT IN
-                   ('deprecated','expired','proposed','quarantined','redacted'))"
+               AND status IN ('active','draft')"
                 .to_string()
         } else {
             format!(
@@ -4179,8 +4176,7 @@ impl Database {
                         epistemic_state, fingerprint
                  FROM entities
                  WHERE archived = 0 AND fingerprint IS NOT NULL
-                   AND (status IS NULL OR status = '' OR status NOT IN
-                       ('deprecated','expired','proposed','quarantined','redacted'))
+                   AND status IN ('active','draft')
                  LIMIT {}",
                 max_scan
             )
@@ -4349,8 +4345,7 @@ impl Database {
             let mut stmt = conn.prepare(&format!(
                 "SELECT id, embedding FROM entities \
                  WHERE archived = 0 AND embedding IS NOT NULL \
-                   AND (status IS NULL OR status = '' OR status NOT IN \
-                       ('deprecated','expired','proposed','quarantined','redacted')) LIMIT {}",
+                   AND status IN ('active','draft') LIMIT {}",
                 max_scan
             ))?;
             let rows = stmt.query_map([], |row| {
@@ -4425,8 +4420,7 @@ impl Database {
                     let mut stmt = conn.prepare(
                         "SELECT id, emb_sig, emb_sig4 FROM entities \
                          WHERE archived = 0 AND emb_sig IS NOT NULL
-                           AND (status IS NULL OR status = '' OR status NOT IN
-                              ('deprecated','expired','proposed','quarantined','redacted'))",
+                           AND status IN ('active','draft')",
                     )?;
                     let rows = stmt.query_map([], |row| {
                         Ok((
@@ -4702,8 +4696,7 @@ impl Database {
                 let mut stmt = conn.prepare(&format!(
                     "SELECT id, emb_sig FROM entities \
                      WHERE archived = 0 AND emb_sig IS NOT NULL
-                       AND (status IS NULL OR status = '' OR status NOT IN
-                           ('deprecated','expired','proposed','quarantined','redacted')) LIMIT {}",
+                       AND status IN ('active','draft') LIMIT {}",
                     max_scan
                 ))?;
                 let rows = stmt.query_map([], |row| {
@@ -5405,9 +5398,12 @@ impl Database {
         if let Some(tombs) = plan["tombstoned"].as_object() {
             for (id, rec) in tombs {
                 let prior = rec["prior_status"].as_str().unwrap_or("active");
+                let canonical_prior = crate::models::canonical_entity_status(prior)
+                    .filter(|status| status != "compacted")
+                    .ok_or_else(|| format!("invalid rollback prior entity status '{prior}'"))?;
                 conn.execute(
                     "UPDATE entities SET status = ?1, archive_reason = '' WHERE id = ?2",
-                    params![prior, id],
+                    params![canonical_prior, id],
                 )
                 .map_err(|e| format!("tombstone restore failed for {id}: {e}"))?;
                 restored.push(id.clone());
@@ -7922,7 +7918,10 @@ impl Database {
     /// pending/proposed or quarantined body is never serveable merely because
     /// the caller knows its id or category/key.
     fn entity_lifecycle_serveable(entity: &Entity) -> bool {
-        !entity.archived
+        let known_canonical = crate::models::canonical_entity_status(&entity.status)
+            .is_some_and(|canonical| canonical == entity.status);
+        known_canonical
+            && !entity.archived
             && !crate::retrieval_telemetry::NON_SERVEABLE_STATUSES
                 .contains(&entity.status.as_str())
     }
@@ -7940,7 +7939,9 @@ impl Database {
     }
 
     fn entity_pending_hidden(entity: &Entity) -> bool {
-        matches!(entity.status.as_str(), "proposed" | "quarantined")
+        let known_canonical = crate::models::canonical_entity_status(&entity.status)
+            .is_some_and(|canonical| canonical == entity.status);
+        !known_canonical || matches!(entity.status.as_str(), "proposed" | "quarantined")
     }
 
     fn filter_direct_readable(
@@ -8266,7 +8267,12 @@ impl Database {
         verified_admission: bool,
         gate_opts: &crate::interference::WriteGateOptions,
     ) -> Result<(String, String), Box<dyn std::error::Error>> {
-        let enriched_entity = ensure_durable_write_provenance(entity, verified_admission);
+        let canonical_status = crate::models::canonical_entity_status(&entity.status)
+            .filter(|status| status != "compacted")
+            .ok_or_else(|| format!("invalid writable entity status '{}': expected one of {:?}", entity.status, crate::models::ENTITY_STATUSES))?;
+        let mut normalized_entity = entity.clone();
+        normalized_entity.status = canonical_status;
+        let enriched_entity = ensure_durable_write_provenance(&normalized_entity, verified_admission);
         // #999: derived-visibility intersection — a write that declares
         // lineage (links with relationship "derived_from") may not be MORE
         // open than its cited inputs, and unreadable inputs refuse the whole
@@ -13057,7 +13063,9 @@ impl Database {
             category,
             key,
             body_json: rec["body_json"].as_str().unwrap_or_default().to_string(),
-            status: rec["status"].as_str().unwrap_or("active").to_string(),
+            // Operator release is the approval boundary: the held proposal
+            // becomes a serveable active entity, never a second proposed row.
+            status: "active".to_string(),
             entity_type: rec["type"].as_str().unwrap_or("insight").to_string(),
             tags: rec["tags"]
                 .as_array()
@@ -13116,7 +13124,7 @@ impl Database {
             rec["valid_from_unix_ms"].as_i64(),
             rec["valid_to_unix_ms"].as_i64(),
             false,
-            false,
+            true,
             &opts,
         )?;
         let conn = self.conn()?;
@@ -18188,6 +18196,9 @@ impl Database {
         status: &str,
         reason: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        let canonical_status = crate::models::canonical_entity_status(status)
+            .filter(|value| value != "compacted")
+            .ok_or_else(|| format!("invalid writable entity status '{}': expected one of {:?}", status, crate::models::ENTITY_STATUSES))?;
         let conn = self.conn()?;
         // #379: writer lock BEFORE the precondition read — see audited_write_tx.
         let tx = Self::audited_write_tx(&conn)?;
@@ -18199,7 +18210,7 @@ impl Database {
             params![id],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?;
-        if cur_status.as_deref() == Some(status) {
+        if cur_status.as_deref() == Some(canonical_status.as_str()) {
             tx.execute(
                 "UPDATE entities SET archive_reason = ?1, last_accessed_unix_ms = ?2 WHERE id = ?3",
                 params![reason, now_ms(), id],
@@ -18224,7 +18235,7 @@ impl Database {
                 recorded_at_unix_ms = ?4, supersedes = ?5,
                 valid_from_unix_ms = COALESCE(valid_from_unix_ms, ?6)
              WHERE id = ?7",
-            params![status, reason, now_ms(), now, history_id, eff_from, id],
+            params![canonical_status, reason, now_ms(), now, history_id, eff_from, id],
         )?;
         tx.commit()?;
         Ok(())
@@ -27050,8 +27061,7 @@ last_accessed: {}
                     epistemic_state, hints, memory_type
              FROM entities
              WHERE archived = 0
-               AND (status IS NULL OR status = '' OR status NOT IN
-                   ('deprecated','expired','proposed','quarantined','redacted'))
+               AND status IN ('active','draft')
                AND rowid IN (SELECT rowid FROM entities_fts WHERE entities_fts MATCH ?1)
                {}
              ORDER BY decay_score DESC, retrieval_count DESC
@@ -55007,6 +55017,53 @@ pub(crate) mod tests {
         assert!(action.starts_with("quarantined"), "{action}");
         assert!(qid.starts_with("qrn-"));
         assert!(db.get_entity("facts", "sparse-dup").unwrap().is_none());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn lifecycle_status_is_closed_canonicalized_and_verified_writes_cannot_hide() {
+        let (db, path) = temp_db();
+        let mut proposed = make_entity(
+            "status-proposed",
+            "facts",
+            "status-proposed",
+            "{\"content\":\"pending status fixture\"}",
+        );
+        proposed.status = "  PROPOSED  ".to_string();
+        db.remember(&proposed).unwrap();
+        assert_eq!(
+            db.get_entity_by_id_for_admission_review(&proposed.id)
+                .unwrap()
+                .unwrap()
+                .status,
+            "proposed"
+        );
+
+        let mut invalid = make_entity(
+            "status-invalid",
+            "facts",
+            "status-invalid",
+            "{\"content\":\"invalid status fixture\"}",
+        );
+        invalid.status = "proposed \u{0000}".to_string();
+        let err = db.remember(&invalid).unwrap_err();
+        assert!(err.to_string().contains("invalid writable entity status"), "{err}");
+
+        let mut verified_hidden = make_entity(
+            "status-verified-hidden",
+            "facts",
+            "status-verified-hidden",
+            "{\"content\":\"verified hidden fixture\"}",
+        );
+        verified_hidden.status = "quarantined".to_string();
+        db.remember_verified_with_options(&verified_hidden, true, None, None, false)
+            .unwrap();
+        assert!(
+            db.get_entity("facts", "status-verified-hidden")
+                .unwrap()
+                .is_none(),
+            "quarantined trusted rows remain hidden from public reads"
+        );
         let _ = std::fs::remove_file(path);
     }
 

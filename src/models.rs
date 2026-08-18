@@ -166,6 +166,29 @@ pub const EPISTEMIC_STATES: [&str; 5] = [
     "defensively_recalled",
 ];
 
+/// Canonical durable entity lifecycle states. Unknown states are never
+/// serveable and are rejected at every durable remember boundary.
+pub const ENTITY_STATUSES: [&str; 8] = [
+    "active",
+    "draft",
+    "deprecated",
+    "expired",
+    "proposed",
+    "quarantined",
+    "redacted",
+    // History-only compaction marker; never a live write state.
+    "compacted",
+];
+
+/// Normalize a caller status to the closed lifecycle vocabulary.
+/// Case/outer-whitespace variants are canonicalized; all other values fail.
+pub fn canonical_entity_status(status: &str) -> Option<String> {
+    let canonical = status.trim().to_ascii_lowercase();
+    ENTITY_STATUSES
+        .contains(&canonical.as_str())
+        .then_some(canonical)
+}
+
 /// #960: source-grounded encoding-strength tier (S1 weakest .. S5 strongest).
 /// How a fact was learned determines the tier, and higher tiers dominate
 /// lower tiers in conflict resolution as a HARD rule (court_audit::recommend

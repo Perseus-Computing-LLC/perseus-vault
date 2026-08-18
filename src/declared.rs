@@ -231,7 +231,7 @@ pub fn declared_schema_set(
         embedding: None,
         _parsed_body: None,
     };
-    db.remember_skip_dedup(&entity)
+    db.remember_verified_with_options(&entity, true, None, None, false)
         .map_err(|e| format!("declared schema: store failed: {e}"))?;
     Ok(schema)
 }

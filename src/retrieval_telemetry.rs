@@ -25,29 +25,33 @@ use rusqlite::{params, Connection};
 /// Non-serveable lifecycle statuses — the truth controls (supersession,
 /// quarantine, expiry, redaction). Serving arms exclude these at the SQL
 /// boundary; telemetry verifies they never re-enter through another arm.
-pub const NON_SERVEABLE_STATUSES: &[&str] = &["deprecated", "expired", "proposed", "quarantined", "redacted"];
+pub const NON_SERVEABLE_STATUSES: &[&str] = &[
+    "deprecated",
+    "expired",
+    "proposed",
+    "quarantined",
+    "redacted",
+    "compacted",
+];
 
 const SERVED_RETENTION_MS: i64 = 7 * 24 * 3600 * 1000;
 const SERVED_CAP_ROWS: i64 = 100_000;
 const AUDIT_RETENTION_MS: i64 = 7 * 24 * 3600 * 1000;
 const AUDIT_CAP_ROWS: i64 = 50_000;
 
-/// Serveable-status SQL clause. `alias` may be "" (bare column) or a table
-/// alias ("e"). Unknown/legacy statuses (NULL, '') remain serveable;
-/// the known non-serveable lifecycle statuses are excluded.
+/// Serveable-status SQL clause. Only canonical active/draft rows are
+/// serveable; NULL, empty, unknown, and terminal/pending states fail closed.
 pub fn serveable_status_clause(alias: &str) -> String {
     let a = if alias.is_empty() {
         String::new()
     } else {
         format!("{alias}.")
     };
-    format!("({a}status IS NULL OR {a}status = '' OR {a}status NOT IN ({STATUS_LIST}))")
+    format!("{a}status IN ('active','draft')")
 }
 
 /// Bare-column variant for splicing into existing SQL (no alias).
-pub const SERVEABLE_STATUS_SQL: &str = "(status IS NULL OR status = '' OR status NOT IN ('deprecated','expired','proposed','quarantined','redacted'))";
-
-const STATUS_LIST: &str = "'deprecated','expired','proposed','quarantined','redacted'";
+pub const SERVEABLE_STATUS_SQL: &str = "status IN ('active','draft')";
 
 /// Coarse query class: up to two content-bearing tokens, lowercased.
 /// Used for fan-out measurement (how many query classes a low-trust
@@ -479,8 +483,7 @@ pub fn retrieval_telemetry_report(
                 .join(",");
             let sql = format!(
                 "SELECT COUNT(*) FROM entities WHERE id IN ({placeholders}) \
-                 AND archived = 0 AND (status IS NULL OR status = '' OR status NOT IN \
-                 ('deprecated','expired','proposed','quarantined','redacted'))"
+                 AND archived = 0 AND status IN ('active','draft')"
             );
             let refs: Vec<&dyn rusqlite::types::ToSql> =
                 chunk.iter().map(|s| s as &dyn rusqlite::types::ToSql).collect();
@@ -1054,11 +1057,12 @@ mod tests {
     #[test]
     fn serveable_clause_excludes_known_statuses() {
         let c = serveable_status_clause("e");
-        assert!(c.contains("e.status NOT IN"));
-        assert!(c.contains("'deprecated'"));
-        assert!(c.contains("'quarantined'"));
+        assert!(c.contains("e.status IN ('active','draft')"));
+        assert!(!c.contains("status NOT IN"));
+        assert!(!c.contains("'deprecated'"));
+        assert!(!c.contains("'quarantined'"));
         let c2 = serveable_status_clause("");
-        assert!(c2.contains("status NOT IN"));
+        assert_eq!(c2, "status IN ('active','draft')");
     }
 
     #[test]
