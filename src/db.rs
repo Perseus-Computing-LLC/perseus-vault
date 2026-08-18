@@ -975,18 +975,40 @@ impl Database {
         )
     }
 
-    /// #919: the text stored in the FTS5 index for an entity — the plaintext
-    /// body plus each prospective query hint on its own line. Empty hints
-    /// return the body unchanged (byte-identical to pre-hints indexing).
+    /// Governance envelopes are durable metadata, not memory content. They are
+    /// intentionally retained in the entity source projection for audit and
+    /// read-back, but must not dominate lexical or semantic retrieval. Keep the
+    /// canonical content body for indexing and embedding while leaving every
+    /// other caller-supplied field intact.
+    fn semantic_body_text(body_plaintext: &str) -> String {
+        let Ok(mut value) = serde_json::from_str::<serde_json::Value>(body_plaintext) else {
+            return body_plaintext.to_string();
+        };
+        let Some(object) = value.as_object_mut() else {
+            return body_plaintext.to_string();
+        };
+        let removed_admission = object.remove("admission").is_some();
+        let removed_provenance = object.remove("provenance").is_some();
+        if !removed_admission && !removed_provenance {
+            return body_plaintext.to_string();
+        }
+        serde_json::to_string(&value).unwrap_or_else(|_| body_plaintext.to_string())
+    }
+
+    /// #919: the text stored in the FTS5 index for an entity — the canonical
+    /// content body plus each prospective query hint on its own line. Empty
+    /// hints return the canonical body unchanged. Governance envelopes are
+    /// excluded so admission receipts cannot distort retrieval ranking.
     /// Every FTS write site that can carry hints must route through this.
     fn fts_indexed_text(body_plaintext: &str, hints: &[String]) -> String {
+        let body_plaintext = Self::semantic_body_text(body_plaintext);
         if hints.is_empty() {
-            return body_plaintext.to_string();
+            return body_plaintext;
         }
         let mut text = String::with_capacity(
             body_plaintext.len() + hints.iter().map(String::len).sum::<usize>() + hints.len(),
         );
-        text.push_str(body_plaintext);
+        text.push_str(&body_plaintext);
         for hint in hints {
             text.push('\n');
             text.push_str(hint);
@@ -3076,8 +3098,9 @@ impl Database {
                         if i >= rows_ref.len() {
                             break;
                         }
+                        let semantic_body = Self::semantic_body_text(&rows_ref[i].1);
                         let out =
-                            Self::generate_embedding_backend(&emb_cfg, &llm_cfg, &rows_ref[i].1)
+                            Self::generate_embedding_backend(&emb_cfg, &llm_cfg, &semantic_body)
                                 .map_err(|e| e.to_string());
                         match &out {
                             Ok(_) => {
@@ -9513,18 +9536,20 @@ impl Database {
         // is safe by this path's own contract: the embed already ran after
         // tx.commit() and failures were explicitly non-fatal (the row just
         // doesn't surface in dense/hybrid search until embedded). The worker
-        // embeds the PLAINTEXT body_json and re-verifies it against the row
-        // before storing (stale guard), so a queued vector can never overwrite
-        // a newer body's embedding — and the update path's transaction already
-        // CLEARED the old vector on content change, so the lag window (or a
-        // dropped job) serves no embedding rather than the previous body's
-        // stale one. The #219 session cache is intentionally not
+        // embeds the canonical semantic body (with governance envelopes
+        // removed) and re-verifies it against the indexed body before storing.
+        // A queued vector can never overwrite a newer body's embedding — and
+        // the update path's transaction already CLEARED the old vector on
+        // content change, so the lag window (or a dropped job) serves no
+        // embedding rather than the previous body's stale one. The #219 session
+        // cache is intentionally not
         // consulted here: new/changed bodies are unique by definition, so the
         // write path only ever paid up to 256 full-body string compares for a
         // guaranteed miss. Gated on the content-changed signal so identical
         // re-asserts don't even enqueue.
         if should_embed && self.embedding_config.enabled {
-            self.enqueue_auto_embed(&id, &entity.body_json);
+            let semantic_body = Self::semantic_body_text(&entity.body_json);
+            self.enqueue_auto_embed(&id, &semantic_body);
         }
 
         Ok((id, action))
@@ -13080,7 +13105,7 @@ impl Database {
             Self::generate_embedding_backend(
                 &self.embedding_config,
                 &self.llm_config,
-                &entity.body_json,
+                &Self::semantic_body_text(&entity.body_json),
             )
             .ok()
         } else {
@@ -31179,6 +31204,16 @@ fn rejected_text(rejected: &[crate::models::RejectedDistractor]) -> String {
 pub(crate) mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn semantic_index_text_omits_admission_envelope() {
+        let body = r#"{"admission":{"record_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"note":"peanuts","provenance":{"state":"admitted"}}"#;
+        let indexed = Database::fts_indexed_text(body, &[]);
+
+        assert_eq!(indexed, r#"{"note":"peanuts"}"#);
+        assert!(!indexed.contains("record_digest"));
+        assert!(!indexed.contains("provenance"));
+    }
 
     pub(crate) fn temp_db() -> (TestDatabase, String) {
         let db = TestDatabase::new("perseus_vault-test-db");
