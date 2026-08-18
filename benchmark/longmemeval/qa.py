@@ -567,6 +567,9 @@ def main():
                     help="Token-per-minute budget for API pacing (default 25000, safely under "
                          "OpenAI Tier-1 gpt-4o's 30k TPM; 0 disables pacing). Answerer and "
                          "judge calls share the budget.")
+    ap.add_argument("--max-retries", type=int, default=12,
+                    help="Maximum provider attempts per answer/judge call (default 12; "
+                         "use 1 for a no-retry canary).")
     ap.add_argument("--resume", action="store_true",
                     help="#518: resume from the progress journal — already-judged questions are "
                          "skipped (their verdicts reload from disk); errored questions are "
@@ -663,7 +666,8 @@ def main():
                   "assembly_k": args.assembly_k,
                   "context_budget": args.context_budget,
                   "assembly_windows": args.assembly_windows,
-                  "context_guidance": args.context_guidance}
+                  "context_guidance": args.context_guidance,
+                  "max_retries": args.max_retries}
     done = {}
     journal = None
     if not args.dry_run:
@@ -749,8 +753,11 @@ def main():
                     try:
                         # #579: CoT needs completion room to reason (1200 tok);
                         # the plain prompt keeps the provider default.
-                        raw_ans, a_usage = call_llm(base_url, api_key, args.model, prompt, budget,
-                                                   max_tokens=1200 if args.cot else None)
+                        raw_ans, a_usage = call_llm(
+                            base_url, api_key, args.model, prompt, budget,
+                            max_retries=args.max_retries,
+                            max_tokens=1200 if args.cot else None
+                        )
                     except Exception as e:
                         # A rate-limited/failed question must NEVER deflate accuracy:
                         # record it as answer_error and exclude it from the denominator.
@@ -776,7 +783,10 @@ def main():
                     jraw = mock_judge(inst, ans)
                 else:
                     try:
-                        jraw, j_usage = call_llm(base_url, api_key, args.judge, jp, budget)
+                        jraw, j_usage = call_llm(
+                            base_url, api_key, args.judge, jp, budget,
+                            max_retries=args.max_retries
+                        )
                     except Exception as e:
                         print(f"  !! JUDGE_ERROR on {qid}/{system} (excluded from accuracy): {e}",
                               file=sys.stderr)
@@ -889,6 +899,7 @@ def main():
         "context_budget": args.context_budget,
         "assembly_windows": args.assembly_windows,
         "context_guidance": args.context_guidance,
+        "max_retries": args.max_retries,
         "verdicts": sorted([v["question_id"], v["system"], v["correct"]] for v in verdicts),
     }, sort_keys=True)
     signature = hashlib.sha256(sig_payload.encode("utf-8")).hexdigest()
@@ -912,6 +923,7 @@ def main():
         "answerer_model": "mock" if args.mock_llm else args.model,
         "judge_model": "mock" if args.mock_llm else args.judge,
         "temperature": 0,
+        "max_retries": args.max_retries,
         "retrieval": {"mode": "hybrid", "k": args.k, "embedding": "bundled-onnx"},
         "context_assembly": {"mode": args.context_assembly, "assembly_k": args.assembly_k,
                              "budget_tokens": args.context_budget,
