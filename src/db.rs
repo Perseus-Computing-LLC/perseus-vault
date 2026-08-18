@@ -1305,8 +1305,8 @@ impl Database {
         //
         // Pool size and busy_timeout are tunable via env so operators can match
         // the pool to their workload and so the concurrent-client load test can
-        // sweep them (#223). Defaults preserve the prior hard-coded values
-        // (max_size=16, busy_timeout=5000ms).
+        // sweep them (#223). Test fixtures default to a bounded max_size=4 to
+        // avoid exhausting macOS/Windows CI resources; production retains 16.
         //
         // Store-size note (#400): maintenance lock holds are bounded — cohere
         // chunks its decay pass (COHERE_DECAY_CHUNK_ROWS per transaction) and
@@ -1319,7 +1319,7 @@ impl Database {
             .ok()
             .and_then(|v| v.parse().ok())
             .filter(|&n| n > 0)
-            .unwrap_or(16);
+            .unwrap_or(if test_mode { 4 } else { 16 });
         let busy_timeout_ms: u64 = std::env::var("PERSEUS_VAULT_BUSY_TIMEOUT_MS")
             .ok()
             .and_then(|v| v.parse().ok())
