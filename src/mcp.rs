@@ -8614,7 +8614,7 @@ mod tests {
         );
         assert_eq!(
             registry_names.len(),
-            169,            "update public metadata when adding a tool"
+            170,            "update public metadata when adding a tool"
         );
 
         let canonical = advertised_names();
@@ -9976,8 +9976,8 @@ mod tests {
         let ops = filter_registry_by_view(registry.clone(), ScopeView::Ops);
         let full = filter_registry_by_view(registry.clone(), ScopeView::Full);
         assert_eq!(agent.len(), 51, "agent view count drifted — new tools must be classified");
-        assert_eq!(ops.len(), 162, "ops view count drifted — new tools must be classified");
-        assert_eq!(full.len(), 169, "full view must expose the whole registry");
+        assert_eq!(ops.len(), 163, "ops view count drifted — new tools must be classified");
+        assert_eq!(full.len(), 170, "full view must expose the whole registry");
         assert!(agent.len() < ops.len() && ops.len() < full.len());
     }
 
