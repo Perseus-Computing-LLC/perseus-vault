@@ -78,7 +78,10 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent.parent
 sys.path.insert(0, str(HERE))
-from context_assembly import assemble_ranked_snippets  # noqa: E402
+from context_assembly import (  # noqa: E402
+    assemble_evidence_ledger,
+    assemble_ranked_snippets,
+)
 from run import PerseusVaultServer, session_text, find_binary  # noqa: E402
 
 # Pinned defaults. Zep's published LongMemEval number is quoted as "GPT-4o";
@@ -373,7 +376,7 @@ def _date_ms(datestr):
 def build_context(
     system, inst, srv, qid, k, ku_shared=False, context_assembly="full",
     assembly_k=20, context_budget=32768, assembly_windows=2,
-    context_guidance="none"
+    context_guidance="none", ledger_budget=12000
 ):
     """Return (context_text, [chosen_session_ids]) for the given system.
 
@@ -383,14 +386,16 @@ def build_context(
     latest-wins row and stale versions go to `entity_history`. Grouping uses
     the dataset's evidence labels — authoring-time knowledge, exactly what a
     real caller has when it re-remembers a fact under its key."""
-    if context_assembly not in {"full", "ranked-snippets"}:
+    if context_assembly not in {"full", "ranked-snippets", "evidence-ledger"}:
         raise ValueError(f"unknown context assembly: {context_assembly}")
-    if context_guidance not in {"none", "preference"}:
+    if context_guidance not in {"none", "preference", "preference-structured", "evidence-structured"}:
         raise ValueError(f"unknown context guidance: {context_guidance}")
     if context_guidance != "none" and context_assembly != "ranked-snippets":
         raise ValueError("context guidance requires ranked-snippets assembly")
     if assembly_k <= 0 or context_budget <= 0 or assembly_windows <= 0:
         raise ValueError("assembly_k, context_budget, and assembly_windows must be positive")
+    if ledger_budget <= 0 or ledger_budget > 16000:
+        raise ValueError("ledger_budget must be between 1 and 16000 tokens")
     sessions = inst["haystack_sessions"]
     sids = inst["haystack_session_ids"]
     dates = inst.get("haystack_dates") or [None] * len(sids)
@@ -406,7 +411,9 @@ def build_context(
         chosen = inst.get("answer_session_ids", [])
     elif system == "perseus-vault":
         # Ingest this instance's haystack, embed, hybrid-retrieve top-k sessions.
-        gold = inst.get("answer_session_ids", []) or []
+        # Gold labels are needed only for the explicit shared-key product arm;
+        # ordinary retrieval and every answer-facing projection stay gold-blind.
+        gold = (inst.get("answer_session_ids", []) or []) if ku_shared else []
         dated_gold = sorted([g for g in gold if by_id.get(g, (None, None))[1]],
                             key=lambda g: _date_ms(by_id[g][1]))
         shared = set(dated_gold) if (ku_shared and len(dated_gold) >= 2) else set()
@@ -423,7 +430,7 @@ def build_context(
                                         "body_json": json.dumps({"note": session_note(d, turns)}),
                                         "type": "fact", "valid_from_unix_ms": _date_ms(d)})
         srv.call("perseus_vault_embed", {"batch_category": qid, "batch_limit": 1000})
-        retrieval_k = assembly_k if context_assembly == "ranked-snippets" else k
+        retrieval_k = assembly_k if context_assembly in {"ranked-snippets", "evidence-ledger"} else k
         r = srv.call("perseus_vault_recall", {"query": inst["question"], "mode": "hybrid",
                                       "category": qid, "limit": retrieval_k, "trust_weight": 0,
                                       "min_decay": 0})
@@ -438,6 +445,12 @@ def build_context(
                 inst, chosen, budget_tokens=context_budget,
                 max_windows_per_session=assembly_windows,
                 guidance=context_guidance
+            )[:2]
+        if context_assembly == "evidence-ledger":
+            return assemble_evidence_ledger(
+                inst["question"], inst["haystack_session_ids"],
+                inst["haystack_sessions"], inst.get("haystack_dates") or [],
+                chosen, budget_tokens=ledger_budget
             )[:2]
     else:
         raise ValueError(system)
@@ -457,7 +470,7 @@ def price_for(model):
 
 
 def estimate_cost(data, systems, k, model, judge, context_assembly="full",
-                  assembly_k=20, context_budget=32768):
+                  assembly_k=20, context_budget=32768, ledger_budget=12000):
     """Rough upfront USD estimate from dataset shape (4-chars/token heuristic).
 
     Ranked-snippet estimates use the configured candidate depth capped by the
@@ -475,7 +488,13 @@ def estimate_cost(data, systems, k, model, judge, context_assembly="full",
     avg_n = sum(sess_counts) / max(1, len(sess_counts))
 
     ranked_ctx = min(context_budget, assembly_k * avg_sess)
-    vault_ctx = ranked_ctx if context_assembly == "ranked-snippets" else k * avg_sess
+    ledger_ctx = min(ledger_budget, 16000)
+    if context_assembly == "ranked-snippets":
+        vault_ctx = ranked_ctx
+    elif context_assembly == "evidence-ledger":
+        vault_ctx = ledger_ctx
+    else:
+        vault_ctx = k * avg_sess
     ctx_per_system = {"perseus-vault": vault_ctx, "fullcontext": avg_n * avg_sess,
                       "oracle": 2 * avg_sess, "stateless": 12}
     n = len(data)
@@ -528,18 +547,22 @@ def main():
     ap.add_argument("--model", default=DEFAULT_ANSWERER, help=f"Answerer model id (default {DEFAULT_ANSWERER})")
     ap.add_argument("--judge", default=DEFAULT_JUDGE, help=f"Judge model id (default {DEFAULT_JUDGE})")
     ap.add_argument("--k", type=int, default=10, help="Sessions retrieved for the perseus_vault system (default 10)")
-    ap.add_argument("--context-assembly", choices=["full", "ranked-snippets"], default="full",
+    ap.add_argument("--context-assembly", choices=["full", "ranked-snippets", "evidence-ledger"], default="full",
                     help="Answer-facing context projection; default full preserves the baseline, "
                          "ranked-snippets retrieves a deeper pool and packs conversational pairs")
     ap.add_argument("--assembly-k", type=int, default=20,
                     help="Candidate retrieval depth for ranked-snippets (default 20)")
     ap.add_argument("--context-budget", type=int, default=32768,
                     help="chars/4 context budget for ranked-snippets (default 32768)")
+    ap.add_argument("--ledger-budget", type=int, default=12000,
+                    help="chars/4 budget for evidence-ledger (default 12000; hard max 16000)")
     ap.add_argument("--assembly-windows", type=int, default=2,
                     help="Maximum non-overlapping turn pairs per session (default 2)")
-    ap.add_argument("--context-guidance", choices=["none", "preference"], default="none",
+    ap.add_argument("--context-guidance", choices=["none", "preference", "preference-structured", "evidence-structured"], default="none",
                     help="Explicit answer-facing guide for ranked-snippets; preference "
-                         "privileges direct user statements over assistant suggestions")
+                         "privileges direct user statements over assistant suggestions; "
+                         "preference-structured labels provenance; evidence-structured adds "
+                         "dated fact/event evidence for cross-session and temporal questions")
     ap.add_argument("--limit", type=int, default=0, help="Only run the first N instances (0 = all; smoke tests)")
     ap.add_argument("--cot", action="store_true",
                     help="#579: use LongMemEval's OFFICIAL chain-of-thought answer prompt (still "
@@ -609,7 +632,8 @@ def main():
         cost, toks, detail = estimate_cost(
             data, args.systems, args.k, args.model, args.judge,
             context_assembly=args.context_assembly,
-            assembly_k=args.assembly_k, context_budget=args.context_budget
+            assembly_k=args.assembly_k, context_budget=args.context_budget,
+            ledger_budget=args.ledger_budget
         )
         print(f"Estimated cost for {len(data)} instances x {len(args.systems)} system(s) "
               f"(answerer={args.model}, judge={args.judge}):\n{detail}\n"
@@ -665,6 +689,7 @@ def main():
                   "context_assembly": args.context_assembly,
                   "assembly_k": args.assembly_k,
                   "context_budget": args.context_budget,
+                  "ledger_budget": args.ledger_budget,
                   "assembly_windows": args.assembly_windows,
                   "context_guidance": args.context_guidance,
                   "max_retries": args.max_retries}
@@ -735,6 +760,7 @@ def main():
                     context_budget=args.context_budget,
                     assembly_windows=args.assembly_windows,
                     context_guidance=args.context_guidance,
+                    ledger_budget=args.ledger_budget,
                 )
                 answer_tmpl = ANSWER_PROMPT_COT if args.cot else ANSWER_PROMPT
                 prompt = answer_tmpl.format(context=ctx, question=inst["question"],
@@ -897,6 +923,7 @@ def main():
         "context_assembly": args.context_assembly,
         "assembly_k": args.assembly_k,
         "context_budget": args.context_budget,
+        "ledger_budget": args.ledger_budget,
         "assembly_windows": args.assembly_windows,
         "context_guidance": args.context_guidance,
         "max_retries": args.max_retries,
@@ -926,7 +953,11 @@ def main():
         "max_retries": args.max_retries,
         "retrieval": {"mode": "hybrid", "k": args.k, "embedding": "bundled-onnx"},
         "context_assembly": {"mode": args.context_assembly, "assembly_k": args.assembly_k,
-                             "budget_tokens": args.context_budget,
+                             "budget_tokens": (args.ledger_budget
+                                               if args.context_assembly == "evidence-ledger"
+                                               else args.context_budget),
+                             "context_budget": args.context_budget,
+                             "ledger_budget": args.ledger_budget,
                              "windows_per_session": args.assembly_windows,
                              "guidance": args.context_guidance},
         "systems": systems_report,
