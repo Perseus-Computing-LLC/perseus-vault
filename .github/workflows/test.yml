@@ -100,7 +100,10 @@ jobs:
   # download-binaries feature ships a macOS aarch64 ONNX Runtime, and the int8
   # model runs on the CPU EP regardless of the avx512_vnni quantization name.
   test-macos:
-    runs-on: macos-latest
+    # Pin away from macos-latest: the current Xcode image can expose a newer
+    # precompiled ort-sys cache layout without libonnxruntime, failing before
+    # project compilation. macos-14 is the stable Apple-Silicon lane.
+    runs-on: macos-14
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
