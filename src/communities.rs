@@ -535,7 +535,7 @@ impl Database {
             let conn = self.conn()?;
             let mut stmt = conn.prepare(
                 "SELECT id, links FROM entities \
-                 WHERE archived = 0 AND workspace_hash = ?1 \
+                 WHERE archived = 0 AND status IN ('active','draft') AND workspace_hash = ?1 \
                    AND category != 'community_summary' \
                  ORDER BY id ASC",
             )?;
@@ -971,22 +971,30 @@ impl Database {
             self.detect_communities(&params.workspace_hash, "label_prop", 2)?;
             rows = self.load_communities(&params.workspace_hash)?;
         }
-        // #783: community summaries are derived from member bodies and can leak
-        // private vocabulary even when member hydration is later filtered. Drop
-        // communities with no readable member BEFORE scoring/rendering summaries.
-        if let Some(requester) = params.requesting_agent_id.as_deref() {
-            let mut visible_rows = Vec::with_capacity(rows.len());
-            for row in rows {
-                let members = self.entities_by_ids(&row.member_ids)?;
+        // #783/#1107: community summaries are derived from member bodies and
+        // can leak vocabulary even when only the final member list is filtered.
+        // A persisted community is public only while EVERY member is present,
+        // active/draft, unsuppressed, and readable by the requester. This also
+        // rejects stale summaries after a member transitions to quarantine,
+        // proposed, compacted, or an unknown lifecycle value.
+        let mut visible_rows = Vec::with_capacity(rows.len());
+        for row in rows {
+            let members = self.filter_serveable(self.entities_by_ids(&row.member_ids)?)?;
+            if members.len() != row.member_ids.len() {
+                continue;
+            }
+            if let Some(requester) = params.requesting_agent_id.as_deref() {
                 if members
                     .iter()
-                    .any(|e| self.can_read(requester, &e.visibility, &e.agent_id))
+                    .any(|e| !self.can_read(requester, &e.visibility, &e.agent_id))
                 {
-                    visible_rows.push(row);
+                    continue;
                 }
             }
-            rows = visible_rows;
+            visible_rows.push(row);
         }
+        rows = visible_rows;
+
         let considered = rows.len();
 
         // Breadth: score the query against community summaries.
@@ -1009,7 +1017,7 @@ impl Database {
         let mut selected: Vec<GlobalRecallCommunity> = Vec::with_capacity(scored.len());
         let mut per_community_members: Vec<Vec<GlobalRecallMember>> = Vec::new();
         for (row, hits) in &scored {
-            let members = self.entities_by_ids(&row.member_ids)?;
+            let members = self.filter_serveable(self.entities_by_ids(&row.member_ids)?)?;
             let mut ranked: Vec<(usize, &Entity)> = members
                 .iter()
                 .map(|e| {

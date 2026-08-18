@@ -307,7 +307,8 @@ SCHEMAS = json.loads(r"""[
     },
     "status": {
      "default": "active",
-     "description": "Entity status: 'active', 'draft', 'deprecated'",
+     "description": "Closed lifecycle status vocabulary; proposed/quarantined/unknown statuses are never publicly serveable",
+     "enum": ["active", "draft", "deprecated", "expired", "proposed", "quarantined", "redacted", "compacted"],
      "type": "string"
     },
     "tags": {
@@ -620,9 +621,50 @@ SCHEMAS = json.loads(r"""[
     "key": {
      "description": "Related entity key for linking",
      "type": "string"
+    },
+    "requesting_agent_id": {
+     "description": "Transport-stamped caller identity; required for admission_source events.",
+     "minLength": 1,
+     "type": "string"
+    },
+    "source_attestation": {
+     "description": "HMAC-SHA256 attestation over canonical admission-source fields; required for admission_source and never stored.",
+     "maxLength": 64,
+     "minLength": 64,
+     "pattern": "^[0-9a-fA-F]{64}$",
+     "type": "string"
     }
    },
    "required": [],
+   "allOf": [
+    {
+     "if": {
+      "properties": {
+       "event_type": {"const": "admission_source"}
+      },
+      "required": ["event_type"]
+     },
+     "then": {
+      "required": ["evaluated", "workspace_hash", "requesting_agent_id", "source_attestation"],
+      "properties": {
+       "evaluated": {
+        "properties": {
+         "actor_identity": {"minLength": 1, "type": "string"},
+         "actor_kind": {"minLength": 1, "type": "string"},
+         "record_digest": {"pattern": "^[0-9a-fA-F]{64}$", "type": "string"},
+         "source_identity": {"minLength": 1, "type": "string"},
+         "workspace_hash": {"minLength": 1, "type": "string"}
+        },
+        "required": ["record_digest", "source_identity", "workspace_hash", "actor_kind", "actor_identity"],
+        "type": "object"
+       },
+       "requesting_agent_id": {"minLength": 1, "type": "string"},
+       "source_attestation": {"maxLength": 64, "minLength": 64, "pattern": "^[0-9a-fA-F]{64}$", "type": "string"},
+       "workspace_hash": {"minLength": 1, "type": "string"}
+      }
+     }
+    }
+   ],
    "type": "object"
   }
  },

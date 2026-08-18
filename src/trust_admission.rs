@@ -5,6 +5,7 @@
 //! durable decision evidence represented here.
 
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 pub const ADMISSION_SCHEMA_VERSION: &str = "perseus-vault-memory-admission/v1";
@@ -354,6 +355,91 @@ pub fn digest_text(value: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(value.as_bytes());
     format!("{:x}", hasher.finalize())
+}
+
+/// Environment-held key used to prove that an admission source was created by
+/// the authenticated transport boundary. Only a digest of the resulting HMAC
+/// is persisted in the journal; the raw attestation is never durable.
+pub(crate) const ADMISSION_SOURCE_HMAC_KEY_ENV: &str =
+    "PERSEUS_VAULT_ADMISSION_SOURCE_HMAC_KEY";
+
+pub(crate) fn admission_source_attestation_payload(
+    evaluated: &Value,
+    requesting_agent_id: &str,
+) -> Result<String, String> {
+    let object = evaluated
+        .as_object()
+        .ok_or("admission_source evaluated must be an object")?;
+    let field = |name: &str| {
+        object
+            .get(name)
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| format!("admission_source attestation requires evaluated.{name}"))
+    };
+    if requesting_agent_id.trim().is_empty() {
+        return Err("admission_source attestation requires requesting_agent_id".to_string());
+    }
+    Ok(json!({
+        "record_digest": field("record_digest")?,
+        "source_identity": field("source_identity")?,
+        "workspace_hash": field("workspace_hash")?,
+        "actor_kind": field("actor_kind")?,
+        "actor_identity": field("actor_identity")?,
+        "requesting_agent_id": requesting_agent_id,
+    })
+    .to_string())
+}
+
+pub(crate) fn admission_source_hmac_hex(key: &str, payload: &str) -> String {
+    const BLOCK_SIZE: usize = 64;
+    let mut key_block = [0u8; BLOCK_SIZE];
+    if key.as_bytes().len() > BLOCK_SIZE {
+        let digest = Sha256::digest(key.as_bytes());
+        key_block[..digest.len()].copy_from_slice(&digest);
+    } else {
+        key_block[..key.len()].copy_from_slice(key.as_bytes());
+    }
+    let mut inner_pad = [0x36u8; BLOCK_SIZE];
+    let mut outer_pad = [0x5cu8; BLOCK_SIZE];
+    for index in 0..BLOCK_SIZE {
+        inner_pad[index] ^= key_block[index];
+        outer_pad[index] ^= key_block[index];
+    }
+    let mut inner = Sha256::new();
+    inner.update(inner_pad);
+    inner.update(payload.as_bytes());
+    let inner_digest = inner.finalize();
+    let mut outer = Sha256::new();
+    outer.update(outer_pad);
+    outer.update(inner_digest);
+    let digest = outer.finalize();
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+pub(crate) fn admission_source_attestation_digest(
+    evaluated: &Value,
+    requesting_agent_id: &str,
+) -> Result<String, String> {
+    let key = match std::env::var(ADMISSION_SOURCE_HMAC_KEY_ENV) {
+        Ok(value) => value,
+        Err(_) => {
+            #[cfg(test)]
+            {
+                "test-admission-source-key".to_string()
+            }
+            #[cfg(not(test))]
+            {
+                return Err(format!("{ADMISSION_SOURCE_HMAC_KEY_ENV} is not configured"));
+            }
+        }
+    };
+    let key = key.trim();
+    if key.is_empty() {
+        return Err(format!("{ADMISSION_SOURCE_HMAC_KEY_ENV} is not configured"));
+    }
+    let payload = admission_source_attestation_payload(evaluated, requesting_agent_id)?;
+    Ok(digest_text(&admission_source_hmac_hex(key, &payload)))
 }
 
 fn canonical_digest<T: Serialize>(value: &T) -> Result<String, String> {

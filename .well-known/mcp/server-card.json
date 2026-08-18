@@ -28,8 +28,9 @@
           },
           "status": {
             "type": "string",
+            "enum": ["active", "draft", "deprecated", "expired", "proposed", "quarantined", "redacted", "compacted"],
             "default": "active",
-            "description": "Entity status: 'active', 'draft', 'deprecated'"
+            "description": "Closed lifecycle status vocabulary; proposed/quarantined/unknown statuses are never publicly serveable"
           },
           "type": {
             "type": "string",
@@ -326,9 +327,48 @@
           "entity_id": {
             "type": "string",
             "description": "Related entity ID for linking"
+          },
+          "requesting_agent_id": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Transport-stamped caller identity; required for admission_source events."
+          },
+          "source_attestation": {
+            "type": "string",
+            "minLength": 64,
+            "maxLength": 64,
+            "pattern": "^[0-9a-fA-F]{64}$",
+            "description": "HMAC-SHA256 attestation over canonical admission-source fields; required for admission_source and never stored."
           }
         },
-        "required": []
+        "required": [],
+        "allOf": [
+          {
+            "if": {
+              "properties": {"event_type": {"const": "admission_source"}},
+              "required": ["event_type"]
+            },
+            "then": {
+              "required": ["evaluated", "workspace_hash", "requesting_agent_id", "source_attestation"],
+              "properties": {
+                "evaluated": {
+                  "type": "object",
+                  "required": ["record_digest", "source_identity", "workspace_hash", "actor_kind", "actor_identity"],
+                  "properties": {
+                    "record_digest": {"type": "string", "pattern": "^[0-9a-fA-F]{64}$"},
+                    "source_identity": {"type": "string", "minLength": 1},
+                    "workspace_hash": {"type": "string", "minLength": 1},
+                    "actor_kind": {"type": "string", "minLength": 1},
+                    "actor_identity": {"type": "string", "minLength": 1}
+                  }
+                },
+                "workspace_hash": {"type": "string", "minLength": 1},
+                "requesting_agent_id": {"type": "string", "minLength": 1},
+                "source_attestation": {"type": "string", "minLength": 64, "maxLength": 64, "pattern": "^[0-9a-fA-F]{64}$"}
+              }
+            }
+          }
+        ]
       },
       "outputSchema": {
         "type": "object",

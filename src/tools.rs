@@ -1632,14 +1632,30 @@ pub fn handle_remember(db: &Database, args: Value) -> Result<String, String> {
         exclude_ids: Vec::new(),
     };
 
-    let (eid, action) = if verified_admission {
-        db.remember_verified_with_write_options(
+    let (eid, action) = if verified_admission && admission_evidence.is_some() {
+        let evidence = admission_evidence
+            .as_ref()
+            .expect("verified admission requires evidence");
+        db.remember_admitted_with_write_options(
             &entity,
             a.skip_dedup,
             a.valid_from_unix_ms,
             a.valid_to_unix_ms,
             a.allow_rejected,
+            evidence,
             &gate_opts,
+        )
+    } else if verified_admission {
+        // Test-only fixtures historically used the verified writer without a
+        // transport envelope. Keep that path explicitly internal and named;
+        // production cannot set verified_admission without evidence.
+        db.remember_internal_trusted_with_options(
+            &entity,
+            a.skip_dedup,
+            a.valid_from_unix_ms,
+            a.valid_to_unix_ms,
+            a.allow_rejected,
+            "mcp_test_fixture",
         )
     } else if gate_opts.sparse_update || mode_override.is_some() || a.interference_bound.is_some() {
         db.remember_with_write_options(
@@ -2024,17 +2040,28 @@ pub fn handle_admission_decide(db: &Database, args: Value) -> Result<String, Str
     // failed transition can never leave a durable completed approval/rejection
     // claim. The completed receipt is appended only after the writer succeeds.
     if decision == "approve" {
+        let source_evaluated = json!({
+            "record_digest": admission.record_digest.clone(),
+            "source_identity": admission.source_identity.clone(),
+            "workspace_hash": workspace_hash,
+            "actor_kind": "operator",
+            "actor_identity": reviewer,
+        });
+        let attestation_digest = crate::trust_admission::admission_source_attestation_digest(
+            &source_evaluated,
+            reviewer,
+        )
+        .map_err(|e| format!("admission_decide source attestation failed: {e}"))?;
+        let mut source_acted: Value = serde_json::from_str(&hash_only_public_journal_payload(
+            &json!({"kind": "operator_review"}),
+        ))
+        .map_err(|e| format!("admission_decide source receipt serialization failed: {e}"))?;
+        source_acted["attestation_digest"] = json!(attestation_digest);
         let source_event = JournalEvent {
             id: review_source_event_id,
             event_type: "admission_source".to_string(),
-            evaluated_json: hash_only_public_journal_payload(&json!({
-                "record_digest": admission.record_digest.clone(),
-                "source_identity": admission.source_identity.clone(),
-                "workspace_hash": workspace_hash,
-                "actor_kind": "operator",
-                "actor_identity": reviewer,
-            })),
-            acted_json: hash_only_public_journal_payload(&json!({"kind": "operator_review"})),
+            evaluated_json: hash_only_public_journal_payload(&source_evaluated),
+            acted_json: source_acted.to_string(),
             forward_json: hash_only_public_journal_payload(&json!({"next": "serve after approval"})),
             category: category.to_string(),
             key: key.to_string(),
@@ -2077,15 +2104,28 @@ pub fn handle_admission_decide(db: &Database, args: Value) -> Result<String, Str
         mode_override: Some(crate::interference::InterferenceMode::Off),
         ..Default::default()
     };
-    let (transition_id, transition_action) = db
-        .remember_verified_with_write_options(
+    let transition_result = if decision == "approve" {
+        db.remember_admitted_with_write_options(
             &updated,
             true,
             None,
             None,
             false,
+            &admission,
             &review_write_options,
         )
+    } else {
+        db.remember_review_transition_with_write_options(
+            &updated,
+            true,
+            None,
+            None,
+            false,
+            &admission,
+            &review_write_options,
+        )
+    };
+    let (transition_id, transition_action) = transition_result
         .map_err(|e| format!("admission_decide durable transition failed after audit intent: {e}"))?;
     if transition_id != entity_id
         || transition_action.starts_with("quarantined")
@@ -4222,7 +4262,7 @@ pub fn handle_promote(db: &Database, args: Value) -> Result<String, String> {
     // the promoted record lands VERIFIED on the trust axis (#880) — never
     // downgraded to a reviewable candidate by the write boundary.
     let (new_id, action) = if source_authorized {
-        db.remember_verified_with_options(&new_entity, true, None, None, false)
+        db.remember_internal_trusted_with_options(&new_entity, true, None, None, false, "promotion")
     } else {
         db.remember_skip_dedup(&new_entity)
     }
@@ -4703,11 +4743,21 @@ pub fn handle_journal(db: &Database, args: Value) -> Result<String, String> {
         a.agent_id
     };
 
+    let acted_json = if source_event {
+        let mut receipt: Value = serde_json::from_str(&hash_only_public_journal_payload(&a.acted))
+            .map_err(|e| format!("admission source receipt serialization failed: {e}"))?;
+        receipt["attestation_digest"] = json!(crate::trust_admission::digest_text(
+            a.source_attestation.trim()
+        ));
+        receipt.to_string()
+    } else {
+        hash_only_public_journal_payload(&a.acted)
+    };
     let event = JournalEvent {
         id,
         event_type: a.event_type,
         evaluated_json: hash_only_public_journal_payload(&a.evaluated),
-        acted_json: hash_only_public_journal_payload(&a.acted),
+        acted_json,
         forward_json: hash_only_public_journal_payload(&a.forward),
         category: a.category,
         key: a.key,
@@ -22251,17 +22301,27 @@ mod tests {
         // Source event binding so an authoritative admission can Commit.
         let commit_body = "{\"note\":\"authoritative fact\"}";
         let commit_digest = crate::trust_admission::digest_text(commit_body);
+        std::env::set_var(ADMISSION_SOURCE_HMAC_KEY_ENV, "test-admission-source-key");
+        let source_evaluated = json!({
+            "record_digest": commit_digest,
+            "source_identity": "email-42",
+            "workspace_hash": "workspace-a",
+            "actor_kind": "connector",
+            "actor_identity": "agent-a"
+        });
+        let source_attestation_digest = crate::trust_admission::admission_source_attestation_digest(
+            &source_evaluated,
+            "requester-a",
+        )
+        .unwrap();
+        let mut source_acted: Value = serde_json::from_str(&hash_only_public_journal_payload(&json!({})))
+            .unwrap();
+        source_acted["attestation_digest"] = json!(source_attestation_digest);
         db.journal_authenticated_admission_source(&crate::models::JournalEvent {
             id: "src-event-1".to_string(),
             event_type: "admission_source".to_string(),
-            evaluated_json: hash_only_public_journal_payload(&json!({
-                "record_digest": commit_digest,
-                "source_identity": "email-42",
-                "workspace_hash": "workspace-a",
-                "actor_kind": "connector",
-                "actor_identity": "agent-a"
-            })),
-            acted_json: hash_only_public_journal_payload(&json!({})),
+            evaluated_json: hash_only_public_journal_payload(&source_evaluated),
+            acted_json: source_acted.to_string(),
             forward_json: hash_only_public_journal_payload(&json!({})),
             category: "source".to_string(),
             key: "src-1".to_string(),

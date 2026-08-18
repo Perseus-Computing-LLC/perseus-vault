@@ -142,7 +142,7 @@ pub fn seed_guide(
         _parsed_body: None,
     };
     let (stored_id, _) = db
-        .remember_verified_with_options(&entity, true, None, None, false)
+        .remember_internal_trusted_with_options(&entity, true, None, None, false, "guide_seed")
         .map_err(|e| format!("guide seed: {e}"))?;
     Ok(serde_json::json!({
         "id": stored_id,

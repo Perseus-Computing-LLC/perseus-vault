@@ -244,7 +244,7 @@ fn scan_live_rows(db: &Database) -> Result<Vec<CardRow>, String> {
                     created_at_unix_ms, last_accessed_unix_ms, archived, links, \
                     valid_from_unix_ms, valid_to_unix_ms, recorded_at_unix_ms, \
                     invalidated_at_unix_ms, supersedes, superseded_by \
-             FROM entities WHERE archived = 0",
+             FROM entities WHERE archived = 0 AND status IN ('active','draft')",
         )
         .map_err(|e| format!("claim card: prepare failed: {e}"))?;
     let rows: Vec<CardRow> = stmt
@@ -256,14 +256,14 @@ fn scan_live_rows(db: &Database) -> Result<Vec<CardRow>, String> {
                 &r.get::<_, String>(6).unwrap_or_else(|_| "[]".to_string()),
             )
             .unwrap_or_default();
-            let body_json: String = r.get(2)?;
+            let body_json: String = r.get(3)?;
             let e = Entity {
                 id: r.get(0)?,
                 category: r.get(1)?,
                 key: r.get(2)?,
                 body_json: body_json.clone(),
-                status: r.get(3)?,
-                entity_type: r.get(4)?,
+                status: r.get(4)?,
+                entity_type: r.get(5)?,
                 tags,
                 decay_score: r.get(7)?,
                 retrieval_count: 0,

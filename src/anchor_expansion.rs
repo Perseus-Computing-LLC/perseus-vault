@@ -97,7 +97,7 @@ pub fn load_anchors(
         "SELECT body_json FROM entities e \
          WHERE e.category IN ({}) \
            AND e.archived = 0 \
-           AND (e.status IS NULL OR e.status = '' OR e.status = 'active') \
+           AND e.status IN ('active','draft') \
            AND e.invalidated_at_unix_ms IS NULL \
            AND (e.workspace_hash = ?1 OR e.workspace_hash = '') \
            AND NOT EXISTS (SELECT 1 FROM entities e2 WHERE e2.supersedes = e.id) \

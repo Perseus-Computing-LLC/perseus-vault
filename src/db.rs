@@ -228,50 +228,65 @@ fn erase_sweep_inbound_links(
     Ok((links_cleaned, derived_quarantined))
 }
 
-/// Ensure every durable entity written through the database has an explicit,
-/// hash-only provenance state. Public tool handlers may supply a richer
-/// admission envelope; direct CLI/import/connector/derived writers reach this
-/// boundary without one and are marked reviewable rather than silently active.
-fn ensure_durable_write_provenance(entity: &Entity, verified_admission: bool) -> Entity {
-    if verified_admission {
-        // Authoritative admission is the strongest trust signal the write
-        // path can carry; mark the record verified (or keep an explicit
-        // operator-set corroborated state) rather than leaving it a candidate.
-        let mut admitted = entity.clone();
-        if !crate::models::EPISTEMIC_STATES.contains(&admitted.epistemic_state.as_str()) {
-            admitted.epistemic_state = "candidate".to_string();
+/// Durable-write authority is explicit at the database boundary. Public and
+/// unverified writers cannot elevate trust; internal derived/maintenance paths
+/// use a named crate-private authority; only an evidence-backed admission may
+/// activate an authoritative record.
+#[derive(Debug, Clone)]
+pub(crate) enum DurableWriteAuthority {
+    Unverified,
+    InternalTrusted(&'static str),
+    Admission(crate::trust_admission::AdmissionEvidence),
+    ReviewTransition(crate::trust_admission::AdmissionEvidence),
+}
+
+fn ensure_durable_write_provenance(entity: &Entity, authority: &DurableWriteAuthority) -> Entity {
+    match authority {
+        DurableWriteAuthority::Admission(_) => {
+            // Admission evidence is independently validated immediately before
+            // this function is called. Preserve an explicit operator label but
+            // elevate the default candidate trust state only for that path.
+            let mut admitted = entity.clone();
+            if !crate::models::EPISTEMIC_STATES.contains(&admitted.epistemic_state.as_str()) {
+                admitted.epistemic_state = "candidate".to_string();
+            }
+            if admitted.epistemic_state == "candidate" {
+                admitted.epistemic_state = "verified".to_string();
+            }
+            admitted
         }
-        if admitted.epistemic_state == "candidate" {
-            admitted.epistemic_state = "verified".to_string();
+        DurableWriteAuthority::InternalTrusted(_writer) => {
+            let mut trusted = entity.clone();
+            if !crate::models::EPISTEMIC_STATES.contains(&trusted.epistemic_state.as_str()) {
+                trusted.epistemic_state = "candidate".to_string();
+            }
+            if trusted.epistemic_state == "candidate" {
+                trusted.epistemic_state = "verified".to_string();
+            }
+            trusted
         }
-        return admitted;
+        DurableWriteAuthority::ReviewTransition(_) => entity.clone(),
+        DurableWriteAuthority::Unverified => {
+            #[cfg(test)]
+            if entity.source != "cli-write" {
+                // Historical in-module fixtures use many source labels. Keep
+                // those read-path fixtures active; production/public writes do
+                // not receive this test-only compatibility branch.
+                return entity.clone();
+            }
+            let mut enriched = entity.clone();
+            if enriched.status == "active" {
+                enriched.status = "proposed".to_string();
+                enriched.always_on = false;
+            }
+            if enriched.epistemic_state != "rejected"
+                && enriched.epistemic_state != "defensively_recalled"
+            {
+                enriched.epistemic_state = "candidate".to_string();
+            }
+            enriched
+        }
     }
-    #[cfg(test)]
-    if entity.source != "cli-write" {
-        // Historical in-module fixtures use many source labels (agent,
-        // graphrag, guide, ingest_file, and so on). Keep those read-path
-        // fixtures active; the direct-writer security tests use cli-write and
-        // still exercise the production gate. This branch is test-only.
-        return entity.clone();
-    }
-    // Keep the semantic body byte-for-byte stable for encryption, embeddings,
-    // file adapters, and deduplication. Database callers do not get to elevate
-    // a write by choosing a source label or by placing an admission-shaped JSON
-    // object in the body; activation requires the verified admission path.
-    let mut enriched = entity.clone();
-    if enriched.status == "active" {
-        enriched.status = "proposed".to_string();
-        enriched.always_on = false;
-    }
-    // Trust axis stays fail-closed: an unverified write is a candidate even
-    // when a caller attempted to label it verified/corroborated — only the
-    // verified admission path may set the trust axis (or an explicit
-    // operator/audit transition after review).
-    if enriched.epistemic_state != "rejected" && enriched.epistemic_state != "defensively_recalled"
-    {
-        enriched.epistemic_state = "candidate".to_string();
-    }
-    enriched
 }
 
 /// A connection checked out from the pool. Derefs to `rusqlite::Connection`, so
@@ -8130,19 +8145,19 @@ impl Database {
         valid_to: Option<i64>,
         allow_rejected: bool,
     ) -> Result<(String, String), Box<dyn std::error::Error>> {
-        self.remember_impl_with_admission(
+        self.remember_impl_with_authority(
             entity,
             skip_dedup,
             valid_from,
             valid_to,
             allow_rejected,
-            false,
+            DurableWriteAuthority::Unverified,
             &crate::interference::WriteGateOptions::none(),
         )
     }
 
     /// #874: governed write with per-write interference-gate and sparse-update
-    /// options (used by the MCP remember tool and trusted internal writers).
+    /// options (used by the MCP remember tool).
     pub fn remember_with_write_options(
         &self,
         entity: &Entity,
@@ -8152,52 +8167,83 @@ impl Database {
         allow_rejected: bool,
         opts: crate::interference::WriteGateOptions,
     ) -> Result<(String, String), Box<dyn std::error::Error>> {
-        self.remember_impl_with_admission(
+        self.remember_impl_with_authority(
             entity,
             skip_dedup,
             valid_from,
             valid_to,
             allow_rejected,
-            false,
+            DurableWriteAuthority::Unverified,
             &opts,
         )
     }
 
-    pub(crate) fn remember_verified_with_options(
+    /// Explicit crate-internal authority for derived, maintenance, import, and
+    /// operator-materialization writers. This path is not reachable through
+    /// the public Database API and never pretends to be transport admission.
+    pub(crate) fn remember_internal_trusted_with_options(
         &self,
         entity: &Entity,
         skip_dedup: bool,
         valid_from: Option<i64>,
         valid_to: Option<i64>,
         allow_rejected: bool,
+        writer: &'static str,
     ) -> Result<(String, String), Box<dyn std::error::Error>> {
-        self.remember_impl_with_admission(
+        self.remember_impl_with_authority(
             entity,
             skip_dedup,
             valid_from,
             valid_to,
             allow_rejected,
-            true,
+            DurableWriteAuthority::InternalTrusted(writer),
             &crate::interference::WriteGateOptions::none(),
         )
     }
 
-    pub(crate) fn remember_verified_with_write_options(
+    /// Admission-only durable writer. The evidence is revalidated against the
+    /// body, authenticated source journal row, transport identity, and HMAC
+    /// proof before the lowest write boundary can elevate trust.
+    pub(crate) fn remember_admitted_with_write_options(
         &self,
         entity: &Entity,
         skip_dedup: bool,
         valid_from: Option<i64>,
         valid_to: Option<i64>,
         allow_rejected: bool,
+        evidence: &crate::trust_admission::AdmissionEvidence,
         opts: &crate::interference::WriteGateOptions,
     ) -> Result<(String, String), Box<dyn std::error::Error>> {
-        self.remember_impl_with_admission(
+        self.remember_impl_with_authority(
             entity,
             skip_dedup,
             valid_from,
             valid_to,
             allow_rejected,
-            true,
+            DurableWriteAuthority::Admission(evidence.clone()),
+            opts,
+        )
+    }
+
+    /// Non-activating operator review transition. This path is deliberately
+    /// distinct from admission activation and cannot elevate trust.
+    pub(crate) fn remember_review_transition_with_write_options(
+        &self,
+        entity: &Entity,
+        skip_dedup: bool,
+        valid_from: Option<i64>,
+        valid_to: Option<i64>,
+        allow_rejected: bool,
+        evidence: &crate::trust_admission::AdmissionEvidence,
+        opts: &crate::interference::WriteGateOptions,
+    ) -> Result<(String, String), Box<dyn std::error::Error>> {
+        self.remember_impl_with_authority(
+            entity,
+            skip_dedup,
+            valid_from,
+            valid_to,
+            allow_rejected,
+            DurableWriteAuthority::ReviewTransition(evidence.clone()),
             opts,
         )
     }
@@ -8257,14 +8303,162 @@ impl Database {
         Ok(entity)
     }
 
-    fn remember_impl_with_admission(
+    /// Revalidate every authority-bearing admission at the lowest durable
+    /// boundary. The MCP handler performs the same checks for early rejection,
+    /// but this duplicate is intentional: a crate-internal caller cannot turn a
+    /// boolean or forged body metadata into an authoritative row.
+    fn validate_admission_write(
+        &self,
+        entity: &Entity,
+        evidence: &crate::trust_admission::AdmissionEvidence,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        evidence
+            .validate()
+            .map_err(|e| format!("admission evidence rejected at durable boundary: {e}"))?;
+        if evidence.outcome != "admitted" || !evidence.authoritative || !evidence.durable {
+            return Err("only durable authoritative admitted evidence may activate a row".into());
+        }
+        let mut body: serde_json::Value = serde_json::from_str(&entity.body_json)
+            .map_err(|e| format!("admission body is not valid JSON: {e}"))?;
+        let object = body
+            .as_object_mut()
+            .ok_or("admission body must be a JSON object")?;
+        let stored_value = object
+            .get("admission")
+            .cloned()
+            .ok_or("durable admission write requires body.admission evidence")?;
+        let stored: crate::trust_admission::AdmissionEvidence =
+            serde_json::from_value(stored_value)
+                .map_err(|e| format!("stored admission evidence is invalid: {e}"))?;
+        if stored != *evidence {
+            return Err("stored admission evidence does not match the commit authority".into());
+        }
+        object.remove("admission");
+        object.remove("provenance");
+        let canonical_body = serde_json::to_string(&body)?;
+        let body_digest = crate::trust_admission::digest_text(&canonical_body);
+        if body_digest != evidence.record_digest {
+            return Err(format!(
+                "admission record_digest does not match canonical entity body: expected {}, got {}",
+                evidence.record_digest, body_digest
+            )
+            .into());
+        }
+
+        let source_event_id = evidence
+            .source_event_id
+            .as_deref()
+            .filter(|id| !id.trim().is_empty())
+            .ok_or("authoritative admission requires source_event_id")?;
+        let conn = self.conn()?;
+        let source: Option<(String, String, String, String, String)> = conn
+            .query_row(
+                "SELECT event_type, workspace_hash, agent_id, evaluated_json, acted_json
+                 FROM journal WHERE id = ?1",
+                params![source_event_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .optional()?;
+        let Some((event_type, source_workspace, requesting_agent, evaluated_json, acted_json)) = source
+        else {
+            return Err("authoritative admission source_event_id is not present in journal".into());
+        };
+        if event_type != "admission_source"
+            || source_workspace != evidence.workspace_hash
+            || requesting_agent.trim().is_empty()
+        {
+            return Err("admission source event is not bound to workspace/transport identity".into());
+        }
+        let actor_kind = evidence
+            .actor_kind
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or("authoritative admission requires actor_kind")?;
+        let actor_identity = evidence
+            .actor_identity
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or("authoritative admission requires actor_identity")?;
+        let binding = json!({
+            "record_digest": evidence.record_digest,
+            "source_identity": evidence.source_identity,
+            "workspace_hash": evidence.workspace_hash,
+            "actor_kind": actor_kind,
+            "actor_identity": actor_identity,
+        });
+        let evaluated: serde_json::Value = serde_json::from_str(&evaluated_json)
+            .map_err(|e| format!("admission source receipt is invalid: {e}"))?;
+        let expected_binding_hash = crate::trust_admission::digest_text(&binding.to_string());
+        if evaluated["redacted"] != true
+            || evaluated["sha256"].as_str() != Some(expected_binding_hash.as_str())
+        {
+            return Err("admission source receipt does not match evidence binding".into());
+        }
+        let acted: serde_json::Value = serde_json::from_str(&acted_json)
+            .map_err(|e| format!("admission source attestation receipt is invalid: {e}"))?;
+        let stored_attestation_digest = acted["attestation_digest"]
+            .as_str()
+            .filter(|value| value.len() == 64 && value.chars().all(|c| c.is_ascii_hexdigit()))
+            .ok_or("admission source receipt lacks attestation proof")?;
+        let expected_attestation_digest =
+            crate::trust_admission::admission_source_attestation_digest(&binding, &requesting_agent)
+                .map_err(|e| format!("admission source HMAC validation failed: {e}"))?;
+        if stored_attestation_digest != expected_attestation_digest {
+            return Err("admission source HMAC proof does not match transport-bound evidence".into());
+        }
+        Ok(())
+    }
+
+    /// Review transitions may persist a non-authoritative terminal outcome,
+    /// but can never activate a row. They still bind the stored evidence to the
+    /// canonical semantic body so a reviewer cannot swap the candidate under a
+    /// valid decision digest.
+    fn validate_review_transition(
+        &self,
+        entity: &Entity,
+        evidence: &crate::trust_admission::AdmissionEvidence,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        evidence
+            .validate()
+            .map_err(|e| format!("review evidence rejected at durable boundary: {e}"))?;
+        if evidence.outcome == "admitted" || evidence.authoritative || evidence.durable {
+            return Err("review transition requires non-authoritative non-durable evidence".into());
+        }
+        if entity.status == "active" && !entity.archived {
+            return Err("non-admitted review transition cannot leave an active row".into());
+        }
+        let mut body: serde_json::Value = serde_json::from_str(&entity.body_json)
+            .map_err(|e| format!("review body is not valid JSON: {e}"))?;
+        let object = body
+            .as_object_mut()
+            .ok_or("review body must be a JSON object")?;
+        let stored_value = object
+            .get("admission")
+            .cloned()
+            .ok_or("review transition requires body.admission evidence")?;
+        let stored: crate::trust_admission::AdmissionEvidence =
+            serde_json::from_value(stored_value)
+                .map_err(|e| format!("stored review evidence is invalid: {e}"))?;
+        if stored != *evidence {
+            return Err("stored review evidence does not match the transition authority".into());
+        }
+        object.remove("admission");
+        object.remove("provenance");
+        let body_digest = crate::trust_admission::digest_text(&serde_json::to_string(&body)?);
+        if body_digest != evidence.record_digest {
+            return Err("review transition record_digest does not match canonical entity body".into());
+        }
+        Ok(())
+    }
+
+    fn remember_impl_with_authority(
         &self,
         entity: &Entity,
         skip_dedup: bool,
         valid_from: Option<i64>,
         valid_to: Option<i64>,
         allow_rejected: bool,
-        verified_admission: bool,
+        authority: DurableWriteAuthority,
         gate_opts: &crate::interference::WriteGateOptions,
     ) -> Result<(String, String), Box<dyn std::error::Error>> {
         let canonical_status = crate::models::canonical_entity_status(&entity.status)
@@ -8272,7 +8466,16 @@ impl Database {
             .ok_or_else(|| format!("invalid writable entity status '{}': expected one of {:?}", entity.status, crate::models::ENTITY_STATUSES))?;
         let mut normalized_entity = entity.clone();
         normalized_entity.status = canonical_status;
-        let enriched_entity = ensure_durable_write_provenance(&normalized_entity, verified_admission);
+        match &authority {
+            DurableWriteAuthority::Admission(evidence) => {
+                self.validate_admission_write(&normalized_entity, evidence)?;
+            }
+            DurableWriteAuthority::ReviewTransition(evidence) => {
+                self.validate_review_transition(&normalized_entity, evidence)?;
+            }
+            DurableWriteAuthority::Unverified | DurableWriteAuthority::InternalTrusted(_) => {}
+        }
+        let enriched_entity = ensure_durable_write_provenance(&normalized_entity, &authority);
         // #999: derived-visibility intersection — a write that declares
         // lineage (links with relationship "derived_from") may not be MORE
         // open than its cited inputs, and unreadable inputs refuse the whole
@@ -12568,6 +12771,15 @@ impl Database {
         if event.event_type != "admission_source" {
             return Err("authenticated admission journal path requires admission_source".into());
         }
+        let acted: serde_json::Value = serde_json::from_str(&event.acted_json)
+            .map_err(|e| format!("admission source receipt is invalid: {e}"))?;
+        let attestation_digest = acted["attestation_digest"]
+            .as_str()
+            .filter(|value| value.len() == 64 && value.chars().all(|c| c.is_ascii_hexdigit()))
+            .ok_or("authenticated admission source requires an HMAC proof digest")?;
+        if attestation_digest.is_empty() {
+            return Err("authenticated admission source requires an HMAC proof digest".into());
+        }
         let conn = self.conn()?;
         self.journal_with_conn(&conn, event)
     }
@@ -13118,13 +13330,13 @@ impl Database {
             mode_override: Some(crate::interference::InterferenceMode::Off),
             ..Default::default()
         };
-        let (eid, action) = self.remember_impl_with_admission(
+        let (eid, action) = self.remember_impl_with_authority(
             &entity,
             true,
             rec["valid_from_unix_ms"].as_i64(),
             rec["valid_to_unix_ms"].as_i64(),
             false,
-            true,
+            DurableWriteAuthority::InternalTrusted("write_quarantine_release"),
             &opts,
         )?;
         let conn = self.conn()?;
@@ -20951,7 +21163,7 @@ impl Database {
     ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
         let conn = self.conn()?;
         let mut stmt = conn.prepare(&format!(
-            "SELECT id, key, body_json, certainty FROM entities WHERE category = ?1 AND archived = 0
+            "SELECT id, key, body_json, certainty FROM entities WHERE category = ?1 AND archived = 0 AND status IN ('active','draft','deprecated','expired','redacted','compacted','superseded','resolved')
              ORDER BY last_accessed_unix_ms DESC LIMIT {} OFFSET ?2",
             Self::CONFLICT_SCAN_WINDOW
         ))?;
@@ -21700,7 +21912,7 @@ impl Database {
             Some(ws) => (
                 format!(
                     "SELECT id, key, body_json, certainty, verified, importance
-                     FROM entities WHERE category = ?1 AND archived = 0
+                     FROM entities WHERE category = ?1 AND archived = 0 AND status IN ('active','draft','deprecated','expired','redacted','compacted','superseded','resolved')
                      AND workspace_hash = ?2{candidate_clause}
                      ORDER BY last_accessed_unix_ms {}, id ASC LIMIT {} OFFSET ?{}",
                     order,
@@ -21712,7 +21924,7 @@ impl Database {
             None => (
                 format!(
                     "SELECT id, key, body_json, certainty, verified, importance
-                     FROM entities WHERE category = ?1 AND archived = 0{candidate_clause}
+                     FROM entities WHERE category = ?1 AND archived = 0 AND status IN ('active','draft','deprecated','expired','redacted','compacted','superseded','resolved'){candidate_clause}
                      ORDER BY last_accessed_unix_ms {}, id ASC LIMIT {} OFFSET ?{}",
                     order,
                     scan_limit,
@@ -23525,7 +23737,7 @@ Return a JSON object with an "insights" array. Each insight has:
         let entities: Vec<(String, String, String, f64)> = {
             let conn = self.conn()?;
             let mut stmt = conn.prepare(&format!(
-                "SELECT id, key, body_json, certainty FROM entities WHERE category = ?1 AND archived = 0
+                "SELECT id, key, body_json, certainty FROM entities WHERE category = ?1 AND archived = 0 AND status IN ('active','draft','deprecated','expired','redacted','compacted','superseded','resolved')
                  ORDER BY last_accessed_unix_ms DESC LIMIT {} OFFSET ?2",
                 Self::CONFLICT_SCAN_WINDOW
             ))?;
@@ -30767,7 +30979,7 @@ pub(crate) mod tests {
         // #880: the trust axis is fail-closed on the write path — a caller
         // that labels its own write 'verified' without authoritative
         // admission must be stored as 'candidate'. Only the verified
-        // admission path (remember_verified_with_options) or an explicit
+        // admission path (remember_admitted_with_write_options) or an explicit
         // operator/audit transition may set verified/corroborated.
         let (db, path) = temp_db();
         let mut entity = make_entity(
@@ -30805,7 +31017,7 @@ pub(crate) mod tests {
         entity.agent_id = "user-1".to_string();
         entity.workspace_hash = "ws-trust".to_string();
         let (_, _) = db
-            .remember_verified_with_options(&entity, true, None, None, false)
+            .remember_internal_trusted_with_options(&entity, true, None, None, false, "test_fixture")
             .expect("verified admission write");
         let stored = db
             .get_entity("decision", "admitted-trust")
@@ -30823,7 +31035,7 @@ pub(crate) mod tests {
         corroborated.agent_id = "user-1".to_string();
         corroborated.workspace_hash = "ws-trust".to_string();
         corroborated.epistemic_state = "corroborated".to_string();
-        db.remember_verified_with_options(&corroborated, true, None, None, false)
+        db.remember_internal_trusted_with_options(&corroborated, true, None, None, false, "test_fixture")
             .expect("verified admission write");
         let stored2 = db
             .get_entity("decision", "corroborated-trust")
@@ -31042,7 +31254,7 @@ pub(crate) mod tests {
         );
         verified.agent_id = "user-1".to_string();
         verified.workspace_hash = "ws-epi".to_string();
-        db.remember_verified_with_options(&verified, true, None, None, false)
+        db.remember_internal_trusted_with_options(&verified, true, None, None, false, "test_fixture")
             .expect("verified write");
 
         let recall = |es: &str, mode: crate::models::SearchMode| {
@@ -31432,7 +31644,7 @@ pub(crate) mod tests {
         );
         ver.agent_id = "user-1".to_string();
         ver.workspace_hash = "ws-t".to_string();
-        db.remember_verified_with_options(&ver, true, None, None, false)
+        db.remember_internal_trusted_with_options(&ver, true, None, None, false, "test_fixture")
             .unwrap();
 
         let response = crate::tools::handle_recall(
@@ -55056,7 +55268,7 @@ pub(crate) mod tests {
             "{\"content\":\"verified hidden fixture\"}",
         );
         verified_hidden.status = "quarantined".to_string();
-        db.remember_verified_with_options(&verified_hidden, true, None, None, false)
+        db.remember_internal_trusted_with_options(&verified_hidden, true, None, None, false, "test_fixture")
             .unwrap();
         assert!(
             db.get_entity("facts", "status-verified-hidden")

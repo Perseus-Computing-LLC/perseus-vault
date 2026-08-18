@@ -231,7 +231,7 @@ pub fn declared_schema_set(
         embedding: None,
         _parsed_body: None,
     };
-    db.remember_verified_with_options(&entity, true, None, None, false)
+    db.remember_internal_trusted_with_options(&entity, true, None, None, false, "declared_schema")
         .map_err(|e| format!("declared schema: store failed: {e}"))?;
     Ok(schema)
 }
@@ -304,7 +304,7 @@ pub fn declared_candidates(
                         NULL as embedding, always_on, certainty, workspace_hash, agent_id,
                         visibility, follow_count, miss_count, follow_rate, efficacy_status,
                         epistemic_state, hints, memory_type
-                 FROM entities WHERE category = ?1 AND archived = 0",
+                 FROM entities WHERE category = ?1 AND archived = 0 AND status IN ('active','draft')",
             )
             .map_err(|e| e.to_string())?;
         let enc = db.encryption.as_ref();

@@ -721,7 +721,7 @@ fn contamination_probe(
                 &format!(
                     "SELECT COUNT(*) FROM entities \
                      WHERE archived = 0 AND embedding IS NOT NULL \
-                     AND (status IN ({excluded}))"
+                     AND (COALESCE(status, '') NOT IN ('active','draft'))"
                 ),
                 [],
                 |r| r.get(0),
@@ -780,7 +780,7 @@ fn contamination_probe(
                         "SELECT COUNT(*) FROM entities \
                          WHERE archived = 0 \
                            AND rowid IN (SELECT rowid FROM entities_fts WHERE entities_fts MATCH ?1) \
-                           AND (status IN ({excluded}))"
+                           AND (COALESCE(status, '') NOT IN ('active','draft'))"
                     ),
                     params![fts_query],
                     |r| r.get(0),
@@ -835,7 +835,7 @@ fn lexical_probe(
             &format!(
                 "SELECT COUNT(*) FROM entities_fts f JOIN entities e ON e.rowid = f.rowid \
                  WHERE entities_fts MATCH ?1 AND e.archived = 0 \
-                   AND (e.status IN ({excluded}))"
+                   AND (COALESCE(e.status, '') NOT IN ('active','draft'))"
             ),
             params![fts_query],
             |r| r.get(0),
@@ -864,7 +864,7 @@ fn temporal_probe(
 
 fn dense_probe(
     conn: &Connection,
-    excluded: &str,
+    _excluded: &str,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     let total: i64 = conn.query_row(
         "SELECT COUNT(*) FROM entities WHERE archived = 0 AND embedding IS NOT NULL",
@@ -874,7 +874,7 @@ fn dense_probe(
     let blocked: i64 = conn.query_row(
         &format!(
             "SELECT COUNT(*) FROM entities WHERE archived = 0 AND embedding IS NOT NULL \
-             AND (status IN ({excluded}))"
+             AND (COALESCE(status, '') NOT IN ('active','draft'))"
         ),
         [],
         |r| r.get(0),
@@ -889,7 +889,7 @@ fn dense_probe(
 fn graph_probe(
     conn: &Connection,
     query: &str,
-    excluded: &str,
+    _excluded: &str,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     // One-hop neighbor set of the top-3 keyword matches (same seed rule as
     // the graph arm), then count excluded-status neighbors.
@@ -904,8 +904,8 @@ fn graph_probe(
         let seed_ids: Vec<String> = conn
             .prepare(
                 "SELECT e.id FROM entities_fts f JOIN entities e ON e.rowid = f.rowid \
-                 WHERE entities_fts MATCH ?1 AND e.archived = 0 AND e.status NOT IN \
-                 ('deprecated','expired','proposed','quarantined','redacted') \
+                 WHERE entities_fts MATCH ?1 AND e.archived = 0 \
+                 AND e.status IN ('active','draft') \
                  ORDER BY bm25(entities_fts) LIMIT 3",
             )?
             .query_map(params![fts_query], |r| r.get::<_, String>(0))?
@@ -964,7 +964,7 @@ fn graph_probe(
         let blocked: i64 = conn.query_row(
             &format!(
                 "SELECT COUNT(*) FROM entities WHERE id IN ({placeholders}) \
-                 AND archived = 0 AND (status IN ({excluded}))"
+                 AND archived = 0 AND (COALESCE(status, '') NOT IN ('active','draft'))"
             ),
             refs.as_slice(),
             |r| r.get(0),

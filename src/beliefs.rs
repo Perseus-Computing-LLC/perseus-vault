@@ -90,11 +90,11 @@ pub fn derive_beliefs(db: &Database, category: Option<&str>) -> Result<Vec<Belie
     let sql = match category {
         Some(_) => "SELECT id, category, key, body_json, certainty, verified, status, \
                     workspace_hash, last_accessed_unix_ms, links \
-             FROM entities WHERE archived = 0 AND category = ?1"
+             FROM entities WHERE archived = 0 AND status IN ('active','draft','deprecated') AND category = ?1"
             .to_string(),
         None => "SELECT id, category, key, body_json, certainty, verified, status, \
                     workspace_hash, last_accessed_unix_ms, links \
-             FROM entities WHERE archived = 0"
+             FROM entities WHERE archived = 0 AND status IN ('active','draft','deprecated')"
             .to_string(),
     };
     let mut stmt = conn

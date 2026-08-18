@@ -900,7 +900,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
         },
         "status": {
           "type": "string",
-          "enum": ["active", "draft", "deprecated", "expired", "proposed", "quarantined", "redacted"],
+          "enum": ["active", "draft", "deprecated", "expired", "proposed", "quarantined", "redacted", "compacted"],
           "default": "active",
           "description": "Closed lifecycle status vocabulary; proposed/quarantined are never publicly serveable"
         },

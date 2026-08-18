@@ -3737,7 +3737,7 @@ fn run() {
             // must carry an admission envelope to activate. This is what
             // keeps operator seeding/scripting workflows (and the Noisegate
             // golden fixture) producing active memory.
-            match database.remember_verified_with_options(&entity, false, None, None, false) {
+            match database.remember_internal_trusted_with_options(&entity, false, None, None, false, "cli_seed") {
                 Ok((id, action)) => {
                     print_json(&serde_json::json!({ "ok": true, "id": id, "action": action }));
                 }
