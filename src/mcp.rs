@@ -7572,6 +7572,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
   {"name":"perseus_vault_action_lease_acquire", "description":"Acquire the single active lease for an action key.", "inputSchema":{"type":"object","properties":{"action_id":{"type":"string"},"holder_id":{"type":"string"},"ttl_seconds":{"type":"integer","default":1}},"required":["action_id","holder_id"]}, "title":"Acquire Action Lease"},
   {"name":"perseus_vault_action_lease_release", "description":"Release an action lease held by its owner.", "inputSchema":{"type":"object","properties":{"lease_id":{"type":"string"},"holder_id":{"type":"string"}},"required":["lease_id","holder_id"]}, "title":"Release Action Lease"},
   {"name":"perseus_vault_stage_trace_validate", "description":"Validate a versioned hash-only runtime stage trace and optionally compare replay semantics. Raw prompts, memory bodies, credentials, and tool payloads are not accepted.", "inputSchema":{"type":"object","properties":{"trace":{"type":"object","description":"perseus-vault-stage-trace/v1 structured trace"},"replay_of":{"type":"object","description":"Optional second trace to compare by replay fingerprint"}},"required":["trace"]}, "title":"Validate Runtime Stage Trace"},
+  {"name":"perseus_vault_context_transform_validate", "description":"#1106: validate a versioned context-transformer proposal at the provider boundary. Returns only a hash-only receipt, bounded changed-span metadata, explicit outcome/lossiness, and replay/original references; raw messages, prompts, memory bodies, credentials, and tool payloads are not returned.", "inputSchema":{"type":"object","properties":{"request":{"type":"object","description":"perseus-vault-context-transformer/v1 request metadata and transient input_messages"},"proposed_output":{"type":"array","description":"Transient proposed provider messages; never returned in the response","items":{"type":"object"}},"proposed_output_tokens":{"type":"integer","minimum":0}},"required":["request","proposed_output"]}, "title":"Validate Context Transform"},
   {"name":"perseus_vault_reject_value", "description":"Record a scoped digest-only rejected-value tombstone. Equivalent values remain rejected across new entity keys and writer paths until the tombstone expires or is explicitly superseded.", "inputSchema":{"type":"object","properties":{"workspace_hash":{"type":"string","description":"Workspace scope; empty means global."},"subject":{"type":"string"},"predicate":{"type":"string"},"value":{"type":"string","description":"Normalized only for matching; the value is not stored."},"reason":{"type":"string"},"evidence_ref":{"type":"string"},"author_agent_id":{"type":"string"},"expires_at_unix_ms":{"type":"integer"}},"required":["workspace_hash","subject","predicate","value"]}, "title":"Reject Value"},
   {
     "name": "perseus_vault_span_audit",
@@ -8078,6 +8079,7 @@ const TOOL_SCOPES: &[(&str, ToolScope)] = &[
     ("perseus_vault_action_lease_acquire", ToolScope::Agent),
     ("perseus_vault_action_lease_release", ToolScope::Agent),
     ("perseus_vault_stage_trace_validate", ToolScope::Ops),
+    ("perseus_vault_context_transform_validate", ToolScope::Ops),
     ("perseus_vault_reject_value", ToolScope::Ops),
     ("perseus_vault_span_audit", ToolScope::Agent),
     ("perseus_vault_report_refusal", ToolScope::Agent),
@@ -8341,6 +8343,41 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
             }))
             .map_err(|e| e.to_string())
         })(),
+        "perseus_vault_context_transform_validate" => (|| -> Result<String, String> {
+            let request_value = args
+                .get("request")
+                .cloned()
+                .ok_or_else(|| "context_transform_validate requires request".to_string())?;
+            let proposed_value = args
+                .get("proposed_output")
+                .cloned()
+                .ok_or_else(|| "context_transform_validate requires proposed_output".to_string())?;
+            let request: crate::context_transform::ContextTransformRequest =
+                serde_json::from_value(request_value)
+                    .map_err(|e| format!("invalid context transform request: {e}"))?;
+            let proposed_output: Vec<crate::context_transform::ContextMessage> =
+                serde_json::from_value(proposed_value)
+                    .map_err(|e| format!("invalid context transform proposed_output: {e}"))?;
+            let proposed_output_tokens = args.get("proposed_output_tokens").and_then(Value::as_u64);
+            let decision = crate::context_transform::transform_context(
+                &request,
+                proposed_output,
+                proposed_output_tokens,
+            )?;
+            let receipt = decision.receipt;
+            let transformed = matches!(receipt.outcome.as_str(), "transformed" | "degraded");
+            serde_json::to_string(&json!({
+                "valid": true,
+                "accepted": true,
+                "transformed": transformed,
+                "outcome": receipt.outcome,
+                "actual_lossiness": receipt.actual_lossiness,
+                "output_message_count": decision.output_messages.len(),
+                "receipt": receipt,
+                "schema_version": crate::context_transform::CONTEXT_TRANSFORMER_SCHEMA_VERSION,
+            }))
+            .map_err(|e| e.to_string())
+        })(),
         "perseus_vault_promote" => tools::handle_promote(db, args),
         "perseus_vault_demote" => tools::handle_demote(db, args),
         "perseus_vault_beliefs" => beliefs::handle_beliefs(db, args),
@@ -8524,7 +8561,7 @@ mod tests {
         );
         assert_eq!(
             registry_names.len(),
-            168,            "update public metadata when adding a tool"
+            169,            "update public metadata when adding a tool"
         );
 
         let canonical = advertised_names();
@@ -8965,6 +9002,59 @@ mod tests {
         assert_eq!(value["valid"], true, "{response}");
         assert_eq!(value["replay_match"], true, "{response}");
         assert!(advertised_names().contains(&"perseus_vault_stage_trace_validate".to_string()));
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn context_transform_tool_returns_hash_only_outcome_and_is_advertised() {
+        let db_path = std::env::temp_dir().join(format!(
+            "perseus-context-transform-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let db = Database::open(db_path.to_str().expect("temp db path")).expect("open temp db");
+        let input = vec![crate::context_transform::ContextMessage::new(
+            "m-1",
+            0,
+            "assistant_prose",
+            json!({"role": "assistant", "content": "MCP_RAW_SENTINEL"}),
+        )];
+        let request = crate::context_transform::ContextTransformRequest::new(
+            "openai",
+            crate::context_transform::SUPPORTED_OPENAI_REQUEST_FORMAT,
+            crate::context_transform::TransformerDescriptor::new("fixture", "1"),
+            vec![crate::context_transform::TransformStage::new(
+                "distill",
+                "1",
+                true,
+                "trusted",
+                None,
+            )],
+            "lossy_opt_in",
+            input.clone(),
+        )
+        .with_input_tokens(Some(20));
+        let mut proposed = input;
+        proposed[0].message["content"] = json!("short");
+        let response = call_tool(
+            "perseus_vault_context_transform_validate",
+            &db,
+            json!({
+                "request": serde_json::to_value(&request).unwrap(),
+                "proposed_output": serde_json::to_value(&proposed).unwrap(),
+                "proposed_output_tokens": 3
+            }),
+            None,
+        );
+        let value: Value = serde_json::from_str(&response).expect("structured response");
+        assert_eq!(value["valid"], true, "{response}");
+        assert_eq!(value["outcome"], "degraded", "{response}");
+        assert_eq!(value["receipt"]["actual_lossiness"], "lossy", "{response}");
+        assert_eq!(value["receipt"]["input_digest"].as_str().unwrap().len(), 64);
+        assert!(!response.contains("MCP_RAW_SENTINEL"), "raw transient body leaked: {response}");
+        assert!(!response.contains("\"message\""), "raw provider message leaked: {response}");
+        assert!(advertised_names().contains(
+            &"perseus_vault_context_transform_validate".to_string()
+        ));
         let _ = fs::remove_file(db_path);
     }
 
@@ -9833,8 +9923,8 @@ mod tests {
         let ops = filter_registry_by_view(registry.clone(), ScopeView::Ops);
         let full = filter_registry_by_view(registry.clone(), ScopeView::Full);
         assert_eq!(agent.len(), 51, "agent view count drifted — new tools must be classified");
-        assert_eq!(ops.len(), 161, "ops view count drifted — new tools must be classified");
-        assert_eq!(full.len(), 168, "full view must expose the whole registry");
+        assert_eq!(ops.len(), 162, "ops view count drifted — new tools must be classified");
+        assert_eq!(full.len(), 169, "full view must expose the whole registry");
         assert!(agent.len() < ops.len() && ops.len() < full.len());
     }
 

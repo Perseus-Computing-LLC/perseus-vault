@@ -1,0 +1,303 @@
+{
+  "contract_version": "perseus-vault-context-transformer/v1",
+  "purpose": "Deterministic synthetic contract fixture; all bodies are synthetic and must not be copied into durable receipts.",
+  "provider": "openai",
+  "request_format": "openai-chat/v1",
+  "transformer": {
+    "name": "fixture-transformer",
+    "version": "1.0.0"
+  },
+  "stages": [
+    {
+      "name": "fixture-distill",
+      "version": "0.3.7",
+      "enabled": true,
+      "trust": "untrusted",
+      "config_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    }
+  ],
+  "lossiness_policies": [
+    "passthrough",
+    "reversible",
+    "lossy_opt_in"
+  ],
+  "messages": [
+    {
+      "id": "system-001",
+      "order": 0,
+      "content_class": "system",
+      "message": {
+        "role": "system",
+        "content": "SYSTEM_POLICY_MARKER: this governed system instruction is never heuristically rewritten."
+      }
+    },
+    {
+      "id": "keystone-001",
+      "order": 1,
+      "content_class": "keystone_policy",
+      "message": {
+        "role": "system",
+        "content": "KEYSTONE_POLICY_MARKER: policy and prohibition content is load-bearing."
+      }
+    },
+    {
+      "id": "authority-001",
+      "order": 2,
+      "content_class": "authority",
+      "message": {
+        "role": "system",
+        "content": "AUTHORITY_MARKER: only an explicitly governed trusted stage may transform this class, and only reversibly."
+      }
+    },
+    {
+      "id": "user-requirements-old-001",
+      "order": 3,
+      "content_class": "user_constraint",
+      "message": {
+        "role": "user",
+        "content": "Legacy user requirement context: preserve the exact acceptance constraint and do not infer missing obligations.\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy user requirement context: preserve the exact acceptance constraint and do\nLegacy\nMUST_KEEP_REQUIREMENT_A\nMUST_KEEP_REQUIREMENT_B\n"
+      }
+    },
+    {
+      "id": "assistant-prose-001",
+      "order": 4,
+      "content_class": "assistant_prose",
+      "message": {
+        "role": "assistant",
+        "content": "Assistant prose is explanatory and may be shortened only when the contract records its loss and recovery policy.\nAssistant prose is explanatory and may be shortened only when the contract recor\nAssistant prose is explanatory and may be shortened only when the contract recor\nAssistant prose is explanatory and may be shortened only when the contract recor\nAssistant prose is explanatory and may be shortened only when the contract recor\nAssistant prose is explanatory and may be shortened only when the contract recor\nAssistant prose is explanatory and may be shortened only when the contract recor\nAssistant prose is explanatory and may be shortened only when the contract recor\nAssistant prose is explanatory and may be shortened only when the contract recor\nAssistant prose is explanatory and may be shortened only when the contract recor\nAssistant prose is explanatory and may be shortened only when the contract recor\nAssistant prose is explanatory and may be shortened only when the contract recor\nAssistant prose is explanatory and may be shortened only when the contract recor\nAssistant prose is explanatory and may be shortened only when the contract recor\nAssistant prose is explanatory and may be shortened only when the contract recor\nAssistant prose is explanatory and may be shortened only when the contract recor\nAssistant prose is explanatory and may be shortened only when the contract recor\nAssistant prose is explanatory and may be shortened only when the contract recor\nAssistant prose is explanatory and may be shortened only when the contract recor\nAssistant prose is explanatory and may be shortened only when the contract recor\nAssistant prose is explanatory and may be shortened only when the contract recor\nAssistant prose is explanatory and may be shortened only when the contract recor\nAssistant prose is explanatory and may be shortened only when the contract recor\nAssistant prose is explanatory and may be shortened only when the contract recor\nAssistant prose is explanatory and may be shortened only when the contract recor\nAssistant prose is explanatory and may be shortened only when the contract recor\nAssistant prose is explanatory and may b\nASSISTANT_PROSE_TAIL\n"
+      }
+    },
+    {
+      "id": "tool-use-001",
+      "order": 5,
+      "content_class": "tool_use",
+      "message": {
+        "role": "assistant",
+        "content": null,
+        "tool_calls": [
+          {
+            "id": "call-critical-001",
+            "type": "function",
+            "function": {
+              "name": "inspect_records",
+              "arguments": "{\"limit\": 240, \"include_tail\": true}"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "id": "tool-result-001",
+      "order": 6,
+      "content_class": "tool_result",
+      "message": {
+        "role": "tool",
+        "tool_call_id": "call-critical-001",
+        "content": "{\n  \"records\": [\n    {\n      \"id\": \"record-0000\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0001\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0002\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0003\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0004\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0005\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0006\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0007\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0008\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0009\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0010\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0011\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0012\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0013\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0014\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0015\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0016\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0017\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0018\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0019\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0020\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0021\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0022\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0023\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0024\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0025\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0026\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0027\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0028\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0029\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0030\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0031\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0032\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0033\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0034\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0035\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0036\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0037\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0038\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0039\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0040\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0041\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0042\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0043\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0044\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0045\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0046\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0047\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0048\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0049\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0050\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0051\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0052\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0053\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0054\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0055\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0056\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0057\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0058\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0059\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0060\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0061\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0062\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0063\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0064\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0065\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0066\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0067\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0068\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0069\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0070\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0071\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0072\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0073\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0074\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0075\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0076\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0077\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0078\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0079\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0080\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0081\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0082\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0083\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0084\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0085\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0086\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0087\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0088\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0089\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0090\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0091\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0092\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0093\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0094\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0095\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0096\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0097\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0098\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0099\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0100\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0101\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0102\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0103\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0104\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0105\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0106\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0107\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0108\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0109\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0110\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0111\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0112\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0113\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0114\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0115\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0116\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0117\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0118\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0119\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0120\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0121\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0122\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0123\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0124\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0125\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0126\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0127\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0128\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0129\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0130\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0131\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0132\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0133\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0134\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0135\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0136\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0137\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0138\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0139\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0140\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0141\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0142\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0143\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0144\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0145\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0146\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0147\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0148\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0149\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0150\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0151\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0152\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0153\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0154\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0155\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0156\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0157\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0158\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0159\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0160\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0161\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0162\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0163\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0164\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0165\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0166\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0167\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0168\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0169\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0170\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0171\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0172\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0173\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0174\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0175\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0176\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0177\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0178\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0179\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0180\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0181\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0182\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0183\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0184\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0185\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0186\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0187\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0188\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0189\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0190\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0191\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0192\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0193\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0194\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0195\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0196\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0197\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0198\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0199\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0200\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0201\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0202\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0203\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0204\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0205\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0206\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0207\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0208\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0209\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0210\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0211\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0212\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0213\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0214\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0215\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0216\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0217\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0218\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0219\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0220\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0221\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0222\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0223\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0224\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0225\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0226\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0227\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0228\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0229\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0230\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0231\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0232\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0233\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0234\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0235\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0236\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0237\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0238\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    },\n    {\n      \"id\": \"record-0239\",\n      \"value\": \"fixture record that is safe synthetic content\"\n    }\n  ],\n  \"metadata\": {\n    \"source\": \"synthetic-context-transformer-fixture\",\n    \"count\": 240\n  },\n  \"critical_tail\": \"MUST_KEEP_TOOL_TAIL\"\n}"
+      }
+    },
+    {
+      "id": "source-code-tail-001",
+      "order": 7,
+      "content_class": "source_code",
+      "message": {
+        "role": "user",
+        "content": "fn ordinary_source_line() { /* source body */ }\nfn ordinary_source_line() { /* source body */ }\n\nfn ordinary_source_line() { /* source body */ }\n\nfn ordinary_source_line() { /* source body */ }\n\nfn ordinary_source_line() { /* source body */ }\n\nfn ordinary_source_line() { /* source body */ }\n\nfn ordinary_source_line() { /* source body */ }\n\nfn ordinary_source_line() { /* source body */ }\n\nfn ordinary_source_line() { /* source body */ }\n\nfn ordinary_source_line() { /* source body */ }\n\nfn ordinary_source_line() { /* source body */ }\n\nfn ordinary_source_line() { /* source body */ }\n\nfn ordinary_source_line() { /* source body */ }\n\nfn ordinary_source_line() { /* source body */ }\n\nfn ordinary_source_line() { /* source body */ }\n\nfn ordinary_source_line() { /* source body */ }\n\nfn ordinary_source_line() { /* source body */ }\n\nfn ordinary_source_line() { /* source body */ }\n\nfn ordinary_source_line() { /* source body */ }\n\nfn ordinary_source_line() { /* source body */ }\n\nfn ordinary_source_line() { /* source body */ }\n\nfn ordinary_source_line() { /* source body */ }\n\nfn ordinary_source_line() { /* source body */ }\n\nfn ordinary_source_line() { /* source body */ }\n\nfn ordinary_source_line() { /* source body */ }\n\nfn ordinary_source_line() { /* source body */ }\n\nfn ordinary_source_line() { /* source body */ }\n\nfn ordinary_source_line() { /* source body */ }\n\nfn ordinary_source_line() { /* source body */ }\n\nfn ordinary_source_line() { /* source body */ }\n\nfn ordinary_source_line() { /* source body */ }\n\nfn ordinary_source_line() { /* source body */ }\n\nfn ordinary_source_line() { /* source body */ }\n\nfn ordinary_source_line() { /* source body */ }\n\nfn ordinary_source_line() { /* source body */ }\n\nfn ordinary_source_line() { /* source body */ }\n\nfn ordinary_source_line() { /* source body */ }\n\nfn ordinary_source_line() { /* source body */ }\n\nfn ordinary_source_line() { /* source body */ }\n\nfn ordinary_source_line() { /* source body */ }\n\nfn ordinary_source_line() { /* source body */ }\n\nfn ordinary_source_line() { /* source body */ }\n\nfn ordinary_source_line() { /* source body */ }\n\nfn ordinary_source_line() { /* source body */ }\n\nfn ordinary_source_line() { /* source body */ }\n\nfn ordinary_source_line() { /* source body */ }\n\nfn ordinary_source_line() { /* source body */ }\n\nfn ordinary_source_line() { /* source body */ }\n\nfn ordinary_source_line() { /* source body */ }\n\nfn ordinary_source_line() { /* source body */ }\n\nfn ordinary_source_line() { /* source body */ }\n\nfn ordinary_source_line() { /* source body */ }\n\nfn ordinary_source_line() { /* source body */ }\n\nfn ordinary_source_line() { /* source body */ }\n\nfn ordinary_source_line() { /* source body */ }\n\nfn ordinary_source_line() { /* source body */ }\n\nfn ordinary_source_line() { /* source body */ }\n\nfn ordinary_source_line() { /* source body */ }\n\nfn ordinary_source_line() { /* source body */ }\n\nfn ordinary_source_line() { /* source body */ }\n\nfn ordinary_source_line() { /* source body */ }\n\nfn ordinary_source_line() { /* source body */ }\n\nfn ordinary_source_line() { /* source body */ }\n\nfn ordinary_source_line() { /* source body */ }\n\nfn ordinary_source_line() { /* source body */ }\n\nfn ordinary_source_line() { /* source body */ }\n\nfn ordinary_source_line() { /* source body */ }\n\nfn ordinary_source_line() { /* source body */ }\n\nfn ordinary_source_line() { /* source body */ }\n\nfn ordinary_source_line() { /* source body */ }\n\nfn ordinary_source_line() { /* source body */ }\n\nfn ordinary_source_line() { /* source body */ }\n\nfn ordinary_source_line() { /* source body */ }\n\nfn ordinary_source_line() { /* source body */ }\n\nfn ordinary_source_line() { /* source body */ }\n\nfn ordinary_source_line() { /* source body */ }\n\nfn ordinary_source_line() { /* source body */ }\n\nfn ordinary_source_line() { /* source body */ }\n\nfn ordinary_source_line() { /* source body */ }\n\nfn ordinary_source_line() { /* source body */ }\n\nfn ordinary_source_line() { /* source body */ }\n\nfn ordinary_source_line() { /* source body */ }\n\nfn ordinary_source_line() { /* source body */ }\n\nfn ordinary_source_line() { /* source body */ }\n\nfn ordinary_source_line() \nfn critical_tail_marker() { /* MUST_KEEP_SOURCE_TAIL */ }\n"
+      }
+    },
+    {
+      "id": "fenced-content-001",
+      "order": 8,
+      "content_class": "fenced",
+      "message": {
+        "role": "user",
+        "content": "```rust\nfn fenced_example() { /* fenced content */ }\n```rust\nfn fenced_example() { /* fenced content */ }\n\n```rust\nfn fenced_example() { /* fenced content */ }\n\n```rust\nfn fenced_example() { /* fenced content */ }\n\n```rust\nfn fenced_example() { /* fenced content */ }\n\n```rust\nfn fenced_example() { /* fenced content */ }\n\n```rust\nfn fenced_example() { /* fenced content */ }\n\n```rust\nfn fenced_example() { /* fenced content */ }\n\n```rust\nfn fenced_example() { /* fenced content */ }\n\n```rust\nfn fenced_example() { /* fenced content */ }\n\n```rust\nfn fenced_example() { /* fenced content */ }\n\n```rust\nfn fenced_example() { /* fenced content */ }\n\n```rust\nfn fenced_example() { /* fenced content */ }\n\n```rust\nfn fenced_example() { /* fenced content */ }\n\n```rust\nfn fenced_example() { /* fenced content */ }\n\n```rust\nfn fenced_example() { /* fenced content */ }\n\n```rust\nfn fenced_example() { /* fenced content */ }\n\n```rust\nfn fenced_example() { /* fenced content */ }\n\n```rust\nfn fenced_example() { /* fenced content */ }\n\n```rust\nfn fenced_example() { /* fenced content */ }\n\n```rust\nfn fenced_example() { /* fenced content */ }\n\n```rust\nfn fenced_example() { /* fenced content */ }\n\n```rust\nfn fenced_example() { /* fenced content */ }\n\n```rust\nfn fenced_example() { /* fenced content */ }\n\n```rust\nfn fenced_example() { /* fenced content */ }\n\n```rust\nfn fenced_example() { /* fenced content */ }\n\n```rust\nfn fenced_example() { /* fenced content */ }\n\n```rust\nfn fenced_example() { /* fenced content */ }\n\n```rust\nfn fenced_example() { /* fenced content */ }\n\n```rust\nfn fenced_example() { /* fenced content */ }\n\n```rust\nfn fenced_example() { /* fenced content */ }\n\n```rust\nfn fenced_example() { /* fenced content */ }\n\n```rust\nfn fenced_example() { /* fenced con\n// MUST_KEEP_FENCED_TAIL\n```\n"
+      }
+    },
+    {
+      "id": "multimodal-openai-001",
+      "order": 9,
+      "content_class": "multimodal",
+      "message": {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "MULTIMODAL_TEXT_MARKER"
+          },
+          {
+            "type": "image_url",
+            "image_url": {
+              "url": "https://example.invalid/synthetic-fixture.png"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "id": "unknown-content-001",
+      "order": 10,
+      "content_class": "unknown",
+      "message": {
+        "role": "user",
+        "content": "UNKNOWN_CONTENT_MUST_PASSTHROUGH"
+      }
+    }
+  ],
+  "required_content_classes": [
+    "system",
+    "keystone_policy",
+    "authority",
+    "user_constraint",
+    "assistant_prose",
+    "tool_use",
+    "tool_result",
+    "source_code",
+    "fenced",
+    "multimodal",
+    "unknown"
+  ],
+  "cases": [
+    {
+      "id": "role-aware-user-constraints",
+      "operation": "transform",
+      "policy": "reversible",
+      "stage_trust": "untrusted",
+      "expected_outcome": "rejected",
+      "expected_output": "original",
+      "assertions": [
+        "user_constraint_markers_retained",
+        "system_policy_retained",
+        "candidate_digest_only"
+      ]
+    },
+    {
+      "id": "tool-result-critical-tail",
+      "operation": "transform",
+      "policy": "reversible",
+      "stage_trust": "trusted",
+      "expected_outcome": "rejected",
+      "expected_output": "original",
+      "assertions": [
+        "tool_pair_shape_valid",
+        "critical_tail_requires_recovery",
+        "loss_not_reversible"
+      ]
+    },
+    {
+      "id": "explicit-lossy-opt-in",
+      "operation": "transform",
+      "policy": "lossy_opt_in",
+      "stage_trust": "trusted",
+      "expected_outcome": "degraded",
+      "expected_output": "candidate",
+      "assertions": [
+        "actual_lossiness_is_lossy",
+        "tool_pair_shape_checked",
+        "critical_tail_not_claimed_recovered"
+      ]
+    },
+    {
+      "id": "reversible-replay",
+      "operation": "transform",
+      "policy": "reversible",
+      "stage_trust": "trusted",
+      "expected_outcome": "transformed",
+      "expected_output": "candidate",
+      "assertions": [
+        "input_output_digests",
+        "token_counts",
+        "stage_config",
+        "membership_order",
+        "bounded_original_reference"
+      ]
+    },
+    {
+      "id": "broken-tool-pair",
+      "operation": "transform",
+      "policy": "lossy_opt_in",
+      "stage_trust": "trusted",
+      "expected_outcome": "rejected",
+      "expected_output": "original",
+      "assertions": [
+        "provider_shape_failure_separate_from_content_recall"
+      ]
+    },
+    {
+      "id": "unknown-content-default",
+      "operation": "transform",
+      "policy": "lossy_opt_in",
+      "stage_trust": "trusted",
+      "expected_outcome": "passthrough",
+      "expected_output": "original",
+      "assertions": [
+        "unknown_class_passthrough"
+      ]
+    },
+    {
+      "id": "multimodal-openai-shape",
+      "operation": "validate_shape",
+      "policy": "passthrough",
+      "stage_trust": "untrusted",
+      "expected_outcome": "passthrough",
+      "expected_output": "original",
+      "assertions": [
+        "content_array_accepted",
+        "image_part_not_dropped"
+      ]
+    },
+    {
+      "id": "backend-unavailable",
+      "operation": "unavailable",
+      "policy": "reversible",
+      "stage_trust": "trusted",
+      "expected_outcome": "unavailable",
+      "expected_output": "original",
+      "assertions": [
+        "unavailable_not_empty_success"
+      ]
+    }
+  ],
+  "report_requirements": {
+    "required_fields": [
+      "schema_version",
+      "provider",
+      "request_format",
+      "transformer",
+      "stages",
+      "lossiness_policy",
+      "outcome",
+      "token_counts",
+      "input_digest",
+      "output_digest",
+      "changed_content_classes",
+      "original_retained",
+      "provider_shape"
+    ],
+    "outcomes": [
+      "passthrough",
+      "transformed",
+      "degraded",
+      "rejected",
+      "unavailable"
+    ],
+    "actual_lossiness": [
+      "none",
+      "reversible",
+      "lossy"
+    ],
+    "forbidden_receipt_keys": [
+      "message",
+      "messages",
+      "content",
+      "body",
+      "body_json",
+      "prompt",
+      "query",
+      "tool_arguments",
+      "credentials",
+      "secret",
+      "token"
+    ]
+  }
+}

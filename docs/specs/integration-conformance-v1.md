@@ -23,6 +23,8 @@ python scripts/validate_integration_conformance.py \
 
 ## Required behavior
 
+Adapters may compose this contract with the governed context-serving boundary described in [`context-transformer-contract-v1.md`](context-transformer-contract-v1.md); it adds provenance for a provider projection and does not replace this adapter contract.
+
 Adapters must distinguish:
 
 - an empty, valid recall from an unavailable or failed backend;
