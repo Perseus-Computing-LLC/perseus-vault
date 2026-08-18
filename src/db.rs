@@ -9567,7 +9567,7 @@ impl Database {
         // write path only ever paid up to 256 full-body string compares for a
         // guaranteed miss. Gated on the content-changed signal so identical
         // re-asserts don't even enqueue.
-        if should_embed && self.embedding_config.enabled {
+        if should_embed && self.embedding_config.enabled && entity.status != "proposed" {
             let semantic_body = Self::semantic_body_text(&entity.body_json);
             self.enqueue_auto_embed(&id, &semantic_body);
         }
