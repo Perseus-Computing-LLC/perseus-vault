@@ -277,305 +277,309 @@ SCHEMAS = json.loads(r"""[
   "title": "Get Context Block"
  },
  {
-  "name": "perseus_vault_recall",
-  "description": "Search entities with FTS5 keyword search. Words are OR'd together. Returns entities sorted by relevance with expanded content/summary fields at top level. Use this to find previously stored facts, decisions, or architecture notes. When encryption is enabled, body_json is decrypted transparently.",
-  "inputSchema": {
-   "type": "object",
-   "properties": {
-    "query": {
-     "type": "string",
-     "description": "Search query — words are OR'd together for broad recall. An EMPTY string (\"\") is the match-all / enumeration path: it drops the keyword predicate and returns every entity in scope (respecting category/type/limit/offset), so it is the way to 'list all' a category. Wildcards are NOT globs: \"*\" is a literal FTS5 term and matches nothing — pass \"\" to enumerate, not \"*\"."
-    },
-    "category": {
-     "type": "string",
-     "description": "Filter by category, e.g. 'decision' or 'architecture'"
-    },
-    "type": {
-     "type": "string",
-     "description": "Filter by entity type, e.g. 'insight' or 'reference'"
-    },
-    "limit": {
-     "type": "integer",
-     "default": 10,
-     "description": "Maximum number of results to return (max 1000)"
-    },
-    "offset": {
-     "type": "integer",
-     "default": 0,
-     "description": "Number of results to skip for pagination"
-    },
-    "min_decay": {
-     "type": "number",
-     "default": 0.0,
-     "description": "Minimum decay score threshold 0.0–1.0 — higher values return fresher results"
-    },
-    "topic_path": {
-     "type": "string",
-     "description": "Filter by topic path prefix, e.g. 'architecture/'"
-    },
-    "mode": {
-     "type": "string",
-     "default": "fts5",
-     "description": "Search mode: 'fts5' (keyword), 'dense' (vector), 'hybrid' (fused via RRF), or 'fused' (TEMPR-style multi-strategy: fts5 + dense + graph + temporal with weighted RRF, token-budget truncation, and a full fused_trace, #883)",
-     "enum": [
-      "fts5",
-      "dense",
-      "hybrid",
-      "fused"
-     ]
-    },
-    "strategies": {
-     "type": "array",
-     "items": {
-      "type": "string",
-      "enum": [
-       "fts5",
-       "dense",
-       "graph",
-       "temporal"
-      ]
-     },
-     "description": "Fused mode only: strategies to engage (2-4). Omit = all four. Unknown names are rejected."
-    },
-    "max_tokens": {
-     "type": "integer",
-     "default": 0,
-     "description": "Fused mode only: token-budget truncation (estimated tokens = chars/4 per body). 0 = derive from depth_budget (mid = 4096)."
-    },
-    "depth_budget": {
-     "type": "string",
-     "enum": [
-      "low",
-      "mid",
-      "high"
-     ],
-     "description": "Fused mode only: depth budget -> default token caps 1024 / 4096 / 16384 when max_tokens is unset."
-    },
-    "strategy_weights": {
-     "type": "object",
-     "description": "Fused mode only: per-strategy RRF weight multipliers (default 1.0 each). Arms that find nothing contribute nothing."
-    },
-    "rerank": {
-     "type": "boolean",
-     "default": false,
-     "description": "Fused mode only: optional rerank stage over the fused pool (rank-calibrated dense + BM25 agreement signals; default off, latency-preserving)."
-    },
-    "query_time_unix_ms": {
-     "type": "integer",
-     "description": "Fused mode only: anchor instant for the temporal strategy (unix ms; default now). Accepts a number or numeric string."
-    },
-    "graph_utility_threshold": {
-     "type": "number",
-     "description": "Fused mode only (#869): graph utility gate threshold in [0,1]. The graph strategy engages only when the query's classified graph utility is >= this value. Omit = 0.5 (documented default). 0.0 disables the gate; 1.0 effectively never engages. The routing decision is always observable in fused_trace.graph_route (reason, selected, skipped_reason, gate counts)."
-    },
-    "profile": {
-     "type": "string",
-     "enum": [
-      "default",
-      "validity"
-     ],
-     "description": "#860: validity-aware recall profile. 'validity' re-ranks fused results by a deterministic validity multiplier (freshness decay, scope match, provenance class, supersession, expiry proximity) and annotates every item with its validity info; 'default'/omitted keeps relevance-only ordering. On non-fused modes the profile only enables item annotation. The weights, grade distribution, and context-invalid count are observable in fused_trace.validity."
-    },
-    "validity_annotate": {
-     "type": "boolean",
-     "default": false,
-     "description": "#860: annotate delivered items with their validity info (grade, freshness, scope match, provenance class, superseded, expiring/expired, multiplier, signals); context-invalid items are additionally flagged 'context_invalid': true. Implied by profile='validity'."
-    },
-    "include_archived": {
-     "type": "boolean",
-     "default": false,
-     "description": "Include archived (soft-deleted) entities in results"
-    },
-    "include_confidence": {
-     "type": "boolean",
-     "default": false,
-     "description": "Add a normalized confidence score (0.0-1.0) to each result, rolled up from rank, trust (verified/certainty), and decay. Presentation-only; does not change ranking."
-    },
-    "include_conflict_flags": {
-     "type": "boolean",
-     "default": false,
-     "description": "#917: add deterministic contradiction/superseded/stale flags containing only entity IDs, validity ranges, and hash-linked claim-card evidence refs. Suppressed values disclose existence only; no body value is rendered."
-    },
-    "include_conflict_flags_markdown": {
-     "type": "boolean",
-     "default": false,
-     "description": "#917: independently add an ID/hash/validity-only markdown conflict block. Does not implicitly enable structured conflict_flags."
-    },
-    "reinforce": {
-     "type": "boolean",
-     "default": false,
-     "description": "Opt-in reinforcement for mode='dense'/'hybrid': bump retrieval_count/last_accessed/decay on the returned hits so semantically-used memories resist decay and promote through layers. Default false keeps semantic recall side-effect-free and byte-deterministic over a frozen DB. No effect on mode='fts5', which already reinforces."
-    },
-    "expansion": {
+   "name": "perseus_vault_recall",
+   "description": "Search entities with FTS5 keyword search. Words are OR'd together. Returns entities sorted by relevance with expanded content/summary fields at top level. Use this to find previously stored facts, decisions, or architecture notes. When encryption is enabled, body_json is decrypted transparently.",
+   "inputSchema": {
      "type": "object",
      "properties": {
-      "enabled": {
-       "type": "boolean",
-       "default": false,
-       "description": "Enable stemming-based query expansion"
-      },
-      "n_variants": {
-       "type": "integer",
-       "default": 1,
-       "description": "Number of stemmed token variants to generate"
-      }
+       "query": {
+         "type": "string",
+         "description": "Search query — words are OR'd together for broad recall. An EMPTY string (\"\") is the match-all / enumeration path: it drops the keyword predicate and returns every entity in scope (respecting category/type/limit/offset), so it is the way to 'list all' a category. Wildcards are NOT globs: \"*\" is a literal FTS5 term and matches nothing — pass \"\" to enumerate, not \"*\"."
+       },
+       "category": {
+         "type": "string",
+         "description": "Filter by category, e.g. 'decision' or 'architecture'"
+       },
+       "type": {
+         "type": "string",
+         "description": "Filter by entity type, e.g. 'insight' or 'reference'"
+       },
+       "limit": {
+         "type": "integer",
+         "default": 10,
+         "description": "Maximum number of results to return (max 1000)"
+       },
+       "offset": {
+         "type": "integer",
+         "default": 0,
+         "description": "Number of results to skip for pagination"
+       },
+       "min_decay": {
+         "type": "number",
+         "default": 0.0,
+         "description": "Minimum decay score threshold 0.0–1.0 — higher values return fresher results"
+       },
+       "topic_path": {
+         "type": "string",
+         "description": "Filter by topic path prefix, e.g. 'architecture/'"
+       },
+       "mode": {
+         "type": "string",
+         "default": "fts5",
+         "description": "Search mode: 'fts5' (keyword), 'dense' (vector), 'hybrid' (fused via RRF), or 'fused' (TEMPR-style multi-strategy: fts5 + dense + graph + temporal with weighted RRF, token-budget truncation, and a full fused_trace, #883)",
+         "enum": [
+           "fts5",
+           "dense",
+           "hybrid",
+           "fused"
+         ]
+       },
+       "strategies": {
+         "type": "array",
+         "items": {
+           "type": "string",
+           "enum": [
+             "fts5",
+             "dense",
+             "graph",
+             "temporal"
+           ]
+         },
+         "description": "Fused mode only: strategies to engage (2-4). Omit = all four. Unknown names are rejected."
+       },
+       "max_tokens": {
+         "type": "integer",
+         "default": 0,
+         "description": "Fused mode only: token-budget truncation (estimated tokens = chars/4 per body). 0 = derive from depth_budget (mid = 4096)."
+       },
+       "depth_budget": {
+         "type": "string",
+         "enum": [
+           "low",
+           "mid",
+           "high"
+         ],
+         "description": "Fused mode only: depth budget -> default token caps 1024 / 4096 / 16384 when max_tokens is unset."
+       },
+       "strategy_weights": {
+         "type": "object",
+         "description": "Fused mode only: per-strategy RRF weight multipliers (default 1.0 each). Arms that find nothing contribute nothing."
+       },
+       "rerank": {
+         "type": "boolean",
+         "default": false,
+         "description": "Fused mode only: optional rerank stage over the fused pool (rank-calibrated dense + BM25 agreement signals; default off, latency-preserving)."
+       },
+       "query_time_unix_ms": {
+         "type": "integer",
+         "description": "Fused mode only: anchor instant for the temporal strategy (unix ms; default now). Accepts a number or numeric string."
+       },
+       "graph_utility_threshold": {
+         "type": "number",
+         "description": "Fused mode only (#869): graph utility gate threshold in [0,1]. The graph strategy engages only when the query's classified graph utility is >= this value. Omit = 0.5 (documented default). 0.0 disables the gate; 1.0 effectively never engages. The routing decision is always observable in fused_trace.graph_route (reason, selected, skipped_reason, gate counts)."
+       },
+       "profile": {
+         "type": "string",
+         "enum": [
+           "default",
+           "validity"
+         ],
+         "description": "#860: validity-aware recall profile. 'validity' re-ranks fused results by a deterministic validity multiplier (freshness decay, scope match, provenance class, supersession, expiry proximity) and annotates every item with its validity info; 'default'/omitted keeps relevance-only ordering. On non-fused modes the profile only enables item annotation. The weights, grade distribution, and context-invalid count are observable in fused_trace.validity."
+       },
+       "validity_annotate": {
+         "type": "boolean",
+         "default": false,
+         "description": "#860: annotate delivered items with their validity info (grade, freshness, scope match, provenance class, superseded, expiring/expired, multiplier, signals); context-invalid items are additionally flagged 'context_invalid': true. Implied by profile='validity'."
+       },
+       "include_archived": {
+         "type": "boolean",
+         "default": false,
+         "description": "Include archived (soft-deleted) entities in results"
+       },
+       "include_confidence": {
+         "type": "boolean",
+         "default": false,
+         "description": "Add a normalized confidence score (0.0-1.0) to each result, rolled up from rank, trust (verified/certainty), and decay. Presentation-only; does not change ranking."
+       },
+       "include_conflict_flags": {
+         "type": "boolean",
+         "default": false,
+         "description": "#917: add deterministic contradiction/superseded/stale flags containing only entity IDs, validity ranges, and hash-linked claim-card evidence refs. Suppressed values disclose existence only; no body value is rendered."
+       },
+       "include_conflict_flags_markdown": {
+         "type": "boolean",
+         "default": false,
+         "description": "#917: independently add an ID/hash/validity-only markdown conflict block. Does not implicitly enable structured conflict_flags."
+       },
+       "reinforce": {
+         "type": "boolean",
+         "default": false,
+         "description": "Opt-in reinforcement for mode='dense'/'hybrid': bump retrieval_count/last_accessed/decay on the returned hits so semantically-used memories resist decay and promote through layers. Default false keeps semantic recall side-effect-free and byte-deterministic over a frozen DB. No effect on mode='fts5', which already reinforces."
+       },
+       "expansion": {
+         "type": "object",
+         "properties": {
+           "enabled": {
+             "type": "boolean",
+             "default": false,
+             "description": "Enable stemming-based query expansion"
+           },
+           "n_variants": {
+             "type": "integer",
+             "default": 1,
+             "description": "Number of stemmed token variants to generate"
+           }
+         },
+         "description": "Configuration for FTS5 query expansion using Porter stemming"
+       },
+       "preview_cap": {
+         "type": "integer",
+         "description": "If set, truncate body_json at N chars and append drill-down footer. Use perseus_vault_get_entity to read full body."
+       },
+       "content_weight": {
+         "type": "number",
+         "minimum": 0,
+         "maximum": 1,
+         "default": 0,
+         "description": "Additive boost for content witness — rewards entities whose body text literally contains query terms. Damped by body length. Never penalizes."
+       },
+       "trust_weight": {
+         "type": "number",
+         "minimum": 0,
+         "maximum": 1,
+         "default": 0.15,
+         "description": "Additive boost for provenance/trust (default 0.15, on by default) — verified sources rank above unverified AI drafts on the same topic. Verified entities get the full boost; unverified ones are scaled by certainty. Set 0 to disable. Never penalizes."
+       },
+       "diversity_halving": {
+         "type": "number",
+         "minimum": 0,
+         "maximum": 1,
+         "default": 1,
+         "description": "Per-keyword diversity quota factor (1.0=disabled). Each distinct matched keyword gets ceil(N x halving^n) slots — first keyword N, second N/2, etc."
+       },
+       "recency_half_life_secs": {
+         "type": "number",
+         "minimum": 0,
+         "description": "Time-aware ranking for mode='hybrid' (default off). When set, each fused result's score is multiplied by 0.5^(age / this), where age is seconds since the memory was created — so a memory this many seconds old keeps half its weight and recent context outranks older but similar hits. Omit for relevance-only ranking."
+       },
+       "workspace_hash": {
+         "type": "string",
+         "description": "Workspace scope filter (v1.2.0). When set, only entities with a matching workspace_hash are returned. Omit for no workspace filtering."
+       },
+       "requesting_agent_id": {
+         "type": "string",
+         "description": "Transport-stamped requester identity used for private/fleet visibility enforcement."
+       },
+       "scope_weight": {
+         "type": "number",
+         "minimum": 0,
+         "maximum": 1,
+         "description": "#485: scope as a ranking multiplier instead of a hard filter. Requires workspace_hash. Widens the workspace filter to also include GLOBAL (workspace_hash='') memories, weighted by this factor in the ranking (hybrid/dense scores multiplied; keyword mode returns current-scope hits first) — current-workspace memories outrank equally-relevant global ones, but a strong global memory still surfaces. Never exposes other workspaces' memories. Omit for the strict filter (unchanged default)."
+       },
+       "agent_id": {
+         "type": "string",
+         "description": "Agent identity filter (v1.2.0). When set, only entities with a matching agent_id are returned. Omit for no agent filtering."
+       },
+       "epistemic_state": {
+         "type": "string",
+         "enum": [
+           "candidate",
+           "verified",
+           "corroborated",
+           "rejected",
+           "defensively_recalled"
+         ],
+         "description": "#880: epistemic trust-axis filter. When set, only entities in the requested trust state are returned — 'candidate' surfaces useful-but-unverified records, 'verified'/'corroborated' restrict to established fact, 'rejected' shows reviewed-and-refused records. Omit for no trust filtering (default)."
+       },
+       "retrieval_profile": {
+         "type": "string",
+         "enum": [
+           "personal",
+           "agent",
+           "shared"
+         ],
+         "description": "#784 serving posture. personal returns preference/personal classes; agent returns convention/correction/keystone classes; shared (default) returns non-personal memory in the requested workspace. Applied after visibility filtering."
+       },
+       "layer": {
+         "type": "string",
+         "description": "Filter by memory layer (world, episodic, semantic)."
+       },
+       "ref_type": {
+         "type": "string",
+         "description": "#728: post-filter hits to entities whose body external_refs carry this ref_type (exact match, e.g. 'repo', 'pull_request', 'jira_key')."
+       },
+       "ref_value": {
+         "type": "string",
+         "description": "#728: post-filter hits to entities whose body external_refs carry this ref_value. Matches exactly or as a hierarchical '/' prefix ('github:Org' matches 'github:Org/repo')."
+       },
+       "deadline_ms": {
+         "type": "integer",
+         "description": "#864: bounded recall. When set, the recall is timed; if it exceeds this many ms the response outcome.status is 'timeout' so callers know the result set may be incomplete. Results are still returned in full."
+       },
+       "include_outcome": {
+         "type": "boolean",
+         "default": false,
+         "description": "#864/#873/#887: always attach the explicit 'outcome' block (status, backend health, abstention, reason). By default it is attached only when recall was degraded/partial/timeout/empty/unavailable/stale, so nominal responses stay byte-identical."
+       },
+       "as_of_unix_ms": {
+         "type": "integer",
+         "description": "#472 Temporal RAG: transaction-time instant (unix ms). Reconstruct semantic recall AS BELIEVED at this past instant — each hit's body is the version that was live at as_of_unix_ms; corrections recorded later do not leak in. Combine with valid_at for the full bi-temporal cell. Hits are stamped with is_live_version / recorded_at_unix_ms / valid_from_unix_ms / valid_to_unix_ms. Omit for today's live view. (v1: candidate generation is over the live index, so a fact fully deleted since that instant will not surface.)"
+       },
+       "valid_at": {
+         "type": "integer",
+         "description": "Valid-time instant (#363/#472, unix ms): reconstruct recall to the world-version whose application-time period [valid_from, valid_to) contains this instant — 'what was true at time T', per current (or as_of) knowledge. Rebuilds the point-in-time body from history (not just a live-row narrow) and returns hits stamped with is_live_version / recorded_at_unix_ms / valid_from/to. Combine with as_of_unix_ms for the full bi-temporal cell."
+       },
+       "valid_from_unix_ms": {
+         "type": "integer",
+         "description": "Valid-time period filter start (#363, unix ms). Pair with valid_to_unix_ms and valid_op; ignored when valid_at is set. Omit for unbounded start."
+       },
+       "valid_to_unix_ms": {
+         "type": "integer",
+         "description": "Valid-time period filter end (#363, unix ms, exclusive). Omit for unbounded end."
+       },
+       "valid_op": {
+         "type": "string",
+         "default": "overlaps",
+         "enum": [
+           "overlaps",
+           "contains"
+         ],
+         "description": "SQL:2011 period predicate for the valid-time period filter (#363): 'overlaps' (fact's valid period shares at least one instant with the queried period) or 'contains' (fact's valid period contains the whole queried period)."
+       }
      },
-     "description": "Configuration for FTS5 query expansion using Porter stemming"
-    },
-    "preview_cap": {
-     "type": "integer",
-     "description": "If set, truncate body_json at N chars and append drill-down footer. Use perseus_vault_get_entity to read full body."
-    },
-    "content_weight": {
-     "type": "number",
-     "minimum": 0,
-     "maximum": 1,
-     "default": 0,
-     "description": "Additive boost for content witness — rewards entities whose body text literally contains query terms. Damped by body length. Never penalizes."
-    },
-    "trust_weight": {
-     "type": "number",
-     "minimum": 0,
-     "maximum": 1,
-     "default": 0.15,
-     "description": "Additive boost for provenance/trust (default 0.15, on by default) — verified sources rank above unverified AI drafts on the same topic. Verified entities get the full boost; unverified ones are scaled by certainty. Set 0 to disable. Never penalizes."
-    },
-    "diversity_halving": {
-     "type": "number",
-     "minimum": 0,
-     "maximum": 1,
-     "default": 1,
-     "description": "Per-keyword diversity quota factor (1.0=disabled). Each distinct matched keyword gets ceil(N x halving^n) slots — first keyword N, second N/2, etc."
-    },
-    "recency_half_life_secs": {
-     "type": "number",
-     "minimum": 0,
-     "description": "Time-aware ranking for mode='hybrid' (default off). When set, each fused result's score is multiplied by 0.5^(age / this), where age is seconds since the memory was created — so a memory this many seconds old keeps half its weight and recent context outranks older but similar hits. Omit for relevance-only ranking."
-    },
-    "workspace_hash": {
-     "type": "string",
-     "description": "Workspace scope filter (v1.2.0). When set, only entities with a matching workspace_hash are returned. Omit for no workspace filtering."
-    },
-    "scope_weight": {
-     "type": "number",
-     "minimum": 0,
-     "maximum": 1,
-     "description": "#485: scope as a ranking multiplier instead of a hard filter. Requires workspace_hash. Widens the workspace filter to also include GLOBAL (workspace_hash='') memories, weighted by this factor in the ranking (hybrid/dense scores multiplied; keyword mode returns current-scope hits first) — current-workspace memories outrank equally-relevant global ones, but a strong global memory still surfaces. Never exposes other workspaces' memories. Omit for the strict filter (unchanged default)."
-    },
-    "agent_id": {
-     "type": "string",
-     "description": "Agent identity filter (v1.2.0). When set, only entities with a matching agent_id are returned. Omit for no agent filtering."
-    },
-    "epistemic_state": {
-     "type": "string",
-     "enum": [
-      "candidate",
-      "verified",
-      "corroborated",
-      "rejected",
-      "defensively_recalled"
-     ],
-     "description": "#880: epistemic trust-axis filter. When set, only entities in the requested trust state are returned — 'candidate' surfaces useful-but-unverified records, 'verified'/'corroborated' restrict to established fact, 'rejected' shows reviewed-and-refused records. Omit for no trust filtering (default)."
-    },
-    "retrieval_profile": {
-     "type": "string",
-     "enum": [
-      "personal",
-      "agent",
-      "shared"
-     ],
-     "description": "#784 serving posture. personal returns preference/personal classes; agent returns convention/correction/keystone classes; shared (default) returns non-personal memory in the requested workspace. Applied after visibility filtering."
-    },
-    "layer": {
-     "type": "string",
-     "description": "Filter by memory layer (world, episodic, semantic)."
-    },
-    "ref_type": {
-     "type": "string",
-     "description": "#728: post-filter hits to entities whose body external_refs carry this ref_type (exact match, e.g. 'repo', 'pull_request', 'jira_key')."
-    },
-    "ref_value": {
-     "type": "string",
-     "description": "#728: post-filter hits to entities whose body external_refs carry this ref_value. Matches exactly or as a hierarchical '/' prefix ('github:Org' matches 'github:Org/repo')."
-    },
-    "deadline_ms": {
-     "type": "integer",
-     "description": "#864: bounded recall. When set, the recall is timed; if it exceeds this many ms the response outcome.status is 'timeout' so callers know the result set may be incomplete. Results are still returned in full."
-    },
-    "include_outcome": {
-     "type": "boolean",
-     "default": false,
-     "description": "#864/#873/#887: always attach the explicit 'outcome' block (status, backend health, abstention, reason). By default it is attached only when recall was degraded/partial/timeout/empty/unavailable/stale, so nominal responses stay byte-identical."
-    },
-    "as_of_unix_ms": {
-     "type": "integer",
-     "description": "#472 Temporal RAG: transaction-time instant (unix ms). Reconstruct semantic recall AS BELIEVED at this past instant — each hit's body is the version that was live at as_of_unix_ms; corrections recorded later do not leak in. Combine with valid_at for the full bi-temporal cell. Hits are stamped with is_live_version / recorded_at_unix_ms / valid_from_unix_ms / valid_to_unix_ms. Omit for today's live view. (v1: candidate generation is over the live index, so a fact fully deleted since that instant will not surface.)"
-    },
-    "valid_at": {
-     "type": "integer",
-     "description": "Valid-time instant (#363/#472, unix ms): reconstruct recall to the world-version whose application-time period [valid_from, valid_to) contains this instant — 'what was true at time T', per current (or as_of) knowledge. Rebuilds the point-in-time body from history (not just a live-row narrow) and returns hits stamped with is_live_version / recorded_at_unix_ms / valid_from/to. Combine with as_of_unix_ms for the full bi-temporal cell."
-    },
-    "valid_from_unix_ms": {
-     "type": "integer",
-     "description": "Valid-time period filter start (#363, unix ms). Pair with valid_to_unix_ms and valid_op; ignored when valid_at is set. Omit for unbounded start."
-    },
-    "valid_to_unix_ms": {
-     "type": "integer",
-     "description": "Valid-time period filter end (#363, unix ms, exclusive). Omit for unbounded end."
-    },
-    "valid_op": {
-     "type": "string",
-     "default": "overlaps",
-     "enum": [
-      "overlaps",
-      "contains"
-     ],
-     "description": "SQL:2011 period predicate for the valid-time period filter (#363): 'overlaps' (fact's valid period shares at least one instant with the queried period) or 'contains' (fact's valid period contains the whole queried period)."
-    }
+     "required": [
+       "query"
+     ]
    },
-   "required": [
-    "query"
-   ]
-  },
-  "outputSchema": {
-   "type": "object",
-   "properties": {
-    "items": {
-     "type": "array",
-     "items": {
-      "type": "object"
-     },
-     "description": "Matching entities with expanded body_json fields at top level"
-    },
-    "total": {
-     "type": "integer",
-     "description": "Number of results returned"
-    },
-    "variants": {
-     "type": "integer",
-     "description": "Number of query variants used when expansion is enabled"
-    },
-    "conflict_flags": {
-     "type": "array",
-     "items": {
-      "type": "object"
-     },
-     "description": "#917: optional deterministic contradiction/supersession/staleness flags; IDs, validity ranges, and hash-linked evidence refs only"
-    },
-    "abstain_hint": {
-     "type": "boolean",
-     "description": "#917: true only when a high-confidence direct contradiction is present in the delivered set"
-    },
-    "conflict_flags_markdown": {
-     "type": "string",
-     "description": "#917: optional ID/hash/validity-only markdown rendering of conflict flags"
-    }
-   }
-  },
-  "annotations": {
-   "readOnlyHint": true
-  },
-  "title": "Recall Entities"
+   "outputSchema": {
+     "type": "object",
+     "properties": {
+       "items": {
+         "type": "array",
+         "items": {
+           "type": "object"
+         },
+         "description": "Matching entities with expanded body_json fields at top level"
+       },
+       "total": {
+         "type": "integer",
+         "description": "Number of results returned"
+       },
+       "variants": {
+         "type": "integer",
+         "description": "Number of query variants used when expansion is enabled"
+       },
+       "conflict_flags": {
+         "type": "array",
+         "items": {
+           "type": "object"
+         },
+         "description": "#917: optional deterministic contradiction/supersession/staleness flags; IDs, validity ranges, and hash-linked evidence refs only"
+       },
+       "abstain_hint": {
+         "type": "boolean",
+         "description": "#917: true only when a high-confidence direct contradiction is present in the delivered set"
+       },
+       "conflict_flags_markdown": {
+         "type": "string",
+         "description": "#917: optional ID/hash/validity-only markdown rendering of conflict flags"
+       }
+     }
+   },
+   "annotations": {
+     "readOnlyHint": true
+   },
+   "title": "Recall Entities"
  },
  {
   "name": "perseus_vault_recall_when",
@@ -628,57 +632,61 @@ SCHEMAS = json.loads(r"""[
   "title": "Proactive Recall by Context"
  },
  {
-  "name": "perseus_vault_semantic_search",
-  "description": "Dense-only semantic search: find entities by meaning, ranked purely by embedding similarity (no keyword fallback). On by default via the bundled in-process ONNX model — zero config, zero network. A one-tool shortcut for 'find things like this'. For fused keyword+vector results use perseus_vault_recall.",
-  "inputSchema": {
-   "type": "object",
-   "properties": {
-    "query": {
-     "type": "string",
-     "description": "Natural-language text to semantically match against stored memories"
-    },
-    "limit": {
-     "type": "integer",
-     "default": 10,
-     "description": "Maximum number of results to return"
-    },
-    "category": {
-     "type": "string",
-     "description": "Filter by category, e.g. 'decision' or 'architecture'"
-    },
-    "workspace_hash": {
-     "type": "string",
-     "description": "Workspace scope filter. When set, only entities with a matching workspace_hash are returned."
-    },
-    "agent_id": {
-     "type": "string",
-     "description": "Agent identity filter. When set, only entities with a matching agent_id are returned."
-    }
-   },
-   "required": [
-    "query"
-   ]
-  },
-  "outputSchema": {
-   "type": "object",
-   "properties": {
-    "items": {
-     "type": "array",
-     "items": {
-      "type": "object"
+   "name": "perseus_vault_semantic_search",
+   "description": "Dense-only semantic search: find entities by meaning, ranked purely by embedding similarity (no keyword fallback). On by default via the bundled in-process ONNX model — zero config, zero network. A one-tool shortcut for 'find things like this'. For fused keyword+vector results use perseus_vault_recall.",
+   "inputSchema": {
+     "type": "object",
+     "properties": {
+       "query": {
+         "type": "string",
+         "description": "Natural-language text to semantically match against stored memories"
+       },
+       "limit": {
+         "type": "integer",
+         "default": 10,
+         "description": "Maximum number of results to return"
+       },
+       "category": {
+         "type": "string",
+         "description": "Filter by category, e.g. 'decision' or 'architecture'"
+       },
+       "workspace_hash": {
+         "type": "string",
+         "description": "Workspace scope filter. When set, only entities with a matching workspace_hash are returned."
+       },
+       "agent_id": {
+         "type": "string",
+         "description": "Agent identity filter. When set, only entities with a matching agent_id are returned."
+       },
+       "requesting_agent_id": {
+         "type": "string",
+         "description": "Transport-stamped requester identity used for private/fleet visibility enforcement."
+       }
      },
-     "description": "Matching entities ranked by dense embedding similarity, with expanded body_json fields at top level"
-    },
-    "total": {
-     "type": "integer",
-     "description": "Number of results returned"
-    }
-   }
-  },
-  "annotations": {
-   "readOnlyHint": true
-  },
-  "title": "Semantic Search Entities"
+     "required": [
+       "query"
+     ]
+   },
+   "outputSchema": {
+     "type": "object",
+     "properties": {
+       "items": {
+         "type": "array",
+         "items": {
+           "type": "object"
+         },
+         "description": "Matching entities ranked by dense embedding similarity, with expanded body_json fields at top level"
+       },
+       "total": {
+         "type": "integer",
+         "description": "Number of results returned"
+       }
+     }
+   },
+   "annotations": {
+     "readOnlyHint": true
+   },
+   "title": "Semantic Search Entities"
  },
  {
   "name": "perseus_vault_stats",

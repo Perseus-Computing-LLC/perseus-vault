@@ -100,10 +100,14 @@ mod tests {
 
     fn seed() -> Fixture {
         let db = TestDatabase::new("leak-harness");
-        db.agent_upsert(AGENT_A, "tenant-a owner", 0, "fleet-a").unwrap();
-        db.agent_upsert(AGENT_B, "tenant-b attacker", 0, "fleet-b").unwrap();
-        db.agent_upsert(AGENT_C, "tenant-c bystander", 0, "fleet-c").unwrap();
-        db.agent_upsert(AGENT_ADMIN, "unscoped admin", 3, "fleet-a").unwrap();
+        db.agent_upsert(AGENT_A, "tenant-a owner", 0, "fleet-a")
+            .unwrap();
+        db.agent_upsert(AGENT_B, "tenant-b attacker", 0, "fleet-b")
+            .unwrap();
+        db.agent_upsert(AGENT_C, "tenant-c bystander", 0, "fleet-c")
+            .unwrap();
+        db.agent_upsert(AGENT_ADMIN, "unscoped admin", 3, "fleet-a")
+            .unwrap();
 
         // Hard sentinels: private pricing facts per tenant.
         let (sentinel_a, _) = db
@@ -243,7 +247,11 @@ mod tests {
             "workspace_hash": WS_B,
         }));
         let out = tools::handle_recall(&f.db, args).expect("recall ok");
-        assert_no_leak("recall(fts, cross-workspace)", &out, &[MAGIC_WA, &f.workspace_row_a]);
+        assert_no_leak(
+            "recall(fts, cross-workspace)",
+            &out,
+            &[MAGIC_WA, &f.workspace_row_a],
+        );
     }
 
     #[test]
@@ -352,9 +360,27 @@ mod tests {
         );
         let t = now + 1;
         for (name, out) in [
-            ("as_of", tools::handle_as_of(&f.db, json!({"category":"pricing","key":"acme-renewal","as_of_unix_ms": t, "requesting_agent_id": AGENT_B}))),
-            ("valid_at", tools::handle_valid_at(&f.db, json!({"category":"pricing","key":"acme-renewal","valid_at_unix_ms": t, "requesting_agent_id": AGENT_B}))),
-            ("bitemporal", tools::handle_bitemporal(&f.db, json!({"category":"pricing","key":"acme-renewal","tx_at_unix_ms": t, "valid_at_unix_ms": t, "requesting_agent_id": AGENT_B}))),
+            (
+                "as_of",
+                tools::handle_as_of(
+                    &f.db,
+                    json!({"category":"pricing","key":"acme-renewal","as_of_unix_ms": t, "requesting_agent_id": AGENT_B}),
+                ),
+            ),
+            (
+                "valid_at",
+                tools::handle_valid_at(
+                    &f.db,
+                    json!({"category":"pricing","key":"acme-renewal","valid_at_unix_ms": t, "requesting_agent_id": AGENT_B}),
+                ),
+            ),
+            (
+                "bitemporal",
+                tools::handle_bitemporal(
+                    &f.db,
+                    json!({"category":"pricing","key":"acme-renewal","tx_at_unix_ms": t, "valid_at_unix_ms": t, "requesting_agent_id": AGENT_B}),
+                ),
+            ),
         ] {
             let out = out.expect(&format!("{name} ok"));
             assert!(
@@ -428,7 +454,10 @@ mod tests {
         // The handler echoes the query context; the leak contract covers the
         // RETURNED ITEMS, so assert on the items array only.
         let parsed: serde_json::Value = serde_json::from_str(&out).expect("recall_when json");
-        let items = parsed.get("items").cloned().unwrap_or(serde_json::json!([]));
+        let items = parsed
+            .get("items")
+            .cloned()
+            .unwrap_or(serde_json::json!([]));
         assert_no_leak("recall_when", &items.to_string(), &[MAGIC_A]);
     }
 
@@ -467,23 +496,35 @@ mod tests {
             json!({"query": format!("{MAGIC_A} renewal"), "limit": 10, "workspace_hash": WS_A, "requesting_agent_id": AGENT_A}),
         )
         .expect("owner recall");
-        assert!(owner_recall.contains(MAGIC_A), "owner must see its own sentinel");
+        assert!(
+            owner_recall.contains(MAGIC_A),
+            "owner must see its own sentinel"
+        );
         let owner_get = tools::handle_get_entity(
             &f.db,
             json!({"id": f.sentinel_a, "requesting_agent_id": AGENT_A}),
         )
         .expect("owner get");
-        assert!(owner_get.contains(MAGIC_A), "owner get-by-id must return the body");
+        assert!(
+            owner_get.contains(MAGIC_A),
+            "owner get-by-id must return the body"
+        );
         // Tier-3 admin (unscoped) reads everything by design.
         let admin_get = tools::handle_get_entity(
             &f.db,
             json!({"id": f.sentinel_a, "requesting_agent_id": AGENT_ADMIN}),
         )
         .expect("admin get");
-        assert!(admin_get.contains(MAGIC_A), "tier-3 admin must read the row");
-        // Identity-less legacy callers are unchanged (unscoped path).
-        let legacy = tools::handle_get_entity(&f.db, json!({"id": f.sentinel_a})).expect("legacy get");
-        assert!(legacy.contains(MAGIC_A), "unscoped legacy caller keeps historical behavior");
+        assert!(
+            admin_get.contains(MAGIC_A),
+            "tier-3 admin must read the row"
+        );
+        // Identity-less callers fail closed; private rows are not a legacy admin path.
+        let legacy = tools::handle_get_entity(&f.db, json!({"id": f.sentinel_a}));
+        assert!(
+            legacy.is_err(),
+            "unscoped caller must not read a private row"
+        );
     }
 
     // ─────────────────────────── randomized sweep ───────────────────────
@@ -543,6 +584,9 @@ mod tests {
                 &forbidden,
             );
         }
-        assert!(probes >= 40, "sweep must exercise at least 40 adversarial probes");
+        assert!(
+            probes >= 40,
+            "sweep must exercise at least 40 adversarial probes"
+        );
     }
 }

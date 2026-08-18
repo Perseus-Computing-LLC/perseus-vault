@@ -71,7 +71,10 @@ pub fn classify(
 pub fn sever_faulty_edges(
     links: &[crate::models::MemoryLink],
     faulty: &HashSet<String>,
-) -> (Vec<crate::models::MemoryLink>, Vec<crate::models::MemoryLink>) {
+) -> (
+    Vec<crate::models::MemoryLink>,
+    Vec<crate::models::MemoryLink>,
+) {
     let mut kept = Vec::new();
     let mut removed = Vec::new();
     for l in links {
@@ -164,8 +167,10 @@ mod tests {
         // Bodies are deliberately lexically distinct: the write interference
         // gate (#874) quarantines trigram-similar writes instead of creating
         // rows, which would collapse this fixture.
-        db.remember_skip_dedup(&ent(a, "{\"fact\": \"alpha one\"}", vec![])).unwrap();
-        db.remember_skip_dedup(&ent(b, "{\"fact\": \"bravo two\"}", vec![])).unwrap();
+        db.remember_skip_dedup(&ent(a, "{\"fact\": \"alpha one\"}", vec![]))
+            .unwrap();
+        db.remember_skip_dedup(&ent(b, "{\"fact\": \"bravo two\"}", vec![]))
+            .unwrap();
         db.remember_skip_dedup(&ent(
             "mem-claim-x",
             "{\"claim\": \"combines alpha and bravo\"}",
@@ -178,11 +183,17 @@ mod tests {
             vec![link(a)],
         ))
         .unwrap();
-        db.remember_skip_dedup(&ent("mem-benign-z", "{\"claim\": \"benign untouched\"}", vec![]))
-            .unwrap();
+        db.remember_skip_dedup(&ent(
+            "mem-benign-z",
+            "{\"claim\": \"benign untouched\"}",
+            vec![],
+        ))
+        .unwrap();
 
         // Dry run writes nothing.
-        let plan = db.rollback_repair(&[a.to_string()], true, false, None).unwrap();
+        let plan = db
+            .rollback_repair(&[a.to_string()], true, false, None)
+            .unwrap();
         assert_eq!(plan["dry_run"], true);
         let conn = db.conn().unwrap();
         let n_state: i64 = conn
@@ -272,8 +283,10 @@ mod tests {
         let db = crate::db::TestDatabase::new("rollback-supersede");
         let good = "mem-v1";
         let faulty = "mem-v2";
-        db.remember_skip_dedup(&ent(good, "{\"v\": \"gamma original\"}", vec![])).unwrap();
-        db.remember_skip_dedup(&ent(faulty, "{\"v\": \"delta faulty\"}", vec![])).unwrap();
+        db.remember_skip_dedup(&ent(good, "{\"v\": \"gamma original\"}", vec![]))
+            .unwrap();
+        db.remember_skip_dedup(&ent(faulty, "{\"v\": \"delta faulty\"}", vec![]))
+            .unwrap();
         {
             let conn = db.conn().unwrap();
             conn.execute(
@@ -292,9 +305,17 @@ mod tests {
             .map(|v| v["entity_id"].as_str().unwrap())
             .collect();
         assert_eq!(preserved_ids, vec![good]);
-        let prior_good = db.get_entity_by_id_unfiltered(good).unwrap().unwrap().status.clone();
+        let prior_good = db
+            .get_entity_by_id_unfiltered(good)
+            .unwrap()
+            .unwrap()
+            .status
+            .clone();
         assert_eq!(
-            db.get_entity_by_id_unfiltered(good).unwrap().unwrap().status,
+            db.get_entity_by_id_unfiltered(good)
+                .unwrap()
+                .unwrap()
+                .status,
             prior_good
         );
         let rid = report["repair_id"].as_str().unwrap().to_string();

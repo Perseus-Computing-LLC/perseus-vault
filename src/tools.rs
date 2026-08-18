@@ -2650,9 +2650,7 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
     // with the surviving set. A no-op for unscoped requesters (empty id → tier
     // 3) and for the default `workspace`/`tenant`/'' visibility — so existing
     // single-agent callers and data are unaffected.
-    if let Some(req) = a.requesting_agent_id.as_deref().filter(|s| !s.is_empty()) {
-        entities.retain(|e| db.can_read(req, &e.visibility, &e.agent_id));
-    }
+    entities.retain(|e| requester_can_read(db, a.requesting_agent_id.as_deref(), e));
 
     // #784: profile-specific serving filter. This is additive to visibility:
     // profile choice can only narrow results and never exposes another scope.
@@ -3152,9 +3150,7 @@ pub fn handle_recall_batch(db: &Database, args: Value) -> Result<String, String>
         last_overturn = overturn;
     }
 
-    if let Some(requester) = requester.as_deref() {
-        fused.retain(|(entity, _)| db.can_read(requester, &entity.visibility, &entity.agent_id));
-    }
+    fused.retain(|(entity, _)| requester_can_read(db, requester.as_deref(), entity));
     let mut items_expanded: Vec<serde_json::Value> = Vec::new();
     let entities_only: Vec<Entity> = fused.iter().map(|(e, _)| e.clone()).collect();
     for (entity, _score) in &fused {
@@ -3248,9 +3244,9 @@ pub fn handle_semantic_search(db: &Database, args: Value) -> Result<String, Stri
     let mut entities = db
         .recall(&params)
         .map_err(|e| format!("Semantic search failed: {}", e))?;
-    if let Some(requester) = a.requesting_agent_id.as_deref().filter(|id| !id.is_empty()) {
-        entities.retain(|entity| db.can_read(requester, &entity.visibility, &entity.agent_id));
-    }
+    entities = db
+        .filter_for_requester(entities, a.requesting_agent_id.as_deref())
+        .map_err(|e| format!("Semantic visibility filtering failed: {e}"))?;
 
     let items_expanded: Vec<serde_json::Value> =
         entities.iter().map(|e| e.to_json_expanded()).collect();
@@ -3475,9 +3471,11 @@ fn requester_can_read(
     requester: Option<&str>,
     entity: &crate::models::Entity,
 ) -> bool {
-    match requester {
+    match requester.filter(|req| !req.trim().is_empty()) {
         Some(req) => db.can_read(req, &entity.visibility, &entity.agent_id),
-        None => true,
+        // Anonymous public transports may serve shared/default rows, but must
+        // never become an implicit admin for requester-scoped visibility.
+        None => !matches!(entity.visibility.as_str(), "private" | "fleet"),
     }
 }
 
@@ -3503,9 +3501,7 @@ pub fn handle_scan(db: &Database, args: Value) -> Result<String, String> {
     // or fleet row never surfaces to a caller that may not read it. Applied
     // BEFORE the page/sentinel split so pagination stays exact over the
     // visible set (mirrors the recall retain in this file).
-    if let Some(req) = stamped_requester(&args) {
-        entities.retain(|e| db.can_read(req, &e.visibility, &e.agent_id));
-    }
+    entities.retain(|e| requester_can_read(db, stamped_requester(&args), e));
 
     let has_more = entities.len() as i64 > limit;
     if has_more {
@@ -3621,9 +3617,9 @@ fn handle_recall_with_expansion(db: &Database, a: &RecallArgs) -> Result<String,
     let mut merged: Vec<_> = best.into_values().collect();
     merged.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     merged.truncate(a.limit as usize);
-    if let Some(requester) = stamped_requester_from_recall_args(a) {
-        merged.retain(|(entity, _)| db.can_read(requester, &entity.visibility, &entity.agent_id));
-    }
+    merged.retain(|(entity, _)| {
+        requester_can_read(db, stamped_requester_from_recall_args(a), entity)
+    });
 
     // #363: valid-time filters, before side-effects so filtered-out entities
     // are not reinforced. No-op unless a filter was requested.
@@ -3709,18 +3705,9 @@ pub fn handle_get_entity(db: &Database, args: Value) -> Result<String, String> {
         .ok_or_else(|| "Missing 'id' parameter".to_string())?;
 
     let entity = db
-        .get_entity_by_id_public(id)
+        .get_entity_by_id_for_requester(id, stamped_requester(&args))
         .map_err(|e| format!("Get entity failed: {e}"))?
         .ok_or_else(|| format!("Entity not found: {id}"))?;
-
-    // #996 leak-harness finding: get-by-id was identity-blind — any caller who
-    // knew an id read the full body with zero enforcement (the classic
-    // unguarded get-by-id leak class the SRB harness exists to catch). Gate on
-    // the transport-stamped identity like recall; over-hide as not-found so
-    // probing cannot confirm a hidden row's existence.
-    if !requester_can_read(db, stamped_requester(&args), &entity) {
-        return Err(format!("Entity not found: {id}"));
-    }
 
     let result = json!({
         "id": entity.id,
@@ -7660,6 +7647,9 @@ pub struct VaultExportArgs {
     /// the live bank is never touched. Omit for the legacy import path.
     #[serde(default)]
     pub shadow_workspace: Option<String>,
+    /// Transport-stamped requester identity; absent means anonymous export.
+    #[serde(default)]
+    pub requesting_agent_id: Option<String>,
 }
 
 // ─── #1060 seal-style tamper evidence handlers ─────────────────────────
@@ -7923,6 +7913,7 @@ pub fn handle_model_inheritance(db: &Database, args: Value) -> Result<String, St
 }
 
 pub fn handle_vault_export(db: &Database, args: Value) -> String {
+    let stamped_requester = stamped_requester(&args).map(str::to_owned);
     let a: VaultExportArgs = match serde_json::from_value(args) {
         Ok(a) => a,
         Err(e) => {
@@ -7941,7 +7932,11 @@ pub fn handle_vault_export(db: &Database, args: Value) -> String {
     // #871: durable op-state wrap — the export run stays observable even if
     // the process dies mid-write (recovered as `interrupted` on restart).
     run_tracked(db, "export", &scope, "internal", move |run_id| {
-        match db.vault_export(&dir, a.workspace_hash.as_deref()) {
+        match db.vault_export_for_requester(
+            &dir,
+            a.workspace_hash.as_deref(),
+            stamped_requester.as_deref(),
+        ) {
             Ok(report) => {
                 let receipt = format!(
                     "files_created={} files_updated={} errors={}",
@@ -7968,20 +7963,27 @@ pub struct DerivedExportArgs {
     pub output_path: String,
     #[serde(default)]
     pub workspace_hash: Option<String>,
+    #[serde(default)]
+    pub requesting_agent_id: Option<String>,
 }
 
 pub fn handle_derived_export(db: &Database, args: Value) -> Result<String, String> {
+    let stamped_requester = stamped_requester(&args).map(str::to_owned);
     let a: DerivedExportArgs = serde_json::from_value(args)
         .map_err(|e| format!("Invalid derived_export arguments: {e}"))?;
+    let _ = a.requesting_agent_id.as_deref();
     let entities = db
-        .recall(&crate::models::RecallParams {
-            query: String::new(),
-            limit: 1000,
-            include_archived: false,
-            workspace_hash: a.workspace_hash.clone(),
-            skip_side_effects: true,
-            ..crate::models::RecallParams::default()
-        })
+        .recall_for_requester(
+            &crate::models::RecallParams {
+                query: String::new(),
+                limit: 1000,
+                include_archived: false,
+                workspace_hash: a.workspace_hash.clone(),
+                skip_side_effects: true,
+                ..crate::models::RecallParams::default()
+            },
+            stamped_requester.as_deref(),
+        )
         .map_err(|e| format!("Derived export recall failed: {e}"))?;
     let mut selected: Vec<_> = entities
         .into_iter()
@@ -17594,6 +17596,27 @@ mod tests {
     }
 
     #[test]
+    fn direct_read_without_requester_hides_private_rows() {
+        let db = Database::open(":memory:").unwrap();
+        let entity: crate::models::Entity = serde_json::from_value(json!({
+            "id": "private-no-requester",
+            "category": "notes",
+            "key": "private-no-requester",
+            "body_json": "{\"secret\":\"NO_REQUESTER_SENTINEL\"}",
+            "status": "active",
+            "agent_id": "alice",
+            "visibility": "private",
+            "created_at_unix_ms": 1,
+            "last_accessed_unix_ms": 1
+        }))
+        .unwrap();
+        assert!(
+            !requester_can_read(&db, None, &entity),
+            "private rows must fail closed without a transport requester"
+        );
+    }
+
+    #[test]
     fn recall_enforces_visibility_by_requesting_agent() {
         // #684: a private entity is hidden from other agents but visible to its
         // author and to an unscoped requester; default-visibility entities are
@@ -17636,11 +17659,11 @@ mod tests {
             2,
             "alice sees her own private note"
         );
-        // No requester identity → unscoped → sees both (existing behavior).
+        // No requester identity → shared rows only; private/fleet rows fail closed.
         assert_eq!(
             count(json!({"query": "quantum", "mode": "fts5"})),
-            2,
-            "unscoped recall is unchanged"
+            1,
+            "unscoped recall must not expose private rows"
         );
 
         let expanded = handle_recall(

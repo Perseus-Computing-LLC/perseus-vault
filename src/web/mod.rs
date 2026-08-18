@@ -27,11 +27,23 @@ use crate::db::Database;
 pub struct WebState {
     pub db: Arc<Database>,
     pub auth_token: Option<String>,
+    /// Identity bound by deployment configuration, never accepted from a
+    /// request parameter. Anonymous web access can therefore only see shared
+    /// rows.
+    pub requesting_agent_id: Option<String>,
 }
 
 /// Build the Axum router with all API endpoints and the dashboard HTML.
 pub fn build_router(db: Arc<Database>, auth_token: Option<String>) -> Router {
-    let state = WebState { db, auth_token };
+    let requesting_agent_id = std::env::var("PERSEUS_VAULT_WEB_REQUESTING_AGENT_ID")
+        .ok()
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty());
+    let state = WebState {
+        db,
+        auth_token,
+        requesting_agent_id,
+    };
 
     // Tighten CORS: if auth token is set, allow specific origins; otherwise disable CORS
     let cors = if state.auth_token.is_some() {
@@ -56,7 +68,10 @@ pub fn build_router(db: Arc<Database>, auth_token: Option<String>) -> Router {
         .route("/api/stats", get(stats))
         .route("/api/journal", get(journal))
         .route("/api/graph", get(graph))
-        .route_layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ))
         .layer(cors)
         .with_state(state);
     // DoS-resistance: explicit body-size cap + global rate limit (Phase 1/2).
@@ -214,31 +229,27 @@ async fn list_entities(
     // (Non-numeric / overflowing `?limit=` is already a 400 via Query<i64>.)
     let limit = params.limit.clamp(1, MAX_API_LIMIT);
     let offset = params.offset.max(0);
+    let category = params.category.clone();
+    let layer = params.layer.clone();
+    let workspace = params.workspace.clone();
+    let requester = state.requesting_agent_id.clone();
     let (items, total) = blocking_db(state.db.clone(), move |db| {
         let entities = db
-            .list_entities(
+            .list_entities_for_requester(
                 offset,
                 limit,
-                params.category.as_deref(),
-                params.layer.as_deref(),
-                params.workspace.as_deref(),
+                category.as_deref(),
+                layer.as_deref(),
+                workspace.as_deref(),
+                requester.as_deref(),
             )
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        // `total` is the true count of matching rows (via a separate
-        // COUNT(*) query with the same filters, no LIMIT/OFFSET), not just
-        // "how many rows came back in this page" — the previous `items.len()`
-        // made it impossible for a client to tell "there are more pages" from
-        // "this is everything".
-        //
-        // NOTE (#402): list + count are two reads without a shared snapshot.
-        // The old Mutex incidentally made them atomic; both reads are cheap
-        // and the dashboard only uses `total` for paging hints, so a rare
-        // off-by-a-write total is acceptable — not worth a read transaction.
         let total = db
-            .count_entities(
-                params.category.as_deref(),
-                params.layer.as_deref(),
-                params.workspace.as_deref(),
+            .count_entities_for_requester(
+                category.as_deref(),
+                layer.as_deref(),
+                workspace.as_deref(),
+                requester.as_deref(),
             )
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         let items: Vec<Value> = entities.iter().map(|e| e.to_json_expanded()).collect();
@@ -248,15 +259,18 @@ async fn list_entities(
 
     // `limit`/`offset` echo the clamped effective values (#413), mirroring
     // /api/graph — so callers (and tests) can see what was actually applied.
-    Ok(Json(json!({ "items": items, "total": total, "limit": limit, "offset": offset })))
+    Ok(Json(
+        json!({ "items": items, "total": total, "limit": limit, "offset": offset }),
+    ))
 }
 
 async fn entity_detail(
     State(state): State<WebState>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, StatusCode> {
+    let requester = state.requesting_agent_id.clone();
     let entity = blocking_db(state.db.clone(), move |db| {
-        match db.get_entity_by_id_public(&id) {
+        match db.get_entity_by_id_for_requester(&id, requester.as_deref()) {
             Ok(Some(entity)) => Ok(entity),
             Ok(None) => Err(StatusCode::NOT_FOUND),
             Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
@@ -273,21 +287,22 @@ async fn search(
     // #413: same clamp as /api/entities — /api/search had the identical
     // unbounded-`?limit=` shape.
     let limit = params.limit.clamp(1, MAX_API_LIMIT);
+    let requester = state.requesting_agent_id.clone();
     let items = blocking_db(state.db.clone(), move |db| {
         let recall_params = crate::models::RecallParams {
             query: params.q.clone(),
             category: params.category.clone(),
             limit,
-            // recall() already supports workspace_hash scoping (v1.2.0) —
-            // the dashboard just wasn't passing it through, so search leaked
-            // cross-workspace results the same way list_entities did.
             workspace_hash: params.workspace.clone(),
             ..Default::default()
         };
         let entities = db
-            .recall(&recall_params)
+            .recall_for_requester(&recall_params, requester.as_deref())
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        Ok(entities.iter().map(|e| e.to_json_expanded()).collect::<Vec<Value>>())
+        Ok(entities
+            .iter()
+            .map(|e| e.to_json_expanded())
+            .collect::<Vec<Value>>())
     })
     .await?;
     // Search doesn't paginate today (single-shot recall with a limit), so
@@ -296,17 +311,68 @@ async fn search(
     // ranking, and adding one would double the recall cost for a value the
     // UI doesn't currently use for pagination. Documented so it doesn't get
     // silently assumed to mean the same thing as list_entities' `total`.
-    Ok(Json(json!({ "items": items, "total": items.len(), "limit": limit })))
+    Ok(Json(
+        json!({ "items": items, "total": items.len(), "limit": limit }),
+    ))
 }
 
 async fn stats(State(state): State<WebState>) -> Result<Json<Value>, StatusCode> {
+    let requester = state.requesting_agent_id.clone();
     let s = blocking_db(state.db.clone(), move |db| {
-        db.stats().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+        // Do not serialize global Stats here: its archived/private/history/journal
+        // counters are not requester-scoped. Build the public projection from the
+        // same visible entity set used by /api/entities instead.
+        let entities = db
+            .list_entities_for_requester(0, i64::MAX, None, None, None, requester.as_deref())
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let mut by_category = serde_json::Map::new();
+        let mut by_type = serde_json::Map::new();
+        let mut by_layer = serde_json::Map::new();
+        let mut oldest: Option<i64> = None;
+        let mut newest: Option<i64> = None;
+        for entity in &entities {
+            for (map, key) in [
+                (&mut by_category, entity.category.as_str()),
+                (&mut by_type, entity.entity_type.as_str()),
+                (&mut by_layer, entity.layer.as_str()),
+            ] {
+                let count = map.get(key).and_then(Value::as_i64).unwrap_or(0) + 1;
+                map.insert(key.to_string(), json!(count));
+            }
+            oldest = Some(oldest.map_or(entity.created_at_unix_ms, |v| {
+                v.min(entity.created_at_unix_ms)
+            }));
+            newest = Some(newest.map_or(entity.created_at_unix_ms, |v| {
+                v.max(entity.created_at_unix_ms)
+            }));
+        }
+        let total = entities.len() as i64;
+        Ok(json!({
+            "total_entities": total,
+            "active_entities": total,
+            "archived_entities": 0,
+            "by_category": by_category,
+            "by_type": by_type,
+            "by_layer": by_layer,
+            "by_category_active": by_category.clone(),
+            "by_type_active": by_type.clone(),
+            "by_layer_active": by_layer.clone(),
+            "total_journal_events": 0,
+            "total_state_entries": 0,
+            "db_file_size_bytes": 0,
+            "oldest_unix_ms": oldest,
+            "newest_unix_ms": newest,
+            "total_communities": 0,
+            "graph_modularity": Value::Null,
+            "total_history_rows": 0,
+            "history_bytes": 0,
+            "top_history_keys": [],
+            "visibility_scope": if requester.is_some() { "configured-agent" } else { "shared-only" },
+            "redacted": true,
+        }))
     })
     .await?;
-    Ok(Json(
-        serde_json::to_value(s).unwrap_or(json!({ "error": "serialization failed" })),
-    ))
+    Ok(Json(s))
 }
 
 async fn journal(
@@ -324,7 +390,9 @@ async fn journal(
     })
     .await?;
 
-    Ok(Json(json!({ "items": events, "total": events.len(), "limit": limit })))
+    Ok(Json(
+        json!({ "items": events, "total": events.len(), "limit": limit }),
+    ))
 }
 
 async fn graph(
@@ -334,9 +402,15 @@ async fn graph(
     // #402: capped by default, clamped ceiling for explicit requests.
     let limit = params.limit.clamp(1, MAX_API_LIMIT);
     let offset = params.offset.max(0);
+    let requester = state.requesting_agent_id.clone();
     let (nodes, edges, total_nodes) = blocking_db(state.db.clone(), move |db| {
-        db.get_entity_graph(params.workspace.as_deref(), limit, offset)
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+        db.get_entity_graph_for_requester(
+            params.workspace.as_deref(),
+            limit,
+            offset,
+            requester.as_deref(),
+        )
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
     })
     .await?;
 
@@ -363,7 +437,10 @@ mod tests {
 
     fn temp_db() -> (Arc<Database>, String) {
         let dir = std::env::temp_dir();
-        let path = dir.join(format!("perseus_vault-web-test-{}.db", uuid::Uuid::new_v4()));
+        let path = dir.join(format!(
+            "perseus_vault-web-test-{}.db",
+            uuid::Uuid::new_v4()
+        ));
         let path_str = path.to_str().unwrap().to_string();
         let db = Database::open(&path_str).expect("open test db");
         (Arc::new(db), path_str)
@@ -507,7 +584,11 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let v = body_json(resp).await;
-        assert_eq!(v["items"].as_array().unwrap().len(), 2, "page size respected");
+        assert_eq!(
+            v["items"].as_array().unwrap().len(),
+            2,
+            "page size respected"
+        );
         assert_eq!(
             v["total"], 3,
             "total must be the true row count, not the page size"
@@ -647,7 +728,12 @@ mod tests {
         let v = body_json(resp).await;
         let nodes = v["nodes"].as_array().unwrap();
         let edges = v["edges"].as_array().unwrap();
-        assert_eq!(nodes.len(), 1, "only the alpha-workspace node should appear: {:?}", nodes);
+        assert_eq!(
+            nodes.len(),
+            1,
+            "only the alpha-workspace node should appear: {:?}",
+            nodes
+        );
         assert_eq!(
             edges.len(),
             0,
@@ -940,7 +1026,10 @@ mod tests {
             .unwrap();
         }
         let router = build_router(db_arc, None);
-        for uri in ["/api/search?q=quasar&limit=999999", "/api/journal?workspace=&limit=999999"] {
+        for uri in [
+            "/api/search?q=quasar&limit=999999",
+            "/api/journal?workspace=&limit=999999",
+        ] {
             let resp = router
                 .clone()
                 .oneshot(HttpRequest::builder().uri(uri).body(Body::empty()).unwrap())
@@ -962,10 +1051,9 @@ mod tests {
         let (db_arc, path) = temp_db();
         {
             let db = &db_arc;
-            for (id, workspace, timestamp) in [
-                ("jrn-alpha", "alpha", 2_i64),
-                ("jrn-beta", "beta", 1_i64),
-            ] {
+            for (id, workspace, timestamp) in
+                [("jrn-alpha", "alpha", 2_i64), ("jrn-beta", "beta", 1_i64)]
+            {
                 db.journal(&crate::models::JournalEvent {
                     id: id.to_string(),
                     event_type: "decision".to_string(),
@@ -1054,7 +1142,10 @@ mod tests {
             "?workspace= must scope to global-'' rows only, got {items:?}"
         );
         assert_eq!(items[0]["key"], "k-global");
-        assert_eq!(v["total"], 1, "count_entities must use the same strict scope");
+        assert_eq!(
+            v["total"], 1,
+            "count_entities must use the same strict scope"
+        );
 
         let resp = router
             .clone()
@@ -1158,15 +1249,10 @@ mod tests {
         for uri in uris {
             let r = router.clone();
             handles.push(tokio::spawn(async move {
-                r.oneshot(
-                    HttpRequest::builder()
-                        .uri(uri)
-                        .body(Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap()
-                .status()
+                r.oneshot(HttpRequest::builder().uri(uri).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap()
+                    .status()
             }));
         }
         for h in handles {
@@ -1214,12 +1300,7 @@ mod tests {
         for uri in ["/api/stats", "/api/journal?workspace="] {
             let resp = router
                 .clone()
-                .oneshot(
-                    HttpRequest::builder()
-                        .uri(uri)
-                        .body(Body::empty())
-                        .unwrap(),
-                )
+                .oneshot(HttpRequest::builder().uri(uri).body(Body::empty()).unwrap())
                 .await
                 .unwrap();
             assert_eq!(resp.status(), StatusCode::OK, "endpoint {} failed", uri);

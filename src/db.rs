@@ -7995,6 +7995,61 @@ impl Database {
         Ok(kept)
     }
 
+    /// Apply the public lifecycle/suppression and requester-visibility gates to
+    /// an already selected result set. `None` is anonymous transport context:
+    /// shared/default rows remain readable, while private/fleet rows fail closed.
+    pub(crate) fn requester_can_read(
+        &self,
+        requesting_agent_id: Option<&str>,
+        visibility: &str,
+        owner_agent_id: &str,
+    ) -> bool {
+        match requesting_agent_id.filter(|id| !id.trim().is_empty()) {
+            Some(requester) => self.can_read(requester, visibility, owner_agent_id),
+            None => !matches!(visibility, "private" | "fleet"),
+        }
+    }
+
+    pub(crate) fn filter_for_requester(
+        &self,
+        entities: Vec<Entity>,
+        requesting_agent_id: Option<&str>,
+    ) -> Result<Vec<Entity>, Box<dyn std::error::Error>> {
+        let readable = self.filter_direct_readable(entities)?;
+        Ok(readable
+            .into_iter()
+            .filter(|entity| {
+                self.requester_can_read(requesting_agent_id, &entity.visibility, &entity.agent_id)
+            })
+            .collect())
+    }
+
+    /// Public direct-ID lookup with the same requester gate as list/search reads.
+    pub(crate) fn get_entity_by_id_for_requester(
+        &self,
+        id: &str,
+        requesting_agent_id: Option<&str>,
+    ) -> Result<Option<Entity>, Box<dyn std::error::Error>> {
+        let Some(entity) = self.get_entity_by_id_raw(id)? else {
+            return Ok(None);
+        };
+        Ok(self
+            .filter_for_requester(vec![entity], requesting_agent_id)?
+            .into_iter()
+            .next())
+    }
+
+    /// Public recall projection with requester visibility enforced after the
+    /// ranking/lifecycle/suppression path has selected its candidates.
+    pub(crate) fn recall_for_requester(
+        &self,
+        params: &RecallParams,
+        requesting_agent_id: Option<&str>,
+    ) -> Result<Vec<Entity>, Box<dyn std::error::Error>> {
+        let entities = self.recall(params)?;
+        self.filter_for_requester(entities, requesting_agent_id)
+    }
+
     /// Temporal/history readers may return explicit hash-only audit markers for
     /// known terminal/archived versions. They never return the original body:
     /// compacted retention markers are preserved as-is, while other terminal
@@ -20449,6 +20504,41 @@ impl Database {
         Ok(self.filter_direct_readable(items)?.len() as i64)
     }
 
+    /// Public list projection with requester visibility enforced before pagination.
+    pub(crate) fn list_entities_for_requester(
+        &self,
+        offset: i64,
+        limit: i64,
+        category: Option<&str>,
+        layer: Option<&str>,
+        workspace_hash: Option<&str>,
+        requesting_agent_id: Option<&str>,
+    ) -> Result<Vec<Entity>, Box<dyn std::error::Error>> {
+        let candidates = self.list_entities(0, i64::MAX, category, layer, workspace_hash)?;
+        let visible = self.filter_for_requester(candidates, requesting_agent_id)?;
+        let start = offset.max(0) as usize;
+        let take = limit.max(0) as usize;
+        if start >= visible.len() {
+            return Ok(Vec::new());
+        }
+        Ok(visible[start..start.saturating_add(take).min(visible.len())].to_vec())
+    }
+
+    /// Public count projection with requester visibility enforced; private/fleet
+    /// rows never affect an anonymous or differently-scoped total.
+    pub(crate) fn count_entities_for_requester(
+        &self,
+        category: Option<&str>,
+        layer: Option<&str>,
+        workspace_hash: Option<&str>,
+        requesting_agent_id: Option<&str>,
+    ) -> Result<i64, Box<dyn std::error::Error>> {
+        let candidates = self.list_entities(0, i64::MAX, category, layer, workspace_hash)?;
+        Ok(self
+            .filter_for_requester(candidates, requesting_agent_id)?
+            .len() as i64)
+    }
+
     /// #562: deterministic keyset enumeration — the first-class "list every
     /// entity in a category" path that recall's empty-query mode cannot be:
     /// recall orders by `retrieval_count DESC, id ASC`, and the primary key
@@ -20639,6 +20729,16 @@ impl Database {
         limit: i64,
         offset: i64,
     ) -> Result<(Vec<GraphNode>, Vec<GraphEdge>, i64), Box<dyn std::error::Error>> {
+        self.get_entity_graph_for_requester(workspace_hash, limit, offset, None)
+    }
+
+    pub(crate) fn get_entity_graph_for_requester(
+        &self,
+        workspace_hash: Option<&str>,
+        limit: i64,
+        offset: i64,
+        requesting_agent_id: Option<&str>,
+    ) -> Result<(Vec<GraphNode>, Vec<GraphEdge>, i64), Box<dyn std::error::Error>> {
         let conn = self.conn()?;
         let limit = if limit <= 0 { -1 } else { limit };
         let offset = offset.max(0);
@@ -20676,7 +20776,7 @@ impl Database {
         drop(conn);
         let mut visible_rows = Vec::with_capacity(rows.len());
         for (id, category, key, _links) in rows {
-            if let Some(entity) = self.get_entity_by_id_public(&id)? {
+            if let Some(entity) = self.get_entity_by_id_for_requester(&id, requesting_agent_id)? {
                 visible_rows.push((entity, category, key));
             }
         }
@@ -25146,10 +25246,31 @@ Return a JSON object with an "insights" array. Each insight has:
     /// Export all non-archived entities to .md files in a vault directory.
     /// Each entity becomes a .md file with YAML frontmatter.
     /// Idempotent — updates changed files, creates new ones, never deletes.
+    /// Internal/admin export retained for maintenance and fixture callers.
+    /// Public transports must call `vault_export_for_requester`.
     pub fn vault_export(
         &self,
         vault_dir: &str,
         workspace_hash: Option<&str>,
+    ) -> Result<VaultReport, Box<dyn std::error::Error>> {
+        self.vault_export_impl(vault_dir, workspace_hash, None, false)
+    }
+
+    pub(crate) fn vault_export_for_requester(
+        &self,
+        vault_dir: &str,
+        workspace_hash: Option<&str>,
+        requesting_agent_id: Option<&str>,
+    ) -> Result<VaultReport, Box<dyn std::error::Error>> {
+        self.vault_export_impl(vault_dir, workspace_hash, requesting_agent_id, true)
+    }
+
+    fn vault_export_impl(
+        &self,
+        vault_dir: &str,
+        workspace_hash: Option<&str>,
+        requesting_agent_id: Option<&str>,
+        enforce_visibility: bool,
     ) -> Result<VaultReport, Box<dyn std::error::Error>> {
         let conn = self.conn()?;
         use std::fs;
@@ -25161,14 +25282,14 @@ Return a JSON object with an "insights" array. Each insight has:
         let sql = if let Some(ws) = workspace_hash {
             format!(
                 "SELECT id, category, key, body_json, type, tags, decay_score,
-                        retrieval_count, layer, workspace_hash, agent_id,
+                        retrieval_count, layer, workspace_hash, agent_id, visibility,
                         created_at_unix_ms, last_accessed_unix_ms, links
                  FROM entities WHERE archived = 0 AND status IN ('active','draft') AND workspace_hash = '{}'",
                 ws.replace('\'', "''")
             )
         } else {
             "SELECT id, category, key, body_json, type, tags, decay_score,
-                    retrieval_count, layer, workspace_hash, agent_id,
+                    retrieval_count, layer, workspace_hash, agent_id, visibility,
                     created_at_unix_ms, last_accessed_unix_ms, links
              FROM entities WHERE archived = 0 AND status IN ('active','draft')"
                 .to_string()
@@ -25204,6 +25325,7 @@ Return a JSON object with an "insights" array. Each insight has:
             layer: String,
             workspace_hash_val: String,
             agent_id_val: String,
+            visibility: String,
             created: i64,
             accessed: i64,
             links_json: String,
@@ -25223,9 +25345,10 @@ Return a JSON object with an "insights" array. Each insight has:
                 layer: r.get::<_, String>(8)?,
                 workspace_hash_val: r.get::<_, String>(9)?,
                 agent_id_val: r.get::<_, String>(10)?,
-                created: r.get::<_, i64>(11)?,
-                accessed: r.get::<_, i64>(12)?,
-                links_json: r.get::<_, String>(13)?,
+                visibility: r.get::<_, String>(11)?,
+                created: r.get::<_, i64>(12)?,
+                accessed: r.get::<_, i64>(13)?,
+                links_json: r.get::<_, String>(14)?,
             })
         })?;
 
@@ -25266,6 +25389,14 @@ Return a JSON object with an "insights" array. Each insight has:
             .zip(triples)
             .filter(|(_, triple)| !primary_hits.contains(triple) && !erased_hits.contains(triple))
             .map(|(row, _)| row)
+            .filter(|row| {
+                !enforce_visibility
+                    || self.requester_can_read(
+                        requesting_agent_id,
+                        &row.visibility,
+                        &row.agent_id_val,
+                    )
+            })
             .collect();
 
         // First pass: id -> (safe_id link target, human-readable key) so the
@@ -25297,6 +25428,7 @@ Return a JSON object with an "insights" array. Each insight has:
                 layer,
                 workspace_hash_val,
                 agent_id_val,
+                visibility: _,
                 created,
                 accessed,
                 links_json,
@@ -25318,6 +25450,23 @@ Return a JSON object with an "insights" array. Each insight has:
             if !links.is_empty() {
                 links_section.push_str("\n## Links\n\n");
                 for link in &links {
+                    // A link to an existing but requester-invisible entity is
+                    // suppressed entirely; rendering it as an unresolved ID
+                    // would disclose the hidden target. Archived/deleted targets
+                    // remain the documented unresolved-link case.
+                    if enforce_visibility {
+                        if let Ok(Some(target)) = self.get_entity_by_id_public(&link.target_id) {
+                            if workspace_hash.is_some_and(|ws| target.workspace_hash != ws)
+                                || !self.requester_can_read(
+                                    requesting_agent_id,
+                                    &target.visibility,
+                                    &target.agent_id,
+                                )
+                            {
+                                continue;
+                            }
+                        }
+                    }
                     let rel = if link.relationship.is_empty() {
                         "related"
                     } else {

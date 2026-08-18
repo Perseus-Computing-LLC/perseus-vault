@@ -298,12 +298,7 @@ pub fn parse_idle_timeout(raw: Option<&str>) -> Option<std::time::Duration> {
 /// Parse one raw JSON-RPC line, dispatch it, and write the response (if any)
 /// to stdout. Shared by the read loop and the #1045 pending-request path so a
 /// forwarded in-flight request gets exactly the same treatment as a live one.
-fn process_request_line(
-    line: &str,
-    state: &MCPState,
-    db: &Database,
-    stdout: &mut std::io::Stdout,
-) {
+fn process_request_line(line: &str, state: &MCPState, db: &Database, stdout: &mut std::io::Stdout) {
     let request: JsonRpcRequest = match serde_json::from_str(line) {
         Ok(r) => r,
         Err(e) => {
@@ -513,9 +508,7 @@ pub fn run_server(db: std::sync::Arc<Database>) {
         // replacement image answers it). Hoisted out of the response write so
         // a suppressed response still hands off.
         if crate::live_update::handoff_pending() {
-            let initialized = state
-                .initialized
-                .load(std::sync::atomic::Ordering::Relaxed);
+            let initialized = state.initialized.load(std::sync::atomic::Ordering::Relaxed);
             let agent = state
                 .session_agent_id
                 .read()
@@ -666,8 +659,14 @@ pub fn handle_request(
             // vanish, making the session look dead even though the swap
             // succeeded.
             if tool_name == "perseus_vault_handoff_restart" {
-                let confirm = tool_args.get("confirm").and_then(Value::as_bool).unwrap_or(false);
-                let dry_run = tool_args.get("dry_run").and_then(Value::as_bool).unwrap_or(false);
+                let confirm = tool_args
+                    .get("confirm")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let dry_run = tool_args
+                    .get("dry_run")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
                 if confirm && !dry_run && crate::live_update::running_stale() {
                     let report_text =
                         match crate::live_update::handle_handoff_restart(tool_args.clone()) {
@@ -711,8 +710,12 @@ pub fn handle_request(
             // (model-forged or empty) is overwritten, never trusted, so no
             // model can claim another agent's identity.
             if let Ok(sid) = state.session_agent_id.read() {
-                if !sid.is_empty() {
-                    if let Some(obj) = tool_args.as_object_mut() {
+                if let Some(obj) = tool_args.as_object_mut() {
+                    if sid.trim().is_empty() {
+                        // No transport identity: caller-supplied requester fields
+                        // are untrusted and must not survive into a public read.
+                        obj.remove("requesting_agent_id");
+                    } else {
                         obj.insert("requesting_agent_id".to_string(), json!(*sid));
                     }
                 }
@@ -723,13 +726,10 @@ pub fn handle_request(
             // identity captured from MCP initialize.clientInfo.name; otherwise
             // an uninitialized caller could choose the reviewer/source agent.
             let admission_source_call = tool_name == "perseus_vault_journal"
-                && tool_args
-                    .get("event_type")
-                    .and_then(Value::as_str)
-                    == Some("admission_source");
+                && tool_args.get("event_type").and_then(Value::as_str) == Some("admission_source");
             let admission_review_call = tool_name == "perseus_vault_admission_decide";
-            let admission_write_call = tool_name == "perseus_vault_remember"
-                && tool_args.get("admission").is_some();
+            let admission_write_call =
+                tool_name == "perseus_vault_remember" && tool_args.get("admission").is_some();
             if admission_source_call || admission_review_call || admission_write_call {
                 let captured_session = state
                     .session_agent_id
@@ -6260,6 +6260,10 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
           "type": "string",
           "default": "~/.perseus-vault/vault",
           "description": "Directory path to write .md files. Created if it doesn't exist. Use ~ for home directory."
+        },
+        "requesting_agent_id": {
+          "type": "string",
+          "description": "Transport-stamped requester identity used for visibility enforcement."
         }
       },
       "required": []
@@ -6303,10 +6307,22 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     "inputSchema": {
       "type": "object",
       "properties": {
-        "output_path": {"type": "string", "description": "Markdown file path to write."},
-        "workspace_hash": {"type": "string", "description": "Optional exact workspace scope."}
+        "output_path": {
+          "type": "string",
+          "description": "Markdown file path to write."
+        },
+        "workspace_hash": {
+          "type": "string",
+          "description": "Optional exact workspace scope."
+        },
+        "requesting_agent_id": {
+          "type": "string",
+          "description": "Transport-stamped requester identity used for visibility enforcement."
+        }
       },
-      "required": ["output_path"]
+      "required": [
+        "output_path"
+      ]
     }
   },
   {
@@ -8206,14 +8222,15 @@ const TOOL_SCOPES: &[(&str, ToolScope)] = &[
     ("perseus_vault_signer_epoch_set", ToolScope::Ops),
     ("perseus_vault_poison_label", ToolScope::Ops),
     ("perseus_vault_transition_audit", ToolScope::Ops),
-        ("perseus_vault_skill_set", ToolScope::Ops),
-        ("perseus_vault_skill_route", ToolScope::Ops),
-        ("perseus_vault_skill_advance", ToolScope::Ops),
-        ("perseus_vault_skill_audit", ToolScope::Ops),
-        ("perseus_vault_decay_audit", ToolScope::Ops),
-        ("perseus_vault_segment_consolidate", ToolScope::Ops),
-        ("perseus_vault_state_audit", ToolScope::Ops),
-    ("perseus_vault_rollback_repair", ToolScope::Ops),    ("perseus_vault_op_run", ToolScope::Ops),
+    ("perseus_vault_skill_set", ToolScope::Ops),
+    ("perseus_vault_skill_route", ToolScope::Ops),
+    ("perseus_vault_skill_advance", ToolScope::Ops),
+    ("perseus_vault_skill_audit", ToolScope::Ops),
+    ("perseus_vault_decay_audit", ToolScope::Ops),
+    ("perseus_vault_segment_consolidate", ToolScope::Ops),
+    ("perseus_vault_state_audit", ToolScope::Ops),
+    ("perseus_vault_rollback_repair", ToolScope::Ops),
+    ("perseus_vault_op_run", ToolScope::Ops),
     ("perseus_vault_op_run_list", ToolScope::Ops),
     ("perseus_vault_op_run_get", ToolScope::Ops),
     ("perseus_vault_op_run_retry", ToolScope::Ops),
@@ -8602,7 +8619,7 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
         "perseus_vault_signer_epoch_set" => tools::handle_signer_epoch_set(db, args),
         "perseus_vault_poison_label" => tools::handle_poison_label(db, args),
         "perseus_vault_transition_audit" => tools::handle_transition_audit(db, args),
-        
+
         "perseus_vault_skill_set" => tools::handle_skill_set(db, args),
         "perseus_vault_skill_route" => tools::handle_skill_route(db, args),
         "perseus_vault_skill_advance" => tools::handle_skill_advance(db, args),
@@ -8613,7 +8630,8 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
         "perseus_vault_segment_consolidate" => tools::handle_segment_consolidate(db, args),
 
         "perseus_vault_state_audit" => tools::handle_state_audit(db, args),
-"perseus_vault_rollback_repair" => tools::handle_rollback_repair(db, args),        "perseus_vault_op_run" => tools::handle_op_run(db, args).map_err(|e| e.to_string()),
+        "perseus_vault_rollback_repair" => tools::handle_rollback_repair(db, args),
+        "perseus_vault_op_run" => tools::handle_op_run(db, args).map_err(|e| e.to_string()),
         "perseus_vault_op_run_list" => {
             tools::handle_op_run_list(db, args).map_err(|e| e.to_string())
         }
@@ -8763,7 +8781,8 @@ mod tests {
         );
         assert_eq!(
             registry_names.len(),
-            170,            "update public metadata when adding a tool"
+            170,
+            "update public metadata when adding a tool"
         );
 
         let canonical = advertised_names();
@@ -9225,11 +9244,7 @@ mod tests {
             crate::context_transform::SUPPORTED_OPENAI_REQUEST_FORMAT,
             crate::context_transform::TransformerDescriptor::new("fixture", "1"),
             vec![crate::context_transform::TransformStage::new(
-                "distill",
-                "1",
-                true,
-                "trusted",
-                None,
+                "distill", "1", true, "trusted", None,
             )],
             "lossy_opt_in",
             input.clone(),
@@ -9252,11 +9267,17 @@ mod tests {
         assert_eq!(value["outcome"], "degraded", "{response}");
         assert_eq!(value["receipt"]["actual_lossiness"], "lossy", "{response}");
         assert_eq!(value["receipt"]["input_digest"].as_str().unwrap().len(), 64);
-        assert!(!response.contains("MCP_RAW_SENTINEL"), "raw transient body leaked: {response}");
-        assert!(!response.contains("\"message\""), "raw provider message leaked: {response}");
-        assert!(advertised_names().contains(
-            &"perseus_vault_context_transform_validate".to_string()
-        ));
+        assert!(
+            !response.contains("MCP_RAW_SENTINEL"),
+            "raw transient body leaked: {response}"
+        );
+        assert!(
+            !response.contains("\"message\""),
+            "raw provider message leaked: {response}"
+        );
+        assert!(
+            advertised_names().contains(&"perseus_vault_context_transform_validate".to_string())
+        );
         let _ = fs::remove_file(db_path);
     }
 
@@ -10085,7 +10106,8 @@ mod tests {
             method: "initialize".to_string(),
             params: Some(json!({"clientInfo": {"name": "first-client"}})),
         };
-        let first_response = handle_request(&first, &state, &db).expect("first initialize response");
+        let first_response =
+            handle_request(&first, &state, &db).expect("first initialize response");
         assert!(first_response.error.is_none());
         let second = JsonRpcRequest {
             jsonrpc: "2.0".to_string(),
@@ -10093,10 +10115,14 @@ mod tests {
             method: "initialize".to_string(),
             params: Some(json!({"clientInfo": {"name": "forged-replacement"}})),
         };
-        let second_response = handle_request(&second, &state, &db).expect("replay initialize response");
+        let second_response =
+            handle_request(&second, &state, &db).expect("replay initialize response");
         assert!(second_response.result.is_none());
         assert_eq!(
-            second_response.error.as_ref().map(|error| error.message.as_str()),
+            second_response
+                .error
+                .as_ref()
+                .map(|error| error.message.as_str()),
             Some("Already initialized; session identity cannot be replaced")
         );
         assert_eq!(
@@ -10229,8 +10255,16 @@ mod tests {
         let agent = filter_registry_by_view(registry.clone(), ScopeView::Agent);
         let ops = filter_registry_by_view(registry.clone(), ScopeView::Ops);
         let full = filter_registry_by_view(registry.clone(), ScopeView::Full);
-        assert_eq!(agent.len(), 51, "agent view count drifted — new tools must be classified");
-        assert_eq!(ops.len(), 163, "ops view count drifted — new tools must be classified");
+        assert_eq!(
+            agent.len(),
+            51,
+            "agent view count drifted — new tools must be classified"
+        );
+        assert_eq!(
+            ops.len(),
+            163,
+            "ops view count drifted — new tools must be classified"
+        );
         assert_eq!(full.len(), 170, "full view must expose the whole registry");
         assert!(agent.len() < ops.len() && ops.len() < full.len());
     }
@@ -10284,5 +10318,4 @@ mod tests {
             "history-only compacted status must not be advertised as writable"
         );
     }
-
 }

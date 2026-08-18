@@ -34,6 +34,13 @@ def test_admission_schema_copies_match_canonical_registry():
     canonical = _canonical_tools()
     installer = _installer_tools()
     server_card = _server_card_tools()
+    # These are intentionally smaller allowlists, but every advertised tool
+    # must be an exact copy of the canonical runtime registry entry.
+    for label, advertised in (("installer", installer), ("server-card", server_card)):
+        assert set(advertised) <= set(canonical), f"{label} advertises unknown tools"
+        for name, tool in advertised.items():
+            assert tool == canonical[name], f"{label} schema drift: {name}"
+
     required = {
         "perseus_vault_remember",
         "perseus_vault_journal",
@@ -43,8 +50,6 @@ def test_admission_schema_copies_match_canonical_registry():
         assert name in canonical
         assert name in installer, f"installer does not advertise {name}"
         assert name in server_card, f"server card does not advertise {name}"
-        assert installer[name] == canonical[name], f"installer schema drift: {name}"
-        assert server_card[name] == canonical[name], f"server-card schema drift: {name}"
 
     remember = canonical["perseus_vault_remember"]
     assert "admission" in remember["inputSchema"]["properties"]

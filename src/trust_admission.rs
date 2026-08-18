@@ -113,7 +113,10 @@ pub struct AdmissionEvidence {
 impl AdmissionEvidence {
     pub fn validate(&self) -> Result<(), String> {
         if self.schema_version != ADMISSION_SCHEMA_VERSION {
-            return Err(format!("unsupported schema_version: {}", self.schema_version));
+            return Err(format!(
+                "unsupported schema_version: {}",
+                self.schema_version
+            ));
         }
         if !OUTCOMES.contains(&self.outcome.as_str()) {
             return Err(format!("unsupported outcome: {}", self.outcome));
@@ -154,8 +157,10 @@ impl AdmissionEvidence {
         if self.outcome == "proposed" && self.authoritative {
             return Err("proposed evidence cannot be authoritative".to_string());
         }
-        if matches!(self.outcome.as_str(), "quarantined" | "suppressed" | "escalated" | "abstained" | "revoked")
-            && self.authoritative
+        if matches!(
+            self.outcome.as_str(),
+            "quarantined" | "suppressed" | "escalated" | "abstained" | "revoked"
+        ) && self.authoritative
         {
             return Err("non-admitted evidence cannot be authoritative".to_string());
         }
@@ -277,25 +282,46 @@ impl AdmissionEvidence {
 
 pub fn evaluate(request: &AdmissionRequest) -> Result<AdmissionEvidence, String> {
     validate_request(request)?;
-    let (outcome, reasons, authoritative, durable) = if request.authorization_scope != request.workspace_hash {
-        ("abstained", vec!["workspace_scope_mismatch"], false, false)
-    } else if request.task_relevance_bps < 5000 {
-        ("suppressed", vec!["task_irrelevant"], false, false)
-    } else if request.instruction_bearing && request.source_trust == "untrusted" {
-        ("quarantined", vec!["untrusted_instruction_bearing"], false, true)
-    } else if request.contradicts_authoritative {
-        ("escalated", vec!["contradicts_authoritative_record"], false, true)
-    } else if request.source_trust == "authoritative"
-        && (!request.validated || request.source_event_id.is_none())
-    {
-        ("proposed", vec!["source_validation_required"], false, true)
-    } else if request.source_trust == "untrusted" {
-        ("quarantined", vec!["untrusted_source"], false, true)
-    } else if request.source_trust == "authoritative" {
-        ("admitted", vec!["authorized_authoritative_source"], true, true)
-    } else {
-        ("proposed", vec!["trusted_source_requires_authority"], false, true)
-    };
+    let (outcome, reasons, authoritative, durable) =
+        if request.authorization_scope != request.workspace_hash {
+            ("abstained", vec!["workspace_scope_mismatch"], false, false)
+        } else if request.task_relevance_bps < 5000 {
+            ("suppressed", vec!["task_irrelevant"], false, false)
+        } else if request.instruction_bearing && request.source_trust == "untrusted" {
+            (
+                "quarantined",
+                vec!["untrusted_instruction_bearing"],
+                false,
+                true,
+            )
+        } else if request.contradicts_authoritative {
+            (
+                "escalated",
+                vec!["contradicts_authoritative_record"],
+                false,
+                true,
+            )
+        } else if request.source_trust == "authoritative"
+            && (!request.validated || request.source_event_id.is_none())
+        {
+            ("proposed", vec!["source_validation_required"], false, true)
+        } else if request.source_trust == "untrusted" {
+            ("quarantined", vec!["untrusted_source"], false, true)
+        } else if request.source_trust == "authoritative" {
+            (
+                "admitted",
+                vec!["authorized_authoritative_source"],
+                true,
+                true,
+            )
+        } else {
+            (
+                "proposed",
+                vec!["trusted_source_requires_authority"],
+                false,
+                true,
+            )
+        };
     let mut evidence = AdmissionEvidence {
         schema_version: ADMISSION_SCHEMA_VERSION.to_string(),
         outcome: outcome.to_string(),
@@ -331,7 +357,10 @@ fn validate_request(request: &AdmissionRequest) -> Result<(), String> {
         validate_identifier(label, value)?;
     }
     if !["untrusted", "trusted", "authoritative"].contains(&request.source_trust.as_str()) {
-        return Err(format!("unsupported source_trust: {}", request.source_trust));
+        return Err(format!(
+            "unsupported source_trust: {}",
+            request.source_trust
+        ));
     }
     for (label, value) in [
         ("source_event_id", request.source_event_id.as_deref()),
@@ -360,8 +389,7 @@ pub fn digest_text(value: &str) -> String {
 /// Environment-held key used to prove that an admission source was created by
 /// the authenticated transport boundary. Only a digest of the resulting HMAC
 /// is persisted in the journal; the raw attestation is never durable.
-pub(crate) const ADMISSION_SOURCE_HMAC_KEY_ENV: &str =
-    "PERSEUS_VAULT_ADMISSION_SOURCE_HMAC_KEY";
+pub(crate) const ADMISSION_SOURCE_HMAC_KEY_ENV: &str = "PERSEUS_VAULT_ADMISSION_SOURCE_HMAC_KEY";
 
 pub(crate) fn admission_source_attestation_payload(
     evaluated: &Value,
@@ -443,7 +471,8 @@ pub(crate) fn admission_source_attestation_digest(
 }
 
 fn canonical_digest<T: Serialize>(value: &T) -> Result<String, String> {
-    let bytes = serde_json::to_vec(value).map_err(|e| format!("admission serialization failed: {e}"))?;
+    let bytes =
+        serde_json::to_vec(value).map_err(|e| format!("admission serialization failed: {e}"))?;
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     Ok(format!("{:x}", hasher.finalize()))
@@ -451,7 +480,9 @@ fn canonical_digest<T: Serialize>(value: &T) -> Result<String, String> {
 
 fn validate_sha256(label: &str, value: &str) -> Result<(), String> {
     if value.len() != 64
-        || !value.bytes().all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
     {
         return Err(format!("{label} must be a lowercase SHA-256 value"));
     }
@@ -460,14 +491,21 @@ fn validate_sha256(label: &str, value: &str) -> Result<(), String> {
 
 fn validate_review_reason(label: &str, value: &str) -> Result<(), String> {
     if value.trim().is_empty() || value.len() > 256 || value.chars().any(|c| c.is_control()) {
-        return Err(format!("{label} must be non-empty, bounded, and free of control characters"));
+        return Err(format!(
+            "{label} must be non-empty, bounded, and free of control characters"
+        ));
     }
     Ok(())
 }
 
 fn validate_identifier(label: &str, value: &str) -> Result<(), String> {
-    if value.is_empty() || value.len() > 256 || value.chars().any(|c| c.is_control() || c.is_whitespace()) {
-        return Err(format!("{label} must be a bounded non-whitespace identifier"));
+    if value.is_empty()
+        || value.len() > 256
+        || value.chars().any(|c| c.is_control() || c.is_whitespace())
+    {
+        return Err(format!(
+            "{label} must be a bounded non-whitespace identifier"
+        ));
     }
     Ok(())
 }
@@ -546,7 +584,9 @@ mod tests {
     fn revocation_is_hash_only_and_preserves_record_identity() {
         let mut evidence = evaluate(&request("authoritative")).unwrap();
         let original = evidence.record_digest.clone();
-        evidence.revoke(&digest("operator"), "poisoning_confirmed").unwrap();
+        evidence
+            .revoke(&digest("operator"), "poisoning_confirmed")
+            .unwrap();
         assert_eq!(evidence.outcome, "revoked");
         assert_eq!(evidence.record_digest, original);
         assert!(evidence.revocation_digest.is_some());
@@ -568,10 +608,22 @@ mod tests {
         let mut block_request = request("trusted");
         block_request.authorization_scope = "workspace-b".to_string();
         let cases = [
-            (evaluate(&request("authoritative")).unwrap(), AdmissionOutcomeClass::Save),
-            (evaluate(&drop_request).unwrap(), AdmissionOutcomeClass::Drop),
-            (evaluate(&block_request).unwrap(), AdmissionOutcomeClass::Block),
-            (evaluate(&request("trusted")).unwrap(), AdmissionOutcomeClass::PendingApproval),
+            (
+                evaluate(&request("authoritative")).unwrap(),
+                AdmissionOutcomeClass::Save,
+            ),
+            (
+                evaluate(&drop_request).unwrap(),
+                AdmissionOutcomeClass::Drop,
+            ),
+            (
+                evaluate(&block_request).unwrap(),
+                AdmissionOutcomeClass::Block,
+            ),
+            (
+                evaluate(&request("trusted")).unwrap(),
+                AdmissionOutcomeClass::PendingApproval,
+            ),
         ];
 
         for (evidence, expected) in cases {

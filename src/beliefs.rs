@@ -271,7 +271,8 @@ mod tests {
     use super::*;
 
     fn temp_db() -> Database {
-        let path = std::env::temp_dir().join(format!("perseus_vault-beliefs-{}.db", uuid::Uuid::new_v4()));
+        let path =
+            std::env::temp_dir().join(format!("perseus_vault-beliefs-{}.db", uuid::Uuid::new_v4()));
         Database::open(path.to_str().expect("temp db path")).expect("open temp db")
     }
 
@@ -411,5 +412,4 @@ mod tests {
             .iter()
             .any(|belief| belief["key"] == "deprecated-public-claim"));
     }
-
 }
