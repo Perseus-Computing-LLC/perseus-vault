@@ -1274,6 +1274,10 @@
             "type": "integer",
             "default": 3,
             "description": "Maximum traversal depth from the starting entity"
+          },
+          "requesting_agent_id": {
+            "type": "string",
+            "description": "Transport-stamped requester identity; required at runtime for body-safe traversal."
           }
         },
         "required": [
@@ -1391,7 +1395,7 @@
     },
     {
       "name": "perseus_vault_vault_export",
-      "description": "Export all non-archived entities to .md files with YAML frontmatter in a vault directory. Files are human-readable, git-trackable, and Obsidian-compatible. Use this for backup, transfer between workspaces, or offline review.",
+      "description": "Export active/draft, unsuppressed entities to .md files with YAML frontmatter in a vault directory. Non-serveable lifecycle rows and governed values are excluded.",
       "inputSchema": {
         "type": "object",
         "properties": {

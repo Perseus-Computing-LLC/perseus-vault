@@ -92,6 +92,18 @@ pub struct Entity {
     pub _parsed_body: Option<serde_json::Value>,
 }
 
+/// Closed public projection for compacted history rows. It intentionally has
+/// no Entity metadata fields: compacted history is an audit marker, not a
+/// resurrected Entity snapshot.
+#[derive(Debug, Clone, Serialize)]
+pub struct CompactedAuditMarker {
+    pub id: String,
+    pub category: String,
+    pub key: String,
+    pub status: String,
+    pub body_json: String,
+}
+
 impl Entity {
     pub fn to_json_expanded(&self) -> serde_json::Value {
         let mut val = serde_json::to_value(self).unwrap_or_else(|_| serde_json::json!({}));
@@ -120,6 +132,33 @@ impl Entity {
             );
         }
         val
+    }
+
+    /// Serialize history through a closed projection for compacted rows. The
+    /// body has already been reduced at the database boundary; this second
+    /// boundary prevents stale/tampered Entity metadata from being re-expanded.
+    pub fn to_history_json(&self) -> serde_json::Value {
+        if self.status != "compacted" {
+            return self.to_json_expanded();
+        }
+        let marker: serde_json::Value =
+            serde_json::from_str(&self.body_json).unwrap_or_else(|_| serde_json::json!({}));
+        let allowlisted_body = serde_json::json!({
+            "compacted": true,
+            "terminal_audit": true,
+            "status": "compacted",
+            "versions": marker.get("versions").and_then(|v| v.as_i64()),
+            "digest": marker.get("digest").and_then(|v| v.as_str()),
+            "body_sha256": marker.get("body_sha256").and_then(|v| v.as_str()),
+        });
+        serde_json::to_value(CompactedAuditMarker {
+            id: self.id.clone(),
+            category: self.category.clone(),
+            key: self.key.clone(),
+            status: "compacted".to_string(),
+            body_json: allowlisted_body.to_string(),
+        })
+        .unwrap_or_else(|_| serde_json::json!({}))
     }
 }
 

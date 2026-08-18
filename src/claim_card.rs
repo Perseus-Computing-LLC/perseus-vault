@@ -235,7 +235,12 @@ fn stale_of_row(row: &CardRow, now: i64) -> bool {
         || row.invalidated_at_unix_ms.is_some_and(|t| t < now)
 }
 
-fn scan_live_rows(db: &Database) -> Result<Vec<CardRow>, String> {
+fn scan_live_rows(
+    db: &Database,
+    workspace_hash: Option<&str>,
+    agent_id: Option<&str>,
+    allow_suppressed: bool,
+) -> Result<Vec<CardRow>, String> {
     let conn = db.conn().map_err(|e| format!("claim card: db: {e}"))?;
     let mut stmt = conn
         .prepare(
@@ -247,7 +252,7 @@ fn scan_live_rows(db: &Database) -> Result<Vec<CardRow>, String> {
              FROM entities WHERE archived = 0 AND status IN ('active','draft')",
         )
         .map_err(|e| format!("claim card: prepare failed: {e}"))?;
-    let rows: Vec<CardRow> = stmt
+    let mut rows: Vec<CardRow> = stmt
         .query_map([], |r| {
             let links_str: String = r.get::<_, String>(16).unwrap_or_else(|_| "[]".to_string());
             let links: Vec<crate::models::MemoryLink> =
@@ -303,6 +308,30 @@ fn scan_live_rows(db: &Database) -> Result<Vec<CardRow>, String> {
         .map_err(|e| format!("claim card: scan failed: {e}"))?
         .filter_map(|r| r.ok())
         .collect();
+    drop(stmt);
+    drop(conn);
+
+    let workspace = workspace_hash.filter(|w| !w.is_empty());
+    let requester = agent_id.filter(|id| !id.is_empty());
+    rows.retain(|row| {
+        let workspace_ok = workspace
+            .map(|w| row.entity.workspace_hash.is_empty() || row.entity.workspace_hash == w)
+            .unwrap_or(true);
+        let requester_ok = requester
+            .map(|req| db.can_read(req, &row.entity.visibility, &row.entity.agent_id))
+            .unwrap_or(true);
+        workspace_ok && requester_ok
+    });
+
+    if !allow_suppressed && !rows.is_empty() {
+        let candidates: Vec<Entity> = rows.iter().map(|row| row.entity.clone()).collect();
+        let kept = db
+            .filter_suppressed(candidates)
+            .map_err(|e| format!("claim card: suppression check failed: {e}"))?;
+        let kept_ids: std::collections::HashSet<String> =
+            kept.into_iter().map(|entity| entity.id).collect();
+        rows.retain(|row| kept_ids.contains(&row.entity.id));
+    }
     Ok(rows)
 }
 
@@ -363,7 +392,7 @@ fn build_claim_card_inner(
     agent_id: Option<&str>,
     include_evidence: bool,
     include_agent_projection: bool,
-    _allow_suppressed: bool,
+    allow_suppressed: bool,
     now: i64,
 ) -> Result<ClaimCard, String> {
     // Resolve identity for the audit marker, then apply lifecycle, visibility,
@@ -374,7 +403,7 @@ fn build_claim_card_inner(
         .map_err(|e| format!("claim card: entity lookup failed: {e}"))?
         .ok_or_else(|| format!("claim card: no entity with id '{entity_id}'"))?;
 
-    let rows = scan_live_rows(db)?;
+    let rows = scan_live_rows(db, workspace_hash, agent_id, allow_suppressed)?;
 
     // The target's bi-temporal/supersession columns: from its live row when
     // present, else a direct read of the (possibly archived) row.
@@ -427,10 +456,18 @@ fn build_claim_card_inner(
     let lifecycle_serveable = !entity.archived
         && crate::models::canonical_entity_status(&entity.status)
             .is_some_and(|status| matches!(status.as_str(), "active" | "draft"));
+    let target_suppressed = if allow_suppressed {
+        false
+    } else {
+        db.is_value_suppressed(&entity.workspace_hash, &entity.category, &entity.body_json)
+            .map_err(|e| format!("claim card: target suppression check failed: {e}"))?
+    };
     if entity.archived {
         withhold_reason = Some("archived".to_string());
     } else if !lifecycle_serveable {
         withhold_reason = Some("lifecycle_hidden".to_string());
+    } else if target_suppressed {
+        withhold_reason = Some("suppressed".to_string());
     } else if matches!(entity.visibility.as_str(), "private" | "fleet") {
         let caller = agent_id.unwrap_or_default();
         if caller.is_empty() || caller != entity.agent_id {
@@ -694,6 +731,12 @@ fn build_claim_card_inner(
 }
 
 pub fn handle_claim_card(db: &Database, args: Value) -> Result<String, String> {
+    let requester = args
+        .get("requesting_agent_id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| "claim_card requires a transport-stamped requesting_agent_id".to_string())?;
     let a: ClaimCardArgs =
         serde_json::from_value(args).map_err(|e| format!("Invalid claim_card arguments: {e}"))?;
     let now = crate::db::now_ms();
@@ -701,7 +744,7 @@ pub fn handle_claim_card(db: &Database, args: Value) -> Result<String, String> {
         db,
         &a.entity_id,
         a.workspace_hash.as_deref(),
-        a.agent_id.as_deref(),
+        Some(requester.as_str()),
         a.include_evidence,
         a.include_agent_projection,
         now,
@@ -1099,6 +1142,107 @@ mod tests {
     }
 
     // Bi-temporal + archived: expired valid_to → stale; forget → withheld.
+    #[test]
+    fn public_claim_card_excludes_hidden_and_suppressed_supporters() {
+        let (db, path) = temp_db();
+        let target = mk_entity(
+            "claim-target-hidden-supporters",
+            "decision",
+            "claim-target-hidden-supporters",
+            r#"{"content":"public target","origin":{"memory_kind":"inferred"}}"#,
+        );
+        remember(&db, &target);
+
+        let mut private = mk_entity(
+            "private-supporter-hidden",
+            "observation",
+            "private-supporter-hidden",
+            r#"{"content":"PRIVATE SUPPORTER SENTINEL","origin":{"memory_kind":"observed"}}"#,
+        );
+        private.visibility = "private".to_string();
+        private.agent_id = "owner-1".to_string();
+        private.links = vec![ev_link("evidence_for", &target.id)];
+        remember(&db, &private);
+
+        let mut other_workspace = mk_entity(
+            "other-workspace-supporter-hidden",
+            "observation",
+            "other-workspace-supporter-hidden",
+            r#"{"content":"WORKSPACE SUPPORTER SENTINEL","origin":{"memory_kind":"observed"}}"#,
+        );
+        other_workspace.workspace_hash = "ws-other".to_string();
+        other_workspace.links = vec![ev_link("evidence_for", &target.id)];
+        remember(&db, &other_workspace);
+
+        let suppressed_body =
+            r#"{"content":"SUPPRESSED SUPPORTER SENTINEL","origin":{"memory_kind":"observed"}}"#;
+        let mut suppressed = mk_entity(
+            "suppressed-supporter-hidden",
+            "observation",
+            "suppressed-supporter-hidden",
+            suppressed_body,
+        );
+        suppressed.links = vec![ev_link("evidence_for", &target.id)];
+        remember(&db, &suppressed);
+        db.reject_value(
+            "ws-cards",
+            "",
+            "observation",
+            suppressed_body,
+            "test suppression",
+            "test",
+            "owner-1",
+            None,
+        )
+        .unwrap();
+
+        let card = build_claim_card(
+            &db,
+            &target.id,
+            Some("ws-cards"),
+            Some("intruder"),
+            true,
+            false,
+            NOW,
+        )
+        .unwrap();
+        let serialized = serde_json::to_string(&card).unwrap();
+        assert_eq!(card.support_count, 1, "hidden supporters must not count");
+        assert!(card.evidence.is_empty(), "hidden evidence leaked: {card:?}");
+        assert!(!serialized.contains("PRIVATE SUPPORTER SENTINEL"));
+        assert!(!serialized.contains("WORKSPACE SUPPORTER SENTINEL"));
+        assert!(!serialized.contains("SUPPRESSED SUPPORTER SENTINEL"));
+
+        db.reject_value(
+            "",
+            "",
+            "decision",
+            &target.body_json,
+            "target suppression",
+            "test",
+            "owner-1",
+            None,
+        )
+        .unwrap();
+        let suppressed_target = build_claim_card(
+            &db,
+            &target.id,
+            Some("ws-cards"),
+            Some("intruder"),
+            true,
+            false,
+            NOW,
+        )
+        .unwrap();
+        assert!(suppressed_target
+            .reason_codes
+            .iter()
+            .any(|reason| reason == "suppressed"));
+        assert!(suppressed_target.agent_projection.text.is_empty());
+
+        let _ = fs::remove_file(&path);
+    }
+
     #[test]
     fn bi_temporal_and_archived_states() {
         let (db, path) = temp_db();

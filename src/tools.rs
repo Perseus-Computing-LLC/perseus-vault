@@ -3941,7 +3941,7 @@ pub fn handle_history(db: &Database, args: Value) -> Result<String, String> {
         total
     };
 
-    let items: Vec<serde_json::Value> = versions.iter().map(|e| e.to_json_expanded()).collect();
+    let items: Vec<serde_json::Value> = versions.iter().map(|e| e.to_history_json()).collect();
     let result = json!({
         "category": category,
         "key": key,
@@ -8388,13 +8388,19 @@ pub fn handle_traverse(db: &Database, args: Value) -> String {
     // request can't be asked to walk an unbounded depth/breadth of the link graph.
     let max_depth = a.max_depth.clamp(0, 64);
     let max_nodes = a.max_nodes.clamp(0, 100_000);
-    let requester = a.requesting_agent_id.as_deref().filter(|s| !s.is_empty());
-    match db.traverse_chain(&a.category, &a.key, max_depth, max_nodes) {
+    let requester = match a.requesting_agent_id.as_deref().filter(|s| !s.is_empty()) {
+        Some(requester) => requester,
+        None => return json!({"error": "requesting_agent_id is required"}).to_string(),
+    };
+    match db.traverse_chain_for_request(
+        &a.category,
+        &a.key,
+        max_depth,
+        max_nodes,
+        requester,
+    ) {
         Ok(chain) => {
-            let chain = match requester {
-                Some(req) => filter_chain_visibility(db, req, chain),
-                None => chain,
-            };
+            let chain = filter_chain_visibility(db, requester, chain);
             serde_json::to_string(&chain)
                 .unwrap_or_else(|e| json!({"error": format!("{e}")}).to_string())
         }

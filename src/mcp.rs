@@ -1930,7 +1930,11 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
         },
         "agent_id": {
           "type": "string",
-          "description": "Caller identity for visibility enforcement (private/fleet entities require the author's agent_id → else revoked_access)"
+          "description": "Legacy caller field; public authorization uses the transport-stamped requesting_agent_id."
+        },
+        "requesting_agent_id": {
+          "type": "string",
+          "description": "Transport-stamped requester identity; required at runtime and never trusted from model input."
         },
         "include_evidence": {
           "type": "boolean",
@@ -4573,6 +4577,10 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
           "type": "integer",
           "default": 100,
           "description": "Maximum total nodes to traverse before stopping"
+        },
+        "requesting_agent_id": {
+          "type": "string",
+          "description": "Transport-stamped requester identity; required at runtime for body-safe traversal."
         }
       },
       "required": [

@@ -18302,7 +18302,7 @@ impl Database {
 
     /// Traverse entity links starting from a given entity.
     /// Returns the entity and all linked entities up to max_depth.
-    pub fn traverse_chain(
+    pub(crate) fn traverse_chain(
         &self,
         category: &str,
         key: &str,
@@ -18349,6 +18349,7 @@ impl Database {
             max_depth,
             max_nodes,
             0,
+            None,
         );
 
         let chain = serde_json::json!({
@@ -18365,6 +18366,65 @@ impl Database {
         Ok(chain)
     }
 
+    /// Public transport-scoped traversal. Authorization is checked before the
+    /// root or any child body is placed into the response value.
+    pub fn traverse_chain_for_request(
+        &self,
+        category: &str,
+        key: &str,
+        max_depth: i64,
+        max_nodes: i64,
+        requester: &str,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+        if requester.trim().is_empty() {
+            return Err("requesting_agent_id is required".into());
+        }
+        let root = self
+            .get_entity(category, key)?
+            .ok_or_else(|| format!("entity not found: {}/{}", category, key))?;
+        if !self.can_read(requester, &root.visibility, &root.agent_id) {
+            return Err("entity not found".into());
+        }
+        let conn = self.conn()?;
+        let root_links: Vec<MemoryLink> =
+            serde_json::from_str(&serde_json::to_string(&root.links).unwrap_or_else(|_| "[]".to_string()))
+                .unwrap_or_default();
+        let root_links_json: Vec<serde_json::Value> = root_links
+            .iter()
+            .map(|l| {
+                serde_json::json!({
+                    "target_id": l.target_id,
+                    "relationship": l.relationship,
+                    "attested": l.source.is_some(),
+                    "source": l.source,
+                })
+            })
+            .collect();
+        let mut visited = std::collections::HashSet::new();
+        let mut traversed = Vec::new();
+        visited.insert(root.id.clone());
+        self._traverse_links(
+            &conn,
+            &root.id,
+            &mut traversed,
+            &mut visited,
+            max_depth,
+            max_nodes,
+            0,
+            Some(requester),
+        );
+        Ok(serde_json::json!({
+            "entity": {
+                "id": root.id,
+                "category": root.category,
+                "key": root.key,
+                "body_json": root.body_json,
+                "links": root_links_json,
+            },
+            "traversed": traversed,
+        }))
+    }
+
     fn _traverse_links(
         &self,
         // #210: thread one pooled connection through the recursion instead of
@@ -18377,6 +18437,7 @@ impl Database {
         max_depth: i64,
         max_nodes: i64,
         current_depth: i64,
+        requester: Option<&str>,
     ) {
         // Traversal remains best-effort for its historical API; query errors
         // are represented as an omitted/dangling link rather than propagated.
@@ -18388,6 +18449,7 @@ impl Database {
             max_depth,
             max_nodes,
             current_depth,
+            requester,
         );
     }
 
@@ -18400,6 +18462,7 @@ impl Database {
         max_depth: i64,
         max_nodes: i64,
         current_depth: i64,
+        requester: Option<&str>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         if current_depth >= max_depth || traversed.len() as i64 >= max_nodes {
             return Ok(());
@@ -18440,7 +18503,10 @@ impl Database {
             let child = match child {
                 Some(entity)
                     if Self::entity_lifecycle_serveable(&entity)
-                        && !self.entity_suppressed_with_conn(conn, &entity, now_ms())? =>
+                        && !self.entity_suppressed_with_conn(conn, &entity, now_ms())?
+                        && requester
+                            .map(|req| self.can_read(req, &entity.visibility, &entity.agent_id))
+                            .unwrap_or(true) =>
                 {
                     entity
                 }
@@ -18495,6 +18561,7 @@ impl Database {
                 max_depth,
                 max_nodes,
                 current_depth + 1,
+                requester,
             )?;
         }
         Ok(())
@@ -25094,14 +25161,14 @@ Return a JSON object with an "insights" array. Each insight has:
                 "SELECT id, category, key, body_json, type, tags, decay_score,
                         retrieval_count, layer, workspace_hash, agent_id,
                         created_at_unix_ms, last_accessed_unix_ms, links
-                 FROM entities WHERE archived = 0 AND workspace_hash = '{}'",
+                 FROM entities WHERE archived = 0 AND status IN ('active','draft') AND workspace_hash = '{}'",
                 ws.replace('\'', "''")
             )
         } else {
             "SELECT id, category, key, body_json, type, tags, decay_score,
                     retrieval_count, layer, workspace_hash, agent_id,
                     created_at_unix_ms, last_accessed_unix_ms, links
-             FROM entities WHERE archived = 0"
+             FROM entities WHERE archived = 0 AND status IN ('active','draft')"
                 .to_string()
         };
 
@@ -25164,6 +25231,40 @@ Return a JSON object with an "insights" array. Each insight has:
         for row in rows {
             collected.push(row?);
         }
+        drop(stmt);
+
+        // Apply the same governance suppression predicate as the public recall
+        // paths before any export rendering or link-map construction. The
+        // primary connection is reused deliberately: read-layer sidecar checks
+        // must not nest another checkout while this query is live.
+        let triples: Vec<(String, String, String)> = collected
+            .iter()
+            .map(|row| {
+                (
+                    row.workspace_hash_val.clone(),
+                    row.category.clone(),
+                    rejected_value_digest(&row.body_json),
+                )
+            })
+            .collect();
+        let primary_hits = Self::mandate_hits_batched(
+            &conn,
+            &triples,
+            "rejected_value_tombstones",
+            Some(now_ms()),
+        )?;
+        let erased_hits = match self.governance_read_conn_compatible()? {
+            Some(sidecar) => {
+                Self::mandate_hits_batched(&sidecar, &triples, "erasure_mandates", None)?
+            }
+            None => std::collections::HashSet::new(),
+        };
+        collected = collected
+            .into_iter()
+            .zip(triples)
+            .filter(|(_, triple)| !primary_hits.contains(triple) && !erased_hits.contains(triple))
+            .map(|(row, _)| row)
+            .collect();
 
         // First pass: id -> (safe_id link target, human-readable key) so the
         // second pass can render `[[<safe_id>|<key>]]` WikiLinks that resolve to
@@ -40132,6 +40233,64 @@ pub(crate) mod tests {
         let _ = fs::remove_file(&path);
     }
 
+    #[test]
+    fn vault_export_hides_terminal_and_suppressed_entities() {
+        let (db, path) = temp_db();
+        let vault =
+            std::env::temp_dir().join(format!("perseus_vault-vault-{}", uuid::Uuid::new_v4()));
+        let vault_str = vault.to_str().unwrap().to_string();
+
+        db.remember_skip_dedup(&make_entity(
+            "export-visible",
+            "facts",
+            "export-visible",
+            r#"{"content":"visible export body"}"#,
+        ))
+        .unwrap();
+
+        let mut terminal = make_entity(
+            "export-terminal",
+            "facts",
+            "export-terminal",
+            r#"{"content":"EXPORT TERMINAL SENTINEL"}"#,
+        );
+        terminal.status = "deprecated".to_string();
+        db.remember_skip_dedup(&terminal).unwrap();
+
+        let suppressed_body = r#"{"content":"EXPORT SUPPRESSED SENTINEL"}"#;
+        db.remember_skip_dedup(&make_entity(
+            "export-suppressed",
+            "facts",
+            "export-suppressed",
+            suppressed_body,
+        ))
+        .unwrap();
+        db.reject_value(
+            "",
+            "",
+            "facts",
+            suppressed_body,
+            "test suppression",
+            "test",
+            "owner-1",
+            None,
+        )
+        .unwrap();
+
+        let report = db.vault_export(&vault_str, None).unwrap();
+        assert!(report.errors.is_empty(), "export errors: {:?}", report.errors);
+        assert_eq!(report.files_created, 1, "only the serveable row may export");
+        assert!(vault.join("export-visible.md").exists());
+        assert!(!vault.join("export-terminal.md").exists());
+        assert!(!vault.join("export-suppressed.md").exists());
+        let visible = std::fs::read_to_string(vault.join("export-visible.md")).unwrap();
+        assert!(!visible.contains("EXPORT TERMINAL SENTINEL"));
+        assert!(!visible.contains("EXPORT SUPPRESSED SENTINEL"));
+
+        let _ = std::fs::remove_dir_all(&vault);
+        let _ = fs::remove_file(&path);
+    }
+
     // #227: keyword recall matches via the FTS5 index (with prefix matching)
     // rather than an unconditional body_json LIKE scan. A prefix query must
     // still find longer tokens, and an exact token must still match.
@@ -46947,6 +47106,51 @@ pub(crate) mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    #[test]
+    fn traverse_requires_transport_identity_before_serializing_private_children() {
+        let (db, path) = temp_db();
+        db.remember_skip_dedup(&make_entity(
+            "traverse-public-root",
+            "traverse-security",
+            "traverse-public-root",
+            r#"{"content":"public root"}"#,
+        ))
+        .unwrap();
+        let mut private = make_entity(
+            "traverse-private-child",
+            "traverse-security",
+            "traverse-private-child",
+            r#"{"content":"TRAVERSE PRIVATE SENTINEL"}"#,
+        );
+        private.visibility = "private".to_string();
+        private.agent_id = "owner-1".to_string();
+        db.remember_skip_dedup(&private).unwrap();
+        db.link(
+            "traverse-security",
+            "traverse-public-root",
+            "traverse-private-child",
+            "depends_on",
+        )
+        .unwrap();
+
+        let response = crate::tools::handle_traverse(
+            &db,
+            serde_json::json!({
+                "category": "traverse-security",
+                "key": "traverse-public-root",
+                "max_depth": 2,
+                "max_nodes": 10
+            }),
+        );
+        assert!(
+            response.contains("requesting_agent_id"),
+            "missing transport identity must fail closed: {response}"
+        );
+        assert!(!response.contains("TRAVERSE PRIVATE SENTINEL"));
+
+        let _ = fs::remove_file(path);
+    }
+
     /// #869: traverse annotates every edge with its evidence state.
     #[test]
     fn traverse_annotates_edges_with_attested_and_source() {
@@ -51326,6 +51530,37 @@ pub(crate) mod tests {
             .expect("compacted window must still answer, with a marker");
         assert_eq!(inside.status, "compacted");
         assert!(inside.body_json.contains("\"versions\":3"));
+        // Public history must not re-expand arbitrary metadata from the
+        // compacted Entity row. This sentinel simulates stale/tampered metadata
+        // that is not part of the compacted audit marker allowlist.
+        let conn = db.conn().unwrap();
+        conn.execute(
+            "UPDATE entity_history SET tags='[\"HISTORY METADATA SENTINEL\"]',
+                    archive_reason='HISTORY ARCHIVE SENTINEL',
+                    source='HISTORY SOURCE SENTINEL',
+                    agent_id='HISTORY AGENT SENTINEL',
+                    visibility='private'
+             WHERE status='compacted'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let history = crate::tools::handle_history(
+            &db,
+            serde_json::json!({
+                "category": "facts",
+                "key": "versioned-key",
+                "limit": 100,
+                "offset": 0
+            }),
+        )
+        .unwrap();
+        assert!(!history.contains("HISTORY METADATA SENTINEL"));
+        assert!(!history.contains("HISTORY ARCHIVE SENTINEL"));
+        assert!(!history.contains("HISTORY SOURCE SENTINEL"));
+        assert!(!history.contains("HISTORY AGENT SENTINEL"));
+
+
 
         // as_of inside a SURVIVING window → the real old version, unchanged.
         let conn = db.conn().unwrap();
