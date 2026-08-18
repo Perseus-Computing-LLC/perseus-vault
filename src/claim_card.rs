@@ -252,10 +252,9 @@ fn scan_live_rows(db: &Database) -> Result<Vec<CardRow>, String> {
             let links_str: String = r.get::<_, String>(16).unwrap_or_else(|_| "[]".to_string());
             let links: Vec<crate::models::MemoryLink> =
                 serde_json::from_str(&links_str).unwrap_or_default();
-            let tags: Vec<String> = serde_json::from_str(
-                &r.get::<_, String>(6).unwrap_or_else(|_| "[]".to_string()),
-            )
-            .unwrap_or_default();
+            let tags: Vec<String> =
+                serde_json::from_str(&r.get::<_, String>(6).unwrap_or_else(|_| "[]".to_string()))
+                    .unwrap_or_default();
             let body_json: String = r.get(3)?;
             let e = Entity {
                 id: r.get(0)?,
@@ -364,16 +363,16 @@ fn build_claim_card_inner(
     agent_id: Option<&str>,
     include_evidence: bool,
     include_agent_projection: bool,
-    allow_suppressed: bool,
+    _allow_suppressed: bool,
     now: i64,
 ) -> Result<ClaimCard, String> {
-    let entity = if allow_suppressed {
-        db.get_entity_by_id_unfiltered(entity_id)
-    } else {
-        db.get_entity_by_id_public(entity_id)
-    }
-    .map_err(|e| format!("claim card: entity lookup failed: {e}"))?
-    .ok_or_else(|| format!("claim card: no entity with id '{entity_id}'"))?;
+    // Resolve identity for the audit marker, then apply lifecycle, visibility,
+    // and workspace withholding below. The returned card never contains a
+    // withheld claim/body, including for the public builder.
+    let entity = db
+        .get_entity_by_id_unfiltered(entity_id)
+        .map_err(|e| format!("claim card: entity lookup failed: {e}"))?
+        .ok_or_else(|| format!("claim card: no entity with id '{entity_id}'"))?;
 
     let rows = scan_live_rows(db)?;
 
@@ -420,11 +419,18 @@ fn build_claim_card_inner(
     let (valid_from, valid_to, recorded_at, invalidated_at, supersedes, superseded_by) =
         target_cols;
 
-    // Visibility enforcement (#684 semantics): private/fleet → author only;
-    // workspace → caller's scope must match a non-global entity's scope.
+    // Visibility enforcement (#684 semantics): lifecycle is the first gate;
+    // private/fleet → author only; workspace → caller's scope must match a
+    // non-global entity's scope. Conflict mode may retain a terminal audit
+    // marker, but it must never materialize the claim/body.
     let mut withhold_reason: Option<String> = None;
+    let lifecycle_serveable = !entity.archived
+        && crate::models::canonical_entity_status(&entity.status)
+            .is_some_and(|status| matches!(status.as_str(), "active" | "draft"));
     if entity.archived {
         withhold_reason = Some("archived".to_string());
+    } else if !lifecycle_serveable {
+        withhold_reason = Some("lifecycle_hidden".to_string());
     } else if matches!(entity.visibility.as_str(), "private" | "fleet") {
         let caller = agent_id.unwrap_or_default();
         if caller.is_empty() || caller != entity.agent_id {
@@ -437,8 +443,7 @@ fn build_claim_card_inner(
     }
     let serveable = withhold_reason.is_none();
 
-    let target_body: Value =
-        serde_json::from_str(&entity.body_json).unwrap_or_else(|_| json!({}));
+    let target_body: Value = serde_json::from_str(&entity.body_json).unwrap_or_else(|_| json!({}));
     let memory_kind = memory_kind_of(&target_body);
 
     // Reverse evidence map: supporter -> target, plus contradiction tags.
@@ -466,7 +471,11 @@ fn build_claim_card_inner(
     let class = provenance_class(memory_kind.as_deref(), has_evidence_links);
 
     let body: Value = serde_json::from_str(&entity.body_json).unwrap_or_else(|_| json!({}));
-    let claim = extract_claim(&body, &entity.key);
+    let claim = if serveable {
+        extract_claim(&body, &entity.key)
+    } else {
+        String::new()
+    };
     let support_count = 1 + supporters.len() as i64;
     let superseded = entity.status == "deprecated" || !superseded_by.is_empty();
     let stale = stale_of_row(
@@ -685,8 +694,8 @@ fn build_claim_card_inner(
 }
 
 pub fn handle_claim_card(db: &Database, args: Value) -> Result<String, String> {
-    let a: ClaimCardArgs = serde_json::from_value(args)
-        .map_err(|e| format!("Invalid claim_card arguments: {e}"))?;
+    let a: ClaimCardArgs =
+        serde_json::from_value(args).map_err(|e| format!("Invalid claim_card arguments: {e}"))?;
     let now = crate::db::now_ms();
     let card = build_claim_card(
         db,
@@ -800,7 +809,13 @@ mod tests {
         remember(&db, &fact2);
 
         let card = build_claim_card(
-            &db, "fact-2", Some("ws-cards"), Some("hermes-agent"), true, true, NOW,
+            &db,
+            "fact-2",
+            Some("ws-cards"),
+            Some("hermes-agent"),
+            true,
+            true,
+            NOW,
         )
         .unwrap();
         assert_eq!(card.provenance_class.as_deref(), Some("fact_derived"));
@@ -828,7 +843,13 @@ mod tests {
         ];
         remember(&db, &fact1b);
         let card2 = build_claim_card(
-            &db, "fact-2", Some("ws-cards"), Some("hermes-agent"), true, true, NOW,
+            &db,
+            "fact-2",
+            Some("ws-cards"),
+            Some("hermes-agent"),
+            true,
+            true,
+            NOW,
         )
         .unwrap();
         assert_eq!(
@@ -852,10 +873,13 @@ mod tests {
         );
         remember(&db, &e);
 
-        let card = build_claim_card(&db, "guess-1", Some("ws-cards"), None, true, true, NOW).unwrap();
+        let card =
+            build_claim_card(&db, "guess-1", Some("ws-cards"), None, true, true, NOW).unwrap();
         assert_eq!(card.provenance_class.as_deref(), Some("inference_agent"));
         assert_eq!(card.support_count, 1);
-        assert!(card.reason_codes.contains(&"missing_provenance".to_string()));
+        assert!(card
+            .reason_codes
+            .contains(&"missing_provenance".to_string()));
         assert!(card.reason_codes.contains(&"serveable".to_string()));
         assert!(card.evidence.is_empty());
 
@@ -883,7 +907,8 @@ mod tests {
         );
         remember(&db, &claim);
 
-        let card = build_claim_card(&db, "claim-1", Some("ws-cards"), None, true, true, NOW).unwrap();
+        let card =
+            build_claim_card(&db, "claim-1", Some("ws-cards"), None, true, true, NOW).unwrap();
         assert!(card.state.contradicted);
         assert!(card.reason_codes.contains(&"contradicted".to_string()));
 
@@ -966,6 +991,40 @@ mod tests {
         let _ = fs::remove_file(&path);
     }
 
+    #[test]
+    fn conflict_card_withheld_lifecycle_does_not_serialize_claim_or_body() {
+        let (db, path) = temp_db();
+        let mut entity = mk_entity(
+            "terminal-card-1",
+            "decision",
+            "terminal-card-1",
+            r#"{"content":"secret terminal claim","origin":{"memory_kind":"asserted"}}"#,
+        );
+        entity.status = "deprecated".to_string();
+        remember(&db, &entity);
+
+        let card = build_claim_card_for_conflict(
+            &db,
+            "terminal-card-1",
+            Some("ws-cards"),
+            None,
+            true,
+            true,
+            NOW,
+        )
+        .expect("conflict audit marker should remain buildable");
+        let serialized = serde_json::to_string(&card).unwrap();
+        assert!(
+            card.claim.is_empty(),
+            "withheld cards must not expose claims"
+        );
+        assert!(card.agent_projection.text.is_empty());
+        assert!(!serialized.contains("secret terminal claim"));
+        assert!(card.reason_codes.contains(&"lifecycle_hidden".to_string()));
+
+        let _ = fs::remove_file(&path);
+    }
+
     // Scope mismatch: caller workspace differs from the entity's non-global
     // scope → withheld with scope_mismatch; projection empty + excluded.
     #[test]
@@ -989,7 +1048,10 @@ mod tests {
             .excluded
             .iter()
             .any(|x| x.contains("scope_mismatch")));
-        assert_eq!(card.entity_id, "ws-entity-1", "structural metadata still visible");
+        assert_eq!(
+            card.entity_id, "ws-entity-1",
+            "structural metadata still visible"
+        );
 
         let _ = fs::remove_file(&path);
     }
@@ -1008,15 +1070,29 @@ mod tests {
         e.agent_id = "owner-1".to_string();
         remember(&db, &e);
 
-        let card =
-            build_claim_card(&db, "priv-1", Some("ws-cards"), Some("intruder"), true, true, NOW)
-                .unwrap();
+        let card = build_claim_card(
+            &db,
+            "priv-1",
+            Some("ws-cards"),
+            Some("intruder"),
+            true,
+            true,
+            NOW,
+        )
+        .unwrap();
         assert_eq!(card.reason_codes[0], "revoked_access");
         assert_eq!(card.agent_projection.text, "");
 
-        let owner =
-            build_claim_card(&db, "priv-1", Some("ws-cards"), Some("owner-1"), true, true, NOW)
-                .unwrap();
+        let owner = build_claim_card(
+            &db,
+            "priv-1",
+            Some("ws-cards"),
+            Some("owner-1"),
+            true,
+            true,
+            NOW,
+        )
+        .unwrap();
         assert_eq!(owner.reason_codes[0], "serveable");
 
         let _ = fs::remove_file(&path);
@@ -1080,7 +1156,8 @@ mod tests {
         );
         remember(&db, &tgt);
 
-        let card = build_claim_card(&db, "tgt-2", Some("ws-cards"), None, true, false, NOW).unwrap();
+        let card =
+            build_claim_card(&db, "tgt-2", Some("ws-cards"), None, true, false, NOW).unwrap();
         assert_eq!(card.agent_projection.text, "");
         assert!(card
             .agent_projection
@@ -1091,7 +1168,10 @@ mod tests {
         let no_evidence =
             build_claim_card(&db, "tgt-2", Some("ws-cards"), None, false, true, NOW).unwrap();
         assert!(no_evidence.evidence.is_empty());
-        assert_eq!(no_evidence.support_count, 2, "support count is store truth, not projection");
+        assert_eq!(
+            no_evidence.support_count, 2,
+            "support count is store truth, not projection"
+        );
 
         let _ = fs::remove_file(&path);
     }

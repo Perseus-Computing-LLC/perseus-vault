@@ -10,7 +10,7 @@
   "tools": [
     {
       "name": "perseus_vault_remember",
-      "description": "Store or update an entity by (category, key). Idempotent \u2014 call as often as you want, same key returns an update. Use this for saving facts, decisions, architecture notes, and conventions.",
+      "description": "Store or update an entity by (category, key). Idempotent — call as often as you want, same key returns an update. NEAR-DUPLICATE MERGING (#531): a NEW key whose body is >=70% trigram-similar to an existing entity in the same category+workspace does NOT create a new entity — the write is folded into the existing one (result: action='deduped', deduped=true, merged_into=<id>). Right for conversational memory; wrong for bulk ingest of templated records, which are similar by construction and will silently collapse to a handful of rows. For bulk ingest pass skip_dedup=true (or use perseus_vault_ingest_file), and check the returned action. Prefer recall_when triggers (retrieve when relevant) over always_on=true (inject unconditionally): the recall-first perseus_vault_context hard-caps the always-on set and warns when it overflows, so reserve always_on for genuinely identity-critical facts. Optional certainty (0.0-1.0) is used by perseus_vault_conflicts for typed-entity conflict detection. Pass derived_from (ids or {category,key} pairs of the memories you recalled) to auto-mark those sources useful — cited memories rank higher and decay slower. Use this for saving facts, decisions, architecture notes, and conventions. Optional hints (#919): 1-3 prospective query phrasings that should retrieve this entity (vocabulary-gap recall) — indexed into FTS5 alongside the body, default-off (PERSEUS_VAULT_HINTS_ENABLED=1 to enable), replaced wholesale on update. When encryption is enabled, body_json is encrypted at rest with AES-256-GCM.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -24,13 +24,21 @@
           },
           "body_json": {
             "type": "string",
-            "description": "JSON object with the entity body \u2014 store content, summary, and any custom fields here"
+            "description": "JSON object with the entity body — store content, summary, and any custom fields here"
           },
           "status": {
             "type": "string",
-            "enum": ["active", "draft", "deprecated", "expired", "proposed", "quarantined", "redacted"],
+            "enum": [
+              "active",
+              "draft",
+              "deprecated",
+              "expired",
+              "proposed",
+              "quarantined",
+              "redacted"
+            ],
             "default": "active",
-            "description": "Closed lifecycle status vocabulary; proposed/quarantined/unknown statuses are never publicly serveable"
+            "description": "Closed lifecycle status vocabulary; proposed/quarantined are never publicly serveable"
           },
           "type": {
             "type": "string",
@@ -47,12 +55,256 @@
           "importance": {
             "type": "number",
             "default": 0.5,
-            "description": "Initial importance 0.0\u20131.0 \u2014 sets the starting decay score"
+            "description": "Initial importance 0.0–1.0 — sets the starting decay score"
           },
           "topic_path": {
             "type": "string",
             "default": "",
             "description": "Hierarchical topic path, e.g. 'architecture/database/postgres'"
+          },
+          "workspace_hash": {
+            "type": "string",
+            "default": "",
+            "description": "Workspace scope identifier (v1.2.0). Empty = global. Entities with a workspace_hash are invisible to recall queries scoped to a different workspace."
+          },
+          "agent_id": {
+            "type": "string",
+            "default": "",
+            "description": "Agent identity (v1.2.0). Tracks which agent wrote this entity. Used for agent attribution and context filtering."
+          },
+          "actor_kind": {
+            "type": "string",
+            "default": "assistant",
+            "description": "Actor basis for the write (for example assistant, user, connector, or system). Missing admission stays reviewable."
+          },
+          "admission": {
+            "type": "object",
+            "description": "Hash-only admission envelope. The server emits one stable outcome_class: save, drop, block, or pending_approval. Authoritative admission requires a validated source_event_id and matching workspace; missing or unverified evidence is retained as proposed/requires_review and is not serveable. DROP/BLOCK decisions return hash-only evidence without persisting the candidate.",
+            "properties": {
+              "record_digest": {
+                "type": "string"
+              },
+              "source_identity": {
+                "type": "string"
+              },
+              "authorization_scope": {
+                "type": "string"
+              },
+              "ingestion_channel": {
+                "type": "string"
+              },
+              "workspace_hash": {
+                "type": "string"
+              },
+              "source_trust": {
+                "type": "string",
+                "enum": [
+                  "untrusted",
+                  "trusted",
+                  "authoritative"
+                ]
+              },
+              "source_event_id": {
+                "type": "string"
+              },
+              "actor_kind": {
+                "type": "string"
+              },
+              "actor_identity": {
+                "type": "string"
+              },
+              "validated": {
+                "type": "boolean"
+              },
+              "valid_from_unix_ms": {
+                "type": "integer"
+              },
+              "recorded_at_unix_ms": {
+                "type": "integer"
+              },
+              "task_relevance_bps": {
+                "type": "integer"
+              },
+              "instruction_bearing": {
+                "type": "boolean"
+              },
+              "contradicts_authoritative": {
+                "type": "boolean"
+              }
+            }
+          },
+          "valid_from_unix_ms": {
+            "type": "integer",
+            "description": "Application-time period start (#363): when the fact became TRUE IN THE WORLD, independent of when it was recorded. Set in the past for retroactive facts ('this was true last week, we just learned it') without rewriting transaction history. Default: transaction time (now). Query with perseus_vault_valid_at / perseus_vault_bitemporal / recall's valid_at filter."
+          },
+          "valid_to_unix_ms": {
+            "type": "integer",
+            "description": "Application-time period end (#363, exclusive): when the fact STOPPED being true in the world. Omit for 'still true' (unbounded). Must be greater than valid_from_unix_ms."
+          },
+          "skip_dedup": {
+            "type": "boolean",
+            "default": false,
+            "description": "Opt out of near-duplicate merging for this write (#531). Set true for bulk/API ingest of templated records so every acknowledged write actually creates its key; leave false for conversational memory."
+          },
+          "allow_rejected": {
+            "type": "boolean",
+            "default": false,
+            "description": "#849: deliberate trusted override of a rejected-value tombstone. Journaled as an audited override; never set automatically."
+          },
+          "derived_from": {
+            "type": "array",
+            "items": {
+              "oneOf": [
+                {
+                  "type": "string",
+                  "description": "Entity id of a cited source, e.g. 'mem-a1b2c3d4e5f6' (as returned by recall/remember)"
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "category": {
+                      "type": "string"
+                    },
+                    "key": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "category",
+                    "key"
+                  ],
+                  "description": "A cited source addressed by (category, key)"
+                }
+              ]
+            },
+            "description": "#487: the memories this write was built on (max 64). Each cited source is automatically marked useful — usefulness_count bumped, last_useful/last_accessed refreshed — so memories that actually inform later writes rank higher in recall and decay slower. Cite the entities you recalled before composing this write. Unknown citations are reported in the result, not fatal; self-citations are ignored."
+          },
+          "origin": {
+            "type": "object",
+            "properties": {
+              "memory_kind": {
+                "type": "string",
+                "enum": [
+                  "asserted",
+                  "extracted",
+                  "inferred",
+                  "imported",
+                  "observed"
+                ]
+              },
+              "source_system": {
+                "type": "string"
+              },
+              "capture_method": {
+                "type": "string"
+              },
+              "observed_at_unix_ms": {
+                "type": "integer"
+              }
+            },
+            "description": "#729: optional memory-origin/provenance metadata (spec: docs/specs/memory-provenance-and-external-refs.md). Stored inside body_json under the reserved 'origin' key — surfaced by recall/get_entity via body expansion. All fields optional; unknown values are left absent, never guessed."
+          },
+          "external_refs": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "ref_type": {
+                  "type": "string"
+                },
+                "ref_value": {
+                  "type": "string"
+                },
+                "source_system": {
+                  "type": "string"
+                },
+                "relationship": {
+                  "type": "string",
+                  "enum": [
+                    "about",
+                    "derived_from",
+                    "mentions",
+                    "applies_to",
+                    "supersedes"
+                  ]
+                }
+              },
+              "required": [
+                "ref_type",
+                "ref_value"
+              ]
+            },
+            "description": "#728: optional first-class pointers to external systems of record (max 32). Stored inside body_json under the reserved 'external_refs' key; filter recall with ref_type/ref_value."
+          },
+          "evidence": {
+            "type": "object",
+            "description": "Write-time audit envelope for captures and decisions. capture_mode distinguishes snapshot, hash_only, pointer_only, not_requested, capture_failed, and legacy_unknown; a missing value is never interpreted implicitly.",
+            "properties": {
+              "capture_mode": {
+                "type": "string",
+                "enum": [
+                  "snapshot",
+                  "hash_only",
+                  "pointer_only",
+                  "not_requested",
+                  "capture_failed",
+                  "legacy_unknown"
+                ]
+              },
+              "resolved_value": {
+                "description": "Resolved source value retained at write time when capture_mode=snapshot"
+              },
+              "content_sha256": {
+                "type": "string",
+                "description": "64-hex SHA-256 of the resolved value or source bytes"
+              },
+              "source_system": {
+                "type": "string"
+              },
+              "source_ref": {
+                "type": "string"
+              },
+              "captured_at_unix_ms": {
+                "type": "integer"
+              },
+              "replayable": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "capture_mode",
+              "captured_at_unix_ms",
+              "replayable"
+            ]
+          },
+          "interference_mode": {
+            "type": "string",
+            "enum": [
+              "auto",
+              "refuse",
+              "quarantine"
+            ],
+            "default": "auto",
+            "description": "#874: per-write interference-gate mode override. auto (default) uses the operator-configured mode (PERSEUS_VAULT_INTERFERENCE_MODE); refuse/quarantine tighten it per-write. Per-write 'off' is refused fail-closed — only the operator can disable the gate."
+          },
+          "interference_bound": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+            "description": "#874: per-write interference bound override — may only TIGHTEN the configured bound (PERSEUS_VAULT_INTERFERENCE_BOUND); a looser bound is refused fail-closed. Writes whose activation overlap with existing memory exceeds the bound are quarantined (default) or refused."
+          },
+          "sparse_update": {
+            "type": "boolean",
+            "default": false,
+            "description": "#874: sparse update mode — touches only the activated subset of state (body slot, activated links), never disturbs neighbors: no salience inflation on re-assert, caller links admitted only when their target is activated by the new body, no near-duplicate absorption on insert."
+          },
+          "hints": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 3,
+            "description": "#919: optional 1-3 prospective query hints — natural-language phrasings that should retrieve this entity, indexed into FTS5 alongside the body (vocabulary-gap recall). Default-off: hints are rejected unless the server runs with PERSEUS_VAULT_HINTS_ENABLED=1. Hints replace any previously stored hints on update (omit to clear)."
           }
         },
         "required": [
@@ -79,12 +331,47 @@
           "key": {
             "type": "string",
             "description": "Entity key"
+          },
+          "derived_from": {
+            "type": "object",
+            "description": "Present when derived_from citations were passed: {reinforced: n, not_found: [labels]}"
+          },
+          "proposed": {
+            "type": "boolean",
+            "description": "True when the write lacks authoritative admission and must remain reviewable."
+          },
+          "requires_review": {
+            "type": "boolean",
+            "description": "Whether the stored write must be reviewed before promotion or authoritative use."
+          },
+          "provenance": {
+            "type": "object",
+            "description": "Hash-only admission/provenance state; raw prompts, bodies, credentials, and tool arguments are excluded."
+          },
+          "outcome_class": {
+            "type": "string",
+            "enum": [
+              "save",
+              "drop",
+              "block",
+              "pending_approval"
+            ],
+            "description": "Stable four-way admission result. SAVE is durably active; DROP and BLOCK are non-persisting terminal decisions; PENDING_APPROVAL is retained but non-serveable until review."
+          },
+          "disposition": {
+            "type": "string",
+            "description": "Existing detailed disposition, such as quarantined; use outcome_class for stable aggregation."
+          },
+          "admission": {
+            "type": "object",
+            "description": "Hash-covered, content-minimized admission evidence."
           }
         }
       },
       "annotations": {
         "destructiveHint": true
-      }
+      },
+      "title": "Remember Entity"
     },
     {
       "name": "perseus_vault_recall",
@@ -94,7 +381,7 @@
         "properties": {
           "query": {
             "type": "string",
-            "description": "Search query \u2014 words are OR'd together for broad recall"
+            "description": "Search query — words are OR'd together for broad recall"
           },
           "category": {
             "type": "string",
@@ -112,7 +399,7 @@
           "min_decay": {
             "type": "number",
             "default": 0.0,
-            "description": "Minimum decay score threshold 0.0\u20131.0 \u2014 higher values return fresher results"
+            "description": "Minimum decay score threshold 0.0–1.0 — higher values return fresher results"
           },
           "topic_path": {
             "type": "string",
@@ -295,7 +582,7 @@
     },
     {
       "name": "perseus_vault_journal",
-      "description": "Append a structured decision/observation log entry. Uses evaluated/acted/forward pattern: what was considered, what was done, and what happens next. Essential for audit trails and timeline reconstruction.",
+      "description": "Append a structured decision/observation log entry. Uses evaluated/acted/forward pattern: what was considered, what was done, and what happens next. Essential for audit trails and timeline reconstruction. Public admission_source events additionally require an initialized clientInfo.name and an enforce-mode memory.admission.source authority for the exact workspace; caller-supplied identities are never authoritative.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -328,9 +615,18 @@
             "type": "string",
             "description": "Related entity ID for linking"
           },
+          "agent_id": {
+            "type": "string",
+            "default": "",
+            "description": "Agent identity (v1.2.0). Records which agent created this journal event."
+          },
+          "workspace_hash": {
+            "type": "string",
+            "default": "",
+            "description": "Explicit workspace attribution for the journal event; empty string denotes the global partition."
+          },
           "requesting_agent_id": {
             "type": "string",
-            "minLength": 1,
             "description": "Transport-stamped caller identity; required for admission_source events."
           },
           "source_attestation": {
@@ -338,33 +634,74 @@
             "minLength": 64,
             "maxLength": 64,
             "pattern": "^[0-9a-fA-F]{64}$",
-            "description": "HMAC-SHA256 attestation over canonical admission-source fields; required for admission_source and never stored."
+            "description": "HMAC-SHA256 attestation over the canonical admission-source fields; required for public admission_source events and never stored."
           }
         },
         "required": [],
         "allOf": [
           {
             "if": {
-              "properties": {"event_type": {"const": "admission_source"}},
-              "required": ["event_type"]
+              "properties": {
+                "event_type": {
+                  "const": "admission_source"
+                }
+              },
+              "required": [
+                "event_type"
+              ]
             },
             "then": {
-              "required": ["evaluated", "workspace_hash", "requesting_agent_id", "source_attestation"],
+              "required": [
+                "evaluated",
+                "workspace_hash",
+                "requesting_agent_id",
+                "source_attestation"
+              ],
               "properties": {
                 "evaluated": {
                   "type": "object",
-                  "required": ["record_digest", "source_identity", "workspace_hash", "actor_kind", "actor_identity"],
+                  "required": [
+                    "record_digest",
+                    "source_identity",
+                    "workspace_hash",
+                    "actor_kind",
+                    "actor_identity"
+                  ],
                   "properties": {
-                    "record_digest": {"type": "string", "pattern": "^[0-9a-fA-F]{64}$"},
-                    "source_identity": {"type": "string", "minLength": 1},
-                    "workspace_hash": {"type": "string", "minLength": 1},
-                    "actor_kind": {"type": "string", "minLength": 1},
-                    "actor_identity": {"type": "string", "minLength": 1}
+                    "record_digest": {
+                      "type": "string",
+                      "pattern": "^[0-9a-fA-F]{64}$"
+                    },
+                    "source_identity": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "workspace_hash": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "actor_kind": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "actor_identity": {
+                      "type": "string",
+                      "minLength": 1
+                    }
                   }
                 },
-                "workspace_hash": {"type": "string", "minLength": 1},
-                "requesting_agent_id": {"type": "string", "minLength": 1},
-                "source_attestation": {"type": "string", "minLength": 64, "maxLength": 64, "pattern": "^[0-9a-fA-F]{64}$"}
+                "workspace_hash": {
+                  "minLength": 1
+                },
+                "requesting_agent_id": {
+                  "minLength": 1
+                },
+                "source_attestation": {
+                  "type": "string",
+                  "minLength": 64,
+                  "maxLength": 64,
+                  "pattern": "^[0-9a-fA-F]{64}$"
+                }
               }
             }
           }
@@ -389,6 +726,124 @@
       },
       "annotations": {
         "destructiveHint": true
+      },
+      "title": "Append Journal Entry"
+    },
+    {
+      "name": "perseus_vault_admission_decide",
+      "description": "#1107: resolve a proposed trust-admission candidate through an explicit operator decision. approve re-signs the pending evidence as SAVE and activates the existing row through the verified writer; reject requires rejection_class=drop or block, re-signs the evidence as that terminal class, archives the row, and never serves it. Both transitions are hash-only in the response, record an admission_review_started intent before mutation, and append a completed admission_approved/admission_rejected receipt only after durable transition. Public calls require an initialized clientInfo.name and an enforce-mode memory.admission.review authority for the exact workspace.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "category": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Candidate entity category"
+          },
+          "key": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Candidate entity key"
+          },
+          "workspace_hash": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Exact non-empty workspace scope of the candidate"
+          },
+          "requesting_agent_id": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Operator/reviewer identity stamped into the audit event"
+          },
+          "decision": {
+            "type": "string",
+            "enum": [
+              "approve",
+              "reject"
+            ]
+          },
+          "rejection_class": {
+            "type": "string",
+            "enum": [
+              "drop",
+              "block"
+            ],
+            "description": "Required when decision=reject"
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Bounded non-empty review reason; the response stores only its SHA-256"
+          }
+        },
+        "required": [
+          "category",
+          "key",
+          "workspace_hash",
+          "requesting_agent_id",
+          "decision",
+          "reason"
+        ],
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "decision": {
+                  "const": "reject"
+                }
+              }
+            },
+            "then": {
+              "required": [
+                "rejection_class"
+              ]
+            }
+          }
+        ]
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "ok": {
+            "type": "boolean"
+          },
+          "id": {
+            "type": "string"
+          },
+          "category": {
+            "type": "string"
+          },
+          "key": {
+            "type": "string"
+          },
+          "decision": {
+            "type": "string",
+            "enum": [
+              "approve",
+              "reject"
+            ]
+          },
+          "outcome_class": {
+            "type": "string",
+            "enum": [
+              "save",
+              "drop",
+              "block"
+            ]
+          },
+          "status": {
+            "type": "string"
+          },
+          "serveable": {
+            "type": "boolean"
+          },
+          "audit_event_id": {
+            "type": "string"
+          },
+          "reason_sha256": {
+            "type": "string"
+          }
+        }
       }
     },
     {
@@ -453,7 +908,7 @@
         "properties": {
           "key": {
             "type": "string",
-            "description": "State key \u2014 unique identifier for this state entry"
+            "description": "State key — unique identifier for this state entry"
           },
           "value_json": {
             "type": "string",
@@ -536,7 +991,7 @@
     },
     {
       "name": "perseus_vault_state_delete",
-      "description": "Delete a state entry by key. Permanent removal \u2014 unlike perseus_vault_forget which is a soft-delete. Use this to clean up expired or unused state entries.",
+      "description": "Delete a state entry by key. Permanent removal — unlike perseus_vault_forget which is a soft-delete. Use this to clean up expired or unused state entries.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -685,7 +1140,7 @@
           "min_decay": {
             "type": "number",
             "default": 0.1,
-            "description": "Decay threshold \u2014 entities with decay score below this are archived"
+            "description": "Decay threshold — entities with decay score below this are archived"
           },
           "dry_run": {
             "type": "boolean",
@@ -803,7 +1258,7 @@
     },
     {
       "name": "perseus_vault_traverse",
-      "description": "Walk the entity link graph starting from a given entity up to a configurable depth. Returns a chain of linked entities \u2014 useful for exploring dependencies, decision trees, and relationship graphs built via perseus_vault_link.",
+      "description": "Walk the entity link graph starting from a given entity up to a configurable depth. Returns a chain of linked entities — useful for exploring dependencies, decision trees, and relationship graphs built via perseus_vault_link.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -844,7 +1299,7 @@
     },
     {
       "name": "perseus_vault_score",
-      "description": "Assign a quality score (0.0\u20131.0) to an entity. Verified entities with high scores resist decay and rank higher in recall results. Use this to mark entities as accurate, verified, or deprecated.",
+      "description": "Assign a quality score (0.0–1.0) to an entity. Verified entities with high scores resist decay and rank higher in recall results. Use this to mark entities as accurate, verified, or deprecated.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -858,7 +1313,7 @@
           },
           "score": {
             "type": "number",
-            "description": "Quality score 0.0\u20131.0. 1.0 = verified, 0.5 = neutral, 0.0 = low quality"
+            "description": "Quality score 0.0–1.0. 1.0 = verified, 0.5 = neutral, 0.0 = low quality"
           }
         },
         "required": [
@@ -894,7 +1349,7 @@
     },
     {
       "name": "perseus_vault_conflicts",
-      "description": "Detect conflicting entities in the same category \u2014 pairs with low trigram similarity in their body_json. Flags potential contradictions, duplicate-but-divergent entries, and stale-overwritten facts that need human review.",
+      "description": "Detect conflicting entities in the same category — pairs with low trigram similarity in their body_json. Flags potential contradictions, duplicate-but-divergent entries, and stale-overwritten facts that need human review.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -906,7 +1361,7 @@
           "threshold": {
             "type": "number",
             "default": 0.4,
-            "description": "Similarity threshold \u2014 pairs below this are flagged as conflicts"
+            "description": "Similarity threshold — pairs below this are flagged as conflicts"
           },
           "limit": {
             "type": "integer",
@@ -982,7 +1437,7 @@
     },
     {
       "name": "perseus_vault_vault_import",
-      "description": "Import .md files from a vault directory into the database. Reads YAML frontmatter for metadata and markdown body for content. Idempotent \u2014 re-running on the same vault won't duplicate entities. Pair with perseus_vault_vault_export for transfer.",
+      "description": "Import .md files from a vault directory into the database. Reads YAML frontmatter for metadata and markdown body for content. Idempotent — re-running on the same vault won't duplicate entities. Pair with perseus_vault_vault_export for transfer.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -1028,7 +1483,7 @@
     },
     {
       "name": "perseus_vault_decay",
-      "description": "Recalculate Ebbinghaus decay scores for all entities based on time since last access. Auto-archives entities that have fully decayed (score < 0.05). Run periodically to keep memory fresh \u2014 decayed entities surface less often in recall results.",
+      "description": "Recalculate Ebbinghaus decay scores for all entities based on time since last access. Auto-archives entities that have fully decayed (score < 0.05). Run periodically to keep memory fresh — decayed entities surface less often in recall results.",
       "inputSchema": {
         "type": "object",
         "properties": {}

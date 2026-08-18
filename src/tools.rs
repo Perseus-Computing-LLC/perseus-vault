@@ -1063,7 +1063,13 @@ pub fn handle_remember(db: &Database, args: Value) -> Result<String, String> {
 
     let requested_status = crate::models::canonical_entity_status(&a.status)
         .filter(|status| status != "compacted")
-        .ok_or_else(|| format!("invalid writable status '{}': expected one of {:?}", a.status, crate::models::ENTITY_STATUSES))?;
+        .ok_or_else(|| {
+            format!(
+                "invalid writable status '{}': expected one of {:?}",
+                a.status,
+                crate::models::ENTITY_STATUSES
+            )
+        })?;
 
     // Validate body_json is valid JSON
     if let Err(e) = serde_json::from_str::<serde_json::Value>(&a.body_json) {
@@ -1854,24 +1860,25 @@ pub fn handle_admission_decide(db: &Database, args: Value) -> Result<String, Str
         .filter(|value| !value.trim().is_empty())
         .ok_or("admission_decide requires a bounded non-empty reason")?;
     if reason.len() > 256 || reason.chars().any(|c| c.is_control()) {
-        return Err("admission_decide reason must be at most 256 non-control characters".to_string());
+        return Err(
+            "admission_decide reason must be at most 256 non-control characters".to_string(),
+        );
     }
     for (label, value) in [("category", category), ("key", key), ("reviewer", reviewer)] {
         if value.len() > 256 || value.chars().any(|c| c.is_control() || c.is_whitespace()) {
-            return Err(format!("{label} must be a bounded non-whitespace identifier"));
+            return Err(format!(
+                "{label} must be a bounded non-whitespace identifier"
+            ));
         }
     }
     if workspace_hash.len() > 256
-        || workspace_hash.chars().any(|c| c.is_control() || c.is_whitespace())
+        || workspace_hash
+            .chars()
+            .any(|c| c.is_control() || c.is_whitespace())
     {
         return Err("workspace_hash must be a bounded non-whitespace identifier".to_string());
     }
-    require_strict_memory_capability(
-        db,
-        reviewer,
-        workspace_hash,
-        "memory.admission.review",
-    )?;
+    require_strict_memory_capability(db, reviewer, workspace_hash, "memory.admission.review")?;
 
     let entity_id = {
         let conn = db
@@ -1911,7 +1918,9 @@ pub fn handle_admission_decide(db: &Database, args: Value) -> Result<String, Str
         .validate()
         .map_err(|e| format!("admission_decide admission evidence failed validation: {e}"))?;
     if admission.workspace_hash != source.workspace_hash {
-        return Err("admission_decide admission workspace does not match entity workspace".to_string());
+        return Err(
+            "admission_decide admission workspace does not match entity workspace".to_string(),
+        );
     }
     if admission.outcome_class().map_err(|e| e.to_string())?
         != crate::trust_admission::AdmissionOutcomeClass::PendingApproval
@@ -1921,7 +1930,9 @@ pub fn handle_admission_decide(db: &Database, args: Value) -> Result<String, Str
     let mut candidate_body = body.clone();
     let canonical_candidate = canonical_admission_entity_body(&candidate_body)?;
     if crate::trust_admission::digest_text(&canonical_candidate) != admission.record_digest {
-        return Err("admission_decide candidate body digest does not match admission evidence".to_string());
+        return Err(
+            "admission_decide candidate body digest does not match admission evidence".to_string(),
+        );
     }
     // The transition below must never retain the old proposed provenance or
     // admission envelope. They are replaced by the newly signed evidence.
@@ -2063,7 +2074,9 @@ pub fn handle_admission_decide(db: &Database, args: Value) -> Result<String, Str
             event_type: "admission_source".to_string(),
             evaluated_json: hash_only_public_journal_payload(&source_evaluated),
             acted_json: source_acted.to_string(),
-            forward_json: hash_only_public_journal_payload(&json!({"next": "serve after approval"})),
+            forward_json: hash_only_public_journal_payload(
+                &json!({"next": "serve after approval"}),
+            ),
             category: category.to_string(),
             key: key.to_string(),
             entity_id: source.id.clone(),
@@ -2072,7 +2085,9 @@ pub fn handle_admission_decide(db: &Database, args: Value) -> Result<String, Str
             created_at_unix_ms: now_ms(),
         };
         db.journal_authenticated_admission_source(&source_event)
-            .map_err(|e| format!("admission_decide source receipt failed before transition: {e}"))?;
+            .map_err(|e| {
+                format!("admission_decide source receipt failed before transition: {e}")
+            })?;
     }
     let review_intent = JournalEvent {
         id: format!("jrn-{}", Uuid::new_v4().simple()),
@@ -2126,8 +2141,9 @@ pub fn handle_admission_decide(db: &Database, args: Value) -> Result<String, Str
             &review_write_options,
         )
     };
-    let (transition_id, transition_action) = transition_result
-        .map_err(|e| format!("admission_decide durable transition failed after audit intent: {e}"))?;
+    let (transition_id, transition_action) = transition_result.map_err(|e| {
+        format!("admission_decide durable transition failed after audit intent: {e}")
+    })?;
     if transition_id != entity_id
         || transition_action.starts_with("quarantined")
         || transition_action.starts_with("deduped")
@@ -2729,8 +2745,10 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
     // first-pass, marked so the caller can see the provenance of the hit.
     if !confirmed_query.is_empty() {
         if let Ok(Some(confirmed)) = db.serve_confirmed_query_key(&confirmed_query) {
-            let existing_ids: std::collections::HashSet<String> =
-                items_expanded.iter().filter_map(|v| v.get("id").and_then(|x| x.as_str()).map(String::from)).collect();
+            let existing_ids: std::collections::HashSet<String> = items_expanded
+                .iter()
+                .filter_map(|v| v.get("id").and_then(|x| x.as_str()).map(String::from))
+                .collect();
             let mut prepend: Vec<serde_json::Value> = Vec::new();
             for e in confirmed {
                 if existing_ids.contains(&e.id) {
@@ -4065,7 +4083,8 @@ fn entity_has_authoritative_admission(db: &Database, entity: &Entity) -> Result<
             Ok(value) => value,
             Err(_) => return Ok(false),
         };
-    if admission.validate().is_err() || !admission.authoritative || admission.outcome != "admitted" {
+    if admission.validate().is_err() || !admission.authoritative || admission.outcome != "admitted"
+    {
         return Ok(false);
     }
     if canonical_admission_entity_body_digest(&body)? != admission.record_digest {
@@ -4764,7 +4783,9 @@ pub fn handle_journal(db: &Database, args: Value) -> Result<String, String> {
             }
         }
         if workspace != a.workspace_hash {
-            return Err("admission_source workspace_hash must match evaluated.workspace_hash".into());
+            return Err(
+                "admission_source workspace_hash must match evaluated.workspace_hash".into(),
+            );
         }
         if a.requesting_agent_id.trim().is_empty() {
             return Err("admission_source requires transport-stamped requesting_agent_id".into());
@@ -4792,8 +4813,11 @@ pub fn handle_journal(db: &Database, args: Value) -> Result<String, String> {
     let acted_json = if source_event {
         let mut receipt: Value = serde_json::from_str(&hash_only_public_journal_payload(&a.acted))
             .map_err(|e| format!("admission source receipt serialization failed: {e}"))?;
+        // The schema intentionally accepts either hex case. Persist the
+        // attestation digest over the canonical lowercase representation so
+        // verification and durable storage bind the same bytes.
         receipt["attestation_digest"] = json!(crate::trust_admission::digest_text(
-            a.source_attestation.trim()
+            &a.source_attestation.trim().to_ascii_lowercase()
         ));
         receipt.to_string()
     } else {
@@ -4818,8 +4842,7 @@ pub fn handle_journal(db: &Database, args: Value) -> Result<String, String> {
     } else {
         db.journal(&event)
     };
-    journal_result
-        .map_err(|e| format!("Journal failed: {}", e))?;
+    journal_result.map_err(|e| format!("Journal failed: {}", e))?;
 
     let result = json!({
         "id": event.id,
@@ -5613,7 +5636,8 @@ fn pack_pipeline(
     // carries a "supersedes" link whose target is the stale fact. A fact is
     // superseded when any candidate links to it that way (the superseder
     // shares the topic, so it is normally in the candidate set too).
-    let mut superseded_targets: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut superseded_targets: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
     for ent in &candidates {
         for l in &ent.links {
             if l.relationship == "supersedes" {
@@ -5712,8 +5736,7 @@ fn intent_trail(
     max_trail: i64,
 ) -> Result<Vec<serde_json::Value>, String> {
     let max_trail = max_trail.clamp(1, 20);
-    let ids: std::collections::HashSet<&str> =
-        candidates.iter().map(|e| e.id.as_str()).collect();
+    let ids: std::collections::HashSet<&str> = candidates.iter().map(|e| e.id.as_str()).collect();
     let cats: std::collections::HashSet<&str> =
         candidates.iter().map(|e| e.category.as_str()).collect();
     let params = crate::models::TimelineParams {
@@ -5870,9 +5893,7 @@ fn pack_conflicts(
         let ya = y["pair"]["entity_a"]["id"].as_str().unwrap_or("");
         let xb = x["pair"]["entity_b"]["id"].as_str().unwrap_or("");
         let yb = y["pair"]["entity_b"]["id"].as_str().unwrap_or("");
-        xc.cmp(yc)
-            .then_with(|| xa.cmp(ya))
-            .then_with(|| xb.cmp(yb))
+        xc.cmp(yc).then_with(|| xa.cmp(ya)).then_with(|| xb.cmp(yb))
     });
     out
 }
@@ -5920,19 +5941,18 @@ pub fn handle_handoff_pack(db: &Database, args: Value) -> Result<String, String>
         // The trail is computed whenever either section is requested (next_work
         // derives its forward plans from it), but each OUTPUT key is emitted
         // only when its own flag is set — the opt-in output contract.
-        let trail =
-            intent_trail(db, &outcome.candidates, a.workspace_hash.as_deref(), a.max_trail)?;
+        let trail = intent_trail(
+            db,
+            &outcome.candidates,
+            a.workspace_hash.as_deref(),
+            a.max_trail,
+        )?;
         if a.include_intent_trail {
             result["intent_trail"] = json!(trail);
         }
         if a.include_next_work {
-            result["next_work"] = next_work_sections(
-                db,
-                &a.query,
-                a.workspace_hash.as_deref(),
-                &trail,
-                &args,
-            );
+            result["next_work"] =
+                next_work_sections(db, &a.query, a.workspace_hash.as_deref(), &trail, &args);
         }
     }
     if a.include_conflicts {
@@ -5998,13 +6018,7 @@ pub fn handle_delegation_brief(db: &Database, args: Value) -> Result<String, Str
         a.workspace_hash.as_deref(),
     )?;
     let trail = intent_trail(db, &outcome.candidates, a.workspace_hash.as_deref(), 5)?;
-    let next = next_work_sections(
-        db,
-        &a.query,
-        a.workspace_hash.as_deref(),
-        &trail,
-        &args,
-    );
+    let next = next_work_sections(db, &a.query, a.workspace_hash.as_deref(), &trail, &args);
     let brief = render_delegation_brief(&a, &outcome, &trail, &next);
     Ok(json!({
         "brief": brief,
@@ -6141,7 +6155,11 @@ fn render_delegation_brief(
         _ => out.push_str("(none specified — return a plan with explicit open questions)\n"),
     }
     out.push_str("\n## Sources\n");
-    let ids: Vec<&str> = outcome.pack.iter().filter_map(|p| p["id"].as_str()).collect();
+    let ids: Vec<&str> = outcome
+        .pack
+        .iter()
+        .filter_map(|p| p["id"].as_str())
+        .collect();
     out.push_str(&format!("{}\n", ids.join(", ")));
     out
 }
@@ -7605,8 +7623,8 @@ pub struct SealArgs {
 /// it. Integrity ≠ truth: a seal proves unchanged-since-sealed, never
 /// true-when-written.
 pub fn handle_seal(db: &Database, args: Value) -> Result<String, String> {
-    let a: SealArgs = serde_json::from_value(args)
-        .map_err(|e| format!("Invalid seal arguments: {e}"))?;
+    let a: SealArgs =
+        serde_json::from_value(args).map_err(|e| format!("Invalid seal arguments: {e}"))?;
     let receipt = db
         .seal_entity(
             &a.target_id,
@@ -7714,133 +7732,139 @@ pub fn handle_param_lineage(db: &Database, args: Value) -> Result<String, String
 
 // ─── #1065 intent-aware typed-relational traversal handlers ─────────────
 
-    #[derive(Debug, Deserialize)]
-    pub struct TypedTraversalArgs {
-        pub query: String,
-        #[serde(default = "default_traversal_limit")]
-        pub limit: usize,
-    }
+#[derive(Debug, Deserialize)]
+pub struct TypedTraversalArgs {
+    pub query: String,
+    #[serde(default = "default_traversal_limit")]
+    pub limit: usize,
+}
 
-    fn default_traversal_limit() -> usize {
-        10
-    }
+fn default_traversal_limit() -> usize {
+    10
+}
 
-    /// Intent-aware typed-relational traversal (MAGMA pattern): the query is
-    /// routed to one relation view (temporal / causal / entity / semantic) by a
-    /// deterministic classifier, the view's traversal policy runs, and the
-    /// explainable path + rejected distractors come back with token accounting
-    /// for the budget discipline. Each run is recorded for the ablation report.
-    pub fn handle_typed_traversal(db: &Database, args: Value) -> Result<String, String> {
-        let a: TypedTraversalArgs = serde_json::from_value(args)
-            .map_err(|e| format!("Invalid typed_traversal arguments: {}", e))?;
-        let t = db
-            .typed_traversal(&a.query, a.limit)
-            .map_err(|e| e.to_string())?;
-        Ok(json!(t).to_string())
-    }
+/// Intent-aware typed-relational traversal (MAGMA pattern): the query is
+/// routed to one relation view (temporal / causal / entity / semantic) by a
+/// deterministic classifier, the view's traversal policy runs, and the
+/// explainable path + rejected distractors come back with token accounting
+/// for the budget discipline. Each run is recorded for the ablation report.
+pub fn handle_typed_traversal(db: &Database, args: Value) -> Result<String, String> {
+    let a: TypedTraversalArgs = serde_json::from_value(args)
+        .map_err(|e| format!("Invalid typed_traversal arguments: {}", e))?;
+    let t = db
+        .typed_traversal(&a.query, a.limit)
+        .map_err(|e| e.to_string())?;
+    Ok(json!(t).to_string())
+}
 
-    /// Per-view ablation report over recorded traversals: mean selected/rejected
-    /// tokens and distractor ratio per relation view — is each view earning its
-    /// token cost?
-    pub fn handle_traversal_ablation(db: &Database, _args: Value) -> Result<String, String> {
-        let rows = db.typed_traversal_ablation().map_err(|e| e.to_string())?;
-        Ok(json!({"views": rows}).to_string())
-    }
+/// Per-view ablation report over recorded traversals: mean selected/rejected
+/// tokens and distractor ratio per relation view — is each view earning its
+/// token cost?
+pub fn handle_traversal_ablation(db: &Database, _args: Value) -> Result<String, String> {
+    let rows = db.typed_traversal_ablation().map_err(|e| e.to_string())?;
+    Ok(json!({"views": rows}).to_string())
+}
 
-    // ─── #1066 model-upgrade inheritance handler ───────────────────────────
+// ─── #1066 model-upgrade inheritance handler ───────────────────────────
 
-    #[derive(Debug, Deserialize)]
-    pub struct ModelInheritanceArgs {
-        /// record | approve | query | depart | replay
-        pub action: String,
-        #[serde(default)]
-        pub subject_id: Option<String>,
-        #[serde(default)]
-        pub from_model: Option<String>,
-        #[serde(default)]
-        pub to_model: Option<String>,
-        #[serde(default)]
-        pub provider: Option<String>,
-        #[serde(default)]
-        pub source_state_hash: Option<String>,
-        #[serde(default)]
-        pub compatibility_report: Option<String>,
-        #[serde(default)]
-        pub receipt_id: Option<String>,
-        #[serde(default)]
-        pub approver: Option<String>,
-        #[serde(default)]
-        pub incarnation_id: Option<String>,
-        #[serde(default)]
-        pub reason: Option<String>,
-        #[serde(default = "default_replay_limit")]
-        pub sample_limit: usize,
-        #[serde(default)]
-        pub requesting_agent_id: Option<String>,
-    }
+#[derive(Debug, Deserialize)]
+pub struct ModelInheritanceArgs {
+    /// record | approve | query | depart | replay
+    pub action: String,
+    #[serde(default)]
+    pub subject_id: Option<String>,
+    #[serde(default)]
+    pub from_model: Option<String>,
+    #[serde(default)]
+    pub to_model: Option<String>,
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub source_state_hash: Option<String>,
+    #[serde(default)]
+    pub compatibility_report: Option<String>,
+    #[serde(default)]
+    pub receipt_id: Option<String>,
+    #[serde(default)]
+    pub approver: Option<String>,
+    #[serde(default)]
+    pub incarnation_id: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default = "default_replay_limit")]
+    pub sample_limit: usize,
+    #[serde(default)]
+    pub requesting_agent_id: Option<String>,
+}
 
-    fn default_replay_limit() -> usize {
-        10
-    }
+fn default_replay_limit() -> usize {
+    10
+}
 
-    /// Model-upgrade inheritance receipts (#1066): a stable subject identity
-    /// distinct from any model/provider/session id, per-incarnation records, and
-    /// explicit governed transitions (record / approve / query / depart / replay)
-    /// so identity continuity across model upgrades is auditable, never
-    /// implicit. Departure preserves tombstones — no silent destruction.
-    pub fn handle_model_inheritance(db: &Database, args: Value) -> Result<String, String> {
-        let a: ModelInheritanceArgs = serde_json::from_value(args)
-            .map_err(|e| format!("Invalid model_inheritance arguments: {}", e))?;
-        let subject = a.subject_id.as_deref().unwrap_or("default-subject");
-        match a.action.as_str() {
-            "record" => {
-                let from_model = a.from_model.as_deref().ok_or("from_model is required")?;
-                let to_model = a.to_model.as_deref().ok_or("to_model is required")?;
-                let receipt = db
-                    .inheritance_receipt_record(
-                        subject,
-                        from_model,
-                        to_model,
-                        a.provider.as_deref().unwrap_or(""),
-                        a.source_state_hash.as_deref().unwrap_or(""),
-                        a.compatibility_report.as_deref().unwrap_or(""),
-                        a.requesting_agent_id.as_deref().unwrap_or(""),
-                    )
-                    .map_err(|e| e.to_string())?;
-                Ok(json!(receipt).to_string())
-            }
-            "approve" => {
-                let receipt_id = a.receipt_id.as_deref().ok_or("receipt_id is required")?;
-                let approver = a.approver.as_deref().ok_or("approver is required")?;
-                let receipt = db
-                    .inheritance_receipt_approve(receipt_id, approver)
-                    .map_err(|e| e.to_string())?;
-                Ok(json!(receipt).to_string())
-            }
-            "query" => {
-                let rows = db
-                    .inheritance_receipt_query(subject)
-                    .map_err(|e| e.to_string())?;
-                Ok(json!({"subject_id": subject, "receipts": rows}).to_string())
-            }
-            "depart" => {
-                let inc = a.incarnation_id.as_deref().ok_or("incarnation_id is required")?;
-                db.incarnation_depart(inc, a.reason.as_deref().unwrap_or(""))
-                    .map_err(|e| e.to_string())?;
-                Ok(json!({"ok": true, "incarnation_id": inc}).to_string())
-            }
-            "replay" => {
-                let receipt_id = a.receipt_id.as_deref().ok_or("receipt_id is required")?;
-                let replay = db
-                    .inheritance_replay(receipt_id, a.sample_limit)
-                    .map_err(|e| e.to_string())?;
-                Ok(json!(replay).to_string())
-            }
-            other => Err(format!("unknown action '{}' (record|approve|query|depart|replay)", other)),
+/// Model-upgrade inheritance receipts (#1066): a stable subject identity
+/// distinct from any model/provider/session id, per-incarnation records, and
+/// explicit governed transitions (record / approve / query / depart / replay)
+/// so identity continuity across model upgrades is auditable, never
+/// implicit. Departure preserves tombstones — no silent destruction.
+pub fn handle_model_inheritance(db: &Database, args: Value) -> Result<String, String> {
+    let a: ModelInheritanceArgs = serde_json::from_value(args)
+        .map_err(|e| format!("Invalid model_inheritance arguments: {}", e))?;
+    let subject = a.subject_id.as_deref().unwrap_or("default-subject");
+    match a.action.as_str() {
+        "record" => {
+            let from_model = a.from_model.as_deref().ok_or("from_model is required")?;
+            let to_model = a.to_model.as_deref().ok_or("to_model is required")?;
+            let receipt = db
+                .inheritance_receipt_record(
+                    subject,
+                    from_model,
+                    to_model,
+                    a.provider.as_deref().unwrap_or(""),
+                    a.source_state_hash.as_deref().unwrap_or(""),
+                    a.compatibility_report.as_deref().unwrap_or(""),
+                    a.requesting_agent_id.as_deref().unwrap_or(""),
+                )
+                .map_err(|e| e.to_string())?;
+            Ok(json!(receipt).to_string())
         }
+        "approve" => {
+            let receipt_id = a.receipt_id.as_deref().ok_or("receipt_id is required")?;
+            let approver = a.approver.as_deref().ok_or("approver is required")?;
+            let receipt = db
+                .inheritance_receipt_approve(receipt_id, approver)
+                .map_err(|e| e.to_string())?;
+            Ok(json!(receipt).to_string())
+        }
+        "query" => {
+            let rows = db
+                .inheritance_receipt_query(subject)
+                .map_err(|e| e.to_string())?;
+            Ok(json!({"subject_id": subject, "receipts": rows}).to_string())
+        }
+        "depart" => {
+            let inc = a
+                .incarnation_id
+                .as_deref()
+                .ok_or("incarnation_id is required")?;
+            db.incarnation_depart(inc, a.reason.as_deref().unwrap_or(""))
+                .map_err(|e| e.to_string())?;
+            Ok(json!({"ok": true, "incarnation_id": inc}).to_string())
+        }
+        "replay" => {
+            let receipt_id = a.receipt_id.as_deref().ok_or("receipt_id is required")?;
+            let replay = db
+                .inheritance_replay(receipt_id, a.sample_limit)
+                .map_err(|e| e.to_string())?;
+            Ok(json!(replay).to_string())
+        }
+        other => Err(format!(
+            "unknown action '{}' (record|approve|query|depart|replay)",
+            other
+        )),
     }
+}
 
-    pub fn handle_vault_export(db: &Database, args: Value) -> String {
+pub fn handle_vault_export(db: &Database, args: Value) -> String {
     let a: VaultExportArgs = match serde_json::from_value(args) {
         Ok(a) => a,
         Err(e) => {
@@ -8494,7 +8518,8 @@ pub fn handle_score(db: &Database, args: Value) -> String {
     let prior = db.get_entity(&a.category, &a.key).ok().flatten();
     match db.score_entity(&a.category, &a.key, a.score) {
         Ok(found) => {
-            let mut out = json!({"found": found, "category": a.category, "key": a.key, "score": a.score});
+            let mut out =
+                json!({"found": found, "category": a.category, "key": a.key, "score": a.score});
             if found {
                 // #1080: an explicit score mutation commits as a signed
                 // transition (old decay → new decay/importance).
@@ -8547,7 +8572,6 @@ pub fn handle_follow(db: &Database, args: Value) -> Result<String, String> {
     serde_json::to_string(&report).map_err(|e| format!("Serialization failed: {}", e))
 }
 
-
 /// #1080: attach a signed transition to a mutation response when a signer
 /// epoch is registered. `None` = unsigned regime (no epoch key registered;
 /// the mutation is journaled by its own handler and remains backward
@@ -8598,8 +8622,8 @@ pub struct PoisonLabelArgs {
 }
 
 pub fn handle_poison_label(db: &Database, args: Value) -> Result<String, String> {
-    let a: PoisonLabelArgs = serde_json::from_value(args)
-        .map_err(|e| format!("Invalid poison_label arguments: {e}"))?;
+    let a: PoisonLabelArgs =
+        serde_json::from_value(args).map_err(|e| format!("Invalid poison_label arguments: {e}"))?;
     let report = db.set_poison_label(&a.entity_id, &a.level, &a.reason)?;
     serde_json::to_string(&report).map_err(|e| format!("Serialization failed: {e}"))
 }
@@ -8634,8 +8658,14 @@ pub fn handle_rollback_repair(db: &Database, args: Value) -> Result<String, Stri
     let report = if let Some(repair_id) = &a.reverse_repair_id {
         db.reverse_rollback_repair(repair_id)?
     } else {
-        db.rollback_repair(&a.faulty_ids, a.dry_run, a.replay, a.workspace_hash.as_deref())?
-    };    serde_json::to_string(&report).map_err(|e| format!("Serialization failed: {e}"))
+        db.rollback_repair(
+            &a.faulty_ids,
+            a.dry_run,
+            a.replay,
+            a.workspace_hash.as_deref(),
+        )?
+    };
+    serde_json::to_string(&report).map_err(|e| format!("Serialization failed: {e}"))
 }
 
 // ── #1090 evolvable retrieval-skill routing (ERSkill) ────────────────────
@@ -8652,11 +8682,15 @@ pub struct SkillSetArgs {
 }
 
 pub fn handle_skill_set(db: &Database, args: Value) -> Result<String, String> {
-    let a: SkillSetArgs = serde_json::from_value(args)
-        .map_err(|e| format!("Invalid skill_set arguments: {e}"))?;
+    let a: SkillSetArgs =
+        serde_json::from_value(args).map_err(|e| format!("Invalid skill_set arguments: {e}"))?;
     let def = crate::retrieval_skills::SkillDef {
         skill_id: a.skill_id,
-        name: if a.name.is_empty() { "skill".to_string() } else { a.name },
+        name: if a.name.is_empty() {
+            "skill".to_string()
+        } else {
+            a.name
+        },
         version: a.version,
         frontier: crate::retrieval_skills::FRONTIER_EXPANSION.to_string(),
         profile: a.profile,
@@ -8674,8 +8708,8 @@ pub struct SkillRouteArgs {
 }
 
 pub fn handle_skill_route(db: &Database, args: Value) -> Result<String, String> {
-    let a: SkillRouteArgs = serde_json::from_value(args)
-        .map_err(|e| format!("Invalid skill_route arguments: {e}"))?;
+    let a: SkillRouteArgs =
+        serde_json::from_value(args).map_err(|e| format!("Invalid skill_route arguments: {e}"))?;
     let report = db.skill_route(&a.query, a.serve)?;
     serde_json::to_string(&report).map_err(|e| format!("Serialization failed: {e}"))
 }
@@ -8701,7 +8735,6 @@ pub fn handle_skill_audit(db: &Database, args: Value) -> Result<String, String> 
     let report = db.skill_audit()?;
     serde_json::to_string(&report).map_err(|e| format!("Serialization failed: {e}"))
 }
-
 
 // ── #1091 type-conditioned temporal decay (ScrubJay) ──────────────────────
 
@@ -8761,8 +8794,8 @@ pub struct StateAuditArgs {
 }
 
 pub fn handle_state_audit(db: &Database, args: Value) -> Result<String, String> {
-    let a: StateAuditArgs = serde_json::from_value(args)
-        .map_err(|e| format!("Invalid state_audit arguments: {e}"))?;
+    let a: StateAuditArgs =
+        serde_json::from_value(args).map_err(|e| format!("Invalid state_audit arguments: {e}"))?;
     let report = db.state_audit(a.dry_run)?;
     serde_json::to_string(&report).map_err(|e| format!("Serialization failed: {e}"))
 }
@@ -11319,7 +11352,6 @@ pub fn handle_ingest(db: &Database, args: Value) -> Result<String, String> {
     }
 }
 
-
 #[derive(Debug, Deserialize)]
 pub struct SpanAuditArgs {
     pub entity_id: String,
@@ -11360,8 +11392,8 @@ pub struct ReportRefusalArgs {
 }
 
 pub fn handle_report_refusal(db: &Database, args: Value) -> Result<String, String> {
-    let a: ReportRefusalArgs =
-        serde_json::from_value(args).map_err(|e| format!("Invalid report_refusal arguments: {e}"))?;
+    let a: ReportRefusalArgs = serde_json::from_value(args)
+        .map_err(|e| format!("Invalid report_refusal arguments: {e}"))?;
     if a.query.trim().is_empty() {
         return Err("report_refusal: query must be non-empty".to_string());
     }
@@ -11381,8 +11413,8 @@ pub struct ReportSuccessArgs {
 }
 
 pub fn handle_report_success(db: &Database, args: Value) -> Result<String, String> {
-    let a: ReportSuccessArgs =
-        serde_json::from_value(args).map_err(|e| format!("Invalid report_success arguments: {e}"))?;
+    let a: ReportSuccessArgs = serde_json::from_value(args)
+        .map_err(|e| format!("Invalid report_success arguments: {e}"))?;
     if a.query.trim().is_empty() {
         return Err("report_success: query must be non-empty".to_string());
     }
@@ -12962,9 +12994,9 @@ pub fn handle_consistency_audit(db: &Database, args: Value) -> Result<String, St
             continue;
         }
         let (Some(a_ent), Some(b_ent)) = (
-            db.get_entity_by_id_public(id_a)
+            db.get_entity_by_id_unfiltered(id_a)
                 .map_err(|e| format!("Entity lookup failed: {e}"))?,
-            db.get_entity_by_id_public(id_b)
+            db.get_entity_by_id_unfiltered(id_b)
                 .map_err(|e| format!("Entity lookup failed: {e}"))?,
         ) else {
             continue;
@@ -13080,11 +13112,11 @@ pub fn handle_audit_ruling(db: &Database, args: Value) -> Result<String, String>
                 return Err("audit_ruling requires entity_a_key and entity_b_key".to_string());
             }
             let ent_a = db
-                .get_entity(&a.category, &a.entity_a_key)
+                .get_entity_by_category_key_for_mutation(&a.category, &a.entity_a_key)
                 .map_err(|e| format!("Entity A lookup failed: {e}"))?
                 .ok_or_else(|| format!("Entity A not found: {}/{}", a.category, a.entity_a_key))?;
             let ent_b = db
-                .get_entity(&a.category, &a.entity_b_key)
+                .get_entity_by_category_key_for_mutation(&a.category, &a.entity_b_key)
                 .map_err(|e| format!("Entity B lookup failed: {e}"))?
                 .ok_or_else(|| format!("Entity B not found: {}/{}", a.category, a.entity_b_key))?;
             if ent_a.id == ent_b.id {
@@ -13123,7 +13155,7 @@ pub fn handle_audit_ruling(db: &Database, args: Value) -> Result<String, String>
                     return Err("override requires winner_category and winner_key".to_string());
                 }
                 let winner_ent = db
-                    .get_entity(&a.winner_category, &a.winner_key)
+                    .get_entity_by_category_key_for_mutation(&a.winner_category, &a.winner_key)
                     .map_err(|e| format!("Winner lookup failed: {e}"))?
                     .ok_or_else(|| {
                         format!("Winner not found: {}/{}", a.winner_category, a.winner_key)
@@ -13205,7 +13237,7 @@ pub fn handle_supersede(db: &Database, args: Value) -> Result<String, String> {
 
     // Find the 'from' entity
     let from_entity = db
-        .get_entity(&a.from_category, &a.from_key)
+        .get_entity_by_category_key_for_mutation(&a.from_category, &a.from_key)
         .map_err(|e| format!("'From' entity lookup failed: {}", e))?
         .ok_or_else(|| {
             format!(
@@ -13216,7 +13248,7 @@ pub fn handle_supersede(db: &Database, args: Value) -> Result<String, String> {
 
     // Find the 'to' entity
     let to_entity = db
-        .get_entity(&a.to_category, &a.to_key)
+        .get_entity_by_category_key_for_mutation(&a.to_category, &a.to_key)
         .map_err(|e| format!("'To' entity lookup failed: {}", e))?
         .ok_or_else(|| format!("'To' entity not found: {}/{}", a.to_category, a.to_key))?;
 
@@ -13227,7 +13259,7 @@ pub fn handle_supersede(db: &Database, args: Value) -> Result<String, String> {
     //   * it must not EXTEND an already-closed period — a fact that ended
     //     stays ended; superseding may only tighten.
     let periods = db
-        .valid_periods_for_ids(&[from_entity.id.clone()])
+        .valid_periods_for_ids_for_mutation(&[from_entity.id.clone()])
         .map_err(|e| format!("'From' entity valid-period lookup failed: {}", e))?;
     let (eff_from, cur_to) = periods
         .get(&from_entity.id)
@@ -14244,7 +14276,10 @@ mod tests {
             .expect("admission test environment lock");
         let previous = std::env::var(ADMISSION_SOURCE_HMAC_KEY_ENV).ok();
         std::env::remove_var(ADMISSION_SOURCE_HMAC_KEY_ENV);
-        AdmissionEnvGuard { _lock: lock, previous }
+        AdmissionEnvGuard {
+            _lock: lock,
+            previous,
+        }
     }
 
     fn remember_rejects_injection_bodies_fail_closed() {
@@ -17175,7 +17210,11 @@ mod tests {
         .expect("first supersede");
         let snapshots = db.history_versions("facts", "rs-old").unwrap().len();
 
-        let old_id = db.get_entity("facts", "rs-old").unwrap().unwrap().id;
+        let old_id = db
+            .get_entity_by_category_key_for_mutation("facts", "rs-old")
+            .unwrap()
+            .unwrap()
+            .id;
         db.update_entity_status(&old_id, "deprecated", "second reason")
             .expect("same-status reason overwrite");
 
@@ -17184,7 +17223,10 @@ mod tests {
             snapshots,
             "a same-status reason overwrite must not write a snapshot"
         );
-        let e = db.get_entity("facts", "rs-old").unwrap().unwrap();
+        let e = db
+            .get_entity_by_category_key_for_mutation("facts", "rs-old")
+            .unwrap()
+            .unwrap();
         assert_eq!(e.status, "deprecated");
         assert_eq!(e.archive_reason, "second reason");
 
@@ -18057,9 +18099,14 @@ mod tests {
         assert!(!v["supersede_receipt"].as_str().unwrap().is_empty());
         assert_eq!(v["compiled_guard"]["relationship"], "supersedes");
         // guard compiled: loser is deprecated with a CLOSED valid period
-        let loser = db.get_entity("facts", "audit-b").unwrap().unwrap();
+        let loser = db
+            .get_entity_by_category_key_for_mutation("facts", "audit-b")
+            .unwrap()
+            .unwrap();
         assert_eq!(loser.status, "deprecated");
-        let periods = db.valid_periods_for_ids(&[id_b.clone()]).unwrap();
+        let periods = db
+            .valid_periods_for_ids_for_mutation(&[id_b.clone()])
+            .unwrap();
         let (_, cur_to) = periods.get(&id_b).copied().unwrap_or((0, None));
         assert!(cur_to.is_some(), "loser valid period must be closed");
         // idempotent re-ruling: same ruling, no new row
@@ -18667,10 +18714,8 @@ mod tests {
                 "evt-fact" => "event",
                 _ => "general",
             };
-            db.scan_entities(Some(category), None, true, None, 50)
+            db.get_entity_by_category_key_for_mutation(category, key)
                 .unwrap()
-                .into_iter()
-                .find(|e| e.key == key)
                 .unwrap()
                 .decay_score
         };
@@ -18904,7 +18949,10 @@ mod tests {
                 "hp-e1",
                 "{\"note\":\"the deployment pipeline uses kubernetes for the public tier\"}",
             ),
-            false, None, None, false,
+            false,
+            None,
+            None,
+            false,
         )
         .unwrap();
         db.remember_with_options(
@@ -18914,7 +18962,10 @@ mod tests {
                 "hp-e2",
                 "{\"note\":\"deployment promotion requires two-person review\"}",
             ),
-            false, None, None, false,
+            false,
+            None,
+            None,
+            false,
         )
         .unwrap();
         let hp_e1_id: String = {
@@ -18962,7 +19013,10 @@ mod tests {
                 "hp-ant",
                 "{\"note\":\"rollout canary checklist\",\"recall_when\":[\"deployment\"]}",
             ),
-            false, None, None, false,
+            false,
+            None,
+            None,
+            false,
         )
         .unwrap();
 
@@ -19001,8 +19055,14 @@ mod tests {
         )
         .unwrap();
         let vp: Value = serde_json::from_str(&raw_plain).unwrap();
-        assert!(vp.get("intent_trail").is_none(), "unrequested trail: {raw_plain}");
-        assert!(vp.get("next_work").is_none(), "unrequested next_work: {raw_plain}");
+        assert!(
+            vp.get("intent_trail").is_none(),
+            "unrequested trail: {raw_plain}"
+        );
+        assert!(
+            vp.get("next_work").is_none(),
+            "unrequested next_work: {raw_plain}"
+        );
         // Opt-in granularity: next_work alone must not emit intent_trail.
         let raw_nw = handle_handoff_pack(
             &db,
@@ -19012,7 +19072,10 @@ mod tests {
         .unwrap();
         let vn: Value = serde_json::from_str(&raw_nw).unwrap();
         assert!(vn.get("next_work").is_some(), "next_work missing: {raw_nw}");
-        assert!(vn.get("intent_trail").is_none(), "trail emitted without flag: {raw_nw}");
+        assert!(
+            vn.get("intent_trail").is_none(),
+            "trail emitted without flag: {raw_nw}"
+        );
         // Determinism: identical store state -> identical enriched output.
         let raw2 = handle_handoff_pack(&db, args).unwrap();
         assert_eq!(raw2, raw, "enriched pack must be deterministic");
@@ -19029,7 +19092,8 @@ mod tests {
             "{\"note\":\"deployment pipeline runs kubernetes for workspace alpha\"}",
         );
         e_a.workspace_hash = "workspace-a".to_string();
-        db.remember_with_options(&e_a, false, None, None, false).unwrap();
+        db.remember_with_options(&e_a, false, None, None, false)
+            .unwrap();
         let mut e_b = crate::db::tests::make_entity(
             "ws-b",
             "facts",
@@ -19037,7 +19101,8 @@ mod tests {
             "{\"note\":\"deployment pipeline runs kubernetes for workspace beta\"}",
         );
         e_b.workspace_hash = "workspace-b".to_string();
-        db.remember_with_options(&e_b, false, None, None, false).unwrap();
+        db.remember_with_options(&e_b, false, None, None, false)
+            .unwrap();
 
         let raw = handle_handoff_pack(
             &db,
@@ -19052,7 +19117,10 @@ mod tests {
             .iter()
             .filter_map(|p| p["key"].as_str())
             .collect();
-        assert!(keys.contains(&"ws-a"), "scoped pack missing own entity: {raw}");
+        assert!(
+            keys.contains(&"ws-a"),
+            "scoped pack missing own entity: {raw}"
+        );
         assert!(!keys.contains(&"ws-b"), "cross-workspace leak: {raw}");
         // Legacy: no workspace -> unscoped pack sees both.
         let raw_g = handle_handoff_pack(
@@ -19092,7 +19160,8 @@ mod tests {
             "{\"note\":\"deployment pipeline alpha release notes\"}",
         );
         iso_a.workspace_hash = "workspace-a".to_string();
-        db.remember_with_options(&iso_a, false, None, None, false).unwrap();
+        db.remember_with_options(&iso_a, false, None, None, false)
+            .unwrap();
         let iso_a_id: String = {
             let conn = db.conn().unwrap();
             conn.query_row("SELECT id FROM entities WHERE key = 'iso-a'", [], |r| {
@@ -19134,7 +19203,8 @@ mod tests {
             "{\"note\":\"deployment pipeline beta release notes\"}",
         );
         iso_b.workspace_hash = "workspace-b".to_string();
-        db.remember_with_options(&iso_b, false, None, None, false).unwrap();
+        db.remember_with_options(&iso_b, false, None, None, false)
+            .unwrap();
         db.journal(&crate::models::JournalEvent {
             id: "jrn-iso-b".to_string(),
             event_type: "action".to_string(),
@@ -19214,7 +19284,8 @@ mod tests {
             "{\"note\":\"deployment pipeline uses kubernetes for rollout orchestration\"}",
         );
         a1.workspace_hash = "workspace-a".to_string();
-        db.remember_with_options(&a1, false, None, None, false).unwrap();
+        db.remember_with_options(&a1, false, None, None, false)
+            .unwrap();
         let mut a2 = crate::db::tests::make_entity(
             "cf-a2",
             "facts",
@@ -19222,7 +19293,8 @@ mod tests {
             "{\"note\":\"deployment pipeline rolls back automatically whenever a canary probe detects latency spikes beyond the alert threshold\"}",
         );
         a2.workspace_hash = "workspace-a".to_string();
-        db.remember_with_options(&a2, false, None, None, false).unwrap();
+        db.remember_with_options(&a2, false, None, None, false)
+            .unwrap();
         let mut b1 = crate::db::tests::make_entity(
             "cf-b1",
             "facts",
@@ -19230,7 +19302,8 @@ mod tests {
             "{\"note\":\"deployment pipeline runs on jenkins workers with manual gates\"}",
         );
         b1.workspace_hash = "workspace-b".to_string();
-        db.remember_with_options(&b1, false, None, None, false).unwrap();
+        db.remember_with_options(&b1, false, None, None, false)
+            .unwrap();
         let mut b2 = crate::db::tests::make_entity(
             "cf-b2",
             "facts",
@@ -19238,7 +19311,8 @@ mod tests {
             "{\"note\":\"deployment pipeline moved to github actions with matrix builds and artifact signing\"}",
         );
         b2.workspace_hash = "workspace-b".to_string();
-        db.remember_with_options(&b2, false, None, None, false).unwrap();
+        db.remember_with_options(&b2, false, None, None, false)
+            .unwrap();
         let b_ids: Vec<String> = {
             let conn = db.conn().unwrap();
             let mut stmt = conn
@@ -19431,7 +19505,12 @@ mod tests {
         // is newest-first on id (descending), so t3 precedes t2, t1, t0.
         let tie_pos: Vec<usize> = ["tr-t3", "tr-t2", "tr-t1", "tr-t0"]
             .iter()
-            .map(|id| ids25.iter().position(|x| x == id).expect("tie member present"))
+            .map(|id| {
+                ids25
+                    .iter()
+                    .position(|x| x == id)
+                    .expect("tie member present")
+            })
             .collect();
         assert!(
             tie_pos.windows(2).all(|w| w[0] < w[1]),
@@ -19456,7 +19535,10 @@ mod tests {
                 "db-d1",
                 "{\"note\":\"deployment promotion requires two-person review before production\"}",
             ),
-            false, None, None, false,
+            false,
+            None,
+            None,
+            false,
         )
         .unwrap();
         db.remember_with_options(
@@ -19466,7 +19548,10 @@ mod tests {
                 "db-d2",
                 "{\"note\":\"deployment promotion approved by a single reviewer\"}",
             ),
-            false, None, None, false,
+            false,
+            None,
+            None,
+            false,
         )
         .unwrap();
         let db_d2_id: String = {
@@ -19478,7 +19563,8 @@ mod tests {
         };
         // db-d1 supersedes db-d2: the old decision must be excluded and
         // listed as do-not-resurrect, never binding context.
-        db.link("decision", "db-d1", &db_d2_id, "supersedes").unwrap();
+        db.link("decision", "db-d1", &db_d2_id, "supersedes")
+            .unwrap();
         let db_d1_id: String = {
             let conn = db.conn().unwrap();
             conn.query_row("SELECT id FROM entities WHERE key = 'db-d1'", [], |r| {
@@ -19526,7 +19612,10 @@ mod tests {
             !binding.contains("db-d2"),
             "superseded decision leaked into binding context: {brief}"
         );
-        let resurrect = &brief[bind_end..brief.find("## Intent trail (recent)").expect("trail header")];
+        let resurrect = &brief[bind_end
+            ..brief
+                .find("## Intent trail (recent)")
+                .expect("trail header")];
         assert!(
             resurrect.contains("db-d2"),
             "superseded decision missing from do-not-resurrect: {brief}"
@@ -19581,10 +19670,11 @@ mod tests {
         assert_eq!(v2["brief"], v["brief"], "brief must be deterministic");
         assert_eq!(v2["brief_digest"], v["brief_digest"]);
         // Validation: goal and query are required.
-        assert!(
-            handle_delegation_brief(&db, json!({"query": "deployment promotion", "goal": "  "}))
-                .is_err()
-        );
+        assert!(handle_delegation_brief(
+            &db,
+            json!({"query": "deployment promotion", "goal": "  "})
+        )
+        .is_err());
         assert!(handle_delegation_brief(&db, json!({"query": "", "goal": "x"})).is_err());
         let _ = std::fs::remove_file(path);
     }
@@ -22321,7 +22411,10 @@ mod tests {
             }),
         )
         .expect_err("empty workspace must be rejected before candidate lookup");
-        assert!(missing_workspace.contains("workspace_hash"), "{missing_workspace}");
+        assert!(
+            missing_workspace.contains("workspace_hash"),
+            "{missing_workspace}"
+        );
         let missing_authority = handle_admission_decide(
             &db,
             json!({
@@ -22334,7 +22427,10 @@ mod tests {
             }),
         )
         .expect_err("review transitions require explicit review authority");
-        assert!(missing_authority.contains("memory.admission.review"), "{missing_authority}");
+        assert!(
+            missing_authority.contains("memory.admission.review"),
+            "{missing_authority}"
+        );
         let _ = std::fs::remove_file(path);
     }
 
@@ -22355,13 +22451,14 @@ mod tests {
             "actor_kind": "connector",
             "actor_identity": "agent-a"
         });
-        let source_attestation_digest = crate::trust_admission::admission_source_attestation_digest(
-            &source_evaluated,
-            "requester-a",
-        )
-        .unwrap();
-        let mut source_acted: Value = serde_json::from_str(&hash_only_public_journal_payload(&json!({})))
+        let source_attestation_digest =
+            crate::trust_admission::admission_source_attestation_digest(
+                &source_evaluated,
+                "requester-a",
+            )
             .unwrap();
+        let mut source_acted: Value =
+            serde_json::from_str(&hash_only_public_journal_payload(&json!({}))).unwrap();
         source_acted["attestation_digest"] = json!(source_attestation_digest);
         db.journal_authenticated_admission_source(&crate::models::JournalEvent {
             id: "src-event-1".to_string(),
@@ -23350,7 +23447,8 @@ mod tests {
         let source_attestation = admission_source_hmac_hex(
             "test-admission-source-key",
             &admission_source_attestation_payload(&evaluated, "transport-requester").unwrap(),
-        );
+        )
+        .to_ascii_uppercase();
         let source = handle_journal(
             &db,
             json!({
@@ -23453,8 +23551,7 @@ mod tests {
         let metadata_mismatch: Value = serde_json::from_str(&metadata_mismatch).unwrap();
         assert_eq!(metadata_mismatch["proposed"], true, "{metadata_mismatch}");
         assert_eq!(
-            metadata_mismatch["admission"]["authoritative"],
-            false,
+            metadata_mismatch["admission"]["authoritative"], false,
             "{metadata_mismatch}"
         );
 
@@ -23609,8 +23706,7 @@ mod tests {
     #[test]
     fn pending_admission_review_has_distinct_approval_and_rejection_audit_outcomes() {
         let (db, path) = temp_db();
-        db.agent_upsert("reviewer", "Reviewer", 2, "test")
-            .unwrap();
+        db.agent_upsert("reviewer", "Reviewer", 2, "test").unwrap();
         db.authority_set(
             &crate::models::AuthorityManifestInput {
                 agent_id: "reviewer".to_string(),
@@ -23696,7 +23792,10 @@ mod tests {
         let approved: Value = serde_json::from_str(&approved).unwrap();
         assert_eq!(approved["outcome_class"], "save");
         assert_eq!(approved["status"], "active");
-        assert!(approved["audit_event_id"].as_str().unwrap().starts_with("jrn-"));
+        assert!(approved["audit_event_id"]
+            .as_str()
+            .unwrap()
+            .starts_with("jrn-"));
         let approved_entity = db
             .get_entity("decision", "review-approve")
             .unwrap()
@@ -23705,16 +23804,21 @@ mod tests {
         let approved_body: Value = serde_json::from_str(&approved_entity.body_json).unwrap();
         let approved_evidence: crate::trust_admission::AdmissionEvidence =
             serde_json::from_value(approved_body["admission"].clone()).unwrap();
-        assert_eq!(approved_evidence.outcome_class().unwrap(), crate::trust_admission::AdmissionOutcomeClass::Save);
+        assert_eq!(
+            approved_evidence.outcome_class().unwrap(),
+            crate::trust_admission::AdmissionOutcomeClass::Save
+        );
         assert!(approved_evidence.authoritative);
         assert!(
-            approved_evidence
-                .source_event_id
-                .as_deref()
-                .is_some_and(|id| id.starts_with("jrn-") && Some(id) != approved["audit_event_id"].as_str()),
+            approved_evidence.source_event_id.as_deref().is_some_and(
+                |id| id.starts_with("jrn-") && Some(id) != approved["audit_event_id"].as_str()
+            ),
             "approval must bind a distinct internal source receipt: {approved_evidence:?}"
         );
-        assert_eq!(approved_evidence.actor_identity.as_deref(), Some("reviewer"));
+        assert_eq!(
+            approved_evidence.actor_identity.as_deref(),
+            Some("reviewer")
+        );
         assert!(approved_evidence.validate().is_ok());
 
         let rejected = handle_admission_decide(
@@ -23735,7 +23839,7 @@ mod tests {
         assert_eq!(rejected["status"], "deprecated");
         assert_eq!(rejected["serveable"], false);
         let rejected_entity = db
-            .get_entity("decision", "review-reject")
+            .get_entity_by_category_key_for_mutation("decision", "review-reject")
             .unwrap()
             .expect("rejected entity remains auditable");
         assert_eq!(rejected_entity.status, "deprecated");
@@ -23743,7 +23847,10 @@ mod tests {
         let rejected_body: Value = serde_json::from_str(&rejected_entity.body_json).unwrap();
         let rejected_evidence: crate::trust_admission::AdmissionEvidence =
             serde_json::from_value(rejected_body["admission"].clone()).unwrap();
-        assert_eq!(rejected_evidence.outcome_class().unwrap(), crate::trust_admission::AdmissionOutcomeClass::Block);
+        assert_eq!(
+            rejected_evidence.outcome_class().unwrap(),
+            crate::trust_admission::AdmissionOutcomeClass::Block
+        );
         assert!(!rejected_evidence.authoritative);
         assert!(rejected_evidence.validate().is_ok());
 
@@ -23752,7 +23859,9 @@ mod tests {
             .prepare("SELECT event_type, acted_json FROM journal WHERE workspace_hash = ?1 AND event_type IN ('admission_review_started', 'admission_approved', 'admission_rejected') ORDER BY created_at_unix_ms ASC, id ASC")
             .unwrap();
         let events: Vec<(String, String)> = stmt
-            .query_map(rusqlite::params!["review-ws"], |row| Ok((row.get(0)?, row.get(1)?)))
+            .query_map(rusqlite::params!["review-ws"], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
             .unwrap()
             .map(|row| row.unwrap())
             .collect();
@@ -24403,7 +24512,6 @@ mod tests {
             .expect("uppercase hex proof accepted by the advertised schema must verify");
     }
 
-
     #[test]
     fn admitted_write_rejects_post_validation_lossy_body_mutation() {
         let _admission_env = admission_env_guard();
@@ -24525,7 +24633,8 @@ mod tests {
                 }
             }),
         );
-        let error = result.expect_err("admission must fail closed when repair changes its bound body");
+        let error =
+            result.expect_err("admission must fail closed when repair changes its bound body");
         assert!(
             error.contains("canonical entity body") || error.contains("record_digest"),
             "unexpected repair/digest error: {error}"
@@ -24538,9 +24647,11 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(status, "proposed", "failed admitted write must not activate row");
+        assert_eq!(
+            status, "proposed",
+            "failed admitted write must not activate row"
+        );
     }
-
 
     #[test]
     fn admission_decide_records_failed_completion_after_completion_write_error() {
@@ -24614,7 +24725,10 @@ mod tests {
             }),
         )
         .expect_err("injected completion write must surface an error");
-        assert!(error.contains("completion receipt"), "unexpected error: {error}");
+        assert!(
+            error.contains("completion receipt"),
+            "unexpected error: {error}"
+        );
 
         let conn = db.conn().unwrap();
         let status: String = conn
@@ -24624,7 +24738,10 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(status, "active", "transition happened before injected completion failure");
+        assert_eq!(
+            status, "active",
+            "transition happened before injected completion failure"
+        );
         let failed_markers: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM journal WHERE event_type='admission_review_failed'",
@@ -24632,7 +24749,9 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(failed_markers, 1, "completion failure must have a durable marker");
+        assert_eq!(
+            failed_markers, 1,
+            "completion failure must have a durable marker"
+        );
     }
-
 }

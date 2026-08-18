@@ -1729,7 +1729,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
         "include_archived": {
           "type": "boolean",
           "default": false,
-          "description": "Include archived (soft-deleted) entities in the scan."
+          "description": "Compatibility flag retained for callers that request historical rows; public scans never return archived or terminal bodies. Use dedicated terminal-audit surfaces for hash-only audit markers."
         },
         "cursor": {
           "type": "string",
