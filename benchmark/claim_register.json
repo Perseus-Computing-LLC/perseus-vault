@@ -60,7 +60,7 @@
       "suite": "beam_task",
       "status": "review",
       "evidence": "fixture_contract_plus_vault_100k_retrieval_only",
-      "scope": "official BEAM 10-ability task ingestion, per-question hash-only retrieval artifacts, token budgets, model/prompt identity envelope, and custody digest"
+      "scope": "official BEAM 10-ability task ingestion, ranked hash-only retrieval artifacts, budget and model/prompt identity envelope, and custody digest"
     },
     {
       "id": "provider-failure-stress",
