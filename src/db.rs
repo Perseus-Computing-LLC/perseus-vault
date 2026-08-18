@@ -8011,7 +8011,23 @@ impl Database {
         let mut visible = Vec::with_capacity(entities.len());
         for entity in entities {
             if entity.status == "compacted" {
-                visible.push(entity);
+                let mut marker = entity;
+                let original_body_sha256 = crate::trust_admission::digest_text(&marker.body_json);
+                let compacted: serde_json::Value =
+                    serde_json::from_str(&marker.body_json).unwrap_or_default();
+                marker.body_json = serde_json::json!({
+                    "compacted": true,
+                    "terminal_audit": true,
+                    "status": "compacted",
+                    "versions": compacted.get("versions").and_then(|v| v.as_i64()),
+                    "digest": compacted.get("digest").and_then(|v| v.as_str()),
+                    "body_sha256": original_body_sha256,
+                })
+                .to_string();
+                marker.links.clear();
+                marker.embedding = None;
+                marker._parsed_body = None;
+                visible.push(marker);
             } else if Self::entity_lifecycle_serveable(&entity) {
                 if !self.entity_suppressed_with_conn(&conn, &entity, now)? {
                     visible.push(entity);

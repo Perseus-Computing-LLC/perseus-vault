@@ -21183,6 +21183,31 @@ mod tests {
             .unwrap()
         };
         handle_prune(&db, json!({"scope": "history", "max_versions_per_key": 1})).expect("evict");
+        {
+            let conn = db.conn().unwrap();
+            let compacted_rows: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM entity_history WHERE key = ?1 AND status = 'compacted'",
+                    ["hot398b"],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(compacted_rows, 1, "expected one compacted history row");
+            let original: String = conn
+                .query_row(
+                    "SELECT body_json FROM entity_history WHERE key = ?1 AND status = 'compacted'",
+                    ["hot398b"],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let mut tampered: Value = serde_json::from_str(&original).unwrap();
+            tampered["content"] = json!("COMPACTED_SENTINEL");
+            conn.execute(
+                "UPDATE entity_history SET body_json = ?1 WHERE key = ?2 AND status = 'compacted'",
+                rusqlite::params![tampered.to_string(), "hot398b"],
+            )
+            .unwrap();
+        }
 
         let resp = handle_as_of(
             &db,
@@ -21197,9 +21222,78 @@ mod tests {
             "marker must be explicit: {resp}"
         );
         assert_eq!(v["status"], json!("compacted"));
+        assert!(
+            !resp.contains("COMPACTED_SENTINEL"),
+            "compacted temporal response leaked the stored body: {resp}"
+        );
         assert_eq!(v["versions_compacted"].as_i64().unwrap(), 2);
         assert_eq!(v["digest"].as_str().unwrap().len(), 16);
         assert!(v["note"].as_str().unwrap().contains("not recoverable"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn declared_query_excludes_terminal_rows_from_items_and_facets() {
+        let (db, path) = temp_db();
+        crate::declared::declared_schema_set(
+            &db,
+            "declared_lifecycle",
+            &[crate::declared::DeclaredField {
+                name: "kind".to_string(),
+                field_type: crate::declared::DeclaredFieldType::Scalar,
+                facet: true,
+            }],
+            "",
+        )
+        .expect("declare schema");
+        handle_remember(
+            &db,
+            json!({
+                "category": "declared_lifecycle",
+                "key": "public",
+                "body_json": "{\"kind\":\"public\"}"
+            }),
+        )
+        .expect("remember public row");
+        handle_remember(
+            &db,
+            json!({
+                "category": "declared_lifecycle",
+                "key": "terminal",
+                "body_json": "{\"kind\":\"secret\"}"
+            }),
+        )
+        .expect("remember terminal row");
+        {
+            let conn = db.conn().unwrap();
+            conn.execute(
+                "UPDATE entities SET status = 'deprecated', archived = 0 WHERE category = ?1 AND key = ?2",
+                ["declared_lifecycle", "terminal"],
+            )
+            .unwrap();
+        }
+
+        let response = handle_declared_query(
+            &db,
+            json!({
+                "category": "declared_lifecycle",
+                "facets": ["kind"],
+                "limit": 50
+            }),
+        )
+        .expect("declared query");
+        let value: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(value["total_matches"], json!(1));
+        assert_eq!(value["items"].as_array().unwrap().len(), 1);
+        assert_eq!(value["items"][0]["key"], json!("public"));
+        assert_eq!(
+            value["facet_counts"]["kind"],
+            json!([{"value":"public","count":1}])
+        );
+        assert!(
+            !response.contains("secret"),
+            "terminal row leaked: {response}"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
