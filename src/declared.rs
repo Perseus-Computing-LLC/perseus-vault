@@ -253,6 +253,7 @@ pub fn declared_candidates(
     schema: &DeclaredSchema,
     filters: &[DeclaredFilter],
     workspace_hash: Option<&str>,
+    requesting_agent_id: Option<&str>,
 ) -> Result<Vec<crate::models::Entity>, String> {
     // Validate filters against the declaration first (fail-closed).
     for f in filters {
@@ -331,6 +332,9 @@ pub fn declared_candidates(
         entities
     };
     let mut entities = db.filter_suppressed(entities).map_err(|e| e.to_string())?;
+    if let Some(requester) = requesting_agent_id.filter(|id| !id.is_empty()) {
+        entities.retain(|entity| db.can_read(requester, &entity.visibility, &entity.agent_id));
+    }
     entities.sort_by(|a, b| {
         a.created_at_unix_ms
             .cmp(&b.created_at_unix_ms)
@@ -401,6 +405,7 @@ pub fn facet_counts(
     filters: &[DeclaredFilter],
     facet_fields: &[String],
     workspace_hash: Option<&str>,
+    requesting_agent_id: Option<&str>,
 ) -> Result<HashMap<String, Vec<FacetCount>>, String> {
     let mut out: HashMap<String, Vec<FacetCount>> = HashMap::new();
     for name in facet_fields {
@@ -421,7 +426,7 @@ pub fn facet_counts(
             .filter(|f| f.field != *name)
             .cloned()
             .collect();
-        let rows = declared_candidates(db, schema, &others, workspace_hash)?;
+        let rows = declared_candidates(db, schema, &others, workspace_hash, requesting_agent_id)?;
         let mut counts: std::collections::BTreeMap<String, usize> =
             std::collections::BTreeMap::new();
         let mut other = 0usize;

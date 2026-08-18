@@ -2973,6 +2973,11 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
 }
 
 pub fn handle_recall_batch(db: &Database, args: Value) -> Result<String, String> {
+    let requester = args
+        .get("requesting_agent_id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned);
     let a: RecallBatchArgs = serde_json::from_value(args)
         .map_err(|e| format!("Invalid recall batch arguments: {}", e))?;
 
@@ -3147,6 +3152,9 @@ pub fn handle_recall_batch(db: &Database, args: Value) -> Result<String, String>
         last_overturn = overturn;
     }
 
+    if let Some(requester) = requester.as_deref() {
+        fused.retain(|(entity, _)| db.can_read(requester, &entity.visibility, &entity.agent_id));
+    }
     let mut items_expanded: Vec<serde_json::Value> = Vec::new();
     let entities_only: Vec<Entity> = fused.iter().map(|(e, _)| e.clone()).collect();
     for (entity, _score) in &fused {
@@ -3212,6 +3220,8 @@ pub struct SemanticSearchArgs {
     pub workspace_hash: Option<String>,
     #[serde(default)]
     pub agent_id: Option<String>,
+    #[serde(default)]
+    pub requesting_agent_id: Option<String>,
 }
 
 /// #271: `perseus_vault_semantic_search` — dense-only semantic search shortcut. Unlike
@@ -3235,9 +3245,12 @@ pub fn handle_semantic_search(db: &Database, args: Value) -> Result<String, Stri
         ..RecallParams::default()
     };
 
-    let entities = db
+    let mut entities = db
         .recall(&params)
         .map_err(|e| format!("Semantic search failed: {}", e))?;
+    if let Some(requester) = a.requesting_agent_id.as_deref().filter(|id| !id.is_empty()) {
+        entities.retain(|entity| db.can_read(requester, &entity.visibility, &entity.agent_id));
+    }
 
     let items_expanded: Vec<serde_json::Value> =
         entities.iter().map(|e| e.to_json_expanded()).collect();
@@ -3446,6 +3459,12 @@ fn stamped_requester(args: &serde_json::Value) -> Option<&str> {
         .filter(|s| !s.is_empty())
 }
 
+fn stamped_requester_from_recall_args(args: &RecallArgs) -> Option<&str> {
+    args.requesting_agent_id
+        .as_deref()
+        .filter(|id| !id.is_empty())
+}
+
 /// #996: fail-closed visibility gate for single-entity direct reads. Returns
 /// true when the requester may read the row, or when no identity is stamped
 /// (legacy unscoped path). Handlers over-hide on false — a hidden row is
@@ -3602,6 +3621,9 @@ fn handle_recall_with_expansion(db: &Database, a: &RecallArgs) -> Result<String,
     let mut merged: Vec<_> = best.into_values().collect();
     merged.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     merged.truncate(a.limit as usize);
+    if let Some(requester) = stamped_requester_from_recall_args(a) {
+        merged.retain(|(entity, _)| db.can_read(requester, &entity.visibility, &entity.agent_id));
+    }
 
     // #363: valid-time filters, before side-effects so filtered-out entities
     // are not reinforced. No-op unless a filter was requested.
@@ -3654,6 +3676,8 @@ pub struct RecallLayerArgs {
     pub layer: String,
     #[serde(default = "default_limit")]
     pub limit: i64,
+    #[serde(default)]
+    pub requesting_agent_id: Option<String>,
 }
 
 pub fn handle_recall_layer(db: &Database, args: Value) -> Result<String, String> {
@@ -3671,6 +3695,7 @@ pub fn handle_recall_layer(db: &Database, args: Value) -> Result<String, String>
         "query": "",
         "limit": a.limit,
         "layer": layer,
+        "requesting_agent_id": a.requesting_agent_id,
     });
 
     handle_recall(db, recall_args)
@@ -3748,7 +3773,7 @@ pub fn handle_as_of(db: &Database, args: Value) -> Result<String, String> {
                 "id": e.id,
                 "category": e.category,
                 "key": e.key,
-                "body_json": e.body_json,
+                "body_json": public_temporal_body_json(&e.status, &e.body_json),
                 "status": e.status,
                 "entity_type": e.entity_type,
                 "as_of_unix_ms": as_of,
@@ -3785,6 +3810,39 @@ fn decorate_compacted_marker(r: &mut serde_json::Value, status: &str, body_json:
     );
 }
 
+/// Closed body projection for every public temporal serializer. Database-level
+/// filters are still required, but this boundary must remain safe if a future
+/// caller constructs a TemporalVersion without passing through them.
+fn public_temporal_body_json(status: &str, body_json: &str) -> String {
+    if matches!(status, "active" | "draft") {
+        return body_json.to_string();
+    }
+    let body: serde_json::Value = serde_json::from_str(body_json).unwrap_or_default();
+    let body_sha256 = body
+        .get("body_sha256")
+        .and_then(|value| value.as_str())
+        .map(str::to_owned)
+        .unwrap_or_else(|| crate::trust_admission::digest_text(body_json));
+    if status == "compacted" {
+        return json!({
+            "compacted": true,
+            "terminal_audit": true,
+            "status": "compacted",
+            "versions": body.get("versions").and_then(|value| value.as_i64()),
+            "digest": body.get("digest").and_then(|value| value.as_str()),
+            "body_sha256": body_sha256,
+        })
+        .to_string();
+    }
+    json!({
+        "terminal_audit": true,
+        "status": status,
+        "archived": body.get("archived").and_then(|value| value.as_bool()),
+        "body_sha256": body_sha256,
+    })
+    .to_string()
+}
+
 /// Serialize a TemporalVersion into the shared found=true response shape used
 /// by perseus_vault_valid_at and perseus_vault_bitemporal (#363). Tombstone versions carry
 /// the #398 compacted-marker decoration.
@@ -3794,7 +3852,7 @@ fn temporal_version_json(v: &crate::db::TemporalVersion) -> serde_json::Value {
         "id": v.entity.id,
         "category": v.entity.category,
         "key": v.entity.key,
-        "body_json": v.entity.body_json,
+        "body_json": public_temporal_body_json(&v.entity.status, &v.entity.body_json),
         "status": v.entity.status,
         "entity_type": v.entity.entity_type,
         "valid_from_unix_ms": v.valid_from_unix_ms,
@@ -8392,13 +8450,7 @@ pub fn handle_traverse(db: &Database, args: Value) -> String {
         Some(requester) => requester,
         None => return json!({"error": "requesting_agent_id is required"}).to_string(),
     };
-    match db.traverse_chain_for_request(
-        &a.category,
-        &a.key,
-        max_depth,
-        max_nodes,
-        requester,
-    ) {
+    match db.traverse_chain_for_request(&a.category, &a.key, max_depth, max_nodes, requester) {
         Ok(chain) => {
             let chain = filter_chain_visibility(db, requester, chain);
             serde_json::to_string(&chain)
@@ -11199,6 +11251,8 @@ pub fn handle_declared_query(db: &Database, args: Value) -> Result<String, Strin
         offset: i64,
         #[serde(default)]
         workspace_hash: Option<String>,
+        #[serde(default)]
+        requesting_agent_id: Option<String>,
     }
     let a: DeclaredQueryArgs = serde_json::from_value(args)
         .map_err(|e| format!("Invalid declared_query arguments: {e}"))?;
@@ -11218,8 +11272,13 @@ pub fn handle_declared_query(db: &Database, args: Value) -> Result<String, Strin
             value: v.clone(),
         })
         .collect();
-    let mut entities =
-        crate::declared::declared_candidates(db, &schema, &filters, a.workspace_hash.as_deref())?;
+    let mut entities = crate::declared::declared_candidates(
+        db,
+        &schema,
+        &filters,
+        a.workspace_hash.as_deref(),
+        a.requesting_agent_id.as_deref(),
+    )?;
     let total = entities.len();
     let offset = a.offset.max(0) as usize;
     let limit = if a.limit < 0 {
@@ -11239,6 +11298,7 @@ pub fn handle_declared_query(db: &Database, args: Value) -> Result<String, Strin
         &filters,
         &a.facets,
         a.workspace_hash.as_deref(),
+        a.requesting_agent_id.as_deref(),
     )?;
     Ok(json!({
         "ok": true,
@@ -17546,7 +17606,7 @@ mod tests {
             &db,
             json!({"category": "notes", "key": "secret",
                    "body_json": "{\"note\":\"quantum widget blueprint\"}",
-                   "visibility": "private", "agent_id": "alice"}),
+                   "visibility": "private", "agent_id": "alice", "layer": "buffer"}),
         )
         .expect("private");
         handle_remember(
@@ -17582,6 +17642,45 @@ mod tests {
             2,
             "unscoped recall is unchanged"
         );
+
+        let expanded = handle_recall(
+            &db,
+            json!({
+                "query": "quantum",
+                "mode": "fts5",
+                "expansion": {"enabled": true, "n_variants": 1},
+                "requesting_agent_id": "bob"
+            }),
+        )
+        .unwrap();
+        assert!(
+            !expanded.contains("quantum widget blueprint"),
+            "expanded recall leaked a private body: {expanded}"
+        );
+
+        let batch = handle_recall_batch(
+            &db,
+            json!({
+                "requesting_agent_id": "bob",
+                "queries": [{"query": "quantum", "mode": "fts5", "limit": 10}]
+            }),
+        )
+        .unwrap();
+        assert!(
+            !batch.contains("quantum widget blueprint"),
+            "recall_batch leaked a private body: {batch}"
+        );
+
+        let layer = handle_recall_layer(
+            &db,
+            json!({"layer": "episodic", "limit": 10, "requesting_agent_id": "bob"}),
+        )
+        .unwrap();
+        assert!(
+            !layer.contains("quantum widget blueprint"),
+            "recall_layer leaked a private body: {layer}"
+        );
+
         let _ = std::fs::remove_file(&path);
     }
 
@@ -21164,6 +21263,35 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// Public temporal serializers must reduce compacted bodies to the marker
+    /// allowlist even when an upstream database filter is bypassed.
+    #[test]
+    fn temporal_version_serializer_closes_compacted_body_projection() {
+        let mut entity: crate::models::Entity = serde_json::from_value(json!({
+            "id": "temporal-serializer-compacted",
+            "category": "facts",
+            "key": "temporal-serializer-compacted",
+            "body_json": r#"{\"content\":\"TEMPORAL SERIALIZER SENTINEL\"}"#,
+            "created_at_unix_ms": 0,
+            "last_accessed_unix_ms": 0
+        }))
+        .unwrap();
+        entity.status = "compacted".to_string();
+        let version = crate::db::TemporalVersion {
+            entity,
+            valid_from_unix_ms: None,
+            valid_to_unix_ms: None,
+            recorded_at_unix_ms: 1,
+            invalidated_at_unix_ms: None,
+        };
+        let response = temporal_version_json(&version);
+        let body = response["body_json"].as_str().unwrap_or("");
+        assert!(!body.contains("TEMPORAL SERIALIZER SENTINEL"));
+        let body_value: Value = serde_json::from_str(body).unwrap();
+        assert_eq!(body_value["compacted"], json!(true));
+        assert_eq!(response["status"], json!("compacted"));
+    }
+
     /// #398: the as_of MCP tool surfaces the tombstone as an explicit
     /// compacted marker (flag + version count + digest), not a fake version.
     #[test]
@@ -21235,6 +21363,85 @@ mod tests {
         assert_eq!(v["versions_compacted"].as_i64().unwrap(), 2);
         assert_eq!(v["digest"].as_str().unwrap().len(), 16);
         assert!(v["note"].as_str().unwrap().contains("not recoverable"));
+
+        let valid_resp = handle_valid_at(
+            &db,
+            json!({"category": "facts", "key": "hot398b", "valid_at_unix_ms": t_first}),
+        )
+        .expect("valid_at compacted probe");
+        let valid_value: Value = serde_json::from_str(&valid_resp).unwrap();
+        assert_eq!(
+            valid_value["found"],
+            json!(true),
+            "valid_at must find marker: {valid_resp}"
+        );
+        assert_eq!(valid_value["compacted"], json!(true));
+        assert!(
+            !valid_resp.contains("COMPACTED_SENTINEL"),
+            "valid_at leaked compacted body: {valid_resp}"
+        );
+
+        let bitemporal_resp = handle_bitemporal(
+            &db,
+            json!({"category": "facts", "key": "hot398b",
+                   "tx_at_unix_ms": t_first, "valid_at_unix_ms": t_first}),
+        )
+        .expect("bitemporal compacted probe");
+        let bitemporal_value: Value = serde_json::from_str(&bitemporal_resp).unwrap();
+        assert_eq!(
+            bitemporal_value["found"],
+            json!(true),
+            "bitemporal must find marker: {bitemporal_resp}"
+        );
+        assert_eq!(bitemporal_value["compacted"], json!(true));
+        assert!(
+            !bitemporal_resp.contains("COMPACTED_SENTINEL"),
+            "bitemporal leaked compacted body: {bitemporal_resp}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[cfg(feature = "bundled-embeddings")]
+    #[test]
+    fn semantic_search_enforces_requester_visibility() {
+        let (db, path) = temp_db();
+        handle_remember(
+            &db,
+            json!({
+                "category": "notes",
+                "key": "semantic-public",
+                "body_json": "{\"note\":\"quantum public reference\"}",
+                "visibility": "public",
+                "agent_id": "alice"
+            }),
+        )
+        .expect("public semantic fixture");
+        handle_remember(
+            &db,
+            json!({
+                "category": "notes",
+                "key": "semantic-private",
+                "body_json": "{\"note\":\"quantum private blueprint\"}",
+                "visibility": "private",
+                "agent_id": "alice"
+            }),
+        )
+        .expect("private semantic fixture");
+
+        let response = handle_semantic_search(
+            &db,
+            json!({
+                "query": "quantum",
+                "limit": 10,
+                "requesting_agent_id": "bob"
+            }),
+        )
+        .expect("semantic search");
+        assert!(
+            !response.contains("quantum private blueprint"),
+            "semantic search leaked a private body: {response}"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -21270,6 +21477,17 @@ mod tests {
             }),
         )
         .expect("remember terminal row");
+        handle_remember(
+            &db,
+            json!({
+                "category": "declared_lifecycle",
+                "key": "private",
+                "body_json": "{\"kind\":\"PRIVATE DECLARED SENTINEL\"}",
+                "visibility": "private",
+                "agent_id": "alice"
+            }),
+        )
+        .expect("remember private row");
         {
             let conn = db.conn().unwrap();
             conn.execute(
@@ -21284,7 +21502,8 @@ mod tests {
             json!({
                 "category": "declared_lifecycle",
                 "facets": ["kind"],
-                "limit": 50
+                "limit": 50,
+                "requesting_agent_id": "bob"
             }),
         )
         .expect("declared query");

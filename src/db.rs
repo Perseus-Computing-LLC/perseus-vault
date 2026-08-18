@@ -10491,6 +10491,7 @@ impl Database {
                 &schema,
                 &filters,
                 params.workspace_hash.as_deref(),
+                None,
             )?;
             declared_scored = candidates.into_iter().map(|e| (e, 1.0)).collect();
             trace.strategies.push(crate::models::FusedStrategyTrace {
@@ -18386,9 +18387,10 @@ impl Database {
             return Err("entity not found".into());
         }
         let conn = self.conn()?;
-        let root_links: Vec<MemoryLink> =
-            serde_json::from_str(&serde_json::to_string(&root.links).unwrap_or_else(|_| "[]".to_string()))
-                .unwrap_or_default();
+        let root_links: Vec<MemoryLink> = serde_json::from_str(
+            &serde_json::to_string(&root.links).unwrap_or_else(|_| "[]".to_string()),
+        )
+        .unwrap_or_default();
         let root_links_json: Vec<serde_json::Value> = root_links
             .iter()
             .map(|l| {
@@ -40278,7 +40280,11 @@ pub(crate) mod tests {
         .unwrap();
 
         let report = db.vault_export(&vault_str, None).unwrap();
-        assert!(report.errors.is_empty(), "export errors: {:?}", report.errors);
+        assert!(
+            report.errors.is_empty(),
+            "export errors: {:?}",
+            report.errors
+        );
         assert_eq!(report.files_created, 1, "only the serveable row may export");
         assert!(vault.join("export-visible.md").exists());
         assert!(!vault.join("export-terminal.md").exists());
@@ -51560,8 +51566,6 @@ pub(crate) mod tests {
         assert!(!history.contains("HISTORY SOURCE SENTINEL"));
         assert!(!history.contains("HISTORY AGENT SENTINEL"));
 
-
-
         // as_of inside a SURVIVING window → the real old version, unchanged.
         let conn = db.conn().unwrap();
         let (surv_rec,): (i64,) = conn
@@ -58378,6 +58382,7 @@ pub(crate) mod tests {
                 value: serde_json::json!("gold"),
             }],
             None,
+            None,
         )
         .unwrap();
         assert_eq!(gold.len(), 2);
@@ -58396,6 +58401,7 @@ pub(crate) mod tests {
                 field: "tags".into(),
                 value: serde_json::json!(["eu"]),
             }],
+            None,
             None,
         )
         .unwrap();
@@ -58420,6 +58426,7 @@ pub(crate) mod tests {
                     value: serde_json::json!("fra"),
                 },
             ],
+            None,
             None,
         )
         .unwrap();
@@ -58508,6 +58515,7 @@ pub(crate) mod tests {
                 value: serde_json::json!("gold"),
             }],
             &["owner".to_string()],
+            None,
             None,
         )
         .unwrap();

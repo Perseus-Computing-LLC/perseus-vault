@@ -1321,6 +1321,10 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
           "type": "string",
           "description": "Workspace scope filter (v1.2.0). When set, only entities with a matching workspace_hash are returned. Omit for no workspace filtering."
         },
+        "requesting_agent_id": {
+          "type": "string",
+          "description": "Transport-stamped requester identity used for private/fleet visibility enforcement."
+        },
         "scope_weight": {
           "type": "number",
           "minimum": 0,
@@ -1648,6 +1652,10 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
               "query"
             ]
           }
+        },
+        "requesting_agent_id": {
+          "type": "string",
+          "description": "Transport-stamped requester identity applied to every nested query and fused result."
         }
       },
       "required": [
@@ -1690,6 +1698,10 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
           "type": "integer",
           "default": 10,
           "description": "Maximum number of results to return (max 1000)."
+        },
+        "requesting_agent_id": {
+          "type": "string",
+          "description": "Transport-stamped requester identity used for visibility enforcement."
         }
       },
       "required": ["layer"]
@@ -1980,6 +1992,10 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
         "agent_id": {
           "type": "string",
           "description": "Agent identity filter. When set, only entities with a matching agent_id are returned."
+        },
+        "requesting_agent_id": {
+          "type": "string",
+          "description": "Transport-stamped requester identity used for private/fleet visibility enforcement."
         }
       },
       "required": [
@@ -5533,7 +5549,11 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
         },
         "limit": {"type": "integer", "default": 10},
         "offset": {"type": "integer", "default": 0},
-        "workspace_hash": {"type": "string", "default": ""}
+        "workspace_hash": {"type": "string", "default": ""},
+        "requesting_agent_id": {
+          "type": "string",
+          "description": "Transport-stamped requester identity used for item and facet visibility enforcement."
+        }
       },
       "required": ["category"]
     },
