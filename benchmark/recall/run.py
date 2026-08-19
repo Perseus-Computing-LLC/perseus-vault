@@ -27,6 +27,12 @@ import subprocess
 import sys
 from pathlib import Path
 
+from benchmark.package.common.replay import (
+    build_envelope as build_replay_envelope,
+    build_snapshot as build_replay_snapshot,
+    sha256_text as replay_sha256_text,
+    stable_json as replay_stable_json,
+)
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent.parent
 
@@ -99,6 +105,59 @@ def score(ranked_keys, relevant, ks):
     return out
 
 
+def _recall_replay_rows(items):
+    rows = []
+    for index, item in enumerate(items):
+        if not isinstance(item, dict):
+            continue
+        key = str(item.get("key") or item.get("id") or f"wire-{index + 1}")
+        identity = replay_sha256_text(key)
+        body = item.get("body_json", item.get("body", item.get("content", key)))
+        row = {
+            "candidate_id": f"candidate-{identity}",
+            "source_ref": f"source-{identity}",
+            "content": replay_stable_json({"candidate": key, "body": body}),
+            "provenance": "vault-recall",
+            "wire_rank": index + 1,
+            "original_position": index + 1,
+        }
+        score = item.get("score")
+        semantics = "provider-score-v1"
+        if not isinstance(score, (int, float)) or isinstance(score, bool):
+            score = item.get("decay_score")
+            semantics = "decay-score-v1"
+        if isinstance(score, (int, float)) and not isinstance(score, bool):
+            row["score"] = score
+            row["score_semantics"] = semantics
+        rows.append(row)
+    return rows
+
+
+def _make_recall_replay(*, dataset_name, query, mode, limit, items, corpus_sha256, config_sha256, code_sha256):
+    rows = _recall_replay_rows(items)
+    snapshot = build_replay_snapshot(rows)
+    cell_id = f"cell-{replay_sha256_text(replay_stable_json({'query_sha256': replay_sha256_text(query), 'mode': mode}))[:32]}"
+    envelope = build_replay_envelope(
+        workspace_id=f"recall:{dataset_name or 'dataset'}",
+        scope="dataset:all",
+        fixture_id="recall-quality-v1",
+        corpus_sha256=corpus_sha256,
+        retrieval_profile=f"recall:{mode}",
+        mode=mode,
+        top_k=limit,
+        cell_id=cell_id,
+        request_sha256=replay_sha256_text(query),
+        config_sha256=config_sha256,
+        code_sha256=code_sha256,
+        context_policy="wire-order-v1",
+        context_policy_version="1",
+        snapshot=snapshot,
+        candidates=rows,
+        sequence_policy="wire_v1",
+    )
+    return envelope, snapshot
+
+
 def main():
     ap = argparse.ArgumentParser(description="Perseus Vault offline recall-quality benchmark")
     ap.add_argument("--bin", default=None, help="Path to the perseus_vault binary")
@@ -106,6 +165,8 @@ def main():
     ap.add_argument("--k", nargs="+", type=int, default=[1, 3, 5])
     ap.add_argument("--modes", nargs="+", default=["fts5", "dense", "hybrid"])
     ap.add_argument("--out", default=str(HERE / "report.json"))
+    ap.add_argument("--replay-out", default=None, help="Hash-only retrieval replay JSONL (default next to --out)")
+    ap.add_argument("--snapshot-out", default=None, help="Hash-only replay snapshot JSONL (default next to --out)")
     ap.add_argument("--limit", type=int, default=10, help="Results requested per query")
     ap.add_argument("--hints", action="store_true",
                     help="#919: ingest prospective query hints from memories[].hints "
@@ -118,6 +179,9 @@ def main():
     data = json.loads(Path(args.dataset).read_text(encoding="utf-8"))
     memories, queries = data["memories"], data["queries"]
     ks = sorted(set(args.k))
+    corpus_sha256 = replay_sha256_text(replay_stable_json(data))
+    config_sha256 = replay_sha256_text(replay_stable_json({"k": ks, "modes": args.modes, "limit": args.limit, "hints": args.hints}))
+    code_sha256 = replay_sha256_text(Path(__file__).read_text(encoding="utf-8"))
 
     db_dir = Path(os.environ.get("TMPDIR") or os.environ.get("TEMP") or "/tmp")
     db = str(db_dir / "perseus_vault-recall-bench.db")
@@ -155,12 +219,26 @@ def main():
     # 3. Query each mode and score.
     agg = {mode: {f"recall@{k}": 0.0 for k in ks} | {"mrr": 0.0} for mode in args.modes}
     per_query = []
+    replay_rows = []
+    snapshot_rows = []
     for q in queries:
         row = {"q": q["q"], "relevant": q["relevant"], "modes": {}}
         for mode in args.modes:
             r = m.call("perseus_vault_recall", {"query": q["q"], "mode": mode, "limit": args.limit,
                                         "trust_weight": 0, "min_decay": 0})
             items = r.get("items", []) if isinstance(r, dict) else []
+            replay_envelope, replay_snapshot = _make_recall_replay(
+                dataset_name=data.get("name"),
+                query=q["q"],
+                mode=mode,
+                limit=args.limit,
+                items=items,
+                corpus_sha256=corpus_sha256,
+                config_sha256=config_sha256,
+                code_sha256=code_sha256,
+            )
+            replay_rows.append(replay_envelope)
+            snapshot_rows.append({"cell_id": replay_envelope["request"]["cell_id"], "snapshot": replay_snapshot})
             ranked = [it.get("key") for it in items]
             s = score(ranked, q["relevant"], ks)
             row["modes"][mode] = {"top": ranked[:max(ks)], **s}
@@ -208,7 +286,14 @@ def main():
         "nondeterministic_modes": sorted(NONDETERMINISTIC & set(args.modes)),
         "per_query": per_query,
     }
-    Path(args.out).write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    out_path = Path(args.out)
+    out_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    replay_path = Path(args.replay_out) if args.replay_out else out_path.with_name(out_path.stem + "_replay.jsonl")
+    snapshot_path = Path(args.snapshot_out) if args.snapshot_out else out_path.with_name(out_path.stem + "_snapshot.jsonl")
+    replay_rows.sort(key=lambda item: item["request"]["cell_id"])
+    snapshot_rows.sort(key=lambda item: item["cell_id"])
+    replay_path.write_text("".join(json.dumps(item, sort_keys=True) + "\n" for item in replay_rows), encoding="utf-8")
+    snapshot_path.write_text("".join(json.dumps(item, sort_keys=True) + "\n" for item in snapshot_rows), encoding="utf-8")
 
     # Human summary.
     print(f"\nPerseus Vault recall quality - {data.get('name')} ({n} queries, {len(memories)} memories)")

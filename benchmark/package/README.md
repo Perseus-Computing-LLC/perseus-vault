@@ -27,6 +27,34 @@ semantic/publication gate and must run before writing or publishing an artifact.
 Specialized suites may additionally use the stricter sanitizer in
 `benchmark/quality` before constructing a report.
 
+## Retrieval replay envelope
+
+`retrieval_replay.schema.json` and `common/replay.py` define the shared
+`perseus-vault-retrieval-replay/v1` contract used by BEAM, LongMemEval
+retrieval diagnostics, and the generic recall lane. The envelope is a
+provider-free, hash-only projection of one retrieval cell:
+
+- candidate identity, source/provenance reference, and content are SHA-256
+  commitments; raw query text, memory bodies, prompts, and provider payloads
+  are never emitted;
+- `wire_rank` preserves the producer's original position while `final_rank`
+  records the delivered position after an explicit sequence-policy overlay;
+- optional scores remain optional and retain their declared semantics—missing
+  scores are not synthesized as `0.0`;
+- membership records requested top-k, candidate/delivered counts, completeness,
+  and truncation; `complete`, `partial`, `empty`, `unavailable`, and `degraded`
+  are distinct states;
+- a hash-only synthetic snapshot sidecar allows a second process to replay
+  membership/order and verify the envelope/projection fingerprints without
+  gold labels or production bodies.
+
+Producers write `retrieval_replay.jsonl` and an aligned
+`retrieval_snapshot.jsonl`. The BEAM fixture tests consume both sidecars as a
+real replay check; LongMemEval `retrieval_diag.py` and `recall/run.py` emit the
+same versioned envelope. The replay builder rejects unknown fields, malformed
+ranks/digests, raw payload keys, inconsistent state, incomplete top-k marked as
+complete, and tampered snapshots or projections.
+
 ## Status vocabulary
 
 `available`, `partial`, `unavailable`, `not_measured`, and `failed` are distinct.

@@ -46,6 +46,12 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
 from run import PerseusVaultServer, session_text, find_binary  # noqa: E402
+from benchmark.package.common.replay import (
+    build_envelope as build_replay_envelope,
+    build_snapshot as build_replay_snapshot,
+    sha256_text as replay_sha256_text,
+    stable_json as replay_stable_json,
+)
 
 from datetime import datetime
 
@@ -70,7 +76,68 @@ def session_note(date, turns):
     return prefix + session_text(turns)
 
 
-def gold_ranks(inst, srv, qid, k, ku_shared=False):
+def _replay_rows(inst, items):
+    """Normalize a provider response into hash-only replay candidate rows."""
+    sids = list(inst.get("haystack_session_ids", []) or [])
+    dates = dict(zip(sids, inst.get("haystack_dates", []) or []))
+    ordered = sorted(
+        sids,
+        key=lambda sid: (0, to_ms(dates[sid])) if dates.get(sid) else (1, sids.index(sid)),
+    )
+    positions = {sid: index + 1 for index, sid in enumerate(ordered)}
+    rows = []
+    for index, item in enumerate(items):
+        if not isinstance(item, dict):
+            continue
+        key = str(item.get("key") or item.get("id") or f"wire-{index + 1}")
+        identity = replay_sha256_text(key)
+        body = item.get("body_json", item.get("body", item.get("content", key)))
+        content = replay_stable_json({"candidate": key, "body": body})
+        row = {
+            "candidate_id": f"candidate-{identity}",
+            "source_ref": f"source-{identity}",
+            "content": content,
+            "provenance": "vault-recall",
+            "wire_rank": index + 1,
+            "original_position": positions.get(key, index + 1),
+        }
+        score = item.get("score")
+        score_semantics = "provider-score-v1"
+        if not isinstance(score, (bool, int, float)) or isinstance(score, bool):
+            score = item.get("decay_score")
+            score_semantics = "decay-score-v1"
+        if isinstance(score, (int, float)) and not isinstance(score, bool):
+            row["score"] = score
+            row["score_semantics"] = score_semantics
+        rows.append(row)
+    return rows
+
+
+def _make_replay_artifact(inst, qid, items, k, *, split, corpus_sha256, config_sha256, code_sha256):
+    rows = _replay_rows(inst, items)
+    snapshot = build_replay_snapshot(rows)
+    envelope = build_replay_envelope(
+        workspace_id=f"longmemeval:{split}",
+        scope=f"question:{qid}",
+        fixture_id="longmemeval-retrieval-v1",
+        corpus_sha256=corpus_sha256,
+        retrieval_profile="longmemeval-hybrid-v1",
+        mode="hybrid",
+        top_k=k,
+        cell_id=qid,
+        request_sha256=replay_sha256_text(replay_stable_json({"question_id": qid, "question_sha256": replay_sha256_text(str(inst.get("question", "")))})),
+        config_sha256=config_sha256,
+        code_sha256=code_sha256,
+        context_policy="wire-order-v1",
+        context_policy_version="1",
+        snapshot=snapshot,
+        candidates=rows,
+        sequence_policy="wire_v1",
+    )
+    return envelope, snapshot
+
+
+def gold_ranks(inst, srv, qid, k, ku_shared=False, *, split="s", corpus_sha256=None, config_sha256=None, code_sha256=None):
     """Ingest this instance's haystack and hybrid-recall top-k, exactly as
     qa.py does. Return (ranks, n_sessions, update_id) where ranks maps each
     gold session id to its 1-based rank in the top-k results (absent => not
@@ -118,7 +185,17 @@ def gold_ranks(inst, srv, qid, k, ku_shared=False):
     ranks = {g: pos.get(g) for g in gold}
     if shared:
         ranks[update_id] = pos.get(SHARED_FACT_KEY)
-    return ranks, len(sids), update_id
+    replay_envelope, replay_snapshot = _make_replay_artifact(
+        inst,
+        qid,
+        items,
+        k,
+        split=split,
+        corpus_sha256=corpus_sha256 or replay_sha256_text("longmemeval-corpus-unbound"),
+        config_sha256=config_sha256 or replay_sha256_text("longmemeval-config-unbound"),
+        code_sha256=code_sha256 or replay_sha256_text("longmemeval-code-unbound"),
+    )
+    return ranks, len(sids), update_id, replay_envelope, replay_snapshot
 
 
 def coverage_at(records, k):
@@ -185,6 +262,8 @@ def main():
     ap.add_argument("--out", default=str(HERE / "diag_report.json"))
     ap.add_argument("--journal", default=None, help="Crash-safe per-question journal (resumable)")
     ap.add_argument("--resume", action="store_true", help="Resume from --journal")
+    ap.add_argument("--replay-out", default=None, help="Hash-only retrieval replay JSONL (default next to --out)")
+    ap.add_argument("--snapshot-out", default=None, help="Hash-only replay snapshot JSONL (default next to --out)")
     ap.add_argument("--min-coverage-at", type=parse_floor, default=None, metavar="K:FRAC",
                     help="Regression gate: exit non-zero if coverage@K < FRAC (e.g. 20:0.95)")
     args = ap.parse_args()
@@ -214,6 +293,11 @@ def main():
     run_config = {"split": args.split, "n": len(data), "k": args.k,
                   "only_types": sorted(args.only_types) if args.only_types else None,
                   "ku_shared_key": args.ku_shared_key}
+    corpus_sha256 = replay_sha256_text(data_path.read_text(encoding="utf-8"))
+    config_sha256 = replay_sha256_text(replay_stable_json(run_config))
+    code_sha256 = replay_sha256_text(Path(__file__).read_text(encoding="utf-8"))
+    replay_rows = []
+    snapshot_rows = []
 
     # ── crash-safe journal + resume (same convention as qa.py) ──────────────
     journal_path = Path(args.journal) if args.journal else None
@@ -233,6 +317,9 @@ def main():
             for rec in lines[1:]:
                 done[rec["question_id"]] = rec
                 records.append(rec)
+                if "retrieval_replay" in rec and "retrieval_snapshot" in rec:
+                    replay_rows.append(rec["retrieval_replay"])
+                    snapshot_rows.append({"cell_id": rec["question_id"], "snapshot": rec["retrieval_snapshot"]})
             resume_ok = True
             print(f"  resume: {len(done)} questions reloaded from {journal_path.name}")
         journal = open(journal_path, "a" if resume_ok else "w", encoding="utf-8")
@@ -248,8 +335,17 @@ def main():
         wipe()
         srv = PerseusVaultServer(binary, db)
         try:
-            ranks, n_sess, update_id = gold_ranks(inst, srv, qid, args.k,
-                                                  ku_shared=args.ku_shared_key)
+            ranks, n_sess, update_id, replay_envelope, replay_snapshot = gold_ranks(
+                inst,
+                srv,
+                qid,
+                args.k,
+                ku_shared=args.ku_shared_key,
+                split=args.split,
+                corpus_sha256=corpus_sha256,
+                config_sha256=config_sha256,
+                code_sha256=code_sha256,
+            )
         finally:
             srv.close()
         rec = {
@@ -259,7 +355,11 @@ def main():
             "update_gold": update_id,
             "ranks": ranks,
             "n_haystack_sessions": n_sess,
+            "retrieval_replay": replay_envelope,
+            "retrieval_snapshot": replay_snapshot,
         }
+        replay_rows.append(replay_envelope)
+        snapshot_rows.append({"cell_id": qid, "snapshot": replay_snapshot})
         records.append(rec)
         if journal:
             journal.write(json.dumps(rec) + "\n")
@@ -313,7 +413,14 @@ def main():
         "n": total, "k": args.k, "ku_shared_key": args.ku_shared_key,
     }, sort_keys=True).encode("utf-8")).hexdigest()
     report["signature_sha256"] = sig
-    Path(args.out).write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    out_path = Path(args.out)
+    out_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    replay_path = Path(args.replay_out) if args.replay_out else out_path.with_name(out_path.stem + "_replay.jsonl")
+    snapshot_path = Path(args.snapshot_out) if args.snapshot_out else out_path.with_name(out_path.stem + "_snapshot.jsonl")
+    replay_rows.sort(key=lambda item: item["request"]["cell_id"])
+    snapshot_rows.sort(key=lambda item: item["cell_id"])
+    replay_path.write_text("".join(json.dumps(item, sort_keys=True) + "\n" for item in replay_rows), encoding="utf-8")
+    snapshot_path.write_text("".join(json.dumps(item, sort_keys=True) + "\n" for item in snapshot_rows), encoding="utf-8")
 
     print(f"\nRetrieval coverage — {len(scored)} scored / {total} instances "
           f"(mode=hybrid, k={args.k}, offline"
