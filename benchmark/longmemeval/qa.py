@@ -83,7 +83,14 @@ from context_assembly import (  # noqa: E402
     assemble_evidence_ledger,
     assemble_ranked_snippets,
 )
-from run import PerseusVaultServer, session_text, find_binary  # noqa: E402
+from run import (  # noqa: E402
+    AGENT,
+    WORKSPACE,
+    PerseusVaultServer,
+    admitted_remember,
+    find_binary,
+    session_text,
+)
 
 # Pinned defaults. Zep's published LongMemEval number is quoted as "GPT-4o";
 # gpt-4o-2024-08-06 is the standard GPT-4o snapshot of that period and is the
@@ -431,14 +438,25 @@ def build_context(
             if sid in shared:
                 continue  # fact versions ingest below, ascending by date
             turns, d = by_id[sid]
-            srv.call("perseus_vault_remember", {"category": qid, "key": sid,
-                                        "body_json": json.dumps({"note": session_note(d, turns)}),
-                                        "type": "fact"})
+            admitted_remember(
+                srv,
+                qid,
+                sid,
+                json.dumps({"note": session_note(d, turns)}),
+                workspace=WORKSPACE,
+                agent=AGENT,
+            )
         for g in dated_gold if shared else []:
             turns, d = by_id[g]
-            srv.call("perseus_vault_remember", {"category": qid, "key": SHARED_FACT_KEY,
-                                        "body_json": json.dumps({"note": session_note(d, turns)}),
-                                        "type": "fact", "valid_from_unix_ms": _date_ms(d)})
+            admitted_remember(
+                srv,
+                qid,
+                SHARED_FACT_KEY,
+                json.dumps({"note": session_note(d, turns)}),
+                workspace=WORKSPACE,
+                agent=AGENT,
+                valid_from_unix_ms=_date_ms(d),
+            )
         srv.call("perseus_vault_embed", {"batch_category": qid, "batch_limit": 1000})
         retrieval_k = assembly_k if context_assembly in {"ranked-snippets", "evidence-ledger"} else k
         r = srv.call("perseus_vault_recall", {"query": inst["question"], "mode": "hybrid",
@@ -725,6 +743,7 @@ def main():
             resume_ok = True
             print(f"  resume: {len(done)} judged answers reloaded from "
                   f"{journal_path.name}; errored/unfinished questions will run.")
+        journal_path.parent.mkdir(parents=True, exist_ok=True)
         journal = open(journal_path, "a" if resume_ok else "w", encoding="utf-8")
         if not resume_ok:
             write_checkpoint(journal, {"_config": run_config})
@@ -869,6 +888,7 @@ def main():
     # (On a resumed run, reloaded answers come first — evaluate_qa.py keys on
     # question_id, so order is immaterial.)
     if not args.dry_run:
+        Path(args.outdir).mkdir(parents=True, exist_ok=True)
         for system in args.systems:
             out = Path(args.outdir) / hypothesis_artifact_name(
                 system, model_tag, cot=args.cot
@@ -1000,7 +1020,9 @@ def main():
                           "error": v["error"], "ans_usage": v.get("ans_usage"),
                           "judge_usage": v.get("judge_usage")} for v in verdicts],
     }
-    Path(args.out).write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    report_path = Path(args.out)
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
 
     print(f"\nLongMemEval end-to-end QA - split=longmemeval_{args.split} n={n}"
           + ("  [MOCK LLM: plumbing only, NOT a real accuracy number]" if args.mock_llm

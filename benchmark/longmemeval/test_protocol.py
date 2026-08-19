@@ -7,6 +7,8 @@ import tempfile
 import unittest
 from unittest import mock
 
+from benchmark import admission_fixture as ADMISSION
+
 
 HERE = pathlib.Path(__file__).resolve().parent
 SPEC = importlib.util.spec_from_file_location("longmemeval_qa", HERE / "qa.py")
@@ -73,8 +75,9 @@ class OfficialCoTProtocolTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)
             data_path = root / "fixture.json"
-            out_path = root / "report.json"
-            journal_path = root / "progress.jsonl"
+            out_path = root / "nested" / "reports" / "report.json"
+            hypotheses_dir = root / "nested" / "hypotheses"
+            journal_path = root / "nested" / "journal" / "progress.jsonl"
             data_path.write_text(json.dumps([{
                 "question_id": "q1",
                 "question_type": "single-session-user",
@@ -103,7 +106,7 @@ class OfficialCoTProtocolTests(unittest.TestCase):
             argv = [
                 "qa.py", "--data", str(data_path), "--systems", "stateless",
                 "--cot", "--tpm", "0", "--max-retries", "1",
-                "--out", str(out_path), "--outdir", str(root),
+                "--out", str(out_path), "--outdir", str(hypotheses_dir),
                 "--journal", str(journal_path),
             ]
             with mock.patch.object(QA, "get_api_key", return_value="test-key"), \
@@ -120,11 +123,66 @@ class OfficialCoTProtocolTests(unittest.TestCase):
             self.assertIn(full_response, seen_prompts[1])
             report = json.loads(out_path.read_text(encoding="utf-8"))
             self.assertEqual(report["hypothesis_mode"], "complete-response")
-            hyp_path = root / "hypotheses-stateless-gpt-4o-2024-08-06-official-cot.jsonl"
+            hyp_path = hypotheses_dir / "hypotheses-stateless-gpt-4o-2024-08-06-official-cot.jsonl"
             hypothesis = json.loads(hyp_path.read_text(encoding="utf-8").splitlines()[0])
             self.assertEqual(hypothesis["hypothesis"], full_response)
 
-    def test_checkpoint_writer_persists_json_record(self):
+    def test_vault_ingest_uses_admitted_fixture_contract(self):
+        instance = {
+            "question": "What did I decide?",
+            "haystack_session_ids": ["s1"],
+            "haystack_dates": ["2024/01/01 (Mon) 00:00"],
+            "haystack_sessions": [[{"role": "user", "content": "I decided."}]],
+        }
+        calls = []
+
+        class FakeServer:
+            def call(self, name, args):
+                calls.append((name, args))
+                if name == "perseus_vault_recall":
+                    return {"items": [{"key": "s1"}]}
+                return {"ok": True}
+
+        def fake_admitted(client, category, key, body_json, **kwargs):
+            calls.append(("admitted_remember", {
+                "category": category,
+                "key": key,
+                "body_json": body_json,
+                **kwargs,
+            }))
+            return {"ok": True, "serveable": True}
+
+        with mock.patch.object(QA, "admitted_remember", side_effect=fake_admitted):
+            context, chosen = QA.build_context(
+                "perseus-vault", instance, FakeServer(), "q1", 10
+            )
+
+        self.assertEqual(chosen, ["s1"])
+        self.assertIn("I decided", context)
+        admitted = [args for name, args in calls if name == "admitted_remember"]
+        self.assertEqual(len(admitted), 1)
+        self.assertEqual(admitted[0]["category"], "q1")
+        self.assertEqual(admitted[0]["key"], "s1")
+
+    def test_admission_fixture_matches_rust_json_for_unicode_body(self):
+        calls = []
+
+        class FakeClient:
+            def call(self, name, args):
+                calls.append((name, args))
+                if name == "perseus_vault_journal":
+                    return {"id": "jrn-unicode"}
+                if name == "perseus_vault_remember":
+                    return {"ok": True, "serveable": True, "proposed": False}
+                return {"ok": True}
+
+        ADMISSION.admitted_remember(
+            FakeClient(), "unicode", "s1", json.dumps({"note": "café"})
+        )
+        remember = [args for name, args in calls if name == "perseus_vault_remember"][0]
+        self.assertIn("café", remember["body_json"])
+        self.assertNotIn("\\u00e9", remember["body_json"])
+
         with tempfile.TemporaryFile(mode="w+") as journal:
             QA.write_checkpoint(journal, {"question_id": "q1", "correct": True})
             journal.seek(0)

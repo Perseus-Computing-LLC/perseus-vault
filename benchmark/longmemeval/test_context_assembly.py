@@ -30,6 +30,10 @@ class _FakeServer:
         self.calls.append((name, args))
         if name == "perseus_vault_recall":
             return {"items": [{"key": sid} for sid in self.ranked]}
+        if name == "perseus_vault_journal":
+            return {"id": "jrn-test"}
+        if name == "perseus_vault_remember":
+            return {"ok": True, "serveable": True, "proposed": False}
         return {}
 
 
