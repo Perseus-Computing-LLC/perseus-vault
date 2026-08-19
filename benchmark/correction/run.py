@@ -28,6 +28,7 @@ REPO = HERE.parent.parent
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 from benchmark.package.common.publication import build_common_report
+from benchmark.admission_fixture import AGENT, admitted_remember, child_env, configure
 
 
 def stable_json(value: Any) -> str:
@@ -89,7 +90,7 @@ class VaultClient:
                     "params": {
                         "protocolVersion": "2025-06-18",
                         "capabilities": {},
-                        "clientInfo": {"name": "correction-benchmark", "version": "1"},
+                        "clientInfo": {"name": AGENT, "version": "1"},
                     },
                 }
             )
@@ -229,15 +230,17 @@ def main() -> int:
         rows.append({"case": case_id, "axis": axis, "ok": bool(ok), "detail": detail})
 
     try:
+        os.environ.update(child_env(dict(os.environ)))
         client = VaultClient(binary, db)
+        configure(client)
         for case in manifest["cases"]:
             category = case["category"]
             key = case["key"]
-            remember(client, category, key, case["original"], valid_from_unix_ms=case["original"]["valid_from_unix_ms"])
+            admitted_remember(client, category, key, stable_json(case["original"]))
             initial = items(client, case["current_query"], category)
             record(case["id"], "setup_original_readable", any(case["expected_history"] in body_blob(item) for item in initial))
 
-            remember(client, category, key, case["updated"], valid_from_unix_ms=case["updated"]["valid_from_unix_ms"])
+            admitted_remember(client, category, key, stable_json(case["updated"]))
             current = items(client, case["current_query"], category)
             current_blob = " ".join(body_blob(item) for item in current)
             record(case["id"], "A_current_answer", case["expected_current"] in current_blob)

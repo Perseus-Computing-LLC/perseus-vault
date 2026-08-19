@@ -77,6 +77,7 @@ def admitted_remember(client: Any, category: str, key: str, body_json: str) -> d
             "acted": {},
             "forward": {},
             "workspace_hash": WORKSPACE,
+            "requesting_agent_id": AGENT,
         },
     )
     result = client.call(
