@@ -34,6 +34,9 @@
 | E11 | Vault↔Ledger bridge | ledger `evidence_hashes`, `policy_version`, `result_hash`, `context_render_schema`, `served_memory_provenance_hash`, `action_receipt_hash` | hash-only binding of served memory + rendered context + receipts into the ledger audit trail | RB §4 |
 | E12 | Deterministic recall + state digest | recall contract + state digest | reproducible retrieval over frozen DB; byte-stable context assembly | RB §10 |
 | E13 | Encryption at rest | DB key path (AES-256-GCM) | CUI-at-rest confidentiality (`docs/ENCRYPTION.md`) | RB §9 |
+| E14 | Synthetic GovCon handling-profile corpus (#1127) | `benchmark/package/common/handling_profile.py` + hash-only receipt | provider-free projection-boundary evidence for synthetic public-safe, internal, FCI-like, CUI-like, export-signal, credential, ambiguous, malformed, and incomplete-redaction cases; explicit scope/redaction/visibility outcomes | benchmark/package README |
+
+**E14 interpretation:** this is bounded product evidence for a synthetic fixture. It is not a CMMC Level 2 assessment, NIST SP 800-171 compliance determination, FIPS validation, ATO/IL5/IL6 authorization, ITAR/EAR determination, or a customer/prime data-handling decision. The synthetic labels are policy-test labels only.
 
 ## 4. Matrix — 3.1 Access Control (AC, 22 requirements)
 
