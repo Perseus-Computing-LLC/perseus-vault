@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://perseus.observer/schemas/perseus-vault-corpus-redaction-v1.json",
+  "title": "Perseus Vault corpus redaction receipt",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "source_tree_sha256",
+    "redacted_tree_sha256",
+    "removed",
+    "redacted_file_count",
+    "redacted_bytes",
+    "raw_inputs_captured",
+    "receipt_sha256"
+  ],
+  "properties": {
+    "schema_version": {"const": "perseus-vault-corpus-redaction/v1"},
+    "source_tree_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "redacted_tree_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "removed": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "bytes", "sha256"],
+        "properties": {
+          "path": {"type": "string", "pattern": "^(?!/)(?!.*\\\\)(?!.*(?:^|/)\\.\\.?/)[^\\u0000]+$"},
+          "bytes": {"type": "integer", "minimum": 0},
+          "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+        }
+      }
+    },
+    "redacted_file_count": {"type": "integer", "minimum": 0},
+    "redacted_bytes": {"type": "integer", "minimum": 0},
+    "raw_inputs_captured": {"const": false},
+    "receipt_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}
