@@ -57,8 +57,9 @@ Dataset download (277 MB, public):
     -o longmemeval_s_cleaned.json
 
 Output: qa_report.json (signed; per-category accuracy, per-question verdicts)
-plus hypotheses-<system>-<model>.jsonl in LongMemEval's official format, so
-LongMemEval's own evaluate_qa.py can cross-check our judge.
+plus hypotheses-<system>-<model>-<prompt-lane>.jsonl in LongMemEval's official
+format, so LongMemEval's own evaluate_qa.py can cross-check our judge without
+allowing plain and official-CoT artifacts to overwrite one another.
 """
 import argparse
 import hashlib
@@ -126,11 +127,13 @@ ANSWER_PROMPT_COT = (
     "the question based on the relevant chat history. Answer the question step by step: "
     "first extract all the relevant information, and then reason over the information to "
     "get the answer.\n\n\n"
-    "History Chats:\n\n{context}\n\n"
-    "Current Date: {question_date}\n"
-    "Question: {question}\n"
+    "History Chats:\n\n{}\n\n"
+    "Current Date: {}\n"
+    "Question: {}\n"
     "Answer (step by step):"
 )
+
+HYPOTHESIS_MODE = "complete-response"
 
 
 def hypothesis_for_judge(text, cot=False):
@@ -143,6 +146,13 @@ def hypothesis_for_judge(text, cot=False):
     """
     del cot
     return text.strip() if text else text
+
+
+def hypothesis_artifact_name(system, model, cot=False):
+    """Return a prompt-lane-specific official hypothesis artifact name."""
+    model_tag = str(model).replace("/", "_")
+    prompt_tag = "official-cot" if cot else "plain"
+    return f"hypotheses-{system}-{model_tag}-{prompt_tag}.jsonl"
 
 
 def extract_cot_answer(text):
@@ -565,11 +575,11 @@ def main():
                          "dated fact/event evidence for cross-session and temporal questions")
     ap.add_argument("--limit", type=int, default=0, help="Only run the first N instances (0 = all; smoke tests)")
     ap.add_argument("--cot", action="store_true",
-                    help="#579: use LongMemEval's OFFICIAL chain-of-thought answer prompt (still "
-                         "official methodology; the benchmark ships both). Raises the answer max_tokens "
-                         "to 1200 and parses the final 'Answer:' line. Recorded as answer_prompt="
-                         "'official-cot' in the journal config and report so it is never blended "
-                         "with a plain-prompt number.")
+                    help="#579: use LongMemEval's OFFICIAL chain-of-thought answer prompt. "
+                         "The complete answerer response is retained for the official "
+                         "judge and hypothesis artifact. Recorded as answer_prompt="
+                         "'official-cot' in the journal config and report so it is never "
+                         "blended with a plain-prompt number.")
     ap.add_argument("--only-types", nargs="+", default=None, metavar="TYPE",
                     help="#579: restrict the run to these question_type categories (e.g. "
                          "single-session-preference multi-session temporal-reasoning) — for the "
@@ -684,6 +694,7 @@ def main():
                   "judge": "mock" if args.mock_llm else args.judge,
                   "k": args.k,
                   "answer_prompt": "official-cot" if args.cot else "plain",
+                  "hypothesis_mode": HYPOTHESIS_MODE,
                   "only_types": sorted(args.only_types) if args.only_types else None,
                   "ku_shared_key": args.ku_shared_key,
                   "context_assembly": args.context_assembly,
@@ -763,8 +774,18 @@ def main():
                     ledger_budget=args.ledger_budget,
                 )
                 answer_tmpl = ANSWER_PROMPT_COT if args.cot else ANSWER_PROMPT
-                prompt = answer_tmpl.format(context=ctx, question=inst["question"],
-                                              question_date=inst.get("question_date", "unknown"))
+                if args.cot:
+                    # Keep the official positional template verbatim; the upstream
+                    # runner fills context, date, and question in this order.
+                    prompt = answer_tmpl.format(
+                        ctx, inst.get("question_date", "unknown"), inst["question"]
+                    )
+                else:
+                    prompt = answer_tmpl.format(
+                        context=ctx,
+                        question=inst["question"],
+                        question_date=inst.get("question_date", "unknown"),
+                    )
                 tok[system] += est_tokens(prompt)
                 nsess[system] += len(chosen)
                 if args.dry_run:
@@ -849,7 +870,9 @@ def main():
     # question_id, so order is immaterial.)
     if not args.dry_run:
         for system in args.systems:
-            out = Path(args.outdir) / f"hypotheses-{system}-{model_tag}.jsonl"
+            out = Path(args.outdir) / hypothesis_artifact_name(
+                system, model_tag, cot=args.cot
+            )
             out.write_text("\n".join(json.dumps(h) for h in hyps[system]) + "\n", encoding="utf-8")
             print(f"  wrote {out}  ({len(hyps[system])} answers)")
 
@@ -918,6 +941,7 @@ def main():
         "answerer": "mock" if args.mock_llm else args.model,
         "judge": "mock" if args.mock_llm else args.judge,
         "answer_prompt": "official-cot" if args.cot else "plain",
+        "hypothesis_mode": HYPOTHESIS_MODE,
         "only_types": sorted(args.only_types) if args.only_types else None,
         "ku_shared_key": args.ku_shared_key,
         "context_assembly": args.context_assembly,
@@ -943,6 +967,7 @@ def main():
         # a CoT accuracy with a plain-prompt one — the scoreboard must state this
         # next to any competitor row.
         "answer_prompt": "official-cot" if args.cot else "plain",
+        "hypothesis_mode": HYPOTHESIS_MODE,
         "only_types": sorted(args.only_types) if args.only_types else None,
         # #590: ingest shape for the perseus_vault arm. NEVER compare a ku-shared-key
         # accuracy against a benchmark-shape one without labeling both.
