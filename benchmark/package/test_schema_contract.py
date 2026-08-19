@@ -15,7 +15,14 @@ class SchemaContractTests(unittest.TestCase):
         self.assertEqual(report["properties"]["raw_inputs_captured"]["const"], False)
         self.assertIn("run_fingerprint_sha256", report["required"])
 
-    def test_report_schema_declares_safe_shape_constraints(self):
+    def test_retrieval_replay_schema_declares_hash_only_versioned_shape(self):
+        schema = json.loads((Path(__file__).parent / "retrieval_replay.schema.json").read_text())
+        self.assertEqual(schema["type"], "object")
+        self.assertTrue(schema["additionalProperties"] is False)
+        self.assertEqual(schema["properties"]["schema_version"]["const"], "perseus-vault-retrieval-replay/v1")
+        self.assertEqual(schema["properties"]["raw_inputs_captured"]["const"], False)
+        self.assertIn("projection_sha256", schema["required"])
+
         schema = json.loads((Path(__file__).parent / "report.schema.json").read_text())
         defs = schema["$defs"]
         self.assertIn("publicIdentifier", defs)

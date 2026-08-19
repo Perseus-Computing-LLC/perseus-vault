@@ -1,0 +1,146 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://perseus.observer/schemas/perseus-vault-retrieval-replay-v1.json",
+  "title": "Perseus Vault retrieval replay envelope",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "workspace_sha256",
+    "scope_sha256",
+    "fixture_id",
+    "corpus_sha256",
+    "snapshot_sha256",
+    "retrieval",
+    "request",
+    "commitments",
+    "context_policy",
+    "status",
+    "membership",
+    "candidates",
+    "raw_inputs_captured",
+    "network_calls",
+    "replay_fingerprint_sha256",
+    "projection_sha256"
+  ],
+  "properties": {
+    "schema_version": {"const": "perseus-vault-retrieval-replay/v1"},
+    "workspace_sha256": {"$ref": "#/$defs/sha256"},
+    "scope_sha256": {"$ref": "#/$defs/sha256"},
+    "fixture_id": {"$ref": "#/$defs/publicIdentifier"},
+    "corpus_sha256": {"$ref": "#/$defs/sha256"},
+    "snapshot_sha256": {"$ref": "#/$defs/sha256"},
+    "retrieval": {"$ref": "#/$defs/retrieval"},
+    "request": {"$ref": "#/$defs/request"},
+    "commitments": {"$ref": "#/$defs/commitments"},
+    "context_policy": {"$ref": "#/$defs/contextPolicy"},
+    "status": {"enum": ["complete", "degraded", "partial", "empty", "unavailable"]},
+    "reason": {"$ref": "#/$defs/publicIdentifier"},
+    "membership": {"$ref": "#/$defs/membership"},
+    "candidates": {"type": "array", "items": {"$ref": "#/$defs/candidate"}},
+    "raw_inputs_captured": {"const": false},
+    "network_calls": {"const": 0},
+    "replay_fingerprint_sha256": {"$ref": "#/$defs/sha256"},
+    "projection_sha256": {"$ref": "#/$defs/sha256"}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"status": {"enum": ["degraded", "partial", "unavailable"]}}, "required": ["status"]},
+      "then": {"required": ["reason"]}
+    },
+    {
+      "if": {"properties": {"status": {"enum": ["complete", "empty"]}}, "required": ["status"]},
+      "then": {"not": {"required": ["reason"]}}
+    }
+  ],
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "publicIdentifier": {
+      "type": "string",
+      "allOf": [
+        {"pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$"},
+        {"not": {"pattern": "(?i)(password|secret|credential|access_token|api_key|authorization)"}}
+      ]
+    },
+    "retrieval": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["profile", "mode", "top_k", "sequence_policy"],
+      "properties": {
+        "profile": {"$ref": "#/$defs/publicIdentifier"},
+        "mode": {"$ref": "#/$defs/publicIdentifier"},
+        "top_k": {"type": "integer", "minimum": 1},
+        "sequence_policy": {"enum": ["wire_v1", "chronological_sequence_v1", "identity_v1"]}
+      }
+    },
+    "request": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cell_id", "request_sha256"],
+      "properties": {
+        "cell_id": {"$ref": "#/$defs/publicIdentifier"},
+        "request_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "commitments": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["config_sha256", "code_sha256"],
+      "properties": {
+        "config_sha256": {"$ref": "#/$defs/sha256"},
+        "code_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "contextPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version"],
+      "properties": {
+        "name": {"$ref": "#/$defs/publicIdentifier"},
+        "version": {"$ref": "#/$defs/publicIdentifier"}
+      }
+    },
+    "membership": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["candidate_count", "delivered_count", "requested_top_k", "complete", "truncated"],
+      "properties": {
+        "candidate_count": {"type": "integer", "minimum": 0},
+        "delivered_count": {"type": "integer", "minimum": 0},
+        "requested_top_k": {"type": "integer", "minimum": 1},
+        "complete": {"type": "boolean"},
+        "truncated": {"type": "boolean"}
+      }
+    },
+    "candidate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "candidate_id_sha256",
+        "source_ref_sha256",
+        "content_sha256",
+        "content_chars",
+        "provenance_sha256",
+        "wire_rank",
+        "original_position",
+        "final_rank"
+      ],
+      "properties": {
+        "candidate_id_sha256": {"$ref": "#/$defs/sha256"},
+        "source_ref_sha256": {"$ref": "#/$defs/sha256"},
+        "content_sha256": {"$ref": "#/$defs/sha256"},
+        "content_chars": {"type": "integer", "minimum": 0},
+        "provenance_sha256": {"$ref": "#/$defs/sha256"},
+        "wire_rank": {"type": "integer", "minimum": 1},
+        "original_position": {"type": "integer", "minimum": 1},
+        "final_rank": {"type": "integer", "minimum": 1},
+        "score": {"type": "number"},
+        "score_semantics": {"$ref": "#/$defs/publicIdentifier"}
+      },
+      "oneOf": [
+        {"required": ["score", "score_semantics"]},
+        {"not": {"anyOf": [{"required": ["score"]}, {"required": ["score_semantics"]}]}}
+      ]
+    }
+  }
+}

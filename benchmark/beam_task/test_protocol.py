@@ -13,6 +13,7 @@ import unittest
 from pathlib import Path
 
 from benchmark.beam_task import protocol
+from benchmark.package.common.replay import replay_envelope
 
 
 HERE = Path(__file__).resolve().parent
@@ -150,7 +151,7 @@ class BeamTaskProtocolTests(unittest.TestCase):
         self.assertNotIn("question", first)
         self.assertNotIn("gold", first)
         self.assertNotIn("private body", json.dumps(first))
-        self.assertEqual(len(first["retrieval"]["ranked"][0]["content_sha256"]), 64)
+        self.assertEqual(len(first["retrieval"]["candidates"][0]["content_sha256"]), 64)
 
     def test_report_projection_keeps_evidence_classes_separate(self):
         report = protocol.build_retrieval_report(
@@ -197,9 +198,14 @@ class BeamTaskProtocolTests(unittest.TestCase):
             self.assertEqual(first["config"]["answerer"]["model"], "not_measured")
             self.assertEqual(first["config"]["answerer"]["prompt_id"], "not_measured")
             self.assertEqual(first["config"]["judge"]["prompt_id"], "not_measured")
-            replay = (Path(directory) / "first" / "retrieval_replay.jsonl").read_text()
-            self.assertEqual(len(replay.splitlines()), 2)
-            self.assertNotIn("Atlas", replay)
+            replay_lines = [json.loads(line) for line in (Path(directory) / "first" / "retrieval_replay.jsonl").read_text().splitlines()]
+            snapshot_lines = [json.loads(line) for line in (Path(directory) / "first" / "retrieval_snapshot.jsonl").read_text().splitlines()]
+            self.assertEqual(len(replay_lines), 2)
+            self.assertEqual(len(snapshot_lines), 2)
+            self.assertNotIn("Atlas", json.dumps(replay_lines + snapshot_lines))
+            for envelope, snapshot_row in zip(replay_lines, snapshot_lines):
+                replayed = replay_envelope(envelope, snapshot_row["snapshot"])
+                self.assertEqual(replayed["replay_fingerprint_sha256"], envelope["replay_fingerprint_sha256"])
             self.assertTrue((Path(directory) / "first" / "report.json").is_file())
 
 

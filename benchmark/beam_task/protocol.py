@@ -16,6 +16,13 @@ import re
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
+from benchmark.package.common.replay import (
+    ReplayValidationError,
+    build_envelope as build_replay_envelope,
+    build_snapshot as build_replay_snapshot,
+    validate_envelope as validate_replay_envelope,
+)
+
 PROTOCOL_SCHEMA = "perseus-vault-beam-task/v1"
 REPORT_SCHEMA = "perseus-vault-beam-task-report/v1"
 SOURCE_REPOSITORY = "https://github.com/mohammadtavakoli78/BEAM"
@@ -408,57 +415,100 @@ def build_manifest(*, data_root: str | Path, sizes: Iterable[str], source_revisi
     }
 
 
-def validate_retrieval_artifact(artifact: dict[str, Any]) -> None:
-    if not isinstance(artifact, dict):
-        raise ValueError("retrieval artifact must be an object")
-    if artifact.get("complete") is not True:
-        raise ValueError("retrieval artifact must be complete")
-    top_k = artifact.get("top_k")
-    if not isinstance(top_k, int) or isinstance(top_k, bool) or top_k <= 0:
-        raise ValueError("retrieval artifact top_k must be positive")
-    ranked = artifact.get("ranked")
-    if not isinstance(ranked, list) or len(ranked) > top_k:
-        raise ValueError("retrieval artifact ranked list is invalid")
-    for index, item in enumerate(ranked, 1):
-        if not isinstance(item, dict) or item.get("rank") != index:
-            raise ValueError("retrieval ranks must be contiguous")
-        _require_sha(item.get("key_sha256"), "retrieval key_sha256")
-        _require_sha(item.get("content_sha256"), "retrieval content_sha256")
-        score = item.get("score")
-        if isinstance(score, bool) or not isinstance(score, (int, float)) or not math.isfinite(float(score)):
-            raise ValueError("retrieval score must be finite")
-    if not _SHA256_RE.fullmatch(str(artifact.get("evidence_sha256", ""))):
-        raise ValueError("retrieval evidence digest is invalid")
+def _case_corpus_sha256(case: dict[str, Any]) -> str:
+    rows = [
+        {
+            "id": str(message.get("id")),
+            "content_sha256": sha256_text(str(message.get("content", ""))),
+        }
+        for message in case.get("messages", [])
+    ]
+    return sha256_text(stable_json(rows))
 
 
-def make_retrieval_artifact(case: dict[str, Any], ranked: list[dict[str, Any]], *, top_k: int) -> dict[str, Any]:
-    if not isinstance(top_k, int) or top_k <= 0:
-        raise ValueError("top_k must be positive")
-    public_ranked: list[dict[str, Any]] = []
-    for index, item in enumerate(ranked[:top_k], 1):
+def _case_request_sha256(case: dict[str, Any]) -> str:
+    return sha256_text(stable_json({
+        "question_id": case["question_id"],
+        "question_sha256": sha256_text(str(case.get("question", ""))),
+    }))
+
+
+def _normalize_retrieval_rows(ranked: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    for index, item in enumerate(ranked):
         if not isinstance(item, dict):
             raise ValueError("retrieval result must be an object")
         key = str(item.get("key", ""))
         content = str(item.get("content", ""))
         if not key or not content:
             raise ValueError("retrieval result key and content are required")
-        score = item.get("score", 0.0)
-        public_ranked.append({
-            "rank": index,
-            "key_sha256": sha256_text(key),
-            "content_sha256": sha256_text(content),
-            "content_chars": len(content),
-            "score": round(float(score), 8),
-        })
-    artifact = {
-        "complete": True,
-        "top_k": top_k,
-        "ranked": public_ranked,
-        "candidate_count": len(ranked),
-        "evidence_sha256": sha256_text(stable_json(public_ranked)),
-    }
-    validate_retrieval_artifact(artifact)
-    return artifact
+        wire_rank = item.get("wire_rank", item.get("rank", index + 1))
+        original_position = item.get("original_position", wire_rank)
+        row = {
+            "candidate_id": key,
+            "source_ref": str(item.get("source_ref", key)),
+            "content": content,
+            "provenance": str(item.get("provenance", "beam-retrieval")),
+            "wire_rank": wire_rank,
+            "original_position": original_position,
+        }
+        if "score" in item:
+            row["score"] = item["score"]
+            row["score_semantics"] = item.get("score_semantics", "retrieval-score-v1")
+        normalized.append(row)
+    return normalized
+
+
+def make_retrieval_snapshot(ranked: list[dict[str, Any]]) -> dict[str, Any]:
+    return build_replay_snapshot(_normalize_retrieval_rows(ranked))
+
+
+def make_retrieval_artifact(
+    case: dict[str, Any],
+    ranked: list[dict[str, Any]],
+    *,
+    top_k: int,
+    config_sha256: str | None = None,
+    code_sha256: str | None = None,
+    retrieval_profile: str = "beam-default",
+    mode: str = "hybrid",
+    sequence_policy: str = "wire_v1",
+    status: str | None = None,
+    reason: str | None = None,
+) -> dict[str, Any]:
+    """Build the shared hash-only replay envelope for one BEAM cell."""
+    if not isinstance(top_k, int) or top_k <= 0:
+        raise ValueError("top_k must be positive")
+    normalized = _normalize_retrieval_rows(ranked)
+    snapshot = build_replay_snapshot(normalized)
+    envelope = build_replay_envelope(
+        workspace_id=f"beam:{case['size']}",
+        scope=f"conversation:{case['conversation_id']}",
+        fixture_id="beam-task-v1",
+        corpus_sha256=_case_corpus_sha256(case),
+        retrieval_profile=retrieval_profile,
+        mode=mode,
+        top_k=top_k,
+        cell_id=case["question_id"],
+        request_sha256=_case_request_sha256(case),
+        config_sha256=config_sha256 or sha256_text(stable_json({"top_k": top_k, "mode": "hybrid"})),
+        code_sha256=code_sha256 or sha256_text("beam-task-protocol-v1"),
+        context_policy="none",
+        context_policy_version="1",
+        snapshot=snapshot,
+        candidates=normalized,
+        sequence_policy=sequence_policy,
+        status=status,
+        reason=reason,
+    )
+    return envelope
+
+
+def validate_retrieval_artifact(artifact: dict[str, Any]) -> None:
+    try:
+        validate_replay_envelope(artifact)
+    except ReplayValidationError as exc:
+        raise ValueError(str(exc)) from exc
 
 
 def project_case(case: dict[str, Any], artifact: dict[str, Any], *, status: str = "retrieved") -> dict[str, Any]:
@@ -470,8 +520,8 @@ def project_case(case: dict[str, Any], artifact: dict[str, Any], *, status: str 
         {"id": str(row.get("id")), "role": row.get("role"), "content_sha256": sha256_text(str(row.get("content", "")))}
         for row in messages
     ]))
+    retrieved_chars = sum(item.get("content_chars", 0) for item in artifact["candidates"])
     question_budget = estimate_tokens(case.get("question", ""))
-    retrieved_chars = sum(item.get("content_chars", 0) for item in artifact["ranked"])
     return {
         "question_id": case["question_id"],
         "ability": case["ability"],
