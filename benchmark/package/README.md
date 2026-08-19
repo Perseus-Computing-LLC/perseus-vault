@@ -83,6 +83,47 @@ Schemas:
 All tests are offline and model/provider-free. Public receipts never contain
 prompts, memory bodies, host paths, credentials, or scanner text.
 
+## Synthetic GovCon handling profiles (#1127)
+
+`common/handling_profile.py` composes with the #1118 corpus boundary and
+provides a versioned, provider-free synthetic handling-profile fixture. The
+labels are test-policy classes only; they are not legal CUI, export-control, or
+contract-information determinations.
+
+The fixture covers `PUBLIC_SAFE`, `INTERNAL_PROGRAM`, `FCI_LIKE`, `CUI_LIKE`,
+`EXPORT_CONTROLLED_SIGNAL`, `CREDENTIAL`, and `REVIEW_REQUIRED`, with signals
+placed independently in content, title, safe summary, Core tags, project/task/
+topic metadata, source references, contract identifiers, and program
+identifiers. It exercises the complete deterministic projection boundary:
+
+1. classify the combined candidate projection;
+2. apply local synthetic-marker redaction only when the case policy permits it;
+3. reclassify the redacted projection;
+4. route it to `SAVE/AGENT_VISIBLE`, `PROTECTED`, `BLOCK`, `PENDING_REVIEW`, or
+   `REVIEW_REQUIRED`.
+
+The receipt publishes case IDs, expected/classified/actual profile labels,
+expected/actual outcomes, bounded reason codes, policy/taxonomy versions, and
+SHA-256 commitments for candidate, redaction, projection, and protected storage.
+It reports false-negative, false-positive, mismatch, and missingness counts by
+profile and proves the synthetic workspace/visibility isolation invariant.
+Raw case text, credentials, CUI-like markers, and customer data never enter the
+receipt. The default lane declares zero model calls, zero provider calls, zero
+network calls, and `raw_inputs_captured=false`.
+
+Files:
+
+- `handling_profile_fixture.json` — synthetic corpus only;
+- `handling_profile_corpus.schema.json` — corpus contract;
+- `handling_profile_report.schema.json` — hash-only receipt contract;
+- `common/handling_profile.py` — validator/classifier/redaction/report logic;
+- `test_handling_profile.py` — deterministic and adversarial contract tests.
+
+This is product evidence for a bounded projection experiment. It does not
+establish CMMC Level 2, NIST SP 800-171 compliance, FIPS validation, ATO,
+IL5/IL6 authorization, ITAR/EAR compliance, or any customer/prime data-handling
+determination.
+
 ## Status vocabulary
 
 `available`, `partial`, `unavailable`, `not_measured`, and `failed` are distinct.

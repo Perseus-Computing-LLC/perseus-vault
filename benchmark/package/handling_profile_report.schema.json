@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://perseus.observer/schemas/perseus-vault-handling-profile-v1.json",
+  "title": "Synthetic GovCon handling-profile certification receipt",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "corpus_version", "policy_version", "taxonomy_version", "provider_mode", "provider_calls", "network_calls", "raw_inputs_captured", "case_count", "cases", "expected_profile_counts", "actual_profile_counts", "outcome_counts", "metrics_by_profile", "totals", "scope_isolation", "report_sha256", "signature_sha256"],
+  "properties": {
+    "schema_version": {"const": "perseus-vault-handling-profile/v1"},
+    "corpus_version": {"type": "string", "minLength": 1}, "policy_version": {"type": "string", "minLength": 1}, "taxonomy_version": {"type": "string", "minLength": 1},
+    "provider_mode": {"const": "zero-model-zero-network"}, "provider_calls": {"const": 0}, "network_calls": {"const": 0}, "raw_inputs_captured": {"const": false},
+    "case_count": {"type": "integer", "minimum": 1}, "cases": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/case"}},
+    "expected_profile_counts": {"$ref": "#/$defs/profile_counts"}, "actual_profile_counts": {"$ref": "#/$defs/profile_counts"}, "outcome_counts": {"$ref": "#/$defs/outcome_counts"},
+    "metrics_by_profile": {"type": "object", "additionalProperties": {"$ref": "#/$defs/metrics"}},
+    "totals": {"$ref": "#/$defs/totals"}, "scope_isolation": {"$ref": "#/$defs/scope"},
+    "report_sha256": {"$ref": "#/$defs/sha256"}, "signature_sha256": {"$ref": "#/$defs/sha256"}
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "profile": {"enum": ["PUBLIC_SAFE", "INTERNAL_PROGRAM", "FCI_LIKE", "CUI_LIKE", "EXPORT_CONTROLLED_SIGNAL", "CREDENTIAL", "REVIEW_REQUIRED"]},
+    "outcome": {"enum": ["SAVE/AGENT_VISIBLE", "PROTECTED", "BLOCK", "PENDING_REVIEW", "REVIEW_REQUIRED"]},
+    "profile_counts": {
+      "type": "object", "additionalProperties": false,
+      "required": ["PUBLIC_SAFE", "INTERNAL_PROGRAM", "FCI_LIKE", "CUI_LIKE", "EXPORT_CONTROLLED_SIGNAL", "CREDENTIAL", "REVIEW_REQUIRED"],
+      "properties": {
+        "PUBLIC_SAFE": {"type": "integer", "minimum": 0}, "INTERNAL_PROGRAM": {"type": "integer", "minimum": 0}, "FCI_LIKE": {"type": "integer", "minimum": 0}, "CUI_LIKE": {"type": "integer", "minimum": 0}, "EXPORT_CONTROLLED_SIGNAL": {"type": "integer", "minimum": 0}, "CREDENTIAL": {"type": "integer", "minimum": 0}, "REVIEW_REQUIRED": {"type": "integer", "minimum": 0}
+      }
+    },
+    "outcome_counts": {
+      "type": "object", "additionalProperties": false,
+      "required": ["SAVE/AGENT_VISIBLE", "PROTECTED", "BLOCK", "PENDING_REVIEW", "REVIEW_REQUIRED"],
+      "properties": {"SAVE/AGENT_VISIBLE": {"type": "integer", "minimum": 0}, "PROTECTED": {"type": "integer", "minimum": 0}, "BLOCK": {"type": "integer", "minimum": 0}, "PENDING_REVIEW": {"type": "integer", "minimum": 0}, "REVIEW_REQUIRED": {"type": "integer", "minimum": 0}}
+    },
+    "metrics": {
+      "type": "object", "additionalProperties": false,
+      "required": ["expected_count", "classified_count", "actual_count", "false_negative_count", "false_positive_count", "mismatch_count", "missingness_count"],
+      "properties": {"expected_count": {"type": "integer", "minimum": 0}, "classified_count": {"type": "integer", "minimum": 0}, "actual_count": {"type": "integer", "minimum": 0}, "false_negative_count": {"type": "integer", "minimum": 0}, "false_positive_count": {"type": "integer", "minimum": 0}, "mismatch_count": {"type": "integer", "minimum": 0}, "missingness_count": {"type": "integer", "minimum": 0}}
+    },
+    "totals": {
+      "type": "object", "additionalProperties": false, "required": ["false_negative_count", "false_positive_count", "mismatch_count", "missingness_count"],
+      "properties": {"false_negative_count": {"type": "integer", "minimum": 0}, "false_positive_count": {"type": "integer", "minimum": 0}, "mismatch_count": {"type": "integer", "minimum": 0}, "missingness_count": {"type": "integer", "minimum": 0}}
+    },
+    "scope": {
+      "type": "object", "additionalProperties": false, "required": ["workspace_count", "agent_visible_case_count", "protected_case_count", "protected_recall_exposure_count", "redacted_original_exposure_count"],
+      "properties": {"workspace_count": {"type": "integer", "minimum": 0}, "agent_visible_case_count": {"type": "integer", "minimum": 0}, "protected_case_count": {"type": "integer", "minimum": 0}, "protected_recall_exposure_count": {"type": "integer", "minimum": 0}, "redacted_original_exposure_count": {"type": "integer", "minimum": 0}}
+    },
+    "case": {
+      "type": "object", "additionalProperties": false,
+      "required": ["case_id", "workspace_sha256", "scope_sha256", "input_state", "expected_profile", "classified_profile", "actual_profile", "expected_outcome", "actual_outcome", "decision_state", "reason_code", "redaction_mode", "redaction_complete", "redaction_sha256", "projection_sha256", "protected_storage_sha256", "candidate_sha256", "false_negative", "false_positive", "mismatch", "missingness", "policy_version", "taxonomy_version", "provider_mode", "network_calls"],
+      "properties": {
+        "case_id": {"type": "string", "minLength": 1}, "workspace_sha256": {"$ref": "#/$defs/sha256"}, "scope_sha256": {"$ref": "#/$defs/sha256"},
+        "input_state": {"enum": ["complete", "ambiguous", "provider-unavailable", "malformed"]}, "expected_profile": {"$ref": "#/$defs/profile"}, "classified_profile": {"$ref": "#/$defs/profile"}, "actual_profile": {"$ref": "#/$defs/profile"},
+        "expected_outcome": {"$ref": "#/$defs/outcome"}, "actual_outcome": {"$ref": "#/$defs/outcome"}, "decision_state": {"enum": ["SAVE", "PROTECTED", "BLOCK", "PENDING_REVIEW", "REVIEW_REQUIRED"]}, "reason_code": {"type": "string", "minLength": 1},
+        "redaction_mode": {"enum": ["none", "permitted", "incomplete"]}, "redaction_complete": {"type": "boolean"}, "redaction_sha256": {"$ref": "#/$defs/sha256"}, "projection_sha256": {"$ref": "#/$defs/sha256"}, "protected_storage_sha256": {"anyOf": [{"$ref": "#/$defs/sha256"}, {"type": "null"}]}, "candidate_sha256": {"$ref": "#/$defs/sha256"},
+        "false_negative": {"type": "boolean"}, "false_positive": {"type": "boolean"}, "mismatch": {"type": "boolean"}, "missingness": {"type": "boolean"}, "policy_version": {"type": "string", "minLength": 1}, "taxonomy_version": {"type": "string", "minLength": 1}, "provider_mode": {"const": "zero-model-zero-network"}, "network_calls": {"const": 0}
+      }
+    }
+  }
+}

@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://perseus.observer/schemas/perseus-vault-handling-profile-corpus-v1.json",
+  "title": "Synthetic GovCon handling-profile corpus",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "corpus_version", "policy_version", "taxonomy_version", "provider_mode", "cases"],
+  "properties": {
+    "schema_version": {"const": "perseus-vault-handling-profile-corpus/v1"},
+    "corpus_version": {"type": "string", "minLength": 1},
+    "policy_version": {"type": "string", "minLength": 1},
+    "taxonomy_version": {"type": "string", "minLength": 1},
+    "provider_mode": {"const": "zero-model-zero-network"},
+    "cases": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/case"}}
+  },
+  "$defs": {
+    "profile": {"enum": ["PUBLIC_SAFE", "INTERNAL_PROGRAM", "FCI_LIKE", "CUI_LIKE", "EXPORT_CONTROLLED_SIGNAL", "CREDENTIAL", "REVIEW_REQUIRED"]},
+    "outcome": {"enum": ["SAVE/AGENT_VISIBLE", "PROTECTED", "BLOCK", "PENDING_REVIEW", "REVIEW_REQUIRED"]},
+    "candidate": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "content": {"type": "string"}, "title": {"type": "string"}, "safe_summary": {"type": "string"},
+        "core_tags": {"type": "array", "items": {"type": "string"}}, "project": {"type": "string"},
+        "task": {"type": "string"}, "topic": {"type": "string"},
+        "source_refs": {"type": "array", "items": {"$ref": "#/$defs/source_ref"}},
+        "contract_id": {"type": "string"}, "program_id": {"type": "string"},
+        "workspace": {"type": "string"}, "scope": {"type": "string"}
+      }
+    },
+    "source_ref": {
+      "type": "object", "additionalProperties": false, "required": ["label", "uri"],
+      "properties": {"label": {"type": "string"}, "uri": {"type": "string"}}
+    },
+    "case": {
+      "type": "object", "additionalProperties": false,
+      "required": ["case_id", "workspace", "scope", "input_state", "redaction_mode", "redaction_exclude_fields", "expected_profile", "expected_outcome", "candidate"],
+      "properties": {
+        "case_id": {"type": "string", "minLength": 1}, "workspace": {"type": "string", "minLength": 1},
+        "scope": {"type": "string", "minLength": 1},
+        "input_state": {"enum": ["complete", "ambiguous", "provider-unavailable", "malformed"]},
+        "redaction_mode": {"enum": ["none", "permitted", "incomplete"]},
+        "redaction_exclude_fields": {"type": "array", "uniqueItems": true, "items": {"enum": ["content", "title", "safe_summary", "core_tags", "project", "task", "topic", "source_refs", "contract_id", "program_id", "workspace", "scope"]}},
+        "expected_profile": {"$ref": "#/$defs/profile"}, "expected_outcome": {"$ref": "#/$defs/outcome"},
+        "candidate": {"$ref": "#/$defs/candidate"}
+      }
+    }
+  }
+}
