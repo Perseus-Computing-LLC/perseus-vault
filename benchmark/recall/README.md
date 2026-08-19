@@ -128,3 +128,24 @@ measure. Reference delta on this dataset (Linux, bundled ONNX):
 
 Run both variants (`--hints` and without) before any default-on flip; dense
 arm values are reference-only (embed step is per-process and noisy).
+
+## Conflict-magnet fusion regression (#1115)
+
+`test_fusion_regression.py` and `fusion_regression.py` provide a deterministic,
+provider-free adversarial lane for presentation-only conflict ordering and
+positive hygiene modulation. The fixture records raw, adjusted, fused, and
+final-delivered ranks, keeps the conflict-neighbor exposure metric separate from
+positive recall, and publishes only bounded IDs, counters, and SHA-256
+commitments. It deliberately excludes prompts, queries, memory bodies, and
+secrets.
+
+Run the contract lane directly:
+
+```bash
+python -m unittest discover -s benchmark/recall -p 'test_*.py' -v
+```
+
+The Rust regression `conflict_magnet_presentation_does_not_change_fusion_input`
+exercises both `flat_rrf` and the legacy `reciprocal_rank_fusion` operator with
+the same raw arm order. The negative control demonstrates why a presentation
+swap before fusion is prohibited.
