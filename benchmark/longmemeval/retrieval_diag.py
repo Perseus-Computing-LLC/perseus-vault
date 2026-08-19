@@ -52,6 +52,7 @@ from benchmark.package.common.replay import (
     sha256_text as replay_sha256_text,
     stable_json as replay_stable_json,
 )
+from benchmark.longmemeval.sufficiency import build_sufficiency_report
 
 from datetime import datetime
 
@@ -233,6 +234,51 @@ def coverage_latest_at(records, k):
     return round(covered / len(scored), 4)
 
 
+def _make_sufficiency_report(records, *, depth, dataset_sha256, config_sha256, code_sha256):
+    """Seal gold-aware evaluator inputs, then publish only its projection."""
+    evaluator_rows = []
+    for record in records:
+        gold = list(record.get("gold", []) or [])
+        if not gold:
+            continue
+        ranked = [f"rank-slot-{index + 1}" for index in range(depth)]
+        for evidence_id, rank in record["ranks"].items():
+            if isinstance(rank, int) and 1 <= rank <= depth:
+                ranked[rank - 1] = evidence_id
+        latest = [record["update_gold"]] if record.get("update_gold") else []
+        temporal = gold if record.get("question_type") == "temporal-reasoning" else []
+        stale = []
+        if latest:
+            stale = [evidence_id for evidence_id in gold if evidence_id != latest[0]]
+        evaluator_rows.append(
+            {
+                "question_id": record["question_id"],
+                "question_type": record.get("question_type", "unknown"),
+                "required_evidence": gold,
+                "latest_evidence": latest,
+                "temporal_anchors": temporal,
+                "stale_evidence": stale,
+                "ranked_ids": ranked,
+                "status": "available",
+            }
+        )
+    if not evaluator_rows:
+        return None
+    ks = tuple(k for k in (1, 3, 5, 10, 20, 50) if k <= depth)
+    return build_sufficiency_report(
+        evaluator_rows,
+        dataset_sha256=dataset_sha256,
+        fixture_sha256=replay_sha256_text("longmemeval-sufficiency-fixture-v1"),
+        retrieval_config_sha256=config_sha256,
+        code_sha256=code_sha256,
+        ks=ks,
+        focus_strata={
+            "multi-evidence": ["multi-session", "knowledge-update"],
+            "temporal": ["temporal-reasoning"],
+        },
+    )
+
+
 def parse_floor(spec):
     """'20:0.95' -> (20, 0.95)."""
     try:
@@ -374,6 +420,13 @@ def main():
     scored = [r for r in records if r["gold"]]
     coverage = {f"@{k}": coverage_at(records, k) for k in ladder}
     coverage_latest = {f"@{k}": coverage_latest_at(records, k) for k in ladder}
+    sufficiency_report = _make_sufficiency_report(
+        records,
+        depth=args.k,
+        dataset_sha256=corpus_sha256,
+        config_sha256=config_sha256,
+        code_sha256=code_sha256,
+    )
 
     # Per-question worst gold rank (None if any gold session absent from top-k).
     def worst_rank(rec):
@@ -402,6 +455,7 @@ def main():
         "ingest_shape": "ku-shared-key (product)" if args.ku_shared_key else "unique-key-per-session (benchmark)",
         "coverage_at_k": coverage,
         "coverage_latest_at_k": coverage_latest,
+        "sufficiency": sufficiency_report,
         "k_recoverable": sorted(k_recoverable, key=lambda x: x["worst_rank"]),
         "hard_misses": sorted(hard),
         "binary": Path(binary).name,
@@ -411,6 +465,7 @@ def main():
     sig = hashlib.sha256(json.dumps({
         "coverage": coverage, "coverage_latest": coverage_latest, "hard": sorted(hard),
         "n": total, "k": args.k, "ku_shared_key": args.ku_shared_key,
+        "sufficiency_signature": sufficiency_report["signature_sha256"] if sufficiency_report else None,
     }, sort_keys=True).encode("utf-8")).hexdigest()
     report["signature_sha256"] = sig
     out_path = Path(args.out)

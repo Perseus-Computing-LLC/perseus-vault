@@ -1,0 +1,67 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://perseus.observer/schemas/longmemeval-sufficiency-v1.json",
+  "title": "LongMemEval evidence sufficiency report",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "benchmark", "metric", "ks", "dataset_sha256", "fixture_sha256", "retrieval_config_sha256", "code_sha256", "question_count", "strata", "cases", "status_counts", "stale_evidence_cases", "offline", "provider_calls", "answerer_calls", "judge_calls", "raw_inputs_captured", "projection_sha256", "signature_sha256"],
+  "properties": {
+    "schema_version": {"const": "perseus-vault-longmemeval-sufficiency/v1"},
+    "benchmark": {"const": "perseus-vault-longmemeval-retrieval-sufficiency"},
+    "metric": {"type": "string"},
+    "ks": {"type": "array", "items": {"type": "integer", "minimum": 1}, "uniqueItems": true},
+    "dataset_sha256": {"$ref": "#/$defs/sha256"},
+    "fixture_sha256": {"$ref": "#/$defs/sha256"},
+    "retrieval_config_sha256": {"$ref": "#/$defs/sha256"},
+    "code_sha256": {"$ref": "#/$defs/sha256"},
+    "question_count": {"type": "integer", "minimum": 1},
+    "strata": {"type": "object"},
+    "cases": {"type": "array", "items": {"$ref": "#/$defs/case"}},
+    "status_counts": {"$ref": "#/$defs/status_counts"},
+    "stale_evidence_cases": {"type": "integer", "minimum": 0},
+    "offline": {"const": true},
+    "provider_calls": {"const": 0},
+    "answerer_calls": {"const": 0},
+    "judge_calls": {"const": 0},
+    "raw_inputs_captured": {"const": false},
+    "projection_sha256": {"$ref": "#/$defs/sha256"},
+    "signature_sha256": {"$ref": "#/$defs/sha256"}
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "status_counts": {
+      "type": "object", "additionalProperties": false,
+      "required": ["available", "partial", "unavailable", "truncated", "duplicate"],
+      "properties": {
+        "available": {"type": "integer", "minimum": 0},
+        "partial": {"type": "integer", "minimum": 0},
+        "unavailable": {"type": "integer", "minimum": 0},
+        "truncated": {"type": "integer", "minimum": 0},
+        "duplicate": {"type": "integer", "minimum": 0}
+      }
+    },
+    "case": {
+      "type": "object", "additionalProperties": false,
+      "required": ["question_id", "question_type", "status", "metric_status", "required_count", "ranked_count", "required_set_sha256", "ranked_set_sha256", "latest_set_sha256", "temporal_set_sha256", "single_hit_rank", "worst_required_rank", "missing_required_count", "latest_missing_count", "temporal_anchor_missing_count", "stale_exposure_count", "stale_required_missing_count"],
+      "properties": {
+        "question_id": {"type": "string"},
+        "question_type": {"type": "string"},
+        "status": {"enum": ["available", "partial", "unavailable", "truncated", "duplicate"]},
+        "metric_status": {"enum": ["eligible", "not-eligible"]},
+        "required_count": {"type": "integer", "minimum": 0},
+        "ranked_count": {"type": "integer", "minimum": 0},
+        "required_set_sha256": {"anyOf": [{"$ref": "#/$defs/sha256"}, {"type": "null"}]},
+        "ranked_set_sha256": {"anyOf": [{"$ref": "#/$defs/sha256"}, {"type": "null"}]},
+        "latest_set_sha256": {"anyOf": [{"$ref": "#/$defs/sha256"}, {"type": "null"}]},
+        "temporal_set_sha256": {"anyOf": [{"$ref": "#/$defs/sha256"}, {"type": "null"}]},
+        "single_hit_rank": {"type": ["integer", "null"], "minimum": 1},
+        "worst_required_rank": {"type": ["integer", "null"], "minimum": 1},
+        "missing_required_count": {"type": ["integer", "null"], "minimum": 0},
+        "latest_missing_count": {"type": ["integer", "null"], "minimum": 0},
+        "temporal_anchor_missing_count": {"type": ["integer", "null"], "minimum": 0},
+        "stale_exposure_count": {"type": ["integer", "null"], "minimum": 0},
+        "stale_required_missing_count": {"type": ["integer", "null"], "minimum": 0}
+      }
+    }
+  }
+}
