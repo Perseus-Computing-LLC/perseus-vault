@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://perseus.observer/schemas/perseus-vault-corpus-certification-v1.json",
+  "title": "Perseus Vault corpus certification receipt",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "status",
+    "passed",
+    "unchecked_opt_out",
+    "manifest_sha256",
+    "surface_digests",
+    "finding_counts",
+    "raw_inputs_captured",
+    "receipt_sha256"
+  ],
+  "properties": {
+    "schema_version": {"const": "perseus-vault-corpus-certification/v1"},
+    "status": {"enum": ["passed", "failed", "unchecked"]},
+    "passed": {"type": "boolean"},
+    "unchecked_opt_out": {"type": "boolean"},
+    "manifest_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "surface_digests": {
+      "type": "object",
+      "propertyNames": {"enum": ["source", "fixture", "evidence", "graph_identity", "challenge"]},
+      "additionalProperties": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+    },
+    "surface_stats": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["items", "bytes"],
+        "properties": {
+          "items": {"type": "integer", "minimum": 0},
+          "bytes": {"type": "integer", "minimum": 0}
+        }
+      }
+    },
+    "missing_surface_count": {"type": "integer", "minimum": 0},
+    "missing_surface_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "finding_counts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "auto-loaded-context",
+        "suspicious-metadata",
+        "benchmark-awareness",
+        "patch-or-diff",
+        "solution-leak"
+      ],
+      "properties": {
+        "auto-loaded-context": {"type": "integer", "minimum": 0},
+        "suspicious-metadata": {"type": "integer", "minimum": 0},
+        "benchmark-awareness": {"type": "integer", "minimum": 0},
+        "patch-or-diff": {"type": "integer", "minimum": 0},
+        "solution-leak": {"type": "integer", "minimum": 0}
+      }
+    },
+    "finding_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "raw_inputs_captured": {"const": false},
+    "receipt_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}

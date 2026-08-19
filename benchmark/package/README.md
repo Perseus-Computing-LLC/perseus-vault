@@ -55,6 +55,34 @@ same versioned envelope. The replay builder rejects unknown fields, malformed
 ranks/digests, raw payload keys, inconsistent state, incomplete top-k marked as
 complete, and tampered snapshots or projections.
 
+## Zero-model corpus certification (#1118)
+
+`common/corpus.py` provides the provider-free packaging boundary for agent-visible
+benchmark inputs. `materialize_git_tree()` archives a pinned Git object into a
+fresh Git-less tree and excludes `.git`, build output, and dependency/cache
+roots. `redact_tree()` is a separate deterministic operation: it removes known
+auto-loaded project-context paths and emits the removed relative paths with
+pre-redaction SHA-256 commitments. Certification never calls redaction or
+mutates its candidate.
+
+`certify_surfaces()` requires all five surfaces—materialized source, fixture,
+evidence, graph identity, and challenge text—and emits only surface digests,
+bounded counts, finding-class counts, and a receipt digest. It detects
+`auto-loaded-context`, `suspicious-metadata`, `benchmark-awareness`,
+`patch-or-diff`, and `solution-leak`. The word `fixture` is checked in
+benchmark-owned identity fields, but not merely because it appears in a graph
+node body. Missing artifacts fail closed; the explicit
+`PERSEUS_VAULT_ALLOW_UNCHECKED_CORPUS=1` opt-out produces `status=unchecked`,
+never a pass.
+
+Schemas:
+
+- `corpus_certification.schema.json`
+- `corpus_redaction.schema.json`
+
+All tests are offline and model/provider-free. Public receipts never contain
+prompts, memory bodies, host paths, credentials, or scanner text.
+
 ## Status vocabulary
 
 `available`, `partial`, `unavailable`, `not_measured`, and `failed` are distinct.
