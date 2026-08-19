@@ -27,16 +27,16 @@ def child_env(base: dict[str, str]) -> dict[str, str]:
     return env
 
 
-def configure(client: Any) -> None:
+def configure(client: Any, *, workspace: str = WORKSPACE, agent: str = AGENT) -> None:
     client.call(
         "perseus_vault_agent",
-        {"agent_id": AGENT, "name": AGENT, "trust_tier": 2, "fleet_id": "benchmark"},
+        {"agent_id": agent, "name": agent, "trust_tier": 2, "fleet_id": "benchmark"},
     )
     client.call(
         "perseus_vault_authority_set",
         {
-            "agent_id": AGENT,
-            "workspace_hash": WORKSPACE,
+            "agent_id": agent,
+            "workspace_hash": workspace,
             "allowed_capabilities": [
                 "memory.admission.source",
                 "memory.commit",
@@ -46,7 +46,7 @@ def configure(client: Any) -> None:
                 "memory.delete",
                 "memory.export",
             ],
-            "scope_anchors": [WORKSPACE],
+            "scope_anchors": [workspace],
             "mode": "enforce",
             "author_agent_id": "operator",
             "capability_constraints_json": "{}",
@@ -54,17 +54,25 @@ def configure(client: Any) -> None:
     )
 
 
-def admitted_remember(client: Any, category: str, key: str, body_json: str) -> dict[str, Any]:
+def admitted_remember(
+    client: Any,
+    category: str,
+    key: str,
+    body_json: str,
+    *,
+    workspace: str = WORKSPACE,
+    agent: str = AGENT,
+) -> dict[str, Any]:
     body = stable_json(json.loads(body_json))
     record_digest = hashlib.sha256(body.encode()).hexdigest()
     evaluated = {
         "record_digest": record_digest,
         "source_identity": f"{category}:{key}",
-        "workspace_hash": WORKSPACE,
+        "workspace_hash": workspace,
         "actor_kind": "connector",
-        "actor_identity": AGENT,
+        "actor_identity": agent,
     }
-    attestation_payload = stable_json({**evaluated, "requesting_agent_id": AGENT})
+    attestation_payload = stable_json({**evaluated, "requesting_agent_id": agent})
     source_attestation = hmac.new(
         HMAC_KEY.encode(), attestation_payload.encode(), hashlib.sha256
     ).hexdigest()
@@ -76,8 +84,8 @@ def admitted_remember(client: Any, category: str, key: str, body_json: str) -> d
             "source_attestation": source_attestation,
             "acted": {},
             "forward": {},
-            "workspace_hash": WORKSPACE,
-            "requesting_agent_id": AGENT,
+            "workspace_hash": workspace,
+            "requesting_agent_id": agent,
         },
     )
     result = client.call(
@@ -87,21 +95,21 @@ def admitted_remember(client: Any, category: str, key: str, body_json: str) -> d
             "key": key,
             "body_json": body,
             "type": "fact",
-            "workspace_hash": WORKSPACE,
-            "agent_id": AGENT,
+            "workspace_hash": workspace,
+            "agent_id": agent,
             "actor_kind": "connector",
-            "requesting_agent_id": AGENT,
+            "requesting_agent_id": agent,
             "skip_dedup": True,
             "admission": {
                 "record_digest": record_digest,
                 "source_identity": evaluated["source_identity"],
                 "source_event_id": source["id"],
-                "authorization_scope": WORKSPACE,
+                "authorization_scope": workspace,
                 "ingestion_channel": "benchmark",
-                "workspace_hash": WORKSPACE,
+                "workspace_hash": workspace,
                 "source_trust": "authoritative",
                 "actor_kind": "connector",
-                "actor_identity": AGENT,
+                "actor_identity": agent,
                 "validated": True,
                 "valid_from_unix_ms": 1,
                 "recorded_at_unix_ms": 2,
