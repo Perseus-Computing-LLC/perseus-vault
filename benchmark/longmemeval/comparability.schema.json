@@ -1,0 +1,93 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://perseus.observer/schemas/longmemeval-comparability-v1.json",
+  "title": "LongMemEval comparability manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "manifest_id", "lane", "dataset", "answerer", "judge", "prompts", "ingest", "retrieval", "evaluator", "provenance", "manifest_sha256"],
+  "properties": {
+    "schema_version": {"const": "perseus-vault-longmemeval-comparability/v1"},
+    "manifest_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$"},
+    "lane": {"enum": ["official-compatible", "product-optimized"]},
+    "dataset": {
+      "type": "object", "additionalProperties": false,
+      "required": ["name", "split", "digest_sha256", "question_count", "question_type_distribution", "scope", "exclusions"],
+      "properties": {
+        "name": {"type": "string"}, "split": {"type": "string"},
+        "digest_sha256": {"$ref": "#/$defs/sha256"},
+        "question_count": {"type": "integer", "minimum": 1},
+        "question_type_distribution": {"type": "object", "additionalProperties": {"type": "integer", "minimum": 0}},
+        "scope": {"type": "string"}, "exclusions": {"type": "array", "items": {"type": "string"}, "uniqueItems": true}
+      }
+    },
+    "answerer": {"$ref": "#/$defs/model"},
+    "judge": {
+      "type": "object", "additionalProperties": false,
+      "required": ["provider", "model", "temperature", "completion_cap", "retry_policy", "threshold"],
+      "properties": {
+        "provider": {"type": "string"}, "model": {"type": "string"}, "temperature": {"type": "number", "minimum": 0, "maximum": 2},
+        "completion_cap": {"type": "integer", "minimum": 1}, "retry_policy": {"$ref": "#/$defs/retry"}, "threshold": {"$ref": "#/$defs/threshold"}
+      }
+    },
+    "prompts": {
+      "type": "object", "additionalProperties": false, "required": ["answer", "judge"],
+      "properties": {"answer": {"$ref": "#/$defs/prompt"}, "judge": {"$ref": "#/$defs/prompt"}}
+    },
+    "ingest": {
+      "type": "object", "additionalProperties": false,
+      "required": ["shape", "memory_serialization", "context_representation"],
+      "properties": {"shape": {"type": "string"}, "memory_serialization": {"type": "string"}, "context_representation": {"type": "string"}}
+    },
+    "retrieval": {
+      "type": "object", "additionalProperties": false,
+      "required": ["mode", "requested_depth", "effective_depth", "context_token_budget", "context_byte_budget", "selection_policy", "assembly_policy"],
+      "properties": {
+        "mode": {"type": "string"}, "requested_depth": {"type": "integer", "minimum": 1}, "effective_depth": {"type": "integer", "minimum": 1},
+        "context_token_budget": {"type": "integer", "minimum": 1}, "context_byte_budget": {"type": ["integer", "null"], "minimum": 1},
+        "selection_policy": {"type": "string"}, "assembly_policy": {"type": "string"}
+      }
+    },
+    "evaluator": {
+      "type": "object", "additionalProperties": false,
+      "required": ["identity", "metric", "denominator", "excluded_cases", "failed_cases", "completion", "abstention"],
+      "properties": {
+        "identity": {"type": "string"}, "metric": {"type": "string"}, "denominator": {"type": "integer", "minimum": 0},
+        "excluded_cases": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+        "failed_cases": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+        "completion": {"enum": ["complete", "partial"]}, "abstention": {"type": "string"}
+      }
+    },
+    "provenance": {
+      "type": "object", "additionalProperties": false,
+      "required": ["state", "harness_commit", "binary_sha256", "run_sha256", "custody_sha256"],
+      "properties": {
+        "state": {"const": "verified"}, "harness_commit": {"type": "string", "pattern": "^[0-9a-f]{40,64}$"},
+        "binary_sha256": {"$ref": "#/$defs/sha256"}, "run_sha256": {"$ref": "#/$defs/sha256"}, "custody_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "manifest_sha256": {"$ref": "#/$defs/sha256"}
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "retry": {
+      "type": "object", "additionalProperties": false, "required": ["max_retries", "on_error"],
+      "properties": {"max_retries": {"type": "integer", "minimum": 0}, "on_error": {"type": "string"}}
+    },
+    "model": {
+      "type": "object", "additionalProperties": false,
+      "required": ["provider", "model", "temperature", "completion_cap", "retry_policy"],
+      "properties": {
+        "provider": {"type": "string"}, "model": {"type": "string"}, "temperature": {"type": "number", "minimum": 0, "maximum": 2},
+        "completion_cap": {"type": "integer", "minimum": 1}, "retry_policy": {"$ref": "#/$defs/retry"}
+      }
+    },
+    "threshold": {
+      "type": "object", "additionalProperties": false, "required": ["kind", "value", "labels"],
+      "properties": {"kind": {"type": "string"}, "value": {"type": "number", "minimum": 0, "maximum": 1}, "labels": {"type": "array", "minItems": 2, "maxItems": 2, "uniqueItems": true, "items": {"type": "string"}}}
+    },
+    "prompt": {
+      "type": "object", "additionalProperties": false, "required": ["id", "digest_sha256"],
+      "properties": {"id": {"type": "string"}, "digest_sha256": {"$ref": "#/$defs/sha256"}}
+    }
+  }
+}

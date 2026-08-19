@@ -108,6 +108,35 @@ across all 500 rose. Reproduce the default experience:
 #310). Drop the flags to also measure the explicit dense/hybrid modes.
 <!-- RESULTS-END -->
 
+## Protocol comparability and dual lanes (#1111)
+
+`comparability.py` and `comparability.schema.json` define the provider-free
+`perseus-vault-longmemeval-comparability/v1` manifest. A manifest binds the
+split/dataset commitment and type distribution, answerer/judge IDs and caps,
+answer/judge prompt digests, threshold semantics, retry/error policy, ingest
+shape, context representation, requested retrieval depth, **effective delivered
+depth**, context budgets, selection/assembly policy, evaluator denominator,
+exclusions/failures, and verified custody hashes.
+
+The harness keeps two lanes separate:
+
+- `official-compatible`: the official LongMemEval CoT answer prompt and
+  per-type evaluator;
+- `product-optimized`: a declared product answer/context/judge contract that is
+  useful for engineering decisions but is not an official-compatible score.
+
+`compare_manifests()` emits bounded field-level matches/mismatches and a
+`like-for-like`/`not-like-for-like` disposition. Model, prompt, judge threshold,
+top-k override, context, denominator, evaluator, and provenance differences are
+reported independently. `build_dual_lane_scorecard()` preserves the lanes and
+never emits a combined accuracy. Stale or unknown provenance, missing fields,
+contradictory denominators, malformed depths, and digest mismatches fail closed.
+
+Older signed reports remain readable through `read_legacy_artifact()` but are
+explicitly `legacy-readable` and not relabeled or made like-for-like by
+inference. No provider, answerer, or judge call is made by the manifest or
+scorecard tests.
+
 ## Stage 2: QA accuracy (pinned answerer + pinned judge — the vs-Zep harness, #475)
 
 `qa.py` is the second stage and the head-to-head-vs-Zep harness. Per question it
