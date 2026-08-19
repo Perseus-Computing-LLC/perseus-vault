@@ -1,0 +1,82 @@
+{
+  "contract_version": "perseus-vault-scoped-memory-contract/v1",
+  "fixture_sha256": "91a28bfb15e91dbefe990c1ad4988d4f670af6590a2a5c36c31771b4dc87db21",
+  "records": [
+    {
+      "body": "synthetic scoped anchor A",
+      "category": "contract",
+      "id": "anchor-a",
+      "key": "anchor-a",
+      "scope": {
+        "agent_id": "agent-a",
+        "session_id": "session-a",
+        "user_id": "user-a",
+        "workspace_hash": "workspace-a"
+      },
+      "source_digest": "d90efd05e85b01977ef7fea225ce74c9394f4e3991f7af41ac474228de414c66",
+      "source_ref": "fixture:anchor-a"
+    },
+    {
+      "body": "synthetic cross-scope distractor B",
+      "category": "contract",
+      "id": "anchor-b",
+      "key": "anchor-b",
+      "scope": {
+        "agent_id": "agent-b",
+        "session_id": "session-b",
+        "user_id": "user-b",
+        "workspace_hash": "workspace-b"
+      },
+      "source_digest": "b4fbec939c8071914748a9eb5774694223bb147a151ac678aacb28c1e3369b4f",
+      "source_ref": "fixture:anchor-b"
+    },
+    {
+      "body": "synthetic session mismatch distractor",
+      "category": "contract",
+      "id": "anchor-session",
+      "key": "anchor-session",
+      "scope": {
+        "agent_id": "agent-a",
+        "session_id": "session-other",
+        "user_id": "user-a",
+        "workspace_hash": "workspace-a"
+      },
+      "source_digest": "6deb11a9fff2cba1e3f17851c42d2226576ad8397a2f0d5a54dc50361832d39c",
+      "source_ref": "fixture:anchor-session"
+    },
+    {
+      "body": "synthetic original value",
+      "category": "contract",
+      "id": "correctable",
+      "key": "correctable",
+      "scope": {
+        "agent_id": "agent-a",
+        "session_id": "session-a",
+        "user_id": "user-a",
+        "workspace_hash": "workspace-a"
+      },
+      "source_digest": "28fc60e8542a84c18665b40539b0ff065d7e11622629470d7b1b45f19bf8e24a",
+      "source_ref": "fixture:correctable"
+    },
+    {
+      "body": "synthetic superseded value",
+      "category": "contract",
+      "id": "supersede-old",
+      "key": "supersede-old",
+      "scope": {
+        "agent_id": "agent-a",
+        "session_id": "session-a",
+        "user_id": "user-a",
+        "workspace_hash": "workspace-a"
+      },
+      "source_digest": "5acd1498a94ce45e9cb67a1516e952b2a2bd4c56f90ebd514a0f2cd9ef2af8a8",
+      "source_ref": "fixture:supersede-old"
+    }
+  ],
+  "trusted_scope": {
+    "agent_id": "agent-a",
+    "session_id": "session-a",
+    "user_id": "user-a",
+    "workspace_hash": "workspace-a"
+  }
+}
