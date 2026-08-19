@@ -84,7 +84,9 @@ python3 benchmark/beam_task/runner.py \
 A run emits:
 
 - `report.json` with one record per question and per-ability aggregates;
-- `retrieval_replay.jsonl` with ranked retrieval hashes and scores;
+- `retrieval_replay.jsonl` with versioned, hash-only retrieval envelopes;
+- `retrieval_snapshot.jsonl` with aligned synthetic hash-only snapshots for
+  independent membership/order replay;
 - manifest/config/result/custody SHA-256 digests;
 - token-budget estimates and explicit answerer/judge model and prompt
   identities;

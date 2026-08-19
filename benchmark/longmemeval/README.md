@@ -244,6 +244,21 @@ The report buckets misses into **k-recoverable** (gold ranked 11–K, a deeper k
 would catch them) and **hard** (a gold session absent from the top-K entirely —
 the interesting engine cases for multi-query / aggregation-aware retrieval).
 
+The diagnostic also emits the shared provider-free replay contract beside the
+report:
+
+```text
+<out stem>_replay.jsonl
+<out stem>_snapshot.jsonl
+```
+
+Each replay envelope is `perseus-vault-retrieval-replay/v1`, keeps wire rank
+separate from final rank, preserves absent scores, and records explicit
+complete/partial/empty/unavailable/degraded states. The aligned snapshot is
+hash-only and can be passed to `benchmark.package.common.replay.replay_envelope`
+for an independent membership/order check; it contains no question text,
+answers, session bodies, or provider responses.
+
 ## Honesty notes (read before quoting a number)
 
 - This is a **retrieval** number, not end-to-end QA accuracy. Do not compare it to

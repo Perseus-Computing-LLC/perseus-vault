@@ -226,8 +226,11 @@ def run_dataset(*, data_root: str | Path, sizes: Iterable[str], source_revision:
         grouped.setdefault(_conversation_key(case), []).append(case)
     public_cases: list[dict[str, Any]] = []
     replay: list[dict[str, Any]] = []
+    snapshots: list[dict[str, Any]] = []
     top_k = int(config["retrieval"]["top_k"])
     mode = str(config["retrieval"]["mode"])
+    config_sha256 = protocol.digest_manifest(config)
+    code_sha256 = protocol.sha256_file(Path(protocol.__file__))
     retry = config["retry_policy"]
 
     with tempfile.TemporaryDirectory(prefix="beam-task-") as temporary:
@@ -252,10 +255,30 @@ def run_dataset(*, data_root: str | Path, sizes: Iterable[str], source_revision:
                         backoff_seconds=retry.get("backoff_seconds", 0.0),
                     )
                     if attempt["status"] == "ok":
-                        artifact = protocol.make_retrieval_artifact(case, attempt["value"], top_k=top_k)
+                        raw_ranked = attempt["value"]
+                        artifact = protocol.make_retrieval_artifact(
+                            case,
+                            raw_ranked,
+                            top_k=top_k,
+                            config_sha256=config_sha256,
+                            code_sha256=code_sha256,
+                            retrieval_profile="beam-task-v1",
+                            mode=mode,
+                        )
                         projected = protocol.project_case(case, artifact, status="retrieved")
                     else:
-                        artifact = protocol.make_retrieval_artifact(case, [], top_k=top_k)
+                        raw_ranked = []
+                        artifact = protocol.make_retrieval_artifact(
+                            case,
+                            raw_ranked,
+                            top_k=top_k,
+                            config_sha256=config_sha256,
+                            code_sha256=code_sha256,
+                            retrieval_profile="beam-task-v1",
+                            mode=mode,
+                            status="unavailable",
+                            reason="retrieval_attempt_failed",
+                        )
                         projected = protocol.project_case(case, artifact, status="failed")
                         projected["retry"] = {
                             "status": "error",
@@ -263,12 +286,10 @@ def run_dataset(*, data_root: str | Path, sizes: Iterable[str], source_revision:
                             "error_class": attempt["error_class"],
                         }
                     public_cases.append(projected)
-                    replay.append({
-                        "question_id": case["question_id"],
-                        "ability": case["ability"],
-                        "status": projected["status"],
-                        "retrieval": artifact,
-                        "attempts": attempt["attempts"],
+                    replay.append(artifact)
+                    snapshots.append({
+                        "cell_id": case["question_id"],
+                        "snapshot": protocol.make_retrieval_snapshot(raw_ranked),
                     })
             finally:
                 if hasattr(adapter, "close"):
@@ -304,9 +325,14 @@ def run_dataset(*, data_root: str | Path, sizes: Iterable[str], source_revision:
         destination = Path(output_dir)
         destination.mkdir(parents=True, exist_ok=True)
         (destination / "report.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
-        replay.sort(key=lambda item: item["question_id"])
+        replay.sort(key=lambda item: item["request"]["cell_id"])
         (destination / "retrieval_replay.jsonl").write_text(
             "".join(json.dumps(item, sort_keys=True) + "\n" for item in replay),
+            encoding="utf-8",
+        )
+        snapshots.sort(key=lambda item: item["cell_id"])
+        (destination / "retrieval_snapshot.jsonl").write_text(
+            "".join(json.dumps(item, sort_keys=True) + "\n" for item in snapshots),
             encoding="utf-8",
         )
     return report
