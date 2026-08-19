@@ -11646,11 +11646,20 @@ impl Database {
         conditions.push(crate::retrieval_telemetry::SERVEABLE_STATUS_SQL.to_string());
 
         // Keyword search: FTS5 OR match + LIKE fallback
-        if !params.query.is_empty() {
+        // #562: `query=""` is the explicit enumeration path, while a
+        // whitespace-trimmed `query="*"` is a literal term that must never
+        // become FTS5's match-all/prefix operator. SQLite versions on the
+        // Windows and Unix runners disagree on how `"*"*` is interpreted,
+        // so short-circuit the documented literal non-match before building
+        // the platform-sensitive FTS expression.
+        if params.query.trim() == "*" {
+            return Ok(None);
+        }
+        if !params.query.trim().is_empty() {
             let words: Vec<&str> = params
                 .query
                 .split_whitespace()
-                .filter(|w| !w.is_empty())
+                .filter(|w| !w.is_empty() && w.chars().any(char::is_alphanumeric))
                 .collect();
 
             if !words.is_empty() {
@@ -11730,6 +11739,10 @@ impl Database {
                         }
                     }
                 }
+            } else {
+                // A non-empty query with no searchable token is a literal
+                // non-match, never the empty-query enumeration path.
+                return Ok(None);
             }
         }
 
@@ -12163,7 +12176,7 @@ impl Database {
         let words: Vec<&str> = params
             .query
             .split_whitespace()
-            .filter(|w| !w.is_empty() && !is_stopword(w))
+            .filter(|w| !w.is_empty() && !is_stopword(w) && w.chars().any(char::is_alphanumeric))
             .collect();
         if words.is_empty() {
             return Ok(Vec::new());

@@ -29,6 +29,7 @@ REPO = HERE.parent.parent
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 from benchmark.package.common.publication import build_common_report
+from benchmark.admission_fixture import AGENT, admitted_remember, child_env, configure
 
 
 def stable_json(value: Any) -> str:
@@ -89,7 +90,7 @@ class Client:
             self._reader = threading.Thread(target=self._reader_loop, daemon=True)
             self._reader.start()
             self.i = 0
-            self.send({"jsonrpc": "2.0", "id": self.next_id(), "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "freshness-benchmark", "version": "1"}}})
+            self.send({"jsonrpc": "2.0", "id": self.next_id(), "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": AGENT, "version": "1"}}})
             self.read()
             self.send({"jsonrpc": "2.0", "method": "notifications/initialized"})
         except BaseException:
@@ -188,12 +189,14 @@ def main() -> int:
     c = None
     category = "benchmark_freshness"
     try:
+        os.environ.update(child_env(dict(os.environ)))
         c = Client(binary, db)
+        configure(c)
         for index in range(max(1, args.samples)):
             key = f"freshness-{index}"
             marker = f"quality-freshness-marker-{index}-9e4a"
             started = time.perf_counter()
-            c.call("perseus_vault_remember", {"category": category, "key": key, "body_json": stable_json({"marker": marker}), "skip_dedup": True})
+            admitted_remember(c, category, key, stable_json({"marker": marker}))
             write_ms = (time.perf_counter() - started) * 1000
             visible = False
             result: dict[str, Any] = {}

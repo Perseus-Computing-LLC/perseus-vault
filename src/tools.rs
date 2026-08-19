@@ -2364,6 +2364,12 @@ fn apply_promotion_explanations(items: &mut [Value]) {
     }
 }
 
+fn recall_query_has_searchable_term(query: &str) -> bool {
+    query
+        .split_whitespace()
+        .any(|word| word.chars().any(char::is_alphanumeric))
+}
+
 pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
     let a: RecallArgs =
         serde_json::from_value(args).map_err(|e| format!("Invalid recall arguments: {}", e))?;
@@ -2430,15 +2436,20 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
     // #271: an unset `mode` ("" — the serde default) auto-selects the best
     // available strategy. When the embedding backend is on AND at least one
     // entity is embedded, default to Hybrid (deterministic dense + keyword RRF);
-    // otherwise fall back to keyword FTS5 exactly as before. An explicit mode
-    // always wins.
+    // otherwise fall back to keyword FTS5 exactly as before. Punctuation-only
+    // literal queries are deliberately forced through the keyword path.
+    // #562: punctuation-only queries are literal terms, not wildcard or
+    // semantic queries. Force them through the keyword path so the default
+    // auto-selector cannot turn `*` into dense neighbors.
+    let searchable_query = recall_query_has_searchable_term(&a.query);
     let mode = match a.mode.as_str() {
-        "dense" => SearchMode::Dense,
-        "hybrid" => SearchMode::Hybrid,
+        "dense" if searchable_query => SearchMode::Dense,
+        "hybrid" if searchable_query => SearchMode::Hybrid,
+        "fused" if searchable_query => SearchMode::Fused,
+        "dense" | "hybrid" | "fused" => SearchMode::Fts5,
         "fts5" => SearchMode::Fts5,
-        "fused" => SearchMode::Fused,
         "" => {
-            if db.embedding_enabled() && db.embedding_coverage() > 0 {
+            if searchable_query && db.embedding_enabled() && db.embedding_coverage() > 0 {
                 SearchMode::Hybrid
             } else {
                 SearchMode::Fts5
@@ -15055,6 +15066,11 @@ mod tests {
                 .body_json,
         )
         .unwrap();
+        let source_created_at = db
+            .get_entity("transcript", &t_key)
+            .unwrap()
+            .unwrap()
+            .created_at_unix_ms;
         let edited_body = json!({
             "content": edited,
             "edited": true,
@@ -15116,7 +15132,7 @@ mod tests {
         let x3: Value = serde_json::from_str(
             &handle_expand_source(
                 &db,
-                json!({"category": "capture", "key": note_key, "as_of_unix_ms": captured_at - 1000}),
+                json!({"category": "capture", "key": note_key, "as_of_unix_ms": source_created_at - 1}),
             )
             .unwrap(),
         )
@@ -15664,6 +15680,46 @@ mod tests {
             star["total"],
             json!(0),
             "'*' is a literal term, not a glob: {star}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn recall_punctuation_only_query_is_empty_in_hybrid_mode() {
+        let (db, path) = temp_db();
+        for i in 0..3 {
+            handle_remember(
+                &db,
+                json!({
+                    "category": "enum-cat",
+                    "key": format!("hybrid-k{i}"),
+                    "body_json": format!(
+                        r#"{{"d": "hybrid punctuation contract body {} pad {}"}}"#,
+                        i,
+                        i * 43
+                    ),
+                    "skip_dedup": true,
+                }),
+            )
+            .expect("remember");
+        }
+        let star: Value = serde_json::from_str(
+            &handle_recall(
+                &db,
+                json!({
+                    "query": "*",
+                    "category": "enum-cat",
+                    "limit": 10,
+                    "mode": "hybrid"
+                }),
+            )
+            .expect("hybrid recall"),
+        )
+        .unwrap();
+        assert_eq!(
+            star["total"],
+            json!(0),
+            "punctuation-only literal query must not become a wildcard or semantic query: {star}"
         );
         let _ = std::fs::remove_file(&path);
     }
