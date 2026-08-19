@@ -137,6 +137,33 @@ explicitly `legacy-readable` and not relabeled or made like-for-like by
 inference. No provider, answerer, or judge call is made by the manifest or
 scorecard tests.
 
+## Evidence sufficiency curves (#1112)
+
+`retrieval_diag.py` now composes an additive `sufficiency` projection using
+`longmemeval/sufficiency.py` and `sufficiency.schema.json`. It keeps the existing
+single-hit/legacy coverage fields readable while adding separate curves at
+`k=1,3,5,10,20,50` (when the retrieval depth reaches each k):
+
+- single-hit recall / Hit@k;
+- all-required-evidence coverage@k;
+- latest-version coverage for rows with a declared latest valid version;
+- temporal-anchor coverage for predeclared temporal rows;
+- worst required rank and missing-evidence counts;
+- overall, question-type, and predeclared focus-stratum curves.
+
+The evaluator runs only after retrieval output is sealed/replayed. Gold evidence
+sets never enter production retrieval or context selection, and public case rows
+contain counts/ranks and set commitments rather than evidence IDs, prompts, or
+memory bodies. Missing, duplicate, unavailable, partial, truncated, and stale
+evidence are represented explicitly; ineligible rows are excluded from metric
+denominators instead of being converted to zeroes. Dataset, fixture, retrieval
+configuration, code, projection, and report signatures are recorded, with
+`offline=true` and zero provider/answerer/judge calls.
+
+The existing `coverage_at_k` and `coverage_latest_at_k` fields remain for
+backward readability. Use `--k 50` for the complete standard sufficiency ladder;
+smaller diagnostic depths publish only the measured prefix.
+
 ## Stage 2: QA accuracy (pinned answerer + pinned judge — the vs-Zep harness, #475)
 
 `qa.py` is the second stage and the head-to-head-vs-Zep harness. Per question it
