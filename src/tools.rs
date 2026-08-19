@@ -15066,6 +15066,11 @@ mod tests {
                 .body_json,
         )
         .unwrap();
+        let source_created_at = db
+            .get_entity("transcript", &t_key)
+            .unwrap()
+            .unwrap()
+            .created_at_unix_ms;
         let edited_body = json!({
             "content": edited,
             "edited": true,
@@ -15127,7 +15132,7 @@ mod tests {
         let x3: Value = serde_json::from_str(
             &handle_expand_source(
                 &db,
-                json!({"category": "capture", "key": note_key, "as_of_unix_ms": captured_at - 1000}),
+                json!({"category": "capture", "key": note_key, "as_of_unix_ms": source_created_at - 1}),
             )
             .unwrap(),
         )
