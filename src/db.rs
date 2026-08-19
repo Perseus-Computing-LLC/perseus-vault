@@ -34998,6 +34998,73 @@ pub(crate) mod tests {
         );
     }
 
+    #[test]
+    fn conflict_magnet_presentation_does_not_change_fusion_input() {
+        let ids = ["relevant", "arm_only", "conflict_neighbor", "distractor"];
+        let e = |id: &str| make_entity(id, "q", id, r#"{"note":"x"}"#);
+        let mut by_id = std::collections::HashMap::new();
+        for id in ids {
+            by_id.insert(id.to_string(), e(id));
+        }
+        let dense_ids = vec![
+            "relevant".to_string(),
+            "arm_only".to_string(),
+            "conflict_neighbor".to_string(),
+            "distractor".to_string(),
+        ];
+        let sparse_ids = vec![
+            "conflict_neighbor".to_string(),
+            "relevant".to_string(),
+            "distractor".to_string(),
+            "arm_only".to_string(),
+        ];
+        let arms = vec![(dense_ids.clone(), 1.0), (sparse_ids.clone(), 1.0)];
+        let flat = super::flat_rrf(&arms, &by_id, 2);
+        assert_eq!(
+            flat.iter().map(|(x, _)| x.id.as_str()).collect::<Vec<_>>(),
+            vec!["relevant", "conflict_neighbor"]
+        );
+
+        let dense: Vec<_> = dense_ids
+            .iter()
+            .map(|id| (by_id.get(id).unwrap().clone(), 0.0))
+            .collect();
+        let sparse: Vec<_> = sparse_ids
+            .iter()
+            .map(|id| (by_id.get(id).unwrap().clone(), 0.0))
+            .collect();
+        let legacy = super::reciprocal_rank_fusion(
+            &dense, &sparse, 60.0, 2, 1.0, None, 0.0, 0,
+        );
+        assert_eq!(
+            legacy.iter().map(|(x, _)| x.id.as_str()).collect::<Vec<_>>(),
+            vec!["relevant", "conflict_neighbor"]
+        );
+
+        // This is the negative control: applying the presentation swap to both
+        // arms before fusion changes the consumed order, which the contract
+        // explicitly forbids.
+        let bad_dense = vec![
+            (by_id["conflict_neighbor"].clone(), 0.0),
+            (by_id["relevant"].clone(), 0.0),
+            (by_id["arm_only"].clone(), 0.0),
+            (by_id["distractor"].clone(), 0.0),
+        ];
+        let bad_sparse = vec![
+            (by_id["conflict_neighbor"].clone(), 0.0),
+            (by_id["relevant"].clone(), 0.0),
+            (by_id["distractor"].clone(), 0.0),
+            (by_id["arm_only"].clone(), 0.0),
+        ];
+        let bad = super::reciprocal_rank_fusion(
+            &bad_dense, &bad_sparse, 60.0, 2, 1.0, None, 0.0, 0,
+        );
+        assert_eq!(
+            bad.iter().map(|(x, _)| x.id.as_str()).collect::<Vec<_>>(),
+            vec!["conflict_neighbor", "relevant"]
+        );
+    }
+
     // ─── #590: event-time supersession tiebreak ──────────────────────────
     #[test]
     fn parse_event_date_key_handles_longmemeval_and_iso() {
