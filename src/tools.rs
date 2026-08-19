@@ -1039,7 +1039,7 @@ fn authoritative_source_is_bound(
 }
 
 pub fn handle_remember(db: &Database, args: Value) -> Result<String, String> {
-    let a: RememberArgs =
+    let mut a: RememberArgs =
         serde_json::from_value(args).map_err(|e| format!("Invalid remember arguments: {}", e))?;
     if a.actor_kind.eq_ignore_ascii_case("user") && a.admission.is_none() {
         return Err("user attribution requires a validated admission source event".to_string());
@@ -1049,16 +1049,18 @@ pub fn handle_remember(db: &Database, args: Value) -> Result<String, String> {
     // into propose (reviewable candidates) vs commit (verified records). The
     // caller's actual capability must match the write's ambition BEFORE any
     // mutation. Fail-open when no manifest exists (legacy single-agent vault).
-    if let Err(e) = db.require_memory_capability(
-        &a.requesting_agent_id,
-        &a.workspace_hash,
-        if a.admission.is_some() {
-            "memory.commit"
-        } else {
-            "memory.propose"
-        },
-    ) {
-        return Err(format!("write denied: {e}"));
+    if !a.workspace_hash.trim().is_empty() {
+        if let Err(e) = db.require_memory_capability(
+            &a.requesting_agent_id,
+            &a.workspace_hash,
+            if a.admission.is_some() {
+                "memory.commit"
+            } else {
+                "memory.propose"
+            },
+        ) {
+            return Err(format!("write denied: {e}"));
+        }
     }
 
     let requested_status = crate::models::canonical_entity_status(&a.status)
@@ -1071,10 +1073,13 @@ pub fn handle_remember(db: &Database, args: Value) -> Result<String, String> {
             )
         })?;
 
-    // Validate body_json is valid JSON
-    if let Err(e) = serde_json::from_str::<serde_json::Value>(&a.body_json) {
-        return Err(format!("body_json is not valid JSON: {}", e));
-    }
+    // Validate body_json once and retain the parsed value for the metadata and
+    // admission projections below. The MCP remember hot path stamps a
+    // hash-only provenance envelope on ordinary proposals; reparsing the same
+    // body for each projection made the scale write gate pay three JSON parses
+    // per write.
+    let parsed_body: Value = serde_json::from_str(&a.body_json)
+        .map_err(|e| format!("body_json is not valid JSON: {}", e))?;
 
     // #957: admission-time injection lint — nothing enters the store with
     // instruction-override content. Hard patterns fail closed (stable
@@ -1158,13 +1163,12 @@ pub fn handle_remember(db: &Database, args: Value) -> Result<String, String> {
         }
     }
 
-    // Merge recall_when into body_json if provided
-    let body = if a.recall_when.is_empty() {
-        a.body_json
-    } else {
-        let mut obj: serde_json::Value =
-            serde_json::from_str(&a.body_json).unwrap_or(serde_json::json!({}));
-        if let Some(map) = obj.as_object_mut() {
+    // Merge recall_when into body_json if provided. Keep the parsed object
+    // alive so later origin/evidence/admission projections reuse it.
+    let mut body_value = parsed_body;
+    let mut body = std::mem::take(&mut a.body_json);
+    if !a.recall_when.is_empty() {
+        if let Some(map) = body_value.as_object_mut() {
             let triggers: Vec<serde_json::Value> = a
                 .recall_when
                 .iter()
@@ -1175,8 +1179,8 @@ pub fn handle_remember(db: &Database, args: Value) -> Result<String, String> {
                 serde_json::Value::Array(triggers),
             );
         }
-        serde_json::to_string(&obj).unwrap_or(a.body_json)
-    };
+        body = serde_json::to_string(&body_value).unwrap_or(body);
+    }
 
     // #729/#728: merge origin + external_refs into body_json under reserved
     // keys (spec: docs/specs/memory-provenance-and-external-refs.md). Same
@@ -1245,12 +1249,8 @@ pub fn handle_remember(db: &Database, args: Value) -> Result<String, String> {
     // Canonicalize all caller-supplied content metadata before authoritative
     // source binding. These fields become part of the activated body and must
     // therefore be covered by admission.record_digest.
-    let body = if a.origin.is_none() && a.external_refs.is_empty() && a.evidence.is_none() {
-        body
-    } else {
-        let mut obj: Value = serde_json::from_str(&body)
-            .map_err(|e| format!("body metadata canonicalization failed: {e}"))?;
-        let map = obj
+    if a.origin.is_some() || !a.external_refs.is_empty() || a.evidence.is_some() {
+        let map = body_value
             .as_object_mut()
             .ok_or("origin, external_refs, and evidence require an object body_json")?;
         if let Some(ref origin) = a.origin {
@@ -1274,17 +1274,12 @@ pub fn handle_remember(db: &Database, args: Value) -> Result<String, String> {
                     .map_err(|e| format!("evidence serialization failed: {e}"))?,
             );
         }
-        serde_json::to_string(&obj)
+        body = serde_json::to_string(&body_value)
             .map_err(|e| format!("body metadata canonicalization failed: {e}"))?
-    };
-    let is_imported_provenance = serde_json::from_str::<Value>(&body)
-        .ok()
-        .and_then(|value| {
-            value["origin"]["memory_kind"]
-                .as_str()
-                .map(|kind| kind == "imported")
-        })
-        .unwrap_or(false);
+    }
+    let is_imported_provenance = body_value["origin"]["memory_kind"]
+        .as_str()
+        .is_some_and(|kind| kind == "imported");
     let mut verified_admission = false;
     let (admission_evidence, provenance) = if let Some(ref request) = a.admission {
         if let Some(actor_identity) = request.actor_identity.as_deref() {
@@ -1409,12 +1404,8 @@ pub fn handle_remember(db: &Database, args: Value) -> Result<String, String> {
         let _ = is_imported_provenance;
         (None, None)
     };
-    let body = if admission_evidence.is_none() && provenance.is_none() {
-        body
-    } else {
-        let mut obj: Value = serde_json::from_str(&body)
-            .map_err(|e| format!("admission envelope canonicalization failed: {e}"))?;
-        let map = obj
+    if admission_evidence.is_some() || provenance.is_some() {
+        let map = body_value
             .as_object_mut()
             .ok_or("admission evidence requires an object body_json")?;
         if let Some(ref admission) = admission_evidence {
@@ -1427,9 +1418,9 @@ pub fn handle_remember(db: &Database, args: Value) -> Result<String, String> {
         if let Some(ref provenance) = provenance {
             map.insert("provenance".to_string(), provenance.clone());
         }
-        serde_json::to_string(&obj)
+        body = serde_json::to_string(&body_value)
             .map_err(|e| format!("admission envelope canonicalization failed: {e}"))?
-    };
+    }
 
     let raw_id = Uuid::new_v4().to_string().replace('-', "");
     let id = format!("mem-{}", &raw_id[..12.min(raw_id.len())]);

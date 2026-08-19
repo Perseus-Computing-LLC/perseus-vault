@@ -240,13 +240,13 @@ pub(crate) enum DurableWriteAuthority {
     ReviewTransition(crate::trust_admission::AdmissionEvidence),
 }
 
-fn ensure_durable_write_provenance(entity: &Entity, authority: &DurableWriteAuthority) -> Entity {
+fn ensure_durable_write_provenance(entity: Entity, authority: &DurableWriteAuthority) -> Entity {
     match authority {
         DurableWriteAuthority::Admission(_) => {
             // Admission evidence is independently validated immediately before
             // this function is called. Preserve an explicit operator label but
             // elevate the default candidate trust state only for that path.
-            let mut admitted = entity.clone();
+            let mut admitted = entity;
             if !crate::models::EPISTEMIC_STATES.contains(&admitted.epistemic_state.as_str()) {
                 admitted.epistemic_state = "candidate".to_string();
             }
@@ -256,7 +256,7 @@ fn ensure_durable_write_provenance(entity: &Entity, authority: &DurableWriteAuth
             admitted
         }
         DurableWriteAuthority::InternalTrusted(_writer) => {
-            let mut trusted = entity.clone();
+            let mut trusted = entity;
             if !crate::models::EPISTEMIC_STATES.contains(&trusted.epistemic_state.as_str()) {
                 trusted.epistemic_state = "candidate".to_string();
             }
@@ -265,16 +265,16 @@ fn ensure_durable_write_provenance(entity: &Entity, authority: &DurableWriteAuth
             }
             trusted
         }
-        DurableWriteAuthority::ReviewTransition(_) => entity.clone(),
+        DurableWriteAuthority::ReviewTransition(_) => entity,
         DurableWriteAuthority::Unverified => {
             #[cfg(test)]
             if entity.source != "cli-write" {
                 // Historical in-module fixtures use many source labels. Keep
                 // those read-path fixtures active; production/public writes do
                 // not receive this test-only compatibility branch.
-                return entity.clone();
+                return entity;
             }
-            let mut enriched = entity.clone();
+            let mut enriched = entity;
             if enriched.status == "active" {
                 enriched.status = "proposed".to_string();
                 enriched.always_on = false;
@@ -981,25 +981,28 @@ impl Database {
     /// read-back, but must not dominate lexical or semantic retrieval. Keep the
     /// canonical content body for indexing and embedding while leaving every
     /// other caller-supplied field intact.
-    fn semantic_body_text(body_plaintext: &str) -> String {
+    fn semantic_body_text<'a>(body_plaintext: &'a str) -> std::borrow::Cow<'a, str> {
         // The normal write path carries ordinary content bodies. Avoid parsing
         // every body while the caller holds the audited SQLite write lock; only
-        // governance-bearing JSON can require projection.
+        // governance-bearing JSON can require projection. Borrowing the common
+        // case also keeps the auto-embed queue from copying each body twice.
         if !body_plaintext.contains("\"admission\"") && !body_plaintext.contains("\"provenance\"") {
-            return body_plaintext.to_string();
+            return std::borrow::Cow::Borrowed(body_plaintext);
         }
         let Ok(mut value) = serde_json::from_str::<serde_json::Value>(body_plaintext) else {
-            return body_plaintext.to_string();
+            return std::borrow::Cow::Borrowed(body_plaintext);
         };
         let Some(object) = value.as_object_mut() else {
-            return body_plaintext.to_string();
+            return std::borrow::Cow::Borrowed(body_plaintext);
         };
         let removed_admission = object.remove("admission").is_some();
         let removed_provenance = object.remove("provenance").is_some();
         if !removed_admission && !removed_provenance {
-            return body_plaintext.to_string();
+            return std::borrow::Cow::Borrowed(body_plaintext);
         }
-        serde_json::to_string(&value).unwrap_or_else(|_| body_plaintext.to_string())
+        std::borrow::Cow::Owned(
+            serde_json::to_string(&value).unwrap_or_else(|_| body_plaintext.to_string()),
+        )
     }
 
     /// #919: the text stored in the FTS5 index for an entity — the canonical
@@ -1010,12 +1013,12 @@ impl Database {
     fn fts_indexed_text(body_plaintext: &str, hints: &[String]) -> String {
         let body_plaintext = Self::semantic_body_text(body_plaintext);
         if hints.is_empty() {
-            return body_plaintext;
+            return body_plaintext.into_owned();
         }
         let mut text = String::with_capacity(
             body_plaintext.len() + hints.iter().map(String::len).sum::<usize>() + hints.len(),
         );
-        text.push_str(&body_plaintext);
+        text.push_str(body_plaintext.as_ref());
         for hint in hints {
             text.push('\n');
             text.push_str(hint);
@@ -7068,7 +7071,14 @@ impl Database {
         threshold: f64,
     ) -> Result<Option<String>, Box<dyn std::error::Error>> {
         let conn = self.conn()?;
-        Self::find_near_duplicate_with_conn(&conn, category, workspace_hash, body_json, threshold)
+        let semantic_body = Self::semantic_body_text(body_json);
+        Self::find_near_duplicate_with_conn(
+            &conn,
+            category,
+            workspace_hash,
+            semantic_body.as_ref(),
+            threshold,
+        )
     }
 
     /// #397: `find_near_duplicate` on the CALLER's already-held connection, so
@@ -7225,10 +7235,14 @@ impl Database {
                     Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
                 })
                 .ok();
-            let Some((body, e_cat, e_ws, e_archived)) = hit else {
+            let Some((stored_body, e_cat, e_ws, e_archived)) = hit else {
                 evict.push(cand_id); // orphaned signature
                 continue;
             };
+            // Governance admission/provenance is durable audit metadata, not
+            // dedup content. Compare and repair against the same semantic body
+            // used by FTS/embeddings; keep `stored_body` untouched in entities.
+            let body = Self::semantic_body_text(&stored_body);
             if e_archived != 0 {
                 evict.push(cand_id); // archived after the signature was written
                 continue;
@@ -7236,17 +7250,28 @@ impl Database {
             if e_cat != category || e_ws != workspace_hash {
                 // The entity moved scope; re-home its signature and move on —
                 // it is not a candidate for THIS scope.
-                repair.push((cand_id, crate::dedup::build_row_signature(&body)));
+                repair.push((
+                    cand_id,
+                    crate::dedup::build_row_signature(body.as_ref()),
+                ));
                 continue;
             }
             let fresh = sig_body_len == body.len() as i64
-                && sig_body_hash == crate::dedup::body_hash64(&body);
+                && sig_body_hash == crate::dedup::body_hash64(body.as_ref());
             if !fresh {
                 // Stale signature (signature-unaware writer): repair it, and
-                // decide from the CURRENT body — identical semantics to the
-                // old rebuild path.
-                repair.push((cand_id.clone(), crate::dedup::build_row_signature(&body)));
-                if Self::dedup_verdict_from_body(&target, a as f64, &body, threshold) {
+                // decide from the CURRENT semantic body — identical semantics
+                // to the old rebuild path, without governance metadata.
+                repair.push((
+                    cand_id.clone(),
+                    crate::dedup::build_row_signature(body.as_ref()),
+                ));
+                if Self::dedup_verdict_from_body(
+                    &target,
+                    a as f64,
+                    body.as_ref(),
+                    threshold,
+                ) {
                     found = Some(cand_id);
                     break 'scan;
                 }
@@ -7257,10 +7282,13 @@ impl Database {
             // malformed-blob fallback, decide from the body; otherwise the
             // signature verdict was Some(true).
             let is_dup = if a == 0 {
-                body == body_json
+                body.as_ref() == body_json
             } else if sig_verdict.is_none() {
-                repair.push((cand_id.clone(), crate::dedup::build_row_signature(&body)));
-                Self::dedup_verdict_from_body(&target, a as f64, &body, threshold)
+                repair.push((
+                    cand_id.clone(),
+                    crate::dedup::build_row_signature(body.as_ref()),
+                ));
+                Self::dedup_verdict_from_body(&target, a as f64, body.as_ref(), threshold)
             } else {
                 // Some(true) — but byte-identical bodies must stay a dup even
                 // at threshold 1.0 boundary semantics; the merge verdict
@@ -7370,8 +7398,10 @@ impl Database {
                     },
                 )
                 .ok()
-                .and_then(|(b, cat, ws)| {
-                    (b.len() as i64 == rs.body_len && crate::dedup::body_hash64(&b) == rs.body_hash)
+                .and_then(|(stored_body, cat, ws)| {
+                    let body = Self::semantic_body_text(&stored_body);
+                    (body.len() as i64 == rs.body_len
+                        && crate::dedup::body_hash64(body.as_ref()) == rs.body_hash)
                         .then_some((cat, ws))
                 });
             let Some((category, workspace_hash)) = fresh_scope else {
@@ -8667,7 +8697,7 @@ impl Database {
             }
             DurableWriteAuthority::Unverified | DurableWriteAuthority::InternalTrusted(_) => {}
         }
-        let enriched_entity = ensure_durable_write_provenance(&normalized_entity, &authority);
+        let enriched_entity = ensure_durable_write_provenance(normalized_entity, &authority);
         // #999: derived-visibility intersection — a write that declares
         // lineage (links with relationship "derived_from") may not be MORE
         // open than its cited inputs, and unreadable inputs refuse the whole
@@ -8796,6 +8826,15 @@ impl Database {
                 .map_err(|e| format!("Encryption error in remember: {}", e))?
         } else {
             effective_body.clone()
+        };
+        // Dedup compares content, not governance metadata. On an unencrypted
+        // store use the envelope-free semantic body; on an encrypted store
+        // retain the historical ciphertext-based behavior and its no-plaintext
+        // leakage property.
+        let dedup_body = if self.encryption.is_some() {
+            std::borrow::Cow::Borrowed(body_encrypted.as_str())
+        } else {
+            Self::semantic_body_text(&effective_body)
         };
 
         // #919: prospective query hints — advisory retrieval metadata stored
@@ -9337,7 +9376,7 @@ impl Database {
             // (fresh GCM nonce), so even an identical-body write moves the
             // stored value the signature must describe. Same transaction as
             // the row write: no window where a scan sees a stale signature.
-            Self::upsert_dedup_signature(&tx, &id, &body_encrypted)?;
+            Self::upsert_dedup_signature(&tx, &id, dedup_body.as_ref())?;
             tx.commit()?;
 
             // #874 sparse mode: journal the applied sparse discipline
@@ -9396,15 +9435,17 @@ impl Database {
                                      // is now signature-driven + band-indexed (exact, and faster than
                                      // the prefilter ever was — the 64-term MATCH per write measured
                                      // SLOWER than the scan it pruned, see #476's A/B).
-            if !skip_dedup && !gate_opts.sparse_update {
-                // #397: run the dedup scan on the connection this remember()
-                // already holds — a nested self.conn() here held TWO pooled
-                // connections per create and collapsed the pool under load.
+            // Reviewable proposals must never merge into an existing active or
+            // admitted row: doing so would return the authoritative row's ID
+            // while reporting a pending outcome, and would erase proposal
+            // provenance. They are also non-serveable, so proposal writes do
+            // not need near-duplicate lookup at all.
+            if !skip_dedup && !gate_opts.sparse_update && entity.status != "proposed" {
                 if let Ok(Some(dup_id)) = Self::find_near_duplicate_with_conn(
                     &conn,
                     &entity.category,
                     &entity.workspace_hash,
-                    &entity.body_json,
+                    dedup_body.as_ref(),
                     dup_threshold,
                 ) {
                     // Near-duplicate found — bump its importance instead of creating new
@@ -9418,14 +9459,12 @@ impl Database {
                 }
             }
 
-            // #874: interference gate — a fresh insert whose content heavily
-            // activates an existing entity (and was NOT resolved by the
-            // near-duplicate merge above — e.g. skip_dedup writes, or
-            // sub-threshold-but-high-activation overlaps) is held
-            // (quarantine) / refused before any mutation.
+            // #874: interference gate — a fresh ACTIVE/ADMITTED insert whose
+            // content heavily activates an existing entity is held or refused.
+            // Reviewable proposals are non-serveable and cannot alter the
+            // authoritative head, so scoring them against the live corpus is
+            // both unnecessary and a growing FTS/decrypt cost at scale.
             let gate_verdict = if entity.status == "proposed" {
-                // Pending candidates are retained for human review and cannot
-                // activate or interfere with the serveable corpus yet.
                 GateVerdict::Proceed(None)
             } else {
                 self.run_interference_gate(
@@ -9543,7 +9582,7 @@ impl Database {
             // body value — ciphertext when encryption is on) in the same
             // transaction as the row itself, so subsequent dedup scans never
             // rebuild this row's trigram set from its body.
-            Self::upsert_dedup_signature(&tx, &id, &body_encrypted)?;
+            Self::upsert_dedup_signature(&tx, &id, dedup_body.as_ref())?;
             tx.commit()?;
 
             action = "created".to_string();
@@ -9567,9 +9606,9 @@ impl Database {
         // write path only ever paid up to 256 full-body string compares for a
         // guaranteed miss. Gated on the content-changed signal so identical
         // re-asserts don't even enqueue.
-        if should_embed && self.embedding_config.enabled && entity.status != "proposed" {
+        if should_embed && self.embedding_config.enabled {
             let semantic_body = Self::semantic_body_text(&entity.body_json);
-            self.enqueue_auto_embed(&id, &semantic_body);
+            self.enqueue_auto_embed(&id, semantic_body.as_ref());
         }
 
         Ok((id, action))
@@ -31234,6 +31273,28 @@ pub(crate) mod tests {
         assert_eq!(indexed, r#"{"note":"peanuts"}"#);
         assert!(!indexed.contains("record_digest"));
         assert!(!indexed.contains("provenance"));
+    }
+
+    #[test]
+    fn semantic_dedup_omits_governance_envelope_but_persists_it() {
+        let (db, path) = temp_db();
+        let first = r#"{"note":"same semantic claim","admission":{"record_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"provenance":{"state":"admitted"}}"#;
+        let second = r#"{"note":"same semantic claim","admission":{"record_digest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"provenance":{"state":"pending"}}"#;
+        db.remember_skip_dedup(&make_entity("semantic-dedup-1", "facts", "semantic-dedup-1", first))
+            .unwrap();
+
+        let duplicate = db
+            .find_near_duplicate("facts", "", second, 0.7)
+            .unwrap();
+        assert_eq!(duplicate.as_deref(), Some("semantic-dedup-1"));
+
+        let stored = db
+            .get_entity_by_id_unfiltered("semantic-dedup-1")
+            .unwrap()
+            .expect("stored governed entity");
+        assert!(stored.body_json.contains("record_digest"));
+        assert!(stored.body_json.contains("provenance"));
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
