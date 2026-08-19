@@ -125,8 +125,13 @@ jobs:
           cp .model-cache/model_qint8_avx512_vnni.onnx .model-cache/model_quantized.onnx
       - name: Build
         run: cargo build --locked --verbose
+      # macOS arm64 runners have a lower pthread/process budget than the Linux
+      # lane. The default Rust test-harness fan-out exhausts it while
+      # embedding-backed tests spawn database workers, producing macOS
+      # Os { code: 35, kind: WouldBlock } failures. Keep this platform lane
+      # deterministic; Linux and Windows retain parallel scheduling.
       - name: Run tests
-        run: cargo test --locked --verbose
+        run: cargo test --locked --verbose -- --test-threads=1
 
   # Guard the default build on OLD glibc (#526): ubuntu-latest is 24.04
   # (glibc 2.39), so the `test` job can't catch it, but the prebuilt ONNX
