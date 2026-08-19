@@ -1,4 +1,6 @@
 """Protocol tests for the LongMemEval official-CoT lane."""
+import hashlib
+import hmac
 import importlib.util
 import json
 import pathlib
@@ -163,6 +165,95 @@ class OfficialCoTProtocolTests(unittest.TestCase):
         self.assertEqual(len(admitted), 1)
         self.assertEqual(admitted[0]["category"], "q1")
         self.assertEqual(admitted[0]["key"], "s1")
+
+    def test_admitted_remember_emits_hash_bound_source_and_valid_time(self):
+        calls = []
+
+        class FakeClient:
+            def call(self, name, args):
+                calls.append((name, args))
+                if name == "perseus_vault_journal":
+                    return {"id": "jrn-bound"}
+                if name == "perseus_vault_remember":
+                    return {"ok": True, "serveable": True, "proposed": False}
+                return {"ok": True}
+
+        body_json = json.dumps({"note": "café"})
+        ADMISSION.admitted_remember(
+            FakeClient(), "unicode", "s1", body_json, valid_from_unix_ms=1234
+        )
+        journal = [args for name, args in calls if name == "perseus_vault_journal"][0]
+        remember = [args for name, args in calls if name == "perseus_vault_remember"][0]
+        canonical_body = ADMISSION.stable_json(json.loads(body_json))
+        digest = hashlib.sha256(canonical_body.encode()).hexdigest()
+        evaluated = journal["evaluated"]
+        attestation_payload = ADMISSION.stable_json(
+            {**evaluated, "requesting_agent_id": ADMISSION.AGENT}
+        )
+        expected_attestation = hmac.new(
+            ADMISSION.HMAC_KEY.encode(), attestation_payload.encode(), hashlib.sha256
+        ).hexdigest()
+        self.assertEqual(evaluated["record_digest"], digest)
+        self.assertEqual(journal["source_attestation"], expected_attestation)
+        self.assertEqual(remember["admission"]["source_event_id"], "jrn-bound")
+        self.assertEqual(remember["admission"]["record_digest"], digest)
+        self.assertEqual(remember["valid_from_unix_ms"], 1234)
+
+    def test_admitted_remember_rejects_proposed_or_unserveable_result(self):
+        for result in (
+            {"ok": True, "serveable": True, "proposed": True},
+            {"ok": True, "serveable": False, "proposed": False},
+        ):
+            class FakeClient:
+                def call(self, name, args):
+                    if name == "perseus_vault_journal":
+                        return {"id": "jrn-reject"}
+                    if name == "perseus_vault_remember":
+                        return result
+                    return {"ok": True}
+
+            with self.assertRaises(RuntimeError):
+                ADMISSION.admitted_remember(
+                    FakeClient(), "category", "key", json.dumps({"note": "x"})
+                )
+
+    def test_ku_shared_key_path_passes_valid_time_to_admission(self):
+        instance = {
+            "question": "What changed?",
+            "answer_session_ids": ["s1", "s2"],
+            "haystack_session_ids": ["s1", "s2"],
+            "haystack_dates": [
+                "2024/01/01 (Mon) 00:00",
+                "2024/01/02 (Tue) 00:00",
+            ],
+            "haystack_sessions": [
+                [{"role": "user", "content": "The value was one."}],
+                [{"role": "user", "content": "The value is two."}],
+            ],
+        }
+        admitted = []
+
+        class FakeServer:
+            def call(self, name, args):
+                if name == "perseus_vault_recall":
+                    return {"items": [{"key": QA.SHARED_FACT_KEY}]}
+                return {"ok": True}
+
+        def fake_admitted(client, category, key, body_json, **kwargs):
+            admitted.append({"category": category, "key": key, **kwargs})
+            return {"ok": True, "serveable": True, "proposed": False}
+
+        with mock.patch.object(QA, "admitted_remember", side_effect=fake_admitted):
+            QA.build_context(
+                "perseus-vault", instance, FakeServer(), "q1", 10,
+                ku_shared=True,
+            )
+        self.assertEqual(len(admitted), 2)
+        self.assertEqual({item["key"] for item in admitted}, {QA.SHARED_FACT_KEY})
+        self.assertEqual(
+            sorted(item["valid_from_unix_ms"] for item in admitted),
+            sorted([QA._date_ms(date) for date in instance["haystack_dates"]]),
+        )
 
     def test_admission_fixture_matches_rust_json_for_unicode_body(self):
         calls = []
