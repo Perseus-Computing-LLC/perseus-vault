@@ -19072,7 +19072,39 @@ impl Database {
     fn audited_write_tx(
         conn: &rusqlite::Connection,
     ) -> rusqlite::Result<rusqlite::Transaction<'_>> {
-        rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
+        // Windows CI can have many pooled linkers arrive at BEGIN IMMEDIATE
+        // simultaneously. SQLite's busy handler does not always get a chance
+        // to serialize that first lock upgrade, so retry the transaction start
+        // itself with a short bounded backoff. Once the transaction exists,
+        // the read-modify-write remains atomic and callers still propagate
+        // non-contention errors immediately.
+        let mut attempt = 0;
+        loop {
+            match rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            ) {
+                Ok(tx) => return Ok(tx),
+                Err(e)
+                    if attempt < 8
+                        && matches!(
+                            e,
+                            rusqlite::Error::SqliteFailure(
+                                rusqlite::ffi::Error {
+                                    code: rusqlite::ErrorCode::DatabaseBusy
+                                        | rusqlite::ErrorCode::DatabaseLocked,
+                                    ..
+                                },
+                                _
+                            )
+                        ) =>
+                {
+                    attempt += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(10 * attempt));
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     /// Snapshot the current live row of `id` into `entity_history`, retired at

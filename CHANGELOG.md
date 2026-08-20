@@ -15,6 +15,10 @@ All notable changes to Perseus Vault are documented here. This project adheres t
   handler is no longer advertised as a local transfer feature; public registry
   counts now reflect 169 canonical tools, and `server.json` pins the OCI
   identifier to the declared `2.23.0` version with CI validation.
+- **Concurrent audited link writes on Windows/macOS.** `BEGIN IMMEDIATE`
+  now retries transient SQLite busy/locked contention with bounded backoff,
+  preventing pooled linkers from failing during the high-concurrency edge
+  preservation contract.
 - **Windows/macOS CI fixture flakes (SQLITE_BUSY "database is locked", #1031
   follow-up).** Test fixtures now default to a 30s `busy_timeout` on
   Windows/macOS (explicit `PERSEUS_VAULT_BUSY_TIMEOUT_MS` still wins;
