@@ -72,7 +72,7 @@ Tested and confirmed working with:
 
 ## Tools & Plugins
 
-### Perseus Vault Itself (57 MCP Tools)
+### Perseus Vault Itself (current registry; 169 canonical MCP tools)
 
 | Category | Tools |
 |---|---|
@@ -84,7 +84,7 @@ Tested and confirmed working with:
 | **Lifecycle** | `perseus_vault_decay`, `perseus_vault_prune`, `perseus_vault_purge`, `perseus_vault_cohere`, `perseus_vault_compact`, `perseus_vault_reindex` |
 | **Quality** | `perseus_vault_score`, `perseus_vault_conflicts`, `perseus_vault_correct` |
 | **Vault** | `perseus_vault_vault_export`, `perseus_vault_vault_import` |
-| **Federation** | `perseus_vault_federate`, `perseus_vault_workspace_list` |
+| **Workspace transfer** | `perseus_vault_workspace_list` (peer federation is intentionally disabled; use explicit export/import) |
 | **Metrics** | `perseus_vault_stats`, `perseus_vault_health`, `perseus_vault_bench`, `perseus_vault_synthesize` |
 
 ### Plugin Ecosystem

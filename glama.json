@@ -3,7 +3,7 @@
   "maintainers": [
     "tcconnally"
   ],
-  "tools": 170,
+  "tools": 169,
   "transport": {
     "stdio": true,
     "sse": true,
@@ -17,7 +17,7 @@
     "journal-audit-trail",
     "state-management",
     "vault-export-import",
-    "federation",
+
     "rag",
     "embedding-generation",
     "web-dashboard"

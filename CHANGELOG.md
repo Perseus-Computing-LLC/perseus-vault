@@ -6,6 +6,15 @@ All notable changes to Perseus Vault are documented here. This project adheres t
 ## [Unreleased]
 
 ### Fixed
+- **Governed rejection propagation through maintenance.** Consolidation,
+  dream, and cross-workspace promotion now exclude rejected source values
+  before clustering/prompt assembly, and public derived reads follow source
+  lineage so a previously materialized observation cannot be refreshed or
+  served after its source is rejected. Added an end-to-end rejection canary.
+- **Federation and release metadata drift.** The disabled peer-federation
+  handler is no longer advertised as a local transfer feature; public registry
+  counts now reflect 169 canonical tools, and `server.json` pins the OCI
+  identifier to the declared `2.23.0` version with CI validation.
 - **Windows/macOS CI fixture flakes (SQLITE_BUSY "database is locked", #1031
   follow-up).** Test fixtures now default to a 30s `busy_timeout` on
   Windows/macOS (explicit `PERSEUS_VAULT_BUSY_TIMEOUT_MS` still wins;
@@ -16,6 +25,10 @@ All notable changes to Perseus Vault are documented here. This project adheres t
   class as #379/#400/#971).
 
 ### Added
+- **Explicit rekey and strict shared-deployment contracts.** Added an
+  end-to-end `init --rekey` migration/idempotence test and the opt-in
+  `PERSEUS_VAULT_STRICT_SCOPE=1` MCP boundary, which requires transport
+  identity, non-empty workspace scope, and an active exact workspace binding.
 - **Keyed-MAC audit-chain verification hardening (#1067).** `verify-audit-chain`
   now accepts `--encryption-key` so operators can verify a keyed (HMAC-SHA256)
   chain, and verification fails closed with an explicit "chain is keyed" error

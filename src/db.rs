@@ -7911,6 +7911,216 @@ impl Database {
         Ok(hits)
     }
 
+    /// Check a value against both suppression stores while the caller owns its
+    /// primary connection. This is deliberately shared by ordinary reads and
+    /// maintenance scans: a derived body is not safe merely because its own
+    /// digest differs from a rejected source body's digest.
+    fn value_suppressed_with_connections(
+        conn: &rusqlite::Connection,
+        overlay: Option<&rusqlite::Connection>,
+        workspace_hash: &str,
+        predicate: &str,
+        value: &str,
+        now: i64,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        let digest = rejected_value_digest(value);
+        let primary: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM rejected_value_tombstones
+                 WHERE workspace_hash IN ('', ?1)
+                   AND predicate IN ('', ?2)
+                   AND value_sha256 = ?3
+                   AND (expires_at_unix_ms IS NULL OR expires_at_unix_ms > ?4)
+                 LIMIT 1",
+                params![workspace_hash, predicate, digest, now],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if primary.is_some() {
+            return Ok(true);
+        }
+        let Some(sidecar) = overlay else {
+            return Ok(false);
+        };
+        let erased: Option<i64> = sidecar
+            .query_row(
+                "SELECT 1 FROM erasure_mandates
+                 WHERE workspace_hash IN ('', ?1)
+                   AND predicate IN ('', ?2)
+                   AND value_sha256 = ?3
+                 LIMIT 1",
+                params![workspace_hash, predicate, digest],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(erased.is_some())
+    }
+
+    /// Source ids carried by a derived body. These fields are intentionally
+    /// hash-free provenance references, not a new authority mechanism; they
+    /// let the read/write governance boundary propagate suppression to derived
+    /// content without storing the rejected source value in the tombstone.
+    fn lineage_source_ids_from_body(body: &str) -> Vec<String> {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+            return Vec::new();
+        };
+        let mut ids = Vec::new();
+        for field in ["source_ids", "evidence_for", "promoted_from"] {
+            if let Some(items) = value.get(field).and_then(|v| v.as_array()) {
+                ids.extend(
+                    items
+                        .iter()
+                        .filter_map(|item| item.as_str().map(str::to_string)),
+                );
+            }
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+
+    fn lineage_source_ids(entity: &Entity) -> Vec<String> {
+        let mut ids = Self::lineage_source_ids_from_body(&entity.body_json);
+        for link in &entity.links {
+            if matches!(
+                link.relationship.as_str(),
+                "evidence_for" | "promoted_from" | "derived_from"
+            ) {
+                ids.push(link.target_id.clone());
+            }
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+
+    /// A maintenance source row may be selected by a global run, so its
+    /// workspace must come from the row rather than from the run's optional
+    /// scope. Scoped runs pass their already-validated exact workspace.
+    fn maintenance_source_suppressed_with_connections(
+        &self,
+        conn: &rusqlite::Connection,
+        overlay: Option<&rusqlite::Connection>,
+        scope_workspace: Option<&str>,
+        entity_id: &str,
+        category: &str,
+        body: &str,
+        now: i64,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        let workspace = match scope_workspace {
+            Some(ws) => ws.to_string(),
+            None => conn
+                .query_row(
+                    "SELECT COALESCE(workspace_hash, '') FROM entities WHERE id = ?1",
+                    params![entity_id],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .unwrap_or_default(),
+        };
+        Self::value_suppressed_with_connections(
+            conn, overlay, &workspace, category, body, now,
+        )
+    }
+
+    /// Follow derived provenance to the source rows and suppress a derived
+    /// record when any source is currently rejected/erased. Missing or
+    /// unauthentic encrypted source bytes fail closed: serving a derived record
+    /// whose evidence cannot be checked would recreate the same bypass.
+    fn lineage_sources_suppressed_with_connections(
+        &self,
+        conn: &rusqlite::Connection,
+        overlay: Option<&rusqlite::Connection>,
+        source_ids: &[String],
+        now: i64,
+        seen: &mut std::collections::HashSet<String>,
+        depth: u8,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        if source_ids.is_empty() {
+            return Ok(false);
+        }
+        if depth >= 8 {
+            return Ok(true);
+        }
+        for source_id in source_ids {
+            if !seen.insert(source_id.clone()) {
+                continue;
+            }
+            let row: Option<(String, String, String, String, String)> = conn
+                .query_row(
+                    "SELECT category, key, body_json, COALESCE(workspace_hash, ''), links
+                     FROM entities WHERE id = ?1",
+                    params![source_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+                )
+                .optional()?;
+            let Some((category, key, raw_body, workspace, links_json)) = row else {
+                continue;
+            };
+            let body = match self.encryption.as_ref() {
+                Some(enc) => match Self::decrypt_body_with_aad_fallback(
+                    enc, &raw_body, &category, &key,
+                ) {
+                    crate::encryption::BodyDecrypt::Plaintext(body)
+                    | crate::encryption::BodyDecrypt::LegacyPlaintext(body) => body,
+                    crate::encryption::BodyDecrypt::AuthFailed(_) => return Ok(true),
+                },
+                None => raw_body,
+            };
+            if Self::value_suppressed_with_connections(
+                conn,
+                overlay,
+                &workspace,
+                &category,
+                &body,
+                now,
+            )? {
+                return Ok(true);
+            }
+            let mut nested = Self::lineage_source_ids_from_body(&body);
+            if let Ok(links) = serde_json::from_str::<Vec<crate::models::MemoryLink>>(&links_json) {
+                nested.extend(links.into_iter().filter_map(|link| {
+                    matches!(
+                        link.relationship.as_str(),
+                        "evidence_for" | "promoted_from" | "derived_from"
+                    )
+                    .then_some(link.target_id)
+                }));
+            }
+            nested.sort_unstable();
+            nested.dedup();
+            if self.lineage_sources_suppressed_with_connections(
+                conn,
+                overlay,
+                &nested,
+                now,
+                seen,
+                depth + 1,
+            )? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn derived_lineage_suppressed_with_connections(
+        &self,
+        conn: &rusqlite::Connection,
+        overlay: Option<&rusqlite::Connection>,
+        entity: &Entity,
+        now: i64,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        let source_ids = Self::lineage_source_ids(entity);
+        self.lineage_sources_suppressed_with_connections(
+            conn,
+            overlay,
+            &source_ids,
+            now,
+            &mut std::collections::HashSet::new(),
+            0,
+        )
+    }
+
     fn filter_suppressed_with_conn(
         &self,
         conn: &rusqlite::Connection,
@@ -7942,12 +8152,22 @@ impl Database {
             }
             None => std::collections::HashSet::new(),
         };
-        Ok(entities
-            .into_iter()
-            .zip(triples.into_iter())
-            .filter(|(_, t)| !primary.contains(t) && !erased.contains(t))
-            .map(|(e, _)| e)
-            .collect())
+        let mut kept = Vec::with_capacity(entities.len());
+        for (entity, triple) in entities.into_iter().zip(triples.into_iter()) {
+            if primary.contains(&triple) || erased.contains(&triple) {
+                continue;
+            }
+            if self.derived_lineage_suppressed_with_connections(
+                conn,
+                overlay.as_ref(),
+                &entity,
+                now,
+            )? {
+                continue;
+            }
+            kept.push(entity);
+        }
+        Ok(kept)
     }
 
     /// #898: per-row suppression check — still used by bounded single/small
@@ -8278,7 +8498,15 @@ impl Database {
         {
             return Ok(true);
         }
-        self.primary_entity_suppressed_with_conn(conn, entity, now)
+        if self.primary_entity_suppressed_with_conn(conn, entity, now)? {
+            return Ok(true);
+        }
+        self.derived_lineage_suppressed_with_connections(
+            conn,
+            overlay.as_ref(),
+            entity,
+            now,
+        )
     }
 
     /// #882: like `filter_suppressed` but for scored candidates (bm25 /
@@ -8327,12 +8555,22 @@ impl Database {
             }
             None => std::collections::HashSet::new(),
         };
-        Ok(scored
-            .into_iter()
-            .zip(triples.into_iter())
-            .filter(|((_, _), t)| !primary.contains(t) && !erased.contains(t))
-            .map(|((e, s), _)| (e, s))
-            .collect())
+        let mut kept = Vec::with_capacity(scored.len());
+        for ((entity, score), triple) in scored.into_iter().zip(triples.into_iter()) {
+            if primary.contains(&triple) || erased.contains(&triple) {
+                continue;
+            }
+            if self.derived_lineage_suppressed_with_connections(
+                conn,
+                overlay.as_ref(),
+                &entity,
+                now,
+            )? {
+                continue;
+            }
+            kept.push((entity, score));
+        }
+        Ok(kept)
     }
 
     fn remember_impl(
@@ -20329,6 +20567,53 @@ impl Database {
         Ok(())
     }
 
+    /// #1112 strict deployment contract. Unlike the compatibility method
+    /// above, an unbound profile, missing workspace, or missing active
+    /// binding is never treated as an unscoped legacy session.
+    pub fn enforce_strict_workspace_binding(
+        &self,
+        profile: Option<&str>,
+        workspace: Option<&str>,
+        mutation: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let profile = profile
+            .filter(|p| !p.trim().is_empty())
+            .ok_or_else(|| "strict scope deployment requires transport-stamped clientInfo.name".to_string())?;
+        let workspace = workspace
+            .filter(|w| !w.trim().is_empty())
+            .ok_or_else(|| "strict scope deployment requires a non-empty workspace_hash".to_string())?;
+        let binding = self
+            .workspace_binding_for(profile)?
+            .ok_or_else(|| format!("strict scope deployment requires an active workspace binding for profile '{profile}'"))?;
+        if binding.binding_state != "active" {
+            return Err(format!(
+                "strict scope deployment denies profile '{profile}': binding is {}{}",
+                binding.binding_state,
+                if binding.quarantine_reason.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", binding.quarantine_reason)
+                }
+            )
+            .into());
+        }
+        if binding.workspace_hash != workspace {
+            return Err(format!(
+                "profile '{profile}' is bound to workspace '{}', not '{workspace}': cross-workspace access denied",
+                binding.workspace_hash
+            )
+            .into());
+        }
+        if mutation && binding.access_mode == "read_only" {
+            return Err(format!(
+                "profile '{profile}' has a read_only binding to workspace '{}': mutation denied",
+                binding.workspace_hash
+            )
+            .into());
+        }
+        Ok(())
+    }
+
     pub fn artifact_resolve_visible(
         &self,
         sha256: &str,
@@ -22376,7 +22661,7 @@ impl Database {
         // #884: at-rest encryption — the scan reads body_json via raw SQL,
         // so decrypt each row before any clustering. AuthFailed rows are
         // dropped (never cluster on unauthenticated bytes).
-        let entities: Vec<(String, String, String, f64, bool, f64)> = rows
+        let scanned_entities: Vec<(String, String, String, f64, bool, f64)> = rows
             .filter_map(|r| r.ok())
             .filter_map(|(id, key, raw_body, certainty, verified, importance)| {
                 let body = match self.encryption.as_ref() {
@@ -22396,6 +22681,26 @@ impl Database {
             })
             .collect();
         drop(stmt);
+        // #849: a maintenance source is governed by its own value digest,
+        // not only by the digest of any observation/dream written later.
+        // Filter before clustering/prompt assembly so derived content cannot
+        // quote a rejected source and evade the ordinary write gate.
+        let maintenance_overlay = self.governance_read_conn_compatible()?;
+        let suppression_now = now_ms();
+        let mut entities = Vec::with_capacity(scanned_entities.len());
+        for entity in scanned_entities {
+            if !self.maintenance_source_suppressed_with_connections(
+                &conn,
+                maintenance_overlay.as_ref(),
+                scope_ws.as_deref(),
+                &entity.0,
+                &params.category,
+                &entity.2,
+                suppression_now,
+            )? {
+                entities.push(entity);
+            }
+        }
 
         // Union-find over entity indices, joining any pair whose trigram
         // similarity meets the threshold.
@@ -22504,6 +22809,7 @@ impl Database {
             entity: crate::models::Entity,
             meta: crate::observations::ObservationMeta,
         }
+        let existing_overlay = self.governance_read_conn_compatible()?;
         let existing_observations: Vec<ExistingObs> = {
             let sql = match scope_ws.as_deref() {
                 Some(ws) => format!(
@@ -22553,10 +22859,9 @@ impl Database {
                 if let Some(meta) = crate::observations::parse_observation(&body_json, created_at) {
                     // Only observations about the scanned category are fold
                     // targets; others are still refreshed below.
-                    out.push(ExistingObs {
-                        entity: self
-                            .get_entity(&crate::observations::OBSERVATION_CATEGORY, &key)?
-                            .unwrap_or_else(|| crate::models::Entity {
+                    let entity = self
+                        .get_entity(&crate::observations::OBSERVATION_CATEGORY, &key)?
+                        .unwrap_or_else(|| crate::models::Entity {
                                 id: id.clone(),
                                 category: crate::observations::OBSERVATION_CATEGORY.to_string(),
                                 key,
@@ -22589,9 +22894,19 @@ impl Database {
                                 _parsed_body: None,
                                 created_at_unix_ms: created_at,
                                 last_accessed_unix_ms: created_at,
-                            }),
-                        meta,
-                    });
+                            });
+                    // A legacy observation can outlive a later rejection of
+                    // one of its sources. Do not let the fallback entity above
+                    // reintroduce it into maintenance or refresh writes.
+                    if self.derived_lineage_suppressed_with_connections(
+                        &conn,
+                        existing_overlay.as_ref(),
+                        &entity,
+                        now,
+                    )? {
+                        continue;
+                    }
+                    out.push(ExistingObs { entity, meta });
                 }
             }
             out
@@ -23626,7 +23941,7 @@ impl Database {
                         r.get::<_, Option<f64>>(5).unwrap_or(None).unwrap_or(0.0),
                     ))
                 };
-            let entities: Vec<(String, String, String, f64, bool, f64)> = {
+            let scanned_entities: Vec<(String, String, String, f64, bool, f64)> = {
                 let it = match binds.len() {
                     3 => {
                         stmt.query_map(rusqlite::params![binds[0], binds[1], binds[2]], map_row)?
@@ -23640,7 +23955,7 @@ impl Database {
 
             // Decrypt bodies when encryption is on — the LLM reflects over
             // plaintext, and trigram clustering over ciphertext is noise.
-            let entities: Vec<(String, String, String, f64, bool, f64)> = entities
+            let decrypted_entities: Vec<(String, String, String, f64, bool, f64)> = scanned_entities
                 .into_iter()
                 .map(|(id, key, body, cert, ver, imp)| {
                     let body = if let Some(ref enc) = self.encryption {
@@ -23656,6 +23971,24 @@ impl Database {
                 })
                 .filter(|e| !e.2.is_empty())
                 .collect();
+            // #849: never send a rejected source to the LLM. The normal write
+            // gate only sees the final insight envelope, whose digest differs
+            // from the source value.
+            let maintenance_overlay = self.governance_read_conn_compatible()?;
+            let mut entities = Vec::with_capacity(decrypted_entities.len());
+            for entity in decrypted_entities {
+                if !self.maintenance_source_suppressed_with_connections(
+                    &conn,
+                    maintenance_overlay.as_ref(),
+                    scope_ws.as_deref(),
+                    &entity.0,
+                    &category,
+                    &entity.2,
+                    now,
+                )? {
+                    entities.push(entity);
+                }
+            }
 
             report.entities_examined += entities.len() as i64;
 
@@ -28155,7 +28488,26 @@ last_accessed: {}
                 }
                 rows.push(row);
             }
-            rows
+            // #849: promotion is also a derived writer. Filter governed source
+            // rows before clustering; copying a rejected source into a new
+            // global body would otherwise evade the exact-body write gate.
+            let maintenance_overlay = self.governance_read_conn_compatible()?;
+            let suppression_now = now_ms();
+            let mut visible = Vec::with_capacity(rows.len());
+            for row in rows {
+                if !self.maintenance_source_suppressed_with_connections(
+                    &conn,
+                    maintenance_overlay.as_ref(),
+                    None,
+                    &row.id,
+                    &row.category,
+                    &row.body,
+                    suppression_now,
+                )? {
+                    visible.push(row);
+                }
+            }
+            visible
         };
 
         // Phase 2 — greedy clustering per category: each row joins the first
@@ -39425,6 +39777,100 @@ pub(crate) mod tests {
     }
 
     // #849: scoped rejected-value tombstones — db-level contract tests.
+    #[test]
+    fn rejected_value_does_not_flow_through_maintenance_derived_writes() {
+        let (db, path) = temp_db();
+        let rejected = r#"{"note":"the deployment uses postgres as the primary datastore rejected-source"}"#;
+        let safe_a = r#"{"note":"the deployment uses postgres as the primary datastore safe-a"}"#;
+        let safe_b = r#"{"note":"the deployment uses postgres as the primary datastore safe-b"}"#;
+        let safe_c = r#"{"note":"the deployment uses postgres as the primary datastore safe-c"}"#;
+
+        for (id, workspace, body) in [
+            ("rejected-a", "ws-a", rejected),
+            ("safe-a", "ws-a", safe_a),
+            ("safe-b", "ws-b", safe_b),
+            ("safe-c", "ws-c", safe_c),
+        ] {
+            let mut entity = make_entity(id, "facts", id, body);
+            entity.workspace_hash = workspace.to_string();
+            db.remember_skip_dedup(&entity).expect("seed maintenance source");
+        }
+
+        db.reject_value(
+            "ws-a",
+            "rejected-a",
+            "facts",
+            rejected,
+            "maintenance canary",
+            "test:maintenance-canary",
+            "test-agent",
+            None,
+        )
+        .expect("record rejection");
+
+        let mut laundering = make_entity("reingested-a", "facts", "reingested-a", rejected);
+        laundering.workspace_hash = "ws-a".to_string();
+        assert!(
+            db.remember_skip_dedup(&laundering).is_err(),
+            "a rejected value must remain blocked through another writer key"
+        );
+
+        let consolidate = crate::models::ConsolidateParams {
+            category: "facts".to_string(),
+            similarity_threshold: 0.3,
+            limit: 50,
+            offset: 0,
+            dry_run: false,
+            cold_first: false,
+            archive_sources: false,
+            workspace_hash: Some("ws-a".to_string()),
+            global: false,
+            requesting_agent_id: String::new(),
+            refine_existing: true,
+            quote_cap_chars: 512,
+            force: false,
+        };
+        let consolidated = db.consolidate(&consolidate).expect("consolidate canary");
+        assert_eq!(
+            consolidated.observations_created, 0,
+            "consolidation must not derive content from a rejected source"
+        );
+
+        let mut dream = dream_params("facts");
+        dream.workspace_hash = Some("ws-a".to_string());
+        let dreamed = db
+            .dream_with_llm(&dream, &|prompt| {
+                assert!(
+                    !prompt.contains("rejected-source"),
+                    "rejected source reached the dream prompt"
+                );
+                Ok(r#"{"insights":[]}"#.to_string())
+            })
+            .expect("dream canary");
+        assert_eq!(
+            dreamed.clusters_dreamed, 0,
+            "dream must not cluster a rejected source"
+        );
+
+        let cohere = db
+            .cohere(&crate::models::CohereParams {
+                cross_scope_promote: true,
+                cross_scope_k: 4,
+                cross_scope_similarity: 0.3,
+                max_links: 0,
+                ..Default::default()
+            })
+            .expect("cohere canary");
+        assert_eq!(
+            cohere.cross_scope_clusters, 0,
+            "cross-scope promotion must not generalize a rejected source"
+        );
+
+        drop(db);
+        let _ = fs::remove_file(path.clone());
+        let _ = fs::remove_file(format!("{path}.governance.db"));
+    }
+
     #[test]
     fn rejected_value_tombstone_blocks_same_value_under_any_key_in_scope() {
         let (db, path) = temp_db();

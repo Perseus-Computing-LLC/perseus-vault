@@ -168,6 +168,11 @@ reported by `perseus-vault doctor` without requiring an encryption key:
 | **Encrypted** | `[ENCRYPTED] AES-256-GCM canary present` | The authoritative `encryption_canary` `id=1` row exists; `body_json` values are ciphertext. A key is required for reads and writes. The canary is verified on every startup — a wrong key is rejected with a fatal error. |
 | **Mixed legacy** | `[WARN] mixed — some bodies appear encrypted` | The canary is **absent** but some `body_json` values match the ciphertext format. This happens when encryption was enabled and later the canary was lost (e.g. a partial restore from backup). Run `perseus-vault init --rekey` to establish a canary and normalise the state. |
 
+The migration contract is exercised by
+`tests/encryption_bootstrap.rs::init_rekey_migrates_existing_plaintext_rows_and_is_idempotent`:
+the first explicit rekey encrypts the legacy row and establishes the canary;
+re-running it skips already encrypted rows rather than double-encrypting them.
+
 The `perseus-vault init` command always produces an **encrypted** database.
 A fresh default database is **encrypted by default** — the standard key is
 generated and the canary established on first write. A plaintext database only

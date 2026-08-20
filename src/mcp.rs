@@ -224,13 +224,29 @@ pub struct MCPState {
     // clientInfo (single-agent / legacy) → unscoped, preserving old behavior.
     // RwLock: set once at initialize, read per tools/call across the shared &state.
     pub session_agent_id: std::sync::RwLock<String>,
+    /// #1112: strict multi-agent/HTTP deployment mode. When enabled, every
+    /// scoped read or mutation needs a transport identity plus an active,
+    /// exact workspace binding; legacy unbound single-agent behavior remains
+    /// available only when this explicit deployment gate is off.
+    pub strict_scope: bool,
 }
 
 impl MCPState {
     pub fn new() -> Self {
+        let strict_scope = std::env::var("PERSEUS_VAULT_STRICT_SCOPE")
+            .ok()
+            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(false);
+        Self::new_with_strict_scope(strict_scope)
+    }
+
+    /// Construct a state with an explicit deployment contract. This keeps
+    /// tests deterministic without mutating the process environment.
+    pub fn new_with_strict_scope(strict_scope: bool) -> Self {
         MCPState {
             initialized: std::sync::atomic::AtomicBool::new(false),
             session_agent_id: std::sync::RwLock::new(String::new()),
+            strict_scope,
         }
     }
 }
@@ -801,7 +817,15 @@ pub fn handle_request(
                     .get("requesting_agent_id")
                     .and_then(|v| v.as_str());
                 let ws = tool_args.get("workspace_hash").and_then(|v| v.as_str());
-                let denied = if SCOPE_MUTATION_TOOLS.contains(&tool_name) {
+                let denied = if state.strict_scope && SCOPE_MUTATION_TOOLS.contains(&tool_name) {
+                    db.enforce_strict_workspace_binding(profile, ws, true)
+                        .err()
+                        .map(|e| e.to_string())
+                } else if state.strict_scope && SCOPE_READ_TOOLS.contains(&tool_name) {
+                    db.enforce_strict_workspace_binding(profile, ws, false)
+                        .err()
+                        .map(|e| e.to_string())
+                } else if SCOPE_MUTATION_TOOLS.contains(&tool_name) {
                     db.enforce_workspace_binding(profile, ws, true)
                         .err()
                         .map(|e| e.to_string())
@@ -6761,60 +6785,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     },
     "title": "Share Entity to Workspace"
   },
-  {
-    "name": "perseus_vault_federate",
-    "description": "Federate entities from one workspace to another. Exports entities scoped to from_workspace, remaps their workspace_hash to to_workspace, and imports them — effectively copying or moving knowledge between workspaces. Use this for cross-agent or cross-project knowledge sharing without manual file transfer.",
-    "inputSchema": {
-      "type": "object",
-      "properties": {
-        "from_workspace": {
-          "type": "string",
-          "description": "Source workspace hash to export entities from"
-        },
-        "to_workspace": {
-          "type": "string",
-          "description": "Target workspace hash to import entities into"
-        },
-        "vault_dir": {
-          "type": "string",
-          "default": "/tmp/perseus-vault-federate",
-          "description": "Temporary vault directory for the intermediate .md export files"
-        }
-      },
-      "required": [
-        "from_workspace",
-        "to_workspace"
-      ]
-    },
-    "outputSchema": {
-      "type": "object",
-      "properties": {
-        "exported": {
-          "type": "integer",
-          "description": "Number of entities exported from the source workspace"
-        },
-        "remapped": {
-          "type": "integer",
-          "description": "Number of entities whose workspace_hash was remapped"
-        },
-        "imported": {
-          "type": "integer",
-          "description": "Number of entities imported into the target workspace"
-        },
-        "import_errors": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          },
-          "description": "Any errors encountered during import"
-        }
-      }
-    },
-    "annotations": {
-      "destructiveHint": true
-    },
-    "title": "Federate Entities Between Workspaces"
-  },
+
   {
     "name": "perseus_vault_correct",
     "description": "Capture a user correction to the agent. Stores what went wrong, what the user said, and the lesson learned — as both a 'correction' entity and a journal entry. Use this every time the user corrects your approach. Enables the self-improving feedback loop: the agent learns from mistakes across sessions.",
@@ -8268,7 +8239,6 @@ const TOOL_SCOPES: &[(&str, ToolScope)] = &[
     ("perseus_vault_recall_when", ToolScope::Agent),
     ("perseus_vault_cohere", ToolScope::Ops),
     ("perseus_vault_share", ToolScope::Ops),
-    ("perseus_vault_federate", ToolScope::Ops),
     ("perseus_vault_correct", ToolScope::Agent),
     ("perseus_vault_synthesize", ToolScope::Agent),
     ("perseus_vault_bench", ToolScope::Ops),
@@ -8781,7 +8751,7 @@ mod tests {
         );
         assert_eq!(
             registry_names.len(),
-            170,
+            169,
             "update public metadata when adding a tool"
         );
 
@@ -8874,6 +8844,14 @@ mod tests {
         assert_eq!(v["dry_run"], json!(true));
 
         let _ = fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn disabled_federate_is_not_advertised() {
+        assert!(
+            !advertised_names().contains(&"perseus_vault_federate".to_string()),
+            "disabled federation must not appear in tools/list"
+        );
     }
 
     #[test]
@@ -10219,6 +10197,88 @@ mod tests {
     }
 
     #[test]
+    fn strict_scope_deployment_requires_bound_transport_identity_and_exact_workspace() {
+        let db_path = std::env::temp_dir().join(format!(
+            "perseus-vault-strict-scope-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let db = Database::open(db_path.to_str().expect("temp db path")).expect("open temp db");
+        db.workspace_bind("host-agent", "host-ws", "read_write", "{}", "operator")
+            .unwrap();
+
+        // Strict deployments reject an uninitialized transport even when the
+        // model supplies a plausible requester and workspace. Without this
+        // gate, a no-manifest write can become an active, serveable fact.
+        let anonymous = MCPState::new_with_strict_scope(true);
+        let init = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(1)),
+            method: "initialize".to_string(),
+            params: Some(json!({})),
+        };
+        handle_request(&init, &anonymous, &db).expect("anonymous initialize");
+        let remember = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(2)),
+            method: "tools/call".to_string(),
+            params: Some(json!({
+                "name": "perseus_vault_remember",
+                "arguments": {
+                    "category": "facts",
+                    "key": "strict-anonymous",
+                    "body_json": "{\"v\":1}",
+                    "workspace_hash": "host-ws"
+                }
+            })),
+        };
+        let denied = handle_request(&remember, &anonymous, &db)
+            .expect("strict anonymous response")
+            .result
+            .expect("strict anonymous result");
+        assert_eq!(denied["isError"], json!(true), "{denied}");
+        assert!(denied["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("clientInfo.name"), "{denied}");
+
+        // A transport identity is not sufficient by itself: strict mode also
+        // requires an active host binding and exact workspace equality.
+        let bound = MCPState::new_with_strict_scope(true);
+        let init = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(3)),
+            method: "initialize".to_string(),
+            params: Some(json!({"clientInfo": {"name": "host-agent"}})),
+        };
+        handle_request(&init, &bound, &db).expect("bound initialize");
+        let cross_scope = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(4)),
+            method: "tools/call".to_string(),
+            params: Some(json!({
+                "name": "perseus_vault_remember",
+                "arguments": {
+                    "category": "facts",
+                    "key": "strict-cross-scope",
+                    "body_json": "{\"v\":1}",
+                    "workspace_hash": "other-ws"
+                }
+            })),
+        };
+        let denied = handle_request(&cross_scope, &bound, &db)
+            .expect("strict cross-scope response")
+            .result
+            .expect("strict cross-scope result");
+        assert_eq!(denied["isError"], json!(true), "{denied}");
+        assert!(denied["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("cross-workspace"), "{denied}");
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
     fn scope_view_parsing_is_lenient_and_defaults_to_full() {
         assert_eq!(resolve_scope_view(None), ScopeView::Full);
         assert_eq!(resolve_scope_view(Some("agent")), ScopeView::Agent);
@@ -10262,10 +10322,10 @@ mod tests {
         );
         assert_eq!(
             ops.len(),
-            163,
+            162,
             "ops view count drifted — new tools must be classified"
         );
-        assert_eq!(full.len(), 170, "full view must expose the whole registry");
+        assert_eq!(full.len(), 169, "full view must expose the whole registry");
         assert!(agent.len() < ops.len() && ops.len() < full.len());
     }
 

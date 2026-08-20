@@ -145,6 +145,138 @@ fn explicit_plaintext_optout_suppresses_default_key_creation() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
+#[test]
+fn init_rekey_migrates_existing_plaintext_rows_and_is_idempotent() {
+    let home = sandbox("rekey-migration");
+    let db_path = home.join("legacy-plaintext.db");
+    let key_path = home.join("migration-key");
+    let plaintext = r#"{"note":"legacy plaintext must be migrated"}"#;
+
+    // Establish the pre-migration state explicitly: a real plaintext body and
+    // no encryption canary, using the documented compatibility opt-out.
+    let write = Command::new(BIN)
+        .env("HOME", &home)
+        .env("PERSEUS_VAULT_ALLOW_PLAINTEXT", "1")
+        .args([
+            "write",
+            "--db",
+            db_path.to_str().unwrap(),
+            "--category",
+            "facts",
+            "--key",
+            "legacy-plaintext",
+            "--body-json",
+            plaintext,
+        ])
+        .output()
+        .expect("spawn plaintext seed write");
+    assert!(
+        write.status.success(),
+        "plaintext seed must succeed: {}",
+        String::from_utf8_lossy(&write.stderr)
+    );
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    assert_eq!(
+        conn.query_row::<i64, _, _>(
+            "SELECT COUNT(*) FROM encryption_canary WHERE id = 1",
+            [],
+            |r| r.get(0)
+        )
+        .unwrap(),
+        0,
+        "the fixture must begin plaintext"
+    );
+    assert_eq!(
+        conn.query_row::<String, _, _>(
+            "SELECT body_json FROM entities WHERE key='legacy-plaintext'",
+            [],
+            |r| r.get(0)
+        )
+        .unwrap(),
+        plaintext
+    );
+    drop(conn);
+
+    // The explicit migration establishes the canary and encrypts the existing
+    // body under the operator-provided key.
+    let migrate = Command::new(BIN)
+        .env("HOME", &home)
+        .env_remove("PERSEUS_VAULT_ALLOW_PLAINTEXT")
+        .args([
+            "init",
+            "--db",
+            db_path.to_str().unwrap(),
+            "--key-file",
+            key_path.to_str().unwrap(),
+            "--rekey",
+        ])
+        .output()
+        .expect("spawn init --rekey");
+    let migrate_stdout = String::from_utf8_lossy(&migrate.stdout);
+    assert!(
+        migrate.status.success(),
+        "init --rekey must succeed: {migrate_stdout}\n{}",
+        String::from_utf8_lossy(&migrate.stderr)
+    );
+    assert!(
+        migrate_stdout.contains("encrypt: 1 records encrypted, 0 skipped, 0 failed"),
+        "migration report must account for the legacy row: {migrate_stdout}"
+    );
+
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    assert_eq!(
+        conn.query_row::<i64, _, _>(
+            "SELECT COUNT(*) FROM encryption_canary WHERE id = 1",
+            [],
+            |r| r.get(0)
+        )
+        .unwrap(),
+        1,
+        "rekey must establish the encryption canary"
+    );
+    let stored: String = conn
+        .query_row(
+            "SELECT body_json FROM entities WHERE key='legacy-plaintext'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_ne!(stored, plaintext, "legacy body must no longer be plaintext");
+    assert!(
+        !stored.contains("legacy plaintext must be migrated"),
+        "ciphertext must not contain the migrated body: {stored}"
+    );
+    drop(conn);
+
+    // A second explicit migration is safe and must not double-encrypt or
+    // replace the key/ciphertext.
+    let migrate_again = Command::new(BIN)
+        .env("HOME", &home)
+        .env_remove("PERSEUS_VAULT_ALLOW_PLAINTEXT")
+        .args([
+            "init",
+            "--db",
+            db_path.to_str().unwrap(),
+            "--key-file",
+            key_path.to_str().unwrap(),
+            "--rekey",
+        ])
+        .output()
+        .expect("spawn idempotent init --rekey");
+    let again_stdout = String::from_utf8_lossy(&migrate_again.stdout);
+    assert!(
+        migrate_again.status.success(),
+        "idempotent init --rekey must succeed: {again_stdout}\n{}",
+        String::from_utf8_lossy(&migrate_again.stderr)
+    );
+    assert!(
+        again_stdout.contains("encrypt: 0 records encrypted, 1 skipped, 0 failed"),
+        "second migration must skip the already encrypted row: {again_stdout}"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 // #1018 companion guard: keygen/init previously truncated any key file at the
 // resolved path, which would destroy the key of an existing encrypted vault
 // (precedence resolution now finds legacy `~/.mimir/secret.key` files, making

@@ -21,7 +21,7 @@
 
 Give your agents memory that survives the session, so they stop re-deriving what they
 already learned and stop repeating past mistakes. Hybrid recall (BM25 + dense + RRF),
-bi-temporal history, and **AES-256-GCM** at rest, exposed as **170 canonical MCP tools** that work with any host. Legacy `mimir_*`/`mneme_*` aliases were removed in the 2026-27
+bi-temporal history, and **AES-256-GCM** at rest, exposed as **169 canonical MCP tools** that work with any host. Legacy `mimir_*`/`mneme_*` aliases were removed in the 2026-27
 major release and are
 not counted separately. **73.8% on LongMemEval's official harness** (vs Zep 63.8%, Mem0
 49.0%).
@@ -416,8 +416,8 @@ attention-constrained agent clients:
 | Setting | Advertised surface | Count |
 |---|---|---|
 | `full` (default) | everything | 169 |
-| `ops` | agent surface + operational grooming, maintenance, governance, export | 140 |
-| `agent` | everyday memory + coordination surface (recall / remember / context / handoffs / state, plus the agent-side AAR calls) | 48 |
+| `ops` | agent surface + operational grooming, maintenance, governance, export | 162 |
+| `agent` | everyday memory + coordination surface (recall / remember / context / handoffs / state, plus the agent-side AAR calls) | 51 |
 
 Scopes are **advertisement-only**: a hidden tool remains fully callable via
 `tools/call`, and authorization stays with workspace binding and authority
@@ -426,6 +426,13 @@ manifests. The tier classification is a 1:1 side table (`TOOL_SCOPES` in
 new tool must be classified. `admin`-tier tools (`migrate`, `purge`,
 `erase`, `vault_import`, `authority_set` / `authority_revoke` /
 `authority_set_signed`) never appear in a scoped list.
+
+For multi-agent or HTTP deployments, set `PERSEUS_VAULT_STRICT_SCOPE=1`.
+Strict scope mode requires every scoped read or mutation to carry a
+transport-stamped MCP `clientInfo.name`, a non-empty `workspace_hash`, and an
+active exact workspace binding. Unbound legacy sessions remain available only
+when this deployment gate is explicitly off; they are not a substitute for
+authority manifests in a shared deployment.
 
 ### Entity CRUD
 | Tool | Description |
@@ -520,14 +527,19 @@ new tool must be classified. `admin`-tier tools (`migrate`, `purge`,
 | `perseus_vault_keystone_get` | Fetch the merged Keystones for a scope, ordered by weight (highest first) then scope specificity — the deterministic session-start counterpart to recall. A renderer injects these ahead of all other context. |
 | `perseus_vault_agent` | Register/update or look up an agent in the multi-agent registry (#684): identity + trust tier (0-3) + fleet. Trust tier gates sensitive ops (e.g. authoring keystones needs tier ≥ 2) and drives visibility enforcement on recall. |
 
-### Vault & Federation
+### Vault Transfer (peer federation disabled)
 | Tool | Description |
 |---|---|
 | `perseus_vault_vault_export` | Export entities to .md files with YAML frontmatter. |
 | `perseus_vault_vault_import` | Import from .md vault directory (idempotent). |
-| `perseus_vault_federate` | Copy entities between workspaces. This is a local export / workspace-rename / re-import (file based, no network peers); the Windows-safe default path is tracked in #704. |
 | `perseus_vault_share` | Share one entity (by category + key) into another workspace, preserving content. |
 | `perseus_vault_workspace_list` | List all distinct entity categories. |
+
+`perseus_vault_federate` is intentionally not advertised or executable. Peer
+transfer remains disabled until authenticated authority, rollback-capable
+custody, conflict handling, and tombstone/erasure propagation are implemented.
+Use the explicit `vault_export` / `vault_import` tools for reviewed file-based
+transfers.
 
 ### Metrics & Ops
 | Tool | Description |

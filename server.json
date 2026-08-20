@@ -2,12 +2,12 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.Perseus-Computing-LLC/perseus-vault",
   "title": "Perseus Vault \u2014 persistent, encrypted memory for AI agents",
-  "description": "Persistent, encrypted, deterministic memory for AI agents. Local-first, 170 canonical tools.",
+  "description": "Persistent, encrypted, deterministic memory for AI agents. Local-first, 169 canonical tools.",
   "version": "2.23.0",
   "packages": [
     {
       "registryType": "oci",
-      "identifier": "ghcr.io/perseus-computing-llc/perseus-vault:2.20.2",
+      "identifier": "ghcr.io/perseus-computing-llc/perseus-vault:2.23.0",
       "transport": {
         "type": "stdio"
       },

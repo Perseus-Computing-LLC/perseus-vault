@@ -12568,66 +12568,14 @@ pub fn handle_prune(db: &Database, args: Value) -> Result<String, String> {
     }
 }
 
-pub fn handle_federate(db: &Database, args: Value) -> Result<String, String> {
-    use serde::Deserialize;
-    #[derive(Deserialize)]
-    struct FederateArgs {
-        from_workspace: String,
-        to_workspace: String,
-        #[serde(default)]
-        vault_dir: String,
-    }
-    let a: FederateArgs =
-        serde_json::from_value(args).map_err(|e| format!("Invalid federate arguments: {}", e))?;
-    return Err("federate requires an authenticated authoritative admission and rollback-capable transfer boundary".to_string());
-
-    let vault_dir = if a.vault_dir.is_empty() {
-        std::env::temp_dir()
-            .join("perseus_vault-federate")
-            .to_string_lossy()
-            .to_string()
-    } else {
-        a.vault_dir
-    };
-
-    // Export from source workspace
-    let export_report = db
-        .vault_export(&vault_dir, Some(&a.from_workspace))
-        .map_err(|e| format!("Federate export failed: {}", e))?;
-
-    // Remap entities: overwrite workspace_hash to target
-    let mut remapped = 0i64;
-    for entry in std::fs::read_dir(&vault_dir).map_err(|e| format!("Read vault dir: {}", e))? {
-        let entry = entry.map_err(|e| format!("Read entry: {}", e))?;
-        let path = entry.path();
-        if path.extension().and_then(|s| s.to_str()) != Some("md") {
-            continue;
-        }
-        let content = std::fs::read_to_string(&path)
-            .map_err(|e| format!("Read {}: {}", path.display(), e))?;
-        let remapped_content = content.replace(
-            &format!("workspace_hash: {}", a.from_workspace),
-            &format!("workspace_hash: {}", a.to_workspace),
-        );
-        if remapped_content != content {
-            std::fs::write(&path, remapped_content)
-                .map_err(|e| format!("Write {}: {}", path.display(), e))?;
-            remapped += 1;
-        }
-    }
-
-    // Import into target workspace
-    let import_report = db
-        .vault_import(&vault_dir)
-        .map_err(|e| format!("Federate import failed: {}", e))?;
-
-    let result = json!({
-        "exported": export_report.files_created + export_report.files_updated,
-        "remapped": remapped,
-        "imported": import_report.files_created + import_report.files_updated,
-        "import_errors": import_report.errors,
-    });
-    Ok(reviewable_write_result(result, "federate").to_string())
+pub fn handle_federate(_db: &Database, _args: Value) -> Result<String, String> {
+    Err(
+        "federate is disabled: peer transfer requires authenticated authoritative admission,\
+         rollback-capable custody, and explicit conflict/erasure propagation. Use\
+         perseus_vault_vault_export and perseus_vault_vault_import for a reviewed\
+         file-based transfer instead."
+            .to_string(),
+    )
 }
 
 pub fn handle_share(db: &Database, args: Value) -> Result<String, String> {

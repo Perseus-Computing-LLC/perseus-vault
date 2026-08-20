@@ -22,9 +22,10 @@ Zero runtime dependencies. Structured entity model with journal events and state
 - **In one line:** everything originally planned from v0.1 through the v2.0 "Platform" milestone has shipped. This document is being corrected to reflect that, and the forward section is deliberately short and honest.
 
 > **Doc hygiene note:** prior revisions of this file listed shipped capabilities
-> (federation, multi-agent scoping, gRPC, offline embeddings) as "future," and
-> carried fabricated quarterly milestones through 2031 — several describing tools
-> that already exist (`perseus_vault_federate`, `perseus_vault_synthesize`). That has been removed.
+(peer federation, multi-agent scoping, gRPC, offline embeddings) as "future," and
+carried fabricated quarterly milestones through 2031 — several describing tools
+that already exist (`perseus_vault_synthesize`). That has been removed. Peer
+federation is intentionally disabled; explicit export/import remains supported.
 > Forward-looking work that is not committed now lives under **Exploratory** with
 > no dates. The canonical roadmap is this file; `docs/ROADMAP.md` points here.
 
@@ -54,8 +55,9 @@ Zero runtime dependencies. Structured entity model with journal events and state
 ### v1.1 – v2.0 — Ecosystem, multi-agent, platform ✅ (2026-06)
 - **Ecosystem:** framework adapters for **LangGraph, CrewAI, AutoGen** (`integrations/`), an **Obsidian plugin**,
   SSE/HTTP transport for non-stdio hosts, Docker image, and a one-line installer (`curl -sSf … | sh`, `v2.0.1`)
-- **Multi-agent & federation:** workspace scoping (`workspace_hash`), agent identity (`agent_id`),
-  per-entity `visibility`, and cross-instance sync via `perseus_vault_federate`
+- **Multi-agent & transfer boundary:** workspace scoping (`workspace_hash`), agent identity (`agent_id`),
+  per-entity `visibility`, and reviewed file-based export/import. Peer federation is
+  intentionally disabled pending a governed transfer contract.
 - **Local/offline embeddings:** ONNX path via `ort` — hybrid search without an external embedding service
 - **Platform (`v2.0.0`):** gRPC transport alongside MCP, and a cryptographically-chained audit log
 - **Additional tools since the docs last counted:** `autocohere`, `bench`, `correct`, `supersede`,
@@ -104,7 +106,8 @@ The genuinely-unshipped pieces of the "Perseus Vault as infrastructure" goal:
 - **Local multimodal ingestion (#236):** `perseus_vault_ingest_file` + an optional `multimodal`
   feature (DOCX/PDF text extraction) shipped on `main` — local-only, lean default unchanged.
 - **Scale:** 100K+ entity stress tests with documented recall latency budgets.
-- **Federation maturation:** sync health/observability (lag, conflict rate, entity drift) for `perseus_vault_federate`.
+- **Governed transfer (future):** peer federation remains uncommitted until authority,
+  rollback/custody, conflict, and erasure propagation are specified and implemented.
 
 ## Next+1 — Memory quality, serving, and shared knowledge
 

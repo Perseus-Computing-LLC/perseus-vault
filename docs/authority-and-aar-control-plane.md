@@ -31,6 +31,24 @@ everything. Consequences for operators:
 - An agent session that resolves to a blank workspace cannot participate
   in the AAR plane until it is configured with the same hash.
 
+### Strict deployment contract for shared transports
+
+For multi-agent or HTTP deployments, start the Vault with
+`PERSEUS_VAULT_STRICT_SCOPE=1`. In this mode the MCP boundary fails closed
+unless a request has all three of:
+
+1. a transport-captured `initialize.clientInfo.name`;
+2. a non-empty `workspace_hash`; and
+3. an active workspace binding for that profile whose workspace matches
+   exactly (and whose access mode permits mutations when applicable).
+
+The compatibility mode without this variable preserves the legacy single-agent
+behavior for unbound sessions. It is not a shared-deployment authority model:
+operators must enable strict scope before exposing HTTP or multiple agents, so
+no unbound write can become an active, serveable fact under that deployment
+contract. The boundary test is
+`mcp::tests::strict_scope_deployment_requires_bound_transport_identity_and_exact_workspace`.
+
 ## 2. Manifest fields and match semantics
 
 | Field | Semantics |
