@@ -41,7 +41,12 @@ import time
 import uuid
 from typing import Any, Dict, List, Optional
 
-__all__ = ["VaultClient", "VaultError", "VaultTimeoutError"]
+__all__ = [
+    "EphemeralAdmissionFixture",
+    "VaultClient",
+    "VaultError",
+    "VaultTimeoutError",
+]
 
 __version__ = "0.1.0"
 
@@ -90,6 +95,7 @@ class VaultClient:
         timeout: float = 30.0,
         env: Optional[Dict[str, str]] = None,
         tool_prefix: str = "perseus_vault",
+        client_info_name: str = "perseus-vault-client",
     ):
         self._binary = binary or os.getenv("PERSEUS_VAULT_BIN", "perseus-vault")
         self._db_path = db_path or os.getenv("PERSEUS_VAULT_DB", "./perseus-vault.db")
@@ -97,6 +103,7 @@ class VaultClient:
         self._timeout = float(timeout)
         self._env = {**os.environ, **(env or {})}
         self._prefix = tool_prefix
+        self._client_info_name = client_info_name
 
         # Reentrant: _request recurses into _start -> _request during the
         # handshake while already holding the lock.
@@ -144,7 +151,7 @@ class VaultClient:
         self._request("initialize", {
             "protocolVersion": _PROTOCOL_VERSION,
             "capabilities": {},
-            "clientInfo": {"name": "perseus-vault-client", "version": __version__},
+            "clientInfo": {"name": self._client_info_name, "version": __version__},
         })
         self._notify("notifications/initialized", {})
 
@@ -468,3 +475,6 @@ class VaultClient:
                 "raw": it,
             })
         return out
+
+
+from .ephemeral import EphemeralAdmissionFixture

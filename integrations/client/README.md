@@ -69,6 +69,24 @@ Anything not covered by a typed helper is reachable via `call_tool`:
 vault.call_tool("perseus_vault_bitemporal", {"category": "decision", "as_of": 1720000000000})
 ```
 
+## Ephemeral admitted integration tests
+
+When an integration test needs a serveable record, use the dependency-free
+[`EphemeralAdmissionFixture`](../../docs/integration/ephemeral-admission-fixture.md)
+instead of weakening the normal write boundary:
+
+```python
+from perseus_vault_client import EphemeralAdmissionFixture
+
+with EphemeralAdmissionFixture(binary="target/debug/perseus-vault") as vault:
+    vault.remember("fixture", "one", {"content": "synthetic"})
+    assert vault.recall("synthetic", category="fixture")
+```
+
+The fixture owns a fresh temporary database, generates a per-run source-event
+key, configures minimum authority through public MCP calls, and removes all
+state on exit. A normal `VaultClient` write remains a reviewable proposal.
+
 ## API
 
 | Method | Tool | Notes |

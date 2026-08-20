@@ -11,6 +11,7 @@ import json
 import os
 import shutil
 import subprocess
+from pathlib import Path
 import sys
 import textwrap
 import threading
@@ -331,11 +332,33 @@ def test_real_binary_store_recall(tmp_path):
     db = str(tmp_path / "real.db")
     with VaultClient(binary=_REAL_BIN, db_path=db) as vault:
         assert vault.health().get("status") == "healthy"
-        vault.remember("architecture", "use-sqlite", {"content": "SQLite FTS5 index"})
-        hits = vault.recall("database index", category="architecture", limit=5)
-        assert any("SQLite" in h["text"] for h in hits)
+        result = vault.remember("architecture", "use-sqlite", {"content": "SQLite FTS5 index"})
+        assert result.get("proposed") is True
+        assert result.get("serveable") is not True
+        assert vault.recall("database index", category="architecture", limit=5) == []
         vault.prune("architecture", purge_all=True)
         assert vault.recall("", category="architecture") == []
+
+
+@pytest.mark.skipif(not _REAL_BIN, reason="perseus-vault binary not available")
+def test_ephemeral_fixture_admits_and_recalls_then_cleans_up(tmp_path):
+    from perseus_vault_client import EphemeralAdmissionFixture
+
+    with EphemeralAdmissionFixture(binary=_REAL_BIN) as fixture:
+        db_path = fixture.db_path
+        assert Path(db_path).parent.name.startswith("perseus-vault-ephemeral-")
+        result = fixture.remember(
+            "integration-fixture",
+            "deterministic",
+            {"content": "ephemeral fixture record"},
+        )
+        assert result.get("serveable") is True
+        assert any(
+            item["id"] == "deterministic"
+            for item in fixture.recall("ephemeral fixture", category="integration-fixture")
+        )
+
+    assert not Path(db_path).exists()
 
 
 @pytest.mark.skipif(not _REAL_BIN, reason="perseus-vault binary not available")
