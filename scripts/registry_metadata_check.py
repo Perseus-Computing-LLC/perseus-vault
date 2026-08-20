@@ -87,6 +87,33 @@ for label, path in metadata.items():
         if label == "server.json" and f"{expected_count} canonical tools" not in text:
             raise SystemExit(f"{label}: missing current registry count {expected_count}")
 
+# Release metadata must identify the same artifact that the package version
+# claims. The publish workflow repairs this at runtime, but the checked-in
+# server.json is itself a release input and must be truthful before publish.
+cargo_text = (ROOT / "Cargo.toml").read_text(encoding="utf-8")
+cargo_version_match = re.search(r'^version\s*=\s*"([^"]+)"', cargo_text, flags=re.MULTILINE)
+if not cargo_version_match:
+    raise SystemExit("Cargo.toml: could not locate package version")
+cargo_version = cargo_version_match.group(1)
+server = json.loads((ROOT / "server.json").read_text(encoding="utf-8"))
+if server.get("version") != cargo_version:
+    raise SystemExit(
+        f"server.json: version={server.get('version')!r}, expected Cargo.toml version {cargo_version!r}"
+    )
+packages = server.get("packages")
+if not isinstance(packages, list) or not packages:
+    raise SystemExit("server.json: missing OCI package metadata")
+oci_identifiers = [
+    package.get("identifier")
+    for package in packages
+    if package.get("registryType") == "oci"
+]
+expected_oci = f"ghcr.io/perseus-computing-llc/perseus-vault:{cargo_version}"
+if oci_identifiers != [expected_oci]:
+    raise SystemExit(
+        f"server.json: OCI identifiers={oci_identifiers!r}, expected [{expected_oci!r}]"
+    )
+
 print(json.dumps({
     "registry_count": expected_count,
     "canonical_tools_list_count": expected_count,
