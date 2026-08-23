@@ -559,7 +559,8 @@ def assemble_assistant_recall_ledger(
     # tiny budget without creating a false claim of complete-turn retention.
     clipped = False
     if _ledger_estimate(context) > budget_tokens:
-        context = "\n".join(lines[:2])
+        fallback_header = "\n".join(lines[:2])
+        context = fallback_header if _ledger_estimate(fallback_header) <= budget_tokens else ""
         clipped = True
         skipped_turns += sum(len(by_id[sid][0]) for sid in unique_ranked)
         emitted_turns = []

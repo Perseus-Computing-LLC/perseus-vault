@@ -78,6 +78,21 @@ class AssistantRecallContinuityTests(unittest.TestCase):
         self.assertLess(context.index("turn=2"), context.index("turn=3"))
         self.assertLess(context.index("turn=3"), context.index("turn=4"))
 
+    def test_tiny_budget_never_exceeds_the_declared_bound(self):
+        context, _selected, telemetry = assemble_assistant_recall_ledger(
+            "q",
+            ["s1"],
+            [[
+                {"role": "user", "content": "a long user turn"},
+                {"role": "assistant", "content": "a long assistant turn"},
+            ]],
+            [None],
+            ["s1"],
+            budget_tokens=1,
+        )
+        self.assertLessEqual((len(context) + 3) // 4, 1)
+        self.assertLessEqual(telemetry["estimated_tokens"], 1)
+
     def test_qa_wires_assistant_recall_as_an_explicit_opt_in_arm(self):
         import importlib.util
 
