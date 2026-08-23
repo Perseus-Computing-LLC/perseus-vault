@@ -83,6 +83,16 @@ class RankedSnippetAssemblyTests(unittest.TestCase):
         self.assertEqual(len(selected), len(set(selected)))
         self.assertTrue(context)
 
+    def test_rendered_context_including_headers_and_guidance_respects_budget(self):
+        context, _selected, _telemetry = assemble_ranked_snippets(
+            self.inst,
+            ["s1", "s2", "s3"],
+            budget_tokens=100,
+            max_windows_per_session=2,
+            guidance="evidence-structured",
+        )
+        self.assertLessEqual((len(context) + 3) // 4, 100)
+
     def test_unknown_and_duplicate_ranked_ids_are_ignored(self):
         _context, selected, telemetry = assemble_ranked_snippets(
             self.inst, ["missing", "s2", "s2", "s1"], budget_tokens=1000

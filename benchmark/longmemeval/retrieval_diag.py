@@ -46,6 +46,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
 from run import PerseusVaultServer, session_text, find_binary  # noqa: E402
+from benchmark.admission_fixture import AGENT, WORKSPACE, admitted_remember  # noqa: E402
 from benchmark.package.common.replay import (
     build_envelope as build_replay_envelope,
     build_snapshot as build_replay_snapshot,
@@ -167,18 +168,29 @@ def gold_ranks(inst, srv, qid, k, ku_shared=False, *, split="s", corpus_sha256=N
         if sid in shared:
             continue  # fact versions ingest below, ascending by date
         turns, d = by_id[sid]
-        srv.call("perseus_vault_remember", {"category": qid, "key": sid,
-                                    "body_json": json.dumps({"note": session_note(d, turns)}),
-                                    "type": "fact"})
+        admitted_remember(
+            srv,
+            qid,
+            sid,
+            json.dumps({"note": session_note(d, turns)}),
+            workspace=WORKSPACE,
+            agent=AGENT,
+        )
     for g in dated_gold if shared else []:
         turns, d = by_id[g]
-        srv.call("perseus_vault_remember", {"category": qid, "key": SHARED_FACT_KEY,
-                                    "body_json": json.dumps({"note": session_note(d, turns)}),
-                                    "type": "fact", "valid_from_unix_ms": to_ms(d)})
+        admitted_remember(
+            srv,
+            qid,
+            SHARED_FACT_KEY,
+            json.dumps({"note": session_note(d, turns)}),
+            workspace=WORKSPACE,
+            agent=AGENT,
+            valid_from_unix_ms=to_ms(d),
+        )
     srv.call("perseus_vault_embed", {"batch_category": qid, "batch_limit": 1000})
     r = srv.call("perseus_vault_recall", {"query": inst["question"], "mode": "hybrid",
                                   "category": qid, "limit": k, "trust_weight": 0,
-                                  "min_decay": 0})
+                                  "min_decay": 0, "skip_side_effects": True})
     items = r.get("items", []) if isinstance(r, dict) else []
     ranked_ids = [it.get("key") for it in items]
     pos = {sid: i + 1 for i, sid in enumerate(ranked_ids)}
@@ -313,7 +325,10 @@ def main():
     ap.add_argument("--min-coverage-at", type=parse_floor, default=None, metavar="K:FRAC",
                     help="Regression gate: exit non-zero if coverage@K < FRAC (e.g. 20:0.95)")
     args = ap.parse_args()
-
+    # LongMemEval contains adversarial-looking text. The benchmark fixture
+    # supplies the hash-bound source admission; disable only content lint so
+    # those legitimate rows can reach the retrieval measurement.
+    os.environ["PERSEUS_VAULT_DISABLE_ADMISSION_LINT"] = "1"
     data_path = Path(args.data) if args.data else HERE / f"longmemeval_{args.split}_cleaned.json"
     if not data_path.exists():
         sys.exit(f"error: dataset not found: {data_path}")

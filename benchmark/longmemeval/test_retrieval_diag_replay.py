@@ -1,11 +1,59 @@
+import inspect
 import json
 import unittest
 
-from benchmark.longmemeval.retrieval_diag import _make_replay_artifact, _make_sufficiency_report
+from benchmark.longmemeval.retrieval_diag import _make_replay_artifact, _make_sufficiency_report, gold_ranks, main
 from benchmark.package.common.replay import replay_envelope
 
 
 class LongMemEvalReplayTests(unittest.TestCase):
+    def test_retrieval_diagnostic_disables_recall_side_effects(self):
+        source = inspect.getsource(gold_ranks)
+        self.assertIn('"skip_side_effects": True', source)
+
+    def test_retrieval_diagnostic_disables_fixture_admission_lint(self):
+        source = inspect.getsource(main)
+        self.assertIn("PERSEUS_VAULT_DISABLE_ADMISSION_LINT", source)
+
+    def test_retrieval_diagnostic_uses_admitted_write_fixture(self):
+        class RecordingServer:
+            def __init__(self):
+                self.calls = []
+
+            def call(self, name, args):
+                self.calls.append((name, args))
+                if name == "perseus_vault_journal":
+                    return {"id": "source-event"}
+                if name == "perseus_vault_remember":
+                    return {"serveable": True, "proposed": False}
+                if name == "perseus_vault_embed":
+                    return {"attempted": 1, "embedded": 1, "failed": 0, "errors": 0}
+                if name == "perseus_vault_recall":
+                    return {"items": [{"key": "s1", "body_json": {"note": "fixture"}, "score": 1.0}]}
+                raise AssertionError(name)
+
+        server = RecordingServer()
+        gold_ranks(
+            {
+                "question": "Which fact?",
+                "haystack_session_ids": ["s1"],
+                "haystack_sessions": [[{"role": "user", "content": "fact"}]],
+                "haystack_dates": ["2023/04/20 (Thu) 00:00"],
+                "answer_session_ids": ["s1"],
+            },
+            server,
+            "q1",
+            1,
+            corpus_sha256="a" * 64,
+            config_sha256="b" * 64,
+            code_sha256="c" * 64,
+        )
+        remember = next(args for name, args in server.calls if name == "perseus_vault_remember")
+        self.assertIn("admission", remember)
+        self.assertEqual(remember["workspace_hash"], "perseus-benchmark")
+        recall = next(args for name, args in server.calls if name == "perseus_vault_recall")
+        self.assertTrue(recall["skip_side_effects"])
+
     def test_sufficiency_projection_is_composed_hash_only(self):
         report = _make_sufficiency_report(
             [

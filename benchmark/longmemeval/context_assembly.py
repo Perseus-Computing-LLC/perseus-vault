@@ -431,7 +431,7 @@ def assemble_ranked_snippets(
         guidance_text = _PREFERENCE_GUIDANCE
     else:
         guidance_text = ""
-    guidance_cost = max(1, len(guidance_text) // 4) if guidance_text else 0
+    guidance_cost = _ledger_estimate(guidance_text + "\n\n") if guidance_text else 0
     selection_budget = max(0, budget_tokens - guidance_cost)
 
     session_ids = list(inst.get("haystack_session_ids", []) or [])
@@ -576,35 +576,77 @@ def assemble_ranked_snippets(
             evidence_appended += 1
             evidence_represented += 1
 
-    blocks: list[str] = []
+    rendered_blocks: list[tuple[dict[str, Any] | None, str]] = []
+    for candidate in selected:
+        sid = str(candidate["sid"])
+        rendered_blocks.append(
+            (
+                candidate,
+                f"{_date_header(sid, candidate['date'], int(candidate['start']), int(candidate['end']))}\n"
+                f"{candidate['body']}",
+            )
+        )
+
+    if evidence_blocks:
+        rendered_blocks.append(
+            (None, evidence_header + "\n" + "\n\n".join(evidence_blocks))
+        )
+
+    # The selection loop above prices source bodies, but the rendered output also
+    # contains headers, separators, guidance, and optional evidence labels. Fit
+    # the final representation itself so the contract applies to what reaches
+    # the answerer, not only to an internal body-cost estimate.
+    guidance_prefix = f"{guidance_text}\n\n" if guidance_text else ""
+    guidance_clipped = False
+    if _ledger_estimate(guidance_prefix) > budget_tokens:
+        guidance_prefix = guidance_prefix[: budget_tokens * 4]
+        guidance_clipped = True
+
+    fitted_blocks: list[tuple[dict[str, Any] | None, str]] = []
+    dropped_rendered_blocks = 0
+    for candidate, block in rendered_blocks:
+        body = "\n\n".join(item[1] for item in fitted_blocks + [(candidate, block)])
+        if _ledger_estimate(guidance_prefix + body) <= budget_tokens:
+            fitted_blocks.append((candidate, block))
+        else:
+            dropped_rendered_blocks += 1
+
+    context_body = "\n\n".join(item[1] for item in fitted_blocks)
+    if not context_body:
+        fallback = "(no prior conversation history is available)"
+        remaining_chars = max(0, budget_tokens * 4 - len(guidance_prefix))
+        context_body = fallback[:remaining_chars]
+    context = guidance_prefix + context_body
+
     selected_ids: list[str] = []
     selected_seen: set[str] = set()
-    for candidate in selected:
+    fitted_candidates = [item[0] for item in fitted_blocks if item[0] is not None]
+    for candidate in fitted_candidates:
         sid = str(candidate["sid"])
         if sid not in selected_seen:
             selected_ids.append(sid)
             selected_seen.add(sid)
-        blocks.append(
-            f"{_date_header(sid, candidate['date'], int(candidate['start']), int(candidate['end']))}\n"
-            f"{candidate['body']}"
-        )
-
-    if evidence_blocks:
-        blocks.append(evidence_header + "\n" + "\n\n".join(evidence_blocks))
-    context_body = "\n\n".join(blocks) or "(no prior conversation history is available)"
-    context = f"{guidance_text}\n\n{context_body}" if guidance_text else context_body
+    evidence_block_fitted = any(item[0] is None for item in fitted_blocks)
+    evidence_represented = sum(
+        1 for item in structured_evidence
+        if item["sid"] in selected_seen
+    )
+    evidence_appended_final = evidence_appended if evidence_block_fitted else 0
+    skipped_final = skipped + dropped_rendered_blocks
+    clipped_final = clipped + int(guidance_clipped)
+    evidence_used = _ledger_estimate(context)
     telemetry = {
         "candidate_sessions": len(unique_ranked),
         "candidate_windows": len(candidates),
-        "selected_windows": len(selected),
+        "selected_windows": len(fitted_candidates),
         "selected_sessions": len(selected_ids),
         "evidence_windows": evidence_represented,
-        "evidence_appended": evidence_appended,
+        "evidence_appended": evidence_appended_final,
         "preference_evidence_windows": evidence_represented if preference_structured else 0,
-        "preference_evidence_appended": evidence_appended if preference_structured else 0,
-        "estimated_tokens": min(evidence_used + guidance_cost, budget_tokens),
-        "skipped_windows": skipped,
-        "clipped_windows": clipped,
+        "preference_evidence_appended": evidence_appended_final if preference_structured else 0,
+        "estimated_tokens": min(evidence_used, budget_tokens),
+        "skipped_windows": skipped_final,
+        "clipped_windows": clipped_final,
         "max_windows_per_session": max_windows_per_session,
         "budget_tokens": budget_tokens,
         "guidance_applied": guidance,
