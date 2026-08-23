@@ -212,7 +212,7 @@ session-end capture):
 
 - **Hermes Agent** ≥ 0.20.0 (native plugin support; `prefetch` injection,
   `on_turn_start`, `on_delegation`, `backup_paths` hooks)
-- **Perseus Vault MCP Server** ≥ 2.22.0 running at `host:port`
+- **Perseus Vault MCP Server** ≥ 2.23.1 running at `host:port`
 - **Python** 3.10+ (for installer)
 
 ## Plugin Files

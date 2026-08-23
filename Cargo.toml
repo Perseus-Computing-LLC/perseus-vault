@@ -1,6 +1,6 @@
 [package]
 name = "perseus-vault"
-version = "2.23.0"
+version = "2.23.1"
 edition = "2021"
 description = "Persistent, encrypted memory engine for AI agents — MCP JSON-RPC stdio server"
 repository = "https://github.com/Perseus-Computing-LLC/perseus-vault"

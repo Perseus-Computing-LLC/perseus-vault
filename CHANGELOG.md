@@ -6,6 +6,11 @@ All notable changes to Perseus Vault are documented here. This project adheres t
 ## [Unreleased]
 
 ### Fixed
+- **Release/public-contract reconciliation.** Corrective release `2.23.1`
+  aligns the Cargo package, lockfile, MCP manifest, OCI identifier, and
+  source-derived 169-tool registry. The release workflow now checks
+  `server.json` and the registry metadata before any tag publication, and
+  current documentation uses canonical `perseus_vault_*` tool names.
 - **Governed rejection propagation through maintenance.** Consolidation,
   dream, and cross-workspace promotion now exclude rejected source values
   before clustering/prompt assembly, and public derived reads follow source

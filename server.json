@@ -3,11 +3,11 @@
   "name": "io.github.Perseus-Computing-LLC/perseus-vault",
   "title": "Perseus Vault \u2014 persistent, encrypted memory for AI agents",
   "description": "Persistent, encrypted, deterministic memory for AI agents. Local-first, 169 canonical tools.",
-  "version": "2.23.0",
+  "version": "2.23.1",
   "packages": [
     {
       "registryType": "oci",
-      "identifier": "ghcr.io/perseus-computing-llc/perseus-vault:2.23.0",
+      "identifier": "ghcr.io/perseus-computing-llc/perseus-vault:2.23.1",
       "transport": {
         "type": "stdio"
       },

@@ -27,7 +27,10 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "manifest.json"
+      - "server.json"
+      - "glama.json"
       - "scripts/check-release-metadata.py"
+      - "scripts/registry_metadata_check.py"
 
 permissions:
   contents: write # upload assets onto the release for the pushed tag
@@ -40,6 +43,8 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Verify Cargo and MCP bundle versions agree
         run: python3 scripts/check-release-metadata.py
+      - name: Verify source-derived registry and OCI metadata
+        run: python3 scripts/registry_metadata_check.py
 
   # Create the GitHub Release object ONCE, up front (#483). On a tag push the
   # lite/full matrix legs each call taiki-e/upload-rust-binary-action, which
