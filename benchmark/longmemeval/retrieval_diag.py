@@ -163,7 +163,7 @@ def _make_replay_artifact(inst, qid, items, k, *, split, corpus_sha256, config_s
         request_sha256=replay_sha256_text(replay_stable_json({"question_id": qid, "question_sha256": replay_sha256_text(str(inst.get("question", "")))})),
         config_sha256=config_sha256,
         code_sha256=code_sha256,
-        context_policy="query-content-tiebreak-v1",
+        context_policy="query-content-fullpool-v1",
         context_policy_version="1",
         snapshot=snapshot,
         candidates=rows,
@@ -221,8 +221,9 @@ def gold_ranks(inst, srv, qid, k, ku_shared=False, *, split="s", corpus_sha256=N
             valid_from_unix_ms=to_ms(d),
         )
     srv.call("perseus_vault_embed", {"batch_category": qid, "batch_limit": 1000})
+    recall_limit = max(k, len(sids))
     r = srv.call("perseus_vault_recall", {"query": inst["question"], "mode": "hybrid",
-                                  "category": qid, "limit": k, "trust_weight": 0,
+                                  "category": qid, "limit": recall_limit, "trust_weight": 0,
                                   "min_decay": 0, "skip_side_effects": True})
     items = stable_ranked_items(
         r.get("items", []) if isinstance(r, dict) else [], inst["question"]

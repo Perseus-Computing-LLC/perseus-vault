@@ -48,6 +48,7 @@ class LongMemEvalReplayTests(unittest.TestCase):
         class OrderedServer:
             def __init__(self, items):
                 self.items = items
+                self.recall_args = None
 
             def call(self, name, args):
                 if name == "perseus_vault_journal":
@@ -57,6 +58,7 @@ class LongMemEvalReplayTests(unittest.TestCase):
                 if name == "perseus_vault_embed":
                     return {"attempted": 3, "embedded": 3, "failed": 0, "errors": 0}
                 if name == "perseus_vault_recall":
+                    self.recall_args = args
                     return {"items": self.items}
                 raise AssertionError(name)
 
@@ -69,8 +71,12 @@ class LongMemEvalReplayTests(unittest.TestCase):
         }
         items_a = [{"key": "s2", "score": 0.5}, {"key": "s1", "score": 0.5}, {"key": "s3", "score": 0.5}]
         items_b = list(reversed(items_a))
-        ranks_a = gold_ranks(inst, OrderedServer(items_a), "q1", 3)[0]
-        ranks_b = gold_ranks(inst, OrderedServer(items_b), "q1", 3)[0]
+        server_a = OrderedServer(items_a)
+        server_b = OrderedServer(items_b)
+        ranks_a = gold_ranks(inst, server_a, "q1", 2)[0]
+        ranks_b = gold_ranks(inst, server_b, "q1", 2)[0]
+        self.assertEqual(server_a.recall_args["limit"], 3)
+        self.assertEqual(server_b.recall_args["limit"], 3)
         self.assertEqual(ranks_a, {"s1": 1})
         self.assertEqual(ranks_b, ranks_a)
 

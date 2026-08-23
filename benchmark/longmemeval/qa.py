@@ -461,8 +461,9 @@ def build_context(
             )
         srv.call("perseus_vault_embed", {"batch_category": qid, "batch_limit": 1000})
         retrieval_k = assembly_k if context_assembly in {"ranked-snippets", "evidence-ledger"} else k
+        recall_limit = max(retrieval_k, len(inst.get("haystack_session_ids", []) or []))
         r = srv.call("perseus_vault_recall", {"query": inst["question"], "mode": "hybrid",
-                                      "category": qid, "limit": retrieval_k, "trust_weight": 0,
+                                      "category": qid, "limit": recall_limit, "trust_weight": 0,
                                       "min_decay": 0})
         items = stable_ranked_items(
             r.get("items", []) if isinstance(r, dict) else [], inst["question"]
