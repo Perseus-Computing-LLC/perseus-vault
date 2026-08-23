@@ -14,12 +14,12 @@ Zero runtime dependencies. Structured entity model with journal events and state
 
 ---
 
-## Status — 2026-06-27
+## Status — 2026-08-23
 
-- **Latest release:** `v2.2.1` (Local-First Semantic Memory + Docker/Alpine fix)
-- **`main`:** unreleased — local knowledge extraction (`perseus_vault_extract`, #234) + local multimodal ingestion (`perseus_vault_ingest_file`, #236, optional `--features multimodal`); MCP tools → 42
-- **MCP tools:** **40**, spanning entities, search/RAG, journal, state, graph, lifecycle, multi-agent/federation, and vault
-- **In one line:** everything originally planned from v0.1 through the v2.0 "Platform" milestone has shipped. This document is being corrected to reflect that, and the forward section is deliberately short and honest.
+- **Latest release:** `v2.23.1` (published 2026-08-23).
+- **`main`:** current post-release head includes the latest benchmark/retrieval remediation; the issue-backed forward backlog is listed below.
+- **MCP tools:** **169 canonical tools**, spanning entities, search/RAG, journal, state, graph, lifecycle, multi-agent/federation, governance, operations, and benchmark/diagnostic surfaces.
+- **In one line:** the original v0.1 through v2.0 platform plan has shipped; this document now tracks the open, issue-backed work without inventing delivery dates.
 
 > **Doc hygiene note:** prior revisions of this file listed shipped capabilities
 (peer federation, multi-agent scoping, gRPC, offline embeddings) as "future," and
@@ -53,10 +53,11 @@ federation is intentionally disabled; explicit export/import remains supported.
 - **Security & ops:** AES-256-GCM encryption at rest, web dashboard, Smithery/Glama/mcpservers.org listings
 
 ### v1.1 – v2.0 — Ecosystem, multi-agent, platform ✅ (2026-06)
-- **Ecosystem:** framework adapters for **LangGraph, CrewAI, AutoGen** (`integrations/`), an **Obsidian plugin**,
-  SSE/HTTP transport for non-stdio hosts, Docker image, and a one-line installer (`curl -sSf … | sh`, `v2.0.1`)
-- **Multi-agent & transfer boundary:** workspace scoping (`workspace_hash`), agent identity (`agent_id`),
-  per-entity `visibility`, and reviewed file-based export/import. Peer federation is
+- **Ecosystem:** framework adapters for **LangGraph, CrewAI, AutoGen** (`integrations/`), an
+  **Obsidian plugin**, SSE/HTTP transport for non-stdio hosts, Docker image, and a one-line
+  installer (`curl -sSf … | sh`, `v2.0.1`)
+- **Multi-agent & transfer boundary:** workspace scoping (`workspace_hash`), agent identity
+  (`agent_id`), per-entity `visibility`, and reviewed file-based export/import. Peer federation is
   intentionally disabled pending a governed transfer contract.
 - **Local/offline embeddings:** ONNX path via `ort` — hybrid search without an external embedding service
 - **Platform (`v2.0.0`):** gRPC transport alongside MCP, and a cryptographically-chained audit log
@@ -65,14 +66,15 @@ federation is intentionally disabled; explicit export/import remains supported.
 
 ### v2.1.0 — Performance & Reliability ✅ (2026-06-26)
 - **Trust-aware recall:** `perseus_vault_recall` ranks verified sources above unverified drafts
-  (uses `verified`/`source`/`certainty`; on by default at a low weight). Consistent with `perseus_vault_conflicts`.
+  (uses `verified`/`source`/`certainty`; on by default at a low weight). Consistent with
+  `perseus_vault_conflicts`.
 - **CLI:** top-level `--db` accepted when running the server directly (`perseus_vault --db <path>`),
   matching the documented MCP host config.
 - **Performance & reliability:** HTTP/SSE connection pool (concurrent reads under WAL),
   cached ONNX session/tokenizer, `dense_search` top-k hydration, recall-ranking index and
   batched side-effects; `bundled-embeddings` made to link on Windows MSVC.
 
-### Unreleased on `main` (`2.2.0`)
+### v2.2.0 — Bundled/offline semantic release ✅
 - **Offline embeddings bundled by default (#237/#238):** the quantized all-MiniLM-L6-v2 model
   is compiled into the binary and the embedding backend is on by default — dense/hybrid search
   works with zero config and zero network. Lean build via `--no-default-features`.
@@ -80,6 +82,11 @@ federation is intentionally disabled; explicit export/import remains supported.
   the hybrid RRF fusion step, default off, fully local.
 - **All-platform CI (#239):** the bundled default is built and tested (with real inference) on
   Linux, Windows MSVC, and macOS.
+
+### v2.23.1 — Current release line ✅
+- Release metadata and the source-derived canonical registry are aligned at **169 tools**;
+  current governance, provenance, benchmark-custody, and retrieval-remediation hardening is
+  documented in `CHANGELOG.md`.
 
 ---
 
@@ -109,19 +116,113 @@ The genuinely-unshipped pieces of the "Perseus Vault as infrastructure" goal:
 - **Governed transfer (future):** peer federation remains uncommitted until authority,
   rollback/custody, conflict, and erasure propagation are specified and implemented.
 
-## Next+1 — Memory quality, serving, and shared knowledge
+## Active roadmap — open issue set (snapshot 2026-08-23)
 
-**Theme:** prove memory quality, preserve provenance, and make durable knowledge serveable without turning Markdown into the source of truth.
+**Theme:** prove memory quality, preserve provenance, and make durable knowledge serveable without
+turning Markdown or a third-party benchmark into the source of truth. The order below is a
+dependency-aware execution recommendation, not a promise of dates. The linked issues remain the
+authoritative acceptance criteria.
 
-This phase turns Vault's memory model into an explicitly measured, operator-reviewable serving system. The emphasis is not "more memory features" in the abstract. The emphasis is discipline: benchmarked quality, explicit lifecycle transitions, governed sharing, and human-readable derived surfaces generated from the durable store.
+### Recommended starting point
 
-- **Benchmark rigor.** Add repeatable memory-quality gates modeled on long-horizon, adversarial, and shared-memory tasks. Publish scorecards for retrieval quality, contradiction handling, stale-memory demotion, and downstream task lift.
-- **Pre-compaction capture.** Make the capture-before-compaction/summary path explicit so important facts are persisted before any compression step can discard them.
-- **Promotion pipeline.** Formalize `episode -> observation -> convention/belief -> keystone` transitions with thresholds, provenance conservation, and journaled promotion/demotion.
-- **Shared-memory governance.** Complete visibility enforcement across all read surfaces, add retrieval profiles per agent/tier, and make cross-scope promotion explainable.
-- **Derived knowledge surfaces.** Generate human-readable, provenance-rich Markdown/wiki artifacts from durable memory as a derived surface for review, sharing, and synthesis, not as the authoritative store.
-- **Memory quality observability.** Surface contradiction rate, stale-hit rate, supersession lag, promotion counts, and served-tier explanations as first-class health signals.
-- **Interop bridges.** Support controlled Markdown import/export and external structured-index anchors where they improve reviewability or interoperability without replacing the structured store.
+Start with two bounded tracks:
+
+1. **Safety first:** [#1134](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1134)
+   is the P1 security/control-plane gap. It is sufficiently isolated to implement without waiting
+   for the retrieval work, and it prevents session splitting from bypassing task-level action
+   composition and budget state.
+2. **Evidence truth before experiments:** complete the no-spend publication/protocol fence of
+   [#1133](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1133) and
+   [#1138](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1138), then build the
+   attribution gate in [#1132](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1132).
+
+Do not start with a graph feature or a new paid benchmark run. The graph work has a wider storage,
+provenance, and serving surface, while the benchmark issues explicitly require provider-free gates
+and strict claim boundaries first. The documentation item can proceed as soon as the accepted
+report/manifest is publishable; it does not authorize another run.
+
+### Execution chunks
+
+Each chunk below is a small workstream, not one giant PR. Use one issue-shaped branch/PR per
+contract, and serialize only the parts that share files or a schema boundary.
+
+#### Chunk 0 — claim and benchmark guardrails (start here; no provider calls)
+
+- **[#1133 — refresh published LongMemEval claims](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1133):** publish the accepted frozen-default result only when its signed report and manifest are available; keep plain-prompt, official-CoT, historical mean, and the new single-run baseline as distinct rows.
+- **[#1138 — cross-reader/cross-judge sensitivity matrix](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1138):** define the reader, judge, prompt-lane, depth, budget, denominator, and custody boundary before interpreting any model or cost delta.
+- **[#1132 — category-specific answer-facing attribution](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1132):** build the deterministic per-question/category gate after the protocol schema is stable; keep it opt-in and separate from the frozen default.
+
+**Exit condition:** public claims are hash-bound and correctly labeled, and provider-free reports
+can distinguish missing evidence, selection/assembly failure, synthesis failure, temporal/version
+failure, and provenance failure. No paid run is implied.
+
+#### Chunk 1 — task-level AAR continuity (parallel-safe, but P1)
+
+- **[#1134 — preserve task-level action lineage across sessions](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1134):** add the opt-in hash-bound lineage/continuation state, fail-closed transitions, bounded receipts, and the Ledger composition fixture.
+
+**Exit condition:** continuation, reset/new authorization, stale/revoked state, scope/policy
+mismatch, replay, and concurrent-head behavior are deterministic; raw prompts, memory bodies,
+arguments, credentials, and sensitive outputs never enter the lineage record. This can run beside
+Chunk 0 because it should not share the benchmark files.
+
+#### Chunk 2 — provider/source and graph substrate
+
+Implement these in order because declared topology needs stable source identity and revision
+semantics:
+
+- **[#1141 — provider-native source identity and event lifecycle](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1141):** source/event envelopes, update and reply lineage, visibility/scope, revision digests, and governed deletion/tombstones.
+- **[#1142 — deterministic declared-edge ingestion and support attestation](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1142):** source-keyed manifests, stable entity/relation IDs, declared-versus-extracted-versus-inferred origin, support/attestation states, idempotent replacement, and fail-closed conflicts.
+
+**Exit condition:** source and edge references resolve to exact revisions/digests and scope;
+replay, collision, stale, deletion, and weak-support behavior is tested before any graph utility
+claim is made.
+
+#### Chunk 3 — answer-facing evidence and inspection
+
+Keep the evidence representation ahead of its explanation surface:
+
+- **[#1135 — governed derived and verbatim evidence lanes](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1135):** join derived facts to source spans without double-counting or promoting unverified verbatim evidence.
+- **[#1140 — bounded context-selection decisions](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1140):** expose opt-in candidate dispositions, reason codes, budgets, and replay fingerprints without changing default response bytes or leaking raw content.
+
+The recommended order is #1135 then #1140 so the inspector can describe lane, source-group,
+evidence, scope, and conflict state consistently. If implementation proves the file boundaries
+are disjoint, the work may be developed concurrently but should remain separate PRs.
+
+#### Chunk 4 — controlled diagnostic interventions
+
+- **[#1136 — receipt-conditioned bucket intervention](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1136):** follow #1132 and the existing evidence-ledger/replay contracts; seal the receipt before intervention, block re-entry through alternate lanes/fallbacks, and compare receipt, random, and matched-size controls.
+- **[#1143 — matched graph-context ablation](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1143):** follow #1142, #1140, and #1138; compare graph-on/off under the same retrieval mode and context budget, and report declared-edge support, path attribution, evidence coverage, and cost separately.
+
+**Exit condition:** all interventions are deterministic, provider-free for the first gate, and
+cannot be presented as model-internal causality or as a third-party benchmark claim.
+
+#### Chunk 5 — parked or separately authorized measurements
+
+These remain visible on the roadmap but must not be pulled into the implementation wave:
+
+- **[#1105 — reproducible edge resource envelopes](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1105):** capture the contract now; the issue explicitly parks implementation planning until the Amy/C3BM partner discussion on or after 2026-08-31.
+- **[#1061 — RECON triathlon run](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1061):** the bounded recheck is not a positive efficacy verdict; a full run needs a frozen revision, resolved protocol discrepancies, cost/token guards, and fresh explicit authorization.
+- **[#1021 — LongMemEval three-run refresh](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1021):** one accepted 81.4% frozen-default run is already recorded, but Runs 2/3 were not started. Keep the issue open for that residual only; do not blend it with plain-prompt or experimental results and do not infer spend authorization.
+
+### Tool-call-sized operating plan
+
+- **One preflight per chunk:** read the live `origin/main` SHA, target issue bodies/states,
+  dependency states, and the exact files likely to change; save a compact progress row outside the
+  repository rather than repeatedly re-fetching full issue pages.
+- **One contract per PR:** run the focused gate and the repository-declared full gate once on the
+  exact tree, then publish/verify that PR at its exact head. Do not combine unrelated benchmark,
+  security, and storage changes to reduce round trips.
+- **Serialize shared surfaces:** use #1138 → #1132 → #1136 for the shared benchmark harness and
+  #1141 → #1142 for source/graph schema work. Rebase each dependent branch onto the verified live
+  `main` before review; old CI or review evidence is stale after a base advance.
+- **Parallelize only disjoint work:** #1133 can run as a docs-only slice beside #1134; later
+  chunks may proceed concurrently only when changed-file sets and schema boundaries are disjoint.
+- **Keep paid and cross-product work separate:** a green provider-free gate is evidence for
+  implementation, not authorization to call a model or publish a new score. Every later canary/run
+  gets its own custody, budget, and claim-boundary check.
+- **Close out independently:** after merge, verify the exact default-branch SHA, artifact/content
+  needles, PR metadata, issue state, and temporary-branch cleanup. Do not infer issue closure or
+  publication from a successful merge response alone.
 
 ## Later — Gated & cross-product
 
