@@ -464,7 +464,9 @@ def build_context(
         r = srv.call("perseus_vault_recall", {"query": inst["question"], "mode": "hybrid",
                                       "category": qid, "limit": retrieval_k, "trust_weight": 0,
                                       "min_decay": 0})
-        items = stable_ranked_items(r.get("items", []) if isinstance(r, dict) else [])
+        items = stable_ranked_items(
+            r.get("items", []) if isinstance(r, dict) else [], inst["question"]
+        )
         chosen = [str(it.get("key") or it.get("id")) for it in items[:retrieval_k]
                   if it.get("key") or it.get("id")]
         if shared:

@@ -27,7 +27,14 @@ class LongMemEvalReplayTests(unittest.TestCase):
         self.assertEqual([item["key"] for item in ordered], ["session-c", "session-a", "session-b"])
         self.assertEqual(stable_ranked_items(list(reversed(items))), ordered)
 
-    def test_equal_provider_scores_are_normalized_before_gold_rank_projection(self):
+    def test_equal_provider_scores_use_content_relevance_before_source_key(self):
+        items = [
+            {"key": "session-a", "score": 0.5, "body_json": {"note": "unrelated travel plans"}},
+            {"key": "session-z", "score": 0.5, "body_json": {"note": "blue bicycle decision"}},
+        ]
+        ordered = stable_ranked_items(items, "What did I decide about the blue bicycle?")
+        self.assertEqual([item["key"] for item in ordered], ["session-z", "session-a"])
+
         class OrderedServer:
             def __init__(self, items):
                 self.items = items

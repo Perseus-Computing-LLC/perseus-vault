@@ -192,7 +192,9 @@ def gold_ranks(inst, srv, qid, k, ku_shared=False, *, split="s", corpus_sha256=N
     r = srv.call("perseus_vault_recall", {"query": inst["question"], "mode": "hybrid",
                                   "category": qid, "limit": k, "trust_weight": 0,
                                   "min_decay": 0, "skip_side_effects": True})
-    items = stable_ranked_items(r.get("items", []) if isinstance(r, dict) else [])
+    items = stable_ranked_items(
+        r.get("items", []) if isinstance(r, dict) else [], inst["question"]
+    )
     ranked_ids = [it.get("key") for it in items]
     pos = {sid: i + 1 for i, sid in enumerate(ranked_ids)}
 

@@ -8,6 +8,7 @@ answer_session_ids or the gold answer.
 """
 from __future__ import annotations
 
+import json
 import re
 from typing import Any
 
@@ -186,9 +187,10 @@ def _ledger_estimate(text: str) -> int:
     return (len(text) + 3) // 4
 
 
-def stable_ranked_items(items: object) -> list[dict[str, Any]]:
+def stable_ranked_items(items: object, query: str = "") -> list[dict[str, Any]]:
     """Normalize provider score ties without depending on storage order."""
     candidates = [item for item in (items if isinstance(items, list) else []) if isinstance(item, dict)]
+    query_terms = _tokens(query)
 
     def score(item: dict[str, Any]) -> float:
         for field in ("score", "decay_score"):
@@ -200,7 +202,20 @@ def stable_ranked_items(items: object) -> list[dict[str, Any]]:
     def source_key(item: dict[str, Any]) -> str:
         return str(item.get("key") or item.get("id") or "")
 
-    return sorted(candidates, key=lambda item: (-score(item), source_key(item)))
+    def content_relevance(item: dict[str, Any]) -> int:
+        for field in ("body_json", "body", "content", "note"):
+            value = item.get(field)
+            if value is None:
+                continue
+            if isinstance(value, (dict, list)):
+                value = json.dumps(value, sort_keys=True, ensure_ascii=False)
+            return len(_tokens(str(value)) & query_terms)
+        return 0
+
+    return sorted(
+        candidates,
+        key=lambda item: (-score(item), -content_relevance(item), source_key(item)),
+    )
 
 
 def _ledger_date_key(value: object) -> tuple[int, ...]:
