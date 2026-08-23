@@ -186,6 +186,23 @@ def _ledger_estimate(text: str) -> int:
     return (len(text) + 3) // 4
 
 
+def stable_ranked_items(items: object) -> list[dict[str, Any]]:
+    """Normalize provider score ties without depending on storage order."""
+    candidates = [item for item in (items if isinstance(items, list) else []) if isinstance(item, dict)]
+
+    def score(item: dict[str, Any]) -> float:
+        for field in ("score", "decay_score"):
+            value = item.get(field)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                return float(value)
+        return float("-inf")
+
+    def source_key(item: dict[str, Any]) -> str:
+        return str(item.get("key") or item.get("id") or "")
+
+    return sorted(candidates, key=lambda item: (-score(item), source_key(item)))
+
+
 def _ledger_date_key(value: object) -> tuple[int, ...]:
     """Return a sortable key without depending on locale or a date library."""
     match = re.search(

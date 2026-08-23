@@ -2,7 +2,13 @@ import inspect
 import json
 import unittest
 
-from benchmark.longmemeval.retrieval_diag import _make_replay_artifact, _make_sufficiency_report, gold_ranks, main
+from benchmark.longmemeval.retrieval_diag import (
+    _make_replay_artifact,
+    _make_sufficiency_report,
+    gold_ranks,
+    main,
+    stable_ranked_items,
+)
 from benchmark.package.common.replay import replay_envelope
 
 
@@ -10,6 +16,46 @@ class LongMemEvalReplayTests(unittest.TestCase):
     def test_retrieval_diagnostic_disables_recall_side_effects(self):
         source = inspect.getsource(gold_ranks)
         self.assertIn('"skip_side_effects": True', source)
+
+    def test_equal_provider_scores_use_a_stable_source_key_tiebreak(self):
+        items = [
+            {"key": "session-b", "score": 0.5},
+            {"key": "session-c", "score": 0.9},
+            {"key": "session-a", "score": 0.5},
+        ]
+        ordered = stable_ranked_items(items)
+        self.assertEqual([item["key"] for item in ordered], ["session-c", "session-a", "session-b"])
+        self.assertEqual(stable_ranked_items(list(reversed(items))), ordered)
+
+    def test_equal_provider_scores_are_normalized_before_gold_rank_projection(self):
+        class OrderedServer:
+            def __init__(self, items):
+                self.items = items
+
+            def call(self, name, args):
+                if name == "perseus_vault_journal":
+                    return {"id": "source-event"}
+                if name == "perseus_vault_remember":
+                    return {"serveable": True, "proposed": False}
+                if name == "perseus_vault_embed":
+                    return {"attempted": 3, "embedded": 3, "failed": 0, "errors": 0}
+                if name == "perseus_vault_recall":
+                    return {"items": self.items}
+                raise AssertionError(name)
+
+        inst = {
+            "question": "Which fact?",
+            "haystack_session_ids": ["s1", "s2", "s3"],
+            "haystack_sessions": [[{"role": "user", "content": "fact"}]] * 3,
+            "haystack_dates": ["2023/04/20 (Thu) 00:00"] * 3,
+            "answer_session_ids": ["s1"],
+        }
+        items_a = [{"key": "s2", "score": 0.5}, {"key": "s1", "score": 0.5}, {"key": "s3", "score": 0.5}]
+        items_b = list(reversed(items_a))
+        ranks_a = gold_ranks(inst, OrderedServer(items_a), "q1", 3)[0]
+        ranks_b = gold_ranks(inst, OrderedServer(items_b), "q1", 3)[0]
+        self.assertEqual(ranks_a, {"s1": 1})
+        self.assertEqual(ranks_b, ranks_a)
 
     def test_retrieval_diagnostic_disables_fixture_admission_lint(self):
         source = inspect.getsource(main)

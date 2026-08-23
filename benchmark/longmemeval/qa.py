@@ -83,6 +83,7 @@ from context_assembly import (  # noqa: E402
     assemble_assistant_recall_ledger,
     assemble_evidence_ledger,
     assemble_ranked_snippets,
+    stable_ranked_items,
 )
 from run import (  # noqa: E402
     AGENT,
@@ -463,8 +464,9 @@ def build_context(
         r = srv.call("perseus_vault_recall", {"query": inst["question"], "mode": "hybrid",
                                       "category": qid, "limit": retrieval_k, "trust_weight": 0,
                                       "min_decay": 0})
-        items = r.get("items", []) if isinstance(r, dict) else []
-        chosen = [it.get("key") for it in items][:retrieval_k]
+        items = stable_ranked_items(r.get("items", []) if isinstance(r, dict) else [])
+        chosen = [str(it.get("key") or it.get("id")) for it in items[:retrieval_k]
+                  if it.get("key") or it.get("id")]
         if shared:
             # The live shared-key row IS the latest gold session; surface it in
             # the context under that session's real id/date.

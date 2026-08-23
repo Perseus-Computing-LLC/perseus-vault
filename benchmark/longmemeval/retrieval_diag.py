@@ -46,6 +46,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
 from run import PerseusVaultServer, session_text, find_binary  # noqa: E402
+from context_assembly import stable_ranked_items  # noqa: E402
 from benchmark.admission_fixture import AGENT, WORKSPACE, admitted_remember  # noqa: E402
 from benchmark.package.common.replay import (
     build_envelope as build_replay_envelope,
@@ -191,7 +192,7 @@ def gold_ranks(inst, srv, qid, k, ku_shared=False, *, split="s", corpus_sha256=N
     r = srv.call("perseus_vault_recall", {"query": inst["question"], "mode": "hybrid",
                                   "category": qid, "limit": k, "trust_weight": 0,
                                   "min_decay": 0, "skip_side_effects": True})
-    items = r.get("items", []) if isinstance(r, dict) else []
+    items = stable_ranked_items(r.get("items", []) if isinstance(r, dict) else [])
     ranked_ids = [it.get("key") for it in items]
     pos = {sid: i + 1 for i, sid in enumerate(ranked_ids)}
 
