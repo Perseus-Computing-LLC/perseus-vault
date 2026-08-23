@@ -505,6 +505,12 @@ def build_context(
     return ctx, [s for s in chosen if s in by_id]
 
 
+def _report_budget_tokens(args):
+    if args.context_assembly in ("evidence-ledger", "assistant-recall"):
+        return args.ledger_budget
+    return args.context_budget
+
+
 def price_for(model):
     return PRICING.get(model, FALLBACK_PRICE)
 
@@ -1012,9 +1018,7 @@ def main():
         "max_retries": args.max_retries,
         "retrieval": {"mode": "hybrid", "k": args.k, "embedding": "bundled-onnx"},
         "context_assembly": {"mode": args.context_assembly, "assembly_k": args.assembly_k,
-                             "budget_tokens": (args.ledger_budget
-                                               if args.context_assembly == "evidence-ledger"
-                                               else args.context_budget),
+                             "budget_tokens": _report_budget_tokens(args),
                              "context_budget": args.context_budget,
                              "ledger_budget": args.ledger_budget,
                              "windows_per_session": args.assembly_windows,

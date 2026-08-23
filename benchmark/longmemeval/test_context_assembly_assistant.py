@@ -1,10 +1,22 @@
 """RED tests for the opt-in assistant-recall continuity projection."""
+import importlib.util
 import pathlib
 import sys
+import types
 import unittest
 
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
+
+
+def load_qa():
+    spec = importlib.util.spec_from_file_location("longmemeval_qa_assistant_report", HERE / "qa.py")
+    if spec is None or spec.loader is None:
+        raise RuntimeError("could not load qa.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
 
 from context_assembly import assemble_assistant_recall_ledger  # noqa: E402
 
@@ -92,6 +104,15 @@ class AssistantRecallContinuityTests(unittest.TestCase):
         )
         self.assertLessEqual((len(context) + 3) // 4, 1)
         self.assertLessEqual(telemetry["estimated_tokens"], 1)
+
+    def test_report_budget_tracks_assistant_recall_ledger_budget(self):
+        qa = load_qa()
+        args = types.SimpleNamespace(
+            context_assembly="assistant-recall",
+            context_budget=32768,
+            ledger_budget=12000,
+        )
+        self.assertEqual(qa._report_budget_tokens(args), 12000)
 
     def test_qa_wires_assistant_recall_as_an_explicit_opt_in_arm(self):
         import importlib.util
