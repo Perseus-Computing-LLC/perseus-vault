@@ -79,6 +79,38 @@ def session_note(date, turns):
     return prefix + session_text(turns)
 
 
+def _canonical_replay_body(inst, key, item):
+    """Use frozen fixture content, excluding provider execution metadata."""
+    sids = list(inst.get("haystack_session_ids", []) or [])
+    sessions = list(inst.get("haystack_sessions", []) or [])
+    dates = list(inst.get("haystack_dates", []) or [])
+    by_id = {sid: (turns, dates[index] if index < len(dates) else None)
+             for index, (sid, turns) in enumerate(zip(sids, sessions))}
+    if key in by_id:
+        turns, date = by_id[key]
+        return {"note": session_note(date, turns)}
+    if key == SHARED_FACT_KEY:
+        dated = [(date, turns) for turns, date in zip(sessions, dates) if date]
+        if dated:
+            date, turns = sorted(dated, key=lambda pair: to_ms(pair[0]))[-1]
+            return {"note": session_note(date, turns)}
+
+    body = item.get("body_json", item.get("body", item.get("content", key)))
+    volatile = {
+        "created_at_unix_ms", "updated_at_unix_ms", "last_accessed_unix_ms",
+        "retrieval_count", "follow_count", "follow_rate", "miss_count",
+    }
+
+    def strip(value):
+        if isinstance(value, dict):
+            return {name: strip(child) for name, child in value.items() if name not in volatile}
+        if isinstance(value, list):
+            return [strip(child) for child in value]
+        return value
+
+    return strip(body)
+
+
 def _replay_rows(inst, items):
     """Normalize a provider response into hash-only replay candidate rows."""
     sids = list(inst.get("haystack_session_ids", []) or [])
@@ -94,7 +126,7 @@ def _replay_rows(inst, items):
             continue
         key = str(item.get("key") or item.get("id") or f"wire-{index + 1}")
         identity = replay_sha256_text(key)
-        body = item.get("body_json", item.get("body", item.get("content", key)))
+        body = _canonical_replay_body(inst, key, item)
         content = replay_stable_json({"candidate": key, "body": body})
         row = {
             "candidate_id": f"candidate-{identity}",
@@ -131,7 +163,7 @@ def _make_replay_artifact(inst, qid, items, k, *, split, corpus_sha256, config_s
         request_sha256=replay_sha256_text(replay_stable_json({"question_id": qid, "question_sha256": replay_sha256_text(str(inst.get("question", "")))})),
         config_sha256=config_sha256,
         code_sha256=code_sha256,
-        context_policy="wire-order-v1",
+        context_policy="query-content-tiebreak-v1",
         context_policy_version="1",
         snapshot=snapshot,
         candidates=rows,

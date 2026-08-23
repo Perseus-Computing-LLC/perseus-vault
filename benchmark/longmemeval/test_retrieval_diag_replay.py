@@ -5,6 +5,7 @@ import unittest
 from benchmark.longmemeval.retrieval_diag import (
     _make_replay_artifact,
     _make_sufficiency_report,
+    _replay_rows,
     gold_ranks,
     main,
     stable_ranked_items,
@@ -27,7 +28,16 @@ class LongMemEvalReplayTests(unittest.TestCase):
         self.assertEqual([item["key"] for item in ordered], ["session-c", "session-a", "session-b"])
         self.assertEqual(stable_ranked_items(list(reversed(items))), ordered)
 
-    def test_equal_provider_scores_use_content_relevance_before_source_key(self):
+    def test_replay_content_uses_fixture_source_not_volatile_provider_metadata(self):
+        inst = {
+            "haystack_session_ids": ["s1"],
+            "haystack_sessions": [[{"role": "user", "content": "stable fact"}]],
+            "haystack_dates": ["2023/04/20 (Thu) 00:00"],
+        }
+        item_a = {"key": "s1", "body_json": {"note": "stable fact", "created_at_unix_ms": 1}}
+        item_b = {"key": "s1", "body_json": {"note": "stable fact", "created_at_unix_ms": 2}}
+        self.assertEqual(_replay_rows(inst, [item_a]), _replay_rows(inst, [item_b]))
+
         items = [
             {"key": "session-a", "score": 0.5, "body_json": {"note": "unrelated travel plans"}},
             {"key": "session-z", "score": 0.5, "body_json": {"note": "blue bicycle decision"}},
