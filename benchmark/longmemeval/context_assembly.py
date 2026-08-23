@@ -393,6 +393,163 @@ def assemble_evidence_ledger(
     }
     return context, unique_ranked, telemetry
 
+
+def _assistant_turn_line(session_id: str, date: object, turn_index: int, turn: object) -> str:
+    """Render one complete source turn with stable role and provenance."""
+    if isinstance(turn, dict):
+        role = str(turn.get("role", "")).lower() or "assistant"
+        content = str(turn.get("content", ""))
+    else:
+        role = "assistant"
+        content = str(turn)
+    label = "user" if role == "user" else "assistant-context"
+    return (
+        f"- [{label}] session={_ledger_safe_label(session_id, 'unknown')} "
+        f"date={_ledger_safe_label(date, 'unknown')} turn={turn_index} :: {content}"
+    )
+
+
+def _assistant_pair_score(turns: list[Any], start: int, query_terms: set[str]) -> float:
+    """Score a complete user turn plus its following assistant turn."""
+    pair = turns[start:start + 2]
+    text = " ".join(
+        str(turn.get("content", "")) if isinstance(turn, dict) else str(turn)
+        for turn in pair
+    )
+    roles = [
+        str(turn.get("role", "")).lower() if isinstance(turn, dict) else "assistant"
+        for turn in pair
+    ]
+    return float(
+        len(_tokens(text) & query_terms) * 8.0
+        + (5.0 if roles and roles[0] == "user" else 0.0)
+        + (2.0 if len(roles) > 1 and roles[1] != "user" else 0.0)
+    )
+
+
+def assemble_assistant_recall_ledger(
+    question: str,
+    session_ids: list[Any],
+    sessions: list[list[dict[str, Any]]],
+    dates: list[Any],
+    ranked_ids: list[Any],
+    *,
+    budget_tokens: int = 12_000,
+) -> tuple[str, list[str], dict[str, Any]]:
+    """Build a bounded complete-turn projection for assistant-authored recall.
+
+    Unlike the sentence ledger, this arm never emits a sentence fragment. It
+    first packs complete ranked sessions; if a whole session cannot fit, it
+    packs complete user/assistant turn pairs selected by question overlap and
+    renders those pairs back in source order. The selector is gold-blind.
+    """
+    if budget_tokens <= 0:
+        raise ValueError("budget_tokens must be positive")
+    if budget_tokens > _LEDGER_HARD_MAX_TOKENS:
+        raise ValueError(f"budget_tokens must be <= {_LEDGER_HARD_MAX_TOKENS}")
+
+    source_dates = list(dates or [])
+    if len(source_dates) < len(session_ids):
+        source_dates.extend([None] * (len(session_ids) - len(source_dates)))
+    by_id = {
+        sid: (turns if isinstance(turns, list) else [], source_dates[index])
+        for index, (sid, turns) in enumerate(zip(session_ids, sessions))
+    }
+    unique_ranked: list[str] = []
+    seen: set[str] = set()
+    for sid in ranked_ids:
+        if sid in by_id and sid not in seen:
+            unique_ranked.append(sid)
+            seen.add(sid)
+
+    lines = [
+        f"[Assistant recall ledger | complete-turn | budget={budget_tokens} tokens]",
+        "[Sources]",
+    ]
+    for rank, sid in enumerate(unique_ranked, 1):
+        _turns, date = by_id[sid]
+        lines.append(
+            f"[rank={rank} session={_ledger_safe_label(sid, 'unknown')} "
+            f"date={_ledger_safe_label(date, 'unknown')} ]"
+        )
+    lines.append("[Turns]")
+    base = "\n".join(lines)
+    query_terms = _tokens(question)
+    emitted_turns: list[tuple[int, int, str]] = []
+    skipped_turns = 0
+    full_sessions = 0
+    fallback_pairs = 0
+
+    for rank, sid in enumerate(unique_ranked):
+        turns, date = by_id[sid]
+        complete = [
+            _assistant_turn_line(sid, date, index + 1, turn)
+            for index, turn in enumerate(turns)
+        ]
+        candidate = "\n".join([base] + [line for _rank, _turn, line in emitted_turns] + complete)
+        if _ledger_estimate(candidate) <= budget_tokens:
+            emitted_turns.extend((rank, index + 1, line) for index, line in enumerate(complete))
+            full_sessions += 1
+            continue
+
+        # Whole-session packing failed. Select complete adjacent user/assistant
+        # pairs, then render them in original turn order; never split a turn.
+        pair_starts = [
+            index for index, turn in enumerate(turns)
+            if isinstance(turn, dict) and str(turn.get("role", "")).lower() == "user"
+        ]
+        ranked_pairs = sorted(
+            pair_starts,
+            key=lambda start: (-_assistant_pair_score(turns, start, query_terms), start),
+        )
+        chosen_indices: set[int] = set()
+        for start in ranked_pairs:
+            indices = [start]
+            if start + 1 < len(turns):
+                indices.append(start + 1)
+            candidate_lines = [complete[index] for index in indices]
+            candidate = "\n".join(
+                [base]
+                + [line for _rank, _turn, line in emitted_turns]
+                + [complete[index] for index in sorted(chosen_indices)]
+                + candidate_lines
+            )
+            if _ledger_estimate(candidate) <= budget_tokens:
+                chosen_indices.update(indices)
+                fallback_pairs += 1
+        for index in sorted(chosen_indices):
+            emitted_turns.append((rank, index + 1, complete[index]))
+        skipped_turns += len(turns) - len(chosen_indices)
+
+    emitted_turns.sort(key=lambda item: (item[0], item[1]))
+    context = "\n".join([base] + [line for _rank, _turn, line in emitted_turns])
+    # The packer only admits complete lines. This guard handles a pathological
+    # tiny budget without creating a false claim of complete-turn retention.
+    clipped = False
+    if _ledger_estimate(context) > budget_tokens:
+        context = "\n".join(lines[:2])
+        clipped = True
+        skipped_turns += sum(len(by_id[sid][0]) for sid in unique_ranked)
+        emitted_turns = []
+
+    telemetry = {
+        "candidate_sessions": len(unique_ranked),
+        "selected_sessions": len(unique_ranked),
+        "full_sessions": full_sessions,
+        "complete_turns": len(emitted_turns),
+        "skipped_turns": skipped_turns,
+        "fallback_pairs": fallback_pairs,
+        "estimated_tokens": _ledger_estimate(context),
+        "budget_tokens": budget_tokens,
+        "hard_max_tokens": _LEDGER_HARD_MAX_TOKENS,
+        "clipped": clipped,
+        "projection_mode": "complete-turn",
+        "gold_fields_read": 0,
+        "provider_calls": 0,
+    }
+    return context, unique_ranked, telemetry
+
+
 def assemble_ranked_snippets(
     inst: dict,
     ranked_ids: list[str],

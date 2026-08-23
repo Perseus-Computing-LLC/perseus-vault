@@ -80,6 +80,7 @@ HERE = Path(__file__).resolve().parent
 REPO = HERE.parent.parent
 sys.path.insert(0, str(HERE))
 from context_assembly import (  # noqa: E402
+    assemble_assistant_recall_ledger,
     assemble_evidence_ledger,
     assemble_ranked_snippets,
 )
@@ -403,7 +404,7 @@ def build_context(
     latest-wins row and stale versions go to `entity_history`. Grouping uses
     the dataset's evidence labels — authoring-time knowledge, exactly what a
     real caller has when it re-remembers a fact under its key."""
-    if context_assembly not in {"full", "ranked-snippets", "evidence-ledger"}:
+    if context_assembly not in {"full", "ranked-snippets", "evidence-ledger", "assistant-recall"}:
         raise ValueError(f"unknown context assembly: {context_assembly}")
     if context_guidance not in {"none", "preference", "preference-structured", "evidence-structured"}:
         raise ValueError(f"unknown context guidance: {context_guidance}")
@@ -480,6 +481,12 @@ def build_context(
                 inst["haystack_sessions"], inst.get("haystack_dates") or [],
                 chosen, budget_tokens=ledger_budget
             )[:2]
+        if context_assembly == "assistant-recall":
+            return assemble_assistant_recall_ledger(
+                inst["question"], inst["haystack_session_ids"],
+                inst["haystack_sessions"], inst.get("haystack_dates") or [],
+                chosen, budget_tokens=ledger_budget
+            )[:2]
     else:
         raise ValueError(system)
 
@@ -520,6 +527,8 @@ def estimate_cost(data, systems, k, model, judge, context_assembly="full",
     if context_assembly == "ranked-snippets":
         vault_ctx = ranked_ctx
     elif context_assembly == "evidence-ledger":
+        vault_ctx = ledger_ctx
+    elif context_assembly == "assistant-recall":
         vault_ctx = ledger_ctx
     else:
         vault_ctx = k * avg_sess
@@ -575,7 +584,7 @@ def main():
     ap.add_argument("--model", default=DEFAULT_ANSWERER, help=f"Answerer model id (default {DEFAULT_ANSWERER})")
     ap.add_argument("--judge", default=DEFAULT_JUDGE, help=f"Judge model id (default {DEFAULT_JUDGE})")
     ap.add_argument("--k", type=int, default=10, help="Sessions retrieved for the perseus_vault system (default 10)")
-    ap.add_argument("--context-assembly", choices=["full", "ranked-snippets", "evidence-ledger"], default="full",
+    ap.add_argument("--context-assembly", choices=["full", "ranked-snippets", "evidence-ledger", "assistant-recall"], default="full",
                     help="Answer-facing context projection; default full preserves the baseline, "
                          "ranked-snippets retrieves a deeper pool and packs conversational pairs")
     ap.add_argument("--assembly-k", type=int, default=20,
