@@ -30,6 +30,10 @@ class _FakeServer:
         self.calls.append((name, args))
         if name == "perseus_vault_recall":
             return {"items": [{"key": sid} for sid in self.ranked]}
+        if name == "perseus_vault_journal":
+            return {"id": "jrn-test"}
+        if name == "perseus_vault_remember":
+            return {"ok": True, "serveable": True, "proposed": False}
         return {}
 
 
@@ -78,6 +82,16 @@ class RankedSnippetAssemblyTests(unittest.TestCase):
         self.assertLessEqual(telemetry["selected_windows"], 3)
         self.assertEqual(len(selected), len(set(selected)))
         self.assertTrue(context)
+
+    def test_rendered_context_including_headers_and_guidance_respects_budget(self):
+        context, _selected, _telemetry = assemble_ranked_snippets(
+            self.inst,
+            ["s1", "s2", "s3"],
+            budget_tokens=100,
+            max_windows_per_session=2,
+            guidance="evidence-structured",
+        )
+        self.assertLessEqual((len(context) + 3) // 4, 100)
 
     def test_unknown_and_duplicate_ranked_ids_are_ignored(self):
         _context, selected, telemetry = assemble_ranked_snippets(

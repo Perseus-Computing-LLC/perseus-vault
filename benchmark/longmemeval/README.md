@@ -249,7 +249,7 @@ python benchmark/longmemeval/qa.py --yes
 Defaults: answerer `gpt-4o-2024-08-06`, judge `gpt-4o-2024-08-06`, split `_s`,
 hybrid k=10 — override with `--model` / `--judge` / `--split` / `--k` / `--limit`
 (all recorded in the report). Optionally cross-check with LongMemEval's official
-judge by feeding the emitted `hypotheses-<system>-<model>.jsonl` to their
+judge by feeding the emitted `hypotheses-<system>-<model>-<prompt-lane>.jsonl` to their
 `src/evaluation/evaluate_qa.py`. Run every system through the **same** models,
 and report the LLM and judge by name beside the number (see COMPARISON.md).
 
@@ -266,11 +266,14 @@ python qa.py --data longmemeval_s_cleaned.json --cot --k 10 --yes \
     --journal cot_full.jsonl --out cot_report.json
 ```
 
-`--cot` uses LongMemEval's own CoT prompt (still 100% official methodology),
-raises the answer `max_tokens` to 1200, and parses the final `Answer:` line for
-judging. Both the journal `_config` and the report carry
-`answer_prompt: "official-cot"` (vs `"plain"`), and the run signature includes
-it — a CoT number can never be silently blended with a plain-prompt one. Use
+`--cot` uses LongMemEval's own CoT prompt (still 100% official methodology)
+and raises the answer `max_tokens` to 1200. The answerer's **complete response**
+is passed to the official per-type judge and written unchanged to the official
+hypothesis artifact; it is never reduced after an `Answer:` marker. Both the
+journal `_config` and the report carry `answer_prompt: "official-cot"` (vs
+`"plain"`), `hypothesis_mode: "complete-response"`, and the run signature
+includes both fields. Hypothesis filenames include the prompt lane, so plain
+and official-CoT outputs cannot overwrite each other. Use
 `--only-types single-session-preference multi-session temporal-reasoning` to run
 a weak-category slice cheaply. **A single run's number is never quoted alone**
 (see the honesty notes) — confirm with ≥2 seeds and, ideally, an independent

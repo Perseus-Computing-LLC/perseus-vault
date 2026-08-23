@@ -18,7 +18,7 @@ HMAC_KEY = "perseus-benchmark-fixture-key"
 
 
 def stable_json(value: Any) -> str:
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
 def child_env(base: dict[str, str]) -> dict[str, str]:
@@ -62,6 +62,7 @@ def admitted_remember(
     *,
     workspace: str = WORKSPACE,
     agent: str = AGENT,
+    valid_from_unix_ms: int | None = None,
 ) -> dict[str, Any]:
     body = stable_json(json.loads(body_json))
     record_digest = hashlib.sha256(body.encode()).hexdigest()
@@ -88,35 +89,35 @@ def admitted_remember(
             "requesting_agent_id": agent,
         },
     )
-    result = client.call(
-        "perseus_vault_remember",
-        {
-            "category": category,
-            "key": key,
-            "body_json": body,
-            "type": "fact",
+    remember_args = {
+        "category": category,
+        "key": key,
+        "body_json": body,
+        "type": "fact",
+        "workspace_hash": workspace,
+        "agent_id": agent,
+        "actor_kind": "connector",
+        "requesting_agent_id": agent,
+        "skip_dedup": True,
+        "admission": {
+            "record_digest": record_digest,
+            "source_identity": evaluated["source_identity"],
+            "source_event_id": source["id"],
+            "authorization_scope": workspace,
+            "ingestion_channel": "benchmark",
             "workspace_hash": workspace,
-            "agent_id": agent,
+            "source_trust": "authoritative",
             "actor_kind": "connector",
-            "requesting_agent_id": agent,
-            "skip_dedup": True,
-            "admission": {
-                "record_digest": record_digest,
-                "source_identity": evaluated["source_identity"],
-                "source_event_id": source["id"],
-                "authorization_scope": workspace,
-                "ingestion_channel": "benchmark",
-                "workspace_hash": workspace,
-                "source_trust": "authoritative",
-                "actor_kind": "connector",
-                "actor_identity": agent,
-                "validated": True,
-                "valid_from_unix_ms": 1,
-                "recorded_at_unix_ms": 2,
-                "task_relevance_bps": 9000,
-            },
+            "actor_identity": agent,
+            "validated": True,
+            "valid_from_unix_ms": 1,
+            "recorded_at_unix_ms": 2,
+            "task_relevance_bps": 9000,
         },
-    )
+    }
+    if valid_from_unix_ms is not None:
+        remember_args["valid_from_unix_ms"] = valid_from_unix_ms
+    result = client.call("perseus_vault_remember", remember_args)
     if not isinstance(result, dict) or result.get("serveable") is not True or result.get("proposed"):
         raise RuntimeError(f"admitted benchmark write was not serveable: {result}")
     return result

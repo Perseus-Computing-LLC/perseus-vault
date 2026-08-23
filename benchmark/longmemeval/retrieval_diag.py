@@ -46,6 +46,8 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
 from run import PerseusVaultServer, session_text, find_binary  # noqa: E402
+from context_assembly import stable_ranked_items  # noqa: E402
+from benchmark.admission_fixture import AGENT, WORKSPACE, admitted_remember  # noqa: E402
 from benchmark.package.common.replay import (
     build_envelope as build_replay_envelope,
     build_snapshot as build_replay_snapshot,
@@ -77,6 +79,38 @@ def session_note(date, turns):
     return prefix + session_text(turns)
 
 
+def _canonical_replay_body(inst, key, item):
+    """Use frozen fixture content, excluding provider execution metadata."""
+    sids = list(inst.get("haystack_session_ids", []) or [])
+    sessions = list(inst.get("haystack_sessions", []) or [])
+    dates = list(inst.get("haystack_dates", []) or [])
+    by_id = {sid: (turns, dates[index] if index < len(dates) else None)
+             for index, (sid, turns) in enumerate(zip(sids, sessions))}
+    if key in by_id:
+        turns, date = by_id[key]
+        return {"note": session_note(date, turns)}
+    if key == SHARED_FACT_KEY:
+        dated = [(date, turns) for turns, date in zip(sessions, dates) if date]
+        if dated:
+            date, turns = sorted(dated, key=lambda pair: to_ms(pair[0]))[-1]
+            return {"note": session_note(date, turns)}
+
+    body = item.get("body_json", item.get("body", item.get("content", key)))
+    volatile = {
+        "created_at_unix_ms", "updated_at_unix_ms", "last_accessed_unix_ms",
+        "retrieval_count", "follow_count", "follow_rate", "miss_count",
+    }
+
+    def strip(value):
+        if isinstance(value, dict):
+            return {name: strip(child) for name, child in value.items() if name not in volatile}
+        if isinstance(value, list):
+            return [strip(child) for child in value]
+        return value
+
+    return strip(body)
+
+
 def _replay_rows(inst, items):
     """Normalize a provider response into hash-only replay candidate rows."""
     sids = list(inst.get("haystack_session_ids", []) or [])
@@ -92,7 +126,7 @@ def _replay_rows(inst, items):
             continue
         key = str(item.get("key") or item.get("id") or f"wire-{index + 1}")
         identity = replay_sha256_text(key)
-        body = item.get("body_json", item.get("body", item.get("content", key)))
+        body = _canonical_replay_body(inst, key, item)
         content = replay_stable_json({"candidate": key, "body": body})
         row = {
             "candidate_id": f"candidate-{identity}",
@@ -129,7 +163,7 @@ def _make_replay_artifact(inst, qid, items, k, *, split, corpus_sha256, config_s
         request_sha256=replay_sha256_text(replay_stable_json({"question_id": qid, "question_sha256": replay_sha256_text(str(inst.get("question", "")))})),
         config_sha256=config_sha256,
         code_sha256=code_sha256,
-        context_policy="wire-order-v1",
+        context_policy="query-content-fullpool-v1",
         context_policy_version="1",
         snapshot=snapshot,
         candidates=rows,
@@ -167,19 +201,33 @@ def gold_ranks(inst, srv, qid, k, ku_shared=False, *, split="s", corpus_sha256=N
         if sid in shared:
             continue  # fact versions ingest below, ascending by date
         turns, d = by_id[sid]
-        srv.call("perseus_vault_remember", {"category": qid, "key": sid,
-                                    "body_json": json.dumps({"note": session_note(d, turns)}),
-                                    "type": "fact"})
+        admitted_remember(
+            srv,
+            qid,
+            sid,
+            json.dumps({"note": session_note(d, turns)}),
+            workspace=WORKSPACE,
+            agent=AGENT,
+        )
     for g in dated_gold if shared else []:
         turns, d = by_id[g]
-        srv.call("perseus_vault_remember", {"category": qid, "key": SHARED_FACT_KEY,
-                                    "body_json": json.dumps({"note": session_note(d, turns)}),
-                                    "type": "fact", "valid_from_unix_ms": to_ms(d)})
+        admitted_remember(
+            srv,
+            qid,
+            SHARED_FACT_KEY,
+            json.dumps({"note": session_note(d, turns)}),
+            workspace=WORKSPACE,
+            agent=AGENT,
+            valid_from_unix_ms=to_ms(d),
+        )
     srv.call("perseus_vault_embed", {"batch_category": qid, "batch_limit": 1000})
+    recall_limit = max(k, len(sids))
     r = srv.call("perseus_vault_recall", {"query": inst["question"], "mode": "hybrid",
-                                  "category": qid, "limit": k, "trust_weight": 0,
-                                  "min_decay": 0})
-    items = r.get("items", []) if isinstance(r, dict) else []
+                                  "category": qid, "limit": recall_limit, "trust_weight": 0,
+                                  "min_decay": 0, "skip_side_effects": True})
+    items = stable_ranked_items(
+        r.get("items", []) if isinstance(r, dict) else [], inst["question"]
+    )
     ranked_ids = [it.get("key") for it in items]
     pos = {sid: i + 1 for i, sid in enumerate(ranked_ids)}
 
@@ -232,6 +280,26 @@ def coverage_latest_at(records, k):
             rr = [rec["ranks"].get(g) for g in rec["gold"]]
             covered += 1 if all(r is not None and r <= k for r in rr) else 0
     return round(covered / len(scored), 4)
+
+
+def _rank_depth_buckets(records, depth):
+    """Classify evidence ranks relative to the requested retrieval depth."""
+    k_recoverable = []
+    hard = []
+    for rec in records:
+        gold = list(rec.get("gold", []) or [])
+        ranks = [rec.get("ranks", {}).get(evidence_id) for evidence_id in gold]
+        if any(not isinstance(rank, int) or isinstance(rank, bool) or rank > depth for rank in ranks):
+            hard.append(rec["question_id"])
+            continue
+        worst = max(ranks, default=0)
+        if worst > 10:
+            k_recoverable.append({
+                "question_id": rec["question_id"],
+                "worst_rank": worst,
+                "question_type": rec.get("question_type", "unknown"),
+            })
+    return sorted(k_recoverable, key=lambda row: (row["worst_rank"], row["question_id"])), sorted(hard)
 
 
 def _make_sufficiency_report(records, *, depth, dataset_sha256, config_sha256, code_sha256):
@@ -313,7 +381,10 @@ def main():
     ap.add_argument("--min-coverage-at", type=parse_floor, default=None, metavar="K:FRAC",
                     help="Regression gate: exit non-zero if coverage@K < FRAC (e.g. 20:0.95)")
     args = ap.parse_args()
-
+    # LongMemEval contains adversarial-looking text. The benchmark fixture
+    # supplies the hash-bound source admission; disable only content lint so
+    # those legitimate rows can reach the retrieval measurement.
+    os.environ["PERSEUS_VAULT_DISABLE_ADMISSION_LINT"] = "1"
     data_path = Path(args.data) if args.data else HERE / f"longmemeval_{args.split}_cleaned.json"
     if not data_path.exists():
         sys.exit(f"error: dataset not found: {data_path}")
@@ -428,20 +499,7 @@ def main():
         code_sha256=code_sha256,
     )
 
-    # Per-question worst gold rank (None if any gold session absent from top-k).
-    def worst_rank(rec):
-        rr = [rec["ranks"].get(g) for g in rec["gold"]]
-        return None if any(r is None for r in rr) else max(rr)
-
-    k_recoverable = []   # all gold found but worst rank > 10 (recoverable by deeper k)
-    hard = []            # >=1 gold session absent from top-k entirely
-    for rec in scored:
-        wr = worst_rank(rec)
-        if wr is None:
-            hard.append(rec["question_id"])
-        elif wr > 10:
-            k_recoverable.append({"question_id": rec["question_id"], "worst_rank": wr,
-                                  "question_type": rec["question_type"]})
+    k_recoverable, hard = _rank_depth_buckets(scored, args.k)
 
     report = {
         "benchmark": "perseus-vault-longmemeval-retrieval-coverage",

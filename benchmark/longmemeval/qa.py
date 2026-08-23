@@ -57,8 +57,9 @@ Dataset download (277 MB, public):
     -o longmemeval_s_cleaned.json
 
 Output: qa_report.json (signed; per-category accuracy, per-question verdicts)
-plus hypotheses-<system>-<model>.jsonl in LongMemEval's official format, so
-LongMemEval's own evaluate_qa.py can cross-check our judge.
+plus hypotheses-<system>-<model>-<prompt-lane>.jsonl in LongMemEval's official
+format, so LongMemEval's own evaluate_qa.py can cross-check our judge without
+allowing plain and official-CoT artifacts to overwrite one another.
 """
 import argparse
 import hashlib
@@ -79,10 +80,19 @@ HERE = Path(__file__).resolve().parent
 REPO = HERE.parent.parent
 sys.path.insert(0, str(HERE))
 from context_assembly import (  # noqa: E402
+    assemble_assistant_recall_ledger,
     assemble_evidence_ledger,
     assemble_ranked_snippets,
+    stable_ranked_items,
 )
-from run import PerseusVaultServer, session_text, find_binary  # noqa: E402
+from run import (  # noqa: E402
+    AGENT,
+    WORKSPACE,
+    PerseusVaultServer,
+    admitted_remember,
+    find_binary,
+    session_text,
+)
 
 # Pinned defaults. Zep's published LongMemEval number is quoted as "GPT-4o";
 # gpt-4o-2024-08-06 is the standard GPT-4o snapshot of that period and is the
@@ -126,11 +136,13 @@ ANSWER_PROMPT_COT = (
     "the question based on the relevant chat history. Answer the question step by step: "
     "first extract all the relevant information, and then reason over the information to "
     "get the answer.\n\n\n"
-    "History Chats:\n\n{context}\n\n"
-    "Current Date: {question_date}\n"
-    "Question: {question}\n"
+    "History Chats:\n\n{}\n\n"
+    "Current Date: {}\n"
+    "Question: {}\n"
     "Answer (step by step):"
 )
+
+HYPOTHESIS_MODE = "complete-response"
 
 
 def hypothesis_for_judge(text, cot=False):
@@ -143,6 +155,13 @@ def hypothesis_for_judge(text, cot=False):
     """
     del cot
     return text.strip() if text else text
+
+
+def hypothesis_artifact_name(system, model, cot=False):
+    """Return a prompt-lane-specific official hypothesis artifact name."""
+    model_tag = str(model).replace("/", "_")
+    prompt_tag = "official-cot" if cot else "plain"
+    return f"hypotheses-{system}-{model_tag}-{prompt_tag}.jsonl"
 
 
 def extract_cot_answer(text):
@@ -386,7 +405,7 @@ def build_context(
     latest-wins row and stale versions go to `entity_history`. Grouping uses
     the dataset's evidence labels — authoring-time knowledge, exactly what a
     real caller has when it re-remembers a fact under its key."""
-    if context_assembly not in {"full", "ranked-snippets", "evidence-ledger"}:
+    if context_assembly not in {"full", "ranked-snippets", "evidence-ledger", "assistant-recall"}:
         raise ValueError(f"unknown context assembly: {context_assembly}")
     if context_guidance not in {"none", "preference", "preference-structured", "evidence-structured"}:
         raise ValueError(f"unknown context guidance: {context_guidance}")
@@ -421,21 +440,36 @@ def build_context(
             if sid in shared:
                 continue  # fact versions ingest below, ascending by date
             turns, d = by_id[sid]
-            srv.call("perseus_vault_remember", {"category": qid, "key": sid,
-                                        "body_json": json.dumps({"note": session_note(d, turns)}),
-                                        "type": "fact"})
+            admitted_remember(
+                srv,
+                qid,
+                sid,
+                json.dumps({"note": session_note(d, turns)}),
+                workspace=WORKSPACE,
+                agent=AGENT,
+            )
         for g in dated_gold if shared else []:
             turns, d = by_id[g]
-            srv.call("perseus_vault_remember", {"category": qid, "key": SHARED_FACT_KEY,
-                                        "body_json": json.dumps({"note": session_note(d, turns)}),
-                                        "type": "fact", "valid_from_unix_ms": _date_ms(d)})
+            admitted_remember(
+                srv,
+                qid,
+                SHARED_FACT_KEY,
+                json.dumps({"note": session_note(d, turns)}),
+                workspace=WORKSPACE,
+                agent=AGENT,
+                valid_from_unix_ms=_date_ms(d),
+            )
         srv.call("perseus_vault_embed", {"batch_category": qid, "batch_limit": 1000})
         retrieval_k = assembly_k if context_assembly in {"ranked-snippets", "evidence-ledger"} else k
+        recall_limit = max(retrieval_k, len(inst.get("haystack_session_ids", []) or []))
         r = srv.call("perseus_vault_recall", {"query": inst["question"], "mode": "hybrid",
-                                      "category": qid, "limit": retrieval_k, "trust_weight": 0,
+                                      "category": qid, "limit": recall_limit, "trust_weight": 0,
                                       "min_decay": 0})
-        items = r.get("items", []) if isinstance(r, dict) else []
-        chosen = [it.get("key") for it in items][:retrieval_k]
+        items = stable_ranked_items(
+            r.get("items", []) if isinstance(r, dict) else [], inst["question"]
+        )
+        chosen = [str(it.get("key") or it.get("id")) for it in items[:retrieval_k]
+                  if it.get("key") or it.get("id")]
         if shared:
             # The live shared-key row IS the latest gold session; surface it in
             # the context under that session's real id/date.
@@ -452,6 +486,12 @@ def build_context(
                 inst["haystack_sessions"], inst.get("haystack_dates") or [],
                 chosen, budget_tokens=ledger_budget
             )[:2]
+        if context_assembly == "assistant-recall":
+            return assemble_assistant_recall_ledger(
+                inst["question"], inst["haystack_session_ids"],
+                inst["haystack_sessions"], inst.get("haystack_dates") or [],
+                chosen, budget_tokens=ledger_budget
+            )[:2]
     else:
         raise ValueError(system)
 
@@ -463,6 +503,12 @@ def build_context(
             blocks.append(f"{hdr}\n{session_text(turns)}")
     ctx = "\n\n".join(blocks) or "(no prior conversation history is available)"
     return ctx, [s for s in chosen if s in by_id]
+
+
+def _report_budget_tokens(args):
+    if args.context_assembly in ("evidence-ledger", "assistant-recall"):
+        return args.ledger_budget
+    return args.context_budget
 
 
 def price_for(model):
@@ -492,6 +538,8 @@ def estimate_cost(data, systems, k, model, judge, context_assembly="full",
     if context_assembly == "ranked-snippets":
         vault_ctx = ranked_ctx
     elif context_assembly == "evidence-ledger":
+        vault_ctx = ledger_ctx
+    elif context_assembly == "assistant-recall":
         vault_ctx = ledger_ctx
     else:
         vault_ctx = k * avg_sess
@@ -547,7 +595,7 @@ def main():
     ap.add_argument("--model", default=DEFAULT_ANSWERER, help=f"Answerer model id (default {DEFAULT_ANSWERER})")
     ap.add_argument("--judge", default=DEFAULT_JUDGE, help=f"Judge model id (default {DEFAULT_JUDGE})")
     ap.add_argument("--k", type=int, default=10, help="Sessions retrieved for the perseus_vault system (default 10)")
-    ap.add_argument("--context-assembly", choices=["full", "ranked-snippets", "evidence-ledger"], default="full",
+    ap.add_argument("--context-assembly", choices=["full", "ranked-snippets", "evidence-ledger", "assistant-recall"], default="full",
                     help="Answer-facing context projection; default full preserves the baseline, "
                          "ranked-snippets retrieves a deeper pool and packs conversational pairs")
     ap.add_argument("--assembly-k", type=int, default=20,
@@ -565,11 +613,11 @@ def main():
                          "dated fact/event evidence for cross-session and temporal questions")
     ap.add_argument("--limit", type=int, default=0, help="Only run the first N instances (0 = all; smoke tests)")
     ap.add_argument("--cot", action="store_true",
-                    help="#579: use LongMemEval's OFFICIAL chain-of-thought answer prompt (still "
-                         "official methodology; the benchmark ships both). Raises the answer max_tokens "
-                         "to 1200 and parses the final 'Answer:' line. Recorded as answer_prompt="
-                         "'official-cot' in the journal config and report so it is never blended "
-                         "with a plain-prompt number.")
+                    help="#579: use LongMemEval's OFFICIAL chain-of-thought answer prompt. "
+                         "The complete answerer response is retained for the official "
+                         "judge and hypothesis artifact. Recorded as answer_prompt="
+                         "'official-cot' in the journal config and report so it is never "
+                         "blended with a plain-prompt number.")
     ap.add_argument("--only-types", nargs="+", default=None, metavar="TYPE",
                     help="#579: restrict the run to these question_type categories (e.g. "
                          "single-session-preference multi-session temporal-reasoning) — for the "
@@ -684,6 +732,7 @@ def main():
                   "judge": "mock" if args.mock_llm else args.judge,
                   "k": args.k,
                   "answer_prompt": "official-cot" if args.cot else "plain",
+                  "hypothesis_mode": HYPOTHESIS_MODE,
                   "only_types": sorted(args.only_types) if args.only_types else None,
                   "ku_shared_key": args.ku_shared_key,
                   "context_assembly": args.context_assembly,
@@ -714,6 +763,7 @@ def main():
             resume_ok = True
             print(f"  resume: {len(done)} judged answers reloaded from "
                   f"{journal_path.name}; errored/unfinished questions will run.")
+        journal_path.parent.mkdir(parents=True, exist_ok=True)
         journal = open(journal_path, "a" if resume_ok else "w", encoding="utf-8")
         if not resume_ok:
             write_checkpoint(journal, {"_config": run_config})
@@ -763,8 +813,18 @@ def main():
                     ledger_budget=args.ledger_budget,
                 )
                 answer_tmpl = ANSWER_PROMPT_COT if args.cot else ANSWER_PROMPT
-                prompt = answer_tmpl.format(context=ctx, question=inst["question"],
-                                              question_date=inst.get("question_date", "unknown"))
+                if args.cot:
+                    # Keep the official positional template verbatim; the upstream
+                    # runner fills context, date, and question in this order.
+                    prompt = answer_tmpl.format(
+                        ctx, inst.get("question_date", "unknown"), inst["question"]
+                    )
+                else:
+                    prompt = answer_tmpl.format(
+                        context=ctx,
+                        question=inst["question"],
+                        question_date=inst.get("question_date", "unknown"),
+                    )
                 tok[system] += est_tokens(prompt)
                 nsess[system] += len(chosen)
                 if args.dry_run:
@@ -848,8 +908,11 @@ def main():
     # (On a resumed run, reloaded answers come first — evaluate_qa.py keys on
     # question_id, so order is immaterial.)
     if not args.dry_run:
+        Path(args.outdir).mkdir(parents=True, exist_ok=True)
         for system in args.systems:
-            out = Path(args.outdir) / f"hypotheses-{system}-{model_tag}.jsonl"
+            out = Path(args.outdir) / hypothesis_artifact_name(
+                system, model_tag, cot=args.cot
+            )
             out.write_text("\n".join(json.dumps(h) for h in hyps[system]) + "\n", encoding="utf-8")
             print(f"  wrote {out}  ({len(hyps[system])} answers)")
 
@@ -918,6 +981,7 @@ def main():
         "answerer": "mock" if args.mock_llm else args.model,
         "judge": "mock" if args.mock_llm else args.judge,
         "answer_prompt": "official-cot" if args.cot else "plain",
+        "hypothesis_mode": HYPOTHESIS_MODE,
         "only_types": sorted(args.only_types) if args.only_types else None,
         "ku_shared_key": args.ku_shared_key,
         "context_assembly": args.context_assembly,
@@ -943,6 +1007,7 @@ def main():
         # a CoT accuracy with a plain-prompt one — the scoreboard must state this
         # next to any competitor row.
         "answer_prompt": "official-cot" if args.cot else "plain",
+        "hypothesis_mode": HYPOTHESIS_MODE,
         "only_types": sorted(args.only_types) if args.only_types else None,
         # #590: ingest shape for the perseus_vault arm. NEVER compare a ku-shared-key
         # accuracy against a benchmark-shape one without labeling both.
@@ -953,9 +1018,7 @@ def main():
         "max_retries": args.max_retries,
         "retrieval": {"mode": "hybrid", "k": args.k, "embedding": "bundled-onnx"},
         "context_assembly": {"mode": args.context_assembly, "assembly_k": args.assembly_k,
-                             "budget_tokens": (args.ledger_budget
-                                               if args.context_assembly == "evidence-ledger"
-                                               else args.context_budget),
+                             "budget_tokens": _report_budget_tokens(args),
                              "context_budget": args.context_budget,
                              "ledger_budget": args.ledger_budget,
                              "windows_per_session": args.assembly_windows,
@@ -975,7 +1038,9 @@ def main():
                           "error": v["error"], "ans_usage": v.get("ans_usage"),
                           "judge_usage": v.get("judge_usage")} for v in verdicts],
     }
-    Path(args.out).write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    report_path = Path(args.out)
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
 
     print(f"\nLongMemEval end-to-end QA - split=longmemeval_{args.split} n={n}"
           + ("  [MOCK LLM: plumbing only, NOT a real accuracy number]" if args.mock_llm

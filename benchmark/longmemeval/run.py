@@ -39,6 +39,16 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent.parent
+if str(REPO) not in sys.path:
+    sys.path.insert(0, str(REPO))
+
+from benchmark.admission_fixture import (  # noqa: E402
+    AGENT,
+    WORKSPACE,
+    admitted_remember,
+    child_env,
+    configure,
+)
 
 
 def find_binary(explicit):
@@ -70,13 +80,15 @@ class PerseusVaultServer:
             [binary, "--db", db],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             text=True, encoding="utf-8", errors="replace",
+            env=child_env(dict(os.environ)),
         )
         self._id = 0
         self._send({"jsonrpc": "2.0", "id": self._next(), "method": "initialize",
                     "params": {"protocolVersion": "2025-06-18", "capabilities": {},
-                               "clientInfo": {"name": "longmemeval", "version": "1"}}})
+                               "clientInfo": {"name": AGENT, "version": "1"}}})
         self._read_result()  # initialize response
         self._send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        configure(self, workspace=WORKSPACE, agent=AGENT)
 
     def _next(self):
         self._id += 1
@@ -199,11 +211,14 @@ def main():
         try:
             # 1. Ingest this instance's sessions.
             for sid, turns in zip(sids, sessions):
-                srv.call("perseus_vault_remember", {
-                    "category": qid, "key": sid,
-                    "body_json": json.dumps({"note": session_text(turns)}),
-                    "type": "fact",
-                })
+                admitted_remember(
+                    srv,
+                    qid,
+                    sid,
+                    json.dumps({"note": session_text(turns)}),
+                    workspace=WORKSPACE,
+                    agent=AGENT,
+                )
             n_sessions_total += len(sessions)
 
             # 2. Embed (bundled ONNX, offline) for dense/hybrid. With #271 every

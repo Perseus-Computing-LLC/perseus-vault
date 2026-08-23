@@ -8,6 +8,7 @@ answer_session_ids or the gold answer.
 """
 from __future__ import annotations
 
+import json
 import re
 from typing import Any
 
@@ -184,6 +185,37 @@ _LEDGER_COMPARISON_RE = re.compile(
 def _ledger_estimate(text: str) -> int:
     """Use the conservative four-character estimate shared by the harness."""
     return (len(text) + 3) // 4
+
+
+def stable_ranked_items(items: object, query: str = "") -> list[dict[str, Any]]:
+    """Normalize provider score ties without depending on storage order."""
+    candidates = [item for item in (items if isinstance(items, list) else []) if isinstance(item, dict)]
+    query_terms = _tokens(query)
+
+    def score(item: dict[str, Any]) -> float:
+        for field in ("score", "decay_score"):
+            value = item.get(field)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                return float(value)
+        return float("-inf")
+
+    def source_key(item: dict[str, Any]) -> str:
+        return str(item.get("key") or item.get("id") or "")
+
+    def content_relevance(item: dict[str, Any]) -> int:
+        for field in ("body_json", "body", "content", "note"):
+            value = item.get(field)
+            if value is None:
+                continue
+            if isinstance(value, (dict, list)):
+                value = json.dumps(value, sort_keys=True, ensure_ascii=False)
+            return len(_tokens(str(value)) & query_terms)
+        return 0
+
+    return sorted(
+        candidates,
+        key=lambda item: (-score(item), -content_relevance(item), source_key(item)),
+    )
 
 
 def _ledger_date_key(value: object) -> tuple[int, ...]:
@@ -393,6 +425,164 @@ def assemble_evidence_ledger(
     }
     return context, unique_ranked, telemetry
 
+
+def _assistant_turn_line(session_id: str, date: object, turn_index: int, turn: object) -> str:
+    """Render one complete source turn with stable role and provenance."""
+    if isinstance(turn, dict):
+        role = str(turn.get("role", "")).lower() or "assistant"
+        content = str(turn.get("content", ""))
+    else:
+        role = "assistant"
+        content = str(turn)
+    label = "user" if role == "user" else "assistant-context"
+    return (
+        f"- [{label}] session={_ledger_safe_label(session_id, 'unknown')} "
+        f"date={_ledger_safe_label(date, 'unknown')} turn={turn_index} :: {content}"
+    )
+
+
+def _assistant_pair_score(turns: list[Any], start: int, query_terms: set[str]) -> float:
+    """Score a complete user turn plus its following assistant turn."""
+    pair = turns[start:start + 2]
+    text = " ".join(
+        str(turn.get("content", "")) if isinstance(turn, dict) else str(turn)
+        for turn in pair
+    )
+    roles = [
+        str(turn.get("role", "")).lower() if isinstance(turn, dict) else "assistant"
+        for turn in pair
+    ]
+    return float(
+        len(_tokens(text) & query_terms) * 8.0
+        + (5.0 if roles and roles[0] == "user" else 0.0)
+        + (2.0 if len(roles) > 1 and roles[1] != "user" else 0.0)
+    )
+
+
+def assemble_assistant_recall_ledger(
+    question: str,
+    session_ids: list[Any],
+    sessions: list[list[dict[str, Any]]],
+    dates: list[Any],
+    ranked_ids: list[Any],
+    *,
+    budget_tokens: int = 12_000,
+) -> tuple[str, list[str], dict[str, Any]]:
+    """Build a bounded complete-turn projection for assistant-authored recall.
+
+    Unlike the sentence ledger, this arm never emits a sentence fragment. It
+    first packs complete ranked sessions; if a whole session cannot fit, it
+    packs complete user/assistant turn pairs selected by question overlap and
+    renders those pairs back in source order. The selector is gold-blind.
+    """
+    if budget_tokens <= 0:
+        raise ValueError("budget_tokens must be positive")
+    if budget_tokens > _LEDGER_HARD_MAX_TOKENS:
+        raise ValueError(f"budget_tokens must be <= {_LEDGER_HARD_MAX_TOKENS}")
+
+    source_dates = list(dates or [])
+    if len(source_dates) < len(session_ids):
+        source_dates.extend([None] * (len(session_ids) - len(source_dates)))
+    by_id = {
+        sid: (turns if isinstance(turns, list) else [], source_dates[index])
+        for index, (sid, turns) in enumerate(zip(session_ids, sessions))
+    }
+    unique_ranked: list[str] = []
+    seen: set[str] = set()
+    for sid in ranked_ids:
+        if sid in by_id and sid not in seen:
+            unique_ranked.append(sid)
+            seen.add(sid)
+
+    lines = [
+        f"[Assistant recall ledger | complete-turn | budget={budget_tokens} tokens]",
+        "[Sources]",
+    ]
+    for rank, sid in enumerate(unique_ranked, 1):
+        _turns, date = by_id[sid]
+        lines.append(
+            f"[rank={rank} session={_ledger_safe_label(sid, 'unknown')} "
+            f"date={_ledger_safe_label(date, 'unknown')} ]"
+        )
+    lines.append("[Turns]")
+    base = "\n".join(lines)
+    query_terms = _tokens(question)
+    emitted_turns: list[tuple[int, int, str]] = []
+    skipped_turns = 0
+    full_sessions = 0
+    fallback_pairs = 0
+
+    for rank, sid in enumerate(unique_ranked):
+        turns, date = by_id[sid]
+        complete = [
+            _assistant_turn_line(sid, date, index + 1, turn)
+            for index, turn in enumerate(turns)
+        ]
+        candidate = "\n".join([base] + [line for _rank, _turn, line in emitted_turns] + complete)
+        if _ledger_estimate(candidate) <= budget_tokens:
+            emitted_turns.extend((rank, index + 1, line) for index, line in enumerate(complete))
+            full_sessions += 1
+            continue
+
+        # Whole-session packing failed. Select complete adjacent user/assistant
+        # pairs, then render them in original turn order; never split a turn.
+        pair_starts = [
+            index for index, turn in enumerate(turns)
+            if isinstance(turn, dict) and str(turn.get("role", "")).lower() == "user"
+        ]
+        ranked_pairs = sorted(
+            pair_starts,
+            key=lambda start: (-_assistant_pair_score(turns, start, query_terms), start),
+        )
+        chosen_indices: set[int] = set()
+        for start in ranked_pairs:
+            indices = [start]
+            if start + 1 < len(turns):
+                indices.append(start + 1)
+            candidate_lines = [complete[index] for index in indices]
+            candidate = "\n".join(
+                [base]
+                + [line for _rank, _turn, line in emitted_turns]
+                + [complete[index] for index in sorted(chosen_indices)]
+                + candidate_lines
+            )
+            if _ledger_estimate(candidate) <= budget_tokens:
+                chosen_indices.update(indices)
+                fallback_pairs += 1
+        for index in sorted(chosen_indices):
+            emitted_turns.append((rank, index + 1, complete[index]))
+        skipped_turns += len(turns) - len(chosen_indices)
+
+    emitted_turns.sort(key=lambda item: (item[0], item[1]))
+    context = "\n".join([base] + [line for _rank, _turn, line in emitted_turns])
+    # The packer only admits complete lines. This guard handles a pathological
+    # tiny budget without creating a false claim of complete-turn retention.
+    clipped = False
+    if _ledger_estimate(context) > budget_tokens:
+        fallback_header = "\n".join(lines[:2])
+        context = fallback_header if _ledger_estimate(fallback_header) <= budget_tokens else ""
+        clipped = True
+        skipped_turns += sum(len(by_id[sid][0]) for sid in unique_ranked)
+        emitted_turns = []
+
+    telemetry = {
+        "candidate_sessions": len(unique_ranked),
+        "selected_sessions": len(unique_ranked),
+        "full_sessions": full_sessions,
+        "complete_turns": len(emitted_turns),
+        "skipped_turns": skipped_turns,
+        "fallback_pairs": fallback_pairs,
+        "estimated_tokens": _ledger_estimate(context),
+        "budget_tokens": budget_tokens,
+        "hard_max_tokens": _LEDGER_HARD_MAX_TOKENS,
+        "clipped": clipped,
+        "projection_mode": "complete-turn",
+        "gold_fields_read": 0,
+        "provider_calls": 0,
+    }
+    return context, unique_ranked, telemetry
+
+
 def assemble_ranked_snippets(
     inst: dict,
     ranked_ids: list[str],
@@ -431,7 +621,7 @@ def assemble_ranked_snippets(
         guidance_text = _PREFERENCE_GUIDANCE
     else:
         guidance_text = ""
-    guidance_cost = max(1, len(guidance_text) // 4) if guidance_text else 0
+    guidance_cost = _ledger_estimate(guidance_text + "\n\n") if guidance_text else 0
     selection_budget = max(0, budget_tokens - guidance_cost)
 
     session_ids = list(inst.get("haystack_session_ids", []) or [])
@@ -576,35 +766,77 @@ def assemble_ranked_snippets(
             evidence_appended += 1
             evidence_represented += 1
 
-    blocks: list[str] = []
+    rendered_blocks: list[tuple[dict[str, Any] | None, str]] = []
+    for candidate in selected:
+        sid = str(candidate["sid"])
+        rendered_blocks.append(
+            (
+                candidate,
+                f"{_date_header(sid, candidate['date'], int(candidate['start']), int(candidate['end']))}\n"
+                f"{candidate['body']}",
+            )
+        )
+
+    if evidence_blocks:
+        rendered_blocks.append(
+            (None, evidence_header + "\n" + "\n\n".join(evidence_blocks))
+        )
+
+    # The selection loop above prices source bodies, but the rendered output also
+    # contains headers, separators, guidance, and optional evidence labels. Fit
+    # the final representation itself so the contract applies to what reaches
+    # the answerer, not only to an internal body-cost estimate.
+    guidance_prefix = f"{guidance_text}\n\n" if guidance_text else ""
+    guidance_clipped = False
+    if _ledger_estimate(guidance_prefix) > budget_tokens:
+        guidance_prefix = guidance_prefix[: budget_tokens * 4]
+        guidance_clipped = True
+
+    fitted_blocks: list[tuple[dict[str, Any] | None, str]] = []
+    dropped_rendered_blocks = 0
+    for candidate, block in rendered_blocks:
+        body = "\n\n".join(item[1] for item in fitted_blocks + [(candidate, block)])
+        if _ledger_estimate(guidance_prefix + body) <= budget_tokens:
+            fitted_blocks.append((candidate, block))
+        else:
+            dropped_rendered_blocks += 1
+
+    context_body = "\n\n".join(item[1] for item in fitted_blocks)
+    if not context_body:
+        fallback = "(no prior conversation history is available)"
+        remaining_chars = max(0, budget_tokens * 4 - len(guidance_prefix))
+        context_body = fallback[:remaining_chars]
+    context = guidance_prefix + context_body
+
     selected_ids: list[str] = []
     selected_seen: set[str] = set()
-    for candidate in selected:
+    fitted_candidates = [item[0] for item in fitted_blocks if item[0] is not None]
+    for candidate in fitted_candidates:
         sid = str(candidate["sid"])
         if sid not in selected_seen:
             selected_ids.append(sid)
             selected_seen.add(sid)
-        blocks.append(
-            f"{_date_header(sid, candidate['date'], int(candidate['start']), int(candidate['end']))}\n"
-            f"{candidate['body']}"
-        )
-
-    if evidence_blocks:
-        blocks.append(evidence_header + "\n" + "\n\n".join(evidence_blocks))
-    context_body = "\n\n".join(blocks) or "(no prior conversation history is available)"
-    context = f"{guidance_text}\n\n{context_body}" if guidance_text else context_body
+    evidence_block_fitted = any(item[0] is None for item in fitted_blocks)
+    evidence_represented = sum(
+        1 for item in structured_evidence
+        if item["sid"] in selected_seen
+    )
+    evidence_appended_final = evidence_appended if evidence_block_fitted else 0
+    skipped_final = skipped + dropped_rendered_blocks
+    clipped_final = clipped + int(guidance_clipped)
+    evidence_used = _ledger_estimate(context)
     telemetry = {
         "candidate_sessions": len(unique_ranked),
         "candidate_windows": len(candidates),
-        "selected_windows": len(selected),
+        "selected_windows": len(fitted_candidates),
         "selected_sessions": len(selected_ids),
         "evidence_windows": evidence_represented,
-        "evidence_appended": evidence_appended,
+        "evidence_appended": evidence_appended_final,
         "preference_evidence_windows": evidence_represented if preference_structured else 0,
-        "preference_evidence_appended": evidence_appended if preference_structured else 0,
-        "estimated_tokens": min(evidence_used + guidance_cost, budget_tokens),
-        "skipped_windows": skipped,
-        "clipped_windows": clipped,
+        "preference_evidence_appended": evidence_appended_final if preference_structured else 0,
+        "estimated_tokens": min(evidence_used, budget_tokens),
+        "skipped_windows": skipped_final,
+        "clipped_windows": clipped_final,
         "max_windows_per_session": max_windows_per_session,
         "budget_tokens": budget_tokens,
         "guidance_applied": guidance,
