@@ -5,6 +5,7 @@ import unittest
 from benchmark.longmemeval.retrieval_diag import (
     _make_replay_artifact,
     _make_sufficiency_report,
+    _rank_depth_buckets,
     _replay_rows,
     gold_ranks,
     main,
@@ -28,7 +29,16 @@ class LongMemEvalReplayTests(unittest.TestCase):
         self.assertEqual([item["key"] for item in ordered], ["session-c", "session-a", "session-b"])
         self.assertEqual(stable_ranked_items(list(reversed(items))), ordered)
 
-    def test_replay_content_uses_fixture_source_not_volatile_provider_metadata(self):
+    def test_rank_depth_buckets_treat_ranks_beyond_requested_k_as_hard(self):
+        records = [
+            {"question_id": "q-over", "question_type": "multi-session", "gold": ["g"], "ranks": {"g": 21}},
+            {"question_id": "q-mid", "question_type": "multi-session", "gold": ["g"], "ranks": {"g": 11}},
+            {"question_id": "q-absent", "question_type": "multi-session", "gold": ["g"], "ranks": {"g": None}},
+        ]
+        recoverable, hard = _rank_depth_buckets(records, 20)
+        self.assertEqual([row["question_id"] for row in recoverable], ["q-mid"])
+        self.assertEqual(hard, ["q-absent", "q-over"])
+
         inst = {
             "haystack_session_ids": ["s1"],
             "haystack_sessions": [[{"role": "user", "content": "stable fact"}]],

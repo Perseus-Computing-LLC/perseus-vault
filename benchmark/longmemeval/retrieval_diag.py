@@ -282,6 +282,26 @@ def coverage_latest_at(records, k):
     return round(covered / len(scored), 4)
 
 
+def _rank_depth_buckets(records, depth):
+    """Classify evidence ranks relative to the requested retrieval depth."""
+    k_recoverable = []
+    hard = []
+    for rec in records:
+        gold = list(rec.get("gold", []) or [])
+        ranks = [rec.get("ranks", {}).get(evidence_id) for evidence_id in gold]
+        if any(not isinstance(rank, int) or isinstance(rank, bool) or rank > depth for rank in ranks):
+            hard.append(rec["question_id"])
+            continue
+        worst = max(ranks, default=0)
+        if worst > 10:
+            k_recoverable.append({
+                "question_id": rec["question_id"],
+                "worst_rank": worst,
+                "question_type": rec.get("question_type", "unknown"),
+            })
+    return sorted(k_recoverable, key=lambda row: (row["worst_rank"], row["question_id"])), sorted(hard)
+
+
 def _make_sufficiency_report(records, *, depth, dataset_sha256, config_sha256, code_sha256):
     """Seal gold-aware evaluator inputs, then publish only its projection."""
     evaluator_rows = []
@@ -479,20 +499,7 @@ def main():
         code_sha256=code_sha256,
     )
 
-    # Per-question worst gold rank (None if any gold session absent from top-k).
-    def worst_rank(rec):
-        rr = [rec["ranks"].get(g) for g in rec["gold"]]
-        return None if any(r is None for r in rr) else max(rr)
-
-    k_recoverable = []   # all gold found but worst rank > 10 (recoverable by deeper k)
-    hard = []            # >=1 gold session absent from top-k entirely
-    for rec in scored:
-        wr = worst_rank(rec)
-        if wr is None:
-            hard.append(rec["question_id"])
-        elif wr > 10:
-            k_recoverable.append({"question_id": rec["question_id"], "worst_rank": wr,
-                                  "question_type": rec["question_type"]})
+    k_recoverable, hard = _rank_depth_buckets(scored, args.k)
 
     report = {
         "benchmark": "perseus-vault-longmemeval-retrieval-coverage",
