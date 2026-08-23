@@ -4,9 +4,9 @@
 
 | Version | Supported |
 |---|---|
-| 2.0.x (latest) | ✅ Active |
-| 1.x | ✅ Security fixes only |
-| 0.x | ❌ Unsupported |
+| 2.23.x (latest) | ✅ Active |
+| 2.22.x | ✅ Security fixes only |
+| < 2.22.0 | ❌ Unsupported |
 
 ## Reporting a Vulnerability
 

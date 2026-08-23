@@ -388,15 +388,9 @@ Any MCP-compatible framework works with Perseus Vault directly. See
 
 ## 169 Canonical MCP Tools
 
-> **Canonical product and tool names.** Perseus Vault is the product name, and integrations use the canonical `perseus_vault_*` tools (for example, `perseus_vault_remember`). The legacy `mimir_*` / `mneme_*` / `plutus_*` names were removed in the 2026-27 major release — the canonical names are the only interface.
-> The count is the number of unique canonical tools in the source registry. Compatibility aliases are callable but are not counted separately.
-> The legacy `perseus_vault_*` and `perseus_vault_*` names remain fully *callable* — every prefix
-> dispatches to the same handler — they are just no longer advertised in
-> `tools/list`. This keeps the advertised manifest to one name per tool instead
-> of tripling it (3× alias bloat), so connected clients don't reload a tripled
-> tool-schema payload on every request. To restore the historical behaviour of advertising all three
-> prefixes, set `PERSEUS_VAULT_TOOL_ALIASES=all` (the legacy env
-> `PERSEUS_VAULT_TOOL_ALIASES` is also honoured; `PERSEUS_VAULT_` takes precedence).
+> **Canonical product and tool names.** Perseus Vault is the product name, and integrations use the canonical `perseus_vault_*` tools (for example, `perseus_vault_remember`). The legacy `mimir_*`, `mneme_*`, and `plutus_*` tool names are not part of the current MCP contract. Historical database/key-path compatibility is retained only for explicit migration of existing installations.
+> The count is the number of unique canonical tools in the source registry. The current server advertises one name per tool in `tools/list`; compatibility and historical records do not inflate the public count.
+> Clients must call the canonical `perseus_vault_*` names. Clients that gate calls on `tools/list` should upgrade to a current Vault release instead of assuming a legacy prefix is callable.
 >
 > **Client compatibility (#633).** Clients that *gate on the advertised list* —
 > they check `tools/list` before calling and skip tools they don't see — will
@@ -862,7 +856,7 @@ Perseus Vault is built for government deployment from the ground up.
 procurement information, compliance status, and deployment models (air-gapped,
 on-premises, classified environments).
 
-Perseus Computing LLC is a US-owned small business. SAM.gov registration in progress.
+Perseus Computing LLC is a US-owned small business. Current procurement identifiers and owner-published readiness claims are maintained in the [public capability statement](https://perseus.observer/government/capability-statement.html). Those claims are dated and scoped; they do not constitute CMMC certification, an ATO, or a cATO authorization.
 NAICS: 541715, 541511, 541512.
 
 ## Privacy Policy
@@ -919,11 +913,11 @@ gh attestation verify perseus-vault-lite-x86_64-unknown-linux-musl.tar.gz \
 # 3. Confirm the binary identity
 ./perseus-vault --version
 # Should show both the release version AND the git commit hash, e.g.:
-#   perseus-vault 2.20.2 (v2.20.2-0-gabcdef1)
+#   perseus-vault 2.23.1 (v2.23.1-0-gabcdef1)
 
 # 4. Confirm the doctor reports the same identity
 ./perseus-vault doctor --db /tmp/test.db | head -1
-#   perseus-vault doctor — v2.20.2 (v2.20.2-0-gabcdef1)
+#   perseus-vault doctor — v2.23.1 (v2.23.1-0-gabcdef1)
 ```
 
 ### Build reproducibly from source

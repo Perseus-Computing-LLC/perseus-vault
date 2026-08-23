@@ -99,8 +99,8 @@ Perseus and Perseus Vault address multiple government AI priorities:
 | Field | Value |
 |---|---|
 | Entity | Perseus Computing LLC |
-| UEI | [Pending SAM.gov registration] |
-| CAGE Code | [Pending] |
+| UEI | PJS2LW7HAK35 |
+| CAGE Code | 22JC5 |
 | NAICS Codes | 541715 (Primary), 541511, 541512 |
 | SBIR Registry | [Pending] |
 | Website | https://perseus.observer |
@@ -125,6 +125,11 @@ perseus-vault --help
 
 **For procurement inquiries, security assessments, or ATO support:**
 Email perseus@perseus.observer.
+
+> **Claim boundary:** procurement identifiers and readiness details in this
+> document are owner-published, dated claims. “CMMC Level 2 self-assessment”
+> is not a CMMC certification; these materials do not grant an ATO, cATO,
+> facility clearance, classified access, or partner/system authority.
 
 ---
 

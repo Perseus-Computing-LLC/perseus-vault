@@ -1,6 +1,6 @@
 # Claims Audit — Perseus Vault
 
-**Date:** 2026-08-01 (refreshed) · **Audited:** README.md vs code and committed benchmark artifacts on `main`
+**Date:** 2026-08-23 (refreshed) · **Audited:** README.md vs code and committed benchmark artifacts on `main`
 
 ## Audit note 2026-07-16 (#702)
 
@@ -16,8 +16,10 @@
 - Clarified that `federate` is a local export / workspace-rename / re-import
   (file based, no network peers); the Windows-safe default path is tracked
   in #704.
-- Tool-count note refreshed: the current registry contains 95 unique canonical
-  tool names. Compatibility aliases are callable but excluded from the count.
+- Tool-count note refreshed: the historical 95-tool observation below is
+  superseded; the current registry contains 169 unique canonical tool names.
+  Historical compatibility identifiers are not part of the current MCP
+  contract and are excluded from the count.
 
 ## Findings
 
