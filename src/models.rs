@@ -875,6 +875,18 @@ pub struct AuthorizedAction {
     pub superseding_head: String,
     #[serde(default)]
     pub handoff_receipt_ref: String,
+    /// #1134: optional task/action lineage sidecar references. Empty values
+    /// keep legacy AAR actions byte-compatible at the storage boundary.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub lineage_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub lineage_transition_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub lineage_outcome: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lineage_continuation: Option<crate::task_lineage::ContinuationReference>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lineage_receipt: Option<crate::task_lineage::LineageReceipt>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

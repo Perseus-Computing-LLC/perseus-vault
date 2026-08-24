@@ -20,6 +20,7 @@ mod extraction;
 mod extraction_loss;
 mod fingerprint;
 mod live_update;
+mod task_lineage;
 // __isoc23_strto* link shims so the default (bundled-embeddings) build links
 // against the prebuilt ONNX Runtime on glibc < 2.38 hosts, e.g. Ubuntu 22.04
 // — the dominant cloud/CI base image (#526).

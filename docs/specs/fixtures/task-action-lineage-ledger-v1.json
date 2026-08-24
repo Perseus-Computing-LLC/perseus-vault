@@ -1,0 +1,40 @@
+{
+  "ledger": {
+    "composition_binding": {
+      "action_digest": "1111111111111111111111111111111111111111111111111111111111111111",
+      "action_id": "act-fixture",
+      "authority_action_id": "act-fixture",
+      "authority_ref": "auth-fixture",
+      "composition_hash": "2222222222222222222222222222222222222222222222222222222222222222",
+      "context_head_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "policy_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "policy_version": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "profile_digest": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "schema": "perseus-ledger-composition-binding/v1",
+      "state_hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "task_lineage_id": "lin-fixture",
+      "taxonomy_hash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "taxonomy_version": "trusted-taxonomy/v1",
+      "verdict": "deny",
+      "workspace_scope": "workspace-fixture"
+    }
+  },
+  "schema": "perseus-vault-task-lineage-fixture/v1",
+  "sensitive_payload": "not_captured",
+  "vault": {
+    "action_id": "act-fixture",
+    "agent_id": "agent-fixture",
+    "authority_manifest_id": "auth-fixture",
+    "authority_manifest_version": 3,
+    "continuation_state_digest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "head_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "lineage_id": "lin-fixture",
+    "outcome": "denied",
+    "parent_head_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "policy_version": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "reason_code": "composition_denied",
+    "schema_version": 1,
+    "transition_id": "lin-tx-fixture",
+    "workspace_hash": "workspace-fixture"
+  }
+}

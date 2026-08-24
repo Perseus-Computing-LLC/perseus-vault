@@ -9304,6 +9304,9 @@ pub struct ActionIntentArgs {
     pub superseding_head: String,
     #[serde(default)]
     pub handoff_receipt_ref: String,
+    /// #1134: explicit, hash-only task/action lineage continuation or reset.
+    #[serde(default)]
+    pub lineage: Option<serde_json::Value>,
 }
 pub fn handle_action_intent(db: &Database, args: Value) -> Result<String, String> {
     let a: ActionIntentArgs = serde_json::from_value(args)
@@ -9318,8 +9321,24 @@ pub fn handle_action_intent(db: &Database, args: Value) -> Result<String, String
             handoff_receipt_ref: a.handoff_receipt_ref.clone(),
         })
     };
-    serde_json::to_string(
-        &db.action_intent(
+    let action = if let Some(lineage_value) = a.lineage.as_ref() {
+        let lineage = crate::task_lineage::parse_request(lineage_value)
+            .map_err(|e| format!("Invalid action_intent lineage: {e}"))?;
+        db.action_intent_with_lineage(
+            &a.agent_id,
+            &a.workspace_hash,
+            &a.scope_anchor,
+            &a.external_ref,
+            &a.capability,
+            &a.action_key,
+            &a.intent_hash,
+            Some(&a.resource_constraints_json),
+            &a.justification_entity_ids,
+            compensation.as_ref(),
+            &lineage,
+        )
+    } else {
+        db.action_intent(
             &a.agent_id,
             &a.workspace_hash,
             &a.scope_anchor,
@@ -9331,8 +9350,9 @@ pub fn handle_action_intent(db: &Database, args: Value) -> Result<String, String
             &a.justification_entity_ids,
             compensation.as_ref(),
         )
-        .map_err(|e| format!("action_intent failed: {e}"))?,
-    )
+    }
+    .map_err(|e| format!("action_intent failed: {e}"))?;
+    serde_json::to_string(&action)
     .map_err(|e| e.to_string())
 }
 #[derive(Debug, Deserialize)]
