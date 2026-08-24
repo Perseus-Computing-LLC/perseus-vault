@@ -20,6 +20,7 @@ mod extraction;
 mod extraction_loss;
 mod fingerprint;
 mod live_update;
+mod provider_source;
 mod task_lineage;
 // __isoc23_strto* link shims so the default (bundled-embeddings) build links
 // against the prebuilt ONNX Runtime on glibc < 2.38 hosts, e.g. Ubuntu 22.04
@@ -2691,6 +2692,7 @@ fn run_prepare(
         // #996: the CLI context path is an unscoped local operator surface —
         // identity gating arrives via the MCP tool (handle_context).
         requesting_agent_id: None,
+        include_provider_source: false,
     };
 
     let context_block = match db.context_block(&opts) {

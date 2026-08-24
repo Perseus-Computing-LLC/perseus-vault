@@ -28758,10 +28758,36 @@ last_accessed: {}
             body_entities.retain(|e| self.can_read(req, &e.visibility, &e.agent_id));
         }
 
+        // #1141: resolve source metadata only after the requester gate.
+        // The projection is explicitly allowlisted and contains no provider body.
+        let mut provider_source_by_entity: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        if opts.include_provider_source {
+            let mut seen = std::collections::HashSet::new();
+            for entity in always_on_entities.iter().chain(body_entities.iter()) {
+                if !seen.insert(entity.id.clone()) {
+                    continue;
+                }
+                if let Some(source) = self.provider_source_projection(
+                    &entity.id,
+                    ws.as_deref(),
+                    opts.requesting_agent_id.as_deref(),
+                )? {
+                    provider_source_by_entity
+                        .insert(entity.id.clone(), serde_json::to_string(&source)?);
+                }
+            }
+        }
+
         // Render.
         let entity_line = |entity: &crate::models::Entity, tag: &str| -> String {
+            let source_suffix = provider_source_by_entity
+                .get(&entity.id)
+                .map(|source| format!("; provider_source: {}", sanitize_prompt_field(source)))
+                .unwrap_or_default();
             format!(
-                "- {}[{}] **{}** — {} (type: {}, retrievals: {}, decay: {:.2})\n",
+                "- {}[{}] **{}** — {} (type: {}, retrievals: {}, decay: {:.2}){}
+",
                 tag,
                 sanitize_prompt_field(&entity.category),
                 sanitize_prompt_field(&entity.key),
@@ -28769,6 +28795,7 @@ last_accessed: {}
                 sanitize_prompt_field(&entity.entity_type),
                 entity.retrieval_count,
                 entity.decay_score,
+                source_suffix,
             )
         };
 
@@ -58899,6 +58926,7 @@ pub(crate) mod tests {
                 exclude_ids: vec![],
                 session_id: "sess-ctx-1".to_string(),
                 requesting_agent_id: None,
+                include_provider_source: false,
             })
             .unwrap();
         assert!(block.entities_injected >= 1);

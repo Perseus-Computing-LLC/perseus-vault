@@ -106,9 +106,9 @@ This is effective for Letta's agent architecture but is **tied to Letta's
 agent loop**. The memory blocks are managed by the Letta runtime, not by
 a standalone memory service.
 
-## MCP Tools: 169 canonical vs 8
+## MCP Tools: 170 canonical vs 8
 
-Perseus Vault's 169 canonical MCP tools cover the entire memory surface. Letta exposes ~8 tools
+Perseus Vault's 170 canonical MCP tools cover the entire memory surface. Letta exposes ~8 tools
 focused on agent state management. Perseus Vault's additional tools enable:
 
 - **perseus_vault_correct** — structured learning from errors
@@ -125,7 +125,7 @@ focused on agent state management. Perseus Vault's additional tools enable:
 **Perseus Vault's strengths vs Letta:**
 - Composable with any framework (not locked into one agent runtime)
 - Single binary, no PostgreSQL dependency
-- 169 canonical MCP tools vs 8
+- 170 canonical MCP tools vs 8
 - Encryption at rest
 - Full entity lifecycle management
 - MIT license

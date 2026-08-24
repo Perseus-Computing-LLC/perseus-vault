@@ -8,7 +8,7 @@ All notable changes to Perseus Vault are documented here. This project adheres t
 ### Fixed
 - **Release/public-contract reconciliation.** Corrective release `2.23.1`
   aligns the Cargo package, lockfile, MCP manifest, OCI identifier, and
-  source-derived 169-tool registry. The release workflow now checks
+  source-derived 170-tool registry. The release workflow now checks
   `server.json` and the registry metadata before any tag publication, and
   current documentation uses canonical `perseus_vault_*` tool names.
 - **Governed rejection propagation through maintenance.** Consolidation,
@@ -18,7 +18,7 @@ All notable changes to Perseus Vault are documented here. This project adheres t
   served after its source is rejected. Added an end-to-end rejection canary.
 - **Federation and release metadata drift.** The disabled peer-federation
   handler is no longer advertised as a local transfer feature; public registry
-  counts now reflect 169 canonical tools, and `server.json` pins the OCI
+  counts now reflect 170 canonical tools, and `server.json` pins the OCI
   identifier to the declared `2.23.0` version with CI validation.
 - **Concurrent audited link writes on Windows/macOS.** `BEGIN IMMEDIATE`
   now retries transient SQLite busy/locked contention with bounded backoff,

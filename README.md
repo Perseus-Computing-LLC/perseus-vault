@@ -21,7 +21,7 @@
 
 Give your agents memory that survives the session, so they stop re-deriving what they
 already learned and stop repeating past mistakes. Hybrid recall (BM25 + dense + RRF),
-bi-temporal history, and **AES-256-GCM** at rest, exposed as **169 canonical MCP tools** that work with any host. Legacy `mimir_*`/`mneme_*` aliases were removed in the 2026-27
+bi-temporal history, and **AES-256-GCM** at rest, exposed as **170 canonical MCP tools** that work with any host. Legacy `mimir_*`/`mneme_*` aliases were removed in the 2026-27
 major release and are
 not counted separately. **81.4% on LongMemEval's official-CoT harness (accepted frozen-default single run, 407/500; not a mean)** (vs Zep 63.8%, Mem0
 49.0%).
@@ -394,7 +394,7 @@ Each adapter:
 Any MCP-compatible framework works with Perseus Vault directly. See
 [MCP client and framework integrations](docs/clients/README.md) for the full list.
 
-## 169 Canonical MCP Tools
+## 170 Canonical MCP Tools
 
 > **Canonical product and tool names.** Perseus Vault is the product name, and integrations use the canonical `perseus_vault_*` tools (for example, `perseus_vault_remember`). The legacy `mimir_*`, `mneme_*`, and `plutus_*` tool names are not part of the current MCP contract. Historical database/key-path compatibility is retained only for explicit migration of existing installations.
 > The count is the number of unique canonical tools in the source registry. The current server advertises one name per tool in `tools/list`; compatibility and historical records do not inflate the public count.
@@ -417,9 +417,9 @@ attention-constrained agent clients:
 
 | Setting | Advertised surface | Count |
 |---|---|---|
-| `full` (default) | everything | 169 |
-| `ops` | agent surface + operational grooming, maintenance, governance, export | 162 |
-| `agent` | everyday memory + coordination surface (recall / remember / context / handoffs / state, plus the agent-side AAR calls) | 51 |
+| `full` (default) | everything | 170 |
+| `ops` | agent surface + operational grooming, maintenance, governance, export | 163 |
+| `agent` | everyday memory + coordination surface (recall / remember / context / handoffs / state, plus the agent-side AAR calls) | 52 |
 
 Scopes are **advertisement-only**: a hidden tool remains fully callable via
 `tools/call`, and authorization stays with workspace binding and authority

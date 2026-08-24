@@ -72,7 +72,7 @@ Tested and confirmed working with:
 
 ## Tools & Plugins
 
-### Perseus Vault Itself (current registry; 169 canonical MCP tools)
+### Perseus Vault Itself (current registry; 170 canonical MCP tools)
 
 | Category | Tools |
 |---|---|
