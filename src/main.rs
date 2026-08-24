@@ -10,6 +10,7 @@ mod context_transform;
 mod court_audit;
 mod db;
 mod declared;
+mod declared_graph;
 mod dedup;
 #[cfg(test)]
 mod derived_visibility;

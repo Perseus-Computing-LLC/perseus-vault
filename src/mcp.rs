@@ -779,6 +779,8 @@ pub fn handle_request(
             {
                 const SCOPE_MUTATION_TOOLS: &[&str] = &[
                     "perseus_vault_provider_source_event",
+                    "perseus_vault_declared_graph_manifest",
+                    "perseus_vault_declared_graph_attest",
                     "perseus_vault_remember",
                     "perseus_vault_journal",
                     "perseus_vault_reject_value",
@@ -801,6 +803,7 @@ pub fn handle_request(
                 ];
                 const SCOPE_READ_TOOLS: &[&str] = &[
                     "perseus_vault_recall",
+                    "perseus_vault_declared_graph_query",
                     "perseus_vault_recall_batch",
                     "perseus_vault_recall_layer",
                     "perseus_vault_scan",
@@ -1183,6 +1186,49 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
   },
   {"name": "perseus_vault_provider_source_event", "description": "Apply a versioned provider-native source event. Preserves stable provider identity, revision and content digests, timestamps, thread or parent lineage, visibility and workspace scope, and governed deletion tombstones. The envelope never accepts or stores raw provider bodies or payloads. Replaying the same provider/external_id/revision is idempotent.", "inputSchema": {"type": "object", "properties": {"schema_version": {"type": "integer", "const": 1}, "event_type": {"type": "string", "enum": ["upsert", "comment", "reply", "attachment", "delete"]}, "provider": {"type": "string"}, "kind": {"type": "string"}, "external_id": {"type": "string"}, "canonical_uri": {"type": "string"}, "thread_id": {"type": "string"}, "parent_id": {"type": "string"}, "provider_event_id": {"type": "string"}, "author": {"type": "string", "maxLength": 256}, "revision": {"type": "string"}, "expected_revision": {"type": "string"}, "observed_at_unix_ms": {"type": "integer", "minimum": 0}, "provider_created_at_unix_ms": {"type": "integer", "minimum": 0}, "provider_updated_at_unix_ms": {"type": "integer", "minimum": 0}, "content_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}, "source_span_ref": {"type": "string"}, "workspace_hash": {"type": "string"}, "visibility": {"type": "string", "enum": ["private", "workspace", "public"]}, "retention_policy": {"type": "string"}, "capture_method": {"type": "string"}, "requesting_agent_id": {"type": "string", "description": "Transport-stamped identity; caller-supplied values are overwritten."}, "entity_id": {"type": "string"}}, "required": ["schema_version", "event_type", "provider", "kind", "external_id", "revision"]}, "outputSchema": {"type": "object", "properties": {"schema_version": {"type": "integer"}, "outcome": {"type": "string", "enum": ["applied", "idempotent", "revision_race", "deleted"]}, "event_type": {"type": "string"}, "event_id": {"type": "string"}, "receipt_digest": {"type": "string"}, "source": {"type": "object"}, "previous_revision": {"type": "string"}, "entity_archived": {"type": "boolean"}}}, "annotations": {"destructiveHint": true}, "title": "Provider Source Event"},
   {
+    "name": "perseus_vault_declared_graph_manifest",
+    "description": "Apply a versioned, source-keyed declared graph manifest. Stable node and edge IDs are scoped by workspace and canonical identity; replace revisions supersede prior active topology, while delete revisions create tombstones and preserve history. Declared edges remain sourced or supported until explicitly attested. No LLM extraction is performed.",
+    "inputSchema": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": {"type": "integer", "const": 1},
+        "operation": {"type": "string", "enum": ["upsert", "delete"]},
+        "source_key": {"type": "string", "maxLength": 256},
+        "revision": {"type": "string", "maxLength": 256},
+        "content_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "source_span_ref": {"type": "string", "maxLength": 1024},
+        "workspace_hash": {"type": "string", "maxLength": 256},
+        "valid_from_unix_ms": {"type": "integer", "minimum": 0},
+        "valid_to_unix_ms": {"type": "integer", "minimum": 0},
+        "policy": {"type": "string", "const": "replace"},
+        "nodes": {"type": "array", "maxItems": 256, "items": {"type": "object", "additionalProperties": false, "properties": {"namespace": {"type": "string", "maxLength": 128}, "canonical_id": {"type": "string", "maxLength": 512}, "node_type": {"type": "string", "maxLength": 128}, "external_ref": {"type": "string", "maxLength": 2048}}, "required": ["namespace", "canonical_id", "node_type"]}},
+        "edges": {"type": "array", "maxItems": 512, "items": {"type": "object", "additionalProperties": false, "properties": {"from": {"type": "string"}, "to": {"type": "string"}, "predicate": {"type": "string", "maxLength": 128}, "direction": {"type": "string", "enum": ["forward", "reverse"]}, "context": {"type": "string", "maxLength": 1024}, "source_span_ref": {"type": "string", "maxLength": 1024}, "origin": {"type": "string", "const": "declared"}, "support_state": {"type": "string", "enum": ["sourced", "supported"]}, "valid_from_unix_ms": {"type": "integer", "minimum": 0}, "valid_to_unix_ms": {"type": "integer", "minimum": 0}}, "required": ["from", "to", "predicate", "direction", "origin", "support_state"]}},
+        "requesting_agent_id": {"type": "string", "description": "Transport-stamped identity; caller-supplied values are overwritten."}
+      },
+      "required": ["schema_version", "operation", "source_key", "revision", "content_sha256", "workspace_hash", "policy"]
+    },
+    "outputSchema": {"type": "object", "properties": {"schema_version": {"type": "integer"}, "outcome": {"type": "string", "enum": ["applied", "idempotent"]}, "manifest_id": {"type": "string"}, "source_id": {"type": "string"}, "node_ids": {"type": "array", "items": {"type": "string"}}, "edge_ids": {"type": "array", "items": {"type": "string"}}, "edges": {"type": "array", "items": {"type": "object"}}}, "required": ["schema_version", "outcome", "manifest_id", "source_id", "node_ids", "edge_ids", "edges"]},
+    "annotations": {"destructiveHint": true},
+    "title": "Declared Graph Manifest"
+  },
+  {
+    "name": "perseus_vault_declared_graph_attest",
+    "description": "Explicitly attest selected active declared edges under an authority reference. Sourced or supported edges cannot become attested through ingestion alone; the selected edge IDs, manifest revision, attestor, and bounded reference are recorded and replay is idempotent.",
+    "inputSchema": {"type": "object", "additionalProperties": false, "properties": {"schema_version": {"type": "integer", "const": 1}, "workspace_hash": {"type": "string", "maxLength": 256}, "source_key": {"type": "string", "maxLength": 256}, "revision": {"type": "string", "maxLength": 256}, "edge_ids": {"type": "array", "minItems": 1, "maxItems": 512, "items": {"type": "string", "maxLength": 128}}, "attestation_ref": {"type": "string", "maxLength": 1024}, "attested_by": {"type": "string", "maxLength": 256}, "requesting_agent_id": {"type": "string", "description": "Transport-stamped identity; caller-supplied values are overwritten."}}, "required": ["schema_version", "workspace_hash", "source_key", "revision", "edge_ids", "attestation_ref", "attested_by"]},
+    "outputSchema": {"type": "object", "properties": {"schema_version": {"type": "integer"}, "outcome": {"type": "string", "enum": ["applied", "idempotent"]}, "manifest_id": {"type": "string"}, "edge_ids": {"type": "array", "items": {"type": "string"}}, "receipt_digest": {"type": "string"}}, "required": ["schema_version", "outcome", "manifest_id", "edge_ids", "receipt_digest"]},
+    "annotations": {"destructiveHint": true},
+    "title": "Attest Declared Graph Edges"
+  },
+  {
+    "name": "perseus_vault_declared_graph_query",
+    "description": "Read a bounded workspace-scoped projection of declared graph nodes and edges. Active-only output is the default; include_history exposes superseded and tombstoned revisions. Every edge carries source revision, digest/span, scope, origin, validity, and explicit attestation state. This is separate from ordinary recall and does not add graph traversal cost to normal queries.",
+    "inputSchema": {"type": "object", "additionalProperties": false, "properties": {"workspace_hash": {"type": "string", "maxLength": 256}, "source_key": {"type": "string", "maxLength": 256}, "requesting_agent_id": {"type": "string", "description": "Transport-stamped identity; caller-supplied values are overwritten."}, "include_history": {"type": "boolean", "default": false}, "limit": {"type": "integer", "minimum": 1, "maximum": 500, "default": 100}}, "required": ["workspace_hash"]},
+    "outputSchema": {"type": "object", "properties": {"schema_version": {"type": "integer"}, "workspace_hash": {"type": "string"}, "source_key": {"type": "string"}, "nodes": {"type": "array", "items": {"type": "object"}}, "edges": {"type": "array", "items": {"type": "object"}}, "truncated": {"type": "boolean"}}, "required": ["schema_version", "workspace_hash", "nodes", "edges", "truncated"]},
+    "annotations": {"readOnlyHint": true},
+    "title": "Query Declared Graph"
+  },
+  {
     "name": "perseus_vault_recall",
     "description": "Search entities with FTS5 keyword search. Words are OR'd together. Returns entities sorted by relevance with expanded content/summary fields at top level. Use this to find previously stored facts, decisions, or architecture notes. When encryption is enabled, body_json is decrypted transparently.",
     "inputSchema": {
@@ -1286,6 +1332,11 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
           "type": "boolean",
           "default": false,
           "description": "#1141: include only sanitized provider identity, revision, digest, scope, and thread lineage; raw provider bodies and payloads are never returned."
+        },
+        "include_declared_graph": {
+          "type": "boolean",
+          "default": false,
+          "description": "#1142: attach a bounded workspace-scoped hash-only declared graph projection. Requires workspace_hash and a transport-stamped requester; ordinary recall does not query the graph."
         },
         "include_conflict_flags": {
           "type": "boolean",
@@ -1441,6 +1492,10 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
         "variants": {
           "type": "integer",
           "description": "Number of query variants used when expansion is enabled"
+        },
+        "declared_graph": {
+          "type": "object",
+          "description": "#1142: optional bounded declared graph projection; nodes/edges carry hash-only source, span, scope, origin, validity, and support state."
         },
         "conflict_flags": {
           "type": "array",
@@ -4384,6 +4439,11 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
           "default": false,
           "description": "#1141: include sanitized provider identity and thread lineage on context lines; provider bodies and payloads are excluded."
         },
+        "include_declared_graph": {
+          "type": "boolean",
+          "default": false,
+          "description": "#1142: attach a bounded workspace-scoped hash-only declared graph projection to the context response. Requires workspace_hash and a transport-stamped requester."
+        },
         "session_id": {
           "type": "string",
           "description": "Session id for preload usage telemetry (#875): injected entities are attributed to this session for precision/recall resolution. Omit or leave empty when unknown."
@@ -4420,6 +4480,10 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
             "type": "string"
           },
           "description": "Soft warnings: always-on cap overflow, budget truncation"
+        },
+        "declared_graph": {
+          "type": "object",
+          "description": "#1142: optional bounded declared graph projection with hash-only source, span, scope, origin, validity, and support state."
         }
       }
     },
@@ -4633,6 +4697,15 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
         "requesting_agent_id": {
           "type": "string",
           "description": "Transport-stamped requester identity; required at runtime for body-safe traversal."
+        },
+        "workspace_hash": {
+          "type": "string",
+          "description": "Workspace scope required when include_declared_graph is true."
+        },
+        "include_declared_graph": {
+          "type": "boolean",
+          "default": false,
+          "description": "#1142: attach a bounded hash-only declared graph projection; ordinary entity traversal never queries it."
         }
       },
       "required": [
@@ -4653,6 +4726,10 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
             "type": "object"
           },
           "description": "Linked entities traversed from root"
+        },
+        "declared_graph": {
+          "type": "object",
+          "description": "#1142: optional bounded declared graph projection with hash-only source, span, scope, origin, validity, and support state."
         }
       },
       "required": [
@@ -8116,6 +8193,9 @@ fn resolve_scope_view(raw: Option<&str>) -> ScopeView {
 /// scripts/registry_metadata_check.py.
 const TOOL_SCOPES: &[(&str, ToolScope)] = &[
     ("perseus_vault_provider_source_event", ToolScope::Agent),
+    ("perseus_vault_declared_graph_manifest", ToolScope::Agent),
+    ("perseus_vault_declared_graph_attest", ToolScope::Ops),
+    ("perseus_vault_declared_graph_query", ToolScope::Agent),
     ("perseus_vault_remember", ToolScope::Agent),
     ("perseus_vault_write_gate", ToolScope::Agent),
     ("perseus_vault_recall", ToolScope::Agent),
@@ -8365,6 +8445,15 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
 
         "perseus_vault_provider_source_event" => {
             tools::handle_provider_source_event(db, args).map_err(|e| e.to_string())
+        }
+        "perseus_vault_declared_graph_manifest" => {
+            tools::handle_declared_graph_manifest(db, args).map_err(|e| e.to_string())
+        }
+        "perseus_vault_declared_graph_attest" => {
+            tools::handle_declared_graph_attest(db, args).map_err(|e| e.to_string())
+        }
+        "perseus_vault_declared_graph_query" => {
+            tools::handle_declared_graph_query(db, args).map_err(|e| e.to_string())
         }
         "perseus_vault_recall" => tools::handle_recall(db, args).map_err(|e| e.to_string()),
         "perseus_vault_handoff_pack" => {
@@ -8767,7 +8856,7 @@ mod tests {
         );
         assert_eq!(
             registry_names.len(),
-            170,
+            173,
             "update public metadata when adding a tool"
         );
 
@@ -10333,15 +10422,15 @@ mod tests {
         let full = filter_registry_by_view(registry.clone(), ScopeView::Full);
         assert_eq!(
             agent.len(),
-            52,
+            54,
             "agent view count drifted — new tools must be classified"
         );
         assert_eq!(
             ops.len(),
-            163,
+            166,
             "ops view count drifted — new tools must be classified"
         );
-        assert_eq!(full.len(), 170, "full view must expose the whole registry");
+        assert_eq!(full.len(), 173, "full view must expose the whole registry");
         assert!(agent.len() < ops.len() && ops.len() < full.len());
     }
 
@@ -10377,6 +10466,120 @@ mod tests {
         for view in [ScopeView::Agent, ScopeView::Ops, ScopeView::Full] {
             let filtered = filter_registry_by_view(tool_registry_base().clone(), view);
             assert!(filtered.len() >= 48);
+        }
+    }
+
+    #[test]
+    fn declared_graph_mcp_tools_use_transport_stamped_identity() {
+        let db_path = std::env::temp_dir().join(format!(
+            "perseus-vault-declared-graph-mcp-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let db = Database::open(db_path.to_str().expect("temp db path")).expect("open temp db");
+        let state = MCPState::new_with_strict_scope(false);
+        let init = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(1)),
+            method: "initialize".to_string(),
+            params: Some(json!({
+                "clientInfo": {"name": "transport-agent", "version": "1.0"}
+            })),
+        };
+        handle_request(&init, &state, &db).expect("initialize");
+        assert_eq!(*state.session_agent_id.read().unwrap(), "transport-agent");
+
+        let call = |id: i64, name: &str, arguments: Value| -> Value {
+            let request = JsonRpcRequest {
+                jsonrpc: "2.0".to_string(),
+                id: Some(json!(id)),
+                method: "tools/call".to_string(),
+                params: Some(json!({"name": name, "arguments": arguments})),
+            };
+            let response = handle_request(&request, &state, &db).expect("tool response");
+            response
+                .result
+                .expect("tool result")
+                .get("structuredContent")
+                .cloned()
+                .expect("structured content")
+        };
+
+        let manifest = call(
+            2,
+            "perseus_vault_declared_graph_manifest",
+            json!({
+                "schema_version": 1,
+                "operation": "upsert",
+                "source_key": "transport-manifest",
+                "revision": "r1",
+                "content_sha256": "a".repeat(64),
+                "source_span_ref": "artifact:transport/span:0-12",
+                "workspace_hash": "workspace-a",
+                "policy": "replace",
+                "nodes": [
+                    {"namespace": "service", "canonical_id": "api", "node_type": "service"},
+                    {"namespace": "service", "canonical_id": "db", "node_type": "database"}
+                ],
+                "edges": [{
+                    "from": "service:api",
+                    "to": "service:db",
+                    "predicate": "DEPENDS_ON",
+                    "direction": "forward",
+                    "origin": "declared",
+                    "support_state": "sourced"
+                }]
+            }),
+        );
+        assert_eq!(manifest["outcome"], "applied");
+        let edge_id = manifest["edge_ids"][0]
+            .as_str()
+            .expect("edge id")
+            .to_string();
+
+        let sourced = call(
+            3,
+            "perseus_vault_declared_graph_query",
+            json!({"workspace_hash": "workspace-a", "limit": 10}),
+        );
+        assert_eq!(sourced["edges"][0]["attestation_state"], "sourced");
+
+        let attested = call(
+            4,
+            "perseus_vault_declared_graph_attest",
+            json!({
+                "schema_version": 1,
+                "workspace_hash": "workspace-a",
+                "source_key": "transport-manifest",
+                "revision": "r1",
+                "edge_ids": [edge_id],
+                "attestation_ref": "review:transport:r1",
+                "attested_by": "reviewer-transport"
+            }),
+        );
+        assert_eq!(attested["outcome"], "applied");
+
+        let verified = call(
+            5,
+            "perseus_vault_declared_graph_query",
+            json!({"workspace_hash": "workspace-a", "limit": 10}),
+        );
+        assert_eq!(verified["edges"][0]["attestation_state"], "attested");
+        assert_eq!(verified["edges"][0]["origin"], "declared");
+        assert_eq!(verified["edges"][0]["source_revision"], "r1");
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn declared_graph_tools_are_registered_with_governed_scopes() {
+        let registry = tool_registry_base();
+        let expected = [
+            ("perseus_vault_declared_graph_manifest", ToolScope::Agent),
+            ("perseus_vault_declared_graph_attest", ToolScope::Ops),
+            ("perseus_vault_declared_graph_query", ToolScope::Agent),
+        ];
+        for (name, scope) in expected {
+            assert!(registry.iter().any(|tool| tool["name"] == name), "missing registry tool {name}");
+            assert_eq!(tool_scope_rank(name), scope.rank(), "wrong scope for {name}");
         }
     }
 
