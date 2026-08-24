@@ -63,8 +63,10 @@ jobs:
           cp .model-cache/model_qint8_avx512_vnni.onnx .model-cache/model_quantized.onnx
       - name: Build
         run: cargo build --locked --verbose
+      # Several repository tests intentionally manipulate process-global embedding
+      # state/environment; serialize this lane so those fixtures cannot poison one another.
       - name: Run tests
-        run: cargo test --locked --verbose
+        run: cargo test --locked --verbose -- --test-threads=1
 
   # All-platform first-class (#237): the bundled default must also build, LINK,
   # and run on Windows MSVC. The esaxx-rs/ort static-vs-dynamic-CRT link clash was
@@ -92,8 +94,10 @@ jobs:
           cp .model-cache/model_qint8_avx512_vnni.onnx .model-cache/model_quantized.onnx
       - name: Build
         run: cargo build --locked --verbose
+      # Several repository tests intentionally manipulate process-global embedding
+      # state/environment; serialize this lane so those fixtures cannot poison one another.
       - name: Run tests
-        run: cargo test --locked --verbose
+        run: cargo test --locked --verbose -- --test-threads=1
 
   # All-platform first-class (#237), cont'd: the bundled default must also build,
   # link, and run real inference on macOS (Apple Silicon). The `ort`
@@ -129,7 +133,7 @@ jobs:
       # lane. The default Rust test-harness fan-out exhausts it while
       # embedding-backed tests spawn database workers, producing macOS
       # Os { code: 35, kind: WouldBlock } failures. Keep this platform lane
-      # deterministic; Linux and Windows retain parallel scheduling.
+      # deterministic; Linux and Windows use the same serialization for process-global fixtures.
       - name: Run tests
         run: cargo test --locked --verbose -- --test-threads=1
 
