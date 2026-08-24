@@ -137,6 +137,45 @@ explicitly `legacy-readable` and not relabeled or made like-for-like by
 inference. No provider, answerer, or judge call is made by the manifest or
 scorecard tests.
 
+## Reader/judge sensitivity matrix (#1138)
+
+`sensitivity_matrix.py` adds a provider-free, opt-in protocol gate for separating
+reader, judge, prompt-lane, and retrieval-cutoff sensitivity. The strict
+`longmemeval-sensitivity-matrix/v1` schema records, per cell:
+
+- reader/provider identity and exact decoding parameters;
+- judge/provider identity, contract, threshold, prompt digest, and whether the
+  result is correlated with the reader;
+- `official-cot` versus `production-generic` prompt lane;
+- retrieval arm, requested/effective depth, context-token budget, retry policy,
+  denominator, and artifact/configuration commitments.
+
+The deterministic synthetic fixture can be rendered without a dataset, binary,
+API key, provider, answerer, judge, network call, or paid spend:
+
+```bash
+python benchmark/longmemeval/sensitivity_matrix.py \
+    --fixture benchmark/longmemeval/sensitivity_matrix_fixture.json \
+    --out /tmp/longmemeval_sensitivity_report.json
+```
+
+Every cell owns an immutable sanitized outcome set and digest. The report emits
+paired hash-only per-question rows, category deltas, and a sensitivity table
+while keeping retrieval coverage, end-to-end QA, abstention/negative behavior,
+judge agreement/discordance, latency, call counts, and provider usage/cost in
+separate fields. Missing protocol fields, incomplete cells, mismatched
+configuration/outcome digests, raw-payload markers, and provider activity in
+the provider-free mode fail closed; the writer never post-processes a baseline
+into a candidate cell.
+
+A same-model answerer/judge cell is explicitly labeled
+`correlated-same-model` and cannot authorize an independent-validation claim.
+A later bounded paid canary is a separate operator decision: it must provide
+complete usage/latency/call telemetry plus a human-audit or second-judge sample
+before any smaller-reader or production-economics claim is eligible. This gate
+is off the default published claim path and does not relabel the existing
+official-compatible or product-optimized lanes.
+
 ## Evidence sufficiency curves (#1112)
 
 `retrieval_diag.py` now composes an additive `sufficiency` projection using
