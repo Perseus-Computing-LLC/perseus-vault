@@ -23,8 +23,10 @@ Give your agents memory that survives the session, so they stop re-deriving what
 already learned and stop repeating past mistakes. Hybrid recall (BM25 + dense + RRF),
 bi-temporal history, and **AES-256-GCM** at rest, exposed as **169 canonical MCP tools** that work with any host. Legacy `mimir_*`/`mneme_*` aliases were removed in the 2026-27
 major release and are
-not counted separately. **73.8% on LongMemEval's official harness** (vs Zep 63.8%, Mem0
+not counted separately. **81.4% on LongMemEval's official-CoT harness (accepted frozen-default single run, 407/500; not a mean)** (vs Zep 63.8%, Mem0
 49.0%).
+**Historical full-run means remain separate: official-CoT 79.0%, plain 73.8%.**
+
 **One binary. One file. No Docker. No Postgres. No cloud.** Local-first, air-gap ready, MIT.
 
 ## One-Line Install
@@ -223,16 +225,22 @@ Perseus Vault is the **only** memory engine that is simultaneously MCP-native,
 local-first, zero-dependency, AND agent-first.
 
 ### LongMemEval QA (official harness)
+Recall quality measured on the LongMemEval official harness. These rows are separate
+protocol claims and must not be blended:
 
-Recall quality measured on LongMemEval's **official** harness, not a home-grown script:
+| Claim | QA accuracy | conditions |
+|---|---:|---|
+| **Perseus Vault accepted frozen-default** | **81.4% (407/500)** | one official-CoT run; accepted after a separately namespaced correction; not a mean |
+| Perseus Vault historical official-CoT mean | 79.0% | mean of three independent full runs |
+| Perseus Vault historical plain-prompt mean | 73.8% | mean of three independent full runs |
+| Zep | 63.8% (published) | conditions not fully protocol-matched |
+| Mem0 | 49.0% (published) | conditions not fully protocol-matched |
 
-| Memory engine | QA accuracy |
-|---|---|
-| **Perseus Vault** | **73.8%** |
-| Zep | 63.8% (published) |
-| Mem0 | 49.0% (published) |
-
-`longmemeval_s` (500 questions), gpt-4o-2024-08-06 answerer + LongMemEval's official judge; competitor numbers are their published values. Perseus Vault's 73.8% is the plain mean of 3 runs; 79.0% with official CoT. [Methodology & content-hashed (sha256) results →](benchmark/longmemeval/COMPARISON.md)
+The accepted run is tied to the [content-hashed report](benchmark/longmemeval/qa_report_cot_frozen_default_20260819.json)
+(SHA-256 `838f71f508b7d5eab033e7256be444164a4d7e7dcd7b33d35ae39b20510abe36`) and
+[public manifest](benchmark/longmemeval/accepted_frozen_default_manifest.json), which records
+the exact final-manifest commitment (SHA-256 `38e23f5e50d6b5aa0cfa5d88c5c68387eb03eb69d88065531678dc0c1e97933d`).
+The accepted single run does not authorize Runs 2/3 or promote the preference-structured candidate.
 
 ### LOCOMO (mem0's own harness)
 

@@ -1,0 +1,86 @@
+{
+  "abstention_subset": {
+    "accuracy": 0.7667,
+    "n": 30
+  },
+  "accepted_report_filename": "qa_report_cot_frozen_default_20260819.json",
+  "answer_prompt": "official-cot",
+  "answerer_model": "gpt-4o-2024-08-06",
+  "benchmark": "perseus-vault-longmemeval-qa",
+  "categories": [
+    {
+      "accuracy": 0.8205128205128205,
+      "correct": 64,
+      "n": 78,
+      "question_type": "knowledge-update"
+    },
+    {
+      "accuracy": 0.7669172932330827,
+      "correct": 102,
+      "n": 133,
+      "question_type": "multi-session"
+    },
+    {
+      "accuracy": 1.0,
+      "correct": 56,
+      "n": 56,
+      "question_type": "single-session-assistant"
+    },
+    {
+      "accuracy": 0.5,
+      "correct": 15,
+      "n": 30,
+      "question_type": "single-session-preference"
+    },
+    {
+      "accuracy": 1.0,
+      "correct": 70,
+      "n": 70,
+      "question_type": "single-session-user"
+    },
+    {
+      "accuracy": 0.7518796992481203,
+      "correct": 100,
+      "n": 133,
+      "question_type": "temporal-reasoning"
+    }
+  ],
+  "claim_boundary": "One accepted frozen-default official-CoT 500-question baseline after a separately namespaced one-cell correction. This is not a three-run mean, a plain-prompt result, or a product-wide claim.",
+  "denominator": {
+    "answer_errors": 0,
+    "attempted_cells": 2000,
+    "graded_cells": 2000,
+    "judge_errors": 0,
+    "planned_cells": 2000,
+    "unknown_or_excluded": 0
+  },
+  "hypothesis_mode": "complete-response",
+  "judge_model": "gpt-4o-2024-08-06",
+  "judge_semantics": "LongMemEval official per-type judge",
+  "preference_structured_included": false,
+  "question_count": 500,
+  "raw_payloads_excluded": true,
+  "retrieval": {
+    "context_mode": "full",
+    "context_token_budget": 32768,
+    "effective_depth": 10,
+    "mode": "hybrid",
+    "requested_depth": 10
+  },
+  "run_id": "longmemeval-official-cot-frozen-default-full-20260819-r4",
+  "runs_2_3_started": false,
+  "schema_version": "perseus-vault-longmemeval-accepted-frozen-default-public/v1",
+  "score": {
+    "accuracy": 0.814,
+    "correct": 407,
+    "denominator": 500
+  },
+  "source_code_commit": "deeff47f352e7af22694d584b07c1e66cd4e7b61",
+  "source_code_tree_sha256": "813d4f4b45434f4ccba9019fa19976c2af04ad504716642e511932611bd530f6",
+  "source_manifest_sha256": "38e23f5e50d6b5aa0cfa5d88c5c68387eb03eb69d88065531678dc0c1e97933d",
+  "source_report_sha256": "838f71f508b7d5eab033e7256be444164a4d7e7dcd7b33d35ae39b20510abe36",
+  "split": "longmemeval_s",
+  "status": "accepted_with_correction",
+  "system": "perseus-vault",
+  "temperature": 0
+}
