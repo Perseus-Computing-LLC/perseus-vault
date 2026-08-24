@@ -1,0 +1,175 @@
+{
+  "schema": "longmemeval-failure-attribution-fixture/v1",
+  "synthetic_only": true,
+  "cases": [
+    {
+      "scenario": "preference_authority",
+      "question_id": "fixture-pref",
+      "question_type": "single-session-preference",
+      "question": "Which drink fits my preference?",
+      "question_date": "2024/01/10 (Wed) 12:00",
+      "required_evidence_ids": ["pref-session"],
+      "ranked_ids": ["pref-session", "pref-distractor"],
+      "sessions": [
+        {
+          "session_id": "pref-session",
+          "date": "2024/01/02 (Tue) 09:00",
+          "turns": [
+            {"role": "user", "content": "I prefer tea and avoid coffee."},
+            {"role": "assistant", "content": "The assistant suggests coffee for a busy morning."}
+          ]
+        },
+        {
+          "session_id": "pref-distractor",
+          "date": "2024/01/03 (Wed) 09:00",
+          "turns": [
+            {"role": "user", "content": "The weather is mild today."},
+            {"role": "assistant", "content": "A walk may be pleasant."}
+          ]
+        }
+      ],
+      "outcomes": {"vault_correct": false, "fullcontext_correct": false, "oracle_correct": true, "stateless_correct": false}
+    },
+    {
+      "scenario": "multi_session_composition",
+      "question_id": "fixture-multi",
+      "question_type": "multi-session",
+      "question": "How many workshops did I attend across the two dates?",
+      "question_date": "2024/02/10 (Sat) 12:00",
+      "required_evidence_ids": ["multi-a", "multi-b"],
+      "ranked_ids": ["multi-a", "multi-distractor"],
+      "sessions": [
+        {
+          "session_id": "multi-a",
+          "date": "2024/02/01 (Thu) 09:00",
+          "turns": [
+            {"role": "user", "content": "I attended 2 workshops on February 1."},
+            {"role": "assistant", "content": "That is the first workshop record."}
+          ]
+        },
+        {
+          "session_id": "multi-b",
+          "date": "2024/02/03 (Sat) 09:00",
+          "turns": [
+            {"role": "user", "content": "I attended 3 workshops on February 3."},
+            {"role": "assistant", "content": "That is the second workshop record."}
+          ]
+        },
+        {
+          "session_id": "multi-distractor",
+          "date": "2024/02/04 (Sun) 09:00",
+          "turns": [
+            {"role": "user", "content": "I read a book."},
+            {"role": "assistant", "content": "Reading is a good habit."}
+          ]
+        }
+      ],
+      "outcomes": {"vault_correct": false, "fullcontext_correct": false, "oracle_correct": true, "stateless_correct": false}
+    },
+    {
+      "scenario": "latest_version_selection",
+      "question_id": "fixture-version",
+      "question_type": "knowledge-update",
+      "question": "What is the latest project limit?",
+      "question_date": "2024/03/10 (Sun) 12:00",
+      "required_evidence_ids": ["version-old", "version-new"],
+      "ranked_ids": ["version-old", "version-distractor", "version-new"],
+      "sessions": [
+        {
+          "session_id": "version-old",
+          "date": "2024/03/01 (Fri) 09:00",
+          "turns": [
+            {"role": "user", "content": "The project limit was 2 items."},
+            {"role": "assistant", "content": "The earlier limit was recorded."}
+          ]
+        },
+        {
+          "session_id": "version-new",
+          "date": "2024/03/08 (Fri) 09:00",
+          "turns": [
+            {"role": "user", "content": "Update: the project limit is now 5 items."},
+            {"role": "assistant", "content": "The latest limit supersedes the earlier value."}
+          ]
+        },
+        {
+          "session_id": "version-distractor",
+          "date": "2024/03/07 (Thu) 09:00",
+          "turns": [
+            {"role": "user", "content": "The project name is Atlas."},
+            {"role": "assistant", "content": "Atlas is the project name."}
+          ]
+        }
+      ],
+      "outcomes": {"vault_correct": false, "fullcontext_correct": false, "oracle_correct": true, "stateless_correct": false}
+    },
+    {
+      "scenario": "temporal_anchor",
+      "question_id": "fixture-temporal",
+      "question_type": "temporal-reasoning",
+      "question": "Which event happened first?",
+      "question_date": "2024/04/10 (Wed) 12:00",
+      "required_evidence_ids": ["temporal-event"],
+      "ranked_ids": ["temporal-event", "temporal-distractor"],
+      "sessions": [
+        {
+          "session_id": "temporal-event",
+          "date": "2024/04/02 (Tue) 09:00",
+          "turns": [
+            {"role": "user", "content": "On April 2 I attended the lecture before the race on April 5."},
+            {"role": "assistant", "content": "The lecture was earlier."}
+          ]
+        },
+        {
+          "session_id": "temporal-distractor",
+          "date": "2024/04/06 (Sat) 09:00",
+          "turns": [
+            {"role": "user", "content": "The weekend was quiet."},
+            {"role": "assistant", "content": "That sounds restful."}
+          ]
+        }
+      ],
+      "outcomes": {"vault_correct": false, "fullcontext_correct": true, "oracle_correct": true, "stateless_correct": false}
+    },
+    {
+      "scenario": "assembly_loss",
+      "question_id": "fixture-assembly",
+      "question_type": "single-session-user",
+      "question": "What color did I choose?",
+      "question_date": "2024/05/10 (Fri) 12:00",
+      "required_evidence_ids": ["assembly-session"],
+      "ranked_ids": ["assembly-session"],
+      "sessions": [
+        {
+          "session_id": "assembly-session",
+          "date": "2024/05/01 (Wed) 09:00",
+          "turns": [
+            {"role": "user", "content": "I chose the green bicycle."},
+            {"role": "assistant", "content": "The green bicycle choice is recorded."}
+          ]
+        }
+      ],
+      "projection": {"source_token_preserved": false, "budget_ok": true},
+      "outcomes": {"vault_correct": false, "fullcontext_correct": false, "oracle_correct": true, "stateless_correct": false}
+    },
+    {
+      "scenario": "answer_synthesis",
+      "question_id": "fixture-synthesis",
+      "question_type": "single-session-user",
+      "question": "What degree did I earn?",
+      "question_date": "2024/06/10 (Mon) 12:00",
+      "required_evidence_ids": ["synthesis-session"],
+      "ranked_ids": ["synthesis-session"],
+      "sessions": [
+        {
+          "session_id": "synthesis-session",
+          "date": "2024/06/01 (Sat) 09:00",
+          "turns": [
+            {"role": "user", "content": "I graduated with a degree in history."},
+            {"role": "assistant", "content": "The degree information is recorded."}
+          ]
+        }
+      ],
+      "outcomes": {"vault_correct": false, "fullcontext_correct": false, "oracle_correct": true, "stateless_correct": false}
+    }
+  ]
+}
