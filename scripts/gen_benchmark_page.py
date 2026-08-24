@@ -22,10 +22,15 @@ import html
 import json
 import math
 import subprocess
+import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent
+if str(REPO) not in sys.path:
+    sys.path.insert(0, str(REPO))
+
+from benchmark.longmemeval.public_claims import load_public_claim
 BENCH = REPO / "benchmark"
 
 GITHUB = "https://github.com/Perseus-Computing-LLC/perseus-vault"
@@ -127,13 +132,26 @@ def sec_retrieval(r):
 </section>"""
 
 
+def _report_system(report):
+    systems = report.get("systems", {}) if isinstance(report, dict) else {}
+    for name in ("perseus-vault", "mimir"):
+        payload = systems.get(name) if isinstance(systems, dict) else None
+        if payload:
+            return payload
+    for name in ("perseus-vault", "mimir"):
+        payload = report.get(name) if isinstance(report, dict) else None
+        if payload:
+            return payload
+    return {}
+
+
 def _run_accs(primary, seeds):
     """[accuracy, ...] across a primary report + its seed reports."""
     out = []
     for r in [primary] + list(seeds):
         if not r:
             continue
-        a = (r.get("systems", {}).get("perseus-vault", {}) or r.get("perseus-vault", {})).get("accuracy")
+        a = _report_system(r).get("accuracy")
         if a is not None:
             out.append(a)
     return out
@@ -154,7 +172,7 @@ def sec_qa_cot(cot, cot_seeds=()):
     return f"""
   <div class="stats"><div class='stat big'><div class='v'>{mean:.1f}%</div>
   <div class='l'>with LongMemEval's official CoT answer prompt (<code>answer_prompt: official-cot</code>) &mdash;
-  mean of {len(accs)} independent signed full runs (range {lo:.1f}&ndash;{hi:.1f}%)</div></div></div>
+  historical official-CoT mean of {len(accs)} independent signed full runs (range {lo:.1f}&ndash;{hi:.1f}%)</div></div></div>
   <p class="note">The benchmark ships two official answer prompts (plain and step-by-step CoT);
   both distributions above are 100% official methodology and differ only in that flag &mdash;
   each number carries its <code>answer_prompt</code>, recorded in the signed report.
@@ -162,7 +180,34 @@ def sec_qa_cot(cot, cot_seeds=()):
   {links}"""
 
 
-def sec_qa(qa, seeds=(), cot_html=""):
+def sec_qa_accepted(claim):
+    score = claim["score"]
+    accuracy = score["accuracy"]
+    rows = ""
+    for row in claim["categories"]:
+        rows += "<tr><th>{}</th><td>{}/{}</td><td>{:.1f}%</td></tr>".format(
+            esc(row["question_type"]), row["correct"], row["n"], row["accuracy"] * 100
+        )
+    report_href = GITHUB + "/blob/main/benchmark/longmemeval/" + esc(claim["accepted_report_filename"])
+    manifest_href = GITHUB + "/blob/main/benchmark/longmemeval/accepted_frozen_default_manifest.json"
+    return (
+        "<div class=stats><div class=stat big><div class=v>{:.1f}%</div>".format(accuracy * 100)
+        + "<div class=l>single accepted frozen-default run, official-CoT, 407/500</div></div></div>"
+        + "<p class=note>This is one accepted frozen-default run, not a mean. It uses the official-CoT "
+        + "answer lane and LongMemEval official per-type judge. It remains separate from the historical "
+        + "three-run means and does not promote the preference-structured candidate or authorize Runs 2/3. "
+        + "Zep and Mem0 published conditions are not fully protocol-matched.</p>"
+        + "<div class=tablewrap><table><thead><tr><th>question type</th><th>correct</th><th>accuracy</th></tr></thead>"
+        + "<tbody>" + rows + "</tbody></table></div>"
+        + ("<div class=src>source: <a href={}>accepted report</a> <span class=sig>report sha256 {}</span>"
+           " &middot; <a href={}>public manifest</a> <span class=sig>manifest sha256 {}</span></div>").format(
+            report_href, claim["source_report_sha256"], manifest_href, claim["source_manifest_sha256"]
+        )
+        + ""
+    )
+
+
+def sec_qa(qa, seeds=(), cot_html="", accepted_html=""):
     zep_line = ('Zep publishes <b>63.8%</b> on LongMemEval with GPT-4o '
                 '(<a href="https://arxiv.org/abs/2501.13956">their paper</a>).')
     if not qa:
@@ -174,22 +219,21 @@ def sec_qa(qa, seeds=(), cot_html=""):
   report and per-category breakdown will render here when it lands. Until then this
   section shows no number, because there is no signed number to show.</p>
 </section>"""
-    overall = qa.get("systems", {}).get("perseus-vault", {}) or qa.get("perseus-vault", {})
+    overall = _report_system(qa)
     acc = overall.get("accuracy")
     # Multi-seed (#475): when confirmation seed reports exist, the headline is the
     # mean across all runs with the range — a single run's number is never quoted
     # alone once a distribution is available.
-    seed_accs = [s.get("systems", {}).get("perseus-vault", {}).get("accuracy")
-                 for s in seeds if s]
+    seed_accs = [_report_system(s).get("accuracy") for s in seeds if s]
     all_accs = [a for a in [acc] + seed_accs if a is not None]
     answerer = esc(qa.get('answerer_model', qa.get('answerer', qa.get('model', 'pinned model'))))
     if len(all_accs) > 1:
         mean = sum(all_accs) / len(all_accs)
         lo, hi = min(all_accs) * 100, max(all_accs) * 100
         acc_html = (f"<div class='stat big'><div class='v'>{mean * 100:.1f}%</div>"
-                    f"<div class='l'>mean of {len(all_accs)} independent full runs "
+                    f"<div class='l'>historical plain-prompt mean of {len(all_accs)} independent full runs "
                     f"(range {lo:.1f}&ndash;{hi:.1f}%, {answerer})</div></div>")
-        runs_note = (f" The headline is the mean of {len(all_accs)} independent signed runs "
+        runs_note = (f" The historical plain-prompt row is the mean of {len(all_accs)} independent signed runs "
                      f"({' / '.join(f'{a*100:.1f}%' for a in all_accs)}); the worst run scores "
                      f"{lo - 63.8:+.1f} points vs Zep's published number.")
     elif acc is not None:
@@ -214,7 +258,8 @@ def sec_qa(qa, seeds=(), cot_html=""):
   Where conditions differ from a competitor's published run, the comparison is flagged, not blended.
   Per-type table is from the primary run's signed report.</p>
   <div class="stats">{acc_html}</div>
-  {cot_html}
+  {accepted_html}
+{cot_html}
   {cat_table}
   {src_link('longmemeval/qa_report.json', qa.get('signature_sha256'))}
   {seed_links}
@@ -469,6 +514,7 @@ def main():
     qa_cot = load("longmemeval/qa_report_cot.json")
     qa_cot_seeds = [load("longmemeval/qa_report_cot_seed2.json"),
                     load("longmemeval/qa_report_cot_seed3.json")]
+    accepted_claim = load_public_claim()
     samebox = load("lambda/results/competitors.json")
     scale = load("scale/report.json")
     temporal = load("temporal/report.json")
@@ -478,7 +524,8 @@ def main():
     today = _dt.date.today().isoformat()
 
     body = (sec_matrix() + sec_retrieval(recall)
-            + sec_qa(qa, qa_seeds, cot_html=sec_qa_cot(qa_cot, qa_cot_seeds))
+            + sec_qa(qa, qa_seeds, accepted_html=sec_qa_accepted(accepted_claim),
+                     cot_html=sec_qa_cot(qa_cot, qa_cot_seeds))
             + sec_samebox(samebox) + sec_scale(scale)
             + sec_temporal(temporal, gauntlet) + sec_beam(beam) + sec_reproduce(commit))
 

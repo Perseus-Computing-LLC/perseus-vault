@@ -16,37 +16,34 @@ flagged per-row, not blended.
 
 | system | LongMemEval QA accuracy | answer prompt | answerer | judge | split | source |
 |---|---:|---|---|---|---|---|
-| **Perseus Vault (official CoT)** | **79.0% mean** (80.0 / 78.6 / 78.4 across 3 full runs) | `official-cot` (`qa.py --cot`) | `gpt-4o-2024-08-06` (pinned) | `gpt-4o-2024-08-06`, LongMemEval **official** per-type judge | `longmemeval_s` (500) | [`qa_report_cot.json`](qa_report_cot.json), [`qa_report_cot_seed2.json`](qa_report_cot_seed2.json), [`qa_report_cot_seed3.json`](qa_report_cot_seed3.json) (all content-hashed, sha256), this repo |
-| **Perseus Vault (plain)** | **73.8% mean** (72.8 / 73.6 / 75.0 across 3 full runs) | `plain` | `gpt-4o-2024-08-06` (pinned) | same official judge | `longmemeval_s` (500) | [`qa_report.json`](qa_report.json), [`qa_report_seed2.json`](qa_report_seed2.json), [`qa_report_seed3.json`](qa_report_seed3.json) (all content-hashed, sha256), this repo |
+| **Perseus Vault (accepted frozen-default official CoT)** | **81.4% single run** (407/500; not a mean) | `official-cot` | `gpt-4o-2024-08-06` (pinned) | `gpt-4o-2024-08-06`, LongMemEval **official** per-type judge | `longmemeval_s` (500) | [`qa_report_cot_frozen_default_20260819.json`](qa_report_cot_frozen_default_20260819.json) and [`accepted_frozen_default_manifest.json`](accepted_frozen_default_manifest.json); report sha256 `838f71f508b7d5eab033e7256be444164a4d7e7dcd7b33d35ae39b20510abe36`; final manifest sha256 `38e23f5e50d6b5aa0cfa5d88c5c68387eb03eb69d88065531678dc0c1e97933d` |
+| **Perseus Vault (historical official CoT)** | **79.0% mean** (80.0 / 78.6 / 78.4 across 3 full runs) | `official-cot` (`qa.py --cot`) | `gpt-4o-2024-08-06` (pinned) | `gpt-4o-2024-08-06`, LongMemEval **official** per-type judge | `longmemeval_s` (500) | [`qa_report_cot.json`](qa_report_cot.json), [`qa_report_cot_seed2.json`](qa_report_cot_seed2.json), [`qa_report_cot_seed3.json`](qa_report_cot_seed3.json) (all content-hashed, sha256), this repo |
+| **Perseus Vault (historical plain)** | **73.8% mean** (72.8 / 73.6 / 75.0 across 3 full runs) | `plain` | `gpt-4o-2024-08-06` (pinned) | same official judge | `longmemeval_s` (500) | [`qa_report.json`](qa_report.json), [`qa_report_seed2.json`](qa_report_seed2.json), [`qa_report_seed3.json`](qa_report_seed3.json) (all content-hashed, sha256), this repo |
 | Zep | 63.8% (published) | not stated | "GPT-4o" (snapshot not stated) | not stated | LongMemEval `_s` (as published) | Zep's published claim, cited in #475 |
 | Mem0 | 49.0% (published) | not stated | "GPT-4o" (snapshot not stated) | not stated | LongMemEval `_s` (as published) | published claim, cited in #475 |
 
-**With LongMemEval's own official CoT answer prompt, Perseus Vault scores 79.0%
-mean over three independent full runs (range 78.4–80.0, stdev 0.9) — the
-*worst* CoT run beats Zep's published 63.8% by 14.6 points; even the worst
-plain-prompt run beats it by 9.0.** The CoT gain over plain (+5.2 mean) is
-exactly where the #580 retrieval diagnostic predicted: 69% of consistent
-plain-prompt failures were reasoning-over-correctly-retrieved-evidence, and the
-step-by-step prompt recovers a large share of them (preference 28.9% → 57.8%
-mean; temporal 69.2% → 76.2% mean). Abstention stayed healthy across the CoT
-runs (86.7 / 83.3 / 80.0) — no robustness trade.
-
-Independently confirmed, one run per prompt variant, re-graded by LongMemEval's
-own `src/evaluation/evaluate_qa.py`: plain run 2 produced **368/500 = 73.60%**
-(bit-for-bit match, [`official-eval-results-gpt-4o.jsonl`](official-eval-results-gpt-4o.jsonl));
-the CoT primary run's 500 answers ([`hypotheses-cot-perseus-vault-gpt-4o-2024-08-06.jsonl`](hypotheses-cot-perseus-vault-gpt-4o-2024-08-06.jsonl))
-re-grade to the **identical aggregate 400/500 = 80.00%**, with 4 individual
-judge verdicts differing (2 flips in each direction — normal LLM-judge
-nondeterminism at temperature 0, net zero; see
-[`official-eval-results-cot-gpt-4o.jsonl`](official-eval-results-cot-gpt-4o.jsonl)).
-
-> **Still confirm before external publication:** the primary source of Zep's
-> 63.8% and the exact split + GPT-4o snapshot Zep used. Our answerer is pinned to
-> `gpt-4o-2024-08-06` (the closest snapshot to an unspecified "GPT-4o"); if Zep
-> used a different snapshot the comparison carries a "close but not identical
-> answerer" caveat.
+**The accepted frozen-default official-CoT result is 81.4% (407/500) from one full run; it is not a new three-run mean.** The historical official-CoT distribution remains 79.0% (80.0 / 78.6 / 78.4), and the historical plain-prompt distribution remains 73.8% (72.8 / 73.6 / 75.0). Zep and Mem0 values below are published results under conditions that are not fully protocol-matched to this run, so they remain separately labeled and are not blended. The accepted report and final-manifest commitment are linked in the table above.
 
 ## By question type
+
+### Accepted frozen-default official-CoT baseline (single run)
+
+The accepted frozen-default run is a separate claim from the historical distributions:
+
+| question type | n | correct | accuracy |
+|---|---:|---:|---:|
+| knowledge-update | 78 | 64 | 82.1% |
+| multi-session | 133 | 102 | 76.7% |
+| single-session-assistant | 56 | 56 | 100.0% |
+| single-session-preference | 30 | 15 | 50.0% |
+| single-session-user | 70 | 70 | 100.0% |
+| temporal-reasoning | 133 | 100 | 75.2% |
+| **overall** | **500** | **407** | **81.4%** |
+
+Protocol: `official-cot`, complete-response hypothesis artifacts, hybrid retrieval at requested/effective depth 10, full context with a 32,768-token budget, and zero answer or judge errors across 2,000/2,000 graded cells. The run was accepted after one separately namespaced correction; preference-structured output was not included and Runs 2/3 were not started. This is a single-run baseline, not a historical mean or a product-wide claim.
+
+Exact report: [`qa_report_cot_frozen_default_20260819.json`](qa_report_cot_frozen_default_20260819.json), SHA-256 `838f71f508b7d5eab033e7256be444164a4d7e7dcd7b33d35ae39b20510abe36`.
+Exact final-manifest commitment: [`accepted_frozen_default_manifest.json`](accepted_frozen_default_manifest.json), SHA-256 `38e23f5e50d6b5aa0cfa5d88c5c68387eb03eb69d88065531678dc0c1e97933d`.
 
 ### Official CoT prompt (primary run, content-hashed `qa_report_cot.json`)
 
