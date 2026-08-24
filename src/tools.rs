@@ -373,6 +373,9 @@ pub struct RecallArgs {
     /// #1141: opt-in hash-only provider identity and thread lineage.
     #[serde(default, deserialize_with = "null_as_default")]
     pub include_provider_source: bool,
+    /// #1142: opt-in bounded declared graph provenance projection.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub include_declared_graph: bool,
     /// #917: emit deterministic contradiction/supersession/staleness flags
     /// alongside recall. Off by default so nominal recall stays compatible.
     #[serde(default, deserialize_with = "null_as_default")]
@@ -929,6 +932,9 @@ pub struct ContextArgs {
     /// #1141: opt-in hash-only provider identity and lineage on context lines.
     #[serde(default, deserialize_with = "null_as_default")]
     pub include_provider_source: bool,
+    /// #1142: opt-in bounded declared graph provenance projection.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub include_declared_graph: bool,
 }
 
 fn default_context_limit() -> i64 {
@@ -2376,6 +2382,60 @@ fn recall_query_has_searchable_term(query: &str) -> bool {
         .any(|word| word.chars().any(char::is_alphanumeric))
 }
 
+/// #1142: apply a declared graph manifest through the governed write boundary.
+pub fn handle_declared_graph_manifest(db: &Database, args: Value) -> Result<String, String> {
+    let request: crate::declared_graph::DeclaredGraphManifestRequest =
+        serde_json::from_value(args)
+            .map_err(|e| format!("Invalid declared graph manifest arguments: {e}"))?;
+    let capability = if request.operation == "delete" {
+        "memory.commit"
+    } else {
+        "memory.propose"
+    };
+    db.require_memory_capability(
+        &request.requesting_agent_id,
+        &request.workspace_hash,
+        capability,
+    )
+    .map_err(|e| format!("declared graph manifest denied: {e}"))?;
+    let result = db.apply_declared_graph_manifest(&request)?;
+    serde_json::to_string(&result)
+        .map_err(|e| format!("declared graph manifest serialization failed: {e}"))
+}
+
+/// #1142: explicitly attest selected declared graph edges.
+pub fn handle_declared_graph_attest(db: &Database, args: Value) -> Result<String, String> {
+    let request: crate::declared_graph::DeclaredGraphAttestationRequest =
+        serde_json::from_value(args)
+            .map_err(|e| format!("Invalid declared graph attestation arguments: {e}"))?;
+    db.require_memory_capability(
+        &request.requesting_agent_id,
+        &request.workspace_hash,
+        "memory.commit",
+    )
+    .map_err(|e| format!("declared graph attestation denied: {e}"))?;
+    let result = db.attest_declared_graph(&request)?;
+    serde_json::to_string(&result)
+        .map_err(|e| format!("declared graph attestation serialization failed: {e}"))
+}
+
+/// #1142: query the bounded declared graph projection.
+pub fn handle_declared_graph_query(db: &Database, args: Value) -> Result<String, String> {
+    let request: crate::declared_graph::DeclaredGraphQuery = serde_json::from_value(args)
+        .map_err(|e| format!("Invalid declared graph query arguments: {e}"))?;
+    db.require_memory_capability(
+        &request.requesting_agent_id,
+        &request.workspace_hash,
+        "memory.read",
+    )
+    .map_err(|e| format!("declared graph query denied: {e}"))?;
+    let result = db
+        .query_declared_graph(&request)
+        .map_err(|e| format!("declared graph query failed: {e}"))?;
+    serde_json::to_string(&result)
+        .map_err(|e| format!("declared graph query serialization failed: {e}"))
+}
+
 /// #1141: apply a provider-native source event through the governed write boundary.
 pub fn handle_provider_source_event(db: &Database, args: Value) -> Result<String, String> {
     let request: crate::provider_source::ProviderSourceEventRequest = serde_json::from_value(args)
@@ -2534,6 +2594,11 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
     } else {
         a.workspace_hash.clone()
     };
+
+    let include_declared_graph = a.include_declared_graph;
+    let declared_graph_limit = a.limit;
+    let declared_graph_workspace = a.workspace_hash.clone();
+    let declared_graph_requester = a.requesting_agent_id.clone();
 
     let params = RecallParams {
         query: a.query,
@@ -2922,6 +2987,22 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
             "retrieval_profile": profile_name,
         })
     };
+    // #1142: declared topology is a separate explicit read surface. Ordinary
+    // recall never queries it; callers must request it with a workspace and
+    // transport-stamped identity.
+    if include_declared_graph {
+        let projection = declared_graph_projection_value(
+            db,
+            declared_graph_workspace.as_deref(),
+            declared_graph_requester.as_deref(),
+            false,
+            declared_graph_limit,
+        )?;
+        if let Some(obj) = result.as_object_mut() {
+            obj.insert("declared_graph".to_string(), projection);
+        }
+    }
+
     // #917: the conflict surface is assembled only after ordinary recall has
     // selected/governed the delivered candidates. It adds no side-effects to
     // the pre-existing recall contract; the detector, suppression interceptor,
@@ -3507,6 +3588,33 @@ fn stamped_requester(args: &serde_json::Value) -> Option<&str> {
     args.get("requesting_agent_id")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
+}
+
+fn declared_graph_projection_value(
+    db: &Database,
+    workspace_hash: Option<&str>,
+    requesting_agent_id: Option<&str>,
+    include_history: bool,
+    limit: i64,
+) -> Result<serde_json::Value, String> {
+    let workspace_hash = workspace_hash
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "include_declared_graph requires a non-empty workspace_hash".to_string())?;
+    let requesting_agent_id = requesting_agent_id
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "include_declared_graph requires a transport-stamped requesting_agent_id".to_string())?;
+    let query = crate::declared_graph::DeclaredGraphQuery {
+        workspace_hash: workspace_hash.to_string(),
+        source_key: None,
+        requesting_agent_id: requesting_agent_id.to_string(),
+        include_history,
+        limit: limit.clamp(1, 500),
+    };
+    let projection = db
+        .query_declared_graph(&query)
+        .map_err(|error| format!("declared graph projection failed: {error}"))?;
+    serde_json::to_value(projection)
+        .map_err(|error| format!("declared graph projection serialization failed: {error}"))
 }
 
 fn stamped_requester_from_recall_args(args: &RecallArgs) -> Option<&str> {
@@ -6848,6 +6956,9 @@ pub fn handle_context(db: &Database, args: Value) -> String {
         }
     };
 
+    let declared_graph_workspace = a.workspace_hash.clone();
+    let declared_graph_requester = stamped_requester(&args).map(str::to_owned);
+
     let opts = crate::models::ContextOptions {
         categories: a.categories,
         limit: a.limit,
@@ -6866,7 +6977,7 @@ pub fn handle_context(db: &Database, args: Value) -> String {
     match db.context_block(&opts) {
         Ok(block) => {
             let total_chars = block.markdown.len();
-            json!({
+            let mut output = json!({
                 "markdown": block.markdown,
                 "total_chars": total_chars,
                 "mode": block.mode,
@@ -6877,8 +6988,25 @@ pub fn handle_context(db: &Database, args: Value) -> String {
                 "estimated_injected_tokens": block.estimated_injected_tokens,
                 "corpus_chars": block.corpus_chars,
                 "estimated_corpus_tokens": block.estimated_corpus_tokens,
-            })
-            .to_string()
+            });
+            if a.include_declared_graph {
+                match declared_graph_projection_value(
+                    db,
+                    declared_graph_workspace.as_deref(),
+                    declared_graph_requester.as_deref(),
+                    false,
+                    a.limit,
+                ) {
+                    Ok(projection) => output["declared_graph"] = projection,
+                    Err(error) => {
+                        return json!({
+                            "error": format!("Declared graph context projection failed: {error}")
+                        })
+                        .to_string()
+                    }
+                }
+            }
+            output.to_string()
         }
         Err(e) => json!({"error": format!("Context generation failed: {}", e)}).to_string(),
     }
@@ -8401,6 +8529,12 @@ pub struct TraverseArgs {
     /// which chain nodes are visible, never trusted from the caller.
     #[serde(default)]
     pub requesting_agent_id: Option<String>,
+    /// #1142: workspace required for an explicit declared graph projection.
+    #[serde(default)]
+    pub workspace_hash: Option<String>,
+    /// #1142: opt-in bounded declared graph provenance projection.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub include_declared_graph: bool,
 }
 
 fn default_depth() -> i64 {
@@ -8509,7 +8643,23 @@ pub fn handle_traverse(db: &Database, args: Value) -> String {
     };
     match db.traverse_chain_for_request(&a.category, &a.key, max_depth, max_nodes, requester) {
         Ok(chain) => {
-            let chain = filter_chain_visibility(db, requester, chain);
+            let mut chain = filter_chain_visibility(db, requester, chain);
+            if a.include_declared_graph {
+                match declared_graph_projection_value(
+                    db,
+                    a.workspace_hash.as_deref(),
+                    Some(requester),
+                    false,
+                    a.max_nodes,
+                ) {
+                    Ok(projection) => {
+                        if let Some(obj) = chain.as_object_mut() {
+                            obj.insert("declared_graph".to_string(), projection);
+                        }
+                    }
+                    Err(error) => return json!({"error": error}).to_string(),
+                }
+            }
             serde_json::to_string(&chain)
                 .unwrap_or_else(|e| json!({"error": format!("{e}")}).to_string())
         }

@@ -728,7 +728,7 @@ CREATE INDEX IF NOT EXISTS idx_preload_proposals_state
 /// — the entity ids an action cited as grounding, so the reverse impact
 /// closure can flag PENDING actions whose justification changed. Additive
 /// column, no backfill (pre-existing actions cite nothing).
-pub(crate) const SCHEMA_VERSION: i64 = 57;
+pub(crate) const SCHEMA_VERSION: i64 = 58;
 
 /// Initialize the v0.2.0 schema on a fresh database.
 pub fn initialize_schema(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
@@ -2358,6 +2358,96 @@ fn apply_migrations(conn: &Connection) -> Result<(), Box<dyn std::error::Error>>
         CREATE TRIGGER IF NOT EXISTS provider_source_events_no_delete
             BEFORE DELETE ON provider_source_events
             BEGIN SELECT RAISE(ABORT, 'provider source event history is append-only'); END;",
+    )?;
+
+    // v58 (#1142 declared graph ingestion). Manifests and edge rows keep
+    // source revision, digest, scope, validity, origin, support state, and
+    // replacement or tombstone history separate from legacy entities.links.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS declared_graph_nodes (
+            node_id TEXT PRIMARY KEY,
+            workspace_hash TEXT NOT NULL,
+            namespace TEXT NOT NULL,
+            canonical_id TEXT NOT NULL,
+            node_type TEXT NOT NULL,
+            external_ref TEXT,
+            state TEXT NOT NULL,
+            created_at_unix_ms INTEGER NOT NULL,
+            updated_at_unix_ms INTEGER NOT NULL,
+            UNIQUE(workspace_hash, namespace, canonical_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_declared_graph_nodes_scope
+            ON declared_graph_nodes(workspace_hash, namespace, canonical_id);
+        CREATE TABLE IF NOT EXISTS declared_graph_manifests (
+            manifest_id TEXT PRIMARY KEY,
+            source_id TEXT NOT NULL,
+            workspace_hash TEXT NOT NULL,
+            source_key TEXT NOT NULL,
+            revision TEXT NOT NULL,
+            content_sha256 TEXT NOT NULL,
+            source_span_ref TEXT,
+            policy TEXT NOT NULL,
+            origin TEXT NOT NULL,
+            state TEXT NOT NULL,
+            request_digest TEXT NOT NULL,
+            node_ids_json TEXT NOT NULL,
+            valid_from_unix_ms INTEGER,
+            valid_to_unix_ms INTEGER,
+            recorded_at_unix_ms INTEGER NOT NULL,
+            updated_at_unix_ms INTEGER NOT NULL,
+            tombstoned_at_unix_ms INTEGER,
+            UNIQUE(workspace_hash, source_key, revision)
+        );
+        CREATE INDEX IF NOT EXISTS idx_declared_graph_manifests_current
+            ON declared_graph_manifests(workspace_hash, source_key, state);
+        CREATE TABLE IF NOT EXISTS declared_graph_edges (
+            edge_id TEXT PRIMARY KEY,
+            manifest_id TEXT NOT NULL REFERENCES declared_graph_manifests(manifest_id),
+            workspace_hash TEXT NOT NULL,
+            from_node_id TEXT NOT NULL REFERENCES declared_graph_nodes(node_id),
+            to_node_id TEXT NOT NULL REFERENCES declared_graph_nodes(node_id),
+            predicate TEXT NOT NULL,
+            direction TEXT NOT NULL,
+            context TEXT,
+            source_span_ref TEXT,
+            origin TEXT NOT NULL,
+            support_state TEXT NOT NULL,
+            attested_by TEXT,
+            attestation_ref TEXT,
+            valid_from_unix_ms INTEGER,
+            valid_to_unix_ms INTEGER,
+            state TEXT NOT NULL,
+            recorded_at_unix_ms INTEGER NOT NULL,
+            updated_at_unix_ms INTEGER NOT NULL,
+            UNIQUE(manifest_id, from_node_id, to_node_id, predicate, direction)
+        );
+        CREATE INDEX IF NOT EXISTS idx_declared_graph_edges_scope
+            ON declared_graph_edges(workspace_hash, state, recorded_at_unix_ms);
+        CREATE INDEX IF NOT EXISTS idx_declared_graph_edges_manifest
+            ON declared_graph_edges(manifest_id, state);
+        CREATE TABLE IF NOT EXISTS declared_graph_manifest_events (
+            event_id TEXT PRIMARY KEY,
+            manifest_id TEXT NOT NULL REFERENCES declared_graph_manifests(manifest_id),
+            source_id TEXT NOT NULL,
+            workspace_hash TEXT NOT NULL,
+            source_key TEXT NOT NULL,
+            revision TEXT NOT NULL,
+            operation TEXT NOT NULL,
+            state_after TEXT NOT NULL,
+            request_digest TEXT NOT NULL,
+            actor_agent_id TEXT NOT NULL,
+            receipt_digest TEXT NOT NULL,
+            recorded_at_unix_ms INTEGER NOT NULL,
+            UNIQUE(manifest_id, request_digest, operation)
+        );
+        CREATE INDEX IF NOT EXISTS idx_declared_graph_events_source
+            ON declared_graph_manifest_events(workspace_hash, source_key, recorded_at_unix_ms);
+        CREATE TRIGGER IF NOT EXISTS declared_graph_manifest_events_no_update
+            BEFORE UPDATE ON declared_graph_manifest_events
+            BEGIN SELECT RAISE(ABORT, \"declared graph manifest history is append only\"); END;
+        CREATE TRIGGER IF NOT EXISTS declared_graph_manifest_events_no_delete
+            BEFORE DELETE ON declared_graph_manifest_events
+            BEGIN SELECT RAISE(ABORT, \"declared graph manifest history is append only\"); END;",
     )?;
 
     // Stamp the migration level so subsequent opens skip the probe block above.
