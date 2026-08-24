@@ -1,0 +1,809 @@
+{
+  "$defs": {
+    "artifact": {
+      "additionalProperties": false,
+      "properties": {
+        "n": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "name": {
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$",
+          "type": "string"
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      },
+      "required": [
+        "name",
+        "sha256"
+      ],
+      "type": "object"
+    },
+    "candidate_gate": {
+      "additionalProperties": false,
+      "properties": {
+        "candidate_identified": {
+          "type": "boolean"
+        },
+        "checks": {
+          "additionalProperties": {
+            "type": "boolean"
+          },
+          "type": "object"
+        },
+        "evidence_present_failure_count": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "falsification": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "hypothesis": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "paid_canary_authorized": {
+          "const": false
+        },
+        "paid_canary_next_step": {
+          "const": "separate_paired_authorization_required"
+        },
+        "paid_canary_started": {
+          "const": false
+        },
+        "provider_free_gate_passed": {
+          "type": "boolean"
+        },
+        "provider_free_regression_test": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "semantic_failure_count": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "specific_testable_candidate": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "provider_free_gate_passed",
+        "candidate_identified",
+        "specific_testable_candidate",
+        "hypothesis",
+        "falsification",
+        "provider_free_regression_test",
+        "evidence_present_failure_count",
+        "semantic_failure_count",
+        "checks",
+        "paid_canary_authorized",
+        "paid_canary_started",
+        "paid_canary_next_step"
+      ],
+      "type": "object"
+    },
+    "case": {
+      "additionalProperties": false,
+      "properties": {
+        "all_required_selected": {
+          "type": "boolean"
+        },
+        "best_required_rank": {
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "budget_ok": {
+          "type": "boolean"
+        },
+        "budget_pressure_observed": {
+          "type": "boolean"
+        },
+        "context_budget_tokens": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "failure_observed": {
+          "type": "boolean"
+        },
+        "fullcontext_correct": {
+          "type": "boolean"
+        },
+        "latest_version_rank": {
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "latest_version_selected": {
+          "type": "boolean"
+        },
+        "missing_required_count": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "oracle_correct": {
+          "type": "boolean"
+        },
+        "preference_assistant_only": {
+          "type": "boolean"
+        },
+        "primary_reason": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "question_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "question_type": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "reason_codes": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "required_evidence_count": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "required_rank_vector": {
+          "items": {
+            "minimum": 1,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "type": "array"
+        },
+        "retrieval_depth": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "selected_context_tokens_est": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "selected_required_count": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "source_token_preserved": {
+          "type": "boolean"
+        },
+        "stateless_correct": {
+          "type": "boolean"
+        },
+        "temporal_anchor_present": {
+          "type": "boolean"
+        },
+        "user_evidence_present": {
+          "type": "boolean"
+        },
+        "vault_correct": {
+          "type": "boolean"
+        },
+        "worst_required_rank": {
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "question_id",
+        "question_type",
+        "retrieval_depth",
+        "context_budget_tokens",
+        "required_evidence_count",
+        "selected_required_count",
+        "missing_required_count",
+        "required_rank_vector",
+        "best_required_rank",
+        "worst_required_rank",
+        "all_required_selected",
+        "selected_context_tokens_est",
+        "budget_pressure_observed",
+        "budget_ok",
+        "source_token_preserved",
+        "latest_version_selected",
+        "latest_version_rank",
+        "temporal_anchor_present",
+        "user_evidence_present",
+        "preference_assistant_only",
+        "vault_correct",
+        "fullcontext_correct",
+        "oracle_correct",
+        "stateless_correct",
+        "failure_observed",
+        "primary_reason",
+        "reason_codes"
+      ],
+      "type": "object"
+    },
+    "configuration": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "context_budget_tokens": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "context_mode": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "default_behavior_changed": {
+              "type": "boolean"
+            },
+            "denominator_cases": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "official_cot_preserved": {
+              "type": "boolean"
+            },
+            "retrieval_depth": {
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "denominator_cases",
+            "retrieval_depth",
+            "context_mode",
+            "context_budget_tokens",
+            "official_cot_preserved",
+            "default_behavior_changed"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "context_budget_tokens": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "context_mode": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "retrieval_depth": {
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "retrieval_depth",
+            "context_mode",
+            "context_budget_tokens"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "fixture_reference": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "available": {
+              "const": false
+            }
+          },
+          "required": [
+            "available"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "available": {
+              "const": true
+            },
+            "judge_calls": {
+              "const": 0
+            },
+            "metric_class": {
+              "const": "synthetic_fixture_reference"
+            },
+            "n": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "provider_calls": {
+              "const": 0
+            },
+            "provider_free_gate_passed": {
+              "type": "boolean"
+            },
+            "signature_sha256": {
+              "$ref": "#/$defs/sha256"
+            }
+          },
+          "required": [
+            "available",
+            "metric_class",
+            "n",
+            "signature_sha256",
+            "provider_free_gate_passed",
+            "provider_calls",
+            "judge_calls"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "judged_qa_reference": {
+      "additionalProperties": false,
+      "properties": {
+        "answerer_model": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "claim": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "judge_model": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "metric_class": {
+          "const": "judged_qa_reference"
+        },
+        "source_status": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "systems": {
+          "additionalProperties": false,
+          "properties": {
+            "fullcontext": {
+              "$ref": "#/$defs/judged_system"
+            },
+            "oracle": {
+              "$ref": "#/$defs/judged_system"
+            },
+            "perseus-vault": {
+              "$ref": "#/$defs/judged_system"
+            },
+            "stateless": {
+              "$ref": "#/$defs/judged_system"
+            }
+          },
+          "required": [
+            "fullcontext",
+            "oracle",
+            "perseus-vault",
+            "stateless"
+          ],
+          "type": "object"
+        }
+      },
+      "required": [
+        "metric_class",
+        "source_status",
+        "answerer_model",
+        "judge_model",
+        "systems",
+        "claim"
+      ],
+      "type": "object"
+    },
+    "judged_system": {
+      "additionalProperties": false,
+      "properties": {
+        "accuracy": {
+          "maximum": 1,
+          "minimum": 0,
+          "type": "number"
+        },
+        "correct": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "n": {
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "n",
+        "correct",
+        "accuracy"
+      ],
+      "type": "object"
+    },
+    "provider_free_attribution": {
+      "additionalProperties": false,
+      "properties": {
+        "metric_class": {
+          "const": "provider_free_attribution"
+        },
+        "reason_code_vocabulary": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "summary": {
+          "$ref": "#/$defs/summary"
+        }
+      },
+      "required": [
+        "metric_class",
+        "summary",
+        "reason_code_vocabulary"
+      ],
+      "type": "object"
+    },
+    "question_type_summary": {
+      "additionalProperties": false,
+      "properties": {
+        "all_required_selected": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "budget_pressure_observed": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "failure_reason_counts": {
+          "additionalProperties": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": "object"
+        },
+        "fullcontext_correct": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "n": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "oracle_correct": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "oracle_right_vault_wrong": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "reason_code_counts": {
+          "additionalProperties": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": "object"
+        },
+        "selected_context_budget_ok": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "source_token_preserved": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "vault_correct": {
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "n",
+        "vault_correct",
+        "fullcontext_correct",
+        "oracle_correct",
+        "oracle_right_vault_wrong",
+        "all_required_selected",
+        "selected_context_budget_ok",
+        "budget_pressure_observed",
+        "source_token_preserved",
+        "reason_code_counts",
+        "failure_reason_counts"
+      ],
+      "type": "object"
+    },
+    "selected_slice_reference": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "available": {
+              "const": false
+            },
+            "metric_class": {
+              "const": "selected_slice_recovery"
+            }
+          },
+          "required": [
+            "available"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "artifact_sha256": {
+              "$ref": "#/$defs/sha256"
+            },
+            "available": {
+              "const": true
+            },
+            "claim_boundary": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "judge_calls": {
+              "const": 0
+            },
+            "metric_class": {
+              "const": "selected_slice_recovery"
+            },
+            "n": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "provider_calls": {
+              "const": 0
+            }
+          },
+          "required": [
+            "available",
+            "metric_class",
+            "n",
+            "artifact_sha256",
+            "provider_calls",
+            "judge_calls",
+            "claim_boundary"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "selection_question_type": {
+      "additionalProperties": false,
+      "properties": {
+        "all_required_selected": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "all_required_selected_rate": {
+          "maximum": 1,
+          "minimum": 0,
+          "type": "number"
+        },
+        "mean_missing_required_count": {
+          "minimum": 0,
+          "type": "number"
+        },
+        "n": {
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "n",
+        "all_required_selected",
+        "all_required_selected_rate",
+        "mean_missing_required_count"
+      ],
+      "type": "object"
+    },
+    "selection_recovery": {
+      "additionalProperties": false,
+      "properties": {
+        "all_required_selected": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "all_required_selected_rate": {
+          "maximum": 1,
+          "minimum": 0,
+          "type": "number"
+        },
+        "by_question_type": {
+          "additionalProperties": {
+            "$ref": "#/$defs/selection_question_type"
+          },
+          "type": "object"
+        },
+        "metric_class": {
+          "const": "provider_free_selection_recovery"
+        },
+        "n": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "retrieval_depth": {
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "metric_class",
+        "retrieval_depth",
+        "n",
+        "all_required_selected",
+        "all_required_selected_rate",
+        "by_question_type"
+      ],
+      "type": "object"
+    },
+    "sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "summary": {
+      "additionalProperties": false,
+      "properties": {
+        "attributable_failure_count": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "by_question_type": {
+          "additionalProperties": {
+            "$ref": "#/$defs/question_type_summary"
+          },
+          "type": "object"
+        },
+        "n": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "primary_reason_counts": {
+          "additionalProperties": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": "object"
+        },
+        "reason_code_counts": {
+          "additionalProperties": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": "object"
+        }
+      },
+      "required": [
+        "n",
+        "attributable_failure_count",
+        "primary_reason_counts",
+        "reason_code_counts",
+        "by_question_type"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "https://perseus.observer/schemas/longmemeval-failure-attribution-v1.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "answerer_calls": {
+      "const": 0
+    },
+    "artifacts": {
+      "items": {
+        "$ref": "#/$defs/artifact"
+      },
+      "type": "array"
+    },
+    "benchmark": {
+      "const": "perseus-vault-longmemeval-failure-attribution"
+    },
+    "candidate_gate": {
+      "$ref": "#/$defs/candidate_gate"
+    },
+    "cases": {
+      "items": {
+        "$ref": "#/$defs/case"
+      },
+      "minItems": 1,
+      "type": "array"
+    },
+    "claim_boundary": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "configuration": {
+      "$ref": "#/$defs/configuration"
+    },
+    "fixture_reference": {
+      "$ref": "#/$defs/fixture_reference"
+    },
+    "judge_calls": {
+      "const": 0
+    },
+    "judged_qa_reference": {
+      "$ref": "#/$defs/judged_qa_reference"
+    },
+    "metric_classes": {
+      "items": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "type": "array",
+      "uniqueItems": true
+    },
+    "offline": {
+      "const": true
+    },
+    "projection_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "provider_calls": {
+      "const": 0
+    },
+    "provider_free_attribution": {
+      "$ref": "#/$defs/provider_free_attribution"
+    },
+    "raw_inputs_captured": {
+      "const": false
+    },
+    "schema": {
+      "const": "longmemeval-failure-attribution/v1"
+    },
+    "selected_slice_recovery_reference": {
+      "$ref": "#/$defs/selected_slice_reference"
+    },
+    "selection_recovery": {
+      "$ref": "#/$defs/selection_recovery"
+    },
+    "signature_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "summary": {
+      "$ref": "#/$defs/summary"
+    }
+  },
+  "required": [
+    "schema",
+    "benchmark",
+    "claim_boundary",
+    "offline",
+    "provider_calls",
+    "answerer_calls",
+    "judge_calls",
+    "raw_inputs_captured",
+    "metric_classes",
+    "configuration",
+    "summary",
+    "artifacts",
+    "provider_free_attribution",
+    "candidate_gate",
+    "cases",
+    "projection_sha256",
+    "signature_sha256"
+  ],
+  "title": "LongMemEval provider-free failure attribution report",
+  "type": "object"
+}
