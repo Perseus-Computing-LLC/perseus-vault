@@ -1,0 +1,683 @@
+{
+  "baseline_cell_id": "cell-official-correlated",
+  "cells": [
+    {
+      "artifact_commitments": {
+        "code_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "config_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "custody_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "dataset_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "fixture_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "run_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+      },
+      "cell_id": "cell-official-correlated",
+      "denominator_policy": {
+        "excluded_errors": [
+          "answer_error",
+          "judge_error"
+        ],
+        "name": "graded-only-v1"
+      },
+      "judge": {
+        "contract_id": "longmemeval-official-yes-no-v1",
+        "decoding": {
+          "completion_cap": 1,
+          "seed": 42,
+          "temperature": 0.0,
+          "top_p": 1.0
+        },
+        "independence_claim_eligible": false,
+        "model": "reader-reference-v1",
+        "prompt_digest_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+        "provider": "synthetic",
+        "relation": "correlated-same-model",
+        "threshold": {
+          "kind": "binary-label",
+          "labels": [
+            "yes",
+            "no"
+          ],
+          "value": 0.5
+        }
+      },
+      "outcomes": [
+        {
+          "abstained": false,
+          "answer_digest_sha256": "6787350742025c05a4bf8dfebb16439fbeaad230ebd739d5ccb03e85835ffd03",
+          "answer_latency_ms": 20,
+          "answer_tokens_est": 100,
+          "answer_verdict": "correct",
+          "calls": {
+            "answerer": 0,
+            "judge": 0,
+            "retrieval": 0
+          },
+          "exclusion_reason": null,
+          "independent_judge_label": null,
+          "judge_digest_sha256": "65142d3d65f16a20f519c983fe067a0b1b966f4dedc057133f09110ce9b2bb7b",
+          "judge_latency_ms": 2,
+          "primary_judge_label": "yes",
+          "question_id_sha256": "c75de8c1b7c3ae5252091267a736a9bf57001d80e82668b3cb3cd09e2f6a43cb",
+          "question_type": "single-session-user",
+          "retrieval_hit": true,
+          "retrieval_latency_ms": 4,
+          "retrieval_rank": 1,
+          "usage": {
+            "answer_completion_tokens": 0,
+            "answer_prompt_tokens": 0,
+            "judge_completion_tokens": 0,
+            "judge_prompt_tokens": 0,
+            "provider_cost_microusd": 0
+          }
+        },
+        {
+          "abstained": true,
+          "answer_digest_sha256": "184c2fe0c16014776fc8d89c688ca11911b7dc3a1d184787dfb133034ec55bc9",
+          "answer_latency_ms": 22,
+          "answer_tokens_est": 90,
+          "answer_verdict": "incorrect",
+          "calls": {
+            "answerer": 0,
+            "judge": 0,
+            "retrieval": 0
+          },
+          "exclusion_reason": null,
+          "independent_judge_label": null,
+          "judge_digest_sha256": "bd54c3d1ba19228c2898570bafc8ec7f9127527775605f2a24e6066033de644a",
+          "judge_latency_ms": 3,
+          "primary_judge_label": "no",
+          "question_id_sha256": "bee98bf120e8906382754c6be52860ac5dbc65a1ca4dbee7576267d8fd3367e1",
+          "question_type": "multi-session",
+          "retrieval_hit": false,
+          "retrieval_latency_ms": 5,
+          "retrieval_rank": null,
+          "usage": {
+            "answer_completion_tokens": 0,
+            "answer_prompt_tokens": 0,
+            "judge_completion_tokens": 0,
+            "judge_prompt_tokens": 0,
+            "provider_cost_microusd": 0
+          }
+        }
+      ],
+      "prompt": {
+        "digest_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+        "lane": "official-cot",
+        "version": "official-cot-v1"
+      },
+      "reader": {
+        "decoding": {
+          "completion_cap": 1200,
+          "seed": 42,
+          "temperature": 0.0,
+          "top_p": 1.0
+        },
+        "model": "reader-reference-v1",
+        "provider": "synthetic"
+      },
+      "retrieval": {
+        "arm": "perseus-vault",
+        "assembly_policy": "full-session-v1",
+        "context_token_budget": 12000,
+        "effective_depth": 10,
+        "mode": "hybrid",
+        "requested_depth": 10
+      },
+      "retry_policy": {
+        "max_retries": 1,
+        "on_error": "exclude-from-denominator"
+      },
+      "source": "synthetic-fixture"
+    },
+    {
+      "artifact_commitments": {
+        "code_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "config_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "custody_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "dataset_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "fixture_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "run_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+      },
+      "cell_id": "cell-reader-swap",
+      "denominator_policy": {
+        "excluded_errors": [
+          "answer_error",
+          "judge_error"
+        ],
+        "name": "graded-only-v1"
+      },
+      "judge": {
+        "contract_id": "longmemeval-official-yes-no-v1",
+        "decoding": {
+          "completion_cap": 1,
+          "seed": 42,
+          "temperature": 0.0,
+          "top_p": 1.0
+        },
+        "independence_claim_eligible": false,
+        "model": "reader-reference-v1",
+        "prompt_digest_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+        "provider": "synthetic",
+        "relation": "independent-model",
+        "threshold": {
+          "kind": "binary-label",
+          "labels": [
+            "yes",
+            "no"
+          ],
+          "value": 0.5
+        }
+      },
+      "outcomes": [
+        {
+          "abstained": false,
+          "answer_digest_sha256": "6787350742025c05a4bf8dfebb16439fbeaad230ebd739d5ccb03e85835ffd03",
+          "answer_latency_ms": 20,
+          "answer_tokens_est": 100,
+          "answer_verdict": "correct",
+          "calls": {
+            "answerer": 0,
+            "judge": 0,
+            "retrieval": 0
+          },
+          "exclusion_reason": null,
+          "independent_judge_label": null,
+          "judge_digest_sha256": "65142d3d65f16a20f519c983fe067a0b1b966f4dedc057133f09110ce9b2bb7b",
+          "judge_latency_ms": 2,
+          "primary_judge_label": "yes",
+          "question_id_sha256": "c75de8c1b7c3ae5252091267a736a9bf57001d80e82668b3cb3cd09e2f6a43cb",
+          "question_type": "single-session-user",
+          "retrieval_hit": true,
+          "retrieval_latency_ms": 4,
+          "retrieval_rank": 1,
+          "usage": {
+            "answer_completion_tokens": 0,
+            "answer_prompt_tokens": 0,
+            "judge_completion_tokens": 0,
+            "judge_prompt_tokens": 0,
+            "provider_cost_microusd": 0
+          }
+        },
+        {
+          "abstained": true,
+          "answer_digest_sha256": "184c2fe0c16014776fc8d89c688ca11911b7dc3a1d184787dfb133034ec55bc9",
+          "answer_latency_ms": 22,
+          "answer_tokens_est": 90,
+          "answer_verdict": "incorrect",
+          "calls": {
+            "answerer": 0,
+            "judge": 0,
+            "retrieval": 0
+          },
+          "exclusion_reason": null,
+          "independent_judge_label": null,
+          "judge_digest_sha256": "bd54c3d1ba19228c2898570bafc8ec7f9127527775605f2a24e6066033de644a",
+          "judge_latency_ms": 3,
+          "primary_judge_label": "no",
+          "question_id_sha256": "bee98bf120e8906382754c6be52860ac5dbc65a1ca4dbee7576267d8fd3367e1",
+          "question_type": "multi-session",
+          "retrieval_hit": false,
+          "retrieval_latency_ms": 5,
+          "retrieval_rank": null,
+          "usage": {
+            "answer_completion_tokens": 0,
+            "answer_prompt_tokens": 0,
+            "judge_completion_tokens": 0,
+            "judge_prompt_tokens": 0,
+            "provider_cost_microusd": 0
+          }
+        }
+      ],
+      "prompt": {
+        "digest_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+        "lane": "official-cot",
+        "version": "official-cot-v1"
+      },
+      "reader": {
+        "decoding": {
+          "completion_cap": 800,
+          "seed": 42,
+          "temperature": 0.0,
+          "top_p": 1.0
+        },
+        "model": "reader-small-v1",
+        "provider": "synthetic"
+      },
+      "retrieval": {
+        "arm": "perseus-vault",
+        "assembly_policy": "full-session-v1",
+        "context_token_budget": 12000,
+        "effective_depth": 10,
+        "mode": "hybrid",
+        "requested_depth": 10
+      },
+      "retry_policy": {
+        "max_retries": 1,
+        "on_error": "exclude-from-denominator"
+      },
+      "source": "synthetic-fixture"
+    },
+    {
+      "artifact_commitments": {
+        "code_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "config_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "custody_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "dataset_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "fixture_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "run_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+      },
+      "cell_id": "cell-judge-swap",
+      "denominator_policy": {
+        "excluded_errors": [
+          "answer_error",
+          "judge_error"
+        ],
+        "name": "graded-only-v1"
+      },
+      "judge": {
+        "contract_id": "longmemeval-independent-yes-no-v1",
+        "decoding": {
+          "completion_cap": 1,
+          "seed": 42,
+          "temperature": 0.0,
+          "top_p": 1.0
+        },
+        "independence_claim_eligible": false,
+        "model": "judge-independent-v1",
+        "prompt_digest_sha256": "8888888888888888888888888888888888888888888888888888888888888888",
+        "provider": "synthetic",
+        "relation": "independent-model",
+        "threshold": {
+          "kind": "binary-label",
+          "labels": [
+            "yes",
+            "no"
+          ],
+          "value": 0.5
+        }
+      },
+      "outcomes": [
+        {
+          "abstained": false,
+          "answer_digest_sha256": "6787350742025c05a4bf8dfebb16439fbeaad230ebd739d5ccb03e85835ffd03",
+          "answer_latency_ms": 20,
+          "answer_tokens_est": 100,
+          "answer_verdict": "correct",
+          "calls": {
+            "answerer": 0,
+            "judge": 0,
+            "retrieval": 0
+          },
+          "exclusion_reason": null,
+          "independent_judge_label": "yes",
+          "judge_digest_sha256": "65142d3d65f16a20f519c983fe067a0b1b966f4dedc057133f09110ce9b2bb7b",
+          "judge_latency_ms": 2,
+          "primary_judge_label": "yes",
+          "question_id_sha256": "c75de8c1b7c3ae5252091267a736a9bf57001d80e82668b3cb3cd09e2f6a43cb",
+          "question_type": "single-session-user",
+          "retrieval_hit": true,
+          "retrieval_latency_ms": 4,
+          "retrieval_rank": 1,
+          "usage": {
+            "answer_completion_tokens": 0,
+            "answer_prompt_tokens": 0,
+            "judge_completion_tokens": 0,
+            "judge_prompt_tokens": 0,
+            "provider_cost_microusd": 0
+          }
+        },
+        {
+          "abstained": true,
+          "answer_digest_sha256": "184c2fe0c16014776fc8d89c688ca11911b7dc3a1d184787dfb133034ec55bc9",
+          "answer_latency_ms": 22,
+          "answer_tokens_est": 90,
+          "answer_verdict": "incorrect",
+          "calls": {
+            "answerer": 0,
+            "judge": 0,
+            "retrieval": 0
+          },
+          "exclusion_reason": null,
+          "independent_judge_label": "no",
+          "judge_digest_sha256": "bd54c3d1ba19228c2898570bafc8ec7f9127527775605f2a24e6066033de644a",
+          "judge_latency_ms": 3,
+          "primary_judge_label": "no",
+          "question_id_sha256": "bee98bf120e8906382754c6be52860ac5dbc65a1ca4dbee7576267d8fd3367e1",
+          "question_type": "multi-session",
+          "retrieval_hit": false,
+          "retrieval_latency_ms": 5,
+          "retrieval_rank": null,
+          "usage": {
+            "answer_completion_tokens": 0,
+            "answer_prompt_tokens": 0,
+            "judge_completion_tokens": 0,
+            "judge_prompt_tokens": 0,
+            "provider_cost_microusd": 0
+          }
+        }
+      ],
+      "prompt": {
+        "digest_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+        "lane": "official-cot",
+        "version": "official-cot-v1"
+      },
+      "reader": {
+        "decoding": {
+          "completion_cap": 1200,
+          "seed": 42,
+          "temperature": 0.0,
+          "top_p": 1.0
+        },
+        "model": "reader-reference-v1",
+        "provider": "synthetic"
+      },
+      "retrieval": {
+        "arm": "perseus-vault",
+        "assembly_policy": "full-session-v1",
+        "context_token_budget": 12000,
+        "effective_depth": 10,
+        "mode": "hybrid",
+        "requested_depth": 10
+      },
+      "retry_policy": {
+        "max_retries": 1,
+        "on_error": "exclude-from-denominator"
+      },
+      "source": "synthetic-fixture"
+    },
+    {
+      "artifact_commitments": {
+        "code_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "config_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "custody_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "dataset_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "fixture_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "run_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+      },
+      "cell_id": "cell-prompt-swap",
+      "denominator_policy": {
+        "excluded_errors": [
+          "answer_error",
+          "judge_error"
+        ],
+        "name": "graded-only-v1"
+      },
+      "judge": {
+        "contract_id": "longmemeval-official-yes-no-v1",
+        "decoding": {
+          "completion_cap": 1,
+          "seed": 42,
+          "temperature": 0.0,
+          "top_p": 1.0
+        },
+        "independence_claim_eligible": false,
+        "model": "reader-reference-v1",
+        "prompt_digest_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+        "provider": "synthetic",
+        "relation": "correlated-same-model",
+        "threshold": {
+          "kind": "binary-label",
+          "labels": [
+            "yes",
+            "no"
+          ],
+          "value": 0.5
+        }
+      },
+      "outcomes": [
+        {
+          "abstained": false,
+          "answer_digest_sha256": "6787350742025c05a4bf8dfebb16439fbeaad230ebd739d5ccb03e85835ffd03",
+          "answer_latency_ms": 20,
+          "answer_tokens_est": 100,
+          "answer_verdict": "correct",
+          "calls": {
+            "answerer": 0,
+            "judge": 0,
+            "retrieval": 0
+          },
+          "exclusion_reason": null,
+          "independent_judge_label": null,
+          "judge_digest_sha256": "65142d3d65f16a20f519c983fe067a0b1b966f4dedc057133f09110ce9b2bb7b",
+          "judge_latency_ms": 2,
+          "primary_judge_label": "yes",
+          "question_id_sha256": "c75de8c1b7c3ae5252091267a736a9bf57001d80e82668b3cb3cd09e2f6a43cb",
+          "question_type": "single-session-user",
+          "retrieval_hit": true,
+          "retrieval_latency_ms": 4,
+          "retrieval_rank": 1,
+          "usage": {
+            "answer_completion_tokens": 0,
+            "answer_prompt_tokens": 0,
+            "judge_completion_tokens": 0,
+            "judge_prompt_tokens": 0,
+            "provider_cost_microusd": 0
+          }
+        },
+        {
+          "abstained": true,
+          "answer_digest_sha256": "184c2fe0c16014776fc8d89c688ca11911b7dc3a1d184787dfb133034ec55bc9",
+          "answer_latency_ms": 22,
+          "answer_tokens_est": 90,
+          "answer_verdict": "incorrect",
+          "calls": {
+            "answerer": 0,
+            "judge": 0,
+            "retrieval": 0
+          },
+          "exclusion_reason": null,
+          "independent_judge_label": null,
+          "judge_digest_sha256": "bd54c3d1ba19228c2898570bafc8ec7f9127527775605f2a24e6066033de644a",
+          "judge_latency_ms": 3,
+          "primary_judge_label": "no",
+          "question_id_sha256": "bee98bf120e8906382754c6be52860ac5dbc65a1ca4dbee7576267d8fd3367e1",
+          "question_type": "multi-session",
+          "retrieval_hit": false,
+          "retrieval_latency_ms": 5,
+          "retrieval_rank": null,
+          "usage": {
+            "answer_completion_tokens": 0,
+            "answer_prompt_tokens": 0,
+            "judge_completion_tokens": 0,
+            "judge_prompt_tokens": 0,
+            "provider_cost_microusd": 0
+          }
+        }
+      ],
+      "prompt": {
+        "digest_sha256": "7777777777777777777777777777777777777777777777777777777777777777",
+        "lane": "production-generic",
+        "version": "production-generic-v1"
+      },
+      "reader": {
+        "decoding": {
+          "completion_cap": 1200,
+          "seed": 42,
+          "temperature": 0.0,
+          "top_p": 1.0
+        },
+        "model": "reader-reference-v1",
+        "provider": "synthetic"
+      },
+      "retrieval": {
+        "arm": "perseus-vault",
+        "assembly_policy": "full-session-v1",
+        "context_token_budget": 12000,
+        "effective_depth": 10,
+        "mode": "hybrid",
+        "requested_depth": 10
+      },
+      "retry_policy": {
+        "max_retries": 1,
+        "on_error": "exclude-from-denominator"
+      },
+      "source": "synthetic-fixture"
+    },
+    {
+      "artifact_commitments": {
+        "code_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "config_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "custody_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "dataset_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "fixture_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "run_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+      },
+      "cell_id": "cell-cutoff-swap",
+      "denominator_policy": {
+        "excluded_errors": [
+          "answer_error",
+          "judge_error"
+        ],
+        "name": "graded-only-v1"
+      },
+      "judge": {
+        "contract_id": "longmemeval-official-yes-no-v1",
+        "decoding": {
+          "completion_cap": 1,
+          "seed": 42,
+          "temperature": 0.0,
+          "top_p": 1.0
+        },
+        "independence_claim_eligible": false,
+        "model": "reader-reference-v1",
+        "prompt_digest_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+        "provider": "synthetic",
+        "relation": "correlated-same-model",
+        "threshold": {
+          "kind": "binary-label",
+          "labels": [
+            "yes",
+            "no"
+          ],
+          "value": 0.5
+        }
+      },
+      "outcomes": [
+        {
+          "abstained": false,
+          "answer_digest_sha256": "6787350742025c05a4bf8dfebb16439fbeaad230ebd739d5ccb03e85835ffd03",
+          "answer_latency_ms": 20,
+          "answer_tokens_est": 100,
+          "answer_verdict": "correct",
+          "calls": {
+            "answerer": 0,
+            "judge": 0,
+            "retrieval": 0
+          },
+          "exclusion_reason": null,
+          "independent_judge_label": null,
+          "judge_digest_sha256": "65142d3d65f16a20f519c983fe067a0b1b966f4dedc057133f09110ce9b2bb7b",
+          "judge_latency_ms": 2,
+          "primary_judge_label": "yes",
+          "question_id_sha256": "c75de8c1b7c3ae5252091267a736a9bf57001d80e82668b3cb3cd09e2f6a43cb",
+          "question_type": "single-session-user",
+          "retrieval_hit": true,
+          "retrieval_latency_ms": 4,
+          "retrieval_rank": 1,
+          "usage": {
+            "answer_completion_tokens": 0,
+            "answer_prompt_tokens": 0,
+            "judge_completion_tokens": 0,
+            "judge_prompt_tokens": 0,
+            "provider_cost_microusd": 0
+          }
+        },
+        {
+          "abstained": true,
+          "answer_digest_sha256": "184c2fe0c16014776fc8d89c688ca11911b7dc3a1d184787dfb133034ec55bc9",
+          "answer_latency_ms": 22,
+          "answer_tokens_est": 90,
+          "answer_verdict": "incorrect",
+          "calls": {
+            "answerer": 0,
+            "judge": 0,
+            "retrieval": 0
+          },
+          "exclusion_reason": null,
+          "independent_judge_label": null,
+          "judge_digest_sha256": "bd54c3d1ba19228c2898570bafc8ec7f9127527775605f2a24e6066033de644a",
+          "judge_latency_ms": 3,
+          "primary_judge_label": "no",
+          "question_id_sha256": "bee98bf120e8906382754c6be52860ac5dbc65a1ca4dbee7576267d8fd3367e1",
+          "question_type": "multi-session",
+          "retrieval_hit": false,
+          "retrieval_latency_ms": 5,
+          "retrieval_rank": null,
+          "usage": {
+            "answer_completion_tokens": 0,
+            "answer_prompt_tokens": 0,
+            "judge_completion_tokens": 0,
+            "judge_prompt_tokens": 0,
+            "provider_cost_microusd": 0
+          }
+        }
+      ],
+      "prompt": {
+        "digest_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+        "lane": "official-cot",
+        "version": "official-cot-v1"
+      },
+      "reader": {
+        "decoding": {
+          "completion_cap": 1200,
+          "seed": 42,
+          "temperature": 0.0,
+          "top_p": 1.0
+        },
+        "model": "reader-reference-v1",
+        "provider": "synthetic"
+      },
+      "retrieval": {
+        "arm": "perseus-vault",
+        "assembly_policy": "full-session-v1",
+        "context_token_budget": 16000,
+        "effective_depth": 20,
+        "mode": "hybrid",
+        "requested_depth": 20
+      },
+      "retry_policy": {
+        "max_retries": 1,
+        "on_error": "exclude-from-denominator"
+      },
+      "source": "synthetic-fixture"
+    }
+  ],
+  "commitments": {
+    "code_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "config_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "custody_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "dataset_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "fixture_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "run_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+  },
+  "dataset": {
+    "digest_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "name": "longmemeval-cleaned",
+    "question_count": 2,
+    "question_type_distribution": {
+      "multi-session": 1,
+      "single-session-user": 1
+    },
+    "split": "s"
+  },
+  "execution": {
+    "mode": "provider-free-synthetic",
+    "network_calls": 0,
+    "paid": false,
+    "provider_calls": 0,
+    "raw_provider_payloads_captured": false
+  },
+  "matrix_id": "longmemeval-sensitivity-synthetic-v1",
+  "required_cell_ids": [
+    "cell-official-correlated",
+    "cell-reader-swap",
+    "cell-judge-swap",
+    "cell-prompt-swap",
+    "cell-cutoff-swap"
+  ],
+  "schema_version": "perseus-vault-longmemeval-sensitivity/v1",
+  "validation": {
+    "human_audit_sample_n": 0,
+    "second_judge_sample_n": 0
+  }
+}

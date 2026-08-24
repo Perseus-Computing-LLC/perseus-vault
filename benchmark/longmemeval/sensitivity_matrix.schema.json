@@ -1,0 +1,172 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://perseus.observer/schemas/longmemeval-sensitivity-matrix-v1.json",
+  "title": "LongMemEval reader/judge sensitivity matrix",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "matrix_id", "status", "dataset", "baseline_cell_id", "required_cell_ids", "commitments", "execution", "validation", "cells", "paired_rows", "category_deltas", "sensitivity_table", "report_sha256"],
+  "properties": {
+    "schema_version": {"const": "perseus-vault-longmemeval-sensitivity/v1"},
+    "matrix_id": {"$ref": "#/$defs/id"},
+    "status": {"const": "complete"},
+    "dataset": {"$ref": "#/$defs/dataset"},
+    "baseline_cell_id": {"$ref": "#/$defs/id"},
+    "required_cell_ids": {"type": "array", "minItems": 2, "uniqueItems": true, "items": {"$ref": "#/$defs/id"}},
+    "commitments": {"$ref": "#/$defs/commitments"},
+    "execution": {"$ref": "#/$defs/execution"},
+    "validation": {"$ref": "#/$defs/validation"},
+    "cells": {"type": "array", "minItems": 2, "items": {"$ref": "#/$defs/cell"}},
+    "paired_rows": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/paired_row"}},
+    "category_deltas": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/category_delta"}},
+    "sensitivity_table": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/sensitivity_row"}},
+    "report_sha256": {"$ref": "#/$defs/sha256"}
+  },
+  "$defs": {
+    "id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$"},
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "dataset": {
+      "type": "object", "additionalProperties": false,
+      "required": ["name", "split", "digest_sha256", "question_count", "question_type_distribution"],
+      "properties": {
+        "name": {"$ref": "#/$defs/id"},
+        "split": {"$ref": "#/$defs/id"},
+        "digest_sha256": {"$ref": "#/$defs/sha256"},
+        "question_count": {"type": "integer", "minimum": 1},
+        "question_type_distribution": {"type": "object", "minProperties": 1, "additionalProperties": {"type": "integer", "minimum": 0}}
+      }
+    },
+    "commitments": {
+      "type": "object", "additionalProperties": false,
+      "required": ["dataset_sha256", "fixture_sha256", "config_sha256", "code_sha256", "run_sha256", "custody_sha256"],
+      "properties": {
+        "dataset_sha256": {"$ref": "#/$defs/sha256"},
+        "fixture_sha256": {"$ref": "#/$defs/sha256"},
+        "config_sha256": {"$ref": "#/$defs/sha256"},
+        "code_sha256": {"$ref": "#/$defs/sha256"},
+        "run_sha256": {"$ref": "#/$defs/sha256"},
+        "custody_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "execution": {
+      "type": "object", "additionalProperties": false,
+      "required": ["mode", "network_calls", "provider_calls", "paid", "raw_provider_payloads_captured"],
+      "properties": {
+        "mode": {"enum": ["provider-free-synthetic", "paid-canary"]},
+        "network_calls": {"type": "integer", "minimum": 0},
+        "provider_calls": {"type": "integer", "minimum": 0},
+        "paid": {"type": "boolean"},
+        "raw_provider_payloads_captured": {"type": "boolean"}
+      }
+    },
+    "decoding": {
+      "type": "object", "additionalProperties": false,
+      "required": ["temperature", "top_p", "seed", "completion_cap"],
+      "properties": {
+        "temperature": {"type": "number", "minimum": 0, "maximum": 2},
+        "top_p": {"type": "number", "exclusiveMinimum": 0, "maximum": 1},
+        "seed": {"type": ["integer", "null"], "minimum": 0},
+        "completion_cap": {"type": "integer", "minimum": 1}
+      }
+    },
+    "reader": {
+      "type": "object", "additionalProperties": false,
+      "required": ["provider", "model", "decoding"],
+      "properties": {"provider": {"$ref": "#/$defs/id"}, "model": {"$ref": "#/$defs/id"}, "decoding": {"$ref": "#/$defs/decoding"}}
+    },
+    "threshold": {
+      "type": "object", "additionalProperties": false,
+      "required": ["kind", "value", "labels"],
+      "properties": {
+        "kind": {"$ref": "#/$defs/id"},
+        "value": {"type": "number", "minimum": 0, "maximum": 1},
+        "labels": {"type": "array", "minItems": 2, "maxItems": 2, "uniqueItems": true, "items": {"enum": ["yes", "no"]}}
+      }
+    },
+    "judge": {
+      "type": "object", "additionalProperties": false,
+      "required": ["provider", "model", "decoding", "contract_id", "prompt_digest_sha256", "threshold", "relation", "independence_claim_eligible"],
+      "properties": {
+        "provider": {"$ref": "#/$defs/id"}, "model": {"$ref": "#/$defs/id"}, "decoding": {"$ref": "#/$defs/decoding"},
+        "contract_id": {"$ref": "#/$defs/id"}, "prompt_digest_sha256": {"$ref": "#/$defs/sha256"}, "threshold": {"$ref": "#/$defs/threshold"},
+        "relation": {"enum": ["correlated-same-model", "independent-model"]}, "independence_claim_eligible": {"type": "boolean"}
+      }
+    },
+    "prompt": {
+      "type": "object", "additionalProperties": false, "required": ["lane", "version", "digest_sha256"],
+      "properties": {"lane": {"enum": ["official-cot", "production-generic"]}, "version": {"$ref": "#/$defs/id"}, "digest_sha256": {"$ref": "#/$defs/sha256"}}
+    },
+    "retrieval": {
+      "type": "object", "additionalProperties": false,
+      "required": ["arm", "mode", "requested_depth", "effective_depth", "context_token_budget", "assembly_policy"],
+      "properties": {
+        "arm": {"$ref": "#/$defs/id"}, "mode": {"$ref": "#/$defs/id"},
+        "requested_depth": {"type": "integer", "minimum": 1}, "effective_depth": {"type": "integer", "minimum": 1},
+        "context_token_budget": {"type": "integer", "minimum": 1}, "assembly_policy": {"$ref": "#/$defs/id"}
+      }
+    },
+    "retry_policy": {
+      "type": "object", "additionalProperties": false, "required": ["max_retries", "on_error"],
+      "properties": {"max_retries": {"type": "integer", "minimum": 0}, "on_error": {"$ref": "#/$defs/id"}}
+    },
+    "denominator_policy": {
+      "type": "object", "additionalProperties": false, "required": ["name", "excluded_errors"],
+      "properties": {"name": {"$ref": "#/$defs/id"}, "excluded_errors": {"type": "array", "uniqueItems": true, "items": {"enum": ["answer_error", "judge_error"]}}}
+    },
+    "calls": {
+      "type": "object", "additionalProperties": false, "required": ["retrieval", "answerer", "judge"],
+      "properties": {"retrieval": {"type": "integer", "minimum": 0}, "answerer": {"type": "integer", "minimum": 0}, "judge": {"type": "integer", "minimum": 0}}
+    },
+    "usage": {
+      "type": "object", "additionalProperties": false,
+      "required": ["answer_prompt_tokens", "answer_completion_tokens", "judge_prompt_tokens", "judge_completion_tokens", "provider_cost_microusd"],
+      "properties": {
+        "answer_prompt_tokens": {"type": "integer", "minimum": 0}, "answer_completion_tokens": {"type": "integer", "minimum": 0},
+        "judge_prompt_tokens": {"type": "integer", "minimum": 0}, "judge_completion_tokens": {"type": "integer", "minimum": 0},
+        "provider_cost_microusd": {"type": "integer", "minimum": 0}
+      }
+    },
+    "outcome": {
+      "type": "object", "additionalProperties": false,
+      "required": ["question_id_sha256", "question_type", "retrieval_hit", "retrieval_rank", "answer_verdict", "abstained", "primary_judge_label", "independent_judge_label", "answer_tokens_est", "retrieval_latency_ms", "answer_latency_ms", "judge_latency_ms", "calls", "usage", "answer_digest_sha256", "judge_digest_sha256", "exclusion_reason"],
+      "properties": {
+        "question_id_sha256": {"$ref": "#/$defs/sha256"}, "question_type": {"$ref": "#/$defs/id"}, "retrieval_hit": {"type": "boolean"},
+        "retrieval_rank": {"type": ["integer", "null"], "minimum": 1}, "answer_verdict": {"enum": ["correct", "incorrect", "answer_error", "judge_error"]},
+        "abstained": {"type": "boolean"}, "primary_judge_label": {"enum": ["yes", "no", "unavailable"]},
+        "independent_judge_label": {"type": ["string", "null"], "enum": ["yes", "no", "unavailable", null]}, "answer_tokens_est": {"type": "integer", "minimum": 0},
+        "retrieval_latency_ms": {"type": "integer", "minimum": 0}, "answer_latency_ms": {"type": "integer", "minimum": 0}, "judge_latency_ms": {"type": "integer", "minimum": 0},
+        "calls": {"$ref": "#/$defs/calls"}, "usage": {"$ref": "#/$defs/usage"}, "answer_digest_sha256": {"$ref": "#/$defs/sha256"}, "judge_digest_sha256": {"$ref": "#/$defs/sha256"},
+        "exclusion_reason": {"type": ["string", "null"], "enum": ["answer_error", "judge_error", null]}
+      }
+    },
+    "artifact_commitments": {"$ref": "#/$defs/commitments"},
+    "metrics": {
+      "type": "object", "additionalProperties": false,
+      "required": ["retrieval", "qa", "abstention", "negative_behavior", "judge", "telemetry"],
+      "properties": {
+        "retrieval": {"type": "object", "additionalProperties": false, "required": ["eligible_n", "hit_n", "coverage", "mean_rank"], "properties": {"eligible_n": {"type": "integer", "minimum": 0}, "hit_n": {"type": "integer", "minimum": 0}, "coverage": {"type": ["number", "null"], "minimum": 0, "maximum": 1}, "mean_rank": {"type": ["number", "null"], "minimum": 0}}},
+        "qa": {"type": "object", "additionalProperties": false, "required": ["attempted_n", "graded_n", "correct_n", "accuracy", "answer_errors", "judge_errors", "excluded_n"], "properties": {"attempted_n": {"type": "integer", "minimum": 0}, "graded_n": {"type": "integer", "minimum": 0}, "correct_n": {"type": "integer", "minimum": 0}, "accuracy": {"type": ["number", "null"], "minimum": 0, "maximum": 1}, "answer_errors": {"type": "integer", "minimum": 0}, "judge_errors": {"type": "integer", "minimum": 0}, "excluded_n": {"type": "integer", "minimum": 0}}},
+        "abstention": {"type": "object", "additionalProperties": false, "required": ["attempted_n", "abstained_n", "abstention_rate", "graded_n", "correct_n", "accuracy"], "properties": {"attempted_n": {"type": "integer", "minimum": 0}, "abstained_n": {"type": "integer", "minimum": 0}, "abstention_rate": {"type": ["number", "null"], "minimum": 0, "maximum": 1}, "graded_n": {"type": "integer", "minimum": 0}, "correct_n": {"type": "integer", "minimum": 0}, "accuracy": {"type": ["number", "null"], "minimum": 0, "maximum": 1}}},
+        "negative_behavior": {"type": "object", "additionalProperties": false, "required": ["abstained_n", "incorrect_abstention_n", "correct_abstention_n", "incorrect_nonabstention_n"], "properties": {"abstained_n": {"type": "integer", "minimum": 0}, "incorrect_abstention_n": {"type": "integer", "minimum": 0}, "correct_abstention_n": {"type": "integer", "minimum": 0}, "incorrect_nonabstention_n": {"type": "integer", "minimum": 0}}},
+        "judge": {"type": "object", "additionalProperties": false, "required": ["relation", "same_model_correlated", "independent_label_n", "agreement_n", "discordance_n", "agreement_rate", "independence_claim_eligible"], "properties": {"relation": {"enum": ["correlated-same-model", "independent-model"]}, "same_model_correlated": {"type": "boolean"}, "independent_label_n": {"type": "integer", "minimum": 0}, "agreement_n": {"type": "integer", "minimum": 0}, "discordance_n": {"type": "integer", "minimum": 0}, "agreement_rate": {"type": ["number", "null"], "minimum": 0, "maximum": 1}, "independence_claim_eligible": {"type": "boolean"}}},
+        "telemetry": {"type": "object", "additionalProperties": false, "required": ["latency_ms", "calls", "provider_usage"], "properties": {"latency_ms": {"type": "object", "additionalProperties": false, "required": ["retrieval_mean", "answer_mean", "judge_mean", "total_mean", "retrieval_p95", "answer_p95", "judge_p95"], "properties": {"retrieval_mean": {"type": ["number", "null"], "minimum": 0}, "answer_mean": {"type": ["number", "null"], "minimum": 0}, "judge_mean": {"type": ["number", "null"], "minimum": 0}, "total_mean": {"type": ["number", "null"], "minimum": 0}, "retrieval_p95": {"type": ["integer", "null"], "minimum": 0}, "answer_p95": {"type": ["integer", "null"], "minimum": 0}, "judge_p95": {"type": ["integer", "null"], "minimum": 0}}}, "calls": {"type": "object", "additionalProperties": false, "required": ["retrieval", "answerer", "judge", "total"], "properties": {"retrieval": {"type": "integer", "minimum": 0}, "answerer": {"type": "integer", "minimum": 0}, "judge": {"type": "integer", "minimum": 0}, "total": {"type": "integer", "minimum": 0}}}, "provider_usage": {"type": "object", "additionalProperties": false, "required": ["answer_prompt_tokens", "answer_completion_tokens", "judge_prompt_tokens", "judge_completion_tokens", "provider_cost_microusd", "total_tokens"], "properties": {"answer_prompt_tokens": {"type": "integer", "minimum": 0}, "answer_completion_tokens": {"type": "integer", "minimum": 0}, "judge_prompt_tokens": {"type": "integer", "minimum": 0}, "judge_completion_tokens": {"type": "integer", "minimum": 0}, "provider_cost_microusd": {"type": "integer", "minimum": 0}, "total_tokens": {"type": "integer", "minimum": 0}}}}}
+      }
+    },
+    "category_metric": {"type": "object", "additionalProperties": false, "required": ["n", "retrieval_hit_n", "retrieval_coverage", "qa_graded_n", "qa_correct_n", "qa_accuracy", "abstention_n", "abstention_rate"], "properties": {"n": {"type": "integer", "minimum": 1}, "retrieval_hit_n": {"type": "integer", "minimum": 0}, "retrieval_coverage": {"type": ["number", "null"], "minimum": 0, "maximum": 1}, "qa_graded_n": {"type": "integer", "minimum": 0}, "qa_correct_n": {"type": "integer", "minimum": 0}, "qa_accuracy": {"type": ["number", "null"], "minimum": 0, "maximum": 1}, "abstention_n": {"type": "integer", "minimum": 0}, "abstention_rate": {"type": ["number", "null"], "minimum": 0, "maximum": 1}}},
+    "cell": {
+      "type": "object", "additionalProperties": false,
+      "required": ["cell_id", "source", "reader", "judge", "prompt", "retrieval", "retry_policy", "denominator_policy", "artifact_commitments", "outcomes", "cell_config_sha256", "outcomes_sha256", "metrics", "category_metrics"],
+      "properties": {
+        "cell_id": {"$ref": "#/$defs/id"}, "source": {"$ref": "#/$defs/id"}, "reader": {"$ref": "#/$defs/reader"}, "judge": {"$ref": "#/$defs/judge"}, "prompt": {"$ref": "#/$defs/prompt"}, "retrieval": {"$ref": "#/$defs/retrieval"}, "retry_policy": {"$ref": "#/$defs/retry_policy"}, "denominator_policy": {"$ref": "#/$defs/denominator_policy"}, "artifact_commitments": {"$ref": "#/$defs/artifact_commitments"}, "outcomes": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/outcome"}}, "cell_config_sha256": {"$ref": "#/$defs/sha256"}, "outcomes_sha256": {"$ref": "#/$defs/sha256"}, "metrics": {"$ref": "#/$defs/metrics"}, "category_metrics": {"type": "object", "additionalProperties": {"$ref": "#/$defs/category_metric"}}
+      }
+    },
+    "paired_cell": {
+      "type": "object", "additionalProperties": false, "required": ["cell_id", "retrieval_hit", "retrieval_rank", "answer_verdict", "abstained", "excluded", "answer_tokens_est", "independent_judge_label"],
+      "properties": {"cell_id": {"$ref": "#/$defs/id"}, "retrieval_hit": {"type": "boolean"}, "retrieval_rank": {"type": ["integer", "null"], "minimum": 1}, "answer_verdict": {"enum": ["correct", "incorrect", "answer_error", "judge_error"]}, "abstained": {"type": "boolean"}, "excluded": {"type": "boolean"}, "answer_tokens_est": {"type": "integer", "minimum": 0}, "independent_judge_label": {"type": ["string", "null"], "enum": ["yes", "no", "unavailable", null]}}
+    },
+    "paired_row": {"type": "object", "additionalProperties": false, "required": ["question_id_sha256", "question_type", "cells"], "properties": {"question_id_sha256": {"$ref": "#/$defs/sha256"}, "question_type": {"$ref": "#/$defs/id"}, "cells": {"type": "array", "minItems": 2, "items": {"$ref": "#/$defs/paired_cell"}}}},
+    "category_delta": {"type": "object", "additionalProperties": false, "required": ["cell_id", "baseline_cell_id", "question_type", "paired_n", "baseline_paired_n", "retrieval_coverage", "baseline_retrieval_coverage", "retrieval_coverage_delta", "qa_accuracy", "baseline_qa_accuracy", "qa_accuracy_delta", "abstention_rate", "baseline_abstention_rate", "abstention_rate_delta"], "properties": {"cell_id": {"$ref": "#/$defs/id"}, "baseline_cell_id": {"$ref": "#/$defs/id"}, "question_type": {"$ref": "#/$defs/id"}, "paired_n": {"type": "integer", "minimum": 0}, "baseline_paired_n": {"type": "integer", "minimum": 0}, "retrieval_coverage": {"type": ["number", "null"], "minimum": 0, "maximum": 1}, "baseline_retrieval_coverage": {"type": ["number", "null"], "minimum": 0, "maximum": 1}, "retrieval_coverage_delta": {"type": ["number", "null"], "minimum": -1, "maximum": 1}, "qa_accuracy": {"type": ["number", "null"], "minimum": 0, "maximum": 1}, "baseline_qa_accuracy": {"type": ["number", "null"], "minimum": 0, "maximum": 1}, "qa_accuracy_delta": {"type": ["number", "null"], "minimum": -1, "maximum": 1}, "abstention_rate": {"type": ["number", "null"], "minimum": 0, "maximum": 1}, "baseline_abstention_rate": {"type": ["number", "null"], "minimum": 0, "maximum": 1}, "abstention_rate_delta": {"type": ["number", "null"], "minimum": -1, "maximum": 1}}},
+    "sensitivity_row": {"type": "object", "additionalProperties": false, "required": ["cell_id", "reader_provider", "reader_model", "judge_provider", "judge_model", "judge_relation", "prompt_lane", "retrieval_arm", "retrieval_mode", "requested_depth", "effective_depth", "context_token_budget", "retrieval_coverage", "qa_accuracy", "abstention_rate", "retrieval_coverage_delta", "qa_accuracy_delta", "abstention_rate_delta", "judge_discordance_n", "independence_claim_eligible"], "properties": {"cell_id": {"$ref": "#/$defs/id"}, "reader_provider": {"$ref": "#/$defs/id"}, "reader_model": {"$ref": "#/$defs/id"}, "judge_provider": {"$ref": "#/$defs/id"}, "judge_model": {"$ref": "#/$defs/id"}, "judge_relation": {"enum": ["correlated-same-model", "independent-model"]}, "prompt_lane": {"enum": ["official-cot", "production-generic"]}, "retrieval_arm": {"$ref": "#/$defs/id"}, "retrieval_mode": {"$ref": "#/$defs/id"}, "requested_depth": {"type": "integer", "minimum": 1}, "effective_depth": {"type": "integer", "minimum": 1}, "context_token_budget": {"type": "integer", "minimum": 1}, "retrieval_coverage": {"type": ["number", "null"], "minimum": 0, "maximum": 1}, "qa_accuracy": {"type": ["number", "null"], "minimum": 0, "maximum": 1}, "abstention_rate": {"type": ["number", "null"], "minimum": 0, "maximum": 1}, "retrieval_coverage_delta": {"type": ["number", "null"], "minimum": -1, "maximum": 1}, "qa_accuracy_delta": {"type": ["number", "null"], "minimum": -1, "maximum": 1}, "abstention_rate_delta": {"type": ["number", "null"], "minimum": -1, "maximum": 1}, "judge_discordance_n": {"type": "integer", "minimum": 0}, "independence_claim_eligible": {"type": "boolean"}}},
+    "same_model_audit": {"type": "object", "additionalProperties": false, "required": ["correlated_cell_ids", "independent_validation_claim_allowed", "finding"], "properties": {"correlated_cell_ids": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/id"}}, "independent_validation_claim_allowed": {"type": "boolean"}, "finding": {"type": "string", "minLength": 1}}},
+    "validation": {"type": "object", "additionalProperties": false, "required": ["human_audit_sample_n", "second_judge_sample_n", "same_model_audit", "smaller_reader_claim_allowed"], "properties": {"human_audit_sample_n": {"type": "integer", "minimum": 0}, "second_judge_sample_n": {"type": "integer", "minimum": 0}, "same_model_audit": {"$ref": "#/$defs/same_model_audit"}, "smaller_reader_claim_allowed": {"type": "boolean"}}}
+  }
+}
