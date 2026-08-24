@@ -353,6 +353,7 @@ pub mod grpc {
                     workspace_hash: r.workspace_hash,
                     mode: models::ContextMode::AlwaysInject,
                     requesting_agent_id,
+                    include_provider_source: false,
                     ..Default::default()
                 };
                 let ctx = db.context_block(&opts)?.markdown;

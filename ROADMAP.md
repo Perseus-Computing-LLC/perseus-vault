@@ -18,7 +18,7 @@ Zero runtime dependencies. Structured entity model with journal events and state
 
 - **Latest release:** `v2.23.1` (published 2026-08-23).
 - **`main`:** current post-release head includes the latest benchmark/retrieval remediation; the issue-backed forward backlog is listed below.
-- **MCP tools:** **169 canonical tools**, spanning entities, search/RAG, journal, state, graph, lifecycle, multi-agent/federation, governance, operations, and benchmark/diagnostic surfaces.
+- **MCP tools:** **170 canonical tools**, spanning entities, search/RAG, journal, state, graph, lifecycle, multi-agent/federation, governance, operations, and benchmark/diagnostic surfaces.
 - **In one line:** the original v0.1 through v2.0 platform plan has shipped; this document now tracks the open, issue-backed work without inventing delivery dates.
 
 > **Doc hygiene note:** prior revisions of this file listed shipped capabilities
@@ -84,7 +84,7 @@ federation is intentionally disabled; explicit export/import remains supported.
   Linux, Windows MSVC, and macOS.
 
 ### v2.23.1 — Current release line ✅
-- Release metadata and the source-derived canonical registry are aligned at **169 tools**;
+- Release metadata and the source-derived canonical registry are aligned at **170 tools**;
   current governance, provenance, benchmark-custody, and retrieval-remediation hardening is
   documented in `CHANGELOG.md`.
 

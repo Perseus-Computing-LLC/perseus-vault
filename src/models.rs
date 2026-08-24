@@ -1558,6 +1558,8 @@ pub struct ContextOptions {
     /// visibility) are dropped before rendering — context injection gets the
     /// same visibility gate as recall.
     pub requesting_agent_id: Option<String>,
+    /// #1141: opt-in hash-only provider identity and lineage in context.
+    pub include_provider_source: bool,
 }
 
 /// A rendered context block plus injection metadata (#366).

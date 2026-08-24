@@ -728,7 +728,7 @@ CREATE INDEX IF NOT EXISTS idx_preload_proposals_state
 /// — the entity ids an action cited as grounding, so the reverse impact
 /// closure can flag PENDING actions whose justification changed. Additive
 /// column, no backfill (pre-existing actions cite nothing).
-pub(crate) const SCHEMA_VERSION: i64 = 56;
+pub(crate) const SCHEMA_VERSION: i64 = 57;
 
 /// Initialize the v0.2.0 schema on a fresh database.
 pub fn initialize_schema(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
@@ -2278,9 +2278,93 @@ fn apply_migrations(conn: &Connection) -> Result<(), Box<dyn std::error::Error>>
         "impact_spent",
         "INTEGER NOT NULL DEFAULT 0",
     )?;
+    // v57 (#1141 provider-native source identity and event lifecycle). Provider
+    // bodies never enter these tables: only bounded identity, lineage, timing,
+    // scope, digest, and hash-only receipt fields are retained.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS provider_sources (
+            source_id TEXT PRIMARY KEY,
+            workspace_hash TEXT NOT NULL DEFAULT '',
+            provider TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            external_id TEXT NOT NULL,
+            canonical_uri TEXT,
+            thread_id TEXT,
+            parent_id TEXT,
+            provider_event_id TEXT,
+            author TEXT,
+            revision TEXT NOT NULL,
+            observed_at_unix_ms INTEGER,
+            provider_created_at_unix_ms INTEGER,
+            provider_updated_at_unix_ms INTEGER,
+            content_sha256 TEXT,
+            source_span_ref TEXT,
+            visibility TEXT NOT NULL DEFAULT 'workspace',
+            retention_policy TEXT,
+            capture_method TEXT NOT NULL DEFAULT 'event_feed',
+            authority_agent_id TEXT NOT NULL DEFAULT '',
+            entity_id TEXT,
+            state TEXT NOT NULL DEFAULT 'active',
+            deleted_at_unix_ms INTEGER,
+            current_event_id TEXT NOT NULL,
+            receipt_digest TEXT NOT NULL,
+            recorded_at_unix_ms INTEGER NOT NULL,
+            updated_at_unix_ms INTEGER NOT NULL
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_provider_sources_identity
+            ON provider_sources(workspace_hash, provider, external_id);
+        CREATE INDEX IF NOT EXISTS idx_provider_sources_entity
+            ON provider_sources(workspace_hash, entity_id);
+        CREATE TABLE IF NOT EXISTS provider_source_events (
+            event_id TEXT PRIMARY KEY,
+            source_id TEXT NOT NULL REFERENCES provider_sources(source_id),
+            workspace_hash TEXT NOT NULL DEFAULT '',
+            provider TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            external_id TEXT NOT NULL,
+            canonical_uri TEXT,
+            thread_id TEXT,
+            parent_id TEXT,
+            provider_event_id TEXT,
+            author TEXT,
+            revision TEXT NOT NULL,
+            expected_revision TEXT,
+            event_type TEXT NOT NULL,
+            observed_at_unix_ms INTEGER,
+            provider_created_at_unix_ms INTEGER,
+            provider_updated_at_unix_ms INTEGER,
+            content_sha256 TEXT,
+            source_span_ref TEXT,
+            visibility TEXT NOT NULL DEFAULT 'workspace',
+            retention_policy TEXT,
+            capture_method TEXT NOT NULL DEFAULT 'event_feed',
+            authority_agent_id TEXT NOT NULL DEFAULT '',
+            entity_id TEXT,
+            state_after TEXT NOT NULL,
+            deleted_at_unix_ms INTEGER,
+            previous_revision TEXT,
+            request_digest TEXT NOT NULL,
+            receipt_digest TEXT NOT NULL,
+            recorded_at_unix_ms INTEGER NOT NULL,
+            UNIQUE(source_id, revision)
+        );
+        CREATE INDEX IF NOT EXISTS idx_provider_source_events_scope
+            ON provider_source_events(workspace_hash, provider, external_id, recorded_at_unix_ms);
+        CREATE INDEX IF NOT EXISTS idx_provider_source_events_source
+            ON provider_source_events(source_id, recorded_at_unix_ms);
+        CREATE TRIGGER IF NOT EXISTS provider_source_events_no_update
+            BEFORE UPDATE ON provider_source_events
+            BEGIN SELECT RAISE(ABORT, 'provider source event history is append-only'); END;
+        CREATE TRIGGER IF NOT EXISTS provider_source_events_no_delete
+            BEFORE DELETE ON provider_source_events
+            BEGIN SELECT RAISE(ABORT, 'provider source event history is append-only'); END;",
+    )?;
+
     // Stamp the migration level so subsequent opens skip the probe block above.
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
 
+    ensure_column(conn, "provider_sources", "author", "TEXT")?;
+    ensure_column(conn, "provider_source_events", "author", "TEXT")?;
     Ok(())
 }
 

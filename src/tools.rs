@@ -370,6 +370,9 @@ pub struct RecallArgs {
     /// existing callers and snapshot tests are unaffected; ranking is unchanged.
     #[serde(default, deserialize_with = "null_as_default")]
     pub include_confidence: bool,
+    /// #1141: opt-in hash-only provider identity and thread lineage.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub include_provider_source: bool,
     /// #917: emit deterministic contradiction/supersession/staleness flags
     /// alongside recall. Off by default so nominal recall stays compatible.
     #[serde(default, deserialize_with = "null_as_default")]
@@ -923,6 +926,9 @@ pub struct ContextArgs {
     /// #875: session id for preload usage telemetry ("" when unknown).
     #[serde(default)]
     pub session_id: String,
+    /// #1141: opt-in hash-only provider identity and lineage on context lines.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub include_provider_source: bool,
 }
 
 fn default_context_limit() -> i64 {
@@ -2370,6 +2376,28 @@ fn recall_query_has_searchable_term(query: &str) -> bool {
         .any(|word| word.chars().any(char::is_alphanumeric))
 }
 
+/// #1141: apply a provider-native source event through the governed write boundary.
+pub fn handle_provider_source_event(db: &Database, args: Value) -> Result<String, String> {
+    let request: crate::provider_source::ProviderSourceEventRequest = serde_json::from_value(args)
+        .map_err(|e| format!("Invalid provider source event arguments: {e}"))?;
+    let capability = if request.event_type == "delete" {
+        "memory.commit"
+    } else {
+        "memory.propose"
+    };
+    if !request.workspace_hash.trim().is_empty() {
+        db.require_memory_capability(
+            &request.requesting_agent_id,
+            &request.workspace_hash,
+            capability,
+        )
+        .map_err(|e| format!("provider source event denied: {e}"))?;
+    }
+    let result = db.apply_provider_source_event(&request)?;
+    serde_json::to_string(&result)
+        .map_err(|e| format!("provider source event serialization failed: {e}"))
+}
+
 pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
     let a: RecallArgs =
         serde_json::from_value(args).map_err(|e| format!("Invalid recall arguments: {}", e))?;
@@ -2834,6 +2862,30 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
 
     if a.include_confidence {
         apply_confidence(&mut items_expanded, &entities);
+    }
+
+    // #1141: source identity is an explicit presentation opt-in. Resolve by
+    // final item id so confirmed-query prepends remain correctly aligned.
+    if a.include_provider_source {
+        for item in &mut items_expanded {
+            let id = item
+                .get("id")
+                .and_then(|value| value.as_str())
+                .map(str::to_owned);
+            let Some(id) = id else { continue };
+            let source = db
+                .provider_source_projection(
+                    &id,
+                    a.workspace_hash.as_deref(),
+                    a.requesting_agent_id.as_deref(),
+                )
+                .map_err(|e| format!("Provider source projection failed: {e}"))?;
+            if let Some(source) = source {
+                if let Some(obj) = item.as_object_mut() {
+                    obj.insert("provider_source".to_string(), source);
+                }
+            }
+        }
     }
 
     // #864/#873/#887: attach the explicit outcome when it has something to
@@ -6808,6 +6860,7 @@ pub fn handle_context(db: &Database, args: Value) -> String {
         session_id: a.session_id,
         // #996: identity-gated injection (transport-stamped, never caller-trusted).
         requesting_agent_id: stamped_requester(&args).map(str::to_owned),
+        include_provider_source: a.include_provider_source,
     };
 
     match db.context_block(&opts) {

@@ -778,6 +778,7 @@ pub fn handle_request(
             // an opt-in governance surface).
             {
                 const SCOPE_MUTATION_TOOLS: &[&str] = &[
+                    "perseus_vault_provider_source_event",
                     "perseus_vault_remember",
                     "perseus_vault_journal",
                     "perseus_vault_reject_value",
@@ -1180,6 +1181,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     },
     "title": "Write Gate"
   },
+  {"name": "perseus_vault_provider_source_event", "description": "Apply a versioned provider-native source event. Preserves stable provider identity, revision and content digests, timestamps, thread or parent lineage, visibility and workspace scope, and governed deletion tombstones. The envelope never accepts or stores raw provider bodies or payloads. Replaying the same provider/external_id/revision is idempotent.", "inputSchema": {"type": "object", "properties": {"schema_version": {"type": "integer", "const": 1}, "event_type": {"type": "string", "enum": ["upsert", "comment", "reply", "attachment", "delete"]}, "provider": {"type": "string"}, "kind": {"type": "string"}, "external_id": {"type": "string"}, "canonical_uri": {"type": "string"}, "thread_id": {"type": "string"}, "parent_id": {"type": "string"}, "provider_event_id": {"type": "string"}, "author": {"type": "string", "maxLength": 256}, "revision": {"type": "string"}, "expected_revision": {"type": "string"}, "observed_at_unix_ms": {"type": "integer", "minimum": 0}, "provider_created_at_unix_ms": {"type": "integer", "minimum": 0}, "provider_updated_at_unix_ms": {"type": "integer", "minimum": 0}, "content_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}, "source_span_ref": {"type": "string"}, "workspace_hash": {"type": "string"}, "visibility": {"type": "string", "enum": ["private", "workspace", "public"]}, "retention_policy": {"type": "string"}, "capture_method": {"type": "string"}, "requesting_agent_id": {"type": "string", "description": "Transport-stamped identity; caller-supplied values are overwritten."}, "entity_id": {"type": "string"}}, "required": ["schema_version", "event_type", "provider", "kind", "external_id", "revision"]}, "outputSchema": {"type": "object", "properties": {"schema_version": {"type": "integer"}, "outcome": {"type": "string", "enum": ["applied", "idempotent", "revision_race", "deleted"]}, "event_type": {"type": "string"}, "event_id": {"type": "string"}, "receipt_digest": {"type": "string"}, "source": {"type": "object"}, "previous_revision": {"type": "string"}, "entity_archived": {"type": "boolean"}}}, "annotations": {"destructiveHint": true}, "title": "Provider Source Event"},
   {
     "name": "perseus_vault_recall",
     "description": "Search entities with FTS5 keyword search. Words are OR'd together. Returns entities sorted by relevance with expanded content/summary fields at top level. Use this to find previously stored facts, decisions, or architecture notes. When encryption is enabled, body_json is decrypted transparently.",
@@ -1279,6 +1281,11 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
           "type": "boolean",
           "default": false,
           "description": "Add a normalized confidence score (0.0-1.0) to each result, rolled up from rank, trust (verified/certainty), and decay. Presentation-only; does not change ranking."
+        },
+        "include_provider_source": {
+          "type": "boolean",
+          "default": false,
+          "description": "#1141: include only sanitized provider identity, revision, digest, scope, and thread lineage; raw provider bodies and payloads are never returned."
         },
         "include_conflict_flags": {
           "type": "boolean",
@@ -4371,6 +4378,11 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
         "max_context_chars": {
           "type": "integer",
           "description": "Explicit character budget for the rendered block; overrides the model profile. In always_inject mode output is clamped only when this is set."
+        },
+        "include_provider_source": {
+          "type": "boolean",
+          "default": false,
+          "description": "#1141: include sanitized provider identity and thread lineage on context lines; provider bodies and payloads are excluded."
         },
         "session_id": {
           "type": "string",
@@ -8103,6 +8115,7 @@ fn resolve_scope_view(raw: Option<&str>) -> ScopeView {
 /// 1:1 + completeness invariant is CI-enforced by
 /// scripts/registry_metadata_check.py.
 const TOOL_SCOPES: &[(&str, ToolScope)] = &[
+    ("perseus_vault_provider_source_event", ToolScope::Agent),
     ("perseus_vault_remember", ToolScope::Agent),
     ("perseus_vault_write_gate", ToolScope::Agent),
     ("perseus_vault_recall", ToolScope::Agent),
@@ -8350,6 +8363,9 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
             tools::handle_report_success(db, args).map_err(|e| e.to_string())
         }
 
+        "perseus_vault_provider_source_event" => {
+            tools::handle_provider_source_event(db, args).map_err(|e| e.to_string())
+        }
         "perseus_vault_recall" => tools::handle_recall(db, args).map_err(|e| e.to_string()),
         "perseus_vault_handoff_pack" => {
             tools::handle_handoff_pack(db, args).map_err(|e| e.to_string())
@@ -8751,7 +8767,7 @@ mod tests {
         );
         assert_eq!(
             registry_names.len(),
-            169,
+            170,
             "update public metadata when adding a tool"
         );
 
@@ -10317,15 +10333,15 @@ mod tests {
         let full = filter_registry_by_view(registry.clone(), ScopeView::Full);
         assert_eq!(
             agent.len(),
-            51,
+            52,
             "agent view count drifted — new tools must be classified"
         );
         assert_eq!(
             ops.len(),
-            162,
+            163,
             "ops view count drifted — new tools must be classified"
         );
-        assert_eq!(full.len(), 169, "full view must expose the whole registry");
+        assert_eq!(full.len(), 170, "full view must expose the whole registry");
         assert!(agent.len() < ops.len() && ops.len() < full.len());
     }
 
