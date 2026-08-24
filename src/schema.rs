@@ -728,7 +728,7 @@ CREATE INDEX IF NOT EXISTS idx_preload_proposals_state
 /// — the entity ids an action cited as grounding, so the reverse impact
 /// closure can flag PENDING actions whose justification changed. Additive
 /// column, no backfill (pre-existing actions cite nothing).
-pub(crate) const SCHEMA_VERSION: i64 = 55;
+pub(crate) const SCHEMA_VERSION: i64 = 56;
 
 /// Initialize the v0.2.0 schema on a fresh database.
 pub fn initialize_schema(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
@@ -2175,6 +2175,109 @@ fn apply_migrations(conn: &Connection) -> Result<(), Box<dyn std::error::Error>>
     )?;
     // ── end v55 ──────────────────────────────────────────────────────────
 
+    // ── v56 (#1134 task/action lineage) ──────────────────────────────────
+    // Optional AAR sidecar. The current row is mutable only through an
+    // exact-head CAS; transitions are append-only history and contain only
+    // bounded/hash-bound admission state.
+    ensure_column(
+        conn,
+        "authorized_actions",
+        "lineage_id",
+        "TEXT NOT NULL DEFAULT \"\"",
+    )?;
+    ensure_column(
+        conn,
+        "authorized_actions",
+        "lineage_transition_id",
+        "TEXT NOT NULL DEFAULT \"\"",
+    )?;
+    ensure_column(
+        conn,
+        "authorized_actions",
+        "lineage_outcome",
+        "TEXT NOT NULL DEFAULT \"\"",
+    )?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS action_lineages (
+            lineage_id TEXT PRIMARY KEY,
+            parent_lineage_id TEXT NOT NULL DEFAULT \"\",
+            parent_head_digest TEXT NOT NULL DEFAULT \"\",
+            workspace_hash TEXT NOT NULL,
+            agent_id TEXT NOT NULL,
+            authority_manifest_id TEXT NOT NULL,
+            authority_manifest_version INTEGER NOT NULL,
+            policy_version TEXT NOT NULL,
+            continuation_state_json TEXT NOT NULL,
+            continuation_state_digest TEXT NOT NULL,
+            head_digest TEXT NOT NULL,
+            budget_limit INTEGER NOT NULL,
+            impact_limit INTEGER NOT NULL,
+            budget_spent INTEGER NOT NULL,
+            impact_units INTEGER NOT NULL,
+            expires_at_unix_ms INTEGER,
+            revoked_at_unix_ms INTEGER,
+            created_at_unix_ms INTEGER NOT NULL,
+            updated_at_unix_ms INTEGER NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS idx_action_lineages_scope
+            ON action_lineages(workspace_hash, agent_id, updated_at_unix_ms);
+         CREATE TABLE IF NOT EXISTS action_lineage_transitions (
+            transition_id TEXT PRIMARY KEY,
+            lineage_id TEXT NOT NULL REFERENCES action_lineages(lineage_id),
+            parent_lineage_id TEXT NOT NULL DEFAULT \"\",
+            action_id TEXT NOT NULL REFERENCES authorized_actions(id),
+            idempotency_key_digest TEXT NOT NULL,
+            request_digest TEXT NOT NULL,
+            parent_head_digest TEXT NOT NULL,
+            head_digest TEXT NOT NULL,
+            continuation_state_json TEXT NOT NULL,
+            continuation_state_digest TEXT NOT NULL,
+            workspace_hash TEXT NOT NULL,
+            agent_id TEXT NOT NULL,
+            authority_manifest_id TEXT NOT NULL,
+            authority_manifest_version INTEGER NOT NULL,
+            policy_version TEXT NOT NULL,
+            outcome TEXT NOT NULL,
+            reason_code TEXT NOT NULL,
+            budget_cost INTEGER NOT NULL,
+            impact_units INTEGER NOT NULL,
+            budget_limit INTEGER NOT NULL,
+            impact_limit INTEGER NOT NULL,
+            budget_spent INTEGER NOT NULL,
+            impact_spent INTEGER NOT NULL DEFAULT 0,
+            expires_at_unix_ms INTEGER,
+            revoked_at_unix_ms INTEGER,
+            created_at_unix_ms INTEGER NOT NULL,
+            UNIQUE(lineage_id, idempotency_key_digest)
+         );
+         CREATE INDEX IF NOT EXISTS idx_action_lineage_transitions_lineage
+            ON action_lineage_transitions(lineage_id, created_at_unix_ms);
+         CREATE TRIGGER IF NOT EXISTS action_lineage_transitions_no_update
+            BEFORE UPDATE ON action_lineage_transitions
+            BEGIN SELECT RAISE(ABORT, \"action lineage history is append-only\"); END;
+         CREATE TRIGGER IF NOT EXISTS action_lineage_transitions_no_delete
+            BEFORE DELETE ON action_lineage_transitions
+            BEGIN SELECT RAISE(ABORT, \"action lineage history is append-only\"); END;",
+    )?;
+
+    ensure_column(
+        conn,
+        "action_lineage_transitions",
+        "budget_limit",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        conn,
+        "action_lineage_transitions",
+        "impact_limit",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        conn,
+        "action_lineage_transitions",
+        "impact_spent",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
     // Stamp the migration level so subsequent opens skip the probe block above.
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
 

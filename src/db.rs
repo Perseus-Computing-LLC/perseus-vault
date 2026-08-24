@@ -6,6 +6,29 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[derive(Debug, Clone)]
+struct StoredTaskLineage {
+    lineage_id: String,
+    parent_lineage_id: String,
+    parent_head_digest: String,
+    workspace_hash: String,
+    agent_id: String,
+    authority_manifest_id: String,
+    authority_manifest_version: i64,
+    policy_version: String,
+    state_json: String,
+    state_digest: String,
+    head_digest: String,
+    budget_limit: i64,
+    impact_limit: i64,
+    budget_spent: i64,
+    impact_units: i64,
+    expires_at_unix_ms: Option<i64>,
+    revoked_at_unix_ms: Option<i64>,
+    created_at_unix_ms: i64,
+    updated_at_unix_ms: i64,
+}
+
 /// Deterministic canonicalization for rejected-value matching (#849):
 /// 1. If the value is valid JSON, re-serialize it compactly with serde_json so
 ///    that structural whitespace/formatting cannot launder a rejected value.
@@ -16954,11 +16977,728 @@ impl Database {
             finding_ref: r.get(20).unwrap_or_default(),
             superseding_head: r.get(21).unwrap_or_default(),
             handoff_receipt_ref: r.get(22).unwrap_or_default(),
+            lineage_id: r.get(23).unwrap_or_default(),
+            lineage_transition_id: r.get(24).unwrap_or_default(),
+            lineage_outcome: r.get(25).unwrap_or_default(),
+            lineage_continuation: None,
+            lineage_receipt: None,
         })
     }
 
     fn action_select_sql() -> &'static str {
-        "SELECT id, manifest_id, manifest_version, agent_id, workspace_hash, scope_anchor, external_ref, capability, action_key, intent_hash, outcome_hash, status, approval_required, approval_ref, created_at_unix_ms, updated_at_unix_ms, resource_constraints_json, resource_constraints_hash, justification_json, compensates_for, finding_ref, superseding_head, handoff_receipt_ref FROM authorized_actions"
+        "SELECT id, manifest_id, manifest_version, agent_id, workspace_hash, scope_anchor, external_ref, capability, action_key, intent_hash, outcome_hash, status, approval_required, approval_ref, created_at_unix_ms, updated_at_unix_ms, resource_constraints_json, resource_constraints_hash, justification_json, compensates_for, finding_ref, superseding_head, handoff_receipt_ref, lineage_id, lineage_transition_id, lineage_outcome FROM authorized_actions"
+    }
+
+    fn task_lineage_get(
+        conn: &rusqlite::Connection,
+        lineage_id: &str,
+    ) -> Result<Option<StoredTaskLineage>, Box<dyn std::error::Error>> {
+        Ok(conn
+            .query_row(
+                "SELECT lineage_id,parent_lineage_id,parent_head_digest,workspace_hash,agent_id,
+                        authority_manifest_id,authority_manifest_version,policy_version,
+                        continuation_state_json,continuation_state_digest,head_digest,
+                        budget_limit,impact_limit,budget_spent,impact_units,
+                        expires_at_unix_ms,revoked_at_unix_ms,created_at_unix_ms,updated_at_unix_ms
+                 FROM action_lineages WHERE lineage_id=?1",
+                params![lineage_id],
+                |r| {
+                    Ok(StoredTaskLineage {
+                        lineage_id: r.get(0)?,
+                        parent_lineage_id: r.get(1)?,
+                        parent_head_digest: r.get(2)?,
+                        workspace_hash: r.get(3)?,
+                        agent_id: r.get(4)?,
+                        authority_manifest_id: r.get(5)?,
+                        authority_manifest_version: r.get(6)?,
+                        policy_version: r.get(7)?,
+                        state_json: r.get(8)?,
+                        state_digest: r.get(9)?,
+                        head_digest: r.get(10)?,
+                        budget_limit: r.get(11)?,
+                        impact_limit: r.get(12)?,
+                        budget_spent: r.get(13)?,
+                        impact_units: r.get(14)?,
+                        expires_at_unix_ms: r.get(15)?,
+                        revoked_at_unix_ms: r.get(16)?,
+                        created_at_unix_ms: r.get(17)?,
+                        updated_at_unix_ms: r.get(18)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    fn validate_task_lineage_row(
+        row: &StoredTaskLineage,
+        workspace_hash: &str,
+        agent_id: &str,
+        reference: Option<&crate::task_lineage::ContinuationReference>,
+        authority_manifest_id: Option<&str>,
+        authority_manifest_version: Option<i64>,
+        policy_version: Option<&str>,
+        require_active: bool,
+        now: i64,
+    ) -> Result<crate::task_lineage::LineageState, Box<dyn std::error::Error>> {
+        if row.workspace_hash != workspace_hash || row.agent_id != agent_id {
+            return Err("lineage scope or agent mismatch".into());
+        }
+        if let Some(expected) = authority_manifest_id {
+            if row.authority_manifest_id != expected {
+                return Err("lineage authority mismatch".into());
+            }
+        }
+        if let Some(expected) = authority_manifest_version {
+            if row.authority_manifest_version != expected {
+                return Err("lineage authority version mismatch".into());
+            }
+        }
+        if let Some(expected) = policy_version {
+            if row.policy_version != expected {
+                return Err("lineage policy version mismatch".into());
+            }
+        }
+        if let Some(reference) = reference {
+            if reference.lineage_id != row.lineage_id
+                || reference.parent_head_digest != row.head_digest
+                || reference.continuation_state_digest != row.state_digest
+                || reference.workspace_hash != row.workspace_hash
+                || reference.agent_id != row.agent_id
+                || reference.authority_manifest_version != row.authority_manifest_version
+                || reference.policy_version != row.policy_version
+            {
+                return Err("lineage continuation reference mismatch".into());
+            }
+        }
+        if require_active {
+            if row.revoked_at_unix_ms.is_some() {
+                return Err("lineage continuation revoked".into());
+            }
+            if row.expires_at_unix_ms.is_some_and(|expires| expires <= now) {
+                return Err("lineage continuation expired".into());
+            }
+        }
+        let state: crate::task_lineage::LineageState = serde_json::from_str(&row.state_json)
+            .map_err(|_| "lineage state malformed")?;
+        let state_digest = crate::task_lineage::state_digest(&state)
+            .map_err(|_| "lineage state malformed")?;
+        if state_digest != row.state_digest {
+            return Err("lineage state digest mismatch".into());
+        }
+        if row.budget_spent < 0
+            || row.impact_units < 0
+            || row.budget_spent > row.budget_limit
+            || row.impact_units > row.impact_limit
+        {
+            return Err("lineage budget state malformed".into());
+        }
+        let expected_head = crate::task_lineage::compute_head_digest(
+            &row.lineage_id,
+            &row.parent_lineage_id,
+            &row.parent_head_digest,
+            &row.workspace_hash,
+            &row.agent_id,
+            &row.authority_manifest_id,
+            row.authority_manifest_version,
+            &row.policy_version,
+            &row.state_digest,
+        );
+        if expected_head != row.head_digest {
+            return Err("lineage head digest mismatch".into());
+        }
+        Ok(state)
+    }
+
+    fn task_lineage_receipt_get(
+        conn: &rusqlite::Connection,
+        transition_id: &str,
+    ) -> Result<crate::task_lineage::LineageReceipt, Box<dyn std::error::Error>> {
+        let (receipt, state_json) = conn.query_row(
+            "SELECT transition_id,lineage_id,parent_lineage_id,action_id,parent_head_digest,head_digest,
+                    continuation_state_json,continuation_state_digest,workspace_hash,agent_id,
+                    authority_manifest_id,authority_manifest_version,policy_version,outcome,
+                    reason_code,budget_spent,impact_spent,budget_limit,impact_limit,
+                    expires_at_unix_ms,revoked_at_unix_ms
+             FROM action_lineage_transitions WHERE transition_id=?1",
+            params![transition_id],
+            |r| {
+                Ok((
+                    crate::task_lineage::LineageReceipt {
+                        schema_version: crate::task_lineage::SCHEMA_VERSION,
+                        transition_id: r.get(0)?,
+                        action_id: r.get(3)?,
+                        lineage_id: r.get(1)?,
+                        parent_lineage_id: r.get(2)?,
+                        parent_head_digest: r.get(4)?,
+                        head_digest: r.get(5)?,
+                        continuation_state_digest: r.get(7)?,
+                        workspace_hash: r.get(8)?,
+                        agent_id: r.get(9)?,
+                        authority_manifest_id: r.get(10)?,
+                        authority_manifest_version: r.get(11)?,
+                        policy_version: r.get(12)?,
+                        outcome: r.get(13)?,
+                        reason_code: r.get(14)?,
+                        budget_spent: r.get(15)?,
+                        impact_units: r.get(16)?,
+                        budget_limit: r.get(17)?,
+                        impact_limit: r.get(18)?,
+                        expires_at_unix_ms: r.get(19)?,
+                        revoked_at_unix_ms: r.get(20)?,
+                    },
+                    r.get::<_, String>(6)?,
+                ))
+            },
+        )?;
+        let state: crate::task_lineage::LineageState =
+            serde_json::from_str(&state_json).map_err(|_| "lineage receipt state malformed")?;
+        let state_digest = crate::task_lineage::state_digest(&state)
+            .map_err(|_| "lineage receipt state malformed")?;
+        if state_digest != receipt.continuation_state_digest {
+            return Err("lineage receipt state digest mismatch".into());
+        }
+        crate::task_lineage::validate_receipt(&receipt)
+            .map_err(|reason| Box::<dyn std::error::Error>::from(reason))?;
+        if receipt.schema_version != crate::task_lineage::SCHEMA_VERSION
+            || !matches!(
+                receipt.outcome.as_str(),
+                "continued" | "new_authorization" | "denied" | "stale" | "revoked" | "abstain"
+            )
+            || !matches!(
+                receipt.reason_code.as_str(),
+                "admitted"
+                    | "new_authorization"
+                    | "resource_denied"
+                    | "composition_denied"
+                    | "budget_denied"
+                    | "impact_denied"
+                    | "stale"
+                    | "revoked"
+                    | "abstain"
+                    | "authority_mismatch"
+                    | "policy_mismatch"
+                    | "expired"
+            )
+            || receipt.budget_spent < 0
+            || receipt.impact_units < 0
+            || receipt.budget_spent > receipt.budget_limit
+            || receipt.impact_units > receipt.impact_limit
+        {
+            return Err("lineage receipt malformed".into());
+        }
+        let expected_head = crate::task_lineage::compute_head_digest(
+            &receipt.lineage_id,
+            &receipt.parent_lineage_id,
+            &receipt.parent_head_digest,
+            &receipt.workspace_hash,
+            &receipt.agent_id,
+            &receipt.authority_manifest_id,
+            receipt.authority_manifest_version,
+            &receipt.policy_version,
+            &receipt.continuation_state_digest,
+        );
+        if expected_head != receipt.head_digest {
+            return Err("lineage receipt head digest mismatch".into());
+        }
+        Ok(receipt)
+    }
+
+    fn attach_task_lineage_projection(
+        &self,
+        mut action: AuthorizedAction,
+    ) -> Result<AuthorizedAction, Box<dyn std::error::Error>> {
+        let any_reference = !action.lineage_id.is_empty()
+            || !action.lineage_transition_id.is_empty()
+            || !action.lineage_outcome.is_empty();
+        if !any_reference {
+            return Ok(action);
+        }
+        if action.lineage_id.is_empty() || action.lineage_transition_id.is_empty() {
+            return Err("authorized action has incomplete lineage reference".into());
+        }
+        let receipt = {
+            let conn = self.conn()?;
+            Self::task_lineage_receipt_get(&conn, &action.lineage_transition_id)?
+        };
+        let binding_mismatch = receipt.authority_manifest_id != action.manifest_id || receipt.authority_manifest_version != action.manifest_version;
+        let outcome_allowed = receipt.outcome.as_bytes() == [115, 116, 97, 108, 101] || receipt.outcome.as_bytes() == [114, 101, 118, 111, 107, 101, 100];
+        let binding_gate = if binding_mismatch { !outcome_allowed } else { false };
+        if receipt.action_id != action.id
+            || receipt.lineage_id != action.lineage_id
+            || receipt.outcome != action.lineage_outcome
+            || receipt.workspace_hash != action.workspace_hash
+            || receipt.agent_id != action.agent_id
+            || binding_gate
+        {
+            return Err("authorized action lineage reference mismatch".into());
+        }
+        action.lineage_receipt = Some(receipt.clone());
+        if matches!(receipt.outcome.as_str(), "continued" | "new_authorization")
+            || (receipt.outcome == "denied"
+                && matches!(
+                    receipt.reason_code.as_str(),
+                    "resource_denied" | "composition_denied" | "budget_denied" | "impact_denied"
+                ))
+        {
+            action.lineage_continuation = Some(crate::task_lineage::ContinuationReference {
+                schema_version: receipt.schema_version,
+                lineage_id: receipt.lineage_id.clone(),
+                parent_head_digest: receipt.head_digest.clone(),
+                continuation_state_digest: receipt.continuation_state_digest.clone(),
+                workspace_hash: receipt.workspace_hash.clone(),
+                agent_id: receipt.agent_id.clone(),
+                authority_manifest_version: receipt.authority_manifest_version,
+                policy_version: receipt.policy_version.clone(),
+            });
+        }
+        Ok(action)
+    }
+
+    fn action_intent_lineage_path(
+        &self,
+        manifest: &AuthorityManifest,
+        agent_id: &str,
+        workspace_hash: &str,
+        scope_anchor: &str,
+        external_ref: &str,
+        capability: &str,
+        action_key: &str,
+        intent_hash: &str,
+        resource_constraints_json: &str,
+        justification_json: &str,
+        justification_entity_ids: &[String],
+        compensates_for: &str,
+        finding_ref: &str,
+        superseding_head: &str,
+        handoff_receipt_ref: &str,
+        resource_permitted: bool,
+        lineage: &crate::task_lineage::ActionLineageRequest,
+    ) -> Result<AuthorizedAction, Box<dyn std::error::Error>> {
+        crate::task_lineage::validate_request(lineage)
+            .map_err(|reason| format!("lineage request rejected: {reason}"))?;
+        crate::task_lineage::validate_capability_action_class(capability, &lineage.action_class)
+            .map_err(|reason| format!("lineage request rejected: {reason}"))?;
+        if !crate::task_lineage::is_sha256(intent_hash)
+            || intent_hash != intent_hash.to_ascii_lowercase()
+        {
+            return Err("lineage intent_hash must be a lowercase SHA-256 hex digest".into());
+        }
+        let (policy_version, policy) = crate::task_lineage::policy_for_constraints(
+            &manifest.capability_constraints_json,
+        )
+        .map_err(|reason| format!("lineage policy rejected: {reason}"))?;
+        let admission_binding = json!({
+            "agent_id": agent_id,
+            "workspace_hash": workspace_hash,
+            "scope_anchor": scope_anchor,
+            "external_ref": external_ref,
+            "authority_manifest_id": &manifest.id,
+            "authority_manifest_version": manifest.version,
+            "policy_version": &policy_version,
+            "resource_constraints_json": resource_constraints_json,
+            "justification_json": justification_json,
+            "compensates_for": &compensates_for,
+            "finding_ref": &finding_ref,
+            "superseding_head": &superseding_head,
+            "handoff_receipt_ref": &handoff_receipt_ref,
+        });
+        let request_digest = crate::task_lineage::request_digest(
+            action_key,
+            capability,
+            intent_hash,
+            &admission_binding,
+            lineage,
+        )
+        .map_err(|reason| format!("lineage request rejected: {reason}"))?;
+        let idempotency_key_digest =
+            crate::task_lineage::idempotency_key_digest(action_key);
+        let now = now_ms();
+        let is_continue = lineage.transition == "continue";
+        let action_id = format!("act-{}", uuid::Uuid::new_v4().simple());
+        let transition_id = format!("lin-tx-{}", uuid::Uuid::new_v4().simple());
+        let new_lineage_id = if is_continue {
+            lineage
+                .continuation
+                .as_ref()
+                .map(|reference| reference.lineage_id.clone())
+                .ok_or("lineage continuation reference is required")?
+        } else {
+            format!("lin-{}", uuid::Uuid::new_v4().simple())
+        };
+        let conn = self.conn()?;
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result: Result<(AuthorizedAction, bool), Box<dyn std::error::Error>> = (|| {
+            let existing: Option<(String, String)> = conn
+                .query_row(
+                    "SELECT action_id,request_digest FROM action_lineage_transitions
+                     WHERE workspace_hash=?1 AND agent_id=?2 AND idempotency_key_digest=?3
+                     ORDER BY created_at_unix_ms DESC LIMIT 1",
+                    params![workspace_hash, agent_id, idempotency_key_digest],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            if let Some((existing_action_id, existing_request_digest)) = existing {
+                if existing_request_digest != request_digest {
+                    return Err("lineage idempotency key conflict".into());
+                }
+                let sql = format!("{} WHERE id=?1", Self::action_select_sql());
+                let action = conn.query_row(&sql, params![existing_action_id], Self::action_from_row)?;
+                return Ok((action, false));
+            }
+
+            let parent_reference = lineage.continuation.as_ref();
+            let mut parent_lineage_id = String::new();
+            let mut parent_head_digest = String::new();
+            let mut current_lineage: Option<StoredTaskLineage> = None;
+            let mut current_state = crate::task_lineage::LineageState::initial();
+            let mut refusal: Option<(String, String)> = None;
+            if is_continue {
+                let reference = parent_reference.ok_or("lineage continuation reference is required")?;
+                let row = Self::task_lineage_get(&conn, &reference.lineage_id)?
+                    .ok_or("lineage continuation missing state")?;
+                let state = Self::validate_task_lineage_row(
+                    &row,
+                    workspace_hash,
+                    agent_id,
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                    now,
+                )?;
+                let reference_matches = reference.parent_head_digest == row.head_digest
+                    && reference.continuation_state_digest == row.state_digest
+                    && reference.workspace_hash == row.workspace_hash
+                    && reference.agent_id == row.agent_id
+                    && reference.authority_manifest_version == row.authority_manifest_version
+                    && reference.policy_version == row.policy_version;
+                if !reference_matches {
+                    refusal = Some(("stale".to_string(), "stale".to_string()));
+                } else if row.revoked_at_unix_ms.is_some() {
+                    refusal = Some(("revoked".to_string(), "revoked".to_string()));
+                } else if row.expires_at_unix_ms.is_some_and(|expires| expires <= now) {
+                    refusal = Some(("stale".to_string(), "expired".to_string()));
+                } else if row.authority_manifest_id != manifest.id
+                    || row.authority_manifest_version != manifest.version
+                {
+                    refusal = Some(("stale".to_string(), "authority_mismatch".to_string()));
+                } else if row.policy_version != policy_version
+                    || row.budget_limit != policy.budget_limit
+                    || row.impact_limit != policy.impact_limit
+                {
+                    refusal = Some(("stale".to_string(), "policy_mismatch".to_string()));
+                }
+                parent_lineage_id = row.lineage_id.clone();
+                parent_head_digest = row.head_digest.clone();
+                current_state = state;
+                current_lineage = Some(row);
+            } else if let Some(reference) = parent_reference {
+                let row = Self::task_lineage_get(&conn, &reference.lineage_id)?
+                    .ok_or("lineage successor parent state missing")?;
+                Self::validate_task_lineage_row(
+                    &row,
+                    workspace_hash,
+                    agent_id,
+                    Some(reference),
+                    None,
+                    None,
+                    None,
+                    false,
+                    now,
+                )?;
+                parent_lineage_id = row.lineage_id.clone();
+                parent_head_digest = row.head_digest.clone();
+            }
+
+            let mut decision = if let Some((outcome, reason)) = refusal.as_ref() {
+                crate::task_lineage::TransitionDecision {
+                    state: current_state.clone(),
+                    outcome: outcome.clone(),
+                    reason: reason.clone(),
+                }
+            } else if !resource_permitted {
+                crate::task_lineage::TransitionDecision {
+                    state: current_state.clone(),
+                    outcome: "denied".to_string(),
+                    reason: "resource_denied".to_string(),
+                }
+            } else {
+                crate::task_lineage::apply_action(
+                    &current_state,
+                    lineage,
+                    &policy,
+                    intent_hash,
+                )
+                .map_err(|reason| format!("lineage transition rejected: {reason}"))?
+            };
+            if !is_continue && decision.outcome == "continued" {
+                decision.outcome = "new_authorization".to_string();
+                decision.reason = "new_authorization".to_string();
+            }
+            let state_json = serde_json::to_string(&decision.state)?;
+            let state_digest = crate::task_lineage::state_digest(&decision.state)
+                .map_err(|reason| format!("lineage state rejected: {reason}"))?;
+            let advance_head = refusal.is_none();
+            let (stored_parent_lineage_id, stored_parent_head_digest, head_digest) =
+                if !advance_head {
+                    let row = current_lineage
+                        .as_ref()
+                        .ok_or("lineage refusal missing current state")?;
+                    (
+                        row.parent_lineage_id.clone(),
+                        row.parent_head_digest.clone(),
+                        row.head_digest.clone(),
+                    )
+                } else {
+                    let next_head = crate::task_lineage::compute_head_digest(
+                        &new_lineage_id,
+                        &parent_lineage_id,
+                        &parent_head_digest,
+                        workspace_hash,
+                        agent_id,
+                        &manifest.id,
+                        manifest.version,
+                        &policy_version,
+                        &state_digest,
+                    );
+                    (parent_lineage_id.clone(), parent_head_digest.clone(), next_head)
+                };
+            let receipt_binding = current_lineage.as_ref();
+            let receipt_authority_manifest_id = receipt_binding.map(|row| row.authority_manifest_id.clone()).unwrap_or_else(|| manifest.id.clone());
+            let receipt_authority_manifest_version = receipt_binding.map(|row| row.authority_manifest_version).unwrap_or(manifest.version);
+            let receipt_policy_version = receipt_binding.map(|row| row.policy_version.clone()).unwrap_or_else(|| policy_version.clone());
+            let receipt_expires_at_unix_ms = receipt_binding.map(|row| row.expires_at_unix_ms).unwrap_or(manifest.expires_at_unix_ms);
+            let receipt_revoked_at_unix_ms = receipt_binding.map(|row| row.revoked_at_unix_ms).unwrap_or(None);
+            if advance_head {
+                if let Some(row) = current_lineage.as_ref() {
+                let changed = conn.execute(
+                    "UPDATE action_lineages
+                     SET parent_lineage_id=?1,parent_head_digest=?2,continuation_state_json=?3,
+                         continuation_state_digest=?4,head_digest=?5,budget_spent=?6,
+                         impact_units=?7,updated_at_unix_ms=?8
+                     WHERE lineage_id=?9 AND head_digest=?10
+                       AND continuation_state_digest=?11 AND revoked_at_unix_ms IS NULL
+                       AND (expires_at_unix_ms IS NULL OR expires_at_unix_ms>?12)",
+                    params![
+                        parent_lineage_id,
+                        parent_head_digest,
+                        state_json,
+                        state_digest,
+                        head_digest,
+                        decision.state.budget_spent,
+                        decision.state.impact_units,
+                        now,
+                        row.lineage_id,
+                        row.head_digest,
+                        row.state_digest,
+                        now,
+                    ],
+                )?;
+                if changed != 1 {
+                    return Err("lineage continuation stale".into());
+                }
+            } else {
+                conn.execute(
+                    "INSERT INTO action_lineages
+                     (lineage_id,parent_lineage_id,parent_head_digest,workspace_hash,agent_id,
+                      authority_manifest_id,authority_manifest_version,policy_version,
+                      continuation_state_json,continuation_state_digest,head_digest,budget_limit,
+                      impact_limit,budget_spent,impact_units,expires_at_unix_ms,revoked_at_unix_ms,
+                      created_at_unix_ms,updated_at_unix_ms)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,NULL,?17,?17)",
+                    params![
+                        new_lineage_id,
+                        parent_lineage_id,
+                        parent_head_digest,
+                        workspace_hash,
+                        agent_id,
+                        manifest.id,
+                        manifest.version,
+                        policy_version,
+                        state_json,
+                        state_digest,
+                        head_digest,
+                        policy.budget_limit,
+                        policy.impact_limit,
+                        decision.state.budget_spent,
+                        decision.state.impact_units,
+                        manifest.expires_at_unix_ms,
+                        now,
+                    ],
+                )?;
+                }
+            }
+
+            let approval_required = manifest
+                .approval_required_capabilities
+                .iter()
+                .any(|value| value == capability);
+            let status = if matches!(decision.outcome.as_str(), "denied" | "stale" | "revoked") {
+                "denied"
+            } else if approval_required {
+                "approval_requested"
+            } else {
+                "intent"
+            };
+            let outcome_hash = if matches!(decision.outcome.as_str(), "denied" | "stale" | "revoked") {
+                state_digest.clone()
+            } else {
+                String::new()
+            };
+            let action = AuthorizedAction {
+                id: action_id.clone(),
+                manifest_id: manifest.id.clone(),
+                manifest_version: manifest.version,
+                agent_id: agent_id.to_string(),
+                workspace_hash: workspace_hash.to_string(),
+                scope_anchor: scope_anchor.to_string(),
+                external_ref: external_ref.to_string(),
+                capability: capability.to_string(),
+                action_key: action_key.to_string(),
+                intent_hash: intent_hash.to_string(),
+                outcome_hash,
+                status: status.to_string(),
+                approval_required,
+                approval_ref: String::new(),
+                created_at_unix_ms: now,
+                updated_at_unix_ms: now,
+                resource_constraints_json: resource_constraints_json.to_string(),
+                resource_constraints_hash: constraint_hash(resource_constraints_json),
+                justification_entity_ids: justification_entity_ids.to_vec(),
+                compensates_for: compensates_for.to_string(),
+                finding_ref: finding_ref.to_string(),
+                superseding_head: superseding_head.to_string(),
+                handoff_receipt_ref: handoff_receipt_ref.to_string(),
+                lineage_id: new_lineage_id.clone(),
+                lineage_transition_id: transition_id.clone(),
+                lineage_outcome: decision.outcome.clone(),
+                lineage_continuation: None,
+                lineage_receipt: None,
+            };
+            conn.execute(
+                "INSERT INTO authorized_actions
+                 (id,manifest_id,manifest_version,agent_id,workspace_hash,scope_anchor,
+                  external_ref,capability,action_key,intent_hash,outcome_hash,status,
+                  approval_required,approval_ref,created_at_unix_ms,updated_at_unix_ms,
+                  resource_constraints_json,resource_constraints_hash,justification_json,
+                  compensates_for,finding_ref,superseding_head,handoff_receipt_ref,
+                  lineage_id,lineage_transition_id,lineage_outcome)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?15,
+                         ?16,?17,?18,?19,?20,?21,?22,?23,?24,?25)",
+                params![
+                    action.id,
+                    action.manifest_id,
+                    action.manifest_version,
+                    action.agent_id,
+                    action.workspace_hash,
+                    action.scope_anchor,
+                    action.external_ref,
+                    action.capability,
+                    action.action_key,
+                    action.intent_hash,
+                    action.outcome_hash,
+                    action.status,
+                    action.approval_required as i64,
+                    action.approval_ref,
+                    now,
+                    action.resource_constraints_json,
+                    action.resource_constraints_hash,
+                    justification_json,
+                    action.compensates_for,
+                    action.finding_ref,
+                    action.superseding_head,
+                    action.handoff_receipt_ref,
+                    action.lineage_id,
+                    action.lineage_transition_id,
+                    action.lineage_outcome,
+                ],
+            )?;
+            conn.execute(
+                "INSERT INTO action_lineage_transitions
+                 (transition_id,lineage_id,parent_lineage_id,action_id,idempotency_key_digest,
+                  request_digest,parent_head_digest,head_digest,continuation_state_json,
+                  continuation_state_digest,workspace_hash,agent_id,authority_manifest_id,
+                  authority_manifest_version,policy_version,outcome,reason_code,budget_cost,
+                  impact_units,budget_limit,impact_limit,budget_spent,impact_spent,
+                  expires_at_unix_ms,revoked_at_unix_ms,created_at_unix_ms)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,
+                         ?18,?19,?20,?21,?22,?23,?24,?25,?26)",
+                params![
+                    transition_id,
+                    new_lineage_id,
+                    stored_parent_lineage_id,
+                    action_id,
+                    idempotency_key_digest,
+                    request_digest,
+                    stored_parent_head_digest,
+                    head_digest,
+                    state_json,
+                    state_digest,
+                    workspace_hash,
+                    agent_id,
+                    receipt_authority_manifest_id,
+                    receipt_authority_manifest_version,
+                    receipt_policy_version,
+                    decision.outcome,
+                    decision.reason,
+                    lineage.budget_cost,
+                    lineage.impact_units,
+                    policy.budget_limit,
+                    policy.impact_limit,
+                    decision.state.budget_spent,
+                    decision.state.impact_units,
+                    receipt_expires_at_unix_ms,
+                    receipt_revoked_at_unix_ms,
+                    now,
+                ],
+            )?;
+            Ok((action, true))
+        })();
+        match result {
+            Ok((action, is_new)) => {
+                conn.execute_batch("COMMIT")?;
+                drop(conn);
+                let action = self.attach_task_lineage_projection(action)?;
+                if is_new {
+                    let receipt = action
+                        .lineage_receipt
+                        .as_ref()
+                        .ok_or("lineage receipt projection missing")?;
+                    self.journal(&JournalEvent {
+                        id: format!("jrn-{}", uuid::Uuid::new_v4().simple()),
+                        event_type: if receipt.outcome == "denied" {
+                            "action_denied".to_string()
+                        } else {
+                            "action_intent".to_string()
+                        },
+                        evaluated_json: json!({
+                            "manifest_id": receipt.authority_manifest_id,
+                            "manifest_version": receipt.authority_manifest_version,
+                            "policy_version": receipt.policy_version,
+                            "lineage_id": receipt.lineage_id,
+                            "lineage_transition_id": receipt.transition_id,
+                            "lineage_outcome": receipt.outcome,
+                            "composition_state_digest": receipt.continuation_state_digest,
+                        })
+                        .to_string(),
+                        acted_json: serde_json::to_string(&action)?,
+                        forward_json: "{}".to_string(),
+                        category: "authorized_action".to_string(),
+                        key: action.id.clone(),
+                        entity_id: String::new(),
+                        agent_id: agent_id.to_string(),
+                        workspace_hash: workspace_hash.to_string(),
+                        created_at_unix_ms: now,
+                    })?;
+                }
+                Ok(action)
+            }
+            Err(error) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
     }
 
     fn active_authority(
@@ -17236,6 +17976,11 @@ impl Database {
             "UPDATE authority_manifests SET revoked_at_unix_ms=?1 WHERE id=?2",
             params![now, manifest_id],
         )?;
+        conn.execute(
+            "UPDATE action_lineages SET revoked_at_unix_ms=?1
+             WHERE authority_manifest_id=?2 AND revoked_at_unix_ms IS NULL",
+            params![now, manifest_id],
+        )?;
         drop(conn);
         self.journal(&JournalEvent {
             id: format!("jrn-{}", uuid::Uuid::new_v4().simple()),
@@ -17265,6 +18010,64 @@ impl Database {
         resource_constraints_json: Option<&str>,
         justification_entity_ids: &[String],
         compensation: Option<&crate::models::CompensationLinkage>,
+    ) -> Result<AuthorizedAction, Box<dyn std::error::Error>> {
+        self.action_intent_internal(
+            agent_id,
+            workspace_hash,
+            scope_anchor,
+            external_ref,
+            capability,
+            action_key,
+            intent_hash,
+            resource_constraints_json,
+            justification_entity_ids,
+            compensation,
+            None,
+        )
+    }
+
+    pub(crate) fn action_intent_with_lineage(
+        &self,
+        agent_id: &str,
+        workspace_hash: &str,
+        scope_anchor: &str,
+        external_ref: &str,
+        capability: &str,
+        action_key: &str,
+        intent_hash: &str,
+        resource_constraints_json: Option<&str>,
+        justification_entity_ids: &[String],
+        compensation: Option<&crate::models::CompensationLinkage>,
+        lineage: &crate::task_lineage::ActionLineageRequest,
+    ) -> Result<AuthorizedAction, Box<dyn std::error::Error>> {
+        self.action_intent_internal(
+            agent_id,
+            workspace_hash,
+            scope_anchor,
+            external_ref,
+            capability,
+            action_key,
+            intent_hash,
+            resource_constraints_json,
+            justification_entity_ids,
+            compensation,
+            Some(lineage),
+        )
+    }
+
+    fn action_intent_internal(
+        &self,
+        agent_id: &str,
+        workspace_hash: &str,
+        scope_anchor: &str,
+        external_ref: &str,
+        capability: &str,
+        action_key: &str,
+        intent_hash: &str,
+        resource_constraints_json: Option<&str>,
+        justification_entity_ids: &[String],
+        compensation: Option<&crate::models::CompensationLinkage>,
+        lineage: Option<&crate::task_lineage::ActionLineageRequest>,
     ) -> Result<AuthorizedAction, Box<dyn std::error::Error>> {
         let manifest = self.active_authority(agent_id, workspace_hash)?;
         if !manifest
@@ -17334,11 +18137,33 @@ impl Database {
         };
         let resource_constraints_json =
             canonical_constraint_json(resource_constraints_json.unwrap_or("{}"))?;
-        if !resource_constraints_permit(
+        let resource_permitted = resource_constraints_permit(
             &manifest.capability_constraints_json,
             capability,
             &resource_constraints_json,
-        )? {
+        )?;
+        if let Some(lineage_request) = lineage {
+            return self.action_intent_lineage_path(
+                &manifest,
+                agent_id,
+                workspace_hash,
+                scope_anchor,
+                external_ref,
+                capability,
+                action_key,
+                intent_hash,
+                &resource_constraints_json,
+                &justification_json,
+                justification_entity_ids,
+                &compensates_for,
+                &finding_ref,
+                &superseding_head,
+                &handoff_receipt_ref,
+                resource_permitted,
+                lineage_request,
+            );
+        }
+        if !resource_permitted {
             // #836 null-effect-on-deny + argv-level policy: a policy denial
             // (including a tool-argument escalation) records an explicit
             // `denied` receipt and grants nothing. Only canonicalized,
@@ -17370,6 +18195,11 @@ impl Database {
                 finding_ref: finding_ref.clone(),
                 superseding_head: superseding_head.clone(),
                 handoff_receipt_ref: handoff_receipt_ref.clone(),
+                lineage_id: String::new(),
+                lineage_transition_id: String::new(),
+                lineage_outcome: String::new(),
+                lineage_continuation: None,
+                lineage_receipt: None,
             };
             let conn = self.conn()?;
             conn.execute(
@@ -17457,6 +18287,11 @@ impl Database {
             finding_ref: finding_ref.clone(),
             superseding_head: superseding_head.clone(),
             handoff_receipt_ref: handoff_receipt_ref.clone(),
+                lineage_id: String::new(),
+                lineage_transition_id: String::new(),
+                lineage_outcome: String::new(),
+                lineage_continuation: None,
+                lineage_receipt: None,
         };
         let conn = self.conn()?;
         conn.execute(
@@ -18281,14 +19116,20 @@ impl Database {
         &self,
         action_id: &str,
     ) -> Result<Option<AuthorizedAction>, Box<dyn std::error::Error>> {
-        let conn = self.conn()?;
-        Ok(conn
-            .query_row(
-                &format!("{} WHERE id=?1", Self::action_select_sql()),
-                params![action_id],
-                Self::action_from_row,
-            )
-            .optional()?)
+        let action = {
+            let conn = self.conn()?;
+            conn
+                .query_row(
+                    &format!("{} WHERE id=?1", Self::action_select_sql()),
+                    params![action_id],
+                    Self::action_from_row,
+                )
+                .optional()?
+        };
+        action
+            .map(|value| self.attach_task_lineage_projection(value))
+            .transpose()
+            .map_err(Into::into)
     }
 
     pub fn action_approve(
