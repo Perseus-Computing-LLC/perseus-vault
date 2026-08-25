@@ -45,6 +45,8 @@ jobs:
         working-directory: sourcey-docs
         run: pnpm install --frozen-lockfile
       - name: Capture live MCP surface
+        env:
+          SOURCE_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           cargo build --no-default-features
           cd sourcey-docs

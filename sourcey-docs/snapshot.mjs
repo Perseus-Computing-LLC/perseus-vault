@@ -52,10 +52,12 @@ if (
 
 const packageJson = JSON.parse(await readFile("package.json", "utf8"));
 const metadata = {
-  source_commit: execFileSync("git", ["rev-parse", "HEAD"], {
-    cwd: "..",
-    encoding: "utf8"
-  }).trim(),
+  source_commit:
+    process.env.SOURCE_COMMIT ??
+    execFileSync("git", ["rev-parse", "HEAD"], {
+      cwd: "..",
+      encoding: "utf8"
+    }).trim(),
   vault_version: rawSpec.server.version,
   feature_profile: "--no-default-features",
   generators: {
