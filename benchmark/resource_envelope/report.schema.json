@@ -1,0 +1,231 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://perseus.observer/schemas/resource-envelope-v1.json",
+  "title": "Perseus Vault edge resource-envelope report",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "status", "benchmark", "manifest", "execution", "samples", "aggregates", "reproducibility", "claims", "commitments", "report_sha256"],
+  "properties": {
+    "schema_version": {"const": "perseus-vault-resource-envelope-report/v1"},
+    "status": {"const": "complete"},
+    "benchmark": {"const": "edge-resource-envelope"},
+    "manifest": {"$ref": "#/$defs/manifest"},
+    "execution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["offline", "network_calls", "provider_calls", "answerer_calls", "judge_calls"],
+      "properties": {
+        "offline": {"const": true},
+        "network_calls": {"const": 0},
+        "provider_calls": {"const": 0},
+        "answerer_calls": {"const": 0},
+        "judge_calls": {"const": 0}
+      }
+    },
+    "samples": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/sample"}},
+    "aggregates": {"type": "object"},
+    "reproducibility": {"type": "object"},
+    "claims": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["label", "low_swap_established", "partner_hardware_benchmarked", "product_efficacy", "power_inferred_from_cpu_or_memory"],
+      "properties": {
+        "label": {"const": "resource-envelope-observation"},
+        "low_swap_established": {"const": false},
+        "partner_hardware_benchmarked": {"const": false},
+        "product_efficacy": {"const": false},
+        "power_inferred_from_cpu_or_memory": {"const": false}
+      }
+    },
+    "commitments": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["manifest_sha256", "observations_sha256", "samples_sha256", "harness_sha256", "driver_sha256"],
+      "properties": {
+        "manifest_sha256": {"$ref": "#/$defs/sha256"},
+        "observations_sha256": {"$ref": "#/$defs/sha256"},
+        "samples_sha256": {"$ref": "#/$defs/sha256"},
+        "harness_sha256": {"$ref": "#/$defs/sha256"},
+        "driver_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "report_sha256": {"$ref": "#/$defs/sha256"}
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "safeId": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,127}$"},
+    "observationValue": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "value"],
+          "properties": {"status": {"const": "available"}, "value": {"type": "number", "minimum": 0}}
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "reason"],
+          "properties": {"status": {"enum": ["partial", "unavailable"]}, "reason": {"type": "string", "minLength": 1}}
+        }
+      ]
+    },
+    "resources": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["wall_time_ns", "cpu_time_ns", "peak_rss_bytes", "read_bytes", "write_bytes", "power_watts", "energy_joules"],
+      "properties": {
+        "wall_time_ns": {"$ref": "#/$defs/observationValue"},
+        "cpu_time_ns": {"$ref": "#/$defs/observationValue"},
+        "peak_rss_bytes": {"$ref": "#/$defs/observationValue"},
+        "read_bytes": {"$ref": "#/$defs/observationValue"},
+        "write_bytes": {"$ref": "#/$defs/observationValue"},
+        "power_watts": {"$ref": "#/$defs/observationValue"},
+        "energy_joules": {"$ref": "#/$defs/observationValue"}
+      }
+    },
+    "workload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["measurement_overhead_ns", "net_wall_time_ns", "recall_candidate_count", "selected_count", "traversal_depth", "context_assembly_ns", "output_bytes", "output_tokens"],
+      "properties": {
+        "measurement_overhead_ns": {"$ref": "#/$defs/observationValue"},
+        "net_wall_time_ns": {"$ref": "#/$defs/observationValue"},
+        "recall_candidate_count": {"$ref": "#/$defs/observationValue"},
+        "selected_count": {"$ref": "#/$defs/observationValue"},
+        "traversal_depth": {"$ref": "#/$defs/observationValue"},
+        "context_assembly_ns": {"$ref": "#/$defs/observationValue"},
+        "output_bytes": {"$ref": "#/$defs/observationValue"},
+        "output_tokens": {"$ref": "#/$defs/observationValue"}
+      }
+    },
+    "sample": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "case_id", "repetition", "outcome_status", "network_calls", "resources", "workload", "profile_id", "corpus_id", "budget_id", "phase"],
+      "properties": {
+        "schema_version": {"const": "perseus-vault-resource-observation/v1"},
+        "case_id": {"$ref": "#/$defs/safeId"},
+        "repetition": {"type": "integer", "minimum": 0},
+        "outcome_status": {"enum": ["available", "empty", "partial", "unavailable", "timeout", "degraded"]},
+        "network_calls": {"const": 0},
+        "resources": {"$ref": "#/$defs/resources"},
+        "workload": {"$ref": "#/$defs/workload"},
+        "profile_id": {"$ref": "#/$defs/safeId"},
+        "corpus_id": {"$ref": "#/$defs/safeId"},
+        "budget_id": {"$ref": "#/$defs/safeId"},
+        "phase": {"enum": ["cold", "warm"]}
+      }
+    },
+    "profile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "hardware_class", "deployment_profile", "backend_runtime_manifest", "constraints", "profile_digest"],
+      "properties": {
+        "id": {"$ref": "#/$defs/safeId"},
+        "hardware_class": {"$ref": "#/$defs/safeId"},
+        "deployment_profile": {"enum": ["offline", "local_only", "local_with_approved_network", "external_actions_enabled"]},
+        "backend_runtime_manifest": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["model_backend", "embedding_backend", "storage_backend", "network"],
+          "properties": {
+            "model_backend": {"type": "string"},
+            "embedding_backend": {"type": "string"},
+            "storage_backend": {"type": "string"},
+            "network": {"const": "disabled"}
+          }
+        },
+        "constraints": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["cpu_threads", "memory_limit_mb"],
+          "properties": {
+            "cpu_threads": {"type": "integer", "minimum": 1},
+            "memory_limit_mb": {"type": "integer", "minimum": 1}
+          }
+        },
+        "profile_digest": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "corpus": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "entity_count", "query_count", "fixture_sha256"],
+      "properties": {
+        "id": {"$ref": "#/$defs/safeId"},
+        "entity_count": {"type": "integer", "minimum": 0},
+        "query_count": {"type": "integer", "minimum": 1},
+        "fixture_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "budget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "recall_limit", "context_char_budget", "traversal_depth"],
+      "properties": {
+        "id": {"$ref": "#/$defs/safeId"},
+        "recall_limit": {"type": "integer", "minimum": 1},
+        "context_char_budget": {"type": "integer", "minimum": 1},
+        "traversal_depth": {"type": "integer", "minimum": 0, "maximum": 8}
+      }
+    },
+    "case": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "profile_id", "corpus_id", "budget_id", "phase", "scenario", "expected_outcomes", "repetitions"],
+      "properties": {
+        "id": {"$ref": "#/$defs/safeId"},
+        "profile_id": {"$ref": "#/$defs/safeId"},
+        "corpus_id": {"$ref": "#/$defs/safeId"},
+        "budget_id": {"$ref": "#/$defs/safeId"},
+        "phase": {"enum": ["cold", "warm"]},
+        "scenario": {"enum": ["available", "empty", "partial", "unavailable", "timeout", "degraded"]},
+        "expected_outcomes": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"enum": ["available", "empty", "partial", "unavailable", "timeout", "degraded"]}
+        },
+        "repetitions": {"type": "integer", "minimum": 2}
+      }
+    },
+    "tolerances": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["relative_spread_max", "minimum_repetitions"],
+      "properties": {
+        "relative_spread_max": {"type": "number", "minimum": 0, "maximum": 2},
+        "minimum_repetitions": {"type": "integer", "minimum": 2}
+      }
+    },
+    "driver": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "sha256"],
+      "properties": {
+        "id": {"$ref": "#/$defs/safeId"},
+        "sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "manifest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "benchmark_id", "benchmark_version", "vault_revision", "seed", "offline", "profiles", "corpora", "budgets", "cases", "tolerances", "driver"],
+      "properties": {
+        "schema_version": {"const": "perseus-vault-resource-envelope-manifest/v1"},
+        "benchmark_id": {"$ref": "#/$defs/safeId"},
+        "benchmark_version": {"$ref": "#/$defs/safeId"},
+        "vault_revision": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "seed": {"type": "integer", "minimum": 0},
+        "offline": {"const": true},
+        "profiles": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/profile"}},
+        "corpora": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/corpus"}},
+        "budgets": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/budget"}},
+        "cases": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/case"}},
+        "tolerances": {"$ref": "#/$defs/tolerances"},
+        "driver": {"$ref": "#/$defs/driver"}
+      }
+    }
+  }
+}
