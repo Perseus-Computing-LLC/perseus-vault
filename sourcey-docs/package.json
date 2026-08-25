@@ -3,10 +3,12 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "snapshot": "node snapshot.mjs",
     "build": "sourcey build"
   },
   "dependencies": {
     "consola": "^3.4.2",
+    "mcp-parser": "0.4.1",
     "sourcey": "3.6.5"
   }
 }

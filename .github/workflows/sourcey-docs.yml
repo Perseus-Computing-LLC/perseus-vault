@@ -26,13 +26,15 @@ jobs:
           node-version: 22
           cache: pnpm
           cache-dependency-path: sourcey-docs/pnpm-lock.yaml
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@1.97.1
       - name: Install dependencies
         working-directory: sourcey-docs
         run: pnpm install --frozen-lockfile
       - name: Build API reference
         working-directory: sourcey-docs
-        run: pnpm build
+        run: |
+          pnpm snapshot
+          pnpm build
       - name: Upload generated site
         uses: actions/upload-artifact@v4
         with:
