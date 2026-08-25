@@ -89,6 +89,12 @@ impl SessionRegistry {
     }
 }
 
+#[derive(Clone)]
+struct SseMessage {
+    session_id: Option<String>,
+    payload: String,
+}
+
 /// Shared state for the MCP HTTP transport, stored as a global static.
 struct TransportState {
     // #210: the DB remains lock-free at this layer. Session-registry locks are
@@ -99,14 +105,14 @@ struct TransportState {
     // Backward compatibility for pre-session clients that initialize and then
     // omit Mcp-Session-Id. It always points at the most recently created session.
     legacy_mcp_state: RwLock<Arc<MCPState>>,
-    sse_tx: broadcast::Sender<String>,
+    sse_tx: broadcast::Sender<SseMessage>,
 }
 
 static TRANSPORT_STATE: OnceLock<TransportState> = OnceLock::new();
 
 /// Initialize the global transport state. Must be called before starting the server.
 pub fn init_transport_state(db: Arc<Database>) {
-    let (sse_tx, _) = broadcast::channel::<String>(256);
+    let (sse_tx, _) = broadcast::channel::<SseMessage>(256);
     let state = TransportState {
         db,
         sessions: Mutex::new(SessionRegistry::new()),
@@ -346,8 +352,11 @@ async fn handle_message(
     match response {
         Some(resp) => {
             if params.session_id.is_some() {
-                let resp_str = serde_json::to_string(&resp).unwrap_or_default();
-                let _ = state.sse_tx.send(resp_str);
+                let payload = serde_json::to_string(&resp).unwrap_or_default();
+                let _ = state.sse_tx.send(SseMessage {
+                    session_id: session_id.clone(),
+                    payload,
+                });
             }
             Ok(json_response(
                 serde_json::to_value(resp)
@@ -364,9 +373,19 @@ async fn handle_message(
 
 /// Handle GET /sse — Server-Sent Events stream.
 async fn handle_sse(
-    Query(_params): Query<SseParams>,
+    Query(params): Query<SseParams>,
+    headers: HeaderMap,
 ) -> Result<Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>>, StatusCode> {
     let state = get_state()?;
+    let header_id = headers
+        .get(MCP_SESSION_ID_HEADER)
+        .map(|value| value.to_str().map(str::to_owned))
+        .transpose()
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let session_id = header_id.or(params.session_id);
+    if session_id.as_deref().is_some_and(|id| !valid_session_id(id)) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
     let rx = state.sse_tx.subscribe();
 
     let stream = async_stream::stream! {
@@ -377,11 +396,12 @@ async fn handle_sse(
         let mut rx = rx;
         loop {
             match rx.recv().await {
-                Ok(msg) => {
+                Ok(message) if message.session_id == session_id => {
                     yield Ok(Event::default()
                         .event("message")
-                        .data(msg));
+                        .data(message.payload));
                 }
+                Ok(_) => continue,
                 Err(broadcast::error::RecvError::Lagged(_)) => {
                     continue;
                 }
@@ -515,6 +535,53 @@ mod tests {
             assert_eq!(&*first_state.session_agent_id.read().unwrap(), "client-a");
             assert_eq!(&*second_state.session_agent_id.read().unwrap(), "client-b");
         }
+
+        // SSE subscribers must not receive another session's response.
+        use futures::StreamExt;
+        let subscribe = |session: &str| Request::builder()
+            .method("GET")
+            .uri(format!("/sse?session_id={session}"))
+            .body(Body::empty())
+            .unwrap();
+        let first_sse = build_transport_router(TransportMode::Sse, None)
+            .oneshot(subscribe(&first_session)).await.unwrap();
+        let second_sse = build_transport_router(TransportMode::Sse, None)
+            .oneshot(subscribe(&second_session)).await.unwrap();
+        let mut first_stream = first_sse.into_body().into_data_stream();
+        let mut second_stream = second_sse.into_body().into_data_stream();
+        tokio::time::timeout(std::time::Duration::from_secs(1), first_stream.next())
+            .await.expect("first SSE endpoint event timed out");
+        tokio::time::timeout(std::time::Duration::from_secs(1), second_stream.next())
+            .await.expect("second SSE endpoint event timed out");
+
+        let session_call = |id: u64, session: &str| Request::builder()
+            .method("POST")
+            .uri(format!("/message?session_id={session}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(MCP_SESSION_ID_HEADER, session)
+            .body(Body::from(json!({
+                "jsonrpc":"2.0", "id":id, "method":"tools/list", "params":{}
+            }).to_string()))
+            .unwrap();
+        router.clone().oneshot(session_call(5, &first_session)).await.unwrap();
+        let first_event = tokio::time::timeout(
+            std::time::Duration::from_secs(1), first_stream.next()
+        ).await.expect("first session SSE response timed out")
+            .expect("first SSE stream ended").expect("first SSE body error");
+        assert!(String::from_utf8_lossy(&first_event).contains("\"id\":5"));
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(100), second_stream.next()
+        ).await.is_err(), "second session received first session's response");
+
+        router.clone().oneshot(session_call(6, &second_session)).await.unwrap();
+        let second_event = tokio::time::timeout(
+            std::time::Duration::from_secs(1), second_stream.next()
+        ).await.expect("second session SSE response timed out")
+            .expect("second SSE stream ended").expect("second SSE body error");
+        assert!(String::from_utf8_lossy(&second_event).contains("\"id\":6"));
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(100), first_stream.next()
+        ).await.is_err(), "first session received second session's response");
 
         for (id, session) in [(3, first_session), (4, second_session)] {
             let request = Request::builder()
