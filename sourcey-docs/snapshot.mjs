@@ -14,4 +14,11 @@ const spec = await snapshot({
   }
 });
 
+spec.description =
+  "Persistent, encrypted, deterministic memory for AI agents. Local-first and MCP-native.";
+for (const tool of spec.tools ?? []) {
+  tool.inputSchema ??= { type: "object", properties: {} };
+  tool.inputSchema.type ??= "object";
+}
+
 await writeFile("mcp.json", `${JSON.stringify(spec, null, 2)}\n`);
