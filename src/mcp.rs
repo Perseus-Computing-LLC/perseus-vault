@@ -1339,6 +1339,11 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
           "minItems": 1,
           "description": "#1135: opt-in governed answer-facing evidence lanes. Omit for the legacy byte-compatible recall response; choose derived, verbatim, or both under the shared max_tokens budget. Duplicate lane names are canonicalized."
         },
+        "include_selection_decisions": {
+          "type": "boolean",
+          "default": false,
+          "description": "#1140: fused mode only. Attach a bounded, hash-only per-candidate selection projection with source-arm ranks, eligibility/disposition reason codes, token-estimator state, unavailable-arm state, and a replay fingerprint. Omit to preserve the legacy response shape."
+        },
         "include_declared_graph": {
           "type": "boolean",
           "default": false,
@@ -1498,6 +1503,10 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
         "evidence": {
           "type": "object",
           "description": "#1135: optional governed derived/verbatim evidence projection with shared budget, exclusions, source groups, and hash-only receipt. Present only when evidence_lanes is supplied."
+        },
+        "fused_trace": {
+          "type": "object",
+          "description": "#883: fused serving trace. When include_selection_decisions=true it contains selection_decisions: a bounded hash-only projection of candidate eligibility, dispositions, arm states, token estimates, delivered order, and replay fingerprint."
         },
         "variants": {
           "type": "integer",
@@ -4449,6 +4458,11 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
           "default": false,
           "description": "#1141: include sanitized provider identity and thread lineage on context lines; provider bodies and payloads are excluded."
         },
+        "include_selection_decisions": {
+          "type": "boolean",
+          "default": false,
+          "description": "#1140: attach a bounded, hash-only per-candidate context-selection projection with source-arm ranks, eligibility/disposition reason codes, token estimates, arm state, and a replay fingerprint. Omit to preserve the legacy response shape."
+        },
         "include_declared_graph": {
           "type": "boolean",
           "default": false,
@@ -4490,6 +4504,10 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
             "type": "string"
           },
           "description": "Soft warnings: always-on cap overflow, budget truncation"
+        },
+        "selection_decisions": {
+          "type": "object",
+          "description": "#1140: optional bounded, hash-only context-selection projection. Contains policy/schema digests, candidate/retention counts, arm states, token estimates, dispositions, delivered order, and replay fingerprint; it never contains query text or memory bodies."
         },
         "declared_graph": {
           "type": "object",
@@ -10607,6 +10625,32 @@ mod tests {
             json!(["derived", "verbatim"])
         );
         assert!(recall["outputSchema"]["properties"]["evidence"].is_object());
+    }
+
+    #[test]
+    fn recall_schema_advertises_opt_in_selection_decisions() {
+        let recall = tool_registry_base()
+            .iter()
+            .find(|tool| tool["name"] == "perseus_vault_recall")
+            .expect("recall tool must be registered");
+        let selection = &recall["inputSchema"]["properties"]["include_selection_decisions"];
+        assert_eq!(selection["type"], "boolean");
+        assert_eq!(selection["default"], false);
+        assert!(selection["description"].as_str().unwrap_or("").contains("#1140"));
+        assert!(recall["outputSchema"]["properties"]["fused_trace"].is_object());
+    }
+
+    #[test]
+    fn context_schema_advertises_opt_in_selection_decisions() {
+        let context = tool_registry_base()
+            .iter()
+            .find(|tool| tool["name"] == "perseus_vault_context")
+            .expect("context tool must be registered");
+        let selection = &context["inputSchema"]["properties"]["include_selection_decisions"];
+        assert_eq!(selection["type"], "boolean");
+        assert_eq!(selection["default"], false);
+        assert!(selection["description"].as_str().unwrap_or("").contains("#1140"));
+        assert!(context["outputSchema"]["properties"]["selection_decisions"].is_object());
     }
 
     #[test]

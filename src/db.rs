@@ -96,6 +96,10 @@ pub(crate) fn sha256_hex(value: &str) -> String {
     format!("{:x}", Sha256::digest(value.as_bytes()))
 }
 
+fn selection_json<T: serde::Serialize>(value: &T) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| "null".to_string())
+}
+
 /// #868: extract the retention expiry (unix ms) from an entity body's
 /// `expires_at` field, if present. Accepts an integer (unix ms), a numeric
 /// string (unix ms), or an ISO 8601 UTC timestamp (util::parse_iso8601_ms).
@@ -10718,6 +10722,25 @@ impl Database {
         ),
         Box<dyn std::error::Error>,
     > {
+        self.fused_recall_with_selection(params, false)
+    }
+
+    /// #1140: fused recall with an opt-in, bounded selection-decision
+    /// projection. The legacy method above remains the default path so callers
+    /// that do not request the projection retain the existing response shape
+    /// and work.
+    pub fn fused_recall_with_selection(
+        &self,
+        params: &RecallParams,
+        include_selection_decisions: bool,
+    ) -> Result<
+        (
+            Vec<Entity>,
+            crate::models::RecallCompleteness,
+            crate::models::FusedTrace,
+        ),
+        Box<dyn std::error::Error>,
+    > {
         const ALL: [&str; 5] = ["declared", "fts5", "dense", "graph", "temporal"];
         let started = std::time::Instant::now();
 
@@ -10826,6 +10849,82 @@ impl Database {
         };
         let query_time = params.query_time_unix_ms.unwrap_or_else(now_ms);
         let limit = params.limit.max(0) as usize;
+        let selection_policy = if include_selection_decisions {
+            let declared_filters: std::collections::BTreeMap<_, _> = params
+                .declared_filters
+                .as_ref()
+                .map(|filters| {
+                    filters
+                        .iter()
+                        .map(|(key, value)| (key.clone(), value.clone()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let mut filters = std::collections::BTreeMap::new();
+            filters.insert("category".to_string(), selection_json(&params.category));
+            filters.insert("entity_type".to_string(), selection_json(&params.entity_type));
+            filters.insert("topic_path".to_string(), selection_json(&params.topic_path));
+            filters.insert("workspace_hash".to_string(), selection_json(&params.workspace_hash));
+            filters.insert("scope_weight".to_string(), selection_json(&params.scope_weight));
+            filters.insert("agent_id".to_string(), selection_json(&params.agent_id));
+            filters.insert("epistemic_state".to_string(), selection_json(&params.epistemic_state));
+            filters.insert("visibility".to_string(), selection_json(&params.visibility));
+            filters.insert("layer".to_string(), selection_json(&params.layer));
+            filters.insert("always_on".to_string(), selection_json(&params.always_on));
+            filters.insert("min_decay".to_string(), selection_json(&params.min_decay));
+            filters.insert("include_archived".to_string(), selection_json(&params.include_archived));
+            filters.insert(
+                "enforce_utility_horizon".to_string(),
+                selection_json(&params.enforce_utility_horizon),
+            );
+            filters.insert("content_weight".to_string(), selection_json(&params.content_weight));
+            filters.insert("trust_weight".to_string(), selection_json(&params.trust_weight));
+            filters.insert(
+                "max_prior_overturn".to_string(),
+                selection_json(&params.max_prior_overturn),
+            );
+            filters.insert(
+                "diversity_halving".to_string(),
+                selection_json(&params.diversity_halving),
+            );
+            filters.insert(
+                "recency_half_life_secs".to_string(),
+                selection_json(&params.recency_half_life_secs),
+            );
+            filters.insert("preview_cap".to_string(), selection_json(&params.preview_cap));
+            filters.insert("tier_order".to_string(), selection_json(&params.tier_order));
+            filters.insert("declared_category".to_string(), selection_json(&params.declared_category));
+            filters.insert("declared_filters".to_string(), selection_json(&declared_filters));
+            filters.insert("type_filter".to_string(), selection_json(&params.type_filter));
+            filters.insert("anchor_expansion".to_string(), selection_json(&params.anchor_expansion));
+            filters.insert("budget_profile".to_string(), selection_json(&params.budget_profile));
+            filters.insert("max_tokens".to_string(), selection_json(&params.max_tokens));
+            filters.insert("depth_budget".to_string(), selection_json(&params.depth_budget));
+            filters.insert("profile".to_string(), selection_json(&params.profile));
+            filters.insert("validity_annotate".to_string(), selection_json(&params.validity_annotate));
+            filters.insert(
+                "query_time_unix_ms".to_string(),
+                selection_json(&params.query_time_unix_ms),
+            );
+            filters.insert(
+                "graph_utility_threshold".to_string(),
+                selection_json(&params.graph_utility_threshold),
+            );
+            Some(crate::selection_decisions::SelectionPolicy {
+                mode: "fused".to_string(),
+                query_sha256: sha256_hex(&params.query),
+                limit: limit.min(4096),
+                token_budget: budget_tokens,
+                budget_profile: params.budget_profile.clone(),
+                rerank: params.rerank,
+                multihop: params.multihop,
+                strategies: strategies.iter().map(|name| (*name).to_string()).collect(),
+                strategy_weights: base_weights.iter().map(|(k, v)| (k.clone(), *v)).collect(),
+                filters,
+            })
+        } else {
+            None
+        };
         // Over-fetch pool for the arms; RRF then truncates to the budget.
         let candidate_k = limit.saturating_mul(5).clamp(64, 2000);
         let mut wide = params.clone();
@@ -11132,7 +11231,59 @@ impl Database {
         {
             by_id.entry(e.id.clone()).or_insert_with(|| e.clone());
         }
+        let mut selection_arm_ranks: std::collections::HashMap<
+            String,
+            std::collections::BTreeMap<String, u32>,
+        > = std::collections::HashMap::new();
+        let mut selection_entities: std::collections::HashMap<String, Entity> =
+            if include_selection_decisions {
+                by_id.clone()
+            } else {
+                std::collections::HashMap::new()
+            };
+        let mut selection_fused_ranks: std::collections::HashMap<String, u32> =
+            std::collections::HashMap::new();
+        let mut selection_fused_scores: std::collections::HashMap<String, f64> =
+            std::collections::HashMap::new();
+        let mut selection_rerank_scores: std::collections::HashMap<String, f64> =
+            std::collections::HashMap::new();
+        let mut selection_validity_multipliers: std::collections::HashMap<String, f64> =
+            std::collections::HashMap::new();
+        if include_selection_decisions {
+            let mut record_arm = |name: &str, list: &[(Entity, f64)]| {
+                for (rank, (entity, _)) in list.iter().enumerate() {
+                    selection_arm_ranks
+                        .entry(entity.id.clone())
+                        .or_default()
+                        .insert(name.to_string(), (rank + 1) as u32);
+                    selection_entities
+                        .entry(entity.id.clone())
+                        .or_insert_with(|| entity.clone());
+                }
+            };
+            if wants("fts5") {
+                record_arm("fts5", &fts5_scored);
+            }
+            if wants("dense") {
+                record_arm("dense", &dense_scored);
+            }
+            if wants("graph") {
+                record_arm("graph", &graph_scored);
+            }
+            if wants("temporal") {
+                record_arm("temporal", &temporal_scored);
+            }
+            if run_declared {
+                record_arm("declared", &declared_scored);
+            }
+        }
         let mut fused = crate::db::flat_rrf(&arms, &by_id, candidate_k);
+        if include_selection_decisions {
+            for (rank, (entity, score)) in fused.iter().enumerate() {
+                selection_fused_ranks.insert(entity.id.clone(), (rank + 1) as u32);
+                selection_fused_scores.insert(entity.id.clone(), *score);
+            }
+        }
         trace.fusion.rrf_k = 60.0;
         trace.fusion.fused_count = fused.len();
         if run_declared {
@@ -11204,7 +11355,11 @@ impl Database {
                             .get(&e.id)
                             .map(|r| 1.0 / (1.0 + *r as f64))
                             .unwrap_or(0.0);
-                        (e.clone(), 0.6 * dn + 0.4 * bn)
+                        let score = 0.6 * dn + 0.4 * bn;
+                        if include_selection_decisions {
+                            selection_rerank_scores.insert(e.id.clone(), score);
+                        }
+                        (e.clone(), score)
                     })
                     .collect();
                 rescored.sort_by(|a, b| {
@@ -11264,6 +11419,9 @@ impl Database {
                         &weights,
                     );
                     *grade_counts.entry(info.grade.clone()).or_insert(0) += 1;
+                    if include_selection_decisions {
+                        selection_validity_multipliers.insert(e.id.clone(), info.multiplier);
+                    }
                     let base_score = if params.rerank && rerank_applied && *base > 0.0 {
                         *base
                     } else {
@@ -11379,6 +11537,25 @@ impl Database {
             let _ = top_set;
         }
 
+        let mut selection_eligible_ids: std::collections::HashSet<String> = if include_selection_decisions {
+            ranked.iter().map(|(entity, _)| entity.id.clone()).collect()
+        } else {
+            std::collections::HashSet::new()
+        };
+        let mut selection_after_type_ids: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        let mut selection_after_coverage_ids: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        let mut selection_after_limit_ids: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        if include_selection_decisions {
+            for (entity, _) in &ranked {
+                selection_entities
+                    .entry(entity.id.clone())
+                    .or_insert_with(|| entity.clone());
+            }
+        }
+
         // ── caller limit, then token-budget truncation ──────────────────
         // #1008: per-type shaping (floors + caps) replaces the plain
         // limit-truncate when a budget_profile is requested. #1003:
@@ -11411,6 +11588,18 @@ impl Database {
                 if ranked.iter().any(|(e, _)| e.id == n.id) {
                     continue;
                 }
+                if include_selection_decisions {
+                    let rank = (expanded_ids.len() + 1) as u32;
+                    selection_entities
+                        .entry(n.id.clone())
+                        .or_insert_with(|| n.clone());
+                    selection_arm_ranks
+                        .entry(n.id.clone())
+                        .or_default()
+                        .entry("multihop".to_string())
+                        .or_insert(rank);
+                    selection_eligible_ids.insert(n.id.clone());
+                }
                 expanded_ids.push(n.id.clone());
                 ordered.push((n, anchor_max_score * crate::multihop::HOP_DISCOUNT));
             }
@@ -11440,12 +11629,15 @@ impl Database {
                 })
                 .collect();
         }
+        if include_selection_decisions {
+            selection_after_type_ids = ordered.iter().map(|(entity, _)| entity.id.clone()).collect();
+        }
         if params.multihop {
             let query_ents = crate::multihop::query_entities(&params.query);
             let (ents, mut mh_trace) =
                 crate::multihop::coverage_select(&ordered, &query_ents, limit, budget_tokens);
             mh_trace.hop_expanded = hop_expanded;
-            mh_trace.expanded_ids = expanded_ids;
+            mh_trace.expanded_ids = expanded_ids.clone();
             trace.multihop = Some(mh_trace);
             ordered = ents
                 .into_iter()
@@ -11458,9 +11650,45 @@ impl Database {
                     (e, s)
                 })
                 .collect();
+            if include_selection_decisions {
+                selection_after_coverage_ids = ordered
+                    .iter()
+                    .map(|(entity, _)| entity.id.clone())
+                    .collect();
+            }
         } else if params.budget_profile.is_none() {
+            if include_selection_decisions {
+                selection_after_coverage_ids = ordered
+                    .iter()
+                    .map(|(entity, _)| entity.id.clone())
+                    .collect();
+            }
             ordered.truncate(limit);
+        } else if include_selection_decisions {
+            selection_after_coverage_ids = ordered
+                .iter()
+                .map(|(entity, _)| entity.id.clone())
+                .collect();
         }
+        if include_selection_decisions {
+            selection_after_limit_ids = ordered
+                .iter()
+                .map(|(entity, _)| entity.id.clone())
+                .collect();
+        }
+        let selection_retained_ids: std::collections::HashSet<String> = if include_selection_decisions {
+            ordered.iter().map(|(entity, _)| entity.id.clone()).collect()
+        } else {
+            std::collections::HashSet::new()
+        };
+        if include_selection_decisions {
+            for (entity, _) in &ordered {
+                selection_entities
+                    .entry(entity.id.clone())
+                    .or_insert_with(|| entity.clone());
+        }
+        }
+        let retained_count_before_token_budget = ordered.len();
         let mut retained: Vec<Entity> = Vec::new();
         let mut tokens_used: i64 = 0;
         let mut dropped = 0usize;
@@ -11576,6 +11804,126 @@ impl Database {
         if params.tier_order {
             crate::mental_model::apply_tier_order(&mut retained);
         }
+        if include_selection_decisions {
+            // Tier ordering is a delivery-stage reorder, so the opt-in
+            // projection is sealed only after it has been applied. This keeps
+            // final_rank and delivered_order truthful for every fused surface.
+            let delivered_order: Vec<String> = retained.iter().map(|e| e.id.clone()).collect();
+            trace.placement = delivered_order.clone();
+            let delivered_ranks: std::collections::HashMap<String, u32> = delivered_order
+                .iter()
+                .enumerate()
+                .map(|(rank, id)| (id.clone(), (rank + 1) as u32))
+                .collect();
+            let candidate_ids = Self::selection_candidate_ids(
+                &selection_entities,
+                &delivered_ranks,
+                &selection_eligible_ids,
+                &selection_fused_ranks,
+                &selection_arm_ranks,
+            )?;
+            let represented_eligible_count = candidate_ids
+                .iter()
+                .filter(|id| selection_eligible_ids.contains(*id))
+                .count();
+            let represented_retained_count =
+                retained_count_before_token_budget.min(represented_eligible_count);
+            let mut candidates = Vec::with_capacity(candidate_ids.len());
+            for id in candidate_ids {
+                let entity = selection_entities
+                    .remove(&id)
+                    .ok_or_else(|| format!("selection candidate missing entity: {id}"))?;
+                let eligible = selection_eligible_ids.contains(&id);
+                let retained_by_policy = selection_retained_ids.contains(&id);
+                let final_rank = delivered_ranks.get(&id).copied();
+                let (selected, disposition) = if final_rank.is_some() {
+                    (true, "selected")
+                } else if !eligible {
+                    (false, Self::selection_filter_disposition(&entity, params))
+                } else if !retained_by_policy {
+                    let reason = if !selection_after_type_ids.contains(&id) {
+                        "dropped_type_cap"
+                    } else if !selection_after_coverage_ids.contains(&id) {
+                        "dropped_coverage"
+                    } else if !selection_after_limit_ids.contains(&id) {
+                        "dropped_caller_limit"
+                    } else {
+                        "dropped_caller_limit"
+                    };
+                    (false, reason)
+                } else {
+                    (false, "dropped_budget")
+                };
+                let token_estimate = (entity.body_json.chars().count() / 4).max(1) as i64;
+                candidates.push(crate::selection_decisions::SelectionDecision {
+                    candidate_id: id.clone(),
+                    source_arm_ranks: selection_arm_ranks.get(&id).cloned().unwrap_or_default(),
+                    fused_rank: selection_fused_ranks.get(&id).copied(),
+                    fused_score: selection_fused_scores.get(&id).copied(),
+                    rerank_score: selection_rerank_scores.get(&id).copied(),
+                    validity_multiplier: selection_validity_multipliers.get(&id).copied(),
+                    token_estimate: Some(token_estimate),
+                    token_estimator: Some("chars-div-4-v1".to_string()),
+                    eligible,
+                    selected,
+                    final_rank,
+                    disposition: disposition.to_string(),
+                });
+            }
+            let mut selection_arms: Vec<crate::selection_decisions::SelectionArmState> = trace
+                .strategies
+                .iter()
+                .map(|strategy| crate::selection_decisions::SelectionArmState {
+                    arm: strategy.strategy.clone(),
+                    status: strategy.status.clone(),
+                    candidate_count: strategy.candidates.min(
+                        crate::selection_decisions::MAX_DECISIONS,
+                    ),
+                })
+                .collect();
+            if params.multihop {
+                selection_arms.push(crate::selection_decisions::SelectionArmState {
+                    arm: "multihop".to_string(),
+                    status: if expanded_ids.is_empty() { "empty" } else { "ok" }.to_string(),
+                    candidate_count: expanded_ids
+                        .len()
+                        .min(crate::selection_decisions::MAX_DECISIONS),
+                });
+            }
+            let abstention_reason = if selection_eligible_ids.is_empty() {
+                let source_unavailable = !trace.strategies.is_empty()
+                    && trace.strategies.iter().all(|strategy| {
+                        matches!(
+                            strategy.status.as_str(),
+                            "degraded" | "unavailable" | "empty" | "skipped"
+                        )
+                    })
+                    && trace.strategies.iter().any(|strategy| {
+                        matches!(strategy.status.as_str(), "degraded" | "unavailable")
+                    });
+                Some(if source_unavailable {
+                    "source_arms_unavailable"
+                } else {
+                    "no_eligible_candidates"
+                }
+                .to_string())
+            } else {
+                None
+            };
+            trace.selection_decisions = Some(
+                crate::selection_decisions::SelectionDecisionTrace::build(
+                    selection_policy
+                        .ok_or_else(|| "selection policy missing for opt-in trace".to_string())?,
+                    candidates,
+                    represented_retained_count,
+                    tokens_used,
+                    selection_arms,
+                    delivered_order,
+                    abstention_reason,
+                )
+                .map_err(|e| format!("fused selection decisions: {e}"))?,
+            );
+        }
         Ok((
             retained,
             crate::models::RecallCompleteness {
@@ -11585,6 +11933,120 @@ impl Database {
             },
             trace,
         ))
+    }
+
+    fn selection_candidate_ids(
+        selection_entities: &std::collections::HashMap<String, Entity>,
+        delivered_ranks: &std::collections::HashMap<String, u32>,
+        eligible_ids: &std::collections::HashSet<String>,
+        fused_ranks: &std::collections::HashMap<String, u32>,
+        arm_ranks: &std::collections::HashMap<
+            String,
+            std::collections::BTreeMap<String, u32>,
+        >,
+    ) -> Result<Vec<String>, String> {
+        if delivered_ranks.len() > crate::selection_decisions::MAX_DECISIONS {
+            return Err(
+                "selection decision bound cannot represent the delivered order".to_string(),
+            );
+        }
+        let mut ids: Vec<String> = selection_entities.keys().cloned().collect();
+        ids.sort_by(|left, right| {
+            let left_delivery = delivered_ranks.get(left).copied();
+            let right_delivery = delivered_ranks.get(right).copied();
+            let left_arm_rank = arm_ranks
+                .get(left)
+                .and_then(|ranks| ranks.values().copied().min())
+                .unwrap_or(u32::MAX);
+            let right_arm_rank = arm_ranks
+                .get(right)
+                .and_then(|ranks| ranks.values().copied().min())
+                .unwrap_or(u32::MAX);
+            (
+                u8::from(left_delivery.is_none()),
+                left_delivery.unwrap_or(u32::MAX),
+                u8::from(!eligible_ids.contains(left)),
+                fused_ranks.get(left).copied().unwrap_or(u32::MAX),
+                left_arm_rank,
+                left.as_str(),
+            )
+                .cmp(&(
+                    u8::from(right_delivery.is_none()),
+                    right_delivery.unwrap_or(u32::MAX),
+                    u8::from(!eligible_ids.contains(right)),
+                    fused_ranks.get(right).copied().unwrap_or(u32::MAX),
+                    right_arm_rank,
+                    right.as_str(),
+                ))
+        });
+        ids.truncate(crate::selection_decisions::MAX_DECISIONS);
+        Ok(ids)
+    }
+
+    fn selection_filter_disposition(entity: &Entity, params: &RecallParams) -> &'static str {
+        if (!params.include_archived && entity.archived) || !Self::entity_lifecycle_serveable(entity) {
+            return "filtered_lifecycle";
+        }
+        if let Some(ws) = params.workspace_hash.as_deref() {
+            let global_allowed = Self::scope_pref(params)
+                .is_some_and(|_| entity.workspace_hash.is_empty());
+            if entity.workspace_hash != ws && !global_allowed {
+                return "filtered_scope";
+            }
+        }
+        if let Some(agent_id) = params.agent_id.as_deref() {
+            if entity.agent_id != agent_id {
+                return "filtered_policy";
+            }
+        }
+        if let Some(epistemic_state) = params.epistemic_state.as_deref() {
+            if entity.epistemic_state != epistemic_state {
+                return "filtered_policy";
+            }
+        }
+        if let Some(category) = params.category.as_deref() {
+            if entity.category != category {
+                return "filtered_policy";
+            }
+        }
+        if let Some(entity_type) = params.entity_type.as_deref() {
+            if entity.entity_type != entity_type {
+                return "filtered_policy";
+            }
+        }
+        if let Some(topic_path) = params.topic_path.as_deref() {
+            if !entity.topic_path.starts_with(topic_path) {
+                return "filtered_policy";
+            }
+        }
+        if let Some(layer) = params.layer.as_deref() {
+            if entity.layer != layer {
+                return "filtered_policy";
+            }
+        }
+        if let Some(always_on) = params.always_on {
+            if entity.always_on != always_on {
+                return "filtered_policy";
+            }
+        }
+        if entity.decay_score < params.min_decay {
+            return "filtered_policy";
+        }
+        if let Some(type_filter) = params.type_filter.as_deref() {
+            if !type_filter.trim().is_empty() && !type_matches(entity, type_filter) {
+                return "filtered_policy";
+            }
+        }
+        if let Some(visibility) = params.visibility.as_deref() {
+            if entity.visibility != visibility {
+                return "filtered_policy";
+            }
+        }
+        // Candidates that survive caller-visible filters but disappear at the
+        // suppression interceptor are still a lifecycle decision, not a rank
+        // or budget decision. This fallback keeps the reason vocabulary honest
+        // without disclosing the suppressed value.
+        "filtered_lifecycle"
     }
 
     pub fn recall_batch(
@@ -28581,6 +29043,24 @@ last_accessed: {}
         &self,
         opts: &crate::models::ContextOptions,
     ) -> Result<crate::models::ContextBlock, Box<dyn std::error::Error>> {
+        self.context_block_internal(opts, false)
+    }
+
+    /// Build a context block and include the bounded selection-decision
+    /// projection requested by #1140. The ordinary method above intentionally
+    /// remains the legacy path so omitted options cannot alter its output.
+    pub fn context_block_with_selection_decisions(
+        &self,
+        opts: &crate::models::ContextOptions,
+    ) -> Result<crate::models::ContextBlock, Box<dyn std::error::Error>> {
+        self.context_block_internal(opts, true)
+    }
+
+    fn context_block_internal(
+        &self,
+        opts: &crate::models::ContextOptions,
+        include_selection_decisions: bool,
+    ) -> Result<crate::models::ContextBlock, Box<dyn std::error::Error>> {
         use crate::models::ContextMode;
         let ws = opts.workspace_hash.clone();
         let on_demand = opts.mode == ContextMode::OnDemand;
@@ -28902,6 +29382,163 @@ last_accessed: {}
         };
         let estimated_corpus_tokens = corpus_chars / 4;
 
+        const CONTEXT_SELECTION_MAX_CANDIDATES: usize = 4096;
+        let selection_decisions = if include_selection_decisions {
+            use std::collections::BTreeMap;
+
+            if always_on_entities
+                .len()
+                .saturating_add(body_entities.len())
+                > CONTEXT_SELECTION_MAX_CANDIDATES
+            {
+                warnings.push(format!(
+                    "selection decision projection capped at {} candidates",
+                    CONTEXT_SELECTION_MAX_CANDIDATES
+                ));
+            }
+
+            let mut candidates: Vec<crate::selection_decisions::SelectionDecision> = Vec::new();
+            let mut candidate_indexes: BTreeMap<String, usize> = BTreeMap::new();
+            let mut delivered_order = Vec::new();
+            let mut arms = Vec::new();
+            let topical_status = if !on_demand {
+                if body_entities.is_empty() { "empty" } else { "ok" }
+            } else if query.is_none() {
+                "skipped"
+            } else if body_entities.is_empty() {
+                "empty"
+            } else {
+                "ok"
+            };
+
+            for (arm, entities, status) in [
+                (
+                    "context_always_on",
+                    always_on_entities.as_slice(),
+                    if always_on_entities.is_empty() { "empty" } else { "ok" },
+                ),
+                ("context_topical", body_entities.as_slice(), topical_status),
+            ] {
+                let arm_limit = CONTEXT_SELECTION_MAX_CANDIDATES.saturating_sub(candidates.len());
+                arms.push(crate::selection_decisions::SelectionArmState {
+                    arm: arm.to_string(),
+                    status: status.to_string(),
+                    candidate_count: entities.len().min(arm_limit),
+                });
+                for (rank, entity) in entities.iter().take(arm_limit).enumerate() {
+                    let source_rank = (rank + 1) as u32;
+                    if let Some(index) = candidate_indexes.get(&entity.id).copied() {
+                        candidates[index]
+                            .source_arm_ranks
+                            .insert(arm.to_string(), source_rank);
+                        continue;
+                    }
+                    candidate_indexes.insert(entity.id.clone(), candidates.len());
+                    let candidate_line = if arm == "context_always_on" {
+                        entity_line(entity, "[always-on] ")
+                    } else {
+                        entity_line(entity, "")
+                    };
+                    let delivered = ctx.contains(&candidate_line);
+                    let final_rank = if delivered {
+                        delivered_order.push(entity.id.clone());
+                        Some(delivered_order.len() as u32)
+                    } else {
+                        None
+                    };
+                    let token_estimate = (entity.body_json.chars().count() / 4).max(1) as i64;
+                    candidates.push(crate::selection_decisions::SelectionDecision {
+                        candidate_id: entity.id.clone(),
+                        source_arm_ranks: BTreeMap::from([(arm.to_string(), source_rank)]),
+                        fused_rank: None,
+                        fused_score: None,
+                        rerank_score: None,
+                        validity_multiplier: None,
+                        token_estimate: Some(token_estimate),
+                        token_estimator: Some("chars-div-4-v1".to_string()),
+                        eligible: true,
+                        selected: delivered,
+                        final_rank,
+                        disposition: if delivered {
+                            "selected".to_string()
+                        } else {
+                            "dropped_budget".to_string()
+                        },
+                    });
+                }
+            }
+
+            let mut filters = BTreeMap::new();
+            filters.insert(
+                "categories_sha256".to_string(),
+                crate::db::sha256_hex(&selection_json(&opts.categories)),
+            );
+            filters.insert(
+                "workspace_sha256".to_string(),
+                crate::db::sha256_hex(&selection_json(&opts.workspace_hash)),
+            );
+            filters.insert(
+                "exclude_ids_sha256".to_string(),
+                crate::db::sha256_hex(&selection_json(&opts.exclude_ids)),
+            );
+            let mut strategies = vec!["context_always_on".to_string()];
+            if on_demand {
+                strategies.extend([
+                    "context_recall_when".to_string(),
+                    "context_keyword".to_string(),
+                ]);
+            } else {
+                strategies.push("context_legacy".to_string());
+            }
+            let policy = crate::selection_decisions::SelectionPolicy {
+                mode: format!("context_{}", opts.mode.as_str()),
+                query_sha256: crate::db::sha256_hex(opts.query.as_deref().unwrap_or("")),
+                limit: opts.limit.max(1).min(4096) as usize,
+                token_budget: if budget > 0 { (budget / 4).max(1) } else { i64::MAX },
+                budget_profile: opts.model.clone(),
+                rerank: false,
+                multihop: false,
+                strategies,
+                strategy_weights: BTreeMap::new(),
+                filters,
+            };
+            let retained_count = candidates.len();
+            let estimated_tokens_used = candidates
+                .iter()
+                .filter(|candidate| candidate.selected)
+                .filter_map(|candidate| candidate.token_estimate)
+                .sum();
+            let abstention_reason = if delivered_order.is_empty() {
+                Some(if candidates.is_empty() {
+                    if query.is_none() {
+                        "no_query".to_string()
+                    } else {
+                        "no_eligible_candidates".to_string()
+                    }
+                } else {
+                    "budget_exhausted".to_string()
+                })
+            } else {
+                None
+            };
+            Some(
+                crate::selection_decisions::SelectionDecisionTrace::build(
+                    policy,
+                    candidates,
+                    retained_count,
+                    estimated_tokens_used,
+                    arms,
+                    delivered_order,
+                    abstention_reason,
+                )
+                .map_err(|error| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, error)
+                })?,
+            )
+        } else {
+            None
+        };
+
         Ok(crate::models::ContextBlock {
             markdown: ctx,
             mode: opts.mode.as_str().to_string(),
@@ -28912,6 +29549,7 @@ last_accessed: {}
             estimated_injected_tokens,
             corpus_chars,
             estimated_corpus_tokens,
+            selection_decisions,
         })
     }
 
@@ -32603,6 +33241,69 @@ pub(crate) mod tests {
         let db = TestDatabase::new("perseus_vault-test-db");
         let path = db.path().to_string();
         (db, path)
+    }
+
+    #[test]
+    fn selection_candidate_bound_is_deterministic_and_preserves_delivered() {
+        let mut entities = std::collections::HashMap::new();
+        for index in 0..5_000 {
+            let id = format!("candidate-{index:04}");
+            entities.insert(id.clone(), make_entity(&id, "facts", &id, "{}"));
+        }
+        let delivered_ranks = std::collections::HashMap::from([
+            ("candidate-4999".to_string(), 1_u32),
+            ("candidate-0001".to_string(), 2_u32),
+        ]);
+        let eligible_ids = ["candidate-4999", "candidate-0001", "candidate-0002"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let fused_ranks = std::collections::HashMap::from([
+            ("candidate-0002".to_string(), 1_u32),
+            ("candidate-0001".to_string(), 2_u32),
+        ]);
+        let arm_ranks = std::collections::HashMap::new();
+
+        let bounded = Database::selection_candidate_ids(
+            &entities,
+            &delivered_ranks,
+            &eligible_ids,
+            &fused_ranks,
+            &arm_ranks,
+        )
+        .expect("bounded candidate selection");
+        assert_eq!(bounded.len(), 4_096);
+        assert_eq!(&bounded[..2], &["candidate-4999", "candidate-0001"]);
+        assert_eq!(bounded[2], "candidate-0002");
+
+        let reversed_entities = (0..5_000)
+            .rev()
+            .map(|index| {
+                let id = format!("candidate-{index:04}");
+                (id.clone(), make_entity(&id, "facts", &id, "{}"))
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+        let repeat = Database::selection_candidate_ids(
+            &reversed_entities,
+            &delivered_ranks,
+            &eligible_ids,
+            &fused_ranks,
+            &arm_ranks,
+        )
+        .expect("deterministic candidate selection");
+        assert_eq!(bounded, repeat);
+
+        let too_many_delivered = (0..=crate::selection_decisions::MAX_DECISIONS as u32)
+            .map(|rank| (format!("candidate-{rank:04}"), rank + 1))
+            .collect();
+        assert!(Database::selection_candidate_ids(
+            &entities,
+            &too_many_delivered,
+            &eligible_ids,
+            &fused_ranks,
+            &arm_ranks,
+        )
+        .is_err());
     }
 
     /// WAL-mode fixture for tests whose semantics require WAL (concurrent

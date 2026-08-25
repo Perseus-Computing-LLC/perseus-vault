@@ -468,6 +468,10 @@ pub struct RecallArgs {
     /// means the legacy recall response remains byte-for-byte unchanged.
     #[serde(default)]
     pub evidence_lanes: Option<serde_json::Value>,
+    /// #1140: opt-in bounded hash-only per-candidate selection decisions.
+    /// Fused mode only; default false preserves the legacy response shape.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub include_selection_decisions: bool,
     /// #883: depth budget "low" | "mid" | "high" → 1024 / 4096 / 16384
     /// default tokens when max_tokens is unset. Omit = mid.
     #[serde(default)]
@@ -936,6 +940,10 @@ pub struct ContextArgs {
     /// #1141: opt-in hash-only provider identity and lineage on context lines.
     #[serde(default, deserialize_with = "null_as_default")]
     pub include_provider_source: bool,
+    /// #1140: opt-in bounded per-candidate selection-decision projection.
+    /// Omitted/false preserves the legacy context response shape.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub include_selection_decisions: bool,
     /// #1142: opt-in bounded declared graph provenance projection.
     #[serde(default, deserialize_with = "null_as_default")]
     pub include_declared_graph: bool,
@@ -2462,6 +2470,172 @@ pub fn handle_provider_source_event(db: &Database, args: Value) -> Result<String
         .map_err(|e| format!("provider source event serialization failed: {e}"))
 }
 
+fn note_selection_filter_removed(
+    reasons: &mut std::collections::BTreeMap<String, String>,
+    before_ids: &[String],
+    after: &[Entity],
+    disposition: &str,
+) {
+    let after_ids: std::collections::HashSet<&str> =
+        after.iter().map(|entity| entity.id.as_str()).collect();
+    for id in before_ids {
+        if !after_ids.contains(id.as_str()) {
+            reasons
+                .entry(id.clone())
+                .or_insert_with(|| disposition.to_string());
+        }
+    }
+}
+
+fn selection_item_token_estimate(item: &Value) -> Option<i64> {
+    item.get("body_json")
+        .and_then(Value::as_str)
+        .map(|body| (body.chars().count() / 4).max(1) as i64)
+}
+
+/// Reconcile the DB-level fused selection trace with governed serving stages
+/// that run in the tool layer (visibility, profile, temporal reconstruction,
+/// and confirmed-query fallback). This is called only for the opt-in surface;
+/// the ordinary response path does not pay for or observe this projection.
+fn finalize_selection_projection(
+    fused_trace: &mut Option<crate::models::FusedTrace>,
+    items: &[Value],
+    entities: &[Entity],
+    excluded: &std::collections::BTreeMap<String, String>,
+) -> Result<(), String> {
+    let Some(trace) = fused_trace.as_mut() else {
+        return Ok(());
+    };
+    let Some(selection) = trace.selection_decisions.as_mut() else {
+        return Ok(());
+    };
+
+    let delivered_order: Vec<String> = items
+        .iter()
+        .map(|item| {
+            item.get("id")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .ok_or_else(|| "selection projection item is missing an id".to_string())
+        })
+        .collect::<Result<_, _>>()?;
+    if delivered_order.len() > crate::selection_decisions::MAX_DECISIONS {
+        return Err("selection decision bound cannot represent the delivered order".to_string());
+    }
+    let delivered_ranks: std::collections::HashMap<&str, u32> = delivered_order
+        .iter()
+        .enumerate()
+        .map(|(rank, id)| (id.as_str(), (rank + 1) as u32))
+        .collect();
+    let mut removed_selected = 0usize;
+
+    for candidate in &mut selection.candidates {
+        if let Some(rank) = delivered_ranks.get(candidate.candidate_id.as_str()) {
+            candidate.eligible = true;
+            candidate.selected = true;
+            candidate.final_rank = Some(*rank);
+            candidate.disposition = "selected".to_string();
+        } else if candidate.selected {
+            removed_selected += 1;
+            candidate.eligible = false;
+            candidate.selected = false;
+            candidate.final_rank = None;
+            candidate.disposition = excluded
+                .get(&candidate.candidate_id)
+                .map(String::as_str)
+                .unwrap_or("filtered_policy")
+                .to_string();
+        }
+    }
+
+    let entity_ids: std::collections::HashSet<&str> =
+        entities.iter().map(|entity| entity.id.as_str()).collect();
+    let mut fallback_ranks: std::collections::BTreeMap<String, u32> =
+        std::collections::BTreeMap::new();
+    let mut fallback_counts: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    let known_ids: std::collections::HashSet<String> = selection
+        .candidates
+        .iter()
+        .map(|candidate| candidate.candidate_id.clone())
+        .collect();
+    let mut added_selected = 0usize;
+    for (index, id) in delivered_order.iter().enumerate() {
+        if known_ids.contains(id) {
+            continue;
+        }
+        let arm = if entity_ids.contains(id.as_str()) {
+            "temporal_history"
+        } else {
+            "confirmed_query"
+        };
+        let arm_rank = fallback_ranks.entry(arm.to_string()).or_insert(0);
+        *arm_rank += 1;
+        *fallback_counts.entry(arm.to_string()).or_insert(0) += 1;
+        if selection.candidates.len() >= crate::selection_decisions::MAX_DECISIONS {
+            return Err("selection decision candidate bound exceeded".to_string());
+        }
+        let token_estimate = selection_item_token_estimate(&items[index]);
+        selection.candidates.push(crate::selection_decisions::SelectionDecision {
+            candidate_id: id.clone(),
+            source_arm_ranks: std::collections::BTreeMap::from([(arm.to_string(), *arm_rank)]),
+            fused_rank: None,
+            fused_score: None,
+            rerank_score: None,
+            validity_multiplier: None,
+            token_estimate,
+            token_estimator: token_estimate.map(|_| "chars-div-4-v1".to_string()),
+            eligible: true,
+            selected: true,
+            final_rank: Some((index + 1) as u32),
+            disposition: "selected".to_string(),
+        });
+        added_selected += 1;
+    }
+
+    for (arm, count) in fallback_counts {
+        if let Some(existing) = selection.arms.iter_mut().find(|state| state.arm == arm) {
+            existing.candidate_count = existing.candidate_count.saturating_add(count);
+        } else {
+            selection.arms.push(crate::selection_decisions::SelectionArmState {
+                arm,
+                status: "ok".to_string(),
+                candidate_count: count,
+            });
+        }
+    }
+
+    selection.candidates.sort_by(|left, right| left.candidate_id.cmp(&right.candidate_id));
+    selection.candidate_count = selection.candidates.len();
+    selection.eligible_count = selection
+        .candidates
+        .iter()
+        .filter(|candidate| candidate.eligible)
+        .count();
+    selection.delivered_order = delivered_order;
+    selection.delivered_count = selection.delivered_order.len();
+    trace.placement = selection.delivered_order.clone();
+    selection.retained_count = selection
+        .retained_count
+        .saturating_sub(removed_selected)
+        .saturating_add(added_selected)
+        .max(selection.delivered_count);
+    selection.estimated_tokens_used = items
+        .iter()
+        .filter_map(selection_item_token_estimate)
+        .sum();
+    if selection.delivered_count == 0 && selection.eligible_count == 0 {
+        selection.abstained = true;
+        selection.abstention_reason = Some("no_eligible_candidates".to_string());
+    } else if selection.delivered_count > 0 {
+        selection.abstained = false;
+        selection.abstention_reason = None;
+    }
+
+    selection.reseal()?;
+    Ok(())
+}
+
 pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
     let a: RecallArgs =
         serde_json::from_value(args).map_err(|e| format!("Invalid recall arguments: {}", e))?;
@@ -2556,6 +2730,16 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
         _ => SearchMode::Fts5,
     };
 
+    // #1140: selection decisions are currently defined for the fused serving
+    // contract only. Rejecting other modes is safer than silently accepting an
+    // opt-in that produces no projection.
+    if a.include_selection_decisions && mode != SearchMode::Fused {
+        return Err(
+            "include_selection_decisions requires mode='fused' and a searchable query"
+                .to_string(),
+        );
+    }
+
     // If query expansion is enabled, generate stemming variants and merge results
     // #472: as_of recall always takes the main path (temporal_resolve); the
     // query-expansion path does not reconstruct point-in-time bodies.
@@ -2575,6 +2759,7 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
         valid_at.is_some() || valid_from.is_some() || valid_to.is_some() || as_of.is_some();
     let mode_for_side_effects = mode.clone();
     let reinforce_requested = a.reinforce;
+    let include_selection_decisions = a.include_selection_decisions;
 
     // #675/#676: startup-optimized recall over-fetches a candidate pool, then
     // re-ranks by actionability and truncates to the caller's limit below. Only
@@ -2675,10 +2860,10 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
 
     // #883: the fused path carries its trace out of the DB layer; the
     // standard path returns entities + completeness only.
-    let (mut entities, recall_completeness, fused_trace) =
+    let (mut entities, recall_completeness, mut fused_trace) =
         if mode_for_side_effects == SearchMode::Fused {
             let (e, c, t) = db
-                .fused_recall(&params)
+                .fused_recall_with_selection(&params, include_selection_decisions)
                 .map_err(|e| format!("Recall failed: {}", e))?;
             (e, c, Some(t))
         } else {
@@ -2687,6 +2872,8 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
                 .map_err(|e| format!("Recall failed: {}", e))?;
             (e, c, None)
         };
+    let mut selection_filter_reasons: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
 
     let elapsed_ms = started.elapsed().as_millis() as i64;
     let deadline_elapsed = deadline_ms.is_some_and(|ms| elapsed_ms >= ms);
@@ -2755,11 +2942,27 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
     // with the surviving set. A no-op for unscoped requesters (empty id → tier
     // 3) and for the default `workspace`/`tenant`/'' visibility — so existing
     // single-agent callers and data are unaffected.
-    entities.retain(|e| requester_can_read(db, a.requesting_agent_id.as_deref(), e));
+    if include_selection_decisions {
+        let before_ids: Vec<String> = entities.iter().map(|entity| entity.id.clone()).collect();
+        entities.retain(|e| requester_can_read(db, a.requesting_agent_id.as_deref(), e));
+        note_selection_filter_removed(
+            &mut selection_filter_reasons,
+            &before_ids,
+            &entities,
+            "filtered_scope",
+        );
+    } else {
+        entities.retain(|e| requester_can_read(db, a.requesting_agent_id.as_deref(), e));
+    }
 
     // #784: profile-specific serving filter. This is additive to visibility:
     // profile choice can only narrow results and never exposes another scope.
     let profile_name = a.retrieval_profile.as_deref().unwrap_or("shared");
+    let profile_before_ids: Vec<String> = if include_selection_decisions {
+        entities.iter().map(|entity| entity.id.clone()).collect()
+    } else {
+        Vec::new()
+    };
     match profile_name {
         "shared" => {
             entities.retain(|e| {
@@ -2783,20 +2986,54 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
             ))
         }
     }
+    if include_selection_decisions {
+        note_selection_filter_removed(
+            &mut selection_filter_reasons,
+            &profile_before_ids,
+            &entities,
+            "filtered_policy",
+        );
+    }
 
     // #728: external-ref post-filter (spec §2.2). Applied after visibility so
     // hidden rows are never inspected; narrows only, never re-ranks.
     if a.ref_type.is_some() || a.ref_value.is_some() {
         let want_type = a.ref_type.as_deref();
         let want_value = a.ref_value.as_deref();
+        let before_ids: Vec<String> = if include_selection_decisions {
+            entities.iter().map(|entity| entity.id.clone()).collect()
+        } else {
+            Vec::new()
+        };
         entities.retain(|e| entity_matches_ref_filter(e, want_type, want_value));
+        if include_selection_decisions {
+            note_selection_filter_removed(
+                &mut selection_filter_reasons,
+                &before_ids,
+                &entities,
+                "filtered_policy",
+            );
+        }
     }
 
     // #675/#676: re-rank the over-fetched pool by actionability and truncate to
     // the caller's limit, so action-changing memories win the top-k over vague/
     // date-only near-neighbors. No-op unless startup was requested.
     if startup_rank && a.offset == 0 {
+        let before_ids: Vec<String> = if include_selection_decisions {
+            entities.iter().map(|entity| entity.id.clone()).collect()
+        } else {
+            Vec::new()
+        };
         entities = crate::db::actionability_rerank(entities, requested_limit.max(0) as usize);
+        if include_selection_decisions {
+            note_selection_filter_removed(
+                &mut selection_filter_reasons,
+                &before_ids,
+                &entities,
+                "dropped_caller_limit",
+            );
+        }
     }
 
     // #472 Temporal RAG: an as_of (transaction) and/or valid_at (world) instant
@@ -2805,6 +3042,11 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
     // transaction axis; together = the full bi-temporal cell. The valid_from/
     // valid_to PERIOD-range filter (when no valid_at instant) stays a live narrow.
     let temporal_meta = if as_of.is_some() || valid_at.is_some() {
+        let before_ids: Vec<String> = if include_selection_decisions {
+            entities.iter().map(|entity| entity.id.clone()).collect()
+        } else {
+            Vec::new()
+        };
         let mut hits = temporal_resolve(db, as_of, valid_at, &mut entities)?;
         // #682: close the documented v1 limitation — surface facts whose
         // query-matching version has since been superseded/retired (live index
@@ -2820,9 +3062,30 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
             &mut entities,
             &mut hits,
         )?;
+        if include_selection_decisions {
+            note_selection_filter_removed(
+                &mut selection_filter_reasons,
+                &before_ids,
+                &entities,
+                "filtered_lifecycle",
+            );
+        }
         Some(hits)
     } else {
+        let before_ids: Vec<String> = if include_selection_decisions {
+            entities.iter().map(|entity| entity.id.clone()).collect()
+        } else {
+            Vec::new()
+        };
         valid_time_retain(db, None, valid_from, valid_to, &valid_op, &mut entities)?;
+        if include_selection_decisions {
+            note_selection_filter_removed(
+                &mut selection_filter_reasons,
+                &before_ids,
+                &entities,
+                "filtered_lifecycle",
+            );
+        }
         None
     };
 
@@ -2866,6 +3129,15 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
             prepend.extend(items_expanded);
             items_expanded = prepend;
         }
+    }
+
+    if include_selection_decisions {
+        finalize_selection_projection(
+            &mut fused_trace,
+            &items_expanded,
+            &entities,
+            &selection_filter_reasons,
+        )?;
     }
 
     // #865: retrieved memory is UNTRUSTED DATA. Every hit whose epistemic
@@ -7030,8 +7302,17 @@ pub fn handle_context(db: &Database, args: Value) -> String {
         include_provider_source: a.include_provider_source,
     };
 
-    match db.context_block(&opts) {
+    let block_result = if a.include_selection_decisions {
+        db.context_block_with_selection_decisions(&opts)
+    } else {
+        db.context_block(&opts)
+    };
+    match block_result {
         Ok(block) => {
+            let selection_projection = block
+                .selection_decisions
+                .as_ref()
+                .map(serde_json::to_value);
             let total_chars = block.markdown.len();
             let mut output = json!({
                 "markdown": block.markdown,
@@ -7045,6 +7326,17 @@ pub fn handle_context(db: &Database, args: Value) -> String {
                 "corpus_chars": block.corpus_chars,
                 "estimated_corpus_tokens": block.estimated_corpus_tokens,
             });
+            if let Some(serialized) = selection_projection {
+                match serialized {
+                    Ok(projection) => output["selection_decisions"] = projection,
+                    Err(error) => {
+                        return json!({
+                            "error": format!("Selection decision projection failed: {error}")
+                        })
+                        .to_string()
+                    }
+                }
+            }
             if a.include_declared_graph {
                 match declared_graph_projection_value(
                     db,
@@ -15775,6 +16067,269 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    #[test]
+    fn fused_selection_projection_is_opt_in_and_hash_only() {
+        let (db, path) = temp_db();
+        handle_remember(
+            &db,
+            json!({
+                "category": "facts",
+                "key": "selection-audit",
+                "body_json": "{\"content\":\"selection audit candidate\"}"
+            }),
+        )
+        .expect("seed recall candidate");
+
+        let legacy: Value = serde_json::from_str(
+            &handle_recall(
+                &db,
+                json!({
+                    "query": "selection audit",
+                    "mode": "fused",
+                    "strategies": ["fts5", "temporal"]
+                }),
+            )
+            .expect("legacy fused recall"),
+        )
+        .unwrap();
+        assert!(legacy["fused_trace"]["selection_decisions"].is_null());
+
+        let projected: Value = serde_json::from_str(
+            &handle_recall(
+                &db,
+                json!({
+                    "query": "selection audit",
+                    "mode": "fused",
+                    "strategies": ["fts5", "temporal"],
+                    "include_selection_decisions": true,
+                    "max_tokens": 1000
+                }),
+            )
+            .expect("projected fused recall"),
+        )
+        .unwrap();
+        let selection = &projected["fused_trace"]["selection_decisions"];
+        assert_eq!(selection["schema_version"], "perseus-vault-selection-decisions/v1");
+        assert_eq!(selection["candidate_count"], 1);
+        assert_eq!(selection["eligible_count"], 1);
+        assert_eq!(selection["delivered_count"], 1);
+        assert_eq!(selection["candidates"][0]["disposition"], "selected");
+        assert_eq!(selection["candidates"][0]["source_arm_ranks"]["fts5"], 1);
+        assert_eq!(selection["candidates"][0]["source_arm_ranks"]["temporal"], 1);
+        assert_eq!(selection["candidates"][0]["token_estimator"], "chars-div-4-v1");
+        assert_eq!(selection["arms"][0]["status"], "ok");
+        assert_eq!(selection["arms"][1]["status"], "ok");
+        assert_eq!(selection["replay_fingerprint_sha256"].as_str().unwrap().len(), 64);
+        let selection_text = selection.to_string();
+        assert!(!selection_text.contains("selection audit"));
+        assert!(!selection_text.contains("candidate text"));
+
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let projected_repeat: Value = serde_json::from_str(
+            &handle_recall(
+                &db,
+                json!({
+                    "query": "selection audit",
+                    "mode": "fused",
+                    "strategies": ["fts5", "temporal"],
+                    "include_selection_decisions": true,
+                    "max_tokens": 1000
+                }),
+            )
+            .expect("repeated projected fused recall"),
+        )
+        .unwrap();
+        assert_eq!(
+            selection["replay_fingerprint_sha256"],
+            projected_repeat["fused_trace"]["selection_decisions"]["replay_fingerprint_sha256"]
+        );
+
+        let filtered: Value = serde_json::from_str(
+            &handle_recall(
+                &db,
+                json!({
+                    "query": "selection audit",
+                    "mode": "fused",
+                    "strategies": ["fts5", "temporal"],
+                    "include_selection_decisions": true,
+                    "retrieval_profile": "personal"
+                }),
+            )
+            .expect("filtered projected fused recall"),
+        )
+        .unwrap();
+        let filtered_selection = &filtered["fused_trace"]["selection_decisions"];
+        assert_eq!(filtered["total"], 0);
+        assert_eq!(filtered_selection["delivered_count"], 0);
+        assert_eq!(filtered_selection["abstention_reason"], "no_eligible_candidates");
+        assert_eq!(filtered_selection["candidates"][0]["disposition"], "filtered_policy");
+        assert!(!filtered_selection["candidates"][0]["selected"].as_bool().unwrap());
+
+        let err = handle_recall(
+            &db,
+            json!({
+                "query": "selection audit",
+                "mode": "fts5",
+                "include_selection_decisions": true
+            }),
+        )
+        .expect_err("projection must reject non-fused modes");
+        assert!(err.contains("requires mode='fused'"), "{err}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn fused_selection_projection_reports_budget_and_type_cap_decisions() {
+        let (db, path) = temp_db();
+        for i in 0..2 {
+            handle_remember(
+                &db,
+                json!({
+                    "category": "selection-budget",
+                    "key": format!("budget-{i}"),
+                    "body_json": format!(
+                        r#"{{"content":"selection budget row {i} {}"}}"#,
+                        "x".repeat(32)
+                    ),
+                    "skip_dedup": true
+                }),
+            )
+            .expect("seed budget candidate");
+        }
+        let budget: Value = serde_json::from_str(
+            &handle_recall(
+                &db,
+                json!({
+                    "query": "selection budget row",
+                    "mode": "fused",
+                    "strategies": ["fts5", "temporal"],
+                    "include_selection_decisions": true,
+                    "limit": 10,
+                    "max_tokens": 20
+                }),
+            )
+            .expect("budget projection"),
+        )
+        .unwrap();
+        let budget_selection = &budget["fused_trace"]["selection_decisions"];
+        assert!(budget_selection["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|candidate| candidate["disposition"] == "dropped_budget"),
+            "{budget_selection}"
+        );
+        assert_eq!(
+            budget_selection["delivered_count"].as_u64().unwrap(),
+            budget["total"].as_u64().unwrap()
+        );
+        assert!(budget_selection["estimated_tokens_used"].as_i64().unwrap() > 0);
+
+        let limited: Value = serde_json::from_str(
+            &handle_recall(
+                &db,
+                json!({
+                    "query": "selection budget row",
+                    "mode": "fused",
+                    "strategies": ["fts5", "temporal"],
+                    "include_selection_decisions": true,
+                    "limit": 1,
+                    "max_tokens": 10000
+                }),
+            )
+            .expect("caller-limit projection"),
+        )
+        .unwrap();
+        assert!(limited["fused_trace"]["selection_decisions"]["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|candidate| candidate["disposition"] == "dropped_caller_limit"));
+
+        for i in 0..7 {
+            handle_remember(
+                &db,
+                json!({
+                    "category": "decision",
+                    "key": format!("cap-{i}"),
+                    "body_json": format!(r#"{{"content":"selection type cap row {i}"}}"#),
+                    "skip_dedup": true
+                }),
+            )
+            .expect("seed type-cap candidate");
+        }
+        let typed: Value = serde_json::from_str(
+            &handle_recall(
+                &db,
+                json!({
+                    "query": "selection type cap row",
+                    "mode": "fused",
+                    "strategies": ["fts5", "temporal"],
+                    "include_selection_decisions": true,
+                    "limit": 10,
+                    "max_tokens": 10000,
+                    "budget_profile": "fact_lookup"
+                }),
+            )
+            .expect("type-cap projection"),
+        )
+        .unwrap();
+        let typed_selection = &typed["fused_trace"]["selection_decisions"];
+        assert!(typed_selection["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|candidate| candidate["disposition"] == "dropped_type_cap"));
+        assert!(typed_selection["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|candidate| candidate["candidate_id"].as_str().unwrap().len() <= 256));
+        assert_eq!(
+            typed_selection["delivered_count"].as_u64().unwrap(),
+            typed["total"].as_u64().unwrap()
+        );
+
+        let now = crate::db::now_ms();
+        handle_remember(
+            &db,
+            json!({
+                "category": "selection-lifecycle",
+                "key": "expired",
+                "body_json": r#"{"content":"selection lifecycle probe"}"#,
+                "valid_from_unix_ms": now - 1_000,
+                "valid_to_unix_ms": now - 500,
+                "skip_dedup": true
+            }),
+        )
+        .expect("seed lifecycle candidate");
+        let lifecycle: Value = serde_json::from_str(
+            &handle_recall(
+                &db,
+                json!({
+                    "query": "selection lifecycle probe",
+                    "mode": "fused",
+                    "strategies": ["fts5", "temporal"],
+                    "category": "selection-lifecycle",
+                    "include_selection_decisions": true,
+                    "valid_from_unix_ms": now + 10_000,
+                    "limit": 10
+                }),
+            )
+            .expect("lifecycle projection"),
+        )
+        .unwrap();
+        let lifecycle_selection = &lifecycle["fused_trace"]["selection_decisions"];
+        assert!(lifecycle_selection["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|candidate| candidate["disposition"] == "filtered_lifecycle"));
+        assert_eq!(lifecycle_selection["delivered_count"], 0);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
     // ─── scope as a ranking multiplier (#485) ────────────────────
 
     #[test]
@@ -20954,6 +21509,7 @@ mod tests {
             "max_context_chars",
             "workspace_hash",
             "categories",
+            "include_selection_decisions",
         ] {
             let mut v = json!({});
             v.as_object_mut()
@@ -21020,7 +21576,79 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    // ─── #859: task-scoped projections ─────────────────────────────────
+    #[test]
+    fn handle_context_selection_decisions_are_opt_in_and_hash_only() {
+        let (db, path) = temp_tool_db();
+        db.remember_with_options(
+            &projection_entity(
+                "ctx-candidate",
+                "facts",
+                "needle",
+                r#"{"note":"needle context candidate","secret":"do-not-project"}"#,
+                "ws",
+            ),
+            false,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let legacy: Value = serde_json::from_str(&handle_context(
+            &db,
+            json!({"workspace_hash":"ws","query":"needle"}),
+        ))
+        .unwrap();
+        assert!(
+            legacy.get("selection_decisions").is_none(),
+            "selection projection must be absent by default: {legacy}"
+        );
+
+        let requested = json!({
+            "workspace_hash":"ws",
+            "query":"needle",
+            "include_selection_decisions":true
+        });
+        let first: Value = serde_json::from_str(&handle_context(&db, requested.clone())).unwrap();
+        let second: Value = serde_json::from_str(&handle_context(&db, requested)).unwrap();
+        let trace = &first["selection_decisions"];
+        assert_eq!(
+            trace["schema_version"],
+            crate::selection_decisions::SELECTION_DECISIONS_SCHEMA_VERSION
+        );
+        assert_eq!(trace["candidate_count"], 1);
+        assert_eq!(trace["delivered_count"], 1);
+        assert_eq!(trace["candidates"][0]["candidate_id"], "ctx-candidate");
+        assert_eq!(trace["candidates"][0]["disposition"], "selected");
+        assert!(trace["candidates"][0].get("body_json").is_none());
+        assert!(trace["candidates"][0].get("secret").is_none());
+        assert!(trace["replay_fingerprint_sha256"].as_str().unwrap().len() == 64);
+        assert_eq!(
+            trace["replay_fingerprint_sha256"],
+            second["selection_decisions"]["replay_fingerprint_sha256"]
+        );
+
+        let budgeted: Value = serde_json::from_str(&handle_context(
+            &db,
+            json!({
+                "workspace_hash":"ws",
+                "query":"needle",
+                "max_context_chars":200,
+                "include_selection_decisions":true
+            }),
+        ))
+        .unwrap();
+        assert_eq!(
+            budgeted["selection_decisions"]["candidates"][0]["disposition"],
+            "dropped_budget"
+        );
+        assert_eq!(budgeted["selection_decisions"]["delivered_count"], 0);
+        assert_eq!(budgeted["selection_decisions"]["abstention_reason"], "budget_exhausted");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ─── #859: task-scoped projections ─────────────────────────────────────
 
     fn projection_entity(id: &str, category: &str, key: &str, body: &str, ws: &str) -> Entity {
         let now = crate::db::now_ms();

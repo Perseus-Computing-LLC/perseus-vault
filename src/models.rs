@@ -1316,6 +1316,10 @@ pub struct FusedTrace {
     /// Present only when `multihop` was requested.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub multihop: Option<crate::multihop::MultiHopTrace>,
+    /// #1140: opt-in bounded, hash-only per-candidate selection decisions.
+    /// Absent unless `include_selection_decisions` was requested.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection_decisions: Option<crate::selection_decisions::SelectionDecisionTrace>,
 }
 
 /// #860: observable validity-profile trace attached to a fused recall.
@@ -1578,6 +1582,10 @@ pub struct ContextBlock {
     pub estimated_injected_tokens: i64,
     pub corpus_chars: i64,
     pub estimated_corpus_tokens: i64,
+    /// #1140: opt-in, bounded, hash-only selection decisions for the
+    /// candidates that contributed to this context block.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection_decisions: Option<crate::selection_decisions::SelectionDecisionTrace>,
 }
 
 /// Parameters for timeline queries over the journal.
