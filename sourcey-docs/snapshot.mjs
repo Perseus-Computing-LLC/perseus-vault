@@ -4,14 +4,8 @@ import { snapshot } from "mcp-parser";
 const spec = await snapshot({
   transport: {
     type: "stdio",
-    command: "cargo",
+    command: "../target/debug/perseus-vault",
     args: [
-      "run",
-      "--quiet",
-      "--manifest-path",
-      "../Cargo.toml",
-      "--no-default-features",
-      "--",
       "serve",
       "--db",
       "/tmp/perseus-sourcey.db"

@@ -31,8 +31,9 @@ jobs:
         working-directory: sourcey-docs
         run: pnpm install --frozen-lockfile
       - name: Build API reference
-        working-directory: sourcey-docs
         run: |
+          cargo build --no-default-features
+          cd sourcey-docs
           pnpm snapshot
           pnpm build
       - name: Upload generated site
