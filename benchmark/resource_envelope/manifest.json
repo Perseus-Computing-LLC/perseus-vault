@@ -1,0 +1,152 @@
+{
+  "benchmark_id": "issue-1105-contract-fixture-v1",
+  "benchmark_version": "1.0.0",
+  "budgets": [
+    {
+      "context_char_budget": 512,
+      "id": "tight",
+      "recall_limit": 3,
+      "traversal_depth": 0
+    },
+    {
+      "context_char_budget": 2048,
+      "id": "broad",
+      "recall_limit": 10,
+      "traversal_depth": 1
+    }
+  ],
+  "cases": [
+    {
+      "budget_id": "broad",
+      "corpus_id": "standard-corpus",
+      "expected_outcomes": [
+        "available"
+      ],
+      "id": "available-warm",
+      "phase": "warm",
+      "profile_id": "local-x86-offline",
+      "repetitions": 3,
+      "scenario": "available"
+    },
+    {
+      "budget_id": "tight",
+      "corpus_id": "empty-corpus",
+      "expected_outcomes": [
+        "empty"
+      ],
+      "id": "empty-cold",
+      "phase": "cold",
+      "profile_id": "local-x86-offline",
+      "repetitions": 3,
+      "scenario": "empty"
+    },
+    {
+      "budget_id": "tight",
+      "corpus_id": "standard-corpus",
+      "expected_outcomes": [
+        "partial"
+      ],
+      "id": "partial-warm",
+      "phase": "warm",
+      "profile_id": "portable-edge-offline",
+      "repetitions": 3,
+      "scenario": "partial"
+    },
+    {
+      "budget_id": "broad",
+      "corpus_id": "standard-corpus",
+      "expected_outcomes": [
+        "unavailable"
+      ],
+      "id": "unavailable-cold",
+      "phase": "cold",
+      "profile_id": "portable-edge-offline",
+      "repetitions": 3,
+      "scenario": "unavailable"
+    },
+    {
+      "budget_id": "tight",
+      "corpus_id": "standard-corpus",
+      "expected_outcomes": [
+        "timeout"
+      ],
+      "id": "timeout-cold",
+      "phase": "cold",
+      "profile_id": "local-x86-offline",
+      "repetitions": 3,
+      "scenario": "timeout"
+    },
+    {
+      "budget_id": "broad",
+      "corpus_id": "standard-corpus",
+      "expected_outcomes": [
+        "degraded"
+      ],
+      "id": "degraded-warm",
+      "phase": "warm",
+      "profile_id": "portable-edge-offline",
+      "repetitions": 3,
+      "scenario": "degraded"
+    }
+  ],
+  "corpora": [
+    {
+      "entity_count": 0,
+      "fixture_sha256": "1bcf8b84a93ad81e23e370ea24dea8c3b3c19dfffc6e1b57cc8d3d83fe4cbffa",
+      "id": "empty-corpus",
+      "query_count": 1
+    },
+    {
+      "entity_count": 64,
+      "fixture_sha256": "ab93c4afec77559648535b85144115b18b17c8659501cb1865530eb7ca42d175",
+      "id": "standard-corpus",
+      "query_count": 8
+    }
+  ],
+  "driver": {
+    "id": "resource-envelope-fixture-driver-v1",
+    "sha256": "289791312b201445b216f1306ccbd6fc7416f1d5a407203e9b673dd3d675cbd1"
+  },
+  "offline": true,
+  "profiles": [
+    {
+      "backend_runtime_manifest": {
+        "embedding_backend": "none",
+        "model_backend": "none",
+        "network": "disabled",
+        "storage_backend": "sqlite-fts5"
+      },
+      "constraints": {
+        "cpu_threads": 4,
+        "memory_limit_mb": 4096
+      },
+      "deployment_profile": "offline",
+      "hardware_class": "x86_64-local-baseline",
+      "id": "local-x86-offline",
+      "profile_digest": "a026fbb1b2e32ec612e6c8f1de21a4f3e58b580c3afe071a926bb3b85bfda0d3"
+    },
+    {
+      "backend_runtime_manifest": {
+        "embedding_backend": "none",
+        "model_backend": "none",
+        "network": "disabled",
+        "storage_backend": "sqlite-fts5"
+      },
+      "constraints": {
+        "cpu_threads": 2,
+        "memory_limit_mb": 1024
+      },
+      "deployment_profile": "offline",
+      "hardware_class": "portable-constrained-edge",
+      "id": "portable-edge-offline",
+      "profile_digest": "80a117ad8af7fe1570231ca63ca25d329a53913277e5627a0ac09fc77c5513b4"
+    }
+  ],
+  "schema_version": "perseus-vault-resource-envelope-manifest/v1",
+  "seed": 1105,
+  "tolerances": {
+    "minimum_repetitions": 3,
+    "relative_spread_max": 0.25
+  },
+  "vault_revision": "2ac619b22db1fe2feef7b51386c7394189e5ccb9"
+}

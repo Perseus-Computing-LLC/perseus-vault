@@ -1,0 +1,1741 @@
+{
+  "aggregates": {
+    "dimensions": {
+      "budget": [
+        {
+          "median_net_wall_time_ns": 909000,
+          "median_peak_rss_bytes": 32001024,
+          "outcomes": {
+            "available": 3,
+            "degraded": 3,
+            "unavailable": 3
+          },
+          "sample_count": 9,
+          "value": "broad"
+        },
+        {
+          "median_net_wall_time_ns": 1109000,
+          "median_peak_rss_bytes": 32001024,
+          "outcomes": {
+            "empty": 3,
+            "partial": 3,
+            "timeout": 3
+          },
+          "sample_count": 9,
+          "value": "tight"
+        }
+      ],
+      "corpus": [
+        {
+          "median_net_wall_time_ns": 509000,
+          "median_peak_rss_bytes": 32001024,
+          "outcomes": {
+            "empty": 3
+          },
+          "sample_count": 3,
+          "value": "empty-corpus"
+        },
+        {
+          "median_net_wall_time_ns": 1109000,
+          "median_peak_rss_bytes": 32001024,
+          "outcomes": {
+            "available": 3,
+            "degraded": 3,
+            "partial": 3,
+            "timeout": 3,
+            "unavailable": 3
+          },
+          "sample_count": 15,
+          "value": "standard-corpus"
+        }
+      ],
+      "outcome_status": [
+        {
+          "median_net_wall_time_ns": 909000,
+          "median_peak_rss_bytes": 32001024,
+          "outcomes": {
+            "available": 3
+          },
+          "sample_count": 3,
+          "value": "available"
+        },
+        {
+          "median_net_wall_time_ns": 1409000,
+          "median_peak_rss_bytes": 32001024,
+          "outcomes": {
+            "degraded": 3
+          },
+          "sample_count": 3,
+          "value": "degraded"
+        },
+        {
+          "median_net_wall_time_ns": 509000,
+          "median_peak_rss_bytes": 32001024,
+          "outcomes": {
+            "empty": 3
+          },
+          "sample_count": 3,
+          "value": "empty"
+        },
+        {
+          "median_net_wall_time_ns": 1109000,
+          "median_peak_rss_bytes": 32001024,
+          "outcomes": {
+            "partial": 3
+          },
+          "sample_count": 3,
+          "value": "partial"
+        },
+        {
+          "median_net_wall_time_ns": 49909000,
+          "median_peak_rss_bytes": 32001024,
+          "outcomes": {
+            "timeout": 3
+          },
+          "sample_count": 3,
+          "value": "timeout"
+        },
+        {
+          "median_net_wall_time_ns": 209000,
+          "median_peak_rss_bytes": 32001024,
+          "outcomes": {
+            "unavailable": 3
+          },
+          "sample_count": 3,
+          "value": "unavailable"
+        }
+      ],
+      "phase": [
+        {
+          "median_net_wall_time_ns": 509000,
+          "median_peak_rss_bytes": 32001024,
+          "outcomes": {
+            "empty": 3,
+            "timeout": 3,
+            "unavailable": 3
+          },
+          "sample_count": 9,
+          "value": "cold"
+        },
+        {
+          "median_net_wall_time_ns": 1109000,
+          "median_peak_rss_bytes": 32001024,
+          "outcomes": {
+            "available": 3,
+            "degraded": 3,
+            "partial": 3
+          },
+          "sample_count": 9,
+          "value": "warm"
+        }
+      ],
+      "profile": [
+        {
+          "median_net_wall_time_ns": 909000,
+          "median_peak_rss_bytes": 32001024,
+          "outcomes": {
+            "available": 3,
+            "empty": 3,
+            "timeout": 3
+          },
+          "sample_count": 9,
+          "value": "local-x86-offline"
+        },
+        {
+          "median_net_wall_time_ns": 1109000,
+          "median_peak_rss_bytes": 32001024,
+          "outcomes": {
+            "degraded": 3,
+            "partial": 3,
+            "unavailable": 3
+          },
+          "sample_count": 9,
+          "value": "portable-edge-offline"
+        }
+      ]
+    }
+  },
+  "benchmark": "edge-resource-envelope",
+  "claims": {
+    "label": "resource-envelope-observation",
+    "low_swap_established": false,
+    "partner_hardware_benchmarked": false,
+    "power_inferred_from_cpu_or_memory": false,
+    "product_efficacy": false
+  },
+  "commitments": {
+    "driver_sha256": "289791312b201445b216f1306ccbd6fc7416f1d5a407203e9b673dd3d675cbd1",
+    "harness_sha256": "e4f140901a8ae3a0e75865f0ef30d543b10d7f6689ed1ddbc5c934e0a8677d4c",
+    "manifest_sha256": "3a54b85edaa804a986c6ba5e0df04651f128e74e42a54b8b616b70f661b1686e",
+    "observations_sha256": "a7c0ed1d993217c81a7e0e366f572ebb7ecb8e23f888309173a6f678b5d1ffcd",
+    "samples_sha256": "9222e9f4133e64917a7f75e89b8c103608a33e6b2e5bc1f786fc7cfea184b521"
+  },
+  "execution": {
+    "answerer_calls": 0,
+    "judge_calls": 0,
+    "network_calls": 0,
+    "offline": true,
+    "provider_calls": 0
+  },
+  "manifest": {
+    "benchmark_id": "issue-1105-contract-fixture-v1",
+    "benchmark_version": "1.0.0",
+    "budgets": [
+      {
+        "context_char_budget": 2048,
+        "id": "broad",
+        "recall_limit": 10,
+        "traversal_depth": 1
+      },
+      {
+        "context_char_budget": 512,
+        "id": "tight",
+        "recall_limit": 3,
+        "traversal_depth": 0
+      }
+    ],
+    "cases": [
+      {
+        "budget_id": "broad",
+        "corpus_id": "standard-corpus",
+        "expected_outcomes": [
+          "available"
+        ],
+        "id": "available-warm",
+        "phase": "warm",
+        "profile_id": "local-x86-offline",
+        "repetitions": 3,
+        "scenario": "available"
+      },
+      {
+        "budget_id": "broad",
+        "corpus_id": "standard-corpus",
+        "expected_outcomes": [
+          "degraded"
+        ],
+        "id": "degraded-warm",
+        "phase": "warm",
+        "profile_id": "portable-edge-offline",
+        "repetitions": 3,
+        "scenario": "degraded"
+      },
+      {
+        "budget_id": "tight",
+        "corpus_id": "empty-corpus",
+        "expected_outcomes": [
+          "empty"
+        ],
+        "id": "empty-cold",
+        "phase": "cold",
+        "profile_id": "local-x86-offline",
+        "repetitions": 3,
+        "scenario": "empty"
+      },
+      {
+        "budget_id": "tight",
+        "corpus_id": "standard-corpus",
+        "expected_outcomes": [
+          "partial"
+        ],
+        "id": "partial-warm",
+        "phase": "warm",
+        "profile_id": "portable-edge-offline",
+        "repetitions": 3,
+        "scenario": "partial"
+      },
+      {
+        "budget_id": "tight",
+        "corpus_id": "standard-corpus",
+        "expected_outcomes": [
+          "timeout"
+        ],
+        "id": "timeout-cold",
+        "phase": "cold",
+        "profile_id": "local-x86-offline",
+        "repetitions": 3,
+        "scenario": "timeout"
+      },
+      {
+        "budget_id": "broad",
+        "corpus_id": "standard-corpus",
+        "expected_outcomes": [
+          "unavailable"
+        ],
+        "id": "unavailable-cold",
+        "phase": "cold",
+        "profile_id": "portable-edge-offline",
+        "repetitions": 3,
+        "scenario": "unavailable"
+      }
+    ],
+    "corpora": [
+      {
+        "entity_count": 0,
+        "fixture_sha256": "1bcf8b84a93ad81e23e370ea24dea8c3b3c19dfffc6e1b57cc8d3d83fe4cbffa",
+        "id": "empty-corpus",
+        "query_count": 1
+      },
+      {
+        "entity_count": 64,
+        "fixture_sha256": "ab93c4afec77559648535b85144115b18b17c8659501cb1865530eb7ca42d175",
+        "id": "standard-corpus",
+        "query_count": 8
+      }
+    ],
+    "driver": {
+      "id": "resource-envelope-fixture-driver-v1",
+      "sha256": "289791312b201445b216f1306ccbd6fc7416f1d5a407203e9b673dd3d675cbd1"
+    },
+    "offline": true,
+    "profiles": [
+      {
+        "backend_runtime_manifest": {
+          "embedding_backend": "none",
+          "model_backend": "none",
+          "network": "disabled",
+          "storage_backend": "sqlite-fts5"
+        },
+        "constraints": {
+          "cpu_threads": 4,
+          "memory_limit_mb": 4096
+        },
+        "deployment_profile": "offline",
+        "hardware_class": "x86_64-local-baseline",
+        "id": "local-x86-offline",
+        "profile_digest": "a026fbb1b2e32ec612e6c8f1de21a4f3e58b580c3afe071a926bb3b85bfda0d3"
+      },
+      {
+        "backend_runtime_manifest": {
+          "embedding_backend": "none",
+          "model_backend": "none",
+          "network": "disabled",
+          "storage_backend": "sqlite-fts5"
+        },
+        "constraints": {
+          "cpu_threads": 2,
+          "memory_limit_mb": 1024
+        },
+        "deployment_profile": "offline",
+        "hardware_class": "portable-constrained-edge",
+        "id": "portable-edge-offline",
+        "profile_digest": "80a117ad8af7fe1570231ca63ca25d329a53913277e5627a0ac09fc77c5513b4"
+      }
+    ],
+    "schema_version": "perseus-vault-resource-envelope-manifest/v1",
+    "seed": 1105,
+    "tolerances": {
+      "minimum_repetitions": 3,
+      "relative_spread_max": 0.25
+    },
+    "vault_revision": "2ac619b22db1fe2feef7b51386c7394189e5ccb9"
+  },
+  "report_sha256": "c4425186617b9ee70b31abc069eb2455f398cd5a33a63e56dd7126020a77847e",
+  "reproducibility": {
+    "evaluated_groups": 6,
+    "groups": [
+      {
+        "case_id": "available-warm",
+        "median_net_wall_time_ns": 909000,
+        "relative_spread": 0.019802,
+        "repetitions": 3,
+        "status": "within_tolerance",
+        "tolerance": 0.25
+      },
+      {
+        "case_id": "degraded-warm",
+        "median_net_wall_time_ns": 1409000,
+        "relative_spread": 0.012775,
+        "repetitions": 3,
+        "status": "within_tolerance",
+        "tolerance": 0.25
+      },
+      {
+        "case_id": "empty-cold",
+        "median_net_wall_time_ns": 509000,
+        "relative_spread": 0.035363,
+        "repetitions": 3,
+        "status": "within_tolerance",
+        "tolerance": 0.25
+      },
+      {
+        "case_id": "partial-warm",
+        "median_net_wall_time_ns": 1109000,
+        "relative_spread": 0.016231,
+        "repetitions": 3,
+        "status": "within_tolerance",
+        "tolerance": 0.25
+      },
+      {
+        "case_id": "timeout-cold",
+        "median_net_wall_time_ns": 49909000,
+        "relative_spread": 0.000361,
+        "repetitions": 3,
+        "status": "within_tolerance",
+        "tolerance": 0.25
+      },
+      {
+        "case_id": "unavailable-cold",
+        "median_net_wall_time_ns": 209000,
+        "relative_spread": 0.086124,
+        "repetitions": 3,
+        "status": "within_tolerance",
+        "tolerance": 0.25
+      }
+    ],
+    "status": "within_tolerance"
+  },
+  "samples": [
+    {
+      "budget_id": "broad",
+      "case_id": "available-warm",
+      "corpus_id": "standard-corpus",
+      "network_calls": 0,
+      "outcome_status": "available",
+      "phase": "warm",
+      "profile_id": "local-x86-offline",
+      "repetition": 0,
+      "resources": {
+        "cpu_time_ns": {
+          "status": "available",
+          "value": 500000
+        },
+        "energy_joules": {
+          "reason": "sensor_not_configured",
+          "status": "unavailable"
+        },
+        "peak_rss_bytes": {
+          "status": "available",
+          "value": 32000000
+        },
+        "power_watts": {
+          "reason": "sensor_not_configured",
+          "status": "unavailable"
+        },
+        "read_bytes": {
+          "status": "available",
+          "value": 4096
+        },
+        "wall_time_ns": {
+          "status": "available",
+          "value": 1000000
+        },
+        "write_bytes": {
+          "status": "available",
+          "value": 2048
+        }
+      },
+      "schema_version": "perseus-vault-resource-observation/v1",
+      "workload": {
+        "context_assembly_ns": {
+          "status": "available",
+          "value": 250000
+        },
+        "measurement_overhead_ns": {
+          "status": "available",
+          "value": 100000
+        },
+        "net_wall_time_ns": {
+          "status": "available",
+          "value": 900000
+        },
+        "output_bytes": {
+          "status": "available",
+          "value": 768
+        },
+        "output_tokens": {
+          "status": "available",
+          "value": 96
+        },
+        "recall_candidate_count": {
+          "status": "available",
+          "value": 7
+        },
+        "selected_count": {
+          "status": "available",
+          "value": 3
+        },
+        "traversal_depth": {
+          "status": "available",
+          "value": 1
+        }
+      }
+    },
+    {
+      "budget_id": "broad",
+      "case_id": "available-warm",
+      "corpus_id": "standard-corpus",
+      "network_calls": 0,
+      "outcome_status": "available",
+      "phase": "warm",
+      "profile_id": "local-x86-offline",
+      "repetition": 1,
+      "resources": {
+        "cpu_time_ns": {
+          "status": "available",
+          "value": 505000
+        },
+        "energy_joules": {
+          "reason": "sensor_not_configured",
+          "status": "unavailable"
+        },
+        "peak_rss_bytes": {
+          "status": "available",
+          "value": 32001024
+        },
+        "power_watts": {
+          "reason": "sensor_not_configured",
+          "status": "unavailable"
+        },
+        "read_bytes": {
+          "status": "available",
+          "value": 8192
+        },
+        "wall_time_ns": {
+          "status": "available",
+          "value": 1010000
+        },
+        "write_bytes": {
+          "status": "available",
+          "value": 4096
+        }
+      },
+      "schema_version": "perseus-vault-resource-observation/v1",
+      "workload": {
+        "context_assembly_ns": {
+          "status": "available",
+          "value": 250000
+        },
+        "measurement_overhead_ns": {
+          "status": "available",
+          "value": 101000
+        },
+        "net_wall_time_ns": {
+          "status": "available",
+          "value": 909000
+        },
+        "output_bytes": {
+          "status": "available",
+          "value": 768
+        },
+        "output_tokens": {
+          "status": "available",
+          "value": 96
+        },
+        "recall_candidate_count": {
+          "status": "available",
+          "value": 7
+        },
+        "selected_count": {
+          "status": "available",
+          "value": 3
+        },
+        "traversal_depth": {
+          "status": "available",
+          "value": 1
+        }
+      }
+    },
+    {
+      "budget_id": "broad",
+      "case_id": "available-warm",
+      "corpus_id": "standard-corpus",
+      "network_calls": 0,
+      "outcome_status": "available",
+      "phase": "warm",
+      "profile_id": "local-x86-offline",
+      "repetition": 2,
+      "resources": {
+        "cpu_time_ns": {
+          "status": "available",
+          "value": 510000
+        },
+        "energy_joules": {
+          "reason": "sensor_not_configured",
+          "status": "unavailable"
+        },
+        "peak_rss_bytes": {
+          "status": "available",
+          "value": 32002048
+        },
+        "power_watts": {
+          "reason": "sensor_not_configured",
+          "status": "unavailable"
+        },
+        "read_bytes": {
+          "status": "available",
+          "value": 12288
+        },
+        "wall_time_ns": {
+          "status": "available",
+          "value": 1020000
+        },
+        "write_bytes": {
+          "status": "available",
+          "value": 6144
+        }
+      },
+      "schema_version": "perseus-vault-resource-observation/v1",
+      "workload": {
+        "context_assembly_ns": {
+          "status": "available",
+          "value": 250000
+        },
+        "measurement_overhead_ns": {
+          "status": "available",
+          "value": 102000
+        },
+        "net_wall_time_ns": {
+          "status": "available",
+          "value": 918000
+        },
+        "output_bytes": {
+          "status": "available",
+          "value": 768
+        },
+        "output_tokens": {
+          "status": "available",
+          "value": 96
+        },
+        "recall_candidate_count": {
+          "status": "available",
+          "value": 7
+        },
+        "selected_count": {
+          "status": "available",
+          "value": 3
+        },
+        "traversal_depth": {
+          "status": "available",
+          "value": 1
+        }
+      }
+    },
+    {
+      "budget_id": "broad",
+      "case_id": "degraded-warm",
+      "corpus_id": "standard-corpus",
+      "network_calls": 0,
+      "outcome_status": "degraded",
+      "phase": "warm",
+      "profile_id": "portable-edge-offline",
+      "repetition": 0,
+      "resources": {
+        "cpu_time_ns": {
+          "status": "available",
+          "value": 750000
+        },
+        "energy_joules": {
+          "reason": "sensor_not_configured",
+          "status": "unavailable"
+        },
+        "peak_rss_bytes": {
+          "status": "available",
+          "value": 32000000
+        },
+        "power_watts": {
+          "reason": "sensor_not_configured",
+          "status": "unavailable"
+        },
+        "read_bytes": {
+          "status": "available",
+          "value": 4096
+        },
+        "wall_time_ns": {
+          "status": "available",
+          "value": 1500000
+        },
+        "write_bytes": {
+          "status": "available",
+          "value": 2048
+        }
+      },
+      "schema_version": "perseus-vault-resource-observation/v1",
+      "workload": {
+        "context_assembly_ns": {
+          "status": "available",
+          "value": 450000
+        },
+        "measurement_overhead_ns": {
+          "status": "available",
+          "value": 100000
+        },
+        "net_wall_time_ns": {
+          "status": "available",
+          "value": 1400000
+        },
+        "output_bytes": {
+          "status": "available",
+          "value": 512
+        },
+        "output_tokens": {
+          "status": "available",
+          "value": 64
+        },
+        "recall_candidate_count": {
+          "status": "available",
+          "value": 7
+        },
+        "selected_count": {
+          "status": "available",
+          "value": 2
+        },
+        "traversal_depth": {
+          "status": "available",
+          "value": 1
+        }
+      }
+    },
+    {
+      "budget_id": "broad",
+      "case_id": "degraded-warm",
+      "corpus_id": "standard-corpus",
+      "network_calls": 0,
+      "outcome_status": "degraded",
+      "phase": "warm",
+      "profile_id": "portable-edge-offline",
+      "repetition": 1,
+      "resources": {
+        "cpu_time_ns": {
+          "status": "available",
+          "value": 755000
+        },
+        "energy_joules": {
+          "reason": "sensor_not_configured",
+          "status": "unavailable"
+        },
+        "peak_rss_bytes": {
+          "status": "available",
+          "value": 32001024
+        },
+        "power_watts": {
+          "reason": "sensor_not_configured",
+          "status": "unavailable"
+        },
+        "read_bytes": {
+          "status": "available",
+          "value": 8192
+        },
+        "wall_time_ns": {
+          "status": "available",
+          "value": 1510000
+        },
+        "write_bytes": {
+          "status": "available",
+          "value": 4096
+        }
+      },
+      "schema_version": "perseus-vault-resource-observation/v1",
+      "workload": {
+        "context_assembly_ns": {
+          "status": "available",
+          "value": 450000
+        },
+        "measurement_overhead_ns": {
+          "status": "available",
+          "value": 101000
+        },
+        "net_wall_time_ns": {
+          "status": "available",
+          "value": 1409000
+        },
+        "output_bytes": {
+          "status": "available",
+          "value": 512
+        },
+        "output_tokens": {
+          "status": "available",
+          "value": 64
+        },
+        "recall_candidate_count": {
+          "status": "available",
+          "value": 7
+        },
+        "selected_count": {
+          "status": "available",
+          "value": 2
+        },
+        "traversal_depth": {
+          "status": "available",
+          "value": 1
+        }
+      }
+    },
+    {
+      "budget_id": "broad",
+      "case_id": "degraded-warm",
+      "corpus_id": "standard-corpus",
+      "network_calls": 0,
+      "outcome_status": "degraded",
+      "phase": "warm",
+      "profile_id": "portable-edge-offline",
+      "repetition": 2,
+      "resources": {
+        "cpu_time_ns": {
+          "status": "available",
+          "value": 760000
+        },
+        "energy_joules": {
+          "reason": "sensor_not_configured",
+          "status": "unavailable"
+        },
+        "peak_rss_bytes": {
+          "status": "available",
+          "value": 32002048
+        },
+        "power_watts": {
+          "reason": "sensor_not_configured",
+          "status": "unavailable"
+        },
+        "read_bytes": {
+          "status": "available",
+          "value": 12288
+        },
+        "wall_time_ns": {
+          "status": "available",
+          "value": 1520000
+        },
+        "write_bytes": {
+          "status": "available",
+          "value": 6144
+        }
+      },
+      "schema_version": "perseus-vault-resource-observation/v1",
+      "workload": {
+        "context_assembly_ns": {
+          "status": "available",
+          "value": 450000
+        },
+        "measurement_overhead_ns": {
+          "status": "available",
+          "value": 102000
+        },
+        "net_wall_time_ns": {
+          "status": "available",
+          "value": 1418000
+        },
+        "output_bytes": {
+          "status": "available",
+          "value": 512
+        },
+        "output_tokens": {
+          "status": "available",
+          "value": 64
+        },
+        "recall_candidate_count": {
+          "status": "available",
+          "value": 7
+        },
+        "selected_count": {
+          "status": "available",
+          "value": 2
+        },
+        "traversal_depth": {
+          "status": "available",
+          "value": 1
+        }
+      }
+    },
+    {
+      "budget_id": "tight",
+      "case_id": "empty-cold",
+      "corpus_id": "empty-corpus",
+      "network_calls": 0,
+      "outcome_status": "empty",
+      "phase": "cold",
+      "profile_id": "local-x86-offline",
+      "repetition": 0,
+      "resources": {
+        "cpu_time_ns": {
+          "status": "available",
+          "value": 300000
+        },
+        "energy_joules": {
+          "reason": "sensor_not_configured",
+          "status": "unavailable"
+        },
+        "peak_rss_bytes": {
+          "status": "available",
+          "value": 32000000
+        },
+        "power_watts": {
+          "reason": "sensor_not_configured",
+          "status": "unavailable"
+        },
+        "read_bytes": {
+          "status": "available",
+          "value": 4096
+        },
+        "wall_time_ns": {
+          "status": "available",
+          "value": 600000
+        },
+        "write_bytes": {
+          "status": "available",
+          "value": 2048
+        }
+      },
+      "schema_version": "perseus-vault-resource-observation/v1",
+      "workload": {
+        "context_assembly_ns": {
+          "status": "available",
+          "value": 80000
+        },
+        "measurement_overhead_ns": {
+          "status": "available",
+          "value": 100000
+        },
+        "net_wall_time_ns": {
+          "status": "available",
+          "value": 500000
+        },
+        "output_bytes": {
+          "status": "available",
+          "value": 0
+        },
+        "output_tokens": {
+          "status": "available",
+          "value": 0
+        },
+        "recall_candidate_count": {
+          "status": "available",
+          "value": 0
+        },
+        "selected_count": {
+          "status": "available",
+          "value": 0
+        },
+        "traversal_depth": {
+          "status": "available",
+          "value": 0
+        }
+      }
+    },
+    {
+      "budget_id": "tight",
+      "case_id": "empty-cold",
+      "corpus_id": "empty-corpus",
+      "network_calls": 0,
+      "outcome_status": "empty",
+      "phase": "cold",
+      "profile_id": "local-x86-offline",
+      "repetition": 1,
+      "resources": {
+        "cpu_time_ns": {
+          "status": "available",
+          "value": 305000
+        },
+        "energy_joules": {
+          "reason": "sensor_not_configured",
+          "status": "unavailable"
+        },
+        "peak_rss_bytes": {
+          "status": "available",
+          "value": 32001024
+        },
+        "power_watts": {
+          "reason": "sensor_not_configured",
+          "status": "unavailable"
+        },
+        "read_bytes": {
+          "status": "available",
+          "value": 8192
+        },
+        "wall_time_ns": {
+          "status": "available",
+          "value": 610000
+        },
+        "write_bytes": {
+          "status": "available",
+          "value": 4096
+        }
+      },
+      "schema_version": "perseus-vault-resource-observation/v1",
+      "workload": {
+        "context_assembly_ns": {
+          "status": "available",
+          "value": 80000
+        },
+        "measurement_overhead_ns": {
+          "status": "available",
+          "value": 101000
+        },
+        "net_wall_time_ns": {
+          "status": "available",
+          "value": 509000
+        },
+        "output_bytes": {
+          "status": "available",
+          "value": 0
+        },
+        "output_tokens": {
+          "status": "available",
+          "value": 0
+        },
+        "recall_candidate_count": {
+          "status": "available",
+          "value": 0
+        },
+        "selected_count": {
+          "status": "available",
+          "value": 0
+        },
+        "traversal_depth": {
+          "status": "available",
+          "value": 0
+        }
+      }
+    },
+    {
+      "budget_id": "tight",
+      "case_id": "empty-cold",
+      "corpus_id": "empty-corpus",
+      "network_calls": 0,
+      "outcome_status": "empty",
+      "phase": "cold",
+      "profile_id": "local-x86-offline",
+      "repetition": 2,
+      "resources": {
+        "cpu_time_ns": {
+          "status": "available",
+          "value": 310000
+        },
+        "energy_joules": {
+          "reason": "sensor_not_configured",
+          "status": "unavailable"
+        },
+        "peak_rss_bytes": {
+          "status": "available",
+          "value": 32002048
+        },
+        "power_watts": {
+          "reason": "sensor_not_configured",
+          "status": "unavailable"
+        },
+        "read_bytes": {
+          "status": "available",
+          "value": 12288
+        },
+        "wall_time_ns": {
+          "status": "available",
+          "value": 620000
+        },
+        "write_bytes": {
+          "status": "available",
+          "value": 6144
+        }
+      },
+      "schema_version": "perseus-vault-resource-observation/v1",
+      "workload": {
+        "context_assembly_ns": {
+          "status": "available",
+          "value": 80000
+        },
+        "measurement_overhead_ns": {
+          "status": "available",
+          "value": 102000
+        },
+        "net_wall_time_ns": {
+          "status": "available",
+          "value": 518000
+        },
+        "output_bytes": {
+          "status": "available",
+          "value": 0
+        },
+        "output_tokens": {
+          "status": "available",
+          "value": 0
+        },
+        "recall_candidate_count": {
+          "status": "available",
+          "value": 0
+        },
+        "selected_count": {
+          "status": "available",
+          "value": 0
+        },
+        "traversal_depth": {
+          "status": "available",
+          "value": 0
+        }
+      }
+    },
+    {
+      "budget_id": "tight",
+      "case_id": "partial-warm",
+      "corpus_id": "standard-corpus",
+      "network_calls": 0,
+      "outcome_status": "partial",
+      "phase": "warm",
+      "profile_id": "portable-edge-offline",
+      "repetition": 0,
+      "resources": {
+        "cpu_time_ns": {
+          "status": "available",
+          "value": 600000
+        },
+        "energy_joules": {
+          "reason": "sensor_not_configured",
+          "status": "unavailable"
+        },
+        "peak_rss_bytes": {
+          "status": "available",
+          "value": 32000000
+        },
+        "power_watts": {
+          "reason": "sensor_not_configured",
+          "status": "unavailable"
+        },
+        "read_bytes": {
+          "status": "available",
+          "value": 4096
+        },
+        "wall_time_ns": {
+          "status": "available",
+          "value": 1200000
+        },
+        "write_bytes": {
+          "status": "available",
+          "value": 2048
+        }
+      },
+      "schema_version": "perseus-vault-resource-observation/v1",
+      "workload": {
+        "context_assembly_ns": {
+          "status": "available",
+          "value": 300000
+        },
+        "measurement_overhead_ns": {
+          "status": "available",
+          "value": 100000
+        },
+        "net_wall_time_ns": {
+          "status": "available",
+          "value": 1100000
+        },
+        "output_bytes": {
+          "status": "available",
+          "value": 256
+        },
+        "output_tokens": {
+          "status": "available",
+          "value": 32
+        },
+        "recall_candidate_count": {
+          "status": "available",
+          "value": 7
+        },
+        "selected_count": {
+          "status": "available",
+          "value": 1
+        },
+        "traversal_depth": {
+          "status": "available",
+          "value": 0
+        }
+      }
+    },
+    {
+      "budget_id": "tight",
+      "case_id": "partial-warm",
+      "corpus_id": "standard-corpus",
+      "network_calls": 0,
+      "outcome_status": "partial",
+      "phase": "warm",
+      "profile_id": "portable-edge-offline",
+      "repetition": 1,
+      "resources": {
+        "cpu_time_ns": {
+          "status": "available",
+          "value": 605000
+        },
+        "energy_joules": {
+          "reason": "sensor_not_configured",
+          "status": "unavailable"
+        },
+        "peak_rss_bytes": {
+          "status": "available",
+          "value": 32001024
+        },
+        "power_watts": {
+          "reason": "sensor_not_configured",
+          "status": "unavailable"
+        },
+        "read_bytes": {
+          "status": "available",
+          "value": 8192
+        },
+        "wall_time_ns": {
+          "status": "available",
+          "value": 1210000
+        },
+        "write_bytes": {
+          "status": "available",
+          "value": 4096
+        }
+      },
+      "schema_version": "perseus-vault-resource-observation/v1",
+      "workload": {
+        "context_assembly_ns": {
+          "status": "available",
+          "value": 300000
+        },
+        "measurement_overhead_ns": {
+          "status": "available",
+          "value": 101000
+        },
+        "net_wall_time_ns": {
+          "status": "available",
+          "value": 1109000
+        },
+        "output_bytes": {
+          "status": "available",
+          "value": 256
+        },
+        "output_tokens": {
+          "status": "available",
+          "value": 32
+        },
+        "recall_candidate_count": {
+          "status": "available",
+          "value": 7
+        },
+        "selected_count": {
+          "status": "available",
+          "value": 1
+        },
+        "traversal_depth": {
+          "status": "available",
+          "value": 0
+        }
+      }
+    },
+    {
+      "budget_id": "tight",
+      "case_id": "partial-warm",
+      "corpus_id": "standard-corpus",
+      "network_calls": 0,
+      "outcome_status": "partial",
+      "phase": "warm",
+      "profile_id": "portable-edge-offline",
+      "repetition": 2,
+      "resources": {
+        "cpu_time_ns": {
+          "status": "available",
+          "value": 610000
+        },
+        "energy_joules": {
+          "reason": "sensor_not_configured",
+          "status": "unavailable"
+        },
+        "peak_rss_bytes": {
+          "status": "available",
+          "value": 32002048
+        },
+        "power_watts": {
+          "reason": "sensor_not_configured",
+          "status": "unavailable"
+        },
+        "read_bytes": {
+          "status": "available",
+          "value": 12288
+        },
+        "wall_time_ns": {
+          "status": "available",
+          "value": 1220000
+        },
+        "write_bytes": {
+          "status": "available",
+          "value": 6144
+        }
+      },
+      "schema_version": "perseus-vault-resource-observation/v1",
+      "workload": {
+        "context_assembly_ns": {
+          "status": "available",
+          "value": 300000
+        },
+        "measurement_overhead_ns": {
+          "status": "available",
+          "value": 102000
+        },
+        "net_wall_time_ns": {
+          "status": "available",
+          "value": 1118000
+        },
+        "output_bytes": {
+          "status": "available",
+          "value": 256
+        },
+        "output_tokens": {
+          "status": "available",
+          "value": 32
+        },
+        "recall_candidate_count": {
+          "status": "available",
+          "value": 7
+        },
+        "selected_count": {
+          "status": "available",
+          "value": 1
+        },
+        "traversal_depth": {
+          "status": "available",
+          "value": 0
+        }
+      }
+    },
+    {
+      "budget_id": "tight",
+      "case_id": "timeout-cold",
+      "corpus_id": "standard-corpus",
+      "network_calls": 0,
+      "outcome_status": "timeout",
+      "phase": "cold",
+      "profile_id": "local-x86-offline",
+      "repetition": 0,
+      "resources": {
+        "cpu_time_ns": {
+          "status": "available",
+          "value": 25000000
+        },
+        "energy_joules": {
+          "reason": "sensor_not_configured",
+          "status": "unavailable"
+        },
+        "peak_rss_bytes": {
+          "status": "available",
+          "value": 32000000
+        },
+        "power_watts": {
+          "reason": "sensor_not_configured",
+          "status": "unavailable"
+        },
+        "read_bytes": {
+          "status": "available",
+          "value": 4096
+        },
+        "wall_time_ns": {
+          "status": "available",
+          "value": 50000000
+        },
+        "write_bytes": {
+          "status": "available",
+          "value": 2048
+        }
+      },
+      "schema_version": "perseus-vault-resource-observation/v1",
+      "workload": {
+        "context_assembly_ns": {
+          "reason": "recall_timeout",
+          "status": "unavailable"
+        },
+        "measurement_overhead_ns": {
+          "status": "available",
+          "value": 100000
+        },
+        "net_wall_time_ns": {
+          "status": "available",
+          "value": 49900000
+        },
+        "output_bytes": {
+          "reason": "recall_timeout",
+          "status": "unavailable"
+        },
+        "output_tokens": {
+          "reason": "recall_timeout",
+          "status": "unavailable"
+        },
+        "recall_candidate_count": {
+          "reason": "recall_timeout",
+          "status": "unavailable"
+        },
+        "selected_count": {
+          "reason": "recall_timeout",
+          "status": "unavailable"
+        },
+        "traversal_depth": {
+          "reason": "recall_timeout",
+          "status": "unavailable"
+        }
+      }
+    },
+    {
+      "budget_id": "tight",
+      "case_id": "timeout-cold",
+      "corpus_id": "standard-corpus",
+      "network_calls": 0,
+      "outcome_status": "timeout",
+      "phase": "cold",
+      "profile_id": "local-x86-offline",
+      "repetition": 1,
+      "resources": {
+        "cpu_time_ns": {
+          "status": "available",
+          "value": 25005000
+        },
+        "energy_joules": {
+          "reason": "sensor_not_configured",
+          "status": "unavailable"
+        },
+        "peak_rss_bytes": {
+          "status": "available",
+          "value": 32001024
+        },
+        "power_watts": {
+          "reason": "sensor_not_configured",
+          "status": "unavailable"
+        },
+        "read_bytes": {
+          "status": "available",
+          "value": 8192
+        },
+        "wall_time_ns": {
+          "status": "available",
+          "value": 50010000
+        },
+        "write_bytes": {
+          "status": "available",
+          "value": 4096
+        }
+      },
+      "schema_version": "perseus-vault-resource-observation/v1",
+      "workload": {
+        "context_assembly_ns": {
+          "reason": "recall_timeout",
+          "status": "unavailable"
+        },
+        "measurement_overhead_ns": {
+          "status": "available",
+          "value": 101000
+        },
+        "net_wall_time_ns": {
+          "status": "available",
+          "value": 49909000
+        },
+        "output_bytes": {
+          "reason": "recall_timeout",
+          "status": "unavailable"
+        },
+        "output_tokens": {
+          "reason": "recall_timeout",
+          "status": "unavailable"
+        },
+        "recall_candidate_count": {
+          "reason": "recall_timeout",
+          "status": "unavailable"
+        },
+        "selected_count": {
+          "reason": "recall_timeout",
+          "status": "unavailable"
+        },
+        "traversal_depth": {
+          "reason": "recall_timeout",
+          "status": "unavailable"
+        }
+      }
+    },
+    {
+      "budget_id": "tight",
+      "case_id": "timeout-cold",
+      "corpus_id": "standard-corpus",
+      "network_calls": 0,
+      "outcome_status": "timeout",
+      "phase": "cold",
+      "profile_id": "local-x86-offline",
+      "repetition": 2,
+      "resources": {
+        "cpu_time_ns": {
+          "status": "available",
+          "value": 25010000
+        },
+        "energy_joules": {
+          "reason": "sensor_not_configured",
+          "status": "unavailable"
+        },
+        "peak_rss_bytes": {
+          "status": "available",
+          "value": 32002048
+        },
+        "power_watts": {
+          "reason": "sensor_not_configured",
+          "status": "unavailable"
+        },
+        "read_bytes": {
+          "status": "available",
+          "value": 12288
+        },
+        "wall_time_ns": {
+          "status": "available",
+          "value": 50020000
+        },
+        "write_bytes": {
+          "status": "available",
+          "value": 6144
+        }
+      },
+      "schema_version": "perseus-vault-resource-observation/v1",
+      "workload": {
+        "context_assembly_ns": {
+          "reason": "recall_timeout",
+          "status": "unavailable"
+        },
+        "measurement_overhead_ns": {
+          "status": "available",
+          "value": 102000
+        },
+        "net_wall_time_ns": {
+          "status": "available",
+          "value": 49918000
+        },
+        "output_bytes": {
+          "reason": "recall_timeout",
+          "status": "unavailable"
+        },
+        "output_tokens": {
+          "reason": "recall_timeout",
+          "status": "unavailable"
+        },
+        "recall_candidate_count": {
+          "reason": "recall_timeout",
+          "status": "unavailable"
+        },
+        "selected_count": {
+          "reason": "recall_timeout",
+          "status": "unavailable"
+        },
+        "traversal_depth": {
+          "reason": "recall_timeout",
+          "status": "unavailable"
+        }
+      }
+    },
+    {
+      "budget_id": "broad",
+      "case_id": "unavailable-cold",
+      "corpus_id": "standard-corpus",
+      "network_calls": 0,
+      "outcome_status": "unavailable",
+      "phase": "cold",
+      "profile_id": "portable-edge-offline",
+      "repetition": 0,
+      "resources": {
+        "cpu_time_ns": {
+          "status": "available",
+          "value": 150000
+        },
+        "energy_joules": {
+          "reason": "sensor_not_configured",
+          "status": "unavailable"
+        },
+        "peak_rss_bytes": {
+          "status": "available",
+          "value": 32000000
+        },
+        "power_watts": {
+          "reason": "sensor_not_configured",
+          "status": "unavailable"
+        },
+        "read_bytes": {
+          "status": "available",
+          "value": 4096
+        },
+        "wall_time_ns": {
+          "status": "available",
+          "value": 300000
+        },
+        "write_bytes": {
+          "status": "available",
+          "value": 2048
+        }
+      },
+      "schema_version": "perseus-vault-resource-observation/v1",
+      "workload": {
+        "context_assembly_ns": {
+          "reason": "recall_unavailable",
+          "status": "unavailable"
+        },
+        "measurement_overhead_ns": {
+          "status": "available",
+          "value": 100000
+        },
+        "net_wall_time_ns": {
+          "status": "available",
+          "value": 200000
+        },
+        "output_bytes": {
+          "reason": "recall_unavailable",
+          "status": "unavailable"
+        },
+        "output_tokens": {
+          "reason": "recall_unavailable",
+          "status": "unavailable"
+        },
+        "recall_candidate_count": {
+          "reason": "recall_unavailable",
+          "status": "unavailable"
+        },
+        "selected_count": {
+          "reason": "recall_unavailable",
+          "status": "unavailable"
+        },
+        "traversal_depth": {
+          "reason": "recall_unavailable",
+          "status": "unavailable"
+        }
+      }
+    },
+    {
+      "budget_id": "broad",
+      "case_id": "unavailable-cold",
+      "corpus_id": "standard-corpus",
+      "network_calls": 0,
+      "outcome_status": "unavailable",
+      "phase": "cold",
+      "profile_id": "portable-edge-offline",
+      "repetition": 1,
+      "resources": {
+        "cpu_time_ns": {
+          "status": "available",
+          "value": 155000
+        },
+        "energy_joules": {
+          "reason": "sensor_not_configured",
+          "status": "unavailable"
+        },
+        "peak_rss_bytes": {
+          "status": "available",
+          "value": 32001024
+        },
+        "power_watts": {
+          "reason": "sensor_not_configured",
+          "status": "unavailable"
+        },
+        "read_bytes": {
+          "status": "available",
+          "value": 8192
+        },
+        "wall_time_ns": {
+          "status": "available",
+          "value": 310000
+        },
+        "write_bytes": {
+          "status": "available",
+          "value": 4096
+        }
+      },
+      "schema_version": "perseus-vault-resource-observation/v1",
+      "workload": {
+        "context_assembly_ns": {
+          "reason": "recall_unavailable",
+          "status": "unavailable"
+        },
+        "measurement_overhead_ns": {
+          "status": "available",
+          "value": 101000
+        },
+        "net_wall_time_ns": {
+          "status": "available",
+          "value": 209000
+        },
+        "output_bytes": {
+          "reason": "recall_unavailable",
+          "status": "unavailable"
+        },
+        "output_tokens": {
+          "reason": "recall_unavailable",
+          "status": "unavailable"
+        },
+        "recall_candidate_count": {
+          "reason": "recall_unavailable",
+          "status": "unavailable"
+        },
+        "selected_count": {
+          "reason": "recall_unavailable",
+          "status": "unavailable"
+        },
+        "traversal_depth": {
+          "reason": "recall_unavailable",
+          "status": "unavailable"
+        }
+      }
+    },
+    {
+      "budget_id": "broad",
+      "case_id": "unavailable-cold",
+      "corpus_id": "standard-corpus",
+      "network_calls": 0,
+      "outcome_status": "unavailable",
+      "phase": "cold",
+      "profile_id": "portable-edge-offline",
+      "repetition": 2,
+      "resources": {
+        "cpu_time_ns": {
+          "status": "available",
+          "value": 160000
+        },
+        "energy_joules": {
+          "reason": "sensor_not_configured",
+          "status": "unavailable"
+        },
+        "peak_rss_bytes": {
+          "status": "available",
+          "value": 32002048
+        },
+        "power_watts": {
+          "reason": "sensor_not_configured",
+          "status": "unavailable"
+        },
+        "read_bytes": {
+          "status": "available",
+          "value": 12288
+        },
+        "wall_time_ns": {
+          "status": "available",
+          "value": 320000
+        },
+        "write_bytes": {
+          "status": "available",
+          "value": 6144
+        }
+      },
+      "schema_version": "perseus-vault-resource-observation/v1",
+      "workload": {
+        "context_assembly_ns": {
+          "reason": "recall_unavailable",
+          "status": "unavailable"
+        },
+        "measurement_overhead_ns": {
+          "status": "available",
+          "value": 102000
+        },
+        "net_wall_time_ns": {
+          "status": "available",
+          "value": 218000
+        },
+        "output_bytes": {
+          "reason": "recall_unavailable",
+          "status": "unavailable"
+        },
+        "output_tokens": {
+          "reason": "recall_unavailable",
+          "status": "unavailable"
+        },
+        "recall_candidate_count": {
+          "reason": "recall_unavailable",
+          "status": "unavailable"
+        },
+        "selected_count": {
+          "reason": "recall_unavailable",
+          "status": "unavailable"
+        },
+        "traversal_depth": {
+          "reason": "recall_unavailable",
+          "status": "unavailable"
+        }
+      }
+    }
+  ],
+  "schema_version": "perseus-vault-resource-envelope-report/v1",
+  "status": "complete"
+}

@@ -158,8 +158,12 @@ The dependency-ordered implementation wave is complete:
    now seals the baseline receipt before intervention and compares receipt, random, and
    same-cardinality/same-token controls without a blocked source-group reentry path.
 
-Keep [#1105](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1105) parked until the
-Amy/C3BM discussion, and keep [#1021](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1021)
+4. [#1105 — offline edge resource envelopes](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1105)
+   now provides a profile/corpus/budget-bound collector, real offline Vault MCP driver, explicit
+   unavailable sensor states, repeatability tolerances, and hash-bound sanitized reports without a
+   low-SWAP or partner-hardware claim.
+
+Keep [#1021](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1021)
 and [#1061](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1061) outside this
 provider-free implementation wave unless their separate custody and spend gates are reopened.
 
@@ -231,13 +235,18 @@ model-internal-causality and third-party-benchmark claims.
 remain separate from the frozen default, and are labeled as trace faithfulness/evidence necessity
 rather than model-internal causality or efficacy.
 
-#### Chunk 5 — parked or separately authorized measurements
+#### Chunk 5 — resource measurement complete; paid runs remain separate
 
-These remain visible but must not be pulled into the implementation wave:
+- **[#1105](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1105) (complete):** the
+  generic resource-envelope implementation no longer depends on a partner-platform decision. It
+  binds hardware/profile, backend/runtime, corpus, budget, cold/warm phase, repetitions, and
+  tolerances; collects bounded offline recall/context observations; records power and energy as
+  unavailable without sensors; and ships a real checkout-built Vault MCP driver. Partner-specific
+  profiles and thresholds remain additive after the partner discussion and cannot create a
+  retroactive low-SWAP claim.
 
-- **[#1105](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1105):** capture the
-  resource-envelope contract now; implementation planning remains parked until the partner
-  discussion on or after 2026-08-31.
+The paid measurements remain visible but must not be pulled into the provider-free implementation
+wave:
 - **[#1061](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1061):** any RECON
   recheck needs a frozen revision, resolved protocol discrepancies, cost/token guards, and fresh
   explicit authorization; it is not a positive efficacy verdict.

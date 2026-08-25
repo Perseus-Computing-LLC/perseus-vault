@@ -34,6 +34,15 @@ All notable changes to Perseus Vault are documented here. This project adheres t
   class as #379/#400/#971).
 
 ### Added
+- **Offline edge resource-envelope benchmark (#1105).** Added a versioned,
+  provider-free collector and real checkout-built Vault MCP driver for bounded
+  cold/warm recall and context-assembly measurements across declared hardware,
+  profile, corpus, and budget dimensions. Reports separate wall/CPU time, peak
+  RSS, I/O, candidate/selection/traversal/context counters, output size, and
+  measurement overhead; missing sensors stay explicitly unavailable, and the
+  hash-bound report refuses low-SWAP, partner-hardware, power, or efficacy
+  claims. Contract fixtures cover available, empty, partial, unavailable,
+  timeout, and degraded outcomes with deterministic repeatability gates.
 - **Receipt-conditioned trace-faithfulness intervention (#1136).** Added a
   provider-free paired benchmark that seals each baseline evidence receipt
   before selecting receipt-blocked, deterministic-random, and
