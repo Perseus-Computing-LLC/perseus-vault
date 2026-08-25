@@ -34,6 +34,12 @@ All notable changes to Perseus Vault are documented here. This project adheres t
   class as #379/#400/#971).
 
 ### Added
+- **Matched graph-context ablation (#1143).** Added a provider-free deterministic
+  ADR/meeting/Slack/postmortem/service-manifest fixture with paired graph-on/off
+  cells that hold retrieval mode, top-k, context budget, reader, prompt, judge,
+  and seed constant. The hash-bound report separates evidence/path integrity,
+  deterministic answer outcomes, context cost, and execution denominators;
+  unsupported, stale, and cross-scope edges remain explicit dropped decisions.
 - **Explicit rekey and strict shared-deployment contracts.** Added an
   end-to-end `init --rekey` migration/idempotence test and the opt-in
   `PERSEUS_VAULT_STRICT_SCOPE=1` MCP boundary, which requires transport

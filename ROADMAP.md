@@ -198,24 +198,27 @@ answer-facing evidence set on replay; duplicates are source-group deduplicated; 
 budgets are explicit; scope, temporal, lifecycle, correction, and malformed-reference cases fail
 closed; the default path is byte-compatible.
 
-#### Chunk 2 — bounded context-selection decisions (active; this branch)
+#### Chunk 2 — bounded context-selection decisions (complete; merged in `origin/main`)
 
-- **[#1140](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1140):** expose opt-in
+- **[#1140](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1140):** the opt-in
   candidate dispositions, reason codes, lane/source-arm decisions, budgets, and replay
-  fingerprints over #1135's shipped evidence contract. The projection is available on fused recall
-  and context serving while the default response remains unchanged.
+  fingerprints over #1135's shipped evidence contract are available on fused recall and context
+  serving while the default response remains unchanged.
 
-**Exit condition:** an inspector can distinguish candidate generation, governance exclusion, lane
-selection, budget truncation, and answer assembly without receiving raw prompts or hidden content.
+**Exit condition met:** an inspector can distinguish candidate generation, governance exclusion,
+lane selection, budget truncation, and answer assembly without receiving raw prompts or hidden
+content.
 
-#### Chunk 3 — matched graph-context diagnosis
+#### Chunk 3 — matched graph-context diagnosis (complete; this branch)
 
-- **[#1143](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1143):** compare graph-on
-  and graph-off under the same retrieval mode, reader, context budget, and judge; report declared
-  edge support, path attribution, evidence coverage, latency, and cost as separate dimensions.
+- **[#1143](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1143):** the provider-free
+  paired graph-on/off fixture holds retrieval mode, reader, prompt, judge, seed, top-k, and context
+  budget constant. Its hash-bound report separates declared-edge support/path attribution,
+  all-required evidence, deterministic answer outcomes, context cost, and explicit unmeasured
+  latency denominators.
 
-**Exit condition:** the diagnostic is provider-free at its first gate, replayable, and cannot be
-presented as model-internal causality or as a third-party benchmark claim.
+**Exit condition met:** the diagnostic is provider-free, replayable, and labeled against
+model-internal-causality and third-party-benchmark claims.
 
 #### Chunk 4 — controlled intervention
 

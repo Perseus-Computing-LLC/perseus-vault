@@ -1,0 +1,162 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://perseus.observer/schemas/graph-context-ablation-v1.json",
+  "title": "Perseus Vault matched graph-context ablation report v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "status",
+    "benchmark",
+    "fixture_id",
+    "fixture_coverage",
+    "corpus",
+    "comparison",
+    "cells",
+    "rows",
+    "commitments",
+    "execution",
+    "comparability",
+    "report_sha256"
+  ],
+  "properties": {
+    "schema_version": {"const": "perseus-vault-graph-context-ablation-report/v1"},
+    "status": {"const": "complete"},
+    "benchmark": {"const": "matched-graph-context-ablation"},
+    "fixture_id": {"type": "string", "minLength": 1, "maxLength": 256},
+    "fixture_coverage": {
+      "type": "array",
+      "minItems": 7,
+      "uniqueItems": true,
+      "items": {"type": "string"}
+    },
+    "corpus": {"$ref": "#/$defs/corpus"},
+    "comparison": {"$ref": "#/$defs/comparison"},
+    "cells": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 2,
+      "items": {"$ref": "#/$defs/cell"}
+    },
+    "rows": {
+      "type": "array",
+      "minItems": 12,
+      "items": {"$ref": "#/$defs/row"}
+    },
+    "commitments": {"$ref": "#/$defs/commitments"},
+    "execution": {"$ref": "#/$defs/execution"},
+    "comparability": {"$ref": "#/$defs/comparability"},
+    "report_sha256": {"$ref": "#/$defs/sha256"}
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "corpus": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source_count", "node_count", "edge_count", "case_count", "source_types", "sources"],
+      "properties": {
+        "source_count": {"type": "integer", "minimum": 1},
+        "node_count": {"type": "integer", "minimum": 1},
+        "edge_count": {"type": "integer", "minimum": 1},
+        "case_count": {"type": "integer", "minimum": 6},
+        "source_types": {"type": "array", "uniqueItems": true, "items": {"enum": ["adr", "meeting_notes", "slack_thread", "postmortem", "service_manifest"]}},
+        "sources": {"type": "array", "items": {"type": "object"}}
+      }
+    },
+    "comparison": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["intended_difference", "mode_comparison_included", "paired_controls"],
+      "properties": {
+        "intended_difference": {"const": "graph_enabled"},
+        "mode_comparison_included": {"const": false},
+        "paired_controls": {"type": "array", "minItems": 9, "uniqueItems": true, "items": {"type": "string"}}
+      }
+    },
+    "cell": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cell_id", "config", "matched_config_sha256", "cell_config_sha256", "metrics"],
+      "properties": {
+        "cell_id": {"enum": ["graph-off", "graph-on"]},
+        "config": {"type": "object"},
+        "matched_config_sha256": {"$ref": "#/$defs/sha256"},
+        "cell_config_sha256": {"$ref": "#/$defs/sha256"},
+        "metrics": {"type": "object"}
+      }
+    },
+    "row": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "cell_id",
+        "case_id",
+        "shape",
+        "query_sha256",
+        "graph_route",
+        "selected_node_ids",
+        "selected_source_ids",
+        "selected_paths",
+        "candidate_decisions",
+        "edge_decisions",
+        "retrieval_evidence",
+        "answer_metrics",
+        "context_cost",
+        "execution"
+      ],
+      "properties": {
+        "cell_id": {"enum": ["graph-off", "graph-on"]},
+        "case_id": {"type": "string"},
+        "shape": {"type": "string"},
+        "query_sha256": {"$ref": "#/$defs/sha256"},
+        "graph_route": {"type": "object"},
+        "selected_node_ids": {"type": "array", "items": {"type": "string"}},
+        "selected_source_ids": {"type": "array", "items": {"type": "string"}},
+        "selected_paths": {"type": "array", "items": {"type": "object"}},
+        "candidate_decisions": {"type": "array", "items": {"type": "object"}},
+        "edge_decisions": {"type": "array", "items": {"type": "object"}},
+        "retrieval_evidence": {"type": "object"},
+        "answer_metrics": {"type": "object"},
+        "context_cost": {"type": "object"},
+        "execution": {"type": "object"}
+      }
+    },
+    "commitments": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["fixture_sha256", "dataset_sha256", "manifest_sha256", "matched_config_sha256", "prompt_sha256", "offline_reader_sha256", "offline_judge_sha256", "harness_sha256"],
+      "properties": {
+        "fixture_sha256": {"$ref": "#/$defs/sha256"},
+        "dataset_sha256": {"$ref": "#/$defs/sha256"},
+        "manifest_sha256": {"$ref": "#/$defs/sha256"},
+        "matched_config_sha256": {"$ref": "#/$defs/sha256"},
+        "prompt_sha256": {"$ref": "#/$defs/sha256"},
+        "offline_reader_sha256": {"$ref": "#/$defs/sha256"},
+        "offline_judge_sha256": {"$ref": "#/$defs/sha256"},
+        "harness_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "execution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "provider_calls", "network_calls", "paid", "raw_external_payloads_captured"],
+      "properties": {
+        "mode": {"const": "provider-free-deterministic"},
+        "provider_calls": {"const": 0},
+        "network_calls": {"const": 0},
+        "paid": {"const": false},
+        "raw_external_payloads_captured": {"const": false}
+      }
+    },
+    "comparability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["label", "third_party_score_comparison_allowed", "claims"],
+      "properties": {
+        "label": {"const": "vault-owned-synthetic-diagnostic"},
+        "third_party_score_comparison_allowed": {"const": false},
+        "claims": {"type": "array", "minItems": 3, "uniqueItems": true, "items": {"type": "string"}}
+      }
+    }
+  }
+}

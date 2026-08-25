@@ -1,0 +1,1012 @@
+{
+  "benchmark": "matched-graph-context-ablation",
+  "cells": [
+    {
+      "cell_config_sha256": "bd13b8e4d43dff9d203961a8f73597dfeb1a2678e92c94837f2d18d8f4ea2fd6",
+      "cell_id": "graph-off",
+      "config": {
+        "context_token_budget": 128,
+        "graph_enabled": false,
+        "graph_max_hops": 2,
+        "judge": "deterministic-fixture-verdict-v1",
+        "prompt": "hash-only-question-plus-selected-evidence-v1",
+        "reader": "deterministic-required-evidence-reader-v1",
+        "retrieval_mode": "fused-provider-free-fixture-v1",
+        "seed": 1143,
+        "top_k": 8
+      },
+      "matched_config_sha256": "677e3178102411371a895e04112543acf104100d3d15f56e879bc0d7242515e9",
+      "metrics": {
+        "answer_quality": {
+          "abstention_count": 1,
+          "denominator": 6,
+          "matched_expected_count": 4,
+          "matched_expected_rate": 0.666667
+        },
+        "context_cost": {
+          "delivered_tokens": 29,
+          "dropped_count": 1,
+          "selected_count": 5,
+          "token_denominator": 6
+        },
+        "execution": {
+          "error_denominator": 6,
+          "errors": 0,
+          "latency": {
+            "denominator": 0,
+            "status": "not_measured_provider_free",
+            "total_ms": 0
+          },
+          "network_calls": 0,
+          "operation_count": 6,
+          "provider_calls": 0
+        },
+        "retrieval_evidence": {
+          "all_required_evidence_rate": 0.666667,
+          "denominator": 7,
+          "path_relation_precision": 1.0,
+          "source_evidence_recall": 0.714286,
+          "stale_conflict_leakage_count": 0,
+          "unsupported_edge_rate": 0.0
+        }
+      }
+    },
+    {
+      "cell_config_sha256": "07c06ac1b262e1814b25cb8007b7cff821f11b153375ab44d6245b65e130c9e1",
+      "cell_id": "graph-on",
+      "config": {
+        "context_token_budget": 128,
+        "graph_enabled": true,
+        "graph_max_hops": 2,
+        "judge": "deterministic-fixture-verdict-v1",
+        "prompt": "hash-only-question-plus-selected-evidence-v1",
+        "reader": "deterministic-required-evidence-reader-v1",
+        "retrieval_mode": "fused-provider-free-fixture-v1",
+        "seed": 1143,
+        "top_k": 8
+      },
+      "matched_config_sha256": "677e3178102411371a895e04112543acf104100d3d15f56e879bc0d7242515e9",
+      "metrics": {
+        "answer_quality": {
+          "abstention_count": 1,
+          "denominator": 6,
+          "matched_expected_count": 6,
+          "matched_expected_rate": 1.0
+        },
+        "context_cost": {
+          "delivered_tokens": 59,
+          "dropped_count": 10,
+          "selected_count": 11,
+          "token_denominator": 6
+        },
+        "execution": {
+          "error_denominator": 6,
+          "errors": 0,
+          "latency": {
+            "denominator": 0,
+            "status": "not_measured_provider_free",
+            "total_ms": 0
+          },
+          "network_calls": 0,
+          "operation_count": 27,
+          "provider_calls": 0
+        },
+        "retrieval_evidence": {
+          "all_required_evidence_rate": 1.0,
+          "denominator": 7,
+          "path_relation_precision": 1.0,
+          "source_evidence_recall": 1.0,
+          "stale_conflict_leakage_count": 0,
+          "unsupported_edge_rate": 0.0
+        }
+      }
+    }
+  ],
+  "commitments": {
+    "dataset_sha256": "3a43faf2170360ee55c5ea7495cd55aeb5feef010f99386c250afcceaf5916de",
+    "fixture_sha256": "f4070b9950d754a8946dd599254a9baea5b8e6e36d0ef1ff2498ab7496ccf081",
+    "harness_sha256": "11ec4638af0a9454ee7cb7af97acc2282ade67ba74e4d787006eb29406f81b39",
+    "manifest_sha256": "785f3d5ad5d306715a86de6a347fb0124ae42b81ae97732d52287267402b8472",
+    "matched_config_sha256": "677e3178102411371a895e04112543acf104100d3d15f56e879bc0d7242515e9",
+    "offline_judge_sha256": "80417c7f32acc5bdc94410740fbaa503cccb95b62c4269bb5e30bba30ed6540c",
+    "offline_reader_sha256": "0763206d46e0bfbe398d995b6824c05731f92d0e461c072dd7e0a4d8dd1622b2",
+    "prompt_sha256": "b0e548e1e57021b7891ea13195e930def5382b9677280779dc0ddb14f63e6b49"
+  },
+  "comparability": {
+    "claims": [
+      "fixture-level graph utility and evidence coverage only",
+      "not model-internal causality",
+      "not third-party benchmark efficacy"
+    ],
+    "label": "vault-owned-synthetic-diagnostic",
+    "third_party_score_comparison_allowed": false
+  },
+  "comparison": {
+    "intended_difference": "graph_enabled",
+    "mode_comparison_included": false,
+    "paired_controls": [
+      "query",
+      "corpus",
+      "retrieval_mode",
+      "top_k",
+      "context_token_budget",
+      "reader",
+      "prompt",
+      "judge",
+      "seed"
+    ]
+  },
+  "corpus": {
+    "case_count": 6,
+    "edge_count": 5,
+    "node_count": 8,
+    "source_count": 7,
+    "source_types": [
+      "adr",
+      "meeting_notes",
+      "postmortem",
+      "service_manifest",
+      "slack_thread"
+    ],
+    "sources": [
+      {
+        "content_sha256": "78894669bd1027a7745a6f3e863977f4e7f70be8134b71a0f9f0d2ff3c32e437",
+        "revision": "r3",
+        "source_id": "adr-checkout",
+        "source_type": "adr"
+      },
+      {
+        "content_sha256": "36e7f8f1b188eedbc304be1bfe4ade977637a35363726f01d11229b467e296c5",
+        "revision": "sha-secret-r2",
+        "source_id": "manifest-other-scope",
+        "source_type": "service_manifest"
+      },
+      {
+        "content_sha256": "08b7776d125458b3d3f04691b9f3f233f56b2733ece18b78ddd189e8465511ac",
+        "revision": "sha-manifest-r8",
+        "source_id": "manifest-service",
+        "source_type": "service_manifest"
+      },
+      {
+        "content_sha256": "9069b791b94b0768a466a8a8ccfb13b45e862854ef813abf97da91f45229ef0c",
+        "revision": "sha-manifest-r8",
+        "source_id": "manifest-unsupported",
+        "source_type": "service_manifest"
+      },
+      {
+        "content_sha256": "e33ff6158ad048ad7a8ddf7dfad291c3f8206321b8593c4246f12661e646b699",
+        "revision": "2026-08-20",
+        "source_id": "meeting-retry-current",
+        "source_type": "meeting_notes"
+      },
+      {
+        "content_sha256": "7a068eb7ca15590cbb978c6cec050f86b2872a60b21b8f16516cf24674e68939",
+        "revision": "inc-204-r1",
+        "source_id": "postmortem-notification",
+        "source_type": "postmortem"
+      },
+      {
+        "content_sha256": "c94595dbea83128e16025662e18572c9f6ac1919d04b0f0f8afbbc20dc9d1696",
+        "revision": "2026-07-01-root-replies",
+        "source_id": "slack-retry-stale",
+        "source_type": "slack_thread"
+      }
+    ]
+  },
+  "execution": {
+    "mode": "provider-free-deterministic",
+    "network_calls": 0,
+    "paid": false,
+    "provider_calls": 0,
+    "raw_external_payloads_captured": false
+  },
+  "fixture_coverage": [
+    "abstention",
+    "cross_scope_target",
+    "no_signal_utility_skip",
+    "single_hop_control",
+    "stale_current_conflict",
+    "true_multi_hop",
+    "unsupported_declared_edge"
+  ],
+  "fixture_id": "issue-1143-company-brain-synthetic-v1",
+  "report_sha256": "67ab45abc3ed9315daadb02d78d16bb161a2a24a6d1dd3bb7468019674d0f2b0",
+  "rows": [
+    {
+      "answer_metrics": {
+        "abstained": false,
+        "expected": "correct",
+        "matched_expected": true,
+        "verdict": "correct"
+      },
+      "candidate_decisions": [
+        {
+          "disposition": "selected",
+          "node_id": "checkout-api",
+          "reason": "retrieval_seed"
+        }
+      ],
+      "case_id": "cross-scope-target",
+      "cell_id": "graph-off",
+      "context_cost": {
+        "delivered_tokens": 5,
+        "dropped_count": 0,
+        "selected_count": 1,
+        "token_budget": 128
+      },
+      "edge_decisions": [],
+      "execution": {
+        "errors": 0,
+        "operation_count": 1
+      },
+      "graph_route": {
+        "reason": "matched_graph_off_arm",
+        "selected": false,
+        "status": "disabled"
+      },
+      "query_sha256": "682c8b5f3ae55f44b36e3c96921f51f4bdcef719d098ff4dc94ae438bc5193fc",
+      "retrieval_evidence": {
+        "all_required_evidence": true,
+        "covered_source_count": 1,
+        "path_relation_precision": 1.0,
+        "required_source_count": 1,
+        "source_evidence_recall": 1.0,
+        "stale_conflict_leakage": 0,
+        "unsupported_edge_rate": 0.0
+      },
+      "selected_node_ids": [
+        "checkout-api"
+      ],
+      "selected_paths": [],
+      "selected_source_ids": [
+        "adr-checkout"
+      ],
+      "shape": "cross_scope_target"
+    },
+    {
+      "answer_metrics": {
+        "abstained": true,
+        "expected": "abstain",
+        "matched_expected": true,
+        "verdict": "abstain"
+      },
+      "candidate_decisions": [],
+      "case_id": "no-signal",
+      "cell_id": "graph-off",
+      "context_cost": {
+        "delivered_tokens": 0,
+        "dropped_count": 0,
+        "selected_count": 0,
+        "token_budget": 128
+      },
+      "edge_decisions": [],
+      "execution": {
+        "errors": 0,
+        "operation_count": 0
+      },
+      "graph_route": {
+        "reason": "matched_graph_off_arm",
+        "selected": false,
+        "status": "disabled"
+      },
+      "query_sha256": "84d90971f1a0fc133f16e1d3cde3ea085571c0cf92f2aad2188f2ab65f8a9aaf",
+      "retrieval_evidence": {
+        "all_required_evidence": true,
+        "covered_source_count": 0,
+        "path_relation_precision": 1.0,
+        "required_source_count": 0,
+        "source_evidence_recall": 1.0,
+        "stale_conflict_leakage": 0,
+        "unsupported_edge_rate": 0.0
+      },
+      "selected_node_ids": [],
+      "selected_paths": [],
+      "selected_source_ids": [],
+      "shape": "no_signal_utility_skip"
+    },
+    {
+      "answer_metrics": {
+        "abstained": false,
+        "expected": "correct",
+        "matched_expected": true,
+        "verdict": "correct"
+      },
+      "candidate_decisions": [
+        {
+          "disposition": "selected",
+          "node_id": "notification-worker",
+          "reason": "retrieval_seed"
+        }
+      ],
+      "case_id": "single-hop-control",
+      "cell_id": "graph-off",
+      "context_cost": {
+        "delivered_tokens": 8,
+        "dropped_count": 0,
+        "selected_count": 1,
+        "token_budget": 128
+      },
+      "edge_decisions": [],
+      "execution": {
+        "errors": 0,
+        "operation_count": 1
+      },
+      "graph_route": {
+        "reason": "matched_graph_off_arm",
+        "selected": false,
+        "status": "disabled"
+      },
+      "query_sha256": "f6a6be8e0bd2c3d201c0715a59d042f938683d61e6b107fd14e63568989cf92d",
+      "retrieval_evidence": {
+        "all_required_evidence": true,
+        "covered_source_count": 1,
+        "path_relation_precision": 1.0,
+        "required_source_count": 1,
+        "source_evidence_recall": 1.0,
+        "stale_conflict_leakage": 0,
+        "unsupported_edge_rate": 0.0
+      },
+      "selected_node_ids": [
+        "notification-worker"
+      ],
+      "selected_paths": [],
+      "selected_source_ids": [
+        "postmortem-notification"
+      ],
+      "shape": "single_hop_control"
+    },
+    {
+      "answer_metrics": {
+        "abstained": false,
+        "expected": "correct",
+        "matched_expected": true,
+        "verdict": "correct"
+      },
+      "candidate_decisions": [
+        {
+          "disposition": "selected",
+          "node_id": "retry-current",
+          "reason": "retrieval_seed"
+        },
+        {
+          "disposition": "filtered_stale",
+          "node_id": "retry-stale",
+          "reason": "retrieval_seed"
+        }
+      ],
+      "case_id": "stale-current-conflict",
+      "cell_id": "graph-off",
+      "context_cost": {
+        "delivered_tokens": 6,
+        "dropped_count": 1,
+        "selected_count": 1,
+        "token_budget": 128
+      },
+      "edge_decisions": [],
+      "execution": {
+        "errors": 0,
+        "operation_count": 2
+      },
+      "graph_route": {
+        "reason": "matched_graph_off_arm",
+        "selected": false,
+        "status": "disabled"
+      },
+      "query_sha256": "721a53bc89f69697af8d14134cd34547771bd9b85cde4f788dbb9ae98e6997d5",
+      "retrieval_evidence": {
+        "all_required_evidence": true,
+        "covered_source_count": 1,
+        "path_relation_precision": 1.0,
+        "required_source_count": 1,
+        "source_evidence_recall": 1.0,
+        "stale_conflict_leakage": 0,
+        "unsupported_edge_rate": 0.0
+      },
+      "selected_node_ids": [
+        "retry-current"
+      ],
+      "selected_paths": [],
+      "selected_source_ids": [
+        "meeting-retry-current"
+      ],
+      "shape": "stale_current_conflict"
+    },
+    {
+      "answer_metrics": {
+        "abstained": false,
+        "expected": "correct",
+        "matched_expected": false,
+        "verdict": "insufficient_evidence"
+      },
+      "candidate_decisions": [
+        {
+          "disposition": "selected",
+          "node_id": "checkout-api",
+          "reason": "retrieval_seed"
+        }
+      ],
+      "case_id": "true-multi-hop",
+      "cell_id": "graph-off",
+      "context_cost": {
+        "delivered_tokens": 5,
+        "dropped_count": 0,
+        "selected_count": 1,
+        "token_budget": 128
+      },
+      "edge_decisions": [],
+      "execution": {
+        "errors": 0,
+        "operation_count": 1
+      },
+      "graph_route": {
+        "reason": "matched_graph_off_arm",
+        "selected": false,
+        "status": "disabled"
+      },
+      "query_sha256": "d5fe29ea27abcf827683c063a967f6ec4214d60fb87b46b18c7551ccbf5c75d6",
+      "retrieval_evidence": {
+        "all_required_evidence": false,
+        "covered_source_count": 1,
+        "path_relation_precision": 1.0,
+        "required_source_count": 2,
+        "source_evidence_recall": 0.5,
+        "stale_conflict_leakage": 0,
+        "unsupported_edge_rate": 0.0
+      },
+      "selected_node_ids": [
+        "checkout-api"
+      ],
+      "selected_paths": [],
+      "selected_source_ids": [
+        "adr-checkout"
+      ],
+      "shape": "true_multi_hop"
+    },
+    {
+      "answer_metrics": {
+        "abstained": false,
+        "expected": "correct",
+        "matched_expected": false,
+        "verdict": "insufficient_evidence"
+      },
+      "candidate_decisions": [
+        {
+          "disposition": "selected",
+          "node_id": "checkout-api",
+          "reason": "retrieval_seed"
+        }
+      ],
+      "case_id": "unsupported-declared-edge",
+      "cell_id": "graph-off",
+      "context_cost": {
+        "delivered_tokens": 5,
+        "dropped_count": 0,
+        "selected_count": 1,
+        "token_budget": 128
+      },
+      "edge_decisions": [],
+      "execution": {
+        "errors": 0,
+        "operation_count": 1
+      },
+      "graph_route": {
+        "reason": "matched_graph_off_arm",
+        "selected": false,
+        "status": "disabled"
+      },
+      "query_sha256": "c2b94e91dcd786f1b4f86ce6d0d522c7d0e017c5f641f4c6e37af0714f215336",
+      "retrieval_evidence": {
+        "all_required_evidence": false,
+        "covered_source_count": 1,
+        "path_relation_precision": 1.0,
+        "required_source_count": 2,
+        "source_evidence_recall": 0.5,
+        "stale_conflict_leakage": 0,
+        "unsupported_edge_rate": 0.0
+      },
+      "selected_node_ids": [
+        "checkout-api"
+      ],
+      "selected_paths": [],
+      "selected_source_ids": [
+        "adr-checkout"
+      ],
+      "shape": "unsupported_declared_edge"
+    },
+    {
+      "answer_metrics": {
+        "abstained": false,
+        "expected": "correct",
+        "matched_expected": true,
+        "verdict": "correct"
+      },
+      "candidate_decisions": [
+        {
+          "disposition": "selected",
+          "node_id": "checkout-api",
+          "reason": "retrieval_seed"
+        },
+        {
+          "disposition": "selected",
+          "node_id": "order-router",
+          "reason": "graph_expansion"
+        },
+        {
+          "disposition": "selected",
+          "node_id": "orders-postgres",
+          "reason": "graph_expansion"
+        }
+      ],
+      "case_id": "cross-scope-target",
+      "cell_id": "graph-on",
+      "context_cost": {
+        "delivered_tokens": 15,
+        "dropped_count": 3,
+        "selected_count": 3,
+        "token_budget": 128
+      },
+      "edge_decisions": [
+        {
+          "disposition": "dropped",
+          "edge_id": "edge-checkout-legacy",
+          "reason": "unsupported_edge"
+        },
+        {
+          "disposition": "selected",
+          "edge_id": "edge-checkout-router",
+          "reason": "supported"
+        },
+        {
+          "disposition": "dropped",
+          "edge_id": "edge-checkout-secret",
+          "reason": "cross_scope"
+        },
+        {
+          "disposition": "dropped",
+          "edge_id": "edge-checkout-stale-retry",
+          "reason": "stale_source"
+        },
+        {
+          "disposition": "selected",
+          "edge_id": "edge-router-postgres",
+          "reason": "supported"
+        }
+      ],
+      "execution": {
+        "errors": 0,
+        "operation_count": 8
+      },
+      "graph_route": {
+        "reason": "relational",
+        "selected": true,
+        "status": "engaged"
+      },
+      "query_sha256": "682c8b5f3ae55f44b36e3c96921f51f4bdcef719d098ff4dc94ae438bc5193fc",
+      "retrieval_evidence": {
+        "all_required_evidence": true,
+        "covered_source_count": 1,
+        "path_relation_precision": 1.0,
+        "required_source_count": 1,
+        "source_evidence_recall": 1.0,
+        "stale_conflict_leakage": 0,
+        "unsupported_edge_rate": 0.0
+      },
+      "selected_node_ids": [
+        "checkout-api",
+        "order-router",
+        "orders-postgres"
+      ],
+      "selected_paths": [
+        {
+          "edge_id": "edge-checkout-router",
+          "evidence_anchor": "adr-checkout#decision-17",
+          "from_node_id": "checkout-api",
+          "origin": "declared",
+          "relation": "depends_on",
+          "source_digest_sha256": "78894669bd1027a7745a6f3e863977f4e7f70be8134b71a0f9f0d2ff3c32e437",
+          "source_id": "adr-checkout",
+          "source_revision": "r3",
+          "support_state": "supported",
+          "to_node_id": "order-router"
+        },
+        {
+          "edge_id": "edge-router-postgres",
+          "evidence_anchor": "manifest-service#services.order-router.dependencies[0]",
+          "from_node_id": "order-router",
+          "origin": "declared",
+          "relation": "depends_on",
+          "source_digest_sha256": "08b7776d125458b3d3f04691b9f3f233f56b2733ece18b78ddd189e8465511ac",
+          "source_id": "manifest-service",
+          "source_revision": "sha-manifest-r8",
+          "support_state": "supported",
+          "to_node_id": "orders-postgres"
+        }
+      ],
+      "selected_source_ids": [
+        "adr-checkout",
+        "manifest-service"
+      ],
+      "shape": "cross_scope_target"
+    },
+    {
+      "answer_metrics": {
+        "abstained": true,
+        "expected": "abstain",
+        "matched_expected": true,
+        "verdict": "abstain"
+      },
+      "candidate_decisions": [],
+      "case_id": "no-signal",
+      "cell_id": "graph-on",
+      "context_cost": {
+        "delivered_tokens": 0,
+        "dropped_count": 0,
+        "selected_count": 0,
+        "token_budget": 128
+      },
+      "edge_decisions": [],
+      "execution": {
+        "errors": 0,
+        "operation_count": 0
+      },
+      "graph_route": {
+        "reason": "no_signal",
+        "selected": false,
+        "status": "skipped"
+      },
+      "query_sha256": "84d90971f1a0fc133f16e1d3cde3ea085571c0cf92f2aad2188f2ab65f8a9aaf",
+      "retrieval_evidence": {
+        "all_required_evidence": true,
+        "covered_source_count": 0,
+        "path_relation_precision": 1.0,
+        "required_source_count": 0,
+        "source_evidence_recall": 1.0,
+        "stale_conflict_leakage": 0,
+        "unsupported_edge_rate": 0.0
+      },
+      "selected_node_ids": [],
+      "selected_paths": [],
+      "selected_source_ids": [],
+      "shape": "no_signal_utility_skip"
+    },
+    {
+      "answer_metrics": {
+        "abstained": false,
+        "expected": "correct",
+        "matched_expected": true,
+        "verdict": "correct"
+      },
+      "candidate_decisions": [
+        {
+          "disposition": "selected",
+          "node_id": "notification-worker",
+          "reason": "retrieval_seed"
+        }
+      ],
+      "case_id": "single-hop-control",
+      "cell_id": "graph-on",
+      "context_cost": {
+        "delivered_tokens": 8,
+        "dropped_count": 0,
+        "selected_count": 1,
+        "token_budget": 128
+      },
+      "edge_decisions": [],
+      "execution": {
+        "errors": 0,
+        "operation_count": 1
+      },
+      "graph_route": {
+        "reason": "ordinary",
+        "selected": false,
+        "status": "skipped"
+      },
+      "query_sha256": "f6a6be8e0bd2c3d201c0715a59d042f938683d61e6b107fd14e63568989cf92d",
+      "retrieval_evidence": {
+        "all_required_evidence": true,
+        "covered_source_count": 1,
+        "path_relation_precision": 1.0,
+        "required_source_count": 1,
+        "source_evidence_recall": 1.0,
+        "stale_conflict_leakage": 0,
+        "unsupported_edge_rate": 0.0
+      },
+      "selected_node_ids": [
+        "notification-worker"
+      ],
+      "selected_paths": [],
+      "selected_source_ids": [
+        "postmortem-notification"
+      ],
+      "shape": "single_hop_control"
+    },
+    {
+      "answer_metrics": {
+        "abstained": false,
+        "expected": "correct",
+        "matched_expected": true,
+        "verdict": "correct"
+      },
+      "candidate_decisions": [
+        {
+          "disposition": "selected",
+          "node_id": "retry-current",
+          "reason": "retrieval_seed"
+        },
+        {
+          "disposition": "filtered_stale",
+          "node_id": "retry-stale",
+          "reason": "retrieval_seed"
+        }
+      ],
+      "case_id": "stale-current-conflict",
+      "cell_id": "graph-on",
+      "context_cost": {
+        "delivered_tokens": 6,
+        "dropped_count": 1,
+        "selected_count": 1,
+        "token_budget": 128
+      },
+      "edge_decisions": [],
+      "execution": {
+        "errors": 0,
+        "operation_count": 2
+      },
+      "graph_route": {
+        "reason": "temporal",
+        "selected": false,
+        "status": "skipped"
+      },
+      "query_sha256": "721a53bc89f69697af8d14134cd34547771bd9b85cde4f788dbb9ae98e6997d5",
+      "retrieval_evidence": {
+        "all_required_evidence": true,
+        "covered_source_count": 1,
+        "path_relation_precision": 1.0,
+        "required_source_count": 1,
+        "source_evidence_recall": 1.0,
+        "stale_conflict_leakage": 0,
+        "unsupported_edge_rate": 0.0
+      },
+      "selected_node_ids": [
+        "retry-current"
+      ],
+      "selected_paths": [],
+      "selected_source_ids": [
+        "meeting-retry-current"
+      ],
+      "shape": "stale_current_conflict"
+    },
+    {
+      "answer_metrics": {
+        "abstained": false,
+        "expected": "correct",
+        "matched_expected": true,
+        "verdict": "correct"
+      },
+      "candidate_decisions": [
+        {
+          "disposition": "selected",
+          "node_id": "checkout-api",
+          "reason": "retrieval_seed"
+        },
+        {
+          "disposition": "selected",
+          "node_id": "order-router",
+          "reason": "graph_expansion"
+        },
+        {
+          "disposition": "selected",
+          "node_id": "orders-postgres",
+          "reason": "graph_expansion"
+        }
+      ],
+      "case_id": "true-multi-hop",
+      "cell_id": "graph-on",
+      "context_cost": {
+        "delivered_tokens": 15,
+        "dropped_count": 3,
+        "selected_count": 3,
+        "token_budget": 128
+      },
+      "edge_decisions": [
+        {
+          "disposition": "dropped",
+          "edge_id": "edge-checkout-legacy",
+          "reason": "unsupported_edge"
+        },
+        {
+          "disposition": "selected",
+          "edge_id": "edge-checkout-router",
+          "reason": "supported"
+        },
+        {
+          "disposition": "dropped",
+          "edge_id": "edge-checkout-secret",
+          "reason": "cross_scope"
+        },
+        {
+          "disposition": "dropped",
+          "edge_id": "edge-checkout-stale-retry",
+          "reason": "stale_source"
+        },
+        {
+          "disposition": "selected",
+          "edge_id": "edge-router-postgres",
+          "reason": "supported"
+        }
+      ],
+      "execution": {
+        "errors": 0,
+        "operation_count": 8
+      },
+      "graph_route": {
+        "reason": "multi_hop",
+        "selected": true,
+        "status": "engaged"
+      },
+      "query_sha256": "d5fe29ea27abcf827683c063a967f6ec4214d60fb87b46b18c7551ccbf5c75d6",
+      "retrieval_evidence": {
+        "all_required_evidence": true,
+        "covered_source_count": 2,
+        "path_relation_precision": 1.0,
+        "required_source_count": 2,
+        "source_evidence_recall": 1.0,
+        "stale_conflict_leakage": 0,
+        "unsupported_edge_rate": 0.0
+      },
+      "selected_node_ids": [
+        "checkout-api",
+        "order-router",
+        "orders-postgres"
+      ],
+      "selected_paths": [
+        {
+          "edge_id": "edge-checkout-router",
+          "evidence_anchor": "adr-checkout#decision-17",
+          "from_node_id": "checkout-api",
+          "origin": "declared",
+          "relation": "depends_on",
+          "source_digest_sha256": "78894669bd1027a7745a6f3e863977f4e7f70be8134b71a0f9f0d2ff3c32e437",
+          "source_id": "adr-checkout",
+          "source_revision": "r3",
+          "support_state": "supported",
+          "to_node_id": "order-router"
+        },
+        {
+          "edge_id": "edge-router-postgres",
+          "evidence_anchor": "manifest-service#services.order-router.dependencies[0]",
+          "from_node_id": "order-router",
+          "origin": "declared",
+          "relation": "depends_on",
+          "source_digest_sha256": "08b7776d125458b3d3f04691b9f3f233f56b2733ece18b78ddd189e8465511ac",
+          "source_id": "manifest-service",
+          "source_revision": "sha-manifest-r8",
+          "support_state": "supported",
+          "to_node_id": "orders-postgres"
+        }
+      ],
+      "selected_source_ids": [
+        "adr-checkout",
+        "manifest-service"
+      ],
+      "shape": "true_multi_hop"
+    },
+    {
+      "answer_metrics": {
+        "abstained": false,
+        "expected": "correct",
+        "matched_expected": true,
+        "verdict": "correct"
+      },
+      "candidate_decisions": [
+        {
+          "disposition": "selected",
+          "node_id": "checkout-api",
+          "reason": "retrieval_seed"
+        },
+        {
+          "disposition": "selected",
+          "node_id": "order-router",
+          "reason": "graph_expansion"
+        },
+        {
+          "disposition": "selected",
+          "node_id": "orders-postgres",
+          "reason": "graph_expansion"
+        }
+      ],
+      "case_id": "unsupported-declared-edge",
+      "cell_id": "graph-on",
+      "context_cost": {
+        "delivered_tokens": 15,
+        "dropped_count": 3,
+        "selected_count": 3,
+        "token_budget": 128
+      },
+      "edge_decisions": [
+        {
+          "disposition": "dropped",
+          "edge_id": "edge-checkout-legacy",
+          "reason": "unsupported_edge"
+        },
+        {
+          "disposition": "selected",
+          "edge_id": "edge-checkout-router",
+          "reason": "supported"
+        },
+        {
+          "disposition": "dropped",
+          "edge_id": "edge-checkout-secret",
+          "reason": "cross_scope"
+        },
+        {
+          "disposition": "dropped",
+          "edge_id": "edge-checkout-stale-retry",
+          "reason": "stale_source"
+        },
+        {
+          "disposition": "selected",
+          "edge_id": "edge-router-postgres",
+          "reason": "supported"
+        }
+      ],
+      "execution": {
+        "errors": 0,
+        "operation_count": 8
+      },
+      "graph_route": {
+        "reason": "relational",
+        "selected": true,
+        "status": "engaged"
+      },
+      "query_sha256": "c2b94e91dcd786f1b4f86ce6d0d522c7d0e017c5f641f4c6e37af0714f215336",
+      "retrieval_evidence": {
+        "all_required_evidence": true,
+        "covered_source_count": 2,
+        "path_relation_precision": 1.0,
+        "required_source_count": 2,
+        "source_evidence_recall": 1.0,
+        "stale_conflict_leakage": 0,
+        "unsupported_edge_rate": 0.0
+      },
+      "selected_node_ids": [
+        "checkout-api",
+        "order-router",
+        "orders-postgres"
+      ],
+      "selected_paths": [
+        {
+          "edge_id": "edge-checkout-router",
+          "evidence_anchor": "adr-checkout#decision-17",
+          "from_node_id": "checkout-api",
+          "origin": "declared",
+          "relation": "depends_on",
+          "source_digest_sha256": "78894669bd1027a7745a6f3e863977f4e7f70be8134b71a0f9f0d2ff3c32e437",
+          "source_id": "adr-checkout",
+          "source_revision": "r3",
+          "support_state": "supported",
+          "to_node_id": "order-router"
+        },
+        {
+          "edge_id": "edge-router-postgres",
+          "evidence_anchor": "manifest-service#services.order-router.dependencies[0]",
+          "from_node_id": "order-router",
+          "origin": "declared",
+          "relation": "depends_on",
+          "source_digest_sha256": "08b7776d125458b3d3f04691b9f3f233f56b2733ece18b78ddd189e8465511ac",
+          "source_id": "manifest-service",
+          "source_revision": "sha-manifest-r8",
+          "support_state": "supported",
+          "to_node_id": "orders-postgres"
+        }
+      ],
+      "selected_source_ids": [
+        "adr-checkout",
+        "manifest-service"
+      ],
+      "shape": "unsupported_declared_edge"
+    }
+  ],
+  "schema_version": "perseus-vault-graph-context-ablation-report/v1",
+  "status": "complete"
+}
