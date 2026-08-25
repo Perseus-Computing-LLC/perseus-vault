@@ -462,7 +462,7 @@ async fn handle_message(
                     session_id = None;
                 }
             }
-            if session_id.is_some() && !is_initialize {
+            if session_id.is_some() && (!is_initialize || params.session_id.is_some()) {
                 let payload = serde_json::to_string(&resp).unwrap_or_default();
                 let _ = state.sse_tx.send(SseMessage {
                     session_id: session_id.clone(),
@@ -735,6 +735,43 @@ mod tests {
 
         // SSE subscribers must not receive another session's response.
         use futures::StreamExt;
+
+        // Legacy HTTP+SSE opens GET first; the endpoint event carries a
+        // server-issued query session, whose initialize response returns on SSE.
+        let legacy_open = build_transport_router(TransportMode::Sse, None)
+            .oneshot(Request::builder().method("GET").uri("/sse")
+                .body(Body::empty()).unwrap()).await.unwrap();
+        let mut legacy_stream = legacy_open.into_body().into_data_stream();
+        let endpoint_event = tokio::time::timeout(
+            std::time::Duration::from_secs(1), legacy_stream.next()
+        ).await.expect("legacy endpoint event timed out")
+            .expect("legacy SSE stream ended").expect("legacy SSE body error");
+        let endpoint_text = String::from_utf8_lossy(&endpoint_event);
+        let legacy_session = endpoint_text.split("session_id=").nth(1)
+            .and_then(|value| value.lines().next())
+            .expect("legacy endpoint omitted session_id").trim().to_string();
+        let legacy_init = router.clone().oneshot(Request::builder()
+            .method("POST")
+            .uri(format!("/message?session_id={legacy_session}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(json!({
+                "jsonrpc":"2.0", "id":10, "method":"initialize",
+                "params":{"clientInfo":{"name":"client-c","version":"0"}}
+            }).to_string()))
+            .unwrap()).await.unwrap();
+        assert_eq!(legacy_init.status(), StatusCode::OK);
+        let legacy_event = tokio::time::timeout(
+            std::time::Duration::from_secs(1), legacy_stream.next()
+        ).await.expect("legacy initialize SSE response timed out")
+            .expect("legacy SSE stream ended").expect("legacy SSE body error");
+        assert!(String::from_utf8_lossy(&legacy_event).contains("\"id\":10"));
+        assert_eq!(
+            &*get_state().unwrap().sessions.lock().unwrap()
+                .get(&legacy_session).unwrap().session_agent_id.read().unwrap(),
+            "client-c"
+        );
+        drop(legacy_stream);
+
         let subscribe = |session: &str| Request::builder()
             .method("GET")
             .uri(format!("/sse?session_id={session}"))
