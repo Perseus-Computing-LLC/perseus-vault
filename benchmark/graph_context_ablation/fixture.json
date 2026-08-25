@@ -1,0 +1,254 @@
+{
+  "schema_version": "perseus-vault-graph-context-ablation-fixture/v1",
+  "fixture_id": "issue-1143-company-brain-synthetic-v1",
+  "workspace_hash": "workspace-a",
+  "valid_at_unix_ms": 1787616000000,
+  "sources": [
+    {
+      "source_id": "adr-checkout",
+      "source_type": "adr",
+      "revision": "r3",
+      "content": "ADR-17: Checkout API calls Order Router before payment capture."
+    },
+    {
+      "source_id": "meeting-retry-current",
+      "source_type": "meeting_notes",
+      "revision": "2026-08-20",
+      "content": "The current queue retry limit is three after the incident review."
+    },
+    {
+      "source_id": "slack-retry-stale",
+      "source_type": "slack_thread",
+      "revision": "2026-07-01-root-replies",
+      "content": "An older Slack root and replies proposed five queue retries."
+    },
+    {
+      "source_id": "postmortem-notification",
+      "source_type": "postmortem",
+      "revision": "inc-204-r1",
+      "content": "Notification Worker delay was caused by an exhausted queue connection pool."
+    },
+    {
+      "source_id": "manifest-service",
+      "source_type": "service_manifest",
+      "revision": "sha-manifest-r8",
+      "content": "Order Router depends on Orders PostgreSQL in workspace A."
+    },
+    {
+      "source_id": "manifest-unsupported",
+      "source_type": "service_manifest",
+      "revision": "sha-manifest-r8",
+      "content": "A proposed Checkout API to Legacy Billing edge lacks source support."
+    },
+    {
+      "source_id": "manifest-other-scope",
+      "source_type": "service_manifest",
+      "revision": "sha-secret-r2",
+      "content": "Workspace B Secret Pricing is isolated from workspace A."
+    }
+  ],
+  "nodes": [
+    {
+      "node_id": "checkout-api",
+      "source_ids": ["adr-checkout"],
+      "workspace_hash": "workspace-a",
+      "valid_from_unix_ms": 1787000000000,
+      "valid_to_unix_ms": null,
+      "summary": "Checkout API invokes Order Router."
+    },
+    {
+      "node_id": "order-router",
+      "source_ids": ["adr-checkout", "manifest-service"],
+      "workspace_hash": "workspace-a",
+      "valid_from_unix_ms": 1787000000000,
+      "valid_to_unix_ms": null,
+      "summary": "Order Router routes checkout orders."
+    },
+    {
+      "node_id": "orders-postgres",
+      "source_ids": ["manifest-service"],
+      "workspace_hash": "workspace-a",
+      "valid_from_unix_ms": 1787000000000,
+      "valid_to_unix_ms": null,
+      "summary": "Orders PostgreSQL stores routed orders."
+    },
+    {
+      "node_id": "notification-worker",
+      "source_ids": ["postmortem-notification"],
+      "workspace_hash": "workspace-a",
+      "valid_from_unix_ms": 1787000000000,
+      "valid_to_unix_ms": null,
+      "summary": "Notification Worker was delayed by queue pool exhaustion."
+    },
+    {
+      "node_id": "retry-current",
+      "source_ids": ["meeting-retry-current"],
+      "workspace_hash": "workspace-a",
+      "valid_from_unix_ms": 1787000000000,
+      "valid_to_unix_ms": null,
+      "summary": "Current queue retry limit is three."
+    },
+    {
+      "node_id": "retry-stale",
+      "source_ids": ["slack-retry-stale"],
+      "workspace_hash": "workspace-a",
+      "valid_from_unix_ms": 1783000000000,
+      "valid_to_unix_ms": 1786000000000,
+      "summary": "Stale queue retry proposal was five."
+    },
+    {
+      "node_id": "legacy-billing",
+      "source_ids": ["manifest-unsupported"],
+      "workspace_hash": "workspace-a",
+      "valid_from_unix_ms": 1787000000000,
+      "valid_to_unix_ms": null,
+      "summary": "Legacy Billing is an unsupported proposed dependency."
+    },
+    {
+      "node_id": "secret-pricing",
+      "source_ids": ["manifest-other-scope"],
+      "workspace_hash": "workspace-b",
+      "valid_from_unix_ms": 1787000000000,
+      "valid_to_unix_ms": null,
+      "summary": "Secret Pricing belongs to another workspace."
+    }
+  ],
+  "edges": [
+    {
+      "edge_id": "edge-checkout-router",
+      "from_node_id": "checkout-api",
+      "to_node_id": "order-router",
+      "relation": "depends_on",
+      "source_id": "adr-checkout",
+      "source_revision": "r3",
+      "evidence_anchor": "adr-checkout#decision-17",
+      "origin": "declared",
+      "support_state": "supported",
+      "workspace_hash": "workspace-a",
+      "valid_from_unix_ms": 1787000000000,
+      "valid_to_unix_ms": null
+    },
+    {
+      "edge_id": "edge-router-postgres",
+      "from_node_id": "order-router",
+      "to_node_id": "orders-postgres",
+      "relation": "depends_on",
+      "source_id": "manifest-service",
+      "source_revision": "sha-manifest-r8",
+      "evidence_anchor": "manifest-service#services.order-router.dependencies[0]",
+      "origin": "declared",
+      "support_state": "supported",
+      "workspace_hash": "workspace-a",
+      "valid_from_unix_ms": 1787000000000,
+      "valid_to_unix_ms": null
+    },
+    {
+      "edge_id": "edge-checkout-legacy",
+      "from_node_id": "checkout-api",
+      "to_node_id": "legacy-billing",
+      "relation": "depends_on",
+      "source_id": "manifest-unsupported",
+      "source_revision": "sha-manifest-r8",
+      "evidence_anchor": "",
+      "origin": "declared",
+      "support_state": "unsupported",
+      "workspace_hash": "workspace-a",
+      "valid_from_unix_ms": 1787000000000,
+      "valid_to_unix_ms": null
+    },
+    {
+      "edge_id": "edge-checkout-secret",
+      "from_node_id": "checkout-api",
+      "to_node_id": "secret-pricing",
+      "relation": "depends_on",
+      "source_id": "manifest-other-scope",
+      "source_revision": "sha-secret-r2",
+      "evidence_anchor": "manifest-other-scope#services.secret-pricing",
+      "origin": "declared",
+      "support_state": "supported",
+      "workspace_hash": "workspace-b",
+      "valid_from_unix_ms": 1787000000000,
+      "valid_to_unix_ms": null
+    },
+    {
+      "edge_id": "edge-checkout-stale-retry",
+      "from_node_id": "checkout-api",
+      "to_node_id": "retry-stale",
+      "relation": "configured_by",
+      "source_id": "slack-retry-stale",
+      "source_revision": "2026-07-01-root-replies",
+      "evidence_anchor": "slack-retry-stale#reply-4",
+      "origin": "derived",
+      "support_state": "supported",
+      "workspace_hash": "workspace-a",
+      "valid_from_unix_ms": 1783000000000,
+      "valid_to_unix_ms": 1786000000000
+    }
+  ],
+  "cases": [
+    {
+      "case_id": "true-multi-hop",
+      "shape": "true_multi_hop",
+      "query": "What data store does the service that Checkout API depends on use?",
+      "graph_utility_reason": "multi_hop",
+      "seed_node_ids": ["checkout-api"],
+      "required_source_ids": ["adr-checkout", "manifest-service"],
+      "expected_answer": "correct"
+    },
+    {
+      "case_id": "single-hop-control",
+      "shape": "single_hop_control",
+      "query": "What caused the Notification Worker delay?",
+      "graph_utility_reason": "ordinary",
+      "seed_node_ids": ["notification-worker"],
+      "required_source_ids": ["postmortem-notification"],
+      "expected_answer": "correct"
+    },
+    {
+      "case_id": "stale-current-conflict",
+      "shape": "stale_current_conflict",
+      "query": "What is the current queue retry limit?",
+      "graph_utility_reason": "temporal",
+      "seed_node_ids": ["retry-current", "retry-stale"],
+      "required_source_ids": ["meeting-retry-current"],
+      "expected_answer": "correct"
+    },
+    {
+      "case_id": "unsupported-declared-edge",
+      "shape": "unsupported_declared_edge",
+      "query": "Which declared Checkout API dependencies have source support?",
+      "graph_utility_reason": "relational",
+      "seed_node_ids": ["checkout-api"],
+      "required_source_ids": ["adr-checkout", "manifest-service"],
+      "expected_answer": "correct"
+    },
+    {
+      "case_id": "cross-scope-target",
+      "shape": "cross_scope_target",
+      "query": "What in-scope service is connected to Checkout API?",
+      "graph_utility_reason": "relational",
+      "seed_node_ids": ["checkout-api"],
+      "required_source_ids": ["adr-checkout"],
+      "expected_answer": "correct"
+    },
+    {
+      "case_id": "no-signal",
+      "shape": "no_signal_utility_skip",
+      "query": "What is on the lunch menu?",
+      "graph_utility_reason": "no_signal",
+      "seed_node_ids": [],
+      "required_source_ids": [],
+      "expected_answer": "abstain"
+    }
+  ],
+  "matched_config": {
+    "retrieval_mode": "fused-provider-free-fixture-v1",
+    "top_k": 8,
+    "context_token_budget": 128,
+    "reader": "deterministic-required-evidence-reader-v1",
+    "prompt": "hash-only-question-plus-selected-evidence-v1",
+    "judge": "deterministic-fixture-verdict-v1",
+    "seed": 1143,
+    "graph_max_hops": 2
+  }
+}
