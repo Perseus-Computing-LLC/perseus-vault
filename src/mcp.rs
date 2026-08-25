@@ -1333,6 +1333,12 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
           "default": false,
           "description": "#1141: include only sanitized provider identity, revision, digest, scope, and thread lineage; raw provider bodies and payloads are never returned."
         },
+        "evidence_lanes": {
+          "type": "array",
+          "items": { "type": "string", "enum": ["derived", "verbatim"] },
+          "minItems": 1,
+          "description": "#1135: opt-in governed answer-facing evidence lanes. Omit for the legacy byte-compatible recall response; choose derived, verbatim, or both under the shared max_tokens budget. Duplicate lane names are canonicalized."
+        },
         "include_declared_graph": {
           "type": "boolean",
           "default": false,
@@ -1488,6 +1494,10 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
         "total": {
           "type": "integer",
           "description": "Number of results returned"
+        },
+        "evidence": {
+          "type": "object",
+          "description": "#1135: optional governed derived/verbatim evidence projection with shared budget, exclusions, source groups, and hash-only receipt. Present only when evidence_lanes is supplied."
         },
         "variants": {
           "type": "integer",
@@ -10581,6 +10591,22 @@ mod tests {
             assert!(registry.iter().any(|tool| tool["name"] == name), "missing registry tool {name}");
             assert_eq!(tool_scope_rank(name), scope.rank(), "wrong scope for {name}");
         }
+    }
+
+    #[test]
+    fn recall_schema_advertises_opt_in_evidence_lanes() {
+        let recall = tool_registry_base()
+            .iter()
+            .find(|tool| tool["name"] == "perseus_vault_recall")
+            .expect("recall tool must be registered");
+        let evidence = &recall["inputSchema"]["properties"]["evidence_lanes"];
+        assert_eq!(evidence["type"], "array");
+        assert_eq!(evidence["minItems"], 1);
+        assert_eq!(
+            evidence["items"]["enum"],
+            json!(["derived", "verbatim"])
+        );
+        assert!(recall["outputSchema"]["properties"]["evidence"].is_object());
     }
 
     #[test]

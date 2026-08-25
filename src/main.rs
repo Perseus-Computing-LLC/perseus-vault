@@ -19,6 +19,7 @@ mod encryption;
 mod eval_regression;
 mod extraction;
 mod extraction_loss;
+mod evidence_lanes;
 mod fingerprint;
 mod live_update;
 mod provider_source;
