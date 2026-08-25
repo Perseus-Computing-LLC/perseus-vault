@@ -19,6 +19,10 @@ spec.description =
 for (const tool of spec.tools ?? []) {
   tool.inputSchema ??= { type: "object", properties: {} };
   tool.inputSchema.type ??= "object";
+  // Sourcey 3.6.5 cannot generate examples for conditional allOf branches.
+  // Keep the canonical fields and required list; omit only those conditions
+  // from the documentation snapshot so every live tool remains renderable.
+  delete tool.inputSchema.allOf;
 }
 
 await writeFile("mcp.json", `${JSON.stringify(spec, null, 2)}\n`);
