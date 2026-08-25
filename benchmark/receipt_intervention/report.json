@@ -1,0 +1,2291 @@
+{
+  "arms": [
+    {
+      "arm_id": "baseline",
+      "config": {
+        "context_token_budget": 48,
+        "judge": "deterministic-evaluator-v1",
+        "reader": "deterministic-required-evidence-reader-v1",
+        "retrieval_mode": "fused-replay-v1",
+        "scan_budget": 12,
+        "seed": 1136,
+        "top_k": 3
+      },
+      "metrics": {
+        "answer_outcomes": {
+          "abstained": 0,
+          "denominator": 5,
+          "insufficient_evidence": 1,
+          "supported": 4
+        },
+        "context_assembly": {
+          "assembly_error_count": 0,
+          "delivered_tokens": 180,
+          "denominator": 5,
+          "selected_count": 15
+        },
+        "execution": {
+          "answerer_calls": 0,
+          "case_denominator": 5,
+          "judge_calls": 0,
+          "provider_calls": 0
+        },
+        "retrieval_sufficiency": {
+          "denominator": 7,
+          "required_evidence_rate": 0.857143,
+          "selected_required_count": 6
+        }
+      }
+    },
+    {
+      "arm_id": "matched-size-control",
+      "config": {
+        "context_token_budget": 48,
+        "judge": "deterministic-evaluator-v1",
+        "reader": "deterministic-required-evidence-reader-v1",
+        "retrieval_mode": "fused-replay-v1",
+        "scan_budget": 12,
+        "seed": 1136,
+        "top_k": 3
+      },
+      "metrics": {
+        "answer_outcomes": {
+          "abstained": 0,
+          "denominator": 5,
+          "insufficient_evidence": 1,
+          "supported": 4
+        },
+        "context_assembly": {
+          "assembly_error_count": 0,
+          "delivered_tokens": 180,
+          "denominator": 5,
+          "selected_count": 15
+        },
+        "execution": {
+          "answerer_calls": 0,
+          "case_denominator": 5,
+          "judge_calls": 0,
+          "provider_calls": 0
+        },
+        "retrieval_sufficiency": {
+          "denominator": 7,
+          "required_evidence_rate": 0.857143,
+          "selected_required_count": 6
+        }
+      }
+    },
+    {
+      "arm_id": "random-control",
+      "config": {
+        "context_token_budget": 48,
+        "judge": "deterministic-evaluator-v1",
+        "reader": "deterministic-required-evidence-reader-v1",
+        "retrieval_mode": "fused-replay-v1",
+        "scan_budget": 12,
+        "seed": 1136,
+        "top_k": 3
+      },
+      "metrics": {
+        "answer_outcomes": {
+          "abstained": 0,
+          "denominator": 5,
+          "insufficient_evidence": 2,
+          "supported": 3
+        },
+        "context_assembly": {
+          "assembly_error_count": 0,
+          "delivered_tokens": 180,
+          "denominator": 5,
+          "selected_count": 15
+        },
+        "execution": {
+          "answerer_calls": 0,
+          "case_denominator": 5,
+          "judge_calls": 0,
+          "provider_calls": 0
+        },
+        "retrieval_sufficiency": {
+          "denominator": 7,
+          "required_evidence_rate": 0.714286,
+          "selected_required_count": 5
+        }
+      }
+    },
+    {
+      "arm_id": "receipt-blocked",
+      "config": {
+        "context_token_budget": 48,
+        "judge": "deterministic-evaluator-v1",
+        "reader": "deterministic-required-evidence-reader-v1",
+        "retrieval_mode": "fused-replay-v1",
+        "scan_budget": 12,
+        "seed": 1136,
+        "top_k": 3
+      },
+      "metrics": {
+        "answer_outcomes": {
+          "abstained": 4,
+          "denominator": 5,
+          "insufficient_evidence": 1,
+          "supported": 0
+        },
+        "context_assembly": {
+          "assembly_error_count": 0,
+          "delivered_tokens": 180,
+          "denominator": 5,
+          "selected_count": 15
+        },
+        "execution": {
+          "answerer_calls": 0,
+          "case_denominator": 5,
+          "judge_calls": 0,
+          "provider_calls": 0
+        },
+        "retrieval_sufficiency": {
+          "denominator": 7,
+          "required_evidence_rate": 0.142857,
+          "selected_required_count": 1
+        }
+      }
+    }
+  ],
+  "benchmark": "receipt-conditioned-trace-faithfulness",
+  "cases": [
+    {
+      "baseline_receipt": {
+        "agent_id": "agent-a",
+        "as_of_unix_ms": 1787616000000,
+        "baseline_selection_sha256": "2ccbcfb31f3a024deeaeb1319fb2bf550580441b2713edb2a1cdc4342e80729c",
+        "case_id": "cache-fallback",
+        "config_sha256": "835b662a6dd58282da6610f6a19c334951ecf1e3e818eb8b5aa12026c552e5f7",
+        "receipt_candidate_ids": [
+          "ev-cache-base"
+        ],
+        "receipt_sha256": "6aa79f715f98fafb2f115562d7bae328c092dcd3998437faec6123f7c83fdf77",
+        "receipt_source_groups": [
+          "g-cache"
+        ],
+        "receipt_source_refs": [
+          "ref-cache-base"
+        ],
+        "schema_version": "perseus-vault-evidence-intervention-receipt/v1",
+        "sealed_before_intervention": true,
+        "workspace_hash": "workspace-a"
+      },
+      "case_id": "cache-fallback",
+      "interventions": {
+        "matched-size-control": {
+          "arm_id": "matched-size-control",
+          "blocked_cardinality": 1,
+          "blocked_source_groups": [
+            "g-dist-a"
+          ],
+          "blocked_tokens": 12,
+          "context_token_budget": 48,
+          "intervention_sha256": "177de5f6ad44251353364e1b9aef30cc502582ae0baf357eafbc2986523a2cfa",
+          "receipt_sha256": "6aa79f715f98fafb2f115562d7bae328c092dcd3998437faec6123f7c83fdf77",
+          "scan_budget": 12
+        },
+        "random-control": {
+          "arm_id": "random-control",
+          "blocked_cardinality": 1,
+          "blocked_source_groups": [
+            "g-dist-c"
+          ],
+          "blocked_tokens": 12,
+          "context_token_budget": 48,
+          "intervention_sha256": "14fedca99991d9cd8f25d6cd114e29bf305b2194738e65e8561fdcb4874c0839",
+          "receipt_sha256": "6aa79f715f98fafb2f115562d7bae328c092dcd3998437faec6123f7c83fdf77",
+          "scan_budget": 12
+        },
+        "receipt-blocked": {
+          "arm_id": "receipt-blocked",
+          "blocked_cardinality": 1,
+          "blocked_source_groups": [
+            "g-cache"
+          ],
+          "blocked_tokens": 12,
+          "context_token_budget": 48,
+          "intervention_sha256": "ef8a1d0c65edec8d97970426352447630e67a71ff7525148d0875f6915e2ec8f",
+          "receipt_sha256": "6aa79f715f98fafb2f115562d7bae328c092dcd3998437faec6123f7c83fdf77",
+          "scan_budget": 12
+        }
+      },
+      "query_sha256": "dddada5ae1bba2c305d2fff15bb442152acd45f5648321b4fb06410c969e8679"
+    },
+    {
+      "baseline_receipt": {
+        "agent_id": "agent-a",
+        "as_of_unix_ms": 1787616000000,
+        "baseline_selection_sha256": "db0a0cbe6b5537ec6ab14cc70e8d6c66a7be2ee53ef888c5c6a8d9f53439abe9",
+        "case_id": "selected-unreceipted",
+        "config_sha256": "835b662a6dd58282da6610f6a19c334951ecf1e3e818eb8b5aa12026c552e5f7",
+        "receipt_candidate_ids": [
+          "ev-primary"
+        ],
+        "receipt_sha256": "c01af3f10a10b431b8240d25d8aa48728ee8d8d37e3841edff63f291a3c41d63",
+        "receipt_source_groups": [
+          "g-primary"
+        ],
+        "receipt_source_refs": [
+          "ref-primary"
+        ],
+        "schema_version": "perseus-vault-evidence-intervention-receipt/v1",
+        "sealed_before_intervention": true,
+        "workspace_hash": "workspace-a"
+      },
+      "case_id": "selected-unreceipted",
+      "interventions": {
+        "matched-size-control": {
+          "arm_id": "matched-size-control",
+          "blocked_cardinality": 1,
+          "blocked_source_groups": [
+            "g-dist-a"
+          ],
+          "blocked_tokens": 12,
+          "context_token_budget": 48,
+          "intervention_sha256": "aa22ff1f8483e6bacc590c136b32c32cf4a46e4d0a3c5c718686bf82fcef5c5c",
+          "receipt_sha256": "c01af3f10a10b431b8240d25d8aa48728ee8d8d37e3841edff63f291a3c41d63",
+          "scan_budget": 12
+        },
+        "random-control": {
+          "arm_id": "random-control",
+          "blocked_cardinality": 1,
+          "blocked_source_groups": [
+            "g-support"
+          ],
+          "blocked_tokens": 12,
+          "context_token_budget": 48,
+          "intervention_sha256": "bca81e728c78795bf52bb0a5e8d592752d743f6bc4f9ba02bf705d9355fb3a00",
+          "receipt_sha256": "c01af3f10a10b431b8240d25d8aa48728ee8d8d37e3841edff63f291a3c41d63",
+          "scan_budget": 12
+        },
+        "receipt-blocked": {
+          "arm_id": "receipt-blocked",
+          "blocked_cardinality": 1,
+          "blocked_source_groups": [
+            "g-primary"
+          ],
+          "blocked_tokens": 12,
+          "context_token_budget": 48,
+          "intervention_sha256": "44112dc6173b73d11990c87a6b0c20952724393644440f6f528ce5193cec06f9",
+          "receipt_sha256": "c01af3f10a10b431b8240d25d8aa48728ee8d8d37e3841edff63f291a3c41d63",
+          "scan_budget": 12
+        }
+      },
+      "query_sha256": "a64cfe443f073d7fbb9ac18d8fe882d0fc30395e280614580908d8f62b67bb29"
+    },
+    {
+      "baseline_receipt": {
+        "agent_id": "agent-a",
+        "as_of_unix_ms": 1787616000000,
+        "baseline_selection_sha256": "475490f748a6a2b2d683ac3c7563313bb42695037103a9cd848021875a670e22",
+        "case_id": "source-expansion",
+        "config_sha256": "835b662a6dd58282da6610f6a19c334951ecf1e3e818eb8b5aa12026c552e5f7",
+        "receipt_candidate_ids": [
+          "ev-exp-base"
+        ],
+        "receipt_sha256": "4616f7ca78758b65a3069faae77da8b485152675cc597cceb76718faee863af8",
+        "receipt_source_groups": [
+          "g-exp"
+        ],
+        "receipt_source_refs": [
+          "ref-exp-base"
+        ],
+        "schema_version": "perseus-vault-evidence-intervention-receipt/v1",
+        "sealed_before_intervention": true,
+        "workspace_hash": "workspace-a"
+      },
+      "case_id": "source-expansion",
+      "interventions": {
+        "matched-size-control": {
+          "arm_id": "matched-size-control",
+          "blocked_cardinality": 1,
+          "blocked_source_groups": [
+            "g-dist-a"
+          ],
+          "blocked_tokens": 12,
+          "context_token_budget": 48,
+          "intervention_sha256": "1dc7e19c4aaed71ab8719c28b53097cfb9e05b9a51a398da76cb1453495eb6c1",
+          "receipt_sha256": "4616f7ca78758b65a3069faae77da8b485152675cc597cceb76718faee863af8",
+          "scan_budget": 12
+        },
+        "random-control": {
+          "arm_id": "random-control",
+          "blocked_cardinality": 1,
+          "blocked_source_groups": [
+            "g-dist-c"
+          ],
+          "blocked_tokens": 12,
+          "context_token_budget": 48,
+          "intervention_sha256": "f486452937b93af4ac93b58045fbf8a65cee6f11737ee92ac3726c6aba113eca",
+          "receipt_sha256": "4616f7ca78758b65a3069faae77da8b485152675cc597cceb76718faee863af8",
+          "scan_budget": 12
+        },
+        "receipt-blocked": {
+          "arm_id": "receipt-blocked",
+          "blocked_cardinality": 1,
+          "blocked_source_groups": [
+            "g-exp"
+          ],
+          "blocked_tokens": 12,
+          "context_token_budget": 48,
+          "intervention_sha256": "e6410f5120001b53e0d64774c8e9e89744030b4ecebe17a93d1773ba6b9cc4ea",
+          "receipt_sha256": "4616f7ca78758b65a3069faae77da8b485152675cc597cceb76718faee863af8",
+          "scan_budget": 12
+        }
+      },
+      "query_sha256": "dec4fe64a2c9678773c6b2ae5be2b5d3bf84ed1f6e5d7888e97446d80a3ff3d8"
+    },
+    {
+      "baseline_receipt": {
+        "agent_id": "agent-a",
+        "as_of_unix_ms": 1787616000000,
+        "baseline_selection_sha256": "8d6c6930556f81ab3adefa872c5814497027332812114581ff9896479d3676f3",
+        "case_id": "synonym-alternate-lane",
+        "config_sha256": "835b662a6dd58282da6610f6a19c334951ecf1e3e818eb8b5aa12026c552e5f7",
+        "receipt_candidate_ids": [
+          "ev-syn-lex"
+        ],
+        "receipt_sha256": "4e99d2e41085fc9928fdbfb7b5023fd35b7a894f9d281a738ca710a262726c00",
+        "receipt_source_groups": [
+          "g-syn"
+        ],
+        "receipt_source_refs": [
+          "ref-syn-primary"
+        ],
+        "schema_version": "perseus-vault-evidence-intervention-receipt/v1",
+        "sealed_before_intervention": true,
+        "workspace_hash": "workspace-a"
+      },
+      "case_id": "synonym-alternate-lane",
+      "interventions": {
+        "matched-size-control": {
+          "arm_id": "matched-size-control",
+          "blocked_cardinality": 1,
+          "blocked_source_groups": [
+            "g-dist-a"
+          ],
+          "blocked_tokens": 12,
+          "context_token_budget": 48,
+          "intervention_sha256": "b56b8b5115c020a3963bdcf901ea1fd8655915cfaed5298e54a2ec271fc399c9",
+          "receipt_sha256": "4e99d2e41085fc9928fdbfb7b5023fd35b7a894f9d281a738ca710a262726c00",
+          "scan_budget": 12
+        },
+        "random-control": {
+          "arm_id": "random-control",
+          "blocked_cardinality": 1,
+          "blocked_source_groups": [
+            "g-dist-c"
+          ],
+          "blocked_tokens": 12,
+          "context_token_budget": 48,
+          "intervention_sha256": "13e2a52f1f60e424c28039981c38ded8798010cdbb92b6bf84403ed3598261a8",
+          "receipt_sha256": "4e99d2e41085fc9928fdbfb7b5023fd35b7a894f9d281a738ca710a262726c00",
+          "scan_budget": 12
+        },
+        "receipt-blocked": {
+          "arm_id": "receipt-blocked",
+          "blocked_cardinality": 1,
+          "blocked_source_groups": [
+            "g-syn"
+          ],
+          "blocked_tokens": 12,
+          "context_token_budget": 48,
+          "intervention_sha256": "7d1ece0dfb336154994c5e295ef9b495d24eb2d6a3d0c2cc065c24d99d0fca6a",
+          "receipt_sha256": "4e99d2e41085fc9928fdbfb7b5023fd35b7a894f9d281a738ca710a262726c00",
+          "scan_budget": 12
+        }
+      },
+      "query_sha256": "328bf9b392d9d890d00467637bd09088fe60e54fdf5240b60114c4d7e3ae7490"
+    },
+    {
+      "baseline_receipt": {
+        "agent_id": "agent-a",
+        "as_of_unix_ms": 1787616000000,
+        "baseline_selection_sha256": "dee4834a57e317b457583343bcd0a28257b265313b4595e6cd134856788292b9",
+        "case_id": "unavailable-evidence",
+        "config_sha256": "835b662a6dd58282da6610f6a19c334951ecf1e3e818eb8b5aa12026c552e5f7",
+        "receipt_candidate_ids": [
+          "ev-partial"
+        ],
+        "receipt_sha256": "c70e74822e5467eda9293101124a958097e0f294429d41720d5dcaa71336f3d1",
+        "receipt_source_groups": [
+          "g-partial"
+        ],
+        "receipt_source_refs": [
+          "ref-partial"
+        ],
+        "schema_version": "perseus-vault-evidence-intervention-receipt/v1",
+        "sealed_before_intervention": true,
+        "workspace_hash": "workspace-a"
+      },
+      "case_id": "unavailable-evidence",
+      "interventions": {
+        "matched-size-control": {
+          "arm_id": "matched-size-control",
+          "blocked_cardinality": 1,
+          "blocked_source_groups": [
+            "g-dist-a"
+          ],
+          "blocked_tokens": 12,
+          "context_token_budget": 48,
+          "intervention_sha256": "9213318d737bd928b6badddb2b23e5291b9c2adfc97c8f1e517da7968d4db1fc",
+          "receipt_sha256": "c70e74822e5467eda9293101124a958097e0f294429d41720d5dcaa71336f3d1",
+          "scan_budget": 12
+        },
+        "random-control": {
+          "arm_id": "random-control",
+          "blocked_cardinality": 1,
+          "blocked_source_groups": [
+            "g-dist-c"
+          ],
+          "blocked_tokens": 12,
+          "context_token_budget": 48,
+          "intervention_sha256": "482249a50b6d9053b768e06a8b156d1b119134eef4d3741a3fa19c88abb541eb",
+          "receipt_sha256": "c70e74822e5467eda9293101124a958097e0f294429d41720d5dcaa71336f3d1",
+          "scan_budget": 12
+        },
+        "receipt-blocked": {
+          "arm_id": "receipt-blocked",
+          "blocked_cardinality": 1,
+          "blocked_source_groups": [
+            "g-partial"
+          ],
+          "blocked_tokens": 12,
+          "context_token_budget": 48,
+          "intervention_sha256": "353e1f74110e69f8810ed1d0bf2981134da8931f79a206952f38ff07eab7036c",
+          "receipt_sha256": "c70e74822e5467eda9293101124a958097e0f294429d41720d5dcaa71336f3d1",
+          "scan_budget": 12
+        }
+      },
+      "query_sha256": "1f6ea06867f1d444094c5acaf90c86a6ef7a7a4dcbfc29c7e54d1c7dd249a50b"
+    }
+  ],
+  "claims": {
+    "existing_attribution_contract_controls_publication": true,
+    "existing_counterfactual_gate_controls_publication": true,
+    "label": "trace-faithfulness-evidence-necessity",
+    "model_internal_causality": false,
+    "third_party_benchmark_comparison": false
+  },
+  "commitments": {
+    "baseline_receipt_set_sha256": "bc66a6eb77bcbdff6833d5dae641a9afe6791e355dc46cfb00b1bcf9a4ff63d2",
+    "fixture_sha256": "41ea74f11db611d56fd4ce0ef7a41e30bf7bb08a1696b22ed6a4825f922bf30b",
+    "harness_sha256": "360f6c28da304f336ef2f0dfc93023819586375bfaef934ba1fc1c1afab61ad4",
+    "intervention_set_sha256": "5cb7a1a2103e35049686d41aa6ab077b052efa94fc94c2fe4defe100d215aaa0",
+    "output_projection_sha256": "038ac83b8861e0c3d03d971dbedb4bc2456f05cba3e70e48127dea404ff7749c",
+    "question_set_sha256": "17f140e9faa3b4ce2f3520dcec9adb4d524d4067c38a37ea093682e96d1f92ef",
+    "retrieval_config_sha256": "835b662a6dd58282da6610f6a19c334951ecf1e3e818eb8b5aa12026c552e5f7"
+  },
+  "evaluator_boundary": {
+    "gold_available_only_after_receipt_seal": true,
+    "gold_used_for_intervention_selection": false,
+    "gold_used_for_production_selection": false
+  },
+  "execution": {
+    "answerer_calls": 0,
+    "judge_calls": 0,
+    "mode": "provider-free-deterministic",
+    "network_calls": 0,
+    "paid": false,
+    "provider_calls": 0,
+    "raw_external_payloads_captured": false
+  },
+  "fixture_id": "issue-1136-synthetic-v1",
+  "report_sha256": "9fbb405058e53747567dca3cf7021d107b8b29969934ad400e7933e6809def03",
+  "rows": [
+    {
+      "agent_id": "agent-a",
+      "answer_outcome": "supported",
+      "arm_id": "baseline",
+      "as_of_unix_ms": 1787616000000,
+      "blocked_source_groups": [],
+      "candidate_decisions": [
+        {
+          "candidate_id": "ev-cache-base",
+          "disposition": "selected",
+          "lane": "fts5",
+          "source_group": "g-cache",
+          "source_ref": "ref-cache-base"
+        },
+        {
+          "candidate_id": "dist-a",
+          "disposition": "selected",
+          "lane": "fts5",
+          "source_group": "g-dist-a",
+          "source_ref": "ref-dist-a"
+        },
+        {
+          "candidate_id": "dist-b",
+          "disposition": "selected",
+          "lane": "dense",
+          "source_group": "g-dist-b",
+          "source_ref": "ref-dist-b"
+        },
+        {
+          "candidate_id": "dist-c",
+          "disposition": "dropped_top_k",
+          "lane": "temporal",
+          "source_group": "g-dist-c",
+          "source_ref": "ref-dist-c"
+        },
+        {
+          "candidate_id": "ev-cache-hit",
+          "disposition": "duplicate_source_group",
+          "lane": "cache",
+          "source_group": "g-cache",
+          "source_ref": "ref-cache-hit"
+        },
+        {
+          "candidate_id": "ev-fallback-hit",
+          "disposition": "duplicate_source_group",
+          "lane": "fallback",
+          "source_group": "g-cache",
+          "source_ref": "ref-fallback-hit"
+        }
+      ],
+      "case_id": "cache-fallback",
+      "context": {
+        "assembly_errors": 0,
+        "delivered_tokens": 36,
+        "scan_budget": 12,
+        "selected_count": 3,
+        "token_budget": 48
+      },
+      "evidence_accounting": {
+        "blocked_gold_evidence_count": 0,
+        "blocked_receipt_evidence_count": 0,
+        "selected_unreceipted_evidence_count": 0,
+        "unavailable_evidence_count": 0
+      },
+      "query_sha256": "dddada5ae1bba2c305d2fff15bb442152acd45f5648321b4fb06410c969e8679",
+      "receipt_output_alignment": true,
+      "retrieval": {
+        "all_required_evidence": true,
+        "required_count": 1,
+        "selected_required_count": 1
+      },
+      "selected_candidate_ids": [
+        "ev-cache-base",
+        "dist-a",
+        "dist-b"
+      ],
+      "selected_source_groups": [
+        "g-cache",
+        "g-dist-a",
+        "g-dist-b"
+      ],
+      "selected_token_counts": [
+        12,
+        12,
+        12
+      ],
+      "workspace_hash": "workspace-a"
+    },
+    {
+      "agent_id": "agent-a",
+      "answer_outcome": "supported",
+      "arm_id": "matched-size-control",
+      "as_of_unix_ms": 1787616000000,
+      "blocked_source_groups": [
+        "g-dist-a"
+      ],
+      "candidate_decisions": [
+        {
+          "candidate_id": "ev-cache-base",
+          "disposition": "selected",
+          "lane": "fts5",
+          "source_group": "g-cache",
+          "source_ref": "ref-cache-base"
+        },
+        {
+          "candidate_id": "dist-a",
+          "disposition": "blocked_control_source_group",
+          "lane": "fts5",
+          "source_group": "g-dist-a",
+          "source_ref": "ref-dist-a"
+        },
+        {
+          "candidate_id": "dist-b",
+          "disposition": "selected",
+          "lane": "dense",
+          "source_group": "g-dist-b",
+          "source_ref": "ref-dist-b"
+        },
+        {
+          "candidate_id": "dist-c",
+          "disposition": "selected",
+          "lane": "temporal",
+          "source_group": "g-dist-c",
+          "source_ref": "ref-dist-c"
+        },
+        {
+          "candidate_id": "ev-cache-hit",
+          "disposition": "duplicate_source_group",
+          "lane": "cache",
+          "source_group": "g-cache",
+          "source_ref": "ref-cache-hit"
+        },
+        {
+          "candidate_id": "ev-fallback-hit",
+          "disposition": "duplicate_source_group",
+          "lane": "fallback",
+          "source_group": "g-cache",
+          "source_ref": "ref-fallback-hit"
+        }
+      ],
+      "case_id": "cache-fallback",
+      "context": {
+        "assembly_errors": 0,
+        "delivered_tokens": 36,
+        "scan_budget": 12,
+        "selected_count": 3,
+        "token_budget": 48
+      },
+      "evidence_accounting": {
+        "blocked_gold_evidence_count": 0,
+        "blocked_receipt_evidence_count": 0,
+        "selected_unreceipted_evidence_count": 0,
+        "unavailable_evidence_count": 0
+      },
+      "query_sha256": "dddada5ae1bba2c305d2fff15bb442152acd45f5648321b4fb06410c969e8679",
+      "receipt_output_alignment": true,
+      "retrieval": {
+        "all_required_evidence": true,
+        "required_count": 1,
+        "selected_required_count": 1
+      },
+      "selected_candidate_ids": [
+        "ev-cache-base",
+        "dist-b",
+        "dist-c"
+      ],
+      "selected_source_groups": [
+        "g-cache",
+        "g-dist-b",
+        "g-dist-c"
+      ],
+      "selected_token_counts": [
+        12,
+        12,
+        12
+      ],
+      "workspace_hash": "workspace-a"
+    },
+    {
+      "agent_id": "agent-a",
+      "answer_outcome": "supported",
+      "arm_id": "random-control",
+      "as_of_unix_ms": 1787616000000,
+      "blocked_source_groups": [
+        "g-dist-c"
+      ],
+      "candidate_decisions": [
+        {
+          "candidate_id": "ev-cache-base",
+          "disposition": "selected",
+          "lane": "fts5",
+          "source_group": "g-cache",
+          "source_ref": "ref-cache-base"
+        },
+        {
+          "candidate_id": "dist-a",
+          "disposition": "selected",
+          "lane": "fts5",
+          "source_group": "g-dist-a",
+          "source_ref": "ref-dist-a"
+        },
+        {
+          "candidate_id": "dist-b",
+          "disposition": "selected",
+          "lane": "dense",
+          "source_group": "g-dist-b",
+          "source_ref": "ref-dist-b"
+        },
+        {
+          "candidate_id": "dist-c",
+          "disposition": "blocked_control_source_group",
+          "lane": "temporal",
+          "source_group": "g-dist-c",
+          "source_ref": "ref-dist-c"
+        },
+        {
+          "candidate_id": "ev-cache-hit",
+          "disposition": "duplicate_source_group",
+          "lane": "cache",
+          "source_group": "g-cache",
+          "source_ref": "ref-cache-hit"
+        },
+        {
+          "candidate_id": "ev-fallback-hit",
+          "disposition": "duplicate_source_group",
+          "lane": "fallback",
+          "source_group": "g-cache",
+          "source_ref": "ref-fallback-hit"
+        }
+      ],
+      "case_id": "cache-fallback",
+      "context": {
+        "assembly_errors": 0,
+        "delivered_tokens": 36,
+        "scan_budget": 12,
+        "selected_count": 3,
+        "token_budget": 48
+      },
+      "evidence_accounting": {
+        "blocked_gold_evidence_count": 0,
+        "blocked_receipt_evidence_count": 0,
+        "selected_unreceipted_evidence_count": 0,
+        "unavailable_evidence_count": 0
+      },
+      "query_sha256": "dddada5ae1bba2c305d2fff15bb442152acd45f5648321b4fb06410c969e8679",
+      "receipt_output_alignment": true,
+      "retrieval": {
+        "all_required_evidence": true,
+        "required_count": 1,
+        "selected_required_count": 1
+      },
+      "selected_candidate_ids": [
+        "ev-cache-base",
+        "dist-a",
+        "dist-b"
+      ],
+      "selected_source_groups": [
+        "g-cache",
+        "g-dist-a",
+        "g-dist-b"
+      ],
+      "selected_token_counts": [
+        12,
+        12,
+        12
+      ],
+      "workspace_hash": "workspace-a"
+    },
+    {
+      "agent_id": "agent-a",
+      "answer_outcome": "abstained",
+      "arm_id": "receipt-blocked",
+      "as_of_unix_ms": 1787616000000,
+      "blocked_source_groups": [
+        "g-cache"
+      ],
+      "candidate_decisions": [
+        {
+          "candidate_id": "ev-cache-base",
+          "disposition": "blocked_receipt_source_group",
+          "lane": "fts5",
+          "source_group": "g-cache",
+          "source_ref": "ref-cache-base"
+        },
+        {
+          "candidate_id": "dist-a",
+          "disposition": "selected",
+          "lane": "fts5",
+          "source_group": "g-dist-a",
+          "source_ref": "ref-dist-a"
+        },
+        {
+          "candidate_id": "dist-b",
+          "disposition": "selected",
+          "lane": "dense",
+          "source_group": "g-dist-b",
+          "source_ref": "ref-dist-b"
+        },
+        {
+          "candidate_id": "dist-c",
+          "disposition": "selected",
+          "lane": "temporal",
+          "source_group": "g-dist-c",
+          "source_ref": "ref-dist-c"
+        },
+        {
+          "candidate_id": "ev-cache-hit",
+          "disposition": "blocked_receipt_source_group",
+          "lane": "cache",
+          "source_group": "g-cache",
+          "source_ref": "ref-cache-hit"
+        },
+        {
+          "candidate_id": "ev-fallback-hit",
+          "disposition": "blocked_receipt_source_group",
+          "lane": "fallback",
+          "source_group": "g-cache",
+          "source_ref": "ref-fallback-hit"
+        }
+      ],
+      "case_id": "cache-fallback",
+      "context": {
+        "assembly_errors": 0,
+        "delivered_tokens": 36,
+        "scan_budget": 12,
+        "selected_count": 3,
+        "token_budget": 48
+      },
+      "evidence_accounting": {
+        "blocked_gold_evidence_count": 1,
+        "blocked_receipt_evidence_count": 1,
+        "selected_unreceipted_evidence_count": 0,
+        "unavailable_evidence_count": 0
+      },
+      "query_sha256": "dddada5ae1bba2c305d2fff15bb442152acd45f5648321b4fb06410c969e8679",
+      "receipt_output_alignment": true,
+      "retrieval": {
+        "all_required_evidence": false,
+        "required_count": 1,
+        "selected_required_count": 0
+      },
+      "selected_candidate_ids": [
+        "dist-a",
+        "dist-b",
+        "dist-c"
+      ],
+      "selected_source_groups": [
+        "g-dist-a",
+        "g-dist-b",
+        "g-dist-c"
+      ],
+      "selected_token_counts": [
+        12,
+        12,
+        12
+      ],
+      "workspace_hash": "workspace-a"
+    },
+    {
+      "agent_id": "agent-a",
+      "answer_outcome": "supported",
+      "arm_id": "baseline",
+      "as_of_unix_ms": 1787616000000,
+      "blocked_source_groups": [],
+      "candidate_decisions": [
+        {
+          "candidate_id": "ev-primary",
+          "disposition": "selected",
+          "lane": "fts5",
+          "source_group": "g-primary",
+          "source_ref": "ref-primary"
+        },
+        {
+          "candidate_id": "dist-a",
+          "disposition": "selected",
+          "lane": "fts5",
+          "source_group": "g-dist-a",
+          "source_ref": "ref-dist-a"
+        },
+        {
+          "candidate_id": "ev-support",
+          "disposition": "selected",
+          "lane": "dense",
+          "source_group": "g-support",
+          "source_ref": "ref-support"
+        },
+        {
+          "candidate_id": "dist-b",
+          "disposition": "dropped_top_k",
+          "lane": "dense",
+          "source_group": "g-dist-b",
+          "source_ref": "ref-dist-b"
+        },
+        {
+          "candidate_id": "dist-c",
+          "disposition": "dropped_top_k",
+          "lane": "temporal",
+          "source_group": "g-dist-c",
+          "source_ref": "ref-dist-c"
+        }
+      ],
+      "case_id": "selected-unreceipted",
+      "context": {
+        "assembly_errors": 0,
+        "delivered_tokens": 36,
+        "scan_budget": 12,
+        "selected_count": 3,
+        "token_budget": 48
+      },
+      "evidence_accounting": {
+        "blocked_gold_evidence_count": 0,
+        "blocked_receipt_evidence_count": 0,
+        "selected_unreceipted_evidence_count": 1,
+        "unavailable_evidence_count": 0
+      },
+      "query_sha256": "a64cfe443f073d7fbb9ac18d8fe882d0fc30395e280614580908d8f62b67bb29",
+      "receipt_output_alignment": true,
+      "retrieval": {
+        "all_required_evidence": true,
+        "required_count": 2,
+        "selected_required_count": 2
+      },
+      "selected_candidate_ids": [
+        "ev-primary",
+        "dist-a",
+        "ev-support"
+      ],
+      "selected_source_groups": [
+        "g-primary",
+        "g-dist-a",
+        "g-support"
+      ],
+      "selected_token_counts": [
+        12,
+        12,
+        12
+      ],
+      "workspace_hash": "workspace-a"
+    },
+    {
+      "agent_id": "agent-a",
+      "answer_outcome": "supported",
+      "arm_id": "matched-size-control",
+      "as_of_unix_ms": 1787616000000,
+      "blocked_source_groups": [
+        "g-dist-a"
+      ],
+      "candidate_decisions": [
+        {
+          "candidate_id": "ev-primary",
+          "disposition": "selected",
+          "lane": "fts5",
+          "source_group": "g-primary",
+          "source_ref": "ref-primary"
+        },
+        {
+          "candidate_id": "dist-a",
+          "disposition": "blocked_control_source_group",
+          "lane": "fts5",
+          "source_group": "g-dist-a",
+          "source_ref": "ref-dist-a"
+        },
+        {
+          "candidate_id": "ev-support",
+          "disposition": "selected",
+          "lane": "dense",
+          "source_group": "g-support",
+          "source_ref": "ref-support"
+        },
+        {
+          "candidate_id": "dist-b",
+          "disposition": "selected",
+          "lane": "dense",
+          "source_group": "g-dist-b",
+          "source_ref": "ref-dist-b"
+        },
+        {
+          "candidate_id": "dist-c",
+          "disposition": "dropped_top_k",
+          "lane": "temporal",
+          "source_group": "g-dist-c",
+          "source_ref": "ref-dist-c"
+        }
+      ],
+      "case_id": "selected-unreceipted",
+      "context": {
+        "assembly_errors": 0,
+        "delivered_tokens": 36,
+        "scan_budget": 12,
+        "selected_count": 3,
+        "token_budget": 48
+      },
+      "evidence_accounting": {
+        "blocked_gold_evidence_count": 0,
+        "blocked_receipt_evidence_count": 0,
+        "selected_unreceipted_evidence_count": 1,
+        "unavailable_evidence_count": 0
+      },
+      "query_sha256": "a64cfe443f073d7fbb9ac18d8fe882d0fc30395e280614580908d8f62b67bb29",
+      "receipt_output_alignment": true,
+      "retrieval": {
+        "all_required_evidence": true,
+        "required_count": 2,
+        "selected_required_count": 2
+      },
+      "selected_candidate_ids": [
+        "ev-primary",
+        "ev-support",
+        "dist-b"
+      ],
+      "selected_source_groups": [
+        "g-primary",
+        "g-support",
+        "g-dist-b"
+      ],
+      "selected_token_counts": [
+        12,
+        12,
+        12
+      ],
+      "workspace_hash": "workspace-a"
+    },
+    {
+      "agent_id": "agent-a",
+      "answer_outcome": "insufficient_evidence",
+      "arm_id": "random-control",
+      "as_of_unix_ms": 1787616000000,
+      "blocked_source_groups": [
+        "g-support"
+      ],
+      "candidate_decisions": [
+        {
+          "candidate_id": "ev-primary",
+          "disposition": "selected",
+          "lane": "fts5",
+          "source_group": "g-primary",
+          "source_ref": "ref-primary"
+        },
+        {
+          "candidate_id": "dist-a",
+          "disposition": "selected",
+          "lane": "fts5",
+          "source_group": "g-dist-a",
+          "source_ref": "ref-dist-a"
+        },
+        {
+          "candidate_id": "ev-support",
+          "disposition": "blocked_control_source_group",
+          "lane": "dense",
+          "source_group": "g-support",
+          "source_ref": "ref-support"
+        },
+        {
+          "candidate_id": "dist-b",
+          "disposition": "selected",
+          "lane": "dense",
+          "source_group": "g-dist-b",
+          "source_ref": "ref-dist-b"
+        },
+        {
+          "candidate_id": "dist-c",
+          "disposition": "dropped_top_k",
+          "lane": "temporal",
+          "source_group": "g-dist-c",
+          "source_ref": "ref-dist-c"
+        }
+      ],
+      "case_id": "selected-unreceipted",
+      "context": {
+        "assembly_errors": 0,
+        "delivered_tokens": 36,
+        "scan_budget": 12,
+        "selected_count": 3,
+        "token_budget": 48
+      },
+      "evidence_accounting": {
+        "blocked_gold_evidence_count": 1,
+        "blocked_receipt_evidence_count": 0,
+        "selected_unreceipted_evidence_count": 0,
+        "unavailable_evidence_count": 0
+      },
+      "query_sha256": "a64cfe443f073d7fbb9ac18d8fe882d0fc30395e280614580908d8f62b67bb29",
+      "receipt_output_alignment": true,
+      "retrieval": {
+        "all_required_evidence": false,
+        "required_count": 2,
+        "selected_required_count": 1
+      },
+      "selected_candidate_ids": [
+        "ev-primary",
+        "dist-a",
+        "dist-b"
+      ],
+      "selected_source_groups": [
+        "g-primary",
+        "g-dist-a",
+        "g-dist-b"
+      ],
+      "selected_token_counts": [
+        12,
+        12,
+        12
+      ],
+      "workspace_hash": "workspace-a"
+    },
+    {
+      "agent_id": "agent-a",
+      "answer_outcome": "insufficient_evidence",
+      "arm_id": "receipt-blocked",
+      "as_of_unix_ms": 1787616000000,
+      "blocked_source_groups": [
+        "g-primary"
+      ],
+      "candidate_decisions": [
+        {
+          "candidate_id": "ev-primary",
+          "disposition": "blocked_receipt_source_group",
+          "lane": "fts5",
+          "source_group": "g-primary",
+          "source_ref": "ref-primary"
+        },
+        {
+          "candidate_id": "dist-a",
+          "disposition": "selected",
+          "lane": "fts5",
+          "source_group": "g-dist-a",
+          "source_ref": "ref-dist-a"
+        },
+        {
+          "candidate_id": "ev-support",
+          "disposition": "selected",
+          "lane": "dense",
+          "source_group": "g-support",
+          "source_ref": "ref-support"
+        },
+        {
+          "candidate_id": "dist-b",
+          "disposition": "selected",
+          "lane": "dense",
+          "source_group": "g-dist-b",
+          "source_ref": "ref-dist-b"
+        },
+        {
+          "candidate_id": "dist-c",
+          "disposition": "dropped_top_k",
+          "lane": "temporal",
+          "source_group": "g-dist-c",
+          "source_ref": "ref-dist-c"
+        }
+      ],
+      "case_id": "selected-unreceipted",
+      "context": {
+        "assembly_errors": 0,
+        "delivered_tokens": 36,
+        "scan_budget": 12,
+        "selected_count": 3,
+        "token_budget": 48
+      },
+      "evidence_accounting": {
+        "blocked_gold_evidence_count": 1,
+        "blocked_receipt_evidence_count": 1,
+        "selected_unreceipted_evidence_count": 1,
+        "unavailable_evidence_count": 0
+      },
+      "query_sha256": "a64cfe443f073d7fbb9ac18d8fe882d0fc30395e280614580908d8f62b67bb29",
+      "receipt_output_alignment": true,
+      "retrieval": {
+        "all_required_evidence": false,
+        "required_count": 2,
+        "selected_required_count": 1
+      },
+      "selected_candidate_ids": [
+        "dist-a",
+        "ev-support",
+        "dist-b"
+      ],
+      "selected_source_groups": [
+        "g-dist-a",
+        "g-support",
+        "g-dist-b"
+      ],
+      "selected_token_counts": [
+        12,
+        12,
+        12
+      ],
+      "workspace_hash": "workspace-a"
+    },
+    {
+      "agent_id": "agent-a",
+      "answer_outcome": "supported",
+      "arm_id": "baseline",
+      "as_of_unix_ms": 1787616000000,
+      "blocked_source_groups": [],
+      "candidate_decisions": [
+        {
+          "candidate_id": "ev-exp-base",
+          "disposition": "selected",
+          "lane": "fts5",
+          "source_group": "g-exp",
+          "source_ref": "ref-exp-base"
+        },
+        {
+          "candidate_id": "dist-a",
+          "disposition": "selected",
+          "lane": "fts5",
+          "source_group": "g-dist-a",
+          "source_ref": "ref-dist-a"
+        },
+        {
+          "candidate_id": "dist-b",
+          "disposition": "selected",
+          "lane": "dense",
+          "source_group": "g-dist-b",
+          "source_ref": "ref-dist-b"
+        },
+        {
+          "candidate_id": "dist-c",
+          "disposition": "dropped_top_k",
+          "lane": "temporal",
+          "source_group": "g-dist-c",
+          "source_ref": "ref-dist-c"
+        },
+        {
+          "candidate_id": "ev-exp-child",
+          "disposition": "duplicate_source_group",
+          "lane": "source_expansion",
+          "source_group": "g-exp",
+          "source_ref": "ref-exp-child"
+        },
+        {
+          "candidate_id": "ev-exp-dense",
+          "disposition": "duplicate_source_group",
+          "lane": "dense",
+          "source_group": "g-exp",
+          "source_ref": "ref-exp-dense"
+        }
+      ],
+      "case_id": "source-expansion",
+      "context": {
+        "assembly_errors": 0,
+        "delivered_tokens": 36,
+        "scan_budget": 12,
+        "selected_count": 3,
+        "token_budget": 48
+      },
+      "evidence_accounting": {
+        "blocked_gold_evidence_count": 0,
+        "blocked_receipt_evidence_count": 0,
+        "selected_unreceipted_evidence_count": 0,
+        "unavailable_evidence_count": 0
+      },
+      "query_sha256": "dec4fe64a2c9678773c6b2ae5be2b5d3bf84ed1f6e5d7888e97446d80a3ff3d8",
+      "receipt_output_alignment": true,
+      "retrieval": {
+        "all_required_evidence": true,
+        "required_count": 1,
+        "selected_required_count": 1
+      },
+      "selected_candidate_ids": [
+        "ev-exp-base",
+        "dist-a",
+        "dist-b"
+      ],
+      "selected_source_groups": [
+        "g-exp",
+        "g-dist-a",
+        "g-dist-b"
+      ],
+      "selected_token_counts": [
+        12,
+        12,
+        12
+      ],
+      "workspace_hash": "workspace-a"
+    },
+    {
+      "agent_id": "agent-a",
+      "answer_outcome": "supported",
+      "arm_id": "matched-size-control",
+      "as_of_unix_ms": 1787616000000,
+      "blocked_source_groups": [
+        "g-dist-a"
+      ],
+      "candidate_decisions": [
+        {
+          "candidate_id": "ev-exp-base",
+          "disposition": "selected",
+          "lane": "fts5",
+          "source_group": "g-exp",
+          "source_ref": "ref-exp-base"
+        },
+        {
+          "candidate_id": "dist-a",
+          "disposition": "blocked_control_source_group",
+          "lane": "fts5",
+          "source_group": "g-dist-a",
+          "source_ref": "ref-dist-a"
+        },
+        {
+          "candidate_id": "dist-b",
+          "disposition": "selected",
+          "lane": "dense",
+          "source_group": "g-dist-b",
+          "source_ref": "ref-dist-b"
+        },
+        {
+          "candidate_id": "dist-c",
+          "disposition": "selected",
+          "lane": "temporal",
+          "source_group": "g-dist-c",
+          "source_ref": "ref-dist-c"
+        },
+        {
+          "candidate_id": "ev-exp-child",
+          "disposition": "duplicate_source_group",
+          "lane": "source_expansion",
+          "source_group": "g-exp",
+          "source_ref": "ref-exp-child"
+        },
+        {
+          "candidate_id": "ev-exp-dense",
+          "disposition": "duplicate_source_group",
+          "lane": "dense",
+          "source_group": "g-exp",
+          "source_ref": "ref-exp-dense"
+        }
+      ],
+      "case_id": "source-expansion",
+      "context": {
+        "assembly_errors": 0,
+        "delivered_tokens": 36,
+        "scan_budget": 12,
+        "selected_count": 3,
+        "token_budget": 48
+      },
+      "evidence_accounting": {
+        "blocked_gold_evidence_count": 0,
+        "blocked_receipt_evidence_count": 0,
+        "selected_unreceipted_evidence_count": 0,
+        "unavailable_evidence_count": 0
+      },
+      "query_sha256": "dec4fe64a2c9678773c6b2ae5be2b5d3bf84ed1f6e5d7888e97446d80a3ff3d8",
+      "receipt_output_alignment": true,
+      "retrieval": {
+        "all_required_evidence": true,
+        "required_count": 1,
+        "selected_required_count": 1
+      },
+      "selected_candidate_ids": [
+        "ev-exp-base",
+        "dist-b",
+        "dist-c"
+      ],
+      "selected_source_groups": [
+        "g-exp",
+        "g-dist-b",
+        "g-dist-c"
+      ],
+      "selected_token_counts": [
+        12,
+        12,
+        12
+      ],
+      "workspace_hash": "workspace-a"
+    },
+    {
+      "agent_id": "agent-a",
+      "answer_outcome": "supported",
+      "arm_id": "random-control",
+      "as_of_unix_ms": 1787616000000,
+      "blocked_source_groups": [
+        "g-dist-c"
+      ],
+      "candidate_decisions": [
+        {
+          "candidate_id": "ev-exp-base",
+          "disposition": "selected",
+          "lane": "fts5",
+          "source_group": "g-exp",
+          "source_ref": "ref-exp-base"
+        },
+        {
+          "candidate_id": "dist-a",
+          "disposition": "selected",
+          "lane": "fts5",
+          "source_group": "g-dist-a",
+          "source_ref": "ref-dist-a"
+        },
+        {
+          "candidate_id": "dist-b",
+          "disposition": "selected",
+          "lane": "dense",
+          "source_group": "g-dist-b",
+          "source_ref": "ref-dist-b"
+        },
+        {
+          "candidate_id": "dist-c",
+          "disposition": "blocked_control_source_group",
+          "lane": "temporal",
+          "source_group": "g-dist-c",
+          "source_ref": "ref-dist-c"
+        },
+        {
+          "candidate_id": "ev-exp-child",
+          "disposition": "duplicate_source_group",
+          "lane": "source_expansion",
+          "source_group": "g-exp",
+          "source_ref": "ref-exp-child"
+        },
+        {
+          "candidate_id": "ev-exp-dense",
+          "disposition": "duplicate_source_group",
+          "lane": "dense",
+          "source_group": "g-exp",
+          "source_ref": "ref-exp-dense"
+        }
+      ],
+      "case_id": "source-expansion",
+      "context": {
+        "assembly_errors": 0,
+        "delivered_tokens": 36,
+        "scan_budget": 12,
+        "selected_count": 3,
+        "token_budget": 48
+      },
+      "evidence_accounting": {
+        "blocked_gold_evidence_count": 0,
+        "blocked_receipt_evidence_count": 0,
+        "selected_unreceipted_evidence_count": 0,
+        "unavailable_evidence_count": 0
+      },
+      "query_sha256": "dec4fe64a2c9678773c6b2ae5be2b5d3bf84ed1f6e5d7888e97446d80a3ff3d8",
+      "receipt_output_alignment": true,
+      "retrieval": {
+        "all_required_evidence": true,
+        "required_count": 1,
+        "selected_required_count": 1
+      },
+      "selected_candidate_ids": [
+        "ev-exp-base",
+        "dist-a",
+        "dist-b"
+      ],
+      "selected_source_groups": [
+        "g-exp",
+        "g-dist-a",
+        "g-dist-b"
+      ],
+      "selected_token_counts": [
+        12,
+        12,
+        12
+      ],
+      "workspace_hash": "workspace-a"
+    },
+    {
+      "agent_id": "agent-a",
+      "answer_outcome": "abstained",
+      "arm_id": "receipt-blocked",
+      "as_of_unix_ms": 1787616000000,
+      "blocked_source_groups": [
+        "g-exp"
+      ],
+      "candidate_decisions": [
+        {
+          "candidate_id": "ev-exp-base",
+          "disposition": "blocked_receipt_source_group",
+          "lane": "fts5",
+          "source_group": "g-exp",
+          "source_ref": "ref-exp-base"
+        },
+        {
+          "candidate_id": "dist-a",
+          "disposition": "selected",
+          "lane": "fts5",
+          "source_group": "g-dist-a",
+          "source_ref": "ref-dist-a"
+        },
+        {
+          "candidate_id": "dist-b",
+          "disposition": "selected",
+          "lane": "dense",
+          "source_group": "g-dist-b",
+          "source_ref": "ref-dist-b"
+        },
+        {
+          "candidate_id": "dist-c",
+          "disposition": "selected",
+          "lane": "temporal",
+          "source_group": "g-dist-c",
+          "source_ref": "ref-dist-c"
+        },
+        {
+          "candidate_id": "ev-exp-child",
+          "disposition": "blocked_receipt_source_group",
+          "lane": "source_expansion",
+          "source_group": "g-exp",
+          "source_ref": "ref-exp-child"
+        },
+        {
+          "candidate_id": "ev-exp-dense",
+          "disposition": "blocked_receipt_source_group",
+          "lane": "dense",
+          "source_group": "g-exp",
+          "source_ref": "ref-exp-dense"
+        }
+      ],
+      "case_id": "source-expansion",
+      "context": {
+        "assembly_errors": 0,
+        "delivered_tokens": 36,
+        "scan_budget": 12,
+        "selected_count": 3,
+        "token_budget": 48
+      },
+      "evidence_accounting": {
+        "blocked_gold_evidence_count": 1,
+        "blocked_receipt_evidence_count": 1,
+        "selected_unreceipted_evidence_count": 0,
+        "unavailable_evidence_count": 0
+      },
+      "query_sha256": "dec4fe64a2c9678773c6b2ae5be2b5d3bf84ed1f6e5d7888e97446d80a3ff3d8",
+      "receipt_output_alignment": true,
+      "retrieval": {
+        "all_required_evidence": false,
+        "required_count": 1,
+        "selected_required_count": 0
+      },
+      "selected_candidate_ids": [
+        "dist-a",
+        "dist-b",
+        "dist-c"
+      ],
+      "selected_source_groups": [
+        "g-dist-a",
+        "g-dist-b",
+        "g-dist-c"
+      ],
+      "selected_token_counts": [
+        12,
+        12,
+        12
+      ],
+      "workspace_hash": "workspace-a"
+    },
+    {
+      "agent_id": "agent-a",
+      "answer_outcome": "supported",
+      "arm_id": "baseline",
+      "as_of_unix_ms": 1787616000000,
+      "blocked_source_groups": [],
+      "candidate_decisions": [
+        {
+          "candidate_id": "ev-syn-lex",
+          "disposition": "selected",
+          "lane": "fts5",
+          "source_group": "g-syn",
+          "source_ref": "ref-syn-primary"
+        },
+        {
+          "candidate_id": "dist-a",
+          "disposition": "selected",
+          "lane": "fts5",
+          "source_group": "g-dist-a",
+          "source_ref": "ref-dist-a"
+        },
+        {
+          "candidate_id": "dist-other-scope",
+          "disposition": "filtered_workspace",
+          "lane": "dense",
+          "source_group": "g-private",
+          "source_ref": "ref-private"
+        },
+        {
+          "candidate_id": "dist-b",
+          "disposition": "selected",
+          "lane": "dense",
+          "source_group": "g-dist-b",
+          "source_ref": "ref-dist-b"
+        },
+        {
+          "candidate_id": "dist-c",
+          "disposition": "dropped_top_k",
+          "lane": "temporal",
+          "source_group": "g-dist-c",
+          "source_ref": "ref-dist-c"
+        },
+        {
+          "candidate_id": "ev-syn-sem",
+          "disposition": "duplicate_source_group",
+          "lane": "dense",
+          "source_group": "g-syn",
+          "source_ref": "ref-syn-semantic-alias"
+        },
+        {
+          "candidate_id": "ev-syn-cache",
+          "disposition": "duplicate_source_group",
+          "lane": "cache",
+          "source_group": "g-syn",
+          "source_ref": "ref-syn-cache-alias"
+        },
+        {
+          "candidate_id": "stale-alias",
+          "disposition": "filtered_as_of",
+          "lane": "fallback",
+          "source_group": "g-stale",
+          "source_ref": "ref-stale-alias"
+        }
+      ],
+      "case_id": "synonym-alternate-lane",
+      "context": {
+        "assembly_errors": 0,
+        "delivered_tokens": 36,
+        "scan_budget": 12,
+        "selected_count": 3,
+        "token_budget": 48
+      },
+      "evidence_accounting": {
+        "blocked_gold_evidence_count": 0,
+        "blocked_receipt_evidence_count": 0,
+        "selected_unreceipted_evidence_count": 0,
+        "unavailable_evidence_count": 0
+      },
+      "query_sha256": "328bf9b392d9d890d00467637bd09088fe60e54fdf5240b60114c4d7e3ae7490",
+      "receipt_output_alignment": true,
+      "retrieval": {
+        "all_required_evidence": true,
+        "required_count": 1,
+        "selected_required_count": 1
+      },
+      "selected_candidate_ids": [
+        "ev-syn-lex",
+        "dist-a",
+        "dist-b"
+      ],
+      "selected_source_groups": [
+        "g-syn",
+        "g-dist-a",
+        "g-dist-b"
+      ],
+      "selected_token_counts": [
+        12,
+        12,
+        12
+      ],
+      "workspace_hash": "workspace-a"
+    },
+    {
+      "agent_id": "agent-a",
+      "answer_outcome": "supported",
+      "arm_id": "matched-size-control",
+      "as_of_unix_ms": 1787616000000,
+      "blocked_source_groups": [
+        "g-dist-a"
+      ],
+      "candidate_decisions": [
+        {
+          "candidate_id": "ev-syn-lex",
+          "disposition": "selected",
+          "lane": "fts5",
+          "source_group": "g-syn",
+          "source_ref": "ref-syn-primary"
+        },
+        {
+          "candidate_id": "dist-a",
+          "disposition": "blocked_control_source_group",
+          "lane": "fts5",
+          "source_group": "g-dist-a",
+          "source_ref": "ref-dist-a"
+        },
+        {
+          "candidate_id": "dist-other-scope",
+          "disposition": "filtered_workspace",
+          "lane": "dense",
+          "source_group": "g-private",
+          "source_ref": "ref-private"
+        },
+        {
+          "candidate_id": "dist-b",
+          "disposition": "selected",
+          "lane": "dense",
+          "source_group": "g-dist-b",
+          "source_ref": "ref-dist-b"
+        },
+        {
+          "candidate_id": "dist-c",
+          "disposition": "selected",
+          "lane": "temporal",
+          "source_group": "g-dist-c",
+          "source_ref": "ref-dist-c"
+        },
+        {
+          "candidate_id": "ev-syn-sem",
+          "disposition": "duplicate_source_group",
+          "lane": "dense",
+          "source_group": "g-syn",
+          "source_ref": "ref-syn-semantic-alias"
+        },
+        {
+          "candidate_id": "ev-syn-cache",
+          "disposition": "duplicate_source_group",
+          "lane": "cache",
+          "source_group": "g-syn",
+          "source_ref": "ref-syn-cache-alias"
+        },
+        {
+          "candidate_id": "stale-alias",
+          "disposition": "filtered_as_of",
+          "lane": "fallback",
+          "source_group": "g-stale",
+          "source_ref": "ref-stale-alias"
+        }
+      ],
+      "case_id": "synonym-alternate-lane",
+      "context": {
+        "assembly_errors": 0,
+        "delivered_tokens": 36,
+        "scan_budget": 12,
+        "selected_count": 3,
+        "token_budget": 48
+      },
+      "evidence_accounting": {
+        "blocked_gold_evidence_count": 0,
+        "blocked_receipt_evidence_count": 0,
+        "selected_unreceipted_evidence_count": 0,
+        "unavailable_evidence_count": 0
+      },
+      "query_sha256": "328bf9b392d9d890d00467637bd09088fe60e54fdf5240b60114c4d7e3ae7490",
+      "receipt_output_alignment": true,
+      "retrieval": {
+        "all_required_evidence": true,
+        "required_count": 1,
+        "selected_required_count": 1
+      },
+      "selected_candidate_ids": [
+        "ev-syn-lex",
+        "dist-b",
+        "dist-c"
+      ],
+      "selected_source_groups": [
+        "g-syn",
+        "g-dist-b",
+        "g-dist-c"
+      ],
+      "selected_token_counts": [
+        12,
+        12,
+        12
+      ],
+      "workspace_hash": "workspace-a"
+    },
+    {
+      "agent_id": "agent-a",
+      "answer_outcome": "supported",
+      "arm_id": "random-control",
+      "as_of_unix_ms": 1787616000000,
+      "blocked_source_groups": [
+        "g-dist-c"
+      ],
+      "candidate_decisions": [
+        {
+          "candidate_id": "ev-syn-lex",
+          "disposition": "selected",
+          "lane": "fts5",
+          "source_group": "g-syn",
+          "source_ref": "ref-syn-primary"
+        },
+        {
+          "candidate_id": "dist-a",
+          "disposition": "selected",
+          "lane": "fts5",
+          "source_group": "g-dist-a",
+          "source_ref": "ref-dist-a"
+        },
+        {
+          "candidate_id": "dist-other-scope",
+          "disposition": "filtered_workspace",
+          "lane": "dense",
+          "source_group": "g-private",
+          "source_ref": "ref-private"
+        },
+        {
+          "candidate_id": "dist-b",
+          "disposition": "selected",
+          "lane": "dense",
+          "source_group": "g-dist-b",
+          "source_ref": "ref-dist-b"
+        },
+        {
+          "candidate_id": "dist-c",
+          "disposition": "blocked_control_source_group",
+          "lane": "temporal",
+          "source_group": "g-dist-c",
+          "source_ref": "ref-dist-c"
+        },
+        {
+          "candidate_id": "ev-syn-sem",
+          "disposition": "duplicate_source_group",
+          "lane": "dense",
+          "source_group": "g-syn",
+          "source_ref": "ref-syn-semantic-alias"
+        },
+        {
+          "candidate_id": "ev-syn-cache",
+          "disposition": "duplicate_source_group",
+          "lane": "cache",
+          "source_group": "g-syn",
+          "source_ref": "ref-syn-cache-alias"
+        },
+        {
+          "candidate_id": "stale-alias",
+          "disposition": "filtered_as_of",
+          "lane": "fallback",
+          "source_group": "g-stale",
+          "source_ref": "ref-stale-alias"
+        }
+      ],
+      "case_id": "synonym-alternate-lane",
+      "context": {
+        "assembly_errors": 0,
+        "delivered_tokens": 36,
+        "scan_budget": 12,
+        "selected_count": 3,
+        "token_budget": 48
+      },
+      "evidence_accounting": {
+        "blocked_gold_evidence_count": 0,
+        "blocked_receipt_evidence_count": 0,
+        "selected_unreceipted_evidence_count": 0,
+        "unavailable_evidence_count": 0
+      },
+      "query_sha256": "328bf9b392d9d890d00467637bd09088fe60e54fdf5240b60114c4d7e3ae7490",
+      "receipt_output_alignment": true,
+      "retrieval": {
+        "all_required_evidence": true,
+        "required_count": 1,
+        "selected_required_count": 1
+      },
+      "selected_candidate_ids": [
+        "ev-syn-lex",
+        "dist-a",
+        "dist-b"
+      ],
+      "selected_source_groups": [
+        "g-syn",
+        "g-dist-a",
+        "g-dist-b"
+      ],
+      "selected_token_counts": [
+        12,
+        12,
+        12
+      ],
+      "workspace_hash": "workspace-a"
+    },
+    {
+      "agent_id": "agent-a",
+      "answer_outcome": "abstained",
+      "arm_id": "receipt-blocked",
+      "as_of_unix_ms": 1787616000000,
+      "blocked_source_groups": [
+        "g-syn"
+      ],
+      "candidate_decisions": [
+        {
+          "candidate_id": "ev-syn-lex",
+          "disposition": "blocked_receipt_source_group",
+          "lane": "fts5",
+          "source_group": "g-syn",
+          "source_ref": "ref-syn-primary"
+        },
+        {
+          "candidate_id": "dist-a",
+          "disposition": "selected",
+          "lane": "fts5",
+          "source_group": "g-dist-a",
+          "source_ref": "ref-dist-a"
+        },
+        {
+          "candidate_id": "dist-other-scope",
+          "disposition": "filtered_workspace",
+          "lane": "dense",
+          "source_group": "g-private",
+          "source_ref": "ref-private"
+        },
+        {
+          "candidate_id": "dist-b",
+          "disposition": "selected",
+          "lane": "dense",
+          "source_group": "g-dist-b",
+          "source_ref": "ref-dist-b"
+        },
+        {
+          "candidate_id": "dist-c",
+          "disposition": "selected",
+          "lane": "temporal",
+          "source_group": "g-dist-c",
+          "source_ref": "ref-dist-c"
+        },
+        {
+          "candidate_id": "ev-syn-sem",
+          "disposition": "blocked_receipt_source_group",
+          "lane": "dense",
+          "source_group": "g-syn",
+          "source_ref": "ref-syn-semantic-alias"
+        },
+        {
+          "candidate_id": "ev-syn-cache",
+          "disposition": "blocked_receipt_source_group",
+          "lane": "cache",
+          "source_group": "g-syn",
+          "source_ref": "ref-syn-cache-alias"
+        },
+        {
+          "candidate_id": "stale-alias",
+          "disposition": "filtered_as_of",
+          "lane": "fallback",
+          "source_group": "g-stale",
+          "source_ref": "ref-stale-alias"
+        }
+      ],
+      "case_id": "synonym-alternate-lane",
+      "context": {
+        "assembly_errors": 0,
+        "delivered_tokens": 36,
+        "scan_budget": 12,
+        "selected_count": 3,
+        "token_budget": 48
+      },
+      "evidence_accounting": {
+        "blocked_gold_evidence_count": 1,
+        "blocked_receipt_evidence_count": 1,
+        "selected_unreceipted_evidence_count": 0,
+        "unavailable_evidence_count": 0
+      },
+      "query_sha256": "328bf9b392d9d890d00467637bd09088fe60e54fdf5240b60114c4d7e3ae7490",
+      "receipt_output_alignment": true,
+      "retrieval": {
+        "all_required_evidence": false,
+        "required_count": 1,
+        "selected_required_count": 0
+      },
+      "selected_candidate_ids": [
+        "dist-a",
+        "dist-b",
+        "dist-c"
+      ],
+      "selected_source_groups": [
+        "g-dist-a",
+        "g-dist-b",
+        "g-dist-c"
+      ],
+      "selected_token_counts": [
+        12,
+        12,
+        12
+      ],
+      "workspace_hash": "workspace-a"
+    },
+    {
+      "agent_id": "agent-a",
+      "answer_outcome": "insufficient_evidence",
+      "arm_id": "baseline",
+      "as_of_unix_ms": 1787616000000,
+      "blocked_source_groups": [],
+      "candidate_decisions": [
+        {
+          "candidate_id": "ev-partial",
+          "disposition": "selected",
+          "lane": "fts5",
+          "source_group": "g-partial",
+          "source_ref": "ref-partial"
+        },
+        {
+          "candidate_id": "dist-a",
+          "disposition": "selected",
+          "lane": "fts5",
+          "source_group": "g-dist-a",
+          "source_ref": "ref-dist-a"
+        },
+        {
+          "candidate_id": "dist-b",
+          "disposition": "selected",
+          "lane": "dense",
+          "source_group": "g-dist-b",
+          "source_ref": "ref-dist-b"
+        },
+        {
+          "candidate_id": "dist-tombstone",
+          "disposition": "filtered_tombstoned",
+          "lane": "fallback",
+          "source_group": "g-tombstone",
+          "source_ref": "ref-tombstone"
+        },
+        {
+          "candidate_id": "dist-c",
+          "disposition": "dropped_top_k",
+          "lane": "temporal",
+          "source_group": "g-dist-c",
+          "source_ref": "ref-dist-c"
+        }
+      ],
+      "case_id": "unavailable-evidence",
+      "context": {
+        "assembly_errors": 0,
+        "delivered_tokens": 36,
+        "scan_budget": 12,
+        "selected_count": 3,
+        "token_budget": 48
+      },
+      "evidence_accounting": {
+        "blocked_gold_evidence_count": 0,
+        "blocked_receipt_evidence_count": 0,
+        "selected_unreceipted_evidence_count": 0,
+        "unavailable_evidence_count": 1
+      },
+      "query_sha256": "1f6ea06867f1d444094c5acaf90c86a6ef7a7a4dcbfc29c7e54d1c7dd249a50b",
+      "receipt_output_alignment": true,
+      "retrieval": {
+        "all_required_evidence": false,
+        "required_count": 2,
+        "selected_required_count": 1
+      },
+      "selected_candidate_ids": [
+        "ev-partial",
+        "dist-a",
+        "dist-b"
+      ],
+      "selected_source_groups": [
+        "g-partial",
+        "g-dist-a",
+        "g-dist-b"
+      ],
+      "selected_token_counts": [
+        12,
+        12,
+        12
+      ],
+      "workspace_hash": "workspace-a"
+    },
+    {
+      "agent_id": "agent-a",
+      "answer_outcome": "insufficient_evidence",
+      "arm_id": "matched-size-control",
+      "as_of_unix_ms": 1787616000000,
+      "blocked_source_groups": [
+        "g-dist-a"
+      ],
+      "candidate_decisions": [
+        {
+          "candidate_id": "ev-partial",
+          "disposition": "selected",
+          "lane": "fts5",
+          "source_group": "g-partial",
+          "source_ref": "ref-partial"
+        },
+        {
+          "candidate_id": "dist-a",
+          "disposition": "blocked_control_source_group",
+          "lane": "fts5",
+          "source_group": "g-dist-a",
+          "source_ref": "ref-dist-a"
+        },
+        {
+          "candidate_id": "dist-b",
+          "disposition": "selected",
+          "lane": "dense",
+          "source_group": "g-dist-b",
+          "source_ref": "ref-dist-b"
+        },
+        {
+          "candidate_id": "dist-tombstone",
+          "disposition": "filtered_tombstoned",
+          "lane": "fallback",
+          "source_group": "g-tombstone",
+          "source_ref": "ref-tombstone"
+        },
+        {
+          "candidate_id": "dist-c",
+          "disposition": "selected",
+          "lane": "temporal",
+          "source_group": "g-dist-c",
+          "source_ref": "ref-dist-c"
+        }
+      ],
+      "case_id": "unavailable-evidence",
+      "context": {
+        "assembly_errors": 0,
+        "delivered_tokens": 36,
+        "scan_budget": 12,
+        "selected_count": 3,
+        "token_budget": 48
+      },
+      "evidence_accounting": {
+        "blocked_gold_evidence_count": 0,
+        "blocked_receipt_evidence_count": 0,
+        "selected_unreceipted_evidence_count": 0,
+        "unavailable_evidence_count": 1
+      },
+      "query_sha256": "1f6ea06867f1d444094c5acaf90c86a6ef7a7a4dcbfc29c7e54d1c7dd249a50b",
+      "receipt_output_alignment": true,
+      "retrieval": {
+        "all_required_evidence": false,
+        "required_count": 2,
+        "selected_required_count": 1
+      },
+      "selected_candidate_ids": [
+        "ev-partial",
+        "dist-b",
+        "dist-c"
+      ],
+      "selected_source_groups": [
+        "g-partial",
+        "g-dist-b",
+        "g-dist-c"
+      ],
+      "selected_token_counts": [
+        12,
+        12,
+        12
+      ],
+      "workspace_hash": "workspace-a"
+    },
+    {
+      "agent_id": "agent-a",
+      "answer_outcome": "insufficient_evidence",
+      "arm_id": "random-control",
+      "as_of_unix_ms": 1787616000000,
+      "blocked_source_groups": [
+        "g-dist-c"
+      ],
+      "candidate_decisions": [
+        {
+          "candidate_id": "ev-partial",
+          "disposition": "selected",
+          "lane": "fts5",
+          "source_group": "g-partial",
+          "source_ref": "ref-partial"
+        },
+        {
+          "candidate_id": "dist-a",
+          "disposition": "selected",
+          "lane": "fts5",
+          "source_group": "g-dist-a",
+          "source_ref": "ref-dist-a"
+        },
+        {
+          "candidate_id": "dist-b",
+          "disposition": "selected",
+          "lane": "dense",
+          "source_group": "g-dist-b",
+          "source_ref": "ref-dist-b"
+        },
+        {
+          "candidate_id": "dist-tombstone",
+          "disposition": "filtered_tombstoned",
+          "lane": "fallback",
+          "source_group": "g-tombstone",
+          "source_ref": "ref-tombstone"
+        },
+        {
+          "candidate_id": "dist-c",
+          "disposition": "blocked_control_source_group",
+          "lane": "temporal",
+          "source_group": "g-dist-c",
+          "source_ref": "ref-dist-c"
+        }
+      ],
+      "case_id": "unavailable-evidence",
+      "context": {
+        "assembly_errors": 0,
+        "delivered_tokens": 36,
+        "scan_budget": 12,
+        "selected_count": 3,
+        "token_budget": 48
+      },
+      "evidence_accounting": {
+        "blocked_gold_evidence_count": 0,
+        "blocked_receipt_evidence_count": 0,
+        "selected_unreceipted_evidence_count": 0,
+        "unavailable_evidence_count": 1
+      },
+      "query_sha256": "1f6ea06867f1d444094c5acaf90c86a6ef7a7a4dcbfc29c7e54d1c7dd249a50b",
+      "receipt_output_alignment": true,
+      "retrieval": {
+        "all_required_evidence": false,
+        "required_count": 2,
+        "selected_required_count": 1
+      },
+      "selected_candidate_ids": [
+        "ev-partial",
+        "dist-a",
+        "dist-b"
+      ],
+      "selected_source_groups": [
+        "g-partial",
+        "g-dist-a",
+        "g-dist-b"
+      ],
+      "selected_token_counts": [
+        12,
+        12,
+        12
+      ],
+      "workspace_hash": "workspace-a"
+    },
+    {
+      "agent_id": "agent-a",
+      "answer_outcome": "abstained",
+      "arm_id": "receipt-blocked",
+      "as_of_unix_ms": 1787616000000,
+      "blocked_source_groups": [
+        "g-partial"
+      ],
+      "candidate_decisions": [
+        {
+          "candidate_id": "ev-partial",
+          "disposition": "blocked_receipt_source_group",
+          "lane": "fts5",
+          "source_group": "g-partial",
+          "source_ref": "ref-partial"
+        },
+        {
+          "candidate_id": "dist-a",
+          "disposition": "selected",
+          "lane": "fts5",
+          "source_group": "g-dist-a",
+          "source_ref": "ref-dist-a"
+        },
+        {
+          "candidate_id": "dist-b",
+          "disposition": "selected",
+          "lane": "dense",
+          "source_group": "g-dist-b",
+          "source_ref": "ref-dist-b"
+        },
+        {
+          "candidate_id": "dist-tombstone",
+          "disposition": "filtered_tombstoned",
+          "lane": "fallback",
+          "source_group": "g-tombstone",
+          "source_ref": "ref-tombstone"
+        },
+        {
+          "candidate_id": "dist-c",
+          "disposition": "selected",
+          "lane": "temporal",
+          "source_group": "g-dist-c",
+          "source_ref": "ref-dist-c"
+        }
+      ],
+      "case_id": "unavailable-evidence",
+      "context": {
+        "assembly_errors": 0,
+        "delivered_tokens": 36,
+        "scan_budget": 12,
+        "selected_count": 3,
+        "token_budget": 48
+      },
+      "evidence_accounting": {
+        "blocked_gold_evidence_count": 1,
+        "blocked_receipt_evidence_count": 1,
+        "selected_unreceipted_evidence_count": 0,
+        "unavailable_evidence_count": 1
+      },
+      "query_sha256": "1f6ea06867f1d444094c5acaf90c86a6ef7a7a4dcbfc29c7e54d1c7dd249a50b",
+      "receipt_output_alignment": true,
+      "retrieval": {
+        "all_required_evidence": false,
+        "required_count": 2,
+        "selected_required_count": 0
+      },
+      "selected_candidate_ids": [
+        "dist-a",
+        "dist-b",
+        "dist-c"
+      ],
+      "selected_source_groups": [
+        "g-dist-a",
+        "g-dist-b",
+        "g-dist-c"
+      ],
+      "selected_token_counts": [
+        12,
+        12,
+        12
+      ],
+      "workspace_hash": "workspace-a"
+    }
+  ],
+  "schema_version": "perseus-vault-receipt-intervention-report/v1",
+  "status": "complete"
+}

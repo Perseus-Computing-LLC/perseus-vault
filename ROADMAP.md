@@ -146,18 +146,17 @@ exact count as an automated registry-integrity invariant:
 
 A count mismatch blocks metadata publication; it does not change the capability roadmap.
 
-### Recommended starting point
+### Provider-free implementation wave
 
-Use one implementation track and one measurement track:
+The dependency-ordered implementation wave is complete:
 
-1. **Selection observability first:** [#1140 — bounded context-selection decisions](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1140).
-   Explain candidate dispositions, reason codes, budgets, and replay fingerprints over the stable
-   evidence representation.
-2. **Graph validation second:** [#1143 — matched graph-context ablation](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1143).
-   Compare graph-on/off under matched retrieval and context conditions; do not interpret an
-   ablation before the selection/evidence receipt is inspectable.
-3. **Separate intervention track:** [#1136 — receipt-conditioned bucket intervention](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1136)
-   follows the existing evidence-ledger/replay contracts and should not be mixed into #1140.
+1. [#1140 — bounded context-selection decisions](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1140)
+   shipped candidate dispositions, budgets, reason codes, and replay fingerprints.
+2. [#1143 — matched graph-context ablation](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1143)
+   shipped a matched provider-free graph-on/off diagnostic.
+3. [#1136 — receipt-conditioned bucket intervention](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1136)
+   now seals the baseline receipt before intervention and compares receipt, random, and
+   same-cardinality/same-token controls without a blocked source-group reentry path.
 
 Keep [#1105](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1105) parked until the
 Amy/C3BM discussion, and keep [#1021](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1021)
@@ -220,14 +219,17 @@ content.
 **Exit condition met:** the diagnostic is provider-free, replayable, and labeled against
 model-internal-causality and third-party-benchmark claims.
 
-#### Chunk 4 — controlled intervention
+#### Chunk 4 — controlled intervention (complete; this branch)
 
-- **[#1136](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1136):** seal the
-  evidence/replay receipt before intervention, block re-entry through alternate lanes or fallbacks,
-  and compare receipt, random, and matched-size controls.
+- **[#1136](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1136):** the baseline
+  selection and canonical evidence receipt are sealed before intervention selection. Receipt,
+  deterministic-random, and same-cardinality/same-token controls share retrieval, scan, context,
+  reader, judge, scope, as-of, and seed contracts. Blocking applies to source groups before
+  selection, preventing synonym, expansion, alternate-lane, cache, and fallback reentry.
 
-**Exit condition:** intervention outputs are tied to exact receipts and remain separate from the
-frozen default and from efficacy claims.
+**Exit condition met:** intervention outputs bind exact baseline receipts and intervention sets,
+remain separate from the frozen default, and are labeled as trace faithfulness/evidence necessity
+rather than model-internal causality or efficacy.
 
 #### Chunk 5 — parked or separately authorized measurements
 

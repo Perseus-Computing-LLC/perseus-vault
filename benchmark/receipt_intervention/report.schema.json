@@ -1,0 +1,185 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://perseus.observer/schemas/receipt-intervention-v1.json",
+  "title": "Perseus Vault receipt-conditioned intervention report v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "status",
+    "benchmark",
+    "fixture_id",
+    "arms",
+    "cases",
+    "rows",
+    "commitments",
+    "evaluator_boundary",
+    "execution",
+    "claims",
+    "report_sha256"
+  ],
+  "properties": {
+    "schema_version": {"const": "perseus-vault-receipt-intervention-report/v1"},
+    "status": {"const": "complete"},
+    "benchmark": {"const": "receipt-conditioned-trace-faithfulness"},
+    "fixture_id": {"type": "string", "minLength": 1, "maxLength": 128},
+    "arms": {
+      "type": "array",
+      "minItems": 4,
+      "maxItems": 4,
+      "items": {"$ref": "#/$defs/arm"}
+    },
+    "cases": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/case"}
+    },
+    "rows": {
+      "type": "array",
+      "minItems": 4,
+      "items": {"$ref": "#/$defs/row"}
+    },
+    "commitments": {"$ref": "#/$defs/commitments"},
+    "evaluator_boundary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["gold_available_only_after_receipt_seal", "gold_used_for_production_selection", "gold_used_for_intervention_selection"],
+      "properties": {
+        "gold_available_only_after_receipt_seal": {"const": true},
+        "gold_used_for_production_selection": {"const": false},
+        "gold_used_for_intervention_selection": {"const": false}
+      }
+    },
+    "execution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "provider_calls", "answerer_calls", "judge_calls", "network_calls", "paid", "raw_external_payloads_captured"],
+      "properties": {
+        "mode": {"const": "provider-free-deterministic"},
+        "provider_calls": {"const": 0},
+        "answerer_calls": {"const": 0},
+        "judge_calls": {"const": 0},
+        "network_calls": {"const": 0},
+        "paid": {"const": false},
+        "raw_external_payloads_captured": {"const": false}
+      }
+    },
+    "claims": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["label", "model_internal_causality", "third_party_benchmark_comparison", "existing_attribution_contract_controls_publication", "existing_counterfactual_gate_controls_publication"],
+      "properties": {
+        "label": {"const": "trace-faithfulness-evidence-necessity"},
+        "model_internal_causality": {"const": false},
+        "third_party_benchmark_comparison": {"const": false},
+        "existing_attribution_contract_controls_publication": {"const": true},
+        "existing_counterfactual_gate_controls_publication": {"const": true}
+      }
+    },
+    "report_sha256": {"$ref": "#/$defs/sha256"}
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "arm": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["arm_id", "config", "metrics"],
+      "properties": {
+        "arm_id": {"enum": ["baseline", "matched-size-control", "random-control", "receipt-blocked"]},
+        "config": {"type": "object"},
+        "metrics": {"type": "object"}
+      }
+    },
+    "receipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "case_id", "workspace_hash", "agent_id", "as_of_unix_ms", "baseline_selection_sha256", "receipt_candidate_ids", "receipt_source_groups", "receipt_source_refs", "config_sha256", "sealed_before_intervention", "receipt_sha256"],
+      "properties": {
+        "schema_version": {"const": "perseus-vault-evidence-intervention-receipt/v1"},
+        "case_id": {"type": "string"},
+        "workspace_hash": {"type": "string"},
+        "agent_id": {"type": "string"},
+        "as_of_unix_ms": {"type": "integer", "minimum": 1},
+        "baseline_selection_sha256": {"$ref": "#/$defs/sha256"},
+        "receipt_candidate_ids": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string"}},
+        "receipt_source_groups": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string"}},
+        "receipt_source_refs": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string"}},
+        "config_sha256": {"$ref": "#/$defs/sha256"},
+        "sealed_before_intervention": {"const": true},
+        "receipt_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "intervention": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["arm_id", "blocked_source_groups", "blocked_cardinality", "blocked_tokens", "scan_budget", "context_token_budget", "receipt_sha256", "intervention_sha256"],
+      "properties": {
+        "arm_id": {"enum": ["matched-size-control", "random-control", "receipt-blocked"]},
+        "blocked_source_groups": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string"}},
+        "blocked_cardinality": {"type": "integer", "minimum": 1},
+        "blocked_tokens": {"type": "integer", "minimum": 1},
+        "scan_budget": {"type": "integer", "minimum": 1},
+        "context_token_budget": {"type": "integer", "minimum": 1},
+        "receipt_sha256": {"$ref": "#/$defs/sha256"},
+        "intervention_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "case": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["case_id", "query_sha256", "baseline_receipt", "interventions"],
+      "properties": {
+        "case_id": {"type": "string"},
+        "query_sha256": {"$ref": "#/$defs/sha256"},
+        "baseline_receipt": {"$ref": "#/$defs/receipt"},
+        "interventions": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["matched-size-control", "random-control", "receipt-blocked"],
+          "properties": {
+            "matched-size-control": {"$ref": "#/$defs/intervention"},
+            "random-control": {"$ref": "#/$defs/intervention"},
+            "receipt-blocked": {"$ref": "#/$defs/intervention"}
+          }
+        }
+      }
+    },
+    "row": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["case_id", "arm_id", "query_sha256", "workspace_hash", "agent_id", "as_of_unix_ms", "blocked_source_groups", "selected_candidate_ids", "selected_source_groups", "selected_token_counts", "candidate_decisions", "retrieval", "context", "evidence_accounting", "answer_outcome", "receipt_output_alignment"],
+      "properties": {
+        "case_id": {"type": "string"},
+        "arm_id": {"enum": ["baseline", "matched-size-control", "random-control", "receipt-blocked"]},
+        "query_sha256": {"$ref": "#/$defs/sha256"},
+        "workspace_hash": {"type": "string"},
+        "agent_id": {"type": "string"},
+        "as_of_unix_ms": {"type": "integer", "minimum": 1},
+        "blocked_source_groups": {"type": "array", "uniqueItems": true, "items": {"type": "string"}},
+        "selected_candidate_ids": {"type": "array", "uniqueItems": true, "items": {"type": "string"}},
+        "selected_source_groups": {"type": "array", "uniqueItems": true, "items": {"type": "string"}},
+        "selected_token_counts": {"type": "array", "items": {"type": "integer", "minimum": 1}},
+        "candidate_decisions": {"type": "array", "items": {"type": "object"}},
+        "retrieval": {"type": "object"},
+        "context": {"type": "object"},
+        "evidence_accounting": {"type": "object"},
+        "answer_outcome": {"enum": ["supported", "insufficient_evidence", "abstained"]},
+        "receipt_output_alignment": {"const": true}
+      }
+    },
+    "commitments": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["fixture_sha256", "question_set_sha256", "retrieval_config_sha256", "baseline_receipt_set_sha256", "intervention_set_sha256", "output_projection_sha256", "harness_sha256"],
+      "properties": {
+        "fixture_sha256": {"$ref": "#/$defs/sha256"},
+        "question_set_sha256": {"$ref": "#/$defs/sha256"},
+        "retrieval_config_sha256": {"$ref": "#/$defs/sha256"},
+        "baseline_receipt_set_sha256": {"$ref": "#/$defs/sha256"},
+        "intervention_set_sha256": {"$ref": "#/$defs/sha256"},
+        "output_projection_sha256": {"$ref": "#/$defs/sha256"},
+        "harness_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    }
+  }
+}

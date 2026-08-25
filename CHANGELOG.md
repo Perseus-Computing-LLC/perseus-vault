@@ -34,6 +34,13 @@ All notable changes to Perseus Vault are documented here. This project adheres t
   class as #379/#400/#971).
 
 ### Added
+- **Receipt-conditioned trace-faithfulness intervention (#1136).** Added a
+  provider-free paired benchmark that seals each baseline evidence receipt
+  before selecting receipt-blocked, deterministic-random, and
+  same-cardinality/same-token controls. Source-group blocking prevents synonym,
+  expansion, alternate-lane, cache, and fallback reentry; hash-bound reports
+  separate retrieval sufficiency, assembly, answer outcomes, and evaluator-only
+  gold accounting without model-causality or third-party efficacy claims.
 - **Matched graph-context ablation (#1143).** Added a provider-free deterministic
   ADR/meeting/Slack/postmortem/service-manifest fixture with paired graph-on/off
   cells that hold retrieval mode, top-k, context budget, reader, prompt, judge,
