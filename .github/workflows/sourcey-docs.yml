@@ -1,0 +1,70 @@
+name: Sourcey API docs
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+    paths:
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "sourcey-docs/**"
+      - ".github/workflows/sourcey-docs.yml"
+  release:
+    types:
+      - published
+  pull_request:
+    paths:
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "sourcey-docs/**"
+      - ".github/workflows/sourcey-docs.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: sourcey-docs/pnpm-lock.yaml
+      - uses: dtolnay/rust-toolchain@1.97.1
+      - name: Install dependencies
+        working-directory: sourcey-docs
+        run: pnpm install --frozen-lockfile
+      - name: Capture live MCP surface
+        env:
+          SOURCE_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          cargo build --no-default-features
+          cd sourcey-docs
+          pnpm snapshot
+      - name: Upload MCP snapshot
+        uses: actions/upload-artifact@v4
+        with:
+          name: perseus-mcp-snapshots
+          path: |
+            sourcey-docs/mcp.raw.json
+            sourcey-docs/mcp.render.json
+            sourcey-docs/metadata.json
+      - name: Build API reference
+        working-directory: sourcey-docs
+        run: |
+          pnpm build
+      - name: Upload generated site
+        uses: actions/upload-artifact@v4
+        with:
+          name: sourcey-api-reference
+          path: sourcey-docs/dist

@@ -1,0 +1,30 @@
+@media (max-width: 767px) {
+  #docs,
+  #content-area,
+  article,
+  .params-list,
+  .param-item,
+  .param-description,
+  .prose {
+    max-width: 100%;
+    min-width: 0;
+  }
+
+  h1,
+  h2,
+  h3,
+  h4,
+  h5,
+  h6,
+  .param-description,
+  .prose p,
+  .prose li {
+    overflow-wrap: anywhere;
+    word-break: break-word;
+  }
+
+  pre {
+    max-width: 100%;
+    overflow-x: auto;
+  }
+}
