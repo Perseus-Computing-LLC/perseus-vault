@@ -1,4 +1,5 @@
 dist/
+node_modules/
 mcp.raw.json
 mcp.render.json
 metadata.json
