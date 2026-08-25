@@ -1,0 +1,12 @@
+{
+  "name": "perseus-vault-sourcey-docs",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "sourcey build"
+  },
+  "dependencies": {
+    "consola": "^3.4.2",
+    "sourcey": "3.6.5"
+  }
+}
