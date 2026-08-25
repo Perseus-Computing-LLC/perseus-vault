@@ -7,11 +7,11 @@
 
 use axum::{
     extract::{Query, State},
-    http::{header, Method, Request, StatusCode},
+    http::{header, HeaderMap, Method, Request, StatusCode},
     middleware::{self, Next},
     response::{
         sse::{Event, Sse},
-        Json, Response,
+        IntoResponse, Json, Response,
     },
     routing::{get, post},
     Router,
@@ -19,7 +19,10 @@ use axum::{
 use futures::stream::Stream;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::sync::{Arc, OnceLock};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{Arc, Mutex, OnceLock},
+};
 use tokio::sync::broadcast;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
@@ -33,24 +36,120 @@ pub enum TransportMode {
     Http,
 }
 
+const MCP_SESSION_ID_HEADER: &str = "mcp-session-id";
+const MCP_PROTOCOL_VERSION_HEADER: &str = "mcp-protocol-version";
+const SUPPORTED_PROTOCOL_VERSIONS: [&str; 2] = ["2025-06-18", "2025-03-26"];
+const DEFAULT_MAX_HTTP_SESSIONS: usize = 1024;
+
+struct SessionEntry {
+    state: Arc<MCPState>,
+    last_used: u64,
+    ready: bool,
+}
+
+struct SessionRegistry {
+    entries: HashMap<String, SessionEntry>,
+    clock: u64,
+    max_sessions: usize,
+}
+
+impl SessionRegistry {
+    fn new() -> Self {
+        let max_sessions = std::env::var("PERSEUS_VAULT_HTTP_MAX_SESSIONS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(DEFAULT_MAX_HTTP_SESSIONS);
+        Self { entries: HashMap::new(), clock: 0, max_sessions }
+    }
+
+    fn get(&mut self, session_id: &str) -> Option<Arc<MCPState>> {
+        self.clock = self.clock.wrapping_add(1);
+        let entry = self.entries.get_mut(session_id)?;
+        if !entry.ready {
+            return None;
+        }
+        entry.last_used = self.clock;
+        Some(Arc::clone(&entry.state))
+    }
+
+    fn get_any(&mut self, session_id: &str) -> Option<Arc<MCPState>> {
+        self.clock = self.clock.wrapping_add(1);
+        let entry = self.entries.get_mut(session_id)?;
+        entry.last_used = self.clock;
+        Some(Arc::clone(&entry.state))
+    }
+
+    fn insert(&mut self, session_id: String, state: Arc<MCPState>, ready: bool) {
+        if self.entries.len() >= self.max_sessions {
+            if let Some(oldest) = self.entries.iter()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(id, _)| id.clone())
+            {
+                self.entries.remove(&oldest);
+            }
+        }
+        self.clock = self.clock.wrapping_add(1);
+        self.entries.insert(session_id, SessionEntry {
+            state,
+            last_used: self.clock,
+            ready,
+        });
+    }
+
+    fn mark_ready(&mut self, session_id: &str) -> bool {
+        let Some(entry) = self.entries.get_mut(session_id) else { return false };
+        entry.ready = true;
+        true
+    }
+
+    fn create_registered(&mut self) -> (String, Arc<MCPState>) {
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let state = Arc::new(MCPState::new());
+        self.insert(session_id.clone(), Arc::clone(&state), false);
+        (session_id, state)
+    }
+}
+
+#[derive(Clone)]
+struct SseMessage {
+    session_id: Option<String>,
+    payload: String,
+}
+
+struct SseLease {
+    state: &'static TransportState,
+    session_id: String,
+}
+
+impl Drop for SseLease {
+    fn drop(&mut self) {
+        if let Ok(mut active) = self.state.active_sse.lock() {
+            active.remove(&self.session_id);
+        }
+    }
+}
+
 /// Shared state for the MCP HTTP transport, stored as a global static.
 struct TransportState {
-    // #210: no Mutex — Database is now Sync (internally pooled), and MCPState
-    // tracks `initialized` via an AtomicBool, so concurrent requests share these
-    // by shared reference and read in parallel instead of serializing on a lock.
+    // #210: the DB remains lock-free at this layer. Session-registry locks are
+    // held only long enough to clone an Arc<MCPState>; tool execution never runs
+    // while the registry is locked.
     db: Arc<Database>,
-    mcp_state: Arc<MCPState>,
-    sse_tx: broadcast::Sender<String>,
+    sessions: Mutex<SessionRegistry>,
+    active_sse: Mutex<HashSet<String>>,
+    sse_tx: broadcast::Sender<SseMessage>,
 }
 
 static TRANSPORT_STATE: OnceLock<TransportState> = OnceLock::new();
 
 /// Initialize the global transport state. Must be called before starting the server.
 pub fn init_transport_state(db: Arc<Database>) {
-    let (sse_tx, _) = broadcast::channel::<String>(256);
+    let (sse_tx, _) = broadcast::channel::<SseMessage>(256);
     let state = TransportState {
         db,
-        mcp_state: Arc::new(MCPState::new()),
+        sessions: Mutex::new(SessionRegistry::new()),
+        active_sse: Mutex::new(HashSet::new()),
         sse_tx,
     };
     TRANSPORT_STATE.set(state).ok();
@@ -83,10 +182,19 @@ pub fn build_transport_router(mode: TransportMode, auth_token: Option<String>) -
     // cookie/ambient, so reflecting Origin does not enable a cross-site
     // credential attack), but a `PERSEUS_VAULT_CORS_ALLOWED_ORIGINS` allowlist can lock
     // it down further.
+    let session_header = header::HeaderName::from_static(MCP_SESSION_ID_HEADER);
+    let protocol_header = header::HeaderName::from_static(MCP_PROTOCOL_VERSION_HEADER);
     let cors = CorsLayer::new()
         .allow_origin(cors_allow_origin())
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
-        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE]);
+        .allow_headers([
+            header::ACCEPT,
+            header::AUTHORIZATION,
+            header::CONTENT_TYPE,
+            session_header.clone(),
+            protocol_header,
+        ])
+        .expose_headers([session_header]);
 
     let mut router = Router::new().route("/message", post(handle_message));
 
@@ -96,6 +204,7 @@ pub fn build_transport_router(mode: TransportMode, auth_token: Option<String>) -
 
     let router = router
         .route_layer(middleware::from_fn_with_state(auth_token, auth_middleware))
+        .route_layer(middleware::from_fn(origin_middleware))
         .layer(cors);
     // DoS-resistance: explicit body-size cap + global rate limit (Phase 1/2).
     crate::httplimit::apply_http_limits(router)
@@ -114,6 +223,62 @@ fn cors_allow_origin() -> AllowOrigin {
         }
         _ => AllowOrigin::mirror_request(),
     }
+}
+
+/// Reject non-loopback browser origins by default. An explicit
+/// PERSEUS_VAULT_CORS_ALLOWED_ORIGINS list replaces the default loopback policy.
+fn origin_allowed(origin: Option<&str>) -> bool {
+    let Some(origin) = origin else { return true };
+    if let Ok(list) = std::env::var("PERSEUS_VAULT_CORS_ALLOWED_ORIGINS") {
+        if !list.trim().is_empty() {
+            return list.split(',').any(|item| item.trim() == origin);
+        }
+    }
+    let Some((scheme, rest)) = origin.split_once("://") else { return false };
+    if !matches!(scheme, "http" | "https") {
+        return false;
+    }
+    let authority = rest.split('/').next().unwrap_or_default();
+    if authority.is_empty() || authority.contains('@') {
+        return false;
+    }
+    let host = if let Some(bracketed) = authority.strip_prefix('[') {
+        let Some(end) = bracketed.find(']') else { return false };
+        let suffix = &bracketed[end + 1..];
+        if !suffix.is_empty()
+            && !suffix.strip_prefix(':').is_some_and(|port| port.parse::<u16>().is_ok())
+        {
+            return false;
+        }
+        &bracketed[..end]
+    } else if let Some((host, port)) = authority.rsplit_once(':') {
+        if port.parse::<u16>().is_err() {
+            return false;
+        }
+        host
+    } else {
+        authority
+    };
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    host.parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
+}
+
+async fn origin_middleware(
+    request: Request<axum::body::Body>,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    let origin = match request.headers().get(header::ORIGIN) {
+        Some(value) => Some(value.to_str().map_err(|_| StatusCode::FORBIDDEN)?),
+        None => None,
+    };
+    if !origin_allowed(origin) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    Ok(next.run(request).await)
 }
 
 /// Middleware: require a Bearer token if one is configured.
@@ -161,69 +326,216 @@ fn get_state() -> Result<&'static TransportState, StatusCode> {
     TRANSPORT_STATE.get().ok_or(StatusCode::SERVICE_UNAVAILABLE)
 }
 
+fn valid_session_id(session_id: &str) -> bool {
+    !session_id.is_empty()
+        && session_id.len() <= 128
+        && session_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b':'))
+}
+
+fn requested_session_id(
+    headers: &HeaderMap,
+    params: &MessageParams,
+) -> Result<(Option<String>, bool), StatusCode> {
+    let header_id = headers
+        .get(MCP_SESSION_ID_HEADER)
+        .map(|value| value.to_str().map(str::to_owned))
+        .transpose()
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let (session_id, from_header) = match header_id {
+        Some(value) => (Some(value), true),
+        None => (params.session_id.clone(), false),
+    };
+    if session_id.as_deref().is_some_and(|id| !valid_session_id(id)) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    Ok((session_id, from_header))
+}
+
+fn validate_protocol_version(headers: &HeaderMap, is_initialize: bool) -> Result<(), StatusCode> {
+    if is_initialize {
+        return Ok(());
+    }
+    if let Some(value) = headers.get(MCP_PROTOCOL_VERSION_HEADER) {
+        let version = value.to_str().map_err(|_| StatusCode::BAD_REQUEST)?;
+        if !SUPPORTED_PROTOCOL_VERSIONS.contains(&version) {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+    }
+    Ok(())
+}
+
+fn resolve_mcp_session(
+    state: &TransportState,
+    req: &JsonRpcRequest,
+    requested_id: Option<String>,
+    from_header: bool,
+) -> Result<(Arc<MCPState>, Option<String>, bool, bool), StatusCode> {
+    if req.method == "initialize" {
+        // Streamable HTTP initialization starts a new server-issued session and
+        // therefore carries no Mcp-Session-Id. A query ID is accepted only for
+        // the legacy GET /sse handshake, which pre-registers a random session.
+        if from_header {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        if let Some(session_id) = requested_id {
+            let mcp_state = state.sessions.lock()
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+                .get_any(&session_id)
+                .ok_or(StatusCode::NOT_FOUND)?;
+            return Ok((mcp_state, Some(session_id), false, true));
+        }
+        let session_id = uuid::Uuid::new_v4().to_string();
+        return Ok((Arc::new(MCPState::new()), Some(session_id), true, false));
+    }
+
+    let session_id = requested_id.ok_or(StatusCode::BAD_REQUEST)?;
+    let mcp_state = state.sessions.lock()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .get(&session_id)
+        .ok_or(StatusCode::NOT_FOUND)?;
+    Ok((mcp_state, Some(session_id), false, false))
+}
+
+fn json_response(value: Value, session_id: Option<&str>) -> Response {
+    let mut response = Json(value).into_response();
+    if let Some(session_id) = session_id {
+        if let Ok(value) = header::HeaderValue::from_str(session_id) {
+            response.headers_mut().insert(
+                header::HeaderName::from_static(MCP_SESSION_ID_HEADER),
+                value,
+            );
+        }
+    }
+    response
+}
+
 /// Handle POST /message — JSON-RPC request → JSON-RPC response.
 async fn handle_message(
     Query(params): Query<MessageParams>,
+    headers: HeaderMap,
     axum::Json(request): axum::Json<Value>,
-) -> Result<Json<Value>, StatusCode> {
+) -> Result<Response, StatusCode> {
     let req: JsonRpcRequest = match serde_json::from_value(request) {
         Ok(r) => r,
         Err(e) => {
-            return Ok(Json(json!({
+            return Ok(json_response(json!({
                 "jsonrpc": "2.0",
                 "id": null,
                 "error": {"code": -32700, "message": format!("Parse error: {}", e)}
-            })));
+            }), None));
         }
     };
 
     let state = get_state()?;
+    let is_initialize = req.method == "initialize";
+    validate_protocol_version(&headers, is_initialize)?;
+    let (requested_id, from_header) = requested_session_id(&headers, &params)?;
+    let (mcp_state, mut session_id, pending_session, mark_ready) =
+        resolve_mcp_session(state, &req, requested_id, from_header)?;
     // #210: the handler is blocking and can make synchronous LLM round-trips
     // (perseus_vault_ask / perseus_vault_synthesize), so run it on the blocking thread pool to
     // keep the Tokio async workers (SSE streams, connection accept) free (#217).
-    // No locks: the DB checks out its own pooled connection and MCPState's
-    // `initialized` is atomic, so concurrent requests run in parallel.
+    // The registry lock was released above; concurrent sessions and requests run
+    // independently while sharing only the pooled database.
+    let pending_state = pending_session.then(|| Arc::clone(&mcp_state));
     let response = tokio::task::spawn_blocking(move || {
-        mcp::handle_request(&req, &state.mcp_state, &state.db)
+        mcp::handle_request(&req, &mcp_state, &state.db)
     })
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     match response {
         Some(resp) => {
-            if params.session_id.is_some() {
-                let resp_str = serde_json::to_string(&resp).unwrap_or_default();
-                let _ = state.sse_tx.send(resp_str);
+            if pending_state.is_some() || mark_ready {
+                if resp.error.is_none() {
+                    let ready_id = session_id.clone().expect("pending session id");
+                    let mut sessions = state.sessions.lock()
+                        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                    if let Some(pending_state) = pending_state {
+                        sessions.insert(ready_id, pending_state, true);
+                    } else if mark_ready && !sessions.mark_ready(&ready_id) {
+                        return Err(StatusCode::NOT_FOUND);
+                    }
+                } else {
+                    session_id = None;
+                }
             }
-            Ok(Json(
+            if session_id.is_some() && (!is_initialize || params.session_id.is_some()) {
+                let payload = serde_json::to_string(&resp).unwrap_or_default();
+                let _ = state.sse_tx.send(SseMessage {
+                    session_id: session_id.clone(),
+                    payload,
+                });
+            }
+            Ok(json_response(
                 serde_json::to_value(resp)
                     .unwrap_or(json!({"jsonrpc":"2.0","id":null,"error":{"code":-32603,"message":"Serialization error"}})),
+                session_id.as_deref(),
             ))
         }
-        None => Ok(Json(json!({"jsonrpc": "2.0", "id": null, "result": null}))),
+        None => Ok(json_response(
+            json!({"jsonrpc": "2.0", "id": null, "result": null}),
+            session_id.as_deref(),
+        )),
     }
 }
 
 /// Handle GET /sse — Server-Sent Events stream.
 async fn handle_sse(
-    Query(_params): Query<SseParams>,
+    Query(params): Query<SseParams>,
+    headers: HeaderMap,
 ) -> Result<Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>>, StatusCode> {
     let state = get_state()?;
+    validate_protocol_version(&headers, false)?;
+    let header_id = headers
+        .get(MCP_SESSION_ID_HEADER)
+        .map(|value| value.to_str().map(str::to_owned))
+        .transpose()
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let requested_id = header_id.or(params.session_id);
+    if requested_id.as_deref().is_some_and(|id| !valid_session_id(id)) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let session_id = {
+        let mut sessions = state.sessions.lock()
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        match requested_id {
+            Some(session_id) => {
+                sessions.get_any(&session_id).ok_or(StatusCode::NOT_FOUND)?;
+                session_id
+            }
+            None => sessions.create_registered().0,
+        }
+    };
+    {
+        let mut active = state.active_sse.lock()
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        if !active.insert(session_id.clone()) {
+            return Err(StatusCode::CONFLICT);
+        }
+    }
+    let lease = SseLease { state, session_id: session_id.clone() };
+    let endpoint = format!("/message?session_id={session_id}");
     let rx = state.sse_tx.subscribe();
 
     let stream = async_stream::stream! {
+        let _lease = lease;
         yield Ok(Event::default()
             .event("endpoint")
-            .data("/message"));
+            .data(endpoint));
 
         let mut rx = rx;
         loop {
             match rx.recv().await {
-                Ok(msg) => {
+                Ok(message) if message.session_id.as_deref() == Some(session_id.as_str()) => {
                     yield Ok(Event::default()
                         .event("message")
-                        .data(msg));
+                        .data(message.payload));
                 }
+                Ok(_) => continue,
                 Err(broadcast::error::RecvError::Lagged(_)) => {
                     continue;
                 }
@@ -309,6 +621,234 @@ mod tests {
         assert!(resp.headers().contains_key(header::WWW_AUTHENTICATE));
     }
 
+    #[tokio::test]
+    async fn non_loopback_browser_origin_is_rejected() {
+        let router = build_transport_router(TransportMode::Http, None);
+        let mut request = message_request(None);
+        request.headers_mut().insert(
+            header::ORIGIN,
+            header::HeaderValue::from_static("https://attacker.example"),
+        );
+        let response = router.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let mut malformed = message_request(None);
+        malformed.headers_mut().insert(
+            header::ORIGIN,
+            header::HeaderValue::from_bytes(&[0x80]).unwrap(),
+        );
+        let response = router.oneshot(malformed).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn independent_http_clients_receive_independent_mcp_sessions() {
+        let path = std::env::temp_dir()
+            .join(format!("perseus-vault-http-sessions-{}.db", uuid::Uuid::new_v4()));
+        let db = Database::open(path.to_str().unwrap()).expect("open session test db");
+        init_transport_state(Arc::new(db));
+        let router = build_transport_router(TransportMode::Http, None);
+
+        let initialize = |id: u64, name: &str| Request::builder()
+            .method("POST")
+            .uri("/message")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(json!({
+                "jsonrpc": "2.0", "id": id, "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-06-18", "capabilities": {},
+                    "clientInfo": {"name": name, "version": "0"}
+                }
+            }).to_string()))
+            .unwrap();
+
+        let first = router.clone().oneshot(initialize(1, "client-a")).await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let first_session = first.headers().get(MCP_SESSION_ID_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .expect("initialize must return Mcp-Session-Id").to_string();
+        let first_body = axum::body::to_bytes(first.into_body(), usize::MAX).await.unwrap();
+        let first_value: Value = serde_json::from_slice(&first_body).unwrap();
+        assert!(first_value.get("result").is_some(), "first initialize failed: {first_value}");
+
+        let second = router.clone().oneshot(initialize(2, "client-b")).await.unwrap();
+        assert_eq!(second.status(), StatusCode::OK);
+        let second_session = second.headers().get(MCP_SESSION_ID_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .expect("initialize must return Mcp-Session-Id").to_string();
+        let second_body = axum::body::to_bytes(second.into_body(), usize::MAX).await.unwrap();
+        let second_value: Value = serde_json::from_slice(&second_body).unwrap();
+        assert!(second_value.get("result").is_some(), "second initialize failed: {second_value}");
+        assert_ne!(first_session, second_session);
+
+        let sessions_before = get_state().unwrap().sessions.lock().unwrap().entries.len();
+        let failed_initialize = router.clone().oneshot(Request::builder()
+            .method("POST")
+            .uri("/message")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(json!({
+                "jsonrpc":"1.0", "id":9, "method":"initialize", "params":{}
+            }).to_string()))
+            .unwrap()).await.unwrap();
+        assert!(failed_initialize.headers().get(MCP_SESSION_ID_HEADER).is_none());
+        let failed_body = axum::body::to_bytes(failed_initialize.into_body(), usize::MAX)
+            .await.unwrap();
+        let failed_value: Value = serde_json::from_slice(&failed_body).unwrap();
+        assert!(failed_value.get("error").is_some());
+        assert_eq!(
+            get_state().unwrap().sessions.lock().unwrap().entries.len(),
+            sessions_before,
+            "failed initialize retained a session"
+        );
+
+        {
+            let state = get_state().unwrap();
+            let mut sessions = state.sessions.lock().unwrap();
+            let first_state = sessions.get(&first_session).unwrap();
+            let second_state = sessions.get(&second_session).unwrap();
+            assert_eq!(&*first_state.session_agent_id.read().unwrap(), "client-a");
+            assert_eq!(&*second_state.session_agent_id.read().unwrap(), "client-b");
+        }
+
+        let no_session = router.clone().oneshot(message_request(None)).await.unwrap();
+        assert_eq!(no_session.status(), StatusCode::BAD_REQUEST);
+        let fixed_initialize = router.clone().oneshot(Request::builder()
+            .method("POST")
+            .uri("/message?session_id=caller-selected")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(json!({
+                "jsonrpc":"2.0", "id":7, "method":"initialize", "params":{}
+            }).to_string()))
+            .unwrap()).await.unwrap();
+        assert_eq!(fixed_initialize.status(), StatusCode::NOT_FOUND);
+        let invalid_version = router.clone().oneshot(Request::builder()
+            .method("POST")
+            .uri("/message")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(MCP_SESSION_ID_HEADER, &first_session)
+            .header(MCP_PROTOCOL_VERSION_HEADER, "1900-01-01")
+            .body(Body::from(json!({
+                "jsonrpc":"2.0", "id":8, "method":"tools/list", "params":{}
+            }).to_string()))
+            .unwrap()).await.unwrap();
+        assert_eq!(invalid_version.status(), StatusCode::BAD_REQUEST);
+
+        // SSE subscribers must not receive another session's response.
+        use futures::StreamExt;
+
+        // Legacy HTTP+SSE opens GET first; the endpoint event carries a
+        // server-issued query session, whose initialize response returns on SSE.
+        let legacy_open = build_transport_router(TransportMode::Sse, None)
+            .oneshot(Request::builder().method("GET").uri("/sse")
+                .body(Body::empty()).unwrap()).await.unwrap();
+        let mut legacy_stream = legacy_open.into_body().into_data_stream();
+        let endpoint_event = tokio::time::timeout(
+            std::time::Duration::from_secs(1), legacy_stream.next()
+        ).await.expect("legacy endpoint event timed out")
+            .expect("legacy SSE stream ended").expect("legacy SSE body error");
+        let endpoint_text = String::from_utf8_lossy(&endpoint_event);
+        let legacy_session = endpoint_text.split("session_id=").nth(1)
+            .and_then(|value| value.lines().next())
+            .expect("legacy endpoint omitted session_id").trim().to_string();
+        let legacy_init = router.clone().oneshot(Request::builder()
+            .method("POST")
+            .uri(format!("/message?session_id={legacy_session}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(json!({
+                "jsonrpc":"2.0", "id":10, "method":"initialize",
+                "params":{"clientInfo":{"name":"client-c","version":"0"}}
+            }).to_string()))
+            .unwrap()).await.unwrap();
+        assert_eq!(legacy_init.status(), StatusCode::OK);
+        let legacy_event = tokio::time::timeout(
+            std::time::Duration::from_secs(1), legacy_stream.next()
+        ).await.expect("legacy initialize SSE response timed out")
+            .expect("legacy SSE stream ended").expect("legacy SSE body error");
+        assert!(String::from_utf8_lossy(&legacy_event).contains("\"id\":10"));
+        assert_eq!(
+            &*get_state().unwrap().sessions.lock().unwrap()
+                .get(&legacy_session).unwrap().session_agent_id.read().unwrap(),
+            "client-c"
+        );
+        drop(legacy_stream);
+
+        let subscribe = |session: &str| Request::builder()
+            .method("GET")
+            .uri(format!("/sse?session_id={session}"))
+            .body(Body::empty())
+            .unwrap();
+        let subscribe_header = |session: &str| Request::builder()
+            .method("GET")
+            .uri("/sse")
+            .header(MCP_SESSION_ID_HEADER, session)
+            .body(Body::empty())
+            .unwrap();
+        let unknown_sse = build_transport_router(TransportMode::Sse, None)
+            .oneshot(subscribe_header("unknown-session")).await.unwrap();
+        assert_eq!(unknown_sse.status(), StatusCode::NOT_FOUND);
+        let first_sse = build_transport_router(TransportMode::Sse, None)
+            .oneshot(subscribe_header(&first_session)).await.unwrap();
+        let duplicate_sse = build_transport_router(TransportMode::Sse, None)
+            .oneshot(subscribe(&first_session)).await.unwrap();
+        assert_eq!(duplicate_sse.status(), StatusCode::CONFLICT);
+        let second_sse = build_transport_router(TransportMode::Sse, None)
+            .oneshot(subscribe(&second_session)).await.unwrap();
+        let mut first_stream = first_sse.into_body().into_data_stream();
+        let mut second_stream = second_sse.into_body().into_data_stream();
+        tokio::time::timeout(std::time::Duration::from_secs(1), first_stream.next())
+            .await.expect("first SSE endpoint event timed out");
+        tokio::time::timeout(std::time::Duration::from_secs(1), second_stream.next())
+            .await.expect("second SSE endpoint event timed out");
+
+        let session_call = |id: u64, session: &str| Request::builder()
+            .method("POST")
+            .uri("/message")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(MCP_SESSION_ID_HEADER, session)
+            .body(Body::from(json!({
+                "jsonrpc":"2.0", "id":id, "method":"tools/list", "params":{}
+            }).to_string()))
+            .unwrap();
+        router.clone().oneshot(session_call(5, &first_session)).await.unwrap();
+        let first_event = tokio::time::timeout(
+            std::time::Duration::from_secs(1), first_stream.next()
+        ).await.expect("first session SSE response timed out")
+            .expect("first SSE stream ended").expect("first SSE body error");
+        assert!(String::from_utf8_lossy(&first_event).contains("\"id\":5"));
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(100), second_stream.next()
+        ).await.is_err(), "second session received first session's response");
+
+        router.clone().oneshot(session_call(6, &second_session)).await.unwrap();
+        let second_event = tokio::time::timeout(
+            std::time::Duration::from_secs(1), second_stream.next()
+        ).await.expect("second session SSE response timed out")
+            .expect("second SSE stream ended").expect("second SSE body error");
+        assert!(String::from_utf8_lossy(&second_event).contains("\"id\":6"));
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(100), first_stream.next()
+        ).await.is_err(), "first session received second session's response");
+
+        for (id, session) in [(3, first_session), (4, second_session)] {
+            let request = Request::builder()
+                .method("POST")
+                .uri("/message")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(MCP_SESSION_ID_HEADER, session)
+                .body(Body::from(json!({
+                    "jsonrpc":"2.0", "id":id, "method":"tools/list", "params":{}
+                }).to_string()))
+                .unwrap();
+            let response = router.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let value: Value = serde_json::from_slice(&body).unwrap();
+            assert!(value.get("result").is_some(), "session {id} was not initialized: {value}");
+        }
+
+        let _ = std::fs::remove_file(path);
+    }
+
     /// #223: concurrent-client load test for the DB connection pool, driven
     /// through the REAL HTTP transport — the same `init_transport_state` +
     /// `build_transport_router` + `axum::serve` path `main.rs` uses — rather
@@ -345,6 +885,26 @@ mod tests {
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(LOCK_RETRY_CAP);
         lock > 0 && lock <= cap && other == 0 && persisted == ok_writes as i64
+    }
+
+    #[test]
+    fn session_registry_hides_unready_state_and_evicts_lru() {
+        let mut registry = SessionRegistry {
+            entries: HashMap::new(),
+            clock: 0,
+            max_sessions: 2,
+        };
+        let (first_id, _) = registry.create_registered();
+        assert!(registry.get(&first_id).is_none(), "unready session was served");
+        assert!(registry.get_any(&first_id).is_some());
+        assert!(registry.mark_ready(&first_id));
+        assert!(registry.get(&first_id).is_some());
+
+        registry.insert("second".into(), Arc::new(MCPState::new()), true);
+        registry.insert("third".into(), Arc::new(MCPState::new()), true);
+        assert!(registry.get_any(&first_id).is_none(), "least-recent session was not evicted");
+        assert!(registry.get("second").is_some());
+        assert!(registry.get("third").is_some());
     }
 
     #[test]
@@ -446,8 +1006,7 @@ mod tests {
         let addr = addr_rx.recv().expect("server address");
         let base = format!("http://{}/message", addr);
 
-        // One MCP handshake; `initialized` lives in the shared global state, so a
-        // single initialize unblocks tools/call for every client.
+        // Initialize once and carry the server-issued session on every request.
         let init = ureq::post(&base)
             .set("Content-Type", "application/json")
             .send_string(
@@ -455,8 +1014,11 @@ mod tests {
                     "jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {}
                 })
                 .to_string(),
-            );
-        assert!(init.is_ok(), "initialize failed: {:?}", init.err());
+            )
+            .expect("initialize request failed");
+        let session_id = init.header("Mcp-Session-Id")
+            .expect("initialize response missing Mcp-Session-Id")
+            .to_string();
 
         // Run one full load pass and return its statistics. Parameterized by
         // category so a retry writes into its own partition and the per-attempt
@@ -470,6 +1032,7 @@ mod tests {
             let mut handles = Vec::new();
             for c in 0..clients {
                 let base = base.clone();
+                let session_id = session_id.clone();
                 let lock_errors = Arc::clone(&lock_errors);
                 let other_errors = Arc::clone(&other_errors);
                 let writes_ok = Arc::clone(&writes_ok);
@@ -483,6 +1046,8 @@ mod tests {
                         });
                         let text = match ureq::post(&base)
                             .set("Content-Type", "application/json")
+                            .set("Mcp-Session-Id", &session_id)
+                            .set("MCP-Protocol-Version", "2025-06-18")
                             .send_string(&body.to_string())
                         {
                             Ok(resp) => resp.into_string().unwrap_or_default(),
