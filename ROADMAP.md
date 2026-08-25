@@ -124,10 +124,11 @@ turning Markdown or a third-party benchmark into the source of truth. The order 
 dependency-aware execution recommendation, not a promise of dates. Linked issues remain the
 authoritative acceptance criteria.
 
-**Live queue at refresh:** seven open issues and no open pull requests. The shipped prerequisites
+**Live queue at refresh:** six open issues and no open pull requests. The shipped prerequisites
 [#1132](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1132),
 [#1133](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1133),
 [#1134](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1134),
+[#1135](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1135),
 [#1138](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1138),
 [#1141](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1141), and
 [#1142](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1142) are not re-queued.
@@ -149,17 +150,14 @@ A count mismatch blocks metadata publication; it does not change the capability 
 
 Use one implementation track and one measurement track:
 
-1. **Evidence substrate first:** [#1135 — governed derived and verbatim evidence lanes](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1135).
-   Add the typed lane contract, source-group deduplication, temporal/scope/lifecycle governance,
-   and hash-bound answer-facing receipt without changing default recall bytes.
-2. **Selection observability second:** [#1140 — bounded context-selection decisions](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1140).
+1. **Selection observability first:** [#1140 — bounded context-selection decisions](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1140).
    Explain candidate dispositions, reason codes, budgets, and replay fingerprints over the stable
    evidence representation.
-3. **Graph validation third:** [#1143 — matched graph-context ablation](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1143).
+2. **Graph validation second:** [#1143 — matched graph-context ablation](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1143).
    Compare graph-on/off under matched retrieval and context conditions; do not interpret an
    ablation before the selection/evidence receipt is inspectable.
-4. **Separate intervention track:** [#1136 — receipt-conditioned bucket intervention](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1136)
-   follows the existing evidence-ledger/replay contracts and should not be mixed into #1135.
+3. **Separate intervention track:** [#1136 — receipt-conditioned bucket intervention](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1136)
+   follows the existing evidence-ledger/replay contracts and should not be mixed into #1140.
 
 Keep [#1105](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1105) parked until the
 Amy/C3BM discussion, and keep [#1021](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1021)
@@ -174,7 +172,7 @@ contract, and serialize only the parts that share files or a schema boundary.
 #### Chunk 0 — roadmap and registry hygiene (complete at this refresh)
 
 - Remove stale hand-maintained tool-count prose from this roadmap.
-- Reconcile the live issue set and mark #1132, #1133, #1134, #1138, #1141, and #1142 as shipped
+- Reconcile the live issue set and mark #1132, #1133, #1134, #1135, #1138, #1141, and #1142 as shipped
   prerequisites rather than future work.
 - Keep `scripts/registry_metadata_check.py` as the publication/CI source of truth; no new tool is
   added by this documentation refresh.
@@ -182,30 +180,30 @@ contract, and serialize only the parts that share files or a schema boundary.
 **Exit condition:** the roadmap describes the current queue without stale issue states or a frozen
 registry number.
 
-#### Chunk 1 — governed derived and verbatim evidence (start here; provider-free)
+#### Chunk 1 — governed derived and verbatim evidence (complete; merged in `origin/main`)
 
-- **[#1135](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1135):** define typed
+- **[#1135](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1135):** the typed
   `derived` and `verbatim` lanes, stable source-group identity, evidence/source-span resolution,
   temporal validity, workspace/agent visibility, stale/superseded/tombstone exclusion, and a
-  bounded union path for answer assembly.
+  bounded union path for answer assembly are shipped.
 - Keep unverified verbatim material explicitly untrusted; it may be returned as evidence only under
   the governed opt-in path and may never silently become an authoritative derived fact.
-- Seal a hash-only receipt over the exact selected rows/spans, lane configuration, source groups,
-  exclusions, token accounting, scope, and temporal anchor. Raw bodies and prompts do not belong in
-  the durable receipt.
-- Preserve the existing default recall request/response bytes and avoid a SQLite schema migration;
-  use additive request metadata and the existing body/history/source-reference channels.
+- The hash-only receipt covers the exact selected rows/spans, lane configuration, source groups,
+  exclusions, token accounting, scope, and temporal anchor. Raw bodies and prompts are excluded.
+- The existing default recall request/response bytes remain unchanged; no SQLite schema migration
+  was introduced.
 
 **Exit condition:** derived-only, verbatim-only, and union fixtures return the same governed
 answer-facing evidence set on replay; duplicates are source-group deduplicated; insufficient
 budgets are explicit; scope, temporal, lifecycle, correction, and malformed-reference cases fail
 closed; the default path is byte-compatible.
 
-#### Chunk 2 — bounded context-selection decisions
+#### Chunk 2 — bounded context-selection decisions (active; this branch)
 
 - **[#1140](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1140):** expose opt-in
-  candidate dispositions, reason codes, lane/source-group decisions, budgets, and replay
-  fingerprints over #1135's evidence contract.
+  candidate dispositions, reason codes, lane/source-arm decisions, budgets, and replay
+  fingerprints over #1135's shipped evidence contract. The projection is available on fused recall
+  and context serving while the default response remains unchanged.
 
 **Exit condition:** an inspector can distinguish candidate generation, governance exclusion, lane
 selection, budget truncation, and answer assembly without receiving raw prompts or hidden content.
@@ -250,9 +248,10 @@ These remain visible but must not be pulled into the implementation wave:
 - **One contract per PR:** run the focused gate and the repository-declared full gate once on the
   exact tree, then publish/verify that PR at its exact head. Do not combine unrelated benchmark,
   security, and storage changes to reduce round trips.
-- **Serialize shared surfaces:** implement #1135 before #1140 and #1143; keep #1136 separate even
-  though it consumes the same evidence/replay vocabulary. Rebase every dependent branch onto the
-  verified live `main` before review; old CI or review evidence is stale after a base advance.
+- **Serialize shared surfaces:** treat the shipped #1135 contract as the prerequisite for #1140 and
+  #1143; keep #1136 separate even though it consumes the same evidence/replay vocabulary. Rebase
+  every dependent branch onto the verified live `main` before review; old CI or review evidence is
+  stale after a base advance.
 - **Parallelize only disjoint work:** documentation/spec work may proceed beside pure fixture work,
   but merge order remains contract-first when modules or schemas converge.
 - **Keep paid and cross-product work separate:** a green provider-free gate is evidence for

@@ -60,6 +60,7 @@ mod preload;
 mod projection;
 mod retrieval_skills;
 mod retrieval_telemetry;
+mod selection_decisions;
 #[cfg(test)]
 mod revocation_cutoff;
 mod rollback_repair;
@@ -2710,6 +2711,7 @@ fn run_prepare(
                 estimated_injected_tokens: 0,
                 corpus_chars: 0,
                 estimated_corpus_tokens: 0,
+                selection_decisions: None,
                 warnings: Vec::new(),
             }
         }
