@@ -464,6 +464,10 @@ pub struct RecallArgs {
     /// 0 = derive from depth_budget. Default 4096.
     #[serde(default, deserialize_with = "null_as_default")]
     pub max_tokens: i64,
+    /// #1135: opt-in governed derived/verbatim evidence projection. Omitted
+    /// means the legacy recall response remains byte-for-byte unchanged.
+    #[serde(default)]
+    pub evidence_lanes: Option<serde_json::Value>,
     /// #883: depth budget "low" | "mid" | "high" → 1024 / 4096 / 16384
     /// default tokens when max_tokens is unset. Omit = mid.
     #[serde(default)]
@@ -2463,6 +2467,12 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
         serde_json::from_value(args).map_err(|e| format!("Invalid recall arguments: {}", e))?;
     // #1048: captured before `a.query` is moved into the recall params below.
     let confirmed_query = a.query.clone();
+    let evidence_selection = a
+        .evidence_lanes
+        .as_ref()
+        .map(crate::evidence_lanes::parse_lane_selection)
+        .transpose()
+        .map_err(|error| format!("Invalid evidence_lanes: {error}"))?;
 
     // #865: granular authority — a manifest's presence requires memory.read
     // for retrieval. Fail-open when no manifest exists (legacy vault).
@@ -2554,7 +2564,7 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
         && mode == SearchMode::Fts5
         && a.as_of_unix_ms.is_none()
     {
-        return handle_recall_with_expansion(db, &a);
+        return handle_recall_with_expansion(db, &a, evidence_selection.as_ref());
     }
 
     // #363: captured before RecallParams moves fields out of `a`.
@@ -2987,6 +2997,27 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
             "retrieval_profile": profile_name,
         })
     };
+
+    if let Some(selection) = evidence_selection.as_ref() {
+        let evidence = crate::evidence_lanes::project_recall_evidence(
+            db,
+            &entities,
+            &confirmed_query,
+            selection,
+            a.max_tokens,
+            a.workspace_hash.as_deref(),
+            a.requesting_agent_id.as_deref(),
+            a.as_of_unix_ms,
+            a.valid_at,
+        )
+        .map_err(|error| format!("Evidence projection failed: {error}"))?;
+        let evidence = serde_json::to_value(evidence)
+            .map_err(|error| format!("Evidence projection serialization failed: {error}"))?;
+        if let Some(object) = result.as_object_mut() {
+            object.insert("evidence".to_string(), evidence);
+        }
+    }
+
     // #1142: declared topology is a separate explicit read surface. Ordinary
     // recall never queries it; callers must request it with a workspace and
     // transport-stamped identity.
@@ -3687,7 +3718,11 @@ pub fn handle_scan(db: &Database, args: Value) -> Result<String, String> {
 
 /// Run recall with stemming-based query expansion, merging results from
 /// the original query and up to `n_variants` stemmed alternatives.
-fn handle_recall_with_expansion(db: &Database, a: &RecallArgs) -> Result<String, String> {
+fn handle_recall_with_expansion(
+    db: &Database,
+    a: &RecallArgs,
+    evidence_selection: Option<&crate::evidence_lanes::LaneSelection>,
+) -> Result<String, String> {
     use rust_stemmers::{Algorithm, Stemmer};
     use std::collections::HashMap;
 
@@ -3821,11 +3856,32 @@ fn handle_recall_with_expansion(db: &Database, a: &RecallArgs) -> Result<String,
         }
     }
 
-    let result = json!({
+    let mut result = json!({
         "items": items_expanded,
         "total": items_expanded.len(),
         "variants": variants.len(),
     });
+    if let Some(selection) = evidence_selection {
+        let final_entities: Vec<crate::models::Entity> =
+            merged.iter().map(|(entity, _)| entity.clone()).collect();
+        let evidence = crate::evidence_lanes::project_recall_evidence(
+            db,
+            &final_entities,
+            &a.query,
+            selection,
+            a.max_tokens,
+            a.workspace_hash.as_deref(),
+            a.requesting_agent_id.as_deref(),
+            a.as_of_unix_ms,
+            a.valid_at,
+        )
+        .map_err(|error| format!("Evidence projection failed: {error}"))?;
+        let evidence = serde_json::to_value(evidence)
+            .map_err(|error| format!("Evidence projection serialization failed: {error}"))?;
+        if let Some(object) = result.as_object_mut() {
+            object.insert("evidence".to_string(), evidence);
+        }
+    }
     Ok(result.to_string())
 }
 
