@@ -44,6 +44,7 @@ const DEFAULT_MAX_HTTP_SESSIONS: usize = 1024;
 struct SessionEntry {
     state: Arc<MCPState>,
     last_used: u64,
+    ready: bool,
 }
 
 struct SessionRegistry {
@@ -65,11 +66,21 @@ impl SessionRegistry {
     fn get(&mut self, session_id: &str) -> Option<Arc<MCPState>> {
         self.clock = self.clock.wrapping_add(1);
         let entry = self.entries.get_mut(session_id)?;
+        if !entry.ready {
+            return None;
+        }
         entry.last_used = self.clock;
         Some(Arc::clone(&entry.state))
     }
 
-    fn insert(&mut self, session_id: String, state: Arc<MCPState>) {
+    fn get_any(&mut self, session_id: &str) -> Option<Arc<MCPState>> {
+        self.clock = self.clock.wrapping_add(1);
+        let entry = self.entries.get_mut(session_id)?;
+        entry.last_used = self.clock;
+        Some(Arc::clone(&entry.state))
+    }
+
+    fn insert(&mut self, session_id: String, state: Arc<MCPState>, ready: bool) {
         if self.entries.len() >= self.max_sessions {
             if let Some(oldest) = self.entries.iter()
                 .min_by_key(|(_, entry)| entry.last_used)
@@ -82,13 +93,20 @@ impl SessionRegistry {
         self.entries.insert(session_id, SessionEntry {
             state,
             last_used: self.clock,
+            ready,
         });
+    }
+
+    fn mark_ready(&mut self, session_id: &str) -> bool {
+        let Some(entry) = self.entries.get_mut(session_id) else { return false };
+        entry.ready = true;
+        true
     }
 
     fn create_registered(&mut self) -> (String, Arc<MCPState>) {
         let session_id = uuid::Uuid::new_v4().to_string();
         let state = Arc::new(MCPState::new());
-        self.insert(session_id.clone(), Arc::clone(&state));
+        self.insert(session_id.clone(), Arc::clone(&state), false);
         (session_id, state)
     }
 }
@@ -253,8 +271,10 @@ async fn origin_middleware(
     request: Request<axum::body::Body>,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    let origin = request.headers().get(header::ORIGIN)
-        .and_then(|value| value.to_str().ok());
+    let origin = match request.headers().get(header::ORIGIN) {
+        Some(value) => Some(value.to_str().map_err(|_| StatusCode::FORBIDDEN)?),
+        None => None,
+    };
     if !origin_allowed(origin) {
         return Err(StatusCode::FORBIDDEN);
     }
@@ -351,7 +371,7 @@ fn resolve_mcp_session(
     req: &JsonRpcRequest,
     requested_id: Option<String>,
     from_header: bool,
-) -> Result<(Arc<MCPState>, Option<String>, bool), StatusCode> {
+) -> Result<(Arc<MCPState>, Option<String>, bool, bool), StatusCode> {
     if req.method == "initialize" {
         // Streamable HTTP initialization starts a new server-issued session and
         // therefore carries no Mcp-Session-Id. A query ID is accepted only for
@@ -362,12 +382,12 @@ fn resolve_mcp_session(
         if let Some(session_id) = requested_id {
             let mcp_state = state.sessions.lock()
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-                .get(&session_id)
+                .get_any(&session_id)
                 .ok_or(StatusCode::NOT_FOUND)?;
-            return Ok((mcp_state, Some(session_id), false));
+            return Ok((mcp_state, Some(session_id), false, true));
         }
         let session_id = uuid::Uuid::new_v4().to_string();
-        return Ok((Arc::new(MCPState::new()), Some(session_id), true));
+        return Ok((Arc::new(MCPState::new()), Some(session_id), true, false));
     }
 
     let session_id = requested_id.ok_or(StatusCode::BAD_REQUEST)?;
@@ -375,7 +395,7 @@ fn resolve_mcp_session(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .get(&session_id)
         .ok_or(StatusCode::NOT_FOUND)?;
-    Ok((mcp_state, Some(session_id), false))
+    Ok((mcp_state, Some(session_id), false, false))
 }
 
 fn json_response(value: Value, session_id: Option<&str>) -> Response {
@@ -412,7 +432,7 @@ async fn handle_message(
     let is_initialize = req.method == "initialize";
     validate_protocol_version(&headers, is_initialize)?;
     let (requested_id, from_header) = requested_session_id(&headers, &params)?;
-    let (mcp_state, mut session_id, pending_session) =
+    let (mcp_state, mut session_id, pending_session, mark_ready) =
         resolve_mcp_session(state, &req, requested_id, from_header)?;
     // #210: the handler is blocking and can make synchronous LLM round-trips
     // (perseus_vault_ask / perseus_vault_synthesize), so run it on the blocking thread pool to
@@ -428,11 +448,16 @@ async fn handle_message(
 
     match response {
         Some(resp) => {
-            if let Some(pending_state) = pending_state {
+            if pending_state.is_some() || mark_ready {
                 if resp.error.is_none() {
-                    state.sessions.lock()
-                        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-                        .insert(session_id.clone().expect("pending session id"), pending_state);
+                    let ready_id = session_id.clone().expect("pending session id");
+                    let mut sessions = state.sessions.lock()
+                        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                    if let Some(pending_state) = pending_state {
+                        sessions.insert(ready_id, pending_state, true);
+                    } else if mark_ready && !sessions.mark_ready(&ready_id) {
+                        return Err(StatusCode::NOT_FOUND);
+                    }
                 } else {
                     session_id = None;
                 }
@@ -479,7 +504,7 @@ async fn handle_sse(
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         match requested_id {
             Some(session_id) => {
-                sessions.get(&session_id).ok_or(StatusCode::NOT_FOUND)?;
+                sessions.get_any(&session_id).ok_or(StatusCode::NOT_FOUND)?;
                 session_id
             }
             None => sessions.create_registered().0,
@@ -604,7 +629,15 @@ mod tests {
             header::ORIGIN,
             header::HeaderValue::from_static("https://attacker.example"),
         );
-        let response = router.oneshot(request).await.unwrap();
+        let response = router.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let mut malformed = message_request(None);
+        malformed.headers_mut().insert(
+            header::ORIGIN,
+            header::HeaderValue::from_bytes(&[0x80]).unwrap(),
+        );
+        let response = router.oneshot(malformed).await.unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
@@ -648,6 +681,26 @@ mod tests {
         assert!(second_value.get("result").is_some(), "second initialize failed: {second_value}");
         assert_ne!(first_session, second_session);
 
+        let sessions_before = get_state().unwrap().sessions.lock().unwrap().entries.len();
+        let failed_initialize = router.clone().oneshot(Request::builder()
+            .method("POST")
+            .uri("/message")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(json!({
+                "jsonrpc":"1.0", "id":9, "method":"initialize", "params":{}
+            }).to_string()))
+            .unwrap()).await.unwrap();
+        assert!(failed_initialize.headers().get(MCP_SESSION_ID_HEADER).is_none());
+        let failed_body = axum::body::to_bytes(failed_initialize.into_body(), usize::MAX)
+            .await.unwrap();
+        let failed_value: Value = serde_json::from_slice(&failed_body).unwrap();
+        assert!(failed_value.get("error").is_some());
+        assert_eq!(
+            get_state().unwrap().sessions.lock().unwrap().entries.len(),
+            sessions_before,
+            "failed initialize retained a session"
+        );
+
         {
             let state = get_state().unwrap();
             let mut sessions = state.sessions.lock().unwrap();
@@ -687,8 +740,17 @@ mod tests {
             .uri(format!("/sse?session_id={session}"))
             .body(Body::empty())
             .unwrap();
+        let subscribe_header = |session: &str| Request::builder()
+            .method("GET")
+            .uri("/sse")
+            .header(MCP_SESSION_ID_HEADER, session)
+            .body(Body::empty())
+            .unwrap();
+        let unknown_sse = build_transport_router(TransportMode::Sse, None)
+            .oneshot(subscribe_header("unknown-session")).await.unwrap();
+        assert_eq!(unknown_sse.status(), StatusCode::NOT_FOUND);
         let first_sse = build_transport_router(TransportMode::Sse, None)
-            .oneshot(subscribe(&first_session)).await.unwrap();
+            .oneshot(subscribe_header(&first_session)).await.unwrap();
         let duplicate_sse = build_transport_router(TransportMode::Sse, None)
             .oneshot(subscribe(&first_session)).await.unwrap();
         assert_eq!(duplicate_sse.status(), StatusCode::CONFLICT);
@@ -786,6 +848,26 @@ mod tests {
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(LOCK_RETRY_CAP);
         lock > 0 && lock <= cap && other == 0 && persisted == ok_writes as i64
+    }
+
+    #[test]
+    fn session_registry_hides_unready_state_and_evicts_lru() {
+        let mut registry = SessionRegistry {
+            entries: HashMap::new(),
+            clock: 0,
+            max_sessions: 2,
+        };
+        let (first_id, _) = registry.create_registered();
+        assert!(registry.get(&first_id).is_none(), "unready session was served");
+        assert!(registry.get_any(&first_id).is_some());
+        assert!(registry.mark_ready(&first_id));
+        assert!(registry.get(&first_id).is_some());
+
+        registry.insert("second".into(), Arc::new(MCPState::new()), true);
+        registry.insert("third".into(), Arc::new(MCPState::new()), true);
+        assert!(registry.get_any(&first_id).is_none(), "least-recent session was not evicted");
+        assert!(registry.get("second").is_some());
+        assert!(registry.get("third").is_some());
     }
 
     #[test]
