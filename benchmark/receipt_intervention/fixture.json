@@ -1,0 +1,93 @@
+{
+  "schema_version": "perseus-vault-receipt-intervention-fixture/v1",
+  "fixture_id": "issue-1136-synthetic-v1",
+  "workspace_hash": "workspace-a",
+  "agent_id": "agent-a",
+  "as_of_unix_ms": 1787616000000,
+  "config": {
+    "retrieval_mode": "fused-replay-v1",
+    "top_k": 3,
+    "context_token_budget": 48,
+    "scan_budget": 12,
+    "reader": "deterministic-required-evidence-reader-v1",
+    "judge": "deterministic-evaluator-v1",
+    "seed": 1136
+  },
+  "candidates": [
+    {"candidate_id":"ev-syn-lex","source_group":"g-syn","source_ref":"ref-syn-primary","lane":"fts5","workspace_hash":"workspace-a","agent_id":"agent-a","valid_from_unix_ms":1786000000000,"valid_to_unix_ms":null,"lifecycle":"active","token_count":12,"rank":1,"available":true},
+    {"candidate_id":"ev-syn-sem","source_group":"g-syn","source_ref":"ref-syn-semantic-alias","lane":"dense","workspace_hash":"workspace-a","agent_id":"agent-a","valid_from_unix_ms":1786000000000,"valid_to_unix_ms":null,"lifecycle":"active","token_count":12,"rank":5,"available":true},
+    {"candidate_id":"ev-syn-cache","source_group":"g-syn","source_ref":"ref-syn-cache-alias","lane":"cache","workspace_hash":"workspace-a","agent_id":"agent-a","valid_from_unix_ms":1786000000000,"valid_to_unix_ms":null,"lifecycle":"active","token_count":12,"rank":6,"available":true},
+    {"candidate_id":"stale-alias","source_group":"g-stale","source_ref":"ref-stale-alias","lane":"fallback","workspace_hash":"workspace-a","agent_id":"agent-a","valid_from_unix_ms":1780000000000,"valid_to_unix_ms":1785000000000,"lifecycle":"active","token_count":12,"rank":7,"available":true},
+
+    {"candidate_id":"ev-exp-base","source_group":"g-exp","source_ref":"ref-exp-base","lane":"fts5","workspace_hash":"workspace-a","agent_id":"agent-a","valid_from_unix_ms":1786000000000,"valid_to_unix_ms":null,"lifecycle":"active","token_count":12,"rank":1,"available":true},
+    {"candidate_id":"ev-exp-child","source_group":"g-exp","source_ref":"ref-exp-child","lane":"source_expansion","workspace_hash":"workspace-a","agent_id":"agent-a","valid_from_unix_ms":1786000000000,"valid_to_unix_ms":null,"lifecycle":"active","token_count":12,"rank":5,"available":true},
+    {"candidate_id":"ev-exp-dense","source_group":"g-exp","source_ref":"ref-exp-dense","lane":"dense","workspace_hash":"workspace-a","agent_id":"agent-a","valid_from_unix_ms":1786000000000,"valid_to_unix_ms":null,"lifecycle":"active","token_count":12,"rank":6,"available":true},
+
+    {"candidate_id":"ev-cache-base","source_group":"g-cache","source_ref":"ref-cache-base","lane":"fts5","workspace_hash":"workspace-a","agent_id":"agent-a","valid_from_unix_ms":1786000000000,"valid_to_unix_ms":null,"lifecycle":"active","token_count":12,"rank":1,"available":true},
+    {"candidate_id":"ev-cache-hit","source_group":"g-cache","source_ref":"ref-cache-hit","lane":"cache","workspace_hash":"workspace-a","agent_id":"agent-a","valid_from_unix_ms":1786000000000,"valid_to_unix_ms":null,"lifecycle":"active","token_count":12,"rank":5,"available":true},
+    {"candidate_id":"ev-fallback-hit","source_group":"g-cache","source_ref":"ref-fallback-hit","lane":"fallback","workspace_hash":"workspace-a","agent_id":"agent-a","valid_from_unix_ms":1786000000000,"valid_to_unix_ms":null,"lifecycle":"active","token_count":12,"rank":6,"available":true},
+
+    {"candidate_id":"ev-primary","source_group":"g-primary","source_ref":"ref-primary","lane":"fts5","workspace_hash":"workspace-a","agent_id":"agent-a","valid_from_unix_ms":1786000000000,"valid_to_unix_ms":null,"lifecycle":"active","token_count":12,"rank":1,"available":true},
+    {"candidate_id":"ev-support","source_group":"g-support","source_ref":"ref-support","lane":"dense","workspace_hash":"workspace-a","agent_id":"agent-a","valid_from_unix_ms":1786000000000,"valid_to_unix_ms":null,"lifecycle":"active","token_count":12,"rank":2,"available":true},
+
+    {"candidate_id":"ev-partial","source_group":"g-partial","source_ref":"ref-partial","lane":"fts5","workspace_hash":"workspace-a","agent_id":"agent-a","valid_from_unix_ms":1786000000000,"valid_to_unix_ms":null,"lifecycle":"active","token_count":12,"rank":1,"available":true},
+
+    {"candidate_id":"dist-a","source_group":"g-dist-a","source_ref":"ref-dist-a","lane":"fts5","workspace_hash":"workspace-a","agent_id":"agent-a","valid_from_unix_ms":1786000000000,"valid_to_unix_ms":null,"lifecycle":"active","token_count":12,"rank":2,"available":true},
+    {"candidate_id":"dist-b","source_group":"g-dist-b","source_ref":"ref-dist-b","lane":"dense","workspace_hash":"workspace-a","agent_id":"agent-a","valid_from_unix_ms":1786000000000,"valid_to_unix_ms":null,"lifecycle":"active","token_count":12,"rank":3,"available":true},
+    {"candidate_id":"dist-c","source_group":"g-dist-c","source_ref":"ref-dist-c","lane":"temporal","workspace_hash":"workspace-a","agent_id":"agent-a","valid_from_unix_ms":1786000000000,"valid_to_unix_ms":null,"lifecycle":"active","token_count":12,"rank":4,"available":true},
+    {"candidate_id":"dist-other-scope","source_group":"g-private","source_ref":"ref-private","lane":"dense","workspace_hash":"workspace-b","agent_id":"agent-b","valid_from_unix_ms":1786000000000,"valid_to_unix_ms":null,"lifecycle":"active","token_count":12,"rank":2,"available":true},
+    {"candidate_id":"dist-tombstone","source_group":"g-tombstone","source_ref":"ref-tombstone","lane":"fallback","workspace_hash":"workspace-a","agent_id":"agent-a","valid_from_unix_ms":1786000000000,"valid_to_unix_ms":null,"lifecycle":"tombstoned","token_count":12,"rank":3,"available":true}
+  ],
+  "cases": [
+    {
+      "case_id":"synonym-alternate-lane",
+      "question":"Which deployment region is active?",
+      "workspace_hash":"workspace-a",
+      "agent_id":"agent-a",
+      "as_of_unix_ms":1787616000000,
+      "candidate_ids":["ev-syn-lex","dist-a","dist-b","dist-c","ev-syn-sem","ev-syn-cache","stale-alias","dist-other-scope"],
+      "receipt_candidate_ids":["ev-syn-lex"],
+      "evaluator":{"required_source_groups":["g-syn"]}
+    },
+    {
+      "case_id":"source-expansion",
+      "question":"Which service owns the retry policy?",
+      "workspace_hash":"workspace-a",
+      "agent_id":"agent-a",
+      "as_of_unix_ms":1787616000000,
+      "candidate_ids":["ev-exp-base","dist-a","dist-b","dist-c","ev-exp-child","ev-exp-dense"],
+      "receipt_candidate_ids":["ev-exp-base"],
+      "evaluator":{"required_source_groups":["g-exp"]}
+    },
+    {
+      "case_id":"cache-fallback",
+      "question":"What queue setting is current?",
+      "workspace_hash":"workspace-a",
+      "agent_id":"agent-a",
+      "as_of_unix_ms":1787616000000,
+      "candidate_ids":["ev-cache-base","dist-a","dist-b","dist-c","ev-cache-hit","ev-fallback-hit"],
+      "receipt_candidate_ids":["ev-cache-base"],
+      "evaluator":{"required_source_groups":["g-cache"]}
+    },
+    {
+      "case_id":"selected-unreceipted",
+      "question":"Which two records support the decision?",
+      "workspace_hash":"workspace-a",
+      "agent_id":"agent-a",
+      "as_of_unix_ms":1787616000000,
+      "candidate_ids":["ev-primary","ev-support","dist-a","dist-b","dist-c"],
+      "receipt_candidate_ids":["ev-primary"],
+      "evaluator":{"required_source_groups":["g-primary","g-support"]}
+    },
+    {
+      "case_id":"unavailable-evidence",
+      "question":"Which unavailable record completes the answer?",
+      "workspace_hash":"workspace-a",
+      "agent_id":"agent-a",
+      "as_of_unix_ms":1787616000000,
+      "candidate_ids":["ev-partial","dist-a","dist-b","dist-c","dist-tombstone"],
+      "receipt_candidate_ids":["ev-partial"],
+      "evaluator":{"required_source_groups":["g-partial","g-missing"]}
+    }
+  ]
+}
