@@ -20,8 +20,8 @@ use futures::stream::Stream;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{
-    collections::HashMap,
-    sync::{Arc, Mutex, OnceLock, RwLock},
+    collections::{HashMap, HashSet},
+    sync::{Arc, Mutex, OnceLock},
 };
 use tokio::sync::broadcast;
 use tower_http::cors::{AllowOrigin, CorsLayer};
@@ -37,6 +37,8 @@ pub enum TransportMode {
 }
 
 const MCP_SESSION_ID_HEADER: &str = "mcp-session-id";
+const MCP_PROTOCOL_VERSION_HEADER: &str = "mcp-protocol-version";
+const SUPPORTED_PROTOCOL_VERSIONS: [&str; 2] = ["2025-06-18", "2025-03-26"];
 const DEFAULT_MAX_HTTP_SESSIONS: usize = 1024;
 
 struct SessionEntry {
@@ -67,10 +69,7 @@ impl SessionRegistry {
         Some(Arc::clone(&entry.state))
     }
 
-    fn create(&mut self, session_id: String) -> Arc<MCPState> {
-        if let Some(existing) = self.get(&session_id) {
-            return existing;
-        }
+    fn insert(&mut self, session_id: String, state: Arc<MCPState>) {
         if self.entries.len() >= self.max_sessions {
             if let Some(oldest) = self.entries.iter()
                 .min_by_key(|(_, entry)| entry.last_used)
@@ -80,12 +79,17 @@ impl SessionRegistry {
             }
         }
         self.clock = self.clock.wrapping_add(1);
-        let state = Arc::new(MCPState::new());
         self.entries.insert(session_id, SessionEntry {
-            state: Arc::clone(&state),
+            state,
             last_used: self.clock,
         });
-        state
+    }
+
+    fn create_registered(&mut self) -> (String, Arc<MCPState>) {
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let state = Arc::new(MCPState::new());
+        self.insert(session_id.clone(), Arc::clone(&state));
+        (session_id, state)
     }
 }
 
@@ -95,6 +99,19 @@ struct SseMessage {
     payload: String,
 }
 
+struct SseLease {
+    state: &'static TransportState,
+    session_id: String,
+}
+
+impl Drop for SseLease {
+    fn drop(&mut self) {
+        if let Ok(mut active) = self.state.active_sse.lock() {
+            active.remove(&self.session_id);
+        }
+    }
+}
+
 /// Shared state for the MCP HTTP transport, stored as a global static.
 struct TransportState {
     // #210: the DB remains lock-free at this layer. Session-registry locks are
@@ -102,9 +119,7 @@ struct TransportState {
     // while the registry is locked.
     db: Arc<Database>,
     sessions: Mutex<SessionRegistry>,
-    // Backward compatibility for pre-session clients that initialize and then
-    // omit Mcp-Session-Id. It always points at the most recently created session.
-    legacy_mcp_state: RwLock<Arc<MCPState>>,
+    active_sse: Mutex<HashSet<String>>,
     sse_tx: broadcast::Sender<SseMessage>,
 }
 
@@ -116,7 +131,7 @@ pub fn init_transport_state(db: Arc<Database>) {
     let state = TransportState {
         db,
         sessions: Mutex::new(SessionRegistry::new()),
-        legacy_mcp_state: RwLock::new(Arc::new(MCPState::new())),
+        active_sse: Mutex::new(HashSet::new()),
         sse_tx,
     };
     TRANSPORT_STATE.set(state).ok();
@@ -150,13 +165,16 @@ pub fn build_transport_router(mode: TransportMode, auth_token: Option<String>) -
     // credential attack), but a `PERSEUS_VAULT_CORS_ALLOWED_ORIGINS` allowlist can lock
     // it down further.
     let session_header = header::HeaderName::from_static(MCP_SESSION_ID_HEADER);
+    let protocol_header = header::HeaderName::from_static(MCP_PROTOCOL_VERSION_HEADER);
     let cors = CorsLayer::new()
         .allow_origin(cors_allow_origin())
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
         .allow_headers([
+            header::ACCEPT,
             header::AUTHORIZATION,
             header::CONTENT_TYPE,
             session_header.clone(),
+            protocol_header,
         ])
         .expose_headers([session_header]);
 
@@ -168,6 +186,7 @@ pub fn build_transport_router(mode: TransportMode, auth_token: Option<String>) -
 
     let router = router
         .route_layer(middleware::from_fn_with_state(auth_token, auth_middleware))
+        .route_layer(middleware::from_fn(origin_middleware))
         .layer(cors);
     // DoS-resistance: explicit body-size cap + global rate limit (Phase 1/2).
     crate::httplimit::apply_http_limits(router)
@@ -186,6 +205,60 @@ fn cors_allow_origin() -> AllowOrigin {
         }
         _ => AllowOrigin::mirror_request(),
     }
+}
+
+/// Reject non-loopback browser origins by default. An explicit
+/// PERSEUS_VAULT_CORS_ALLOWED_ORIGINS list replaces the default loopback policy.
+fn origin_allowed(origin: Option<&str>) -> bool {
+    let Some(origin) = origin else { return true };
+    if let Ok(list) = std::env::var("PERSEUS_VAULT_CORS_ALLOWED_ORIGINS") {
+        if !list.trim().is_empty() {
+            return list.split(',').any(|item| item.trim() == origin);
+        }
+    }
+    let Some((scheme, rest)) = origin.split_once("://") else { return false };
+    if !matches!(scheme, "http" | "https") {
+        return false;
+    }
+    let authority = rest.split('/').next().unwrap_or_default();
+    if authority.is_empty() || authority.contains('@') {
+        return false;
+    }
+    let host = if let Some(bracketed) = authority.strip_prefix('[') {
+        let Some(end) = bracketed.find(']') else { return false };
+        let suffix = &bracketed[end + 1..];
+        if !suffix.is_empty()
+            && !suffix.strip_prefix(':').is_some_and(|port| port.parse::<u16>().is_ok())
+        {
+            return false;
+        }
+        &bracketed[..end]
+    } else if let Some((host, port)) = authority.rsplit_once(':') {
+        if port.parse::<u16>().is_err() {
+            return false;
+        }
+        host
+    } else {
+        authority
+    };
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    host.parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
+}
+
+async fn origin_middleware(
+    request: Request<axum::body::Body>,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    let origin = request.headers().get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok());
+    if !origin_allowed(origin) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    Ok(next.run(request).await)
 }
 
 /// Middleware: require a Bearer token if one is configured.
@@ -260,49 +333,49 @@ fn requested_session_id(
     Ok((session_id, from_header))
 }
 
+fn validate_protocol_version(headers: &HeaderMap, is_initialize: bool) -> Result<(), StatusCode> {
+    if is_initialize {
+        return Ok(());
+    }
+    if let Some(value) = headers.get(MCP_PROTOCOL_VERSION_HEADER) {
+        let version = value.to_str().map_err(|_| StatusCode::BAD_REQUEST)?;
+        if !SUPPORTED_PROTOCOL_VERSIONS.contains(&version) {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+    }
+    Ok(())
+}
+
 fn resolve_mcp_session(
     state: &TransportState,
     req: &JsonRpcRequest,
     requested_id: Option<String>,
     from_header: bool,
-) -> Result<(Arc<MCPState>, Option<String>), StatusCode> {
+) -> Result<(Arc<MCPState>, Option<String>, bool), StatusCode> {
     if req.method == "initialize" {
-        let mut sessions = state.sessions.lock()
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        let (session_id, mcp_state) = match requested_id {
-            Some(session_id) if from_header => {
-                let mcp_state = sessions.get(&session_id).ok_or(StatusCode::NOT_FOUND)?;
-                (session_id, mcp_state)
-            }
-            Some(session_id) => {
-                let mcp_state = sessions.create(session_id.clone());
-                (session_id, mcp_state)
-            }
-            None => {
-                let session_id = uuid::Uuid::new_v4().to_string();
-                let mcp_state = sessions.create(session_id.clone());
-                (session_id, mcp_state)
-            }
-        };
-        drop(sessions);
-        if !from_header {
-            *state.legacy_mcp_state.write()
-                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)? = Arc::clone(&mcp_state);
+        // Streamable HTTP initialization starts a new server-issued session and
+        // therefore carries no Mcp-Session-Id. A query ID is accepted only for
+        // the legacy GET /sse handshake, which pre-registers a random session.
+        if from_header {
+            return Err(StatusCode::BAD_REQUEST);
         }
-        return Ok((mcp_state, Some(session_id)));
+        if let Some(session_id) = requested_id {
+            let mcp_state = state.sessions.lock()
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+                .get(&session_id)
+                .ok_or(StatusCode::NOT_FOUND)?;
+            return Ok((mcp_state, Some(session_id), false));
+        }
+        let session_id = uuid::Uuid::new_v4().to_string();
+        return Ok((Arc::new(MCPState::new()), Some(session_id), true));
     }
 
-    if let Some(session_id) = requested_id {
-        let mcp_state = state.sessions.lock()
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-            .get(&session_id)
-            .ok_or(StatusCode::NOT_FOUND)?;
-        return Ok((mcp_state, Some(session_id)));
-    }
-
-    let legacy = state.legacy_mcp_state.read()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok((Arc::clone(&*legacy), None))
+    let session_id = requested_id.ok_or(StatusCode::BAD_REQUEST)?;
+    let mcp_state = state.sessions.lock()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .get(&session_id)
+        .ok_or(StatusCode::NOT_FOUND)?;
+    Ok((mcp_state, Some(session_id), false))
 }
 
 fn json_response(value: Value, session_id: Option<&str>) -> Response {
@@ -336,13 +409,17 @@ async fn handle_message(
     };
 
     let state = get_state()?;
+    let is_initialize = req.method == "initialize";
+    validate_protocol_version(&headers, is_initialize)?;
     let (requested_id, from_header) = requested_session_id(&headers, &params)?;
-    let (mcp_state, session_id) = resolve_mcp_session(state, &req, requested_id, from_header)?;
+    let (mcp_state, mut session_id, pending_session) =
+        resolve_mcp_session(state, &req, requested_id, from_header)?;
     // #210: the handler is blocking and can make synchronous LLM round-trips
     // (perseus_vault_ask / perseus_vault_synthesize), so run it on the blocking thread pool to
     // keep the Tokio async workers (SSE streams, connection accept) free (#217).
     // The registry lock was released above; concurrent sessions and requests run
     // independently while sharing only the pooled database.
+    let pending_state = pending_session.then(|| Arc::clone(&mcp_state));
     let response = tokio::task::spawn_blocking(move || {
         mcp::handle_request(&req, &mcp_state, &state.db)
     })
@@ -351,7 +428,16 @@ async fn handle_message(
 
     match response {
         Some(resp) => {
-            if params.session_id.is_some() {
+            if let Some(pending_state) = pending_state {
+                if resp.error.is_none() {
+                    state.sessions.lock()
+                        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+                        .insert(session_id.clone().expect("pending session id"), pending_state);
+                } else {
+                    session_id = None;
+                }
+            }
+            if session_id.is_some() && !is_initialize {
                 let payload = serde_json::to_string(&resp).unwrap_or_default();
                 let _ = state.sse_tx.send(SseMessage {
                     session_id: session_id.clone(),
@@ -377,26 +463,49 @@ async fn handle_sse(
     headers: HeaderMap,
 ) -> Result<Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>>, StatusCode> {
     let state = get_state()?;
+    validate_protocol_version(&headers, false)?;
     let header_id = headers
         .get(MCP_SESSION_ID_HEADER)
         .map(|value| value.to_str().map(str::to_owned))
         .transpose()
         .map_err(|_| StatusCode::BAD_REQUEST)?;
-    let session_id = header_id.or(params.session_id);
-    if session_id.as_deref().is_some_and(|id| !valid_session_id(id)) {
+    let requested_id = header_id.or(params.session_id);
+    if requested_id.as_deref().is_some_and(|id| !valid_session_id(id)) {
         return Err(StatusCode::BAD_REQUEST);
     }
+
+    let session_id = {
+        let mut sessions = state.sessions.lock()
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        match requested_id {
+            Some(session_id) => {
+                sessions.get(&session_id).ok_or(StatusCode::NOT_FOUND)?;
+                session_id
+            }
+            None => sessions.create_registered().0,
+        }
+    };
+    {
+        let mut active = state.active_sse.lock()
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        if !active.insert(session_id.clone()) {
+            return Err(StatusCode::CONFLICT);
+        }
+    }
+    let lease = SseLease { state, session_id: session_id.clone() };
+    let endpoint = format!("/message?session_id={session_id}");
     let rx = state.sse_tx.subscribe();
 
     let stream = async_stream::stream! {
+        let _lease = lease;
         yield Ok(Event::default()
             .event("endpoint")
-            .data("/message"));
+            .data(endpoint));
 
         let mut rx = rx;
         loop {
             match rx.recv().await {
-                Ok(message) if message.session_id == session_id => {
+                Ok(message) if message.session_id.as_deref() == Some(session_id.as_str()) => {
                     yield Ok(Event::default()
                         .event("message")
                         .data(message.payload));
@@ -488,6 +597,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn non_loopback_browser_origin_is_rejected() {
+        let router = build_transport_router(TransportMode::Http, None);
+        let mut request = message_request(None);
+        request.headers_mut().insert(
+            header::ORIGIN,
+            header::HeaderValue::from_static("https://attacker.example"),
+        );
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
     async fn independent_http_clients_receive_independent_mcp_sessions() {
         let path = std::env::temp_dir()
             .join(format!("perseus-vault-http-sessions-{}.db", uuid::Uuid::new_v4()));
@@ -536,6 +657,29 @@ mod tests {
             assert_eq!(&*second_state.session_agent_id.read().unwrap(), "client-b");
         }
 
+        let no_session = router.clone().oneshot(message_request(None)).await.unwrap();
+        assert_eq!(no_session.status(), StatusCode::BAD_REQUEST);
+        let fixed_initialize = router.clone().oneshot(Request::builder()
+            .method("POST")
+            .uri("/message?session_id=caller-selected")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(json!({
+                "jsonrpc":"2.0", "id":7, "method":"initialize", "params":{}
+            }).to_string()))
+            .unwrap()).await.unwrap();
+        assert_eq!(fixed_initialize.status(), StatusCode::NOT_FOUND);
+        let invalid_version = router.clone().oneshot(Request::builder()
+            .method("POST")
+            .uri("/message")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(MCP_SESSION_ID_HEADER, &first_session)
+            .header(MCP_PROTOCOL_VERSION_HEADER, "1900-01-01")
+            .body(Body::from(json!({
+                "jsonrpc":"2.0", "id":8, "method":"tools/list", "params":{}
+            }).to_string()))
+            .unwrap()).await.unwrap();
+        assert_eq!(invalid_version.status(), StatusCode::BAD_REQUEST);
+
         // SSE subscribers must not receive another session's response.
         use futures::StreamExt;
         let subscribe = |session: &str| Request::builder()
@@ -545,6 +689,9 @@ mod tests {
             .unwrap();
         let first_sse = build_transport_router(TransportMode::Sse, None)
             .oneshot(subscribe(&first_session)).await.unwrap();
+        let duplicate_sse = build_transport_router(TransportMode::Sse, None)
+            .oneshot(subscribe(&first_session)).await.unwrap();
+        assert_eq!(duplicate_sse.status(), StatusCode::CONFLICT);
         let second_sse = build_transport_router(TransportMode::Sse, None)
             .oneshot(subscribe(&second_session)).await.unwrap();
         let mut first_stream = first_sse.into_body().into_data_stream();
@@ -556,7 +703,7 @@ mod tests {
 
         let session_call = |id: u64, session: &str| Request::builder()
             .method("POST")
-            .uri(format!("/message?session_id={session}"))
+            .uri("/message")
             .header(header::CONTENT_TYPE, "application/json")
             .header(MCP_SESSION_ID_HEADER, session)
             .body(Body::from(json!({
@@ -740,9 +887,7 @@ mod tests {
         let addr = addr_rx.recv().expect("server address");
         let base = format!("http://{}/message", addr);
 
-        // This legacy load client omits Mcp-Session-Id after initialization; the
-        // compatibility pointer keeps its subsequent tools/call requests on the
-        // most recently created session.
+        // Initialize once and carry the server-issued session on every request.
         let init = ureq::post(&base)
             .set("Content-Type", "application/json")
             .send_string(
@@ -750,8 +895,11 @@ mod tests {
                     "jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {}
                 })
                 .to_string(),
-            );
-        assert!(init.is_ok(), "initialize failed: {:?}", init.err());
+            )
+            .expect("initialize request failed");
+        let session_id = init.header("Mcp-Session-Id")
+            .expect("initialize response missing Mcp-Session-Id")
+            .to_string();
 
         // Run one full load pass and return its statistics. Parameterized by
         // category so a retry writes into its own partition and the per-attempt
@@ -765,6 +913,7 @@ mod tests {
             let mut handles = Vec::new();
             for c in 0..clients {
                 let base = base.clone();
+                let session_id = session_id.clone();
                 let lock_errors = Arc::clone(&lock_errors);
                 let other_errors = Arc::clone(&other_errors);
                 let writes_ok = Arc::clone(&writes_ok);
@@ -778,6 +927,8 @@ mod tests {
                         });
                         let text = match ureq::post(&base)
                             .set("Content-Type", "application/json")
+                            .set("Mcp-Session-Id", &session_id)
+                            .set("MCP-Protocol-Version", "2025-06-18")
                             .send_string(&body.to_string())
                         {
                             Ok(resp) => resp.into_string().unwrap_or_default(),
